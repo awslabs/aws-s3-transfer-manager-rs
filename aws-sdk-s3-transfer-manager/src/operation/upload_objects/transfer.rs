@@ -673,6 +673,26 @@ impl UploadObjectsTransfer {
         let mut batch: Vec<ClaimedEntry> = Vec::new();
         // Loop until one spawnable entry is claimed or the queue is exhausted.
         while let Some(entry) = state.pending_entries.pop_front() {
+            // Only a regular file holds bytes to upload. A walk yields anything else only when
+            // asked, and an upload never asks — but the entry type can carry a socket, a FIFO or a
+            // symlink left alone, so the check belongs here rather than in a comment. Reading a
+            // FIFO with no writer would block this task for as long as the transfer lives, and an
+            // unfollowed symlink carries the link's own length while the path opens the target.
+            //
+            // Checked before a key is derived: a name holding a custom delimiter fails derivation,
+            // and under the abort policy that ends the run — over an entry nothing was going to
+            // upload.
+            if entry.file_type() != FileType::Regular {
+                // TODO(sync): a log is all this says. A run that reports what became of every key
+                // needs this passed-over entry in its output, not only in the trace.
+                tracing::warn!(
+                    path = ?entry.path(),
+                    file_type = ?entry.file_type(),
+                    "skipping: not a regular file",
+                );
+                continue;
+            }
+
             let relative = entry.relative_path().to_string_lossy().to_string();
             let key =
                 match derive_object_key(&relative, key_prefix.as_deref(), delimiter.as_deref()) {
@@ -690,24 +710,9 @@ impl UploadObjectsTransfer {
                         continue;
                     }
                 };
-
-            // Only a regular file holds bytes to upload. A walk yields anything else only when
-            // asked, and an upload never asks — but the entry type can carry a socket, a FIFO or a
-            // symlink left alone, so the check belongs here rather than in a comment. Reading a
-            // FIFO with no writer would block this task for as long as the transfer lives, and an
-            // unfollowed symlink carries the link's own length while the path opens the target.
-            if entry.file_type() != FileType::Regular {
-                tracing::warn!(
-                    path = ?entry.path(),
-                    file_type = ?entry.file_type(),
-                    "skipping: not a regular file",
-                );
-                continue;
-            }
             // The walk reports a regular file it could not describe as an error, so no entry for
             // one reaches here. Were that to change, building the stream without a length makes it
-            // `stat` the path again, which both blocks this task and reads a length the walk never
-            // saw.
+            // `stat` the path, which both blocks this task and reads a length the walk never saw.
             let Some(metadata) = entry.metadata() else {
                 state.failed.push(FailedUpload {
                     input: None,
@@ -1407,6 +1412,60 @@ mod tests {
         assert!(transfer.take_failed().is_empty());
     }
 
+    // A name is only worth deriving a key for once the entry is known to be uploadable. A custom
+    // delimiter inside a name is a derivation failure, and under the abort policy one failure ends
+    // the run — so a socket nobody was going to upload could stop a transfer.
+    #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn a_name_that_cannot_be_uploaded_is_not_turned_into_a_key() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "hello").unwrap();
+        // `-` is the configured delimiter, and it appears in this name.
+        let _listener = UnixListener::bind(dir.path().join("we-ird.sock")).unwrap();
+
+        let config = crate::Config::builder().client(mock_s3_success()).build();
+        let handle = crate::client::Handle::test_handle_tokio(config);
+        let input = super::super::UploadObjectsInputBuilder::default()
+            .bucket("test-bucket")
+            .source(dir.path())
+            .delimiter("-")
+            .failure_policy(FailedTransferPolicy::Abort)
+            .build()
+            .unwrap();
+        let walker = FsWalker::builder()
+            .include_special_files(true)
+            .build()
+            .walk(FsWalkContext::builder().root(dir.path()).build());
+        let (ctx, completion_rx) = TransferContext::new(handle);
+        let transfer = UploadObjectsTransfer::new(ctx, input, walker);
+        transfer
+            .inner
+            .ctx
+            .handle
+            .scheduler
+            .register_empty_group_for_test(transfer.inner.ctx.id.id);
+
+        timeout(Duration::from_secs(5), async {
+            drive_transfer(&transfer).await;
+            let _ = completion_rx.await;
+        })
+        .await
+        .expect("transfer should complete within timeout");
+
+        assert_eq!(
+            transfer.successful_uploads(),
+            1,
+            "the regular file should still be uploaded"
+        );
+        assert!(
+            transfer.take_failed().is_empty(),
+            "a socket is passed over, so its name never needs a key"
+        );
+    }
+
     // A walk asked for what no transfer can move yields a socket at its own key. An upload has to
     // leave it alone: its bytes cannot be read, and opening a FIFO with no writer would block the
     // read task for as long as the transfer lives.
@@ -1435,8 +1494,9 @@ mod tests {
         .await
         .expect("transfer should complete within timeout");
 
-        // Only the regular file. The socket is neither uploaded nor counted as a failure, the same
-        // as when the walk is not asked for it at all.
+        // Only the regular file is uploaded. A socket is not a failed upload, since nothing was
+        // attempted, and this output has no way to say it was passed over — a caller asking what
+        // became of every name the walk produced cannot learn it here.
         assert_eq!(transfer.successful_uploads(), 1);
         assert!(
             transfer.take_failed().is_empty(),
