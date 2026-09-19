@@ -89,7 +89,10 @@ pub(crate) fn strip_key_prefix<'a>(
         return stripped;
     }
 
-    &stripped[1..]
+    // By the delimiter's own length. A delimiter is caller-supplied and arbitrary, so one byte is
+    // right only for a single-byte one: two bytes leave half of it on the key, and slicing inside a
+    // multi-byte character panics.
+    &stripped[delim.len()..]
 }
 
 // `key` with the bucket's delimiter swapped for the platform's path separator, so a key becomes a
@@ -178,6 +181,23 @@ mod tests {
             assert_eq!(
                 *expected, actual,
                 "key={key:?} prefix={prefix:?} delim={delim:?}"
+            );
+        }
+    }
+
+    // FR-Root-4 lets a caller write the root with or without its trailing delimiter, so the prefix
+    // reaching here often does not end in one — which is the only shape that gets as far as taking
+    // the delimiter off. The sibling test below always passes a prefix that ends in it, so it
+    // returns early and never exercises this.
+    #[test]
+    fn a_prefix_without_its_delimiter_still_strips_one_delimiter() {
+        for delim in ["/", "//", "\\", "|", "delim", "§"] {
+            let key = format!("notes{delim}2021{delim}1.txt");
+            let expected = format!("2021{delim}1.txt");
+            assert_eq!(
+                strip_key_prefix(&key, Some("notes"), Some(delim)),
+                expected,
+                "delim={delim:?}"
             );
         }
     }
