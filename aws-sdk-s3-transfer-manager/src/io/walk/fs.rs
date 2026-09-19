@@ -906,14 +906,17 @@ impl FsWalk {
                 // Without a type there is no telling whether this name was a file or a directory, so
                 // the honest report is the wider one: if it was a directory, everything under it
                 // went unenumerated.
+                //
+                // Reported even when the filter excluded the name, because a rule on a name says
+                // nothing about the keys under it — `exclude("img")` matches `img` and not
+                // `img/a.txt`. An excluded entry stays silent, and this may be a directory, which
+                // is not an entry.
                 Err(e) => {
-                    if !rejected {
-                        result.errors.push(WalkError::new(
-                            Some(path),
-                            WalkErrorKind::DirectoryUnreadable,
-                            Box::new(e),
-                        ));
-                    }
+                    result.errors.push(WalkError::new(
+                        Some(path),
+                        WalkErrorKind::DirectoryUnreadable,
+                        Box::new(e),
+                    ));
                     continue;
                 }
             };
@@ -936,17 +939,29 @@ impl FsWalk {
                 let metadata = match std::fs::metadata(&path) {
                     Ok(m) => m,
                     Err(e) => {
-                        if !rejected {
-                            let kind = match e.kind() {
-                                // A link pointing at nothing has no subtree to lose.
-                                std::io::ErrorKind::NotFound => WalkErrorKind::BrokenSymlink,
-                                // Anything else leaves the target's kind unknown, and a link to a
-                                // directory would have filed a whole subtree under this name.
-                                _ => WalkErrorKind::DirectoryUnreadable,
-                            };
-                            result
-                                .errors
-                                .push(WalkError::new(Some(path), kind, Box::new(e)));
+                        match e.kind() {
+                            // A link pointing at nothing has no subtree to lose, so it is one
+                            // entry, and an excluded entry stays silent.
+                            std::io::ErrorKind::NotFound => {
+                                if !rejected {
+                                    result.errors.push(WalkError::new(
+                                        Some(path),
+                                        WalkErrorKind::BrokenSymlink,
+                                        Box::new(e),
+                                    ));
+                                }
+                            }
+                            // Anything else leaves the target's kind unknown, and a link to a
+                            // directory would have filed a whole subtree under this name. Reported
+                            // even when the filter excluded the name, because a rule on a name says
+                            // nothing about the keys under it.
+                            _ => {
+                                result.errors.push(WalkError::new(
+                                    Some(path),
+                                    WalkErrorKind::DirectoryUnreadable,
+                                    Box::new(e),
+                                ));
+                            }
                         }
                         continue;
                     }

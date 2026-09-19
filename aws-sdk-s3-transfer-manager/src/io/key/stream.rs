@@ -914,6 +914,56 @@ mod tests {
         );
     }
 
+    // A filter excluding a name says nothing about the keys under it: `exclude("link")` matches
+    // `link` and not `link/a.txt`. So when the walk cannot tell what `link` is, suppressing the
+    // failure because the name was excluded loses every key beneath it with nothing said.
+    #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn an_excluded_name_of_unknown_type_still_reports_its_range() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let outside = tempdir().unwrap();
+        let protected = outside.path().join("protected");
+        fs::create_dir(&protected).unwrap();
+        fs::create_dir(protected.join("data")).unwrap();
+        fs::set_permissions(&protected, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::metadata(protected.join("data")).is_ok() {
+            fs::set_permissions(&protected, fs::Permissions::from_mode(0o755)).unwrap();
+            return; // running as root
+        }
+
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "").unwrap();
+        std::os::unix::fs::symlink(protected.join("data"), dir.path().join("link")).unwrap();
+
+        // Excludes the name `link`, which leaves `link/...` included.
+        let filter = Arc::new(KeyFilter::new(vec![Rule::exclude("link")]));
+        let mut walk = FsWalker::builder()
+            .recursive(true)
+            .sort_order(SortOrder::WholeWalk)
+            .follow_symlinks(true)
+            .path_filter(local_predicate(filter))
+            .build()
+            .walk(FsWalkContext::builder().root(dir.path()).build());
+
+        let mut costs = Vec::new();
+        while let Some(next) = walk.next_entry().await {
+            if let Err(err) = next {
+                costs.push((walk_kind(&err), err.keys_lost()));
+            }
+        }
+        fs::set_permissions(&protected, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            costs.contains(&(
+                Some(WalkErrorKind::DirectoryUnreadable),
+                KeysLost::UnknownRange
+            )),
+            "the keys under an excluded name are not themselves excluded, got {costs:?}"
+        );
+    }
+
     // The reason this layer exists. A source that could not read one subdirectory must not let the
     // destination's keys under that name be deleted: they may still exist on the source, inside the
     // part nobody could see.
