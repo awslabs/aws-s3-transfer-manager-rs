@@ -142,9 +142,11 @@ first — the same check the failure paths already made. Miss it at one site and
 comes out anyway.
 
 **D9. A name that cannot be keyed is never filtered out.** Key derivation returns `None` for a
-name that is not valid UTF-8, and the local predicate keeps such an entry. Excluding it there
-would drop it silently, and a name nobody hears about reads as a name that is free. So filters can
-only exclude names that have keys.
+name that is not valid UTF-8, and the local predicate keeps such an entry. The listing side has
+the same case from the other direction, an object the listing gave no key for, and its predicate
+keeps that too. Excluding either would drop it silently, and a name nobody hears about reads as a
+name that is free. So filters can only exclude names that have keys, and whether a filter is
+installed decides what gets selected, never what gets reported.
 
 **D10. Filters run inside enumeration, on both sides, before metadata is read.** One ordered rule
 list matched on the relative key (FR-Filter-1, FR-Filter-2), applied to both sides (FR-Filter-3),
@@ -152,6 +154,11 @@ independent of arrival order and holding neither side whole (FR-Filter-4), with 
 expressed in the API (FR-Filter-6). Both sides, or an excluded local file makes its object look
 orphaned and delete mode removes it. Before metadata, or an excluded entry has already warned,
 which FR-Filter-5 forbids.
+
+That silence is owed to an entry, and a name whose type could not be read is not yet one. It may
+be a directory, and a rule matches a name and not the keys beneath it — `img` and not `img/a.txt`
+— so excluding it cannot stand for excluding what it holds. Such a failure is reported whatever
+the rules say.
 
 ---
 
@@ -241,7 +248,7 @@ That is the whole comparison. Nothing announced that `img/logo.png` was absent f
 the bucket side moved past where it would have been. **Absence is read from position.** Everything
 in this layer exists to make that inference sound.
 
-### Five types
+### The types
 
 **`FsWalk`** (existing) walks a local directory tree. **`S3Walk`** (existing) calls
 `ListObjectsV2` repeatedly, following the continuation token. Internally they share nothing.
@@ -253,7 +260,8 @@ comparison modes need fields only the original carries, like a checksum or an ET
 summary closes that door.
 
 **`KeyFilter`** (new) is the gate, and it matches on the key. **`WalkError`** (existing, one
-variant added) carries everything the stream could not turn into an entry.
+variant added) carries what a walk could not read, and **`StreamError`** (new) carries that
+alongside the two failures the stream has of its own, which D13 gives the reason for.
 
 `SortOrder`, `FsEntry`, `FileType` and `WalkErrorKind` are public, so a caller can come to depend on
 them. `FileType` and `WalkErrorKind` are `#[non_exhaustive]`, so a kind added later breaks nobody.
