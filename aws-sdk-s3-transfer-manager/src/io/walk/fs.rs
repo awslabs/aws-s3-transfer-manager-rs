@@ -81,10 +81,14 @@ fn name_bytes(path: &Path) -> &[u8] {
         .unwrap_or(b"")
 }
 
-// A directory that cannot be read. At the walk root this is fatal, since nothing
-// can be enumerated; deeper it is not, but it is kept distinct from entry-level
-// failures so consumers can tell that a subtree went unenumerated.
-fn dir_error_kind(e: &std::io::Error, depth: usize) -> WalkErrorKind {
+// A directory that could not be opened. At the walk root this is fatal, since nothing can be
+// enumerated; deeper it is not, but it stays distinct from entry-level failures so a consumer can
+// tell that a subtree went unenumerated.
+//
+// Opening is in the name because the root case turns on it. A directory whose read fails partway
+// through has already handed out names, and calling that fatal ends a run that was working — so
+// that site reports a lost range at every depth and does not come here.
+fn dir_open_error_kind(e: &std::io::Error, depth: usize) -> WalkErrorKind {
     if depth == 0 {
         match WalkError::classify_io(e) {
             WalkErrorKind::NotADirectory => WalkErrorKind::NotADirectory,
@@ -874,7 +878,7 @@ impl FsWalk {
         ancestor_handles: &[Arc<Handle>],
     ) -> Result<ReadDirResult, WalkError> {
         let entries = std::fs::read_dir(dir).map_err(|e| {
-            let kind = dir_error_kind(&e, depth);
+            let kind = dir_open_error_kind(&e, depth);
             WalkError::new(Some(dir.to_path_buf()), kind, Box::new(e))
         })?;
 
@@ -883,7 +887,7 @@ impl FsWalk {
         // chain is never consulted and the open()+fstat is pure cost.
         let next_ancestors = if self.config.follow_symlinks {
             let self_handle = Arc::new(Handle::from_path(dir).map_err(|e| {
-                let kind = dir_error_kind(&e, depth);
+                let kind = dir_open_error_kind(&e, depth);
                 WalkError::new(Some(dir.to_path_buf()), kind, Box::new(e))
             })?);
             let mut chain = ancestor_handles.to_vec();
@@ -904,8 +908,12 @@ impl FsWalk {
                 // The iterator may end on its next call, so how many of this directory's remaining
                 // names never arrived is unknown. That is a range, and the error names the directory
                 // rather than any one entry, so it has to report the kind a lost subtree reports.
+                //
+                // Never escalated for the root. Opening it failing means nothing can be enumerated,
+                // but the iterator failing means it opened and gave out names first, and ending the
+                // run over the rest would fail a transfer that had already uploaded files.
                 Err(e) => {
-                    let kind = dir_error_kind(&e, depth);
+                    let kind = WalkErrorKind::DirectoryUnreadable;
                     result
                         .errors
                         .push(WalkError::new(Some(dir.to_path_buf()), kind, Box::new(e)));
@@ -1005,8 +1013,9 @@ impl FsWalk {
                         // The directory is not descended into, so its subtree goes unenumerated —
                         // the same cost as a directory that could not be read, and it has to report
                         // the same kind or a consumer reads the side as complete. Never the root,
-                        // since this is a child of the directory being read, so `dir_error_kind`'s
-                        // depth test would wrongly call a top-level link the walk root.
+                        // since this is a child of the directory being read, so
+                        // `dir_open_error_kind`'s depth test would wrongly call a top-level link the
+                        // walk root.
                         Err(e) => {
                             let kind = WalkErrorKind::DirectoryUnreadable;
                             result
@@ -1459,8 +1468,9 @@ mod tests {
 
     // A fatal error says nothing further can be enumerated, so the walk has to stop saying it. When
     // the root fails the walk ends anyway, having queued nothing — the case worth pinning is a fatal
-    // error arriving while entries are still queued, which no filesystem condition reaches today
-    // because the kinds raised below the root are all per-entry. Injected for that reason.
+    // error arriving while entries are still queued. A file's `stat` failing with `ENOTDIR` reaches
+    // it, which takes a path component being replaced by a file between the directory read and the
+    // stat; the error is injected here rather than raced for.
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn a_fatal_error_ends_the_walk_even_with_entries_queued() {
@@ -1486,6 +1496,26 @@ mod tests {
             walk.next().await.is_none(),
             "a fatal error means nothing more can be enumerated, so no entry may follow it"
         );
+    }
+
+    // Failing to open the walk root means nothing can be enumerated, which is the one directory
+    // failure that ends a run. One level down the same failure costs that subtree. Pinned because
+    // the iterator site deliberately does not use this: by the time it fails, names have gone out.
+    #[test]
+    fn only_a_root_that_cannot_be_opened_ends_a_walk() {
+        let denied = || std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+
+        assert_eq!(
+            dir_open_error_kind(&denied(), 0),
+            WalkErrorKind::SourceUnreadable
+        );
+        assert!(dir_open_error_kind(&denied(), 0).is_fatal());
+
+        assert_eq!(
+            dir_open_error_kind(&denied(), 1),
+            WalkErrorKind::DirectoryUnreadable
+        );
+        assert!(!dir_open_error_kind(&denied(), 1).is_fatal());
     }
 
     #[cfg_attr(miri, ignore)]
