@@ -11,7 +11,9 @@
 
 use std::fmt;
 
-use super::admission::{AdmissionGuard, DirectDebitError, ReservationState, ReserveError};
+use super::admission::{
+    AdmissionGuard, CoverageDebit, DirectDebitError, ReservationState, ReserveError,
+};
 use super::arena::{ArenaError, ClaimBatch};
 use super::block::{
     BlockError, BlockSlot, CarrierAllocation, CarrierAllocationBatch, CarrierLocation,
@@ -69,6 +71,8 @@ struct AcquisitionDebit {
     direct: Option<Arc<ReservationState>>,
     /// Charges not yet transferred to carrier guards.
     untransferred: CarrierCount,
+    /// Uncovered contribution still owned by the provisional charges.
+    aggregate: CoverageDebit,
 }
 
 impl AcquisitionDebit {
@@ -85,19 +89,20 @@ impl AcquisitionDebit {
         }
 
         let aggregate = match pool.try_debit_covered(count) {
-            Ok(true) => Ok(()),
+            Ok(true) => Ok(CoverageDebit::covered()),
             Ok(false) => {
                 let mut admission = AdmissionGuard::new(pool.admission.lock());
                 PoolInner::debit_and_prepare_locked(pool, &mut admission, count)
             }
             Err(error) => Err(error),
         };
-        if let Err(error) = aggregate {
-            return Err(map_reserve_error(error));
-        }
+        let aggregate = match aggregate {
+            Ok(aggregate) => aggregate,
+            Err(error) => return Err(map_reserve_error(error)),
+        };
         if let Some(direct) = direct.as_ref() {
             if let Err(error) = direct.try_debit(count) {
-                PoolInner::release_acquisition_charges(pool, count);
+                PoolInner::rollback_acquisition_charges(pool, count, aggregate);
                 return Err(map_direct_debit_error(error));
             }
         }
@@ -106,6 +111,7 @@ impl AcquisitionDebit {
             pool: Arc::clone(pool),
             direct,
             untransferred: count,
+            aggregate,
         })
     }
 
@@ -120,6 +126,7 @@ impl AcquisitionDebit {
             direct: self.direct.as_ref().map(Arc::clone),
         });
         self.untransferred = untransferred;
+        self.aggregate.commit_one();
         guard
     }
 }
@@ -132,7 +139,7 @@ impl Drop for AcquisitionDebit {
         if let Some(direct) = self.direct.as_ref() {
             direct.release(self.untransferred);
         }
-        PoolInner::release_acquisition_charges(&self.pool, self.untransferred);
+        PoolInner::rollback_acquisition_charges(&self.pool, self.untransferred, self.aggregate);
     }
 }
 
@@ -474,6 +481,7 @@ fn map_direct_debit_error(error: DirectDebitError) -> AcquireError {
 fn map_reserve_error(error: ReserveError) -> AcquireError {
     match error {
         ReserveError::InvalidSize => AcquireError::InvalidSize,
+        ReserveError::ExceedsCapacity => AcquireError::CapacityOverflow,
         ReserveError::PhysicalPreparationFailed => AcquireError::PhysicalAllocationFailed,
         ReserveError::MetadataAllocationFailed => AcquireError::MetadataAllocationFailed,
         ReserveError::CapacityOverflow => AcquireError::CapacityOverflow,
@@ -701,6 +709,41 @@ mod tests {
     }
 
     #[test]
+    fn test_failed_covered_acquisition_restores_prior_coverage_classification() {
+        let (pool, carrier_size) = test_pool(2, 6, 1);
+        let uncovered = pool.acquire_unreserved(carrier_size * 2).unwrap();
+        let reservation = pool
+            .try_reserve(carrier_size * 4)
+            .unwrap()
+            .expect("reservation");
+        let before = pool.inner.test_accounting_state();
+        assert_eq!(
+            before,
+            (
+                CarrierCount::new(6),
+                CarrierCount::new(4),
+                CarrierCount::new(4),
+                CarrierCount::new(2),
+                0,
+            )
+        );
+        pool.inject_acquisition_allocation_failure(1);
+
+        assert!(matches!(
+            pool.acquire(&reservation, carrier_size),
+            Err(AcquireError::MetadataAllocationFailed)
+        ));
+
+        assert_eq!(pool.inner.test_accounting_state(), before);
+        let retry = pool
+            .acquire(&reservation, carrier_size)
+            .expect("rollback preserved covered acquisition authority");
+        drop(retry);
+        drop(reservation);
+        drop(uncovered);
+    }
+
+    #[test]
     fn test_covered_acquisition_does_not_enter_admission() {
         let (pool, carrier_size) = test_pool(1, 1, 1);
         let reservation = pool
@@ -783,7 +826,7 @@ mod tests {
         let second = pool
             .try_reserve(carrier_size)
             .unwrap()
-            .expect("idle-only reservation");
+            .expect("second reservation");
         let second_acquired = pool.acquire(&second, carrier_size).unwrap();
         let (waker, wake_state) = claiming_waker(pool.clone());
         let mut queued = pool.reserve(carrier_size);
@@ -921,18 +964,6 @@ mod tests {
             for _ in 0..STEPS {
                 match next(&mut state) % 4 {
                     0 => {
-                        let active: usize = actors
-                            .iter()
-                            .filter_map(|actor| actor.reservation.as_ref().map(|_| actor.envelope))
-                            .sum();
-                        let live: usize = owners.iter().map(|owner| owner.carriers).sum();
-
-                        // When no reservation is active, one request may exceed
-                        // the normal ceiling so retained owners cannot stop
-                        // progress. This model covers normal-ceiling admission.
-                        if active == 0 && live != 0 {
-                            continue;
-                        }
                         let Some(actor) = actors.iter_mut().find(|actor| !actor.used) else {
                             continue;
                         };
@@ -1236,7 +1267,7 @@ mod loom_tests {
             let holder = pool
                 .try_reserve(carrier_size)
                 .unwrap()
-                .expect("idle-only reservation");
+                .expect("reservation within configured capacity");
             let (waker, wake_count) = counting_waker();
             let mut future = pool.reserve(carrier_size);
 
@@ -1318,7 +1349,7 @@ mod loom_tests {
             let holder = pool
                 .try_reserve(carrier_size)
                 .unwrap()
-                .expect("idle-only reservation");
+                .expect("reservation within configured capacity");
             let (waker, wake_count) = counting_waker();
             let mut future = pool.reserve(carrier_size);
 

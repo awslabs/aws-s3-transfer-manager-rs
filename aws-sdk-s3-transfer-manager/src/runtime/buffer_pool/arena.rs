@@ -39,6 +39,9 @@ pub(super) struct Arena {
     registry: BlockRegistry,
     /// Serialized slot creation and registry rebuilding.
     state: Mutex<ArenaState>,
+    /// Whether test slots retain inaccessible pages around each block.
+    #[cfg(test)]
+    enable_guard_pages: bool,
 }
 
 /// Construction policy for one arena.
@@ -48,6 +51,9 @@ pub(super) struct ArenaOptions {
     optimistic_scan_words: usize,
     /// Whether successful optimistic claims update per-acquisition counters.
     enable_detailed_counters: bool,
+    /// Whether test slots retain inaccessible pages around each block.
+    #[cfg(test)]
+    enable_guard_pages: bool,
 }
 
 impl ArenaOptions {
@@ -56,7 +62,21 @@ impl ArenaOptions {
         Self {
             optimistic_scan_words,
             enable_detailed_counters,
+            #[cfg(test)]
+            enable_guard_pages: false,
         }
+    }
+
+    /// Returns the maximum bitmap words inspected optimistically.
+    pub(super) fn optimistic_scan_words(self) -> usize {
+        self.optimistic_scan_words
+    }
+
+    /// Enables inaccessible pages around each test block range.
+    #[cfg(test)]
+    pub(super) fn enable_guard_pages(mut self) -> Self {
+        self.enable_guard_pages = true;
+        self
     }
 }
 
@@ -77,6 +97,8 @@ impl Arena {
                 slots: Vec::new(),
                 next_slot: Some(0),
             }),
+            #[cfg(test)]
+            enable_guard_pages: options.enable_guard_pages,
         })
     }
 
@@ -97,7 +119,7 @@ impl Arena {
         let slot_id = state.next_slot.ok_or(ArenaError::SlotIdExhausted)?;
 
         state.slots.try_reserve(1)?;
-        let slot = Arc::new(BlockSlot::new(slot_id, self.geometry)?);
+        let slot = Arc::new(self.new_slot(slot_id)?);
         let generation = RegistryGeneration::try_with_slot(&state.slots, &slot)?;
 
         state.slots.push(Arc::clone(&slot));
@@ -105,6 +127,15 @@ impl Arena {
         self.registry.publish(generation);
         self.diagnostics.record_block_range_reserved();
         Ok(slot)
+    }
+
+    /// Reserves one block using the configured test storage layout.
+    fn new_slot(&self, slot_id: u32) -> Result<BlockSlot, BlockError> {
+        #[cfg(test)]
+        if self.enable_guard_pages {
+            return BlockSlot::new_guarded(slot_id, self.geometry);
+        }
+        BlockSlot::new(slot_id, self.geometry)
     }
 
     /// Classifies a complete nonempty range within one stable block slot.

@@ -70,6 +70,20 @@ impl VirtualMemoryError {
         )
     }
 
+    /// Reports overflow while adding guard pages around a managed range.
+    #[cfg(test)]
+    fn reservation_length_overflow(len: usize, guard_len: usize) -> Self {
+        Self::new(
+            VirtualMemoryOperation::Reserve,
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "range length {len} overflows while adding {guard_len} bytes of guards per side"
+                ),
+            ),
+        )
+    }
+
     /// Returns the operation that failed.
     pub(super) fn operation(&self) -> VirtualMemoryOperation {
         self.operation
@@ -175,15 +189,24 @@ pub(super) fn page_size() -> Result<NonZeroUsize, VirtualMemoryError> {
         .map_err(|source| VirtualMemoryError::new(VirtualMemoryOperation::QueryPageSize, source))
 }
 
-/// An exclusively owned, page-aligned virtual address range.
+/// An exclusively owned, page-aligned virtual-memory range.
 ///
-/// The address and length remain stable until drop. Protection and backing may
-/// change without returning the address range to the operating system.
+/// `base` and `len` identify the range controlled by the block lifecycle and
+/// remain stable until drop. Protection and backing may change without
+/// releasing its address. Production uses that range as the complete operating
+/// system reservation. Native tests may place it inside a larger reservation
+/// with inaccessible guard pages on both sides.
 #[derive(Debug)]
 pub(super) struct VirtualRange {
-    /// Allocation base retained until drop.
+    /// Complete address reservation retained until drop in test builds.
+    #[cfg(test)]
+    reservation_base: NonNull<MaybeUninit<u8>>,
+    /// Complete address reservation length in test builds.
+    #[cfg(test)]
+    reservation_len: usize,
+    /// Base of the range controlled by the block lifecycle.
     base: NonNull<MaybeUninit<u8>>,
-    /// Reserved length in bytes.
+    /// Length of the range controlled by the block lifecycle.
     len: usize,
     /// One-shot transition failures installed by tests.
     #[cfg(test)]
@@ -199,15 +222,16 @@ impl VirtualRange {
     /// Reserves an inaccessible page-aligned range.
     ///
     /// `len` must be a nonzero multiple of `page_size`. Success retains the
-    /// complete range at one address until drop.
+    /// range at one address until drop.
     pub(super) fn reserve(len: usize, page_size: NonZeroUsize) -> Result<Self, VirtualMemoryError> {
-        if len == 0 || !len.is_multiple_of(page_size.get()) {
-            return Err(VirtualMemoryError::invalid_length(len, page_size.get()));
-        }
-
+        Self::validate_length(len, page_size)?;
         let base = sys::reserve(len)
             .map_err(|source| VirtualMemoryError::new(VirtualMemoryOperation::Reserve, source))?;
         Ok(Self {
+            #[cfg(test)]
+            reservation_base: base,
+            #[cfg(test)]
+            reservation_len: len,
             base,
             len,
             #[cfg(test)]
@@ -215,12 +239,46 @@ impl VirtualRange {
         })
     }
 
-    /// Returns the reserved length in bytes.
+    /// Reserves a managed range with one inaccessible page on each side.
+    #[cfg(test)]
+    pub(super) fn reserve_guarded(
+        len: usize,
+        page_size: NonZeroUsize,
+    ) -> Result<Self, VirtualMemoryError> {
+        Self::validate_length(len, page_size)?;
+        let guard_len = page_size.get();
+        let reservation_len = len
+            .checked_add(guard_len)
+            .and_then(|len| len.checked_add(guard_len))
+            .ok_or_else(|| VirtualMemoryError::reservation_length_overflow(len, guard_len))?;
+        let reservation_base = sys::reserve(reservation_len)
+            .map_err(|source| VirtualMemoryError::new(VirtualMemoryOperation::Reserve, source))?;
+        // SAFETY: `guard_len` lies within the complete reservation.
+        let base = unsafe { reservation_base.byte_add(guard_len) };
+        Ok(Self {
+            reservation_base,
+            reservation_len,
+            base,
+            len,
+            #[cfg(test)]
+            injected_failures: InjectedFailures::default(),
+        })
+    }
+
+    /// Rejects range lengths the virtual-memory backends cannot represent.
+    fn validate_length(len: usize, page_size: NonZeroUsize) -> Result<(), VirtualMemoryError> {
+        if len == 0 || !len.is_multiple_of(page_size.get()) {
+            return Err(VirtualMemoryError::invalid_length(len, page_size.get()));
+        }
+        Ok(())
+    }
+
+    /// Returns the managed range length in bytes.
     pub(super) fn len(&self) -> usize {
         self.len
     }
 
-    /// Returns the allocation base for address comparison.
+    /// Returns the managed range base for address comparison.
     ///
     /// The integer does not grant access and is never converted back to a
     /// pointer.
@@ -228,7 +286,14 @@ impl VirtualRange {
         self.base.as_ptr().addr()
     }
 
-    /// Makes the complete range readable and writable.
+    /// Returns the complete address reservation retained by this range.
+    #[cfg(test)]
+    pub(super) fn reservation_address_range(&self) -> std::ops::Range<usize> {
+        let start = self.reservation_base.as_ptr().addr();
+        start..start + self.reservation_len
+    }
+
+    /// Makes the complete managed range readable and writable.
     ///
     /// Failure preserves exclusive address ownership but leaves protection
     /// unspecified. Bytes remain logically uninitialized after success.
@@ -240,7 +305,7 @@ impl VirtualRange {
             .map_err(|source| VirtualMemoryError::new(VirtualMemoryOperation::Prepare, source))
     }
 
-    /// Makes the complete range inaccessible while retaining its address.
+    /// Makes the complete managed range inaccessible while retaining its address.
     ///
     /// Failure preserves exclusive address ownership but leaves protection
     /// unspecified.
@@ -252,7 +317,7 @@ impl VirtualRange {
             .map_err(|source| VirtualMemoryError::new(VirtualMemoryOperation::Deactivate, source))
     }
 
-    /// Makes backing from an inaccessible range reclaimable.
+    /// Makes backing from the inaccessible managed range reclaimable.
     ///
     /// Failure leaves the address reserved and may leave backing resident.
     pub(super) fn discard(&self) -> Result<(), VirtualMemoryError> {
@@ -289,22 +354,27 @@ impl VirtualRange {
             return None;
         }
 
-        // SAFETY: the checked nonempty subrange lies within this reservation.
+        // SAFETY: the checked nonempty subrange lies within the managed range.
         Some(unsafe { self.base.byte_add(offset) })
     }
 }
 
 impl Drop for VirtualRange {
     fn drop(&mut self) {
+        #[cfg(test)]
+        let (reservation_base, reservation_len) = (self.reservation_base, self.reservation_len);
+        #[cfg(not(test))]
+        let (reservation_base, reservation_len) = (self.base, self.len);
+
         // A valid reservation release cannot fail. Drop cannot return the
         // platform error or retry after relinquishing ownership of this value.
-        if let Err(error) = sys::release(self.base, self.len) {
+        if let Err(error) = sys::release(reservation_base, reservation_len) {
             tracing::error!(
                 target: crate::telemetry::TARGET_MEMORY,
                 operation = %VirtualMemoryOperation::Release,
                 error = %error,
-                base = self.base_address(),
-                len = self.len,
+                base = reservation_base.as_ptr().addr(),
+                len = reservation_len,
                 "buffer-pool virtual range release failed; aborting"
             );
             std::process::abort();
@@ -733,6 +803,39 @@ mod tests {
         unsafe { last.as_ptr().write(MaybeUninit::new(0xa5)) };
         // SAFETY: the preceding write initialized this byte.
         assert_eq!(unsafe { last.as_ptr().read().assume_init() }, 0xa5);
+    }
+
+    #[cfg(not(any(miri, s3_tm_loom)))]
+    #[test]
+    fn guarded_range_prepares_only_the_managed_range() {
+        let page_size = page_size().unwrap();
+        let range_len = page_size.get() * 2;
+        let range = VirtualRange::reserve_guarded(range_len, page_size).unwrap();
+
+        assert_eq!(range.len(), range_len);
+        assert_eq!(
+            range.base_address(),
+            range.reservation_base.as_ptr().addr() + page_size.get()
+        );
+        assert_eq!(range.reservation_len, range_len + page_size.get() * 2);
+
+        range.prepare().unwrap();
+        // SAFETY: the complete managed range is prepared and exclusively retained.
+        let first = unsafe { range.ptr_for_range(0, 1).unwrap() };
+        // SAFETY: the complete managed range is prepared and exclusively retained.
+        let last = unsafe { range.ptr_for_range(range_len - 1, 1).unwrap() };
+        // SAFETY: these distinct range bytes are writable and unaliased.
+        unsafe {
+            first.as_ptr().write(MaybeUninit::new(0x5a));
+            last.as_ptr().write(MaybeUninit::new(0xa5));
+        }
+        // SAFETY: the preceding writes initialized these bytes.
+        assert_eq!(unsafe { first.as_ptr().read().assume_init() }, 0x5a);
+        // SAFETY: the preceding writes initialized these bytes.
+        assert_eq!(unsafe { last.as_ptr().read().assume_init() }, 0xa5);
+
+        range.deactivate().unwrap();
+        range.discard().unwrap();
     }
 
     #[test]
