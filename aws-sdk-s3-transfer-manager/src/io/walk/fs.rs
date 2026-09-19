@@ -1045,6 +1045,12 @@ impl FsWalk {
                 if rejected {
                     continue;
                 }
+                // TODO(walker): read this when the entry is handed over, not when its directory is.
+                // Ordering needs a name and a type, so in key order every file on the way down to
+                // the first key gets stat'd before anything is emitted — on a chain of directories
+                // that is the whole tree. Moving it also puts a read failure at its own key's
+                // position rather than at its directory's, which is a separate change to how
+                // failures are ordered.
                 let metadata = match std::fs::metadata(&path) {
                     Ok(m) => m,
                     Err(e) => {
