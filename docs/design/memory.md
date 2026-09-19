@@ -40,6 +40,9 @@ does not become bounded merely because its caller shares the pool.
 
 FIFO order and eligibility are pool-wide. One component's head request may block later requests
 from every component; the shared domain provides no per-component latency isolation.
+Scheduler priority does not reorder this FIFO. It controls which transfer may generate and
+dispatch more work, while requests that have entered shared-pool admission retain arrival order.
+A later high-priority transfer may therefore wait behind an older lower-priority reservation.
 
 Transfer-manager shutdown releases only that manager's state. It does not close a pool retained by
 another caller.

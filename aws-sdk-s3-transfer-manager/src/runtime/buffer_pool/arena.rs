@@ -257,6 +257,20 @@ impl Arena {
         sample
     }
 
+    /// Returns whether one prepared slot contains a complete free word run.
+    ///
+    /// The caller must externally quiesce claims and returns. Unlike the
+    /// allocator's cursor-bounded and serialized searches, this test/fuzz
+    /// oracle examines every current slot and performs no bitmap mutation.
+    #[cfg(any(test, s3_tm_fuzz))]
+    pub(super) fn has_free_word_run_quiescent(&self, word_count: usize) -> bool {
+        let generation = self.registry_generation();
+        generation
+            .slots_in_claim_order()
+            .iter()
+            .any(|slot| slot.has_free_word_run_quiescent(word_count))
+    }
+
     /// Prepares capacity through `target` under admission serialization.
     ///
     /// Whole-block preparation may raise prepared capacity above `target`.
@@ -325,7 +339,36 @@ impl Arena {
         }
 
         let budget = self.optimistic_scan_words.min(total_positions);
-        let origin = self.scan_origin.fetch_add(budget, Ordering::Relaxed) % total_positions;
+        // Partial scans advance by one charged window. A full-space window
+        // would wrap to the same origin, so rotate it by one word instead.
+        let origin_stride = if budget == total_positions { 1 } else { budget };
+        let origin = self.scan_origin.fetch_add(origin_stride, Ordering::Relaxed) % total_positions;
+        if let Some(word_count) = self.contiguous_word_count(required) {
+            while batch.inspected_words < budget && !batch.is_complete() {
+                let position = wrapped_position(origin, batch.inspected_words, total_positions);
+                let slot_index = position / words_per_slot;
+                let start_word = position % words_per_slot;
+                let word_limit = (words_per_slot - start_word).min(budget - batch.inspected_words);
+                let claim = BlockSlot::try_claim_word_run(
+                    &slots[slot_index],
+                    start_word,
+                    word_limit,
+                    word_count,
+                )?;
+                let inspected = claim.inspected_words();
+                if inspected == 0 || inspected > word_limit {
+                    invariant_violation("contiguous block claim reported invalid scan work");
+                }
+                batch.inspected_words += inspected;
+                if let Some(provisional) = claim.into_provisional() {
+                    batch.push(provisional)?;
+                }
+            }
+            self.diagnostics
+                .record_optimistic_scan(batch.inspected_words, !batch.is_complete());
+            return Ok(batch);
+        }
+
         while batch.inspected_words < budget && !batch.is_complete() {
             let position = wrapped_position(origin, batch.inspected_words, total_positions);
             let slot_index = position / words_per_slot;
@@ -369,6 +412,27 @@ impl Arena {
         let mut tracker = SerializedFallbackTracker::new(self.diagnostics.as_ref());
 
         let mut state = self.state.lock();
+        if batch.claimed() == CarrierCount::ZERO {
+            if let Some(word_count) = self.contiguous_word_count(batch.required) {
+                let slot_count = state.slots.len();
+                if slot_count != 0 {
+                    let words_per_slot = self.geometry.bitmap_words();
+                    let start_slot =
+                        (self.scan_origin.load(Ordering::Relaxed) / words_per_slot) % slot_count;
+                    for offset in 0..slot_count {
+                        let slot = &state.slots[(start_slot + offset) % slot_count];
+                        tracker.record_slot_inspected();
+                        let claim =
+                            BlockSlot::try_claim_word_run(slot, 0, words_per_slot, word_count)?;
+                        if let Some(provisional) = claim.into_provisional() {
+                            batch.push(provisional)?;
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+
         for slot in &state.slots {
             if batch.is_complete() {
                 return Ok(());
@@ -410,6 +474,17 @@ impl Arena {
             batch.push(provisional)?;
         }
         Ok(())
+    }
+
+    /// Returns the whole-word run required for a preferred contiguous claim.
+    fn contiguous_word_count(&self, count: CarrierCount) -> Option<usize> {
+        if count == CarrierCount::ZERO
+            || count > self.geometry.carriers_per_block()
+            || !count.get().is_multiple_of(u64::BITS as usize)
+        {
+            return None;
+        }
+        Some(count.get() / u64::BITS as usize)
     }
 
     /// Protects the current immutable registry generation.
@@ -1222,6 +1297,7 @@ mod tests {
 
     use super::super::admission::{AdmissionGuard, AdmissionState, MAX_PACKED_CARRIERS};
     use super::super::block::TrimBlocked;
+    use super::super::test_util::operation_sequence::PLACEMENT_PROFILE;
     use super::super::virtual_memory::{page_size, VirtualMemoryOperation};
     use super::super::CarrierCount;
     use super::*;
@@ -1537,6 +1613,130 @@ mod tests {
         }
 
         assert_eq!(indices, vec![0, 128, 64]);
+        assert_fully_free(&slot);
+    }
+
+    #[test]
+    fn scan_origin_rotates_when_budget_covers_the_scan_space() {
+        let arena = test_arena(geometry_with_carriers(130), 3).unwrap();
+        let slot = prepare_slots(&arena, 1).pop().unwrap();
+        let mut indices = Vec::new();
+
+        for _ in 0..3 {
+            let carriers = arena
+                .claim_optimistic(CarrierCount::new(1))
+                .unwrap()
+                .finish()
+                .unwrap();
+            indices.push(carriers[0].carrier_index());
+            drop(carriers);
+        }
+
+        assert_eq!(indices, vec![0, 64, 128]);
+        assert_fully_free(&slot);
+    }
+
+    #[test]
+    fn placement_profile_matches_arena_whole_word_eligibility() {
+        let arena = test_arena(
+            geometry_with_carriers(PLACEMENT_PROFILE.block_carriers()),
+            1,
+        )
+        .unwrap();
+
+        for carriers in 0..=PLACEMENT_PROFILE.configured_carriers() + 1 {
+            assert_eq!(
+                arena
+                    .contiguous_word_count(CarrierCount::new(carriers))
+                    .is_some(),
+                PLACEMENT_PROFILE.is_whole_word_claim(carriers),
+                "placement profile drifted at {carriers} carriers"
+            );
+        }
+    }
+
+    #[test]
+    fn contiguous_scan_prefers_a_complete_run_over_fragmented_prefix() {
+        let arena = test_arena(geometry_with_carriers(192), 3).unwrap();
+        let slot = prepare_slots(&arena, 1).pop().unwrap();
+        let mut occupied = BlockSlot::try_claim(&slot, CarrierCount::new(192))
+            .unwrap()
+            .unwrap()
+            .into_carriers()
+            .unwrap();
+        drop(occupied.drain(64..192).collect::<Vec<_>>());
+        drop(occupied.drain(0..32).collect::<Vec<_>>());
+
+        let carriers = arena
+            .claim_optimistic(CarrierCount::new(128))
+            .unwrap()
+            .finish()
+            .unwrap();
+
+        assert_eq!(carriers.first().unwrap().carrier_index(), 64);
+        assert_eq!(carriers.last().unwrap().carrier_index(), 191);
+        drop(carriers);
+        drop(occupied);
+        assert_fully_free(&slot);
+    }
+
+    #[test]
+    fn serialized_contiguous_scan_starts_from_the_rotating_cursor() {
+        let arena = test_arena(geometry_with_carriers(192), 1).unwrap();
+        let slots = prepare_slots(&arena, 2);
+        let mut occupied = BlockSlot::try_claim(&slots[0], CarrierCount::new(192))
+            .unwrap()
+            .unwrap()
+            .into_carriers()
+            .unwrap();
+        drop(occupied.drain(128..192).collect::<Vec<_>>());
+        drop(occupied.drain(0..64).collect::<Vec<_>>());
+        arena.scan_origin.store(2, Ordering::Relaxed);
+
+        let mut batch = arena.claim_optimistic(CarrierCount::new(128)).unwrap();
+        assert_eq!(batch.claimed(), CarrierCount::ZERO);
+        let admission = admission_with_prepared(CarrierCount::new(384));
+        arena
+            .complete_claim_serialized(&mut AdmissionGuard::new(admission.lock()), &mut batch)
+            .unwrap();
+        let carriers = batch.finish().unwrap();
+
+        assert!(carriers
+            .iter()
+            .all(|carrier| carrier.slot_id() == slots[1].id()));
+        assert_eq!(carriers.first().unwrap().carrier_index(), 0);
+        assert_eq!(carriers.last().unwrap().carrier_index(), 127);
+        drop(carriers);
+        drop(occupied);
+        assert_fully_free(&slots[0]);
+        assert_fully_free(&slots[1]);
+    }
+
+    #[test]
+    fn contiguous_miss_preserves_fragmented_fallback() {
+        let arena = test_arena(geometry_with_carriers(192), 1).unwrap();
+        let slot = prepare_slots(&arena, 1).pop().unwrap();
+        let mut occupied = BlockSlot::try_claim(&slot, CarrierCount::new(192))
+            .unwrap()
+            .unwrap()
+            .into_carriers()
+            .unwrap();
+        drop(occupied.drain(128..192).collect::<Vec<_>>());
+        drop(occupied.drain(0..64).collect::<Vec<_>>());
+
+        let mut batch = arena.claim_optimistic(CarrierCount::new(128)).unwrap();
+        assert_eq!(batch.claimed(), CarrierCount::ZERO);
+        let admission = admission_with_prepared(CarrierCount::new(192));
+        arena
+            .complete_claim_serialized(&mut AdmissionGuard::new(admission.lock()), &mut batch)
+            .unwrap();
+        let carriers = batch.finish().unwrap();
+
+        assert_eq!(carriers.len(), 128);
+        assert_eq!(carriers.first().unwrap().carrier_index(), 0);
+        assert_eq!(carriers.last().unwrap().carrier_index(), 191);
+        drop(carriers);
+        drop(occupied);
         assert_fully_free(&slot);
     }
 
@@ -2131,6 +2331,76 @@ mod tests {
     )]
     fn packed_fallback_work_has_an_exact_ci_regression_barrier() {
         assert_packed_fallback_work(&[8, 16, 32, 64, 128, 256], 64, 1, 256);
+    }
+
+    #[test]
+    fn whole_word_miss_has_an_exact_serialized_work_barrier() {
+        /*
+         * Four two-word slots each retain one carrier in each word:
+         *
+         *     [x...............................][x...............................]
+         *
+         * No complete two-word run exists. Serialized completion must inspect
+         * all four slots for a contiguous run, then consume 126 fragmented
+         * carriers from slot 0 and the final two from slot 1. The exact work is
+         * therefore 4 + 2 slot inspections, with no growth pass.
+         */
+        const SLOTS: usize = 4;
+        const WORDS_PER_SLOT: usize = 2;
+        const REQUEST: usize = WORDS_PER_SLOT * u64::BITS as usize;
+
+        let arena = test_arena(geometry_with_carriers(REQUEST), 1).unwrap();
+        let slots = prepare_slots(&arena, SLOTS);
+        let mut blockers = Vec::new();
+        for slot in &slots {
+            for word in 0..WORDS_PER_SLOT {
+                let blocker = BlockSlot::try_claim_words(slot, word, 1, CarrierCount::new(1))
+                    .unwrap()
+                    .into_provisional()
+                    .expect("one carrier remains free in each word")
+                    .into_carriers()
+                    .unwrap();
+                blockers.push(blocker);
+            }
+        }
+
+        let admission = admission_with_prepared(CarrierCount::new(SLOTS * REQUEST));
+        let before = arena.diagnostics();
+        let mut batch = arena.claim_optimistic(CarrierCount::new(REQUEST)).unwrap();
+        assert_eq!(batch.claimed(), CarrierCount::ZERO);
+        arena
+            .complete_claim_serialized(&mut AdmissionGuard::new(admission.lock()), &mut batch)
+            .unwrap();
+        let carriers = batch.finish().unwrap();
+        let after = arena.diagnostics();
+
+        assert_eq!(after.serialized_fallbacks - before.serialized_fallbacks, 1);
+        assert_eq!(
+            after.serialized_slots_inspected - before.serialized_slots_inspected,
+            6
+        );
+        assert_eq!(after.blocks_prepared, before.blocks_prepared);
+        assert_eq!(after.block_ranges_reserved, before.block_ranges_reserved);
+        assert_eq!(
+            carriers
+                .iter()
+                .filter(|carrier| carrier.slot_id() == slots[0].id())
+                .count(),
+            REQUEST - WORDS_PER_SLOT
+        );
+        assert_eq!(
+            carriers
+                .iter()
+                .filter(|carrier| carrier.slot_id() == slots[1].id())
+                .count(),
+            WORDS_PER_SLOT
+        );
+
+        drop(carriers);
+        drop(blockers);
+        for slot in &slots {
+            assert_fully_free(slot);
+        }
     }
 
     #[test]
