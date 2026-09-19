@@ -62,6 +62,8 @@ struct DownloadTransferInner {
     object_meta: std::sync::OnceLock<ObjectMetadata>,
     /// Object-integrity result (set once discovery completes)
     integrity_checks: std::sync::OnceLock<crate::types::IntegrityChecks>,
+    /// Expected total bytes produced by this download, discovered from the response.
+    expected_download_len: std::sync::OnceLock<u64>,
     /// Notified when discovery completes (success or failure)
     discovery_notify: tokio::sync::Notify,
 }
@@ -117,6 +119,7 @@ impl DownloadTransfer {
             writer,
             object_meta: std::sync::OnceLock::new(),
             integrity_checks: std::sync::OnceLock::new(),
+            expected_download_len: std::sync::OnceLock::new(),
             discovery_notify: tokio::sync::Notify::new(),
         });
         Self { inner }
@@ -597,18 +600,27 @@ impl DownloadTransfer {
 
         let etag: Option<Arc<str>> = object_meta.e_tag.as_deref().map(Arc::from);
 
-        // Optimization: Preallocate space for the full object/download size if there is a
-        // destination/sink and it supports it. e.g. pre-allocate disk space for the full
-        // download to avoid per-write metadata updates and late ENOSPC errors.
+        // Prepare the destination before range writes begin. Owned temporary files
+        // request best-effort allocation to reduce per-write metadata work. Linux
+        // storage or quota exhaustion is terminal here; other preallocation failures
+        // are logged and writes proceed. Successful completion establishes the exact
+        // logical length after the terminal drain.
         let chunk_content_len = chunk_meta
             .as_ref()
             .and_then(|m| m.content_length)
             .and_then(|length| u64::try_from(length).ok())
             .unwrap_or(0);
-        let total_size =
+        let expected_download_len =
             chunk_content_len + remaining.as_ref().map_or(0, |r| r.end() - r.start() + 1);
-        self.inner.writer.preallocate(total_size);
-        self.inner.ctx.set_total_bytes(total_size);
+        if let Err(error) = self.inner.writer.prepare(expected_download_len) {
+            let guard = self.inner.state.lock().unwrap();
+            return self.fail(
+                guard,
+                crate::error::Error::new(crate::error::ErrorKind::IOError, error),
+            );
+        }
+        let _ = self.inner.expected_download_len.set(expected_download_len);
+        self.inner.ctx.set_total_bytes(expected_download_len);
 
         // If there's an initial chunk, claim seq BEFORE waking to prevent race
         // where poll_work exhausts the window before we can claim our seq.
@@ -1042,7 +1054,12 @@ impl DownloadTransfer {
     /// never happens under it. Symmetric with `fail`, which error paths already call from
     /// `execute`.
     fn finalize_completion(&self) -> WorkOutcome {
-        if let Err(e) = self.inner.writer.finalize() {
+        let expected_len = *self
+            .inner
+            .expected_download_len
+            .get()
+            .expect("completed download must have a discovered length");
+        if let Err(e) = self.inner.writer.finalize(expected_len) {
             // Finalize failed: transition to failed. The state is already Terminal; `fail`
             // calls `enter_terminal` which is idempotent on Terminal (returns None).
             let guard = self.inner.state.lock().unwrap();
@@ -1074,7 +1091,7 @@ impl DownloadTransfer {
         drop(pending);
         // Wake all waiters
         self.inner.discovery_notify.notify_waiters();
-        let _ = self.inner.writer.finalize();
+        let _ = self.inner.writer.terminal_drain();
         self.inner.writer.notify_consumer();
         self.inner.ctx.signal_terminal();
         WorkOutcome::Failed { classification }
@@ -1082,7 +1099,12 @@ impl DownloadTransfer {
 
     /// Transition to terminal success state. Requires holding the work lock.
     fn complete(&self, mut guard: std::sync::MutexGuard<'_, DownloadState>) {
-        if let Err(e) = self.inner.writer.finalize() {
+        let expected_len = *self
+            .inner
+            .expected_download_len
+            .get()
+            .expect("completed download must have a discovered length");
+        if let Err(e) = self.inner.writer.finalize(expected_len) {
             self.fail(guard, error::Error::new(error::ErrorKind::IOError, e));
             return;
         }
@@ -1122,7 +1144,7 @@ impl Transfer for DownloadTransfer {
         drop(pending);
 
         self.inner.discovery_notify.notify_waiters();
-        let _ = self.inner.writer.finalize();
+        let _ = self.inner.writer.terminal_drain();
         self.inner.writer.notify_consumer();
     }
 }

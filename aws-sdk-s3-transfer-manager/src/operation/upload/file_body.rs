@@ -570,6 +570,36 @@ mod tests {
         assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
     }
 
+    #[cfg_attr(miri, ignore)] // The 1 MiB cross-chunk path is prohibitively slow under Miri.
+    #[test]
+    fn direct_body_does_not_publish_a_partially_read_chunk_after_truncation() {
+        let size = FILE_BODY_CHUNK_SIZE + 37;
+        let payload: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+        let tmp = write_tempfile(&payload);
+        let pool = test_pool();
+        let mut body = DirectFileBody::new(source(tmp.path(), &pool), 0, size as u64);
+
+        let first = match poll_body_once(&mut body) {
+            Poll::Ready(Some(Ok(frame))) => frame.into_data().unwrap(),
+            result => panic!("expected the complete first chunk, got {result:?}"),
+        };
+        assert_eq!(first.as_ref(), &payload[..FILE_BODY_CHUNK_SIZE]);
+        drop(first);
+        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+
+        tmp.as_file()
+            .set_len((FILE_BODY_CHUNK_SIZE + 5) as u64)
+            .unwrap();
+        let error = match poll_body_once(&mut body) {
+            Poll::Ready(Some(Err(error))) => error,
+            result => panic!("expected truncation to fail the next chunk, got {result:?}"),
+        };
+
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(body.is_end_stream());
+        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+    }
+
     #[test]
     fn direct_body_frames_retain_pool_ownership() {
         let payload = b"owner-backed body frame";
@@ -640,6 +670,31 @@ mod tests {
         let error = poll_fn(|cx| Pin::new(&mut body).poll_frame(cx))
             .await
             .expect("reader completion should produce a terminal frame")
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(body.is_end_stream());
+    }
+
+    #[cfg_attr(miri, ignore)] // Tokio's runtime uses unsupported platform FFI under Miri.
+    #[tokio::test]
+    async fn offloaded_body_propagates_reader_error() {
+        let (tx, rx) = mpsc::channel(1);
+        tx.send(Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "injected reader error",
+        )))
+        .await
+        .unwrap();
+        drop(tx);
+        let task = tokio::spawn(async {});
+        let mut body = OffloadedFileBody {
+            state: OffloadedState::Active { rx, task },
+            progress: FileBodyProgress::new(1),
+        };
+
+        let error = poll_fn(|cx| Pin::new(&mut body).poll_frame(cx))
+            .await
+            .expect("reader error should produce a terminal frame")
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
         assert!(body.is_end_stream());
