@@ -35,9 +35,14 @@ pub(crate) struct EntryMeta {
     // observed, and a real zero-byte object would be indistinguishable from an entry the walk
     // could not describe.
     pub(crate) size: Option<u64>,
-    // `None` when the platform cannot represent the recorded time. Substituting a
-    // value here would hand a comparison a number nobody observed, with nothing to
-    // say so.
+    // Optional because a side may have no time to report: the walk read no metadata, or the
+    // platform does not supply one.
+    //
+    // Do not compare two of these with `<`. `None` is less than every `Some`, so a source with no
+    // time reads as older than a destination that has one: asking "is the destination older?" gives
+    // `false`, and the key is skipped.
+    //
+    // Note that the S3 side always produces `Some`.
     pub(crate) last_modified_secs: Option<i64>,
 }
 
@@ -629,12 +634,15 @@ mod tests {
     // Uploading, so local is the source: a same-size entry is left alone unless the
     // destination is the older of the two.
     fn decide<S, D>(src: &Entry<S>, dest: &Entry<D>) -> Action {
-        if src.meta.size != dest.meta.size
-            || dest.meta.last_modified_secs < src.meta.last_modified_secs
-        {
-            Action::Transfer
-        } else {
-            Action::Skip
+        if src.meta.size != dest.meta.size {
+            return Action::Transfer;
+        }
+        // Absence is answered here rather than by comparing the options, because `None` sorts below
+        // every `Some`: a source with no time would read as older than the destination and be
+        // skipped, which is the one outcome a side that cannot describe itself must not produce.
+        match (src.meta.last_modified_secs, dest.meta.last_modified_secs) {
+            (Some(src_secs), Some(dest_secs)) if dest_secs >= src_secs => Action::Skip,
+            _ => Action::Transfer,
         }
     }
 
@@ -1677,9 +1685,37 @@ mod tests {
         );
     }
 
+    // A side with no time to compare cannot be shown to match, so the pair has to transfer. Letting
+    // `Option`'s own ordering answer gets this backwards: `None` sorts below every `Some`, so
+    // "destination older than source" reads as false and the key is skipped.
+    #[test]
+    fn an_entry_with_no_time_is_not_taken_for_unchanged() {
+        let entry = |size, secs| Entry {
+            key: "a.txt".to_string(),
+            meta: EntryMeta {
+                size,
+                last_modified_secs: secs,
+            },
+            source: (),
+        };
+
+        // Same size on both sides, and the source's time could not be read.
+        assert_eq!(
+            decide(&entry(Some(5), None), &entry(Some(5), Some(1_700_000_000))),
+            Action::Transfer,
+            "a source with no time cannot be shown to match the destination"
+        );
+        // And the same the other way round.
+        assert_eq!(
+            decide(&entry(Some(5), Some(1_700_000_000)), &entry(Some(5), None)),
+            Action::Transfer,
+            "a destination with no time cannot be shown to match the source"
+        );
+    }
+
     // A walk that read no metadata must not look like a real zero-byte object. Reporting a size of
     // zero makes the two compare equal, and with no time to compare either the pair reads as
-    // unchanged — so the key is skipped, which is what FR-Enum-5 forbids.
+    // unchanged — so the key is skipped, which is the one outcome it must never produce.
     #[test]
     fn an_entry_whose_metadata_was_never_read_is_not_taken_for_an_empty_object() {
         let unread = Entry {
