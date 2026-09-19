@@ -73,7 +73,9 @@ fn assert_named_milestones(name: &str, report: SequenceReport) {
     }
 }
 
-#[cfg(not(miri))]
+// cargo-ndk copies the test binary to the device without the package source
+// tree. Host CI retains the exact source-directory manifest assertion.
+#[cfg(all(not(miri), not(target_os = "android")))]
 #[test]
 fn manifest_matches_the_checked_in_directory() {
     let corpus_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

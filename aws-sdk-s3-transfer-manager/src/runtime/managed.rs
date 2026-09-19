@@ -198,6 +198,13 @@ impl ManagedThreadRuntime {
     ) -> Self {
         let shutdown_token = CancellationToken::new();
 
+        #[cfg(target_os = "android")]
+        let dns_resolver = ShufflingDnsResolver::new(
+            // Hickory reads /etc/resolv.conf on Unix. Android routes libc
+            // resolution through netd and does not provide that file.
+            aws_smithy_runtime::client::dns::TokioDnsResolver::new(),
+        );
+        #[cfg(not(target_os = "android"))]
         let dns_resolver = ShufflingDnsResolver::new(aws_smithy_dns::HickoryDnsResolver::default());
         // spawn and initialize concurrently
         let pending: Vec<_> = topology

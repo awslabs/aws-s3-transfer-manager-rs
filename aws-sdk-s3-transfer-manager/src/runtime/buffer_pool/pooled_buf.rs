@@ -141,6 +141,7 @@ impl PooledBufMut {
         not(s3_tm_loom),
         not(s3_tm_tsan),
         any(
+            target_os = "android",
             target_os = "freebsd",
             target_os = "linux",
             target_os = "macos",

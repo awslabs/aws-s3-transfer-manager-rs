@@ -49,6 +49,9 @@ dial9 = ["dep:dial9-tokio-telemetry"]
 libc = "0.2.189"
 nix = { version = "0.31", features = ["uio", "fs", "resource"] }
 
+[target.'cfg(target_os = "android")'.dependencies]
+aws-smithy-runtime = { version = "1.14.0", features = ["client", "rt-tokio"] }
+
 # Virtual memory and total physical RAM.
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_System_Memory", "Win32_System_SystemInformation"] }

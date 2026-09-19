@@ -5,12 +5,13 @@
 
 //! Retry loop for transfer operations and its classifiers.
 //!
-//! [`retry`] re-issues an operation up to [`MAX_ATTEMPTS`] times, deciding per
-//! failure via a caller-supplied classifier and backing off per [`Backoff`].
+//! [`retry`](crate::retry::retry) re-issues an operation up to `MAX_ATTEMPTS` times,
+//! deciding per failure via a caller-supplied classifier and backing off per
+//! [`Backoff`](crate::retry::Backoff).
 //! The loop is deadline-agnostic: any latency deadline is composed by the caller
 //! inside the built future (see
 //! [`LatencyTracker::guarded`](crate::metrics::latency::LatencyTracker::guarded)),
-//! surfacing a timeout as [`GuardError::DeadlineExceeded`].
+//! surfacing a timeout as [`crate::retry::GuardError::DeadlineExceeded`].
 
 use std::future::Future;
 use std::time::Duration;
@@ -224,7 +225,7 @@ where
 /// Convert a terminal [`GuardError`] into the error returned to the caller.
 ///
 /// [`GuardError::DeadlineExceeded`] carries no inner error, so it becomes an
-/// [`ErrorKind::IOError`](crate::error::ErrorKind::IOError) naming the deadline
+/// [`ErrorKind::IOError`] naming the deadline
 /// the final attempt exceeded. An inner error is returned verbatim.
 fn into_error(ge: GuardError<Error>) -> Error {
     match ge {

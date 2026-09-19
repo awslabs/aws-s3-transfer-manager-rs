@@ -303,7 +303,8 @@ pub(crate) struct BodySlot {
     /// Memory reservation held from claim through response collection. A
     /// successful fill closes acquisition authority; the immutable payload then
     /// owns every live carrier charge directly. `None` until
-    /// [`attach_reservation`], and on paths that do not reserve (tests).
+    /// [`BodySlot::attach_reservation`], and on paths that do not reserve
+    /// (tests).
     reservation: Option<Reservation>,
 }
 

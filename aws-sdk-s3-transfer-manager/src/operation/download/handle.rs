@@ -294,8 +294,8 @@ impl DownloadHandle {
 
     /// Runtime I/O controls for this download.
     ///
-    /// See [`DownloadIoCtl`](crate::operation::download::DownloadIoCtl) for available
-    /// controls (e.g. adjusting read-ahead on a running transfer).
+    /// See [`DownloadIoCtl`] for available controls (e.g. adjusting read-ahead on a
+    /// running transfer).
     pub fn io_ctl(&self) -> crate::operation::download::DownloadIoCtl<'_> {
         self.inner.io_ctl()
     }
@@ -422,8 +422,8 @@ impl ManagedDownloadHandle {
 
     /// Runtime I/O controls for this download.
     ///
-    /// See [`DownloadIoCtl`](crate::operation::download::DownloadIoCtl) for available
-    /// controls (e.g. adjusting read-ahead on a running transfer).
+    /// See [`DownloadIoCtl`] for available controls (e.g. adjusting read-ahead on a
+    /// running transfer).
     pub fn io_ctl(&self) -> crate::operation::download::DownloadIoCtl<'_> {
         self.inner.io_ctl()
     }
