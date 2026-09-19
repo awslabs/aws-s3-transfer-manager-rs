@@ -188,7 +188,7 @@ fn meminfo_total() -> Option<usize> {
 /// parent cgroup may impose a tighter limit). Tries v2, then v1 (hybrid). `None`
 /// when no limit is set, then `available_ram` uses physical RAM.
 ///
-/// Refs: cgroups(7) /proc/[pid]/cgroup <https://man7.org/linux/man-pages/man7/cgroups.7.html>;
+/// Refs: cgroups(7) `/proc/<pid>/cgroup` <https://man7.org/linux/man-pages/man7/cgroups.7.html>;
 /// cgroup v2 memory.max <https://docs.kernel.org/admin-guide/cgroup-v2.html>;
 /// cgroup v1 memory.limit_in_bytes <https://docs.kernel.org/admin-guide/cgroup-v1/memory.html>
 #[cfg(any(target_os = "android", target_os = "linux"))]
@@ -628,8 +628,6 @@ pub(crate) fn resolve_auto_concurrency(
 mod tests {
     use super::*;
 
-    const GIB: usize = 1024 * 1024 * 1024;
-
     #[test]
     fn test_cap_none_is_absolute_max() {
         // No detection (non-Unix, or getrlimit failed) -> absolute ceiling.
@@ -779,6 +777,8 @@ mod tests {
         ignore = "available_ram reads /proc and calls platform syscalls miri cannot emulate"
     )]
     fn test_available_ram_detected_on_supported_platforms() {
+        const GIB: usize = 1024 * 1024 * 1024;
+
         // The detected machine has at least 1 GiB; guards the platform syscall.
         assert!(available_ram().expect("RAM detected") >= GIB);
     }

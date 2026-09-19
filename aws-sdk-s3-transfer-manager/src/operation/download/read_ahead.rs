@@ -22,8 +22,9 @@
 //!
 //! # Pacing
 //!
-//! The window is a fixed per-transfer cap ([`DEFAULT_WINDOW_PARTS`]). The pacing
-//! behaviors follow from the occupancy gate directly:
+//! The window is a fixed per-transfer cap
+//! ([`DEFAULT_WINDOW_PARTS`](crate::operation::download::read_ahead::DEFAULT_WINDOW_PARTS)).
+//! The pacing behaviors follow from the occupancy gate directly:
 //!
 //! - Fast consumer: `released` keeps pace, `issued - released` stays small, the
 //!   gate does not bind, and the transfer runs at the concurrency limit.
@@ -37,8 +38,9 @@
 //!   a full window of slack to make progress around the hole rather than collapsing
 //!   to one part.
 //!
-//! The window is stored in an [`AtomicU64`] so it can be lowered with a lock-free
-//! store while a transfer runs (see [`ReadAhead::set_window`]).
+//! The window is stored in an [`std::sync::atomic::AtomicU64`] so it can be lowered
+//! with a lock-free store while a transfer runs (see
+//! [`ReadAhead::set_window`](crate::operation::download::read_ahead::ReadAhead::set_window)).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
