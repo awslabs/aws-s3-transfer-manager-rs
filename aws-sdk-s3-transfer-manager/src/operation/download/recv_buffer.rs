@@ -75,12 +75,14 @@
 //!
 //! # Stream surface
 //!
-//! [`RecvBufferConsumer`] is the unique (non-cloneable) stream handle;
-//! [`poll_next`](RecvBufferConsumer::poll_next) delivers one payload at a time in
-//! strict sequence order. `poll_next` takes `&mut self`, so "single consumer" is a
-//! type-level fact: the delivery cursor and the current-segment `Arc` are fields of the
-//! handle rather than shared state, and `poll_next` reads and advances them — including
-//! the hop to a successor segment via its `next` pointer — without taking the lock.
+//! [`RecvBufferConsumer`](crate::operation::download::recv_buffer::RecvBufferConsumer)
+//! is the unique (non-cloneable) stream handle;
+//! [`poll_next`](crate::operation::download::recv_buffer::RecvBufferConsumer::poll_next)
+//! delivers one payload at a time in strict sequence order. `poll_next` takes `&mut
+//! self`, so "single consumer" is a type-level fact: the delivery cursor and the
+//! current-segment `Arc` are fields of the handle rather than shared state, and
+//! `poll_next` reads and advances them — including the hop to a successor segment via
+//! its `next` pointer — without taking the lock.
 //!
 //! The cursor is mirrored to an atomic `consumed` (the two are always equal) so the
 //! issuer can read the delivery position for reclaim without synchronizing with the
@@ -89,12 +91,14 @@
 //!
 //! # Block surface
 //!
-//! [`PagedRecvBuffer`] is the cloneable producer/block handle;
-//! [`take_drain_run`](PagedRecvBuffer::take_drain_run) hands out a contiguous filled
-//! *run* as an owned [`SegmentWrite`] for bulk consumption. Runs may be taken and
-//! completed out of order and concurrently, and one segment may be partitioned into
-//! several runs. The block surface never uses the delivery cursor; it tracks two
-//! per-segment counters instead:
+//! [`PagedRecvBuffer`](crate::operation::download::recv_buffer::PagedRecvBuffer) is the
+//! cloneable producer/block handle;
+//! [`take_drain_run`](crate::operation::download::recv_buffer::PagedRecvBuffer::take_drain_run)
+//! hands out a contiguous filled *run* as an owned
+//! [`SegmentWrite`](crate::operation::download::recv_buffer::SegmentWrite) for bulk
+//! consumption. Runs may be taken and completed out of order and concurrently, and
+//! one segment may be partitioned into several runs. The block surface never uses the
+//! delivery cursor; it tracks two per-segment counters instead:
 //!
 //! ```text
 //!   block surface: one segment, seg_size = 8, drain batch = 3
@@ -151,7 +155,8 @@
 //!
 //! 1. **Exclusive producer write.** Each sequence number is claimed once (the
 //!    issuer advances `issued` monotonically), so the producer holding a
-//!    [`SlotHandle`] is the sole writer of that slot.
+//!    [`SlotHandle`](crate::operation::download::recv_buffer::SlotHandle) is the sole
+//!    writer of that slot.
 //! 2. **State-gated read.** A reader touches a slot's payload only after observing
 //!    `FILLED` via an `Acquire` load (`SlotState::is_filled`); the producer's
 //!    `Release` store of `FILLED` (`SlotState::publish_filled`) publishes the
@@ -173,7 +178,8 @@
 //!    consumer reconstruct an `Arc` from the `next` pointer without the lock. This
 //!    concerns *segment* removal only; emptying a *slot's* payload leaves the segment
 //!    in place and does not bear on the hop.
-//! 5. **Outstanding block pin.** A live [`SegmentWrite`] holds an
+//! 5. **Outstanding block pin.** A live
+//!    [`SegmentWrite`](crate::operation::download::recv_buffer::SegmentWrite) holds an
 //!    `Arc<Segment<T>>`, so a segment with a run still being consumed by the block
 //!    surface stays alive until that token drains, even if front-reclaim pops it from
 //!    the deque first.
@@ -200,7 +206,7 @@ use crate::runtime::sync::sync::atomic::{
 };
 use crate::runtime::sync::sync::{Arc, Mutex};
 
-/// Default slots per segment for [`PagedRecvBuffer::new`].
+/// Default slots per segment for the test-only default buffer constructor.
 ///
 /// Slots per segment is the unit of allocation and front-reclaim. A larger value
 /// amortizes allocation and deque churn over more sequences but holds more memory

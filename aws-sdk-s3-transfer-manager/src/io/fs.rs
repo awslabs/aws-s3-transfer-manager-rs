@@ -18,6 +18,104 @@ use std::io;
 
 use crate::io::PartBuffer;
 
+/// Repeats positioned reads until `dst` is full.
+///
+/// The callback may complete a prefix, return [`io::ErrorKind::Interrupted`],
+/// or report end of file with a zero-length read. Offsets advance only by bytes
+/// the callback reports initialized.
+fn read_exact_at_loop(
+    mut dst: &mut [u8],
+    mut offset: u64,
+    mut read: impl FnMut(&mut [u8], u64) -> io::Result<usize>,
+) -> io::Result<()> {
+    while !dst.is_empty() {
+        match read(dst, offset) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "positioned read reached end of file",
+                ));
+            }
+            Ok(count) if count <= dst.len() => {
+                offset = offset
+                    .checked_add(count as u64)
+                    .ok_or_else(|| io::Error::other("file read offset overflowed"))?;
+                let current = dst;
+                dst = &mut current[count..];
+            }
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "positioned read reported more bytes than requested",
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+/// Repeats positioned writes until `buf` is empty.
+///
+/// The callback observes the buffer at its current cursor. A successful
+/// partial write advances both the buffer and absolute file offset. Interrupted
+/// calls are retried without advancement; zero progress is [`io::ErrorKind::WriteZero`].
+fn write_all_at_loop<B>(
+    buf: &mut B,
+    mut offset: u64,
+    mut write: impl FnMut(&B, u64) -> io::Result<usize>,
+) -> io::Result<()>
+where
+    B: Buf,
+{
+    while buf.has_remaining() {
+        let remaining = buf.remaining();
+        match write(buf, offset) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "positioned write made no progress",
+                ));
+            }
+            Ok(count) if count <= remaining => {
+                buf.advance(count);
+                offset = offset
+                    .checked_add(count as u64)
+                    .ok_or_else(|| io::Error::other("file write offset overflowed"))?;
+            }
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "positioned write reported more bytes than provided",
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_unix_range(offset: u64, len: usize) -> io::Result<()> {
+    if len == 0 {
+        return Ok(());
+    }
+    let len = u64::try_from(len)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "file range is too large"))?;
+    let last = offset
+        .checked_add(len - 1)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "file range overflowed"))?;
+    if last > i64::MAX as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "file range exceeds the platform offset limit",
+        ));
+    }
+    Ok(())
+}
+
 /// Reads exactly enough bytes to fill every writable run in `dst`.
 ///
 /// The first byte is read from `offset`; subsequent runs continue from the end
@@ -106,27 +204,34 @@ mod sys {
 
     /// Fills one contiguous destination range without changing the file cursor.
     pub(super) fn read_exact_at(file: &File, dst: &mut [u8], offset: u64) -> io::Result<()> {
-        file.read_exact_at(dst, offset)
+        super::validate_unix_range(offset, dst.len())?;
+        super::read_exact_at_loop(dst, offset, |dst, offset| file.read_at(dst, offset))
     }
 
     /// Drains segmented input with as few positioned writes as the iovec limit permits.
     pub(super) fn write_all_at(file: &File, buf: &mut impl Buf, offset: u64) -> io::Result<()> {
         let fd = file.as_fd();
-        let mut pos = offset as i64;
-
-        while buf.has_remaining() {
+        super::validate_unix_range(offset, buf.remaining())?;
+        super::write_all_at_loop(buf, offset, |buf, offset| {
             let mut slices = [IoSlice::new(&[]); MAX_IO_SLICES];
             let n = buf.chunks_vectored(&mut slices);
-            let written = nix::sys::uio::pwritev(fd, &slices[..n], pos).map_err(io::Error::from)?;
-            pos += written as i64;
-            buf.advance(written);
-        }
-        Ok(())
+            let offset = i64::try_from(offset).expect("validated Unix file offset must fit in i64");
+            nix::sys::uio::pwritev(fd, &slices[..n], offset).map_err(io::Error::from)
+        })
     }
 
     #[cfg(target_os = "linux")]
     pub(super) fn preallocate(file: &File, len: u64) -> io::Result<()> {
-        nix::fcntl::posix_fallocate(file.as_fd(), 0, len as i64).map_err(io::Error::from)
+        if len == 0 {
+            return file.set_len(0);
+        }
+        let len = i64::try_from(len).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "file length exceeds the platform limit",
+            )
+        })?;
+        nix::fcntl::posix_fallocate(file.as_fd(), 0, len).map_err(io::Error::from)
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -148,18 +253,15 @@ mod sys {
     use std::os::unix::fs::FileExt;
 
     pub(super) fn read_exact_at(file: &File, dst: &mut [u8], offset: u64) -> io::Result<()> {
-        file.read_exact_at(dst, offset)
+        super::validate_unix_range(offset, dst.len())?;
+        super::read_exact_at_loop(dst, offset, |dst, offset| file.read_at(dst, offset))
     }
 
     pub(super) fn write_all_at(file: &File, buf: &mut impl Buf, offset: u64) -> io::Result<()> {
-        let mut pos = offset;
-        while buf.has_remaining() {
-            let chunk = buf.chunk();
-            let written = file.write_at(chunk, pos)?;
-            pos += written as u64;
-            buf.advance(written);
-        }
-        Ok(())
+        super::validate_unix_range(offset, buf.remaining())?;
+        super::write_all_at_loop(buf, offset, |buf, offset| {
+            file.write_at(buf.chunk(), offset)
+        })
     }
 
     pub(super) fn preallocate(file: &File, len: u64) -> io::Result<()> {
@@ -179,34 +281,13 @@ mod sys {
     use std::os::windows::fs::FileExt;
 
     pub(super) fn read_exact_at(file: &File, dst: &mut [u8], offset: u64) -> io::Result<()> {
-        let mut initialized = 0;
-
-        while initialized < dst.len() {
-            let read_offset = offset
-                .checked_add(initialized as u64)
-                .ok_or_else(|| io::Error::other("file read offset overflowed"))?;
-            let count = file.seek_read(&mut dst[initialized..], read_offset)?;
-            if count == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "unexpected end of file",
-                ));
-            }
-            initialized += count;
-        }
-        Ok(())
+        super::read_exact_at_loop(dst, offset, |dst, offset| file.seek_read(dst, offset))
     }
 
     pub(super) fn write_all_at(file: &File, buf: &mut impl Buf, offset: u64) -> io::Result<()> {
-        let mut pos = offset;
-
-        while buf.has_remaining() {
-            let chunk = buf.chunk();
-            let written = file.seek_write(chunk, pos)?;
-            pos += written as u64;
-            buf.advance(written);
-        }
-        Ok(())
+        super::write_all_at_loop(buf, offset, |buf, offset| {
+            file.seek_write(buf.chunk(), offset)
+        })
     }
 
     pub(super) fn preallocate(file: &File, len: u64) -> io::Result<()> {
@@ -249,6 +330,7 @@ mod sys {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::IoSlice;
     use std::task::{Context, Waker};
 
     use bytes::Bytes;
@@ -263,6 +345,150 @@ mod tests {
             .memory_budget(MemoryBudgetConfig::Limit(1024 * 1024))
             .build()
             .unwrap()
+    }
+
+    fn buf_prefix(buf: &impl Buf, limit: usize) -> Vec<u8> {
+        let mut slices = [IoSlice::new(&[]); 8];
+        let count = buf.chunks_vectored(&mut slices);
+        let mut remaining = limit.min(buf.remaining());
+        let mut out = Vec::with_capacity(remaining);
+        for slice in &slices[..count] {
+            let count = remaining.min(slice.len());
+            out.extend_from_slice(&slice[..count]);
+            remaining -= count;
+            if remaining == 0 {
+                break;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn read_exact_loop_retries_interrupts_and_short_reads() {
+        let source = b"0123456789";
+        let mut dst = [0u8; 5];
+        let mut calls = 0usize;
+        let mut offsets = Vec::new();
+
+        read_exact_at_loop(&mut dst, 3, |dst, offset| {
+            offsets.push(offset);
+            calls += 1;
+            if calls == 1 {
+                return Err(io::Error::from(io::ErrorKind::Interrupted));
+            }
+            let count = match calls {
+                2 => 2,
+                3 => 1,
+                _ => dst.len(),
+            };
+            let start = offset as usize;
+            dst[..count].copy_from_slice(&source[start..start + count]);
+            Ok(count)
+        })
+        .unwrap();
+
+        assert_eq!(&dst, b"34567");
+        assert_eq!(offsets, [3, 3, 5, 6]);
+    }
+
+    #[test]
+    fn read_exact_loop_reports_unexpected_eof_after_partial_progress() {
+        let mut dst = [0xff; 4];
+        let mut calls = 0usize;
+
+        let error = read_exact_at_loop(&mut dst, 0, |dst, _| {
+            calls += 1;
+            if calls == 1 {
+                dst[..2].copy_from_slice(b"ab");
+                Ok(2)
+            } else {
+                Ok(0)
+            }
+        })
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(dst, [b'a', b'b', 0xff, 0xff]);
+    }
+
+    #[test]
+    fn write_all_loop_retries_interrupts_and_advances_segmented_input() {
+        let mut input = SegmentedBuf::new();
+        input.push(Bytes::from_static(b"ab"));
+        input.push(Bytes::from_static(b"cdef"));
+        input.push(Bytes::from_static(b"ghi"));
+        let mut output = vec![0u8; 4];
+        let mut calls = 0usize;
+        let mut offsets = Vec::new();
+
+        write_all_at_loop(&mut input, 4, |buf, offset| {
+            offsets.push(offset);
+            calls += 1;
+            if calls == 1 {
+                return Err(io::Error::from(io::ErrorKind::Interrupted));
+            }
+            let limit = match calls {
+                2 => 2,
+                3 => 3,
+                _ => usize::MAX,
+            };
+            let bytes = buf_prefix(buf, limit);
+            let start = offset as usize;
+            output.resize(start + bytes.len(), 0);
+            output[start..].copy_from_slice(&bytes);
+            Ok(bytes.len())
+        })
+        .unwrap();
+
+        assert_eq!(input.remaining(), 0);
+        assert_eq!(&output[..4], &[0; 4]);
+        assert_eq!(&output[4..], b"abcdefghi");
+        assert_eq!(offsets, [4, 4, 6, 9]);
+    }
+
+    #[test]
+    fn write_all_loop_preserves_partial_progress_on_error() {
+        let mut input = Bytes::from_static(b"abcdef");
+        let mut calls = 0usize;
+        let mut offsets = Vec::new();
+
+        let error = write_all_at_loop(&mut input, 10, |buf, offset| {
+            offsets.push(offset);
+            calls += 1;
+            if calls == 1 {
+                assert_eq!(buf_prefix(buf, 2), b"ab");
+                Ok(2)
+            } else {
+                Err(io::Error::other("injected write failure"))
+            }
+        })
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(input.as_ref(), b"cdef");
+        assert_eq!(offsets, [10, 12]);
+    }
+
+    #[test]
+    fn write_all_loop_rejects_zero_progress() {
+        let mut input = Bytes::from_static(b"payload");
+        let error = write_all_at_loop(&mut input, 0, |_, _| Ok(0)).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::WriteZero);
+        assert_eq!(input.as_ref(), b"payload");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_all_at_rejects_unrepresentable_unix_offset() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let mut input = Bytes::from_static(b"x");
+
+        let error = write_all_at(tmp.as_file(), &mut input, u64::MAX).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(input.as_ref(), b"x");
+        assert_eq!(tmp.as_file().metadata().unwrap().len(), 0);
     }
 
     #[test]

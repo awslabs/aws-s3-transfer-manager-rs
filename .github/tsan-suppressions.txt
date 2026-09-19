@@ -1,0 +1,8 @@
+# Tokio initializes ScheduledIo before registering its address as a mio token
+# with the kernel reactor. An event can then be dispatched on another runtime
+# worker, but TSan does not model epoll registration and delivery as a
+# happens-before edge. It consequently reports the constructor write racing
+# with set_readiness even though the kernel cannot return the token before
+# registration. Keep this suppression on Tokio's registration allocation path
+# so unrelated reactor and transfer-manager races remain visible.
+race:tokio::runtime::io::registration_set::RegistrationSet>::allocate
