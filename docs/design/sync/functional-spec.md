@@ -394,6 +394,17 @@ outcome — not even when it is unreadable, or a device or pipe, or has just bee
 ignore it, so problems with it are not problems.
 
 This means filtering MUST happen before skip-warnings are produced.
+
+The unit is an entry, which is what FR-Filter-2 matches a pattern against. A directory is not one, and
+a bare pattern is an exact match rather than a prefix: `img` excludes the key `img` and leaves
+`img/a.txt` alone, where `img/*` is how a subtree is excluded. So excluding a name MUST NOT stop sync
+from enumerating what that name contains.
+
+Which means a name whose type sync cannot read is not yet known to be an entry, and MUST be reported
+whatever the rules say. It may be a directory holding keys no pattern excluded, and silence there
+would take those keys out of the run with nothing said — leaving a delete free to remove their
+counterparts. A warning about a name the caller excluded is the price of that, and it is the cheaper
+of the two.
 *`[ISSUE]` [#1117](https://github.com/aws/aws-cli/issues/1117) — a FIFO excluded by `--exclude '*'` still warns and forces exit code 2. [#3671](https://github.com/aws/aws-cli/issues/3671) — a socket file warned about despite being excluded by an explicit pattern. [#2473](https://github.com/aws/aws-cli/issues/2473) — "file does not exist" for a path inside an excluded tree. [#7072](https://github.com/aws/aws-cli/issues/7072) — "symlinks are evaluated before exclude\include": a symlink to a missing file warns even though its name does not match `--include "package*"`. This inverts the CLI's stage order, where `FileGenerator` emits warnings before `Filter` ever runs.*
 
 **FR-Filter-6** It MUST be possible to say whether a pattern is measured from the root or matched anywhere
