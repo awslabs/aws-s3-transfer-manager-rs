@@ -16,10 +16,12 @@ pub enum WalkErrorKind {
     NotADirectory,
     /// S3 service error from `ListObjectsV2` or related call. Ends the run.
     Service,
-    /// I/O error reading a subdirectory or entry during the walk.
-    /// The affected entry is skipped and the walk continues.
+    /// I/O error reading one entry during the walk. That entry is skipped and the walk
+    /// continues. A directory that could not be read reports `DirectoryUnreadable` instead,
+    /// since the cost there is every key beneath it rather than one.
     Io,
-    /// Permission denied on a subdirectory or entry during the walk.
+    /// Permission denied on one entry during the walk. As with `Io`, a directory reports
+    /// `DirectoryUnreadable`.
     PermissionDenied,
     /// A directory below the root could not be read: the `read_dir` itself failed,
     /// or opening it for cycle detection did. The same failure at the root is

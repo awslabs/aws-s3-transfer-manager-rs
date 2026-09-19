@@ -141,8 +141,10 @@ pub(crate) trait KeyStream {
 pub(crate) enum KeysLost {
     // Nothing: every key this side holds is still accounted for.
     Nothing,
-    // One key, at the position the error arrived. The stream is ordered, so the position is what
-    // identifies it; the keys around it are known.
+    // One key, and the keys around it are known. Which key depends on the side: a listing names the
+    // key it dropped, while a local failure carries a path nothing here turns into a key and arrives
+    // at the position of the directory holding it. So a consumer can act on the one key for the
+    // first, and for the second knows only that a key inside that directory is gone.
     OneKey,
     // An unknown range. A subtree went unenumerated, or the side stopped before its end, so
     // absence cannot be read from position at all.
@@ -639,6 +641,11 @@ mod tests {
     //
     // Uploading, so local is the source: a same-size entry is left alone unless the
     // destination is the older of the two.
+    //
+    // Size and time are all this reads, so it will answer `Transfer` for a name no transfer can
+    // move — a socket holds a key and cannot be uploaded. A real comparison has to reach the
+    // source's own item for that, which means a third answer beside transfer and skip: the key is
+    // taken, so no delete may touch it, and nothing can be sent for it either.
     fn decide<S, D>(src: &Entry<S>, dest: &Entry<D>) -> Action {
         if src.meta.size != dest.meta.size {
             return Action::Transfer;
@@ -1001,6 +1008,61 @@ mod tests {
     // The reason this layer exists. A source that could not read one subdirectory must not let the
     // destination's keys under that name be deleted: they may still exist on the source, inside the
     // part nobody could see.
+    // One key the source could not describe must not license deleting its counterpart. The name is
+    // taken on both sides; the source simply cannot say what is behind it. A range is not the only
+    // kind of loss that has to hold a delete back.
+    #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn one_lost_key_on_the_source_holds_back_its_delete() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "x").unwrap();
+        // Followed, and pointing at nothing, so the walk can name it but not describe it.
+        std::os::unix::fs::symlink(dir.path().join("missing"), dir.path().join("b")).unwrap();
+
+        let contents = vec![object("a.txt", 1), object("b", 1), object("z.txt", 1)];
+        let output = aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output::builder()
+            .set_contents(Some(contents))
+            .build();
+        let rule = aws_smithy_mocks::mock!(aws_sdk_s3::Client::list_objects_v2)
+            .then_output(move || output.clone());
+        let client = aws_smithy_mocks::mock_client!(
+            aws_sdk_s3,
+            aws_smithy_mocks::RuleMode::MatchAny,
+            &[rule]
+        );
+
+        let mut src = FsWalker::builder()
+            .recursive(true)
+            .sort_order(SortOrder::WholeWalk)
+            .include_special_files(true)
+            .follow_symlinks(true)
+            .build()
+            .walk(FsWalkContext::builder().root(dir.path()).build());
+        let mut dest = s3(client, None);
+        let (plan, lost) = merge_respecting_loss(&mut src, &mut dest).await;
+
+        assert!(
+            lost,
+            "a key the source could not describe is a loss: {plan:?}"
+        );
+        assert!(
+            !plan
+                .iter()
+                .any(|(key, action)| key == "b" && *action == Action::Delete),
+            "deleting `b` removes the counterpart of a key the source could not describe: {plan:?}"
+        );
+        // And the cost of holding the whole run back: `z.txt` really is gone from the source and
+        // could be deleted safely. Asserted so the conservatism reads as chosen, and so relaxing it
+        // to a per-key rule has to change this line on purpose.
+        assert!(
+            !plan
+                .iter()
+                .any(|(key, action)| key == "z.txt" && *action == Action::Delete),
+            "a run-wide hold keeps every delete, including ones that were safe: {plan:?}"
+        );
+    }
+
     #[cfg(unix)]
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
@@ -1068,20 +1130,25 @@ mod tests {
         D: KeyStream,
     {
         let mut plan = Vec::new();
-        let mut source_lost_a_range = false;
+        let mut source_lost_keys = false;
 
         // Read one side past any failures, recording whether the view stayed trustworthy.
-        async fn advance<K: KeyStream>(
-            k: &mut K,
-            lost_range: &mut bool,
-        ) -> Option<Entry<K::Source>> {
+        async fn advance<K: KeyStream>(k: &mut K, lost: &mut bool) -> Option<Entry<K::Source>> {
             loop {
                 match k.next_entry().await {
                     None => return None,
                     Some(Ok(entry)) => return Some(entry),
+                    // Any loss counts, not only a range. A lost range is unnameable by definition,
+                    // and a single lost key is unnameable in practice on the local side: the failure
+                    // carries an absolute path, nothing here turns that into a key, and it arrives
+                    // at the position of the directory holding it rather than its own. So this
+                    // cannot suppress the delete of just the key that went missing, and holding
+                    // back every delete is the safe reading left. The cost is that a key genuinely
+                    // absent from the source keeps its counterpart too, which a per-key mechanism
+                    // recovers once a failure can name a relative key.
                     Some(Err(err)) => {
-                        if err.keys_lost() == KeysLost::UnknownRange {
-                            *lost_range = true;
+                        if err.keys_lost() != KeysLost::Nothing {
+                            *lost = true;
                         }
                     }
                 }
@@ -1089,17 +1156,17 @@ mod tests {
         }
 
         let mut ignored = false;
-        let mut s = advance(src, &mut source_lost_a_range).await;
+        let mut s = advance(src, &mut source_lost_keys).await;
         let mut d = advance(dest, &mut ignored).await;
         loop {
             match (&s, &d) {
                 (None, None) => break,
                 (Some(se), None) => {
                     plan.push((se.key.clone(), Action::Transfer));
-                    s = advance(src, &mut source_lost_a_range).await;
+                    s = advance(src, &mut source_lost_keys).await;
                 }
                 (None, Some(de)) => {
-                    if !source_lost_a_range {
+                    if !source_lost_keys {
                         plan.push((de.key.clone(), Action::Delete));
                     }
                     d = advance(dest, &mut ignored).await;
@@ -1107,23 +1174,23 @@ mod tests {
                 (Some(se), Some(de)) => match se.key.cmp(&de.key) {
                     std::cmp::Ordering::Less => {
                         plan.push((se.key.clone(), Action::Transfer));
-                        s = advance(src, &mut source_lost_a_range).await;
+                        s = advance(src, &mut source_lost_keys).await;
                     }
                     std::cmp::Ordering::Greater => {
-                        if !source_lost_a_range {
+                        if !source_lost_keys {
                             plan.push((de.key.clone(), Action::Delete));
                         }
                         d = advance(dest, &mut ignored).await;
                     }
                     std::cmp::Ordering::Equal => {
                         plan.push((se.key.clone(), decide(se, de)));
-                        s = advance(src, &mut source_lost_a_range).await;
+                        s = advance(src, &mut source_lost_keys).await;
                         d = advance(dest, &mut ignored).await;
                     }
                 },
             }
         }
-        (plan, source_lost_a_range)
+        (plan, source_lost_keys)
     }
 
     // The join reads "this key is absent from the other side" from position alone, so

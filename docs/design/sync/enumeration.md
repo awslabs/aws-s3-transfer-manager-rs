@@ -214,11 +214,17 @@ compared. A name that cannot be keyed had the same problem in reverse: it read a
 when the walk had read the name perfectly.
 
 Separating them lets the consumer ask the question it actually has, which is what a failure cost.
-`keys_lost` answers in three: nothing, one key at the position the error arrived, or an unknown
-range. A comparison can act on the first two and must hold back on the third, because a delete is
-only safe when one side can say a key is absent, and a side that lost a subtree cannot say that. The
-answer is matched over every error kind rather than tested against one, so a kind added later will
-not compile until it is placed.
+`keys_lost` answers in three: nothing, one key, or an unknown range. A delete is only safe when one
+side can say a key is absent, and a side that lost a subtree cannot say that, so a comparison must
+hold back on a range. The answer is matched over every error kind rather than tested against one, so
+a kind added later will not compile until it is placed.
+
+Which key the middle answer names depends on the side. A listing names the key it dropped, so a
+comparison can act on that one key alone. A local failure cannot: it carries an absolute path
+that nothing here turns into a key, and it arrives at the position of the directory holding it
+rather than its own. So the most a comparison can do with a local single-key loss today is what
+it does with a range: hold every delete back. Recovering the narrower action means carrying a
+relative key on the failure, which needs the walk root the walk already has.
 
 ## 3. How the pieces fit
 
