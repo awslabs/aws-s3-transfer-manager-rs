@@ -672,7 +672,11 @@ impl FsWalk {
     pub async fn next(&mut self) -> Option<Result<FsEntry, WalkError>> {
         loop {
             if let Some(err) = self.pending_errors.pop_front() {
-                if !err.is_fatal() {
+                if err.is_fatal() {
+                    // Nothing further can be enumerated, so anything still queued would be part of a
+                    // view this error already says is incomplete.
+                    self.done = true;
+                } else {
                     tracing::warn!(
                         path = ?err.path(),
                         kind = ?err.kind(),
@@ -1406,6 +1410,37 @@ mod tests {
         assert!(
             !errors.is_empty(),
             "expected cycle detection errors but got none"
+        );
+    }
+
+    // A fatal error says nothing further can be enumerated, so the walk has to stop saying it. When
+    // the root fails the walk ends anyway, having queued nothing — the case worth pinning is a fatal
+    // error arriving while entries are still queued, which no filesystem condition reaches today
+    // because the kinds raised below the root are all per-entry. Injected for that reason.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn a_fatal_error_ends_the_walk_even_with_entries_queued() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("a.txt"), b"a").unwrap();
+        std::fs::write(temp.path().join("b.txt"), b"b").unwrap();
+
+        let mut walk = walker().build().walk(ctx(temp.path()));
+        assert!(
+            matches!(walk.next().await, Some(Ok(_))),
+            "the first file should arrive"
+        );
+
+        walk.pending_errors.push_back(WalkError::new(
+            Some(temp.path().to_path_buf()),
+            WalkErrorKind::SourceUnreadable,
+            Box::new(std::io::Error::other("injected")),
+        ));
+
+        let err = walk.next().await.unwrap().unwrap_err();
+        assert!(err.is_fatal(), "the injected error should be fatal");
+        assert!(
+            walk.next().await.is_none(),
+            "a fatal error means nothing more can be enumerated, so no entry may follow it"
         );
     }
 
