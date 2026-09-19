@@ -670,6 +670,7 @@ impl FsWalk {
     ///   followed by more results as the walk continues.
     /// - `None` when the walk is complete.
     pub async fn next(&mut self) -> Option<Result<FsEntry, WalkError>> {
+        let mut read_a_directory = false;
         loop {
             if let Some(err) = self.pending_errors.pop_front() {
                 if err.is_fatal() {
@@ -754,6 +755,15 @@ impl FsWalk {
                     }
                     return Some(Err(err));
                 }
+            }
+
+            // Reading a directory blocks, and this loop keeps reading until it has a file to
+            // return: down the leftmost chain under depth-first order, and through any directory
+            // holding no files under breadth-first. Yielding before every read after the first
+            // keeps one call from holding the runtime for all of them, and leaves a call that reads
+            // a single directory costing what it always did.
+            if std::mem::replace(&mut read_a_directory, true) {
+                tokio::task::yield_now().await;
             }
         }
     }
@@ -1411,6 +1421,34 @@ mod tests {
             !errors.is_empty(),
             "expected cycle detection errors but got none"
         );
+    }
+
+    // A descent must not run to its end inside one poll. Depth-first order reaches the first file
+    // only at the bottom of a chain, so every directory above it is read before the caller gets
+    // anything back, and nothing else on the runtime gets to run either.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn a_descent_does_not_run_to_its_end_in_one_poll() {
+        let temp = tempfile::tempdir().unwrap();
+        let deep = temp.path().join("a").join("b").join("c");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("file.txt"), b"x").unwrap();
+
+        let mut walk = walker()
+            .recursive(true)
+            .sort_order(SortOrder::WholeWalk)
+            .build()
+            .walk(ctx(temp.path()));
+
+        {
+            let mut first = tokio_test::task::spawn(walk.next());
+            tokio_test::assert_pending!(first.poll(), "the chain should not be read in one poll");
+        }
+
+        // Dropping that poll loses nothing: what was read is held on the walk, so the file still
+        // arrives.
+        let entry = walk.next().await.unwrap().unwrap();
+        assert!(entry.path().ends_with("file.txt"), "got {:?}", entry.path());
     }
 
     // A fatal error says nothing further can be enumerated, so the walk has to stop saying it. When
