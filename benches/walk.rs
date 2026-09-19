@@ -4,11 +4,16 @@
  */
 
 // Filesystem walk benchmarks: cost per entry, and what ordering adds on top.
-// `WithinDirectory` is breadth-first; `WholeWalk` is depth-first in key order,
-// which must descend a subtree before emitting a sibling that sorts after it.
+// `Native` does no sorting and is the default; `WithinDirectory` is breadth-first with each
+// directory sorted; `WholeWalk` is depth-first in key order, which must descend a subtree before
+// emitting a sibling that sorts after it.
 //
 // Caches are warm — criterion re-walks the same fixture and there is no portable way to drop page
 // cache — so every duration here is a floor, and what the device would add is unmeasured.
+//
+// Fixtures go wherever `TMPDIR` points, since that is what `TempDir` honours. Several distributions
+// back `/tmp` with RAM, so a run that does not set it may measure no device at all. Any figure
+// quoted from here is worth nothing without saying which filesystem held the fixtures.
 
 use aws_sdk_s3_transfer_manager::io::walk::{FsWalkContext, FsWalker, SortOrder};
 use criterion::{criterion_group, BenchmarkId, Criterion, Throughput};
@@ -127,7 +132,12 @@ fn walker_with(order: SortOrder, follow_symlinks: bool) -> FsWalker {
 
 // Following symlinks adds an open()+fstat per directory for cycle detection.
 // Same fixture, same run, so the delta is attributable.
-fn drain_follow(rt: &tokio::runtime::Runtime, root: &Path, follow_symlinks: bool) -> usize {
+fn drain_follow(
+    rt: &tokio::runtime::Runtime,
+    root: &Path,
+    follow_symlinks: bool,
+    expected: usize,
+) -> usize {
     rt.block_on(async {
         let ctx = FsWalkContext::builder().root(root).build();
         let mut walk = walker_with(SortOrder::WithinDirectory, follow_symlinks).walk(ctx);
@@ -137,6 +147,13 @@ fn drain_follow(rt: &tokio::runtime::Runtime, root: &Path, follow_symlinks: bool
                 n += 1;
             }
         }
+        // The rate is computed from the fixture's own count, so a walk that gave up early would be
+        // reported as a fast one. Opening a handle per directory for cycle detection is a failure
+        // point this arm has and the other does not.
+        assert_eq!(
+            n, expected,
+            "walk yielded {n} entries, fixture holds {expected}"
+        );
         n
     })
 }
@@ -153,7 +170,7 @@ fn walk_cycle_detection_cost(c: &mut Criterion) {
     group.throughput(Throughput::Elements(count as u64));
     for (label, follow) in [("no_follow", false), ("follow_symlinks", true)] {
         group.bench_function(BenchmarkId::new("balanced_1110dirs", label), |b| {
-            b.iter(|| black_box(drain_follow(&rt, dir.path(), follow)));
+            b.iter(|| black_box(drain_follow(&rt, dir.path(), follow, count)));
         });
     }
     group.finish();
@@ -182,23 +199,28 @@ fn drain(rt: &tokio::runtime::Runtime, root: &Path, order: SortOrder, expected: 
 // Panics rather than returning a whole-walk duration when no entry ever arrives. Timing an empty
 // walk and calling it first-entry latency would manufacture the rising curve the scaling benchmark
 // exists to rule out.
-fn time_to_first_entry(rt: &tokio::runtime::Runtime, root: &Path, order: SortOrder) -> Duration {
+fn time_to_first_entry(
+    rt: &tokio::runtime::Runtime,
+    root: &Path,
+    order: SortOrder,
+    expected_first: &str,
+) -> Duration {
     rt.block_on(async {
         let ctx = FsWalkContext::builder().root(root).build();
         let mut walk = walker(order).walk(ctx);
         let start = Instant::now();
-        let mut arrived = false;
-        while let Some(result) = walk.next().await {
-            if result.is_ok() {
-                arrived = true;
-                break;
-            }
-        }
+        let first = walk.next().await;
         let elapsed = start.elapsed();
-        assert!(
-            arrived,
-            "no entry arrived, so there is no first-entry time to report"
-        );
+        // Which key arrives is the measurement, not merely that one did. An error absorbed here
+        // would be timed as part of the wait, and an ordering that changed which entry comes first
+        // would still produce a number.
+        let entry = first
+            .expect("no entry arrived, so there is no first-entry time to report")
+            .expect("an error before the first entry would be timed as the wait for it");
+        // The relative path, not the file name: in a chain of directories every level holds a
+        // `f0000.dat`, so the name alone cannot say which one arrived.
+        let arrived = entry.relative_path().to_string_lossy().replace('\\', "/");
+        assert_eq!(arrived, expected_first, "the wrong entry arrived first");
         elapsed
     })
 }
@@ -227,6 +249,10 @@ fn walk_throughput(c: &mut Criterion) {
     for (label, dir, count) in &fixtures {
         group.throughput(Throughput::Elements(*count as u64));
         for (mode, order) in [
+            // What ships by default, and what this branch's base did: no sort at all. Without it the
+            // two sorted arms only measure one comparison against another, since both pay a
+            // per-directory sort.
+            ("native", SortOrder::Native),
             ("within_directory", SortOrder::WithinDirectory),
             ("whole_walk", SortOrder::WholeWalk),
         ] {
@@ -244,19 +270,49 @@ fn walk_first_entry_latency(c: &mut Criterion) {
         .build()
         .unwrap();
 
-    let dir = TempDir::new().unwrap();
-    assert!(build_front_loaded(dir.path(), 100, 10) > 0);
+    let front = TempDir::new().unwrap();
+    assert!(build_front_loaded(front.path(), 100, 10) > 0);
+
+    // A chain is the other shape, and the harder one. Key order puts `d1/` before `f0000.dat`, so
+    // the first key in order sits at the bottom and every directory above it is read first, where
+    // ordering within a directory takes the file it already has.
+    const CHAIN: usize = 100;
+    let deep = TempDir::new().unwrap();
+    assert!(build_deep(deep.path(), CHAIN, 100) > 0);
+    let bottom = (0..CHAIN)
+        .map(|d| format!("d{d}"))
+        .collect::<Vec<_>>()
+        .join("/");
 
     let mut group = c.benchmark_group("walk_first_entry");
-    for (mode, order) in [
-        ("within_directory", SortOrder::WithinDirectory),
-        ("whole_walk", SortOrder::WholeWalk),
+    for (mode, order, front_first, deep_first) in [
+        (
+            "within_directory",
+            SortOrder::WithinDirectory,
+            "zzz0000.dat".to_string(),
+            "d0/f0000.dat".to_string(),
+        ),
+        (
+            "whole_walk",
+            SortOrder::WholeWalk,
+            "aaa0000/f0000.dat".to_string(),
+            format!("{bottom}/f0000.dat"),
+        ),
     ] {
         group.bench_function(BenchmarkId::new("front_loaded_100dirs", mode), |b| {
             b.iter_custom(|iters| {
                 let mut total = Duration::ZERO;
                 for _ in 0..iters {
-                    total += time_to_first_entry(&rt, dir.path(), order);
+                    total += time_to_first_entry(&rt, front.path(), order, &front_first);
+                }
+                total
+            });
+        });
+        group.bench_function(BenchmarkId::new("chain_100deep", mode), |b| {
+            b.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    total += time_to_first_entry(&rt, deep.path(), order, &deep_first);
                 }
                 total
             });
@@ -291,7 +347,7 @@ fn walk_first_entry_scaling(c: &mut Criterion) {
                 b.iter_custom(|iters| {
                     let mut total = Duration::ZERO;
                     for _ in 0..iters {
-                        total += time_to_first_entry(&rt, dir.path(), order);
+                        total += time_to_first_entry(&rt, dir.path(), order, "aaa/f.dat");
                     }
                     total
                 });
