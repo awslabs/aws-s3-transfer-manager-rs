@@ -298,6 +298,11 @@ async fn test_download_write_to_file() {
     let dir = tempfile::tempdir().unwrap();
     let file_path = dir.path().join("file_output.dat");
     let file = std::fs::File::create(&file_path).unwrap();
+    file.set_len((size + 4096) as u64).unwrap();
+    assert_eq!(
+        std::fs::metadata(&file_path).unwrap().len(),
+        (size + 4096) as u64
+    );
 
     let handle = m
         .client
@@ -312,6 +317,43 @@ async fn test_download_write_to_file() {
     let written = std::fs::read(&file_path).unwrap();
     assert_eq!(written.len(), content.len(), "size mismatch");
     assert_eq!(written, content, "data integrity check failed");
+
+    m.handle.shutdown().await.expect("shutdown");
+}
+
+/// A caller-provided file that cannot be written or finalized wakes joiners.
+#[cfg(any(unix, windows))]
+#[tokio::test]
+async fn test_download_write_to_read_only_file_fails() {
+    let m = setup().await;
+    let content = deterministic_data(1024);
+    m.server
+        .add_object("test-bucket", "write-to-read-only-file-key", content, None)
+        .await
+        .expect("add object");
+
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("read_only_output.dat");
+    std::fs::write(&file_path, b"existing").unwrap();
+    let file = std::fs::File::open(&file_path).unwrap();
+
+    let handle = m
+        .client
+        .download()
+        .bucket("test-bucket")
+        .key("write-to-read-only-file-key")
+        .write_to_file(file)
+        .unwrap();
+
+    let error = tokio::time::timeout(std::time::Duration::from_secs(5), handle.join())
+        .await
+        .expect("destination write failure should wake the download joiner")
+        .expect_err("download to a read-only file should fail");
+    assert_eq!(
+        error.kind(),
+        &aws_sdk_s3_transfer_manager::error::ErrorKind::IOError
+    );
+    assert_eq!(std::fs::read(&file_path).unwrap(), b"existing");
 
     m.handle.shutdown().await.expect("shutdown");
 }
