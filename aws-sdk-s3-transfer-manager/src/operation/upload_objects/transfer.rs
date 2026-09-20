@@ -12,8 +12,9 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use crate::io::fs::FileType;
 use crate::io::key::derive_object_key;
-use crate::io::walk::{FileType, FsEntry, FsWalk};
+use crate::io::walk::{FsEntry, FsWalk};
 use crate::io::InputStream;
 use crate::operation::upload::{Upload, UploadHandle, UploadInput};
 use crate::runtime::sync::Mutex;

@@ -14,7 +14,7 @@ mod stream;
 
 /// Error types related to I/O abstractions
 pub mod error;
-pub(crate) mod fs;
+pub mod fs;
 pub(crate) mod key;
 mod size_hint;
 /// Walker types for traversing filesystems and S3 buckets.

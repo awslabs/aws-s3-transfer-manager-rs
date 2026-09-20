@@ -12,6 +12,7 @@ use std::sync::Arc;
 use same_file::Handle;
 
 use super::error::{WalkError, WalkErrorKind};
+use crate::io::fs::{special_file_type, FileType};
 
 /// A directory queued for traversal, carrying the chain of ancestor directory
 /// handles needed for per-path symlink cycle detection.
@@ -115,27 +116,6 @@ fn dir_open_error_kind(e: &std::io::Error, depth: usize) -> WalkErrorKind {
     }
 }
 
-// Which of the special kinds a file type names. `FileType` from `std` answers each of these
-// separately on Unix, and a walk reports what it was told.
-fn special_file_type(file_type: &std::fs::FileType) -> FileType {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::FileTypeExt;
-        if file_type.is_fifo() {
-            return FileType::Fifo;
-        }
-        if file_type.is_socket() {
-            return FileType::Socket;
-        }
-        if file_type.is_block_device() || file_type.is_char_device() {
-            return FileType::Device;
-        }
-    }
-    #[cfg(not(unix))]
-    let _ = file_type;
-    FileType::Device
-}
-
 // Order two children as `ListObjectsV2` orders the keys they produce: a
 // directory sorts as if its name ended in '/' (0x2F), so `a.txt` precedes
 // `a/c`. Names within a directory never contain '/', so one trailing byte
@@ -152,26 +132,6 @@ fn cmp_key_form(a: &Child, b: &Child) -> Ordering {
         }
         ord => ord,
     }
-}
-
-/// What the filesystem said is at a path.
-///
-/// A walk yields an entry for whatever it found, so a consumer decides what to do with each
-/// one. Only a regular file holds bytes a transfer could move; the rest are named so a consumer
-/// can say why it left them alone.
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FileType {
-    /// A regular file.
-    Regular,
-    /// A symlink this walk did not follow, so nothing here describes its target.
-    Symlink,
-    /// A named pipe.
-    Fifo,
-    /// A socket.
-    Socket,
-    /// A block or character device.
-    Device,
 }
 
 /// One thing a filesystem walk found.
