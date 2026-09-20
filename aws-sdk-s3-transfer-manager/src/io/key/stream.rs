@@ -468,7 +468,7 @@ mod tests {
     fn local(root: &std::path::Path) -> FsWalk {
         FsWalker::builder()
             .recursive(true)
-            .sort_order(SortOrder::WholeWalk)
+            .sort(SortOrder::WholeWalk)
             .include_special_files(true)
             .build()
             .walk(FsWalkContext::builder().root(root).build())
@@ -933,7 +933,7 @@ mod tests {
 
         let mut walk = FsWalker::builder()
             .recursive(true)
-            .sort_order(SortOrder::WholeWalk)
+            .sort(SortOrder::WholeWalk)
             .follow_symlinks(true)
             .build()
             .walk(FsWalkContext::builder().root(dir.path()).build());
@@ -982,7 +982,7 @@ mod tests {
         let filter = Arc::new(KeyFilter::new(vec![Rule::exclude("link")]));
         let mut walk = FsWalker::builder()
             .recursive(true)
-            .sort_order(SortOrder::WholeWalk)
+            .sort(SortOrder::WholeWalk)
             .follow_symlinks(true)
             .path_filter(local_predicate(filter))
             .build()
@@ -1034,7 +1034,7 @@ mod tests {
 
         let mut src = FsWalker::builder()
             .recursive(true)
-            .sort_order(SortOrder::WholeWalk)
+            .sort(SortOrder::WholeWalk)
             .include_special_files(true)
             .follow_symlinks(true)
             .build()
@@ -1411,7 +1411,7 @@ mod tests {
         let filter = Arc::new(KeyFilter::new(rules));
         FsWalker::builder()
             .recursive(true)
-            .sort_order(SortOrder::WholeWalk)
+            .sort(SortOrder::WholeWalk)
             // On, so the socket test proves the filter suppresses a report that would
             // otherwise fire.
             .include_special_files(true)
@@ -1451,7 +1451,7 @@ mod tests {
         let filter = Arc::new(KeyFilter::new(vec![Rule::exclude("logs/*")]));
         let mut walk = FsWalker::builder()
             .recursive(true)
-            .sort_order(SortOrder::WholeWalk)
+            .sort(SortOrder::WholeWalk)
             .follow_symlinks(true)
             .path_filter(local_predicate(filter))
             .build()
@@ -1678,7 +1678,7 @@ mod tests {
 
         let mut walk = FsWalker::builder()
             .recursive(true)
-            .sort_order(SortOrder::WholeWalk)
+            .sort(SortOrder::WholeWalk)
             .follow_symlinks(true)
             .build()
             .walk(FsWalkContext::builder().root(dir.path()).build());
@@ -1712,7 +1712,7 @@ mod tests {
 
         let mut walk = FsWalker::builder()
             .recursive(true)
-            .sort_order(SortOrder::WholeWalk)
+            .sort(SortOrder::WholeWalk)
             .follow_symlinks(true)
             .build()
             .walk(FsWalkContext::builder().root(dir.path()).build());
@@ -1756,7 +1756,7 @@ mod tests {
 
         let mut walk = FsWalker::builder()
             .recursive(true)
-            .sort_order(SortOrder::WholeWalk)
+            .sort(SortOrder::WholeWalk)
             .follow_symlinks(true)
             .build()
             .walk(FsWalkContext::builder().root(dir.path()).build());

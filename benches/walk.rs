@@ -125,7 +125,7 @@ fn walker(order: SortOrder) -> FsWalker {
 fn walker_with(order: SortOrder, follow_symlinks: bool) -> FsWalker {
     FsWalker::builder()
         .recursive(true)
-        .sort_order(order)
+        .sort(order)
         .follow_symlinks(follow_symlinks)
         .build()
 }
