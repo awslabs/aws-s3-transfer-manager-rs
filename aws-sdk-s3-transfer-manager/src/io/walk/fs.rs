@@ -59,6 +59,9 @@ enum Child {
 }
 
 impl Child {
+    // Only `SortOrder::WithinDirectory` sorts by path, so this follows that variant behind the
+    // feature rather than sitting unused in a shipped build.
+    #[cfg(any(test, feature = "test-util"))]
     fn path(&self) -> &Path {
         match self {
             Child::File(e) => &e.path,
@@ -249,7 +252,9 @@ pub enum SortOrder {
     /// The traversal stays breadth-first, so a directory's files come out before its
     /// subdirectories are descended, and entries are not ordered against entries elsewhere in
     /// the tree. [`try_claim_subtree`](FsWalk::try_claim_subtree) stays available, and claims come
-    /// in the same order every run.
+    /// in the same order every run — which is the only thing this order is for, so it sits behind
+    /// the `test-util` feature instead of shipping.
+    #[cfg(any(test, feature = "test-util"))]
     WithinDirectory,
 
     /// Every entry ordered against every other, lexicographically by the key it would produce.
@@ -401,11 +406,21 @@ impl FsWalker {
             SortOrder::WholeWalk => Cursor::Depth {
                 stack: vec![VecDeque::from([Child::Dir(root_dir)])],
             },
-            SortOrder::Native | SortOrder::WithinDirectory if done => Cursor::Breadth {
+            SortOrder::Native if done => Cursor::Breadth {
                 pending_dirs: VecDeque::new(),
                 ready_files: VecDeque::new(),
             },
-            SortOrder::Native | SortOrder::WithinDirectory => Cursor::Breadth {
+            #[cfg(any(test, feature = "test-util"))]
+            SortOrder::WithinDirectory if done => Cursor::Breadth {
+                pending_dirs: VecDeque::new(),
+                ready_files: VecDeque::new(),
+            },
+            SortOrder::Native => Cursor::Breadth {
+                pending_dirs: VecDeque::from([root_dir]),
+                ready_files: VecDeque::new(),
+            },
+            #[cfg(any(test, feature = "test-util"))]
+            SortOrder::WithinDirectory => Cursor::Breadth {
                 pending_dirs: VecDeque::from([root_dir]),
                 ready_files: VecDeque::new(),
             },
@@ -1139,6 +1154,7 @@ impl FsWalk {
         // order the filesystem gave.
         match self.config.sort_order {
             SortOrder::WholeWalk => result.children.sort_by(cmp_key_form),
+            #[cfg(any(test, feature = "test-util"))]
             SortOrder::WithinDirectory => result.children.sort_by(|a, b| a.path().cmp(b.path())),
             SortOrder::Native => {}
         }
