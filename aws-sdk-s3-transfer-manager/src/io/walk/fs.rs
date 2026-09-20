@@ -88,6 +88,19 @@ fn name_bytes(path: &Path) -> &[u8] {
 // Opening is in the name because the root case turns on it. A directory whose read fails partway
 // through has already handed out names, and calling that fatal ends a run that was working — so
 // that site reports a lost range at every depth and does not come here.
+// A single entry that could not be read. Never fatal: one name failing says nothing about the rest
+// of the walk, and a fatal kind here discards every entry already read.
+//
+// `ENOTDIR` is the reason this exists. It means a component of the path stopped being a directory,
+// so the failure is not about this name at all — the directory holding it can no longer be
+// enumerated, which is a lost range under the parent rather than one key under this name.
+fn entry_error_kind(e: &std::io::Error) -> WalkErrorKind {
+    match WalkError::classify_io(e) {
+        WalkErrorKind::NotADirectory => WalkErrorKind::DirectoryUnreadable,
+        other => other,
+    }
+}
+
 fn dir_open_error_kind(e: &std::io::Error, depth: usize) -> WalkErrorKind {
     if depth == 0 {
         match WalkError::classify_io(e) {
@@ -1064,10 +1077,18 @@ impl FsWalk {
                 let metadata = match std::fs::metadata(&path) {
                     Ok(m) => m,
                     Err(e) => {
-                        let kind = WalkError::classify_io(&e);
+                        // Named for the directory when the failure is about the path rather than the
+                        // name: `ENOTDIR` says a component above this is no longer a directory, so
+                        // reporting this file's path would name something that is not what failed.
+                        let kind = entry_error_kind(&e);
+                        let named = if kind == WalkErrorKind::DirectoryUnreadable {
+                            dir.to_path_buf()
+                        } else {
+                            path
+                        };
                         result
                             .errors
-                            .push(WalkError::new(Some(path), kind, Box::new(e)));
+                            .push(WalkError::new(Some(named), kind, Box::new(e)));
                         continue;
                     }
                 };
@@ -1496,6 +1517,27 @@ mod tests {
         assert!(
             walk.next().await.is_none(),
             "a fatal error means nothing more can be enumerated, so no entry may follow it"
+        );
+    }
+
+    // One name failing must never end the walk, whatever the reason. `ENOTDIR` is the case that used
+    // to: a component of the path stopped being a directory, which `classify_io` calls fatal, so one
+    // racing name threw away every entry already read. It is a lost range under the parent.
+    #[test]
+    fn one_unreadable_entry_never_ends_the_walk() {
+        for err in [
+            std::io::ErrorKind::NotADirectory,
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::Other,
+        ] {
+            let kind = entry_error_kind(&std::io::Error::from(err));
+            assert!(!kind.is_fatal(), "{err:?} became fatal as {kind:?}");
+        }
+        assert_eq!(
+            entry_error_kind(&std::io::Error::from(std::io::ErrorKind::NotADirectory)),
+            WalkErrorKind::DirectoryUnreadable,
+            "a path component that stopped being a directory costs the range under it"
         );
     }
 
