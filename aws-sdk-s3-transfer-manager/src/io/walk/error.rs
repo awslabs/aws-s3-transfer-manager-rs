@@ -39,8 +39,12 @@ pub enum WalkErrorKind {
 }
 
 impl WalkErrorKind {
-    /// Whether an error of this kind terminates the walk.
-    pub fn is_fatal(&self) -> bool {
+    // Whether an error of this kind terminates the walk.
+    //
+    // Crate-private, because a kind alone cannot answer it. The same failure is fatal at the walk
+    // root, where nothing can be enumerated, and costs one subtree a level down — so the position
+    // decides, and `FsWalk::is_done` is what tells a caller the walk stopped.
+    pub(crate) fn is_fatal(&self) -> bool {
         matches!(
             self,
             WalkErrorKind::SourceUnreadable | WalkErrorKind::NotADirectory | WalkErrorKind::Service
@@ -75,12 +79,9 @@ impl WalkError {
     pub fn kind(&self) -> WalkErrorKind {
         self.kind
     }
-    /// Whether this error terminates the walk.
-    ///
-    /// When `true`, no further entries will be produced by the walk.
-    /// When `false`, the walk continues and may produce more entries.
-    /// Equivalent to `self.kind().is_fatal()`.
-    pub fn is_fatal(&self) -> bool {
+    // Whether this error terminates the walk. Equivalent to `self.kind().is_fatal()`, and
+    // crate-private for the same reason.
+    pub(crate) fn is_fatal(&self) -> bool {
         self.kind.is_fatal()
     }
 
