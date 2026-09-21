@@ -14,7 +14,7 @@ mod stream;
 
 /// Error types related to I/O abstractions
 pub mod error;
-pub mod fs;
+pub(crate) mod fs;
 pub(crate) mod key;
 mod size_hint;
 /// Walker types for traversing filesystems and S3 buckets.
@@ -23,6 +23,7 @@ pub mod walk;
 // re-exports
 pub use self::aggregated_bytes::AggregatedBytes;
 pub(crate) use self::buffer::Buffer;
+pub use self::fs::FileType;
 pub use self::path_body::PathBodyBuilder;
 pub use self::size_hint::SizeHint;
 pub use self::stream::InputStream;

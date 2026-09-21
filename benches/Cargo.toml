@@ -17,7 +17,7 @@ name = "walk"
 path = "walk.rs"
 harness = false
 
-[dependencies]
+[dev-dependencies]
 criterion = { version = "0.7", features = ["html_reports"] }
 tokio = { version = "1", features = ["full"] }
 aws-sdk-s3 = "1"

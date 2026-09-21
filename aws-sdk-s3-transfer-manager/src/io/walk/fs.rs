@@ -244,9 +244,9 @@ pub enum SortOrder {
 /// # Traversal model
 ///
 /// The walker reads one directory at a time, and which order it emits in decides how the rest is
-/// held: [`SortOrder::Native`] and [`SortOrder::WithinDirectory`] queue subdirectories for later
-/// reads, while [`SortOrder::WholeWalk`] keeps the directories of the current descent path open so
-/// a subtree can be emitted where it sorts.
+/// held: [`SortOrder::Native`] queues subdirectories for later reads, while
+/// [`SortOrder::WholeWalk`] keeps the directories of the current descent path open so a subtree can
+/// be emitted where it sorts.
 ///
 /// Regular files always produce an [`FsEntry`]. A socket, FIFO, device or symlink left unfollowed
 /// produces one too when the walker is asked for them, so a consumer can see that the name is
