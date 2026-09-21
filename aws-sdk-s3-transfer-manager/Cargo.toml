@@ -43,6 +43,7 @@ dial9-tokio-telemetry = { version = "0.3", optional = true, features = ["cpu-pro
 
 [features]
 dial9 = ["dep:dial9-tokio-telemetry"]
+test-util = []
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", features = ["uio", "fs", "resource"] }

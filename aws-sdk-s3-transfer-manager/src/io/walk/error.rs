@@ -6,37 +6,48 @@
 use std::path::{Path, PathBuf};
 
 /// Classifies a [`WalkError`].
-///
-/// Each kind has a deterministic fatality (see [`WalkErrorKind::is_fatal`]).
-/// Errors whose kind is fatal terminate the walk; non-fatal kinds report
-/// the affected entry and the walk continues.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WalkErrorKind {
     /// Source root cannot be opened for reading (I/O or permission error
-    /// on the initial path). Fatal: the walk never gets off the ground.
+    /// on the initial path). Ends the run: the walk never gets off the ground.
     SourceUnreadable,
-    /// Source root exists but is not a directory. Fatal.
+    /// Source root exists but is not a directory. Ends the run.
     NotADirectory,
-    /// S3 service error from `ListObjectsV2` or related call. Fatal.
+    /// S3 service error from `ListObjectsV2` or related call. Ends the run.
     Service,
-    /// I/O error reading a subdirectory or entry during the walk.
-    /// Non-fatal: the affected entry is skipped and the walk continues.
+    /// I/O error reading one entry during the walk. That entry is skipped and the walk
+    /// continues. A directory that could not be read reports `DirectoryUnreadable` instead,
+    /// since the cost there is every key beneath it rather than one.
     Io,
-    /// Permission denied on a subdirectory or entry during the walk.
-    /// Non-fatal.
+    /// Permission denied on one entry during the walk. As with `Io`, a directory reports
+    /// `DirectoryUnreadable`.
     PermissionDenied,
-    /// Symlink encountered with no valid target. Non-fatal.
+    /// A directory below the root could not be read: the `read_dir` itself failed,
+    /// or opening it for cycle detection did. The same failure at the root is
+    /// [`SourceUnreadable`](Self::SourceUnreadable), which leaves nothing to walk;
+    /// here the walk continues with the rest of the tree, but that subtree was never
+    /// enumerated.
+    DirectoryUnreadable,
+    /// Symlink encountered with no valid target.
     BrokenSymlink,
     /// Symlink whose target is a directory already on the current descent
     /// path (a cycle). Non-cyclic duplicate symlinks (two different symlinks
     /// to the same target) are not reported as cycles and are traversed
-    /// normally. Non-fatal.
+    /// normally.
     SymlinkCycle,
 }
 
 impl WalkErrorKind {
-    /// Whether an error of this kind terminates the walk.
-    pub fn is_fatal(&self) -> bool {
+    // Whether an error of this kind terminates the walk. The kind carries the answer because the
+    // position was folded in when it was chosen: the same underlying failure becomes
+    // `SourceUnreadable` at the walk root and `DirectoryUnreadable` a level down.
+    //
+    // Crate-private because a caller cannot hold this predicate safely. `WalkErrorKind` is public
+    // and `#[non_exhaustive]`, so a hand-written version needs a wildcard arm, and a kind added
+    // later would read as non-fatal there — turning a walk that stopped early into one that looks
+    // finished. `FsWalk::is_done` answers the question directly instead.
+    pub(crate) fn is_fatal(&self) -> bool {
         matches!(
             self,
             WalkErrorKind::SourceUnreadable | WalkErrorKind::NotADirectory | WalkErrorKind::Service
@@ -47,8 +58,9 @@ impl WalkErrorKind {
 /// An error encountered during a directory walk.
 ///
 /// Wraps an optional path, a [`WalkErrorKind`] classifier, and a source
-/// error. Fatality is determined by [`kind`](Self::kind); see
-/// [`is_fatal`](Self::is_fatal).
+/// error. Whether the walk stopped is answered by
+/// [`FsWalk::is_done`](crate::io::walk::FsWalk::is_done), not by reading the
+/// kind.
 #[derive(Debug)]
 pub struct WalkError {
     path: Option<PathBuf>,
@@ -71,13 +83,9 @@ impl WalkError {
     pub fn kind(&self) -> WalkErrorKind {
         self.kind
     }
-
-    /// Whether this error terminates the walk.
-    ///
-    /// When `true`, no further entries will be produced by the walk.
-    /// When `false`, the walk continues and may produce more entries.
-    /// Equivalent to `self.kind().is_fatal()`.
-    pub fn is_fatal(&self) -> bool {
+    // Whether this error terminates the walk. Equivalent to `self.kind().is_fatal()`, and
+    // crate-private for the same reason.
+    pub(crate) fn is_fatal(&self) -> bool {
         self.kind.is_fatal()
     }
 
@@ -165,5 +173,25 @@ mod tests {
         assert!(!WalkErrorKind::PermissionDenied.is_fatal());
         assert!(!WalkErrorKind::BrokenSymlink.is_fatal());
         assert!(!WalkErrorKind::SymlinkCycle.is_fatal());
+    }
+
+    // Every kind, so a new one has to be placed deliberately. Only a failure that leaves nothing
+    // to carry on with ends the walk; the rest cost one entry, and a cycle costs the subtree it
+    // stopped at, which the run's failure policy decides about.
+    #[test]
+    fn only_a_failure_with_nothing_left_ends_the_walk() {
+        let cases = [
+            (WalkErrorKind::SourceUnreadable, true),
+            (WalkErrorKind::NotADirectory, true),
+            (WalkErrorKind::Service, true),
+            (WalkErrorKind::Io, false),
+            (WalkErrorKind::PermissionDenied, false),
+            (WalkErrorKind::DirectoryUnreadable, false),
+            (WalkErrorKind::BrokenSymlink, false),
+            (WalkErrorKind::SymlinkCycle, false),
+        ];
+        for (kind, ends_the_walk) in cases {
+            assert_eq!(kind.is_fatal(), ends_the_walk, "kind={kind:?}");
+        }
     }
 }

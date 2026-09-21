@@ -5,6 +5,47 @@
 
 //! Platform-specific filesystem operations.
 
+/// What the filesystem said is at a path.
+///
+/// A walk yields an entry for whatever it found, so a consumer decides what to do with each
+/// one. Only a regular file holds bytes a transfer could move; the rest are named so a consumer
+/// can say why it left them alone.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileType {
+    /// A regular file.
+    Regular,
+    /// A symlink this walk did not follow, so nothing here describes its target.
+    Symlink,
+    /// A named pipe.
+    Fifo,
+    /// A socket.
+    Socket,
+    /// A block or character device.
+    Device,
+}
+
+// Which of the special kinds a file type names. `FileType` from `std` answers each of these
+// separately on Unix, and a walk reports what it was told.
+pub(crate) fn special_file_type(file_type: &std::fs::FileType) -> FileType {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        if file_type.is_fifo() {
+            return FileType::Fifo;
+        }
+        if file_type.is_socket() {
+            return FileType::Socket;
+        }
+        if file_type.is_block_device() || file_type.is_char_device() {
+            return FileType::Device;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = file_type;
+    FileType::Device
+}
+
 use bytes::Buf;
 use std::fs::File;
 use std::io;

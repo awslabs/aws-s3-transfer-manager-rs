@@ -5,19 +5,18 @@
 
 //! State machine for plural upload (`upload_objects`).
 
-use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
 use std::future::Future;
-use std::path::{PathBuf, MAIN_SEPARATOR, MAIN_SEPARATOR_STR};
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use crate::error;
-use crate::io::walk::{DirEntry, FsWalk};
+use crate::io::fs::FileType;
+use crate::io::key::derive_object_key;
+use crate::io::walk::{FsEntry, FsWalk};
 use crate::io::InputStream;
 use crate::operation::upload::{Upload, UploadHandle, UploadInput};
-use crate::operation::DEFAULT_DELIMITER;
 use crate::runtime::sync::Mutex;
 use crate::transfer::{IoRequest, PollWork, Transfer, TransferContext, TransferId, WorkOutcome};
 use crate::types::{FailedTransferPolicy, FailedUpload};
@@ -328,7 +327,7 @@ impl fmt::Debug for ChildTransfer {
 
 /// Mutable state of an `upload_objects` transfer.
 ///
-/// Walker enumeration produces `DirEntry`s into `pending_entries`.
+/// Walker enumeration produces `FsEntry`s into `pending_entries`.
 /// `poll_work` consumes them through `claim_one` into child
 /// `UploadHandle`s in `children`, reaps terminal children via
 /// `JoinChildren` work items, and accumulates outcomes into
@@ -357,7 +356,7 @@ struct State {
     walks: BTreeMap<u64, FsWalk>,
     next_walk_id: u64,
     in_flight_walks: usize,
-    pending_entries: VecDeque<DirEntry>,
+    pending_entries: VecDeque<FsEntry>,
     children: HashMap<TransferId, ChildTransfer>,
     /// Entries that have been claimed from `pending_entries` by a `poll_work`
     /// frame that has released the state lock to run `orchestrate_child`, but
@@ -675,6 +674,30 @@ impl UploadObjectsTransfer {
         let mut batch: Vec<ClaimedEntry> = Vec::new();
         // Loop until one spawnable entry is claimed or the queue is exhausted.
         while let Some(entry) = state.pending_entries.pop_front() {
+            // Only a regular file holds bytes to upload. A walk yields anything else only when
+            // asked, and an upload never asks — but the entry type can carry a socket, a FIFO or a
+            // symlink left alone, so the check belongs here rather than in a comment.
+            //
+            // What it prevents is a plausible-looking object at a name that holds no bytes: the
+            // length comes from the entry's metadata, which is zero for a socket or a FIFO, so the
+            // upload succeeds and writes an empty object. A later run then compares that object
+            // against a name no transfer can move. An unfollowed symlink is worse still: it carries
+            // the link's own length while the path would open the target.
+            //
+            // Checked before a key is derived: a name holding a custom delimiter fails derivation,
+            // and under the abort policy that ends the run — over an entry nothing was going to
+            // upload.
+            if entry.file_type() != FileType::Regular {
+                // TODO(sync): a log is all this says. A run that reports what became of every key
+                // needs this passed-over entry in its output, not only in the trace.
+                tracing::warn!(
+                    path = ?entry.path(),
+                    file_type = ?entry.file_type(),
+                    "skipping: not a regular file",
+                );
+                continue;
+            }
+
             let relative = entry.relative_path().to_string_lossy().to_string();
             let key =
                 match derive_object_key(&relative, key_prefix.as_deref(), delimiter.as_deref()) {
@@ -692,10 +715,27 @@ impl UploadObjectsTransfer {
                         continue;
                     }
                 };
-
+            // The walk reports a regular file it could not describe as an error, so no entry for
+            // one reaches here. Were that to change, building the stream without a length makes it
+            // `stat` the path, which both blocks this task and reads a length the walk never saw.
+            let Some(metadata) = entry.metadata() else {
+                state.failed.push(FailedUpload {
+                    input: None,
+                    error: crate::error::Error::new(
+                        crate::error::ErrorKind::IOError,
+                        "walk produced a regular file with no metadata",
+                    ),
+                    source_path: Some(entry.path().to_path_buf()),
+                });
+                if *self.failure_policy() == FailedTransferPolicy::Abort {
+                    self.abort(state, "entry with no metadata");
+                    return SpawnDecision::Abort;
+                }
+                continue;
+            };
             let stream = match InputStream::read_from()
                 .path(entry.path())
-                .metadata(entry.metadata().clone())
+                .metadata(metadata.clone())
                 .build()
             {
                 Ok(s) => s,
@@ -1248,46 +1288,6 @@ impl Transfer for UploadObjectsTransfer {
     fn on_terminal(&self) {}
 }
 
-/// Derive the S3 object key for a file at `relative_filename` inside the walk root.
-///
-/// The key is formed by optionally prepending a prefix and substituting the
-/// path separator with a custom delimiter if one is configured. When the
-/// custom delimiter appears inside `relative_filename`, derivation fails with
-/// an invalid-input error.
-pub(crate) fn derive_object_key<'a>(
-    relative_filename: &'a str,
-    object_key_prefix: Option<&str>,
-    object_key_delimiter: Option<&str>,
-) -> Result<Cow<'a, str>, error::Error> {
-    if let Some(delim) = object_key_delimiter {
-        if delim != DEFAULT_DELIMITER && relative_filename.contains(delim) {
-            return Err(error::invalid_input(format!(
-                "a custom delimiter `{delim}` should not appear in `{relative_filename}`"
-            )));
-        }
-    }
-
-    let delim = object_key_delimiter.unwrap_or(DEFAULT_DELIMITER);
-
-    let relative_filename = if delim == MAIN_SEPARATOR_STR {
-        Cow::Borrowed(relative_filename)
-    } else {
-        Cow::Owned(relative_filename.replace(MAIN_SEPARATOR, delim))
-    };
-
-    let object_key = if let Some(prefix) = object_key_prefix {
-        if prefix.ends_with(delim) {
-            Cow::Owned(format!("{prefix}{relative_filename}"))
-        } else {
-            Cow::Owned(format!("{prefix}{delim}{relative_filename}"))
-        }
-    } else {
-        relative_filename
-    };
-
-    Ok(object_key)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1301,74 +1301,6 @@ mod tests {
     use tokio::time::timeout;
 
     use crate::io::walk::{FsWalkContext, FsWalker};
-
-    #[cfg(target_family = "unix")]
-    #[test]
-    fn test_derive_object_key() {
-        assert_eq!(
-            "2023/Jan/1.png",
-            derive_object_key("2023/Jan/1.png", None, None).unwrap()
-        );
-        assert_eq!(
-            "foobar/2023/Jan/1.png",
-            derive_object_key("2023/Jan/1.png", Some("foobar"), None).unwrap()
-        );
-        assert_eq!(
-            "foobar/2023/Jan/1.png",
-            derive_object_key("2023/Jan/1.png", Some("foobar/"), None).unwrap()
-        );
-        assert_eq!(
-            "2023-Jan-1.png",
-            derive_object_key("2023/Jan/1.png", None, Some("-")).unwrap()
-        );
-        assert_eq!(
-            "foobar-2023-Jan-1.png",
-            derive_object_key("2023/Jan/1.png", Some("foobar"), Some("-")).unwrap()
-        );
-        assert_eq!(
-            "foobar-2023-Jan-1.png",
-            derive_object_key("2023/Jan/1.png", Some("foobar-"), Some("-")).unwrap()
-        );
-        assert_eq!(
-            "foobar--2023-Jan-1.png",
-            derive_object_key("2023/Jan/1.png", Some("foobar--"), Some("-")).unwrap()
-        );
-        assert_eq!(
-            "2023/MYLONGDELIMJan/MYLONGDELIM1.png",
-            derive_object_key("2023/Jan/1.png", None, Some("/MYLONGDELIM")).unwrap()
-        );
-        {
-            use std::error::Error as _;
-            let err = derive_object_key("2023/Jan-1.png", None, Some("-"))
-                .err()
-                .unwrap();
-            assert_eq!(
-                "a custom delimiter `-` should not appear in `2023/Jan-1.png`",
-                format!("{}", err.source().unwrap())
-            );
-        }
-
-        // Should not replace the path separator in prefix with a custom delimiter
-        assert_eq!(
-            "foo/bar-2023-Jan-1.png",
-            derive_object_key("2023/Jan/1.png", Some("foo/bar"), Some("-")).unwrap()
-        );
-
-        // Should not fail if the user specifies the default delimiter as a custom delimiter
-        assert_eq!(
-            "2023/Jan/1.png",
-            derive_object_key("2023/Jan/1.png", None, Some(DEFAULT_DELIMITER)).unwrap()
-        );
-    }
-
-    #[cfg(target_family = "windows")]
-    #[test]
-    fn test_derive_object_key() {
-        assert_eq!(
-            "2023/Jan/1.png",
-            derive_object_key("2023\\Jan\\1.png", None, None).unwrap()
-        );
-    }
 
     fn mock_s3_success() -> aws_sdk_s3::Client {
         let put = mock!(aws_sdk_s3::Client::put_object)
@@ -1397,6 +1329,19 @@ mod tests {
         UploadObjectsTransfer,
         crate::transfer::StateMachineTerminalReceiver,
     ) {
+        setup_with_special_files(source, policy, s3_client, recursive, false)
+    }
+
+    fn setup_with_special_files(
+        source: &std::path::Path,
+        policy: FailedTransferPolicy,
+        s3_client: aws_sdk_s3::Client,
+        recursive: bool,
+        include_special_files: bool,
+    ) -> (
+        UploadObjectsTransfer,
+        crate::transfer::StateMachineTerminalReceiver,
+    ) {
         let config = crate::Config::builder().client(s3_client).build();
         let handle = crate::client::Handle::test_handle_tokio(config);
 
@@ -1410,6 +1355,7 @@ mod tests {
         let walker = FsWalker::builder()
             .recursive(recursive)
             .follow_symlinks(true)
+            .include_special_files(include_special_files)
             .build()
             .walk(FsWalkContext::builder().root(source).build());
 
@@ -1468,6 +1414,129 @@ mod tests {
         .expect("transfer should complete within timeout");
 
         assert_eq!(transfer.successful_uploads(), 3);
+        assert!(transfer.take_failed().is_empty());
+    }
+
+    // A name is only worth deriving a key for once the entry is known to be uploadable. A custom
+    // delimiter inside a name is a derivation failure, and under the abort policy one failure ends
+    // the run — so a socket nobody was going to upload could stop a transfer.
+    #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn a_name_that_cannot_be_uploaded_is_not_turned_into_a_key() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "hello").unwrap();
+        // `-` is the configured delimiter, and it appears in this name.
+        let _listener = UnixListener::bind(dir.path().join("we-ird.sock")).unwrap();
+
+        let config = crate::Config::builder().client(mock_s3_success()).build();
+        let handle = crate::client::Handle::test_handle_tokio(config);
+        let input = super::super::UploadObjectsInputBuilder::default()
+            .bucket("test-bucket")
+            .source(dir.path())
+            .delimiter("-")
+            .failure_policy(FailedTransferPolicy::Abort)
+            .build()
+            .unwrap();
+        let walker = FsWalker::builder()
+            .include_special_files(true)
+            .build()
+            .walk(FsWalkContext::builder().root(dir.path()).build());
+        let (ctx, completion_rx) = TransferContext::new(handle);
+        let transfer = UploadObjectsTransfer::new(ctx, input, walker);
+        transfer
+            .inner
+            .ctx
+            .handle
+            .scheduler
+            .register_empty_group_for_test(transfer.inner.ctx.id.id);
+
+        timeout(Duration::from_secs(5), async {
+            drive_transfer(&transfer).await;
+            let _ = completion_rx.await;
+        })
+        .await
+        .expect("transfer should complete within timeout");
+
+        assert_eq!(
+            transfer.successful_uploads(),
+            1,
+            "the regular file should still be uploaded"
+        );
+        assert!(
+            transfer.take_failed().is_empty(),
+            "a socket is passed over, so its name never needs a key"
+        );
+    }
+
+    // A walk asked for what no transfer can move yields a socket at its own key. An upload has to
+    // leave it alone: its bytes cannot be read, and opening a FIFO with no writer would block the
+    // read task for as long as the transfer lives.
+    #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_special_files_are_not_uploaded() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "hello").unwrap();
+        let _listener = UnixListener::bind(dir.path().join("socket.sock")).unwrap();
+
+        let (transfer, completion_rx) = setup_with_special_files(
+            dir.path(),
+            FailedTransferPolicy::Continue,
+            mock_s3_success(),
+            false,
+            true,
+        );
+
+        timeout(Duration::from_secs(5), async {
+            drive_transfer(&transfer).await;
+            let _ = completion_rx.await;
+        })
+        .await
+        .expect("transfer should complete within timeout");
+
+        // Only the regular file is uploaded. A socket is not a failed upload, since nothing was
+        // attempted, and this output has no way to say it was passed over — a caller asking what
+        // became of every name the walk produced cannot learn it here.
+        assert_eq!(transfer.successful_uploads(), 1);
+        assert!(
+            transfer.take_failed().is_empty(),
+            "a socket is not a failed upload"
+        );
+    }
+
+    // A FIFO is the case that would be uploaded rather than fail: nothing opens it, so the length
+    // comes from metadata as zero and an empty object appears at its name. The timeout is only a
+    // guard against a future change that does open it.
+    #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_a_fifo_does_not_stall_the_transfer() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "hello").unwrap();
+        let fifo = dir.path().join("pipe");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).unwrap();
+
+        let (transfer, completion_rx) = setup_with_special_files(
+            dir.path(),
+            FailedTransferPolicy::Continue,
+            mock_s3_success(),
+            false,
+            true,
+        );
+
+        timeout(Duration::from_secs(5), async {
+            drive_transfer(&transfer).await;
+            let _ = completion_rx.await;
+        })
+        .await
+        .expect("a FIFO must not stall the transfer");
+
+        assert_eq!(transfer.successful_uploads(), 1);
         assert!(transfer.take_failed().is_empty());
     }
 
