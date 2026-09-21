@@ -139,12 +139,15 @@ pub(crate) trait KeyStream {
 // other side" it has to know whether the side it is reading is still able to account for its keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KeysLost {
-    // Nothing: every key this side holds is still accounted for.
-    Nothing,
-    // One key, and the keys around it are known. Which key depends on the side: a listing names the
-    // key it dropped, while a local failure carries a path nothing here turns into a key and arrives
-    // at the position of the directory holding it. So a consumer can act on the one key for the
-    // first, and for the second knows only that a key inside that directory is gone.
+    // One key, and the keys around it are known. Whether a consumer can act on that one key alone
+    // depends on which failure produced it.
+    //
+    // A listing names the key it dropped. A name no key can carry names the file itself, at that
+    // file's own position, so it is just as identifiable — what it cannot do is produce a key to
+    // match against the other side, which is why nothing can be sent for it even though the name is
+    // taken. A walk failure is the weak one: it carries an absolute path nothing here turns into a
+    // key, and it arrives at the position of the directory holding it, so all a consumer learns is
+    // that some key inside that directory is gone.
     OneKey,
     // An unknown range. A subtree went unenumerated, or the side stopped before its end, so
     // absence cannot be read from position at all.
@@ -171,9 +174,15 @@ impl StreamError {
                 | WalkErrorKind::PermissionDenied
                 | WalkErrorKind::BrokenSymlink => KeysLost::OneKey,
             },
-            // The walk read the name; it is S3 that has no key it could take. Nothing on the other
-            // side can correspond to it, so no comparable key went missing.
-            StreamError::UnkeyableName(_) => KeysLost::Nothing,
+            // One entry, like the devices and sockets it is grouped with, and not a range — losing a
+            // whole directory is a separate case. What it costs is this: the name is taken, and no key
+            // can carry it, so the upload path's lossy derivation may already have put an object
+            // where a walk cannot look. Not `Nothing`, which would license deleting that object.
+            //
+            // The truthful state is narrower than either: the key is occupied and nothing can be
+            // sent for it. Saying so needs an answer beside transfer and skip, which the comparison
+            // owns; until then this is the conservative half of it.
+            StreamError::UnkeyableName(_) => KeysLost::OneKey,
             // The object was listed and then dropped, so its key is absent from this side while
             // the keys around it arrived.
             StreamError::MalformedListing { key: Some(_), .. } => KeysLost::OneKey,
@@ -897,11 +906,11 @@ mod tests {
                 },
                 KeysLost::UnknownRange,
             ),
-            // No S3 key can carry a name that is not valid UTF-8, so nothing on the other side
-            // could have corresponded to it.
+            // No key can carry a name that is not valid UTF-8, and an object may already sit at the
+            // key the upload path would have derived for it. One entry, like a device or a socket.
             (
                 StreamError::UnkeyableName(PathBuf::from("/tmp/x")),
-                KeysLost::Nothing,
+                KeysLost::OneKey,
             ),
         ];
         for (err, cost) in cases {
@@ -1123,6 +1132,57 @@ mod tests {
     // nobody could read, so its absence cannot be trusted and a delete has to be held back.
     //
     // This is the shape the comparison will take. It lives here to show the stream hands over enough
+    // A stream of scripted results, for a side the filesystem cannot be made to produce: a name
+    // that is not valid UTF-8 cannot be created on every platform these tests run on.
+    struct Scripted(std::collections::VecDeque<Result<Entry<()>, StreamError>>);
+
+    impl Scripted {
+        fn new(items: Vec<Result<Entry<()>, StreamError>>) -> Self {
+            Self(items.into())
+        }
+    }
+
+    impl KeyStream for Scripted {
+        type Source = ();
+
+        async fn next_entry(&mut self) -> Option<Result<Entry<()>, StreamError>> {
+            self.0.pop_front()
+        }
+    }
+
+    fn keyed(key: &str) -> Result<Entry<()>, StreamError> {
+        Ok(Entry {
+            key: key.to_string(),
+            meta: EntryMeta {
+                size: Some(1),
+                last_modified_secs: Some(1_700_000_000),
+            },
+            source: (),
+        })
+    }
+
+    // A name no key can carry still has an object waiting for it, because the upload path derives
+    // keys with `to_string_lossy` — so this crate writes an object at the lossy key and a later walk
+    // cannot name the file that produced it. Reading that as costing nothing licenses deleting the
+    // object while the file is still there.
+    #[tokio::test]
+    async fn a_name_no_key_can_carry_does_not_license_a_delete() {
+        let mut src = Scripted::new(vec![
+            keyed("a.txt"),
+            Err(StreamError::UnkeyableName(PathBuf::from(
+                "/data/caf\u{FFFD}.txt",
+            ))),
+        ]);
+        let mut dest = Scripted::new(vec![keyed("a.txt"), keyed("caf\u{FFFD}.txt")]);
+
+        let (plan, lost) = merge_respecting_loss(&mut src, &mut dest).await;
+        assert!(lost, "a name the walk could not key is a gap: {plan:?}");
+        assert!(
+            !plan.iter().any(|(_, action)| *action == Action::Delete),
+            "the object at the lossy key must not be deleted: {plan:?}"
+        );
+    }
+
     // to make that decision.
     async fn merge_respecting_loss<S, D>(src: &mut S, dest: &mut D) -> (Vec<(String, Action)>, bool)
     where
@@ -1138,19 +1198,18 @@ mod tests {
                 match k.next_entry().await {
                     None => return None,
                     Some(Ok(entry)) => return Some(entry),
-                    // Any loss counts, not only a range. A lost range is unnameable by definition,
-                    // and a single lost key is unnameable in practice on the local side: the failure
-                    // carries an absolute path, nothing here turns that into a key, and it arrives
-                    // at the position of the directory holding it rather than its own. So this
-                    // cannot suppress the delete of just the key that went missing, and holding
-                    // back every delete is the safe reading left. The cost is that a key genuinely
-                    // absent from the source keeps its counterpart too, which a per-key mechanism
-                    // recovers once a failure can name a relative key.
-                    Some(Err(err)) => {
-                        if err.keys_lost() != KeysLost::Nothing {
-                            *lost = true;
-                        }
-                    }
+                    Some(Err(err)) => match err.keys_lost() {
+                        // Both answers collapse to the same action here. A range is unnameable by
+                        // definition, and one key is unnameable in practice on the local side: the
+                        // failure carries an absolute path, nothing here turns that into a key, and
+                        // it arrives at the position of the directory holding it rather than its
+                        // own. So neither can suppress the delete of just the key that went
+                        // missing, and holding every delete back is the safe reading left. The cost
+                        // is that a key genuinely absent from the source keeps its counterpart too,
+                        // which a per-key mechanism recovers once a failure can name a relative
+                        // key.
+                        KeysLost::OneKey | KeysLost::UnknownRange => *lost = true,
+                    },
                 }
             }
         }
