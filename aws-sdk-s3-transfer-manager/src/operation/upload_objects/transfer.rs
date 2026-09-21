@@ -1519,14 +1519,7 @@ mod tests {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("a.txt"), "hello").unwrap();
         let fifo = dir.path().join("pipe");
-        let made = std::process::Command::new("mkfifo")
-            .arg(&fifo)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if !made {
-            return; // no mkfifo on this host
-        }
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).unwrap();
 
         let (transfer, completion_rx) = setup_with_special_files(
             dir.path(),

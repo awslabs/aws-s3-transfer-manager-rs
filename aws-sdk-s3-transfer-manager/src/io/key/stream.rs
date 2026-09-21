@@ -1609,19 +1609,15 @@ mod tests {
         );
     }
 
-    // A named pipe is skipped without a warning whether or not a rule excludes it.
+    // A named pipe is skipped without a warning whether or not a rule excludes it. Unix-only
+    // because a named pipe is, and `nix` is only a dependency there.
+    #[cfg(unix)]
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn an_excluded_special_file_warns_about_nothing() {
         let dir = tempdir().unwrap();
         let fifo = dir.path().join("pipe");
-        let status = std::process::Command::new("mkfifo")
-            .arg(&fifo)
-            .status()
-            .expect("mkfifo");
-        if !status.success() {
-            return;
-        }
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).unwrap();
         fs::write(dir.path().join("keep.txt"), "").unwrap();
 
         let mut walk = filtered_local(dir.path(), vec![Rule::exclude("pipe")]);
@@ -1947,25 +1943,38 @@ mod tests {
         );
     }
 
-    // The largest time this platform holds still converts, and one second more cannot be built
-    // at all, so the checked conversion never fails here. It guards a platform whose clock is
-    // wider than `i64` seconds; should this assertion ever fail, that platform has arrived and
-    // `secs_since_epoch` wants testing against a time it cannot report.
+    // The largest time this platform can hold still converts. The ceiling is searched for rather
+    // than assumed, because a clock's range is not the same everywhere: one counts seconds in a
+    // width that reaches `i64::MAX`, another counts 100ns ticks from 1601 and runs out long before.
+    //
+    // The assertion on that ceiling is also the canary. Should a platform arrive whose clock reaches
+    // past `i64` seconds, `secs_since_epoch` has a time it cannot report and wants testing against
+    // it.
     #[test]
     fn no_time_this_platform_can_hold_overflows_the_conversion() {
         use std::time::Duration;
 
-        let largest = UNIX_EPOCH
-            .checked_add(Duration::from_secs(u64::try_from(i64::MAX).unwrap()))
-            .expect("i64::MAX seconds from the epoch");
-        assert_eq!(secs_since_epoch(Ok(largest)), Some(i64::MAX));
+        let mut lo = 0u64;
+        let mut hi = u64::MAX;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2 + 1;
+            if UNIX_EPOCH.checked_add(Duration::from_secs(mid)).is_some() {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
 
-        let beyond = u64::try_from(i64::MAX).unwrap() + 1;
         assert!(
-            UNIX_EPOCH
-                .checked_add(Duration::from_secs(beyond))
-                .is_none(),
+            lo <= u64::try_from(i64::MAX).unwrap(),
             "this platform holds a time beyond i64 seconds, so the conversion needs testing"
+        );
+        let largest = UNIX_EPOCH
+            .checked_add(Duration::from_secs(lo))
+            .expect("the ceiling the search just found");
+        assert_eq!(
+            secs_since_epoch(Ok(largest)),
+            Some(i64::try_from(lo).unwrap())
         );
     }
 }
