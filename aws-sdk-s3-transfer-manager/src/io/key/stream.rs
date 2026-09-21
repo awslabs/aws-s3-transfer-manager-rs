@@ -543,7 +543,9 @@ mod tests {
         assert_eq!(entry.source.path(), dir.path().join("f"));
     }
 
-    // What a stream error is, for asserting on a whole batch at once.
+    // What a stream error is, for asserting on a whole batch at once. Every caller builds its
+    // failures from permissions or symlinks, so it follows them behind the gate.
+    #[cfg(unix)]
     fn walk_kind(err: &StreamError) -> Option<WalkErrorKind> {
         match err {
             StreamError::Walk(err) => Some(err.kind()),
@@ -1523,6 +1525,7 @@ mod tests {
     // rules have to be consulted before the metadata is.
     // A directory that can be listed but whose children cannot be stat'd: readable,
     // not searchable. Returns `None` when the mode has no effect, as for root.
+    #[cfg(unix)]
     fn unstattable_dir(root: &std::path::Path) -> Option<std::path::PathBuf> {
         use std::os::unix::fs::PermissionsExt;
 
@@ -1541,11 +1544,13 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn unlock(dir: &std::path::Path) {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
+    #[cfg(unix)]
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn an_excluded_unreadable_file_warns_about_nothing() {
@@ -1576,6 +1581,7 @@ mod tests {
 
     // The control for the test above: without the rule, the same file does warn, so
     // the silence there comes from the filter and not from swallowing errors.
+    #[cfg(unix)]
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn an_unreadable_file_that_is_not_excluded_still_warns() {
@@ -1697,6 +1703,7 @@ mod tests {
         assert!(remote(&object("data/a.txt", 1)));
     }
 
+    #[cfg(unix)]
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn an_unreadable_subdirectory_leaves_a_range_unaccounted_for() {
@@ -1728,6 +1735,7 @@ mod tests {
         assert!(incomplete, "an unread subtree must be an incomplete view");
     }
 
+    #[cfg(unix)]
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn a_broken_symlink_costs_one_entry_not_the_view() {
@@ -1759,6 +1767,7 @@ mod tests {
 
     // A cycle stops a descent, so everything under it goes unenumerated. The side has to say so, or
     // a delete removes destination keys nobody ever looked for.
+    #[cfg(unix)]
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn a_symlink_cycle_leaves_a_range_unaccounted_for() {
@@ -1792,6 +1801,7 @@ mod tests {
 
     // A directory reached through a symlink that cannot be opened is not descended into either, so
     // it has to report what every other unreadable directory reports.
+    #[cfg(unix)]
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn a_symlinked_directory_that_cannot_be_opened_costs_a_range() {

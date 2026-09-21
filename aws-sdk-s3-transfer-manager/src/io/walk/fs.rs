@@ -1802,6 +1802,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_entry_failure_is_not_directory_scoped() {
