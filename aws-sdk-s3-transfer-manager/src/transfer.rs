@@ -14,6 +14,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Wake, Waker};
+use std::time::Instant;
 
 /// Edge-triggered wake flag for transfer state machines.
 ///
@@ -431,6 +432,7 @@ pub(crate) struct MetricsState {
     total_bytes: std::sync::OnceLock<u64>,
     started_at: std::time::Instant,
     finished_at: std::sync::OnceLock<std::time::Instant>,
+    request_metrics: crate::metrics::RequestMetricsState,
 }
 
 impl MetricsState {
@@ -443,6 +445,7 @@ impl MetricsState {
             total_bytes: std::sync::OnceLock::new(),
             started_at: std::time::Instant::now(),
             finished_at: std::sync::OnceLock::new(),
+            request_metrics: crate::metrics::RequestMetricsState::default(),
         }
     }
 
@@ -468,6 +471,16 @@ impl MetricsState {
         let _ = self.finished_at.set(std::time::Instant::now());
     }
 
+    /// Merge one completed service-request measurement.
+    pub(crate) fn record_request(&self, metrics: &crate::metrics::RequestMetrics) {
+        self.request_metrics.record(metrics);
+    }
+
+    /// Return the cumulative request measurement for this transfer.
+    pub(crate) fn request_metrics(&self) -> crate::metrics::RequestMetrics {
+        self.request_metrics.snapshot()
+    }
+
     /// Snapshot current metrics into the public type.
     pub(crate) fn snapshot(&self) -> crate::types::TransferMetrics {
         crate::types::TransferMetrics {
@@ -489,6 +502,7 @@ impl std::fmt::Debug for MetricsState {
             .field("network_rx", &self.network_rx.load(Ordering::Relaxed))
             .field("disk_read", &self.disk_read.load(Ordering::Relaxed))
             .field("disk_write", &self.disk_write.load(Ordering::Relaxed))
+            .field("request_metrics", &self.request_metrics())
             .finish()
     }
 }
@@ -518,6 +532,56 @@ pub(crate) struct TransferContext {
     cancellation_token: tokio_util::sync::CancellationToken,
     /// Per-transfer metrics backing store
     pub(crate) metrics: Arc<MetricsState>,
+}
+
+/// In-progress measurement for one logical transfer-manager request.
+///
+/// The guard publishes exactly once when finished or dropped. Drop publication
+/// keeps early returns and cancellation paths from losing a request after it
+/// started. A ranged discovery may carry the guard with its response body so
+/// headers and validated body collection remain one logical request.
+#[derive(Debug)]
+pub(crate) struct RequestMeasurement {
+    ctx: TransferContext,
+    started_at: Instant,
+    metrics: crate::metrics::RequestMetrics,
+    published: bool,
+}
+
+impl RequestMeasurement {
+    fn new(ctx: TransferContext) -> Self {
+        Self {
+            ctx,
+            started_at: Instant::now(),
+            metrics: crate::metrics::RequestMetrics::default(),
+            published: false,
+        }
+    }
+
+    /// Return the request aggregate updated by the retry loop.
+    pub(crate) fn metrics_mut(&mut self) -> &mut crate::metrics::RequestMetrics {
+        &mut self.metrics
+    }
+
+    /// Complete and publish this logical request.
+    pub(crate) fn finish(mut self) {
+        self.publish();
+    }
+
+    fn publish(&mut self) {
+        if self.published {
+            return;
+        }
+        self.metrics.record_request(self.started_at.elapsed());
+        self.ctx.record_request_metrics(&self.metrics);
+        self.published = true;
+    }
+}
+
+impl Drop for RequestMeasurement {
+    fn drop(&mut self) {
+        self.publish();
+    }
 }
 
 /// Task wake adapter for futures polled from a transfer's synchronous state machine.
@@ -846,6 +910,16 @@ impl TransferContext {
         self.handle.telemetry.io_counters.record(sample);
     }
 
+    /// Record one request in the transfer aggregate.
+    pub(crate) fn record_request_metrics(&self, metrics: &crate::metrics::RequestMetrics) {
+        self.metrics.record_request(metrics);
+    }
+
+    /// Start measuring one logical service request.
+    pub(crate) fn start_request_metrics(&self) -> RequestMeasurement {
+        RequestMeasurement::new(self.clone())
+    }
+
     /// Set the expected total payload bytes for this transfer.
     pub(crate) fn set_total_bytes(&self, n: u64) {
         self.metrics.set_total_bytes(n);
@@ -1084,6 +1158,40 @@ mod tests {
             assert_eq!(stats.network_rx, 220);
             assert_eq!(stats.disk_read, 330);
             assert_eq!(stats.disk_write, 440);
+        }
+
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn request_metrics_merge_into_transfer_aggregate() {
+            let handle = test_handle();
+            assert!(!handle.config.diagnostics().transfer().enable_summaries());
+            let (ctx, _rx) = TransferContext::new(handle);
+            let req_metrics = crate::metrics::RequestMetrics {
+                requests: 1,
+                elapsed: std::time::Duration::from_millis(15),
+                max_elapsed: std::time::Duration::from_millis(15),
+                retry_reissues: 2,
+                throttle_reissues: 3,
+                hedge_reissues: 1,
+                retry_exhaustions: 1,
+                backoff_duration: std::time::Duration::from_millis(9),
+            };
+
+            ctx.record_request_metrics(&req_metrics);
+
+            assert_eq!(ctx.metrics.request_metrics(), req_metrics);
+        }
+
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn request_measurement_publishes_once_on_finish_or_drop() {
+            let handle = test_handle();
+            let (ctx, _rx) = TransferContext::new(handle);
+
+            ctx.start_request_metrics().finish();
+            drop(ctx.start_request_metrics());
+
+            assert_eq!(ctx.metrics.request_metrics().requests, 2);
         }
 
         #[cfg_attr(miri, ignore)]

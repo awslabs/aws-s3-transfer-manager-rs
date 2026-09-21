@@ -20,6 +20,7 @@ use aws_sdk_s3::config::retry::{RetryPartition, TokenBucket};
 
 use crate::error::{Error, ErrorKind};
 pub(crate) use crate::metrics::latency::GuardError;
+use crate::metrics::RequestMetrics;
 
 /// Maximum attempts per operation before the last error is returned.
 const MAX_ATTEMPTS: u32 = 3;
@@ -117,6 +118,10 @@ pub(crate) enum RetryDecision {
 /// Retry an operation up to [`MAX_ATTEMPTS`] times, deciding each failure via
 /// `classify` and backing off per `backoff`.
 ///
+/// `metrics` records transfer-manager reissues, retry exhaustion, and selected
+/// backoff. The caller remains responsible for recording the logical request's
+/// final elapsed time and publishing the completed measurement.
+///
 /// Each attempt calls `build(allow_hedge)` for a fresh future; `build` must
 /// produce an identical request each call so a retry re-sends/re-reads the same
 /// data. Any latency deadline is composed inside `build` (via
@@ -139,6 +144,7 @@ pub(crate) enum RetryDecision {
 /// transport retry. The loop still terminates — at most one exceedance is free
 /// (hedge-once), bounding it to [`MAX_ATTEMPTS`] + 1 iterations.
 pub(crate) async fn retry<T, F, Fut>(
+    metrics: &mut RequestMetrics,
     classify: impl Fn(&GuardError<Error>) -> RetryDecision,
     mut build: F,
 ) -> Result<T, Error>
@@ -174,6 +180,7 @@ where
                 let backoff = match decision {
                     RetryDecision::NoRetry => return Err(into_error(ge)),
                     _ if !free_hedge && attempt >= MAX_ATTEMPTS => {
+                        metrics.record_retry_exhaustion();
                         tracing::debug!(
                             target: crate::telemetry::TARGET_TRANSFER,
                             attempts = attempt,
@@ -192,12 +199,18 @@ where
                 // their normal backoff progression.
                 let delay = backoff.delay(attempt - 1, fastrand::f64());
                 if free_hedge {
+                    metrics.record_hedge_reissue(delay);
                     tracing::debug!(
                         target: crate::telemetry::TARGET_TRANSFER,
                         backoff_ms = delay.as_millis() as u64,
                         "hedging request after latency deadline (free reissue)"
                     );
                 } else {
+                    match decision {
+                        RetryDecision::Retry => metrics.record_retry_reissue(delay),
+                        RetryDecision::RetryThrottle => metrics.record_throttle_reissue(delay),
+                        RetryDecision::NoRetry => unreachable!("terminal decisions return above"),
+                    }
                     tracing::debug!(
                         target: crate::telemetry::TARGET_TRANSFER,
                         attempt,
@@ -446,7 +459,8 @@ mod tests {
     async fn retries_then_succeeds() {
         // First attempt fails retryably (IOError), second succeeds.
         let attempts = AtomicUsize::new(0);
-        let result = retry(classify_test, |_| {
+        let mut metrics = RequestMetrics::default();
+        let result = retry(&mut metrics, classify_test, |_| {
             let n = attempts.fetch_add(1, Ordering::Relaxed);
             async move {
                 if n == 0 {
@@ -459,6 +473,10 @@ mod tests {
 
         assert_eq!(result.unwrap(), 42);
         assert_eq!(attempts.load(Ordering::Relaxed), 2);
+        assert_eq!(metrics.retry_reissues, 1);
+        assert_eq!(metrics.throttle_reissues, 0);
+        assert_eq!(metrics.hedge_reissues, 0);
+        assert_eq!(metrics.retry_exhaustions, 0);
     }
 
     #[cfg_attr(miri, ignore)]
@@ -471,7 +489,8 @@ mod tests {
         // last error surfaces. (A real `guarded` cannot exceed the deadline once
         // `allow_hedge` is cleared; this build ignores the flag to drive the loop.)
         let attempts = AtomicUsize::new(0);
-        let result: Result<(), _> = retry(classify_test, |_| {
+        let mut metrics = RequestMetrics::default();
+        let result: Result<(), _> = retry(&mut metrics, classify_test, |_| {
             attempts.fetch_add(1, Ordering::Relaxed);
             async { Err::<(), _>(GuardError::DeadlineExceeded(Duration::from_millis(200))) }
         })
@@ -480,6 +499,9 @@ mod tests {
         let err = result.unwrap_err();
         assert_eq!(err.kind(), &ErrorKind::IOError);
         assert_eq!(attempts.load(Ordering::Relaxed), MAX_ATTEMPTS as usize + 1);
+        assert_eq!(metrics.hedge_reissues, 1);
+        assert_eq!(metrics.retry_reissues, 2);
+        assert_eq!(metrics.retry_exhaustions, 1);
     }
 
     #[cfg_attr(miri, ignore)]
@@ -490,7 +512,8 @@ mod tests {
         // chunk is speculatively cancelled at most once and later attempts run
         // untimed. Record the flag each attempt.
         let flags = std::sync::Mutex::new(Vec::new());
-        let result: Result<(), _> = retry(classify_test, |allow_hedge| {
+        let mut metrics = RequestMetrics::default();
+        let result: Result<(), _> = retry(&mut metrics, classify_test, |allow_hedge| {
             flags.lock().unwrap().push(allow_hedge);
             // Every call trips the deadline, so after the first (free) hedge the
             // loop must clear the flag. The free hedge does not consume an attempt,
@@ -507,6 +530,9 @@ mod tests {
             "hedge allowed on the first call only, then cleared; the free hedge \
              adds one iteration on top of MAX_ATTEMPTS"
         );
+        assert_eq!(metrics.hedge_reissues, 1);
+        assert_eq!(metrics.retry_reissues, 2);
+        assert_eq!(metrics.retry_exhaustions, 1);
     }
 
     #[cfg_attr(miri, ignore)]
@@ -516,7 +542,8 @@ mod tests {
         // consume the once-per-operation hedge allowance.
         let flags = std::sync::Mutex::new(Vec::new());
         let attempts = AtomicUsize::new(0);
-        let result: Result<(), _> = retry(classify_test, |allow_hedge| {
+        let mut metrics = RequestMetrics::default();
+        let result: Result<(), _> = retry(&mut metrics, classify_test, |allow_hedge| {
             flags.lock().unwrap().push(allow_hedge);
             let n = attempts.fetch_add(1, Ordering::Relaxed);
             async move {
@@ -535,6 +562,9 @@ mod tests {
             vec![true, true, true],
             "inner errors are not hedges; the hedge allowance stays open"
         );
+        assert_eq!(metrics.retry_reissues, 2);
+        assert_eq!(metrics.hedge_reissues, 0);
+        assert_eq!(metrics.retry_exhaustions, 0);
     }
 
     #[cfg_attr(miri, ignore)]
@@ -545,7 +575,8 @@ mod tests {
         // transport attempt — the operation still gets the full MAX_ATTEMPTS
         // genuine retries after the free hedge, succeeding on the last one.
         let attempts = AtomicUsize::new(0);
-        let result = retry(classify_test, |allow_hedge| {
+        let mut metrics = RequestMetrics::default();
+        let result = retry(&mut metrics, classify_test, |allow_hedge| {
             let n = attempts.fetch_add(1, Ordering::Relaxed);
             async move {
                 // Call 0: the one-time hedge (deadline exceedance), free.
@@ -575,13 +606,17 @@ mod tests {
             MAX_ATTEMPTS as usize + 1,
             "hedge is free; genuine failures keep the full MAX_ATTEMPTS"
         );
+        assert_eq!(metrics.hedge_reissues, 1);
+        assert_eq!(metrics.retry_reissues, 2);
+        assert_eq!(metrics.retry_exhaustions, 0);
     }
 
     #[cfg_attr(miri, ignore)]
     #[tokio::test(start_paused = true)]
     async fn exhausts_attempts_on_persistent_retryable_error() {
         let attempts = AtomicUsize::new(0);
-        let result: Result<(), _> = retry(classify_test, |_| {
+        let mut metrics = RequestMetrics::default();
+        let result: Result<(), _> = retry(&mut metrics, classify_test, |_| {
             attempts.fetch_add(1, Ordering::Relaxed);
             async { Err::<(), _>(GuardError::Inner(Error::new(ErrorKind::IOError, "reset"))) }
         })
@@ -589,13 +624,16 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(attempts.load(Ordering::Relaxed), MAX_ATTEMPTS as usize);
+        assert_eq!(metrics.retry_reissues, 2);
+        assert_eq!(metrics.retry_exhaustions, 1);
     }
 
     #[cfg_attr(miri, ignore)]
     #[tokio::test(start_paused = true)]
     async fn does_not_retry_terminal_inner_error() {
         let attempts = AtomicUsize::new(0);
-        let result: Result<(), _> = retry(classify_test, |_| {
+        let mut metrics = RequestMetrics::default();
+        let result: Result<(), _> = retry(&mut metrics, classify_test, |_| {
             attempts.fetch_add(1, Ordering::Relaxed);
             async {
                 Err::<(), _>(GuardError::Inner(Error::new(
@@ -608,6 +646,7 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(attempts.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics, RequestMetrics::default());
     }
 
     #[cfg_attr(miri, ignore)]
@@ -633,7 +672,8 @@ mod tests {
 
         let attempts = AtomicUsize::new(0);
         let start = tokio::time::Instant::now();
-        let result: Result<(), _> = retry(classify_throttle, |_| {
+        let mut metrics = RequestMetrics::default();
+        let result: Result<(), _> = retry(&mut metrics, classify_throttle, |_| {
             attempts.fetch_add(1, Ordering::Relaxed);
             async { Err::<(), _>(GuardError::Inner(Error::test_service_error("SlowDown"))) }
         })
@@ -653,6 +693,14 @@ mod tests {
         assert!(
             elapsed <= Duration::from_secs(3),
             "elapsed {elapsed:?} exceeds the throttle backoff ceiling sum"
+        );
+        assert_eq!(metrics.throttle_reissues, 2);
+        assert_eq!(metrics.retry_reissues, 0);
+        assert_eq!(metrics.retry_exhaustions, 1);
+        assert!(
+            metrics.backoff_duration.abs_diff(elapsed) <= Duration::from_millis(1),
+            "selected backoff {:?} must account for paused-clock elapsed {elapsed:?}",
+            metrics.backoff_duration
         );
     }
 

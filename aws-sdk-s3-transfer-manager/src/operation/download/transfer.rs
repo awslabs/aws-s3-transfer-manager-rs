@@ -28,7 +28,9 @@ use crate::operation::download::DownloadInput;
 use crate::runtime::buffer_pool::{
     AcquireError, BufferPool, Reservation, ReserveError, SegmentedBytes,
 };
-use crate::transfer::{IoRequest, PollWork, Transfer, TransferContext, TransferId, WorkOutcome};
+use crate::transfer::{
+    IoRequest, PollWork, RequestMeasurement, Transfer, TransferContext, TransferId, WorkOutcome,
+};
 use crate::types::BucketType;
 use tracing::Instrument;
 
@@ -636,11 +638,14 @@ impl DownloadTransfer {
         // not `poll_work`).
         let initial_work = match (initial_chunk, chunk_meta) {
             (Some(initial), Some(meta)) => {
+                let req_metrics = initial
+                    .request_metrics
+                    .expect("ranged discovery body carries its request measurement");
                 let mut slot = self.inner.writer.claim();
                 match self.reserve_discovery_chunk(initial.expected_len).await {
                     Ok(Some(reservation)) => {
                         slot.attach_reservation(reservation);
-                        Some((initial.body, initial.expected_len, meta, slot))
+                        Some((initial.body, initial.expected_len, req_metrics, meta, slot))
                     }
                     // Terminal (cancel/fail by another path) while reserving the discovery
                     // chunk: the transfer is already in its terminal state, so drop the
@@ -685,9 +690,16 @@ impl DownloadTransfer {
 
         // If discovery returned an initial chunk, process it
         match initial_work {
-            Some((stream, expected_len, chunk_meta, slot)) => {
-                self.execute_read_discovery_body(stream, expected_len, slot, chunk_meta, etag)
-                    .await
+            Some((stream, expected_len, request, chunk_meta, slot)) => {
+                self.execute_read_discovery_body(
+                    stream,
+                    expected_len,
+                    request,
+                    slot,
+                    chunk_meta,
+                    etag,
+                )
+                .await
             }
             None => WorkOutcome::Success { data: None },
         }
@@ -697,6 +709,7 @@ impl DownloadTransfer {
         &self,
         stream: aws_sdk_s3::primitives::ByteStream,
         expected_len: usize,
+        mut req_metrics: RequestMeasurement,
         slot: BodySlot,
         chunk_meta: ChunkMetadata,
         etag: Option<Arc<str>>,
@@ -723,7 +736,8 @@ impl DownloadTransfer {
         // "send" would drag the TTFB mean toward zero). Only a genuine re-issue
         // goes through `guarded`, which times and records its TTFB.
         let reservation = slot.reservation();
-        let result = crate::retry::retry(crate::retry::classify_body_retry, |allow_hedge| {
+        let retry_classify = crate::retry::classify_body_retry;
+        let result = crate::retry::retry(req_metrics.metrics_mut(), retry_classify, |allow_hedge| {
             let pre_issued = initial.take();
             let etag = etag.clone();
             let ctx = self.inner.ctx.clone();
@@ -754,10 +768,12 @@ impl DownloadTransfer {
                         // range cannot appear on a re-issue, so retrying would
                         // deterministically fail again and waste a backoff.
                         if reissue_range.is_none() {
-                            return Err(crate::retry::GuardError::Inner(crate::error::Error::new(
-                                crate::error::ErrorKind::RuntimeError,
-                                "cannot re-issue discovery chunk: response carried no content-range",
-                            )));
+                            return Err(crate::retry::GuardError::Inner(
+                                crate::error::Error::new(
+                                    crate::error::ErrorKind::RuntimeError,
+                                    "cannot re-issue discovery chunk: response carried no content-range",
+                                ),
+                            ));
                         }
                         recv_latencies
                             .guarded(allow_hedge, async {
@@ -777,8 +793,8 @@ impl DownloadTransfer {
                     expected_len,
                     || ctx.is_active(),
                 )
-                    .await
-                    .map_err(crate::retry::GuardError::Inner)
+                .await
+                .map_err(crate::retry::GuardError::Inner)
             }
         })
         .instrument(tracing::debug_span!(
@@ -787,6 +803,7 @@ impl DownloadTransfer {
             tid = %self.id()
         ))
         .await;
+        req_metrics.finish();
 
         let bytes = match result {
             Ok(val) => val,
@@ -886,53 +903,57 @@ impl DownloadTransfer {
         // stream is caught by stalled-stream protection. A `GuardError`
         // (deadline timeout OR inner error from either phase) is classified by
         // the retry loop.
-        let result = crate::retry::retry(crate::retry::classify_body_retry, |allow_hedge| {
-            let rh = range_header.clone();
-            let etag = etag.clone();
-            let ctx = self.inner.ctx.clone();
-            // Every chunk GET must carry the same request fields as discovery
-            // (checksum_mode, SSE-C key, version_id, ...). Derive from the input
-            // conversion, then pin this chunk's range and the discovered etag.
-            let mut builder =
-                copy_fields_to_get_object_request(input, ctx.s3_client().get_object());
-            builder = builder.set_range(Some(rh.clone()));
-            if let Some(etag) = etag.as_ref() {
-                builder = builder.if_match(etag.as_ref());
-            }
-            let req = builder
-                .customize()
-                .config_override(ctx.handle.download_get_override(input.bucket()));
-            async move {
-                // Timed (TTFB): obtain response headers. Validate the range here
-                // so a mismatch is classified before we commit to the body read.
-                let rh_validate = rh.clone();
-                let resp = recv_latencies
-                    .guarded(allow_hedge, async move {
-                        let resp = req.send().await.map_err(crate::error::Error::from)?;
-                        validate_content_range(&rh_validate, resp.content_range())?;
-                        Ok::<_, crate::error::Error>(resp)
-                    })
-                    .await?;
-                // Untimed: drain the body. Errors here are inner (retryable IO).
-                let chunk_meta = ChunkMetadata::from(&resp);
-                let bytes = collect_response_body(
-                    &ctx.handle.buffer_pool,
-                    resp.body,
-                    reservation,
-                    expected_len,
-                    || ctx.is_active(),
-                )
-                .await
-                .map_err(crate::retry::GuardError::Inner)?;
-                Ok::<_, crate::retry::GuardError<crate::error::Error>>((chunk_meta, bytes))
-            }
-        })
-        .instrument(tracing::debug_span!(
-            target: crate::telemetry::TARGET_TRANSFER,
-            "download-part-reissue",
-            tid = %self.id()
-        ))
-        .await;
+        let mut req_metrics = self.inner.ctx.start_request_metrics();
+        let retry_classify = crate::retry::classify_body_retry;
+        let result =
+            crate::retry::retry(req_metrics.metrics_mut(), retry_classify, |allow_hedge| {
+                let rh = range_header.clone();
+                let etag = etag.clone();
+                let ctx = self.inner.ctx.clone();
+                // Every chunk GET must carry the same request fields as discovery
+                // (checksum_mode, SSE-C key, version_id, ...). Derive from the input
+                // conversion, then pin this chunk's range and the discovered etag.
+                let mut builder =
+                    copy_fields_to_get_object_request(input, ctx.s3_client().get_object());
+                builder = builder.set_range(Some(rh.clone()));
+                if let Some(etag) = etag.as_ref() {
+                    builder = builder.if_match(etag.as_ref());
+                }
+                let req = builder
+                    .customize()
+                    .config_override(ctx.handle.download_get_override(input.bucket()));
+                async move {
+                    // Timed (TTFB): obtain response headers. Validate the range here
+                    // so a mismatch is classified before we commit to the body read.
+                    let rh_validate = rh.clone();
+                    let resp = recv_latencies
+                        .guarded(allow_hedge, async move {
+                            let resp = req.send().await.map_err(crate::error::Error::from)?;
+                            validate_content_range(&rh_validate, resp.content_range())?;
+                            Ok::<_, crate::error::Error>(resp)
+                        })
+                        .await?;
+                    // Untimed: drain the body. Errors here are inner (retryable IO).
+                    let chunk_meta = ChunkMetadata::from(&resp);
+                    let bytes = collect_response_body(
+                        &ctx.handle.buffer_pool,
+                        resp.body,
+                        reservation,
+                        expected_len,
+                        || ctx.is_active(),
+                    )
+                    .await
+                    .map_err(crate::retry::GuardError::Inner)?;
+                    Ok::<_, crate::retry::GuardError<crate::error::Error>>((chunk_meta, bytes))
+                }
+            })
+            .instrument(tracing::debug_span!(
+                target: crate::telemetry::TARGET_TRANSFER,
+                "download-part-reissue",
+                tid = %self.id()
+            ))
+            .await;
+        req_metrics.finish();
 
         let (chunk_meta, bytes) = match result {
             Ok(val) => val,
@@ -1728,6 +1749,11 @@ mod tests {
     async fn test_generates_ranges_after_discovery() {
         let transfer = create_download(24 * MB, 8 * MB);
         skip_discovery(&transfer).await;
+        assert_eq!(
+            transfer.ctx().metrics.request_metrics().requests,
+            1,
+            "discovery headers and its lazy response body are one request"
+        );
 
         let mut work = assert_ready(transfer.poll_work());
         let data = work.data_mut::<DownloadWork>();
@@ -1849,6 +1875,7 @@ mod tests {
         execute(&transfer, &mut range).await;
 
         assert_done(transfer.poll_work());
+        assert_eq!(transfer.ctx().metrics.request_metrics().requests, 2);
     }
 
     #[cfg_attr(miri, ignore)]

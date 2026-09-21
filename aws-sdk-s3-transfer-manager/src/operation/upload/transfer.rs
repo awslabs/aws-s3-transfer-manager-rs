@@ -318,7 +318,8 @@ impl UploadTransfer {
 
         let transfer_diagnostics = self.inner.ctx.handle.config.diagnostics().transfer();
         let create_timer = UploadDiagnosticTimer::start(transfer_diagnostics);
-        let resp = match mpu_req
+        let req_metrics = self.inner.ctx.start_request_metrics();
+        let response = mpu_req
             .customize()
             .config_override(
                 self.inner
@@ -328,8 +329,9 @@ impl UploadTransfer {
             )
             .send()
             .instrument(tracing::debug_span!("send-create-multipart-upload"))
-            .await
-        {
+            .await;
+        req_metrics.finish();
+        let resp = match response {
             Ok(resp) => resp,
             Err(e) => return self.fail(e.into()),
         };
@@ -624,7 +626,9 @@ impl UploadTransfer {
         // response-first-byte gap).
         let request_timer =
             UploadDiagnosticTimer::start(self.inner.ctx.handle.config.diagnostics().transfer());
-        let result = crate::retry::retry(crate::retry::classify_upload_part_retry, |_hedge| {
+        let mut req_metrics = self.inner.ctx.start_request_metrics();
+        let retry_classify = crate::retry::classify_upload_part_retry;
+        let result = crate::retry::retry(req_metrics.metrics_mut(), retry_classify, |_hedge| {
             let body = sdk_body
                 .try_clone()
                 .expect("UploadPart SdkBody must be retryable");
@@ -662,6 +666,7 @@ impl UploadTransfer {
             part_number
         ))
         .await;
+        req_metrics.finish();
         let request_elapsed = request_timer.elapsed();
         // The original retry body retains every immutable payload owner even
         // after the successful request clone has been consumed. Release it
@@ -787,7 +792,9 @@ impl UploadTransfer {
         // No adaptive latency deadline; a mid-upload-body stall is bounded by
         // stalled-stream protection (`upload_override`), a post-send response-wait
         // is not (see the module docs on the response-first-byte gap).
-        let result = crate::retry::retry(crate::retry::classify_upload_part_retry, |_hedge| {
+        let mut req_metrics = self.inner.ctx.start_request_metrics();
+        let retry_classify = crate::retry::classify_upload_part_retry;
+        let result = crate::retry::retry(req_metrics.metrics_mut(), retry_classify, |_hedge| {
             let body = sdk_body
                 .try_clone()
                 .expect("PutObject SdkBody must be retryable");
@@ -821,6 +828,7 @@ impl UploadTransfer {
             tid = %transfer_id
         ))
         .await;
+        req_metrics.finish();
         let resp = match result {
             Ok(resp) => {
                 tracing::debug!(
@@ -927,7 +935,8 @@ impl UploadTransfer {
         .await;
 
         let request_timer = UploadDiagnosticTimer::start(transfer_diagnostics);
-        let resp = match complete_req
+        let req_metrics = self.inner.ctx.start_request_metrics();
+        let response = complete_req
             .customize()
             .config_override(
                 self.inner
@@ -937,8 +946,9 @@ impl UploadTransfer {
             )
             .send()
             .instrument(tracing::debug_span!("send-complete-multipart-upload"))
-            .await
-        {
+            .await;
+        req_metrics.finish();
+        let resp = match response {
             Ok(resp) => resp,
             Err(e) => return self.fail(e.into()),
         };
@@ -1484,6 +1494,12 @@ mod tests {
         // 6. Result should be available
         let result = transfer.take_result();
         assert!(result.is_some());
+
+        let request_metrics = transfer.ctx().metrics.request_metrics();
+        assert_eq!(request_metrics.requests, 4);
+        assert_eq!(request_metrics.retry_reissues, 0);
+        assert_eq!(request_metrics.throttle_reissues, 0);
+        assert_eq!(request_metrics.hedge_reissues, 0);
     }
 
     #[cfg_attr(miri, ignore)]
@@ -1511,6 +1527,7 @@ mod tests {
             !transfer.ctx().handle.telemetry.io_counters.is_idle(),
             "PutObject should record network_tx to IOCounters"
         );
+        assert_eq!(transfer.ctx().metrics.request_metrics().requests, 1);
     }
 
     /// Regression: when the upload source is a file (`InputStream::from_path`),

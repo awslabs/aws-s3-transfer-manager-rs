@@ -18,6 +18,7 @@ use super::transfer::DownloadTransfer;
 use super::DownloadInput;
 use crate::error;
 use crate::http::header::{self, ByteRange};
+use crate::transfer::RequestMeasurement;
 
 #[derive(Debug, Clone, PartialEq)]
 enum ObjectDiscoveryStrategy {
@@ -54,6 +55,8 @@ pub(super) struct ObjectDiscovery {
 pub(super) struct InitialChunk {
     pub(super) body: ByteStream,
     pub(super) expected_len: usize,
+    /// Request measurement carried until the lazy response body is validated.
+    pub(super) request_metrics: Option<RequestMeasurement>,
 }
 
 /// Parse the stored part count from an MPU ETag of the form `"<hash>-<N>"`.
@@ -165,7 +168,9 @@ async fn discover_obj_with_get_first_part(
     transfer: &DownloadTransfer,
     input: &DownloadInput,
 ) -> Result<ObjectDiscovery, error::Error> {
-    let resp = crate::retry::retry(crate::retry::classify_discovery_retry, |_allow_hedge| {
+    let mut req_metrics = transfer.ctx().start_request_metrics();
+    let retry_classify = crate::retry::classify_discovery_retry;
+    let result = crate::retry::retry(req_metrics.metrics_mut(), retry_classify, |_allow_hedge| {
         let builder =
             copy_fields_to_get_object_request(input, transfer.ctx().s3_client().get_object());
         let req = builder
@@ -189,15 +194,19 @@ async fn discover_obj_with_get_first_part(
         "discover-get-first-part",
         tid = %transfer.ctx().id
     ))
-    .await?;
-    first_chunk_response_handler(resp, None)
+    .await;
+    let resp = result?;
+    let discovery = first_chunk_response_handler(resp, None)?;
+    Ok(attach_request_measurement(discovery, req_metrics))
 }
 
 async fn discover_obj_with_head(
     transfer: &DownloadTransfer,
     input: &DownloadInput,
 ) -> Result<ObjectDiscovery, crate::error::Error> {
-    let resp = crate::retry::retry(crate::retry::classify_discovery_retry, |_allow_hedge| {
+    let mut req_metrics = transfer.ctx().start_request_metrics();
+    let retry_classify = crate::retry::classify_discovery_retry;
+    let result = crate::retry::retry(req_metrics.metrics_mut(), retry_classify, |_allow_hedge| {
         let req = transfer
             .ctx()
             .s3_client()
@@ -223,7 +232,9 @@ async fn discover_obj_with_head(
         "discover-head",
         tid = %transfer.ctx().id
     ))
-    .await?;
+    .await;
+    req_metrics.finish();
+    let resp = result?;
     let object_meta: ObjectMetadata = resp.into();
 
     Ok(ObjectDiscovery {
@@ -250,7 +261,9 @@ async fn discover_obj_with_get(
         ),
         None => ByteRange::Inclusive(0, target_part_size - 1),
     };
-    let result = crate::retry::retry(crate::retry::classify_discovery_retry, |_allow_hedge| {
+    let mut req_metrics = transfer.ctx().start_request_metrics();
+    let retry_classify = crate::retry::classify_discovery_retry;
+    let result = crate::retry::retry(req_metrics.metrics_mut(), retry_classify, |_allow_hedge| {
         let builder =
             copy_fields_to_get_object_request(input, transfer.ctx().s3_client().get_object());
         let req = builder
@@ -278,11 +291,33 @@ async fn discover_obj_with_get(
         Err(error) if error.code() == Some("InvalidRange") && range_from_user.is_none() => {
             // InvalidRange with no user-supplied range indicates an empty object.
             // Discover via partNumber=1 instead.
+            req_metrics.finish();
             discover_obj_with_get_first_part(transfer, input).await
         }
-        Err(error) => Err(error),
-        Ok(response) => first_chunk_response_handler(response, range_from_user),
+        Err(error) => {
+            req_metrics.finish();
+            Err(error)
+        }
+        Ok(response) => {
+            let discovery = first_chunk_response_handler(response, range_from_user)?;
+            Ok(attach_request_measurement(discovery, req_metrics))
+        }
     }
+}
+
+/// Keep a ranged discovery request open until its lazy body is validated.
+///
+/// Empty responses have no deferred body work, so their measurement completes
+/// at discovery.
+fn attach_request_measurement(
+    mut discovery: ObjectDiscovery,
+    req_metrics: RequestMeasurement,
+) -> ObjectDiscovery {
+    match discovery.initial_chunk.as_mut() {
+        Some(initial) => initial.request_metrics = Some(req_metrics),
+        None => req_metrics.finish(),
+    }
+    discovery
 }
 
 fn first_chunk_response_handler(
@@ -320,6 +355,7 @@ fn first_chunk_response_handler(
             expected_len: usize::try_from(length).map_err(|_| {
                 error::discovery_failed("response content-length exceeds platform representation")
             })?,
+            request_metrics: None,
         }),
     };
 
@@ -455,6 +491,7 @@ mod tests {
         let remaining = discovery.remaining.unwrap();
         assert_eq!(500, remaining.clone().count());
         assert_eq!(0..=499, remaining);
+        assert_eq!(transfer.ctx().metrics.request_metrics().requests, 1);
     }
 
     #[cfg_attr(miri, ignore)]
@@ -486,14 +523,19 @@ mod tests {
         assert_eq!(200, remaining.clone().count());
         assert_eq!(500..=699, remaining);
 
-        let initial_chunk = discovery
-            .initial_chunk
-            .expect("initial chunk")
-            .body
-            .collect()
-            .await
-            .expect("valid body");
+        let initial = discovery.initial_chunk.expect("initial chunk");
+        assert_eq!(
+            transfer.ctx().metrics.request_metrics().requests,
+            0,
+            "the ranged request remains open until its lazy body is consumed"
+        );
+        let initial_chunk = initial.body.collect().await.expect("valid body");
+        initial
+            .request_metrics
+            .expect("request measurement")
+            .finish();
         assert_eq!(500, initial_chunk.remaining());
+        assert_eq!(transfer.ctx().metrics.request_metrics().requests, 1);
     }
 
     #[cfg_attr(miri, ignore)]
