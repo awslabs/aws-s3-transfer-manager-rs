@@ -676,9 +676,13 @@ impl UploadObjectsTransfer {
         while let Some(entry) = state.pending_entries.pop_front() {
             // Only a regular file holds bytes to upload. A walk yields anything else only when
             // asked, and an upload never asks — but the entry type can carry a socket, a FIFO or a
-            // symlink left alone, so the check belongs here rather than in a comment. Reading a
-            // FIFO with no writer would block this task for as long as the transfer lives, and an
-            // unfollowed symlink carries the link's own length while the path opens the target.
+            // symlink left alone, so the check belongs here rather than in a comment.
+            //
+            // What it prevents is a plausible-looking object at a name that holds no bytes: the
+            // length comes from the entry's metadata, which is zero for a socket or a FIFO, so the
+            // upload succeeds and writes an empty object. A later run then compares that object
+            // against a name no transfer can move. An unfollowed symlink is worse still: it carries
+            // the link's own length while the path would open the target.
             //
             // Checked before a key is derived: a name holding a custom delimiter fails derivation,
             // and under the abort policy that ends the run — over an entry nothing was going to
@@ -1505,8 +1509,9 @@ mod tests {
         );
     }
 
-    // A FIFO with no writer is the case that would hang rather than fail: opening it blocks until a
-    // writer appears, which for a transfer means forever. The timeout is the assertion.
+    // A FIFO is the case that would be uploaded rather than fail: nothing opens it, so the length
+    // comes from metadata as zero and an empty object appears at its name. The timeout is only a
+    // guard against a future change that does open it.
     #[cfg(unix)]
     #[cfg_attr(miri, ignore)]
     #[tokio::test]

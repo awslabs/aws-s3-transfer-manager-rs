@@ -637,7 +637,12 @@ impl From<crate::io::walk::WalkError> for Error {
     /// A subdirectory that turns out not to be a directory between being listed and being read is
     /// one of the latter. It used to be [`ErrorKind::InputInvalid`] and end the walk, because the
     /// kind came from the error itself rather than from where it happened; a walk that has already
-    /// produced entries has no reason to stop over one name, so it now costs that name alone.
+    /// produced entries has no reason to stop over one name, so it now costs the keys beneath that
+    /// directory instead of the run.
+    ///
+    /// One error stands for all of them. This type has no way to say how many keys a failure
+    /// covered, so a caller counting failures against entries will find fewer failures than keys
+    /// that never arrived.
     fn from(e: crate::io::walk::WalkError) -> Self {
         use crate::io::walk::WalkErrorKind;
         match e.kind() {

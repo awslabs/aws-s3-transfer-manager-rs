@@ -109,16 +109,19 @@ follow from the entry existing: it arrives at its own key carrying `FileType::So
 comparison that reads absence from position sees the key occupied. Reporting it instead put a
 per-key fact on a channel with no keys in it.
 
-So errors divide in two, which `is_fatal` answers and only a walk can:
+So errors divide in two by whether the walk can carry on, which only a walk can say. A consumer
+reads the answer from `is_done` rather than from the kind:
 
 ```
-   ends the walk   nothing is left to do       SourceUnreadable, NotADirectory, Service
-   one entry       should have been readable    Io, PermissionDenied, DirectoryUnreadable,
-                                                BrokenSymlink, SymlinkCycle
+   ends the run        nothing is left to enumerate   SourceUnreadable, NotADirectory, Service
+   the walk carries on  something was lost            Io, PermissionDenied, DirectoryUnreadable,
+                                                     BrokenSymlink, SymlinkCycle
 ```
 
-A cycle sits with the second group. It stops a descent, so a subtree goes unenumerated, and no
-single key stands for a subtree — the same reason D5 keeps an unreadable directory distinct.
+What each of the second group cost is a different question, and `keys_lost` answers it. `Io`,
+`PermissionDenied` and `BrokenSymlink` cost one key. `DirectoryUnreadable` and `SymlinkCycle` each
+leave a subtree unenumerated, and no single key stands for a subtree — the same reason D5 keeps an
+unreadable directory distinct from an entry-level failure.
 
 A link pointing at nothing is an error while a socket is an entry, which is easy to get backwards.
 FR-Enum-3 sorts by whether the walk *should have been able to read it*: a dangling link is a read

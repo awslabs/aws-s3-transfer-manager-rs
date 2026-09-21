@@ -39,11 +39,14 @@ pub enum WalkErrorKind {
 }
 
 impl WalkErrorKind {
-    // Whether an error of this kind terminates the walk.
+    // Whether an error of this kind terminates the walk. The kind carries the answer because the
+    // position was folded in when it was chosen: the same underlying failure becomes
+    // `SourceUnreadable` at the walk root and `DirectoryUnreadable` a level down.
     //
-    // Crate-private, because a kind alone cannot answer it. The same failure is fatal at the walk
-    // root, where nothing can be enumerated, and costs one subtree a level down — so the position
-    // decides, and `FsWalk::is_done` is what tells a caller the walk stopped.
+    // Crate-private because a caller cannot hold this predicate safely. `WalkErrorKind` is public
+    // and `#[non_exhaustive]`, so a hand-written version needs a wildcard arm, and a kind added
+    // later would read as non-fatal there — turning a walk that stopped early into one that looks
+    // finished. `FsWalk::is_done` answers the question directly instead.
     pub(crate) fn is_fatal(&self) -> bool {
         matches!(
             self,
@@ -55,8 +58,9 @@ impl WalkErrorKind {
 /// An error encountered during a directory walk.
 ///
 /// Wraps an optional path, a [`WalkErrorKind`] classifier, and a source
-/// error. Fatality is determined by [`kind`](Self::kind); see
-/// [`is_fatal`](Self::is_fatal).
+/// error. Whether the walk stopped is answered by
+/// [`FsWalk::is_done`](crate::io::walk::FsWalk::is_done), not by reading the
+/// kind.
 #[derive(Debug)]
 pub struct WalkError {
     path: Option<PathBuf>,
