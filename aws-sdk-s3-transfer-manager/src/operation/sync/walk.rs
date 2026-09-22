@@ -15,6 +15,7 @@
 // one side but still listed on the other reads as a key that was deleted.
 
 use std::cmp::Ordering;
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -37,12 +38,10 @@ pub(crate) enum SideState<T> {
     // because a consumer reading absence from position needs to know the position is no
     // longer something to read from.
     //
-    // TODO(sync): the merge answers this for keys a side could not look at.
-    //
     // Say the local walk cannot open `photos/2019/` and carries on with `photos/2020/`. The
     // keys under `photos/2019/` never arrive, and position alone reads that as nothing being
     // there, so delete mode would remove `photos/2019/x.jpg` from the bucket while the local
-    // file sits there unread. Those keys belong here. Nothing builds one yet.
+    // file sits there unread. Those keys arrive here.
     Unknown(KeysLost),
 }
 
@@ -102,6 +101,35 @@ pub(crate) struct Walk<S: KeyStream, D: KeyStream> {
     destination: D,
     src: Head<S::Source>,
     dst: Head<D::Source>,
+    // What a side's survivable failure cost, held until that side produces its next key.
+    //
+    // The failure arrives before the keys it hid, so anything the other side holds in
+    // between is a key this one could not account for. Reading such a key as absent is what
+    // allows it to be deleted, which is the whole reason the answer is carried here.
+    src_gap: Option<KeysLost>,
+    dst_gap: Option<KeysLost>,
+    // Keys a side named as lost, held until the merge reaches each one.
+    //
+    // A failure costing one key arrives before that key sorts, so the answer cannot be given
+    // where it is heard. Reading a directory already collects every child before any is
+    // handed over, and the errors from that read are queued with them, so these keys are a
+    // subset of what the walk holds anyway. Both arrive in key order, so this drains from the
+    // front and deciding one key costs what deciding the first one cost.
+    src_lost: VecDeque<String>,
+    dst_lost: VecDeque<String>,
+    // Set when a side lost one key and could not say which.
+    //
+    // A listing names the key it dropped. A walk names a path, and the failure arrives at the
+    // position of the directory holding it while the key sorts later, somewhere inside — so
+    // the one key at risk cannot be picked out from here. Holding the side's whole account
+    // open is the answer that cannot delete the wrong object, and narrowing it needs the walk
+    // root, which arrives with the next change.
+    src_lost_unnamed: bool,
+    dst_lost_unnamed: bool,
+    // Set when a key went unaccounted for, so a caller can tell a whole plan from a partial
+    // one. A run that lost keys and reports a clean plan is one whose caller cannot know it
+    // acted on less than it was asked about.
+    incomplete: bool,
     // Set when a side reported a failure that ends it.
     //
     // A transfer needs a source, and a delete needs the source established absent, so a side
@@ -118,6 +146,13 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
             destination,
             src: Head::Unread,
             dst: Head::Unread,
+            src_gap: None,
+            dst_gap: None,
+            src_lost: VecDeque::new(),
+            dst_lost: VecDeque::new(),
+            src_lost_unnamed: false,
+            dst_lost_unnamed: false,
+            incomplete: false,
             ended_by_failure: false,
         }
     }
@@ -140,8 +175,15 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
                 // enumeration layer offers for this; classifying the error here would put a
                 // second opinion beside the walk's own, and the two could drift apart.
                 Some(Err(err)) => {
+                    self.incomplete = true;
                     if self.source.is_done() {
                         self.ended_by_failure = true;
+                    } else {
+                        match cost_of(&err) {
+                            Cost::Key(key) => self.src_lost.push_back(key),
+                            Cost::UnnamedKey => self.src_lost_unnamed = true,
+                            Cost::Stretch(cost) => self.src_gap = Some(cost),
+                        }
                     }
                     return Some(Err(err));
                 }
@@ -152,8 +194,15 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
             match self.destination.next_entry().await {
                 Some(Ok(entry)) => self.dst = Head::Entry(entry),
                 Some(Err(err)) => {
+                    self.incomplete = true;
                     if self.destination.is_done() {
                         self.ended_by_failure = true;
+                    } else {
+                        match cost_of(&err) {
+                            Cost::Key(key) => self.dst_lost.push_back(key),
+                            Cost::UnnamedKey => self.dst_lost_unnamed = true,
+                            Cost::Stretch(cost) => self.dst_gap = Some(cost),
+                        }
                     }
                     return Some(Err(err));
                 }
@@ -179,6 +228,14 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
         }
     }
 
+    // Whether every key both sides hold was accounted for.
+    //
+    // False once anything went unread, whether the merge carried on past it or stopped. What a
+    // caller does with that belongs to whoever reports a run.
+    pub(crate) fn is_plan_complete(&self) -> bool {
+        !self.incomplete
+    }
+
     // Whether anything further will be paired.
     //
     // A walk that has not been advanced answers `false`, since neither side has said yet
@@ -189,25 +246,66 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
 
     fn take_source_only(&mut self) -> Pairing<S::Source, D::Source> {
         let entry = self.take_src();
+        let destination = Self::missing(
+            self.dst_gap,
+            &mut self.dst_lost,
+            self.dst_lost_unnamed,
+            &entry.key,
+        );
         Pairing {
             key: entry.key.clone(),
             source: SideState::Present(entry),
-            destination: SideState::Absent,
+            destination,
         }
     }
 
     fn take_destination_only(&mut self) -> Pairing<S::Source, D::Source> {
         let entry = self.take_dst();
+        let source = Self::missing(
+            self.src_gap,
+            &mut self.src_lost,
+            self.src_lost_unnamed,
+            &entry.key,
+        );
         Pairing {
             key: entry.key.clone(),
-            source: SideState::Absent,
+            source,
             destination: SideState::Present(entry),
         }
     }
 
+    // What a side that did not produce this key is saying. Absent while it is accounting for
+    // itself, unknown while a failure has left it unable to, and unknown for a key it named as
+    // lost.
+    fn missing<T>(
+        gap: Option<KeysLost>,
+        lost: &mut VecDeque<String>,
+        lost_unnamed: bool,
+        key: &str,
+    ) -> SideState<T> {
+        let_go_before(lost, key);
+        if lost.front().is_some_and(|held| held == key) {
+            lost.pop_front();
+            return SideState::Unknown(KeysLost::OneKey);
+        }
+        match gap {
+            Some(cost) => SideState::Unknown(cost),
+            // A range, because the conclusion here is that absence cannot be read from
+            // position on this side any more. `OneKey` says the keys around it are known,
+            // which a consumer would act on by holding back one key and trusting the rest.
+            None if lost_unnamed => SideState::Unknown(KeysLost::UnknownRange),
+            None => SideState::Absent,
+        }
+    }
+
     fn take_both(&mut self) -> Pairing<S::Source, D::Source> {
+        // Neither side is missing here, so neither has anything to answer for — but a key held
+        // from earlier has now been passed, and keeping it would grow the set for the length of
+        // the run.
         let src = self.take_src();
         let dst = self.take_dst();
+        let_go_before(&mut self.src_lost, &src.key);
+        let_go_before(&mut self.dst_lost, &src.key);
         Pairing {
             key: src.key.clone(),
             source: SideState::Present(src),
@@ -216,6 +314,9 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
     }
 
     fn take_src(&mut self) -> Entry<S::Source> {
+        // Producing a key accounts for everything up to it, so whatever the failure hid is
+        // now behind the merge.
+        self.src_gap = None;
         match std::mem::replace(&mut self.src, Head::Unread) {
             Head::Entry(entry) => entry,
             _ => unreachable!("taken only with an entry at the head"),
@@ -223,6 +324,7 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
     }
 
     fn take_dst(&mut self) -> Entry<D::Source> {
+        self.dst_gap = None;
         match std::mem::replace(&mut self.dst, Head::Unread) {
             Head::Entry(entry) => entry,
             _ => unreachable!("taken only with an entry at the head"),
@@ -334,6 +436,42 @@ impl Walker {
             "a directory bucket does not list in key order, which the merge depends on"
         );
         walk
+    }
+}
+
+// Let go of every held key sorting before this one.
+//
+// Held keys and the merge both run in key order, so a key still at the front was passed
+// without either side reaching it, and no decision will ever be owed for it.
+fn let_go_before(lost: &mut VecDeque<String>, key: &str) {
+    while lost.front().is_some_and(|held| held.as_str() < key) {
+        lost.pop_front();
+    }
+}
+
+// What a failure the side survived costs the merge.
+//
+// One key where the side named it, and one key held coarsely where it did not: a walk reports an
+// absolute path, and turning that into a key needs the walk root, which this layer does not hold
+// yet.
+#[derive(Debug)]
+enum Cost {
+    // One key, and the failure named it. The side holds that key until the merge reaches it,
+    // and answers unknown there.
+    Key(String),
+    // One key, and which one cannot be worked out here. Every later key on that side has to stay
+    // open, since any of them could be the one that went unread.
+    UnnamedKey,
+    // Every key from here to wherever that side speaks next.
+    Stretch(KeysLost),
+}
+
+fn cost_of(err: &StreamError) -> Cost {
+    match err {
+        // A listing names the key it dropped, already taken relative to the root.
+        StreamError::MalformedListing { key: Some(key), .. } => Cost::Key(key.clone()),
+        _ if err.keys_lost() == KeysLost::OneKey => Cost::UnnamedKey,
+        _ => Cost::Stretch(err.keys_lost()),
     }
 }
 
@@ -646,6 +784,255 @@ mod tests {
             "the entry held at the other head survives the failure"
         );
         assert_eq!(at(after.destination()), At::Here);
+    }
+
+    // A directory nobody could open, taken from the design's own example.
+    fn a_lost_directory() -> StreamError {
+        StreamError::Walk(WalkError::new(
+            Some(PathBuf::from("/root/photos/2019")),
+            WalkErrorKind::DirectoryUnreadable,
+            Box::from("permission denied"),
+        ))
+    }
+
+    #[tokio::test]
+    async fn keys_a_lost_directory_hid_are_unknown_and_not_absent() {
+        // The source cannot open `photos/2019/` and carries on at `photos/2020/`. The
+        // destination holds a key inside the directory nobody read, and reporting it absent
+        // is what would delete it.
+        let mut walk = Walk::new(
+            Scripted::from(vec![
+                Ok(entry("photos/2018/a.jpg")),
+                Err(a_lost_directory()),
+                Ok(entry("photos/2020/b.jpg")),
+            ]),
+            Scripted::of(&[
+                "photos/2018/a.jpg",
+                "photos/2019/x.jpg",
+                "photos/2020/b.jpg",
+            ]),
+        );
+        let mut seen = Vec::new();
+        while let Some(next) = walk.next().await {
+            if let Ok(pairing) = next {
+                seen.push((
+                    pairing.key().to_string(),
+                    at(pairing.source()),
+                    at(pairing.destination()),
+                ));
+            }
+        }
+        assert_eq!(
+            seen,
+            plan(&[
+                ("photos/2018/a.jpg", At::Here, At::Here),
+                ("photos/2019/x.jpg", At::UnknownRange, At::Here),
+                ("photos/2020/b.jpg", At::Here, At::Here),
+            ]),
+            "the key inside the unread directory is unknown, and the sibling after it compares"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_side_that_produces_a_key_has_accounted_for_what_came_before() {
+        // Once the source reaches `photos/2020/`, its earlier failure says nothing about keys
+        // from there on, so a destination-only key past it is absent again.
+        let mut walk = Walk::new(
+            Scripted::from(vec![Err(a_lost_directory()), Ok(entry("m.txt"))]),
+            Scripted::of(&["m.txt", "z.txt"]),
+        );
+        let _ = walk.next().await.expect("the failure");
+        let m = walk.next().await.expect("m.txt").expect("a pairing");
+        assert_eq!(m.key(), "m.txt");
+        let z = walk.next().await.expect("z.txt").expect("a pairing");
+        assert_eq!(at(z.source()), At::Gone, "the gap closed at m.txt");
+    }
+
+    // A listing that dropped one object and named which.
+    fn a_lost_key(key: &str) -> StreamError {
+        StreamError::MalformedListing {
+            key: Some(key.to_string()),
+            what: "size",
+        }
+    }
+
+    async fn drain(mut walk: Walk<Scripted, Scripted>) -> Vec<(String, At, At)> {
+        let mut seen = Vec::new();
+        while let Some(next) = walk.next().await {
+            if let Ok(pairing) = next {
+                seen.push((
+                    pairing.key().to_string(),
+                    at(pairing.source()),
+                    at(pairing.destination()),
+                ));
+            }
+        }
+        seen
+    }
+
+    #[tokio::test]
+    async fn a_key_a_side_named_as_lost_is_unknown_where_it_sorts() {
+        // The destination drops `m.txt` and says so while handing over `a.txt`, so the answer is
+        // due three keys later. Its neighbours are unaffected.
+        let walk = Walk::new(
+            Scripted::of(&["a.txt", "m.txt", "q.txt", "z.txt"]),
+            Scripted::from(vec![
+                Ok(entry("a.txt")),
+                Err(a_lost_key("m.txt")),
+                Ok(entry("q.txt")),
+                Ok(entry("z.txt")),
+            ]),
+        );
+        assert_eq!(
+            drain(walk).await,
+            plan(&[
+                ("a.txt", At::Here, At::Here),
+                ("m.txt", At::Here, At::UnknownKey),
+                ("q.txt", At::Here, At::Here),
+                ("z.txt", At::Here, At::Here),
+            ]),
+            "one key is unknown on the side that lost it, and the keys around it compare"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_key_the_source_lost_is_unknown_there() {
+        // Downloading makes the source a listing, so the side naming a dropped key can be
+        // either one.
+        //
+        // `q.txt` is the key that shows only `m.txt` is affected. Treating the
+        // failure as a stretch would hold every destination-only key until the source spoke
+        // again, and `q.txt` sits inside that window.
+        let walk = Walk::new(
+            Scripted::from(vec![
+                Ok(entry("a.txt")),
+                Err(a_lost_key("m.txt")),
+                Ok(entry("z.txt")),
+            ]),
+            Scripted::of(&["a.txt", "m.txt", "q.txt", "z.txt"]),
+        );
+        assert_eq!(
+            drain(walk).await,
+            plan(&[
+                ("a.txt", At::Here, At::Here),
+                ("m.txt", At::UnknownKey, At::Here),
+                ("q.txt", At::Gone, At::Here),
+                ("z.txt", At::Here, At::Here),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_held_key_is_let_go_once_the_merge_is_past_it() {
+        // Held keys are bounded by what the walk has open, which only holds while keys nobody
+        // reaches are let go. Without that the list grows for the length of the run.
+        let mut walk = Walk::new(
+            Scripted::of(&["z.txt"]),
+            Scripted::from(vec![Err(a_lost_key("m.txt")), Ok(entry("z.txt"))]),
+        );
+        let _ = walk.next().await.expect("the failure");
+        assert_eq!(walk.dst_lost.len(), 1, "the key is held when it is named");
+        let _ = walk.next().await.expect("z.txt");
+        assert!(
+            walk.dst_lost.is_empty(),
+            "a key the merge passed without reaching is no longer held"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lost_key_nobody_reaches_leaves_later_keys_alone() {
+        // `m.txt` is named as lost and neither side ever produces it, so the answer is due at a
+        // key that never arrives. `z.txt` must not inherit it.
+        let walk = Walk::new(
+            Scripted::of(&["z.txt"]),
+            Scripted::from(vec![Err(a_lost_key("m.txt"))]),
+        );
+        assert_eq!(
+            drain(walk).await,
+            plan(&[("z.txt", At::Here, At::Gone)]),
+            "a held key that nobody reached says nothing about a later one"
+        );
+    }
+
+    // One file the walk could not read. The error names a path, not a key, and it arrives at
+    // the directory's position rather than where the file sorts inside it.
+    fn one_file_unread() -> StreamError {
+        StreamError::Walk(WalkError::new(
+            Some(PathBuf::from("/root/photos/2019/b.jpg")),
+            WalkErrorKind::PermissionDenied,
+            Box::from("permission denied"),
+        ))
+    }
+
+    #[tokio::test]
+    async fn a_lost_key_nobody_could_name_holds_the_side_open() {
+        // Which key was lost cannot be worked out here, so no later key on that side may be
+        // called absent — that is what would delete the object matching the file nobody read.
+        let walk = Walk::new(
+            Scripted::from(vec![Err(one_file_unread()), Ok(entry("a.txt"))]),
+            Scripted::of(&["a.txt", "q.txt", "z.txt"]),
+        );
+        assert_eq!(
+            drain(walk).await,
+            plan(&[
+                ("a.txt", At::Here, At::Here),
+                ("q.txt", At::UnknownRange, At::Here),
+                ("z.txt", At::UnknownRange, At::Here),
+            ]),
+            "every later key stays unknown on the side that lost one it could not name"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_key_lost_without_a_name_is_reported_as_a_range() {
+        // What a consumer is told has to match what was concluded. `OneKey` says the keys
+        // around it are known, and acting on that means holding one key back and trusting the
+        // rest — the opposite of what this side can promise.
+        let mut walk = Walk::new(
+            Scripted::from(vec![Err(one_file_unread()), Ok(entry("a.txt"))]),
+            Scripted::of(&["a.txt", "z.txt"]),
+        );
+        let _ = walk.next().await.expect("the failure");
+        let _ = walk.next().await.expect("a.txt");
+        let z = walk.next().await.expect("z.txt").expect("a pairing");
+        assert!(
+            matches!(z.source(), SideState::Unknown(KeysLost::UnknownRange)),
+            "got {:?}",
+            z.source()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_a_fatal_failure_ended_reports_a_partial_plan() {
+        // The merge stopped, so most of the keyspace was never looked at. A caller reading the
+        // short plan as a whole one is the mistake this answer exists to prevent.
+        let mut walk = Walk::new(
+            Scripted::that_stops(vec![Err(a_fatal_failure())]),
+            Scripted::of(&["a.txt", "b.txt", "c.txt"]),
+        );
+        while walk.next().await.is_some() {}
+        assert!(walk.is_done());
+        assert!(!walk.is_plan_complete());
+    }
+
+    #[tokio::test]
+    async fn a_clean_run_reports_a_whole_plan() {
+        let mut walk = Walk::new(Scripted::of(&["a.txt"]), Scripted::of(&["a.txt"]));
+        while walk.next().await.is_some() {}
+        assert!(walk.is_plan_complete());
+    }
+
+    #[tokio::test]
+    async fn a_run_that_lost_a_key_reports_a_partial_plan() {
+        let mut walk = Walk::new(
+            Scripted::of(&["a.txt"]),
+            Scripted::from(vec![Ok(entry("a.txt")), Err(a_lost_key("m.txt"))]),
+        );
+        while walk.next().await.is_some() {}
+        assert!(
+            !walk.is_plan_complete(),
+            "a caller cannot tell it acted on less than it asked about unless the run says so"
+        );
     }
 
     #[tokio::test]
