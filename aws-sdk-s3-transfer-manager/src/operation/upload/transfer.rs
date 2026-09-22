@@ -56,7 +56,7 @@ use crate::operation::upload::input::convert::{
 };
 use crate::operation::upload::part_body;
 use crate::operation::upload::{UploadInput, UploadOutput, UploadOutputBuilder};
-use crate::transfer::{IoRequest, PollWork, Transfer, TransferContext, WorkOutcome};
+use crate::transfer::{IoRequest, PendingCause, PollWork, Transfer, TransferContext, WorkOutcome};
 use crate::types::BucketType;
 
 /// Upload-specific work data.
@@ -199,7 +199,9 @@ impl UploadTransfer {
                     stream,
                 } => {
                     if *init_in_flight {
-                        self.inner.ctx.set_pending();
+                        self.inner
+                            .ctx
+                            .set_pending(PendingCause::in_flight_work("create_multipart_upload"));
                         return PollWork::Pending;
                     }
 
@@ -256,7 +258,7 @@ impl UploadTransfer {
                         PartTransferTransition::Pending(pending_reason),
                         snapshot,
                     );
-                    self.inner.ctx.set_pending();
+                    self.inner.ctx.set_pending(pending_reason);
                     return PollWork::Pending;
                 }
                 UploadState::Completing { .. } => {
@@ -281,11 +283,15 @@ impl UploadTransfer {
                     });
                 }
                 UploadState::CompleteInFlight { .. } => {
-                    self.inner.ctx.set_pending();
+                    self.inner
+                        .ctx
+                        .set_pending(PendingCause::in_flight_work("complete_multipart_upload"));
                     return PollWork::Pending;
                 }
                 UploadState::PutObjectInFlight => {
-                    self.inner.ctx.set_pending();
+                    self.inner
+                        .ctx
+                        .set_pending(PendingCause::in_flight_work("put_object"));
                     return PollWork::Pending;
                 }
                 UploadState::Done => return PollWork::Done,
@@ -474,7 +480,7 @@ impl UploadTransfer {
                 };
                 (
                     future,
-                    PartReadWake::new(self.inner.ctx.scheduler_waker()),
+                    PartReadWake::new(self.inner.ctx.waker()),
                     work.take_timing(),
                 )
             }

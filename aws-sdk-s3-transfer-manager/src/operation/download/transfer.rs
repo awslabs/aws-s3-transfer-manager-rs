@@ -19,7 +19,7 @@ use super::input::copy_fields_to_get_object_request;
 use crate::error::{self, ChunkRef, Error};
 use crate::operation::download::body::{BodySlot, BodyWriter, ChunkOutput};
 use crate::operation::download::chunk_meta::ChunkMetadata;
-use crate::operation::download::context::{DownloadState, PendingClaim};
+use crate::operation::download::context::{DownloadPendingReason, DownloadState, PendingClaim};
 use crate::operation::download::discovery::{discover_obj, ObjectDiscovery};
 use crate::operation::download::object_meta::ObjectMetadata;
 use crate::operation::download::read_ahead::ReadAhead;
@@ -252,7 +252,7 @@ impl DownloadTransfer {
                 })
             }
             DownloadState::DiscoveryInFlight => {
-                self.inner.ctx.set_pending();
+                self.inner.ctx.set_pending(DownloadPendingReason::Discovery);
                 PollWork::Pending
             }
             DownloadState::Transferring {
@@ -308,7 +308,7 @@ impl DownloadTransfer {
                             window,
                             "read-ahead gate closed: issuance paused until the consumer drains",
                         );
-                        return self.park();
+                        return self.park(DownloadPendingReason::ReadAhead);
                     }
                     // Gate admitted (and counted) the slot. Claim it from the buffer and
                     // reserve its backing memory against the shared budget. A grant issues now;
@@ -326,7 +326,7 @@ impl DownloadTransfer {
                     }
                 } else if *ranges_in_flight > 0 {
                     // All ranges generated, waiting for in-flight to complete.
-                    return self.park();
+                    return self.park(DownloadPendingReason::RangeCompletion);
                 } else {
                     // No-data completion: the object carried no ranges (0-byte object
                     // whose discovery produced no initial chunk). Data-carrying terminal
@@ -383,8 +383,8 @@ impl DownloadTransfer {
     /// waker re-readies it: the consumer freeing occupancy, or a GET
     /// completion decrementing the in-flight count. Memory reservations use their
     /// own scheduler-backed task waker.
-    fn park(&self) -> PollWork {
-        self.inner.ctx.set_pending();
+    fn park(&self, reason: DownloadPendingReason) -> PollWork {
+        self.inner.ctx.set_pending(reason);
         PollWork::Pending
     }
 
@@ -396,17 +396,21 @@ impl DownloadTransfer {
     /// transfers this can deadlock. Flush the resident run first, and return
     /// `Pending` only when there is nothing to flush.
     ///
-    /// The pending reservation future has already registered a scheduler waker,
-    /// so this path does not arm the transfer context's separate edge-triggered
-    /// wake flag. A `has_drainable_resident` guard keeps it from emitting empty
-    /// drains when an in-flight gap blocks the prefix or stream delivery owns
-    /// progress.
+    /// The pending reservation future has already registered the context's
+    /// scheduler waker. This path still records and arms the common pending
+    /// state; the registered wake and `try_wake` paths reconcile through the
+    /// same descriptor protocol. A `has_drainable_resident` guard keeps it from
+    /// emitting empty drains when an in-flight gap blocks the prefix or stream
+    /// delivery owns progress.
     fn poll_memory_blocked(&self) -> PollWork {
         if self.inner.writer.has_drainable_resident() {
             PollWork::ready(IoRequest {
                 data: Some(Box::new(DownloadWork::DrainResident)),
             })
         } else {
+            self.inner
+                .ctx
+                .set_pending(DownloadPendingReason::MemoryAdmission);
             PollWork::Pending
         }
     }
@@ -420,7 +424,7 @@ impl DownloadTransfer {
         &self,
         pending: &mut Option<PendingClaim>,
     ) -> Result<Option<BodySlot>, ReserveError> {
-        let waker = self.inner.ctx.scheduler_waker();
+        let waker = self.inner.ctx.waker();
         let mut context = Context::from_waker(&waker);
         let reservation =
             match Pin::new(&mut pending.as_mut().unwrap().reservation).poll(&mut context) {
@@ -445,7 +449,7 @@ impl DownloadTransfer {
     ) -> Result<Option<BodySlot>, ReserveError> {
         let mut slot = self.inner.writer.claim();
         let mut reservation = self.inner.ctx.handle.buffer_pool.reserve(range_len);
-        let waker = self.inner.ctx.scheduler_waker();
+        let waker = self.inner.ctx.waker();
         let mut context = Context::from_waker(&waker);
 
         match Pin::new(&mut reservation).poll(&mut context) {
