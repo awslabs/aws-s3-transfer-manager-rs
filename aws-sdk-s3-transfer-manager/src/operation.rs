@@ -19,6 +19,10 @@ pub mod download_objects;
 /// Types for multiple object upload operation
 pub mod upload_objects;
 
+// Reached only by its own tests until the operation drives it.
+#[allow(dead_code)] // TODO(sync): the sync operation wires this up
+pub(crate) mod sync;
+
 /// Conservative per-transfer backstop on concurrently-materialized child
 /// transfers (shared by upload_objects and download_objects).
 ///

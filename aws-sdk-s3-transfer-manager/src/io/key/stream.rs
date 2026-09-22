@@ -18,6 +18,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use aws_sdk_s3::types::Object;
 
+use crate::io::FileType;
+
 use super::filter::KeyFilter;
 use super::{derive_object_key, DEFAULT_DELIMITER};
 use crate::io::walk::{
@@ -44,6 +46,39 @@ pub(crate) struct EntryMeta {
     //
     // Note that the S3 side always produces `Some`.
     pub(crate) last_modified_secs: Option<i64>,
+    // What stops this item taking part in a transfer, where the walk or the listing already
+    // shows it. `None` for an ordinary file or object.
+    pub(crate) obstruction: Option<Obstruction>,
+}
+
+// Why an item cannot take part in a transfer.
+//
+// The name still has to reach a comparison, because a taken name is what keeps the matching key
+// on the other side from being deleted. What a comparison needs beyond that is why nothing can
+// be sent, and the causes differ in whether anything can be done about them.
+//
+// Some obstructions never appear here. A retention lock, a legal hold, and which tier an
+// Intelligent-Tiering object currently sits in each need a request per object, so they arrive as
+// a failed transfer. Conditions on the action instead of the item arrive the same way — a key no
+// filename on the destination platform can hold, a path too long, a full disk — because where the
+// destination lacks the key there is no item here to hang them on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Obstruction {
+    // A socket, a device, a named pipe, or a symlink the walk was told not to follow: the name is
+    // taken and holds nothing a transfer could read, and reading one may never finish.
+    NothingToRead,
+}
+
+impl Obstruction {
+    // Whether this also stops the item being written over.
+    //
+    // A name with nothing behind it does: replacing a device is not what anyone asked for, and
+    // writing to a pipe nobody reads never returns.
+    pub(crate) fn blocks_overwrite(&self) -> bool {
+        match self {
+            Self::NothingToRead => true,
+        }
+    }
 }
 
 // An item a walker produced, carried under the key a comparison pairs it by, with the metadata
@@ -131,6 +166,15 @@ pub(crate) trait KeyStream {
     fn next_entry(
         &mut self,
     ) -> impl Future<Output = Option<Result<Entry<Self::Source>, StreamError>>> + Send;
+
+    // Whether the stream has stopped, whether because it reached the end or because a
+    // failure ended it.
+    //
+    // A consumer needs this to tell those apart from the failure it was just handed: a
+    // stream that stopped answers `None` from here on, and position alone reads that as
+    // "no key is there". Classifying the error instead would put a second opinion in the
+    // consumer, and `WalkErrorKind` is `#[non_exhaustive]`, so the two could disagree.
+    fn is_done(&self) -> bool;
 }
 
 // What a failure cost the side that hit it.
@@ -312,6 +356,10 @@ pub(crate) fn s3_predicate(
 impl KeyStream for FsWalk {
     type Source = FsEntry;
 
+    fn is_done(&self) -> bool {
+        FsWalk::is_done(self)
+    }
+
     async fn next_entry(&mut self) -> Option<Result<Entry<FsEntry>, StreamError>> {
         match self.next().await? {
             Ok(entry) => {
@@ -327,6 +375,12 @@ impl KeyStream for FsWalk {
                     last_modified_secs: entry
                         .metadata()
                         .and_then(|m| secs_since_epoch(m.modified())),
+                    obstruction: match entry.file_type() {
+                        FileType::Regular => None,
+                        // A special file, or a symlink left unresolved. The walk yields it so the
+                        // name counts as taken; nothing can be read from it.
+                        _ => Some(Obstruction::NothingToRead),
+                    },
                 };
                 Some(Ok(Entry {
                     key,
@@ -341,6 +395,10 @@ impl KeyStream for FsWalk {
 
 impl KeyStream for S3Walk {
     type Source = Object;
+
+    fn is_done(&self) -> bool {
+        S3Walk::is_done(self)
+    }
 
     async fn next_entry(&mut self) -> Option<Result<Entry<Object>, StreamError>> {
         loop {
@@ -418,6 +476,17 @@ pub(crate) fn relative_key<'a>(key: &'a str, root_prefix: &str) -> Option<&'a st
 // `Ok(None)` is the prefix itself, a folder marker, or a key outside the root. `Err` means
 // the listing was not what the API documents.
 //
+// What stops a listed object being read.
+//
+// Nothing today. An object in Glacier Flexible Retrieval or Deep Archive with no restored copy
+// cannot be read either, and a listing carries what says so, but reading that needs a request
+// parameter this walk does not set yet. Named so the answer has one home and a test can hold it,
+// where an inline `None` leaves nowhere to put either.
+fn object_obstruction(obj: &Object) -> Option<Obstruction> {
+    let _ = obj;
+    None
+}
+
 // Markers are dropped here, so they are invisible whether or not a filter is
 // configured. The walker's own default filter is replaced by any filter a caller
 // sets, which would otherwise make an entry out of a key holding nothing.
@@ -460,6 +529,7 @@ fn key_and_meta(
             size: Some(size),
             // Always present: a listing without one is rejected above.
             last_modified_secs: Some(last_modified_secs),
+            obstruction: object_obstruction(obj),
         },
     )))
 }
@@ -1150,6 +1220,10 @@ mod tests {
         async fn next_entry(&mut self) -> Option<Result<Entry<()>, StreamError>> {
             self.0.pop_front()
         }
+
+        fn is_done(&self) -> bool {
+            self.0.is_empty()
+        }
     }
 
     fn keyed(key: &str) -> Result<Entry<()>, StreamError> {
@@ -1158,6 +1232,7 @@ mod tests {
             meta: EntryMeta {
                 size: Some(1),
                 last_modified_secs: Some(1_700_000_000),
+                obstruction: None,
             },
             source: (),
         })
@@ -1427,6 +1502,25 @@ mod tests {
         assert!(key_and_meta(&no_time, "data/").is_err());
     }
 
+    #[test]
+    fn every_cause_known_today_also_stops_an_overwrite() {
+        // An archive will not: overwriting never reads what is already there, so an upload over an
+        // archived object has to go ahead. Spelled as a match, so adding a cause stops this
+        // compiling until someone says which way it goes.
+        let cause = Obstruction::NothingToRead;
+        match cause {
+            Obstruction::NothingToRead => assert!(cause.blocks_overwrite()),
+        }
+    }
+
+    #[test]
+    fn an_ordinary_listed_object_can_be_read() {
+        // The listing side's answer has one home, so a cause added there without thinking about
+        // the ordinary case shows up here.
+        let obj = Object::builder().key("data/a").size(1).build();
+        assert_eq!(object_obstruction(&obj), None);
+    }
+
     // Readability is decided from the listing, without a HeadObject per key.
     #[test]
     fn archival_metadata_survives_on_the_source() {
@@ -1446,6 +1540,7 @@ mod tests {
             meta: EntryMeta {
                 size: Some(1),
                 last_modified_secs: Some(1),
+                obstruction: None,
             },
             source: obj,
         };
@@ -1853,6 +1948,7 @@ mod tests {
             meta: EntryMeta {
                 size,
                 last_modified_secs: secs,
+                obstruction: None,
             },
             source: (),
         };
@@ -1881,6 +1977,7 @@ mod tests {
             meta: EntryMeta {
                 size: None,
                 last_modified_secs: None,
+                obstruction: None,
             },
             source: (),
         };
@@ -1889,6 +1986,7 @@ mod tests {
             meta: EntryMeta {
                 size: Some(0),
                 last_modified_secs: Some(1_700_000_000),
+                obstruction: None,
             },
             source: (),
         };
