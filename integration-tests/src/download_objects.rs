@@ -835,7 +835,7 @@ async fn test_upload_then_download_objects_roundtrip_tokio_mt() {
 }
 
 // ---------------------------------------------------------------------------
-// RUST-1224: lifecycle events for `download_objects`.
+// Lifecycle events for `download_objects`.
 //
 // The download side is where the event's byte count is easiest to get wrong.
 // `TransferMetrics` carries four counters and a download populates `network_rx`,
@@ -1345,6 +1345,550 @@ async fn test_download_objects_entry_count_reaches_its_total_with_failures() {
     })
     .await
     .expect("test_download_objects_entry_count_reaches_its_total_with_failures timed out");
+}
+
+/// The stream is sufficient: a caller gets callback-shaped reporting from it in one function.
+///
+/// This is the assertion behind a scope decision rather than a feature test. A callback module
+/// was built on top of the stream and then dropped, because the stream is the primitive the
+/// design settled on and a trait the library invokes is the shape it settled *against*. Dropping
+/// it is only defensible if the capability survives, and this is what says it does: everything
+/// needed (`channel`, `TransferView::metrics`/`byte_total`/`entry_total`/`entries_settled`) is
+/// `pub`, so this reimplements the surface from outside the crate with no crate-internal help.
+///
+/// What it costs a caller is this function — the measured price of not shipping the module, which
+/// is why the price is a test rather than an estimate.
+///
+/// Asserted: one terminal per initiation split by outcome, a byte reading that reaches the payload
+/// that actually moved, and an entry count that reaches its total despite failures.
+#[tokio::test]
+async fn test_download_objects_a_caller_can_rebuild_the_callbacks_from_the_stream() {
+    use aws_sdk_s3_transfer_manager::events::TryNextError;
+    use aws_sdk_s3_transfer_manager::types::TransferView;
+
+    timeout(TEST_TIMEOUT, async {
+        let m = mock_tm(RuntimeMode::Managed).await;
+
+        let count = 6usize;
+        let size = 4 * ByteUnit::Kibibyte.as_bytes_usize();
+        let bucket = "test-bucket";
+        let prefix = "rebuild/";
+        seed_bucket(&m.server, bucket, prefix, count, size).await;
+        for doomed in ["0001.bin", "0004.bin"] {
+            m.server.insert_fault(
+                bucket,
+                &format!("{prefix}{doomed}"),
+                FaultType::ServiceError { status: 403 },
+                0,
+                Occurrence::Always,
+            );
+        }
+
+        let (sink, mut stream) = aws_sdk_s3_transfer_manager::events::channel(
+            std::num::NonZeroUsize::new(2 * (count + 1)).expect("capacity > 0"),
+        );
+
+        let dest = tempfile::tempdir().expect("tempdir");
+        let handle = m
+            .client
+            .download_objects()
+            .bucket(bucket)
+            .destination(dest.path())
+            .key_prefix(prefix)
+            .failure_policy(FailedTransferPolicy::Continue)
+            .events(sink)
+            .initiate()
+            .expect("initiate download_objects");
+
+        let output = handle.join().await.expect("join download_objects");
+
+        // The caller's own dispatch loop: the `Decided` view is the pull handle, so the
+        // numbers come off it rather than out of an event.
+        let mut views: HashMap<u64, TransferView> = HashMap::new();
+        let (mut initiated, mut complete, mut failed, mut cancelled) = (0u64, 0u64, 0u64, 0u64);
+        let mut last_bytes = 0u64;
+        let mut files_done = 0u64;
+        let mut files_total = 0u64;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while initiated == 0 || complete + failed + cancelled < initiated {
+            if tokio::time::Instant::now() >= deadline {
+                panic!(
+                    "timed out: {initiated} initiated, {} terminal",
+                    complete + failed + cancelled
+                );
+            }
+            match stream.try_next() {
+                Ok(TransferEvent::Decided {
+                    id, decision, view, ..
+                }) => {
+                    if matches!(decision, Decision::Skip { .. }) {
+                        continue;
+                    }
+                    initiated += 1;
+                    if let Some(v) = view {
+                        views.insert(id, v);
+                    }
+                }
+                Ok(TransferEvent::Settled { id, outcome, .. }) => {
+                    if let Some(v) = views.remove(&id) {
+                        last_bytes = last_bytes.max(v.metrics().network_rx);
+                        files_done = files_done.max(v.entries_settled());
+                        if let EntryTotal::Final(n) = v.entry_total() {
+                            files_total = n;
+                        }
+                    }
+                    match outcome {
+                        Outcome::Succeeded { .. } => complete += 1,
+                        Outcome::Failed { .. } => failed += 1,
+                        _ => cancelled += 1,
+                    }
+                }
+                // Required here and absent from the in-crate sampler: `TransferEvent` is
+                // `#[non_exhaustive]`, which binds an external crate and does not apply inside
+                // the defining one. This arm is exactly the cost the attribute imposes on a
+                // caller who rebuilds this loop.
+                Ok(_) => continue,
+                Err(TryNextError::Empty) => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(_) => break,
+            }
+        }
+
+        assert_eq!(
+            (count - 2) as u64,
+            output.objects_downloaded(),
+            "two objects must have failed, or the failure count proves nothing"
+        );
+        assert_eq!(
+            (count + 1) as u64,
+            initiated,
+            "one initiation per entry plus the root"
+        );
+        assert_eq!(2, failed, "the two poisoned objects each report a failure");
+        assert_eq!(
+            initiated,
+            complete + failed + cancelled,
+            "every initiated entry gets exactly one terminal: {complete} ok + {failed} failed \
+             + {cancelled} cancelled against {initiated} initiated"
+        );
+        assert_eq!(
+            ((count - 2) * size) as u64,
+            last_bytes,
+            "the byte reading reaches the payload that actually moved"
+        );
+        assert_eq!(
+            count as u64, files_total,
+            "total_files is every object listed"
+        );
+        assert_eq!(
+            count as u64, files_done,
+            "the entry count reaches its total despite two failures"
+        );
+
+        m.handle.shutdown().await.expect("shutdown");
+    })
+    .await
+    .expect("test_download_objects_a_caller_can_rebuild_the_callbacks_from_the_stream timed out");
+}
+
+/// A client-level sink and a request-level sink both receive every event, and a second
+/// `.events()` call adds a consumer instead of replacing the first.
+///
+/// This is the other half of the SEP's *"a list of progress listeners on both client level
+/// and request level"* — which the conformance matrix recorded as unmet in both directions. The
+/// request half was one `Option<TransferEventSink>` where a second call silently dropped the
+/// first; the client half did not exist at all.
+///
+/// The property that matters is independence. Each consumer has its own channel, capacity and
+/// `dropped` count, so the failure mode this rules out is one observer's slowness costing
+/// another observer's events — a metrics exporter that stops draining must not blind the
+/// progress bar.
+#[tokio::test]
+async fn test_download_objects_client_and_request_sinks_both_receive_everything() {
+    timeout(TEST_TIMEOUT, async {
+        let count = 8usize;
+        let size = 4 * ByteUnit::Kibibyte.as_bytes_usize();
+        let bucket = "test-bucket";
+        let prefix = "bothlevels/";
+
+        // Three independent consumers: one on the client, two on the request.
+        let cap = std::num::NonZeroUsize::new(4 * (count + 1)).expect("capacity > 0");
+        let (client_sink, client_stream) = aws_sdk_s3_transfer_manager::events::channel(cap);
+        let (req_sink_a, req_stream_a) = aws_sdk_s3_transfer_manager::events::channel(cap);
+        let (req_sink_b, req_stream_b) = aws_sdk_s3_transfer_manager::events::channel(cap);
+
+        let m =
+            crate::harness::mock_tm_with(RuntimeMode::Managed, |cfg| cfg.events(client_sink)).await;
+        seed_bucket(&m.server, bucket, prefix, count, size).await;
+
+        let dest = tempfile::tempdir().expect("tempdir");
+        let handle = m
+            .client
+            .download_objects()
+            .bucket(bucket)
+            .destination(dest.path())
+            .key_prefix(prefix)
+            // Twice on purpose: the second must add, not replace.
+            .events(req_sink_a)
+            .events(req_sink_b)
+            .initiate()
+            .expect("initiate download_objects");
+
+        // Polled to a deadline rather than awaiting termination, because the two levels
+        // terminate differently and one of them does not terminate at all while the client is
+        // alive: the client-level sink lives in `Config`, so its stream stays open for more
+        // operations. A request-level stream ends when its operation does. Draining both the
+        // same way is what makes the assertion below about *delivery* rather than about
+        // lifetime.
+        let expected = count + 1;
+        let drain = |mut s: aws_sdk_s3_transfer_manager::events::TransferEventStream| {
+            tokio::spawn(async move {
+                let mut decided = 0usize;
+                let mut settled = 0usize;
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+                while (decided < expected || settled < expected)
+                    && tokio::time::Instant::now() < deadline
+                {
+                    match s.try_next() {
+                        Ok(TransferEvent::Decided { .. }) => decided += 1,
+                        Ok(TransferEvent::Settled { .. }) => settled += 1,
+                        Ok(_) => {}
+                        Err(aws_sdk_s3_transfer_manager::events::TryNextError::Empty) => {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                        // Every sink gone: nothing more is coming, so stop rather than spin.
+                        Err(_) => break,
+                    }
+                }
+                (decided, settled, s.dropped())
+            })
+        };
+        let c = drain(client_stream);
+        let a = drain(req_stream_a);
+        let b = drain(req_stream_b);
+
+        let output = handle.join().await.expect("join download_objects");
+        let (c, a, b) = (
+            c.await.expect("client drain"),
+            a.await.expect("req a drain"),
+            b.await.expect("req b drain"),
+        );
+
+        assert_eq!(
+            count as u64,
+            output.objects_downloaded(),
+            "all must download"
+        );
+
+        // Root plus every child, on every one of the three consumers.
+        for (name, (decided, settled, dropped)) in [
+            ("client-level", c),
+            ("request-level A", a),
+            ("request-level B", b),
+        ] {
+            assert_eq!(
+                0, dropped,
+                "{name}: capacity was ample, so nothing should be lost"
+            );
+            assert_eq!(
+                expected, decided,
+                "{name} must see one Decided per entry plus the root"
+            );
+            assert_eq!(
+                expected, settled,
+                "{name} must see one Settled per entry plus the root"
+            );
+        }
+
+        m.handle.shutdown().await.expect("shutdown");
+    })
+    .await
+    .expect("test_download_objects_client_and_request_sinks_both_receive_everything timed out");
+}
+
+/// The download directory's input-builder entry point reports events.
+///
+/// The fourth and last of the `initiate_with` family. Each built a fresh fluent builder and
+/// copied only the input across, so a sink could not reach any of them — not dropped, but
+/// structurally absent, which is why no compiler error marked it. `initiate_with_events` is the
+/// form that carries one, and this asserts the composite announces its root and every child
+/// through it.
+#[tokio::test]
+async fn test_download_objects_reports_events_via_the_input_builder() {
+    timeout(TEST_TIMEOUT, async {
+        let m = mock_tm(RuntimeMode::Managed).await;
+
+        let count = 8usize;
+        let size = 4 * ByteUnit::Kibibyte.as_bytes_usize();
+        let bucket = "test-bucket";
+        let prefix = "viabuilder/";
+        seed_bucket(&m.server, bucket, prefix, count, size).await;
+
+        let dest = tempfile::tempdir().expect("tempdir");
+        let (sink, mut stream) = aws_sdk_s3_transfer_manager::events::channel(
+            std::num::NonZeroUsize::new(2 * (count + 1)).expect("capacity > 0"),
+        );
+
+        let handle = aws_sdk_s3_transfer_manager::operation::download_objects::DownloadObjectsInputBuilder::default()
+            .bucket(bucket)
+            .destination(dest.path())
+            .key_prefix(prefix)
+            .initiate_with_events(&m.client, sink)
+            .expect("initiate_with_events");
+
+        let collector = tokio::spawn(async move {
+            let mut root = None;
+            let mut children = 0usize;
+            while let Some(ev) = stream.next().await {
+                match ev {
+                    TransferEvent::Decided {
+                        parent: None, view, ..
+                    } => root = view,
+                    TransferEvent::Settled {
+                        parent: Some(_), ..
+                    } => children += 1,
+                    _ => {}
+                }
+            }
+            (root, children)
+        });
+
+        let output = handle.join().await.expect("join download_objects");
+        let (root, children) = collector.await.expect("collector");
+
+        assert_eq!(count as u64, output.objects_downloaded(), "all must download");
+        let root = root.expect(
+            "the input-builder entry point must announce the root with a view; `None` here is \
+             the sink being discarded",
+        );
+        assert_eq!(count, children, "one terminal per object");
+        assert_eq!(
+            EntryTotal::Final(count as u64),
+            root.entry_total(),
+            "listing finished, so the entry count is final"
+        );
+        assert_eq!(
+            count as u64,
+            root.entries_settled(),
+            "and every entry settled"
+        );
+
+        m.handle.shutdown().await.expect("shutdown");
+    })
+    .await
+    .expect("test_download_objects_reports_events_via_the_input_builder timed out");
+}
+
+/// A consumer reaches exactly 100% on a run with failures by banking each failed entry's
+/// shortfall, which is what the AWS CLI does and what the design claims is possible.
+///
+/// The root's byte numerator stops short by whatever never moved — asserted next door in
+/// `test_download_objects_bar_is_monotonic_and_short_by_what_never_moved`. The CLI's answer is
+/// `_record_failure_result`, which computes `progress_left = total_file_size - total_progress`
+/// into `bytes_failed_to_transfer` and renders `transferred + failed` over the total. This test
+/// is that arithmetic, run against the per-entry views the stream hands out.
+///
+/// It depends entirely on a *failed* entry having a byte denominator. Before the listed size
+/// was seeded into the child at spawn, a download child learned `total_bytes` only from its own
+/// `GetObject` response, so an object refused with a 403 reported `ByteTotal::Unknown` and the
+/// shortfall was not computable — the design's recipe named a number the surface never
+/// published. That is the regression this pins, and the first assertion below is the one that
+/// fails without the seed.
+#[tokio::test]
+async fn test_download_objects_a_consumer_reaches_full_progress_by_banking_failed_bytes() {
+    timeout(TEST_TIMEOUT, async {
+        let m = mock_tm(RuntimeMode::Managed).await;
+
+        let count = 16usize;
+        let size = 8 * ByteUnit::Kibibyte.as_bytes_usize();
+        let bucket = "test-bucket";
+        let prefix = "banked/";
+        seed_bucket(&m.server, bucket, prefix, count, size).await;
+
+        for doomed in ["0002.bin", "0011.bin"] {
+            m.server.insert_fault(
+                bucket,
+                &format!("{prefix}{doomed}"),
+                FaultType::ServiceError { status: 403 },
+                0,
+                Occurrence::Always,
+            );
+        }
+
+        let dest = tempfile::tempdir().expect("tempdir");
+        let (sink, mut stream) = aws_sdk_s3_transfer_manager::events::channel(
+            std::num::NonZeroUsize::new(2 * (count + 1)).expect("capacity > 0"),
+        );
+
+        let handle = m
+            .client
+            .download_objects()
+            .bucket(bucket)
+            .destination(dest.path())
+            .key_prefix(prefix)
+            .failure_policy(FailedTransferPolicy::Continue)
+            .events(sink)
+            .initiate()
+            .expect("initiate download_objects");
+
+        // The consumer the design describes: a per-entry map keyed on id, populated from
+        // `Decided` and read on `Settled`. Exactly the map a CLI already keeps for its
+        // per-file output lines, so the arithmetic costs it no extra state.
+        let collector = tokio::spawn(async move {
+            let mut live: HashMap<u64, aws_sdk_s3_transfer_manager::types::TransferView> =
+                HashMap::new();
+            let mut root = None;
+            // (denominator, moved) read at the instant the entry settled.
+            let mut at_settle: Vec<(ByteTotal, u64)> = Vec::new();
+            // The same views, retained past the terminal, to re-read after join.
+            let mut retained = Vec::new();
+
+            while let Some(ev) = stream.next().await {
+                match ev {
+                    TransferEvent::Decided {
+                        id, parent, view, ..
+                    } => match parent {
+                        None => root = view,
+                        Some(_) => {
+                            if let Some(v) = view {
+                                live.insert(id, v);
+                            }
+                        }
+                    },
+                    TransferEvent::Settled {
+                        id,
+                        parent: Some(_),
+                        ..
+                    } => {
+                        if let Some(v) = live.remove(&id) {
+                            at_settle.push((v.byte_total(), v.metrics().network_rx));
+                            retained.push(v);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            (root, at_settle, retained, live)
+        });
+
+        let output = handle.join().await.expect("join download_objects");
+        let (root, at_settle, retained, leftover) = collector.await.expect("collector");
+        let root = root.expect("the root announced itself with a view");
+
+        assert_eq!(
+            (count - 2) as u64,
+            output.objects_downloaded(),
+            "two objects must actually have failed, or this test proves nothing"
+        );
+        assert!(
+            leftover.is_empty(),
+            "every announced entry settled, so the consumer's map drains to empty: {} left",
+            leftover.len()
+        );
+        assert_eq!(
+            count,
+            at_settle.len(),
+            "one reading per entry: {} readings for {count} entries",
+            at_settle.len()
+        );
+
+        // THE assertion. Every entry knows its own size at its terminal, including the two
+        // that moved nothing — which is only true because the listing seeded it.
+        //
+        // Which of the two states it is in is itself the contract. An entry that reached
+        // discovery published its real size and reads `Final`; one refused before its
+        // `GetObject` returned has only the listing's estimate and reads `Provisional`. Both
+        // carry the number, which is what the banking below needs; the state is what tells a
+        // consumer whether the object was ever actually opened.
+        let mut provisional = 0usize;
+        for (i, (total, _)) in at_settle.iter().enumerate() {
+            match total {
+                ByteTotal::Final(n) | ByteTotal::Provisional(n) => assert_eq!(
+                    size as u64, *n,
+                    "entry {i} reported the wrong size for itself"
+                ),
+                ByteTotal::Unknown => panic!(
+                    "entry {i} settled with no byte denominator, so its shortfall cannot be \
+                     computed and a consumer cannot reach 100%"
+                ),
+                _ => panic!("entry {i}: unexpected ByteTotal state"),
+            }
+            if matches!(total, ByteTotal::Provisional(_)) {
+                provisional += 1;
+            }
+        }
+        assert_eq!(
+            2, provisional,
+            "exactly the two refused objects never reached discovery, so exactly two \
+             denominators stay provisional"
+        );
+
+        // The CLI's arithmetic: transferred + failed == total.
+        //
+        // `saturating_sub`, not `-`: a `Provisional` denominator is the listing's estimate, and
+        // an object overwritten larger between the listing page and its own GetObject can move
+        // more than the estimate admits. That is the one case where the shortfall is negative,
+        // and it must clamp rather than wrap a `u64`.
+        let mut transferred = 0u64;
+        let mut failed = 0u64;
+        for (total, moved) in &at_settle {
+            transferred += moved;
+            if let ByteTotal::Final(n) | ByteTotal::Provisional(n) = total {
+                failed += n.saturating_sub(*moved);
+            }
+        }
+        let listed = (count * size) as u64;
+        assert_eq!(
+            listed,
+            transferred + failed,
+            "a consumer banking each shortfall renders exactly 100%: {transferred} moved + \
+             {failed} failed against {listed} listed"
+        );
+        // Non-vacuous in both directions: the banked amount is two whole objects, so this
+        // cannot pass by every shortfall being zero.
+        assert_eq!(
+            2 * size as u64,
+            failed,
+            "the banked shortfall is exactly the two refused objects"
+        );
+        assert_eq!(
+            listed - 2 * size as u64,
+            transferred,
+            "and the moved bytes are exactly the other fourteen"
+        );
+
+        // The root still stops short, unchanged: banking is the consumer's job, and the
+        // library does not inflate its own numerator to hide a failure.
+        assert_eq!(
+            transferred,
+            root.metrics().network_rx,
+            "the sum over entries equals the root's numerator at quiescence"
+        );
+
+        // A reading taken at `Settled` is already final for that entry: re-reading the same
+        // views after `join()` returns gives the same numbers. This is what lets a consumer
+        // bank the shortfall once, at the terminal, instead of re-scanning every entry.
+        let after: Vec<(ByteTotal, u64)> = retained
+            .iter()
+            .map(|v| (v.byte_total(), v.metrics().network_rx))
+            .collect();
+        let mut sorted_at_settle = at_settle.clone();
+        let mut sorted_after = after.clone();
+        sorted_at_settle.sort_by_key(|(_, moved)| *moved);
+        sorted_after.sort_by_key(|(_, moved)| *moved);
+        assert_eq!(
+            sorted_at_settle, sorted_after,
+            "an entry's counters do not move after its own terminal event"
+        );
+
+        m.handle.shutdown().await.expect("shutdown");
+    })
+    .await
+    .expect(
+        "test_download_objects_a_consumer_reaches_full_progress_by_banking_failed_bytes timed out",
+    );
 }
 
 /// A run whose listing never completed publishes no entry total, for the same reason it

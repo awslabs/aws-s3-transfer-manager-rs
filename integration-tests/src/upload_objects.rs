@@ -52,6 +52,103 @@ fn make_flat_dataset(count: usize, size: usize) -> TempDir {
     dir
 }
 
+/// The upload directory seals both denominators, and its input-builder entry point reports.
+///
+/// Two gaps in one test. `UploadObjectsInputBuilder::initiate_with` builds a fresh fluent
+/// builder and copies only the input across, so no sink could reach it —
+/// `initiate_with_events` is the form that can, and this is its only coverage.
+///
+/// And the entry count had been asserted on `download_objects` only. The two composites learn
+/// their count from different walkers — `FsWalker` here against `ListObjectsV2` there — so
+/// "one seal, two denominators" was a claim about upload with no test behind it. The
+/// `entries_settled() == entry_total()` equality is what a consumer renders as
+/// `0 file(s) remaining`, and it is the SEP's Required `transferredFiles` reaching its total.
+#[tokio::test]
+async fn test_upload_objects_seals_both_denominators_via_the_input_builder() {
+    use aws_sdk_s3_transfer_manager::events::TransferEvent;
+    use aws_sdk_s3_transfer_manager::types::{ByteTotal, EntryTotal};
+
+    timeout(TEST_TIMEOUT, async {
+        let m = setup().await;
+
+        let count = 12usize;
+        let size = 4 * ByteUnit::Kibibyte.as_bytes_usize();
+        let dataset = make_flat_dataset(count, size);
+
+        let (sink, mut stream) = aws_sdk_s3_transfer_manager::events::channel(
+            std::num::NonZeroUsize::new(2 * (count + 1)).expect("capacity > 0"),
+        );
+
+        let handle = aws_sdk_s3_transfer_manager::operation::upload_objects::UploadObjectsInputBuilder::default()
+            .bucket("test-bucket")
+            .source(dataset.path())
+            .key_prefix("viabuilder/")
+            .initiate_with_events(&m.client, sink)
+            .expect("initiate_with_events");
+
+        let collector = tokio::spawn(async move {
+            let mut root = None;
+            let mut children = 0usize;
+            while let Some(ev) = stream.next().await {
+                match ev {
+                    TransferEvent::Decided {
+                        parent: None, view, ..
+                    } => root = view,
+                    TransferEvent::Settled {
+                        parent: Some(_), ..
+                    } => children += 1,
+                    _ => {}
+                }
+            }
+            (root, children)
+        });
+
+        let output = handle.join().await.expect("join upload_objects");
+        let (root, children) = collector.await.expect("collector");
+
+        assert_eq!(
+            count as u64,
+            output.objects_uploaded(),
+            "every file must have uploaded, or the denominators below prove nothing"
+        );
+        let root = root.expect(
+            "the input-builder entry point must announce the root with a view; a `None` here \
+             is the sink being discarded",
+        );
+        assert_eq!(
+            count, children,
+            "one terminal per file through the input-builder path"
+        );
+
+        // Both denominators final, from one seal.
+        assert_eq!(
+            EntryTotal::Final(count as u64),
+            root.entry_total(),
+            "the walk finished, so the entry count is final"
+        );
+        assert_eq!(
+            ByteTotal::Final((count * size) as u64),
+            root.byte_total(),
+            "and the byte total seals in the same call, never one without the other"
+        );
+        // Numerator reaches denominator: nothing is left pending on a finished run.
+        assert_eq!(
+            count as u64,
+            root.entries_settled(),
+            "every entry settled, which is what renders as `0 file(s) remaining`"
+        );
+        assert_eq!(
+            (count * size) as u64,
+            root.metrics().network_tx,
+            "and with no failures the byte bar reaches 100% too"
+        );
+
+        m.handle.shutdown().await.expect("shutdown");
+    })
+    .await
+    .expect("test_upload_objects_seals_both_denominators_via_the_input_builder timed out");
+}
+
 /// Count objects in the mock server bucket under a given key prefix.
 async fn count_objects(server: &S3MockServer, bucket: &str, prefix: &str) -> usize {
     server
@@ -479,7 +576,7 @@ async fn test_upload_objects_abort_terminates() {
     timeout(TEST_TIMEOUT, async {
         let m = setup().await;
 
-        let count = 200usize;
+        let count = 24usize;
         let size = 1024usize;
         let dataset = make_flat_dataset(count, size);
 

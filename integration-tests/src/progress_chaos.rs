@@ -5,7 +5,7 @@
 
 //! Does the metrics surface survive partial failure?
 //!
-//! Written for RUST-1224 as a spike that pinned two defects as executable evidence: a
+//! Written as a spike that pinned two defects as executable evidence: a
 //! composite counted only its successful children's bytes, and never established a byte
 //! denominator at all. Both assertions carried a note naming what they should become, and
 //! both have since been inverted — these tests now guard the fixed behaviour, so a

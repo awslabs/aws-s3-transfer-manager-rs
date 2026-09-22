@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Scale chaos for RUST-1224: does lifecycle delivery hold as object count grows?
+//! Scale chaos: does lifecycle delivery hold as object count grows?
 //!
 //! `progress_chaos.rs` establishes what today's surface reports at 20 objects.
 //! This file asks the question the *design* has to answer: at 50, 250 and 1000
@@ -13,8 +13,8 @@
 //!
 //! Small single-part files, deliberately, rather than the two-part 10 MiB files
 //! in `progress_chaos.rs`. The stressor here is the **event rate** (two per
-//! object) and not byte accounting, and the brainstorm doc is explicit that the
-//! stream's rate is bounded by discovery rather than by throughput. A directory
+//! object) and not byte accounting: the stream's rate is bounded by discovery
+//! rather than by throughput. A directory
 //! of small files is the shape that makes that claim falsifiable: 200 tiny
 //! objects must produce more events than 20 large ones, even though they move a
 //! fiftieth of the bytes.
@@ -386,9 +386,15 @@ async fn absent_consumer_costs_nothing() {
     timeout(TEST_TIMEOUT, async {
         let n = 250;
         let baseline = run(n, "base/", 10, None, Consumer::Fast).await;
-        let absent = run(n, "absent/", 10, Some(2 * n + 2), Consumer::Absent).await;
+        // Capacity 2, not `2 * n + 2`. The rule-sized channel has room for every event this
+        // run produces, so an undrained one never fills and the emit path never takes its
+        // full-channel branch -- the scenario this test is named for would not happen. Two
+        // slots fill on the first entry and stay full for the remaining 250, which is what
+        // makes the wall-clock comparison below mean "an unserviced full channel costs the
+        // transfer nothing" rather than "a channel nobody read was big enough".
+        let absent = run(n, "absent/", 10, Some(2), Consumer::Absent).await;
         report("no sink at all (baseline)", &baseline);
-        report("sink registered, stream dropped", &absent);
+        report("sink registered, stream dropped, capacity 2", &absent);
 
         // Not a benchmark — a guard against the absent-consumer path blocking or
         // gating. A 3x envelope is loose enough for a shared CI box and tight

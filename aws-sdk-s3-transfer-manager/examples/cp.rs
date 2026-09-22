@@ -141,6 +141,20 @@ pub struct Args {
     /// Draw a progress bar and print a line per object (recursive transfers only)
     #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
     progress: bool,
+
+    /// `MaxKeys` for the listing behind a recursive download. Lower it to widen the window
+    /// in which the entry total is still provisional, which is what makes the `~N file(s)
+    /// remaining` state observable rather than a single overwritten frame.
+    #[arg(long)]
+    list_page_size: Option<i32>,
+
+    /// Event channel capacity. Set it low (`--events-capacity 2`) to see the push/pull split
+    /// directly: the bar's bytes, percentage and `N file(s) remaining` are *pulled* off the
+    /// root's view on each repaint and stay exact, while `(N ok, N failed)` is *tallied from
+    /// the stream* and falls short by however many events were dropped. Both halves print on
+    /// the same line, so a starved channel makes them visibly disagree.
+    #[arg(long, default_value_t = 1024)]
+    events_capacity: usize,
 }
 
 #[derive(Debug, Clone, clap::Args)]
@@ -370,8 +384,13 @@ async fn draw_progress(
             ),
             _ => format!("[{:<40}] {} (total unknown)", "", ByteUnit::display(done)),
         };
+        // `\x1b[K` erases from the cursor to the end of the line. A bare `\r` only moves
+        // the cursor, so a shorter line leaves the tail of a longer one behind it: the
+        // remaining-count shrinks as the run proceeds -- `~1000 file(s) remaining` is wider
+        // than `0 file(s) remaining` -- and without the erase the final frame reads
+        // `(1500 ok, 0 failed) ) )`, with the stray parens belonging to earlier frames.
         print!(
-            "\r{line} with {}  ({ok} ok, {failed} failed) ",
+            "\r\x1b[K{line} with {}  ({ok} ok, {failed} failed)",
             remaining(view)
         );
         let _ = std::io::stdout().flush();
@@ -390,8 +409,10 @@ async fn draw_progress(
                         match outcome {
                             Outcome::Failed { error, .. } => {
                                 failed += 1;
-                                // Printed above the bar, which the next tick redraws.
-                                println!("\r{} failed: {error}", transfer.source());
+                                // Printed above the bar, which the next tick redraws. Erased
+                                // first for the same reason the bar is: this line lands on top
+                                // of a bar frame that is usually wider than it.
+                                println!("\r\x1b[K{} failed: {error}", transfer.source());
                             }
                             _ => ok += 1,
                         }
@@ -418,6 +439,8 @@ async fn do_recursive_download(
     key_prefix: &str,
     dest: &Path,
     progress: bool,
+    list_page_size: Option<i32>,
+    events_capacity: usize,
 ) -> Result<u64, BoxError> {
     fs::create_dir_all(dest).await?;
 
@@ -427,12 +450,31 @@ async fn do_recursive_download(
         .key_prefix(key_prefix)
         .destination(dest);
 
-    // Capacity is the consumer's admission of how far behind it may fall. 1024 events is
+    // A smaller `MaxKeys` is the only way to *watch* `EntryTotal::Provisional`. The total is
+    // provisional for exactly as long as listing runs, so at the 1000-key default a
+    // 1500-object prefix is two round trips -- a window narrower than one repaint, which is
+    // why the state renders for a single frame and is then overwritten. Dropping the page size
+    // trades request count for a window measured in seconds.
+    //
+    // The prefix is repeated on the walker deliberately: a supplied walker owns the listing, so
+    // the request's `key_prefix` no longer scopes it and omitting it here lists the whole bucket.
+    // Nothing is needed for folder markers: `download_objects` drops them itself, whatever
+    // walker it is given.
+    if let Some(n) = list_page_size {
+        req = req.walker(
+            aws_sdk_s3_transfer_manager::io::walk::S3Walker::builder()
+                .prefix(key_prefix)
+                .page_size(n)
+                .build(),
+        );
+    }
+
+    // Capacity is the consumer's admission of how far behind it may fall. The 1024 default is
     // ~512 objects of slack; past that the oldest are dropped and counted rather than
     // the transfer being slowed to match the terminal.
     let drawing = if progress {
         let (sink, stream) = aws_sdk_s3_transfer_manager::events::channel(
-            std::num::NonZeroUsize::new(1024).expect("capacity > 0"),
+            std::num::NonZeroUsize::new(events_capacity).expect("capacity > 0"),
         );
         req = req.events(sink);
         Some(tokio::spawn(draw_progress(stream, Numerator::Received)))
@@ -485,6 +527,7 @@ async fn do_recursive_upload(
     key_prefix: &str,
     source: &Path,
     progress: bool,
+    events_capacity: usize,
 ) -> Result<u64, BoxError> {
     let mut req = tm
         .upload_objects()
@@ -499,7 +542,7 @@ async fn do_recursive_upload(
 
     let drawing = if progress {
         let (sink, stream) = aws_sdk_s3_transfer_manager::events::channel(
-            std::num::NonZeroUsize::new(1024).expect("capacity > 0"),
+            std::num::NonZeroUsize::new(events_capacity).expect("capacity > 0"),
         );
         req = req.events(sink);
         Some(tokio::spawn(draw_progress(stream, Numerator::Sent)))
@@ -714,7 +757,16 @@ async fn run(args: Args) -> Result<(), BoxError> {
             let (bucket, key) = args.source.expect_s3().parts();
             let dest = args.dest.expect_local();
             if args.recursive {
-                do_recursive_download(&tm, bucket, key, dest, args.progress).await?
+                do_recursive_download(
+                    &tm,
+                    bucket,
+                    key,
+                    dest,
+                    args.progress,
+                    args.list_page_size,
+                    args.events_capacity,
+                )
+                .await?
             } else {
                 do_single_download(&tm, bucket, key, dest).await?
             }
@@ -722,7 +774,15 @@ async fn run(args: Args) -> Result<(), BoxError> {
             let (bucket, key) = args.dest.expect_s3().parts();
             let source = args.source.expect_local();
             if args.recursive {
-                do_recursive_upload(&tm, bucket, key, source, args.progress).await?
+                do_recursive_upload(
+                    &tm,
+                    bucket,
+                    key,
+                    source,
+                    args.progress,
+                    args.events_capacity,
+                )
+                .await?
             } else {
                 do_single_upload(&tm, bucket, key, source).await?
             }
