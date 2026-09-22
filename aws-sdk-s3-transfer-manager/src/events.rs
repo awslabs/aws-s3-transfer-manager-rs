@@ -552,35 +552,107 @@ pub fn channel(capacity: NonZeroUsize) -> (TransferEventSink, TransferEventStrea
     let dropped = Arc::new(AtomicU64::new(0));
     (
         TransferEventSink {
-            tx,
-            dropped: dropped.clone(),
+            outlets: Arc::from(vec![Outlet {
+                tx,
+                dropped: dropped.clone(),
+            }]),
         },
         TransferEventStream { rx, dropped },
     )
 }
 
-/// Registration endpoint. Cheap to clone; every clone feeds one stream.
-#[derive(Debug, Clone)]
-pub struct TransferEventSink {
+/// Combine the client-level sink with the request-level one.
+///
+/// Merged rather than overridden, both directions: a client-wide observer must not be
+/// switched off by a request that registers its own sink, and a request's sink must not be
+/// ignored because the client has one. Called at every operation entry point, which is why it
+/// lives here rather than being rewritten six times.
+pub(crate) fn resolve_sink(
+    client_level: Option<&TransferEventSink>,
+    request_level: Option<TransferEventSink>,
+) -> Option<TransferEventSink> {
+    match (client_level, request_level) {
+        (None, request) => request,
+        (Some(client), None) => Some(client.clone()),
+        (Some(client), Some(request)) => Some(client.clone().merge(request)),
+    }
+}
+
+/// One stream's receiving end, as seen from the producing side.
+#[derive(Debug)]
+struct Outlet {
     tx: tokio::sync::mpsc::Sender<TransferEvent>,
+    /// This stream's own loss counter. Per-outlet and not shared: one slow consumer
+    /// losing events says nothing about another, and a shared counter would report a
+    /// fast consumer's stream as lossy because a different one fell behind.
     dropped: Arc<AtomicU64>,
 }
 
+/// Registration endpoint. Cheap to clone; every clone feeds the same stream or streams.
+///
+/// A sink carries one or more outlets. [`channel`] produces one; [`merge`](Self::merge)
+/// combines sinks so a single registration feeds several independent consumers — which is
+/// what lets a client-level sink and a request-level sink both receive every event instead
+/// of one silently replacing the other.
+#[derive(Debug, Clone)]
+pub struct TransferEventSink {
+    outlets: Arc<[Outlet]>,
+}
+
 impl TransferEventSink {
-    /// Non-blocking send. Counts the event as dropped if the channel was full.
+    /// A sink that emits to this sink's consumers **and** `other`'s.
     ///
-    /// Returns whether the event reached the channel. A `false` return covers two
-    /// different facts, and only the first is counted in [`TransferEventStream::dropped`]:
-    /// the channel was full (the consumer lost an event), or the receiver is gone (there
-    /// is no consumer to lose anything). Either way the producer does not stall.
+    /// Neither side can affect the other: each outlet has its own channel, its own capacity
+    /// and its own [`dropped`](TransferEventStream::dropped) count, so a consumer that stops
+    /// draining loses its own events and nobody else's.
+    ///
+    /// This is how the SEP's *"a list of progress listeners"* is expressed — as composition
+    /// rather than as a `Vec` on every builder, so the registration surface stays one method
+    /// per operation and a second `.events()` call adds a consumer rather than dropping one.
+    pub fn merge(self, other: TransferEventSink) -> TransferEventSink {
+        let mut outlets: Vec<Outlet> = Vec::with_capacity(self.outlets.len() + other.outlets.len());
+        for src in [&self.outlets, &other.outlets] {
+            outlets.extend(src.iter().map(|o| Outlet {
+                tx: o.tx.clone(),
+                dropped: o.dropped.clone(),
+            }));
+        }
+        TransferEventSink {
+            outlets: Arc::from(outlets),
+        }
+    }
+
+    /// Non-blocking send to every outlet. Counts the event as dropped on each outlet whose
+    /// channel was full.
+    ///
+    /// Returns whether the event reached **at least one** consumer. A `false` return covers
+    /// two different facts, and only the first is counted in
+    /// [`TransferEventStream::dropped`]: the channel was full (the consumer lost an event),
+    /// or the receiver is gone (there is no consumer to lose anything). Either way the
+    /// producer does not stall, on any outlet.
     fn emit(&self, event: TransferEvent) -> bool {
+        // The last outlet takes the event by move and the others clone, so a single-outlet
+        // sink — the common case by far — clones nothing. Cloning is refcount-only anyway:
+        // the endpoints a `TransferRef` carries are `Arc<str>`/`Arc<Path>`.
+        let Some((last, rest)) = self.outlets.split_last() else {
+            return false;
+        };
+        let mut delivered = false;
+        for outlet in rest {
+            delivered |= Self::push(outlet, event.clone());
+        }
+        delivered | Self::push(last, event)
+    }
+
+    /// Try one outlet, counting a full channel as a loss and a closed one as nothing.
+    fn push(outlet: &Outlet, event: TransferEvent) -> bool {
         use tokio::sync::mpsc::error::TrySendError;
-        match self.tx.try_send(event) {
+        match outlet.tx.try_send(event) {
             Ok(()) => true,
             // Counted: the consumer is still there and lost this one, which is what
             // `dropped()` reports.
             Err(TrySendError::Full(_)) => {
-                self.dropped.fetch_add(1, Ordering::Relaxed);
+                outlet.dropped.fetch_add(1, Ordering::Relaxed);
                 false
             }
             // NOT counted. The receiver is gone, so every subsequent event is also
@@ -1239,7 +1311,7 @@ mod tests {
         );
         assert_eq!(
             1,
-            sink.dropped.load(Ordering::Relaxed),
+            sink.outlets[0].dropped.load(Ordering::Relaxed),
             "a closed receiver must not be counted as lost events"
         );
     }

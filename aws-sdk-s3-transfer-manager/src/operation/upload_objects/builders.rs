@@ -39,7 +39,13 @@ impl UploadObjectsFluentBuilder {
 
     /// observe lifecycle events for this request and its children.
     pub fn events(mut self, sink: crate::events::TransferEventSink) -> Self {
-        self.events = Some(sink);
+        // Appends rather than replaces, so every registered consumer sees every event: the
+        // SEP asks for "a list of progress listeners", and a replacing setter would make a
+        // client-level sink and a request-level sink mutually exclusive.
+        self.events = Some(match self.events.take() {
+            Some(existing) => existing.merge(sink),
+            None => sink,
+        });
         self
     }
 
@@ -51,11 +57,9 @@ impl UploadObjectsFluentBuilder {
     ))]
     pub fn initiate(self) -> Result<UploadObjectsHandle, crate::error::Error> {
         let input = self.inner.build()?;
-        crate::operation::upload_objects::UploadObjects::orchestrate(
-            self.handle,
-            input,
-            self.events,
-        )
+        // Resolved before the handle moves into `orchestrate`.
+        let events = crate::events::resolve_sink(self.handle.config.events(), self.events);
+        crate::operation::upload_objects::UploadObjects::orchestrate(self.handle, input, events)
     }
 
     /// The S3 bucket name that objects will upload to. Required.

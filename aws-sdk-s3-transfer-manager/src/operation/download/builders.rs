@@ -28,7 +28,13 @@ impl DownloadFluentBuilder {
     /// Registered on the builder rather than the handle because orchestration
     /// dispatches work before the handle exists.
     pub fn events(mut self, sink: crate::events::TransferEventSink) -> Self {
-        self.events = Some(sink);
+        // Appends rather than replaces, so every registered consumer sees every event: the
+        // SEP asks for "a list of progress listeners", and a replacing setter would make a
+        // client-level sink and a request-level sink mutually exclusive.
+        self.events = Some(match self.events.take() {
+            Some(existing) => existing.merge(sink),
+            None => sink,
+        });
         self
     }
 
@@ -39,17 +45,16 @@ impl DownloadFluentBuilder {
     ))]
     pub fn initiate(self) -> Result<DownloadHandle, crate::error::Error> {
         let input = self.inner.build()?;
-        crate::operation::download::Download::orchestrate(
-            self.handle,
-            input,
-            false,
-            self.events
-                .map(|sink| crate::operation::download::EventRegistration {
+        // Resolved before the handle moves into `orchestrate`.
+        let events =
+            crate::events::resolve_sink(self.handle.config.events(), self.events).map(|sink| {
+                crate::operation::download::EventRegistration {
                     sink,
                     // The caller drains the body itself, so there is no file to name.
                     destination: crate::events::Endpoint::Stream {},
-                }),
-        )
+                }
+            });
+        crate::operation::download::Download::orchestrate(self.handle, input, false, events)
     }
 
     /// Download the object and write it to the given file path.
@@ -64,13 +69,14 @@ impl DownloadFluentBuilder {
     ) -> Result<ManagedDownloadHandle, crate::error::Error> {
         let input = self.inner.build()?;
         let path = path.into();
-        let events = self
-            .events
-            .map(|sink| crate::operation::download::EventRegistration {
-                sink,
-                destination: crate::events::Endpoint::Local {
-                    path: std::sync::Arc::from(path.as_path()),
-                },
+        let events =
+            crate::events::resolve_sink(self.handle.config.events(), self.events).map(|sink| {
+                crate::operation::download::EventRegistration {
+                    sink,
+                    destination: crate::events::Endpoint::Local {
+                        path: std::sync::Arc::from(path.as_path()),
+                    },
+                }
             });
         crate::operation::download::Download::orchestrate_to_path(
             self.handle,
@@ -98,11 +104,12 @@ impl DownloadFluentBuilder {
         // that the transfer manager cannot know. `Unresolved` would be wrong the other way
         // -- it means "could not be determined", where here there is a real sink the caller
         // already holds.
-        let events = self
-            .events
-            .map(|sink| crate::operation::download::EventRegistration {
-                sink,
-                destination: crate::events::Endpoint::Stream {},
+        let events =
+            crate::events::resolve_sink(self.handle.config.events(), self.events).map(|sink| {
+                crate::operation::download::EventRegistration {
+                    sink,
+                    destination: crate::events::Endpoint::Stream {},
+                }
             });
         crate::operation::download::Download::orchestrate_to_file(self.handle, input, file, events)
     }
