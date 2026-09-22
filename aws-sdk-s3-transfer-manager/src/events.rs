@@ -169,6 +169,11 @@ pub enum Direction {
     /// S3 to local filesystem.
     Download,
     /// S3 to S3.
+    ///
+    /// Hidden for the same reason as [`SkipReason`]: nothing constructs it —
+    /// [`TransferRef`] builds only uploads and downloads — so the name has not been
+    /// exercised by the layer that will populate it. It becomes visible with `CopyObject`.
+    #[doc(hidden)]
     Copy,
 }
 
@@ -395,10 +400,17 @@ pub enum Decision {
     /// Carries no reason because the reason is the action: present at the
     /// destination, absent at the source, delete mode on. Braced-but-empty so it
     /// can gain one compatibly if a second way to reach a delete appears.
+    ///
+    /// Hidden until `sync` produces it: nothing in the crate decides a delete today.
+    #[doc(hidden)]
     #[non_exhaustive]
     Delete {},
     /// Leave the entry alone. Nothing is attempted, so this decision is terminal on
     /// arrival and no [`TransferEvent::Settled`] follows it.
+    ///
+    /// Hidden until `sync` produces it, which is also why its [`SkipReason`] payload is
+    /// hidden — a visible variant carrying a hidden type is the inconsistency this removes.
+    #[doc(hidden)]
     #[non_exhaustive]
     Skip {
         /// Why nothing was done.
@@ -437,11 +449,21 @@ pub enum Outcome {
 
 /// One fact about one entry.
 ///
-/// `parent` is what separates an entry from the operation it belongs to: the root
-/// of a directory operation is announced too, and its endpoints are the source
-/// directory and the key prefix rather than a file and a key. A consumer acting on
-/// each entry as it lands — deleting each source after its upload, say — must skip
-/// the event whose `parent` is `None`, or it acts on the whole tree.
+/// `parent` says which operation an event belongs to. `None` means *this event is the
+/// operation you called* — so what that implies depends on which one you called, and reading
+/// it as "not a real entry" is wrong.
+///
+/// For [`upload`](crate::Client::upload) or [`download`](crate::Client::download), the single
+/// event with `parent: None` **is** the file. For
+/// [`upload_objects`](crate::Client::upload_objects) or
+/// [`download_objects`](crate::Client::download_objects), it is the root — its endpoints are
+/// the source directory and the key prefix, not a file and a key — and every child carries
+/// `parent: Some(root_id)`.
+///
+/// So a consumer acting per entry — deleting each source once its upload succeeds — skips the
+/// `parent: None` event **only for the directory operations**, where acting on it would act on
+/// the whole tree. Skipping it unconditionally is wrong: it drops every single-file transfer,
+/// whose sole event is the one with no parent.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum TransferEvent {
@@ -716,8 +738,18 @@ impl TransferLifecycle {
     /// The obligation is taken even if the send is dropped, so a lost `Decided`
     /// cannot silently cancel the matching `Settled`. That keeps the two counts
     /// comparable, which is what makes a dropped event visible.
+    ///
+    /// A [`Decision::Skip`] takes no obligation, which is what enforces that variant's
+    /// "no `Settled` follows it": `finish` cannot answer for a lifecycle that never owed a
+    /// terminal, so no shared terminal path can emit one for an entry nothing was attempted
+    /// on. That matters to a consumer keying per-entry state off `Decided` and freeing it on
+    /// `Settled`: a terminal for an entry that was never attempted is state it never
+    /// allocated, and the decision alone is what tells the two shapes apart.
+    /// Currently unreachable — [`new`](Self::new) constructs only `Transfer`.
     pub(crate) fn announce(&self) {
-        self.owes_finish.store(true, Ordering::Release);
+        if !matches!(self.decision, Decision::Skip { .. }) {
+            self.owes_finish.store(true, Ordering::Release);
+        }
         self.sink.emit(TransferEvent::Decided {
             id: self.id,
             parent: self.parent,

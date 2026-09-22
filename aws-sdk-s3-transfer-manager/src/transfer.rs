@@ -150,9 +150,15 @@ pub(crate) struct TransferId {
 }
 
 impl std::fmt::Display for TransferId {
+    /// `parent/child`, or just the id for a root.
+    ///
+    /// Parent first, so a `tid` sorts and reads outside-in like a path, and the two numbers
+    /// are not transposable by eye. The separator is `/` and not `-` because `-` already
+    /// means a byte range throughout this crate (`bytes 1024-2047/4096`), so `7-3` reads as
+    /// a range, or as subtraction, rather than as a parent link.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.parent {
-            Some(parent) => write!(f, "{}-{}", self.id, parent),
+            Some(parent) => write!(f, "{}/{}", parent, self.id),
             None => write!(f, "{}", self.id),
         }
     }
