@@ -147,8 +147,16 @@ enum SpawnDecision {
     Abort,
     /// A (possibly empty) batch of entries ready to be orchestrated outside
     /// the state lock, paired with a `Reservation` token that owns the
-    /// matching `children_reserved` slots until consumed by `merge_spawned`.
-    Batch(Vec<ClaimedEntry>, Reservation),
+    /// matching `children_reserved` slots until consumed by `merge_spawned`,
+    /// and the child sink these entries must be announced on.
+    ///
+    /// The sink travels with the batch because it has to be captured in the same
+    /// critical section that popped the entries: see `claim_one`.
+    Batch(
+        Vec<ClaimedEntry>,
+        Reservation,
+        Option<crate::events::TransferEventSink>,
+    ),
 }
 
 /// Owns N slots in `State::reaping_in_flight` plus the drained
@@ -499,11 +507,17 @@ impl UploadObjectsTransfer {
     /// would make `Decided` and `Settled` counts disagree for a reason a
     /// consumer cannot see. It gets no lifecycle in the child map because there
     /// is no child to reap.
+    /// `batch_sink` comes from `claim_one`, captured under the same state guard that popped this
+    /// entry from `pending_entries`. It is a parameter rather than a field because a stored
+    /// `TransferEventSink` is a live mpsc `Sender` and the stream ends only when the last one
+    /// drops; held for the transfer's lifetime it would hang a consumer that awaits its collector
+    /// after `join()`. Scoped to the batch, it covers exactly the claim-to-announce window.
     fn announce_child(
         &self,
         outcome: &OrchestrateOutcome,
         source_path: &std::path::Path,
         key: &str,
+        batch_sink: Option<&crate::events::TransferEventSink>,
     ) {
         // The root guard is held across the whole body, so the check that the root is
         // still live and the insert into `child_lifecycles` are one critical section.
@@ -527,8 +541,29 @@ impl UploadObjectsTransfer {
         // nesting is this function's lifecycle -> child_lifecycles; no path takes them in
         // the other order, so there is no inversion. `announce()` is a non-blocking
         // `try_send` with no `.await`, so holding the guard across it is bounded.
+        // Whether the root is still live decides where the `Settled` comes from, not whether
+        // there is one. A live root means `finish_root` has not run, so the orphan drain will
+        // still read `child_lifecycles` and owes this child its terminal. A taken root means that
+        // drain has already happened and will not happen again, so this child finishes here --
+        // the entry is off `pending_entries`, so `record_abandoned_entries` cannot see it either.
+        //
+        // `on_terminal` reaches `finish_root` without the `children_reserved == 0` gate that
+        // `check_terminal` has, which is what makes the taken case reachable mid-batch.
+        // `root_guard.is_some()` is read at the use site rather than bound here. A binding keeps
+        // compiling if someone later releases the guard early and then silently carries a stale
+        // answer; the read below stops compiling instead, which is the failure we want for an edit
+        // that breaks the invariant that this decision and the sink choice are the same instant.
         let root_guard = self.inner.lifecycle.lock();
-        let Some(root) = root_guard.clone() else {
+        let Some(sink) = root_guard
+            .as_ref()
+            .map(|root| root.child_sink())
+            .or_else(|| batch_sink.cloned())
+        else {
+            // No sink was ever registered, so there is no event to lose. The count still stands
+            // on its own: `add_discovered` took this entry into the denominator when the walker
+            // produced it, and leaving it uncounted seals `EntryTotal::Final(N)` against
+            // `entries_settled() == N - 1` for the life of the process.
+            self.inner.ctx.metrics.record_entry_settled();
             return;
         };
         let child_ref = self.child_ref(source_path, Some(Arc::from(key)));
@@ -536,14 +571,25 @@ impl UploadObjectsTransfer {
             Ok(handle) => {
                 let child_id = handle.id();
                 let lc = Arc::new(crate::events::TransferLifecycle::new(
-                    root.child_sink(),
+                    sink,
                     child_id.id,
                     Some(self.inner.ctx.id.id),
                     child_ref,
                     Some(handle.view()),
                 ));
                 lc.announce();
-                self.inner.child_lifecycles.lock().insert(child_id, lc);
+                if root_guard.is_some() {
+                    self.inner.child_lifecycles.lock().insert(child_id, lc);
+                } else if let Some(emit) = lc.finish(crate::events::Outcome::Cancelled {}) {
+                    // `Cancelled` rather than derived from the handle, unlike `finish_root`'s
+                    // orphan drain: that drain runs at the root's terminal and can find a child
+                    // that already committed its object, but this child was orchestrated
+                    // microseconds ago and the cascade that took the root cancels it next.
+                    // Inserting instead would put it in a map nothing reads again, costing it the
+                    // `Settled` its `announce` above already owes.
+                    self.inner.ctx.metrics.record_entry_settled();
+                    emit.send();
+                }
             }
             Err(e) => {
                 // A fresh id rather than a placeholder: this entry never got a
@@ -551,7 +597,7 @@ impl UploadObjectsTransfer {
                 // consumer keying a map on `id` would collide every such entry
                 // onto one slot -- reporting one failure where there were five.
                 let lc = crate::events::TransferLifecycle::new(
-                    root.child_sink(),
+                    sink,
                     crate::transfer::next_transfer_id().id,
                     Some(self.inner.ctx.id.id),
                     child_ref,
@@ -593,6 +639,51 @@ impl UploadObjectsTransfer {
         crate::events::TransferRef::upload(source, destination)
     }
 
+    /// Announce-and-finish an entry that failed preparation before it could be
+    /// orchestrated -- its key would not derive, or its `InputStream` would not
+    /// build. Caller holds the state guard and sends `out` once it is released.
+    ///
+    /// An unprepared entry has no child, so no reap and no orphan drain in
+    /// `finish_root` can ever settle it, while `add_discovered` already counted it
+    /// when the walker produced it. Without this the entry sits in `entry_total()`
+    /// with nothing able to settle it: `entries_settled()` stops short of
+    /// `EntryTotal::Final` for the rest of the process, and a consumer rendering
+    /// "N remaining" from the difference sticks above zero on an operation whose
+    /// `join()` already returned. It is also the only reason the two observers
+    /// agree at all -- `state.failed` counts the entry, and before this the stream
+    /// did not.
+    ///
+    /// A fresh id rather than a placeholder, for the reason `announce_child`'s `Err`
+    /// arm uses one: a consumer keying a map on `id` would collide every unprepared
+    /// entry onto one slot and report one failure where there were five. No view,
+    /// because no transfer was created and there are no counters to read.
+    fn settle_unprepared_entry(
+        &self,
+        root: Option<&crate::events::TransferLifecycle>,
+        source_path: &std::path::Path,
+        key: Option<Arc<str>>,
+        error: &error::Error,
+        out: &mut Vec<crate::events::PendingEmit>,
+    ) {
+        let Some(root) = root else {
+            return;
+        };
+        let lc = crate::events::TransferLifecycle::new(
+            root.child_sink(),
+            crate::transfer::next_transfer_id().id,
+            Some(self.inner.ctx.id.id),
+            self.child_ref(source_path, key),
+            None,
+        );
+        lc.announce();
+        if let Some(emit) = lc.finish(crate::events::Outcome::Failed {
+            error: error.clone(),
+        }) {
+            self.inner.ctx.metrics.record_entry_settled();
+            out.push(emit);
+        }
+    }
+
     /// claim one child's terminal emit. Safe under the state guard --
     /// claiming does not send. The caller sends once the guard is released.
     ///
@@ -619,6 +710,14 @@ impl UploadObjectsTransfer {
     /// `on_terminal` on the cancel/panic paths. The `owes_finish` swap is what
     /// makes that safe: the first caller wins and the rest are no-ops. A reserved
     /// slot would not have tolerated more than one candidate site.
+    ///
+    /// **Every caller must hold the state guard.** All three do today, and the `&State`
+    /// parameter is the reminder rather than the enforcement. A caller that takes the root
+    /// without it reopens the claim-to-announce window: `claim_one` captures the child sink in the
+    /// same critical section that pops `pending_entries`, so holding the guard here is what orders
+    /// the two. Drop it and an entry can be off `pending_entries`, not yet in `child_lifecycles`,
+    /// and have no sink -- reachable by neither sweep, and its event is lost while every test
+    /// still passes, because the counts stay exact and only the stream is short.
     ///
     /// Two things happen here that a per-transfer view of the problem misses.
     /// First, the root's terminal is the only place that can discharge children
@@ -828,10 +927,11 @@ impl UploadObjectsTransfer {
             let claim = self.claim_one(&mut state, emits);
             match claim {
                 SpawnDecision::Abort => return PollWork::Done,
-                SpawnDecision::Batch(claimed, reservation) => {
+                SpawnDecision::Batch(claimed, reservation, batch_sink) => {
                     if !claimed.is_empty() {
                         attempted = true;
-                        // Phase 2: orchestrate with lock released.
+                        // Phase 2: orchestrate with lock released. `batch_sink` was captured
+                        // inside `claim_one`, under this same guard.
                         drop(state);
                         let outcomes: Vec<(OrchestrateOutcome, PathBuf, String)> = claimed
                             .into_iter()
@@ -852,7 +952,12 @@ impl UploadObjectsTransfer {
                                 // phase 2 drops it above and phase 3 re-takes it,
                                 // and every other exit from `poll_work` returns
                                 // with the guard live.
-                                self.announce_child(&outcome, &source_path, &key);
+                                self.announce_child(
+                                    &outcome,
+                                    &source_path,
+                                    &key,
+                                    batch_sink.as_ref(),
+                                );
                                 (outcome, source_path, key)
                             })
                             .collect();
@@ -943,10 +1048,14 @@ impl UploadObjectsTransfer {
         // ordering rule. This returns `Done`, so the scheduler removes the
         // transfer without ever calling `on_terminal` and without another
         // `check_terminal` -- emit here or the root's event is never sent and the
-        // stream never ends. But children may still be executing, so their
-        // obligations are discharged as `Cancelled` before the root's, which keeps
-        // child-before-root ordering at the cost of accuracy: a child that had
-        // already succeeded and was awaiting reap is reported cancelled.
+        // stream never ends. But children may still be executing, so their obligations are
+        // discharged before the root's, which keeps child-before-root ordering.
+        //
+        // Each one's outcome is derived from its own handle, not assumed: a child still in
+        // `state.children` is asked. The case that has no handle to ask is a child in the
+        // caller's current reap batch, already removed from that map -- which is why
+        // `execute_join_children` claims every batch member with its real outcome *before* it
+        // can reach this path, leaving nothing here to mislabel.
         // The caller holds the state guard and `abort` returns `Done`, so there is
         // no post-guard point to publish from. `try_send` cannot block, so sending
         // here is legal; a reserving send would not be, and moving this onto an
@@ -1019,8 +1128,14 @@ impl UploadObjectsTransfer {
                 count: 0,
                 consumed: false,
             };
-            return SpawnDecision::Batch(Vec::new(), reservation);
+            // Nothing claimed, so nothing to announce and no sink to hold.
+            return SpawnDecision::Batch(Vec::new(), reservation, None);
         }
+
+        // Taken once rather than per failing entry: under `Continue` this loop runs
+        // to the end of the queue, so a tree of unreadable files would otherwise
+        // acquire the lifecycle lock once per file inside a single `poll_work`.
+        let root = self.inner.lifecycle.lock().clone();
 
         let mut batch: Vec<ClaimedEntry> = Vec::new();
         // Loop until one spawnable entry is claimed or the queue is exhausted.
@@ -1030,6 +1145,18 @@ impl UploadObjectsTransfer {
                 match derive_object_key(&relative, key_prefix.as_deref(), delimiter.as_deref()) {
                     Ok(k) => k.into_owned(),
                     Err(e) => {
+                        // Before the policy branch, so the entry settles under `Abort`
+                        // too, and so its `Settled` precedes the root's -- `abort`
+                        // pushes the root's emit onto the same `out`.
+                        self.settle_unprepared_entry(
+                            root.as_deref(),
+                            entry.path(),
+                            // The key is what failed to derive, so there is no
+                            // destination to name.
+                            None,
+                            &e,
+                            out,
+                        );
                         state.failed.push(FailedUpload {
                             input: None,
                             error: e,
@@ -1050,9 +1177,19 @@ impl UploadObjectsTransfer {
             {
                 Ok(s) => s,
                 Err(e) => {
+                    let e: error::Error = e.into();
+                    // The key derived, so this entry can name the object it would
+                    // have become -- unlike the arm above.
+                    self.settle_unprepared_entry(
+                        root.as_deref(),
+                        entry.path(),
+                        Some(Arc::from(key.as_str())),
+                        &e,
+                        out,
+                    );
                     state.failed.push(FailedUpload {
                         input: None,
-                        error: e.into(),
+                        error: e,
                         source_path: Some(entry.path().to_path_buf()),
                     });
                     if *self.failure_policy() == FailedTransferPolicy::Abort {
@@ -1083,7 +1220,28 @@ impl UploadObjectsTransfer {
             count: batch.len(),
             consumed: false,
         };
-        SpawnDecision::Batch(batch, reservation)
+        // Captured here, not at the call site. This function borrows `&mut State`, so it cannot
+        // release the caller's guard -- the pop above and this capture are one critical section by
+        // construction rather than by the caller keeping two statements in order. `on_terminal`
+        // needs that guard to sweep, and it reaches `finish_root` without the
+        // `children_reserved == 0` gate `check_terminal` has, so a capture after the guard is
+        // released leaves these entries off `pending_entries` with their sink already taken and
+        // nothing for `announce_child` to emit on.
+        //
+        // Only for a non-empty batch: nothing to announce otherwise, and a held sink keeps the
+        // stream from ending. The clone itself is one `Arc` refcount bump -- `TransferEventSink` is
+        // `Arc<[Outlet]>` -- so it is the *lifetime* that costs, not the copy. Discarded unread
+        // whenever the root survives the batch, which is the common path.
+        let batch_sink = (!batch.is_empty())
+            .then(|| {
+                self.inner
+                    .lifecycle
+                    .lock()
+                    .as_ref()
+                    .map(|root| root.child_sink())
+            })
+            .flatten();
+        SpawnDecision::Batch(batch, reservation, batch_sink)
     }
 
     /// Phase 3 of child spawning: merge orchestration results into state.
@@ -1567,23 +1725,43 @@ impl UploadObjectsTransfer {
         // claimed terminal emits, sent after the guard is released.
         let mut pending_emits: Vec<crate::events::PendingEmit> = Vec::new();
 
-        for (result, source_path, key, child_id, status_before_join) in results {
+        // Pass 1: claim every child in the batch with its real outcome, before any
+        // iteration can abort.
+        //
+        // The two passes are not cosmetic. `abort()` calls `finish_root`, whose orphan
+        // drain empties `child_lifecycles` and derives each child's outcome from
+        // `state.children` -- but `drain_terminal_children` already removed every member of
+        // this batch from that map, so each resolves `None` and is reported `Cancelled`.
+        // Interleaved with the state updates below, one `Err` under `Abort` therefore
+        // reported every later child of the same batch as cancelled, including ones durably
+        // in S3, while their true outcomes sat unread in `results`. A delete-on-success
+        // consumer then keeps a source whose object is committed -- the conservative
+        // direction, but still a wrong terminal on up to `MAX_REAP_PER_POLL - 1` entries.
+        //
+        // Claiming first makes the drain a no-op for them: `claim_child_finish` removes the
+        // lifecycle, so `finish_root` finds nothing to discharge and `finish` returns `None`
+        // -- which is the case `finish_root`'s own doc already describes as "removed by a
+        // reap that already claimed its emit".
+        for (result, _, _, child_id, status_before_join) in &results {
             // One classification, two consumers: the counters below and the
             // lifecycle event. `join()` returns `Err` for a cancelled child and a
             // failed one alike, so the pre-join status is the only thing that
             // separates them -- which is why it was captured before the handle was
             // consumed.
             let was_cancelled =
-                result.is_err() && status_before_join == crate::types::TransferStatus::Cancelled;
+                result.is_err() && *status_before_join == crate::types::TransferStatus::Cancelled;
 
             // Claim under the guard, send after it is released.
-            let outcome = match &result {
+            let outcome = match result {
                 Ok(_) => crate::events::Outcome::Succeeded {},
                 Err(_) if was_cancelled => crate::events::Outcome::Cancelled {},
                 Err(e) => crate::events::Outcome::Failed { error: e.clone() },
             };
-            pending_emits.extend(self.claim_child_finish(child_id, outcome));
+            pending_emits.extend(self.claim_child_finish(*child_id, outcome));
+        }
 
+        // Pass 2: fold outcomes into state, and cascade an abort if one is owed.
+        for (result, source_path, key, _child_id, _status_before_join) in results {
             match result {
                 Ok(_output) => {
                     state.successful_uploads += 1;
@@ -1871,6 +2049,189 @@ mod tests {
             )
         });
         mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[put])
+    }
+
+    /// A non-empty claim must carry the child sink.
+    ///
+    /// The other half of the window's closure, and the download side's twin.
+    /// `announce_child_still_emits_after_the_root_is_taken` proves that *given* a sink the event
+    /// survives the root being taken; this proves a sink is always there to give. That test
+    /// hand-builds its sink, so it passes with the capture moved anywhere -- only this one pins
+    /// where the capture lives.
+    ///
+    /// The capture sits inside `claim_one` rather than at the `poll_work` call site because this
+    /// function borrows `&mut State` and so cannot release the caller's guard: the pop and the
+    /// capture are one critical section by construction, not by two statements staying in order
+    /// either side of `drop(state)`.
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn claim_one_captures_the_sink_under_the_state_guard() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("a.bin"), b"x").unwrap();
+        let (transfer, _rx) = setup(
+            dir.path(),
+            FailedTransferPolicy::Abort,
+            mock_s3_success(),
+            false,
+        );
+
+        let (sink, _stream) =
+            crate::events::channel(std::num::NonZeroUsize::new(4).expect("capacity > 0"));
+        let root = Arc::new(crate::events::TransferLifecycle::new(
+            sink,
+            transfer.inner.ctx.id.id,
+            None,
+            transfer.child_ref(dir.path(), None),
+            None,
+        ));
+        *transfer.inner.lifecycle.lock() = Some(root);
+
+        // A real `DirEntry`: its fields are private, so the walker is the only way to get one.
+        let mut walk = FsWalker::builder()
+            .recursive(false)
+            .build()
+            .walk(FsWalkContext::builder().root(dir.path()).build());
+        let entry = loop {
+            match walk.next().await {
+                Some(Ok(e)) if e.metadata().is_file() => break e,
+                Some(_) => continue,
+                None => panic!("the walk must yield the file written above"),
+            }
+        };
+
+        // Scoped so the guard is released before the reservation drops: an unconsumed
+        // `Reservation` with a non-zero count re-locks `state` in its `Drop` to give the slot
+        // back, and holding the guard across that deadlocks.
+        let (claimed, reservation, batch_sink) = {
+            let mut state = transfer.inner.state.lock();
+
+            // Nothing pending: no entry to announce, so no sink should be held. A sink is a live
+            // mpsc `Sender` and one held for no reason keeps the stream from ending.
+            let mut emits = Vec::new();
+            match transfer.claim_one(&mut state, &mut emits) {
+                SpawnDecision::Batch(empty, empty_res, no_sink) => {
+                    assert!(empty.is_empty(), "nothing was pending");
+                    assert!(
+                        no_sink.is_none(),
+                        "an empty claim must not hold a sink open"
+                    );
+                    // Count 0, so this `Drop` is a no-op and takes no lock.
+                    drop(empty_res);
+                }
+                SpawnDecision::Abort => panic!("no entry was claimed, so nothing could fail"),
+            }
+
+            state.pending_entries.push_back(entry);
+            match transfer.claim_one(&mut state, &mut emits) {
+                SpawnDecision::Batch(c, r, sink) => (c, r, sink),
+                SpawnDecision::Abort => {
+                    panic!("the entry is uploadable, so the claim must not abort")
+                }
+            }
+        };
+
+        assert_eq!(
+            1,
+            claimed.len(),
+            "one entry pending and the budget allows it"
+        );
+        assert!(
+            batch_sink.is_some(),
+            "a non-empty claim must carry the sink: this entry is now off `pending_entries`, so \
+             `record_abandoned_entries` cannot see it, and `announce_child` has only this sink \
+             left if the root is taken before it runs"
+        );
+        drop(reservation);
+    }
+
+    /// `announce_child` must still emit once the root has been taken.
+    ///
+    /// The download-side twin of this test carries the full argument; in short: `on_terminal`
+    /// reaches `finish_root` without the `children_reserved == 0` gate `check_terminal` has, so
+    /// the root can be taken while a batch sits between `claim_one` and `announce_child`. That
+    /// entry is off `pending_entries`, so `record_abandoned_entries` cannot see it, and it is not
+    /// yet in `child_lifecycles`, so the orphan drain cannot either. The batch-scoped sink is what
+    /// keeps it from vanishing.
+    ///
+    /// The interleaving is constructed rather than raced for, so it costs milliseconds and does
+    /// not depend on machine load.
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn announce_child_still_emits_after_the_root_is_taken() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("a.bin"), b"x").unwrap();
+        let (transfer, _rx) = setup(
+            dir.path(),
+            FailedTransferPolicy::Abort,
+            mock_s3_success(),
+            false,
+        );
+
+        let (sink, mut stream) =
+            crate::events::channel(std::num::NonZeroUsize::new(16).expect("capacity > 0"));
+        let root = Arc::new(crate::events::TransferLifecycle::new(
+            sink,
+            transfer.inner.ctx.id.id,
+            None,
+            transfer.child_ref(dir.path(), None),
+            None,
+        ));
+        *transfer.inner.lifecycle.lock() = Some(root);
+
+        // What the claim takes while it still holds the state guard. Hand-built here because this
+        // test covers the second half of the contract -- given a sink, the fallback emits after
+        // the root is taken. That a sink is always captured is the other half, and
+        // `claim_one_captures_the_sink_under_the_state_guard` covers it.
+        let batch_sink = transfer
+            .inner
+            .lifecycle
+            .lock()
+            .as_ref()
+            .map(|r| r.child_sink());
+        assert!(
+            batch_sink.is_some(),
+            "a sink was registered, so the batch has one"
+        );
+
+        // `on_terminal` beating this batch to the root.
+        let taken = transfer.inner.lifecycle.lock().take();
+        assert!(taken.is_some(), "the root was live until this point");
+        drop(taken);
+
+        let before = transfer.inner.ctx.metrics.entries_settled();
+        let outcome: OrchestrateOutcome = Err(crate::error::Error::new(
+            crate::error::ErrorKind::ChildOperationFailed,
+            "orchestrate failed",
+        ));
+        transfer.announce_child(
+            &outcome,
+            &dir.path().join("a.bin"),
+            "a.bin",
+            batch_sink.as_ref(),
+        );
+
+        assert_eq!(
+            before + 1,
+            transfer.inner.ctx.metrics.entries_settled(),
+            "the count is owed regardless of the event"
+        );
+
+        // Drop every sink so the stream can end, then read what the entry produced.
+        drop(batch_sink);
+        let mut decided = 0;
+        let mut settled = 0;
+        while let Some(ev) = stream.next().await {
+            match ev {
+                crate::events::TransferEvent::Decided { .. } => decided += 1,
+                crate::events::TransferEvent::Settled { .. } => settled += 1,
+            }
+        }
+        assert_eq!(
+            (1, 1),
+            (decided, settled),
+            "the entry must be announced and settled exactly once; (0, 0) is the lost event \
+             this window used to produce"
+        );
     }
 
     fn setup(

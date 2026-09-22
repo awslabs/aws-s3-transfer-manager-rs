@@ -369,8 +369,34 @@ async fn run_abort(percent: usize, prefix: &str) -> AbortRun {
     }
 }
 
+/// Under `Abort`, a parent's counters keep moving after it reports terminal — and that is
+/// correct rather than a leak.
+///
+/// `signal_terminal` is safe to call while in-flight work drains and the per-transfer token is
+/// never cancelled, so a child's `record_io` can land after the parent is `Failed`. Because the
+/// rollup walks the parent chain as bytes move rather than folding at reap, those late bytes
+/// reach the parent too. A consumer reading `metrics()` after the terminal therefore sees a
+/// *larger* number, which is what §3's byte-ordering invariant promises and what makes
+/// `metrics()` safe to read at any time — the alternative, freezing the parent at terminal,
+/// would under-report every aborted run by whatever was in flight.
+///
+/// **Two assertions are deliberately absent, and both have been tried.** `tx_settled >=
+/// tx_at_terminal` compares two reads of a counter that only ever `fetch_add`s, so it cannot fail.
+/// `moved > 0` depends on work still being in flight at the terminal, which is a scheduling
+/// outcome, so it fails on a healthy run under load. The post-terminal number is printed instead;
+/// what is asserted is a floor and a ceiling, and both can fail. The body says which is which.
+///
+/// The test was also once named `..._parent_aggregate_stays_zero`, describing a parent that stayed
+/// at 0 — true when the fold ran at reap inside the success arm, false since the rollup landed:
+/// two runs read 60 MiB and 10 MiB at terminal, with 30 MiB and 60 MiB arriving after.
+///
+/// Those figures vary by run because where the abort lands relative to the drain is a race, which
+/// is why the assertions below are a floor, a ceiling and a non-zero rather than any equality.
+/// The floor is not a guess: a doomed child fails only after pushing `FAULT_SKIP` parts, so the
+/// abort is *caused by* a child that has already moved bytes, and `tx_at_terminal` cannot be 0
+/// unless the rollup itself is broken.
 #[tokio::test]
-async fn chaos_abort_parent_aggregate_stays_zero() {
+async fn chaos_abort_parent_counts_bytes_that_land_after_terminal() {
     timeout(TEST_TIMEOUT, async {
         let r = run_abort(15, "abort/").await;
         let moved = r.tx_settled.saturating_sub(r.tx_at_terminal);
@@ -384,20 +410,43 @@ async fn chaos_abort_parent_aggregate_stays_zero() {
             r.status_at_terminal, r.polls_to_terminal, r.tx_at_terminal, r.tx_settled, moved,
         );
 
-        // NOT a quiescence measurement. Under Abort no child is reaped, so the
-        // parent aggregate never leaves 0 and both samples read 0 for that
-        // reason rather than because nothing drained. Renamed to say what it
-        // actually observes. Post-terminal mutation lands on a CHILD's
-        // MetricsState, which has no public handle, so it cannot be reached
-        // from an integration test at all -- see the design's §5.
-        println!("observed post-terminal movement: {moved} bytes");
+        // The rollup reaches the parent on the abort path, not only the happy one. This is the
+        // assertion that fails if `record_io` stops walking the parent chain -- reverting that
+        // walk reads 0 here, which is exactly what the pre-rollup defect looked like.
         assert!(
-            r.tx_settled >= r.tx_at_terminal,
-            "counters are monotonic; a decrease would be a different bug"
+            r.tx_at_terminal > 0,
+            "a parent must count its children's bytes as they move, including under Abort; \
+             0 means the rollup regressed to a reap-time fold"
+        );
+
+        // `moved` is printed and deliberately not asserted, in either direction.
+        //
+        // Non-zero cannot be asserted: whether any bytes are still in flight at the terminal is a
+        // scheduling outcome, so a fixed-delay sample cannot tell "the counters froze" from "the
+        // drain finished before we looked". Under CPU starvation the second happens and
+        // `moved > 0` fails on a healthy run.
+        //
+        // `tx_settled >= tx_at_terminal` cannot be asserted either, for the opposite reason: both
+        // are reads of a counter that only ever `fetch_add`s, so it cannot fail and proves
+        // nothing. Reaching for it as the "safe" alternative is how this test lost its teeth once
+        // already.
+        //
+        // So the property is observed here and pinned elsewhere: the two assertions around this
+        // comment are a floor and a ceiling, and both can fail.
+
+        // Ceiling: the parent cannot report more payload than the dataset contains. Loose by
+        // design -- an aborted run moves well under the total -- but it is the guard against a
+        // reap-time fold being re-added *beside* the live rollup, which counts every byte twice.
+        let dataset = FILE_COUNT as u64 * FILE_SIZE as u64;
+        assert!(
+            r.tx_settled <= dataset,
+            "parent reported {} bytes against a {dataset}-byte dataset; over the total means \
+             bytes are being counted twice",
+            r.tx_settled
         );
     })
     .await
-    .expect("chaos_abort_parent_aggregate_stays_zero timed out");
+    .expect("chaos_abort_parent_counts_bytes_that_land_after_terminal timed out");
 }
 
 // ---------------------------------------------------------------------------

@@ -340,7 +340,18 @@ impl DownloadObjectsTransfer {
     /// make `Decided` and `Settled` counts disagree for a reason a consumer
     /// cannot see. It gets no entry in the child map because there is nothing to
     /// reap.
-    fn announce_child(&self, result: &Result<(ManagedDownloadHandle, PathBuf), Error>, key: &str) {
+    /// `batch_sink` is the sink cloned when this batch was claimed, used only if the root has
+    /// been taken since. It is passed in rather than stored on `self` because a stored
+    /// `TransferEventSink` is a live mpsc `Sender`: the stream ends when the last sink drops, so
+    /// a sink held for the transfer's lifetime keeps `next()` returning `Pending` until the
+    /// scheduler releases the transfer, and a consumer that awaits its collector after `join()`
+    /// hangs. Batch-scoped, it covers exactly the claim-to-announce window and no longer.
+    fn announce_child(
+        &self,
+        result: &Result<(ManagedDownloadHandle, PathBuf), Error>,
+        key: &str,
+        batch_sink: Option<&crate::events::TransferEventSink>,
+    ) {
         // The root guard is held across the whole body, so the check that the root is
         // still live and the insert into `child_lifecycles` are one critical section.
         //
@@ -364,7 +375,31 @@ impl DownloadObjectsTransfer {
         // the other order, so there is no inversion. `announce()` is a non-blocking
         // `try_send` with no `.await`, so holding the guard across it is bounded.
         let root_guard = self.inner.lifecycle.lock();
-        let Some(root) = root_guard.clone() else {
+        // Read at the use site rather than bound here. A binding keeps compiling if someone later
+        // releases the guard early and then silently carries a stale answer; `root_guard.is_some()`
+        // below stops compiling instead, which is the failure we want for an edit that breaks the
+        // invariant that this decision and the sink choice are the same instant.
+        //
+        // Whether the root is still live decides where the `Settled` comes from, not whether
+        // there is one. A live root means `finish_root` has not run, so the orphan drain will
+        // still read `child_lifecycles` and owes this child its terminal. A taken root means
+        // that drain has already happened and will not happen again, so this child must finish
+        // here or not at all -- it is off `pending_entries`, so `record_abandoned_entries`
+        // cannot see it either.
+        let Some(sink) = root_guard
+            .as_ref()
+            .map(|root| root.child_sink())
+            .or_else(|| batch_sink.cloned())
+        else {
+            // No sink was ever registered, so there is no event to lose. The count still
+            // stands on its own: `accumulate_listed` took this object into the denominator
+            // when listing produced it, and leaving it uncounted seals `EntryTotal::Final(N)`
+            // against `entries_settled() == N - 1` for the life of the process.
+            //
+            // Counted unconditionally because every object reaching here is addressable:
+            // `spawn_children` expects a key, and `accumulate_listed` counts exactly the
+            // objects that have one.
+            self.inner.ctx.metrics.record_entry_settled();
             return;
         };
         let child_ref = |destination| {
@@ -380,7 +415,7 @@ impl DownloadObjectsTransfer {
             Ok((handle, dest_path)) => {
                 let child_id = handle.transfer_id();
                 let lc = Arc::new(crate::events::TransferLifecycle::new(
-                    root.child_sink(),
+                    sink,
                     child_id.id,
                     Some(self.inner.ctx.id.id),
                     child_ref(crate::events::Endpoint::Local {
@@ -389,7 +424,18 @@ impl DownloadObjectsTransfer {
                     Some(handle.view()),
                 ));
                 lc.announce();
-                self.inner.child_lifecycles.lock().insert(child_id, lc);
+                if root_guard.is_some() {
+                    self.inner.child_lifecycles.lock().insert(child_id, lc);
+                } else if let Some(emit) = lc.finish(crate::events::Outcome::Cancelled {}) {
+                    // `Cancelled` rather than derived from the handle, unlike `finish_root`'s
+                    // orphan drain: that drain runs at the root's terminal and can find a child
+                    // that already succeeded, but this child was spawned microseconds ago and
+                    // the cascade that took the root cancels it next. Inserting instead would
+                    // put it in a map nothing reads again, costing it the `Settled` its
+                    // `announce` above already owes.
+                    self.inner.ctx.metrics.record_entry_settled();
+                    emit.send();
+                }
             }
             Err(e) => {
                 // A fresh id rather than a placeholder: this key never got a child
@@ -401,7 +447,7 @@ impl DownloadObjectsTransfer {
                 // created. Naming the destination root instead would print a
                 // location the transfer manager never wrote to.
                 let lc = crate::events::TransferLifecycle::new(
-                    root.child_sink(),
+                    sink,
                     crate::transfer::next_transfer_id().id,
                     Some(self.inner.ctx.id.id),
                     child_ref(crate::events::Endpoint::Unresolved {}),
@@ -511,6 +557,14 @@ impl DownloadObjectsTransfer {
     ///
     /// Emits are pushed onto `out` rather than sent, and the root's goes last, so a
     /// caller that reaped children in the same pass publishes them before the root.
+    ///
+    /// **Every caller must hold the state guard.** All three do today, and the `&State`
+    /// parameter is the reminder rather than the enforcement. A caller that takes the root
+    /// without it reopens the claim-to-announce window: `claim_one` captures the child sink in
+    /// the same critical section that drains `pending_entries`, so holding the guard here is what
+    /// orders the two. Drop it and an entry can be off `pending_entries`, not yet in
+    /// `child_lifecycles`, and have no sink -- reachable by neither sweep, and its event is lost
+    /// while every test still passes, because the counts stay exact and only the stream is short.
     fn finish_root(
         &self,
         state: &State,
@@ -631,11 +685,11 @@ impl DownloadObjectsTransfer {
         let mut attempted = false;
         let mut materialized = false;
         if self.inner.ctx.is_active() {
-            let (to_spawn, reservation) = self.claim_one(&mut state);
+            let (to_spawn, reservation, batch_sink) = self.claim_one(&mut state);
             if !to_spawn.is_empty() {
                 attempted = true;
                 drop(state);
-                let spawned = self.spawn_children(to_spawn);
+                let spawned = self.spawn_children(to_spawn, batch_sink);
                 state = self.inner.state.lock();
                 materialized = self.merge_spawned(&mut state, spawned, reservation) > 0;
             }
@@ -715,7 +769,20 @@ impl DownloadObjectsTransfer {
     ///
     /// Gates on the *in-flight budget*: active children plus reserved, against
     /// `pipeline_depth`. Returns an empty Vec when nothing can be claimed.
-    fn claim_one(&self, state: &mut State) -> (Vec<Object>, Reservation) {
+    ///
+    /// The third element is the child sink, taken here rather than in `spawn_children` so the
+    /// claim and the capture are one critical section. The caller drops the state guard between
+    /// the two, and `on_terminal` needs that guard to sweep — so capturing later leaves a window
+    /// where the entry is off `pending_entries` with its sink already gone. `state -> lifecycle`
+    /// is the order `record_abandoned_entries` already takes; nothing takes the reverse.
+    fn claim_one(
+        &self,
+        state: &mut State,
+    ) -> (
+        Vec<Object>,
+        Reservation,
+        Option<crate::events::TransferEventSink>,
+    ) {
         let active = state
             .children
             .values()
@@ -734,10 +801,32 @@ impl DownloadObjectsTransfer {
             count: batch.len(),
             consumed: false,
         };
-        (batch, reservation)
+        // Only when something was claimed: an empty batch has nothing to announce, and a held sink
+        // keeps the stream from ending. The clone itself is one `Arc` refcount bump --
+        // `TransferEventSink` is `Arc<[Outlet]>` -- so it is the *lifetime* that costs, not the
+        // copy. Discarded unread whenever the root survives the batch, which is the common path.
+        let batch_sink = (!batch.is_empty())
+            .then(|| {
+                self.inner
+                    .lifecycle
+                    .lock()
+                    .as_ref()
+                    .map(|root| root.child_sink())
+            })
+            .flatten();
+        (batch, reservation, batch_sink)
     }
 
-    fn spawn_children(&self, entries: Vec<Object>) -> Vec<(Object, Result<ChildTransfer, Error>)> {
+    /// `batch_sink` comes from `claim_one`, captured under the same state guard that removed
+    /// these entries from `pending_entries`. It is a parameter rather than a field because a
+    /// stored `TransferEventSink` is a live mpsc `Sender` and the stream ends only when the last
+    /// one drops; held for the transfer's lifetime it would hang a consumer that awaits its
+    /// collector after `join()`. Scoped to the batch, it drops with this function.
+    fn spawn_children(
+        &self,
+        entries: Vec<Object>,
+        batch_sink: Option<crate::events::TransferEventSink>,
+    ) -> Vec<(Object, Result<ChildTransfer, Error>)> {
         let handle = &self.inner.ctx.handle;
 
         tracing::trace!(
@@ -763,7 +852,7 @@ impl DownloadObjectsTransfer {
                 // Announced here rather than in `merge_spawned`: this is the only
                 // point in `poll_work` where the state guard is not held, and
                 // announcing is a send.
-                self.announce_child(&result, &key);
+                self.announce_child(&result, &key, batch_sink.as_ref());
                 (
                     obj,
                     result.map(|(handle, _dest)| ChildTransfer { handle, key }),
@@ -894,20 +983,20 @@ impl DownloadObjectsTransfer {
                         .key(&key)
                         .build()
                         .unwrap();
+                    // Same shape as the spawn-failure site above: clone under `Abort`
+                    // only, push, then signal, so the root's `source()` is the
+                    // child's real error and no terminal path sees the abort before
+                    // the object is recorded.
+                    let root_cause = (self.inner.failure_policy == FailedTransferPolicy::Abort)
+                        .then(|| err.clone());
                     state.failed.push(FailedDownload {
                         input: failed_input,
                         error: err,
                     });
-                    if self.inner.failure_policy == FailedTransferPolicy::Abort {
-                        // TODO: the triggering child's error is preserved in
-                        // `state.failed` (reachable via
-                        // `Error::failed_downloads`), but the root error's
-                        // `source()` is only this string. Connecting the root
-                        // `source()` to the failing child's error needs a
-                        // shareable error (`Arc`) since `Error` is not `Clone`.
+                    if let Some(cause) = root_cause {
                         self.inner.ctx.set_failed_and_signal(Error::new(
                             ErrorKind::ChildOperationFailed,
-                            format!("download failed for key '{key}'"),
+                            cause,
                         ));
                     }
                 }
@@ -1263,20 +1352,28 @@ impl DownloadObjectsTransfer {
                         .key(&key)
                         .build()
                         .unwrap();
+                    // Cloned before the move, and only under `Abort`, so the root
+                    // error's `source()` is the triggering child's own error rather
+                    // than a formatted string. Cloning is a refcount bump — `Error`
+                    // shares its source — which is what makes the same error
+                    // reportable to `join()` and recordable per object at once. The
+                    // key stays reachable two ways: `Display` for
+                    // `ChildOperationFailed` names the first failure, and
+                    // `failed_downloads()` carries each object's input beside its
+                    // own error.
+                    let root_cause = (self.inner.failure_policy == FailedTransferPolicy::Abort)
+                        .then(|| err.clone());
                     state.failed.push(FailedDownload {
                         input: failed_input,
                         error: err,
                     });
-                    if self.inner.failure_policy == FailedTransferPolicy::Abort {
-                        // TODO: the triggering child's error is preserved in
-                        // `state.failed` (reachable via
-                        // `Error::failed_downloads`), but the root error's
-                        // `source()` is only this string. Connecting the root
-                        // `source()` to the failing child's error needs a
-                        // shareable error (`Arc`) since `Error` is not `Clone`.
+                    // Signalled after the push, not before: this thread holds the
+                    // state guard, and a terminal path that reads `state.failed`
+                    // must not observe the abort with this object missing from it.
+                    if let Some(cause) = root_cause {
                         self.inner.ctx.set_failed_and_signal(Error::new(
                             ErrorKind::ChildOperationFailed,
-                            format!("download failed for key '{key}'"),
+                            cause,
                         ));
                     }
                 }
@@ -1537,6 +1634,161 @@ mod tests {
             .unwrap();
         let transfer = DownloadObjectsTransfer::new(ctx, &input, walk, 1000, None);
         (transfer, completion_rx)
+    }
+
+    /// A non-empty claim must carry the child sink.
+    ///
+    /// The other half of the window's closure. `announce_child_still_emits_after_the_root_is_taken`
+    /// proves that *given* a sink the event survives the root being taken; this proves a sink is
+    /// always there to give. Without it, that test passes with the capture moved anywhere, because
+    /// it hand-builds the sink itself.
+    ///
+    /// The capture lives inside `claim_one` rather than at the call site because this function
+    /// borrows `&mut State` and so cannot release the caller's guard -- the drain and the capture
+    /// are one critical section by construction.
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn claim_one_captures_the_sink_under_the_state_guard() {
+        let dest = tempdir().unwrap();
+        let (transfer, _rx) = setup(dest.path(), FailedTransferPolicy::Abort, mock_s3_success());
+
+        let (sink, _stream) =
+            crate::events::channel(std::num::NonZeroUsize::new(4).expect("capacity > 0"));
+        let root = Arc::new(crate::events::TransferLifecycle::new(
+            sink,
+            transfer.inner.ctx.id.id,
+            None,
+            crate::events::TransferRef::download(
+                crate::events::Endpoint::S3 {
+                    bucket: Arc::from("test-bucket"),
+                    key: Arc::from("p/"),
+                },
+                crate::events::Endpoint::Local {
+                    path: Arc::from(dest.path()),
+                },
+            ),
+            None,
+        ));
+        *transfer.inner.lifecycle.lock() = Some(root);
+
+        // Scoped so the guard is released before `reservation` drops. An unconsumed `Reservation`
+        // with a non-zero count re-locks `state` in its `Drop` to give the slot back, so holding
+        // the guard across that drop deadlocks the test.
+        let (batch, reservation, batch_sink) = {
+            let mut state = transfer.inner.state.lock();
+
+            // Nothing pending: no entry to announce, so no sink should be held. A sink is a live
+            // mpsc `Sender` and one held for no reason keeps the stream from ending.
+            let (empty, empty_res, no_sink) = transfer.claim_one(&mut state);
+            assert!(empty.is_empty(), "nothing was pending");
+            assert!(
+                no_sink.is_none(),
+                "an empty claim must not hold a sink open"
+            );
+            // Count 0, so this `Drop` is a no-op and takes no lock.
+            drop(empty_res);
+
+            state.pending_entries.push_back(
+                aws_sdk_s3::types::Object::builder()
+                    .key("p/0000.bin")
+                    .size(1)
+                    .build(),
+            );
+            transfer.claim_one(&mut state)
+        };
+
+        assert_eq!(1, batch.len(), "one entry pending and the budget allows it");
+        assert!(
+            batch_sink.is_some(),
+            "a non-empty claim must carry the sink: this entry is now off `pending_entries`, so \
+             `record_abandoned_entries` cannot see it, and `announce_child` has only this sink \
+             left if the root is taken before it runs"
+        );
+        drop(reservation);
+    }
+
+    /// `announce_child` must still emit once the root has been taken.
+    ///
+    /// The interleaving is constructed rather than raced for. `on_terminal` reaches
+    /// `finish_root` without the `children_reserved == 0` gate that `check_terminal` has, so it
+    /// can take the root while a batch is between `claim_one` and `announce_child`. That entry is
+    /// off `pending_entries`, so `record_abandoned_entries` cannot see it, and it is not yet in
+    /// `child_lifecycles`, so the orphan drain cannot either. The batch-scoped sink is what keeps
+    /// it from vanishing.
+    ///
+    /// Racing for this under load reproduced at roughly 1 run in 5, which is not a test. Taking
+    /// the root by hand is the same window with none of the variance.
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn announce_child_still_emits_after_the_root_is_taken() {
+        let dest = tempdir().unwrap();
+        let (transfer, _rx) = setup(dest.path(), FailedTransferPolicy::Abort, mock_s3_success());
+
+        let (sink, mut stream) =
+            crate::events::channel(std::num::NonZeroUsize::new(16).expect("capacity > 0"));
+        let root = Arc::new(crate::events::TransferLifecycle::new(
+            sink,
+            transfer.inner.ctx.id.id,
+            None,
+            crate::events::TransferRef::download(
+                crate::events::Endpoint::S3 {
+                    bucket: Arc::from("test-bucket"),
+                    key: Arc::from("p/"),
+                },
+                crate::events::Endpoint::Local {
+                    path: Arc::from(dest.path()),
+                },
+            ),
+            None,
+        ));
+        *transfer.inner.lifecycle.lock() = Some(root);
+
+        // What the claim takes while it still holds the state guard. Hand-built here because this
+        // test covers the second half of the contract -- given a sink, the fallback emits after
+        // the root is taken. That a sink is always captured is the other half, and
+        // `claim_one_captures_the_sink_under_the_state_guard` covers it.
+        let batch_sink = transfer
+            .inner
+            .lifecycle
+            .lock()
+            .as_ref()
+            .map(|r| r.child_sink());
+        assert!(
+            batch_sink.is_some(),
+            "a sink was registered, so the batch has one"
+        );
+
+        // `on_terminal` beating this batch to the root.
+        let taken = transfer.inner.lifecycle.lock().take();
+        assert!(taken.is_some(), "the root was live until this point");
+        drop(taken);
+
+        let before = transfer.inner.ctx.metrics.entries_settled();
+        let err = Error::new(ErrorKind::ChildOperationFailed, "spawn failed");
+        transfer.announce_child(&Err(err), "p/0000.bin", batch_sink.as_ref());
+
+        assert_eq!(
+            before + 1,
+            transfer.inner.ctx.metrics.entries_settled(),
+            "the count is owed regardless of the event"
+        );
+
+        // Drop every sink so the stream can end, then read what the entry produced.
+        drop(batch_sink);
+        let mut decided = 0;
+        let mut settled = 0;
+        while let Some(ev) = stream.next().await {
+            match ev {
+                crate::events::TransferEvent::Decided { .. } => decided += 1,
+                crate::events::TransferEvent::Settled { .. } => settled += 1,
+            }
+        }
+        assert_eq!(
+            (1, 1),
+            (decided, settled),
+            "the entry must be announced and settled exactly once; (0, 0) is the lost event \
+             this window used to produce"
+        );
     }
 
     async fn drive_transfer(transfer: &DownloadObjectsTransfer) {

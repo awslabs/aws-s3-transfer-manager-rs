@@ -480,6 +480,71 @@ async fn test_download_objects_abort_terminates() {
     .expect("test_download_objects_abort_terminates timed out");
 }
 
+/// Under `Abort`, the error `join()` returns must reach the child's real cause.
+///
+/// Closes the TODO that stood at `download_objects/transfer.rs:902` and `:1264`. Its stated
+/// blocker — *"needs a shareable error (`Arc`) since `Error` is not `Clone`"* — went away when
+/// `Error` gained `Clone`, but the code did not follow, so the root error's `source()` stayed a
+/// formatted string.
+///
+/// What this rules out: a caller whose bulk download aborts runs `DisplayErrorContext` over what
+/// `join()` gave back, and the chain dead-ends at `"download failed for key 'k'"` — the status
+/// code, the request id and the service message all unreachable, so the one thing needed to tell a
+/// 503 from a 403 is missing from the only error the caller was handed.
+///
+/// Asserted structurally rather than on message text: the root's immediate `source()` must
+/// downcast to the library's own [`Error`], which a `String` source cannot do.
+#[tokio::test]
+async fn test_download_objects_abort_error_reaches_the_child_cause() {
+    use std::error::Error as _;
+
+    timeout(TEST_TIMEOUT, async {
+        let m = mock_tm(RuntimeMode::Managed).await;
+
+        let count = 8usize;
+        let size = 1024usize;
+        let bucket = "test-bucket";
+        let prefix = "abort-cause/";
+        seed_bucket(&m.server, bucket, prefix, count, size).await;
+
+        m.server.insert_fault(
+            bucket,
+            &format!("{prefix}0000.bin"),
+            FaultType::ServiceError { status: 503 },
+            0,
+            Occurrence::Always,
+        );
+
+        let dest = tempfile::tempdir().expect("tempdir");
+        let err = m
+            .client
+            .download_objects()
+            .bucket(bucket)
+            .destination(dest.path())
+            .key_prefix(prefix)
+            .failure_policy(FailedTransferPolicy::Abort)
+            .initiate()
+            .expect("initiate")
+            .join()
+            .await
+            .expect_err("a faulted key under Abort must fail the operation");
+
+        let source = err.source().expect("the root error owes a source");
+        let child = source
+            .downcast_ref::<aws_sdk_s3_transfer_manager::error::Error>()
+            .unwrap_or_else(|| panic!("root source must be the child's own Error, got: {source}"));
+        // And the child's own chain continues past it, which is where the status code lives.
+        assert!(
+            child.source().is_some(),
+            "the child error must keep its own source: {child}"
+        );
+
+        m.handle.shutdown().await.expect("shutdown");
+    })
+    .await
+    .expect("test_download_objects_abort_error_reaches_the_child_cause timed out");
+}
+
 // ---------------------------------------------------------------------------
 // DOWNLOAD-SPECIFIC TESTS
 // ---------------------------------------------------------------------------
@@ -1450,16 +1515,19 @@ async fn test_download_objects_events_report_per_object_failure() {
     .expect("test_download_objects_events_report_per_object_failure timed out");
 }
 
-/// Under `Abort`, a key the walker listed but never got to spawn must still reach
-/// the stream. Without the abandoned-entry sweep those keys vanish: the run reports
-/// fewer objects on the stream than it listed, and a per-object consumer never hears
-/// that the file existed.
+/// Under `Abort`, a key the walker listed but never got to spawn must still be accounted for.
+/// Without the abandoned-entry sweep those keys vanish: the run reports one object where it
+/// listed `count`, and a per-object consumer never hears that the files existed.
 ///
 /// The setup makes the gap deterministic. All `count` keys fit in one list page
 /// (count < WALK_LOW_WATER), so the walk drains into `pending_entries` before spawn
 /// touches it; `max_concurrent_downloads(1)` then spawns only the faulted head key
-/// before it fails and Abort cancels, leaving every other listed key unspawned. With
-/// the sweep, all `count` keys appear; without it, one does.
+/// before it fails and Abort cancels, leaving every other listed key unspawned.
+///
+/// Two things are checked, because two separate mechanisms have to hold. Every listed key must
+/// reach the stream, which takes all three settle paths including `announce_child`'s root-gone
+/// branch. And `entries_settled` must reach the sealed total, which is what lets a progress bar
+/// finish and is the assertion a lost count would break while the stream still looked complete.
 #[tokio::test]
 async fn test_download_objects_events_abandoned_entries_still_settle() {
     timeout(TEST_TIMEOUT, async {
@@ -1559,11 +1627,45 @@ async fn test_download_objects_events_abandoned_entries_still_settle() {
                 settled.get(id)
             );
         }
+
+        // Every listed key, with no allowance. Three separate paths have to cover the three
+        // places an entry can be when Abort lands: `record_abandoned_entries` for the ones
+        // still in `pending_entries`, `finish_root`'s orphan drain for the ones in
+        // `child_lifecycles`, and `announce_child`'s root-gone branch for the one that can be
+        // in neither -- claimed off `pending_entries` and mid-spawn when `on_terminal` takes
+        // the root. That last path is why this is `==` and not `>= count - 1`: it needs the
+        // sink kept outside `lifecycle`, and without it this assertion fails intermittently
+        // under load at `count - 1`.
         assert_eq!(
             count,
             child_keys.len(),
-            "every listed key must reach the stream: the sweep is what covers the \
-             ones cancelled before they spawned"
+            "every listed key must reach the stream: the three sweeps together are what cover \
+             the ones cancelled before they could be reaped"
+        );
+
+        // The guarantee that actually protects a consumer, and the one the stream cannot give:
+        // the counts reconcile exactly. An entry whose event was lost above is still counted,
+        // so `entries_settled` reaches the total and a progress bar completes. Skipping the
+        // count instead is what seals a bar below 100% for the life of the process.
+        let root_view = events
+            .iter()
+            .find_map(|ev| match ev {
+                TransferEvent::Decided {
+                    parent: None, view, ..
+                } => view.clone(),
+                _ => None,
+            })
+            .expect("the root announces itself, and it carries a view");
+        assert_eq!(
+            EntryTotal::Final(count as u64),
+            root_view.entry_total(),
+            "listing completed, so the denominator must be sealed at the listed count"
+        );
+        assert_eq!(
+            count as u64,
+            root_view.entries_settled(),
+            "every listed entry must be counted as settled even when its event was lost; \
+             short here is the stuck-progress-bar defect"
         );
 
         m.handle.shutdown().await.expect("shutdown");

@@ -762,7 +762,7 @@ async fn test_upload_objects_events_caller_abort_settles_abandoned_entries() {
         m.server.insert_fault(
             bucket,
             &format!("{key_prefix}0000.bin"),
-            s3_mock_server::FaultType::ServiceError { status: 503 },
+            s3_mock_server::FaultType::ServiceError { status: 403 },
             0,
             s3_mock_server::Occurrence::Always,
         );
@@ -894,4 +894,278 @@ async fn test_upload_objects_events_caller_abort_settles_abandoned_entries() {
     })
     .await
     .expect("test_upload_objects_events_caller_abort_settles_abandoned_entries timed out");
+}
+
+/// Under `Abort`, no child reported `Cancelled` may have its object durably in S3.
+///
+/// **A regression guard, not a defect reproduction — and the measurement is the point.** The
+/// mechanism below is real and the code used to document its cost, but the precondition never
+/// occurred: the failing child must share a reap batch with an already-committed one *and* come
+/// first in iteration order. Instrumenting every batch showed why it does not. Across 191
+/// batches over two fault modes — a non-retryable 403 and a retryable 503 that fails late —
+/// batches reached size 27, yet **every batch carrying the error had size 1**: a failure
+/// reaches terminal at a different instant from a successful upload, so the reaper, which runs
+/// every poll, takes it alone. Twelve runs under different `HashMap` seeds (`state.children` is
+/// a `HashMap`, so batch order is reseeded per process) produced no mislabelled child either.
+///
+/// So the fix is applied on the strength of the mechanism, not of a red test, and the honest
+/// severity is lower than "deterministic": it needs a timing coincidence this workload does not
+/// produce. This test guards the property going forward.
+///
+/// The mechanism: `abort()` calls `finish_root`, whose orphan drain empties
+/// `child_lifecycles` and derives each child's outcome from `state.children` — but
+/// `drain_terminal_children` has already removed every member of the current reap batch from
+/// that map, so each resolves `None` and is reported `Cancelled`. Interleaved with the state
+/// fold, one `Err` under `Abort` reported every *later* child of the same batch as cancelled,
+/// including ones already committed, while their true outcomes sat unread in the results
+/// vector.
+///
+/// Why it matters beyond a wrong label: the design is justified by `mv --recursive`, which
+/// deletes a source once its upload succeeds. A committed object reported `Cancelled` makes
+/// that consumer keep a source it should have removed. That is the conservative direction — a
+/// retained file, not a lost one — but it is still a wrong terminal on up to 63 entries.
+///
+/// Asserted against ground truth rather than against a count: for every `Cancelled` terminal,
+/// the destination object must be absent from the bucket. A count can be right while the
+/// labels are attached to the wrong entries.
+#[tokio::test]
+async fn test_upload_objects_abort_never_reports_a_committed_object_as_cancelled() {
+    use aws_sdk_s3_transfer_manager::events::{Endpoint, Outcome, TransferEvent};
+    use aws_sdk_s3_transfer_manager::types::FailedTransferPolicy;
+
+    timeout(TEST_TIMEOUT, async {
+        let m = setup().await;
+
+        // Enough objects that several reach terminal in one drain batch, and small enough
+        // that they do. One object faults; the rest must commit.
+        let count = 200usize;
+        let size = 1024usize;
+        let dataset = make_flat_dataset(count, size);
+        let bucket = "test-bucket";
+        let key_prefix = "abort-truth/";
+
+        m.server.create_bucket(bucket).await.expect("create bucket");
+        m.server.insert_fault(
+            bucket,
+            &format!("{key_prefix}0000.bin"),
+            s3_mock_server::FaultType::ServiceError { status: 503 },
+            0,
+            s3_mock_server::Occurrence::Always,
+        );
+
+        let (sink, mut stream) = aws_sdk_s3_transfer_manager::events::channel(
+            std::num::NonZeroUsize::new(4 * (count + 1)).expect("capacity > 0"),
+        );
+
+        let handle = m
+            .client
+            .upload_objects()
+            .bucket(bucket)
+            .source(dataset.path())
+            .walker(FsWalker::builder().recursive(true).build())
+            .key_prefix(key_prefix)
+            .failure_policy(FailedTransferPolicy::Abort)
+            .events(sink)
+            .initiate()
+            .expect("initiate upload_objects");
+
+        let _ = handle.join().await;
+
+        // Collect every terminal with the key it names. `Settled` repeats the `TransferRef`
+        // precisely so no side map is needed here.
+        let mut cancelled_keys: Vec<String> = Vec::new();
+        let mut succeeded_keys: Vec<String> = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            match stream.try_next() {
+                Ok(TransferEvent::Settled {
+                    transfer, outcome, ..
+                }) => {
+                    let key = match transfer.destination() {
+                        Endpoint::S3 { key, .. } => key.to_string(),
+                        _ => continue,
+                    };
+                    match outcome {
+                        Outcome::Cancelled { .. } => cancelled_keys.push(key),
+                        Outcome::Succeeded { .. } => succeeded_keys.push(key),
+                        _ => {}
+                    }
+                }
+                Ok(_) => continue,
+                Err(aws_sdk_s3_transfer_manager::events::TryNextError::Empty) => {
+                    if tokio::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(_) => break,
+            }
+        }
+
+        // The property. A cancelled entry must not exist in the bucket.
+        let mut committed_but_cancelled = Vec::new();
+        for key in &cancelled_keys {
+            if m.server
+                .object_exists(bucket, key)
+                .await
+                .expect("object_exists")
+            {
+                committed_but_cancelled.push(key.clone());
+            }
+        }
+
+        assert!(
+            committed_but_cancelled.is_empty(),
+            "these objects are committed in S3 but their entry reported Cancelled, so a \
+             delete-on-success consumer keeps their sources: {committed_but_cancelled:?} \
+             (of {} cancelled, {} succeeded)",
+            cancelled_keys.len(),
+            succeeded_keys.len()
+        );
+
+        // And the converse, so the test cannot pass by reporting nothing at all.
+        for key in &succeeded_keys {
+            assert!(
+                m.server
+                    .object_exists(bucket, key)
+                    .await
+                    .expect("object_exists"),
+                "{key} reported Succeeded but is not in the bucket"
+            );
+        }
+
+        m.handle.shutdown().await.expect("shutdown");
+    })
+    .await
+    .expect("test_upload_objects_abort_never_reports_a_committed_object_as_cancelled timed out");
+}
+
+/// An entry that cannot be prepared still settles, so the entry bar reaches its total.
+///
+/// `claim_one` pops the entry, records the failure in `state.failed`, and continues. It
+/// never becomes a child, so neither a reap nor `finish_root`'s orphan drain can settle
+/// it — while the walker's batch already counted it into `entry_total()`. The gap is
+/// permanent and consumer-visible: `entry_total()` seals at `Final(N+1)`, `entries_settled()`
+/// stops at `N`, and a caller rendering the difference shows `1 file(s) remaining` forever
+/// after `join()` returned `Ok`.
+///
+/// Asserted on the stream as well as on the counters. The count alone would pass if the
+/// entry were counted without being reported, which is the same defect seen from the other
+/// side: `state.failed` says one thing and the event stream says another about how many
+/// objects the operation had.
+///
+/// Drives the key-derivation arm, which a custom delimiter makes deterministic. The
+/// `InputStream` arm beside it has no portable trigger — it shares `settle_unprepared_entry`
+/// with this arm rather than having its own coverage.
+#[tokio::test]
+async fn test_upload_objects_an_unpreparable_entry_still_settles() {
+    use aws_sdk_s3_transfer_manager::events::{Endpoint, Outcome, TransferEvent};
+    use aws_sdk_s3_transfer_manager::types::{EntryTotal, FailedTransferPolicy};
+
+    timeout(TEST_TIMEOUT, async {
+        let m = setup().await;
+
+        // `make_flat_dataset` names files `NNNN.bin`, none of which contain the
+        // delimiter below, so exactly one entry of the walk fails to derive a key.
+        let good = 6usize;
+        let dataset = make_flat_dataset(good, 64);
+        std::fs::write(dataset.path().join("bad-name.bin"), vec![0u8; 64]).expect("write");
+        let entries = good + 1;
+
+        let (sink, mut stream) = aws_sdk_s3_transfer_manager::events::channel(
+            std::num::NonZeroUsize::new(4 * (entries + 2)).expect("capacity > 0"),
+        );
+
+        let handle = m
+            .client
+            .upload_objects()
+            .bucket("test-bucket")
+            .source(dataset.path())
+            .key_prefix("unprepared/")
+            // "bad-name.bin" contains the delimiter, so `derive_object_key` rejects it.
+            .delimiter("-")
+            .failure_policy(FailedTransferPolicy::Continue)
+            .events(sink)
+            .initiate()
+            .expect("initiate upload_objects");
+
+        let collector = tokio::spawn(async move {
+            let mut root = None;
+            let mut settled = 0usize;
+            let mut unresolved_failures: Vec<String> = Vec::new();
+            while let Some(ev) = stream.next().await {
+                match ev {
+                    TransferEvent::Decided {
+                        parent: None, view, ..
+                    } => root = view,
+                    TransferEvent::Settled {
+                        parent: Some(_),
+                        transfer,
+                        outcome,
+                        ..
+                    } => {
+                        settled += 1;
+                        // A key that never derived has no destination to name, so
+                        // `Unresolved` is how this entry is distinguishable on the stream.
+                        if matches!(outcome, Outcome::Failed { .. })
+                            && matches!(transfer.destination(), Endpoint::Unresolved { .. })
+                        {
+                            if let Endpoint::Local { path, .. } = transfer.source() {
+                                unresolved_failures.push(path.to_string_lossy().to_string());
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            (root, settled, unresolved_failures)
+        });
+
+        let output = handle.join().await.expect("Continue policy returns Ok");
+        let (root, settled, unresolved_failures) = collector.await.expect("collector");
+
+        assert_eq!(
+            good as u64,
+            output.objects_uploaded(),
+            "the six derivable files upload; only the seventh entry fails to prepare"
+        );
+        assert_eq!(
+            1,
+            output.failed_transfers().len(),
+            "and the unpreparable entry is in the failure bucket"
+        );
+
+        assert_eq!(
+            1,
+            unresolved_failures.len(),
+            "the unpreparable entry must reach the stream as a failed terminal with an \
+             unresolved destination; got {unresolved_failures:?}"
+        );
+        assert!(
+            unresolved_failures[0].ends_with("bad-name.bin"),
+            "and it must name the file that could not be prepared, not some other entry: {}",
+            unresolved_failures[0]
+        );
+        assert_eq!(
+            entries, settled,
+            "one terminal per enumerated entry, including the one that never became a child"
+        );
+
+        let root = root.expect("the root is announced with a view when a sink is attached");
+        assert_eq!(
+            EntryTotal::Final(entries as u64),
+            root.entry_total(),
+            "the walk finished, so every entry it produced is in the denominator"
+        );
+        assert_eq!(
+            entries as u64,
+            root.entries_settled(),
+            "the numerator reaches it: a short count renders as `1 file(s) remaining` on a \
+             transfer whose `join()` already returned"
+        );
+
+        m.handle.shutdown().await.expect("shutdown");
+    })
+    .await
+    .expect("test_upload_objects_an_unpreparable_entry_still_settles timed out");
 }
