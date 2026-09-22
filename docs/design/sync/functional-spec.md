@@ -146,28 +146,50 @@ folder shows up in the browser — MUST be invisible to sync on both sides: neve
 deleted, never treated as a directory.
 *`[CLI]` `filegenerator.py` → `FileGenerator.list_objects` yields such keys only when `operation_name == 'delete'`, and sync's reverse generator uses `''`, so markers are filtered on both sides.*
 
-**FR-Enum-3** Walking the local tree MUST skip a single *entry* rather than fail the whole run when
-that entry cannot be transferred or cannot be read, and the two cases MUST be told apart:
+**FR-Enum-3** Walking the local tree MUST skip a single *entry* rather than fail the whole run when that
+entry cannot be transferred, cannot be read, or has no key it could take, and the three cases MUST be
+told apart:
 
 - **Nothing to transfer** — a device (`/dev/null`), a FIFO, or a socket. No setting makes these
   transferable, and reading one may never finish. A warning under either policy. A symlink sync was told
-  not to follow belongs here too (FR-Enum-4), as does a local name that is not valid UTF-8: an S3 object
-  key is Unicode encoded as UTF-8, so there is no key such a name could take.
-
-  Such a name MUST NOT be converted lossily to make a key. Two names differing only in invalid bytes would
-  collapse onto one key, and sync would then treat two files as one. The entry MUST be skipped and named,
-  so a caller can see which file it was.
+  not to follow belongs here too (FR-Enum-4).
 - **Should have been readable and was not** — missing, deleted mid-run, unreadable, or a symlink pointing
   at nothing: a failure, following the global policy (FR-Fail-9).
+- **No key it could take** — a local name that is not valid UTF-8. An S3 object key is Unicode encoded as
+  UTF-8, so no key corresponds to such a name. It MUST be reported as `skipped-with-warning`, naming the
+  file with its invalid bytes escaped. It MUST NOT be converted lossily to make a key: two names
+  differing only in invalid bytes would collapse onto one, and sync would then treat two files as one.
 
-Neither kind may be dropped silently. If sync left these entries out of the list, anything reading that
-list would conclude the name is unused — and delete whatever sits at the matching name on the other side
+The first two kinds MUST reach the comparison. If sync left them out, anything reading that list would
+conclude the name is unused — and delete whatever sits at the matching name on the other side
 (FR-Fail-7). A FIFO is never transferred, but the fact that *something occupies that name* is what has to
 stop the destination object from being deleted.
 
+The third kind cannot reach it, because occupying a name means holding a key and this entry has none. It
+therefore takes no part in the comparison, and sync MUST NOT hold anything back on its behalf. An object
+written under a key derived lossily from such a name has a source side that is genuinely absent — no local
+file carries that key — so FR-Fail-7's distinction never arises and delete mode (FR-Exec-2) removes it as
+it would any other object with no counterpart.
+
+This library writes such objects today: `upload_objects` derives its key with a lossy conversion, so the
+two operations run against the same pair are in conflict. Uploading a directory writes an object at the
+lossy key, syncing the same directory with delete mode removes it, and sync never replaces it because
+enumeration will not produce a key for the file. The local file is never replicated by sync, and
+alternating the two operations writes and removes the object indefinitely. That cost is accepted here, and
+this requirement is what makes it visible; changing the upload path is out of scope for sync.
+
+A hold was designed before it was rejected. Sync cannot recover which file an object came from, but it can
+bound where that file must be: keys under the same parent whose remaining bytes match the valid part of
+the name, with a replacement character wherever the invalid bytes were. That set contains the object and
+usually little else. It was rejected because the set is reached before the name that defines it —
+enumeration reports a directory's failures only after emitting its entries, so a key inside the set can be
+paired and deleted before the hold exists — and making it timely requires enumeration to report such names
+earlier for every caller. Paying that to protect an object that may correspond to any of several files, or
+to none, costs more than the delete.
+
 This is about one entry at a time. Failing to read an entire directory is a different problem
 (FR-Enum-12).
-*`[ISSUE]` [#487](https://github.com/aws/aws-cli/issues/487) — "S3 sync will exit when a broken symlink are present" (sic) — and its mirror [#425](https://github.com/aws/aws-cli/issues/425), where a filesystem exception makes the CLI "exit silently, and with a non-error (0) exit status", stopping "prematurely … before all files had been sync'ed up". The requirement is skip-and-warn: not skip-and-stop, and not fail. `[CLI]` the two categories are `filegenerator.py` → `is_special_file` versus `is_readable`; a name the filesystem encoding cannot decode is skipped with a warning naming its raw bytes (`should_ignore_file_with_decoding_warnings` → `FileDecodingError`). That check is locale-dependent, which a UTF-8 validity test is not.*
+*`[ISSUE]` [#487](https://github.com/aws/aws-cli/issues/487) — "S3 sync will exit when a broken symlink are present" (sic) — and its mirror [#425](https://github.com/aws/aws-cli/issues/425), where a filesystem exception makes the CLI "exit silently, and with a non-error (0) exit status", stopping "prematurely … before all files had been sync'ed up". The requirement is skip-and-warn: not skip-and-stop, and not fail. `[CLI]` the two categories are `filegenerator.py` → `is_special_file` versus `is_readable`; a name the filesystem encoding cannot decode is skipped with a warning naming its raw bytes (`should_ignore_file_with_decoding_warnings` → `FileDecodingError`). That check is locale-dependent, which a UTF-8 validity test is not. `[TM]` directory upload disagrees across implementations, so an object at a lossily-derived key is something sync will meet: this crate's `upload_objects` and the Java v2 transfer manager both build the key with a lossy conversion, the Go transfer manager passes the raw filename bytes through because a Go string need not be valid UTF-8, and boto3 and the JavaScript SDK have no directory upload at all.*
 
 **FR-Enum-4** Following symlinks MUST be a setting, and MUST default to **not** following them. With
 following turned on, sync transfers what the link points at, filed under the link's own name rather than

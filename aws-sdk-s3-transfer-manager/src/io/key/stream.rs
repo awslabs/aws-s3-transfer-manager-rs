@@ -218,14 +218,7 @@ impl StreamError {
                 | WalkErrorKind::PermissionDenied
                 | WalkErrorKind::BrokenSymlink => KeysLost::OneKey,
             },
-            // One entry, like the devices and sockets it is grouped with, and not a range — losing a
-            // whole directory is a separate case. What it costs is this: the name is taken, and no key
-            // can carry it, so the upload path's lossy derivation may already have put an object
-            // where a walk cannot look. Not `Nothing`, which would license deleting that object.
-            //
-            // The truthful state is narrower than either: the key is occupied and nothing can be
-            // sent for it. Saying so needs an answer beside transfer and skip, which the comparison
-            // owns; until then this is the conservative half of it.
+            // Exactly one name went unaccounted for, and the report names it.
             StreamError::UnkeyableName(_) => KeysLost::OneKey,
             // The object was listed and then dropped, so its key is absent from this side while
             // the keys around it arrived.
@@ -1107,13 +1100,14 @@ mod tests {
     // The reason this layer exists. A source that could not read one subdirectory must not let the
     // destination's keys under that name be deleted: they may still exist on the source, inside the
     // part nobody could see.
-    // One key the source could not describe must not license deleting its counterpart. The name is
-    // taken on both sides; the source simply cannot say what is behind it. A range is not the only
-    // kind of loss that has to hold a delete back.
+    // A key the source could not describe is reported as a loss covering one key, which is what lets
+    // a consumer hold back that key's delete. The name is taken on both sides; the source simply
+    // cannot say what is behind it. What this pins is the report, and the coarse consumer above acting
+    // on it — whether sync holds one key or a stretch is decided and tested in `sync::Walk`.
     #[cfg(unix)]
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
-    async fn one_lost_key_on_the_source_holds_back_its_delete() {
+    async fn one_lost_key_on_the_source_is_reported_so_a_delete_can_be_held() {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("a.txt"), "x").unwrap();
         // Followed, and pointing at nothing, so the walk can name it but not describe it.
@@ -1165,7 +1159,7 @@ mod tests {
     #[cfg(unix)]
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
-    async fn a_lost_range_on_the_source_holds_back_every_delete() {
+    async fn a_lost_range_on_the_source_is_reported_as_covering_every_later_key() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempdir().unwrap();
@@ -1256,25 +1250,17 @@ mod tests {
         })
     }
 
-    // A name no key can carry still has an object waiting for it, because the upload path derives
-    // keys with `to_string_lossy` — so this crate writes an object at the lossy key and a later walk
-    // cannot name the file that produced it. Reading that as costing nothing licenses deleting the
-    // object while the file is still there.
     #[tokio::test]
-    async fn a_name_no_key_can_carry_does_not_license_a_delete() {
-        let mut src = Scripted::new(vec![
-            keyed("a.txt"),
-            Err(StreamError::UnkeyableName(PathBuf::from(
-                "/data/caf\u{FFFD}.txt",
-            ))),
-        ]);
-        let mut dest = Scripted::new(vec![keyed("a.txt"), keyed("caf\u{FFFD}.txt")]);
-
-        let (plan, lost) = merge_respecting_loss(&mut src, &mut dest).await;
-        assert!(lost, "a name the walk could not key is a gap: {plan:?}");
+    async fn a_name_no_key_can_carry_costs_one_key_and_names_the_file() {
+        // The walk cannot produce a key for it, so all it can do is say one key's worth went
+        // unaccounted for and which file it was. A range would overstate that: the names around
+        // this one were read normally.
+        let path = PathBuf::from("/data/caf\u{FFFD}.txt");
+        let err = StreamError::UnkeyableName(path.clone());
+        assert_eq!(err.keys_lost(), KeysLost::OneKey);
         assert!(
-            !plan.iter().any(|(_, action)| *action == Action::Delete),
-            "the object at the lossy key must not be deleted: {plan:?}"
+            err.to_string().contains("caf"),
+            "the file has to be identifiable from the report: {err}"
         );
     }
 
@@ -1294,15 +1280,13 @@ mod tests {
                     None => return None,
                     Some(Ok(entry)) => return Some(entry),
                     Some(Err(err)) => match err.keys_lost() {
-                        // Both answers collapse to the same action here. A range is unnameable by
-                        // definition, and one key is unnameable in practice on the local side: the
-                        // failure carries an absolute path, nothing here turns that into a key, and
-                        // it arrives at the position of the directory holding it rather than its
-                        // own. So neither can suppress the delete of just the key that went
-                        // missing, and holding every delete back is the safe reading left. The cost
-                        // is that a key genuinely absent from the source keeps its counterpart too,
-                        // which a per-key mechanism recovers once a failure can name a relative
-                        // key.
+                        // This model collapses both answers, which is the coarsest reading the contract
+                        // allows and deliberately not what sync does. `sync::Walk` holds per key where a
+                        // failure names one and per stretch otherwise, and that policy is tested there,
+                        // against the real merge. What these tests are for is the half the contract owes:
+                        // a failure reports a loss at all, and says whether it covers one key or a
+                        // stretch. A consumer choosing to act on that coarsely is still a consumer that
+                        // could not have been misled.
                         KeysLost::OneKey | KeysLost::UnknownRange => *lost = true,
                     },
                 }

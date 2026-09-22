@@ -193,6 +193,7 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
                             Cost::Key(key) => self.src_lost.push_back(key),
                             Cost::UnnamedKey => self.src_lost_unnamed = true,
                             Cost::Stretch(cost) => self.src_gap = Some(cost),
+                            Cost::Nothing => {}
                         }
                     }
                     return Some(Err(err));
@@ -212,6 +213,7 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
                             Cost::Key(key) => self.dst_lost.push_back(key),
                             Cost::UnnamedKey => self.dst_lost_unnamed = true,
                             Cost::Stretch(cost) => self.dst_gap = Some(cost),
+                            Cost::Nothing => {}
                         }
                     }
                     return Some(Err(err));
@@ -475,9 +477,9 @@ fn let_go_before(lost: &mut VecDeque<String>, key: &str) {
 
 // What a failure the side survived costs the merge.
 //
-// One key where it can be named, and one key held coarsely where it cannot. A listing names the key
-// it dropped; a walk names an absolute path, which becomes a key once the root it sits under is
-// known, and where that fails the side's whole account stays open.
+// Two of these look alike from `keys_lost()` alone, which reports one key for both. The difference
+// is whether a key exists for the merge to answer for: a file nobody could read has one, and naming it is
+// a matter of working out which, where a name no key can carry has none at all.
 #[derive(Debug)]
 enum Cost {
     // One key, and the failure named it. The side holds that key until the merge reaches it,
@@ -488,6 +490,9 @@ enum Cost {
     UnnamedKey,
     // Every key from here to wherever that side speaks next.
     Stretch(KeysLost),
+    // Nothing for the merge to answer for. The name produced no key on this side, so no pairing will
+    // ever ask about it, and holding anything back would hold back a key chosen at random.
+    Nothing,
 }
 
 // A listing says which key it dropped. A walk says which path it could not read, and a path is not
@@ -497,6 +502,9 @@ fn cost_of(err: &StreamError, root: Option<&Path>) -> Cost {
     match err {
         // A listing names the key it dropped, already taken relative to the root.
         StreamError::MalformedListing { key: Some(key), .. } => Cost::Key(key.clone()),
+        // A name no key can carry takes no part in the comparison, so there is no key here to
+        // answer for. What it cost a run shows up as the plan coming out incomplete.
+        StreamError::UnkeyableName(_) => Cost::Nothing,
         // A walk names a path, which is a key only once the root it sits under is known. Three
         // things can stop that: no root was supplied, the error carries no path, or the root and
         // the walk disagree about the path's form — a root left uncanonicalized against a walk
@@ -1151,6 +1159,44 @@ mod tests {
             "got {:?}",
             z.source()
         );
+    }
+
+    // A local name that is not text, so no key could carry it.
+    fn a_name_no_key_can_carry() -> StreamError {
+        StreamError::UnkeyableName(PathBuf::from("/root/photos/caf\u{FFFD}.txt"))
+    }
+
+    #[tokio::test]
+    async fn a_name_no_key_can_carry_holds_nothing_back() {
+        // Such a name never becomes a key, so no pairing ever asks about it and there is nothing
+        // to answer for. Treating the side as unable to account for itself would report every
+        // later key as unknown, suppressing every delete in the run over a key the comparison
+        // never saw.
+        let walk = Walk::new(
+            Scripted::from(vec![Err(a_name_no_key_can_carry()), Ok(entry("a.txt"))]),
+            Scripted::of(&["a.txt", "photos/caf\u{FFFD}.txt", "z.txt"]),
+        );
+        assert_eq!(
+            drain(walk).await,
+            plan(&[
+                ("a.txt", At::Here, At::Here),
+                ("photos/caf\u{FFFD}.txt", At::Gone, At::Here),
+                ("z.txt", At::Gone, At::Here),
+            ]),
+            "the object at the lossy key is an orphan like any other, and later keys compare"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_name_no_key_can_carry_still_leaves_the_plan_incomplete() {
+        // Nothing is held, but a file was not accounted for, so the run cannot claim it covered
+        // everything it was pointed at.
+        let mut walk = Walk::new(
+            Scripted::from(vec![Err(a_name_no_key_can_carry()), Ok(entry("a.txt"))]),
+            Scripted::of(&["a.txt"]),
+        );
+        while walk.next().await.is_some() {}
+        assert!(!walk.is_plan_complete());
     }
 
     #[tokio::test]
