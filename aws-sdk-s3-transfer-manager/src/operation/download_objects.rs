@@ -56,9 +56,10 @@ impl DownloadObjects {
             .map(|n| n.max(1))
             .unwrap_or(super::DEFAULT_MAX_CONCURRENT_CHILDREN);
 
+        // Only the prefix. Folder markers are dropped where the walk is drained, so the rule
+        // holds for a caller-supplied walker too -- see `is_folder_marker`.
         let walker = input.walker().cloned().unwrap_or_else(|| {
-            let mut builder =
-                S3Walker::builder().filter(crate::io::walk::exclude_s3_folder_markers);
+            let mut builder = S3Walker::builder();
             if let Some(prefix) = input.key_prefix() {
                 builder = builder.prefix(prefix);
             }

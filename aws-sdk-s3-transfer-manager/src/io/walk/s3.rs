@@ -77,20 +77,10 @@ impl std::fmt::Debug for S3Walker {
 }
 
 impl Default for S3Walker {
-    /// A default walker that filters out 0-byte folder markers (keys ending in '/').
+    /// An unconfigured walker: whole bucket, no delimiter, no filter, no pagination overrides.
     fn default() -> Self {
-        S3Walker::builder()
-            .filter(exclude_s3_folder_markers)
-            .build()
+        S3Walker::builder().build()
     }
-}
-
-/// Exclude 0-byte objects whose key ends with `/`. These are "folder markers"
-/// created by the S3 console and have no meaningful content to download.
-pub(crate) fn exclude_s3_folder_markers(obj: &Object) -> bool {
-    let dominated_by_slash = obj.key().unwrap_or("").ends_with('/');
-    let is_zero_byte = obj.size().unwrap_or(1) == 0;
-    !(dominated_by_slash && is_zero_byte)
 }
 
 impl S3Walker {

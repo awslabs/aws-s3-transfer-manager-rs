@@ -17,7 +17,9 @@ use super::{DownloadObjectsHandle, DownloadObjectsInputBuilder};
 ///
 /// Walk behavior (prefix, filter, pagination) is configured by supplying a
 /// custom [`S3Walker`] via [`walker`](Self::walker). When not set, a default
-/// walker is used that filters out 0-byte folder markers.
+/// walker is used that applies [`key_prefix`](Self::key_prefix). A supplied
+/// walker replaces that, so it must carry its own prefix. 0-byte folder markers
+/// are dropped either way: the operation excludes them, not the walker.
 #[derive(Debug)]
 pub struct DownloadObjectsFluentBuilder {
     handle: Arc<crate::client::Handle>,
@@ -78,6 +80,17 @@ impl DownloadObjectsFluentBuilder {
     }
 
     /// Limit the response to keys that begin with the given prefix.
+    ///
+    /// This does two jobs: it scopes the listing, and it is stripped from each key to derive the
+    /// local path under the destination. Supplying a custom [`walker`](Self::walker) takes over
+    /// the first job only -- the listing is then whatever the walker enumerates, while the prefix
+    /// continues to be stripped from local paths.
+    ///
+    /// Keep the two in agreement. If the walker lists keys outside the prefix, stripping is no
+    /// longer uniform and two objects can collide on one local path: under `key_prefix("b/")`, key
+    /// `b/a/x` strips to `a/x` while key `a/x` passes through unchanged, and whichever lands second
+    /// wins. The destination-escape guard does not catch this -- both paths are inside the
+    /// destination.
     pub fn key_prefix(mut self, input: impl Into<String>) -> Self {
         self.inner = self.inner.key_prefix(input);
         self
@@ -123,7 +136,34 @@ impl DownloadObjectsFluentBuilder {
         self.inner.get_failure_policy()
     }
 
-    /// Walker configuration (filter, pagination, etc.).
+    /// Walker configuration (prefix, filter, pagination, etc.).
+    ///
+    /// The walker owns the listing: supplying one replaces the default walker, and with it the
+    /// scope that [`key_prefix`](Self::key_prefix) would otherwise set. A walker built without a
+    /// prefix lists the whole bucket even when `key_prefix` is set, so set the prefix on the
+    /// walker as well:
+    ///
+    /// ```no_run
+    /// # use aws_sdk_s3_transfer_manager::io::walk::S3Walker;
+    /// # fn f(client: &aws_sdk_s3_transfer_manager::Client) -> Result<(), Box<dyn std::error::Error>> {
+    /// client
+    ///     .download_objects()
+    ///     .bucket("my-bucket")
+    ///     .destination("/tmp/out")
+    ///     .key_prefix("logs/") // still strips `logs/` from local paths
+    ///     .walker(
+    ///         S3Walker::builder()
+    ///             .prefix("logs/") // and this is what scopes the listing
+    ///             .page_size(100)
+    ///             .build(),
+    ///     )
+    ///     .initiate()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// A [`filter`](crate::io::walk::S3WalkerBuilder::filter) set here is yours alone and needs no
+    /// allowance for folder markers.
     pub fn walker(mut self, input: S3Walker) -> Self {
         self.inner = self.inner.walker(input);
         self

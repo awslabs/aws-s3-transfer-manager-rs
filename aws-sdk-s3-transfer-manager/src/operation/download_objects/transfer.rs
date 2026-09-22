@@ -773,6 +773,13 @@ impl DownloadObjectsTransfer {
         loop {
             match walk.next().await {
                 Some(Ok(obj)) => {
+                    // Applied here rather than as a walker filter, and so it holds for a
+                    // caller-supplied walker too. `S3Walker::filter` replaces nothing and means
+                    // only what it says; a caller narrowing to `*.parquet` cannot re-admit markers
+                    // by accident.
+                    if is_folder_marker(&obj) {
+                        continue;
+                    }
                     chunk.push(obj);
                     discovered += 1;
                     if chunk.len() >= WALK_FLUSH_CHUNK {
@@ -930,6 +937,30 @@ impl Transfer for DownloadObjectsTransfer {
     }
 
     fn on_terminal(&self) {}
+}
+
+/// A 0-byte object whose key ends with `/`: a "folder marker", created by the S3 console to make
+/// an empty prefix visible.
+///
+/// Not downloadable, which is why this lives with the operation rather than on the walker. The
+/// derived local path for `sub/` is `<dest>/sub`, the directory `sub/b.bin` needs, so the write
+/// fails with `EISDIR` and the default [`FailedTransferPolicy::Abort`] takes the whole operation
+/// down. Which of the pair fails depends on listing order, so the failure is non-deterministic too.
+///
+/// Expressing it as a walker filter instead put it behind [`S3Walker::filter`], which *replaces*:
+/// any caller setting a predicate of their own silently dropped it and walked into that crash.
+///
+/// Both conditions are required. A `/`-terminated key *with* a body is a real object and is kept;
+/// only the empty ones are markers. `size()` is `Option<i64>` because the model allows absence, not
+/// because S3 omits it -- a real `ListObjectsV2` returns `Size: 0` for a marker -- so `unwrap_or(1)`
+/// treats an absent size as "not a marker" and keeps the object.
+///
+/// [`FailedTransferPolicy::Abort`]: crate::types::FailedTransferPolicy::Abort
+/// [`S3Walker::filter`]: crate::io::walk::S3WalkerBuilder::filter
+fn is_folder_marker(obj: &Object) -> bool {
+    let key_ends_with_delimiter = obj.key().unwrap_or("").ends_with('/');
+    let is_zero_byte = obj.size().unwrap_or(1) == 0;
+    key_ends_with_delimiter && is_zero_byte
 }
 
 fn strip_key_prefix<'a>(key: &'a str, prefix: Option<&str>, delimiter: Option<&str>) -> &'a str {

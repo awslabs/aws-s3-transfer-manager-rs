@@ -764,3 +764,166 @@ async fn test_upload_then_download_objects_roundtrip_mock_gp() {
 async fn test_upload_then_download_objects_roundtrip_tokio_mt() {
     test_upload_then_download_objects_roundtrip(RuntimeMode::MultiThreadTokio).await;
 }
+
+/// A caller-supplied walker must still exclude 0-byte folder markers.
+///
+/// Verified against a real bucket: the marker `markers/sub/` derives the local path `<dest>/sub`,
+/// which is the directory `markers/sub/b.bin` already created, so the write fails with `EISDIR` and
+/// the default `FailedTransferPolicy::Abort` takes the whole operation down -- exit 1, four of five
+/// objects on disk. Which of the pair fails depends on listing order, so the failure is
+/// non-deterministic too.
+///
+/// The exclusion belongs to the operation rather than the walker, which is what makes it survive a
+/// supplied walker. `markers/notamarker/` pins the other half: a `/`-terminated key *with* a body is
+/// a real object and must still download, so the rule cannot be simplified to a key-suffix test.
+#[tokio::test]
+async fn test_download_objects_custom_walker_still_excludes_folder_markers() {
+    timeout(TEST_TIMEOUT, async {
+        let m = mock_tm(RuntimeMode::Managed).await;
+        let bucket = "test-bucket";
+        m.server.create_bucket(bucket).await.expect("create bucket");
+
+        for (key, body) in [
+            ("markers/a.bin", vec![1u8; 128]),
+            ("markers/sub/b.bin", vec![2u8; 128]),
+            // Console-style folder markers: 0 bytes, key ends with the delimiter.
+            ("markers/sub/", Vec::new()),
+            ("markers/emptydir/", Vec::new()),
+            // Ends with the delimiter but is not empty, so it is not a marker.
+            ("markers/notamarker/", vec![3u8; 128]),
+        ] {
+            m.server
+                .add_object(bucket, key, body, None)
+                .await
+                .expect("seed object");
+        }
+
+        let dest = tempfile::tempdir().expect("tempdir");
+        let handle = m
+            .client
+            .download_objects()
+            .bucket(bucket)
+            .destination(dest.path())
+            .key_prefix("markers/")
+            // Both are required: the prefix because a supplied walker owns the listing, and
+            // `page_size` because pagination is the reason to supply one at all.
+            .walker(S3Walker::builder().prefix("markers/").page_size(2).build())
+            .initiate()
+            .expect("initiate download_objects");
+
+        let output = handle
+            .join()
+            .await
+            .expect("a folder marker must not fail the operation");
+
+        assert!(
+            output.failed_transfers().is_empty(),
+            "no child may fail: {:?}",
+            output.failed_transfers()
+        );
+        assert_eq!(
+            3,
+            output.objects_downloaded(),
+            "the two 0-byte markers are excluded; `notamarker/` is not a marker and stays"
+        );
+        assert_eq!(
+            3,
+            count_files(dest.path()),
+            "and only those three land on disk"
+        );
+        assert!(
+            dest.path().join("sub").is_dir(),
+            "`sub` must stay the directory `sub/b.bin` needs, not a 0-byte file"
+        );
+        assert!(
+            !dest.path().join("emptydir").exists(),
+            "a marker must not materialize as an empty file"
+        );
+        assert_eq!(
+            vec![3u8; 128],
+            std::fs::read(dest.path().join("notamarker")).expect("read notamarker"),
+            "a non-empty `/`-terminated key is a real object and must download intact"
+        );
+
+        m.handle.shutdown().await.expect("shutdown");
+    })
+    .await
+    .expect("test_download_objects_custom_walker_still_excludes_folder_markers timed out");
+}
+
+/// A caller's own `filter` must not re-admit folder markers.
+///
+/// This is the case that decided where the exclusion lives. `S3Walker::filter` replaces nothing and
+/// means only what it says, so a caller narrowing the listing writes a predicate about their own
+/// business -- and any predicate broad enough to keep real keys also keeps `sub/`. As a walker-level
+/// default the exclusion was removable by setting a filter at all, and the run then hit the `EISDIR`
+/// abort the default existed to prevent. Dropping markers where the walk is drained puts them out of
+/// a predicate's reach.
+#[tokio::test]
+async fn test_download_objects_a_caller_filter_cannot_re_admit_folder_markers() {
+    timeout(TEST_TIMEOUT, async {
+        let m = mock_tm(RuntimeMode::Managed).await;
+        let bucket = "test-bucket";
+        m.server.create_bucket(bucket).await.expect("create bucket");
+
+        for (key, body) in [
+            ("keep/a.bin", vec![1u8; 128]),
+            ("keep/sub/b.bin", vec![2u8; 128]),
+            ("keep/sub/", Vec::new()),
+            ("keep/emptydir/", Vec::new()),
+        ] {
+            m.server
+                .add_object(bucket, key, body, None)
+                .await
+                .expect("seed object");
+        }
+
+        let dest = tempfile::tempdir().expect("tempdir");
+        let handle = m
+            .client
+            .download_objects()
+            .bucket(bucket)
+            .destination(dest.path())
+            .key_prefix("keep/")
+            // Deliberately permissive: it admits the markers too. A caller writing
+            // `|o| o.key().is_some_and(|k| k.ends_with(".parquet"))` would exclude them by luck;
+            // this one does not, which is what makes the assertion mean something.
+            .walker(
+                S3Walker::builder()
+                    .prefix("keep/")
+                    .filter(|o| o.key().unwrap_or_default().starts_with("keep/"))
+                    .build(),
+            )
+            .initiate()
+            .expect("initiate download_objects");
+
+        let output = handle
+            .join()
+            .await
+            .expect("a caller filter must not reintroduce the EISDIR abort");
+
+        assert!(
+            output.failed_transfers().is_empty(),
+            "no child may fail: {:?}",
+            output.failed_transfers()
+        );
+        assert_eq!(
+            2,
+            output.objects_downloaded(),
+            "only the two real objects; the caller's filter admitted the markers and the \
+             operation dropped them anyway"
+        );
+        assert!(
+            dest.path().join("sub").is_dir(),
+            "`sub` must stay the directory `sub/b.bin` needs, not a 0-byte file"
+        );
+        assert!(
+            !dest.path().join("emptydir").exists(),
+            "a marker must not materialize as an empty file"
+        );
+
+        m.handle.shutdown().await.expect("shutdown");
+    })
+    .await
+    .expect("test_download_objects_a_caller_filter_cannot_re_admit_folder_markers timed out");
+}
