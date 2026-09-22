@@ -14,4 +14,5 @@
 // out of its reach.
 
 pub(crate) mod compare;
+pub(crate) mod modes;
 pub(crate) mod walk;

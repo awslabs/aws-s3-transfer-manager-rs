@@ -41,6 +41,13 @@ impl Decision {
         })
     }
 
+    // The destination already holds this key and the mode refuses to write over one.
+    pub(crate) fn skip_destination_exists() -> Self {
+        Self::Skip(Skip {
+            cause: Cause::DestinationExists,
+        })
+    }
+
     // A mode asked to be called again and nothing here does that.
     pub(crate) fn skip_deferred() -> Self {
         Self::Skip(Skip {
@@ -93,6 +100,7 @@ pub(crate) struct Skip {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Cause {
     Unchanged,
+    DestinationExists,
     Deferred,
     Unknown(KeysLost),
     Obstructed(Obstruction),
@@ -102,6 +110,7 @@ impl Skip {
     pub(crate) fn reason(&self) -> SkipReason {
         match self.cause {
             Cause::Unchanged => SkipReason::Unchanged,
+            Cause::DestinationExists => SkipReason::DestinationExists,
             Cause::Deferred => SkipReason::Deferred,
             Cause::Unknown(_) => SkipReason::Unknown,
             Cause::Obstructed(_) => SkipReason::Obstructed,
@@ -113,7 +122,10 @@ impl Skip {
         match self.cause {
             Cause::Unknown(lost) => Some(lost),
             // Spelled out, so a cause added later has to say whether it lost keys.
-            Cause::Unchanged | Cause::Deferred | Cause::Obstructed(_) => None,
+            Cause::Unchanged
+            | Cause::DestinationExists
+            | Cause::Deferred
+            | Cause::Obstructed(_) => None,
         }
     }
 
@@ -121,7 +133,9 @@ impl Skip {
     pub(crate) fn obstruction(&self) -> Option<Obstruction> {
         match self.cause {
             Cause::Obstructed(obstruction) => Some(obstruction),
-            Cause::Unchanged | Cause::Deferred | Cause::Unknown(_) => None,
+            Cause::Unchanged | Cause::DestinationExists | Cause::Deferred | Cause::Unknown(_) => {
+                None
+            }
         }
     }
 }
@@ -156,6 +170,9 @@ pub(crate) enum SkipReason {
     // cannot be read where it sits. Which one is on the skip itself. The name being occupied is
     // what keeps the matching key on the other side from being deleted.
     Obstructed,
+    // The destination already holds this key, and the mode deciding refuses to write over one.
+    // Separate from `Unchanged` because the two sides were never compared.
+    DestinationExists,
     // A mode asked to be called again. Every mode shipped here answers immediately, so a run
     // that reaches this has a mode promising more than the plan can carry out.
     Deferred,
@@ -235,6 +252,18 @@ pub(crate) trait Compare<S, D> {
     fn compare_described(&self, source: Described<'_, S>, destination: Described<'_, D>)
         -> Verdict;
 
+    // What to answer where nothing is in the way and a field went unread.
+    //
+    // Sending it is right for a mode reading both fields, since one of them is missing and
+    // nothing can show the two sides match. The entries come along because a mode reading only
+    // one field may still have what it needs: a size comparison is unaffected by a timestamp
+    // nobody could read. A mode refusing to write over a key the destination holds answers
+    // without reading either.
+    fn compare_undescribed(&self, source: &Entry<S>, destination: &Entry<D>) -> Verdict {
+        let _ = (source, destination);
+        Verdict::decided(Decision::transfer(TransferReason::Undescribable))
+    }
+
     // Every case a mode has no say over.
     //
     // Each has one correct answer for all modes, and three of them fail quietly when a mode
@@ -273,10 +302,10 @@ pub(crate) trait Compare<S, D> {
                         (Some(source), Some(destination)) => {
                             return self.compare_described(source, destination)
                         }
-                        // A field nobody read cannot show a match, so the key is sent. A side
-                        // that can never describe an entry sends it every run, which is the safe
-                        // direction of the two.
-                        _ => Decision::transfer(TransferReason::Undescribable),
+                        // A field nobody read cannot show a match. What to do about that is the
+                        // mode's to say, and every mode but `NoOverwrite` answers by sending the
+                        // key.
+                        _ => return self.compare_undescribed(source, destination),
                     }
                 }
             }
