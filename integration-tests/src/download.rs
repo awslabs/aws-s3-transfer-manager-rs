@@ -893,3 +893,228 @@ async fn test_concurrent_disk_downloads_under_tight_budget_do_not_wedge_tokio_mt
     test_concurrent_disk_downloads_under_tight_budget_do_not_wedge(RuntimeMode::MultiThreadTokio)
         .await;
 }
+
+/// `bytes_streamed` is wired to the one shared body loop, and conserves.
+///
+/// This is Aaron's `bytes_in_flight` item: `network_rx` is recorded once per *part*, so a
+/// single-part transfer shows nothing between 0 and done, and at the 5 MiB download default
+/// most small-file transfers are single-part — precisely where a per-file progress line is
+/// read. `bytes_streamed` advances per chunk on the body-read path instead, so a consumer has
+/// a numerator that moves inside a part.
+///
+/// Asserted here: conservation at completion. Every streamed byte is a received byte and
+/// vice versa, across a multi-part download, which is what rules out the two ways the hook
+/// can be wrong — counting a chunk twice (the loop runs per chunk and per part), or missing
+/// the discovery path (`read_body_stream` serves both, so a hook placed in the caller rather
+/// than the loop would cover only one).
+///
+/// **Not asserted: that a reading is visible mid-part.** That needs a body delivered slower
+/// than the sampler ticks, and the mock's only throttle sheds requests with a 503 rather than
+/// rate-limiting a body. So the intra-part *visibility* this feature exists for is reasoned
+/// from the hook site, not observed — the honest label is assumed, where conservation is
+/// verified.
+#[tokio::test]
+async fn test_download_bytes_streamed_conserves_against_network_rx() {
+    use aws_sdk_s3_transfer_manager::events::TransferEvent;
+    use std::time::Duration;
+
+    let size = 16 * ByteUnit::Mebibyte.as_bytes_usize();
+    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let m = setup_concurrent(part_size, 8).await;
+    m.server
+        .add_object(
+            "test-bucket",
+            "streamed-key",
+            deterministic_data(size),
+            None,
+        )
+        .await
+        .expect("add object");
+
+    let (sink, mut stream) = aws_sdk_s3_transfer_manager::events::channel(
+        std::num::NonZeroUsize::new(8).expect("capacity > 0"),
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let handle = m
+        .client
+        .download()
+        .bucket("test-bucket")
+        .key("streamed-key")
+        .events(sink)
+        .write_to_path(dir.path().join("out.bin"))
+        .await
+        .expect("write_to_path");
+
+    handle.join().await.expect("join download");
+
+    let mut view = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while view.is_none() && tokio::time::Instant::now() < deadline {
+        match stream.try_next() {
+            Ok(TransferEvent::Decided { view: Some(v), .. }) => view = Some(v),
+            Ok(_) => continue,
+            Err(aws_sdk_s3_transfer_manager::events::TryNextError::Empty) => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(_) => break,
+        }
+    }
+    let view = view.expect("a real transfer owes a view");
+    let metrics = view.metrics();
+
+    assert_eq!(
+        size as u64, metrics.network_rx,
+        "the confirmed numerator must reach the payload"
+    );
+    assert_eq!(
+        metrics.network_rx, metrics.bytes_streamed,
+        "every streamed byte is a received byte on a run with no retries: \
+         streamed {} against received {}",
+        metrics.bytes_streamed, metrics.network_rx
+    );
+
+    m.handle.shutdown().await.expect("shutdown");
+}
+
+/// `bytes_streamed` stays 0 for an upload, so a caller cannot read it as a generic numerator.
+///
+/// The counter is fed from the download body-read loop only. An upload's payload leaves
+/// through `network_tx`, and a caller that added `bytes_streamed` to a bar would double-count
+/// if this ever became non-zero without the doc changing with it.
+#[tokio::test]
+async fn test_upload_leaves_bytes_streamed_at_zero() {
+    use aws_sdk_s3_transfer_manager::events::TransferEvent;
+    use aws_sdk_s3_transfer_manager::io::InputStream;
+    use std::time::Duration;
+
+    let size = 16 * ByteUnit::Mebibyte.as_bytes_usize();
+    let m = setup().await;
+
+    let (sink, mut stream) = aws_sdk_s3_transfer_manager::events::channel(
+        std::num::NonZeroUsize::new(8).expect("capacity > 0"),
+    );
+    let handle = m
+        .client
+        .upload()
+        .bucket("test-bucket")
+        .key("streamed-upload-key")
+        .body(InputStream::from(vec![3u8; size]))
+        .events(sink)
+        .initiate()
+        .expect("initiate");
+
+    handle.join().await.expect("join upload");
+
+    let mut view = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while view.is_none() && tokio::time::Instant::now() < deadline {
+        match stream.try_next() {
+            Ok(TransferEvent::Decided { view: Some(v), .. }) => view = Some(v),
+            Ok(_) => continue,
+            Err(aws_sdk_s3_transfer_manager::events::TryNextError::Empty) => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(_) => break,
+        }
+    }
+    let metrics = view.expect("a real transfer owes a view").metrics();
+
+    assert_eq!(
+        size as u64, metrics.network_tx,
+        "the upload numerator must reach the payload"
+    );
+    assert_eq!(
+        0, metrics.bytes_streamed,
+        "bytes_streamed is a download counter and must stay 0 for an upload"
+    );
+
+    m.handle.shutdown().await.expect("shutdown");
+}
+
+/// A stalled download says *why* it is stalled.
+///
+/// This is Aaron's `StallReason` item. Byte counters cannot answer it: a bar sitting still
+/// looks identical whether the consumer stopped reading, the memory budget is full, or the
+/// listing has not returned — and the first is the caller's own doing, which is the one case
+/// they can fix.
+///
+/// The case exercised is the one a caller actually causes: initiate a download and never read
+/// the body. Prefetch fills the read-ahead window, the gate closes, and the transfer parks. A
+/// consumer polling the view then reads `ReadAheadWindow` rather than a still bar with no
+/// explanation.
+#[tokio::test]
+async fn test_download_stalled_on_read_ahead_reports_the_reason() {
+    use aws_sdk_s3_transfer_manager::events::TransferEvent;
+    use aws_sdk_s3_transfer_manager::types::StallReason;
+    use std::time::Duration;
+
+    // The window must close *before* every range is issued, or the transfer parks on
+    // `AwaitingCompletion` first and the read-ahead gate is never reached — which is what a
+    // first version of this test observed at 8 parts with concurrency 8. So: many parts, a
+    // window of 2, and concurrency below the part count.
+    let size = 40 * ByteUnit::Mebibyte.as_bytes_usize();
+    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let m = mock_tm_with(RuntimeMode::Managed, |b| {
+        b.part_size(PartSize::Target(part_size as u64))
+            .concurrency(ConcurrencyMode::Explicit(2))
+            .read_ahead(aws_sdk_s3_transfer_manager::types::ReadAhead::Parts(2))
+    })
+    .await;
+    m.server
+        .add_object("test-bucket", "stall-key", deterministic_data(size), None)
+        .await
+        .expect("add object");
+
+    let (sink, mut stream) = aws_sdk_s3_transfer_manager::events::channel(
+        std::num::NonZeroUsize::new(8).expect("capacity > 0"),
+    );
+    // Deliberately not joined and the body deliberately not drained: the handle is held so
+    // the transfer stays alive while parked.
+    let _handle = m
+        .client
+        .download()
+        .bucket("test-bucket")
+        .key("stall-key")
+        .events(sink)
+        .initiate()
+        .expect("initiate");
+
+    let mut view = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while view.is_none() && tokio::time::Instant::now() < deadline {
+        match stream.try_next() {
+            Ok(TransferEvent::Decided { view: Some(v), .. }) => view = Some(v),
+            Ok(_) => continue,
+            Err(aws_sdk_s3_transfer_manager::events::TryNextError::Empty) => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(_) => break,
+        }
+    }
+    let view = view.expect("a real transfer owes a view");
+
+    // Poll until the transfer parks. It has to issue and fill the window first, so the
+    // reason is not available on the first reading.
+    let mut seen = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        if let Some(reason) = view.stall_reason() {
+            seen = Some(reason);
+            // `matches!` with `{ .. }`, not `==`: every `StallReason` variant is
+            // `#[non_exhaustive]`, so an external crate cannot construct one to compare
+            // against — it matches instead. This is the shape a real consumer writes.
+            if matches!(reason, StallReason::ReadAheadWindow { .. }) {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    assert!(
+        matches!(seen, Some(StallReason::ReadAheadWindow { .. })),
+        "a download whose body is never read must report the read-ahead window as the reason \
+         it stopped, not an unexplained still bar; got {seen:?}"
+    );
+
+    m.handle.shutdown().await.expect("shutdown");
+}

@@ -424,6 +424,40 @@ pub(crate) struct MetricsState {
     network_rx: AtomicU64,
     disk_read: AtomicU64,
     disk_write: AtomicU64,
+    /// Payload bytes read off a socket, counted as each chunk arrives rather than at
+    /// confirmed success.
+    ///
+    /// Exists because `network_rx` is recorded once per *part*, so a single-part transfer
+    /// moves 0 → done with nothing in between — and at the 5 MiB download default that is
+    /// most of a small-file workload, which is exactly where a per-file progress line is
+    /// read. This counter moves during the body read, so a consumer has a numerator that
+    /// advances inside a part.
+    ///
+    /// **Monotonic and never decremented, which is what makes it correct under
+    /// cancellation.** The alternative — add on read, subtract on confirm-or-fail — cannot
+    /// be made leak-free here: both body-read sites run inside a `retry::retry` closure with
+    /// hedging enabled, so the losing attempt's future is *dropped* mid-read and no release
+    /// path on it ever runs. Every dropped hedge would strand its partial bytes in the
+    /// counter, and the strand rolls up to the parent, so a directory transfer would report
+    /// phantom in-flight bytes that never clear.
+    ///
+    /// The cost of that choice: a retried or hedged attempt's partial bytes are counted and
+    /// never removed, so this can exceed the payload actually received, and after a retry it
+    /// can exceed `total_bytes`. It is an optimistic numerator for smoothing, never an
+    /// accounting figure — `network_rx` remains the exact one.
+    bytes_streamed: AtomicU64,
+    /// Why this transfer produced no work on its most recent poll, as a
+    /// [`StallReason`](crate::types::StallReason) discriminant; 0 for "not stalled".
+    ///
+    /// Not rolled up to the parent, unlike every byte counter here: a composite's own poll
+    /// parks for its own reasons, and inheriting a child's reason would report a directory as
+    /// read-ahead-blocked because one of nine hundred objects is.
+    ///
+    /// Lives here rather than beside the wake flag because [`TransferView`] already carries an
+    /// `Arc<MetricsState>` and carries nothing else, and because the wake flag's `pending` bit
+    /// is consumed by a destructive swap — a reader that peeked at it would race the
+    /// scheduler's wake.
+    stall: AtomicU8,
     /// Running sum of the payload sizes of the entries enumerated so far, for a
     /// composite; always 0 for a leaf, which learns its total in one piece.
     ///
@@ -468,6 +502,8 @@ impl MetricsState {
             network_rx: AtomicU64::new(0),
             disk_read: AtomicU64::new(0),
             disk_write: AtomicU64::new(0),
+            bytes_streamed: AtomicU64::new(0),
+            stall: AtomicU8::new(0),
             discovered_bytes: AtomicU64::new(0),
             discovered_entries: AtomicU64::new(0),
             settled_entries: AtomicU64::new(0),
@@ -498,6 +534,56 @@ impl MetricsState {
             m.disk_read.fetch_add(sample.disk_read, Ordering::Relaxed);
             m.disk_write.fetch_add(sample.disk_write, Ordering::Relaxed);
             cur = m.parent.as_deref();
+        }
+    }
+
+    /// Record payload bytes read off a socket, into this transfer and every composite above
+    /// it.
+    ///
+    /// Separate from [`record_io`](Self::record_io) and deliberately not folded into
+    /// `IoSample`: every other counter there is recorded once per part at confirmed success,
+    /// and this one is recorded per chunk on the body-read path. Sharing the sample type
+    /// would mean every existing call site had to pass a zero for a field whose recording
+    /// discipline is not theirs, and one that forgot would silently report streamed bytes it
+    /// never saw.
+    ///
+    /// Never feeds `IOWindow` or the adaptive concurrency controller: those sample
+    /// confirmed-success bytes deliberately, and mixing in a counter that overcounts under
+    /// retry would make the goodput signal optimistic exactly when the link is worst.
+    pub(crate) fn record_bytes_streamed(&self, n: u64) {
+        let mut cur = Some(self);
+        while let Some(m) = cur {
+            m.bytes_streamed.fetch_add(n, Ordering::Relaxed);
+            cur = m.parent.as_deref();
+        }
+    }
+
+    /// Record why this transfer produced no work, or clear it with `None`.
+    ///
+    /// Written on every poll by the operation's `poll_work` — cleared at entry, set again if
+    /// that poll parks — so the value describes the most recent poll and cannot go stale while
+    /// the transfer is running.
+    pub(crate) fn set_stall(&self, reason: Option<crate::types::StallReason>) {
+        use crate::types::StallReason as R;
+        let code = match reason {
+            None => 0u8,
+            Some(R::ReadAheadWindow {}) => 1,
+            Some(R::MemoryBudget {}) => 2,
+            Some(R::PendingDiscovery {}) => 3,
+            Some(R::AwaitingCompletion {}) => 4,
+        };
+        self.stall.store(code, Ordering::Relaxed);
+    }
+
+    /// Why this transfer last produced no work, if it did not.
+    pub(crate) fn stall_reason(&self) -> Option<crate::types::StallReason> {
+        use crate::types::StallReason as R;
+        match self.stall.load(Ordering::Relaxed) {
+            1 => Some(R::ReadAheadWindow {}),
+            2 => Some(R::MemoryBudget {}),
+            3 => Some(R::PendingDiscovery {}),
+            4 => Some(R::AwaitingCompletion {}),
+            _ => None,
         }
     }
 
@@ -588,6 +674,7 @@ impl MetricsState {
             network_rx: self.network_rx.load(Ordering::Relaxed),
             disk_read: self.disk_read.load(Ordering::Relaxed),
             disk_write: self.disk_write.load(Ordering::Relaxed),
+            bytes_streamed: self.bytes_streamed.load(Ordering::Relaxed),
             total_bytes: self.total_bytes.get().copied(),
             started_at: self.started_at,
             finished_at: self.finished_at.get().copied(),
@@ -961,10 +1048,25 @@ impl TransferContext {
         self.handle.telemetry.io_counters.record(sample);
     }
 
+    /// Record payload bytes read off a socket, per chunk.
+    ///
+    /// Per-transfer metrics only, and deliberately not `handle.telemetry.io_counters`: those
+    /// counters are the client-wide confirmed-success totals that the goodput signal reads,
+    /// and this counter overcounts under retry.
+    pub(crate) fn record_bytes_streamed(&self, n: u64) {
+        self.metrics.record_bytes_streamed(n);
+    }
+
+    /// Record why this transfer produced no work on this poll, or clear it with `None`.
+    pub(crate) fn set_stall(&self, reason: Option<crate::types::StallReason>) {
+        self.metrics.set_stall(reason);
+    }
+
     /// Set the expected total payload bytes for this transfer.
     pub(crate) fn set_total_bytes(&self, n: u64) {
         self.metrics.set_total_bytes(n);
     }
+
 
     /// Get current transfer status as a public enum.
     pub(crate) fn transfer_status(&self) -> crate::types::TransferStatus {

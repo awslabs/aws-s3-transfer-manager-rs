@@ -327,6 +327,18 @@ pub struct TransferMetrics {
     pub disk_read: u64,
     /// Bytes written to disk.
     pub disk_write: u64,
+    /// Download payload bytes read off a socket, counted per chunk as they arrive rather
+    /// than per part at confirmed success.
+    ///
+    /// Use this when you need a numerator that moves *inside* a part: `network_rx` advances
+    /// once per part, so a single-part transfer shows nothing between 0 and done, and at the
+    /// 5 MiB download default most small-file transfers are single-part.
+    ///
+    /// **An optimistic estimate, not an accounting figure.** Monotonic, but a retried or
+    /// hedged attempt's partial bytes are counted and never removed, so this can exceed
+    /// `network_rx` permanently and can exceed `total_bytes`. Clamp it when rendering, and
+    /// use `network_rx` for any total that has to be right. Always 0 for an upload.
+    pub bytes_streamed: u64,
     /// Expected total payload bytes, if known.
     pub total_bytes: Option<u64>,
     /// When the transfer was initiated.
@@ -374,6 +386,15 @@ impl TransferView {
         self.metrics.snapshot()
     }
 
+    /// Why this transfer produced no work on its most recent poll, if it produced none.
+    ///
+    /// `None` means it produced work, so a reading of `None` is not a promise that bytes are
+    /// moving — only that the transfer was not parked when last asked. See [`StallReason`] for
+    /// which reasons are reported and which two a reader might expect and will not find.
+    pub fn stall_reason(&self) -> Option<StallReason> {
+        self.metrics.stall_reason()
+    }
+
     /// This transfer's byte denominator. See [`ByteTotal`].
     ///
     /// For a single-object transfer this is `Final` as soon as the length is known, and
@@ -415,6 +436,45 @@ impl TransferView {
     pub fn entries_settled(&self) -> u64 {
         self.metrics.entries_settled()
     }
+}
+
+/// Why a transfer is producing no work right now.
+///
+/// Answers *"why is nothing moving"*, which byte counters cannot: a bar sitting still looks
+/// identical whether the consumer has stopped reading, the memory budget is full, or the
+/// listing has not returned. Read it from
+/// [`TransferView::stall_reason`](TransferView::stall_reason); `None` means the transfer
+/// produced work on its most recent poll.
+///
+/// **Currently reported for downloads only.** An upload's park sites are not labelled, so a
+/// stalled upload reports `None` rather than a wrong reason.
+///
+/// Two reasons a reader might expect are deliberately absent. *Consumer backpressure* is not
+/// separate from [`ReadAheadWindow`](StallReason::ReadAheadWindow) here — the read-ahead gate
+/// closes precisely because the consumer has not drained, so they are one mechanism and
+/// splitting them would invite a caller to handle two cases that cannot be distinguished. And
+/// a *concurrency limit* never appears: when the client is at its concurrency target the
+/// scheduler does not poll the transfer at all, so the transfer has no opportunity to report a
+/// reason. That one is a client-wide fact, not a per-transfer one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StallReason {
+    /// The read-ahead window is full: prefetched data is waiting for the caller to read it.
+    /// Issuance resumes when the consumer drains.
+    #[non_exhaustive]
+    ReadAheadWindow {},
+    /// The client's memory budget has no room for another part. Resumes when an in-flight
+    /// part completes and releases its reservation.
+    #[non_exhaustive]
+    MemoryBudget {},
+    /// The initial `GetObject`/`HeadObject` has not returned, so the transfer does not yet
+    /// know what to fetch.
+    #[non_exhaustive]
+    PendingDiscovery {},
+    /// Every range has been issued and the transfer is waiting for the last in-flight
+    /// requests to finish. Not a problem — the normal tail of a transfer.
+    #[non_exhaustive]
+    AwaitingCompletion {},
 }
 
 /// A transfer's expected total payload bytes, and how much to trust it.
