@@ -1791,6 +1791,79 @@ mod tests {
         );
     }
 
+    /// A child that *spawned successfully* into a taken root must settle, not be filed away.
+    ///
+    /// The `Ok` sibling of `announce_child_still_emits_after_the_root_is_taken`, which drives the
+    /// `Err` arm. Both arms choose between `child_lifecycles` and emitting directly, and the
+    /// choice is only correct while the root is live: `finish_root` has already drained that map,
+    /// so an entry inserted afterwards sits in a map nothing reads again and its consumer holds
+    /// per-entry state open forever.
+    ///
+    /// Without this, forcing the branch to always insert leaves every test in the workspace
+    /// green -- the counts stay exact and only the stream is short.
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn a_spawned_child_settles_when_the_root_is_already_taken() {
+        let dest = tempdir().unwrap();
+        let (transfer, _rx) = setup(dest.path(), FailedTransferPolicy::Abort, mock_s3_success());
+
+        let (sink, mut stream) =
+            crate::events::channel(std::num::NonZeroUsize::new(16).expect("capacity > 0"));
+        let root = Arc::new(crate::events::TransferLifecycle::new(
+            sink,
+            transfer.inner.ctx.id.id,
+            None,
+            crate::events::TransferRef::download(
+                crate::events::Endpoint::S3 {
+                    bucket: Arc::from("test-bucket"),
+                    key: Arc::from("p/"),
+                },
+                crate::events::Endpoint::Local {
+                    path: Arc::from(dest.path()),
+                },
+            ),
+            None,
+        ));
+        *transfer.inner.lifecycle.lock() = Some(root);
+
+        let batch_sink = transfer
+            .inner
+            .lifecycle
+            .lock()
+            .as_ref()
+            .map(|r| r.child_sink());
+
+        // A real spawn, so this exercises the `Ok` arm rather than the error one.
+        let spawned = transfer.spawn_single_child(&transfer.inner.ctx.handle, "p/0000.bin", None);
+        assert!(spawned.is_ok(), "the mock S3 client accepts this child");
+
+        // `on_terminal` reaching `finish_root` between the spawn and the announce.
+        drop(transfer.inner.lifecycle.lock().take());
+
+        transfer.announce_child(&spawned, "p/0000.bin", batch_sink.as_ref());
+
+        assert!(
+            transfer.inner.child_lifecycles.lock().is_empty(),
+            "the root is gone, so its orphan drain will never run again -- filing the entry \
+             here loses its terminal"
+        );
+
+        drop(batch_sink);
+        let mut decided = 0;
+        let mut settled = 0;
+        while let Some(ev) = stream.next().await {
+            match ev {
+                crate::events::TransferEvent::Decided { .. } => decided += 1,
+                crate::events::TransferEvent::Settled { .. } => settled += 1,
+            }
+        }
+        assert_eq!(
+            (1, 1),
+            (decided, settled),
+            "announced and settled exactly once; (1, 0) is the entry filed into a drained map"
+        );
+    }
+
     async fn drive_transfer(transfer: &DownloadObjectsTransfer) {
         loop {
             match transfer.poll_work() {

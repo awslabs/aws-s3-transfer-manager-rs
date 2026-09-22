@@ -3326,4 +3326,89 @@ mod tests {
 
         drop(w1);
     }
+    /// A child that *orchestrated successfully* into a taken root must settle, not be filed away.
+    ///
+    /// The `Ok` sibling of `announce_child_still_emits_after_the_root_is_taken`, and the download
+    /// side's twin. Both arms choose between `child_lifecycles` and emitting directly, and the
+    /// choice is only correct while the root is live: `finish_root` has already drained that map,
+    /// so an entry inserted afterwards sits in a map nothing reads again.
+    ///
+    /// Without this, forcing the branch to always insert leaves every test in the workspace green
+    /// -- the counts stay exact and only the stream is short.
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn an_orchestrated_child_settles_when_the_root_is_already_taken() {
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("a.bin");
+        std::fs::write(&src, b"x").unwrap();
+        let (transfer, _rx) = setup(
+            dir.path(),
+            FailedTransferPolicy::Abort,
+            mock_s3_success(),
+            false,
+        );
+
+        let (sink, mut stream) =
+            crate::events::channel(std::num::NonZeroUsize::new(16).expect("capacity > 0"));
+        let root = Arc::new(crate::events::TransferLifecycle::new(
+            sink,
+            transfer.inner.ctx.id.id,
+            None,
+            transfer.child_ref(dir.path(), None),
+            None,
+        ));
+        *transfer.inner.lifecycle.lock() = Some(root);
+
+        let batch_sink = transfer
+            .inner
+            .lifecycle
+            .lock()
+            .as_ref()
+            .map(|r| r.child_sink());
+
+        // A real orchestration, so this drives the `Ok` arm rather than the error one.
+        let stream_body = InputStream::read_from()
+            .path(&src)
+            .metadata(std::fs::metadata(&src).unwrap())
+            .build()
+            .expect("a regular file builds a body");
+        let input = UploadInput::builder()
+            .bucket("test-bucket")
+            .key("a.bin")
+            .body(stream_body)
+            .build()
+            .unwrap();
+        let outcome: OrchestrateOutcome = crate::operation::upload::Upload::orchestrate_child(
+            transfer.inner.ctx.handle.clone(),
+            input,
+            &transfer.inner.ctx,
+        );
+        assert!(outcome.is_ok(), "the mock S3 client accepts this child");
+
+        // `on_terminal` reaching `finish_root` between the orchestrate and the announce.
+        drop(transfer.inner.lifecycle.lock().take());
+
+        transfer.announce_child(&outcome, &src, "a.bin", batch_sink.as_ref());
+
+        assert!(
+            transfer.inner.child_lifecycles.lock().is_empty(),
+            "the root is gone, so its orphan drain will never run again -- filing the entry \
+             here loses its terminal"
+        );
+
+        drop(batch_sink);
+        let mut decided = 0;
+        let mut settled = 0;
+        while let Some(ev) = stream.next().await {
+            match ev {
+                crate::events::TransferEvent::Decided { .. } => decided += 1,
+                crate::events::TransferEvent::Settled { .. } => settled += 1,
+            }
+        }
+        assert_eq!(
+            (1, 1),
+            (decided, settled),
+            "announced and settled exactly once; (1, 0) is the entry filed into a drained map"
+        );
+    }
 }
