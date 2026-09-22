@@ -16,12 +16,12 @@
 
 use std::cmp::Ordering;
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::io::key::filter::KeyFilter;
 use crate::io::key::stream::{
-    local_predicate, s3_predicate, Entry, KeyStream, KeysLost, StreamError,
+    key_under_root, local_predicate, s3_predicate, Entry, KeyStream, KeysLost, StreamError,
 };
 use crate::io::walk::{
     FsWalk, FsWalkContext, FsWalker, S3Walk, S3WalkContext, S3Walker, SortOrder,
@@ -126,6 +126,14 @@ pub(crate) struct Walk<S: KeyStream, D: KeyStream> {
     // root, which arrives with the next change.
     src_lost_unnamed: bool,
     dst_lost_unnamed: bool,
+    // The root a side's paths are taken under, when that side walks a filesystem.
+    //
+    // A walk names the file it could not read by absolute path, and turning that into a key
+    // needs the root it sits under. The stream that reported the failure was handed a walker
+    // which never says what its root is, so the answer comes from here — which is what makes
+    // one lost key nameable at this layer and not a layer down.
+    src_root: Option<PathBuf>,
+    dst_root: Option<PathBuf>,
     // Set when a key went unaccounted for, so a caller can tell a whole plan from a partial
     // one. A run that lost keys and reports a clean plan is one whose caller cannot know it
     // acted on less than it was asked about.
@@ -152,6 +160,8 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
             dst_lost: VecDeque::new(),
             src_lost_unnamed: false,
             dst_lost_unnamed: false,
+            src_root: None,
+            dst_root: None,
             incomplete: false,
             ended_by_failure: false,
         }
@@ -179,7 +189,7 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
                     if self.source.is_done() {
                         self.ended_by_failure = true;
                     } else {
-                        match cost_of(&err) {
+                        match cost_of(&err, self.src_root.as_deref()) {
                             Cost::Key(key) => self.src_lost.push_back(key),
                             Cost::UnnamedKey => self.src_lost_unnamed = true,
                             Cost::Stretch(cost) => self.src_gap = Some(cost),
@@ -198,7 +208,7 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
                     if self.destination.is_done() {
                         self.ended_by_failure = true;
                     } else {
-                        match cost_of(&err) {
+                        match cost_of(&err, self.dst_root.as_deref()) {
                             Cost::Key(key) => self.dst_lost.push_back(key),
                             Cost::UnnamedKey => self.dst_lost_unnamed = true,
                             Cost::Stretch(cost) => self.dst_gap = Some(cost),
@@ -226,6 +236,18 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
                 unreachable!("both heads are filled before they are compared")
             }
         }
+    }
+
+    // The roots the two sides walk, for the sides that walk a filesystem.
+    #[must_use]
+    pub(crate) fn with_roots(
+        mut self,
+        source: Option<PathBuf>,
+        destination: Option<PathBuf>,
+    ) -> Self {
+        self.src_root = source;
+        self.dst_root = destination;
+        self
     }
 
     // Whether every key both sides hold was accounted for.
@@ -385,9 +407,11 @@ impl Walker {
     // function with the two streams swapped. A copy needs a different context first, because one
     // `bucket` field cannot name a source and a destination bucket.
     pub(crate) fn uploading(&self, ctx: WalkContext) -> Walk<FsWalk, S3Walk> {
+        let root = ctx.local_root.clone();
         let local = self.local_walk(ctx.local_root);
         let remote = self.remote_walk(ctx.client, ctx.bucket, ctx.prefix);
-        Walk::new(local, remote)
+        // Only the source walks a filesystem here; a listing names its own lost keys.
+        Walk::new(local, remote).with_roots(Some(root), None)
     }
 
     // The merge depends on all three of these, so this layer fixes them and a caller never
@@ -451,25 +475,46 @@ fn let_go_before(lost: &mut VecDeque<String>, key: &str) {
 
 // What a failure the side survived costs the merge.
 //
-// One key where the side named it, and one key held coarsely where it did not: a walk reports an
-// absolute path, and turning that into a key needs the walk root, which this layer does not hold
-// yet.
+// One key where it can be named, and one key held coarsely where it cannot. A listing names the key
+// it dropped; a walk names an absolute path, which becomes a key once the root it sits under is
+// known, and where that fails the side's whole account stays open.
 #[derive(Debug)]
 enum Cost {
     // One key, and the failure named it. The side holds that key until the merge reaches it,
     // and answers unknown there.
     Key(String),
-    // One key, and which one cannot be worked out here. Every later key on that side has to stay
+    // One key, and which one could not be worked out. Every later key on that side has to stay
     // open, since any of them could be the one that went unread.
     UnnamedKey,
     // Every key from here to wherever that side speaks next.
     Stretch(KeysLost),
 }
 
-fn cost_of(err: &StreamError) -> Cost {
+// A listing says which key it dropped. A walk says which path it could not read, and a path is not
+// a key: turning one into the other needs the walk root, which lives a layer up from the stream
+// that reported it.
+fn cost_of(err: &StreamError, root: Option<&Path>) -> Cost {
     match err {
         // A listing names the key it dropped, already taken relative to the root.
         StreamError::MalformedListing { key: Some(key), .. } => Cost::Key(key.clone()),
+        // A walk names a path, which is a key only once the root it sits under is known. Three
+        // things can stop that: no root was supplied, the error carries no path, or the root and
+        // the walk disagree about the path's form — a root left uncanonicalized against a walk
+        // that resolved it, say. Each one drops back to holding the side's whole account open,
+        // which is safe and much coarser, so it says so.
+        StreamError::Walk(walk) if err.keys_lost() == KeysLost::OneKey => {
+            match root.and_then(|root| walk.path().and_then(|p| key_under_root(root, p))) {
+                Some(key) => Cost::Key(key),
+                None => {
+                    tracing::warn!(
+                        path = ?walk.path(),
+                        root = ?root,
+                        "could not name the lost key, so this side's account stays open for the run"
+                    );
+                    Cost::UnnamedKey
+                }
+            }
+        }
         _ if err.keys_lost() == KeysLost::OneKey => Cost::UnnamedKey,
         _ => Cost::Stretch(err.keys_lost()),
     }
@@ -983,6 +1028,112 @@ mod tests {
         );
     }
 
+    // A directory that lists but whose children cannot be stat'd: readable, not searchable.
+    // `None` when the mode has no effect, as it has none for root.
+    #[cfg(unix)]
+    fn unstattable_dir(root: &std::path::Path) -> Option<PathBuf> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let locked = root.join("locked");
+        std::fs::create_dir(&locked).expect("a directory");
+        std::fs::write(locked.join("secret.txt"), "").expect("a file inside it");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o400)).expect("chmod");
+        let listable = std::fs::read_dir(&locked).is_ok();
+        let stattable = std::fs::metadata(locked.join("secret.txt")).is_ok();
+        if listable && !stattable {
+            Some(locked)
+        } else {
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+            None
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_real_walk_failure_is_named_against_the_root_the_walk_reports() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // The root this layer holds and the paths the walk puts in its errors have to agree on
+        // form. They do only because the walk is built without canonicalizing its root — turn
+        // that on and the root stays `/var/...` while the walk reports `/private/var/...`, the
+        // prefix no longer strips, and every key after the failure goes back to unknown. A
+        // scripted failure cannot catch that, because the test writes both halves.
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let Some(locked) = unstattable_dir(dir.path()) else {
+            return;
+        };
+
+        let walker = Walker::builder().build();
+        let mut walk = Walk::new(
+            walker.local_walk(dir.path().to_path_buf()),
+            Scripted::of(&["locked/secret.txt", "z.txt"]),
+        )
+        .with_roots(Some(dir.path().to_path_buf()), None);
+
+        let mut seen = Vec::new();
+        while let Some(next) = walk.next().await {
+            if let Ok(pairing) = next {
+                seen.push((
+                    pairing.key().to_string(),
+                    at(pairing.source()),
+                    at(pairing.destination()),
+                ));
+            }
+        }
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        assert_eq!(
+            seen,
+            plan(&[
+                ("locked/secret.txt", At::UnknownKey, At::Here),
+                ("z.txt", At::Gone, At::Here),
+            ]),
+            "the unreadable file's own key is unknown, and the key after it is absent"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_walk_failure_names_one_key_once_the_root_is_known() {
+        // The same unreadable file, with the root supplied. `/root/photos/2019/b.jpg` under
+        // `/root` is the key `photos/2019/b.jpg`, so that one key is held and `z.txt` after it
+        // is absent as usual — where without a root the whole side would read as unknown.
+        let walk = Walk::new(
+            Scripted::from(vec![Err(one_file_unread()), Ok(entry("a.txt"))]),
+            Scripted::of(&["a.txt", "photos/2019/b.jpg", "z.txt"]),
+        )
+        .with_roots(Some(PathBuf::from("/root")), None);
+        assert_eq!(
+            drain(walk).await,
+            plan(&[
+                ("a.txt", At::Here, At::Here),
+                ("photos/2019/b.jpg", At::UnknownKey, At::Here),
+                ("z.txt", At::Gone, At::Here),
+            ]),
+            "one key is unknown, and the key after it compares"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_named_lost_key_is_reported_as_one_key() {
+        // Naming the key is what lets a consumer act on it alone, which is what `OneKey`
+        // promises and `UnknownRange` does not.
+        let mut walk = Walk::new(
+            Scripted::from(vec![Err(one_file_unread()), Ok(entry("a.txt"))]),
+            Scripted::of(&["a.txt", "photos/2019/b.jpg"]),
+        )
+        .with_roots(Some(PathBuf::from("/root")), None);
+        let _ = walk.next().await.expect("the failure");
+        let _ = walk.next().await.expect("a.txt");
+        let lost = walk.next().await.expect("the lost key").expect("a pairing");
+        assert_eq!(lost.key(), "photos/2019/b.jpg");
+        assert!(
+            matches!(lost.source(), SideState::Unknown(KeysLost::OneKey)),
+            "got {:?}",
+            lost.source()
+        );
+    }
+
     #[tokio::test]
     async fn a_key_lost_without_a_name_is_reported_as_a_range() {
         // What a consumer is told has to match what was concluded. `OneKey` says the keys
@@ -1235,6 +1386,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_loss_naming_the_root_itself_covers_every_key_under_it() {
+        let err = StreamError::Walk(WalkError::new(
+            Some(PathBuf::from("/root")),
+            WalkErrorKind::DirectoryUnreadable,
+            Box::from("permission denied"),
+        ));
+        let walk = Walk::new(
+            Scripted::from(vec![Err(err), Ok(entry("zzz.txt"))]),
+            Scripted::of(&["a.txt", "m.txt", "zzz.txt"]),
+        )
+        .with_roots(Some(PathBuf::from("/root")), None);
+        assert_eq!(
+            drain(walk).await,
+            plan(&[
+                ("a.txt", At::UnknownRange, At::Here),
+                ("m.txt", At::UnknownRange, At::Here),
+                ("zzz.txt", At::Here, At::Here),
+            ]),
+            "a failure naming the root hid every key under it"
+        );
+    }
+
+    #[tokio::test]
     async fn a_walk_is_built_against_both_roots() {
         let dir = tempfile::tempdir().expect("a temp dir");
         let walk = Walker::builder().build().uploading(
@@ -1248,6 +1422,17 @@ mod tests {
         assert!(
             !walk.is_done(),
             "a walk that has read nothing has not finished"
+        );
+        // Without this the local side cannot turn a failure's path into a key, and one
+        // unreadable file would hold that side's whole account open.
+        assert_eq!(
+            walk.src_root.as_deref(),
+            Some(dir.path()),
+            "the side that walks a filesystem is told the root it walks"
+        );
+        assert_eq!(
+            walk.dst_root, None,
+            "a listing names its own lost keys, so it needs no root"
         );
     }
 }

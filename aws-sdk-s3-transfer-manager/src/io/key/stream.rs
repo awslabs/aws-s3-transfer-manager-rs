@@ -296,6 +296,24 @@ fn key_for_relative_path(relative: &std::path::Path) -> Option<Cow<'_, str>> {
     )
 }
 
+// The key a path would take, given the root it sits under.
+//
+// A walk reports a failure by absolute path, and the rules for turning one into a key live
+// here — a name that is not valid UTF-8 has no key, and case and Unicode form pass through
+// untouched. The root has to be supplied, because a stream is handed a walker that already
+// knows its root and never says what it is.
+pub(crate) fn key_under_root(root: &std::path::Path, path: &std::path::Path) -> Option<String> {
+    let relative = path.strip_prefix(root).ok()?;
+    // The root itself is not a key under it, the same answer `relative_key` gives for its own
+    // root. An empty remainder would otherwise become the empty key, and a caller deriving a
+    // bound from that gets one that matches nothing while sorting below every real key — so the
+    // range it stands for would be let go at the first name the side produced.
+    if relative.as_os_str().is_empty() {
+        return None;
+    }
+    key_for_relative_path(relative).map(Cow::into_owned)
+}
+
 // Predicates that apply one rule set to both sides.
 //
 // Both derive the key the same way the streams do, so a rule cannot decide one thing
