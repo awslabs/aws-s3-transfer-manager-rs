@@ -602,20 +602,38 @@ pub struct TransferEventSink {
 impl TransferEventSink {
     /// A sink that emits to this sink's consumers **and** `other`'s.
     ///
-    /// Neither side can affect the other: each outlet has its own channel, its own capacity
+    /// Distinct consumers cannot affect each other: each has its own channel, its own capacity
     /// and its own [`dropped`](TransferEventStream::dropped) count, so a consumer that stops
     /// draining loses its own events and nobody else's.
     ///
-    /// This is how the SEP's *"a list of progress listeners"* is expressed — as composition
+    /// **Merging the same sink twice is a no-op, not a doubling.** Registering one sink at both
+    /// the client and the request level is the documented way to observe both, so a caller
+    /// reaches that composition by accident as easily as on purpose. Without the check below
+    /// each event would be sent twice down one channel, and a consumer deleting a source on
+    /// each terminal would delete it twice.
+    ///
+    /// This is how the spec's *"a list of progress listeners"* is expressed — as composition
     /// rather than as a `Vec` on every builder, so the registration surface stays one method
     /// per operation and a second `.events()` call adds a consumer rather than dropping one.
     pub fn merge(self, other: TransferEventSink) -> TransferEventSink {
         let mut outlets: Vec<Outlet> = Vec::with_capacity(self.outlets.len() + other.outlets.len());
         for src in [&self.outlets, &other.outlets] {
-            outlets.extend(src.iter().map(|o| Outlet {
-                tx: o.tx.clone(),
-                dropped: o.dropped.clone(),
-            }));
+            for outlet in src.iter() {
+                // Keyed on the channel rather than on the sink, because a sink is `Clone` and
+                // two clones are the same consumer. `owes_finish` guarantees one *emit*; the
+                // fan-out in `emit` is downstream of it, so a duplicate outlet breaks
+                // exactly-once at the only place it means anything -- the consumer.
+                if outlets
+                    .iter()
+                    .any(|kept: &Outlet| kept.tx.same_channel(&outlet.tx))
+                {
+                    continue;
+                }
+                outlets.push(Outlet {
+                    tx: outlet.tx.clone(),
+                    dropped: outlet.dropped.clone(),
+                });
+            }
         }
         TransferEventSink {
             outlets: Arc::from(outlets),
@@ -1314,5 +1332,79 @@ mod tests {
             sink.outlets[0].dropped.load(Ordering::Relaxed),
             "a closed receiver must not be counted as lost events"
         );
+    }
+    /// The same sink at both registration levels must not double-deliver.
+    ///
+    /// `Config::builder().events(sink.clone())` plus `.download_objects().events(sink)` is the
+    /// documented way to observe at both levels, and a caller reaches it by accident as easily
+    /// as on purpose. `resolve_sink` merges the two, so without deduplication one emit is sent
+    /// twice down one channel. `owes_finish` does not catch it: it guarantees a single emit, and
+    /// the fan-out is downstream of that -- so the count is exact at the producer and doubled at
+    /// the consumer, which is where a `mv --recursive` consumer deletes each source twice.
+    #[tokio::test]
+    async fn the_same_sink_at_both_levels_delivers_each_event_once() {
+        let (sink, mut stream) = channel(std::num::NonZeroUsize::new(16).expect("capacity > 0"));
+        let resolved =
+            resolve_sink(Some(&sink), Some(sink.clone())).expect("both levels registered");
+
+        resolved.emit(TransferEvent::Settled {
+            id: 7,
+            parent: Some(1),
+            transfer: TransferRef::download(Endpoint::Stream {}, Endpoint::Stream {}),
+            decision: Decision::Transfer {
+                reason: TransferReason::Forced {},
+            },
+            outcome: Outcome::Succeeded {},
+        });
+        drop(resolved);
+        drop(sink);
+
+        let mut settled = 0;
+        while let Some(ev) = stream.next().await {
+            if matches!(ev, TransferEvent::Settled { .. }) {
+                settled += 1;
+            }
+        }
+        assert_eq!(
+            1, settled,
+            "one terminal must reach one stream once; a second delivery is a second delete"
+        );
+        assert_eq!(
+            0,
+            stream.dropped(),
+            "nothing was lost, so nothing is counted"
+        );
+    }
+
+    /// Two genuinely different consumers both receive, which is what `merge` is for.
+    ///
+    /// The other half of the deduplication contract: the check is keyed on the channel, so it
+    /// must not collapse two distinct streams into one.
+    #[tokio::test]
+    async fn merging_two_distinct_sinks_delivers_to_both() {
+        let (a, mut sa) = channel(std::num::NonZeroUsize::new(8).expect("capacity > 0"));
+        let (b, mut sb) = channel(std::num::NonZeroUsize::new(8).expect("capacity > 0"));
+        let merged = a.merge(b);
+
+        merged.emit(TransferEvent::Settled {
+            id: 9,
+            parent: None,
+            transfer: TransferRef::download(Endpoint::Stream {}, Endpoint::Stream {}),
+            decision: Decision::Transfer {
+                reason: TransferReason::Forced {},
+            },
+            outcome: Outcome::Succeeded {},
+        });
+        drop(merged);
+
+        let count = |s: &mut TransferEventStream| {
+            let mut n = 0;
+            while s.try_next().is_ok() {
+                n += 1;
+            }
+            n
+        };
+        assert_eq!(1, count(&mut sa), "the first consumer receives");
+        assert_eq!(1, count(&mut sb), "the second consumer receives");
     }
 }
