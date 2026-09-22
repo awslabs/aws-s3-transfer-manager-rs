@@ -130,7 +130,6 @@ impl Default for TransferPendingStats {
 
 impl TransferPendingStats {
     /// Returns the accumulated values for one common category.
-    #[cfg(test)]
     pub(crate) fn category(&self, category: PendingCategory) -> PendingCategoryStats {
         self.categories[category.index()]
     }
@@ -381,7 +380,6 @@ impl TransferPendingState {
     }
 
     /// Returns a copy of the accumulated statistics.
-    #[cfg(test)]
     pub(crate) fn snapshot(&self) -> TransferPendingStats {
         self.data.lock().stats
     }
