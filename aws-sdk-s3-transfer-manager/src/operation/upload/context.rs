@@ -16,10 +16,33 @@ use crate::io::{InputStream, SizeHint};
 #[cfg(test)]
 use crate::operation::upload::diagnostics::PartTransferSummary;
 use crate::operation::upload::diagnostics::{
-    PartTransferPendingReason, PartTransferSnapshot, SourceReadObservation, UploadPartTiming,
-    UploadTransferDiagnostics,
+    PartTransferSnapshot, SourceReadObservation, UploadPartTiming, UploadTransferDiagnostics,
 };
 use crate::operation::upload::UploadOutputBuilder;
+use crate::transfer::{PendingCategory, PendingCause};
+
+/// Why multipart dispatch cannot schedule another source part.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PartTransferPendingReason {
+    /// A caller-provided source operation is retained until its registered wake.
+    SourceUnavailable,
+    /// Every known part was dispatched or the source reported end-of-stream.
+    DispatchClosed,
+    /// No retained source operation is ready and no new operation can start.
+    NoReadyPart,
+}
+
+impl From<PartTransferPendingReason> for PendingCause {
+    fn from(reason: PartTransferPendingReason) -> Self {
+        match reason {
+            PartTransferPendingReason::SourceUnavailable => {
+                Self::new(PendingCategory::Source, "source_unavailable")
+            }
+            PartTransferPendingReason::DispatchClosed => Self::in_flight_work("part_completion"),
+            PartTransferPendingReason::NoReadyPart => Self::in_flight_work("part_work"),
+        }
+    }
+}
 
 /// Multipart dispatch boundary and source-size declaration.
 ///

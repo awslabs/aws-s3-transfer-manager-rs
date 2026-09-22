@@ -19,7 +19,9 @@ use crate::io::InputStream;
 use crate::operation::upload::{Upload, UploadHandle, UploadInput};
 use crate::operation::DEFAULT_DELIMITER;
 use crate::runtime::sync::Mutex;
-use crate::transfer::{IoRequest, PollWork, Transfer, TransferContext, TransferId, WorkOutcome};
+use crate::transfer::{
+    IoRequest, PendingCause, PollWork, Transfer, TransferContext, TransferId, WorkOutcome,
+};
 use crate::types::{FailedTransferPolicy, FailedUpload};
 
 /// Maximum number of walkers active at once (live in `State::walks` plus
@@ -585,7 +587,9 @@ impl UploadObjectsTransfer {
         if active {
             state.debug_assert_capacity(self.max_concurrent_uploads());
         }
-        self.inner.ctx.set_pending();
+        self.inner
+            .ctx
+            .set_pending(PendingCause::in_flight_work("bulk_work_completion"));
         PollWork::Pending
     }
 

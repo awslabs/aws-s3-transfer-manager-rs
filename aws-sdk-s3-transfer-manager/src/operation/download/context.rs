@@ -5,6 +5,33 @@
 
 use crate::operation::download::body::BodySlot;
 use crate::runtime::buffer_pool::ReserveFuture;
+use crate::transfer::{PendingCategory, PendingCause};
+
+/// Why the download state machine cannot produce another work item.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum DownloadPendingReason {
+    /// Object discovery is still in flight.
+    Discovery,
+    /// Stream delivery is waiting for the consumer to release read-ahead capacity.
+    ReadAhead,
+    /// A claimed body slot is waiting for shared buffer-pool admission.
+    MemoryAdmission,
+    /// Every range was issued and in-flight range work must retire.
+    RangeCompletion,
+}
+
+impl From<DownloadPendingReason> for PendingCause {
+    fn from(reason: DownloadPendingReason) -> Self {
+        match reason {
+            DownloadPendingReason::Discovery => Self::in_flight_work("discovery"),
+            DownloadPendingReason::ReadAhead => Self::new(PendingCategory::Consumer, "read_ahead"),
+            DownloadPendingReason::MemoryAdmission => {
+                Self::new(PendingCategory::Memory, "memory_admission")
+            }
+            DownloadPendingReason::RangeCompletion => Self::in_flight_work("range_completion"),
+        }
+    }
+}
 
 /// A claimed slot waiting for shared memory admission.
 ///

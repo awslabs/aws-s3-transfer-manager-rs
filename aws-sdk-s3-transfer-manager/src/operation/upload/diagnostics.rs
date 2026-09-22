@@ -12,6 +12,7 @@
 use std::time::{Duration, Instant};
 
 use crate::config::TransferDiagnosticsConfig;
+use crate::operation::upload::context::PartTransferPendingReason;
 
 /// One multipart-pipeline state sampled while the upload-state lock is held.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,17 +46,6 @@ pub(crate) struct PartTransferSummary {
     pub(crate) drain_duration: Duration,
     pub(crate) complete_mpu_request_duration: Duration,
     pub(crate) complete_mpu_duration: Duration,
-}
-
-/// Why the multipart pipeline cannot dispatch another part.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PartTransferPendingReason {
-    /// A custom source operation is retained until its registered wake.
-    SourceUnavailable,
-    /// Every known part was dispatched or the source reported end-of-stream.
-    DispatchClosed,
-    /// No retained source operation is ready and no new operation can start.
-    NoReadyPart,
 }
 
 /// Closed diagnostic vocabulary for multipart scheduling transitions.

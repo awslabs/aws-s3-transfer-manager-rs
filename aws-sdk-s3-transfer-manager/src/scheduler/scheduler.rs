@@ -86,10 +86,11 @@
 //! A [`Transfer`](crate::transfer::Transfer) implementation must uphold:
 //! - **Failed lifecycle**: record the error and signal termination before returning
 //!   a failure outcome.
-//! - **Poll-time pending/wake obligation**: every `PollWork::Pending` must have a
-//!   future wake path. The wake primitive is edge-triggered; the mutator pattern is
-//!   `lock → mutate → unlock → try_wake`. See [`crate::transfer::TransferContext`]
-//!   for the protocol.
+//! - **Poll-time pending/wake obligation**: every `PollWork::Pending` must record
+//!   its cause through `TransferContext::set_pending` and have a future wake path.
+//!   Transfer-owned mutations use the edge-triggered
+//!   `lock → mutate → unlock → try_wake` pattern; registered futures use the
+//!   context waker. See [`crate::transfer::TransferContext`] for the protocol.
 //! - **Execution-yield obligation**: before returning `WorkOutcome::Yielded`, a
 //!   transfer must reconcile the dispatched work exactly once. A retained
 //!   continuation keeps its progress and wake state; retracted work leaves no
@@ -249,6 +250,7 @@ impl Scheduler {
                     drop(transfers);
                     let ctx = transfer.ctx();
                     ctx.set_cancelled();
+                    transfer.on_terminal();
                     ctx.signal_terminal();
                     return;
                 }
@@ -321,7 +323,7 @@ impl Scheduler {
                 // recheck path. Otherwise the insert (or no-op if
                 // already queued) puts the descriptor back in the
                 // ready set.
-                desc.mark_wake_requested();
+                desc.record_wake_request();
                 // OrphanedChild: parent's group was removed; wake is moot.
                 let _ = self.0.ready_set.insert(desc);
                 tracing::trace!(
@@ -421,16 +423,16 @@ impl Scheduler {
         (target, children)
     }
 
-    /// Cancel a single transfer descriptor: set cancelled, signal terminal,
-    /// clean up on_terminal, purge pending work, and notify idle.
+    /// Cancel a single transfer descriptor: set cancelled, clean up through
+    /// `on_terminal`, signal terminal, purge pending work, and notify idle.
     fn cancel_descriptor(&self, desc: TransferDescriptor) {
         let id = desc.id();
         let ctx = desc.transfer().ctx();
         if ctx.is_active() {
             ctx.set_cancelled();
         }
-        ctx.signal_terminal();
         desc.transfer().on_terminal();
+        ctx.signal_terminal();
         let purged = self.handle().runtime.remove_pending_for_transfer(id);
         self.release_dispatched(purged);
         desc.work_purged(purged);
@@ -547,8 +549,8 @@ impl Scheduler {
             "worker panic during execute",
         );
         ctx.set_failed(err);
-        ctx.signal_terminal();
         desc.transfer().on_terminal();
+        ctx.signal_terminal();
 
         let is_idle = desc.work_finished();
         if is_idle {
@@ -691,7 +693,8 @@ impl Scheduler {
                 let id = desc.id();
                 // Consume any pre-existing wake signal so we only observe
                 // wakes that arrive DURING the poll below.
-                desc.take_wake_requested();
+                desc.clear_wake_request();
+                desc.transfer().ctx().begin_poll();
 
                 let claim = ClaimGuard::new(&desc);
                 let poll_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -748,7 +751,7 @@ impl Scheduler {
                         // succeeds) or sets wake_requested for us to
                         // observe. See the `claim` module for the protocol.
                         claim.release();
-                        if desc.take_wake_requested() {
+                        if desc.reconcile_pending_wake() {
                             // OrphanedChild: parent's group was removed; wake is moot.
                             let _ = self.0.ready_set.insert(desc);
                         }
@@ -936,18 +939,23 @@ impl Scheduler {
 #[cfg(test)]
 mod tests {
     use crate::client::Handle;
+    use crate::runtime::ScheduledWork;
+    use crate::scheduler::descriptor::TransferDescriptor;
     use crate::scheduler::descriptor::{vruntime_delta_for_cost, IO_WORK_COST, SPAWN_WORK_COST};
     use crate::scheduler::transfer::mock::{
         BuggyDoneMock, FixedWorkCount, FusedReadySpawnedMock, MockStateMachine,
         TerminalWithoutSignalMock, WithDelay, WithExecute,
     };
     use crate::scheduler::MockTransfer;
-    use crate::transfer::{IoRequest, PollWork, Transfer, TransferId, WorkOutcome};
+    use crate::transfer::{
+        IoRequest, PendingCategory, PendingCause, PollWork, Transfer, TransferContext, TransferId,
+        WorkOutcome,
+    };
     use aws_smithy_runtime::test_util::capture_test_logs::show_test_logs;
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Barrier};
     use std::time::Duration;
 
     // A test that returns with work still in flight leaves a strong `Handle` on the
@@ -958,6 +966,196 @@ mod tests {
         let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
         let config = crate::Config::builder().client(s3_client).build();
         Handle::new_for_test(config, concurrency)
+    }
+
+    fn test_handle_with_diagnostics(concurrency: usize, detail: u64) -> Arc<Handle> {
+        let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
+        let config = crate::Config::builder()
+            .client(s3_client)
+            .diagnostics_for_test(crate::config::MemoryDiagnosticsConfig::default(), detail)
+            .build();
+        Handle::new_for_test(config, concurrency)
+    }
+
+    /// Transfer whose first poll wakes before publishing its pending cause.
+    ///
+    /// This models a future that invokes its registered waker synchronously
+    /// from `poll`. The descriptor must retain the wake until `poll_work`
+    /// returns `Pending`, then repoll the transfer.
+    #[derive(Debug)]
+    struct WakeBeforePendingTransfer {
+        ctx: TransferContext,
+        /// Number of scheduler polls observed by the test transfer.
+        polls: AtomicUsize,
+    }
+
+    impl Transfer for WakeBeforePendingTransfer {
+        fn ctx(&self) -> &TransferContext {
+            &self.ctx
+        }
+
+        fn poll_work(&self) -> PollWork {
+            if self.polls.fetch_add(1, Ordering::SeqCst) == 0 {
+                // Model a registered future becoming ready inside poll_work,
+                // before the state machine publishes its Pending outcome.
+                self.ctx.waker().wake_by_ref();
+                self.ctx
+                    .set_pending(PendingCause::new(PendingCategory::Memory, "test"));
+                PollWork::Pending
+            } else {
+                self.ctx.set_completed();
+                self.ctx.signal_terminal();
+                PollWork::Done
+            }
+        }
+
+        fn execute<'a>(
+            &'a self,
+            _work: &'a mut IoRequest,
+        ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
+            Box::pin(async { unreachable!("test transfer produces no work") })
+        }
+    }
+
+    /// Transfer that blocks inside `on_terminal` to expose notification order.
+    ///
+    /// Tests wait for `terminal_hook_entered`, verify that the terminal receiver
+    /// remains pending, then release the hook.
+    #[derive(Debug)]
+    struct TerminalOrderingTransfer {
+        ctx: TransferContext,
+        terminal_hook_entered: Arc<Barrier>,
+        release_terminal_hook: Arc<Barrier>,
+    }
+
+    impl Transfer for TerminalOrderingTransfer {
+        fn ctx(&self) -> &TransferContext {
+            &self.ctx
+        }
+
+        fn poll_work(&self) -> PollWork {
+            self.ctx.set_pending(PendingCause::other("test"));
+            PollWork::Pending
+        }
+
+        fn execute<'a>(
+            &'a self,
+            _work: &'a mut IoRequest,
+        ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
+            Box::pin(async { unreachable!("test transfer produces no work") })
+        }
+
+        fn on_terminal(&self) {
+            self.terminal_hook_entered.wait();
+            self.release_terminal_hook.wait();
+        }
+    }
+
+    /// A wake retained during `poll_work` is attributed after Pending is visible.
+    #[tokio::test]
+    async fn wake_before_pending_is_backfilled_and_repolled() {
+        let handle = test_handle_with_diagnostics(1, 1);
+        let id = TransferId {
+            id: 40_001,
+            parent: None,
+        };
+        let (ctx, completion_rx) = TransferContext::with_id(id, handle.clone());
+        let observer = ctx.clone();
+        let polls = AtomicUsize::new(0);
+        let transfer = WakeBeforePendingTransfer { ctx, polls };
+
+        handle.scheduler.enqueue_transfer(Box::new(transfer));
+        completion_rx
+            .await
+            .expect("second poll should complete the transfer");
+
+        let stats = observer
+            .pending_stats()
+            .expect("summary diagnostics enabled");
+        assert_eq!(stats.category(PendingCategory::Memory).count, 1);
+        assert_eq!(stats.terminal_cause, None);
+        handle.runtime.shutdown();
+    }
+
+    /// Cancellation completes direction cleanup before notifying terminal waiters.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn cancellation_runs_terminal_hook_before_notification() {
+        let handle = test_handle(1);
+        let id = TransferId {
+            id: 40_002,
+            parent: None,
+        };
+        let (ctx, mut completion_rx) = TransferContext::with_id(id, handle.clone());
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        handle
+            .scheduler
+            .enqueue_transfer(Box::new(TerminalOrderingTransfer {
+                ctx,
+                terminal_hook_entered: Arc::clone(&entered),
+                release_terminal_hook: Arc::clone(&release),
+            }));
+
+        let scheduler = handle.scheduler.clone();
+        let cancel = std::thread::spawn(move || drop(scheduler.cancel_transfer(id)));
+        entered.wait();
+        assert_eq!(
+            completion_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty),
+            "terminal notification must wait for on_terminal cleanup"
+        );
+        release.wait();
+        cancel.join().unwrap();
+        completion_rx
+            .await
+            .expect("cancellation should signal terminal");
+        handle.runtime.shutdown();
+    }
+
+    /// Panic handling completes direction cleanup before notifying terminal waiters.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn worker_panic_runs_terminal_hook_before_notification() {
+        let handle = test_handle(1);
+        let id = TransferId {
+            id: 40_003,
+            parent: None,
+        };
+        let (ctx, mut completion_rx) = TransferContext::with_id(id, handle.clone());
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let descriptor = TransferDescriptor::new(Box::new(TerminalOrderingTransfer {
+            ctx,
+            terminal_hook_entered: Arc::clone(&entered),
+            release_terminal_hook: Arc::clone(&release),
+        }));
+        descriptor.work_queued();
+        descriptor.work_started();
+        handle.scheduler.0.dispatched.store(1, Ordering::Relaxed);
+        let work = ScheduledWork {
+            item: IoRequest { data: None },
+            descriptor,
+        };
+
+        let scheduler = handle.scheduler.clone();
+        let tokio_handle = tokio::runtime::Handle::current();
+        let panic = std::thread::spawn(move || {
+            let _runtime = tokio_handle.enter();
+            scheduler.on_panic(work);
+        });
+        entered.wait();
+        assert_eq!(
+            completion_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty),
+            "terminal notification must wait for on_terminal cleanup"
+        );
+        release.wait();
+        panic.join().unwrap();
+        completion_rx
+            .await
+            .expect("panic handling should signal terminal");
+        handle.runtime.shutdown();
     }
 
     #[derive(Debug)]

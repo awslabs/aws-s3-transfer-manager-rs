@@ -5,6 +5,8 @@
 
 //! Transfer types that define what a transfer is and what it produces.
 
+mod pending;
+
 use crate::error;
 use crate::scheduler::concurrency::ErrorKind;
 use std::any::Any;
@@ -15,6 +17,11 @@ use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Wake, Waker};
 use std::time::Instant;
+
+use pending::TransferPendingState;
+#[cfg(test)]
+use pending::TransferPendingStats;
+pub(crate) use pending::{PendingCategory, PendingCause};
 
 /// Edge-triggered wake flag for transfer state machines.
 ///
@@ -62,9 +69,9 @@ pub(crate) mod wake_flag {
 /// Implementations must uphold:
 /// - **Failed lifecycle**: record the error and signal termination before returning
 ///   `WorkOutcome::Failed`.
-/// - **Pending/wake obligation**: every `PollWork::Pending` must have a corresponding
-///   future call to `scheduler.wake(id)`. See [`TransferContext`] for the wake
-///   primitive protocol.
+/// - **Pending/wake obligation**: every `PollWork::Pending` must first call
+///   `ctx.set_pending(cause)` and have a future wake path. See
+///   [`TransferContext`] for the wake primitive protocol.
 /// - **Panic safety**: `execute` panics are caught by the runtime's
 ///   `catch_unwind` wrapper and converted to a terminal transition. `poll_work`
 ///   panics are caught by the scheduler inside `generate_work`, which
@@ -526,8 +533,10 @@ pub(crate) struct TransferContext {
     error: Arc<Mutex<Option<Box<error::Error>>>>,
     /// Completion signal sender - signals "state machine reached terminal state"
     completion_tx: Arc<Mutex<Option<StateMachineTerminalSender>>>,
-    /// Set when poll_work returns Pending, cleared on try_wake
+    /// Set when `poll_work` returns `Pending`, cleared by a wake or resumed poll.
     wake_flag: Arc<wake_flag::WakeFlag>,
+    /// Optional scheduler-visible pending interval accounting.
+    pending_state: Option<Arc<TransferPendingState>>,
     /// Cancellation token for cooperative cancellation
     cancellation_token: tokio_util::sync::CancellationToken,
     /// Per-transfer metrics backing store
@@ -648,6 +657,10 @@ impl TransferContext {
         id: TransferId,
     ) -> (Self, StateMachineTerminalReceiver) {
         let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+        let diagnostics = handle.config.diagnostics().transfer();
+        let pending_state = diagnostics
+            .enable_summaries()
+            .then(|| Arc::new(TransferPendingState::new(diagnostics.enable_transitions())));
         let ctx = Self {
             id,
             metrics: Arc::new(MetricsState::new()),
@@ -656,6 +669,7 @@ impl TransferContext {
             error: Arc::new(Mutex::new(None)),
             completion_tx: Arc::new(Mutex::new(Some(completion_tx))),
             wake_flag: Arc::new(wake_flag::WakeFlag::new()),
+            pending_state,
             cancellation_token: tokio_util::sync::CancellationToken::new(),
         };
         (ctx, completion_rx)
@@ -668,18 +682,7 @@ impl TransferContext {
         id: TransferId,
         handle: Arc<crate::client::Handle>,
     ) -> (Self, StateMachineTerminalReceiver) {
-        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
-        let ctx = Self {
-            id,
-            metrics: Arc::new(MetricsState::new()),
-            handle,
-            status: StateMachineStatus::new(),
-            error: Arc::new(Mutex::new(None)),
-            completion_tx: Arc::new(Mutex::new(Some(completion_tx))),
-            wake_flag: Arc::new(wake_flag::WakeFlag::new()),
-            cancellation_token: tokio_util::sync::CancellationToken::new(),
-        };
-        (ctx, completion_rx)
+        Self::new_inner(handle, id)
     }
 
     /// Record that `poll_work` is about to return `Pending`.
@@ -731,11 +734,17 @@ impl TransferContext {
     /// are harmless — `wake` on a descriptor not in pending state is a
     /// no-op.
     #[inline]
-    pub(crate) fn set_pending(&self) {
+    pub(crate) fn set_pending(&self, cause: impl Into<PendingCause>) {
+        let cause = cause.into();
         self.wake_flag.set_pending();
+        if let Some(pending) = &self.pending_state {
+            pending.record_pending(self.id, cause);
+        }
         tracing::trace!(
             target: crate::telemetry::TARGET_TRANSFER,
             tid = %self.id,
+            category = cause.category.as_str(),
+            reason = cause.reason,
             "ctx.set_pending",
         );
     }
@@ -754,7 +763,7 @@ impl TransferContext {
                 tid = %self.id,
                 "ctx.try_wake.fired",
             );
-            self.handle.scheduler.wake(self.id);
+            self.wake();
         } else {
             tracing::trace!(
                 target: crate::telemetry::TARGET_TRANSFER,
@@ -764,6 +773,16 @@ impl TransferContext {
         }
     }
 
+    /// Unconditionally notify the scheduler that this transfer should be polled.
+    ///
+    /// Futures registered from `poll_work` use this path because their wake may
+    /// race before or after the transfer publishes `Pending`. The descriptor's
+    /// wake-requested protocol retains either ordering.
+    #[inline]
+    pub(crate) fn wake(&self) {
+        self.handle.scheduler.wake(self.id);
+    }
+
     /// Returns a task waker that requeues this transfer in the scheduler.
     ///
     /// Use this for a `Future` polled inside `poll_work`. Its wake is level-like
@@ -771,11 +790,37 @@ impl TransferContext {
     /// retained by the descriptor's release-and-recheck protocol. Ordinary
     /// state mutations should continue to use [`Self::set_pending`] and
     /// [`Self::try_wake`] under their shared state lock.
-    pub(crate) fn scheduler_waker(&self) -> Waker {
+    pub(crate) fn waker(&self) -> Waker {
         Waker::from(Arc::new(SchedulerWake {
             scheduler: self.handle.scheduler.clone(),
             id: self.id,
         }))
+    }
+
+    /// Reconcile the previous pending interval before the scheduler polls again.
+    ///
+    /// Clearing the edge-triggered flag here also handles registered-future
+    /// wakes, which enter through [`Self::waker`] rather than [`Self::try_wake`].
+    pub(crate) fn begin_poll(&self) {
+        self.wake_flag.take_pending();
+        if let Some(pending) = &self.pending_state {
+            pending.begin_poll(self.id);
+        }
+    }
+
+    /// Record the first scheduler wake observed for the current pending interval.
+    pub(crate) fn record_wake(&self) {
+        if let Some(pending) = &self.pending_state {
+            pending.record_wake(self.id);
+        }
+    }
+
+    /// Return optional scheduler-visible pending statistics.
+    #[cfg(test)]
+    pub(crate) fn pending_stats(&self) -> Option<TransferPendingStats> {
+        self.pending_state
+            .as_ref()
+            .map(|pending| pending.snapshot())
     }
 
     /// The S3 client to use for SDK operations
@@ -873,6 +918,10 @@ impl TransferContext {
     /// transition must therefore reach exactly one `signal_terminal`. It is safe
     /// to call while in-flight work is still draining.
     pub(crate) fn signal_terminal(&self) {
+        if let Some(pending) = &self.pending_state {
+            pending.record_terminal(self.id);
+        }
+        self.wake_flag.take_pending();
         self.metrics.set_finished();
         if let Some(tx) = self.completion_tx.lock().unwrap().take() {
             let _ = tx.send(());
@@ -1087,6 +1136,15 @@ mod tests {
             crate::client::Handle::new_for_test(config, 4)
         }
 
+        fn test_handle_with_diagnostics(detail: u64) -> Arc<crate::client::Handle> {
+            let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
+            let config = crate::Config::builder()
+                .client(s3_client)
+                .diagnostics_for_test(crate::config::MemoryDiagnosticsConfig::default(), detail)
+                .build();
+            crate::client::Handle::new_for_test(config, 4)
+        }
+
         #[cfg_attr(miri, ignore)]
         #[test]
         fn status_transitions() {
@@ -1192,6 +1250,44 @@ mod tests {
             drop(ctx.start_request_metrics());
 
             assert_eq!(ctx.metrics.request_metrics().requests, 2);
+        }
+
+        #[test]
+        fn disabled_diagnostics_do_not_allocate_pending_stats() {
+            let (ctx, _rx) = TransferContext::new(test_handle());
+            ctx.set_pending(PendingCause::new(PendingCategory::Memory, "test"));
+            ctx.record_wake();
+            ctx.begin_poll();
+
+            assert_eq!(ctx.pending_stats(), None);
+        }
+
+        #[test]
+        fn pending_cause_is_accounted_across_wake_and_repoll() {
+            let (ctx, _rx) = TransferContext::new(test_handle_with_diagnostics(1));
+            ctx.set_pending(PendingCause::new(PendingCategory::Memory, "test"));
+            ctx.record_wake();
+            ctx.record_wake();
+            ctx.begin_poll();
+
+            let stats = ctx.pending_stats().expect("summary diagnostics enabled");
+            let memory = stats.category(PendingCategory::Memory);
+            assert_eq!(memory.count, 1);
+            assert_eq!(stats.terminal_cause, None);
+        }
+
+        #[test]
+        fn terminal_signal_closes_pending_interval_once() {
+            let (ctx, _rx) = TransferContext::new(test_handle_with_diagnostics(1));
+            let cause = PendingCause::in_flight_work("test");
+            ctx.set_pending(cause);
+            ctx.set_cancelled();
+            ctx.signal_terminal();
+            ctx.signal_terminal();
+
+            let stats = ctx.pending_stats().expect("summary diagnostics enabled");
+            assert_eq!(stats.terminal_cause, Some(cause));
+            assert_eq!(stats.category(PendingCategory::InFlightWork).count, 1);
         }
 
         #[cfg_attr(miri, ignore)]
