@@ -195,16 +195,15 @@ async fn assert_chaos(percent: usize, prefix: &str) {
         r.network_tx_after,
     );
 
-    // FIXED: a composite counts every byte its children moved, including bytes moved
-    // by a child that then failed.
+    // A composite counts every byte its children moved, including bytes moved by a
+    // child that then failed.
     //
-    // This used to assert `network_tx_at_join == expected_success_bytes(percent)` —
-    // the defect. The fold into the parent ran once, at reap, inside the success arm
-    // only, so a child that pushed most of its object and then failed contributed
-    // nothing, not late but never, and a bar built on `metrics()` could not reach
-    // 100% on any run with a failure. `MetricsState` now carries a parent link and
-    // `record_io` walks it, so a child's bytes reach the parent as they move and the
-    // reap-time folds are gone.
+    // What that rules out: folding a child's bytes into the parent once, at reap, in
+    // the success arm only. A child that pushed most of its object and then failed
+    // then contributes nothing — not late but never — and a bar built on `metrics()`
+    // cannot reach 100% on any run with a failure. `MetricsState` carries a parent
+    // link and `record_io` walks it, so a child's bytes reach the parent as they
+    // move.
     assert!(
         expected_lost_bytes(percent) > 0,
         "the scenario must actually push bytes that then fail, or it proves nothing"
@@ -229,12 +228,12 @@ async fn assert_chaos(percent: usize, prefix: &str) {
         expected_success_bytes(percent) + expected_lost_bytes(percent)
     );
 
-    // FIXED: a composite establishes a byte denominator.
+    // A composite establishes a byte denominator.
     //
-    // This used to assert `total_bytes.is_none()` — `set_total_bytes` had three call
-    // sites, all leaf transfers, so a directory transfer had no denominator at all and
-    // a percentage was undefined. Both composites now accumulate the sizes of every
-    // entry their walk enumerates and seal the total once enumeration is quiescent.
+    // What that rules out: leaning on `set_total_bytes`, a leaf-transfer mechanism,
+    // which leaves a directory transfer with no denominator and a percentage
+    // undefined. Both composites accumulate the sizes of every entry their walk
+    // enumerates and seal the total once enumeration is quiescent.
     //
     // Every file is enumerated whatever its eventual outcome, so the denominator is the
     // whole dataset — not the part that succeeded. That is the point: a numerator that

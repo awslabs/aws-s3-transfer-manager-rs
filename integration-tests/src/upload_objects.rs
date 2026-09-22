@@ -996,7 +996,7 @@ async fn test_upload_objects_events_caller_abort_settles_abandoned_entries() {
 /// Under `Abort`, no child reported `Cancelled` may have its object durably in S3.
 ///
 /// **A regression guard, not a defect reproduction — and the measurement is the point.** The
-/// mechanism below is real and the code used to document its cost, but the precondition never
+/// mechanism below is real and its cost is documented in the code, but the precondition never
 /// occurred: the failing child must share a reap batch with an already-committed one *and* come
 /// first in iteration order. Instrumenting every batch showed why it does not. Across 191
 /// batches over two fault modes — a non-retryable 403 and a retryable 503 that fails late —

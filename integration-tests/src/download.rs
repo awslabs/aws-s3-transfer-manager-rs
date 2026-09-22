@@ -1049,9 +1049,9 @@ async fn test_download_stalled_on_read_ahead_reports_the_reason() {
     use std::time::Duration;
 
     // The window must close *before* every range is issued, or the transfer parks on
-    // `AwaitingCompletion` first and the read-ahead gate is never reached — which is what a
-    // first version of this test observed at 8 parts with concurrency 8. So: many parts, a
-    // window of 2, and concurrency below the part count.
+    // `AwaitingCompletion` first and the read-ahead gate is never reached — which is what
+    // 8 parts at concurrency 8 does. So: many parts, a window of 2, and concurrency below
+    // the part count.
     let size = 40 * ByteUnit::Mebibyte.as_bytes_usize();
     let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
     let m = mock_tm_with(RuntimeMode::Managed, |b| {

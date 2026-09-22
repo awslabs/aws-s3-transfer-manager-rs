@@ -1027,9 +1027,9 @@ impl DownloadObjectsTransfer {
     /// `Object::size()` is an `Option<i64>` because the model allows absence, not because S3
     /// produces it: a `ListObjectsV2` against a real bucket returns `Size: 0` for a folder
     /// marker, never an absent size — checked against three console-shaped markers
-    /// (`dir/`, `dir/nested/`, `empty/`) in us-west-2, all `Size: 0`. An earlier version of
-    /// this comment claimed the absent case *was* the folder marker, which would have made
-    /// `exclude_s3_folder_markers`' `size().unwrap_or(1)` the wrong default; it is not.
+    /// (`dir/`, `dir/nested/`, `empty/`) in us-west-2, all `Size: 0`. An absent size therefore
+    /// does not identify a marker, which is why `is_folder_marker` reads the size and treats
+    /// absence as "not a marker".
     /// Absence and the signed type both collapse to 0 rather than being skipped, so a size
     /// the wire omits understates the byte total instead of corrupting it — a size is not
     /// needed to settle an entry, where a key is.

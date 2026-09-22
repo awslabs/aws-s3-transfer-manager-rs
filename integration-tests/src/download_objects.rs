@@ -482,10 +482,8 @@ async fn test_download_objects_abort_terminates() {
 
 /// Under `Abort`, the error `join()` returns must reach the child's real cause.
 ///
-/// Closes the TODO that stood at `download_objects/transfer.rs:902` and `:1264`. Its stated
-/// blocker — *"needs a shareable error (`Arc`) since `Error` is not `Clone`"* — went away when
-/// `Error` gained `Clone`, but the code did not follow, so the root error's `source()` stayed a
-/// formatted string.
+/// `Error` is `Clone`, so the abort path carries the triggering child's error itself rather
+/// than a formatted string, and the root's `source()` chain reaches the real cause.
 ///
 /// What this rules out: a caller whose bulk download aborts runs `DisplayErrorContext` over what
 /// `join()` gave back, and the chain dead-ends at `"download failed for key 'k'"` — the status
@@ -2220,11 +2218,10 @@ async fn test_download_objects_events_abandoned_entries_still_settle() {
 
 /// A composite seals a byte denominator covering every object it listed.
 ///
-/// `set_total_bytes` used to have three call sites, all leaf transfers, so a directory
-/// transfer had no denominator at all and a percentage was undefined for the whole run.
-/// Both composites now accumulate the size of every entry their walk produces, in the
+/// `set_total_bytes` is a leaf-transfer mechanism, so a composite takes its denominator from
+/// its listing instead: both accumulate the size of every entry their walk produces, in the
 /// same critical section that publishes the entry, and seal the total once listing is
-/// quiescent.
+/// quiescent. Without that a percentage is undefined for the whole run.
 ///
 /// Asserted on the joined output rather than mid-flight: the seal fires when listing
 /// drains, and a timing-based read of the provisional value would be flaky. What this
@@ -2285,8 +2282,8 @@ async fn test_download_objects_seals_a_byte_denominator() {
 /// dropped after a failure.
 ///
 /// Exercised through the destination-validation path: a destination that is a file rather
-/// than a directory fails on the first walker advance, before a single key is listed. That
-/// used to seal `Some(0)` for an arbitrarily large prefix.
+/// than a directory fails on the first walker advance, before a single key is listed. Sealing
+/// `Some(0)` there would claim an arbitrarily large prefix was empty.
 #[tokio::test]
 async fn test_download_objects_does_not_seal_a_total_when_listing_never_ran() {
     timeout(TEST_TIMEOUT, async {

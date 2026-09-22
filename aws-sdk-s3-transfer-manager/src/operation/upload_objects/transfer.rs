@@ -649,9 +649,9 @@ impl UploadObjectsTransfer {
     /// with nothing able to settle it: `entries_settled()` stops short of
     /// `EntryTotal::Final` for the rest of the process, and a consumer rendering
     /// "N remaining" from the difference sticks above zero on an operation whose
-    /// `join()` already returned. It is also the only reason the two observers
-    /// agree at all -- `state.failed` counts the entry, and before this the stream
-    /// did not.
+    /// `join()` already returned. It is also what keeps the two observers in
+    /// agreement: `state.failed` counts the entry, so the stream has to settle it
+    /// too.
     ///
     /// A fresh id rather than a placeholder, for the reason `announce_child`'s `Err`
     /// arm uses one: a consumer keying a map on `id` would collide every unprepared
