@@ -65,6 +65,23 @@ pub(crate) struct EventRegistration {
     pub(crate) destination: crate::events::Endpoint,
 }
 
+/// The file a download writes into, and the two facts that only travel with it.
+///
+/// Grouped rather than passed as three parameters because none of them is meaningful
+/// without the others: the offset says what the file's byte 0 means, and `owns_file`
+/// says who closes it. Keeping them together is also what holds
+/// [`Download::orchestrate_with_sink`] inside clippy's argument limit now that the
+/// listing's `known_size` travels with it.
+pub(crate) struct FileSink {
+    pub(crate) file: std::fs::File,
+    /// Offset in the *object* that this file's offset 0 corresponds to — non-zero only
+    /// for a ranged download.
+    pub(crate) object_range_start: u64,
+    /// `true` when the transfer manager created the file and must clean it up (the
+    /// temp-file-then-rename path); `false` when the caller opened it and owns it.
+    pub(crate) owns_file: bool,
+}
+
 impl Download {
     fn lifecycle_for(
         ctx: &crate::transfer::TransferContext,
@@ -149,8 +166,19 @@ impl Download {
         let file = tokio_file.into_std().await;
 
         let range_start = object_range_start_from_input(&input);
-        let inner =
-            Self::orchestrate_with_sink(handle, input, file, range_start, true, parent, events)?;
+        // No listing behind this entry point, so the size comes from discovery as before.
+        let inner = Self::orchestrate_with_sink(
+            handle,
+            input,
+            FileSink {
+                file,
+                object_range_start: range_start,
+                owns_file: true,
+            },
+            parent,
+            events,
+            None,
+        )?;
         Ok(ManagedDownloadHandle::new(inner, temp_path, dest_path))
     }
 
@@ -163,22 +191,36 @@ impl Download {
         events: Option<EventRegistration>,
     ) -> Result<ManagedDownloadHandle, error::Error> {
         let range_start = object_range_start_from_input(&input);
-        let inner =
-            Self::orchestrate_with_sink(handle, input, file, range_start, false, None, events)?;
+        let inner = Self::orchestrate_with_sink(
+            handle,
+            input,
+            FileSink {
+                file,
+                object_range_start: range_start,
+                owns_file: false,
+            },
+            None,
+            events,
+            None,
+        )?;
         // No temp/dest paths — caller manages the file lifecycle
         Ok(ManagedDownloadHandle::new_unmanaged(inner))
     }
 
     /// Shared orchestration for file-sink downloads.
+    ///
+    /// `known_size` is the object's size when the caller already learned it — a composite
+    /// has it from its listing. Seeding it here rather than waiting for discovery is what
+    /// gives the entry a byte denominator it keeps even if its own `GetObject` never
+    /// succeeds; see the note at the `set_total_bytes` call below.
     #[cfg(any(unix, windows))]
     pub(crate) fn orchestrate_with_sink(
         handle: Arc<crate::client::Handle>,
         input: DownloadInput,
-        file: std::fs::File,
-        object_range_start: u64,
-        owns_file: bool,
+        sink: FileSink,
         parent: Option<&crate::transfer::TransferContext>,
         events: Option<EventRegistration>,
+        known_size: Option<u64>,
     ) -> Result<DownloadHandleInner, error::Error> {
         use crate::transfer::TransferContext;
 
@@ -190,12 +232,28 @@ impl Download {
             BucketType::from_bucket_name(input.bucket().expect("bucket is available"));
 
         let (writer, _consumer) =
-            body::new_recv_body_with_sink(file, object_range_start, owns_file);
+            body::new_recv_body_with_sink(sink.file, sink.object_range_start, sink.owns_file);
 
         let (ctx, completion_rx) = match parent {
             Some(parent) => TransferContext::new_child(handle.clone(), parent),
             None => TransferContext::new(handle.clone()),
         };
+
+        // Before `enqueue_transfer`, so the value is in place by the time the transfer can be
+        // polled and no reader sees an entry with no denominator at all.
+        //
+        // The listed size is what the entry is *expected* to move. An object refused before
+        // its first body byte — a 403, an integrity failure — never reaches discovery, so
+        // without this its denominator would stay `Unknown` and a consumer could not tell how
+        // much that entry failed to transfer. That shortfall is what the AWS CLI banks into
+        // `bytes_failed_to_transfer` to reach 100% on a run with failures.
+        //
+        // `set_expected_bytes` and not `set_total_bytes`: see its doc comment. The short
+        // version is that the listed size is an estimate until the object is opened, so it
+        // reads `Provisional` and discovery still gets to publish the real total.
+        if let Some(size) = known_size {
+            ctx.set_expected_bytes(size);
+        }
 
         let lifecycle = Self::lifecycle_for(&ctx, &input, events);
         let transfer =

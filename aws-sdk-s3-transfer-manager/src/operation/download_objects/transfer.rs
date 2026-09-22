@@ -754,7 +754,12 @@ impl DownloadObjectsTransfer {
                     .key()
                     .expect("S3Walk yields objects with keys")
                     .to_string();
-                let result = self.spawn_single_child(handle, &key);
+                // The listed size is this entry's byte denominator, and the listing is the
+                // only place it is known for an object that fails before its own GetObject
+                // returns. Negative is not representable in S3 and is clamped rather than
+                // trusted, matching `accumulate_listed`.
+                let listed_size = obj.size().map(|n| n.max(0) as u64);
+                let result = self.spawn_single_child(handle, &key, listed_size);
                 // Announced here rather than in `merge_spawned`: this is the only
                 // point in `poll_work` where the state guard is not held, and
                 // announcing is a send.
@@ -780,6 +785,7 @@ impl DownloadObjectsTransfer {
         &self,
         handle: &Arc<crate::client::Handle>,
         key: &str,
+        listed_size: Option<u64>,
     ) -> Result<(ManagedDownloadHandle, PathBuf), Error> {
         let dest_path = local_key_path(
             &self.inner.destination,
@@ -838,13 +844,16 @@ impl DownloadObjectsTransfer {
         let inner = Download::orchestrate_with_sink(
             handle.clone(),
             input,
-            file,
-            0, // range_start
-            true,
+            crate::operation::download::FileSink {
+                file,
+                object_range_start: 0,
+                owns_file: true,
+            },
             Some(&self.inner.ctx),
             // No sink for the child: the parent announces its own children, so
             // registering one here would announce every child twice.
             None,
+            listed_size,
         )?;
         Ok((
             ManagedDownloadHandle::new(inner, temp_path, dest_path.clone()),
@@ -926,10 +935,15 @@ impl DownloadObjectsTransfer {
     /// remaining" would stick above zero on a transfer that had finished. Excluding it keeps
     /// the entry total equal to the number of entries that can reach a terminal.
     ///
-    /// `Object::size()` is an `Option<i64>`: absent for a zero-byte folder marker, and
-    /// the signed type is the wire shape rather than a real possibility. Both collapse to
-    /// 0 rather than being skipped, so a missing size understates the byte total instead of
-    /// corrupting it — a size is not needed to settle an entry, where a key is.
+    /// `Object::size()` is an `Option<i64>` because the model allows absence, not because S3
+    /// produces it: a `ListObjectsV2` against a real bucket returns `Size: 0` for a folder
+    /// marker, never an absent size — checked against three console-shaped markers
+    /// (`dir/`, `dir/nested/`, `empty/`) in us-west-2, all `Size: 0`. An earlier version of
+    /// this comment claimed the absent case *was* the folder marker, which would have made
+    /// `exclude_s3_folder_markers`' `size().unwrap_or(1)` the wrong default; it is not.
+    /// Absence and the signed type both collapse to 0 rather than being skipped, so a size
+    /// the wire omits understates the byte total instead of corrupting it — a size is not
+    /// needed to settle an entry, where a key is.
     fn accumulate_listed(&self, state: &mut State, batch: &[Object]) {
         if state.total_sealed {
             return;
@@ -1122,7 +1136,8 @@ impl DownloadObjectsTransfer {
                     // Applied here rather than as a walker filter, and so it holds for a
                     // caller-supplied walker too. `S3Walker::filter` replaces nothing and means
                     // only what it says; a caller narrowing to `*.parquet` cannot re-admit markers
-                    // by accident.
+                    // by accident. Not counted either: `accumulate_listed` runs on `chunk`, so a
+                    // marker never enters `EntryTotal`.
                     if is_folder_marker(&obj) {
                         continue;
                     }

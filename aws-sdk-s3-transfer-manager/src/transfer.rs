@@ -1067,6 +1067,25 @@ impl TransferContext {
         self.metrics.set_total_bytes(n);
     }
 
+    /// Record a size this transfer's *parent* learned for it, before the transfer has
+    /// confirmed its own.
+    ///
+    /// A composite knows each entry's size from its listing, which is the only place that
+    /// size exists for an object refused before its own `GetObject` returns. It goes to the
+    /// provisional accumulator rather than to `set_total_bytes`, and the difference is load
+    /// bearing: `total_bytes` is a `OnceLock`, so seeding it would make the listed size
+    /// unretractable and turn discovery's own write into a no-op. An object overwritten
+    /// between the listing page and this transfer's `GetObject` would then move more bytes
+    /// than its denominator admits — a bar past 100%, and an underflow in any consumer
+    /// computing `total - moved` on `u64`.
+    ///
+    /// Through the accumulator instead, the entry reads `Provisional(listed)` until discovery
+    /// promotes it to `Final(actual)`, which is the honest sequence: the listed size *is* an
+    /// estimate until the object is opened. Entries are passed as 0 because a leaf has none;
+    /// only a composite counts entries.
+    pub(crate) fn set_expected_bytes(&self, n: u64) {
+        self.metrics.add_discovered(n, 0);
+    }
 
     /// Get current transfer status as a public enum.
     pub(crate) fn transfer_status(&self) -> crate::types::TransferStatus {
