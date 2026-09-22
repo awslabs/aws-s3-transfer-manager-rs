@@ -610,6 +610,9 @@ impl DownloadFluentBuilder {
 
 impl crate::operation::download::input::DownloadInputBuilder {
     /// Initiate a download transfer for a single object with this input using the given client.
+    ///
+    /// This entry point reports no [events](crate::events) — an input builder has no sink to
+    /// carry. Use [`initiate_with_events`](Self::initiate_with_events) to register one.
     pub fn initiate_with(
         self,
         client: &crate::Client,
@@ -617,5 +620,22 @@ impl crate::operation::download::input::DownloadInputBuilder {
         let mut fluent_builder = client.download();
         fluent_builder.inner = self;
         fluent_builder.initiate()
+    }
+
+    /// Initiate a download transfer for a single object, reporting lifecycle
+    /// [events](crate::events) to `sink`.
+    ///
+    /// The events-carrying form of [`initiate_with`](Self::initiate_with). It exists because a
+    /// sink is registered on the fluent builder, which this entry point bypasses — without it,
+    /// a caller who assembled an input directly has no way to observe the transfer, and the
+    /// silence would look like a transfer that never produced events.
+    pub fn initiate_with_events(
+        self,
+        client: &crate::Client,
+        sink: crate::events::TransferEventSink,
+    ) -> Result<DownloadHandle, crate::error::Error> {
+        let mut fluent_builder = client.download();
+        fluent_builder.inner = self;
+        fluent_builder.events(sink).initiate()
     }
 }

@@ -324,11 +324,16 @@ async fn test_download_write_to_file() {
 /// nothing warned — the failure mode of a builder method that quietly ignores half its
 /// configuration.
 ///
-/// Covered as a table over all three single-object download entry points rather than as one
+/// Covered as a table over every single-object download entry point rather than as one
 /// test for the one that was broken, because the defect is *per entry point* and a fourth
 /// would be just as silent. A single-object transfer is one entry, so the shape is the same
-/// for all three: one `Decided` with no parent carrying a view, one `Settled` succeeding, and
+/// for all of them: one `Decided` with no parent carrying a view, one `Settled` succeeding, and
 /// the view's counter reaching the object size.
+///
+/// `InitiateWith` is the fourth, and it was silent for the same reason with a different cause:
+/// `DownloadInputBuilder::initiate_with` builds a *fresh* fluent builder and copies only the
+/// input across, so `events` was structurally unreachable rather than dropped — there was no
+/// parameter to pass one. `initiate_with_events` is that parameter.
 #[cfg(any(unix, windows))]
 #[tokio::test]
 async fn test_download_single_object_entry_points_all_report_events() {
@@ -341,11 +346,12 @@ async fn test_download_single_object_entry_points_all_report_events() {
         Path,
         File,
         Body,
+        InitiateWith,
     }
 
     let size = 8 * ByteUnit::Mebibyte.as_bytes_usize();
 
-    for variant in [Sink::Path, Sink::File, Sink::Body] {
+    for variant in [Sink::Path, Sink::File, Sink::Body, Sink::InitiateWith] {
         let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
         let m = setup_concurrent(part_size, 8).await;
         let content = deterministic_data(size);
@@ -358,12 +364,15 @@ async fn test_download_single_object_entry_points_all_report_events() {
             std::num::NonZeroUsize::new(8).expect("capacity > 0"),
         );
         let dir = tempfile::tempdir().unwrap();
+        // Cloned so the `InitiateWith` arm, which bypasses the fluent builder entirely, still
+        // has a sink to register. An extra live clone only means the stream never disconnects,
+        // which the deadline loop below already tolerates.
         let req = m
             .client
             .download()
             .bucket("test-bucket")
             .key("ev-key")
-            .events(sink);
+            .events(sink.clone());
 
         // Each arm drives the transfer to completion and drops its handle, which is what
         // releases the sink and ends the stream.
@@ -382,6 +391,17 @@ async fn test_download_single_object_entry_points_all_report_events() {
             }
             Sink::Body => {
                 let mut h = req.initiate().expect("initiate");
+                drain_body(&mut h).await.expect("drain body");
+                h.join().await.expect("join");
+            }
+            Sink::InitiateWith => {
+                drop(req); // this arm is about the input-builder path, not the fluent one
+                let mut h =
+                    aws_sdk_s3_transfer_manager::operation::download::DownloadInput::builder()
+                        .bucket("test-bucket")
+                        .key("ev-key")
+                        .initiate_with_events(&m.client, sink)
+                        .expect("initiate_with_events");
                 drain_body(&mut h).await.expect("drain body");
                 h.join().await.expect("join");
             }
