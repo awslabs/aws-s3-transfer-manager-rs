@@ -19,9 +19,7 @@ use std::task::{Wake, Waker};
 use std::time::Instant;
 
 use pending::TransferPendingState;
-#[cfg(test)]
-use pending::TransferPendingStats;
-pub(crate) use pending::{PendingCategory, PendingCause};
+pub(crate) use pending::{PendingCategory, PendingCause, TransferPendingStats};
 
 /// Edge-triggered wake flag for transfer state machines.
 ///
@@ -573,8 +571,9 @@ impl RequestMeasurement {
     }
 
     /// Complete and publish this logical request.
-    pub(crate) fn finish(mut self) {
+    pub(crate) fn finish(mut self) -> crate::metrics::RequestMetrics {
         self.publish();
+        self.metrics
     }
 
     fn publish(&mut self) {
@@ -816,7 +815,6 @@ impl TransferContext {
     }
 
     /// Return optional scheduler-visible pending statistics.
-    #[cfg(test)]
     pub(crate) fn pending_stats(&self) -> Option<TransferPendingStats> {
         self.pending_state
             .as_ref()
@@ -918,11 +916,7 @@ impl TransferContext {
     /// transition must therefore reach exactly one `signal_terminal`. It is safe
     /// to call while in-flight work is still draining.
     pub(crate) fn signal_terminal(&self) {
-        if let Some(pending) = &self.pending_state {
-            pending.record_terminal(self.id);
-        }
-        self.wake_flag.take_pending();
-        self.metrics.set_finished();
+        self.finalize_terminal_metrics();
         if let Some(tx) = self.completion_tx.lock().unwrap().take() {
             let _ = tx.send(());
         }
@@ -933,6 +927,19 @@ impl TransferContext {
                 parent: None,
             });
         }
+    }
+
+    /// Closes common timing intervals before a terminal diagnostic is emitted.
+    ///
+    /// This operation is idempotent. State machines may call it before
+    /// [`Self::signal_terminal`] so their terminal summary observes the same
+    /// finished timestamp and pending interval that the owning handle will see.
+    pub(crate) fn finalize_terminal_metrics(&self) {
+        if let Some(pending) = &self.pending_state {
+            pending.record_terminal(self.id);
+        }
+        self.wake_flag.take_pending();
+        self.metrics.set_finished();
     }
 
     /// Mark the transfer failed and immediately signal terminal (the

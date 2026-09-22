@@ -315,7 +315,9 @@ fn attach_request_measurement(
 ) -> ObjectDiscovery {
     match discovery.initial_chunk.as_mut() {
         Some(initial) => initial.request_metrics = Some(req_metrics),
-        None => req_metrics.finish(),
+        None => {
+            req_metrics.finish();
+        }
     }
     discovery
 }
