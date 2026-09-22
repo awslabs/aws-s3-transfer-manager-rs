@@ -13,4 +13,5 @@
 // drives two streams that do, and a comparison is a plain function, so a per-key request is
 // out of its reach.
 
+pub(crate) mod compare;
 pub(crate) mod walk;

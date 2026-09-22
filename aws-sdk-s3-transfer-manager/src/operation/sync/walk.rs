@@ -71,6 +71,17 @@ pub(crate) struct Pairing<S, D> {
 }
 
 impl<S, D> Pairing<S, D> {
+    // Built by the merge in every other case. A test for whoever consumes a pairing needs to
+    // state one directly, without a pair of streams behind it.
+    #[cfg(test)]
+    pub(crate) fn new(key: String, source: SideState<S>, destination: SideState<D>) -> Self {
+        Self {
+            key,
+            source,
+            destination,
+        }
+    }
+
     pub(crate) fn key(&self) -> &str {
         &self.key
     }
