@@ -176,16 +176,16 @@ impl Default for PendingData {
 /// ready polls and wakes unrelated to a pending interval.
 pub(crate) struct TransferPendingState {
     interval_open: AtomicBool,
-    emit_transitions: bool,
+    emit_events: bool,
     data: Mutex<PendingData>,
 }
 
 impl TransferPendingState {
-    /// Creates enabled state with optional per-transition diagnostic records.
-    pub(crate) fn new(emit_transitions: bool) -> Self {
+    /// Creates enabled state with optional per-event diagnostic records.
+    pub(crate) fn new(emit_events: bool) -> Self {
         Self {
             interval_open: AtomicBool::new(false),
-            emit_transitions,
+            emit_events,
             data: Mutex::new(PendingData::default()),
         }
     }
@@ -198,7 +198,7 @@ impl TransferPendingState {
             return;
         }
 
-        if self.record_pending_at(cause, Instant::now()) && self.emit_transitions {
+        if self.record_pending_at(cause, Instant::now()) && self.emit_events {
             tracing::trace!(
                 target: crate::telemetry::TARGET_TRANSFER,
                 tid = %id,
@@ -220,7 +220,7 @@ impl TransferPendingState {
         }
 
         if let Some((cause, elapsed)) = self.record_wake_at(Instant::now()) {
-            if self.emit_transitions {
+            if self.emit_events {
                 tracing::trace!(
                     target: crate::telemetry::TARGET_TRANSFER,
                     tid = %id,
@@ -244,7 +244,7 @@ impl TransferPendingState {
         }
 
         if let Some(interval) = self.record_repoll_at(Instant::now()) {
-            if self.emit_transitions {
+            if self.emit_events {
                 tracing::trace!(
                     target: crate::telemetry::TARGET_TRANSFER,
                     tid = %id,
@@ -269,7 +269,7 @@ impl TransferPendingState {
         }
 
         if let Some((cause, elapsed)) = self.record_terminal_at(Instant::now()) {
-            if self.emit_transitions {
+            if self.emit_events {
                 tracing::trace!(
                     target: crate::telemetry::TARGET_TRANSFER,
                     tid = %id,
