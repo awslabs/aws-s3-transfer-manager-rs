@@ -73,6 +73,8 @@
 //! | multipart (Auto sz) | ENABLED      | default           | round-trip (ranges auto-aligned)      | mock + real |
 //! | single-part (file)  | ENABLED      | default           | round-trip on disk                    | mock + real |
 //! | composite MPU value | ENABLED      | default           | object value == composite_checksum    | real        |
+//! | multipart, pinned misaligned size | ENABLED | default | NotValidated{Unavailable}    | mock + real |
+//! | multipart, explicit byte range    | ENABLED | default | NotValidated{Unavailable}    | mock + real |
 //!
 //! ## Negative: a tampered download MUST fail (mock only)
 //!
@@ -83,6 +85,8 @@
 //! | multipart (matched) | ENABLED      | WrongStoredChecksum | IntegrityError (explicit matched size)  |
 //! | multipart (Auto sz) | ENABLED      | WrongStoredChecksum | IntegrityError (auto-aligned, caught)   |
 //! | single-PUT split    | ENABLED      | CorruptBody         | #[ignore] intent: must IntegrityError — FAILS today (TODO) |
+//! | pinned misaligned size | ENABLED   | CorruptBody         | NOT caught; verdict never reads Validated |
+//! | pinned misaligned size | ENABLED   | CorruptBody         | #[ignore] intent: must IntegrityError — FAILS today (RUST-1173 scope) |
 //!
 //! * Verdict stays NotValidated even on success until the SDK exposes a
 //!   per-response validation outcome (see "Current limitation"). The negative
@@ -1000,6 +1004,158 @@ async fn single_put_split_tamper_caught_mock_gp() {
     );
 
     let result = t.download("obj", Some(ChecksumMode::Enabled)).await;
+    assert_integrity_error(result);
+
+    t.shutdown().await;
+}
+
+// caller-driven ranges: pinned part size, and explicit byte range (RUST-1173) ---
+//
+// Two request shapes defeat the stored-part alignment that makes multipart
+// validation work. A pinned part size suppresses auto-alignment (it is gated on
+// the size being Auto) and a pinned size that differs from the uploaded one cannot
+// align. An explicit range is excluded from alignment outright. In both cases S3
+// returns no checksum for the resulting sub-ranges, so the SDK validates nothing
+// and the verdict must say so rather than claim a validation that did not happen.
+
+/// A part size that deliberately does NOT divide the uploaded part size, so no
+/// download range can land on a stored part boundary.
+const MISALIGNED_DOWNLOAD_PART_SIZE: PartSize = PartSize::Target(5 * 1024 * 1024);
+/// The size `multipart_data()` is uploaded at for these tests: 20 MiB in 8 MiB
+/// parts, whose boundaries (8 MiB, 16 MiB) no multiple of 5 MiB reaches.
+const UPLOAD_PART_SIZE: PartSize = PartSize::Target(8 * 1024 * 1024);
+
+/// A caller-pinned part size that misaligns with the stored boundaries: the
+/// download succeeds with the right bytes, and reports that nothing was validated.
+async fn misaligned_part_size_reports_not_validated(target: Target) {
+    let t = target.connect_with(Some(UPLOAD_PART_SIZE)).await;
+    let data = multipart_data();
+    t.put(
+        "obj",
+        data.clone(),
+        ChecksumStrategy::with_calculated_crc32(),
+    )
+    .await;
+
+    let downloader = t.tm_with_part_size(MISALIGNED_DOWNLOAD_PART_SIZE);
+    let (bytes, output) = t
+        .download_range_with(&downloader, "obj", Some(ChecksumMode::Enabled), None)
+        .await
+        .expect("download");
+
+    assert_same_content(&data, &bytes);
+    assert_not_validated(&output, NotValidatedReason::Unavailable);
+
+    t.shutdown().await;
+}
+
+#[tokio::test]
+async fn misaligned_part_size_reports_not_validated_mock_gp() {
+    misaligned_part_size_reports_not_validated(Target::mock_gp()).await;
+}
+#[cfg(e2e_test)]
+#[tokio::test]
+async fn misaligned_part_size_reports_not_validated_real_gp() {
+    misaligned_part_size_reports_not_validated(Target::real_gp()).await;
+}
+
+/// An explicit byte range: the requested bytes arrive intact, and the verdict
+/// reports that nothing was validated. The range here sits strictly inside stored
+/// part 1, so it cannot match a boundary even by accident.
+async fn explicit_range_reports_not_validated(target: Target) {
+    let t = target.connect_with(Some(UPLOAD_PART_SIZE)).await;
+    let data = multipart_data();
+    t.put(
+        "obj",
+        data.clone(),
+        ChecksumStrategy::with_calculated_crc32(),
+    )
+    .await;
+
+    let (bytes, output) = t
+        .download_range_with(
+            &t.tm_with_part_size(UPLOAD_PART_SIZE),
+            "obj",
+            Some(ChecksumMode::Enabled),
+            Some("bytes=1048576-3145727"),
+        )
+        .await
+        .expect("download");
+
+    assert_eq!(bytes, data[1048576..=3145727], "requested range contents");
+    assert_not_validated(&output, NotValidatedReason::Unavailable);
+
+    t.shutdown().await;
+}
+
+#[tokio::test]
+async fn explicit_range_reports_not_validated_mock_gp() {
+    explicit_range_reports_not_validated(Target::mock_gp()).await;
+}
+#[cfg(e2e_test)]
+#[tokio::test]
+async fn explicit_range_reports_not_validated_real_gp() {
+    explicit_range_reports_not_validated(Target::real_gp()).await;
+}
+
+/// A corrupted body on the misaligned path is NOT caught, and the verdict must not
+/// claim otherwise. This pins the half of the guarantee that holds today: no path
+/// reports `Validated` for bytes nothing checked. It deliberately does not assert
+/// that the download fails — see the intent test below for that.
+#[tokio::test]
+async fn misaligned_part_size_tamper_is_not_caught_but_never_reads_validated_mock_gp() {
+    let t = Target::mock_gp().connect_with(Some(UPLOAD_PART_SIZE)).await;
+    let data = multipart_data();
+    t.put("obj", data, ChecksumStrategy::with_calculated_crc32())
+        .await;
+
+    let mock = t.mock().expect("requires the mock backend");
+    mock.insert_fault(
+        t.bucket(),
+        &t.key("obj"),
+        FaultType::CorruptBody,
+        0,
+        Occurrence::Always,
+    );
+
+    let downloader = t.tm_with_part_size(MISALIGNED_DOWNLOAD_PART_SIZE);
+    let (_bytes, output) = t
+        .download_range_with(&downloader, "obj", Some(ChecksumMode::Enabled), None)
+        .await
+        .expect("corruption on an unvalidated path does not fail the download");
+
+    assert_not_validated(&output, NotValidatedReason::Unavailable);
+
+    t.shutdown().await;
+}
+
+/// INTENT (scope decision pending): a tampered chunk of a misaligned-part-size
+/// download MUST fail the download. Ignored because it FAILS today — the chunks
+/// carry no checksum, so nothing detects the corruption. Whether this is required
+/// is the open question on RUST-1173: its acceptance criterion permits reporting
+/// not-validated instead, while RUST-1172's identical situation requires an error.
+/// If the error is required, this shares RUST-1172's mechanism.
+#[tokio::test]
+#[ignore = "RUST-1173 scope decision: requires TM-computed validation over unaligned ranges, shared with RUST-1172"]
+async fn misaligned_part_size_tamper_caught_mock_gp() {
+    let t = Target::mock_gp().connect_with(Some(UPLOAD_PART_SIZE)).await;
+    let data = multipart_data();
+    t.put("obj", data, ChecksumStrategy::with_calculated_crc32())
+        .await;
+
+    let mock = t.mock().expect("requires the mock backend");
+    mock.insert_fault(
+        t.bucket(),
+        &t.key("obj"),
+        FaultType::CorruptBody,
+        0,
+        Occurrence::Always,
+    );
+
+    let downloader = t.tm_with_part_size(MISALIGNED_DOWNLOAD_PART_SIZE);
+    let result = t
+        .download_range_with(&downloader, "obj", Some(ChecksumMode::Enabled), None)
+        .await;
     assert_integrity_error(result);
 
     t.shutdown().await;
