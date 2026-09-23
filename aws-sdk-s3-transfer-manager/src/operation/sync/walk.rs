@@ -15,7 +15,7 @@
 // one side but still listed on the other reads as a key that was deleted.
 
 use std::cmp::Ordering;
-use std::collections::VecDeque;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -106,28 +106,86 @@ enum Head<T> {
     Finished,
 }
 
+impl<T> Head<T> {
+    fn entry(&self) -> Option<&Entry<T>> {
+        match self {
+            Head::Entry(entry) => Some(entry),
+            Head::Unread | Head::Finished => None,
+        }
+    }
+}
+
+// A stretch of keys one failure hid, bounded by a prefix taken from the failure's own path.
+//
+// The bound matters because a failure does not always arrive where the keys it hid would sort. A
+// directory nobody could open is reported where that directory sorts, but a symlink loop is noticed
+// while reading the parent, so it arrives ahead of every sibling — including siblings sorting
+// earlier than the subtree it cost. Releasing the stretch at the side's next key would let such a
+// sibling stand in for keys nobody enumerated.
+#[derive(Debug, Clone)]
+struct Stretch {
+    cost: KeysLost,
+    // `None` where no prefix could be worked out, which holds the rest of the side: a stretch
+    // whose extent is unknown could cover any later key.
+    under: Option<String>,
+}
+
+impl Stretch {
+    // Whether this key is one the failure hid.
+    fn covers(&self, key: &str) -> bool {
+        match &self.under {
+            None => true,
+            Some(name) => at_or_under(key, name),
+        }
+    }
+
+    // Whether the merge reaching this key has passed everything the failure hid.
+    fn passed_by(&self, key: &str) -> bool {
+        match &self.under {
+            None => false,
+            Some(name) => !at_or_under(key, name) && key > name.as_str(),
+        }
+    }
+}
+
+// Whether a key is the named one or sits beneath it.
+//
+// The name counts as hidden along with its subtree, because the walk reports a range for a name
+// whose type it could not read — it may have been a file. Matching the subtree alone would leave
+// that one name reading absent, and delete mode removes what reads absent.
+//
+// The boundary check is what keeps a neighbour out: under `link`, the key `link/inner` is covered
+// and `linkfoo` is not.
+fn at_or_under(key: &str, name: &str) -> bool {
+    key.starts_with(name) && (key.len() == name.len() || key.as_bytes()[name.len()] == b'/')
+}
+
 // Two key-ordered streams merged into one pairing per key.
 pub(crate) struct Walk<S: KeyStream, D: KeyStream> {
     source: S,
     destination: D,
     src: Head<S::Source>,
     dst: Head<D::Source>,
-    // What a side's survivable failure cost, held until that side produces its next key.
+    // What a side's survivable failure cost, held until the merge is past the keys it hid.
     //
-    // The failure arrives before the keys it hid, so anything the other side holds in
-    // between is a key this one could not account for. Reading such a key as absent is what
-    // allows it to be deleted, which is the whole reason the answer is carried here.
-    src_gap: Option<KeysLost>,
-    dst_gap: Option<KeysLost>,
+    // Anything the other side holds inside that stretch is a key this one could not account for.
+    // Reading such a key as absent is what allows it to be deleted, which is the whole reason the
+    // answer is carried here.
+    src_gap: Option<Stretch>,
+    dst_gap: Option<Stretch>,
     // Keys a side named as lost, held until the merge reaches each one.
     //
     // A failure costing one key arrives before that key sorts, so the answer cannot be given
-    // where it is heard. Reading a directory already collects every child before any is
-    // handed over, and the errors from that read are queued with them, so these keys are a
-    // subset of what the walk holds anyway. Both arrive in key order, so this drains from the
-    // front and deciding one key costs what deciding the first one cost.
-    src_lost: VecDeque<String>,
-    dst_lost: VecDeque<String>,
+    // where it is heard. Reading a directory already collects every child before any is handed
+    // over, and the errors from that read are queued with them, so these keys are a subset of what
+    // the walk holds anyway.
+    //
+    // Ordered by key and not by arrival, because a walk reports the failures from one directory in
+    // whatever order the filesystem listed it. Two unreadable children arriving as `z` then `a`
+    // would leave `a` unmatched against a queue drained from the front, and an unmatched key reads
+    // as absent — a delete for a file sitting on disk whose loss was reported.
+    src_lost: BTreeSet<String>,
+    dst_lost: BTreeSet<String>,
     // Set when a side lost one key and could not say which.
     //
     // A listing names the key it dropped. A walk names a path, and the failure arrives at the
@@ -167,8 +225,8 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
             dst: Head::Unread,
             src_gap: None,
             dst_gap: None,
-            src_lost: VecDeque::new(),
-            dst_lost: VecDeque::new(),
+            src_lost: BTreeSet::new(),
+            dst_lost: BTreeSet::new(),
             src_lost_unnamed: false,
             dst_lost_unnamed: false,
             src_root: None,
@@ -201,9 +259,11 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
                         self.ended_by_failure = true;
                     } else {
                         match cost_of(&err, self.src_root.as_deref()) {
-                            Cost::Key(key) => self.src_lost.push_back(key),
+                            Cost::Key(key) => {
+                                self.src_lost.insert(key);
+                            }
                             Cost::UnnamedKey => self.src_lost_unnamed = true,
-                            Cost::Stretch(cost) => self.src_gap = Some(cost),
+                            Cost::Stretch(stretch) => self.src_gap = Some(stretch),
                             Cost::Nothing => {}
                         }
                     }
@@ -221,9 +281,11 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
                         self.ended_by_failure = true;
                     } else {
                         match cost_of(&err, self.dst_root.as_deref()) {
-                            Cost::Key(key) => self.dst_lost.push_back(key),
+                            Cost::Key(key) => {
+                                self.dst_lost.insert(key);
+                            }
                             Cost::UnnamedKey => self.dst_lost_unnamed = true,
-                            Cost::Stretch(cost) => self.dst_gap = Some(cost),
+                            Cost::Stretch(stretch) => self.dst_gap = Some(stretch),
                             Cost::Nothing => {}
                         }
                     }
@@ -282,7 +344,7 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
     fn take_source_only(&mut self) -> Pairing<S::Source, D::Source> {
         let entry = self.take_src();
         let destination = Self::missing(
-            self.dst_gap,
+            self.dst_gap.as_ref(),
             &mut self.dst_lost,
             self.dst_lost_unnamed,
             &entry.key,
@@ -297,7 +359,7 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
     fn take_destination_only(&mut self) -> Pairing<S::Source, D::Source> {
         let entry = self.take_dst();
         let source = Self::missing(
-            self.src_gap,
+            self.src_gap.as_ref(),
             &mut self.src_lost,
             self.src_lost_unnamed,
             &entry.key,
@@ -313,18 +375,18 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
     // itself, unknown while a failure has left it unable to, and unknown for a key it named as
     // lost.
     fn missing<T>(
-        gap: Option<KeysLost>,
-        lost: &mut VecDeque<String>,
+        gap: Option<&Stretch>,
+        lost: &mut BTreeSet<String>,
         lost_unnamed: bool,
         key: &str,
     ) -> SideState<T> {
         let_go_before(lost, key);
-        if lost.front().is_some_and(|held| held == key) {
-            lost.pop_front();
+        if lost.remove(key) {
             return SideState::Unknown(KeysLost::OneKey);
         }
         match gap {
-            Some(cost) => SideState::Unknown(cost),
+            Some(stretch) if stretch.covers(key) => SideState::Unknown(stretch.cost),
+            Some(_) => SideState::Absent,
             // A range, because the conclusion here is that absence cannot be read from
             // position on this side any more. `OneKey` says the keys around it are known,
             // which a consumer would act on by holding back one key and trusting the rest.
@@ -349,9 +411,16 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
     }
 
     fn take_src(&mut self) -> Entry<S::Source> {
-        // Producing a key accounts for everything up to it, so whatever the failure hid is
-        // now behind the merge.
-        self.src_gap = None;
+        // Producing a key past the stretch accounts for everything it hid. A key inside it, or
+        // one sorting before it, accounts for nothing: the failure was heard early and what it
+        // cost is still ahead.
+        if self.src.entry().is_some_and(|entry| {
+            self.src_gap
+                .as_ref()
+                .is_some_and(|s| s.passed_by(&entry.key))
+        }) {
+            self.src_gap = None;
+        }
         match std::mem::replace(&mut self.src, Head::Unread) {
             Head::Entry(entry) => entry,
             _ => unreachable!("taken only with an entry at the head"),
@@ -359,7 +428,13 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
     }
 
     fn take_dst(&mut self) -> Entry<D::Source> {
-        self.dst_gap = None;
+        if self.dst.entry().is_some_and(|entry| {
+            self.dst_gap
+                .as_ref()
+                .is_some_and(|s| s.passed_by(&entry.key))
+        }) {
+            self.dst_gap = None;
+        }
         match std::mem::replace(&mut self.dst, Head::Unread) {
             Head::Entry(entry) => entry,
             _ => unreachable!("taken only with an entry at the head"),
@@ -482,12 +557,10 @@ impl Walker {
 
 // Let go of every held key sorting before this one.
 //
-// Held keys and the merge both run in key order, so a key still at the front was passed
-// without either side reaching it, and no decision will ever be owed for it.
-fn let_go_before(lost: &mut VecDeque<String>, key: &str) {
-    while lost.front().is_some_and(|held| held.as_str() < key) {
-        lost.pop_front();
-    }
+// The merge runs in key order, so a key still held below this one was passed without either side
+// reaching it, and no decision will ever be owed for it.
+fn let_go_before(lost: &mut BTreeSet<String>, key: &str) {
+    *lost = lost.split_off(key);
 }
 
 // What a failure the side survived costs the merge.
@@ -503,8 +576,8 @@ enum Cost {
     // One key, and which one could not be worked out. Every later key on that side has to stay
     // open, since any of them could be the one that went unread.
     UnnamedKey,
-    // Every key from here to wherever that side speaks next.
-    Stretch(KeysLost),
+    // Every key the failure hid, under the prefix it names where one could be worked out.
+    Stretch(Stretch),
     // Nothing for the merge to answer for. The name produced no key on this side, so no pairing will
     // ever ask about it, and holding anything back would hold back a key chosen at random.
     Nothing,
@@ -539,7 +612,19 @@ fn cost_of(err: &StreamError, root: Option<&Path>) -> Cost {
             }
         }
         _ if err.keys_lost() == KeysLost::OneKey => Cost::UnnamedKey,
-        _ => Cost::Stretch(err.keys_lost()),
+        // A stretch, bounded by the name it cost where the failure named a path and the root is
+        // known. The bound is the name itself, which `covers` reads as that name and everything
+        // beneath it. Without a bound the rest of the side is answered unknown, since a failure
+        // reported before the keys it hid says nothing about where they stop.
+        _ => Cost::Stretch(Stretch {
+            cost: err.keys_lost(),
+            under: match err {
+                StreamError::Walk(walk) => {
+                    root.and_then(|root| walk.path().and_then(|p| key_under_root(root, p)))
+                }
+                _ => None,
+            },
+        }),
     }
 }
 
@@ -902,13 +987,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_side_that_produces_a_key_has_accounted_for_what_came_before() {
-        // Once the source reaches `photos/2020/`, its earlier failure says nothing about keys
-        // from there on, so a destination-only key past it is absent again.
+    async fn a_key_outside_the_lost_subtree_is_absent() {
+        // The failure cost `photos/2019/` and nothing else, so `z.txt` is absent as usual. What
+        // bounds it is the prefix taken from the failure's own path: the side producing a later key
+        // settles nothing, because a failure can be heard before the keys it hid.
         let mut walk = Walk::new(
             Scripted::from(vec![Err(a_lost_directory()), Ok(entry("m.txt"))]),
             Scripted::of(&["m.txt", "z.txt"]),
-        );
+        )
+        .with_roots(Some(PathBuf::from("/root")), None);
         let _ = walk.next().await.expect("the failure");
         let m = walk.next().await.expect("m.txt").expect("a pairing");
         assert_eq!(m.key(), "m.txt");
@@ -1113,6 +1200,92 @@ mod tests {
                 ("z.txt", At::Gone, At::Here),
             ]),
             "the unreadable file's own key is unknown, and the key after it is absent"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn two_keys_lost_from_one_directory_are_both_unknown() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // A directory that lists but whose children cannot be stat'd, holding two files. The walk
+        // reports both in the order the filesystem hands them over, which is not key order.
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let locked = dir.path().join("locked");
+        std::fs::create_dir(&locked).expect("a directory");
+        std::fs::write(locked.join("z.txt"), "").expect("a file");
+        std::fs::write(locked.join("a.txt"), "").expect("a file");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o400)).expect("chmod");
+        let usable =
+            std::fs::read_dir(&locked).is_ok() && std::fs::metadata(locked.join("a.txt")).is_err();
+        assert!(
+            usable,
+            "this platform does not produce the state under test"
+        );
+
+        let walker = Walker::builder().build();
+        let mut walk = Walk::new(
+            walker.local_walk(dir.path().to_path_buf()),
+            Scripted::of(&["locked/a.txt", "locked/z.txt"]),
+        )
+        .with_roots(Some(dir.path().to_path_buf()), None);
+
+        let mut seen = Vec::new();
+        while let Some(next) = walk.next().await {
+            if let Ok(pairing) = next {
+                seen.push((
+                    pairing.key().to_string(),
+                    at(pairing.source()),
+                    at(pairing.destination()),
+                ));
+            }
+        }
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        assert_eq!(
+            seen,
+            plan(&[
+                ("locked/a.txt", At::UnknownKey, At::Here),
+                ("locked/z.txt", At::UnknownKey, At::Here),
+            ]),
+            "both files exist and both were reported unreadable, so neither may read as absent"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_loss_reported_before_its_own_position_still_covers_the_keys_it_hid() {
+        // A symlink pointing at its own ancestor. The walk notices while reading the parent, so the
+        // failure arrives ahead of every sibling — including ones sorting earlier than the subtree
+        // it hid. A key inside that subtree must not read as absent.
+        let dir = tempfile::tempdir().expect("a temp dir");
+        std::fs::write(dir.path().join("a.txt"), "").expect("a file");
+        std::os::unix::fs::symlink(".", dir.path().join("zlink")).expect("a self-referring link");
+
+        let walker = Walker::builder().follow_symlinks(true).build();
+        let mut walk = Walk::new(
+            walker.local_walk(dir.path().to_path_buf()),
+            Scripted::of(&["a.txt", "zlink/deep.txt"]),
+        )
+        .with_roots(Some(dir.path().to_path_buf()), None);
+
+        let mut seen = Vec::new();
+        while let Some(next) = walk.next().await {
+            if let Ok(pairing) = next {
+                seen.push((
+                    pairing.key().to_string(),
+                    at(pairing.source()),
+                    at(pairing.destination()),
+                ));
+            }
+        }
+        assert_eq!(
+            seen,
+            plan(&[
+                ("a.txt", At::Here, At::Here),
+                ("zlink/deep.txt", At::UnknownRange, At::Here),
+            ]),
+            "nobody enumerated under the link, so what is there cannot be read from position"
         );
     }
 
@@ -1474,6 +1647,29 @@ mod tests {
                 ("zzz.txt", At::Here, At::Here),
             ]),
             "a failure naming the root hid every key under it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lost_name_of_unknown_type_is_covered_with_its_subtree() {
+        let err = StreamError::Walk(WalkError::new(
+            Some(PathBuf::from("/root/link")),
+            WalkErrorKind::DirectoryUnreadable,
+            Box::from("permission denied"),
+        ));
+        let walk = Walk::new(
+            Scripted::from(vec![Err(err), Ok(entry("zzz.txt"))]),
+            Scripted::of(&["link", "link/inner.txt", "zzz.txt"]),
+        )
+        .with_roots(Some(PathBuf::from("/root")), None);
+        assert_eq!(
+            drain(walk).await,
+            plan(&[
+                ("link", At::UnknownRange, At::Here),
+                ("link/inner.txt", At::UnknownRange, At::Here),
+                ("zzz.txt", At::Here, At::Here),
+            ]),
+            "the name whose type was unknown is as unaccounted for as its subtree"
         );
     }
 
