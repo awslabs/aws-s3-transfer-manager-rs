@@ -158,17 +158,23 @@ async fn run_chaos(percent: usize, prefix: &str) -> Run {
     run
 }
 
-/// Bytes each doomed child pushed before dying: `FAULT_SKIP` successful parts.
-fn expected_lost_bytes(percent: usize) -> u64 {
-    let every = 100 / percent;
-    let doomed = (0..FILE_COUNT).filter(|i| i % every == 0).count() as u64;
-    doomed * FAULT_SKIP as u64 * PART
+/// Bytes the children that *did* succeed moved, from the count the run reported.
+///
+/// Derived from `objects_uploaded()` rather than from the injected fault pattern. The pattern
+/// says which children are doomed; it does not say that no other child fails. A loaded host
+/// fails more of them -- one CI run injected faults into 2 of 20 and finished with 7 failed and
+/// 13 uploaded -- so a figure predicted from the pattern describes a run that did not happen.
+fn success_bytes(uploaded: u64) -> u64 {
+    uploaded * FILE_SIZE as u64
 }
 
-fn expected_success_bytes(percent: usize) -> u64 {
-    let every = 100 / percent;
-    let ok = (0..FILE_COUNT).filter(|i| i % every != 0).count() as u64;
-    ok * FILE_SIZE as u64
+/// The most a run could have pushed: every child's whole object.
+///
+/// A ceiling rather than an estimate. An injected fault fires after `FAULT_SKIP` parts, but a
+/// child that fails for any other reason can get arbitrarily far first, so the only bound that
+/// holds for every failure is the object's own size.
+fn ceiling_bytes(uploaded: u64, failed: u64) -> u64 {
+    (uploaded + failed) * FILE_SIZE as u64
 }
 
 async fn assert_chaos(percent: usize, prefix: &str) {
@@ -179,8 +185,8 @@ async fn assert_chaos(percent: usize, prefix: &str) {
          objects uploaded ........ {}\n\
          objects failed .......... {}  (of which no source_path: {})\n\
          parent network_tx ....... {}\n\
-         success-only bytes ...... {}\n\
-         bytes pushed by doomed .. {}  <- lost if parent == success-only\n\
+         success-only bytes ...... {}  <- parent must exceed this\n\
+         ceiling (all children) .. {}  <- parent must not exceed this\n\
          total_bytes ............. {:?}\n\
          network_tx at join ...... {}\n\
          network_tx 250ms later .. {}\n",
@@ -188,8 +194,8 @@ async fn assert_chaos(percent: usize, prefix: &str) {
         r.failed,
         r.failed_without_path,
         r.network_tx_at_join,
-        expected_success_bytes(percent),
-        expected_lost_bytes(percent),
+        success_bytes(r.uploaded),
+        ceiling_bytes(r.uploaded, r.failed as u64),
         r.total_bytes,
         r.network_tx_at_join,
         r.network_tx_after,
@@ -205,27 +211,25 @@ async fn assert_chaos(percent: usize, prefix: &str) {
     // link and `record_io` walks it, so a child's bytes reach the parent as they
     // move.
     assert!(
-        expected_lost_bytes(percent) > 0,
-        "the scenario must actually push bytes that then fail, or it proves nothing"
+        r.failed > 0,
+        "the scenario must actually fail some children, or it proves nothing"
     );
-    // Bounds, not equality. `expected_lost_bytes` models how much a doomed child gets
-    // through before its fault fires (`FAULT_SKIP` parts each), which is an upper
-    // estimate: a doomed child can be cancelled, or reach its fault sooner, so the real
-    // figure sits between the two. The load-bearing half is the lower bound — strictly
-    // greater than success-only is what proves a failed child's bytes are counted.
+    // Bounds against what the run reported, never against what the fault pattern predicted.
+    // The lower bound is the load-bearing one: a parent holding more than the successful
+    // children's own bytes can only have gotten the difference from a child that failed.
     assert!(
-        r.network_tx_at_join > expected_success_bytes(percent),
-        "the parent must count bytes pushed by children that later failed; \
-         {} == {} means the rollup regressed to a success-arm fold",
+        r.network_tx_at_join > success_bytes(r.uploaded),
+        "the parent must count bytes pushed by children that later failed; {} <= {} means \
+         the rollup regressed to a success-arm fold",
         r.network_tx_at_join,
-        expected_success_bytes(percent)
+        success_bytes(r.uploaded)
     );
     assert!(
-        r.network_tx_at_join <= expected_success_bytes(percent) + expected_lost_bytes(percent),
+        r.network_tx_at_join <= ceiling_bytes(r.uploaded, r.failed as u64),
         "the parent counted {} but at most {} could have been pushed — a total above \
          that means something is counted twice",
         r.network_tx_at_join,
-        expected_success_bytes(percent) + expected_lost_bytes(percent)
+        ceiling_bytes(r.uploaded, r.failed as u64)
     );
 
     // A composite establishes a byte denominator.
