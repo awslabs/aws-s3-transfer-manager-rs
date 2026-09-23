@@ -61,6 +61,67 @@ pub(crate) struct ExactTimestamps;
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct NoOverwrite;
 
+// Which built-in comparison a run uses.
+//
+// The trait is how a caller plugs in their own; this is the shortcut for callers wanting one of
+// ours, chosen from a flag or a config value without naming a type.
+//
+// A match on this is exhaustive, so adding a mode breaks every match until each one says what it
+// does with the new variant. That is what is wanted while the type reaches nobody outside this
+// crate. Publishing it means saying the opposite — that a caller's match has to expect variants it
+// has not seen — and comparing checksums and comparing properties a caller picks are both waiting
+// to be added.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum Mode {
+    #[default]
+    SizeAndTime,
+    SizeOnly,
+    ExactTimestamps,
+    NoOverwrite,
+}
+
+// Picking one, per direction.
+//
+// `Mode` deliberately does not implement `Compare`. An impl would have to forward each method, and
+// a method added later would go unforwarded — `Mode` would answer the trait's default while the
+// selected mode's override sat unused, which is the bug this selector exists to avoid, one level
+// up. Handing back the mode itself means every method it defines is the one that runs, now and
+// after the trait grows.
+macro_rules! picker {
+    ($picker:ident, $source:ty, $destination:ty, $doc:literal) => {
+        impl Mode {
+            #[doc = $doc]
+            pub(crate) fn $picker(&self) -> &'static dyn Compare<$source, $destination> {
+                match self {
+                    Self::SizeAndTime => &SizeAndTime,
+                    Self::SizeOnly => &SizeOnly,
+                    Self::ExactTimestamps => &ExactTimestamps,
+                    Self::NoOverwrite => &NoOverwrite,
+                }
+            }
+        }
+    };
+}
+
+picker!(
+    uploading,
+    FsEntry,
+    Object,
+    "The comparison this mode makes for an upload."
+);
+picker!(
+    downloading,
+    Object,
+    FsEntry,
+    "The comparison this mode makes for a download."
+);
+picker!(
+    copying,
+    Object,
+    Object,
+    "The comparison this mode makes for a copy between two buckets."
+);
+
 // How much later the destination was written than the source. Negative when the source is newer.
 fn delta<S, D>(source: &Described<'_, S>, destination: &Described<'_, D>) -> i64 {
     destination.last_modified_secs() - source.last_modified_secs()
@@ -504,6 +565,87 @@ mod tests {
             SizeAndTime.compare(&uploading(local(1, 50, fs), object(1, 100))),
             unchanged()
         );
+    }
+
+    #[test]
+    fn picking_a_mode_by_name_answers_what_that_mode_answers() {
+        // Sizes match, the source is newer, and the destination holds the key. Three answers,
+        // because exact timestamps keeps the default rule for a copy — so this pairing cannot
+        // tell those two apart, and `picking_exact_timestamps_by_name_changes_a_download` is what
+        // separates them.
+        let pairing = || copying(object(1, 100), object(1, 50));
+        for (mode, expected) in [
+            (Mode::SizeAndTime, send(TransferReason::TimeDiffers)),
+            (Mode::SizeOnly, unchanged()),
+            (Mode::ExactTimestamps, send(TransferReason::TimeDiffers)),
+            (Mode::NoOverwrite, destination_exists()),
+        ] {
+            assert_eq!(mode.copying().compare(&pairing()), expected, "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn picking_no_overwrite_by_name_keeps_what_it_answers_for_an_unreadable_field() {
+        // The case it decides differently from every other mode. Forwarding only the first trait
+        // method would send this pair, overwriting the key the mode exists to protect, and the
+        // test above would still pass.
+        let unread = described(None, Some(100));
+        assert_eq!(
+            Mode::NoOverwrite
+                .copying()
+                .compare(&copying(object(1, 100), unread.clone())),
+            destination_exists()
+        );
+        assert_eq!(
+            Mode::SizeAndTime
+                .copying()
+                .compare(&copying(object(1, 100), unread)),
+            send(TransferReason::Undescribable),
+            "what the other modes answer for the same pair"
+        );
+    }
+
+    #[tokio::test]
+    async fn picking_exact_timestamps_by_name_changes_a_download() {
+        // The only thing this mode changes, and the one direction it changes it in. A copy cannot
+        // show it, because there the mode keeps the default rule by design — so wiring this
+        // variant to the default would pass every other selector test.
+        let (_dir, fs) = a_local_entry().await;
+        let newer_object = downloading(object(1, 200), local(1, 100, fs));
+        assert_eq!(
+            Mode::ExactTimestamps.downloading().compare(&newer_object),
+            send(TransferReason::TimeDiffers),
+            "a newer object comes down"
+        );
+        assert_eq!(
+            Mode::SizeAndTime.downloading().compare(&newer_object),
+            unchanged(),
+            "where the default rule leaves it on the service"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mode_picked_by_name_serves_every_direction() {
+        let (_down_dir, down) = a_local_entry().await;
+        assert_eq!(
+            Mode::SizeOnly
+                .downloading()
+                .compare(&downloading(object(1, 200), local(1, 100, down))),
+            unchanged(),
+            "sizes match, and this mode reads nothing else"
+        );
+        let (_up_dir, up) = a_local_entry().await;
+        assert_eq!(
+            Mode::SizeOnly
+                .uploading()
+                .compare(&uploading(local(1, 200, up), object(2, 100))),
+            send(TransferReason::SizeDiffers)
+        );
+    }
+
+    #[test]
+    fn the_default_mode_is_the_one_the_cli_applies() {
+        assert_eq!(Mode::default(), Mode::SizeAndTime);
     }
 
     #[test]
