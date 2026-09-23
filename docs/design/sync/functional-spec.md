@@ -322,8 +322,10 @@ uses itself.
 - **A comparison MUST be able to do work before it answers.** Comparing checksums (FR-Cmp-9) or properties
   (FR-Cmp-11) means reading bytes or making a request first, so the interface MUST accept "not yet, ask me
   again" instead of demanding an immediate decision — including in the first release, where every built-in
-  mode does answer immediately. Answers that arrive late arrive out of order, and MUST be applied in key
-  order so FR-Cmp-8 still holds.
+  mode does answer immediately. A comparison answering immediately produces answers in key order, because
+  the merge hands it keys in that order. A deferred answer carries no such promise, and none is required:
+  FR-Cmp-8 is about what a plan contains, not the sequence it is handed over in, and a consumer needing
+  order sorts what it collects.
 - The comparison MUST be given the **entries themselves**. A checksum or ETag check
   needs listing fields that only the entry carries. Whatever it decides MUST come back with the reason
   attached (FR-Obs-1).
@@ -334,9 +336,15 @@ the fraction of a second a local filesystem records and S3 does not. Once a file
 MUST keep agreeing: repeated runs over an unchanged pair MUST NOT flip between transferring and skipping.
 *`[CLI]` `subscribers.py` → `ProvideLastModifiedTimeSubscriber` writes back `int(time.mktime(last_modified.timetuple()))` — whole seconds — via `utils.set_file_utime`; `syncstrategy/base.py` → `total_seconds` yields float seconds, so `ExactTimestampsSync` demands exact equality. `[DERIVED]` non-oscillation follows only because S3 `LastModified` is second-granular and the write-back matches it.*
 
-**FR-Cmp-8** The same side states and the same options MUST always produce the same plan. Both sides arrive
-in key order (FR-Enum-13); beyond that, the plan MUST NOT depend on how the two interleave, or on the order
-in which earlier transfers finished.
+**FR-Cmp-8** The same side states and the same options MUST always produce the same plan. Both sides
+arrive in key order (FR-Enum-13); beyond that, the plan MUST NOT depend on how the two interleave, or on
+the order in which earlier transfers finished.
+
+"The same plan" means the same decision and the same reason for every key. It does not mean the same
+sequence: FR-Exec-12 lets transfers happen in any order, so nothing downstream depends on the order
+decisions are handed over in, and the destination reaches the same state either way. A consumer that needs
+an ordered plan — diffing two dry runs, say — MUST sort what it collects rather than assume the order it
+arrived in.
 *`[DERIVED]` from `comparator.py` → `Comparator.call`, whose merge join requires both sides "listed in the same order, least to greatest in collation order", and `filegenerator.py` → `list_files` + `normalize_sort`, which emulate S3 byte order locally by suffixing directory names with the path separator before sorting.*
 
 **FR-Cmp-9 (checksum mode)** Sync MUST offer an opt-in mode that compares the checksums both sides have
@@ -605,15 +613,26 @@ half-written destination entry looking like a finished one, and MUST report what
 
 What happens when an entry, a directory, or a listing cannot be handled, and what the caller is told.
 
-**FR-Fail-1** An object sitting in an archival storage class, not currently restored, MUST be skipped with
-a warning on `Download` and `Copy` — its bytes are not retrievable, so trying is a guaranteed failure. Two
-separate switches MUST exist: one to attempt the transfer anyway, one to stop warning about it. `Upload` is
-unaffected.
+**FR-Fail-1** An object in `GLACIER` or `DEEP_ARCHIVE` with no restored copy MUST be skipped with a
+warning on `Download` and `Copy` — its bytes are not retrievable, so trying is a guaranteed failure. An
+object whose restore is under way MUST be skipped and reported as such, separately: the bytes arrive when
+it finishes, so a later run gets them, and a caller told only that it was archived would think asking
+again is pointless. Two separate switches MUST exist: one to attempt the transfer anyway, one to stop
+warning about it. `Upload` is unaffected, because writing over an object never reads what is already
+there.
+
+Those two classes are the only ones a listing can answer for, and the names are a poor guide. `GLACIER_IR`
+reads in real time and never carries a restore status, so treating every Glacier-named class as archived
+would skip every one of those objects on every run. `INTELLIGENT_TIERING` reports the same class whether
+or not the object currently sits in an archive tier, so a listing cannot tell; sync finds out when a
+transfer comes back `InvalidObjectState`.
 
 Storage class comes back in a listing. Restore state only comes back when the listing asks for it, so sync
-MUST request `RestoreStatus` on every listing — which keeps the check free of per-entry requests
-(FR-Cmp-5). It has to be every listing: leave the header off and the field is simply missing, which looks
-identical to an object that was never restored.
+MUST request `RestoreStatus` on every listing it makes — which keeps the check free of per-entry requests
+(FR-Cmp-5). It has to be every one: leave the parameter off and the field is simply missing, which looks
+identical to an object that was never restored, so a comparison MUST treat a listing that did not ask as
+saying nothing about whether an object is reachable. The parameter is unsupported for directory buckets,
+and sync MUST NOT turn it on for listings made on behalf of other operations.
 *`[CLI]` `s3handler.py` → `_warn_glacier` (checked in `DownloadRequestSubmitter` and `CopyRequestSubmitter` warning handlers); `fileinfo.py` → `is_glacier_compatible` / `_is_glacier_object` (`GLACIER`, `DEEP_ARCHIVE`). The restore half is a departure: `_is_restored` tests for `ongoing-request="false"` in `Restore`, a HeadObject header, against data that came from a listing, and the CLI never sends `OptionalObjectAttributes`. So the test always fails during a sync and a restored object is skipped with a warning even though its bytes are available. `[DOC]` `--force-glacier-transfer`, `--ignore-glacier-warnings` (including its effect on the exit code); `ListObjectsV2` carries `RestoreStatus` (`IsRestoreInProgress`, `RestoreExpiryDate`) when the request sends `x-amz-optional-object-attributes: RestoreStatus`.*
 
 **FR-Fail-2** Sync MUST offer two failure policies, continue and abort, and MUST default to continue.
@@ -732,6 +751,11 @@ dry runs included.
 
 They MUST carry enough that a caller can print the familiar `upload:` / `download:` / `copy:` / `delete:`
 lines from them alone.
+
+An entry with no key it could take (FR-Enum-3) is the one exception to carrying a key, since none exists
+to carry. It MUST be identified by its name with the invalid bytes escaped, which is what the warning for
+it already names, and everything else on the value is unchanged. Reporting it is what tells a caller a
+name was seen and skipped; leaving it out would make the run look like it covered a tree it did not.
 
 Delivery MUST be bounded, so a caller that reads slowly MAY miss events and the run MUST NOT slow down
 waiting. The result stays complete either way (FR-Fail-4). A dry run is the exception, where the events are
