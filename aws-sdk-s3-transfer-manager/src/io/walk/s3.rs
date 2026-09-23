@@ -455,6 +455,15 @@ impl S3Walk {
         self.done
     }
 
+    // Whether each listing asked for restore status.
+    //
+    // A consumer deciding whether an archived object can be read has to know: without the field,
+    // every object comes back without a restore status, and one that was restored looks the same
+    // as one that never was.
+    pub(crate) fn requests_restore_status(&self) -> bool {
+        self.config.request_restore_status
+    }
+
     /// Whether the target bucket is a directory bucket (S3 Express).
     ///
     /// Directory buckets may not return lexicographically sorted listing

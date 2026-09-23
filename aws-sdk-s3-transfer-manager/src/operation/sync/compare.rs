@@ -615,6 +615,20 @@ mod tests {
     }
 
     #[test]
+    fn what_is_in_the_way_is_answered_before_what_could_not_be_described() {
+        // A socket whose fields also went unread. Asking about the fields first would answer
+        // "send it", which asks for bytes that never arrive — so the order of these two checks is
+        // the thing being pinned, and every other obstructed pair is described on purpose.
+        assert_eq!(
+            decide(
+                SideState::Present(entry(None, None, Some(Obstruction::NothingToRead))),
+                SideState::Present(file()),
+            ),
+            (obstructed(Obstruction::NothingToRead), false)
+        );
+    }
+
+    #[test]
     fn a_source_whose_size_went_unread_is_transferred() {
         assert_eq!(
             decide(

@@ -187,8 +187,9 @@ impl Compare<Object, Object> for SizeAndTime {
     }
 }
 
-// Downloading: leave it while the file is at least as new as the object, which is the test that
-// keeps a newer object on the service.
+// Downloading: leave it while the object is at least as new as the file. That is the same relation
+// uploading tests, and the sign flips because the object is the source here — which is what keeps a
+// newer object on the service.
 impl Compare<Object, FsEntry> for SizeAndTime {
     fn compare_described(
         &self,
@@ -646,6 +647,35 @@ mod tests {
     #[test]
     fn the_default_mode_is_the_one_the_cli_applies() {
         assert_eq!(Mode::default(), Mode::SizeAndTime);
+    }
+
+    #[tokio::test]
+    async fn equal_times_leave_an_upload_and_a_download_alone() {
+        // The boundary both predicates turn on. Narrowing either to a strict comparison would send
+        // every key whose sides already agree, on every run, for as long as the pair exists.
+        let (_up_dir, up) = a_local_entry().await;
+        assert_eq!(
+            SizeAndTime.compare(&uploading(local(1, 100, up), object(1, 100))),
+            unchanged(),
+            "an upload whose object carries the file's own second"
+        );
+        let (_down_dir, down) = a_local_entry().await;
+        assert_eq!(
+            SizeAndTime.compare(&downloading(object(1, 100), local(1, 100, down))),
+            unchanged(),
+            "and a download, once a written file carries the object's second"
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_timestamps_leaves_an_upload_the_default_rule_leaves() {
+        // This mode's upload impl, which no other test reaches. It delegates, so what it must show
+        // is that the delegation is wired: a newer object is left alone, as the default rule says.
+        let (_dir, fs) = a_local_entry().await;
+        assert_eq!(
+            ExactTimestamps.compare(&uploading(local(1, 50, fs), object(1, 100))),
+            unchanged()
+        );
     }
 
     #[test]

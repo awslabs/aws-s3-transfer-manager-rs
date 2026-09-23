@@ -419,22 +419,26 @@ impl KeyStream for S3Walk {
     }
 
     async fn next_entry(&mut self) -> Option<Result<Entry<Object>, StreamError>> {
+        let restore_status_asked_for = self.requests_restore_status();
         loop {
             match self.next().await? {
                 Err(err) => return Some(Err(err.into())),
-                Ok(obj) => match key_and_meta(&obj, &root_prefix(self.prefix())) {
-                    Ok(None) => continue,
-                    Ok(Some((key, meta))) => {
-                        return Some(Ok(Entry {
-                            key,
-                            meta,
-                            source: obj,
-                        }))
+                Ok(obj) => {
+                    match key_and_meta(&obj, &root_prefix(self.prefix()), restore_status_asked_for)
+                    {
+                        Ok(None) => continue,
+                        Ok(Some((key, meta))) => {
+                            return Some(Ok(Entry {
+                                key,
+                                meta,
+                                source: obj,
+                            }))
+                        }
+                        // One key that cannot be compared. The listing itself arrived, so the run
+                        // carries on with the keys around it.
+                        Err(err) => return Some(Err(err)),
                     }
-                    // One key that cannot be compared. The listing itself arrived, so the run
-                    // carries on with the keys around it.
-                    Err(err) => return Some(Err(err)),
-                },
+                }
             }
         }
     }
@@ -491,9 +495,6 @@ pub(crate) fn relative_key<'a>(key: &'a str, root_prefix: &str) -> Option<&'a st
     (!relative.is_empty()).then_some(relative)
 }
 
-// `Ok(None)` is the prefix itself, a folder marker, or a key outside the root. `Err` means
-// the listing was not what the API documents.
-//
 // What stops a listed object being read.
 //
 // Two answers come from one pair of fields, because neither settles it alone. A restore status is
@@ -505,10 +506,17 @@ pub(crate) fn relative_key<'a>(key: &'a str, root_prefix: &str) -> Option<&'a st
 // archived would skip every one of those objects on every run. `INTELLIGENT_TIERING` reports the
 // same value whether or not the object currently sits in an archive tier, so it cannot be answered
 // from a listing at all; a transfer finds out and fails.
-fn object_obstruction(obj: &Object) -> Option<Obstruction> {
+fn object_obstruction(obj: &Object, restore_status_asked_for: bool) -> Option<Obstruction> {
     match obj.storage_class() {
         Some(ObjectStorageClass::Glacier) | Some(ObjectStorageClass::DeepArchive) => {}
         _ => return None,
+    }
+    // An absent restore status means "no copy was asked for" only where the listing asked for the
+    // field. A listing that did not carries none for any object, so claiming to know would skip
+    // every restored object for as long as the bucket holds it — worse than a transfer that fails,
+    // because nothing would happen and nothing would say why.
+    if !restore_status_asked_for {
+        return None;
     }
     match obj.restore_status() {
         // Nobody asked for a copy.
@@ -525,6 +533,9 @@ fn object_obstruction(obj: &Object) -> Option<Obstruction> {
     }
 }
 
+// `Ok(None)` is the prefix itself, a folder marker, or a key outside the root. `Err` means
+// the listing was not what the API documents.
+//
 // Markers are dropped here, so they are invisible whether or not a filter is
 // configured. The walker's own default filter is replaced by any filter a caller
 // sets, which would otherwise make an entry out of a key holding nothing.
@@ -534,6 +545,7 @@ fn object_obstruction(obj: &Object) -> Option<Obstruction> {
 fn key_and_meta(
     obj: &Object,
     root_prefix: &str,
+    restore_status_asked_for: bool,
 ) -> Result<Option<(String, EntryMeta)>, StreamError> {
     if !exclude_s3_folder_markers(obj) {
         return Ok(None);
@@ -567,7 +579,7 @@ fn key_and_meta(
             size: Some(size),
             // Always present: a listing without one is rejected above.
             last_modified_secs: Some(last_modified_secs),
-            obstruction: object_obstruction(obj),
+            obstruction: object_obstruction(obj, restore_status_asked_for),
         },
     )))
 }
@@ -927,7 +939,7 @@ mod tests {
             .key("data/a/b.txt")
             .last_modified(DateTime::from_secs(1))
             .build();
-        match key_and_meta(&no_size, "data/") {
+        match key_and_meta(&no_size, "data/", true) {
             Err(StreamError::MalformedListing {
                 key: Some(key),
                 what,
@@ -965,7 +977,7 @@ mod tests {
             .last_modified(DateTime::from_secs(1))
             .build();
         assert!(matches!(
-            key_and_meta(&no_key, "data/"),
+            key_and_meta(&no_key, "data/", true),
             Err(StreamError::MalformedListing { key: None, .. })
         ));
     }
@@ -1447,7 +1459,7 @@ mod tests {
 
     #[test]
     fn object_keys_lose_the_root_prefix() {
-        let (key, meta) = key_and_meta(&object("data/a/b.txt", 3), "data/")
+        let (key, meta) = key_and_meta(&object("data/a/b.txt", 3), "data/", true)
             .unwrap()
             .unwrap();
         assert_eq!(key, "a/b.txt");
@@ -1508,13 +1520,15 @@ mod tests {
 
     #[test]
     fn an_unprefixed_listing_keeps_whole_keys() {
-        let (key, _) = key_and_meta(&object("a/b.txt", 1), "").unwrap().unwrap();
+        let (key, _) = key_and_meta(&object("a/b.txt", 1), "", true)
+            .unwrap()
+            .unwrap();
         assert_eq!(key, "a/b.txt");
     }
 
     #[test]
     fn the_prefix_itself_is_not_an_entry() {
-        assert!(key_and_meta(&object("data/", 0), "data/")
+        assert!(key_and_meta(&object("data/", 0), "data/", true)
             .unwrap()
             .is_none());
     }
@@ -1525,10 +1539,10 @@ mod tests {
             .key("data/a")
             .last_modified(DateTime::from_secs(1))
             .build();
-        assert!(key_and_meta(&no_size, "data/").is_err());
+        assert!(key_and_meta(&no_size, "data/", true).is_err());
 
         let no_time = Object::builder().key("data/a").size(1).build();
-        assert!(key_and_meta(&no_time, "data/").is_err());
+        assert!(key_and_meta(&no_time, "data/", true).is_err());
     }
 
     #[test]
@@ -1543,6 +1557,11 @@ mod tests {
         // every archived key in a bucket.
         assert!(!Obstruction::Archived.blocks_overwrite());
         assert!(!Obstruction::BeingRestored.blocks_overwrite());
+    }
+
+    // The classification for a listing that asked for restore status, which is what sync's does.
+    fn object_obstruction_asked(obj: &Object) -> Option<Obstruction> {
+        object_obstruction(obj, true)
     }
 
     // A listed object in the class and restore state a test names.
@@ -1561,7 +1580,7 @@ mod tests {
     fn an_archived_object_with_no_restored_copy_cannot_be_read() {
         for class in [ObjectStorageClass::Glacier, ObjectStorageClass::DeepArchive] {
             assert_eq!(
-                object_obstruction(&listed(Some(class.clone()), None)),
+                object_obstruction_asked(&listed(Some(class.clone()), None)),
                 Some(Obstruction::Archived),
                 "{class:?}"
             );
@@ -1574,7 +1593,7 @@ mod tests {
             .is_restore_in_progress(true)
             .build();
         assert_eq!(
-            object_obstruction(&listed(Some(ObjectStorageClass::Glacier), Some(restore))),
+            object_obstruction_asked(&listed(Some(ObjectStorageClass::Glacier), Some(restore))),
             Some(Obstruction::BeingRestored)
         );
     }
@@ -1586,7 +1605,7 @@ mod tests {
             .restore_expiry_date(DateTime::from_secs(1_800_000_000))
             .build();
         assert_eq!(
-            object_obstruction(&listed(Some(ObjectStorageClass::Glacier), Some(restore))),
+            object_obstruction_asked(&listed(Some(ObjectStorageClass::Glacier), Some(restore))),
             None
         );
     }
@@ -1596,8 +1615,23 @@ mod tests {
         // Nothing here says the bytes are reachable, so the answer stays the conservative one.
         let restore = RestoreStatus::builder().build();
         assert_eq!(
-            object_obstruction(&listed(Some(ObjectStorageClass::Glacier), Some(restore))),
+            object_obstruction_asked(&listed(Some(ObjectStorageClass::Glacier), Some(restore))),
             Some(Obstruction::Archived)
+        );
+    }
+
+    #[test]
+    fn a_listing_that_did_not_ask_claims_nothing_about_an_archive() {
+        // Without the field every object arrives without a restore status, so a restored one and
+        // one nobody restored look the same. Claiming the first is unreachable would skip it for as
+        // long as the bucket holds it, and nothing would say why; a transfer that fails at least
+        // reports.
+        let archived = listed(Some(ObjectStorageClass::Glacier), None);
+        assert_eq!(object_obstruction(&archived, false), None);
+        assert_eq!(
+            object_obstruction(&archived, true),
+            Some(Obstruction::Archived),
+            "the same object, where the listing did ask"
         );
     }
 
@@ -1606,7 +1640,7 @@ mod tests {
         // The name says Glacier and the bytes are there. Treating every Glacier-named class as
         // archived would skip every one of these objects on every run, forever.
         assert_eq!(
-            object_obstruction(&listed(Some(ObjectStorageClass::GlacierIr), None)),
+            object_obstruction_asked(&listed(Some(ObjectStorageClass::GlacierIr), None)),
             None
         );
     }
@@ -1616,7 +1650,7 @@ mod tests {
         // The class reads the same whether or not the object sits in an archive tier, so a
         // listing cannot tell. A transfer finds out and fails.
         assert_eq!(
-            object_obstruction(&listed(Some(ObjectStorageClass::IntelligentTiering), None)),
+            object_obstruction_asked(&listed(Some(ObjectStorageClass::IntelligentTiering), None)),
             None
         );
     }
@@ -1626,7 +1660,7 @@ mod tests {
         // The listing side's answer has one home, so a cause added there without thinking about
         // the ordinary case shows up here.
         let obj = Object::builder().key("data/a").size(1).build();
-        assert_eq!(object_obstruction(&obj), None);
+        assert_eq!(object_obstruction(&obj, true), None);
     }
 
     // Readability is decided from the listing, without a HeadObject per key.
@@ -2111,7 +2145,7 @@ mod tests {
             .size(-1)
             .last_modified(DateTime::from_secs(1))
             .build();
-        match key_and_meta(&negative, "data/") {
+        match key_and_meta(&negative, "data/", true) {
             Err(StreamError::MalformedListing {
                 key: Some(key),
                 what,
