@@ -41,14 +41,24 @@
 //! The value records what S3 stored; validation records whether the delivered
 //! bytes were checked against it.
 //!
-//! ## Current limitation
+//! ## How the verdict is reached
 //!
-//! The Rust SDK does not yet expose a per-response validation outcome, so the
-//! transfer manager cannot currently confirm a positive result: the verdict is
-//! `NotValidated` whenever validation is requested, and `Disabled` when it is
-//! not. The integrity-critical negative guarantee (a tampered response fails the
-//! download) holds today and is tested here. Positive-result assertions are
-//! marked `TODO(vnext)` until the SDK reports the outcome.
+//! The SDK exposes no per-response validation outcome, so the transfer manager
+//! infers coverage per chunk and aggregates: a chunk whose response carried a
+//! checksum covering exactly its own bytes was compared against it by the SDK, and
+//! a mismatch would have failed the body stream, so a chunk that both carried one
+//! and arrived was validated. `Validated` requires *every* delivered chunk to have
+//! been covered — one uncovered chunk downgrades the whole transfer, which is the
+//! property a per-response outcome could not express.
+//!
+//! Where no chunk can carry a checksum of its own — a pinned part size that misses
+//! the stored boundaries, or a large single-PUT object split into ranges — the
+//! transfer manager hashes the delivered bytes itself and folds them into the
+//! object's checksum. That fold outranks the per-chunk inference: it is evidence
+//! about the bytes rather than about the headers. A mismatch fails the download.
+//!
+//! So the two shapes agree, and deliberately so: a caller who pins an awkward part
+//! size gets the same verdict as the default aligned path, by a different route.
 //!
 //! # Coverage
 //!
@@ -65,16 +75,18 @@
 //!
 //! | Object              | Request mode | Client validation | Verdict asserted                      | Backend     |
 //! |---------------------|--------------|-------------------|---------------------------------------|-------------|
-//! | single-part         | unset        | WhenSupported     | NotValidated{Unavailable}*            | mock + real |
+//! | single-part         | unset        | WhenSupported     | Validated{Crc32}                      | mock + real |
 //! | single-part         | unset        | WhenRequired      | NotValidated{Disabled}                | mock        |
-//! | single-part         | ENABLED      | default           | object value surfaced; not Validated* | mock + real |
+//! | single-part         | ENABLED      | default           | object value surfaced; Validated{Crc32} | mock + real |
 //! | multipart full-obj  | ENABLED      | default           | object value is NOT a part checksum   | mock + real |
-//! | multipart composite | ENABLED      | default           | object value is NOT a part checksum   | mock + real |
-//! | multipart (Auto sz) | ENABLED      | default           | round-trip (ranges auto-aligned)      | mock + real |
+//! | multipart composite | ENABLED      | default           | Validated{Sha256} — per-part, not the object value | mock + real |
+//! | multipart (Auto sz) | ENABLED      | default           | Validated{Crc32} (ranges auto-aligned) | mock + real |
 //! | single-part (file)  | ENABLED      | default           | round-trip on disk                    | mock + real |
 //! | composite MPU value | ENABLED      | default           | object value == composite_checksum    | real        |
-//! | multipart, pinned misaligned size | ENABLED | default | NotValidated{Unavailable}    | mock + real |
+//! | multipart, pinned misaligned size | ENABLED | default | Validated{Crc32} (by the fold) | mock + real |
 //! | multipart, explicit byte range    | ENABLED | default | NotValidated{Unavailable}    | mock + real |
+//! | single-part, no stored checksum    | ENABLED | default | NotValidated{Unavailable}   | mock        |
+//! | single-part, composite value only  | ENABLED | default | NotValidated{CompositeChecksum} | mock    |
 //!
 //! ## Negative: a tampered download MUST fail (mock only)
 //!
@@ -84,13 +96,16 @@
 //! | single-part (file)  | ENABLED      | CorruptBody         | IntegrityError; temp cleaned, dest absent |
 //! | multipart (matched) | ENABLED      | WrongStoredChecksum | IntegrityError (explicit matched size)  |
 //! | multipart (Auto sz) | ENABLED      | WrongStoredChecksum | IntegrityError (auto-aligned, caught)   |
-//! | single-PUT split    | ENABLED      | CorruptBody         | #[ignore] intent: must IntegrityError — FAILS today (TODO) |
-//! | pinned misaligned size | ENABLED   | CorruptBody         | NOT caught; verdict never reads Validated |
-//! | pinned misaligned size | ENABLED   | CorruptBody         | #[ignore] intent: must IntegrityError — FAILS today (RUST-1173 scope) |
+//! | single-PUT split    | ENABLED      | CorruptBody         | IntegrityError (transfer-computed whole-object hash) |
+//! | pinned misaligned size | ENABLED   | CorruptBody         | IntegrityError (transfer-computed whole-object hash) |
+//! | pinned misaligned size | unset     | CorruptBody         | IntegrityError — unset is not off, so the default path errors too |
 //!
-//! * Verdict stays NotValidated even on success until the SDK exposes a
-//!   per-response validation outcome (see "Current limitation"). The negative
-//!   tables hold today regardless.
+//! The one shape corruption cannot be caught in is an explicit sub-range: the only
+//! value S3 holds covers the whole object, and nothing derived from it validates a
+//! strict subset of those bytes, so a tampered range download succeeds. What it
+//! must never do is claim the bytes were checked —
+//! `explicit_range_tamper_not_caught_but_never_validated_mock_gp` pins that, and is
+//! the executable statement of the limit.
 //!
 //! Tamper tests assert the specific `ErrorKind::IntegrityError` (the kind a
 //! checksum mismatch surfaces as), not merely `is_err()`, so an unrelated
@@ -103,14 +118,12 @@
 //! part (including the ragged tail). An explicit user part size is respected as-is
 //! (no auto-align), so it validates only when it matches the uploaded part size.
 //!
-//! One `#[ignore]`d intent test states the remaining deferred goal (gated on wire
-//! checksum): `single_put_split_tamper_caught_mock_gp` — a large single-PUT
-//! object split into ranged GETs has no per-range checksum, so validating it needs
-//! a TM-computed whole-object hash. It verifiably FAILS today and is the executable
-//! statement of that goal.
-//!
-//! *not Validated until the SDK reports a per-response validation outcome
-//! (see the limitation above).
+//! Where alignment is impossible the transfer manager validates the bytes itself:
+//! a caller-pinned part size that cannot land on stored boundaries, and a large
+//! single-PUT object split into ranged GETs, both hash each chunk as it arrives and
+//! fold the results into the object's checksum, which S3 reports for the whole
+//! object. Only the fold needs byte order, and it happens off the data path, so
+//! chunks still complete out of order. Costs one HeadObject to learn the value.
 //!
 //! Algorithm is a pass-through axis for the transfer manager (it forwards the
 //! choice and reads back whatever S3 returns), so per-algorithm value
@@ -162,6 +175,14 @@ fn assert_not_validated(output: &DownloadOutput, expected: NotValidatedReason) {
     }
 }
 
+/// Assert the download reports every delivered byte as validated, by `expected`.
+fn assert_validated(output: &DownloadOutput, expected: aws_sdk_s3::types::ChecksumAlgorithm) {
+    match output.integrity_checks().checksum_validation() {
+        ChecksumValidation::Validated { algorithm, .. } => assert_eq!(*algorithm, expected),
+        other => panic!("expected Validated{{{expected:?}}}, got {other:?}"),
+    }
+}
+
 /// Write `len` bytes of the deterministic `i % 256` pattern to `path` and return
 /// their CRC64NVME digest, in a single streaming pass (no full-file buffer). Used
 /// to stage a large upload source on disk without holding it in memory.
@@ -209,8 +230,8 @@ fn crc64nvme_file(path: &std::path::Path) -> Vec<u8> {
 // Leaving checksum_mode unset does NOT mean validation is off: the SDK's
 // GetObject mutator auto-enables ChecksumMode when the client's
 // ResponseChecksumValidation resolves to WhenSupported (the default). So a
-// default download attempts validation; the verdict is Unavailable (not
-// Disabled) until the SDK reports a confirmed outcome (TODO(vnext) -> Validated).
+// default download validates, and the verdict says so — the distinction this pins
+// is against `Disabled`, which is what a WhenRequired client gets.
 
 async fn single_part_mode_default(target: Target) {
     let t = target.connect().await;
@@ -224,9 +245,9 @@ async fn single_part_mode_default(target: Target) {
 
     let (bytes, output) = t.download("obj", None).await.expect("download");
     assert_same_content(&data, &bytes);
-    // Default resolves to validation-attempted (SDK auto-enables ChecksumMode),
-    // so the verdict is Unavailable, NOT Disabled.
-    assert_not_validated(&output, NotValidatedReason::Unavailable);
+    // Default resolves to validation on (the SDK auto-enables ChecksumMode), and
+    // the whole object came back under one checksum, so it was validated.
+    assert_validated(&output, aws_sdk_s3::types::ChecksumAlgorithm::Crc32);
 
     t.shutdown().await;
 }
@@ -292,19 +313,13 @@ async fn single_part_mode_on(target: Target) {
         .await
         .expect("download");
     assert_same_content(&data, &bytes);
-    // Whole object in one chunk: the object's checksum is surfaced.
+    // Whole object in one chunk: the object's checksum is surfaced, and it covered
+    // every delivered byte.
     assert!(
         output.integrity_checks().checksum_crc32().is_some(),
         "whole-object checksum should be surfaced"
     );
-    // TODO(vnext): assert Validated{Crc32} once the SDK reports the outcome.
-    assert!(
-        !matches!(
-            output.integrity_checks().checksum_validation(),
-            ChecksumValidation::Validated { .. }
-        ),
-        "must not report Validated without an SDK-confirmed outcome"
-    );
+    assert_validated(&output, aws_sdk_s3::types::ChecksumAlgorithm::Crc32);
 
     t.shutdown().await;
 }
@@ -386,6 +401,11 @@ async fn multipart_composite(target: Target) {
         output.integrity_checks().checksum_sha256().is_none(),
         "must not surface a part checksum as the object checksum"
     );
+    // A composite object can still be fully validated: the ranges are aligned to
+    // the stored parts, and each part's own checksum is a plain value covering
+    // exactly that part's bytes. What cannot be validated is the *object* value,
+    // and nothing here claims to have used it.
+    assert_validated(&output, aws_sdk_s3::types::ChecksumAlgorithm::Sha256);
 
     t.shutdown().await;
 }
@@ -915,11 +935,17 @@ async fn multipart_aligned_round_trips(target: Target) {
     )
     .await;
 
-    let (bytes, _output) = t
+    let (bytes, output) = t
         .download("obj", Some(ChecksumMode::Enabled))
         .await
         .expect("download");
     assert_same_content(&data, &bytes);
+    // Ranges are auto-aligned to the stored boundaries here, so every chunk carried
+    // its own part checksum and the SDK validated each one. The verdict must be the
+    // same as on the misaligned path, which reaches it by folding instead: a caller
+    // pinning an awkward part size must not get a *better*-looking verdict than the
+    // default.
+    assert_validated(&output, aws_sdk_s3::types::ChecksumAlgorithm::Crc32);
 
     t.shutdown().await;
 }
@@ -981,13 +1007,10 @@ async fn multipart_default_tamper_caught_mock_gp() {
 // expected value + an ordered hash at the slot-buffer consume point), or a wire
 // checksum from S3 over arbitrary response bytes.
 
-/// INTENT (not yet implemented): a tampered chunk of a split single-PUT download
-/// MUST fail the download. Ignored until the transfer manager validates this path
-/// itself; it currently succeeds (the chunks carry no checksum), so this FAILS
-/// today. The test states the desired behavior; the ignore reason states why it
-/// is not running yet.
+/// A tampered chunk of a split single-PUT download fails the download. S3 returns
+/// no checksum for a sub-range of a single-stored-part object, so the SDK
+/// validates nothing; the transfer manager's own whole-object hash catches it.
 #[tokio::test]
-#[ignore = "TODO(vnext): wire checksums, or TM-computed whole-object checksum over the slot-buffer bytes, to validate split single-PUT downloads"]
 async fn single_put_split_tamper_caught_mock_gp() {
     let t = Target::mock_gp().connect().await; // default part sizes; 12 MiB -> 3 ranged GETs
     let data = large_single_put();
@@ -1025,9 +1048,11 @@ const MISALIGNED_DOWNLOAD_PART_SIZE: PartSize = PartSize::Target(5 * 1024 * 1024
 /// parts, whose boundaries (8 MiB, 16 MiB) no multiple of 5 MiB reaches.
 const UPLOAD_PART_SIZE: PartSize = PartSize::Target(8 * 1024 * 1024);
 
-/// A caller-pinned part size that misaligns with the stored boundaries: the
-/// download succeeds with the right bytes, and reports that nothing was validated.
-async fn misaligned_part_size_reports_not_validated(target: Target) {
+/// A caller-pinned part size that misaligns with the stored boundaries: no chunk
+/// carries a checksum of its own, so the transfer hashes the delivered bytes and
+/// folds them into the object's checksum — the download succeeds with the right
+/// bytes and reports them as validated.
+async fn misaligned_part_size_validates_delivered_bytes(target: Target) {
     let t = target.connect_with(Some(UPLOAD_PART_SIZE)).await;
     let data = multipart_data();
     t.put(
@@ -1044,19 +1069,19 @@ async fn misaligned_part_size_reports_not_validated(target: Target) {
         .expect("download");
 
     assert_same_content(&data, &bytes);
-    assert_not_validated(&output, NotValidatedReason::Unavailable);
+    assert_validated(&output, aws_sdk_s3::types::ChecksumAlgorithm::Crc32);
 
     t.shutdown().await;
 }
 
 #[tokio::test]
-async fn misaligned_part_size_reports_not_validated_mock_gp() {
-    misaligned_part_size_reports_not_validated(Target::mock_gp()).await;
+async fn misaligned_part_size_validates_delivered_bytes_mock_gp() {
+    misaligned_part_size_validates_delivered_bytes(Target::mock_gp()).await;
 }
 #[cfg(e2e_test)]
 #[tokio::test]
-async fn misaligned_part_size_reports_not_validated_real_gp() {
-    misaligned_part_size_reports_not_validated(Target::real_gp()).await;
+async fn misaligned_part_size_validates_delivered_bytes_real_gp() {
+    misaligned_part_size_validates_delivered_bytes(Target::real_gp()).await;
 }
 
 /// An explicit byte range: the requested bytes arrive intact, and the verdict
@@ -1098,45 +1123,11 @@ async fn explicit_range_reports_not_validated_real_gp() {
     explicit_range_reports_not_validated(Target::real_gp()).await;
 }
 
-/// A corrupted body on the misaligned path is NOT caught, and the verdict must not
-/// claim otherwise. This pins the half of the guarantee that holds today: no path
-/// reports `Validated` for bytes nothing checked. It deliberately does not assert
-/// that the download fails — see the intent test below for that.
+/// A tampered chunk of a misaligned-part-size download fails the download. No
+/// chunk carries a checksum of its own here, so the SDK validates nothing; the
+/// transfer manager hashes the delivered bytes and compares against the object's
+/// stored checksum, which is what catches this.
 #[tokio::test]
-async fn misaligned_part_size_tamper_is_not_caught_but_never_reads_validated_mock_gp() {
-    let t = Target::mock_gp().connect_with(Some(UPLOAD_PART_SIZE)).await;
-    let data = multipart_data();
-    t.put("obj", data, ChecksumStrategy::with_calculated_crc32())
-        .await;
-
-    let mock = t.mock().expect("requires the mock backend");
-    mock.insert_fault(
-        t.bucket(),
-        &t.key("obj"),
-        FaultType::CorruptBody,
-        0,
-        Occurrence::Always,
-    );
-
-    let downloader = t.tm_with_part_size(MISALIGNED_DOWNLOAD_PART_SIZE);
-    let (_bytes, output) = t
-        .download_range_with(&downloader, "obj", Some(ChecksumMode::Enabled), None)
-        .await
-        .expect("corruption on an unvalidated path does not fail the download");
-
-    assert_not_validated(&output, NotValidatedReason::Unavailable);
-
-    t.shutdown().await;
-}
-
-/// INTENT (scope decision pending): a tampered chunk of a misaligned-part-size
-/// download MUST fail the download. Ignored because it FAILS today — the chunks
-/// carry no checksum, so nothing detects the corruption. Whether this is required
-/// is the open question on RUST-1173: its acceptance criterion permits reporting
-/// not-validated instead, while RUST-1172's identical situation requires an error.
-/// If the error is required, this shares RUST-1172's mechanism.
-#[tokio::test]
-#[ignore = "RUST-1173 scope decision: requires TM-computed validation over unaligned ranges, shared with RUST-1172"]
 async fn misaligned_part_size_tamper_caught_mock_gp() {
     let t = Target::mock_gp().connect_with(Some(UPLOAD_PART_SIZE)).await;
     let data = multipart_data();
@@ -1157,6 +1148,84 @@ async fn misaligned_part_size_tamper_caught_mock_gp() {
         .download_range_with(&downloader, "obj", Some(ChecksumMode::Enabled), None)
         .await;
     assert_integrity_error(result);
+
+    t.shutdown().await;
+}
+
+/// The same corruption on the same shape with `checksum_mode` left unset also
+/// fails the download.
+///
+/// This is the case that carries most downloads: unset does not mean off, because
+/// the SDK auto-enables validation whenever the client resolves
+/// `ResponseChecksumValidation` to `WhenSupported`, the default. Gating the fold
+/// on an explicit opt-in would leave exactly this path returning `Ok` over
+/// corrupt bytes, which is the defect the ticket names.
+#[tokio::test]
+async fn misaligned_part_size_tamper_caught_default_mode_mock_gp() {
+    let t = Target::mock_gp().connect_with(Some(UPLOAD_PART_SIZE)).await;
+    let data = multipart_data();
+    t.put("obj", data, ChecksumStrategy::with_calculated_crc32())
+        .await;
+
+    let mock = t.mock().expect("requires the mock backend");
+    mock.insert_fault(
+        t.bucket(),
+        &t.key("obj"),
+        FaultType::CorruptBody,
+        0,
+        Occurrence::Always,
+    );
+
+    let downloader = t.tm_with_part_size(MISALIGNED_DOWNLOAD_PART_SIZE);
+    let result = t.download_range_with(&downloader, "obj", None, None).await;
+    assert_integrity_error(result);
+
+    t.shutdown().await;
+}
+
+/// Corruption inside an explicit sub-range is NOT caught, and the verdict says so
+/// rather than claiming the bytes were checked.
+///
+/// The limit is arithmetic, not an omission: the only value S3 holds covers the
+/// whole object, and no part of it validates a strict subset of those bytes. So
+/// the range path can be honest but not safe, and this test pins the honest half
+/// -- it fails if anything ever reports `Validated` here.
+#[tokio::test]
+async fn explicit_range_tamper_not_caught_but_never_validated_mock_gp() {
+    let t = Target::mock_gp().connect_with(Some(UPLOAD_PART_SIZE)).await;
+    let data = multipart_data();
+    t.put(
+        "obj",
+        data.clone(),
+        ChecksumStrategy::with_calculated_crc32(),
+    )
+    .await;
+
+    let mock = t.mock().expect("requires the mock backend");
+    mock.insert_fault(
+        t.bucket(),
+        &t.key("obj"),
+        FaultType::CorruptBody,
+        0,
+        Occurrence::Always,
+    );
+
+    let (bytes, output) = t
+        .download_range_with(
+            &t.tm_with_part_size(UPLOAD_PART_SIZE),
+            "obj",
+            Some(ChecksumMode::Enabled),
+            Some("bytes=1048576-3145727"),
+        )
+        .await
+        .expect("a sub-range download cannot detect this, so it succeeds");
+
+    assert_ne!(
+        bytes,
+        data[1048576..=3145727],
+        "the fault must actually have corrupted the delivered bytes"
+    );
+    assert_not_validated(&output, NotValidatedReason::Unavailable);
 
     t.shutdown().await;
 }

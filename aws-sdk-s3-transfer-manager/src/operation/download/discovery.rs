@@ -13,6 +13,7 @@ use tracing::Instrument;
 
 use super::chunk_meta::ChunkMetadata;
 use super::input::copy_fields_to_get_object_request;
+use super::object_crc::ObjectCrcAlgorithm;
 use super::object_meta::ObjectMetadata;
 use super::transfer::DownloadTransfer;
 use super::DownloadInput;
@@ -47,6 +48,12 @@ pub(super) struct ObjectDiscovery {
     /// object's stored part size so every range aligns to a stored part boundary
     /// (the precondition for per-part download validation).
     pub(super) effective_part_size: u64,
+
+    /// The object's own checksum and algorithm, present only when the transfer
+    /// must validate the delivered bytes itself: validation is on, no chunk will
+    /// carry a checksum of its own, and the object's stored value covers bytes
+    /// (not part checksums). `None` leaves validation to the SDK's per-chunk path.
+    pub(super) object_crc: Option<(ObjectCrcAlgorithm, String)>,
 }
 
 /// Parse the stored part count from an MPU ETag of the form `"<hash>-<N>"`.
@@ -144,6 +151,23 @@ pub(super) async fn discover_obj(
         );
         aligned.effective_part_size = stored_part_size;
         discovery = aligned;
+    } else if validation_enabled && input.range().is_none() && discovery.remaining.is_some() {
+        // Not aligned, so no chunk will carry a checksum of its own: either the
+        // caller pinned a part size that cannot land on stored boundaries, or the
+        // object has no stored parts to align to. If S3 holds a byte-covering
+        // value for the whole object, the transfer hashes the delivered bytes and
+        // compares at completion -- the only way corruption here is detectable.
+        //
+        // A ranged request is excluded above: the stored value covers the whole
+        // object, so there is nothing to compare a sub-range against.
+        //
+        // Gated on the same condition as the align branch, not on the request
+        // having set `ChecksumMode::Enabled`: with validation on, corruption must
+        // fail the download whether or not the caller asked about integrity
+        // explicitly. That costs one `HeadObject` here, the same trade the align
+        // branch above already makes with its extra GET.
+        let etag = discovery.object_meta.e_tag.clone();
+        discovery.object_crc = fetch_object_crc(transfer, input, etag.as_deref()).await?;
     }
 
     tracing::trace!(
@@ -154,6 +178,74 @@ pub(super) async fn discover_obj(
     );
 
     Ok(discovery)
+}
+
+/// Fetch the object's own checksum, for a transfer that must validate its bytes
+/// itself.
+///
+/// `HeadObject` rather than a GET because only the object-level response carries
+/// the whole-object value: a ranged GET of a multipart object reports the part's
+/// checksum. Returns `None` -- leaving the download unvalidated but honest --
+/// when the object has no checksum, or has only a composite one, which is a
+/// checksum of part checksums and so cannot be reproduced from bytes.
+///
+/// `etag` is the one discovery observed, pinned here the same way every chunk GET
+/// pins it. Without it a replacement landing between discovery and this HEAD
+/// yields the new object's checksum for the old object's bytes, and the fold
+/// reports corruption on a download that was never corrupt.
+async fn fetch_object_crc(
+    transfer: &DownloadTransfer,
+    input: &DownloadInput,
+    etag: Option<&str>,
+) -> Result<Option<(ObjectCrcAlgorithm, String)>, error::Error> {
+    let resp = crate::retry::retry(crate::retry::classify_discovery_retry, |_allow_hedge| {
+        let mut builder = super::input::copy_fields_to_head_object_request(
+            input,
+            transfer.ctx().s3_client().head_object(),
+        )
+        // Validation may be on through client config alone, with the request's
+        // mode unset; the object's checksum is the whole point of this request.
+        .checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled);
+        if let Some(etag) = etag {
+            builder = builder.if_match(etag);
+        }
+        let req = builder.customize().config_override(
+            transfer
+                .ctx()
+                .handle
+                .bucket_partition_override(input.bucket()),
+        );
+        async move {
+            req.send()
+                .await
+                .map_err(|e| crate::retry::GuardError::Inner(error::Error::from(e)))
+        }
+    })
+    .instrument(tracing::debug_span!("send-head-object-for-object-checksum"))
+    .await?;
+
+    // Priority order matches the SDK's: the cheapest algorithm first. Only one is
+    // ever present for a given object.
+    let candidates = [
+        (ObjectCrcAlgorithm::Crc64Nvme, resp.checksum_crc64_nvme()),
+        (ObjectCrcAlgorithm::Crc32, resp.checksum_crc32()),
+        (ObjectCrcAlgorithm::Crc32C, resp.checksum_crc32_c()),
+    ];
+    let found = candidates
+        .into_iter()
+        .find_map(|(alg, value)| value.map(|v| (alg, v)))
+        .filter(|(_, value)| !super::object_crc::is_composite_value(value));
+
+    match found {
+        Some((alg, value)) => {
+            tracing::debug!(
+                ?alg,
+                "validating delivered bytes against the object checksum"
+            );
+            Ok(Some((alg, value.to_string())))
+        }
+        None => Ok(None),
+    }
 }
 
 async fn discover_obj_with_get_first_part(
@@ -193,20 +285,20 @@ async fn discover_obj_with_head(
     input: &DownloadInput,
 ) -> Result<ObjectDiscovery, crate::error::Error> {
     let resp = crate::retry::retry(crate::retry::classify_discovery_retry, |_allow_hedge| {
-        let req = transfer
-            .ctx()
-            .s3_client()
-            .head_object()
-            .set_range(input.range.clone())
-            .set_bucket(input.bucket().map(str::to_string))
-            .set_key(input.key().map(str::to_string))
-            .customize()
-            .config_override(
-                transfer
-                    .ctx()
-                    .handle
-                    .bucket_partition_override(input.bucket()),
-            );
+        let req = super::input::copy_fields_to_head_object_request(
+            input,
+            transfer.ctx().s3_client().head_object(),
+        )
+        // Discovery describes the range the caller asked for, so the HEAD carries
+        // it: the response's Content-Range is what bounds the transfer.
+        .set_range(input.range.clone())
+        .customize()
+        .config_override(
+            transfer
+                .ctx()
+                .handle
+                .bucket_partition_override(input.bucket()),
+        );
         async move {
             req.send()
                 .await
@@ -228,6 +320,7 @@ async fn discover_obj_with_head(
         initial_chunk: None,
         // Filled in by discover_obj (configured size, or stored size when aligning).
         effective_part_size: 0,
+        object_crc: None,
     })
 }
 
@@ -317,6 +410,7 @@ fn first_chunk_response_handler(
         initial_chunk,
         // Filled in by discover_obj (configured size, or stored size when aligning).
         effective_part_size: 0,
+        object_crc: None,
     })
 }
 

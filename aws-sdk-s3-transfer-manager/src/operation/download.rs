@@ -45,6 +45,13 @@ pub use chunk_meta::ChunkMetadata;
 mod object_meta;
 pub use object_meta::ObjectMetadata;
 
+/// Folds per-chunk CRCs into the object's checksum, for downloads whose ranges
+/// carry no checksum of their own.
+pub(crate) mod object_crc;
+
+/// Aggregates per-chunk validation coverage into the transfer's verdict.
+pub(crate) mod coverage;
+
 use crate::error;
 use crate::operation::download::body::new_recv_body;
 use crate::types::BucketType;

@@ -479,4 +479,14 @@ impl IntegrityChecks {
             checksum_validation,
         }
     }
+
+    /// Replace the verdict, keeping the reported checksum values.
+    ///
+    /// The values S3 reported are known as soon as the object is discovered;
+    /// whether the delivered bytes were validated is only known once the last chunk
+    /// lands. This is the seam between those two moments.
+    pub(crate) fn with_validation(mut self, checksum_validation: ChecksumValidation) -> Self {
+        self.checksum_validation = checksum_validation;
+        self
+    }
 }

@@ -6,6 +6,7 @@
 use std::fmt;
 
 use aws_sdk_s3::operation::get_object::builders::GetObjectFluentBuilder;
+use aws_sdk_s3::operation::head_object::builders::HeadObjectFluentBuilder;
 use aws_smithy_types::error::operation::BuildError;
 
 /// Input type for downloading a single object
@@ -938,6 +939,38 @@ pub(crate) fn copy_fields_to_get_object_request(
         .set_response_content_language(input.response_content_language.clone())
         .set_response_content_type(input.response_content_type.clone())
         .set_response_expires(input.response_expires)
+        .set_version_id(input.version_id.clone())
+        .set_sse_customer_algorithm(input.sse_customer_algorithm.clone())
+        .set_sse_customer_key(input.sse_customer_key.clone())
+        .set_sse_customer_key_md5(input.sse_customer_key_md5.clone())
+        .set_request_payer(input.request_payer.clone())
+        .set_expected_bucket_owner(input.expected_bucket_owner.clone())
+        .set_checksum_mode(input.checksum_mode.clone())
+}
+
+/// Copy the caller's fields onto a `HeadObject` the transfer issues on its own
+/// behalf, so the HEAD describes the same object the chunk GETs read.
+///
+/// Everything [`copy_fields_to_get_object_request`] copies except `range` (the
+/// caller sets it: a HEAD's range means something different per call site) and
+/// the `response_*` overrides, which shape a body a HEAD does not return.
+///
+/// Dropping any of the rest is not a lost optimization but a failed or wrong
+/// request: an SSE-C object rejects a HEAD carrying no customer key, a
+/// requester-pays bucket rejects one carrying no payer, and a `version_id`
+/// download would read the *current* version's metadata for bytes it fetched
+/// from an older one.
+pub(crate) fn copy_fields_to_head_object_request(
+    input: &DownloadInput,
+    builder: HeadObjectFluentBuilder,
+) -> HeadObjectFluentBuilder {
+    builder
+        .set_bucket(input.bucket.clone())
+        .set_key(input.key.clone())
+        .set_if_match(input.if_match.clone())
+        .set_if_modified_since(input.if_modified_since)
+        .set_if_none_match(input.if_none_match.clone())
+        .set_if_unmodified_since(input.if_unmodified_since)
         .set_version_id(input.version_id.clone())
         .set_sse_customer_algorithm(input.sse_customer_algorithm.clone())
         .set_sse_customer_key(input.sse_customer_key.clone())
