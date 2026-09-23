@@ -181,11 +181,10 @@ this requirement is what makes it visible; changing the upload path is out of sc
 A hold was designed before it was rejected. Sync cannot recover which file an object came from, but it can
 bound where that file must be: keys under the same parent whose remaining bytes match the valid part of
 the name, with a replacement character wherever the invalid bytes were. That set contains the object and
-usually little else. It was rejected because the set is reached before the name that defines it —
-enumeration reports a directory's failures only after emitting its entries, so a key inside the set can be
-paired and deleted before the hold exists — and making it timely requires enumeration to report such names
-earlier for every caller. Paying that to protect an object that may correspond to any of several files, or
-to none, costs more than the delete.
+usually little else. It was rejected on cost: the hold protects an object that may correspond to any of
+several files or to none, so what it buys is the survival of an arbitrary one, and paying for that means
+every caller carrying the machinery to bound and release the set. Paying that to protect an object that
+may correspond to any of several files, or to none, costs more than the delete.
 
 This is about one entry at a time. Failing to read an entire directory is a different problem
 (FR-Enum-12).
@@ -691,10 +690,13 @@ happens: ignore (default), warn, skip, or fail.
 happen: an entry that could not be listed, a directory that could not be read, a listing page that could
 not be fetched, an object that could not be transferred or copied, a key that could not be deleted.
 
-One policy, so a caller reasons about failure once. Two things sit outside it:
+One policy, so a caller reasons about failure once. Three things sit outside it:
 
-- An entry that could never be transferred whatever the settings — device, FIFO, socket, a symlink sync was
-  told not to follow — is a warning under either policy (FR-Enum-3).
+- An entry that could never be transferred whatever the settings — device, FIFO, socket, a symlink sync
+  was told not to follow — is a warning under either policy (FR-Enum-3).
+- A local name with no key it could take is a warning under either policy too, for the same reason: no
+  setting makes it transferable, and aborting a run over a name sync was never going to send would stop a
+  transfer of everything else for nothing (FR-Enum-3).
 - A failure that leaves nothing to carry on with — a source root that is unreadable or is not a directory
   (FR-Fail-6) — ends the run under either policy. Not because the policy is overridden, but because there
   is nothing left to continue doing.

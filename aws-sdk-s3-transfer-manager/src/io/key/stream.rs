@@ -1139,6 +1139,7 @@ mod tests {
     // The reason this layer exists. A source that could not read one subdirectory must not let the
     // destination's keys under that name be deleted: they may still exist on the source, inside the
     // part nobody could see.
+    //
     // A key the source could not describe is reported as a loss covering one key, which is what lets
     // a consumer hold back that key's delete. The name is taken on both sides; the source simply
     // cannot say what is behind it. What this pins is the report, and the coarse consumer above acting

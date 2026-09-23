@@ -60,8 +60,6 @@ impl<T> SideState<T> {
     }
 }
 
-// Whether the bytes behind a side's own item can be sent.
-//
 // One key, and what each side holds at it.
 #[derive(Debug)]
 pub(crate) struct Pairing<S, D> {
@@ -122,12 +120,41 @@ impl<T> Head<T> {
 // while reading the parent, so it arrives ahead of every sibling — including siblings sorting
 // earlier than the subtree it cost. Releasing the stretch at the side's next key would let such a
 // sibling stand in for keys nobody enumerated.
-#[derive(Debug, Clone)]
+//
+// Every stretch costs an unknown range. A failure costing one key is held as that key, or as the
+// whole side where the key could not be worked out, so neither reaches here.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Stretch {
-    cost: KeysLost,
     // `None` where no prefix could be worked out, which holds the rest of the side: a stretch
     // whose extent is unknown could cover any later key.
     under: Option<String>,
+}
+
+// Every stretch a side still owes an answer for.
+//
+// A side can be holding more than one at a time, and they do not arrive in the order their keys sort: a
+// symlink loop noticed while the root is read comes before a failure descending into a directory
+// whose name sorts earlier. Keeping one at a time forgets whichever arrived first, and the keys it
+// covered go back to reading absent.
+#[derive(Debug, Clone, Default)]
+struct Stretches(Vec<Stretch>);
+
+impl Stretches {
+    fn add(&mut self, stretch: Stretch) {
+        if !self.0.contains(&stretch) {
+            self.0.push(stretch);
+        }
+    }
+
+    // Whether any stretch still owes an answer for this key.
+    fn covers(&self, key: &str) -> bool {
+        self.0.iter().any(|s| s.covers(key))
+    }
+
+    // Drop every stretch the merge has passed.
+    fn release_passed(&mut self, key: &str) {
+        self.0.retain(|s| !s.passed_by(key));
+    }
 }
 
 impl Stretch {
@@ -171,8 +198,8 @@ pub(crate) struct Walk<S: KeyStream, D: KeyStream> {
     // Anything the other side holds inside that stretch is a key this one could not account for.
     // Reading such a key as absent is what allows it to be deleted, which is the whole reason the
     // answer is carried here.
-    src_gap: Option<Stretch>,
-    dst_gap: Option<Stretch>,
+    src_gap: Stretches,
+    dst_gap: Stretches,
     // Keys a side named as lost, held until the merge reaches each one.
     //
     // A failure costing one key arrives before that key sorts, so the answer cannot be given
@@ -223,8 +250,8 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
             destination,
             src: Head::Unread,
             dst: Head::Unread,
-            src_gap: None,
-            dst_gap: None,
+            src_gap: Stretches::default(),
+            dst_gap: Stretches::default(),
             src_lost: BTreeSet::new(),
             dst_lost: BTreeSet::new(),
             src_lost_unnamed: false,
@@ -263,7 +290,7 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
                                 self.src_lost.insert(key);
                             }
                             Cost::UnnamedKey => self.src_lost_unnamed = true,
-                            Cost::Stretch(stretch) => self.src_gap = Some(stretch),
+                            Cost::Stretch(stretch) => self.src_gap.add(stretch),
                             Cost::Nothing => {}
                         }
                     }
@@ -285,7 +312,7 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
                                 self.dst_lost.insert(key);
                             }
                             Cost::UnnamedKey => self.dst_lost_unnamed = true,
-                            Cost::Stretch(stretch) => self.dst_gap = Some(stretch),
+                            Cost::Stretch(stretch) => self.dst_gap.add(stretch),
                             Cost::Nothing => {}
                         }
                     }
@@ -344,7 +371,7 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
     fn take_source_only(&mut self) -> Pairing<S::Source, D::Source> {
         let entry = self.take_src();
         let destination = Self::missing(
-            self.dst_gap.as_ref(),
+            &self.dst_gap,
             &mut self.dst_lost,
             self.dst_lost_unnamed,
             &entry.key,
@@ -359,7 +386,7 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
     fn take_destination_only(&mut self) -> Pairing<S::Source, D::Source> {
         let entry = self.take_dst();
         let source = Self::missing(
-            self.src_gap.as_ref(),
+            &self.src_gap,
             &mut self.src_lost,
             self.src_lost_unnamed,
             &entry.key,
@@ -375,7 +402,7 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
     // itself, unknown while a failure has left it unable to, and unknown for a key it named as
     // lost.
     fn missing<T>(
-        gap: Option<&Stretch>,
+        gap: &Stretches,
         lost: &mut BTreeSet<String>,
         lost_unnamed: bool,
         key: &str,
@@ -384,14 +411,13 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
         if lost.remove(key) {
             return SideState::Unknown(KeysLost::OneKey);
         }
-        match gap {
-            Some(stretch) if stretch.covers(key) => SideState::Unknown(stretch.cost),
-            Some(_) => SideState::Absent,
+        match gap.covers(key) {
+            true => SideState::Unknown(KeysLost::UnknownRange),
             // A range, because the conclusion here is that absence cannot be read from
             // position on this side any more. `OneKey` says the keys around it are known,
             // which a consumer would act on by holding back one key and trusting the rest.
-            None if lost_unnamed => SideState::Unknown(KeysLost::UnknownRange),
-            None => SideState::Absent,
+            false if lost_unnamed => SideState::Unknown(KeysLost::UnknownRange),
+            false => SideState::Absent,
         }
     }
 
@@ -411,15 +437,12 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
     }
 
     fn take_src(&mut self) -> Entry<S::Source> {
-        // Producing a key past the stretch accounts for everything it hid. A key inside it, or
-        // one sorting before it, accounts for nothing: the failure was heard early and what it
-        // cost is still ahead.
-        if self.src.entry().is_some_and(|entry| {
-            self.src_gap
-                .as_ref()
-                .is_some_and(|s| s.passed_by(&entry.key))
-        }) {
-            self.src_gap = None;
+        // Producing a key releases every stretch the merge has passed. A key inside one, or one
+        // sorting before it, releases nothing: the failure was heard early and what it cost is
+        // still ahead.
+        if let Some(entry) = self.src.entry() {
+            let key = entry.key.clone();
+            self.src_gap.release_passed(&key);
         }
         match std::mem::replace(&mut self.src, Head::Unread) {
             Head::Entry(entry) => entry,
@@ -428,12 +451,9 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
     }
 
     fn take_dst(&mut self) -> Entry<D::Source> {
-        if self.dst.entry().is_some_and(|entry| {
-            self.dst_gap
-                .as_ref()
-                .is_some_and(|s| s.passed_by(&entry.key))
-        }) {
-            self.dst_gap = None;
+        if let Some(entry) = self.dst.entry() {
+            let key = entry.key.clone();
+            self.dst_gap.release_passed(&key);
         }
         match std::mem::replace(&mut self.dst, Head::Unread) {
             Head::Entry(entry) => entry,
@@ -617,7 +637,6 @@ fn cost_of(err: &StreamError, root: Option<&Path>) -> Cost {
         // beneath it. Without a bound the rest of the side is answered unknown, since a failure
         // reported before the keys it hid says nothing about where they stop.
         _ => Cost::Stretch(Stretch {
-            cost: err.keys_lost(),
             under: match err {
                 StreamError::Walk(walk) => {
                     root.and_then(|root| walk.path().and_then(|p| key_under_root(root, p)))
@@ -1249,6 +1268,55 @@ mod tests {
                 ("locked/z.txt", At::UnknownKey, At::Here),
             ]),
             "both files exist and both were reported unreadable, so neither may read as absent"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn two_stretches_lost_from_one_side_are_both_covered() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Two range losses on one walk. The cycle on `mlink` is noticed while the root is read, so it
+        // arrives first; descending into `adir` then fails, and its prefix sorts earlier. Keeping one
+        // stretch at a time forgets whichever arrived first.
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let adir = dir.path().join("adir");
+        std::fs::create_dir(&adir).expect("a directory");
+        std::fs::write(adir.join("inner.txt"), "").expect("a file inside it");
+        std::fs::set_permissions(&adir, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        std::os::unix::fs::symlink(".", dir.path().join("mlink")).expect("a self-referring link");
+        let usable = std::fs::read_dir(&adir).is_err();
+        assert!(
+            usable,
+            "this platform does not produce the state under test"
+        );
+
+        let walker = Walker::builder().follow_symlinks(true).build();
+        let mut walk = Walk::new(
+            walker.local_walk(dir.path().to_path_buf()),
+            Scripted::of(&["adir/inner.txt", "mlink/deep.txt"]),
+        )
+        .with_roots(Some(dir.path().to_path_buf()), None);
+
+        let mut seen = Vec::new();
+        while let Some(next) = walk.next().await {
+            if let Ok(pairing) = next {
+                seen.push((
+                    pairing.key().to_string(),
+                    at(pairing.source()),
+                    at(pairing.destination()),
+                ));
+            }
+        }
+        std::fs::set_permissions(&adir, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        assert_eq!(
+            seen,
+            plan(&[
+                ("adir/inner.txt", At::UnknownRange, At::Here),
+                ("mlink/deep.txt", At::UnknownRange, At::Here),
+            ]),
+            "nobody enumerated under either, so neither may read as absent"
         );
     }
 
