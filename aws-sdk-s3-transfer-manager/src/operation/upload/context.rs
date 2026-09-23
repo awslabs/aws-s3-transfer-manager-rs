@@ -14,9 +14,10 @@ use smallvec::SmallVec;
 use crate::io::part_reader::{NextPartFuture, PartReader};
 use crate::io::{InputStream, SizeHint};
 #[cfg(test)]
-use crate::operation::upload::observability::PartTransferSummary;
+use crate::operation::upload::observability::MultipartTransferSummary;
 use crate::operation::upload::observability::{
-    PartTransferSnapshot, SourceReadObservation, UploadObservability, UploadPartTiming,
+    SourceReadObservation, UploadExecutionState, UploadObservability, UploadPartTiming,
+    UploadStateSnapshot,
 };
 use crate::operation::upload::UploadOutputBuilder;
 use crate::transfer::{PendingCategory, PendingCause};
@@ -357,7 +358,7 @@ pub(crate) struct PartTransferState {
     bytes_read: u64,
     /// Bytes accepted by completed UploadPart requests.
     bytes_uploaded: u64,
-    /// Optional aggregate collection and transition-reporting policy.
+    /// Optional aggregate collection and event-reporting policy.
     observability: UploadObservability,
 }
 
@@ -563,22 +564,19 @@ impl PartTransferState {
     }
 
     /// Returns a coherent view while the caller holds the upload-state lock.
-    pub(crate) fn snapshot(&self) -> PartTransferSnapshot {
-        PartTransferSnapshot {
+    pub(crate) fn snapshot(&self) -> UploadStateSnapshot {
+        UploadStateSnapshot {
+            state: UploadExecutionState::Transferring,
             parts_dispatched: self.parts_dispatched,
             parts_in_flight: self.parts_in_flight,
             uploads_in_flight: self.observability.uploads_in_flight(),
             pending_reads: self.pending_reads.entries.len(),
             completed_parts: self.completed_parts.len(),
+            bytes_read: self.bytes_read,
             bytes_uploaded: self.bytes_uploaded,
             eof: self.eof,
             dispatch_closed: self.plan.all_dispatched(self.parts_dispatched, self.eof),
         }
-    }
-
-    /// Returns a coherent snapshot only when transition reporting is enabled.
-    pub(crate) fn transition_snapshot(&self) -> Option<PartTransferSnapshot> {
-        self.observability.transition_snapshot(self.snapshot())
     }
 
     /// Classifies why `poll_work` cannot schedule another part from this state.
@@ -607,7 +605,7 @@ impl PartTransferState {
     }
 
     #[cfg(test)]
-    pub(crate) fn test_summary(&self) -> PartTransferSummary {
+    pub(crate) fn test_summary(&self) -> MultipartTransferSummary {
         self.observability
             .test_summary(self.snapshot())
             .expect("test transfer diagnostics should be enabled")
@@ -620,7 +618,7 @@ pub(crate) struct MultipartCompletion {
     pub(crate) plan: PartPlan,
     pub(crate) completed_parts: Vec<CompletedPart>,
     pub(crate) bytes_read: u64,
-    pub(crate) final_snapshot: PartTransferSnapshot,
+    pub(crate) final_snapshot: UploadStateSnapshot,
 }
 
 /// State machine for tracking upload work progress.

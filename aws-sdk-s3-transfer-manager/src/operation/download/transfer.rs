@@ -23,8 +23,8 @@ use crate::operation::download::context::{DownloadPendingReason, DownloadState, 
 use crate::operation::download::discovery::{discover_obj, ObjectDiscovery};
 use crate::operation::download::object_meta::ObjectMetadata;
 use crate::operation::download::observability::{
-    DownloadDestination, DownloadObservability, DownloadRequestKind, DownloadRequestMeasurement,
-    DownloadStateKind, DownloadStateSnapshot, DownloadTerminalReport, DownloadTransition,
+    DownloadDestination, DownloadEvent, DownloadExecutionState, DownloadObservability,
+    DownloadRequestKind, DownloadRequestMeasurement, DownloadStateSnapshot, DownloadTerminalReport,
 };
 use crate::operation::download::read_ahead::ReadAhead;
 use crate::operation::download::recv_buffer::{DrainMode, FillOutcome};
@@ -155,16 +155,15 @@ impl DownloadTransfer {
         snapshot_state(state, self.inner.read_ahead.window())
     }
 
-    fn observe_transition(&self, transition: DownloadTransition, state: &DownloadState) {
+    fn observe_event(&self, event: DownloadEvent, state: &DownloadState) {
         let snapshot = self.snapshot(state);
-        let emitted = self.inner.observability.transition_snapshot(snapshot);
         self.inner
             .observability
-            .publish_transition(self.inner.ctx.id, transition, emitted);
+            .observe_event(self.inner.ctx.id, event, snapshot);
     }
 
     /// Emits the download terminal summary before notifying the owning handle.
-    fn report_terminal(&self) {
+    fn report_terminal(&self, state_snapshot: DownloadStateSnapshot) {
         self.inner.ctx.finalize_terminal_metrics();
         let pending = self.inner.ctx.pending_stats().unwrap_or_default();
         let checksum_validation = self
@@ -183,6 +182,7 @@ impl DownloadTransfer {
                 request_total: self.inner.ctx.metrics.request_metrics(),
                 pending,
                 checksum_validation,
+                state_snapshot,
             });
     }
 
@@ -309,15 +309,15 @@ impl DownloadTransfer {
         match &mut *state {
             DownloadState::PendingDiscovery => {
                 *state = DownloadState::DiscoveryInFlight;
-                self.observe_transition(DownloadTransition::DiscoveryScheduled, &state);
+                self.observe_event(DownloadEvent::DiscoveryScheduled, &state);
                 PollWork::ready(IoRequest {
                     data: Some(Box::new(DownloadWork::Discovery)),
                 })
             }
             DownloadState::DiscoveryInFlight => {
                 self.inner.ctx.set_pending(DownloadPendingReason::Discovery);
-                self.observe_transition(
-                    DownloadTransition::Pending(DownloadPendingReason::Discovery),
+                self.observe_event(
+                    DownloadEvent::Pending(DownloadPendingReason::Discovery),
                     &state,
                 );
                 PollWork::Pending
@@ -476,17 +476,17 @@ impl DownloadTransfer {
                     self.inner.read_ahead.window(),
                     pending.is_some(),
                 );
-                let emitted = self.inner.observability.range_scheduled(snapshot);
-                self.inner.observability.publish_transition(
+                self.inner.observability.record_range_scheduled();
+                self.inner.observability.observe_event(
                     self.inner.ctx.id,
-                    DownloadTransition::RangeScheduled,
-                    emitted,
+                    DownloadEvent::RangeScheduled,
+                    snapshot,
                 );
                 if all_ranges_issued {
-                    self.inner.observability.publish_transition(
+                    self.inner.observability.observe_event(
                         self.inner.ctx.id,
-                        DownloadTransition::AllRangesIssued,
-                        emitted,
+                        DownloadEvent::AllRangesIssued,
+                        snapshot,
                     );
                 }
 
@@ -508,11 +508,10 @@ impl DownloadTransfer {
     /// own scheduler-backed task waker.
     fn park(&self, reason: DownloadPendingReason, snapshot: DownloadStateSnapshot) -> PollWork {
         self.inner.ctx.set_pending(reason);
-        let emitted = self.inner.observability.transition_snapshot(snapshot);
-        self.inner.observability.publish_transition(
+        self.inner.observability.observe_event(
             self.inner.ctx.id,
-            DownloadTransition::Pending(reason),
-            emitted,
+            DownloadEvent::Pending(reason),
+            snapshot,
         );
         PollWork::Pending
     }
@@ -533,11 +532,10 @@ impl DownloadTransfer {
     /// delivery owns progress.
     fn poll_memory_blocked(&self, snapshot: DownloadStateSnapshot) -> PollWork {
         if self.inner.writer.has_drainable_resident() {
-            let emitted = self.inner.observability.transition_snapshot(snapshot);
-            self.inner.observability.publish_transition(
+            self.inner.observability.observe_event(
                 self.inner.ctx.id,
-                DownloadTransition::MemoryReliefScheduled,
-                emitted,
+                DownloadEvent::MemoryReliefScheduled,
+                snapshot,
             );
             PollWork::ready(IoRequest {
                 data: Some(Box::new(DownloadWork::DrainResident)),
@@ -546,11 +544,10 @@ impl DownloadTransfer {
             self.inner
                 .ctx
                 .set_pending(DownloadPendingReason::MemoryAdmission);
-            let emitted = self.inner.observability.transition_snapshot(snapshot);
-            self.inner.observability.publish_transition(
+            self.inner.observability.observe_event(
                 self.inner.ctx.id,
-                DownloadTransition::Pending(DownloadPendingReason::MemoryAdmission),
-                emitted,
+                DownloadEvent::Pending(DownloadPendingReason::MemoryAdmission),
+                snapshot,
             );
             PollWork::Pending
         }
@@ -699,14 +696,13 @@ impl DownloadTransfer {
             }
             self.snapshot(&work)
         };
-        let emitted = self
-            .inner
+        self.inner
             .observability
-            .memory_relief_completed(snapshot, freed);
-        self.inner.observability.publish_transition(
+            .record_memory_relief_completed(freed);
+        self.inner.observability.observe_event(
             self.inner.ctx.id,
-            DownloadTransition::MemoryReliefCompleted,
-            emitted,
+            DownloadEvent::MemoryReliefCompleted,
+            snapshot,
         );
         self.inner.ctx.try_wake();
         WorkOutcome::Success { data: None }
@@ -843,23 +839,19 @@ impl DownloadTransfer {
             };
             self.snapshot(&work)
         };
-        let emitted = if has_initial_work {
-            self.inner.observability.range_scheduled(discovery_snapshot)
-        } else {
-            self.inner
-                .observability
-                .transition_snapshot(discovery_snapshot)
-        };
-        self.inner.observability.publish_transition(
+        if has_initial_work {
+            self.inner.observability.record_range_scheduled();
+        }
+        self.inner.observability.observe_event(
             self.inner.ctx.id,
-            DownloadTransition::DiscoveryCompleted,
-            emitted,
+            DownloadEvent::DiscoveryCompleted,
+            discovery_snapshot,
         );
         if all_ranges_issued {
-            self.inner.observability.publish_transition(
+            self.inner.observability.observe_event(
                 self.inner.ctx.id,
-                DownloadTransition::AllRangesIssued,
-                emitted,
+                DownloadEvent::AllRangesIssued,
+                discovery_snapshot,
             );
         }
 
@@ -1247,11 +1239,11 @@ impl DownloadTransfer {
         };
         drop(pending);
         if let Some(snapshot) = snapshot {
-            let emitted = self.inner.observability.range_completed(snapshot, freed);
-            self.inner.observability.publish_transition(
+            self.inner.observability.record_range_completed(freed);
+            self.inner.observability.observe_event(
                 self.inner.ctx.id,
-                DownloadTransition::RangeCompleted,
-                emitted,
+                DownloadEvent::RangeCompleted,
+                snapshot,
             );
         }
         // Wake the issuer on every non-terminal completion so a pending poll_work can
@@ -1284,16 +1276,20 @@ impl DownloadTransfer {
             let guard = self.inner.state.lock().unwrap();
             return self.fail(guard, error::Error::new(error::ErrorKind::IOError, e));
         }
+        let state_snapshot = {
+            let state = self.inner.state.lock().expect("lock poisoned");
+            self.snapshot(&state)
+        };
         if self.inner.writer.has_sink() {
-            self.inner.observability.publish_transition(
+            self.inner.observability.observe_event(
                 self.inner.ctx.id,
-                DownloadTransition::DestinationFinalized,
-                None,
+                DownloadEvent::DestinationFinalized,
+                state_snapshot,
             );
         }
         self.inner.ctx.set_completed();
         self.inner.writer.notify_consumer();
-        self.report_terminal();
+        self.report_terminal(state_snapshot);
         self.inner.ctx.signal_terminal();
         WorkOutcome::Success { data: None }
     }
@@ -1317,13 +1313,12 @@ impl DownloadTransfer {
         let pending = guard.enter_terminal();
         drop(guard); // release lock before dropping the claim and signaling waiters
         drop(pending);
-        let _ = self.inner.observability.transition_snapshot(snapshot);
         // Wake all waiters
         self.inner.discovery_notify.notify_waiters();
         let drain = self.inner.writer.terminal_drain();
         self.inner.observability.terminal_drain_completed(&drain);
         self.inner.writer.notify_consumer();
-        self.report_terminal();
+        self.report_terminal(snapshot);
         self.inner.ctx.signal_terminal();
         WorkOutcome::Failed { classification }
     }
@@ -1343,21 +1338,20 @@ impl DownloadTransfer {
             self.fail(guard, error::Error::new(error::ErrorKind::IOError, e));
             return;
         }
+        let snapshot = self.snapshot(&guard);
         if self.inner.writer.has_sink() {
-            self.inner.observability.publish_transition(
+            self.inner.observability.observe_event(
                 self.inner.ctx.id,
-                DownloadTransition::DestinationFinalized,
-                None,
+                DownloadEvent::DestinationFinalized,
+                snapshot,
             );
         }
         self.inner.ctx.set_completed();
-        let snapshot = self.snapshot(&guard);
         let pending = guard.enter_terminal();
         drop(guard); // release lock before dropping the claim and signaling waiters
         drop(pending);
-        let _ = self.inner.observability.transition_snapshot(snapshot);
         self.inner.writer.notify_consumer();
-        self.report_terminal();
+        self.report_terminal(snapshot);
         self.inner.ctx.signal_terminal();
     }
 }
@@ -1388,24 +1382,25 @@ impl Transfer for DownloadTransfer {
             (state.enter_terminal(), snapshot)
         };
         drop(pending);
-        let _ = self.inner.observability.transition_snapshot(snapshot);
 
         self.inner.discovery_notify.notify_waiters();
         let drain = self.inner.writer.terminal_drain();
         self.inner.observability.terminal_drain_completed(&drain);
         self.inner.writer.notify_consumer();
-        self.report_terminal();
+        self.report_terminal(snapshot);
     }
 }
 
 fn snapshot_state(state: &DownloadState, read_ahead_window: u64) -> DownloadStateSnapshot {
     match state {
-        DownloadState::PendingDiscovery => {
-            DownloadStateSnapshot::inactive(DownloadStateKind::PendingDiscovery, read_ahead_window)
-        }
-        DownloadState::DiscoveryInFlight => {
-            DownloadStateSnapshot::inactive(DownloadStateKind::DiscoveryInFlight, read_ahead_window)
-        }
+        DownloadState::PendingDiscovery => DownloadStateSnapshot::inactive(
+            DownloadExecutionState::PendingDiscovery,
+            read_ahead_window,
+        ),
+        DownloadState::DiscoveryInFlight => DownloadStateSnapshot::inactive(
+            DownloadExecutionState::DiscoveryInFlight,
+            read_ahead_window,
+        ),
         DownloadState::Transferring {
             remaining,
             ranges_in_flight,
@@ -1420,7 +1415,7 @@ fn snapshot_state(state: &DownloadState, read_ahead_window: u64) -> DownloadStat
             pending.is_some(),
         ),
         DownloadState::Terminal => {
-            DownloadStateSnapshot::inactive(DownloadStateKind::Terminal, read_ahead_window)
+            DownloadStateSnapshot::inactive(DownloadExecutionState::Terminal, read_ahead_window)
         }
     }
 }
@@ -1433,7 +1428,7 @@ fn transferring_snapshot(
     memory_claim_pending: bool,
 ) -> DownloadStateSnapshot {
     DownloadStateSnapshot {
-        state: DownloadStateKind::Transferring,
+        state: DownloadExecutionState::Transferring,
         remaining_bytes: remaining.map(|range| {
             range
                 .end()
@@ -1641,6 +1636,46 @@ mod tests {
     use aws_smithy_types::error::metadata::ErrorMetadata;
 
     const MB: u64 = 1024 * 1024;
+
+    #[test]
+    fn download_state_snapshot_classifies_execution_and_occupancy() {
+        assert_eq!(
+            snapshot_state(&DownloadState::PendingDiscovery, 4),
+            DownloadStateSnapshot::inactive(DownloadExecutionState::PendingDiscovery, 4)
+        );
+        assert_eq!(
+            snapshot_state(&DownloadState::DiscoveryInFlight, 4),
+            DownloadStateSnapshot::inactive(DownloadExecutionState::DiscoveryInFlight, 4)
+        );
+        assert_eq!(
+            snapshot_state(&DownloadState::Terminal, 4),
+            DownloadStateSnapshot::inactive(DownloadExecutionState::Terminal, 4)
+        );
+
+        let mut gate = super::super::context::OccupancyGate::with_issued(3);
+        gate.release(1);
+        let transferring = DownloadState::Transferring {
+            remaining: Some(8..=15),
+            ranges_in_flight: 2,
+            etag: None,
+            part_size: 8,
+            gate,
+            pending: None,
+        };
+        assert_eq!(
+            snapshot_state(&transferring, 4),
+            DownloadStateSnapshot {
+                state: DownloadExecutionState::Transferring,
+                remaining_bytes: Some(8),
+                ranges_in_flight: 2,
+                ranges_issued: 3,
+                ranges_released: 1,
+                resident_parts: 2,
+                read_ahead_window: 4,
+                memory_claim_pending: false,
+            }
+        );
+    }
 
     /// Deterministic multi-frame body separating transport frames from carriers.
     struct TestFrameBody {
@@ -2091,11 +2126,7 @@ mod tests {
             assert_eq!(summary.ranges_scheduled, 1);
             assert_eq!(summary.ranges_completed, 1);
             assert_eq!(
-                summary
-                    .state
-                    .expect("completed receive state")
-                    .resident_parts,
-                1,
+                summary.state.resident_parts, 1,
                 "terminal receive does not imply stream-consumer delivery"
             );
             assert!(!summary.destination_work.file_finalized);
@@ -2168,8 +2199,8 @@ mod tests {
             1
         );
         assert_eq!(
-            summary.state.expect("discovery state").state,
-            DownloadStateKind::DiscoveryInFlight
+            summary.state.state,
+            DownloadExecutionState::DiscoveryInFlight
         );
     }
 

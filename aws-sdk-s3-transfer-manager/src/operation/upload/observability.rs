@@ -5,9 +5,9 @@
 
 //! Upload state-machine observation and diagnostic emission.
 //!
-//! [`UploadObservability`] receives state-machine transitions and request
+//! [`UploadObservability`] receives state-machine events and request
 //! measurements from PutObject and multipart uploads. The disabled variant
-//! avoids allocation, clocks, counters, and transition snapshots.
+//! avoids allocation, clocks, counters, and event snapshots.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -19,43 +19,142 @@ use crate::io::SizeHint;
 use crate::metrics::RequestMetrics;
 use crate::operation::upload::context::PartTransferPendingReason;
 use crate::transfer::{
-    PendingCategory, RequestMeasurement, TransferContext, TransferId, TransferPendingStats,
+    AttributedRequestMeasurement, PendingCategory, RequestMetricsAttribution, TransferContext,
+    TransferId, TransferPendingStats,
 };
 use crate::types::{TransferMetrics, TransferStatus};
 
-/// Multipart state sampled while the upload-state lock is held.
+/// Copyable execution-state projection of
+/// [`UploadState`](super::context::UploadState).
+///
+/// `UploadState` remains authoritative for source ownership, multipart
+/// bookkeeping, request futures, and terminal response construction. This enum
+/// retains only its current state-machine state for diagnostics.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct PartTransferSnapshot {
+pub(crate) enum UploadExecutionState {
+    /// The state machine has not selected PutObject or multipart upload.
+    PendingInitialization,
+    /// CreateMultipartUpload is in flight.
+    CreateMultipartUploadInFlight,
+    /// Source parts are being read and uploaded.
+    Transferring,
+    /// Multipart source work has drained and completion can be scheduled.
+    MultipartCompletionPending,
+    /// CompleteMultipartUpload is in flight.
+    CompleteMultipartUploadInFlight,
+    /// PutObject is in flight.
+    PutObjectInFlight,
+    /// No more upload work can be produced.
+    Done,
+}
+
+impl UploadExecutionState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::PendingInitialization => "pending_initialization",
+            Self::CreateMultipartUploadInFlight => "create_multipart_upload_in_flight",
+            Self::Transferring => "transferring",
+            Self::MultipartCompletionPending => "multipart_completion_pending",
+            Self::CompleteMultipartUploadInFlight => "complete_multipart_upload_in_flight",
+            Self::PutObjectInFlight => "put_object_in_flight",
+            Self::Done => "done",
+        }
+    }
+}
+
+/// Diagnostic projection of [`UploadState`](super::context::UploadState)
+/// sampled while the upload-state lock is held.
+///
+/// The snapshot combines the current execution state with multipart counters
+/// owned by the authoritative upload state. Multipart counters are zero while
+/// the upload is outside multipart execution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct UploadStateSnapshot {
+    /// Current state-machine state projected from
+    /// [`UploadState`](super::context::UploadState).
+    pub(crate) state: UploadExecutionState,
+    /// Multipart work admitted by the scheduler.
     pub(crate) parts_dispatched: u64,
+    /// Source reads or UploadPart requests that have not retired.
     pub(crate) parts_in_flight: usize,
+    /// UploadPart requests currently executing.
     pub(crate) uploads_in_flight: usize,
+    /// Source reads retained after returning `Poll::Pending`.
     pub(crate) pending_reads: usize,
+    /// UploadPart requests accepted by S3.
     pub(crate) completed_parts: usize,
+    /// Bytes returned by source reads.
+    pub(crate) bytes_read: u64,
+    /// Bytes accepted by completed UploadPart requests.
     pub(crate) bytes_uploaded: u64,
+    /// Whether a caller-provided source reported end-of-stream.
     pub(crate) eof: bool,
+    /// Whether no additional source reads may be dispatched.
     pub(crate) dispatch_closed: bool,
+}
+
+impl UploadStateSnapshot {
+    /// Returns a snapshot for an execution state without multipart counters.
+    pub(crate) const fn inactive(state: UploadExecutionState) -> Self {
+        Self {
+            state,
+            parts_dispatched: 0,
+            parts_in_flight: 0,
+            uploads_in_flight: 0,
+            pending_reads: 0,
+            completed_parts: 0,
+            bytes_read: 0,
+            bytes_uploaded: 0,
+            eof: false,
+            dispatch_closed: false,
+        }
+    }
+
+    /// Reclassifies multipart counters after the state machine advances.
+    pub(crate) const fn with_state(mut self, state: UploadExecutionState) -> Self {
+        self.state = state;
+        self
+    }
 }
 
 /// Aggregate multipart state included in an upload terminal summary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct PartTransferSummary {
-    pub(crate) snapshot: PartTransferSnapshot,
+pub(crate) struct MultipartTransferSummary {
+    /// Last coherent multipart execution state.
+    pub(crate) snapshot: UploadStateSnapshot,
+    /// Parts whose request body used more than one presentation segment.
     pub(crate) segmented_parts: u64,
+    /// Total presentation segments across all UploadPart requests.
     pub(crate) presentation_segments: u64,
+    /// Largest presentation-segment count for one UploadPart request.
     pub(crate) max_presentation_segments: usize,
+    /// Highest source-read or UploadPart work count.
     pub(crate) max_parts_in_flight: usize,
+    /// Highest concurrently executing UploadPart request count.
     pub(crate) max_uploads_in_flight: usize,
+    /// Total CreateMultipartUpload request time.
     pub(crate) create_mpu_duration: Duration,
+    /// Total elapsed source-read time.
     pub(crate) source_read_duration: Duration,
+    /// Longest elapsed source read.
     pub(crate) max_source_read_duration: Duration,
+    /// Source-future polls that returned `Pending`.
     pub(crate) read_pending_polls: u64,
+    /// Source parts that returned `Pending` at least once.
     pub(crate) read_pending_parts: u64,
+    /// Elapsed source-read time for parts that returned `Pending`.
     pub(crate) read_pending_duration: Duration,
+    /// Total UploadPart request time.
     pub(crate) upload_request_duration: Duration,
+    /// Longest UploadPart request.
     pub(crate) max_upload_request_duration: Duration,
+    /// Time from multipart creation through source and UploadPart drain.
     pub(crate) body_duration: Duration,
+    /// Time from source dispatch closure through multipart body drain.
     pub(crate) drain_duration: Duration,
+    /// Total CompleteMultipartUpload request time.
     pub(crate) complete_mpu_request_duration: Duration,
+    /// Elapsed completion work including checksum finalization.
     pub(crate) complete_mpu_duration: Duration,
 }
 
@@ -153,11 +252,11 @@ impl UploadTerminalOutcome {
     }
 }
 
-/// Closed diagnostic vocabulary for upload state-machine transitions.
+/// Closed diagnostic vocabulary for upload state-machine events.
 ///
-/// Each variant maps to one stable `transition` and `reason` field pair.
+/// Each variant maps to one stable `event` and `reason` field pair.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum UploadTransition {
+pub(crate) enum UploadEvent {
     /// PutObject work was selected for the source.
     PutObjectScheduled,
     /// CreateMultipartUpload work was selected for the source.
@@ -184,7 +283,7 @@ pub(crate) enum UploadTransition {
     Terminal(UploadTerminalOutcome),
 }
 
-impl UploadTransition {
+impl UploadEvent {
     fn fields(self) -> (&'static str, &'static str) {
         match self {
             Self::PutObjectScheduled => ("work_scheduled", "put_object"),
@@ -293,9 +392,13 @@ impl SourceReadObservation {
 /// Per-request-kind metrics retained for an upload terminal summary.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct UploadRequestMetrics {
+    /// Aggregate for PutObject requests.
     pub(crate) put_object: RequestMetrics,
+    /// Aggregate for CreateMultipartUpload requests.
     pub(crate) create_multipart_upload: RequestMetrics,
+    /// Aggregate for UploadPart requests.
     pub(crate) upload_part: RequestMetrics,
+    /// Aggregate for CompleteMultipartUpload requests.
     pub(crate) complete_multipart_upload: RequestMetrics,
 }
 
@@ -314,16 +417,46 @@ impl UploadRequestMetrics {
 /// Complete diagnostic report for one upload transfer.
 #[derive(Clone, Debug)]
 pub(crate) struct UploadTransferSummary {
+    /// Terminal outcome reported by the common transfer context.
     pub(crate) outcome: UploadTerminalOutcome,
+    /// S3 operation strategy selected for the source.
     pub(crate) mode: UploadMode,
+    /// Bounds declared by the upload source.
     pub(crate) length_kind: UploadLengthKind,
+    /// Transfer-manager error classification for a failed upload.
     pub(crate) error_kind: Option<ErrorKind>,
+    /// Time from transfer creation through terminal reporting.
     pub(crate) elapsed: Duration,
+    /// Common byte and I/O metrics for the transfer.
     pub(crate) metrics: TransferMetrics,
+    /// Request metrics separated by upload request kind.
     pub(crate) requests: UploadRequestMetrics,
+    /// Common aggregate across every request issued by the upload.
     pub(crate) request_total: RequestMetrics,
+    /// Scheduler pending intervals attributed by common category.
     pub(crate) pending: TransferPendingStats,
-    pub(crate) multipart: Option<PartTransferSummary>,
+    /// Last coherent upload state observed before terminal reporting.
+    pub(crate) state: UploadStateSnapshot,
+    /// Multipart-only work and timing, absent for PutObject.
+    pub(crate) multipart: Option<MultipartTransferSummary>,
+}
+
+/// Common and direction-specific facts captured at one terminal boundary.
+pub(crate) struct UploadTerminalReport {
+    /// Transfer receiving the terminal report.
+    pub(crate) transfer_id: TransferId,
+    /// Common transfer status at the terminal boundary.
+    pub(crate) status: TransferStatus,
+    /// Transfer-manager error classification for a failed upload.
+    pub(crate) error_kind: Option<ErrorKind>,
+    /// Common byte and I/O metrics for the transfer.
+    pub(crate) metrics: TransferMetrics,
+    /// Common aggregate across every request issued by the upload.
+    pub(crate) request_total: RequestMetrics,
+    /// Scheduler pending intervals attributed by common category.
+    pub(crate) pending: TransferPendingStats,
+    /// State captured at the terminal boundary.
+    pub(crate) state_snapshot: UploadStateSnapshot,
 }
 
 /// Optional upload observation kept separate from correctness state.
@@ -335,7 +468,7 @@ pub(crate) enum UploadObservability {
 
 #[derive(Debug)]
 pub(crate) struct EnabledUploadObservability {
-    transitions: bool,
+    emit_events: bool,
     terminal_reported: AtomicBool,
     state: Mutex<UploadObservabilityState>,
     #[cfg(test)]
@@ -362,7 +495,7 @@ struct UploadObservabilityState {
     read_pending_parts: u64,
     read_pending_duration: Duration,
     complete_mpu_duration: Duration,
-    latest_part_snapshot: Option<PartTransferSnapshot>,
+    latest_snapshot: Option<UploadStateSnapshot>,
     requests: UploadRequestMetrics,
 }
 
@@ -373,7 +506,7 @@ impl UploadObservability {
             return Self::Disabled;
         }
         Self::Enabled(Arc::new(EnabledUploadObservability {
-            transitions: config.enable_transitions(),
+            emit_events: config.events_enabled(),
             terminal_reported: AtomicBool::new(false),
             state: Mutex::new(UploadObservabilityState {
                 mode: UploadMode::Undecided,
@@ -394,7 +527,7 @@ impl UploadObservability {
                 read_pending_parts: 0,
                 read_pending_duration: Duration::ZERO,
                 complete_mpu_duration: Duration::ZERO,
-                latest_part_snapshot: None,
+                latest_snapshot: None,
                 requests: UploadRequestMetrics::default(),
             }),
             #[cfg(test)]
@@ -422,16 +555,12 @@ impl UploadObservability {
     }
 
     /// Starts a request measurement attributed to one upload request kind.
-    pub(crate) fn start_request<'a>(
-        &'a self,
+    pub(crate) fn start_request(
+        &self,
         ctx: &TransferContext,
         kind: UploadRequestKind,
-    ) -> UploadRequestMeasurement<'a> {
-        UploadRequestMeasurement {
-            measurement: Some(ctx.start_request_metrics()),
-            observability: self,
-            kind,
-        }
+    ) -> UploadRequestMeasurement {
+        UploadRequestMeasurement::new(ctx, self.clone(), kind)
     }
 
     fn record_request(&self, kind: UploadRequestKind, metrics: &RequestMetrics) {
@@ -555,39 +684,31 @@ impl UploadObservability {
         }
     }
 
-    /// Records the latest multipart state and returns it at detail level two.
-    pub(crate) fn transition_snapshot(
-        &self,
-        snapshot: PartTransferSnapshot,
-    ) -> Option<PartTransferSnapshot> {
-        match self {
-            Self::Disabled => None,
-            Self::Enabled(enabled) => {
-                let mut state = enabled.state.lock().expect("lock poisoned");
-                state.latest_part_snapshot = Some(snapshot);
-                state.max_parts_in_flight = state.max_parts_in_flight.max(snapshot.parts_in_flight);
-                enabled.transitions.then_some(snapshot)
-            }
-        }
-    }
-
     /// Records the completed multipart state.
     pub(crate) fn finish_multipart(
         &self,
-        snapshot: PartTransferSnapshot,
+        snapshot: UploadStateSnapshot,
         complete_duration: Option<Duration>,
     ) {
         let Self::Enabled(enabled) = self else {
             return;
         };
         let mut state = enabled.state.lock().expect("lock poisoned");
-        state.latest_part_snapshot = Some(snapshot);
+        update_snapshot(&mut state, snapshot);
         state.complete_mpu_duration = complete_duration.unwrap_or(Duration::ZERO);
     }
 
-    fn multipart_summary(state: &UploadObservabilityState) -> Option<PartTransferSummary> {
-        let snapshot = state.latest_part_snapshot?;
-        Some(PartTransferSummary {
+    fn multipart_summary(state: &UploadObservabilityState) -> Option<MultipartTransferSummary> {
+        let snapshot = state.latest_snapshot?;
+        if !matches!(
+            snapshot.state,
+            UploadExecutionState::Transferring
+                | UploadExecutionState::MultipartCompletionPending
+                | UploadExecutionState::CompleteMultipartUploadInFlight
+        ) {
+            return None;
+        }
+        Some(MultipartTransferSummary {
             snapshot,
             segmented_parts: state.segmented_parts,
             presentation_segments: state.presentation_segments,
@@ -609,50 +730,53 @@ impl UploadObservability {
         })
     }
 
-    /// Emits one upload state transition at diagnostic detail level two.
-    pub(crate) fn publish_transition(
+    /// Observes one state-machine event and its coherent state snapshot.
+    pub(crate) fn observe_event(
         &self,
         transfer_id: TransferId,
-        transition: UploadTransition,
-        snapshot: Option<PartTransferSnapshot>,
+        event: UploadEvent,
+        snapshot: UploadStateSnapshot,
     ) {
         let Self::Enabled(enabled) = self else {
             return;
         };
-        if enabled.transitions {
-            emit_transition(transfer_id, transition, snapshot);
+        update_snapshot(&mut enabled.state.lock().expect("lock poisoned"), snapshot);
+        if enabled.emit_events {
+            emit_event(transfer_id, event, snapshot);
         }
     }
 
-    /// Emits one retained source operation at diagnostic detail level two.
-    pub(crate) fn publish_source_pending(
+    /// Observes one retained source operation.
+    pub(crate) fn observe_source_pending(
         &self,
         transfer_id: TransferId,
         observation: SourceReadObservation,
-        snapshot: Option<PartTransferSnapshot>,
+        snapshot: UploadStateSnapshot,
     ) {
         let Self::Enabled(enabled) = self else {
             return;
         };
-        if enabled.transitions {
+        update_snapshot(&mut enabled.state.lock().expect("lock poisoned"), snapshot);
+        if enabled.emit_events {
             emit_source_pending(transfer_id, observation, snapshot);
         }
     }
 
-    /// Emits one UploadPart request start at diagnostic detail level two.
-    pub(crate) fn publish_part_started(
+    /// Observes one UploadPart request start.
+    pub(crate) fn observe_part_started(
         &self,
         transfer_id: TransferId,
         part_number: u64,
         bytes_sent: u64,
         presentation_segments: usize,
         observation: SourceReadObservation,
-        snapshot: Option<PartTransferSnapshot>,
+        snapshot: UploadStateSnapshot,
     ) {
         let Self::Enabled(enabled) = self else {
             return;
         };
-        if enabled.transitions {
+        update_snapshot(&mut enabled.state.lock().expect("lock poisoned"), snapshot);
+        if enabled.emit_events {
             emit_part_started(
                 transfer_id,
                 part_number,
@@ -664,20 +788,21 @@ impl UploadObservability {
         }
     }
 
-    /// Emits one failed UploadPart request at diagnostic detail level two.
-    pub(crate) fn publish_part_failed(
+    /// Observes one failed UploadPart request.
+    pub(crate) fn observe_part_failed(
         &self,
         transfer_id: TransferId,
         part_number: u64,
         bytes_sent: u64,
         presentation_segments: usize,
         request_duration: Duration,
-        snapshot: Option<PartTransferSnapshot>,
+        snapshot: UploadStateSnapshot,
     ) {
         let Self::Enabled(enabled) = self else {
             return;
         };
-        if enabled.transitions {
+        update_snapshot(&mut enabled.state.lock().expect("lock poisoned"), snapshot);
+        if enabled.emit_events {
             emit_part_failed(
                 transfer_id,
                 part_number,
@@ -689,20 +814,21 @@ impl UploadObservability {
         }
     }
 
-    /// Emits one completed UploadPart request at diagnostic detail level two.
-    pub(crate) fn publish_part_completed(
+    /// Observes one completed UploadPart request.
+    pub(crate) fn observe_part_completed(
         &self,
         transfer_id: TransferId,
         part_number: u64,
         bytes_sent: u64,
         presentation_segments: usize,
         request_duration: Duration,
-        snapshot: Option<PartTransferSnapshot>,
+        snapshot: UploadStateSnapshot,
     ) {
         let Self::Enabled(enabled) = self else {
             return;
         };
-        if enabled.transitions {
+        update_snapshot(&mut enabled.state.lock().expect("lock poisoned"), snapshot);
+        if enabled.emit_events {
             emit_part_completed(
                 transfer_id,
                 part_number,
@@ -717,51 +843,54 @@ impl UploadObservability {
     /// Finalizes and emits the upload terminal summary once.
     pub(crate) fn report_terminal(
         &self,
-        transfer_id: TransferId,
-        status: TransferStatus,
-        error_kind: Option<ErrorKind>,
-        metrics: TransferMetrics,
-        request_total: RequestMetrics,
-        pending: TransferPendingStats,
+        report: UploadTerminalReport,
     ) -> Option<UploadTransferSummary> {
         let Self::Enabled(enabled) = self else {
             return None;
         };
-        let outcome = UploadTerminalOutcome::from_status(status)?;
+        let outcome = UploadTerminalOutcome::from_status(report.status)?;
         if enabled.terminal_reported.swap(true, Ordering::AcqRel) {
             return None;
         }
 
-        let state = enabled.state.lock().expect("lock poisoned");
+        let mut state = enabled.state.lock().expect("lock poisoned");
+        if state.latest_snapshot.is_none() {
+            update_snapshot(&mut state, report.state_snapshot);
+        }
+        let terminal_snapshot = state
+            .latest_snapshot
+            .expect("terminal upload summary must retain a state snapshot");
         let summary = UploadTransferSummary {
             outcome,
             mode: state.mode,
             length_kind: state.length_kind,
-            error_kind,
-            elapsed: metrics
+            error_kind: report.error_kind,
+            elapsed: report
+                .metrics
                 .finished_at
-                .map(|finished_at| finished_at.saturating_duration_since(metrics.started_at))
+                .map(|finished_at| finished_at.saturating_duration_since(report.metrics.started_at))
                 .unwrap_or_default(),
-            metrics,
+            metrics: report.metrics,
             requests: state.requests,
-            request_total,
-            pending,
+            request_total: report.request_total,
+            pending: report.pending,
+            state: terminal_snapshot,
             multipart: Self::multipart_summary(&state),
         };
         drop(state);
 
-        if enabled.transitions {
-            emit_transition(
-                transfer_id,
-                UploadTransition::Terminal(outcome),
-                summary.multipart.map(|multipart| multipart.snapshot),
+        if enabled.emit_events {
+            emit_event(
+                report.transfer_id,
+                UploadEvent::Terminal(outcome),
+                terminal_snapshot,
             );
         }
         #[cfg(test)]
         {
             *enabled.last_summary.lock().expect("lock poisoned") = Some(summary.clone());
         }
-        emit_terminal_summary(transfer_id, &summary);
+        emit_terminal_summary(report.transfer_id, &summary);
         Some(summary)
     }
 
@@ -769,14 +898,14 @@ impl UploadObservability {
     #[cfg(test)]
     pub(crate) fn test_summary(
         &self,
-        snapshot: PartTransferSnapshot,
-    ) -> Option<PartTransferSummary> {
+        snapshot: UploadStateSnapshot,
+    ) -> Option<MultipartTransferSummary> {
         self.finish_body();
         let Self::Enabled(enabled) = self else {
             return None;
         };
         let mut state = enabled.state.lock().expect("lock poisoned");
-        state.latest_part_snapshot = Some(snapshot);
+        update_snapshot(&mut state, snapshot);
         Self::multipart_summary(&state)
     }
 
@@ -790,87 +919,48 @@ impl UploadObservability {
     }
 }
 
+impl RequestMetricsAttribution for UploadObservability {
+    type Kind = UploadRequestKind;
+
+    fn record_request_metrics(&self, kind: Self::Kind, metrics: &RequestMetrics) {
+        self.record_request(kind, metrics);
+    }
+}
+
 /// In-progress request measurement attributed to one upload request kind.
-pub(crate) struct UploadRequestMeasurement<'a> {
-    measurement: Option<RequestMeasurement>,
-    observability: &'a UploadObservability,
-    kind: UploadRequestKind,
+pub(crate) type UploadRequestMeasurement = AttributedRequestMeasurement<UploadObservability>;
+
+fn update_snapshot(state: &mut UploadObservabilityState, snapshot: UploadStateSnapshot) {
+    state.latest_snapshot = Some(snapshot);
+    state.max_parts_in_flight = state.max_parts_in_flight.max(snapshot.parts_in_flight);
 }
 
-impl UploadRequestMeasurement<'_> {
-    /// Returns the request metrics updated by the retry loop.
-    pub(crate) fn metrics_mut(&mut self) -> &mut RequestMetrics {
-        self.measurement
-            .as_mut()
-            .expect("request measurement already finished")
-            .metrics_mut()
-    }
-
-    /// Publishes the request measurement to transfer and upload aggregates.
-    pub(crate) fn finish(mut self) -> RequestMetrics {
-        self.publish()
-    }
-
-    fn publish(&mut self) -> RequestMetrics {
-        let measurement = self
-            .measurement
-            .take()
-            .expect("request measurement already finished");
-        let metrics = measurement.finish();
-        self.observability.record_request(self.kind, &metrics);
-        metrics
-    }
-}
-
-impl Drop for UploadRequestMeasurement<'_> {
-    fn drop(&mut self) {
-        if self.measurement.is_some() {
-            let _ = self.publish();
-        }
-    }
-}
-
-fn emit_transition(
-    transfer_id: TransferId,
-    transition: UploadTransition,
-    snapshot: Option<PartTransferSnapshot>,
-) {
-    let (transition, reason) = transition.fields();
-    if let Some(snapshot) = snapshot {
-        tracing::trace!(
-            target: crate::telemetry::TARGET_TRANSFER,
-            tid = %transfer_id,
-            transition,
-            reason,
-            parts_dispatched = snapshot.parts_dispatched,
-            parts_in_flight = snapshot.parts_in_flight,
-            uploads_in_flight = snapshot.uploads_in_flight,
-            pending_reads = snapshot.pending_reads,
-            completed_parts = snapshot.completed_parts,
-            bytes_uploaded = snapshot.bytes_uploaded,
-            eof = snapshot.eof,
-            dispatch_closed = snapshot.dispatch_closed,
-            "upload state transition",
-        );
-    } else {
-        tracing::trace!(
-            target: crate::telemetry::TARGET_TRANSFER,
-            tid = %transfer_id,
-            transition,
-            reason,
-            "upload state transition",
-        );
-    }
+fn emit_event(transfer_id: TransferId, event: UploadEvent, snapshot: UploadStateSnapshot) {
+    let (event, reason) = event.fields();
+    tracing::trace!(
+        target: crate::telemetry::TARGET_TRANSFER,
+        tid = %transfer_id,
+        event,
+        reason,
+        state = snapshot.state.as_str(),
+        parts_dispatched = snapshot.parts_dispatched,
+        parts_in_flight = snapshot.parts_in_flight,
+        uploads_in_flight = snapshot.uploads_in_flight,
+        pending_reads = snapshot.pending_reads,
+        completed_parts = snapshot.completed_parts,
+        bytes_read = snapshot.bytes_read,
+        bytes_uploaded = snapshot.bytes_uploaded,
+        eof = snapshot.eof,
+        dispatch_closed = snapshot.dispatch_closed,
+        "upload state-machine event",
+    );
 }
 
 fn emit_source_pending(
     transfer_id: TransferId,
     observation: SourceReadObservation,
-    snapshot: Option<PartTransferSnapshot>,
+    snapshot: UploadStateSnapshot,
 ) {
-    let Some(snapshot) = snapshot else {
-        return;
-    };
     tracing::trace!(
         target: crate::telemetry::TARGET_TRANSFER,
         tid = %transfer_id,
@@ -892,11 +982,8 @@ fn emit_part_started(
     bytes_sent: u64,
     presentation_segments: usize,
     observation: SourceReadObservation,
-    snapshot: Option<PartTransferSnapshot>,
+    snapshot: UploadStateSnapshot,
 ) {
-    let Some(snapshot) = snapshot else {
-        return;
-    };
     tracing::trace!(
         target: crate::telemetry::TARGET_TRANSFER,
         tid = %transfer_id,
@@ -921,11 +1008,8 @@ fn emit_part_failed(
     bytes_sent: u64,
     presentation_segments: usize,
     request_duration: Duration,
-    snapshot: Option<PartTransferSnapshot>,
+    _snapshot: UploadStateSnapshot,
 ) {
-    let Some(_snapshot) = snapshot else {
-        return;
-    };
     tracing::trace!(
         target: crate::telemetry::TARGET_TRANSFER,
         tid = %transfer_id,
@@ -944,11 +1028,8 @@ fn emit_part_completed(
     bytes_sent: u64,
     presentation_segments: usize,
     request_duration: Duration,
-    snapshot: Option<PartTransferSnapshot>,
+    snapshot: UploadStateSnapshot,
 ) {
-    let Some(snapshot) = snapshot else {
-        return;
-    };
     tracing::trace!(
         target: crate::telemetry::TARGET_TRANSFER,
         tid = %transfer_id,
@@ -984,6 +1065,7 @@ fn emit_terminal_summary(transfer_id: TransferId, summary: &UploadTransferSummar
         outcome = summary.outcome.as_str(),
         mode = summary.mode.as_str(),
         source_length = summary.length_kind.as_str(),
+        state = summary.state.state.as_str(),
         error_kind = ?summary.error_kind,
         elapsed_us = duration_micros(summary.elapsed),
         expected_bytes = summary.metrics.total_bytes,
@@ -1131,13 +1213,36 @@ mod tests {
         }
     }
 
-    fn snapshot() -> PartTransferSnapshot {
-        PartTransferSnapshot {
+    fn terminal_report(
+        transfer_id: u64,
+        status: TransferStatus,
+        error_kind: Option<ErrorKind>,
+        request_total: RequestMetrics,
+        state_snapshot: UploadStateSnapshot,
+    ) -> UploadTerminalReport {
+        UploadTerminalReport {
+            transfer_id: TransferId {
+                id: transfer_id,
+                parent: None,
+            },
+            status,
+            error_kind,
+            metrics: test_transfer_metrics(),
+            request_total,
+            pending: TransferPendingStats::default(),
+            state_snapshot,
+        }
+    }
+
+    fn snapshot() -> UploadStateSnapshot {
+        UploadStateSnapshot {
+            state: UploadExecutionState::Transferring,
             parts_dispatched: 1,
             parts_in_flight: 0,
             uploads_in_flight: 0,
             pending_reads: 0,
             completed_parts: 1,
+            bytes_read: 8 * 1024 * 1024,
             bytes_uploaded: 8 * 1024 * 1024,
             eof: false,
             dispatch_closed: true,
@@ -1145,29 +1250,38 @@ mod tests {
     }
 
     #[test]
-    fn disabled_collection_does_not_start_timers_or_emit_snapshots() {
+    fn disabled_collection_does_not_start_timers_or_retain_events() {
         let observability = UploadObservability::new(config(0), exact_size_hint());
         let timing = observability.part_scheduled();
         assert!(matches!(observability, UploadObservability::Disabled));
         assert_eq!(UploadDiagnosticTimer::start(config(0)).elapsed(), None);
         assert_eq!(timing.finish().elapsed, None);
-        assert_eq!(observability.transition_snapshot(snapshot()), None);
-    }
-
-    #[test]
-    fn summary_and_transition_levels_are_distinct() {
-        let summary = UploadObservability::new(config(1), exact_size_hint());
-        assert_eq!(summary.transition_snapshot(snapshot()), None);
-
-        let transitions = UploadObservability::new(config(2), exact_size_hint());
-        assert_eq!(
-            transitions.transition_snapshot(snapshot()),
-            Some(snapshot())
+        observability.observe_event(
+            TransferId {
+                id: 1,
+                parent: None,
+            },
+            UploadEvent::NewPartScheduled,
+            snapshot(),
         );
     }
 
     #[test]
-    fn summary_level_aggregates_without_transition_snapshots() {
+    fn summary_and_event_levels_are_distinct() {
+        let summary = UploadObservability::new(config(1), exact_size_hint());
+        let events = UploadObservability::new(config(2), exact_size_hint());
+        assert!(matches!(
+            summary,
+            UploadObservability::Enabled(ref enabled) if !enabled.emit_events
+        ));
+        assert!(matches!(
+            events,
+            UploadObservability::Enabled(ref enabled) if enabled.emit_events
+        ));
+    }
+
+    #[test]
+    fn summary_level_aggregates_without_event_emission() {
         let observability = UploadObservability::new(config(1), exact_size_hint());
         observability.select_mode(UploadMode::Multipart);
         let mut timing = observability.part_scheduled();
@@ -1212,61 +1326,61 @@ mod tests {
     }
 
     #[test]
-    fn upload_transition_vocabulary_is_closed_and_stable() {
+    fn upload_event_vocabulary_is_closed_and_stable() {
         assert_eq!(
-            UploadTransition::PutObjectScheduled.fields(),
+            UploadEvent::PutObjectScheduled.fields(),
             ("work_scheduled", "put_object")
         );
         assert_eq!(
-            UploadTransition::MultipartUploadScheduled.fields(),
+            UploadEvent::MultipartUploadScheduled.fields(),
             ("work_scheduled", "create_multipart_upload")
         );
         assert_eq!(
-            UploadTransition::MultipartUploadCreated.fields(),
+            UploadEvent::MultipartUploadCreated.fields(),
             ("state_changed", "multipart_upload_created")
         );
         assert_eq!(
-            UploadTransition::NewPartScheduled.fields(),
+            UploadEvent::NewPartScheduled.fields(),
             ("work_scheduled", "new_part")
         );
         assert_eq!(
-            UploadTransition::SourceWakeScheduled.fields(),
+            UploadEvent::SourceWakeScheduled.fields(),
             ("work_scheduled", "source_wake")
         );
         assert_eq!(
-            UploadTransition::SourceExhausted.fields(),
+            UploadEvent::SourceExhausted.fields(),
             ("dispatch_closed", "source_eof")
         );
         assert_eq!(
-            UploadTransition::EmptyObjectPartScheduled.fields(),
+            UploadEvent::EmptyObjectPartScheduled.fields(),
             ("work_scheduled", "empty_object")
         );
         assert_eq!(
-            UploadTransition::CompletionReady.fields(),
+            UploadEvent::CompletionReady.fields(),
             ("completion_ready", "multipart_drained")
         );
         assert_eq!(
-            UploadTransition::Pending(PartTransferPendingReason::SourceUnavailable).fields(),
+            UploadEvent::Pending(PartTransferPendingReason::SourceUnavailable).fields(),
             ("poll_pending", "source_unavailable")
         );
         assert_eq!(
-            UploadTransition::Pending(PartTransferPendingReason::DispatchClosed).fields(),
+            UploadEvent::Pending(PartTransferPendingReason::DispatchClosed).fields(),
             ("poll_pending", "dispatch_closed")
         );
         assert_eq!(
-            UploadTransition::Pending(PartTransferPendingReason::NoReadyPart).fields(),
+            UploadEvent::Pending(PartTransferPendingReason::NoReadyPart).fields(),
             ("poll_pending", "no_ready_part")
         );
         assert_eq!(
-            UploadTransition::CustomSourceBlocked.fields(),
+            UploadEvent::CustomSourceBlocked.fields(),
             ("work_retracted", "custom_source_blocked")
         );
         assert_eq!(
-            UploadTransition::MultipartCompletionStarted.fields(),
+            UploadEvent::MultipartCompletionStarted.fields(),
             ("request_started", "complete_multipart_upload")
         );
         assert_eq!(
-            UploadTransition::Terminal(UploadTerminalOutcome::Completed).fields(),
+            UploadEvent::Terminal(UploadTerminalOutcome::Completed).fields(),
             ("terminal", "completed")
         );
     }
@@ -1275,28 +1389,20 @@ mod tests {
     fn terminal_summary_is_reported_once() {
         let observability = UploadObservability::new(config(1), exact_size_hint());
         observability.select_mode(UploadMode::PutObject);
-        let first = observability.report_terminal(
-            TransferId {
-                id: 1,
-                parent: None,
-            },
+        let first = observability.report_terminal(terminal_report(
+            1,
             TransferStatus::Completed,
             None,
-            test_transfer_metrics(),
             RequestMetrics::default(),
-            TransferPendingStats::default(),
-        );
-        let second = observability.report_terminal(
-            TransferId {
-                id: 1,
-                parent: None,
-            },
+            UploadStateSnapshot::inactive(UploadExecutionState::PutObjectInFlight),
+        ));
+        let second = observability.report_terminal(terminal_report(
+            1,
             TransferStatus::Completed,
             None,
-            test_transfer_metrics(),
             RequestMetrics::default(),
-            TransferPendingStats::default(),
-        );
+            UploadStateSnapshot::inactive(UploadExecutionState::PutObjectInFlight),
+        ));
         assert_eq!(first.expect("first report").mode, UploadMode::PutObject);
         assert!(second.is_none());
     }
@@ -1310,17 +1416,13 @@ mod tests {
         observability.record_request(UploadRequestKind::UploadPart, &upload_part);
 
         let summary = observability
-            .report_terminal(
-                TransferId {
-                    id: 2,
-                    parent: None,
-                },
+            .report_terminal(terminal_report(
+                2,
                 TransferStatus::Failed,
                 Some(ErrorKind::RuntimeError),
-                test_transfer_metrics(),
                 upload_part,
-                TransferPendingStats::default(),
-            )
+                UploadStateSnapshot::inactive(UploadExecutionState::PutObjectInFlight),
+            ))
             .expect("terminal report");
         assert_eq!(summary.requests.upload_part, upload_part);
         assert_eq!(summary.requests.put_object, RequestMetrics::default());

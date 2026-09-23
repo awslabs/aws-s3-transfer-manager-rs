@@ -53,8 +53,8 @@ use crate::operation::upload::input::convert::{
 #[cfg(test)]
 use crate::operation::upload::observability::UploadTerminalOutcome;
 use crate::operation::upload::observability::{
-    PartTransferSnapshot, UploadDiagnosticTimer, UploadMode, UploadObservability, UploadPartTiming,
-    UploadRequestKind, UploadTransition,
+    UploadDiagnosticTimer, UploadEvent, UploadExecutionState, UploadMode, UploadObservability,
+    UploadPartTiming, UploadRequestKind, UploadStateSnapshot, UploadTerminalReport,
 };
 use crate::operation::upload::part_body;
 use crate::operation::upload::{UploadInput, UploadOutput, UploadOutputBuilder};
@@ -94,7 +94,7 @@ struct UploadTransferInner {
     ctx: TransferContext,
     /// State machine for work progression
     state: Mutex<UploadState>,
-    /// Optional upload-wide transition and summary observation.
+    /// Optional upload-wide event and summary observation.
     observability: UploadObservability,
     /// The original request (body taken for processing)
     request: Arc<UploadInput>,
@@ -148,28 +148,33 @@ impl UploadTransfer {
         &self.inner.ctx
     }
 
-    fn publish_transition(
-        &self,
-        transition: UploadTransition,
-        snapshot: Option<PartTransferSnapshot>,
-    ) {
+    fn observe_event(&self, event: UploadEvent, state: &UploadState) {
+        let snapshot = snapshot_state(state);
         self.inner
             .observability
-            .publish_transition(self.inner.ctx.id, transition, snapshot);
+            .observe_event(self.inner.ctx.id, event, snapshot);
     }
 
     /// Emits the upload terminal summary before notifying the owning handle.
     fn report_terminal(&self) {
         self.inner.ctx.finalize_terminal_metrics();
+        let state_snapshot = {
+            let state = self.inner.state.lock().expect("lock poisoned");
+            snapshot_state(&state)
+        };
         let pending = self.inner.ctx.pending_stats().unwrap_or_default();
-        let _ = self.inner.observability.report_terminal(
-            self.inner.ctx.id,
-            self.inner.ctx.transfer_status(),
-            self.inner.ctx.error_kind(),
-            self.inner.ctx.metrics(),
-            self.inner.ctx.metrics.request_metrics(),
-            pending,
-        );
+        let _ = self
+            .inner
+            .observability
+            .report_terminal(UploadTerminalReport {
+                transfer_id: self.inner.ctx.id,
+                status: self.inner.ctx.transfer_status(),
+                error_kind: self.inner.ctx.error_kind(),
+                metrics: self.inner.ctx.metrics(),
+                request_total: self.inner.ctx.metrics.request_metrics(),
+                pending,
+                state_snapshot,
+            });
     }
 
     /// Get the transfer ID.
@@ -247,7 +252,13 @@ impl UploadTransfer {
                     return if use_mpu {
                         *init_in_flight = true;
                         self.inner.observability.select_mode(UploadMode::Multipart);
-                        self.publish_transition(UploadTransition::MultipartUploadScheduled, None);
+                        self.inner.observability.observe_event(
+                            self.inner.ctx.id,
+                            UploadEvent::MultipartUploadScheduled,
+                            UploadStateSnapshot::inactive(
+                                UploadExecutionState::CreateMultipartUploadInFlight,
+                            ),
+                        );
                         PollWork::ready(IoRequest {
                             data: Some(Box::new(UploadWork::CreateMPU)),
                         })
@@ -255,7 +266,7 @@ impl UploadTransfer {
                         let stream = stream.take().expect("stream already taken");
                         *state = UploadState::PutObjectInFlight;
                         self.inner.observability.select_mode(UploadMode::PutObject);
-                        self.publish_transition(UploadTransition::PutObjectScheduled, None);
+                        self.observe_event(UploadEvent::PutObjectScheduled, &state);
                         PollWork::ready(IoRequest {
                             data: Some(Box::new(UploadWork::PutObject {
                                 stream: Some(stream),
@@ -265,34 +276,47 @@ impl UploadTransfer {
                 }
                 UploadState::Transferring { parts, .. } => {
                     if let Some(work) = parts.schedule_part() {
-                        let transition = if work.is_resumed() {
-                            UploadTransition::SourceWakeScheduled
+                        let event = if work.is_resumed() {
+                            UploadEvent::SourceWakeScheduled
                         } else {
-                            UploadTransition::NewPartScheduled
+                            UploadEvent::NewPartScheduled
                         };
-                        self.publish_transition(transition, parts.transition_snapshot());
-                        return PollWork::ready(IoRequest {
-                            data: Some(Box::new(UploadWork::UploadPart(work))),
-                        });
-                    }
-                    if let Some(work) = parts.maybe_start_empty_object_part() {
-                        self.publish_transition(
-                            UploadTransition::EmptyObjectPartScheduled,
-                            parts.transition_snapshot(),
+                        self.inner.observability.observe_event(
+                            self.inner.ctx.id,
+                            event,
+                            parts.snapshot(),
                         );
                         return PollWork::ready(IoRequest {
                             data: Some(Box::new(UploadWork::UploadPart(work))),
                         });
                     }
-                    let snapshot = parts.transition_snapshot();
+                    if let Some(work) = parts.maybe_start_empty_object_part() {
+                        self.inner.observability.observe_event(
+                            self.inner.ctx.id,
+                            UploadEvent::EmptyObjectPartScheduled,
+                            parts.snapshot(),
+                        );
+                        return PollWork::ready(IoRequest {
+                            data: Some(Box::new(UploadWork::UploadPart(work))),
+                        });
+                    }
+                    let snapshot = parts.snapshot();
                     let pending_reason = parts.pending_reason();
                     if parts.is_complete() {
-                        self.publish_transition(UploadTransition::CompletionReady, snapshot);
+                        self.inner.observability.observe_event(
+                            self.inner.ctx.id,
+                            UploadEvent::CompletionReady,
+                            snapshot,
+                        );
                     }
                     if try_begin_completing(&mut state) {
                         continue;
                     }
-                    self.publish_transition(UploadTransition::Pending(pending_reason), snapshot);
+                    self.inner.observability.observe_event(
+                        self.inner.ctx.id,
+                        UploadEvent::Pending(pending_reason),
+                        snapshot,
+                    );
                     self.inner.ctx.set_pending(pending_reason);
                     return PollWork::Pending;
                 }
@@ -428,7 +452,7 @@ impl UploadTransfer {
                     upper.div_ceil(part_size) as usize
                 }),
         };
-        {
+        let snapshot = {
             let mut state = self.inner.state.lock().expect("lock poisoned");
             *state = UploadState::Transferring {
                 upload_id,
@@ -440,9 +464,14 @@ impl UploadTransfer {
                 ),
                 response_builder,
             };
-        }
+            snapshot_state(&state)
+        };
         self.inner.observability.multipart_created();
-        self.publish_transition(UploadTransition::MultipartUploadCreated, None);
+        self.inner.observability.observe_event(
+            self.inner.ctx.id,
+            UploadEvent::MultipartUploadCreated,
+            snapshot,
+        );
 
         tracing::debug!(
             target: crate::telemetry::TARGET_TRANSFER,
@@ -491,9 +520,13 @@ impl UploadTransfer {
                             panic!("unexpected state while retracting upload part");
                         };
                         parts.retract_scheduled_part();
-                        let snapshot = parts.transition_snapshot();
+                        let snapshot = parts.snapshot();
                         drop(state);
-                        self.publish_transition(UploadTransition::CustomSourceBlocked, snapshot);
+                        self.inner.observability.observe_event(
+                            self.inner.ctx.id,
+                            UploadEvent::CustomSourceBlocked,
+                            snapshot,
+                        );
                         return WorkOutcome::Yielded;
                     }
                     PartReadStart::Finished => {
@@ -528,9 +561,9 @@ impl UploadTransfer {
                     wake,
                     timing,
                 });
-                let snapshot = parts.transition_snapshot();
+                let snapshot = parts.snapshot();
                 drop(state);
-                self.inner.observability.publish_source_pending(
+                self.inner.observability.observe_source_pending(
                     self.inner.ctx.id,
                     observation,
                     snapshot,
@@ -587,10 +620,14 @@ impl UploadTransfer {
                 panic!("unexpected state at upload end-of-stream");
             };
             let transitioned = parts.record_end_of_stream();
-            (transitioned, parts.transition_snapshot())
+            (transitioned, parts.snapshot())
         };
         if transitioned {
-            self.publish_transition(UploadTransition::SourceExhausted, snapshot);
+            self.inner.observability.observe_event(
+                self.inner.ctx.id,
+                UploadEvent::SourceExhausted,
+                snapshot,
+            );
         }
 
         // End-of-stream may close dispatch while `poll_work` is parked behind the source gate.
@@ -603,7 +640,7 @@ impl UploadTransfer {
     /// Uploads one part and records it for CompleteMultipartUpload.
     ///
     /// This is shared by ordinary source output and the empty-object part, keeping request
-    /// retries, accounting, and completion transitions identical.
+    /// retries, accounting, and completion behavior identical.
     async fn send_part(&self, data: PartData, timing: UploadPartTiming) -> WorkOutcome {
         let part_number = data.part_number;
         let presentation_segments = data.data.segment_count();
@@ -617,18 +654,14 @@ impl UploadTransfer {
                     upload_id, parts, ..
                 } => {
                     let source_observation = parts.begin_upload(presentation_segments, timing);
-                    (
-                        upload_id.clone(),
-                        source_observation,
-                        parts.transition_snapshot(),
-                    )
+                    (upload_id.clone(), source_observation, parts.snapshot())
                 }
                 _ => panic!("unexpected state for send_part"),
             }
         };
 
         let part_num_i32 = part_number as i32;
-        self.inner.observability.publish_part_started(
+        self.inner.observability.observe_part_started(
             self.inner.ctx.id,
             part_number,
             bytes_sent,
@@ -712,9 +745,9 @@ impl UploadTransfer {
                     let UploadState::Transferring { parts, .. } = &*state else {
                         panic!("unexpected state while reporting failed upload part");
                     };
-                    parts.transition_snapshot()
+                    parts.snapshot()
                 };
-                self.inner.observability.publish_part_failed(
+                self.inner.observability.observe_part_failed(
                     self.inner.ctx.id,
                     part_number,
                     bytes_sent,
@@ -742,11 +775,12 @@ impl UploadTransfer {
                 panic!("unexpected state while completing upload part");
             };
             parts.complete_part(completed, bytes_sent);
-            let snapshot = parts.transition_snapshot();
-            (try_begin_completing(&mut state), snapshot)
+            let should_wake = try_begin_completing(&mut state);
+            let snapshot = snapshot_state(&state);
+            (should_wake, snapshot)
         };
 
-        self.inner.observability.publish_part_completed(
+        self.inner.observability.observe_part_completed(
             self.inner.ctx.id,
             part_number,
             bytes_sent,
@@ -913,9 +947,9 @@ impl UploadTransfer {
     async fn execute_complete_mpu(&self) -> WorkOutcome {
         let transfer_diagnostics = self.inner.ctx.handle.config.diagnostics().transfer();
         let completion_timer = UploadDiagnosticTimer::start(transfer_diagnostics);
-        self.publish_transition(UploadTransition::MultipartCompletionStarted, None);
-        let (upload_id, response_builder, parts) = {
+        let (upload_id, response_builder, parts, snapshot) = {
             let mut state = self.inner.state.lock().expect("lock poisoned");
+            let snapshot = snapshot_state(&state);
             match &mut *state {
                 UploadState::Completing {
                     upload_id,
@@ -928,10 +962,16 @@ impl UploadTransfer {
                         .take()
                         .expect("response_builder already taken"),
                     parts.take().expect("part transfer state already taken"),
+                    snapshot,
                 ),
                 _ => panic!("unexpected state for complete_mpu"),
             }
         };
+        self.inner.observability.observe_event(
+            self.inner.ctx.id,
+            UploadEvent::MultipartCompletionStarted,
+            snapshot,
+        );
 
         let MultipartCompletion {
             part_reader,
@@ -988,9 +1028,10 @@ impl UploadTransfer {
             Ok(resp) => resp,
             Err(e) => return self.fail(e.into()),
         };
-        self.inner
-            .observability
-            .finish_multipart(final_snapshot, completion_timer.elapsed());
+        self.inner.observability.finish_multipart(
+            final_snapshot.with_state(UploadExecutionState::CompleteMultipartUploadInFlight),
+            completion_timer.elapsed(),
+        );
 
         let result = response_builder
             .update_from_complete_mpu(&resp)
@@ -1017,6 +1058,40 @@ impl UploadTransfer {
         self.report_terminal();
         self.inner.ctx.signal_terminal();
         WorkOutcome::Failed { classification }
+    }
+}
+
+/// Returns a copyable view of upload execution while the state lock is held.
+fn snapshot_state(state: &UploadState) -> UploadStateSnapshot {
+    match state {
+        UploadState::PendingInit {
+            init_in_flight: false,
+            ..
+        } => UploadStateSnapshot::inactive(UploadExecutionState::PendingInitialization),
+        UploadState::PendingInit {
+            init_in_flight: true,
+            ..
+        } => UploadStateSnapshot::inactive(UploadExecutionState::CreateMultipartUploadInFlight),
+        UploadState::Transferring { parts, .. } => parts.snapshot(),
+        UploadState::Completing {
+            parts,
+            complete_in_flight,
+            ..
+        } => {
+            let execution_state = if *complete_in_flight {
+                UploadExecutionState::CompleteMultipartUploadInFlight
+            } else {
+                UploadExecutionState::MultipartCompletionPending
+            };
+            parts.as_ref().map_or_else(
+                || UploadStateSnapshot::inactive(execution_state),
+                |parts| parts.snapshot().with_state(execution_state),
+            )
+        }
+        UploadState::PutObjectInFlight => {
+            UploadStateSnapshot::inactive(UploadExecutionState::PutObjectInFlight)
+        }
+        UploadState::Done => UploadStateSnapshot::inactive(UploadExecutionState::Done),
     }
 }
 
@@ -1146,6 +1221,59 @@ mod tests {
             StatusCode::try_from(412).unwrap(),
             SdkBody::from("<Error><Code>PreconditionFailed</Code></Error>"),
         )
+    }
+
+    #[test]
+    fn upload_state_snapshot_classifies_non_multipart_execution() {
+        let pending = UploadState::PendingInit {
+            stream: None,
+            size_hint: crate::io::SizeHint::exact(0),
+            init_in_flight: false,
+        };
+        assert_eq!(
+            snapshot_state(&pending),
+            UploadStateSnapshot::inactive(UploadExecutionState::PendingInitialization)
+        );
+
+        let creating = UploadState::PendingInit {
+            stream: None,
+            size_hint: crate::io::SizeHint::exact(0),
+            init_in_flight: true,
+        };
+        assert_eq!(
+            snapshot_state(&creating),
+            UploadStateSnapshot::inactive(UploadExecutionState::CreateMultipartUploadInFlight)
+        );
+
+        let completion_pending = UploadState::Completing {
+            upload_id: None,
+            parts: None,
+            response_builder: None,
+            complete_in_flight: false,
+        };
+        assert_eq!(
+            snapshot_state(&completion_pending),
+            UploadStateSnapshot::inactive(UploadExecutionState::MultipartCompletionPending)
+        );
+
+        let completion_in_flight = UploadState::Completing {
+            upload_id: None,
+            parts: None,
+            response_builder: None,
+            complete_in_flight: true,
+        };
+        assert_eq!(
+            snapshot_state(&completion_in_flight),
+            UploadStateSnapshot::inactive(UploadExecutionState::CompleteMultipartUploadInFlight)
+        );
+        assert_eq!(
+            snapshot_state(&UploadState::PutObjectInFlight),
+            UploadStateSnapshot::inactive(UploadExecutionState::PutObjectInFlight)
+        );
+        assert_eq!(
+            snapshot_state(&UploadState::Done),
+            UploadStateSnapshot::inactive(UploadExecutionState::Done)
+        );
     }
 
     #[derive(Debug)]
@@ -1386,12 +1514,14 @@ mod tests {
             assert_eq!(parts.test_counts(), (3, 3, 1));
             assert_eq!(
                 parts.snapshot(),
-                PartTransferSnapshot {
+                UploadStateSnapshot {
+                    state: UploadExecutionState::Transferring,
                     parts_dispatched: 3,
                     parts_in_flight: 3,
                     uploads_in_flight: 0,
                     pending_reads: 1,
                     completed_parts: 0,
+                    bytes_read: 0,
                     bytes_uploaded: 0,
                     eof: false,
                     dispatch_closed: false,

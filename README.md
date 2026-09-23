@@ -77,10 +77,9 @@ are independent.
 
 `transfer.detail` controls diagnostics for individual upload and download state
 machines. Level `0` is the default and collects nothing. Level `1` collects
-aggregate per-transfer summaries; level `2` also emits individual state
-transitions. Multipart uploads currently provide summaries and transitions.
-Transfer records use the
-`aws_sdk_s3_transfer_manager::transfer` tracing target:
+aggregate per-transfer summaries; level `2` also emits individual state-machine
+events. Uploads and downloads provide summaries and events. Transfer records use
+the `aws_sdk_s3_transfer_manager::transfer` tracing target:
 
 ```sh
 AWS_S3_TM_DIAGNOSTICS=transfer.detail=1 \

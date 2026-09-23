@@ -592,6 +592,79 @@ impl Drop for RequestMeasurement {
     }
 }
 
+/// Direction-specific attribution for one logical request measurement.
+///
+/// The common measurement records transfer totals. Implementations add the
+/// same result to the request-kind aggregate owned by one transfer direction.
+pub(crate) trait RequestMetricsAttribution: Clone {
+    /// Direction-specific request classification.
+    type Kind: Copy + std::fmt::Debug;
+
+    /// Records one finished request under its direction-specific kind.
+    fn record_request_metrics(&self, kind: Self::Kind, metrics: &crate::metrics::RequestMetrics);
+}
+
+/// Request measurement published to common and direction-specific aggregates.
+///
+/// The guard publishes exactly once when explicitly finished or dropped.
+pub(crate) struct AttributedRequestMeasurement<A: RequestMetricsAttribution> {
+    measurement: Option<RequestMeasurement>,
+    attribution: A,
+    kind: A::Kind,
+}
+
+impl<A: RequestMetricsAttribution> AttributedRequestMeasurement<A> {
+    /// Starts a logical request associated with one direction-specific kind.
+    pub(crate) fn new(ctx: &TransferContext, attribution: A, kind: A::Kind) -> Self {
+        Self {
+            measurement: Some(ctx.start_request_metrics()),
+            attribution,
+            kind,
+        }
+    }
+
+    /// Returns the request metrics updated by the retry loop.
+    pub(crate) fn metrics_mut(&mut self) -> &mut crate::metrics::RequestMetrics {
+        self.measurement
+            .as_mut()
+            .expect("request measurement already finished")
+            .metrics_mut()
+    }
+
+    /// Publishes the request measurement to both aggregate scopes.
+    pub(crate) fn finish(mut self) -> crate::metrics::RequestMetrics {
+        self.publish()
+    }
+
+    fn publish(&mut self) -> crate::metrics::RequestMetrics {
+        let measurement = self
+            .measurement
+            .take()
+            .expect("request measurement already finished");
+        let metrics = measurement.finish();
+        self.attribution.record_request_metrics(self.kind, &metrics);
+        metrics
+    }
+}
+
+impl<A: RequestMetricsAttribution> std::fmt::Debug for AttributedRequestMeasurement<A> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AttributedRequestMeasurement")
+            .field("kind", &self.kind)
+            .field("finished", &self.measurement.is_none())
+            .finish()
+    }
+}
+
+impl<A: RequestMetricsAttribution> Drop for AttributedRequestMeasurement<A> {
+    fn drop(&mut self) {
+        if self.measurement.is_some() {
+            let _ = self.publish();
+        }
+    }
+}
+
 /// Task wake adapter for futures polled from a transfer's synchronous state machine.
 ///
 /// This deliberately enters the scheduler directly instead of using
@@ -659,7 +732,7 @@ impl TransferContext {
         let diagnostics = handle.config.diagnostics().transfer();
         let pending_state = diagnostics
             .enable_summaries()
-            .then(|| Arc::new(TransferPendingState::new(diagnostics.enable_transitions())));
+            .then(|| Arc::new(TransferPendingState::new(diagnostics.events_enabled())));
         let ctx = Self {
             id,
             metrics: Arc::new(MetricsState::new()),
@@ -1152,6 +1225,23 @@ mod tests {
             crate::client::Handle::new_for_test(config, 4)
         }
 
+        #[derive(Clone, Default)]
+        struct TestRequestAttribution {
+            records: Arc<Mutex<Vec<(u8, crate::metrics::RequestMetrics)>>>,
+        }
+
+        impl RequestMetricsAttribution for TestRequestAttribution {
+            type Kind = u8;
+
+            fn record_request_metrics(
+                &self,
+                kind: Self::Kind,
+                metrics: &crate::metrics::RequestMetrics,
+            ) {
+                self.records.lock().unwrap().push((kind, *metrics));
+            }
+        }
+
         #[cfg_attr(miri, ignore)]
         #[test]
         fn status_transitions() {
@@ -1257,6 +1347,34 @@ mod tests {
             drop(ctx.start_request_metrics());
 
             assert_eq!(ctx.metrics.request_metrics().requests, 2);
+        }
+
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn attributed_request_measurement_publishes_to_both_aggregates() {
+            let handle = test_handle();
+            let (ctx, _rx) = TransferContext::new(handle);
+            let attribution = TestRequestAttribution::default();
+
+            let mut finished = AttributedRequestMeasurement::new(&ctx, attribution.clone(), 7);
+            finished
+                .metrics_mut()
+                .record_retry_reissue(std::time::Duration::from_millis(3));
+            let finished_metrics = finished.finish();
+
+            drop(AttributedRequestMeasurement::new(
+                &ctx,
+                attribution.clone(),
+                9,
+            ));
+
+            let records = attribution.records.lock().unwrap();
+            assert_eq!(records.len(), 2);
+            assert_eq!(records[0], (7, finished_metrics));
+            assert_eq!(records[1].0, 9);
+            assert_eq!(records[1].1.requests, 1);
+            assert_eq!(ctx.metrics.request_metrics().requests, 2);
+            assert_eq!(ctx.metrics.request_metrics().retry_reissues, 1);
         }
 
         #[test]

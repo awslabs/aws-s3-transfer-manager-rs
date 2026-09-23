@@ -5,9 +5,9 @@
 
 //! Download state-machine observation and diagnostic emission.
 //!
-//! [`DownloadObservability`] receives state-machine transitions and request
+//! [`DownloadObservability`] receives state-machine events and request
 //! measurements from discovery and range transfer. The disabled variant avoids
-//! optional allocation, clocks, counters, and transition snapshots.
+//! optional allocation, clocks, counters, and event snapshots.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -18,7 +18,8 @@ use crate::error::ErrorKind;
 use crate::metrics::RequestMetrics;
 use crate::operation::download::context::DownloadPendingReason;
 use crate::transfer::{
-    PendingCategory, RequestMeasurement, TransferContext, TransferId, TransferPendingStats,
+    AttributedRequestMeasurement, PendingCategory, RequestMetricsAttribution, TransferContext,
+    TransferId, TransferPendingStats,
 };
 use crate::types::{ChecksumValidation, TransferMetrics, TransferStatus};
 
@@ -53,20 +54,25 @@ pub(crate) enum DownloadRequestKind {
     Range,
 }
 
-/// Coarse download state retained in a diagnostic snapshot.
+/// Copyable execution-state projection of
+/// [`DownloadState`](super::context::DownloadState).
+///
+/// `DownloadState` remains authoritative for discovery, range ownership,
+/// destination delivery, and terminal state. This enum retains only its
+/// current state-machine state for diagnostics.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum DownloadStateKind {
+pub(crate) enum DownloadExecutionState {
     /// Discovery has not been scheduled.
     PendingDiscovery,
     /// Discovery work is executing.
     DiscoveryInFlight,
     /// Object ranges are being issued or retired.
     Transferring,
-    /// The state machine has claimed its terminal transition.
+    /// The state machine has claimed terminal ownership.
     Terminal,
 }
 
-impl DownloadStateKind {
+impl DownloadExecutionState {
     const fn as_str(self) -> &'static str {
         match self {
             Self::PendingDiscovery => "pending_discovery",
@@ -77,22 +83,35 @@ impl DownloadStateKind {
     }
 }
 
-/// Download state sampled while the download-state lock is held.
+/// Diagnostic projection of [`DownloadState`](super::context::DownloadState)
+/// sampled while the download-state lock is held.
+///
+/// The snapshot combines the current execution state with range-transfer
+/// counters owned by the authoritative download state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DownloadStateSnapshot {
-    pub(crate) state: DownloadStateKind,
+    /// Current state-machine state projected from
+    /// [`DownloadState`](super::context::DownloadState).
+    pub(crate) state: DownloadExecutionState,
+    /// Bytes not yet assigned to an object range.
     pub(crate) remaining_bytes: Option<u64>,
+    /// Object-range requests that have not retired.
     pub(crate) ranges_in_flight: usize,
+    /// Read-ahead slots claimed for range issuance.
     pub(crate) ranges_issued: u64,
+    /// Read-ahead slots released by delivery or disk draining.
     pub(crate) ranges_released: u64,
+    /// Issued slots whose payload remains resident.
     pub(crate) resident_parts: u64,
+    /// Maximum resident-part window used by the issuance gate.
     pub(crate) read_ahead_window: u64,
+    /// Whether one claimed slot is waiting for buffer-pool admission.
     pub(crate) memory_claim_pending: bool,
 }
 
 impl DownloadStateSnapshot {
     /// Returns a snapshot for a state without range-transfer counters.
-    pub(crate) const fn inactive(state: DownloadStateKind, read_ahead_window: u64) -> Self {
+    pub(crate) const fn inactive(state: DownloadExecutionState, read_ahead_window: u64) -> Self {
         Self {
             state,
             remaining_bytes: None,
@@ -136,9 +155,9 @@ impl DownloadTerminalOutcome {
     }
 }
 
-/// Closed diagnostic vocabulary for download state-machine transitions.
+/// Closed diagnostic vocabulary for download state-machine events.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum DownloadTransition {
+pub(crate) enum DownloadEvent {
     /// Discovery work was scheduled.
     DiscoveryScheduled,
     /// Discovery established the object and transfer geometry.
@@ -161,7 +180,7 @@ pub(crate) enum DownloadTransition {
     Terminal(DownloadTerminalOutcome),
 }
 
-impl DownloadTransition {
+impl DownloadEvent {
     fn fields(self) -> (&'static str, &'static str) {
         match self {
             Self::DiscoveryScheduled => ("work_scheduled", "discovery"),
@@ -190,9 +209,13 @@ impl DownloadTransition {
 /// Per-request-kind metrics retained for a download terminal summary.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct DownloadRequestMetrics {
+    /// Aggregate for HeadObject discovery requests.
     pub(crate) discovery_head: RequestMetrics,
+    /// Aggregate for ranged GetObject discovery requests.
     pub(crate) discovery_range: RequestMetrics,
+    /// Aggregate for part-number GetObject discovery requests.
     pub(crate) discovery_part: RequestMetrics,
+    /// Aggregate for post-discovery ranged GetObject requests.
     pub(crate) range: RequestMetrics,
 }
 
@@ -211,45 +234,77 @@ impl DownloadRequestMetrics {
 /// Destination work included in a download terminal summary.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct DownloadDestinationSummary {
+    /// Whether the file destination completed preparation.
     pub(crate) prepared: bool,
+    /// Whether successful file finalization completed.
     pub(crate) file_finalized: bool,
+    /// Whether destination finalization returned an error.
     pub(crate) finalization_failed: bool,
+    /// Parts released by ordinary batched file draining.
     pub(crate) batched_drain_parts: u64,
+    /// Eager drains issued to release resident memory.
     pub(crate) memory_relief_drains: u64,
+    /// Parts released by eager memory-pressure drains.
     pub(crate) memory_relief_parts: u64,
+    /// Parts released while reaching a terminal destination state.
     pub(crate) terminal_drain_parts: u64,
+    /// Whether terminal draining returned an error.
     pub(crate) terminal_drain_failed: bool,
 }
 
 /// Complete diagnostic report for one download transfer.
 #[derive(Clone, Debug)]
 pub(crate) struct DownloadTransferSummary {
+    /// Terminal outcome reported by the common transfer context.
     pub(crate) outcome: DownloadTerminalOutcome,
+    /// Delivery surface selected for downloaded bytes.
     pub(crate) destination: DownloadDestination,
+    /// Transfer-manager error classification for a failed download.
     pub(crate) error_kind: Option<ErrorKind>,
+    /// Time from transfer creation through terminal reporting.
     pub(crate) elapsed: Duration,
+    /// Common byte and I/O metrics for the transfer.
     pub(crate) metrics: TransferMetrics,
+    /// Request metrics separated by download request kind.
     pub(crate) requests: DownloadRequestMetrics,
+    /// Common aggregate across every request issued by the download.
     pub(crate) request_total: RequestMetrics,
+    /// Scheduler pending intervals attributed by common category.
     pub(crate) pending: TransferPendingStats,
-    pub(crate) state: Option<DownloadStateSnapshot>,
+    /// Last coherent download state observed before terminal reporting.
+    pub(crate) state: DownloadStateSnapshot,
+    /// Object ranges admitted for execution.
     pub(crate) ranges_scheduled: u64,
+    /// Object ranges retired after delivery or failure.
     pub(crate) ranges_completed: u64,
+    /// Highest concurrent object-range count.
     pub(crate) max_ranges_in_flight: usize,
+    /// Highest read-ahead occupancy retained in memory.
     pub(crate) max_resident_parts: u64,
+    /// File preparation, draining, and finalization work.
     pub(crate) destination_work: DownloadDestinationSummary,
+    /// SDK checksum-validation result captured during discovery.
     pub(crate) checksum_validation: Option<ChecksumValidation>,
 }
 
 /// Common and direction-specific facts captured at one terminal boundary.
 pub(crate) struct DownloadTerminalReport {
+    /// Transfer receiving the terminal report.
     pub(crate) transfer_id: TransferId,
+    /// Common transfer status at the terminal boundary.
     pub(crate) status: TransferStatus,
+    /// Transfer-manager error classification for a failed download.
     pub(crate) error_kind: Option<ErrorKind>,
+    /// Common byte and I/O metrics for the transfer.
     pub(crate) metrics: TransferMetrics,
+    /// Common aggregate across every request issued by the download.
     pub(crate) request_total: RequestMetrics,
+    /// Scheduler pending intervals attributed by common category.
     pub(crate) pending: TransferPendingStats,
+    /// SDK checksum-validation result captured during discovery.
     pub(crate) checksum_validation: Option<ChecksumValidation>,
+    /// State captured at the terminal boundary.
+    pub(crate) state_snapshot: DownloadStateSnapshot,
 }
 
 /// Optional download observation kept separate from correctness state.
@@ -261,7 +316,7 @@ pub(crate) enum DownloadObservability {
 
 #[derive(Debug)]
 pub(crate) struct EnabledDownloadObservability {
-    transitions: bool,
+    emit_events: bool,
     terminal_reported: AtomicBool,
     state: Mutex<DownloadObservabilityState>,
     #[cfg(test)]
@@ -287,7 +342,7 @@ impl DownloadObservability {
             return Self::Disabled;
         }
         Self::Enabled(Arc::new(EnabledDownloadObservability {
-            transitions: config.enable_transitions(),
+            emit_events: config.events_enabled(),
             terminal_reported: AtomicBool::new(false),
             state: Mutex::new(DownloadObservabilityState {
                 destination,
@@ -310,11 +365,7 @@ impl DownloadObservability {
         ctx: &TransferContext,
         kind: DownloadRequestKind,
     ) -> DownloadRequestMeasurement {
-        DownloadRequestMeasurement {
-            measurement: Some(ctx.start_request_metrics()),
-            observability: self.clone(),
-            kind,
-        }
+        DownloadRequestMeasurement::new(ctx, self.clone(), kind)
     }
 
     fn record_request(&self, kind: DownloadRequestKind, metrics: &RequestMetrics) {
@@ -339,27 +390,18 @@ impl DownloadObservability {
     }
 
     /// Records a successfully issued range and updates state high-water marks.
-    pub(crate) fn range_scheduled(
-        &self,
-        snapshot: DownloadStateSnapshot,
-    ) -> Option<DownloadStateSnapshot> {
+    pub(crate) fn record_range_scheduled(&self) {
         let Self::Enabled(enabled) = self else {
-            return None;
+            return;
         };
         let mut state = enabled.state.lock().expect("lock poisoned");
         state.ranges_scheduled = state.ranges_scheduled.saturating_add(1);
-        update_snapshot(&mut state, snapshot);
-        enabled.transitions.then_some(snapshot)
     }
 
     /// Records a retired range and any batched disk drain it triggered.
-    pub(crate) fn range_completed(
-        &self,
-        snapshot: DownloadStateSnapshot,
-        drained_parts: u64,
-    ) -> Option<DownloadStateSnapshot> {
+    pub(crate) fn record_range_completed(&self, drained_parts: u64) {
         let Self::Enabled(enabled) = self else {
-            return None;
+            return;
         };
         let mut state = enabled.state.lock().expect("lock poisoned");
         state.ranges_completed = state.ranges_completed.saturating_add(1);
@@ -367,18 +409,12 @@ impl DownloadObservability {
             .destination_work
             .batched_drain_parts
             .saturating_add(drained_parts);
-        update_snapshot(&mut state, snapshot);
-        enabled.transitions.then_some(snapshot)
     }
 
     /// Records one eager disk drain used to relieve memory pressure.
-    pub(crate) fn memory_relief_completed(
-        &self,
-        snapshot: DownloadStateSnapshot,
-        drained_parts: u64,
-    ) -> Option<DownloadStateSnapshot> {
+    pub(crate) fn record_memory_relief_completed(&self, drained_parts: u64) {
         let Self::Enabled(enabled) = self else {
-            return None;
+            return;
         };
         let mut state = enabled.state.lock().expect("lock poisoned");
         state.destination_work.memory_relief_drains = state
@@ -389,8 +425,6 @@ impl DownloadObservability {
             .destination_work
             .memory_relief_parts
             .saturating_add(drained_parts);
-        update_snapshot(&mut state, snapshot);
-        enabled.transitions.then_some(snapshot)
     }
 
     /// Records terminal disk draining without changing its error policy.
@@ -428,33 +462,19 @@ impl DownloadObservability {
         }
     }
 
-    /// Records the latest state and returns it at diagnostic detail level two.
-    pub(crate) fn transition_snapshot(
-        &self,
-        snapshot: DownloadStateSnapshot,
-    ) -> Option<DownloadStateSnapshot> {
-        match self {
-            Self::Disabled => None,
-            Self::Enabled(enabled) => {
-                let mut state = enabled.state.lock().expect("lock poisoned");
-                update_snapshot(&mut state, snapshot);
-                enabled.transitions.then_some(snapshot)
-            }
-        }
-    }
-
-    /// Emits one download state transition at diagnostic detail level two.
-    pub(crate) fn publish_transition(
+    /// Observes one state-machine event and its coherent state snapshot.
+    pub(crate) fn observe_event(
         &self,
         transfer_id: TransferId,
-        transition: DownloadTransition,
-        snapshot: Option<DownloadStateSnapshot>,
+        event: DownloadEvent,
+        snapshot: DownloadStateSnapshot,
     ) {
         let Self::Enabled(enabled) = self else {
             return;
         };
-        if enabled.transitions {
-            emit_transition(transfer_id, transition, snapshot);
+        update_snapshot(&mut enabled.state.lock().expect("lock poisoned"), snapshot);
+        if enabled.emit_events {
+            emit_event(transfer_id, event, snapshot);
         }
     }
 
@@ -471,7 +491,11 @@ impl DownloadObservability {
             return None;
         }
 
-        let state = enabled.state.lock().expect("lock poisoned");
+        let mut state = enabled.state.lock().expect("lock poisoned");
+        update_snapshot(&mut state, report.state_snapshot);
+        let terminal_snapshot = state
+            .latest_snapshot
+            .expect("terminal download summary must retain a state snapshot");
         let summary = DownloadTransferSummary {
             outcome,
             destination: state.destination,
@@ -485,7 +509,7 @@ impl DownloadObservability {
             requests: state.requests,
             request_total: report.request_total,
             pending: report.pending,
-            state: state.latest_snapshot,
+            state: terminal_snapshot,
             ranges_scheduled: state.ranges_scheduled,
             ranges_completed: state.ranges_completed,
             max_ranges_in_flight: state.max_ranges_in_flight,
@@ -495,11 +519,11 @@ impl DownloadObservability {
         };
         drop(state);
 
-        if enabled.transitions {
-            emit_transition(
+        if enabled.emit_events {
+            emit_event(
                 report.transfer_id,
-                DownloadTransition::Terminal(outcome),
-                summary.state,
+                DownloadEvent::Terminal(outcome),
+                terminal_snapshot,
             );
         }
         #[cfg(test)]
@@ -524,93 +548,41 @@ fn update_snapshot(state: &mut DownloadObservabilityState, snapshot: DownloadSta
     // Preserve the last state that carried download progress. A finalization
     // failure or duplicate terminal callback can observe `Terminal` after the
     // range-election winner already recorded the useful preterminal counters.
-    if snapshot.state != DownloadStateKind::Terminal || state.latest_snapshot.is_none() {
+    if snapshot.state != DownloadExecutionState::Terminal || state.latest_snapshot.is_none() {
         state.latest_snapshot = Some(snapshot);
     }
     state.max_ranges_in_flight = state.max_ranges_in_flight.max(snapshot.ranges_in_flight);
     state.max_resident_parts = state.max_resident_parts.max(snapshot.resident_parts);
 }
 
+impl RequestMetricsAttribution for DownloadObservability {
+    type Kind = DownloadRequestKind;
+
+    fn record_request_metrics(&self, kind: Self::Kind, metrics: &RequestMetrics) {
+        self.record_request(kind, metrics);
+    }
+}
+
 /// In-progress request measurement attributed to one download request kind.
-pub(crate) struct DownloadRequestMeasurement {
-    measurement: Option<RequestMeasurement>,
-    observability: DownloadObservability,
-    kind: DownloadRequestKind,
-}
+pub(crate) type DownloadRequestMeasurement = AttributedRequestMeasurement<DownloadObservability>;
 
-impl std::fmt::Debug for DownloadRequestMeasurement {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DownloadRequestMeasurement")
-            .field("kind", &self.kind)
-            .field("finished", &self.measurement.is_none())
-            .finish()
-    }
-}
-
-impl DownloadRequestMeasurement {
-    /// Returns the request metrics updated by the retry loop.
-    pub(crate) fn metrics_mut(&mut self) -> &mut RequestMetrics {
-        self.measurement
-            .as_mut()
-            .expect("request measurement already finished")
-            .metrics_mut()
-    }
-
-    /// Publishes the request measurement to transfer and download aggregates.
-    pub(crate) fn finish(mut self) -> RequestMetrics {
-        self.publish()
-    }
-
-    fn publish(&mut self) -> RequestMetrics {
-        let measurement = self
-            .measurement
-            .take()
-            .expect("request measurement already finished");
-        let metrics = measurement.finish();
-        self.observability.record_request(self.kind, &metrics);
-        metrics
-    }
-}
-
-impl Drop for DownloadRequestMeasurement {
-    fn drop(&mut self) {
-        if self.measurement.is_some() {
-            let _ = self.publish();
-        }
-    }
-}
-
-fn emit_transition(
-    transfer_id: TransferId,
-    transition: DownloadTransition,
-    snapshot: Option<DownloadStateSnapshot>,
-) {
-    let (transition, reason) = transition.fields();
-    if let Some(snapshot) = snapshot {
-        tracing::trace!(
-            target: crate::telemetry::TARGET_TRANSFER,
-            tid = %transfer_id,
-            transition,
-            reason,
-            state = snapshot.state.as_str(),
-            remaining_bytes = snapshot.remaining_bytes,
-            ranges_in_flight = snapshot.ranges_in_flight,
-            ranges_issued = snapshot.ranges_issued,
-            ranges_released = snapshot.ranges_released,
-            resident_parts = snapshot.resident_parts,
-            read_ahead_window = snapshot.read_ahead_window,
-            memory_claim_pending = snapshot.memory_claim_pending,
-            "download state transition",
-        );
-    } else {
-        tracing::trace!(
-            target: crate::telemetry::TARGET_TRANSFER,
-            tid = %transfer_id,
-            transition,
-            reason,
-            "download state transition",
-        );
-    }
+fn emit_event(transfer_id: TransferId, event: DownloadEvent, snapshot: DownloadStateSnapshot) {
+    let (event, reason) = event.fields();
+    tracing::trace!(
+        target: crate::telemetry::TARGET_TRANSFER,
+        tid = %transfer_id,
+        event,
+        reason,
+        state = snapshot.state.as_str(),
+        remaining_bytes = snapshot.remaining_bytes,
+        ranges_in_flight = snapshot.ranges_in_flight,
+        ranges_issued = snapshot.ranges_issued,
+        ranges_released = snapshot.ranges_released,
+        resident_parts = snapshot.resident_parts,
+        read_ahead_window = snapshot.read_ahead_window,
+        memory_claim_pending = snapshot.memory_claim_pending,
+        "download state-machine event",
+    );
 }
 
 fn emit_terminal_summary(transfer_id: TransferId, summary: &DownloadTransferSummary) {
@@ -678,14 +650,14 @@ fn emit_terminal_summary(transfer_id: TransferId, summary: &DownloadTransferSumm
         other_max_pending_us = duration_micros(other_pending.max_pending_to_repoll),
         terminal_pending_category = terminal_category,
         terminal_pending_reason = terminal_reason,
-        state = summary.state.map(|snapshot| snapshot.state.as_str()),
-        remaining_bytes = summary.state.and_then(|snapshot| snapshot.remaining_bytes),
-        ranges_in_flight = summary.state.map(|snapshot| snapshot.ranges_in_flight),
-        ranges_issued = summary.state.map(|snapshot| snapshot.ranges_issued),
-        ranges_released = summary.state.map(|snapshot| snapshot.ranges_released),
-        resident_parts = summary.state.map(|snapshot| snapshot.resident_parts),
-        read_ahead_window = summary.state.map(|snapshot| snapshot.read_ahead_window),
-        memory_claim_pending = summary.state.map(|snapshot| snapshot.memory_claim_pending),
+        state = summary.state.state.as_str(),
+        remaining_bytes = summary.state.remaining_bytes,
+        ranges_in_flight = summary.state.ranges_in_flight,
+        ranges_issued = summary.state.ranges_issued,
+        ranges_released = summary.state.ranges_released,
+        resident_parts = summary.state.resident_parts,
+        read_ahead_window = summary.state.read_ahead_window,
+        memory_claim_pending = summary.state.memory_claim_pending,
         ranges_scheduled = summary.ranges_scheduled,
         ranges_completed = summary.ranges_completed,
         max_ranges_in_flight = summary.max_ranges_in_flight,
@@ -723,7 +695,7 @@ mod tests {
 
     fn snapshot() -> DownloadStateSnapshot {
         DownloadStateSnapshot {
-            state: DownloadStateKind::Transferring,
+            state: DownloadExecutionState::Transferring,
             remaining_bytes: Some(8 * 1024 * 1024),
             ranges_in_flight: 2,
             ranges_issued: 3,
@@ -763,26 +735,36 @@ mod tests {
             request_total,
             pending: TransferPendingStats::default(),
             checksum_validation: None,
+            state_snapshot: snapshot(),
         }
     }
 
     #[test]
-    fn disabled_collection_does_not_emit_snapshots() {
+    fn disabled_collection_does_not_retain_events() {
         let observability = DownloadObservability::new(config(0), DownloadDestination::Stream);
         assert!(matches!(observability, DownloadObservability::Disabled));
-        assert_eq!(observability.transition_snapshot(snapshot()), None);
+        observability.observe_event(
+            TransferId {
+                id: 1,
+                parent: None,
+            },
+            DownloadEvent::RangeScheduled,
+            snapshot(),
+        );
     }
 
     #[test]
-    fn summary_and_transition_levels_are_distinct() {
+    fn summary_and_event_levels_are_distinct() {
         let summary = DownloadObservability::new(config(1), DownloadDestination::Stream);
-        assert_eq!(summary.transition_snapshot(snapshot()), None);
-
-        let transitions = DownloadObservability::new(config(2), DownloadDestination::Stream);
-        assert_eq!(
-            transitions.transition_snapshot(snapshot()),
-            Some(snapshot())
-        );
+        let events = DownloadObservability::new(config(2), DownloadDestination::Stream);
+        assert!(matches!(
+            summary,
+            DownloadObservability::Enabled(ref enabled) if !enabled.emit_events
+        ));
+        assert!(matches!(
+            events,
+            DownloadObservability::Enabled(ref enabled) if enabled.emit_events
+        ));
     }
 
     #[test]
@@ -826,29 +808,31 @@ mod tests {
     #[test]
     fn terminal_state_does_not_erase_the_last_progress_snapshot() {
         let observability = DownloadObservability::new(config(1), DownloadDestination::Stream);
-        let _ = observability.transition_snapshot(snapshot());
-        let _ = observability.transition_snapshot(DownloadStateSnapshot::inactive(
-            DownloadStateKind::Terminal,
-            4,
-        ));
+        observability.observe_event(
+            TransferId {
+                id: 4,
+                parent: None,
+            },
+            DownloadEvent::RangeCompleted,
+            snapshot(),
+        );
+        let mut report = terminal_report(4, TransferStatus::Failed, RequestMetrics::default());
+        report.state_snapshot =
+            DownloadStateSnapshot::inactive(DownloadExecutionState::Terminal, 4);
 
         let summary = observability
-            .report_terminal(terminal_report(
-                4,
-                TransferStatus::Failed,
-                RequestMetrics::default(),
-            ))
+            .report_terminal(report)
             .expect("terminal report");
-        assert_eq!(summary.state, Some(snapshot()));
+        assert_eq!(summary.state, snapshot());
     }
 
     #[test]
     fn destination_and_range_work_are_aggregated() {
         let observability = DownloadObservability::new(config(1), DownloadDestination::File);
         observability.destination_prepared();
-        observability.range_scheduled(snapshot());
-        observability.range_completed(snapshot(), 2);
-        observability.memory_relief_completed(snapshot(), 1);
+        observability.record_range_scheduled();
+        observability.record_range_completed(2);
+        observability.record_memory_relief_completed(1);
         observability.destination_finalized(&Ok(3));
 
         let summary = observability
@@ -867,21 +851,21 @@ mod tests {
     }
 
     #[test]
-    fn download_transition_vocabulary_is_closed_and_stable() {
+    fn download_event_vocabulary_is_closed_and_stable() {
         assert_eq!(
-            DownloadTransition::DiscoveryScheduled.fields(),
+            DownloadEvent::DiscoveryScheduled.fields(),
             ("work_scheduled", "discovery")
         );
         assert_eq!(
-            DownloadTransition::Pending(DownloadPendingReason::ReadAhead).fields(),
+            DownloadEvent::Pending(DownloadPendingReason::ReadAhead).fields(),
             ("poll_pending", "read_ahead")
         );
         assert_eq!(
-            DownloadTransition::MemoryReliefCompleted.fields(),
+            DownloadEvent::MemoryReliefCompleted.fields(),
             ("work_completed", "memory_relief")
         );
         assert_eq!(
-            DownloadTransition::Terminal(DownloadTerminalOutcome::Completed).fields(),
+            DownloadEvent::Terminal(DownloadTerminalOutcome::Completed).fields(),
             ("terminal", "completed")
         );
     }
