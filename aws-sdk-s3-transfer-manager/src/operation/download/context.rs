@@ -8,7 +8,7 @@ use crate::runtime::buffer_pool::ReserveFuture;
 use crate::transfer::{PendingCategory, PendingCause};
 
 /// Why the download state machine cannot produce another work item.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DownloadPendingReason {
     /// Object discovery is still in flight.
     Discovery,
@@ -190,7 +190,8 @@ impl OccupancyGate {
 
 #[cfg(test)]
 mod tests {
-    use super::OccupancyGate;
+    use super::{DownloadPendingReason, OccupancyGate};
+    use crate::transfer::PendingCategory;
 
     #[test]
     fn gate_closes_at_window() {
@@ -226,5 +227,37 @@ mod tests {
         assert!(!g.try_issue(1), "window 1 admits exactly one resident part");
         g.release(1);
         assert!(g.try_issue(1), "gate reopened, next part may issue");
+    }
+
+    #[test]
+    fn pending_reasons_map_to_common_transfer_categories() {
+        let cases = [
+            (
+                DownloadPendingReason::Discovery,
+                PendingCategory::InFlightWork,
+                "discovery",
+            ),
+            (
+                DownloadPendingReason::ReadAhead,
+                PendingCategory::Consumer,
+                "read_ahead",
+            ),
+            (
+                DownloadPendingReason::MemoryAdmission,
+                PendingCategory::Memory,
+                "memory_admission",
+            ),
+            (
+                DownloadPendingReason::RangeCompletion,
+                PendingCategory::InFlightWork,
+                "range_completion",
+            ),
+        ];
+
+        for (reason, category, detail) in cases {
+            let cause = crate::transfer::PendingCause::from(reason);
+            assert_eq!(cause.category, category);
+            assert_eq!(cause.reason, detail);
+        }
     }
 }
