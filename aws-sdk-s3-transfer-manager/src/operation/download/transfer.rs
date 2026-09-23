@@ -165,6 +165,9 @@ impl DownloadTransfer {
     /// Emits the download terminal summary before notifying the owning handle.
     fn report_terminal(&self, state_snapshot: DownloadStateSnapshot) {
         self.inner.ctx.finalize_terminal_metrics();
+        if !self.inner.ctx.claim_terminal_report() {
+            return;
+        }
         let pending = self.inner.ctx.pending_stats().unwrap_or_default();
         let checksum_validation = self
             .inner

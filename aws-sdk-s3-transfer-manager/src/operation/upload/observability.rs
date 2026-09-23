@@ -9,7 +9,6 @@
 //! measurements from PutObject and multipart uploads. The disabled variant
 //! avoids allocation, clocks, counters, and event snapshots.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -469,7 +468,6 @@ pub(crate) enum UploadObservability {
 #[derive(Debug)]
 pub(crate) struct EnabledUploadObservability {
     emit_events: bool,
-    terminal_reported: AtomicBool,
     state: Mutex<UploadObservabilityState>,
     #[cfg(test)]
     last_summary: Mutex<Option<UploadTransferSummary>>,
@@ -510,7 +508,6 @@ impl UploadObservability {
         }
         Self::Enabled(Arc::new(EnabledUploadObservability {
             emit_events: config.events_enabled(),
-            terminal_reported: AtomicBool::new(false),
             state: Mutex::new(UploadObservabilityState {
                 mode: UploadMode::Undecided,
                 length_kind: UploadLengthKind::from_size_hint(size_hint),
@@ -859,18 +856,16 @@ impl UploadObservability {
         }
     }
 
-    /// Finalizes and emits the upload terminal summary once.
+    /// Finalizes and emits the upload terminal projection.
     pub(crate) fn report_terminal(
         &self,
         report: UploadTerminalReport,
     ) -> Option<UploadTransferSummary> {
+        let outcome = UploadTerminalOutcome::from_status(report.status)?;
         let Self::Enabled(enabled) = self else {
+            emit_terminal_lifecycle(&report, outcome);
             return None;
         };
-        let outcome = UploadTerminalOutcome::from_status(report.status)?;
-        if enabled.terminal_reported.swap(true, Ordering::AcqRel) {
-            return None;
-        }
 
         let mut state = enabled.state.lock().expect("lock poisoned");
         update_snapshot(&mut state, report.state_snapshot);
@@ -1105,6 +1100,25 @@ fn emit_part_completed(
         completed_parts = snapshot.completed_parts,
         dispatch_closed = snapshot.dispatch_closed,
         "upload part request completed",
+    );
+}
+
+fn emit_terminal_lifecycle(report: &UploadTerminalReport, outcome: UploadTerminalOutcome) {
+    let elapsed = report
+        .metrics
+        .finished_at
+        .map(|finished_at| finished_at.saturating_duration_since(report.metrics.started_at))
+        .unwrap_or_default();
+    tracing::debug!(
+        target: crate::telemetry::TARGET_TRANSFER,
+        tid = %report.transfer_id,
+        outcome = outcome.as_str(),
+        error_kind = ?report.error_kind,
+        elapsed = ?elapsed,
+        expected_bytes = report.metrics.total_bytes,
+        network_tx = report.metrics.network_tx,
+        disk_read = report.metrics.disk_read,
+        "upload transfer terminal",
     );
 }
 
@@ -1442,17 +1456,10 @@ mod tests {
     }
 
     #[test]
-    fn terminal_summary_is_reported_once() {
+    fn terminal_summary_records_mode_and_last_active_state() {
         let observability = UploadObservability::new(config(1), exact_size_hint());
         observability.select_mode(UploadMode::PutObject);
         let first = observability.report_terminal(terminal_report(
-            1,
-            TransferStatus::Completed,
-            None,
-            RequestMetrics::default(),
-            UploadStateSnapshot::inactive(UploadExecutionState::PutObjectInFlight),
-        ));
-        let second = observability.report_terminal(terminal_report(
             1,
             TransferStatus::Completed,
             None,
@@ -1465,7 +1472,6 @@ mod tests {
             first.last_active_state,
             UploadExecutionState::PutObjectInFlight
         );
-        assert!(second.is_none());
     }
 
     #[test]
