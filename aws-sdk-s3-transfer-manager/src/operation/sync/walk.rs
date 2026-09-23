@@ -452,8 +452,12 @@ impl Walker {
         bucket: String,
         prefix: Option<String>,
     ) -> S3Walk {
-        let mut walker =
-            S3Walker::builder().filter(s3_predicate(Arc::clone(&self.filter), prefix.clone()));
+        // Restore status is asked for here and nowhere else. Without it an object in an archive
+        // and one with a restored copy look the same, and a comparison would either refuse every
+        // archived key or hand execution a transfer that fails.
+        let mut walker = S3Walker::builder()
+            .request_restore_status(true)
+            .filter(s3_predicate(Arc::clone(&self.filter), prefix.clone()));
         if let Some(prefix) = prefix {
             walker = walker.prefix(prefix);
         }
@@ -1406,7 +1410,15 @@ mod tests {
             ]))
             .build();
         let rule = aws_smithy_mocks::mock!(aws_sdk_s3::Client::list_objects_v2)
-            .match_requests(|req| req.delimiter().is_none() && req.continuation_token().is_none())
+            .match_requests(|req| {
+                req.delimiter().is_none()
+                    && req.continuation_token().is_none()
+                    // Asked for, so an archived object can be told from a restored one. A listing
+                    // without it reports no restore status at all, and every archived key would be
+                    // skipped for the life of the bucket.
+                    && req.optional_object_attributes()
+                        == [aws_sdk_s3::types::OptionalObjectAttributes::RestoreStatus]
+            })
             .then_output(move || listing.clone());
         let client = aws_smithy_mocks::mock_client!(
             aws_sdk_s3,

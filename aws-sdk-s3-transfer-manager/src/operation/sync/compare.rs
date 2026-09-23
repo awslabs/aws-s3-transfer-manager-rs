@@ -558,6 +558,63 @@ mod tests {
     }
 
     #[test]
+    fn an_archived_source_is_skipped() {
+        assert_eq!(
+            decide(
+                SideState::Present(entry(Some(1), Some(0), Some(Obstruction::Archived))),
+                SideState::Present(file()),
+            ),
+            (obstructed(Obstruction::Archived), false),
+            "its bytes cannot be read, so there is nothing to send"
+        );
+    }
+
+    #[test]
+    fn an_archived_source_is_skipped_even_where_nothing_is_there_to_overwrite() {
+        // The destination holding nothing is what makes this its own case. Deciding it by asking
+        // whether the cause stops an overwrite reads as sound — there is nothing to overwrite —
+        // and an archive does not stop one, so the pair would fall through to a transfer and ask
+        // for bytes that cannot be read. What matters here is the source: it cannot be read at
+        // all, whatever the destination holds.
+        assert_eq!(
+            decide(
+                SideState::Present(entry(Some(1), Some(0), Some(Obstruction::Archived))),
+                SideState::Absent,
+            ),
+            (obstructed(Obstruction::Archived), false),
+            "an archived object is unreadable whether or not the destination has the key"
+        );
+    }
+
+    #[test]
+    fn an_archived_destination_is_compared_and_written_over() {
+        // Writing over an object never reads what is already there. Answering both roles from one
+        // question would refuse every upload to a key holding an archived object, which is the
+        // case that pins the two apart — the source test above uses the same cause and skips.
+        let (verdict, consulted) = decide(
+            SideState::Present(file()),
+            SideState::Present(entry(Some(9), Some(0), Some(Obstruction::Archived))),
+        );
+        assert!(
+            consulted,
+            "the mode decides this pair, since nothing is in the way: {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn a_destination_holding_nothing_readable_is_still_not_written_over() {
+        // The other half of the same distinction: a pipe or device does stop an overwrite, so this
+        // must keep skipping while the archived case above stops doing so.
+        assert_eq!(
+            decide(
+                SideState::Present(file()),
+                SideState::Present(entry(Some(0), Some(0), Some(Obstruction::NothingToRead))),
+            ),
+            (obstructed(Obstruction::NothingToRead), false)
+        );
+    }
+
+    #[test]
     fn a_source_whose_size_went_unread_is_transferred() {
         assert_eq!(
             decide(

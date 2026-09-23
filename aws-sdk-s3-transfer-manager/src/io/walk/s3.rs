@@ -60,6 +60,7 @@ pub struct S3Walker {
     start_after: Option<String>,
     continuation_token: Option<String>,
     page_size: Option<i32>,
+    request_restore_status: bool,
 }
 
 impl std::fmt::Debug for S3Walker {
@@ -72,6 +73,7 @@ impl std::fmt::Debug for S3Walker {
             .field("start_after", &self.start_after)
             .field("continuation_token", &self.continuation_token)
             .field("page_size", &self.page_size)
+            .field("request_restore_status", &self.request_restore_status)
             .finish()
     }
 }
@@ -148,6 +150,7 @@ impl S3Walker {
 #[derive(Default)]
 pub struct S3WalkerBuilder {
     prefix: Option<String>,
+    request_restore_status: bool,
     delimiter: Option<String>,
     expected_bucket_owner: Option<String>,
     request_payer: Option<aws_sdk_s3::types::RequestPayer>,
@@ -242,6 +245,17 @@ impl S3WalkerBuilder {
         self
     }
 
+    // Ask each listing to report whether an archived object has a restored copy.
+    //
+    // Off by default, because it adds a request parameter S3 documents as unsupported for
+    // directory buckets, and this walker is shared — turning it on for everyone would change what
+    // existing callers send. Without it an archived object and a restored one look alike, and
+    // telling them apart is the whole point of asking.
+    pub(crate) fn request_restore_status(mut self, request: bool) -> Self {
+        self.request_restore_status = request;
+        self
+    }
+
     /// Build the [`S3Walker`] configuration.
     #[must_use]
     pub fn build(self) -> S3Walker {
@@ -254,6 +268,7 @@ impl S3WalkerBuilder {
             start_after: self.start_after,
             continuation_token: self.continuation_token,
             page_size: self.page_size,
+            request_restore_status: self.request_restore_status,
         }
     }
 }
@@ -459,6 +474,12 @@ impl S3Walk {
             .list_objects_v2()
             .bucket(self.bucket.name())
             .prefix(prefix);
+
+        if self.config.request_restore_status {
+            req = req.optional_object_attributes(
+                aws_sdk_s3::types::OptionalObjectAttributes::RestoreStatus,
+            );
+        }
 
         // Runtime pagination token for this page. When a caller-supplied
         // continuation_token is configured AND this is the first request

@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use aws_sdk_s3::types::Object;
+use aws_sdk_s3::types::{Object, ObjectStorageClass};
 
 use crate::io::FileType;
 
@@ -67,6 +67,10 @@ pub(crate) enum Obstruction {
     // A socket, a device, a named pipe, or a symlink the walk was told not to follow: the name is
     // taken and holds nothing a transfer could read, and reading one may never finish.
     NothingToRead,
+    // An object whose bytes sit in an archive with no restored copy to read.
+    Archived,
+    // A restore is under way. The bytes arrive when it finishes, so a later run gets them.
+    BeingRestored,
 }
 
 impl Obstruction {
@@ -77,6 +81,9 @@ impl Obstruction {
     pub(crate) fn blocks_overwrite(&self) -> bool {
         match self {
             Self::NothingToRead => true,
+            // Writing over an object never reads what is already there, so an upload to a key
+            // holding an archived object goes ahead and replaces it.
+            Self::Archived | Self::BeingRestored => false,
         }
     }
 }
@@ -489,13 +496,33 @@ pub(crate) fn relative_key<'a>(key: &'a str, root_prefix: &str) -> Option<&'a st
 //
 // What stops a listed object being read.
 //
-// Nothing today. An object in Glacier Flexible Retrieval or Deep Archive with no restored copy
-// cannot be read either, and a listing carries what says so, but reading that needs a request
-// parameter this walk does not set yet. Named so the answer has one home and a test can hold it,
-// where an inline `None` leaves nowhere to put either.
+// Two answers come from one pair of fields, because neither settles it alone. A restore status is
+// reported only for an object that has one, so its absence says nothing: a STANDARD object and a
+// Glacier object nobody ever restored both arrive without it.
+//
+// Only two classes keep their bytes out of reach. The names are a poor guide — `GLACIER_IR` reads
+// in real time and never carries a restore status, so treating every Glacier-named class as
+// archived would skip every one of those objects on every run. `INTELLIGENT_TIERING` reports the
+// same value whether or not the object currently sits in an archive tier, so it cannot be answered
+// from a listing at all; a transfer finds out and fails.
 fn object_obstruction(obj: &Object) -> Option<Obstruction> {
-    let _ = obj;
-    None
+    match obj.storage_class() {
+        Some(ObjectStorageClass::Glacier) | Some(ObjectStorageClass::DeepArchive) => {}
+        _ => return None,
+    }
+    match obj.restore_status() {
+        // Nobody asked for a copy.
+        None => Some(Obstruction::Archived),
+        Some(status) if status.is_restore_in_progress() == Some(true) => {
+            Some(Obstruction::BeingRestored)
+        }
+        // A finished restore, readable until its copy expires. The answer is a snapshot either
+        // way: an expiry can pass between this listing and the transfer, and then the transfer
+        // meets the same refusal it would have met without the check.
+        Some(status) if status.restore_expiry_date().is_some() => None,
+        // Neither under way nor carrying an expiry, so nothing here says the bytes are reachable.
+        Some(_) => Some(Obstruction::Archived),
+    }
 }
 
 // Markers are dropped here, so they are invisible whether or not a filter is
@@ -1505,14 +1532,93 @@ mod tests {
     }
 
     #[test]
-    fn every_cause_known_today_also_stops_an_overwrite() {
-        // An archive will not: overwriting never reads what is already there, so an upload over an
-        // archived object has to go ahead. Spelled as a match, so adding a cause stops this
-        // compiling until someone says which way it goes.
-        let cause = Obstruction::NothingToRead;
-        match cause {
-            Obstruction::NothingToRead => assert!(cause.blocks_overwrite()),
+    fn a_name_holding_nothing_stops_a_read_and_an_overwrite() {
+        assert!(Obstruction::NothingToRead.blocks_overwrite());
+    }
+
+    #[test]
+    fn an_archive_stops_a_read_and_allows_an_overwrite() {
+        // Writing over an object never reads what is already there, so an upload to a key holding
+        // an archived object replaces it. Answering both roles alike would refuse that upload for
+        // every archived key in a bucket.
+        assert!(!Obstruction::Archived.blocks_overwrite());
+        assert!(!Obstruction::BeingRestored.blocks_overwrite());
+    }
+
+    // A listed object in the class and restore state a test names.
+    fn listed(class: Option<ObjectStorageClass>, restore: Option<RestoreStatus>) -> Object {
+        let mut obj = Object::builder().key("data/a").size(1);
+        if let Some(class) = class {
+            obj = obj.storage_class(class);
         }
+        if let Some(restore) = restore {
+            obj = obj.restore_status(restore);
+        }
+        obj.build()
+    }
+
+    #[test]
+    fn an_archived_object_with_no_restored_copy_cannot_be_read() {
+        for class in [ObjectStorageClass::Glacier, ObjectStorageClass::DeepArchive] {
+            assert_eq!(
+                object_obstruction(&listed(Some(class.clone()), None)),
+                Some(Obstruction::Archived),
+                "{class:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_object_being_restored_cannot_be_read_yet() {
+        let restore = RestoreStatus::builder()
+            .is_restore_in_progress(true)
+            .build();
+        assert_eq!(
+            object_obstruction(&listed(Some(ObjectStorageClass::Glacier), Some(restore))),
+            Some(Obstruction::BeingRestored)
+        );
+    }
+
+    #[test]
+    fn a_restored_object_can_be_read_until_its_copy_expires() {
+        let restore = RestoreStatus::builder()
+            .is_restore_in_progress(false)
+            .restore_expiry_date(DateTime::from_secs(1_800_000_000))
+            .build();
+        assert_eq!(
+            object_obstruction(&listed(Some(ObjectStorageClass::Glacier), Some(restore))),
+            None
+        );
+    }
+
+    #[test]
+    fn a_restore_status_saying_neither_reads_as_archived() {
+        // Nothing here says the bytes are reachable, so the answer stays the conservative one.
+        let restore = RestoreStatus::builder().build();
+        assert_eq!(
+            object_obstruction(&listed(Some(ObjectStorageClass::Glacier), Some(restore))),
+            Some(Obstruction::Archived)
+        );
+    }
+
+    #[test]
+    fn glacier_instant_retrieval_reads_in_real_time() {
+        // The name says Glacier and the bytes are there. Treating every Glacier-named class as
+        // archived would skip every one of these objects on every run, forever.
+        assert_eq!(
+            object_obstruction(&listed(Some(ObjectStorageClass::GlacierIr), None)),
+            None
+        );
+    }
+
+    #[test]
+    fn intelligent_tiering_is_not_answered_from_a_listing() {
+        // The class reads the same whether or not the object sits in an archive tier, so a
+        // listing cannot tell. A transfer finds out and fails.
+        assert_eq!(
+            object_obstruction(&listed(Some(ObjectStorageClass::IntelligentTiering), None)),
+            None
+        );
     }
 
     #[test]
