@@ -461,7 +461,7 @@ mod test {
     }
 
     fn test_metrics() -> std::sync::Arc<crate::transfer::MetricsState> {
-        std::sync::Arc::new(crate::transfer::MetricsState::new())
+        std::sync::Arc::new(crate::transfer::MetricsState::with_parent(None))
     }
 
     fn test_telemetry() -> std::sync::Arc<crate::telemetry::Telemetry> {

@@ -23,6 +23,9 @@ use super::{UploadObjectsHandle, UploadObjectsInputBuilder};
 pub struct UploadObjectsFluentBuilder {
     handle: Arc<crate::client::Handle>,
     inner: UploadObjectsInputBuilder,
+    /// Held beside the generated input, not inside it, so a
+    /// retryable `FailedUpload::input()` does not retain a sink.
+    events: Option<crate::events::TransferEventSink>,
 }
 
 impl UploadObjectsFluentBuilder {
@@ -30,7 +33,20 @@ impl UploadObjectsFluentBuilder {
         Self {
             handle,
             inner: std::default::Default::default(),
+            events: None,
         }
+    }
+
+    /// observe lifecycle events for this request and its children.
+    pub fn events(mut self, sink: crate::events::TransferEventSink) -> Self {
+        // Appends rather than replaces, so every registered consumer sees every event: the
+        // SEP asks for "a list of progress listeners", and a replacing setter would make a
+        // client-level sink and a request-level sink mutually exclusive.
+        self.events = Some(match self.events.take() {
+            Some(existing) => existing.merge(sink),
+            None => sink,
+        });
+        self
     }
 
     /// Initiate upload of multiple objects.
@@ -41,7 +57,9 @@ impl UploadObjectsFluentBuilder {
     ))]
     pub fn initiate(self) -> Result<UploadObjectsHandle, crate::error::Error> {
         let input = self.inner.build()?;
-        crate::operation::upload_objects::UploadObjects::orchestrate(self.handle, input)
+        // Resolved before the handle moves into `orchestrate`.
+        let events = crate::events::resolve_sink(self.handle.config.events(), self.events);
+        crate::operation::upload_objects::UploadObjects::orchestrate(self.handle, input, events)
     }
 
     /// The S3 bucket name that objects will upload to. Required.
@@ -173,6 +191,9 @@ impl UploadObjectsFluentBuilder {
 
 impl crate::operation::upload_objects::input::UploadObjectsInputBuilder {
     /// Initiate upload of multiple objects using the given client.
+    ///
+    /// This entry point reports no [events](crate::events) — an input builder has no sink to
+    /// carry. Use [`initiate_with_events`](Self::initiate_with_events) to register one.
     pub fn initiate_with(
         self,
         client: &crate::Client,
@@ -180,5 +201,22 @@ impl crate::operation::upload_objects::input::UploadObjectsInputBuilder {
         let mut fluent_builder = client.upload_objects();
         fluent_builder.inner = self;
         fluent_builder.initiate()
+    }
+
+    /// Initiate upload of multiple objects, reporting per-object lifecycle
+    /// [events](crate::events) to `sink`.
+    ///
+    /// The events-carrying form of [`initiate_with`](Self::initiate_with). It exists because a
+    /// sink is registered on the fluent builder, which this entry point bypasses — without it,
+    /// a caller who assembled an input directly has no way to observe the transfer, and the
+    /// silence would look like a transfer that never produced events.
+    pub fn initiate_with_events(
+        self,
+        client: &crate::Client,
+        sink: crate::events::TransferEventSink,
+    ) -> Result<UploadObjectsHandle, crate::error::Error> {
+        let mut fluent_builder = client.upload_objects();
+        fluent_builder.inner = self;
+        fluent_builder.events(sink).initiate()
     }
 }

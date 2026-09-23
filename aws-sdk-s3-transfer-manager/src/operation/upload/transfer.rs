@@ -95,6 +95,11 @@ struct UploadTransferInner {
     create_mpu_complete: tokio::sync::Notify,
     /// Stored result for handle to retrieve
     result: Mutex<Option<UploadOutput>>,
+    /// Lifecycle emitter, `None` unless a caller registered a sink.
+    ///
+    /// A single-object upload has no children, so one emitter is the whole story:
+    /// announced by `orchestrate`, discharged by `on_terminal`.
+    lifecycle: Option<Arc<crate::events::TransferLifecycle>>,
 }
 
 impl UploadTransfer {
@@ -103,6 +108,7 @@ impl UploadTransfer {
         bucket_type: BucketType,
         request: UploadInput,
         stream: InputStream,
+        lifecycle: Option<Arc<crate::events::TransferLifecycle>>,
     ) -> Self {
         // `None` for a `PartStream` whose total size is not known up front. Such a source is always
         // `is_mpu_only`, so it routes through the multipart path and its parts are dispatched
@@ -126,6 +132,7 @@ impl UploadTransfer {
             bucket_type,
             create_mpu_complete: tokio::sync::Notify::new(),
             result: Mutex::new(None),
+            lifecycle,
         });
 
         Self { inner }
@@ -901,6 +908,33 @@ impl Transfer for UploadTransfer {
     ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
         Box::pin(UploadTransfer::execute(self, work))
     }
+
+    /// The one terminal emit for a single-object upload.
+    ///
+    /// Every removal path routes through here -- normal completion, cancellation,
+    /// a worker panic, and completion-driven removal -- so no per-path emit is
+    /// needed. Reaching it more than once is harmless: the obligation is claimed
+    /// by exactly one caller.
+    fn on_terminal(&self) {
+        let Some(lc) = &self.inner.lifecycle else {
+            return;
+        };
+        let outcome = match self.inner.ctx.transfer_status() {
+            crate::types::TransferStatus::Completed => crate::events::Outcome::Succeeded {},
+            crate::types::TransferStatus::Failed => crate::events::Outcome::Failed {
+                error: self.inner.ctx.error().unwrap_or_else(|| {
+                    crate::error::Error::new(
+                        crate::error::ErrorKind::ChildOperationFailed,
+                        "upload failed",
+                    )
+                }),
+            },
+            _ => crate::events::Outcome::Cancelled {},
+        };
+        if let Some(emit) = lc.finish(outcome) {
+            emit.send();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -927,7 +961,7 @@ mod tests {
         let stream = InputStream::from(content);
 
         let (ctx, _completion_rx) = TransferContext::new(handle);
-        UploadTransfer::new(ctx, BucketType::Standard, input, stream)
+        UploadTransfer::new(ctx, BucketType::Standard, input, stream, None)
     }
 
     fn mock_s3_client_for_mpu() -> aws_sdk_s3::Client {
@@ -990,6 +1024,7 @@ mod tests {
             BucketType::Standard,
             input,
             InputStream::from_part_stream(NoUpperBound),
+            None,
         );
 
         let mut work = assert_ready(transfer.poll_work());
@@ -1153,7 +1188,7 @@ mod tests {
             .unwrap();
         let stream = InputStream::from_path(tmp.path()).unwrap();
         let (ctx, _completion_rx) = TransferContext::new(handle);
-        let transfer = UploadTransfer::new(ctx, BucketType::Standard, input, stream);
+        let transfer = UploadTransfer::new(ctx, BucketType::Standard, input, stream, None);
 
         let mut work = assert_ready(transfer.poll_work());
         assert!(matches!(

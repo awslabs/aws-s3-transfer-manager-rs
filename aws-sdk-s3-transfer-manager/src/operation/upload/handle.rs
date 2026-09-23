@@ -198,6 +198,11 @@ impl UploadHandle {
         self.transfer.ctx().id
     }
 
+    /// A read-only view of this upload's counters, for a parent to hand to observers.
+    pub(crate) fn view(&self) -> crate::types::TransferView {
+        self.transfer.ctx().view()
+    }
+
     /// Get scheduling controls for this transfer.
     pub fn scheduling(&self) -> crate::transfer::SchedulingCtl<'_> {
         self.transfer.ctx().scheduling()
@@ -266,7 +271,7 @@ mod tests {
             .unwrap();
         let stream = InputStream::from(Vec::<u8>::new());
         let (ctx, completion_rx) = TransferContext::new(handle);
-        let transfer = UploadTransfer::new(ctx.clone(), BucketType::Standard, input, stream);
+        let transfer = UploadTransfer::new(ctx.clone(), BucketType::Standard, input, stream, None);
 
         // Drive to Cancelled terminal state.
         ctx.set_cancelled();

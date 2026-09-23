@@ -219,6 +219,22 @@ struct State {
 
     /// Whether a walker work item is currently in flight.
     walk_in_flight: bool,
+    /// The walker reported itself exhausted. Positive on purpose: it is set at exactly
+    /// one site, the clean end of enumeration, so every path that abandons a walk — a
+    /// fatal listing error, a destination that is not a directory, a cancel — leaves it
+    /// `false` by default. A negative "abandoned" flag would have to be set at every
+    /// teardown site and would fail open the moment a new one was added.
+    ///
+    /// `state.walk.is_none()` cannot answer this: `dispatch_walk` takes the walk out for
+    /// the duration of an advance, so `None` means "out for execution", "exhausted", or
+    /// "dropped after a failure" indistinguishably.
+    listing_complete: bool,
+    /// Listing is finished, so the metrics' running enumerated total will not change again.
+    ///
+    /// Read and written only under this same `State` lock, never as a separate atomic:
+    /// a "has X happened yet?" flag checked in one critical section and acted on in
+    /// another is a race however tight the window looks.
+    total_sealed: bool,
 
     /// Objects discovered by the walker, waiting to be spawned as children.
     pending_entries: std::collections::VecDeque<Object>,
@@ -254,7 +270,9 @@ impl std::fmt::Debug for DownloadObjectsTransfer {
 struct DownloadObjectsTransferInner {
     ctx: TransferContext,
     state: Mutex<State>,
-    bucket: String,
+    /// Interned once per operation: every child event names it, and a directory
+    /// download over millions of objects must not allocate it per entry.
+    bucket: Arc<str>,
     destination: PathBuf,
     key_prefix: Option<String>,
     delimiter: Option<String>,
@@ -263,6 +281,13 @@ struct DownloadObjectsTransferInner {
     /// Directories already created (dedup `create_dir_all` across children
     /// that share a prefix; objects in the same S3 "folder" map to one dir).
     created_dirs: Mutex<HashSet<PathBuf>>,
+    /// The root's lifecycle, `None` when no caller registered a sink. Taken by
+    /// `finish_root` so the sink is released and the stream can end.
+    lifecycle: Mutex<Option<Arc<crate::events::TransferLifecycle>>>,
+    /// One lifecycle per announced child, removed by whichever of reap or
+    /// `finish_root` reaches it first. A child left here at the root's terminal
+    /// was announced and never reaped, and `finish_root` owes it a `Settled`.
+    child_lifecycles: Mutex<HashMap<TransferId, Arc<crate::events::TransferLifecycle>>>,
 }
 
 impl DownloadObjectsTransfer {
@@ -271,8 +296,9 @@ impl DownloadObjectsTransfer {
         input: &crate::operation::download_objects::DownloadObjectsInput,
         walk: S3Walk,
         pipeline_depth: usize,
+        lifecycle: Option<Arc<crate::events::TransferLifecycle>>,
     ) -> Self {
-        let bucket = input.bucket().unwrap().to_string();
+        let bucket: Arc<str> = Arc::from(input.bucket().expect("bucket validated by builder"));
         let destination = input.destination().unwrap().to_path_buf();
         let key_prefix = input.key_prefix().map(|s| s.to_string());
         let delimiter = input.delimiter().map(|s| s.to_string());
@@ -285,6 +311,8 @@ impl DownloadObjectsTransfer {
                     walk: Some(walk),
                     validated: false,
                     walk_in_flight: false,
+                    listing_complete: false,
+                    total_sealed: false,
                     pending_entries: std::collections::VecDeque::new(),
                     children: HashMap::new(),
                     children_reserved: 0,
@@ -299,7 +327,290 @@ impl DownloadObjectsTransfer {
                 failure_policy,
                 pipeline_depth,
                 created_dirs: Mutex::new(HashSet::new()),
+                lifecycle: Mutex::new(lifecycle),
+                child_lifecycles: Mutex::new(HashMap::new()),
             }),
+        }
+    }
+
+    /// Announce one spawned child. Called with no state guard held.
+    ///
+    /// A child whose orchestration failed is announced too, then finished
+    /// immediately: it is a real fact about a real key, and suppressing it would
+    /// make `Decided` and `Settled` counts disagree for a reason a consumer
+    /// cannot see. It gets no entry in the child map because there is nothing to
+    /// reap.
+    /// `batch_sink` is the sink cloned when this batch was claimed, used only if the root has
+    /// been taken since. It is passed in rather than stored on `self` because a stored
+    /// `TransferEventSink` is a live mpsc `Sender`: the stream ends when the last sink drops, so
+    /// a sink held for the transfer's lifetime keeps `next()` returning `Pending` until the
+    /// scheduler releases the transfer, and a consumer that awaits its collector after `join()`
+    /// hangs. Batch-scoped, it covers exactly the claim-to-announce window and no longer.
+    fn announce_child(
+        &self,
+        result: &Result<(ManagedDownloadHandle, PathBuf), Error>,
+        key: &str,
+        batch_sink: Option<&crate::events::TransferEventSink>,
+    ) {
+        // The root guard is held across the whole body, so the check that the root is
+        // still live and the insert into `child_lifecycles` are one critical section.
+        //
+        // Cloning the root and releasing first admits this interleaving, which loses a
+        // `Settled` for good:
+        //
+        //   A (walk thread, announce_child)      B (terminal path, finish_root)
+        //   ---------------------------------    -----------------------------------
+        //   lock lifecycle, clone -> Some        .
+        //   unlock lifecycle                     .
+        //   .                                    lock child_lifecycles, drain (empty)
+        //   .                                    unlock
+        //   .                                    lock lifecycle, take -> None
+        //   .                                    unlock; root Settled emitted
+        //   lock child_lifecycles, insert        .
+        //   unlock  <-- nothing drains this map again
+        //
+        // `finish_root` takes `lifecycle` before touching `child_lifecycles`, so it
+        // blocks here until this body finishes and then observes the insert. The only
+        // nesting is this function's lifecycle -> child_lifecycles; no path takes them in
+        // the other order, so there is no inversion. `announce()` is a non-blocking
+        // `try_send` with no `.await`, so holding the guard across it is bounded.
+        let root_guard = self.inner.lifecycle.lock();
+        // Read at the use site rather than bound here. A binding keeps compiling if someone later
+        // releases the guard early and then silently carries a stale answer; `root_guard.is_some()`
+        // below stops compiling instead, which is the failure we want for an edit that breaks the
+        // invariant that this decision and the sink choice are the same instant.
+        //
+        // Whether the root is still live decides where the `Settled` comes from, not whether
+        // there is one. A live root means `finish_root` has not run, so the orphan drain will
+        // still read `child_lifecycles` and owes this child its terminal. A taken root means
+        // that drain has already happened and will not happen again, so this child must finish
+        // here or not at all -- it is off `pending_entries`, so `record_abandoned_entries`
+        // cannot see it either.
+        let Some(sink) = root_guard
+            .as_ref()
+            .map(|root| root.child_sink())
+            .or_else(|| batch_sink.cloned())
+        else {
+            // No sink was ever registered, so there is no event to lose. The count still
+            // stands on its own: `accumulate_listed` took this object into the denominator
+            // when listing produced it, and leaving it uncounted seals `EntryTotal::Final(N)`
+            // against `entries_settled() == N - 1` for the life of the process.
+            //
+            // Counted unconditionally because every object reaching here is addressable:
+            // `spawn_children` expects a key, and `accumulate_listed` counts exactly the
+            // objects that have one.
+            self.inner.ctx.metrics.record_entry_settled();
+            return;
+        };
+        let child_ref = |destination| {
+            crate::events::TransferRef::download(
+                crate::events::Endpoint::S3 {
+                    bucket: self.inner.bucket.clone(),
+                    key: Arc::from(key),
+                },
+                destination,
+            )
+        };
+        match result {
+            Ok((handle, dest_path)) => {
+                let child_id = handle.transfer_id();
+                let lc = Arc::new(crate::events::TransferLifecycle::new(
+                    sink,
+                    child_id.id,
+                    Some(self.inner.ctx.id.id),
+                    child_ref(crate::events::Endpoint::Local {
+                        path: Arc::from(dest_path.as_path()),
+                    }),
+                    Some(handle.view()),
+                ));
+                lc.announce();
+                if root_guard.is_some() {
+                    self.inner.child_lifecycles.lock().insert(child_id, lc);
+                } else if let Some(emit) = lc.finish(crate::events::Outcome::Cancelled {}) {
+                    // `Cancelled` rather than derived from the handle, unlike `finish_root`'s
+                    // orphan drain: that drain runs at the root's terminal and can find a child
+                    // that already succeeded, but this child was spawned microseconds ago and
+                    // the cascade that took the root cancels it next. Inserting instead would
+                    // put it in a map nothing reads again, costing it the `Settled` its
+                    // `announce` above already owes.
+                    self.inner.ctx.metrics.record_entry_settled();
+                    emit.send();
+                }
+            }
+            Err(e) => {
+                // A fresh id rather than a placeholder: this key never got a child
+                // transfer, but it is still announced and finished, and a consumer
+                // keying a map on `id` would collide every such key onto one slot.
+                //
+                // The destination is `Unresolved`: orchestration failed, so either
+                // the path could not be derived or its directory could not be
+                // created. Naming the destination root instead would print a
+                // location the transfer manager never wrote to.
+                let lc = crate::events::TransferLifecycle::new(
+                    sink,
+                    crate::transfer::next_transfer_id().id,
+                    Some(self.inner.ctx.id.id),
+                    child_ref(crate::events::Endpoint::Unresolved {}),
+                    // No transfer was ever created, so there are no counters to view.
+                    None,
+                );
+                lc.announce();
+                if let Some(emit) = lc.finish(crate::events::Outcome::Failed { error: e.clone() }) {
+                    // Settled without ever being a child: orchestration failed. Still one of
+                    // the enumerated entries, and still no longer pending.
+                    self.inner.ctx.metrics.record_entry_settled();
+                    emit.send();
+                }
+            }
+        }
+    }
+
+    /// Announce-and-finish every entry that was listed but never claimed.
+    ///
+    /// `check_terminal` abandons `pending_entries` on the cancel/failure branch:
+    /// once the transfer is inactive the ladder never spawns them, so they reach
+    /// no child and no `Settled`, which is indistinguishable to a consumer from
+    /// the transfer having had fewer objects than it listed. Draining is
+    /// idempotent, so this is safe from more than one terminal site.
+    ///
+    /// An abandoned entry's key is known (it came off the walker), but its local
+    /// destination was never derived because no child was spawned, so the
+    /// destination is `Unresolved` -- the same shape `announce_child` uses for a
+    /// key whose orchestration failed before a path existed.
+    fn record_abandoned_entries(
+        &self,
+        state: &mut State,
+        out: &mut Vec<crate::events::PendingEmit>,
+    ) {
+        if state.pending_entries.is_empty() {
+            return;
+        }
+        // Taken once, not per entry. Cloning the root sink per abandoned entry is
+        // the per-iteration cost this loop keeps small; it runs under the state
+        // guard and is bounded by the entry buffer's high-water mark.
+        let Some(root) = self.inner.lifecycle.lock().clone() else {
+            state.pending_entries.clear();
+            return;
+        };
+        let abandoned: Vec<_> = state.pending_entries.drain(..).collect();
+        for obj in abandoned {
+            let Some(key) = obj.key() else {
+                continue;
+            };
+            let transfer = crate::events::TransferRef::download(
+                crate::events::Endpoint::S3 {
+                    bucket: self.inner.bucket.clone(),
+                    key: Arc::from(key),
+                },
+                crate::events::Endpoint::Unresolved {},
+            );
+            let lc = crate::events::TransferLifecycle::new(
+                root.child_sink(),
+                crate::transfer::next_transfer_id().id,
+                Some(self.inner.ctx.id.id),
+                transfer,
+                // Abandoned before it was started, so it never had a transfer.
+                None,
+            );
+            lc.announce();
+            if let Some(emit) = lc.finish(crate::events::Outcome::Cancelled {}) {
+                // An abandoned entry settles too: it is no longer pending, and it was counted
+                // into the enumerated total when listing produced it. Not counting it here
+                // would leave `entries_settled()` permanently short of `EntryTotal::Final` on
+                // every cancelled run.
+                self.inner.ctx.metrics.record_entry_settled();
+                out.push(emit);
+            }
+        }
+    }
+
+    /// Claim one child's terminal emit. Safe under the state guard -- claiming
+    /// does not send. The caller sends once the guard is released.
+    ///
+    /// The settled-entry count rides the claim rather than the caller: `finish` yields
+    /// `Some` for exactly one caller per entry, so counting here is exactly-once on every
+    /// terminal path for free. Counting at the call sites instead would need the same
+    /// guarantee rebuilt at each, and a new terminal path would silently not count.
+    fn claim_child_finish(
+        &self,
+        child_id: TransferId,
+        outcome: crate::events::Outcome,
+    ) -> Option<crate::events::PendingEmit> {
+        let lc = self.inner.child_lifecycles.lock().remove(&child_id);
+        let emit = lc.and_then(|lc| lc.finish(outcome));
+        if emit.is_some() {
+            self.inner.ctx.metrics.record_entry_settled();
+        }
+        emit
+    }
+
+    /// Discharge every outstanding obligation and release the sink.
+    ///
+    /// Reachable from both `check_terminal` branches and from `on_terminal` on the
+    /// cancel/panic paths. The `owes_finish` swap makes that safe: the first caller
+    /// wins and the rest are no-ops.
+    ///
+    /// The root's terminal is the only place that can discharge children which were
+    /// announced but never reaped -- under `Abort` those children are cancelled with
+    /// their handles dropped, so no reap runs and their `Settled` would otherwise
+    /// never be emitted. Releasing the sink clones is what lets the stream end.
+    ///
+    /// Emits are pushed onto `out` rather than sent, and the root's goes last, so a
+    /// caller that reaped children in the same pass publishes them before the root.
+    ///
+    /// **Every caller must hold the state guard.** All three do today, and the `&State`
+    /// parameter is the reminder rather than the enforcement. A caller that takes the root
+    /// without it reopens the claim-to-announce window: `claim_one` captures the child sink in
+    /// the same critical section that drains `pending_entries`, so holding the guard here is what
+    /// orders the two. Drop it and an entry can be off `pending_entries`, not yet in
+    /// `child_lifecycles`, and have no sink -- reachable by neither sweep, and its event is lost
+    /// while every test still passes, because the counts stay exact and only the stream is short.
+    fn finish_root(
+        &self,
+        state: &State,
+        outcome: crate::events::Outcome,
+        out: &mut Vec<crate::events::PendingEmit>,
+    ) {
+        // Take the root FIRST. `announce_child` holds the `lifecycle` guard across its
+        // check and its insert, so taking it here either blocks until that insert is
+        // visible to the drain below, or wins and makes the next `announce_child` see
+        // `None` and announce nothing. Draining first would let a concurrent announce
+        // insert into a map nothing reads again — see the interleaving on `announce_child`.
+        let root = self.inner.lifecycle.lock().take();
+        let orphans: Vec<_> = self.inner.child_lifecycles.lock().drain().collect();
+        for (child_id, lc) in orphans {
+            // Derived from the child's own handle rather than assumed. Under `Abort`
+            // a child can have already succeeded and be awaiting a reap that will
+            // now never run; reporting it `Cancelled` would tell a consumer to
+            // discard a file that is complete on disk.
+            let child_outcome = match state.children.get(&child_id) {
+                Some(child) => match child.handle.status() {
+                    crate::types::TransferStatus::Completed => crate::events::Outcome::Succeeded {},
+                    crate::types::TransferStatus::Failed => crate::events::Outcome::Failed {
+                        error: Error::new(
+                            ErrorKind::ChildOperationFailed,
+                            format!("download of {} failed", child.key),
+                        ),
+                    },
+                    _ => crate::events::Outcome::Cancelled {},
+                },
+                None => crate::events::Outcome::Cancelled {},
+            };
+            if let Some(emit) = lc.finish(child_outcome) {
+                // An orphan discharged here settles like any other entry. Under `Abort` this
+                // is the only site that ever settles it, so omitting the count would leave
+                // `entries_settled()` short by every cancelled child.
+                self.inner.ctx.metrics.record_entry_settled();
+                out.push(emit);
+            }
+        }
+        if let Some(lc) = root {
+            // Deliberately not counted: the root is the operation, not one of the entries it
+            // enumerated. Counting it would put `entries_settled()` one above
+            // `EntryTotal::Final` at the end of every run.
+            if let Some(emit) = lc.finish(outcome) {
+                out.push(emit);
+            }
         }
     }
     pub(crate) fn ctx(&self) -> &TransferContext {
@@ -337,7 +648,19 @@ impl DownloadObjectsTransfer {
     /// turns and done children are retired as they appear rather than
     /// accumulating. Walk and spawn are skipped when inactive, so cancel/fail
     /// stops new work while in-flight drains.
+    /// Wraps `poll_work_inner` so every return path publishes through one point.
+    /// Claiming an emit is safe under the state guard; sending is not, and
+    /// `poll_work_inner` returns with the guard live on several paths.
     pub(crate) fn poll_work(&self) -> PollWork {
+        let mut emits = Vec::new();
+        let work = self.poll_work_inner(&mut emits);
+        for emit in emits {
+            emit.send();
+        }
+        work
+    }
+
+    fn poll_work_inner(&self, emits: &mut Vec<crate::events::PendingEmit>) -> PollWork {
         let mut state = self.inner.state.lock();
 
         // 1: Walk (refill). `dispatch_walk` gates on the low-water mark, so it
@@ -362,11 +685,11 @@ impl DownloadObjectsTransfer {
         let mut attempted = false;
         let mut materialized = false;
         if self.inner.ctx.is_active() {
-            let (to_spawn, reservation) = self.claim_one(&mut state);
+            let (to_spawn, reservation, batch_sink) = self.claim_one(&mut state);
             if !to_spawn.is_empty() {
                 attempted = true;
                 drop(state);
-                let spawned = self.spawn_children(to_spawn);
+                let spawned = self.spawn_children(to_spawn, batch_sink);
                 state = self.inner.state.lock();
                 materialized = self.merge_spawned(&mut state, spawned, reservation) > 0;
             }
@@ -394,7 +717,7 @@ impl DownloadObjectsTransfer {
         if attempted {
             return PollWork::Spawned;
         }
-        if let Some(result) = self.check_terminal(&state) {
+        if let Some(result) = self.check_terminal(&mut state, emits) {
             return result;
         }
         self.inner.ctx.set_pending();
@@ -446,7 +769,20 @@ impl DownloadObjectsTransfer {
     ///
     /// Gates on the *in-flight budget*: active children plus reserved, against
     /// `pipeline_depth`. Returns an empty Vec when nothing can be claimed.
-    fn claim_one(&self, state: &mut State) -> (Vec<Object>, Reservation) {
+    ///
+    /// The third element is the child sink, taken here rather than in `spawn_children` so the
+    /// claim and the capture are one critical section. The caller drops the state guard between
+    /// the two, and `on_terminal` needs that guard to sweep — so capturing later leaves a window
+    /// where the entry is off `pending_entries` with its sink already gone. `state -> lifecycle`
+    /// is the order `record_abandoned_entries` already takes; nothing takes the reverse.
+    fn claim_one(
+        &self,
+        state: &mut State,
+    ) -> (
+        Vec<Object>,
+        Reservation,
+        Option<crate::events::TransferEventSink>,
+    ) {
         let active = state
             .children
             .values()
@@ -465,12 +801,33 @@ impl DownloadObjectsTransfer {
             count: batch.len(),
             consumed: false,
         };
-        (batch, reservation)
+        // Only when something was claimed: an empty batch has nothing to announce, and a held sink
+        // keeps the stream from ending. The clone itself is one `Arc` refcount bump --
+        // `TransferEventSink` is `Arc<[Outlet]>` -- so it is the *lifetime* that costs, not the
+        // copy. Discarded unread whenever the root survives the batch, which is the common path.
+        let batch_sink = (!batch.is_empty())
+            .then(|| {
+                self.inner
+                    .lifecycle
+                    .lock()
+                    .as_ref()
+                    .map(|root| root.child_sink())
+            })
+            .flatten();
+        (batch, reservation, batch_sink)
     }
 
-    fn spawn_children(&self, entries: Vec<Object>) -> Vec<(Object, Result<ChildTransfer, Error>)> {
+    /// `batch_sink` comes from `claim_one`, captured under the same state guard that removed
+    /// these entries from `pending_entries`. It is a parameter rather than a field because a
+    /// stored `TransferEventSink` is a live mpsc `Sender` and the stream ends only when the last
+    /// one drops; held for the transfer's lifetime it would hang a consumer that awaits its
+    /// collector after `join()`. Scoped to the batch, it drops with this function.
+    fn spawn_children(
+        &self,
+        entries: Vec<Object>,
+        batch_sink: Option<crate::events::TransferEventSink>,
+    ) -> Vec<(Object, Result<ChildTransfer, Error>)> {
         let handle = &self.inner.ctx.handle;
-        let parent_id = self.inner.ctx.id.id;
 
         tracing::trace!(
             target: crate::telemetry::TARGET_TRANSFER,
@@ -486,8 +843,20 @@ impl DownloadObjectsTransfer {
                     .key()
                     .expect("S3Walk yields objects with keys")
                     .to_string();
-                let result = self.spawn_single_child(handle, &key, parent_id);
-                (obj, result.map(|h| ChildTransfer { handle: h, key }))
+                // The listed size is this entry's byte denominator, and the listing is the
+                // only place it is known for an object that fails before its own GetObject
+                // returns. Negative is not representable in S3 and is clamped rather than
+                // trusted, matching `accumulate_listed`.
+                let listed_size = obj.size().map(|n| n.max(0) as u64);
+                let result = self.spawn_single_child(handle, &key, listed_size);
+                // Announced here rather than in `merge_spawned`: this is the only
+                // point in `poll_work` where the state guard is not held, and
+                // announcing is a send.
+                self.announce_child(&result, &key, batch_sink.as_ref());
+                (
+                    obj,
+                    result.map(|(handle, _dest)| ChildTransfer { handle, key }),
+                )
             })
             .collect()
     }
@@ -505,8 +874,8 @@ impl DownloadObjectsTransfer {
         &self,
         handle: &Arc<crate::client::Handle>,
         key: &str,
-        parent_id: u64,
-    ) -> Result<ManagedDownloadHandle, Error> {
+        listed_size: Option<u64>,
+    ) -> Result<(ManagedDownloadHandle, PathBuf), Error> {
         let dest_path = local_key_path(
             &self.inner.destination,
             key,
@@ -538,7 +907,7 @@ impl DownloadObjectsTransfer {
         }
 
         let input = DownloadInput::builder()
-            .bucket(&self.inner.bucket)
+            .bucket(&*self.inner.bucket)
             .key(key)
             .build()
             .expect("bucket and key are set");
@@ -564,12 +933,21 @@ impl DownloadObjectsTransfer {
         let inner = Download::orchestrate_with_sink(
             handle.clone(),
             input,
-            file,
-            0, // range_start
-            true,
-            Some(parent_id),
+            crate::operation::download::FileSink {
+                file,
+                object_range_start: 0,
+                owns_file: true,
+            },
+            Some(&self.inner.ctx),
+            // No sink for the child: the parent announces its own children, so
+            // registering one here would announce every child twice.
+            None,
+            listed_size,
         )?;
-        Ok(ManagedDownloadHandle::new(inner, temp_path, dest_path))
+        Ok((
+            ManagedDownloadHandle::new(inner, temp_path, dest_path.clone()),
+            dest_path,
+        ))
     }
 
     /// Merge results of child spawning back into state. Inserts each child into
@@ -601,24 +979,24 @@ impl DownloadObjectsTransfer {
                         .expect("S3Walk yields objects with keys")
                         .to_string();
                     let failed_input = DownloadInput::builder()
-                        .bucket(&self.inner.bucket)
+                        .bucket(&*self.inner.bucket)
                         .key(&key)
                         .build()
                         .unwrap();
+                    // Same shape as the spawn-failure site above: clone under `Abort`
+                    // only, push, then signal, so the root's `source()` is the
+                    // child's real error and no terminal path sees the abort before
+                    // the object is recorded.
+                    let root_cause = (self.inner.failure_policy == FailedTransferPolicy::Abort)
+                        .then(|| err.clone());
                     state.failed.push(FailedDownload {
                         input: failed_input,
                         error: err,
                     });
-                    if self.inner.failure_policy == FailedTransferPolicy::Abort {
-                        // TODO: the triggering child's error is preserved in
-                        // `state.failed` (reachable via
-                        // `Error::failed_downloads`), but the root error's
-                        // `source()` is only this string. Connecting the root
-                        // `source()` to the failing child's error needs a
-                        // shareable error (`Arc`) since `Error` is not `Clone`.
+                    if let Some(cause) = root_cause {
                         self.inner.ctx.set_failed_and_signal(Error::new(
                             ErrorKind::ChildOperationFailed,
-                            format!("download failed for key '{key}'"),
+                            cause,
                         ));
                     }
                 }
@@ -630,7 +1008,68 @@ impl DownloadObjectsTransfer {
         inserted
     }
 
-    fn check_terminal(&self, state: &State) -> Option<PollWork> {
+    /// Accumulate a just-listed batch into the enumerated byte and entry totals.
+    ///
+    /// Caller holds the `State` lock, and the caller extends `pending_entries` from this
+    /// same batch in this same critical section, which is what makes the entry count and the
+    /// entries that will actually be acted on the same set. The denominator counts what was
+    /// *listed*, so an object abandoned later still belongs in it — a bar that omitted those
+    /// could never reach its numerator once they were swept.
+    ///
+    /// **A keyless object is counted in neither total.** `Object::key()` is an `Option`, and
+    /// `record_abandoned_entries` skips an object without one — it cannot name a source, so
+    /// no event can be emitted for it and no child can be spawned. Counted, it would sit in
+    /// both denominators with nothing able to settle it: `entries_settled()` would stop one
+    /// short of `EntryTotal::Final` for the rest of the run, so a caller showing "N
+    /// remaining" would stick above zero on a transfer that had finished. Excluding it keeps
+    /// the entry total equal to the number of entries that can reach a terminal.
+    ///
+    /// `Object::size()` is an `Option<i64>` because the model allows absence, not because S3
+    /// produces it: a `ListObjectsV2` against a real bucket returns `Size: 0` for a folder
+    /// marker, never an absent size — checked against three console-shaped markers
+    /// (`dir/`, `dir/nested/`, `empty/`) in us-west-2, all `Size: 0`. An absent size therefore
+    /// does not identify a marker, which is why `is_folder_marker` reads the size and treats
+    /// absence as "not a marker".
+    /// Absence and the signed type both collapse to 0 rather than being skipped, so a size
+    /// the wire omits understates the byte total instead of corrupting it — a size is not
+    /// needed to settle an entry, where a key is.
+    fn accumulate_listed(&self, state: &mut State, batch: &[Object]) {
+        if state.total_sealed {
+            return;
+        }
+        let addressable = batch.iter().filter(|o| o.key().is_some());
+        let (bytes, entries) = addressable.fold((0u64, 0u64), |(bytes, entries), o| {
+            (bytes + o.size().unwrap_or(0).max(0) as u64, entries + 1)
+        });
+        self.inner.ctx.metrics.add_discovered(bytes, entries);
+    }
+
+    /// Seal the enumerated-byte total once listing is quiescent.
+    ///
+    /// Finality is walk quiescence, deliberately not the transfer's terminal signal: the
+    /// `Abort` reap arm signals immediately while the walker's drain loop can still be
+    /// flushing chunks, so a total published there would freeze below what those chunks
+    /// go on to produce — and a caller could see a "final" percentage decrease after
+    /// `join()` had already returned.
+    ///
+    /// Caller holds the `State` lock, so the seal and the last accumulation are in one
+    /// critical section. A cancelled run may never seal, which is the honest answer:
+    /// listing did not finish, so nobody knows the total.
+    fn maybe_seal_total(&self, state: &mut State) {
+        if !state.total_sealed && state.listing_complete && !state.walk_in_flight {
+            state.total_sealed = true;
+            self.inner.ctx.metrics.seal_total();
+        }
+    }
+
+    fn check_terminal(
+        &self,
+        state: &mut State,
+        out: &mut Vec<crate::events::PendingEmit>,
+    ) -> Option<PollWork> {
+        // Before any terminal decision: if listing has drained, the denominator is final.
+        self.maybe_seal_total(state);
+
         if !self.inner.ctx.is_active() {
             // Wait for all in-flight work to drain
             if state.children.is_empty()
@@ -645,7 +1084,11 @@ impl DownloadObjectsTransfer {
                     failed = state.failed.len(),
                     "download_objects terminal (cancelled/failed), signaling",
                 );
+                // Children are provably empty on this branch (the gate above), so
+                // only listed-but-unspawned entries can still be owed a Settled.
+                self.record_abandoned_entries(state, out);
                 self.inner.ctx.signal_terminal();
+                self.finish_root(state, crate::events::Outcome::Cancelled {}, out);
                 return Some(PollWork::Done);
             }
             return None;
@@ -671,6 +1114,7 @@ impl DownloadObjectsTransfer {
             // set_failed/set_cancelled, where completing would be wrong).
             self.inner.ctx.set_completed();
             self.inner.ctx.signal_terminal();
+            self.finish_root(state, crate::events::Outcome::Succeeded {}, out);
             return Some(PollWork::Done);
         }
 
@@ -752,10 +1196,15 @@ impl DownloadObjectsTransfer {
                 state.walk_in_flight = false;
                 // set_failed alone: check_terminal arbitrates the terminal signal once in-flight work (children/walks/reaps) drains.
                 self.inner.ctx.set_failed(err);
-                if self.check_terminal(&state).is_some() {
+                let mut emits = Vec::new();
+                let terminal = self.check_terminal(&mut state, &mut emits).is_some();
+                drop(state);
+                for emit in emits {
+                    emit.send();
+                }
+                if terminal {
                     return WorkOutcome::Success { data: None };
                 }
-                drop(state);
                 self.inner.ctx.try_wake();
                 return WorkOutcome::Success { data: None };
             }
@@ -773,10 +1222,19 @@ impl DownloadObjectsTransfer {
         loop {
             match walk.next().await {
                 Some(Ok(obj)) => {
+                    // Applied here rather than as a walker filter, and so it holds for a
+                    // caller-supplied walker too. `S3Walker::filter` replaces nothing and means
+                    // only what it says; a caller narrowing to `*.parquet` cannot re-admit markers
+                    // by accident. Not counted either: `accumulate_listed` runs on `chunk`, so a
+                    // marker never enters `EntryTotal`.
+                    if is_folder_marker(&obj) {
+                        continue;
+                    }
                     chunk.push(obj);
                     discovered += 1;
                     if chunk.len() >= WALK_FLUSH_CHUNK {
                         let mut state = self.inner.state.lock();
+                        self.accumulate_listed(&mut state, &chunk);
                         state.pending_entries.extend(chunk.drain(..));
                         drop(state);
                         // Wake so a spawn poll runs against the just-published
@@ -827,8 +1285,14 @@ impl DownloadObjectsTransfer {
                 walk_done = walk.is_done(),
                 "download_objects walker advanced",
             );
+            self.accumulate_listed(&mut state, &chunk);
             state.pending_entries.extend(chunk.drain(..));
-            if !walk.is_done() {
+            if walk.is_done() {
+                // The one place enumeration is known to have *completed* rather than
+                // stopped. Reached only when `fatal_error` is `None`, so a walk that
+                // errored never sets this.
+                state.listing_complete = true;
+            } else {
                 state.walk = Some(walk);
             }
         }
@@ -836,12 +1300,19 @@ impl DownloadObjectsTransfer {
         // An execute callback that drains the last in-flight work owns the
         // terminal transition: check and signal here rather than deferring to
         // a subsequent poll_work.
-        if self.check_terminal(&state).is_some() {
+        let mut emits = Vec::new();
+        if self.check_terminal(&mut state, &mut emits).is_some() {
             drop(state);
+            for emit in emits {
+                emit.send();
+            }
             return WorkOutcome::Success { data: None };
         }
 
         drop(state);
+        for emit in emits {
+            emit.send();
+        }
         // Wake: new entries in pending_entries unblock poll_work from Pending.
         self.inner.ctx.try_wake();
         WorkOutcome::Success { data: None }
@@ -849,48 +1320,60 @@ impl DownloadObjectsTransfer {
 
     async fn execute_join_children(&self, mut batch: ReapingBatch) -> WorkOutcome {
         let children = batch.take_children();
+        let mut pending_emits: Vec<crate::events::PendingEmit> = Vec::new();
         for child in children {
             let key = child.key;
-            // Snapshot metrics before `join()` consumes the handle.
-            let metrics = child.handle.metrics();
-            match child.handle.join().await {
+            // The id must be captured before `join()` consumes the handle.
+            let child_id = child.handle.transfer_id();
+            let was_cancelled = child.handle.status() == crate::types::TransferStatus::Cancelled;
+            let result = child.handle.join().await;
+            // Claimed from the result rather than from the status: `join()` returns
+            // `Err` for a cancelled child too, and the two are not the same fact to
+            // a consumer deciding whether the file on disk is usable.
+            let outcome = match &result {
+                Ok(_) => crate::events::Outcome::Succeeded {},
+                Err(_) if was_cancelled => crate::events::Outcome::Cancelled {},
+                Err(e) => crate::events::Outcome::Failed { error: e.clone() },
+            };
+            pending_emits.extend(self.claim_child_finish(child_id, outcome));
+            match result {
                 Ok(_output) => {
                     let mut state = self.inner.state.lock();
                     state.successful_downloads += 1;
                     drop(state);
-                    // Aggregate the child's bytes into the parent's per-transfer
-                    // MetricsState directly (not via record_io on the child's
-                    // context, which already updated the client-level counters
-                    // during the child transfer) so DownloadObjectsOutput.metrics
-                    // reflects the whole directory download without double-counting.
-                    self.inner.ctx.metrics.record_io(&crate::metrics::IoSample {
-                        network_tx: metrics.network_tx,
-                        network_rx: metrics.network_rx,
-                        disk_read: metrics.disk_read,
-                        disk_write: metrics.disk_write,
-                    });
+                    // No byte fold here. The child's `MetricsState` carries a parent
+                    // link, so its bytes reached this transfer's counters as they
+                    // moved. Folding again at reap would count every byte twice.
                 }
                 Err(err) => {
                     let mut state = self.inner.state.lock();
                     let failed_input = DownloadInput::builder()
-                        .bucket(&self.inner.bucket)
+                        .bucket(&*self.inner.bucket)
                         .key(&key)
                         .build()
                         .unwrap();
+                    // Cloned before the move, and only under `Abort`, so the root
+                    // error's `source()` is the triggering child's own error rather
+                    // than a formatted string. Cloning is a refcount bump — `Error`
+                    // shares its source — which is what makes the same error
+                    // reportable to `join()` and recordable per object at once. The
+                    // key stays reachable two ways: `Display` for
+                    // `ChildOperationFailed` names the first failure, and
+                    // `failed_downloads()` carries each object's input beside its
+                    // own error.
+                    let root_cause = (self.inner.failure_policy == FailedTransferPolicy::Abort)
+                        .then(|| err.clone());
                     state.failed.push(FailedDownload {
                         input: failed_input,
                         error: err,
                     });
-                    if self.inner.failure_policy == FailedTransferPolicy::Abort {
-                        // TODO: the triggering child's error is preserved in
-                        // `state.failed` (reachable via
-                        // `Error::failed_downloads`), but the root error's
-                        // `source()` is only this string. Connecting the root
-                        // `source()` to the failing child's error needs a
-                        // shareable error (`Arc`) since `Error` is not `Clone`.
+                    // Signalled after the push, not before: this thread holds the
+                    // state guard, and a terminal path that reads `state.failed`
+                    // must not observe the abort with this object missing from it.
+                    if let Some(cause) = root_cause {
                         self.inner.ctx.set_failed_and_signal(Error::new(
                             ErrorKind::ChildOperationFailed,
-                            format!("download failed for key '{key}'"),
+                            cause,
                         ));
                     }
                 }
@@ -902,11 +1385,22 @@ impl DownloadObjectsTransfer {
         // An execute callback that drains the last in-flight work owns the
         // terminal transition: check and signal here rather than deferring to
         // a subsequent poll_work.
-        if self.check_terminal(&state).is_some() {
+        // `check_terminal` appends the root's emit to the same vector this reap
+        // filled, so the root is published after every child reaped in this pass.
+        if self
+            .check_terminal(&mut state, &mut pending_emits)
+            .is_some()
+        {
             drop(state);
+            for emit in pending_emits {
+                emit.send();
+            }
             return WorkOutcome::Success { data: None };
         }
         drop(state);
+        for emit in pending_emits {
+            emit.send();
+        }
         // Wake: freed pipeline capacity may unblock dispatch_walk or spawning.
         self.inner.ctx.try_wake();
         WorkOutcome::Success { data: None }
@@ -929,7 +1423,63 @@ impl Transfer for DownloadObjectsTransfer {
         Box::pin(self.execute(work))
     }
 
-    fn on_terminal(&self) {}
+    fn on_terminal(&self) {
+        // The terminal event, from the hook every removal path reaches: the
+        // scheduler's cancel path, its panic path, the `Done` arm, and
+        // `on_completion`. The `owes_finish` swap makes reaching it from more than
+        // one of those safe.
+        //
+        // The outcome is derived from the status rather than assumed: the panic path
+        // sets `Failed` first, and hardcoding `Cancelled` would report a panicked
+        // transfer as one the caller stopped.
+        let outcome = match self.inner.ctx.transfer_status() {
+            crate::types::TransferStatus::Completed => crate::events::Outcome::Succeeded {},
+            crate::types::TransferStatus::Failed => crate::events::Outcome::Failed {
+                error: self.inner.ctx.error().unwrap_or_else(|| {
+                    Error::new(ErrorKind::ChildOperationFailed, "download_objects failed")
+                }),
+            },
+            _ => crate::events::Outcome::Cancelled {},
+        };
+        let mut emits = Vec::new();
+        {
+            let mut state = self.inner.state.lock();
+            // Sweep before finishing the root, and here as well as in
+            // `check_terminal`: whichever terminal path fires first drains
+            // `pending_entries`, and the other finds it empty. This hook is the one
+            // that runs on the scheduler-driven cancel path, where no further
+            // `poll_work` re-enters `check_terminal` to sweep.
+            self.record_abandoned_entries(&mut state, &mut emits);
+            DownloadObjectsTransfer::finish_root(self, &state, outcome, &mut emits);
+        }
+        for emit in emits {
+            emit.send();
+        }
+    }
+}
+
+/// A 0-byte object whose key ends with `/`: a "folder marker", created by the S3 console to make
+/// an empty prefix visible.
+///
+/// Not downloadable, which is why this lives with the operation rather than on the walker. The
+/// derived local path for `sub/` is `<dest>/sub`, the directory `sub/b.bin` needs, so the write
+/// fails with `EISDIR` and the default [`FailedTransferPolicy::Abort`] takes the whole operation
+/// down. Which of the pair fails depends on listing order, so the failure is non-deterministic too.
+///
+/// Expressing it as a walker filter instead put it behind [`S3Walker::filter`], which *replaces*:
+/// any caller setting a predicate of their own silently dropped it and walked into that crash.
+///
+/// Both conditions are required. A `/`-terminated key *with* a body is a real object and is kept;
+/// only the empty ones are markers. `size()` is `Option<i64>` because the model allows absence, not
+/// because S3 omits it -- a real `ListObjectsV2` returns `Size: 0` for a marker -- so `unwrap_or(1)`
+/// treats an absent size as "not a marker" and keeps the object.
+///
+/// [`FailedTransferPolicy::Abort`]: crate::types::FailedTransferPolicy::Abort
+/// [`S3Walker::filter`]: crate::io::walk::S3WalkerBuilder::filter
+fn is_folder_marker(obj: &Object) -> bool {
+    let key_ends_with_delimiter = obj.key().unwrap_or("").ends_with('/');
+    let is_zero_byte = obj.size().unwrap_or(1) == 0;
+    key_ends_with_delimiter && is_zero_byte
 }
 
 fn strip_key_prefix<'a>(key: &'a str, prefix: Option<&str>, delimiter: Option<&str>) -> &'a str {
@@ -1082,8 +1632,236 @@ mod tests {
             .failure_policy(policy)
             .build()
             .unwrap();
-        let transfer = DownloadObjectsTransfer::new(ctx, &input, walk, 1000);
+        let transfer = DownloadObjectsTransfer::new(ctx, &input, walk, 1000, None);
         (transfer, completion_rx)
+    }
+
+    /// A non-empty claim must carry the child sink.
+    ///
+    /// The other half of the window's closure. `announce_child_still_emits_after_the_root_is_taken`
+    /// proves that *given* a sink the event survives the root being taken; this proves a sink is
+    /// always there to give. Without it, that test passes with the capture moved anywhere, because
+    /// it hand-builds the sink itself.
+    ///
+    /// The capture lives inside `claim_one` rather than at the call site because this function
+    /// borrows `&mut State` and so cannot release the caller's guard -- the drain and the capture
+    /// are one critical section by construction.
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn claim_one_captures_the_sink_under_the_state_guard() {
+        let dest = tempdir().unwrap();
+        let (transfer, _rx) = setup(dest.path(), FailedTransferPolicy::Abort, mock_s3_success());
+
+        let (sink, _stream) =
+            crate::events::channel(std::num::NonZeroUsize::new(4).expect("capacity > 0"));
+        let root = Arc::new(crate::events::TransferLifecycle::new(
+            sink,
+            transfer.inner.ctx.id.id,
+            None,
+            crate::events::TransferRef::download(
+                crate::events::Endpoint::S3 {
+                    bucket: Arc::from("test-bucket"),
+                    key: Arc::from("p/"),
+                },
+                crate::events::Endpoint::Local {
+                    path: Arc::from(dest.path()),
+                },
+            ),
+            None,
+        ));
+        *transfer.inner.lifecycle.lock() = Some(root);
+
+        // Scoped so the guard is released before `reservation` drops. An unconsumed `Reservation`
+        // with a non-zero count re-locks `state` in its `Drop` to give the slot back, so holding
+        // the guard across that drop deadlocks the test.
+        let (batch, reservation, batch_sink) = {
+            let mut state = transfer.inner.state.lock();
+
+            // Nothing pending: no entry to announce, so no sink should be held. A sink is a live
+            // mpsc `Sender` and one held for no reason keeps the stream from ending.
+            let (empty, empty_res, no_sink) = transfer.claim_one(&mut state);
+            assert!(empty.is_empty(), "nothing was pending");
+            assert!(
+                no_sink.is_none(),
+                "an empty claim must not hold a sink open"
+            );
+            // Count 0, so this `Drop` is a no-op and takes no lock.
+            drop(empty_res);
+
+            state.pending_entries.push_back(
+                aws_sdk_s3::types::Object::builder()
+                    .key("p/0000.bin")
+                    .size(1)
+                    .build(),
+            );
+            transfer.claim_one(&mut state)
+        };
+
+        assert_eq!(1, batch.len(), "one entry pending and the budget allows it");
+        assert!(
+            batch_sink.is_some(),
+            "a non-empty claim must carry the sink: this entry is now off `pending_entries`, so \
+             `record_abandoned_entries` cannot see it, and `announce_child` has only this sink \
+             left if the root is taken before it runs"
+        );
+        drop(reservation);
+    }
+
+    /// `announce_child` must still emit once the root has been taken.
+    ///
+    /// The interleaving is constructed rather than raced for. `on_terminal` reaches
+    /// `finish_root` without the `children_reserved == 0` gate that `check_terminal` has, so it
+    /// can take the root while a batch is between `claim_one` and `announce_child`. That entry is
+    /// off `pending_entries`, so `record_abandoned_entries` cannot see it, and it is not yet in
+    /// `child_lifecycles`, so the orphan drain cannot either. The batch-scoped sink is what keeps
+    /// it from vanishing.
+    ///
+    /// Racing for this under load reproduced at roughly 1 run in 5, which is not a test. Taking
+    /// the root by hand is the same window with none of the variance.
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn announce_child_still_emits_after_the_root_is_taken() {
+        let dest = tempdir().unwrap();
+        let (transfer, _rx) = setup(dest.path(), FailedTransferPolicy::Abort, mock_s3_success());
+
+        let (sink, mut stream) =
+            crate::events::channel(std::num::NonZeroUsize::new(16).expect("capacity > 0"));
+        let root = Arc::new(crate::events::TransferLifecycle::new(
+            sink,
+            transfer.inner.ctx.id.id,
+            None,
+            crate::events::TransferRef::download(
+                crate::events::Endpoint::S3 {
+                    bucket: Arc::from("test-bucket"),
+                    key: Arc::from("p/"),
+                },
+                crate::events::Endpoint::Local {
+                    path: Arc::from(dest.path()),
+                },
+            ),
+            None,
+        ));
+        *transfer.inner.lifecycle.lock() = Some(root);
+
+        // What the claim takes while it still holds the state guard. Hand-built here because this
+        // test covers the second half of the contract -- given a sink, the fallback emits after
+        // the root is taken. That a sink is always captured is the other half, and
+        // `claim_one_captures_the_sink_under_the_state_guard` covers it.
+        let batch_sink = transfer
+            .inner
+            .lifecycle
+            .lock()
+            .as_ref()
+            .map(|r| r.child_sink());
+        assert!(
+            batch_sink.is_some(),
+            "a sink was registered, so the batch has one"
+        );
+
+        // `on_terminal` beating this batch to the root.
+        let taken = transfer.inner.lifecycle.lock().take();
+        assert!(taken.is_some(), "the root was live until this point");
+        drop(taken);
+
+        let before = transfer.inner.ctx.metrics.entries_settled();
+        let err = Error::new(ErrorKind::ChildOperationFailed, "spawn failed");
+        transfer.announce_child(&Err(err), "p/0000.bin", batch_sink.as_ref());
+
+        assert_eq!(
+            before + 1,
+            transfer.inner.ctx.metrics.entries_settled(),
+            "the count is owed regardless of the event"
+        );
+
+        // Drop every sink so the stream can end, then read what the entry produced.
+        drop(batch_sink);
+        let mut decided = 0;
+        let mut settled = 0;
+        while let Some(ev) = stream.next().await {
+            match ev {
+                crate::events::TransferEvent::Decided { .. } => decided += 1,
+                crate::events::TransferEvent::Settled { .. } => settled += 1,
+            }
+        }
+        assert_eq!(
+            (1, 1),
+            (decided, settled),
+            "the entry must be announced and settled exactly once; (0, 0) is the lost event \
+             this window used to produce"
+        );
+    }
+
+    /// A child that *spawned successfully* into a taken root must settle, not be filed away.
+    ///
+    /// The `Ok` sibling of `announce_child_still_emits_after_the_root_is_taken`, which drives the
+    /// `Err` arm. Both arms choose between `child_lifecycles` and emitting directly, and the
+    /// choice is only correct while the root is live: `finish_root` has already drained that map,
+    /// so an entry inserted afterwards sits in a map nothing reads again and its consumer holds
+    /// per-entry state open forever.
+    ///
+    /// Without this, forcing the branch to always insert leaves every test in the workspace
+    /// green -- the counts stay exact and only the stream is short.
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn a_spawned_child_settles_when_the_root_is_already_taken() {
+        let dest = tempdir().unwrap();
+        let (transfer, _rx) = setup(dest.path(), FailedTransferPolicy::Abort, mock_s3_success());
+
+        let (sink, mut stream) =
+            crate::events::channel(std::num::NonZeroUsize::new(16).expect("capacity > 0"));
+        let root = Arc::new(crate::events::TransferLifecycle::new(
+            sink,
+            transfer.inner.ctx.id.id,
+            None,
+            crate::events::TransferRef::download(
+                crate::events::Endpoint::S3 {
+                    bucket: Arc::from("test-bucket"),
+                    key: Arc::from("p/"),
+                },
+                crate::events::Endpoint::Local {
+                    path: Arc::from(dest.path()),
+                },
+            ),
+            None,
+        ));
+        *transfer.inner.lifecycle.lock() = Some(root);
+
+        let batch_sink = transfer
+            .inner
+            .lifecycle
+            .lock()
+            .as_ref()
+            .map(|r| r.child_sink());
+
+        // A real spawn, so this exercises the `Ok` arm rather than the error one.
+        let spawned = transfer.spawn_single_child(&transfer.inner.ctx.handle, "p/0000.bin", None);
+        assert!(spawned.is_ok(), "the mock S3 client accepts this child");
+
+        // `on_terminal` reaching `finish_root` between the spawn and the announce.
+        drop(transfer.inner.lifecycle.lock().take());
+
+        transfer.announce_child(&spawned, "p/0000.bin", batch_sink.as_ref());
+
+        assert!(
+            transfer.inner.child_lifecycles.lock().is_empty(),
+            "the root is gone, so its orphan drain will never run again -- filing the entry \
+             here loses its terminal"
+        );
+
+        drop(batch_sink);
+        let mut decided = 0;
+        let mut settled = 0;
+        while let Some(ev) = stream.next().await {
+            match ev {
+                crate::events::TransferEvent::Decided { .. } => decided += 1,
+                crate::events::TransferEvent::Settled { .. } => settled += 1,
+            }
+        }
+        assert_eq!(
+            (1, 1),
+            (decided, settled),
+            "announced and settled exactly once; (1, 0) is the entry filed into a drained map"
+        );
     }
 
     async fn drive_transfer(transfer: &DownloadObjectsTransfer) {
@@ -1127,7 +1905,7 @@ mod tests {
             .failure_policy(policy)
             .build()
             .unwrap();
-        let transfer = DownloadObjectsTransfer::new(ctx, &input, walk, 1000);
+        let transfer = DownloadObjectsTransfer::new(ctx, &input, walk, 1000, None);
 
         handle
             .scheduler
@@ -1487,7 +2265,7 @@ mod tests {
             .failure_policy(FailedTransferPolicy::Continue)
             .build()
             .unwrap();
-        let transfer = DownloadObjectsTransfer::new(ctx, &input, walk, 1000);
+        let transfer = DownloadObjectsTransfer::new(ctx, &input, walk, 1000, None);
 
         timeout(Duration::from_secs(10), async {
             drive_transfer(&transfer).await;
@@ -2132,7 +2910,7 @@ mod tests {
             .failure_policy(FailedTransferPolicy::Continue)
             .build()
             .unwrap();
-        let transfer = DownloadObjectsTransfer::new(ctx, &input, walk, max_concurrent);
+        let transfer = DownloadObjectsTransfer::new(ctx, &input, walk, max_concurrent, None);
 
         let mut max_observed: usize = 0;
 

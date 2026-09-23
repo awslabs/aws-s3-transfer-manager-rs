@@ -17,8 +17,12 @@ use std::time::Duration;
 
 use aws_sdk_s3_transfer_manager::io::walk::S3Walker;
 use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
-use aws_sdk_s3_transfer_manager::types::{FailedTransferPolicy, RuntimeMode};
+use aws_sdk_s3_transfer_manager::types::{
+    ByteTotal, EntryTotal, FailedTransferPolicy, RuntimeMode,
+};
 use s3_mock_server::{FaultType, Occurrence, S3MockServer};
+
+use aws_sdk_s3_transfer_manager::events::{Decision, Endpoint, Outcome, TransferEvent};
 
 use crate::harness::mock_tm;
 use tokio::time::timeout;
@@ -476,6 +480,69 @@ async fn test_download_objects_abort_terminates() {
     .expect("test_download_objects_abort_terminates timed out");
 }
 
+/// Under `Abort`, the error `join()` returns must reach the child's real cause.
+///
+/// `Error` is `Clone`, so the abort path carries the triggering child's error itself rather
+/// than a formatted string, and the root's `source()` chain reaches the real cause.
+///
+/// What this rules out: a caller whose bulk download aborts runs `DisplayErrorContext` over what
+/// `join()` gave back, and the chain dead-ends at `"download failed for key 'k'"` — the status
+/// code, the request id and the service message all unreachable, so the one thing needed to tell a
+/// 503 from a 403 is missing from the only error the caller was handed.
+///
+/// Asserted structurally rather than on message text: the root's immediate `source()` must
+/// downcast to the library's own [`Error`], which a `String` source cannot do.
+#[tokio::test]
+async fn test_download_objects_abort_error_reaches_the_child_cause() {
+    use std::error::Error as _;
+
+    timeout(TEST_TIMEOUT, async {
+        let m = mock_tm(RuntimeMode::Managed).await;
+
+        let count = 8usize;
+        let size = 1024usize;
+        let bucket = "test-bucket";
+        let prefix = "abort-cause/";
+        seed_bucket(&m.server, bucket, prefix, count, size).await;
+
+        m.server.insert_fault(
+            bucket,
+            &format!("{prefix}0000.bin"),
+            FaultType::ServiceError { status: 503 },
+            0,
+            Occurrence::Always,
+        );
+
+        let dest = tempfile::tempdir().expect("tempdir");
+        let err = m
+            .client
+            .download_objects()
+            .bucket(bucket)
+            .destination(dest.path())
+            .key_prefix(prefix)
+            .failure_policy(FailedTransferPolicy::Abort)
+            .initiate()
+            .expect("initiate")
+            .join()
+            .await
+            .expect_err("a faulted key under Abort must fail the operation");
+
+        let source = err.source().expect("the root error owes a source");
+        let child = source
+            .downcast_ref::<aws_sdk_s3_transfer_manager::error::Error>()
+            .unwrap_or_else(|| panic!("root source must be the child's own Error, got: {source}"));
+        // And the child's own chain continues past it, which is where the status code lives.
+        assert!(
+            child.source().is_some(),
+            "the child error must keep its own source: {child}"
+        );
+
+        m.handle.shutdown().await.expect("shutdown");
+    })
+    .await
+    .expect("test_download_objects_abort_error_reaches_the_child_cause timed out");
+}
+
 // ---------------------------------------------------------------------------
 // DOWNLOAD-SPECIFIC TESTS
 // ---------------------------------------------------------------------------
@@ -763,4 +830,1669 @@ async fn test_upload_then_download_objects_roundtrip_mock_gp() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_upload_then_download_objects_roundtrip_tokio_mt() {
     test_upload_then_download_objects_roundtrip(RuntimeMode::MultiThreadTokio).await;
+}
+
+// ---------------------------------------------------------------------------
+// Lifecycle events for `download_objects`.
+//
+// The download side is where the event's byte count is easiest to get wrong.
+// `TransferMetrics` carries four counters and a download populates `network_rx`,
+// not `network_tx` — so an emit copy-pasted from `upload_objects` compiles, runs,
+// and reports every object as having transferred zero bytes. The byte assertions
+// below are the regression guard for exactly that.
+// ---------------------------------------------------------------------------
+
+/// One `Decided` per object plus the root, each finishing exactly once, with
+/// byte counts that match what was actually downloaded.
+#[tokio::test]
+async fn test_download_objects_events_pair_and_report_bytes() {
+    timeout(TEST_TIMEOUT, async {
+        let m = mock_tm(RuntimeMode::Managed).await;
+
+        let count = 12usize;
+        let size = 8 * ByteUnit::Kibibyte.as_bytes_usize();
+        let bucket = "test-bucket";
+        let prefix = "events/";
+        seed_bucket(&m.server, bucket, prefix, count, size).await;
+
+        let dest = tempfile::tempdir().expect("tempdir");
+        // 2 per transfer (Decided + Settled) plus the root's pair, so nothing
+        // is dropped for want of room and the counts below are exact.
+        let (sink, mut stream) = aws_sdk_s3_transfer_manager::events::channel(
+            std::num::NonZeroUsize::new(2 * (count + 1)).expect("capacity > 0"),
+        );
+
+        let handle = m
+            .client
+            .download_objects()
+            .bucket(bucket)
+            .destination(dest.path())
+            .key_prefix(prefix)
+            .events(sink)
+            .initiate()
+            .expect("initiate download_objects");
+
+        let collector = tokio::spawn(async move {
+            let mut evs = Vec::new();
+            while let Some(ev) = stream.next().await {
+                evs.push(ev);
+            }
+            (evs, stream.dropped())
+        });
+
+        let output = handle.join().await.expect("join download_objects");
+        assert_eq!(count as u64, output.objects_downloaded());
+        let (events, dropped) = collector.await.expect("collector");
+        assert_eq!(0, dropped, "capacity 2*(n+1) must lose nothing");
+
+        // Keyed by id, holding the destination each event named, so the two halves
+        // of a pair can be checked against each other.
+        let mut decided: HashMap<u64, PathBuf> = HashMap::new();
+        let mut settled: HashMap<u64, u64> = HashMap::new();
+        let mut root_id: Option<u64> = None;
+
+        for ev in &events {
+            let dest_path = match ev.transfer().destination() {
+                Endpoint::Local { path, .. } => path.to_path_buf(),
+                other => panic!("a download writes to a local file, got {other:?}"),
+            };
+            assert!(
+                matches!(ev.decision(), Decision::Transfer { .. }),
+                "every event of a download_objects run decides a transfer: {ev:?}"
+            );
+            match ev {
+                TransferEvent::Decided { id, parent, .. } => {
+                    assert!(
+                        decided.insert(*id, dest_path).is_none(),
+                        "id {id} announced twice"
+                    );
+                    if parent.is_none() {
+                        root_id = Some(*id);
+                    }
+                }
+                TransferEvent::Settled { id, outcome, .. } => {
+                    *settled.entry(*id).or_default() += 1;
+                    assert!(
+                        matches!(outcome, Outcome::Succeeded { .. }),
+                        "id {id} must succeed, got {outcome:?}"
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        assert_eq!(
+            count + 1,
+            decided.len(),
+            "one decision per object plus the root"
+        );
+        assert_eq!(
+            decided.len(),
+            settled.len(),
+            "every announced transfer must settle"
+        );
+        for (id, n) in &settled {
+            assert_eq!(1, *n, "id {id} settled {n} times, expected exactly once");
+        }
+
+        // The byte regression guard, read from the operation's own result rather
+        // than summed from the stream: delivery is lossy, so a stream-derived total
+        // is only ever a lower bound. A download populates `network_rx`; reading
+        // `network_tx` yields 0 here.
+        let expected = (count * size) as u64;
+        assert_eq!(
+            expected,
+            output.metrics().network_rx,
+            "the operation must report the whole directory's downloaded bytes"
+        );
+
+        // Each child names the file it wrote, inside the destination directory.
+        let root = root_id.expect("root was announced");
+        for (id, path) in &decided {
+            if *id == root {
+                assert_eq!(
+                    dest.path(),
+                    path.as_path(),
+                    "the root's destination is the destination directory"
+                );
+                continue;
+            }
+            assert!(
+                path.starts_with(dest.path()),
+                "child destination {path:?} must be inside {:?}",
+                dest.path()
+            );
+        }
+
+        m.handle.shutdown().await.expect("shutdown");
+    })
+    .await
+    .expect("test_download_objects_events_pair_and_report_bytes timed out");
+}
+
+/// The view handed out on `Decided` is what makes per-object progress readable, and it
+/// has to keep working after `join(self)` has consumed the operation handle.
+///
+/// This is the one assertion that exercises the pull half of the design end to end: the
+/// stream pushes lifecycle, the view is pulled for bytes. Without it the events carry an
+/// id and nothing a caller can read a numerator from, which is how the feature looked
+/// while every other test in this file was already green.
+///
+/// Read after `join()` on purpose. A view holding the `TransferContext` — or anything
+/// reaching the client `Handle` — would either fail to compile here or defer the runtime
+/// shutdown below; holding only the metrics `Arc` is what makes both fine.
+#[tokio::test]
+async fn test_download_objects_views_report_per_object_progress() {
+    timeout(TEST_TIMEOUT, async {
+        let m = mock_tm(RuntimeMode::Managed).await;
+
+        let count = 10usize;
+        let size = 8 * ByteUnit::Kibibyte.as_bytes_usize();
+        let bucket = "test-bucket";
+        let prefix = "views/";
+        seed_bucket(&m.server, bucket, prefix, count, size).await;
+
+        let dest = tempfile::tempdir().expect("tempdir");
+        let (sink, mut stream) = aws_sdk_s3_transfer_manager::events::channel(
+            std::num::NonZeroUsize::new(2 * (count + 1)).expect("capacity > 0"),
+        );
+
+        let handle = m
+            .client
+            .download_objects()
+            .bucket(bucket)
+            .destination(dest.path())
+            .key_prefix(prefix)
+            .events(sink)
+            .initiate()
+            .expect("initiate download_objects");
+
+        // Keep only the views, keyed by id and by whether the entry is the root. The
+        // events themselves are covered by the pairing test above.
+        let collector = tokio::spawn(async move {
+            let mut views = Vec::new();
+            while let Some(ev) = stream.next().await {
+                if let TransferEvent::Decided {
+                    id, parent, view, ..
+                } = ev
+                {
+                    views.push((id, parent, view));
+                }
+            }
+            views
+        });
+
+        let output = handle.join().await.expect("join download_objects");
+        let views = collector.await.expect("collector");
+
+        assert_eq!(
+            count + 1,
+            views.len(),
+            "one Decided per object plus the root"
+        );
+
+        let expected_total = (count * size) as u64;
+        let mut roots = 0;
+        let mut children = 0;
+        for (id, parent, view) in &views {
+            let view = view
+                .as_ref()
+                .unwrap_or_else(|| panic!("id {id} became a real transfer, so it owes a view"));
+            let metrics = view.metrics();
+            if parent.is_none() {
+                roots += 1;
+                assert_eq!(
+                    ByteTotal::Final(expected_total),
+                    view.byte_total(),
+                    "the root's denominator is sealed and covers every listed object"
+                );
+                assert_eq!(
+                    expected_total, metrics.network_rx,
+                    "the root's numerator reaches its denominator on a clean run"
+                );
+                // The same fact the joined output reports, from a handle the caller kept
+                // across the join rather than from the value join returned.
+                assert_eq!(
+                    output.metrics().network_rx,
+                    metrics.network_rx,
+                    "a view and the operation's own result must not disagree"
+                );
+            } else {
+                children += 1;
+                assert_eq!(
+                    ByteTotal::Final(size as u64),
+                    view.byte_total(),
+                    "a single-object download knows its length, so its total is final"
+                );
+                assert_eq!(
+                    size as u64, metrics.network_rx,
+                    "each child reports exactly the object it downloaded"
+                );
+            }
+            assert!(
+                metrics.finished_at.is_some(),
+                "id {id} settled before join returned, so its view reports terminal"
+            );
+        }
+        assert_eq!(1, roots, "exactly one entry has no parent");
+        assert_eq!(count, children, "every object announced a child view");
+
+        m.handle.shutdown().await.expect("shutdown");
+    })
+    .await
+    .expect("test_download_objects_views_report_per_object_progress timed out");
+}
+
+/// A bar drawn off the root view never walks backwards and never exceeds its denominator,
+/// and a failed object leaves it short by exactly the bytes that never moved.
+///
+/// This is what `examples/cp.rs --progress` renders, asserted rather than eyeballed. The
+/// root view is read at every child `Settled` — a real mid-flight moment, and one per
+/// object, so the sample count is fixed rather than dependent on a tick landing inside the
+/// transfer. A time-sampled version of this test would pass vacuously whenever the mock
+/// finished between ticks.
+///
+/// **The root's own counter does not reach its own denominator on a run with failures.**
+/// The denominator counts every object that was *listed*; the numerator counts bytes that
+/// actually moved. An object rejected with a 403 is refused before a single body byte
+/// arrives, so it contributes 0 of its 8 KiB and the root ends short — here at 14/16 of the
+/// payload. Bytes from a failure *mid-body* do count (that is what the parent rollup fixed,
+/// and what `progress_chaos.rs` pins), so the shortfall is exactly the payload that was
+/// never transferred and never more. That exactness is the assertion below, and it is what
+/// makes the shortfall reconstructible rather than merely absent.
+///
+/// A consumer that wants a bar reaching 100% adds the abandoned payload back, per child, as
+/// `byte_total() - network_rx` at its `Settled` — the AWS CLI's
+/// `ResultRecorder._record_failure_result` arithmetic. Not asserted here: this test pins the
+/// root counter's meaning, which is what that reconstruction depends on.
+#[tokio::test]
+async fn test_download_objects_bar_is_monotonic_and_short_by_what_never_moved() {
+    timeout(TEST_TIMEOUT, async {
+        let m = mock_tm(RuntimeMode::Managed).await;
+
+        let count = 16usize;
+        let size = 8 * ByteUnit::Kibibyte.as_bytes_usize();
+        let bucket = "test-bucket";
+        let prefix = "bar/";
+        seed_bucket(&m.server, bucket, prefix, count, size).await;
+
+        // 403 is non-retryable, so each doomed object fails on its first attempt and the
+        // run does not depend on the retry policy.
+        for doomed in ["0002.bin", "0011.bin"] {
+            m.server.insert_fault(
+                bucket,
+                &format!("{prefix}{doomed}"),
+                FaultType::ServiceError { status: 403 },
+                0,
+                Occurrence::Always,
+            );
+        }
+
+        let dest = tempfile::tempdir().expect("tempdir");
+        let (sink, mut stream) = aws_sdk_s3_transfer_manager::events::channel(
+            std::num::NonZeroUsize::new(2 * (count + 1)).expect("capacity > 0"),
+        );
+
+        let handle = m
+            .client
+            .download_objects()
+            .bucket(bucket)
+            .destination(dest.path())
+            .key_prefix(prefix)
+            .failure_policy(FailedTransferPolicy::Continue)
+            .events(sink)
+            .initiate()
+            .expect("initiate download_objects");
+
+        // The drawer, in the shape the example uses: hold the root's view, and read it
+        // whenever something happens. Bytes are pulled, never pushed — no event carries a
+        // count, which is why a lost event cannot corrupt the bar.
+        let collector = tokio::spawn(async move {
+            let mut root: Option<aws_sdk_s3_transfer_manager::types::TransferView> = None;
+            let mut samples: Vec<(u64, ByteTotal)> = Vec::new();
+            while let Some(ev) = stream.next().await {
+                match ev {
+                    TransferEvent::Decided {
+                        parent: None, view, ..
+                    } => root = view,
+                    TransferEvent::Settled {
+                        parent: Some(_), ..
+                    } => {
+                        if let Some(view) = &root {
+                            samples.push((view.metrics().network_rx, view.byte_total()));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            (root, samples)
+        });
+
+        let output = handle.join().await.expect("join download_objects");
+        let (root, samples) = collector.await.expect("collector");
+        let root = root.expect("the root announced itself with a view");
+
+        assert_eq!(
+            count,
+            samples.len(),
+            "one reading per settled object: {} readings for {count} objects",
+            samples.len()
+        );
+
+        // Monotonic: a bar that can decrease is worse than no bar, because a caller reads
+        // a decrease as data loss.
+        for pair in samples.windows(2) {
+            assert!(
+                pair[1].0 >= pair[0].0,
+                "the numerator must never decrease: {} then {}",
+                pair[0].0,
+                pair[1].0
+            );
+        }
+        // Never over 100% at any sample, and the denominator never shrinks once final.
+        for (done, total) in &samples {
+            if let ByteTotal::Final(n) = total {
+                assert!(
+                    done <= n,
+                    "a sample must not exceed its own denominator: {done} of {n}"
+                );
+            }
+        }
+
+        let listed = (count * size) as u64;
+        assert_eq!(
+            ByteTotal::Final(listed),
+            root.byte_total(),
+            "every listed object belongs in the denominator, including the failed ones"
+        );
+        assert_eq!(
+            (count - 2) as u64,
+            output.objects_downloaded(),
+            "two objects must actually have failed, or this test proves nothing"
+        );
+        // The shortfall is the whole of what the two rejected objects would have carried,
+        // to the byte. Less than this would mean a successful object's bytes went missing;
+        // more would mean a failed object's bytes were counted twice.
+        assert_eq!(
+            listed - 2 * size as u64,
+            root.metrics().network_rx,
+            "a 403 is refused before any body byte, so the bar ends short by exactly the \
+             payload that never moved"
+        );
+
+        m.handle.shutdown().await.expect("shutdown");
+    })
+    .await
+    .expect("test_download_objects_bar_is_monotonic_and_short_by_what_never_moved timed out");
+}
+
+/// The entry count reaches its total on a run with failures, which is the question bytes
+/// cannot answer.
+///
+/// This is the `N file(s) remaining` the AWS CLI prints on every progress line and the
+/// `transferredFiles` the SEP's directory snapshot marks Required. The byte bar on this same
+/// run ends at 14/16 of the payload, because two objects moved no bytes — so a consumer with
+/// only bytes cannot distinguish "finished with failures" from "still working". The count
+/// can: 16 of 16 settled, 2 of them unsuccessfully.
+///
+/// Both halves matter and both are asserted: the numerator counts endings rather than
+/// successes, and the denominator counts every object listed.
+#[tokio::test]
+async fn test_download_objects_entry_count_reaches_its_total_with_failures() {
+    timeout(TEST_TIMEOUT, async {
+        let m = mock_tm(RuntimeMode::Managed).await;
+
+        let count = 16usize;
+        let size = 8 * ByteUnit::Kibibyte.as_bytes_usize();
+        let bucket = "test-bucket";
+        let prefix = "entries/";
+        seed_bucket(&m.server, bucket, prefix, count, size).await;
+
+        for doomed in ["0002.bin", "0011.bin"] {
+            m.server.insert_fault(
+                bucket,
+                &format!("{prefix}{doomed}"),
+                FaultType::ServiceError { status: 403 },
+                0,
+                Occurrence::Always,
+            );
+        }
+
+        let dest = tempfile::tempdir().expect("tempdir");
+        let (sink, mut stream) = aws_sdk_s3_transfer_manager::events::channel(
+            std::num::NonZeroUsize::new(2 * (count + 1)).expect("capacity > 0"),
+        );
+
+        let handle = m
+            .client
+            .download_objects()
+            .bucket(bucket)
+            .destination(dest.path())
+            .key_prefix(prefix)
+            .failure_policy(FailedTransferPolicy::Continue)
+            .events(sink)
+            .initiate()
+            .expect("initiate download_objects");
+
+        let collector = tokio::spawn(async move {
+            let mut root = None;
+            let mut settled_events = 0usize;
+            while let Some(ev) = stream.next().await {
+                match ev {
+                    TransferEvent::Decided {
+                        parent: None, view, ..
+                    } => root = view,
+                    TransferEvent::Settled {
+                        parent: Some(_), ..
+                    } => settled_events += 1,
+                    _ => {}
+                }
+            }
+            (root, settled_events, stream.dropped())
+        });
+
+        let output = handle.join().await.expect("join download_objects");
+        let (root, settled_events, dropped) = collector.await.expect("collector");
+        let root = root.expect("the root announced itself with a view");
+
+        assert_eq!(
+            (count - 2) as u64,
+            output.objects_downloaded(),
+            "two objects must actually have failed, or this test proves nothing"
+        );
+
+        // The denominator: every object listed, including the two that failed.
+        assert_eq!(
+            EntryTotal::Final(count as u64),
+            root.entry_total(),
+            "the entry denominator counts what listing produced"
+        );
+        // The numerator: every ending, not every success. 14 succeeded and 2 failed, and all
+        // 16 are no longer pending — so "remaining" is 0 and a CLI stops printing work left.
+        assert_eq!(
+            count as u64,
+            root.entries_settled(),
+            "a failed entry has still settled; counting only successes would leave 2 \
+             objects 'remaining' forever on a finished transfer"
+        );
+
+        // The count is published on the view, not tallied from the stream, and this is why:
+        // the two agree here only because nothing was dropped. Under loss the view stays
+        // exact and the tally goes short.
+        assert_eq!(0, dropped, "capacity 2*(n+1) must lose nothing");
+        assert_eq!(
+            count, settled_events,
+            "with no loss the stream's terminal count matches the view's, which is the \
+             invariant that makes the view the authority when there is loss"
+        );
+
+        // And the contrast that motivates the whole item: bytes stop short on this same run.
+        assert_eq!(
+            ByteTotal::Final((count * size) as u64),
+            root.byte_total(),
+            "both denominators seal together"
+        );
+        assert_eq!(
+            ((count - 2) * size) as u64,
+            root.metrics().network_rx,
+            "the byte numerator is short by the two objects that moved nothing, which is \
+             exactly why the entry count is needed"
+        );
+
+        m.handle.shutdown().await.expect("shutdown");
+    })
+    .await
+    .expect("test_download_objects_entry_count_reaches_its_total_with_failures timed out");
+}
+
+/// The stream is sufficient: a caller gets callback-shaped reporting from it in one function.
+///
+/// This is the assertion behind a scope decision rather than a feature test. A callback module
+/// was built on top of the stream and then dropped, because the stream is the primitive the
+/// design settled on and a trait the library invokes is the shape it settled *against*. Dropping
+/// it is only defensible if the capability survives, and this is what says it does: everything
+/// needed (`channel`, `TransferView::metrics`/`byte_total`/`entry_total`/`entries_settled`) is
+/// `pub`, so this reimplements the surface from outside the crate with no crate-internal help.
+///
+/// What it costs a caller is this function — the measured price of not shipping the module, which
+/// is why the price is a test rather than an estimate.
+///
+/// Asserted: one terminal per initiation split by outcome, a byte reading that reaches the payload
+/// that actually moved, and an entry count that reaches its total despite failures.
+#[tokio::test]
+async fn test_download_objects_a_caller_can_rebuild_the_callbacks_from_the_stream() {
+    use aws_sdk_s3_transfer_manager::events::TryNextError;
+    use aws_sdk_s3_transfer_manager::types::TransferView;
+
+    timeout(TEST_TIMEOUT, async {
+        let m = mock_tm(RuntimeMode::Managed).await;
+
+        let count = 6usize;
+        let size = 4 * ByteUnit::Kibibyte.as_bytes_usize();
+        let bucket = "test-bucket";
+        let prefix = "rebuild/";
+        seed_bucket(&m.server, bucket, prefix, count, size).await;
+        for doomed in ["0001.bin", "0004.bin"] {
+            m.server.insert_fault(
+                bucket,
+                &format!("{prefix}{doomed}"),
+                FaultType::ServiceError { status: 403 },
+                0,
+                Occurrence::Always,
+            );
+        }
+
+        let (sink, mut stream) = aws_sdk_s3_transfer_manager::events::channel(
+            std::num::NonZeroUsize::new(2 * (count + 1)).expect("capacity > 0"),
+        );
+
+        let dest = tempfile::tempdir().expect("tempdir");
+        let handle = m
+            .client
+            .download_objects()
+            .bucket(bucket)
+            .destination(dest.path())
+            .key_prefix(prefix)
+            .failure_policy(FailedTransferPolicy::Continue)
+            .events(sink)
+            .initiate()
+            .expect("initiate download_objects");
+
+        let output = handle.join().await.expect("join download_objects");
+
+        // The caller's own dispatch loop: the `Decided` view is the pull handle, so the
+        // numbers come off it rather than out of an event.
+        let mut views: HashMap<u64, TransferView> = HashMap::new();
+        let (mut initiated, mut complete, mut failed, mut cancelled) = (0u64, 0u64, 0u64, 0u64);
+        let mut last_bytes = 0u64;
+        let mut files_done = 0u64;
+        let mut files_total = 0u64;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while initiated == 0 || complete + failed + cancelled < initiated {
+            if tokio::time::Instant::now() >= deadline {
+                panic!(
+                    "timed out: {initiated} initiated, {} terminal",
+                    complete + failed + cancelled
+                );
+            }
+            match stream.try_next() {
+                Ok(TransferEvent::Decided {
+                    id, decision, view, ..
+                }) => {
+                    if matches!(decision, Decision::Skip { .. }) {
+                        continue;
+                    }
+                    initiated += 1;
+                    if let Some(v) = view {
+                        views.insert(id, v);
+                    }
+                }
+                Ok(TransferEvent::Settled { id, outcome, .. }) => {
+                    if let Some(v) = views.remove(&id) {
+                        last_bytes = last_bytes.max(v.metrics().network_rx);
+                        files_done = files_done.max(v.entries_settled());
+                        if let EntryTotal::Final(n) = v.entry_total() {
+                            files_total = n;
+                        }
+                    }
+                    match outcome {
+                        Outcome::Succeeded { .. } => complete += 1,
+                        Outcome::Failed { .. } => failed += 1,
+                        _ => cancelled += 1,
+                    }
+                }
+                // Required here and absent from the in-crate sampler: `TransferEvent` is
+                // `#[non_exhaustive]`, which binds an external crate and does not apply inside
+                // the defining one. This arm is exactly the cost the attribute imposes on a
+                // caller who rebuilds this loop.
+                Ok(_) => continue,
+                Err(TryNextError::Empty) => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(_) => break,
+            }
+        }
+
+        assert_eq!(
+            (count - 2) as u64,
+            output.objects_downloaded(),
+            "two objects must have failed, or the failure count proves nothing"
+        );
+        assert_eq!(
+            (count + 1) as u64,
+            initiated,
+            "one initiation per entry plus the root"
+        );
+        assert_eq!(2, failed, "the two poisoned objects each report a failure");
+        assert_eq!(
+            initiated,
+            complete + failed + cancelled,
+            "every initiated entry gets exactly one terminal: {complete} ok + {failed} failed \
+             + {cancelled} cancelled against {initiated} initiated"
+        );
+        assert_eq!(
+            ((count - 2) * size) as u64,
+            last_bytes,
+            "the byte reading reaches the payload that actually moved"
+        );
+        assert_eq!(
+            count as u64, files_total,
+            "total_files is every object listed"
+        );
+        assert_eq!(
+            count as u64, files_done,
+            "the entry count reaches its total despite two failures"
+        );
+
+        m.handle.shutdown().await.expect("shutdown");
+    })
+    .await
+    .expect("test_download_objects_a_caller_can_rebuild_the_callbacks_from_the_stream timed out");
+}
+
+/// A client-level sink and a request-level sink both receive every event, and a second
+/// `.events()` call adds a consumer instead of replacing the first.
+///
+/// This is the other half of the SEP's *"a list of progress listeners on both client level
+/// and request level"* — which the conformance matrix recorded as unmet in both directions. The
+/// request half was one `Option<TransferEventSink>` where a second call silently dropped the
+/// first; the client half did not exist at all.
+///
+/// The property that matters is independence. Each consumer has its own channel, capacity and
+/// `dropped` count, so the failure mode this rules out is one observer's slowness costing
+/// another observer's events — a metrics exporter that stops draining must not blind the
+/// progress bar.
+#[tokio::test]
+async fn test_download_objects_client_and_request_sinks_both_receive_everything() {
+    timeout(TEST_TIMEOUT, async {
+        let count = 8usize;
+        let size = 4 * ByteUnit::Kibibyte.as_bytes_usize();
+        let bucket = "test-bucket";
+        let prefix = "bothlevels/";
+
+        // Three independent consumers: one on the client, two on the request.
+        let cap = std::num::NonZeroUsize::new(4 * (count + 1)).expect("capacity > 0");
+        let (client_sink, client_stream) = aws_sdk_s3_transfer_manager::events::channel(cap);
+        let (req_sink_a, req_stream_a) = aws_sdk_s3_transfer_manager::events::channel(cap);
+        let (req_sink_b, req_stream_b) = aws_sdk_s3_transfer_manager::events::channel(cap);
+
+        let m =
+            crate::harness::mock_tm_with(RuntimeMode::Managed, |cfg| cfg.events(client_sink)).await;
+        seed_bucket(&m.server, bucket, prefix, count, size).await;
+
+        let dest = tempfile::tempdir().expect("tempdir");
+        let handle = m
+            .client
+            .download_objects()
+            .bucket(bucket)
+            .destination(dest.path())
+            .key_prefix(prefix)
+            // Twice on purpose: the second must add, not replace.
+            .events(req_sink_a)
+            .events(req_sink_b)
+            .initiate()
+            .expect("initiate download_objects");
+
+        // Polled to a deadline rather than awaiting termination, because the two levels
+        // terminate differently and one of them does not terminate at all while the client is
+        // alive: the client-level sink lives in `Config`, so its stream stays open for more
+        // operations. A request-level stream ends when its operation does. Draining both the
+        // same way is what makes the assertion below about *delivery* rather than about
+        // lifetime.
+        let expected = count + 1;
+        let drain = |mut s: aws_sdk_s3_transfer_manager::events::TransferEventStream| {
+            tokio::spawn(async move {
+                let mut decided = 0usize;
+                let mut settled = 0usize;
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+                while (decided < expected || settled < expected)
+                    && tokio::time::Instant::now() < deadline
+                {
+                    match s.try_next() {
+                        Ok(TransferEvent::Decided { .. }) => decided += 1,
+                        Ok(TransferEvent::Settled { .. }) => settled += 1,
+                        Ok(_) => {}
+                        Err(aws_sdk_s3_transfer_manager::events::TryNextError::Empty) => {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                        // Every sink gone: nothing more is coming, so stop rather than spin.
+                        Err(_) => break,
+                    }
+                }
+                (decided, settled, s.dropped())
+            })
+        };
+        let c = drain(client_stream);
+        let a = drain(req_stream_a);
+        let b = drain(req_stream_b);
+
+        let output = handle.join().await.expect("join download_objects");
+        let (c, a, b) = (
+            c.await.expect("client drain"),
+            a.await.expect("req a drain"),
+            b.await.expect("req b drain"),
+        );
+
+        assert_eq!(
+            count as u64,
+            output.objects_downloaded(),
+            "all must download"
+        );
+
+        // Root plus every child, on every one of the three consumers.
+        for (name, (decided, settled, dropped)) in [
+            ("client-level", c),
+            ("request-level A", a),
+            ("request-level B", b),
+        ] {
+            assert_eq!(
+                0, dropped,
+                "{name}: capacity was ample, so nothing should be lost"
+            );
+            assert_eq!(
+                expected, decided,
+                "{name} must see one Decided per entry plus the root"
+            );
+            assert_eq!(
+                expected, settled,
+                "{name} must see one Settled per entry plus the root"
+            );
+        }
+
+        m.handle.shutdown().await.expect("shutdown");
+    })
+    .await
+    .expect("test_download_objects_client_and_request_sinks_both_receive_everything timed out");
+}
+
+/// The download directory's input-builder entry point reports events.
+///
+/// The fourth and last of the `initiate_with` family. Each built a fresh fluent builder and
+/// copied only the input across, so a sink could not reach any of them — not dropped, but
+/// structurally absent, which is why no compiler error marked it. `initiate_with_events` is the
+/// form that carries one, and this asserts the composite announces its root and every child
+/// through it.
+#[tokio::test]
+async fn test_download_objects_reports_events_via_the_input_builder() {
+    timeout(TEST_TIMEOUT, async {
+        let m = mock_tm(RuntimeMode::Managed).await;
+
+        let count = 8usize;
+        let size = 4 * ByteUnit::Kibibyte.as_bytes_usize();
+        let bucket = "test-bucket";
+        let prefix = "viabuilder/";
+        seed_bucket(&m.server, bucket, prefix, count, size).await;
+
+        let dest = tempfile::tempdir().expect("tempdir");
+        let (sink, mut stream) = aws_sdk_s3_transfer_manager::events::channel(
+            std::num::NonZeroUsize::new(2 * (count + 1)).expect("capacity > 0"),
+        );
+
+        let handle = aws_sdk_s3_transfer_manager::operation::download_objects::DownloadObjectsInputBuilder::default()
+            .bucket(bucket)
+            .destination(dest.path())
+            .key_prefix(prefix)
+            .initiate_with_events(&m.client, sink)
+            .expect("initiate_with_events");
+
+        let collector = tokio::spawn(async move {
+            let mut root = None;
+            let mut children = 0usize;
+            while let Some(ev) = stream.next().await {
+                match ev {
+                    TransferEvent::Decided {
+                        parent: None, view, ..
+                    } => root = view,
+                    TransferEvent::Settled {
+                        parent: Some(_), ..
+                    } => children += 1,
+                    _ => {}
+                }
+            }
+            (root, children)
+        });
+
+        let output = handle.join().await.expect("join download_objects");
+        let (root, children) = collector.await.expect("collector");
+
+        assert_eq!(count as u64, output.objects_downloaded(), "all must download");
+        let root = root.expect(
+            "the input-builder entry point must announce the root with a view; `None` here is \
+             the sink being discarded",
+        );
+        assert_eq!(count, children, "one terminal per object");
+        assert_eq!(
+            EntryTotal::Final(count as u64),
+            root.entry_total(),
+            "listing finished, so the entry count is final"
+        );
+        assert_eq!(
+            count as u64,
+            root.entries_settled(),
+            "and every entry settled"
+        );
+
+        m.handle.shutdown().await.expect("shutdown");
+    })
+    .await
+    .expect("test_download_objects_reports_events_via_the_input_builder timed out");
+}
+
+/// A consumer reaches exactly 100% on a run with failures by banking each failed entry's
+/// shortfall, which is what the AWS CLI does and what the design claims is possible.
+///
+/// The root's byte numerator stops short by whatever never moved — asserted next door in
+/// `test_download_objects_bar_is_monotonic_and_short_by_what_never_moved`. The CLI's answer is
+/// `_record_failure_result`, which computes `progress_left = total_file_size - total_progress`
+/// into `bytes_failed_to_transfer` and renders `transferred + failed` over the total. This test
+/// is that arithmetic, run against the per-entry views the stream hands out.
+///
+/// It depends entirely on a *failed* entry having a byte denominator. Before the listed size
+/// was seeded into the child at spawn, a download child learned `total_bytes` only from its own
+/// `GetObject` response, so an object refused with a 403 reported `ByteTotal::Unknown` and the
+/// shortfall was not computable — the design's recipe named a number the surface never
+/// published. That is the regression this pins, and the first assertion below is the one that
+/// fails without the seed.
+#[tokio::test]
+async fn test_download_objects_a_consumer_reaches_full_progress_by_banking_failed_bytes() {
+    timeout(TEST_TIMEOUT, async {
+        let m = mock_tm(RuntimeMode::Managed).await;
+
+        let count = 16usize;
+        let size = 8 * ByteUnit::Kibibyte.as_bytes_usize();
+        let bucket = "test-bucket";
+        let prefix = "banked/";
+        seed_bucket(&m.server, bucket, prefix, count, size).await;
+
+        for doomed in ["0002.bin", "0011.bin"] {
+            m.server.insert_fault(
+                bucket,
+                &format!("{prefix}{doomed}"),
+                FaultType::ServiceError { status: 403 },
+                0,
+                Occurrence::Always,
+            );
+        }
+
+        let dest = tempfile::tempdir().expect("tempdir");
+        let (sink, mut stream) = aws_sdk_s3_transfer_manager::events::channel(
+            std::num::NonZeroUsize::new(2 * (count + 1)).expect("capacity > 0"),
+        );
+
+        let handle = m
+            .client
+            .download_objects()
+            .bucket(bucket)
+            .destination(dest.path())
+            .key_prefix(prefix)
+            .failure_policy(FailedTransferPolicy::Continue)
+            .events(sink)
+            .initiate()
+            .expect("initiate download_objects");
+
+        // The consumer the design describes: a per-entry map keyed on id, populated from
+        // `Decided` and read on `Settled`. Exactly the map a CLI already keeps for its
+        // per-file output lines, so the arithmetic costs it no extra state.
+        let collector = tokio::spawn(async move {
+            let mut live: HashMap<u64, aws_sdk_s3_transfer_manager::types::TransferView> =
+                HashMap::new();
+            let mut root = None;
+            // (denominator, moved) read at the instant the entry settled.
+            let mut at_settle: Vec<(ByteTotal, u64)> = Vec::new();
+            // The same views, retained past the terminal, to re-read after join.
+            let mut retained = Vec::new();
+
+            while let Some(ev) = stream.next().await {
+                match ev {
+                    TransferEvent::Decided {
+                        id, parent, view, ..
+                    } => match parent {
+                        None => root = view,
+                        Some(_) => {
+                            if let Some(v) = view {
+                                live.insert(id, v);
+                            }
+                        }
+                    },
+                    TransferEvent::Settled {
+                        id,
+                        parent: Some(_),
+                        ..
+                    } => {
+                        if let Some(v) = live.remove(&id) {
+                            at_settle.push((v.byte_total(), v.metrics().network_rx));
+                            retained.push(v);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            (root, at_settle, retained, live)
+        });
+
+        let output = handle.join().await.expect("join download_objects");
+        let (root, at_settle, retained, leftover) = collector.await.expect("collector");
+        let root = root.expect("the root announced itself with a view");
+
+        assert_eq!(
+            (count - 2) as u64,
+            output.objects_downloaded(),
+            "two objects must actually have failed, or this test proves nothing"
+        );
+        assert!(
+            leftover.is_empty(),
+            "every announced entry settled, so the consumer's map drains to empty: {} left",
+            leftover.len()
+        );
+        assert_eq!(
+            count,
+            at_settle.len(),
+            "one reading per entry: {} readings for {count} entries",
+            at_settle.len()
+        );
+
+        // THE assertion. Every entry knows its own size at its terminal, including the two
+        // that moved nothing — which is only true because the listing seeded it.
+        //
+        // Which of the two states it is in is itself the contract. An entry that reached
+        // discovery published its real size and reads `Final`; one refused before its
+        // `GetObject` returned has only the listing's estimate and reads `Provisional`. Both
+        // carry the number, which is what the banking below needs; the state is what tells a
+        // consumer whether the object was ever actually opened.
+        let mut provisional = 0usize;
+        for (i, (total, _)) in at_settle.iter().enumerate() {
+            match total {
+                ByteTotal::Final(n) | ByteTotal::Provisional(n) => assert_eq!(
+                    size as u64, *n,
+                    "entry {i} reported the wrong size for itself"
+                ),
+                ByteTotal::Unknown => panic!(
+                    "entry {i} settled with no byte denominator, so its shortfall cannot be \
+                     computed and a consumer cannot reach 100%"
+                ),
+                _ => panic!("entry {i}: unexpected ByteTotal state"),
+            }
+            if matches!(total, ByteTotal::Provisional(_)) {
+                provisional += 1;
+            }
+        }
+        assert_eq!(
+            2, provisional,
+            "exactly the two refused objects never reached discovery, so exactly two \
+             denominators stay provisional"
+        );
+
+        // The CLI's arithmetic: transferred + failed == total.
+        //
+        // `saturating_sub`, not `-`: a `Provisional` denominator is the listing's estimate, and
+        // an object overwritten larger between the listing page and its own GetObject can move
+        // more than the estimate admits. That is the one case where the shortfall is negative,
+        // and it must clamp rather than wrap a `u64`.
+        let mut transferred = 0u64;
+        let mut failed = 0u64;
+        for (total, moved) in &at_settle {
+            transferred += moved;
+            if let ByteTotal::Final(n) | ByteTotal::Provisional(n) = total {
+                failed += n.saturating_sub(*moved);
+            }
+        }
+        let listed = (count * size) as u64;
+        assert_eq!(
+            listed,
+            transferred + failed,
+            "a consumer banking each shortfall renders exactly 100%: {transferred} moved + \
+             {failed} failed against {listed} listed"
+        );
+        // Non-vacuous in both directions: the banked amount is two whole objects, so this
+        // cannot pass by every shortfall being zero.
+        assert_eq!(
+            2 * size as u64,
+            failed,
+            "the banked shortfall is exactly the two refused objects"
+        );
+        assert_eq!(
+            listed - 2 * size as u64,
+            transferred,
+            "and the moved bytes are exactly the other fourteen"
+        );
+
+        // The root still stops short, unchanged: banking is the consumer's job, and the
+        // library does not inflate its own numerator to hide a failure.
+        assert_eq!(
+            transferred,
+            root.metrics().network_rx,
+            "the sum over entries equals the root's numerator at quiescence"
+        );
+
+        // A reading taken at `Settled` is already final for that entry: re-reading the same
+        // views after `join()` returns gives the same numbers. This is what lets a consumer
+        // bank the shortfall once, at the terminal, instead of re-scanning every entry.
+        let after: Vec<(ByteTotal, u64)> = retained
+            .iter()
+            .map(|v| (v.byte_total(), v.metrics().network_rx))
+            .collect();
+        let mut sorted_at_settle = at_settle.clone();
+        let mut sorted_after = after.clone();
+        sorted_at_settle.sort_by_key(|(_, moved)| *moved);
+        sorted_after.sort_by_key(|(_, moved)| *moved);
+        assert_eq!(
+            sorted_at_settle, sorted_after,
+            "an entry's counters do not move after its own terminal event"
+        );
+
+        m.handle.shutdown().await.expect("shutdown");
+    })
+    .await
+    .expect(
+        "test_download_objects_a_consumer_reaches_full_progress_by_banking_failed_bytes timed out",
+    );
+}
+
+/// A run whose listing never completed publishes no entry total, for the same reason it
+/// publishes no byte total: nobody knows how many objects there were.
+///
+/// `EntryTotal::Final(0)` would be the damaging answer — a consumer reads it as "zero objects
+/// to do, we are done" at the instant listing failed.
+#[tokio::test]
+async fn test_download_objects_does_not_seal_an_entry_total_when_listing_never_ran() {
+    timeout(TEST_TIMEOUT, async {
+        let m = mock_tm(RuntimeMode::Managed).await;
+
+        let bucket = "test-bucket";
+        let prefix = "unsealed-entries/";
+        seed_bucket(&m.server, bucket, prefix, 12, 1024).await;
+
+        // A destination that is a plain file, not a directory: validation fails on the first
+        // walker advance, before a single key is listed.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let not_a_dir = dir.path().join("regular-file");
+        std::fs::write(&not_a_dir, b"x").expect("write file");
+
+        let (sink, mut stream) = aws_sdk_s3_transfer_manager::events::channel(
+            std::num::NonZeroUsize::new(8).expect("capacity > 0"),
+        );
+
+        let handle = m
+            .client
+            .download_objects()
+            .bucket(bucket)
+            .destination(&not_a_dir)
+            .key_prefix(prefix)
+            .events(sink)
+            .initiate()
+            .expect("initiate download_objects");
+
+        let collector = tokio::spawn(async move {
+            let mut root = None;
+            while let Some(ev) = stream.next().await {
+                if let TransferEvent::Decided {
+                    parent: None, view, ..
+                } = ev
+                {
+                    root = view;
+                }
+            }
+            root
+        });
+
+        let _ = handle.join().await;
+        let root = collector
+            .await
+            .expect("collector")
+            .expect("the root announced itself with a view");
+
+        assert_eq!(
+            EntryTotal::Unknown,
+            root.entry_total(),
+            "listing never ran, so the object count is unknown and must not read as 0 of 0"
+        );
+        assert_eq!(
+            ByteTotal::Unknown,
+            root.byte_total(),
+            "and the byte total is unknown for the same reason, from the same seal"
+        );
+
+        m.handle.shutdown().await.expect("shutdown");
+    })
+    .await
+    .expect("test_download_objects_does_not_seal_an_entry_total_when_listing_never_ran timed out");
+}
+
+/// A doomed object must surface as `Outcome::Failed` on its own child event while
+/// the rest still report success, under `Continue`.
+#[tokio::test]
+async fn test_download_objects_events_report_per_object_failure() {
+    timeout(TEST_TIMEOUT, async {
+        let m = mock_tm(RuntimeMode::Managed).await;
+
+        let count = 8usize;
+        let size = 4 * ByteUnit::Kibibyte.as_bytes_usize();
+        let bucket = "test-bucket";
+        let prefix = "evfail/";
+        seed_bucket(&m.server, bucket, prefix, count, size).await;
+
+        // 403 rather than 500: non-retryable, so the child fails on its first
+        // attempt and the run does not depend on the retry policy.
+        let doomed = format!("{prefix}0003.bin");
+        m.server.insert_fault(
+            bucket,
+            &doomed,
+            FaultType::ServiceError { status: 403 },
+            0,
+            Occurrence::Always,
+        );
+
+        let dest = tempfile::tempdir().expect("tempdir");
+        let (sink, mut stream) = aws_sdk_s3_transfer_manager::events::channel(
+            std::num::NonZeroUsize::new(2 * (count + 1)).expect("capacity > 0"),
+        );
+
+        let handle = m
+            .client
+            .download_objects()
+            .bucket(bucket)
+            .destination(dest.path())
+            .key_prefix(prefix)
+            .failure_policy(FailedTransferPolicy::Continue)
+            .events(sink)
+            .initiate()
+            .expect("initiate download_objects");
+
+        let collector = tokio::spawn(async move {
+            let mut evs = Vec::new();
+            while let Some(ev) = stream.next().await {
+                evs.push(ev);
+            }
+            evs
+        });
+
+        let _ = handle.join().await;
+        let events = collector.await.expect("collector");
+
+        let mut failed_keys = Vec::new();
+        let mut succeeded = 0usize;
+        let mut announced = 0usize;
+        let mut finished = 0usize;
+        for ev in &events {
+            // The key comes off the event's own source endpoint, which is where a
+            // download reads from -- no side map keyed by id.
+            let key = match ev.transfer().source() {
+                Endpoint::S3 { key, .. } => key.to_string(),
+                other => panic!("a download reads from S3, got {other:?}"),
+            };
+            match ev {
+                TransferEvent::Decided { .. } => announced += 1,
+                TransferEvent::Settled {
+                    outcome, parent, ..
+                } => {
+                    finished += 1;
+                    match outcome {
+                        Outcome::Failed { .. } => failed_keys.push(key),
+                        Outcome::Succeeded { .. } if parent.is_some() => succeeded += 1,
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        assert_eq!(
+            announced, finished,
+            "every announced transfer must reach a terminal event"
+        );
+        assert!(
+            failed_keys.iter().any(|k| k == &doomed),
+            "the doomed key must report Failed, got {failed_keys:?}"
+        );
+        assert_eq!(
+            count - 1,
+            succeeded,
+            "every other object must still report Succeeded"
+        );
+
+        m.handle.shutdown().await.expect("shutdown");
+    })
+    .await
+    .expect("test_download_objects_events_report_per_object_failure timed out");
+}
+
+/// Under `Abort`, a key the walker listed but never got to spawn must still be accounted for.
+/// Without the abandoned-entry sweep those keys vanish: the run reports one object where it
+/// listed `count`, and a per-object consumer never hears that the files existed.
+///
+/// The setup makes the gap deterministic. All `count` keys fit in one list page
+/// (count < WALK_LOW_WATER), so the walk drains into `pending_entries` before spawn
+/// touches it; `max_concurrent_downloads(1)` then spawns only the faulted head key
+/// before it fails and Abort cancels, leaving every other listed key unspawned.
+///
+/// Two things are checked, because two separate mechanisms have to hold. Every listed key must
+/// reach the stream, which takes all three settle paths including `announce_child`'s root-gone
+/// branch. And `entries_settled` must reach the sealed total, which is what lets a progress bar
+/// finish and is the assertion a lost count would break while the stream still looked complete.
+#[tokio::test]
+async fn test_download_objects_events_abandoned_entries_still_settle() {
+    timeout(TEST_TIMEOUT, async {
+        let m = mock_tm(RuntimeMode::Managed).await;
+
+        let count = 60usize;
+        let size = 1024usize;
+        let bucket = "test-bucket";
+        let prefix = "abandon/";
+        seed_bucket(&m.server, bucket, prefix, count, size).await;
+
+        // 503 Always on the first key: it exhausts retries and fails, which under
+        // Abort cancels the run with the remaining listed keys still in
+        // `pending_entries`.
+        m.server.insert_fault(
+            bucket,
+            &format!("{prefix}0000.bin"),
+            FaultType::ServiceError { status: 503 },
+            0,
+            Occurrence::Always,
+        );
+
+        let dest = tempfile::tempdir().expect("tempdir");
+        // 2 per object plus the root's pair; the sweep announces-and-finishes every
+        // abandoned key, so the stream must have room for all of them to lose nothing.
+        let (sink, mut stream) = aws_sdk_s3_transfer_manager::events::channel(
+            std::num::NonZeroUsize::new(2 * (count + 1)).expect("capacity > 0"),
+        );
+
+        let handle = m
+            .client
+            .download_objects()
+            .bucket(bucket)
+            .destination(dest.path())
+            .key_prefix(prefix)
+            .failure_policy(FailedTransferPolicy::Abort)
+            // Serialize spawning so only the faulted head key materializes before
+            // the abort; the rest stay listed-but-unspawned for the sweep.
+            .max_concurrent_downloads(1)
+            .events(sink)
+            .initiate()
+            .expect("initiate download_objects");
+
+        let collector = tokio::spawn(async move {
+            let mut evs = Vec::new();
+            while let Some(ev) = stream.next().await {
+                evs.push(ev);
+            }
+            (evs, stream.dropped())
+        });
+
+        let result = handle.join().await;
+        assert!(
+            result.is_err(),
+            "Abort with a faulted key must return an error"
+        );
+        let (events, dropped) = collector.await.expect("collector");
+        assert_eq!(0, dropped, "capacity 2*(n+1) must lose nothing");
+
+        // Pairing: every announced id settles exactly once. The sweep announces and
+        // finishes an abandoned entry in one step, so a swept key contributes one of
+        // each; the two-lock reorder bug (a late Decided landing in a drained map)
+        // would surface here as a Decided with no Settled.
+        let mut decided: HashMap<u64, bool> = HashMap::new();
+        let mut settled: HashMap<u64, usize> = HashMap::new();
+        // Completeness: the distinct S3 keys of child events. This is the sweep's
+        // guard -- without it, only the head key appears.
+        let mut child_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for ev in &events {
+            let key = match ev.transfer().source() {
+                Endpoint::S3 { key, .. } => key.to_string(),
+                other => panic!("a download reads from S3, got {other:?}"),
+            };
+            match ev {
+                TransferEvent::Decided { id, parent, .. } => {
+                    assert!(
+                        decided.insert(*id, parent.is_some()).is_none(),
+                        "id {id} announced twice"
+                    );
+                    if parent.is_some() {
+                        child_keys.insert(key);
+                    }
+                }
+                TransferEvent::Settled { id, .. } => {
+                    *settled.entry(*id).or_default() += 1;
+                }
+                _ => {}
+            }
+        }
+
+        for id in decided.keys() {
+            assert_eq!(
+                Some(&1),
+                settled.get(id),
+                "announced id {id} must settle exactly once, got {:?}",
+                settled.get(id)
+            );
+        }
+
+        // Every listed key, with no allowance. Three separate paths have to cover the three
+        // places an entry can be when Abort lands: `record_abandoned_entries` for the ones
+        // still in `pending_entries`, `finish_root`'s orphan drain for the ones in
+        // `child_lifecycles`, and `announce_child`'s root-gone branch for the one that can be
+        // in neither -- claimed off `pending_entries` and mid-spawn when `on_terminal` takes
+        // the root. That last path is why this is `==` and not `>= count - 1`: it needs the
+        // sink kept outside `lifecycle`, and without it this assertion fails intermittently
+        // under load at `count - 1`.
+        assert_eq!(
+            count,
+            child_keys.len(),
+            "every listed key must reach the stream: the three sweeps together are what cover \
+             the ones cancelled before they could be reaped"
+        );
+
+        // The guarantee that actually protects a consumer, and the one the stream cannot give:
+        // the counts reconcile exactly. An entry whose event was lost above is still counted,
+        // so `entries_settled` reaches the total and a progress bar completes. Skipping the
+        // count instead is what seals a bar below 100% for the life of the process.
+        let root_view = events
+            .iter()
+            .find_map(|ev| match ev {
+                TransferEvent::Decided {
+                    parent: None, view, ..
+                } => view.clone(),
+                _ => None,
+            })
+            .expect("the root announces itself, and it carries a view");
+        assert_eq!(
+            EntryTotal::Final(count as u64),
+            root_view.entry_total(),
+            "listing completed, so the denominator must be sealed at the listed count"
+        );
+        assert_eq!(
+            count as u64,
+            root_view.entries_settled(),
+            "every listed entry must be counted as settled even when its event was lost; \
+             short here is the stuck-progress-bar defect"
+        );
+
+        m.handle.shutdown().await.expect("shutdown");
+    })
+    .await
+    .expect("test_download_objects_events_abandoned_entries_still_settle timed out");
+}
+
+/// A composite seals a byte denominator covering every object it listed.
+///
+/// `set_total_bytes` is a leaf-transfer mechanism, so a composite takes its denominator from
+/// its listing instead: both accumulate the size of every entry their walk produces, in the
+/// same critical section that publishes the entry, and seal the total once listing is
+/// quiescent. Without that a percentage is undefined for the whole run.
+///
+/// Asserted on the joined output rather than mid-flight: the seal fires when listing
+/// drains, and a timing-based read of the provisional value would be flaky. What this
+/// pins is the invariant that matters for a bar — the denominator covers the whole
+/// dataset, so the numerator can reach it.
+#[tokio::test]
+async fn test_download_objects_seals_a_byte_denominator() {
+    timeout(TEST_TIMEOUT, async {
+        let m = mock_tm(RuntimeMode::Managed).await;
+
+        let count = 25usize;
+        let size = 4096usize;
+        let bucket = "test-bucket";
+        let prefix = "denominator/";
+        seed_bucket(&m.server, bucket, prefix, count, size).await;
+
+        let dest = tempfile::tempdir().expect("tempdir");
+        let handle = m
+            .client
+            .download_objects()
+            .bucket(bucket)
+            .destination(dest.path())
+            .key_prefix(prefix)
+            .initiate()
+            .expect("initiate download_objects");
+
+        let output = handle.join().await.expect("download_objects");
+
+        assert_eq!(
+            Some(count as u64 * size as u64),
+            output.metrics.total_bytes,
+            "the sealed total must cover every listed object"
+        );
+        // The numerator reaches the denominator on a clean run. Before the rollup and the
+        // seal, one was folded only from successful children and the other did not exist.
+        assert_eq!(
+            output.metrics.total_bytes,
+            Some(output.metrics.network_rx),
+            "on a run with no failures the bar must reach exactly 100%"
+        );
+
+        m.handle.shutdown().await.expect("shutdown");
+    })
+    .await
+    .expect("test_download_objects_seals_a_byte_denominator timed out");
+}
+
+/// A run whose listing never completed must not publish a byte total.
+///
+/// `total_bytes` means "this is the whole payload". Sealing it on a path where enumeration
+/// stopped early makes that claim false and `OnceLock` makes it permanent: a consumer sees
+/// `None -> Some(partial)` at the instant listing fails and its bar snaps toward 100%
+/// immediately before the transfer reports failure.
+///
+/// The seal is therefore gated on a positive `listing_complete` flag set only where the
+/// walker reports itself exhausted, not on "the walk is no longer in state" — which is
+/// equally true of a walk that is out for execution, one that finished, and one that was
+/// dropped after a failure.
+///
+/// Exercised through the destination-validation path: a destination that is a file rather
+/// than a directory fails on the first walker advance, before a single key is listed. Sealing
+/// `Some(0)` there would claim an arbitrarily large prefix was empty.
+#[tokio::test]
+async fn test_download_objects_does_not_seal_a_total_when_listing_never_ran() {
+    timeout(TEST_TIMEOUT, async {
+        let m = mock_tm(RuntimeMode::Managed).await;
+
+        let bucket = "test-bucket";
+        let prefix = "unsealed/";
+        seed_bucket(&m.server, bucket, prefix, 12, 4096).await;
+
+        // A file, not a directory: `validate_destination` fails on the first advance.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let not_a_dir = dir.path().join("regular-file");
+        std::fs::write(&not_a_dir, b"x").expect("write file");
+
+        let handle = m
+            .client
+            .download_objects()
+            .bucket(bucket)
+            .destination(&not_a_dir)
+            .key_prefix(prefix)
+            .initiate()
+            .expect("initiate download_objects");
+
+        // Read metrics AFTER the transfer has gone terminal. Reading before it starts
+        // would assert `None` on a transfer that had not run yet, which is vacuous.
+        loop {
+            if handle.status().is_terminal() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let metrics = handle.metrics();
+        let result = handle.join().await;
+
+        assert!(
+            result.is_err(),
+            "a non-directory destination must fail the transfer"
+        );
+        assert_eq!(
+            None, metrics.total_bytes,
+            "listing never ran, so no total is known — Some(0) here would claim the \
+             prefix was empty"
+        );
+
+        m.handle.shutdown().await.expect("shutdown");
+    })
+    .await
+    .expect("test_download_objects_does_not_seal_a_total_when_listing_never_ran timed out");
+}
+
+/// A caller-supplied walker must still exclude 0-byte folder markers.
+///
+/// Verified against a real bucket: the marker `markers/sub/` derives the local path `<dest>/sub`,
+/// which is the directory `markers/sub/b.bin` already created, so the write fails with `EISDIR` and
+/// the default `FailedTransferPolicy::Abort` takes the whole operation down -- exit 1, four of five
+/// objects on disk. Which of the pair fails depends on listing order, so the failure is
+/// non-deterministic too.
+///
+/// The exclusion belongs to the operation rather than the walker, which is what makes it survive a
+/// supplied walker. `markers/notamarker/` pins the other half: a `/`-terminated key *with* a body is
+/// a real object and must still download, so the rule cannot be simplified to a key-suffix test.
+#[tokio::test]
+async fn test_download_objects_custom_walker_still_excludes_folder_markers() {
+    timeout(TEST_TIMEOUT, async {
+        let m = mock_tm(RuntimeMode::Managed).await;
+        let bucket = "test-bucket";
+        m.server.create_bucket(bucket).await.expect("create bucket");
+
+        for (key, body) in [
+            ("markers/a.bin", vec![1u8; 128]),
+            ("markers/sub/b.bin", vec![2u8; 128]),
+            // Console-style folder markers: 0 bytes, key ends with the delimiter.
+            ("markers/sub/", Vec::new()),
+            ("markers/emptydir/", Vec::new()),
+            // Ends with the delimiter but is not empty, so it is not a marker.
+            ("markers/notamarker/", vec![3u8; 128]),
+        ] {
+            m.server
+                .add_object(bucket, key, body, None)
+                .await
+                .expect("seed object");
+        }
+
+        let dest = tempfile::tempdir().expect("tempdir");
+        let handle = m
+            .client
+            .download_objects()
+            .bucket(bucket)
+            .destination(dest.path())
+            .key_prefix("markers/")
+            // Both are required: the prefix because a supplied walker owns the listing, and
+            // `page_size` because pagination is the reason to supply one at all.
+            .walker(S3Walker::builder().prefix("markers/").page_size(2).build())
+            .initiate()
+            .expect("initiate download_objects");
+
+        let output = handle
+            .join()
+            .await
+            .expect("a folder marker must not fail the operation");
+
+        assert!(
+            output.failed_transfers().is_empty(),
+            "no child may fail: {:?}",
+            output.failed_transfers()
+        );
+        assert_eq!(
+            3,
+            output.objects_downloaded(),
+            "the two 0-byte markers are excluded; `notamarker/` is not a marker and stays"
+        );
+        assert_eq!(
+            3,
+            count_files(dest.path()),
+            "and only those three land on disk"
+        );
+        assert!(
+            dest.path().join("sub").is_dir(),
+            "`sub` must stay the directory `sub/b.bin` needs, not a 0-byte file"
+        );
+        assert!(
+            !dest.path().join("emptydir").exists(),
+            "a marker must not materialize as an empty file"
+        );
+        assert_eq!(
+            vec![3u8; 128],
+            std::fs::read(dest.path().join("notamarker")).expect("read notamarker"),
+            "a non-empty `/`-terminated key is a real object and must download intact"
+        );
+
+        m.handle.shutdown().await.expect("shutdown");
+    })
+    .await
+    .expect("test_download_objects_custom_walker_still_excludes_folder_markers timed out");
+}
+
+/// A caller's own `filter` must not re-admit folder markers.
+///
+/// This is the case that decided where the exclusion lives. `S3Walker::filter` replaces nothing and
+/// means only what it says, so a caller narrowing the listing writes a predicate about their own
+/// business -- and any predicate broad enough to keep real keys also keeps `sub/`. As a walker-level
+/// default the exclusion was removable by setting a filter at all, and the run then hit the `EISDIR`
+/// abort the default existed to prevent. Dropping markers where the walk is drained puts them out of
+/// a predicate's reach.
+#[tokio::test]
+async fn test_download_objects_a_caller_filter_cannot_re_admit_folder_markers() {
+    timeout(TEST_TIMEOUT, async {
+        let m = mock_tm(RuntimeMode::Managed).await;
+        let bucket = "test-bucket";
+        m.server.create_bucket(bucket).await.expect("create bucket");
+
+        for (key, body) in [
+            ("keep/a.bin", vec![1u8; 128]),
+            ("keep/sub/b.bin", vec![2u8; 128]),
+            ("keep/sub/", Vec::new()),
+            ("keep/emptydir/", Vec::new()),
+        ] {
+            m.server
+                .add_object(bucket, key, body, None)
+                .await
+                .expect("seed object");
+        }
+
+        let dest = tempfile::tempdir().expect("tempdir");
+        let handle = m
+            .client
+            .download_objects()
+            .bucket(bucket)
+            .destination(dest.path())
+            .key_prefix("keep/")
+            // Deliberately permissive: it admits the markers too. A caller writing
+            // `|o| o.key().is_some_and(|k| k.ends_with(".parquet"))` would exclude them by luck;
+            // this one does not, which is what makes the assertion mean something.
+            .walker(
+                S3Walker::builder()
+                    .prefix("keep/")
+                    .filter(|o| o.key().unwrap_or_default().starts_with("keep/"))
+                    .build(),
+            )
+            .initiate()
+            .expect("initiate download_objects");
+
+        let output = handle
+            .join()
+            .await
+            .expect("a caller filter must not reintroduce the EISDIR abort");
+
+        assert!(
+            output.failed_transfers().is_empty(),
+            "no child may fail: {:?}",
+            output.failed_transfers()
+        );
+        assert_eq!(
+            2,
+            output.objects_downloaded(),
+            "only the two real objects; the caller's filter admitted the markers and the \
+             operation dropped them anyway"
+        );
+        assert!(
+            dest.path().join("sub").is_dir(),
+            "`sub` must stay the directory `sub/b.bin` needs, not a 0-byte file"
+        );
+        assert!(
+            !dest.path().join("emptydir").exists(),
+            "a marker must not materialize as an empty file"
+        );
+
+        m.handle.shutdown().await.expect("shutdown");
+    })
+    .await
+    .expect("test_download_objects_a_caller_filter_cannot_re_admit_folder_markers timed out");
 }

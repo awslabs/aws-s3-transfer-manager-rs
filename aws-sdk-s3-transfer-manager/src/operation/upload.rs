@@ -34,30 +34,40 @@ pub(crate) struct Upload;
 
 impl Upload {
     /// Execute a single `Upload` transfer operation.
+    /// `events` is `None` unless the caller registered a sink on the builder.
     pub(crate) fn orchestrate(
         handle: Arc<crate::client::Handle>,
         input: crate::operation::upload::UploadInput,
+        events: Option<crate::events::TransferEventSink>,
     ) -> Result<UploadHandle, error::Error> {
-        Self::orchestrate_inner(handle, input, None)
+        Self::orchestrate_inner(handle, input, None, events)
     }
 
     /// Execute an `Upload` as a child of another transfer.
     ///
-    /// The child's `TransferContext` is linked to `parent_id` so that
-    /// `signal_terminal` on the child wakes the parent (letting the parent's
-    /// state machine reap it) and cancelling the parent cascades to this child.
+    /// The child's `TransferContext` is linked to `parent` so that `signal_terminal` on
+    /// the child wakes the parent (letting the parent's state machine reap it), cancelling
+    /// the parent cascades to this child, and the child's bytes roll up into the parent's
+    /// metrics as they move.
+    ///
+    /// Takes the parent context rather than its id so the id link and the metrics link
+    /// cannot be established separately — and so a child that reports no bytes upward is
+    /// not silently possible.
     pub(crate) fn orchestrate_child(
         handle: Arc<crate::client::Handle>,
         input: crate::operation::upload::UploadInput,
-        parent_id: u64,
+        parent: &crate::transfer::TransferContext,
     ) -> Result<UploadHandle, error::Error> {
-        Self::orchestrate_inner(handle, input, Some(parent_id))
+        // No sink: a composite announces its own children, so passing one here
+        // would announce every child twice.
+        Self::orchestrate_inner(handle, input, Some(parent), None)
     }
 
     fn orchestrate_inner(
         handle: Arc<crate::client::Handle>,
         mut input: crate::operation::upload::UploadInput,
-        parent_id: Option<u64>,
+        parent: Option<&crate::transfer::TransferContext>,
+        events: Option<crate::events::TransferEventSink>,
     ) -> Result<UploadHandle, error::Error> {
         if input.checksum_strategy.is_none() {
             // User didn't explicitly set checksum strategy.
@@ -83,12 +93,44 @@ impl Upload {
         // Create transfer context — linked to parent when this is a child
         // transfer, so signal_terminal wakes the parent and cancellation
         // cascades from the parent.
-        let (ctx, completion_rx) = match parent_id {
-            Some(pid) => TransferContext::new_child(handle.clone(), pid),
+        let (ctx, completion_rx) = match parent {
+            Some(parent) => TransferContext::new_child(handle.clone(), parent),
             None => TransferContext::new(handle.clone()),
         };
 
-        let transfer = UploadTransfer::new(ctx, bucket_type, input, stream);
+        // Announced before `enqueue_transfer`, which can drive the transfer fully
+        // terminal before this function returns.
+        //
+        // The source is the body the caller supplied: a path when the body reads
+        // from a file, and a stream otherwise. Naming a path for an in-memory body
+        // would report a file the transfer manager never opened.
+        let lifecycle = events.map(|sink| {
+            let source = match stream.source_path() {
+                Some(path) => crate::events::Endpoint::Local {
+                    path: Arc::from(path),
+                },
+                None => crate::events::Endpoint::Stream {},
+            };
+            Arc::new(crate::events::TransferLifecycle::new(
+                sink,
+                ctx.id.id,
+                None,
+                crate::events::TransferRef::upload(
+                    source,
+                    crate::events::Endpoint::S3 {
+                        bucket: Arc::from(input.bucket().unwrap_or_default()),
+                        key: Arc::from(input.key().unwrap_or_default()),
+                    },
+                ),
+                Some(ctx.view()),
+            ))
+        });
+
+        let transfer = UploadTransfer::new(ctx, bucket_type, input, stream, lifecycle.clone());
+
+        if let Some(lc) = &lifecycle {
+            lc.announce();
+        }
 
         handle
             .scheduler

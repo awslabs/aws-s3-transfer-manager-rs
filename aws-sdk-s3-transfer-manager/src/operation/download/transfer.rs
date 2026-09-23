@@ -98,6 +98,8 @@ struct DownloadTransferInner {
     integrity_checks: std::sync::OnceLock<crate::types::IntegrityChecks>,
     /// Notified when discovery completes (success or failure)
     discovery_notify: tokio::sync::Notify,
+    /// Lifecycle emitter, `None` unless a caller registered a sink.
+    lifecycle: Option<Arc<crate::events::TransferLifecycle>>,
 }
 
 impl DownloadTransfer {
@@ -106,6 +108,7 @@ impl DownloadTransfer {
         bucket_type: BucketType,
         input: DownloadInput,
         writer: BodyWriter,
+        lifecycle: Option<Arc<crate::events::TransferLifecycle>>,
     ) -> Self {
         // Resolve the read-ahead knob (per-request override, else client default)
         // to a window in parts before `ctx` and `input` are moved into the struct.
@@ -125,6 +128,7 @@ impl DownloadTransfer {
             object_meta: std::sync::OnceLock::new(),
             integrity_checks: std::sync::OnceLock::new(),
             discovery_notify: tokio::sync::Notify::new(),
+            lifecycle,
         });
         Self { inner }
     }
@@ -243,6 +247,11 @@ impl DownloadTransfer {
             tracing::debug!("not active, returning Done");
             return PollWork::Done;
         }
+        // Cleared at entry and set again by whichever park site this poll reaches, so the
+        // reason describes the most recent poll rather than the last one that happened to
+        // park. Without the clear, a transfer that parked once would report that reason for
+        // the rest of its life, including while moving bytes.
+        self.inner.ctx.set_stall(None);
 
         let mut state = self.inner.state.lock().unwrap();
 
@@ -254,6 +263,9 @@ impl DownloadTransfer {
                 })
             }
             DownloadState::DiscoveryInFlight => {
+                self.inner
+                    .ctx
+                    .set_stall(Some(crate::types::StallReason::PendingDiscovery {}));
                 self.inner.ctx.set_pending();
                 PollWork::Pending
             }
@@ -308,7 +320,7 @@ impl DownloadTransfer {
                             window,
                             "read-ahead gate closed: issuance paused until the consumer drains",
                         );
-                        return self.park();
+                        return self.park(crate::types::StallReason::ReadAheadWindow {});
                     }
 
                     // Gate admitted (and counted) the slot. Claim it from the buffer and
@@ -326,7 +338,7 @@ impl DownloadTransfer {
                     }
                 } else if *ranges_in_flight > 0 {
                     // All ranges generated, waiting for in-flight to complete.
-                    return self.park();
+                    return self.park(crate::types::StallReason::AwaitingCompletion {});
                 } else {
                     // No-data completion: the object carried no ranges (0-byte object
                     // whose discovery produced no initial chunk). Data-carrying terminal
@@ -382,7 +394,8 @@ impl DownloadTransfer {
     /// Park the transfer: mark it pending so the scheduler stops polling it until a
     /// waker re-readies it — the consumer freeing occupancy (gate), the budget granting
     /// a queued reservation, or a GET completion decrementing the in-flight count.
-    fn park(&self) -> PollWork {
+    fn park(&self, reason: crate::types::StallReason) -> PollWork {
+        self.inner.ctx.set_stall(Some(reason));
         self.inner.ctx.set_pending();
         PollWork::Pending
     }
@@ -407,7 +420,7 @@ impl DownloadTransfer {
                 data: Some(Box::new(DownloadWork::DrainResident)),
             })
         } else {
-            self.park()
+            self.park(crate::types::StallReason::MemoryBudget {})
         }
     }
 
@@ -856,6 +869,11 @@ impl DownloadTransfer {
         while let Some(result) = body_stream.next().await {
             let data = result.map_err(|e| crate::error::body_read_error(e, None))?;
             bytes_received += data.len() as u64;
+            // Per chunk, not per part: this is the only counter that moves inside a part, and
+            // the one that lets a single-part transfer show progress between 0 and done. This
+            // loop is the single shared body path for both the ranged and discovery reads, so
+            // one hook covers both.
+            ctx.record_bytes_streamed(data.len() as u64);
             segmented.push(data);
             if !ctx.is_active() {
                 return Err(crate::error::Error::new(
@@ -1137,6 +1155,25 @@ impl Transfer for DownloadTransfer {
         self.inner.discovery_notify.notify_waiters();
         let _ = self.inner.writer.finalize();
         self.inner.writer.notify_consumer();
+
+        // The terminal event, from the same hook every removal path reaches.
+        if let Some(lc) = &self.inner.lifecycle {
+            let outcome = match self.inner.ctx.transfer_status() {
+                crate::types::TransferStatus::Completed => crate::events::Outcome::Succeeded {},
+                crate::types::TransferStatus::Failed => crate::events::Outcome::Failed {
+                    error: self.inner.ctx.error().unwrap_or_else(|| {
+                        crate::error::Error::new(
+                            crate::error::ErrorKind::ChildOperationFailed,
+                            "download failed",
+                        )
+                    }),
+                },
+                _ => crate::events::Outcome::Cancelled {},
+            };
+            if let Some(emit) = lc.finish(outcome) {
+                emit.send();
+            }
+        }
     }
 }
 
@@ -1322,7 +1359,7 @@ mod tests {
         let (writer, _consumer) = crate::operation::download::body::new_recv_body();
         let (ctx, _completion_rx) = TransferContext::new(handle);
 
-        DownloadTransfer::new(ctx, BucketType::Standard, input, writer)
+        DownloadTransfer::new(ctx, BucketType::Standard, input, writer, None)
     }
 
     /// Execute work using DownloadTransfer directly.
@@ -1421,7 +1458,7 @@ mod tests {
 
         let (writer, _consumer) = crate::operation::download::body::new_recv_body();
         let (ctx, _completion_rx) = TransferContext::new(handle);
-        let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, writer);
+        let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, writer, None);
 
         skip_discovery(&transfer).await;
 
@@ -1561,7 +1598,7 @@ mod tests {
 
         let (writer, consumer) = crate::operation::download::body::new_recv_body();
         let (ctx, _completion_rx) = TransferContext::new(handle);
-        let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, writer);
+        let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, writer, None);
         (transfer, consumer)
     }
 
@@ -1864,7 +1901,7 @@ mod tests {
         let (writer, _consumer) =
             crate::operation::download::body::new_recv_body_with_sink(file, 0, false);
         let (ctx, _completion_rx) = TransferContext::new(handle);
-        let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, writer);
+        let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, writer, None);
 
         // Budget starts empty.
         assert_eq!(budget.in_use_chunks(), 0);
@@ -1922,7 +1959,7 @@ mod tests {
         let (writer, consumer) =
             crate::operation::download::body::new_recv_body_with_sink(file, 0, false);
         let (ctx, _completion_rx) = TransferContext::new(handle);
-        let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, writer);
+        let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, writer, None);
         (transfer, consumer, dir)
     }
 
@@ -2174,7 +2211,7 @@ mod tests {
                 .unwrap();
             let (writer, _consumer) = crate::operation::download::body::new_recv_body();
             let (ctx, _rx) = TransferContext::new(handle);
-            DownloadTransfer::new(ctx, BucketType::Standard, input, writer)
+            DownloadTransfer::new(ctx, BucketType::Standard, input, writer, None)
         };
 
         // No request override: the client default resolves.

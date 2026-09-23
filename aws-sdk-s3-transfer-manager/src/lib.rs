@@ -64,6 +64,11 @@
 /// Error types emitted by `aws-sdk-s3-transfer-manager`
 pub mod error;
 
+// No `///` here: an outer doc comment on the `mod` line merges with the module's
+// own `//!` block and resolves its intra-doc links in *this* module's scope, where
+// none of the event types are named. The module documents itself.
+pub mod events;
+
 /// Common types used by `aws-sdk-s3-transfer-manager`
 pub mod types;
 

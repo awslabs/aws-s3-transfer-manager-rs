@@ -48,7 +48,8 @@ pub struct UploadObjectsOutput {
     /// read while the rest of the tree was enumerable).
     pub failed_transfers: Vec<FailedUpload>,
 
-    /// Aggregated metrics across every completed child upload: network and
+    /// Aggregated byte counters across every child upload, including bytes sent by a
+    /// child that later failed: network and
     /// disk byte counters plus start/finish timestamps. See
     /// [`TransferMetrics`] for the full set of fields.
     ///
@@ -77,7 +78,7 @@ impl UploadObjectsOutput {
         self.failed_transfers.as_slice()
     }
 
-    /// Aggregated transfer metrics across all completed child uploads.
+    /// Aggregated byte counters across all child uploads, failed ones included.
     pub fn metrics(&self) -> &TransferMetrics {
         &self.metrics
     }

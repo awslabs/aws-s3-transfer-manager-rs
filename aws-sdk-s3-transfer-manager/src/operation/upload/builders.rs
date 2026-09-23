@@ -14,6 +14,7 @@ use super::{ChecksumStrategy, UploadHandle, UploadInputBuilder};
 pub struct UploadFluentBuilder {
     handle: Arc<crate::client::Handle>,
     inner: UploadInputBuilder,
+    events: Option<crate::events::TransferEventSink>,
 }
 
 impl UploadFluentBuilder {
@@ -21,7 +22,24 @@ impl UploadFluentBuilder {
         Self {
             handle,
             inner: ::std::default::Default::default(),
+            events: None,
         }
+    }
+
+    /// Report lifecycle events for this transfer to `sink`.
+    ///
+    /// Registered on the builder rather than the handle because orchestration
+    /// dispatches work before the handle exists, so a handle-side registration
+    /// could miss the transfer's own start.
+    pub fn events(mut self, sink: crate::events::TransferEventSink) -> Self {
+        // Appends rather than replaces, so every registered consumer sees every event: the
+        // SEP asks for "a list of progress listeners", and a replacing setter would make a
+        // client-level sink and a request-level sink mutually exclusive.
+        self.events = Some(match self.events.take() {
+            Some(existing) => existing.merge(sink),
+            None => sink,
+        });
+        self
     }
 
     /// Initiate an upload transfer for a single object
@@ -32,7 +50,8 @@ impl UploadFluentBuilder {
 
     pub fn initiate(self) -> Result<UploadHandle, crate::error::Error> {
         let input = self.inner.build()?;
-        crate::operation::upload::Upload::orchestrate(self.handle, input)
+        let events = crate::events::resolve_sink(self.handle.config.events(), self.events);
+        crate::operation::upload::Upload::orchestrate(self.handle, input, events)
     }
 
     /// <p>The canned ACL to apply to the object. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/dev/acl-overview.html#CannedACL">Canned ACL</a> in the <i>Amazon S3 User Guide</i>.</p>
@@ -863,6 +882,9 @@ impl UploadFluentBuilder {
 
 impl crate::operation::upload::input::UploadInputBuilder {
     /// Initiate an upload transfer for a single object with this input using the given client.
+    ///
+    /// This entry point reports no [events](crate::events) — an input builder has no sink to
+    /// carry. Use [`initiate_with_events`](Self::initiate_with_events) to register one.
     pub fn initiate_with(
         self,
         client: &crate::Client,
@@ -870,5 +892,22 @@ impl crate::operation::upload::input::UploadInputBuilder {
         let mut fluent_builder = client.upload();
         fluent_builder.inner = self;
         fluent_builder.initiate()
+    }
+
+    /// Initiate an upload transfer for a single object, reporting lifecycle
+    /// [events](crate::events) to `sink`.
+    ///
+    /// The events-carrying form of [`initiate_with`](Self::initiate_with). It exists because a
+    /// sink is registered on the fluent builder, which this entry point bypasses — without it,
+    /// a caller who assembled an input directly has no way to observe the transfer, and the
+    /// silence would look like a transfer that never produced events.
+    pub fn initiate_with_events(
+        self,
+        client: &crate::Client,
+        sink: crate::events::TransferEventSink,
+    ) -> Result<UploadHandle, crate::error::Error> {
+        let mut fluent_builder = client.upload();
+        fluent_builder.inner = self;
+        fluent_builder.events(sink).initiate()
     }
 }

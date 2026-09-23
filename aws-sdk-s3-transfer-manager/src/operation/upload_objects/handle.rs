@@ -123,7 +123,16 @@ impl UploadObjectsHandle {
         self.transfer.ctx().transfer_status()
     }
 
-    /// Snapshot of aggregated transfer metrics across every completed child.
+    /// Snapshot of this operation's byte counters, aggregated across all of its children.
+    ///
+    /// Live: a child's bytes are counted as they move, not when the child is reaped, so
+    /// this advances continuously rather than in whole-object jumps. Bytes moved by a
+    /// child that later failed are included — they were transferred, and omitting them
+    /// would make the total unreachable by any denominator.
+    ///
+    /// [`TransferMetrics::total_bytes`](crate::types::TransferMetrics::total_bytes) is
+    /// `Some` once the directory walk has completed, and stays `None` on a run whose walk
+    /// was cancelled or failed — nobody knows the total in that case.
     pub fn metrics(&self) -> crate::types::TransferMetrics {
         self.transfer.ctx().metrics()
     }

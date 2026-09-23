@@ -137,6 +137,24 @@ pub struct Args {
     /// Enable CPU profiling in dial9 traces (Linux only, requires --trace-dir)
     #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue, requires = "trace_dir")]
     cpu_profiling: bool,
+
+    /// Draw a progress bar and print a line per object (recursive transfers only)
+    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
+    progress: bool,
+
+    /// `MaxKeys` for the listing behind a recursive download. Lower it to widen the window
+    /// in which the entry total is still provisional, which is what makes the `~N file(s)
+    /// remaining` state observable rather than a single overwritten frame.
+    #[arg(long)]
+    list_page_size: Option<i32>,
+
+    /// Event channel capacity. Set it low (`--events-capacity 2`) to see the push/pull split
+    /// directly: the bar's bytes, percentage and `N file(s) remaining` are *pulled* off the
+    /// root's view on each repaint and stay exact, while `(N ok, N failed)` is *tallied from
+    /// the stream* and falls short by however many events were dropped. Both halves print on
+    /// the same line, so a starved channel makes them visibly disagree.
+    #[arg(long, default_value_t = 1024)]
+    events_capacity: usize,
 }
 
 #[derive(Debug, Clone, clap::Args)]
@@ -272,22 +290,206 @@ async fn do_single_download(
     }
 }
 
+/// Which counter is the numerator. Summing all four double-counts: a file-backed upload
+/// records the same payload as both `disk_read` and `network_tx`.
+#[derive(Clone, Copy)]
+enum Numerator {
+    Sent,
+    Received,
+}
+
+impl Numerator {
+    fn of(&self, m: &aws_sdk_s3_transfer_manager::types::TransferMetrics) -> u64 {
+        match self {
+            Numerator::Sent => m.network_tx,
+            Numerator::Received => m.network_rx,
+        }
+    }
+}
+
+/// Render one whole-transfer bar plus a line per object, from the event stream.
+///
+/// The push/pull split in one function: lifecycle arrives on the stream, and bytes are
+/// *pulled* off the root's view on the repaint tick. Nothing pushes a byte count, so a
+/// consumer repainting at 10 Hz reads the same handle 10 times a second and the transfer
+/// never waits for it.
+///
+/// The bar is monotonic and never exceeds 100%. This drawer reads the root's counter only,
+/// so it reaches 100% only when every listed object's payload actually moved: the
+/// denominator counts what was enumerated, so an object that failed before its first body
+/// byte leaves this bar short by its whole size. Bytes from a failure mid-body do count.
+///
+/// Reaching 100% on a run with failures is possible and this example does not do it. It
+/// costs a `HashMap<u64, TransferView>` of child views kept from `Decided`: on a child's
+/// `Settled { outcome: Failed }`, `byte_total() - metrics().network_rx` is the payload that
+/// will now never move, and a bar drawn against `moved + abandoned` completes. That is what
+/// the AWS CLI does (`ResultRecorder._record_failure_result`). Kept out of here so the
+/// example stays one view and one loop; a CLI wants the map anyway for its per-file lines.
+async fn draw_progress(
+    mut stream: aws_sdk_s3_transfer_manager::events::TransferEventStream,
+    numerator: Numerator,
+) {
+    use aws_sdk_s3_transfer_manager::events::{Outcome, TransferEvent};
+    use aws_sdk_s3_transfer_manager::types::{ByteTotal, TransferView};
+    use std::io::Write;
+
+    // The root announces itself first and is the only entry with no parent, so one
+    // subscription covers both the per-object lines and the whole-transfer bar.
+    let mut root: Option<TransferView> = None;
+    let (mut ok, mut failed) = (0u64, 0u64);
+
+    // "N file(s) remaining", the AWS CLI's own tail. Both numbers come off the view rather
+    // than being tallied from the stream, so they stay exact when events are dropped.
+    let remaining = |view: &TransferView| -> String {
+        use aws_sdk_s3_transfer_manager::types::EntryTotal;
+        let settled = view.entries_settled();
+        match view.entry_total() {
+            // `~` while enumeration can still grow the total, matching how the CLI marks a
+            // total it has not finished calculating.
+            EntryTotal::Provisional(total) => {
+                format!("~{} file(s) remaining", total.saturating_sub(settled))
+            }
+            EntryTotal::Final(total) => {
+                format!("{} file(s) remaining", total.saturating_sub(settled))
+            }
+            // No total to subtract from: report what is done instead of a remainder.
+            _ => format!("{settled} file(s) done"),
+        }
+    };
+
+    let repaint = |root: &Option<TransferView>, ok: u64, failed: u64| {
+        let Some(view) = root else { return };
+        let done = numerator.of(&view.metrics());
+        let line = match view.byte_total() {
+            // A percentage is defined only against a final total. While enumeration is
+            // still running the denominator can still grow, so a bar drawn against it
+            // would walk backwards; show bytes instead.
+            ByteTotal::Final(total) if total > 0 => {
+                let frac = (done as f64 / total as f64).min(1.0);
+                let filled = (frac * 40.0).round() as usize;
+                format!(
+                    "[{}{}] {:>5.1}%  {} / {}",
+                    "#".repeat(filled),
+                    "-".repeat(40 - filled),
+                    frac * 100.0,
+                    ByteUnit::display(done),
+                    ByteUnit::display(total),
+                )
+            }
+            ByteTotal::Provisional(total) => format!(
+                "[{:<40}] {} / {}+ (listing)",
+                "",
+                ByteUnit::display(done),
+                ByteUnit::display(total),
+            ),
+            _ => format!("[{:<40}] {} (total unknown)", "", ByteUnit::display(done)),
+        };
+        // `\x1b[K` erases from the cursor to the end of the line. A bare `\r` only moves
+        // the cursor, so a shorter line leaves the tail of a longer one behind it: the
+        // remaining-count shrinks as the run proceeds -- `~1000 file(s) remaining` is wider
+        // than `0 file(s) remaining` -- and without the erase the final frame reads
+        // `(1500 ok, 0 failed) ) )`, with the stray parens belonging to earlier frames.
+        print!(
+            "\r\x1b[K{line} with {}  ({ok} ok, {failed} failed)",
+            remaining(view)
+        );
+        let _ = std::io::stdout().flush();
+    };
+
+    let mut tick = tokio::time::interval(time::Duration::from_millis(100));
+    loop {
+        tokio::select! {
+            ev = stream.next() => {
+                // `None` once every sink is gone: the operation is over and its last
+                // event has been handed over.
+                let Some(ev) = ev else { break };
+                match ev {
+                    TransferEvent::Decided { parent: None, view, .. } => root = view,
+                    TransferEvent::Settled { parent: Some(_), outcome, transfer, .. } => {
+                        match outcome {
+                            Outcome::Failed { error, .. } => {
+                                failed += 1;
+                                // Printed above the bar, which the next tick redraws. Erased
+                                // first for the same reason the bar is: this line lands on top
+                                // of a bar frame that is usually wider than it.
+                                println!("\r\x1b[K{} failed: {error}", transfer.source());
+                            }
+                            _ => ok += 1,
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ = tick.tick() => repaint(&root, ok, failed),
+        }
+    }
+    repaint(&root, ok, failed);
+    println!();
+    let lost = stream.dropped();
+    if lost > 0 {
+        // Delivery is lossy on purpose. The counts above are short by exactly this much,
+        // and a consumer that needs exact numbers reads the operation's own output.
+        println!("note: {lost} events dropped; per-object counts are a lower bound");
+    }
+}
+
 async fn do_recursive_download(
     tm: &aws_sdk_s3_transfer_manager::Client,
     bucket: &str,
     key_prefix: &str,
     dest: &Path,
+    progress: bool,
+    list_page_size: Option<i32>,
+    events_capacity: usize,
 ) -> Result<u64, BoxError> {
     fs::create_dir_all(dest).await?;
 
-    let handle = tm
+    let mut req = tm
         .download_objects()
         .bucket(bucket)
         .key_prefix(key_prefix)
-        .destination(dest)
-        .initiate()?;
+        .destination(dest);
+
+    // A smaller `MaxKeys` is the only way to *watch* `EntryTotal::Provisional`. The total is
+    // provisional for exactly as long as listing runs, so at the 1000-key default a
+    // 1500-object prefix is two round trips -- a window narrower than one repaint, which is
+    // why the state renders for a single frame and is then overwritten. Dropping the page size
+    // trades request count for a window measured in seconds.
+    //
+    // The prefix is repeated on the walker deliberately: a supplied walker owns the listing, so
+    // the request's `key_prefix` no longer scopes it and omitting it here lists the whole bucket.
+    // Nothing is needed for folder markers: `download_objects` drops them itself, whatever
+    // walker it is given.
+    if let Some(n) = list_page_size {
+        req = req.walker(
+            aws_sdk_s3_transfer_manager::io::walk::S3Walker::builder()
+                .prefix(key_prefix)
+                .page_size(n)
+                .build(),
+        );
+    }
+
+    // Capacity is the consumer's admission of how far behind it may fall. The 1024 default is
+    // ~512 objects of slack; past that the oldest are dropped and counted rather than
+    // the transfer being slowed to match the terminal.
+    let drawing = if progress {
+        let (sink, stream) = aws_sdk_s3_transfer_manager::events::channel(
+            std::num::NonZeroUsize::new(events_capacity).expect("capacity > 0"),
+        );
+        req = req.events(sink);
+        Some(tokio::spawn(draw_progress(stream, Numerator::Received)))
+    } else {
+        None
+    };
+
+    let handle = req.initiate()?;
 
     let output = handle.join().await?;
+    if let Some(drawing) = drawing {
+        // The sinks are gone once the operation is, so the drawer's loop has ended or is
+        // about to; awaiting it is what stops the bar from interleaving with the summary.
+        let _ = drawing.await;
+    }
     tracing::info!("download output: {output:?}");
 
     let transfer_size_bytes = output.metrics.network_rx;
@@ -324,8 +526,10 @@ async fn do_recursive_upload(
     bucket: &str,
     key_prefix: &str,
     source: &Path,
+    progress: bool,
+    events_capacity: usize,
 ) -> Result<u64, BoxError> {
-    let handle = tm
+    let mut req = tm
         .upload_objects()
         .source(source)
         .bucket(bucket)
@@ -334,10 +538,24 @@ async fn do_recursive_upload(
             aws_sdk_s3_transfer_manager::io::walk::FsWalker::builder()
                 .recursive(true)
                 .build(),
-        )
-        .initiate()?;
+        );
+
+    let drawing = if progress {
+        let (sink, stream) = aws_sdk_s3_transfer_manager::events::channel(
+            std::num::NonZeroUsize::new(events_capacity).expect("capacity > 0"),
+        );
+        req = req.events(sink);
+        Some(tokio::spawn(draw_progress(stream, Numerator::Sent)))
+    } else {
+        None
+    };
+
+    let handle = req.initiate()?;
 
     let output = handle.join().await?;
+    if let Some(drawing) = drawing {
+        let _ = drawing.await;
+    }
     tracing::info!("recursive upload output: {output:?}");
 
     let transfer_size_bytes = output.metrics.network_tx;
@@ -539,7 +757,16 @@ async fn run(args: Args) -> Result<(), BoxError> {
             let (bucket, key) = args.source.expect_s3().parts();
             let dest = args.dest.expect_local();
             if args.recursive {
-                do_recursive_download(&tm, bucket, key, dest).await?
+                do_recursive_download(
+                    &tm,
+                    bucket,
+                    key,
+                    dest,
+                    args.progress,
+                    args.list_page_size,
+                    args.events_capacity,
+                )
+                .await?
             } else {
                 do_single_download(&tm, bucket, key, dest).await?
             }
@@ -547,7 +774,15 @@ async fn run(args: Args) -> Result<(), BoxError> {
             let (bucket, key) = args.dest.expect_s3().parts();
             let source = args.source.expect_local();
             if args.recursive {
-                do_recursive_upload(&tm, bucket, key, source).await?
+                do_recursive_upload(
+                    &tm,
+                    bucket,
+                    key,
+                    source,
+                    args.progress,
+                    args.events_capacity,
+                )
+                .await?
             } else {
                 do_single_upload(&tm, bucket, key, source).await?
             }
