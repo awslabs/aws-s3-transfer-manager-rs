@@ -14,11 +14,11 @@ use tracing::Instrument;
 use super::chunk_meta::ChunkMetadata;
 use super::input::copy_fields_to_get_object_request;
 use super::object_meta::ObjectMetadata;
+use super::observability::{DownloadRequestKind, DownloadRequestMeasurement};
 use super::transfer::DownloadTransfer;
 use super::DownloadInput;
 use crate::error;
 use crate::http::header::{self, ByteRange};
-use crate::transfer::RequestMeasurement;
 
 #[derive(Debug, Clone, PartialEq)]
 enum ObjectDiscoveryStrategy {
@@ -56,7 +56,7 @@ pub(super) struct InitialChunk {
     pub(super) body: ByteStream,
     pub(super) expected_len: usize,
     /// Request measurement carried until the lazy response body is validated.
-    pub(super) request_metrics: Option<RequestMeasurement>,
+    pub(super) request_metrics: Option<DownloadRequestMeasurement>,
 }
 
 /// Parse the stored part count from an MPU ETag of the form `"<hash>-<N>"`.
@@ -168,7 +168,7 @@ async fn discover_obj_with_get_first_part(
     transfer: &DownloadTransfer,
     input: &DownloadInput,
 ) -> Result<ObjectDiscovery, error::Error> {
-    let mut req_metrics = transfer.ctx().start_request_metrics();
+    let mut req_metrics = transfer.start_request(DownloadRequestKind::DiscoveryPart);
     let retry_classify = crate::retry::classify_discovery_retry;
     let result = crate::retry::retry(req_metrics.metrics_mut(), retry_classify, |_allow_hedge| {
         let builder =
@@ -204,7 +204,7 @@ async fn discover_obj_with_head(
     transfer: &DownloadTransfer,
     input: &DownloadInput,
 ) -> Result<ObjectDiscovery, crate::error::Error> {
-    let mut req_metrics = transfer.ctx().start_request_metrics();
+    let mut req_metrics = transfer.start_request(DownloadRequestKind::DiscoveryHead);
     let retry_classify = crate::retry::classify_discovery_retry;
     let result = crate::retry::retry(req_metrics.metrics_mut(), retry_classify, |_allow_hedge| {
         let req = transfer
@@ -261,7 +261,7 @@ async fn discover_obj_with_get(
         ),
         None => ByteRange::Inclusive(0, target_part_size - 1),
     };
-    let mut req_metrics = transfer.ctx().start_request_metrics();
+    let mut req_metrics = transfer.start_request(DownloadRequestKind::DiscoveryRange);
     let retry_classify = crate::retry::classify_discovery_retry;
     let result = crate::retry::retry(req_metrics.metrics_mut(), retry_classify, |_allow_hedge| {
         let builder =
@@ -311,7 +311,7 @@ async fn discover_obj_with_get(
 /// at discovery.
 fn attach_request_measurement(
     mut discovery: ObjectDiscovery,
-    req_metrics: RequestMeasurement,
+    req_metrics: DownloadRequestMeasurement,
 ) -> ObjectDiscovery {
     match discovery.initial_chunk.as_mut() {
         Some(initial) => initial.request_metrics = Some(req_metrics),
