@@ -312,11 +312,7 @@ impl UploadTransfer {
                     if try_begin_completing(&mut state) {
                         continue;
                     }
-                    self.inner.observability.observe_event(
-                        self.inner.ctx.id,
-                        UploadEvent::Pending(pending_reason),
-                        snapshot,
-                    );
+                    self.inner.observability.observe_state(snapshot);
                     self.inner.ctx.set_pending(pending_reason);
                     return PollWork::Pending;
                 }
@@ -1569,8 +1565,8 @@ mod tests {
             };
             assert_eq!(parts.test_counts(), (1, 0, 0));
             let summary = parts.test_summary();
-            assert_eq!(summary.snapshot.completed_parts, 1);
-            assert_eq!(summary.snapshot.bytes_uploaded, 5);
+            assert_eq!(summary.parts_completed, 1);
+            assert_eq!(summary.bytes_uploaded, 5);
             assert_eq!(summary.read_pending_polls, 1);
             assert_eq!(summary.read_pending_parts, 1);
             assert_eq!(summary.presentation_segments, 1);
@@ -1675,10 +1671,10 @@ mod tests {
                 panic!("upload did not enter completing state");
             };
             let summary = parts.test_summary();
-            assert_eq!(summary.snapshot.completed_parts, 2);
-            assert_eq!(summary.snapshot.parts_in_flight, 0);
-            assert_eq!(summary.snapshot.uploads_in_flight, 0);
-            assert_eq!(summary.snapshot.pending_reads, 0);
+            assert_eq!(summary.parts_completed, 2);
+            assert_eq!(summary.last_active_snapshot.parts_in_flight, 0);
+            assert_eq!(summary.last_active_snapshot.uploads_in_flight, 0);
+            assert_eq!(summary.last_active_snapshot.pending_reads, 0);
             assert_eq!(summary.segmented_parts, 0);
             assert_eq!(summary.presentation_segments, 2);
             assert_eq!(summary.max_presentation_segments, 1);
@@ -1721,8 +1717,7 @@ mod tests {
             summary
                 .multipart
                 .expect("multipart summary")
-                .snapshot
-                .completed_parts,
+                .parts_completed,
             2
         );
     }
@@ -1970,8 +1965,8 @@ mod tests {
         assert_eq!(summary.requests.create_multipart_upload.requests, 1);
         assert_eq!(summary.requests.upload_part.requests, 1);
         let multipart = summary.multipart.expect("multipart state");
-        assert_eq!(multipart.snapshot.completed_parts, 0);
-        assert_eq!(multipart.snapshot.uploads_in_flight, 0);
+        assert_eq!(multipart.parts_completed, 0);
+        assert_eq!(multipart.last_active_snapshot.uploads_in_flight, 0);
     }
 
     #[cfg_attr(miri, ignore)]
@@ -2017,11 +2012,7 @@ mod tests {
         assert_eq!(summary.requests.upload_part.requests, 2);
         assert_eq!(summary.requests.complete_multipart_upload.requests, 1);
         assert_eq!(
-            summary
-                .multipart
-                .expect("multipart state")
-                .snapshot
-                .completed_parts,
+            summary.multipart.expect("multipart state").parts_completed,
             2
         );
     }

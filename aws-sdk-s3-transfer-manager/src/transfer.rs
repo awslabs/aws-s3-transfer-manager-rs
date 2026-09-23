@@ -19,7 +19,9 @@ use std::task::{Wake, Waker};
 use std::time::Instant;
 
 use pending::TransferPendingState;
-pub(crate) use pending::{PendingCategory, PendingCause, TransferPendingStats};
+pub(crate) use pending::{
+    emit_pending_details, PendingCategory, PendingCause, TransferPendingStats,
+};
 
 /// Edge-triggered wake flag for transfer state machines.
 ///
@@ -813,7 +815,7 @@ impl TransferContext {
             pending.record_pending(self.id, cause);
         }
         tracing::trace!(
-            target: crate::telemetry::TARGET_TRANSFER,
+            target: crate::telemetry::TARGET_SCHEDULING,
             tid = %self.id,
             category = cause.category.as_str(),
             reason = cause.reason,
@@ -831,14 +833,14 @@ impl TransferContext {
     pub(crate) fn try_wake(&self) {
         if self.wake_flag.take_pending() {
             tracing::trace!(
-                target: crate::telemetry::TARGET_TRANSFER,
+                target: crate::telemetry::TARGET_SCHEDULING,
                 tid = %self.id,
                 "ctx.try_wake.fired",
             );
             self.wake();
         } else {
             tracing::trace!(
-                target: crate::telemetry::TARGET_TRANSFER,
+                target: crate::telemetry::TARGET_SCHEDULING,
                 tid = %self.id,
                 "ctx.try_wake.skipped",
             );
@@ -876,7 +878,7 @@ impl TransferContext {
     pub(crate) fn begin_poll(&self) {
         self.wake_flag.take_pending();
         if let Some(pending) = &self.pending_state {
-            pending.begin_poll(self.id);
+            pending.record_poll_started(self.id);
         }
     }
 
@@ -1388,7 +1390,7 @@ mod tests {
         }
 
         #[test]
-        fn pending_cause_is_accounted_across_wake_and_repoll() {
+        fn pending_cause_is_accounted_across_wake_and_next_poll() {
             let (ctx, _rx) = TransferContext::new(test_handle_with_diagnostics(1));
             ctx.set_pending(PendingCause::new(PendingCategory::Memory, "test"));
             ctx.record_wake();

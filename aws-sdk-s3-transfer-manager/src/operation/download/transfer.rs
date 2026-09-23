@@ -316,10 +316,9 @@ impl DownloadTransfer {
             }
             DownloadState::DiscoveryInFlight => {
                 self.inner.ctx.set_pending(DownloadPendingReason::Discovery);
-                self.observe_event(
-                    DownloadEvent::Pending(DownloadPendingReason::Discovery),
-                    &state,
-                );
+                self.inner
+                    .observability
+                    .observe_state(self.snapshot(&state));
                 PollWork::Pending
             }
             DownloadState::Transferring {
@@ -508,11 +507,7 @@ impl DownloadTransfer {
     /// own scheduler-backed task waker.
     fn park(&self, reason: DownloadPendingReason, snapshot: DownloadStateSnapshot) -> PollWork {
         self.inner.ctx.set_pending(reason);
-        self.inner.observability.observe_event(
-            self.inner.ctx.id,
-            DownloadEvent::Pending(reason),
-            snapshot,
-        );
+        self.inner.observability.observe_state(snapshot);
         PollWork::Pending
     }
 
@@ -544,11 +539,7 @@ impl DownloadTransfer {
             self.inner
                 .ctx
                 .set_pending(DownloadPendingReason::MemoryAdmission);
-            self.inner.observability.observe_event(
-                self.inner.ctx.id,
-                DownloadEvent::Pending(DownloadPendingReason::MemoryAdmission),
-                snapshot,
-            );
+            self.inner.observability.observe_state(snapshot);
             PollWork::Pending
         }
     }
@@ -2126,7 +2117,7 @@ mod tests {
             assert_eq!(summary.ranges_scheduled, 1);
             assert_eq!(summary.ranges_completed, 1);
             assert_eq!(
-                summary.state.resident_parts, 1,
+                summary.last_active_snapshot.resident_parts, 1,
                 "terminal receive does not imply stream-consumer delivery"
             );
             assert!(!summary.destination_work.file_finalized);
@@ -2199,7 +2190,7 @@ mod tests {
             1
         );
         assert_eq!(
-            summary.state.state,
+            summary.last_active_snapshot.state,
             DownloadExecutionState::DiscoveryInFlight
         );
     }
