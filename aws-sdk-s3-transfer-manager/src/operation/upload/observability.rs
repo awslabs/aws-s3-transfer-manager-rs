@@ -17,9 +17,8 @@ use crate::config::TransferDiagnosticsConfig;
 use crate::error::ErrorKind;
 use crate::io::SizeHint;
 use crate::metrics::RequestMetrics;
-use crate::operation::upload::context::PartTransferPendingReason;
 use crate::transfer::{
-    AttributedRequestMeasurement, PendingCategory, RequestMetricsAttribution, TransferContext,
+    emit_pending_details, AttributedRequestMeasurement, RequestMetricsAttribution, TransferContext,
     TransferId, TransferPendingStats,
 };
 use crate::types::{TransferMetrics, TransferStatus};
@@ -120,8 +119,14 @@ impl UploadStateSnapshot {
 /// Aggregate multipart state included in an upload terminal summary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct MultipartTransferSummary {
-    /// Last coherent multipart execution state.
-    pub(crate) snapshot: UploadStateSnapshot,
+    /// Last active multipart state observed before terminal reporting.
+    pub(crate) last_active_snapshot: UploadStateSnapshot,
+    /// UploadPart requests accepted by S3.
+    pub(crate) parts_completed: usize,
+    /// Bytes returned by multipart source reads.
+    pub(crate) bytes_read: u64,
+    /// Bytes accepted by completed UploadPart requests.
+    pub(crate) bytes_uploaded: u64,
     /// Parts whose request body used more than one presentation segment.
     pub(crate) segmented_parts: u64,
     /// Total presentation segments across all UploadPart requests.
@@ -169,6 +174,17 @@ pub(crate) enum UploadRequestKind {
     UploadPart,
     /// Multipart upload completion.
     CompleteMultipartUpload,
+}
+
+impl UploadRequestKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::PutObject => "put_object",
+            Self::CreateMultipartUpload => "create_multipart_upload",
+            Self::UploadPart => "upload_part",
+            Self::CompleteMultipartUpload => "complete_multipart_upload",
+        }
+    }
 }
 
 /// Upload execution strategy selected from source size and stream behavior.
@@ -273,14 +289,10 @@ pub(crate) enum UploadEvent {
     EmptyObjectPartScheduled,
     /// Dispatch is closed and every scheduled operation has retired.
     CompletionReady,
-    /// No upload-part work can be dispatched until multipart state changes.
-    Pending(PartTransferPendingReason),
     /// A speculative dispatch was retracted after a custom source blocked.
     CustomSourceBlocked,
     /// CompleteMultipartUpload is ready to run.
     MultipartCompletionStarted,
-    /// The upload reached one terminal outcome.
-    Terminal(UploadTerminalOutcome),
 }
 
 impl UploadEvent {
@@ -294,20 +306,8 @@ impl UploadEvent {
             Self::SourceExhausted => ("dispatch_closed", "source_eof"),
             Self::EmptyObjectPartScheduled => ("work_scheduled", "empty_object"),
             Self::CompletionReady => ("completion_ready", "multipart_drained"),
-            Self::Pending(PartTransferPendingReason::SourceUnavailable) => {
-                ("poll_pending", "source_unavailable")
-            }
-            Self::Pending(PartTransferPendingReason::DispatchClosed) => {
-                ("poll_pending", "dispatch_closed")
-            }
-            Self::Pending(PartTransferPendingReason::NoReadyPart) => {
-                ("poll_pending", "no_ready_part")
-            }
             Self::CustomSourceBlocked => ("work_retracted", "custom_source_blocked"),
             Self::MultipartCompletionStarted => ("request_started", "complete_multipart_upload"),
-            Self::Terminal(UploadTerminalOutcome::Completed) => ("terminal", "completed"),
-            Self::Terminal(UploadTerminalOutcome::Failed) => ("terminal", "failed"),
-            Self::Terminal(UploadTerminalOutcome::Cancelled) => ("terminal", "cancelled"),
         }
     }
 }
@@ -435,8 +435,8 @@ pub(crate) struct UploadTransferSummary {
     pub(crate) request_total: RequestMetrics,
     /// Scheduler pending intervals attributed by common category.
     pub(crate) pending: TransferPendingStats,
-    /// Last coherent upload state observed before terminal reporting.
-    pub(crate) state: UploadStateSnapshot,
+    /// Last active upload execution state observed before terminal reporting.
+    pub(crate) last_active_state: UploadExecutionState,
     /// Multipart-only work and timing, absent for PutObject.
     pub(crate) multipart: Option<MultipartTransferSummary>,
 }
@@ -495,7 +495,10 @@ struct UploadObservabilityState {
     read_pending_parts: u64,
     read_pending_duration: Duration,
     complete_mpu_duration: Duration,
-    latest_snapshot: Option<UploadStateSnapshot>,
+    last_active_snapshot: Option<UploadStateSnapshot>,
+    parts_completed: usize,
+    bytes_read: u64,
+    bytes_uploaded: u64,
     requests: UploadRequestMetrics,
 }
 
@@ -527,7 +530,10 @@ impl UploadObservability {
                 read_pending_parts: 0,
                 read_pending_duration: Duration::ZERO,
                 complete_mpu_duration: Duration::ZERO,
-                latest_snapshot: None,
+                last_active_snapshot: None,
+                parts_completed: 0,
+                bytes_read: 0,
+                bytes_uploaded: 0,
                 requests: UploadRequestMetrics::default(),
             }),
             #[cfg(test)]
@@ -699,9 +705,12 @@ impl UploadObservability {
     }
 
     fn multipart_summary(state: &UploadObservabilityState) -> Option<MultipartTransferSummary> {
-        let snapshot = state.latest_snapshot?;
+        if state.mode != UploadMode::Multipart {
+            return None;
+        }
+        let last_active_snapshot = state.last_active_snapshot?;
         if !matches!(
-            snapshot.state,
+            last_active_snapshot.state,
             UploadExecutionState::Transferring
                 | UploadExecutionState::MultipartCompletionPending
                 | UploadExecutionState::CompleteMultipartUploadInFlight
@@ -709,7 +718,10 @@ impl UploadObservability {
             return None;
         }
         Some(MultipartTransferSummary {
-            snapshot,
+            last_active_snapshot,
+            parts_completed: state.parts_completed,
+            bytes_read: state.bytes_read,
+            bytes_uploaded: state.bytes_uploaded,
             segmented_parts: state.segmented_parts,
             presentation_segments: state.presentation_segments,
             max_presentation_segments: state.max_presentation_segments,
@@ -743,6 +755,13 @@ impl UploadObservability {
         update_snapshot(&mut enabled.state.lock().expect("lock poisoned"), snapshot);
         if enabled.emit_events {
             emit_event(transfer_id, event, snapshot);
+        }
+    }
+
+    /// Retains coherent state without emitting a direction-specific event.
+    pub(crate) fn observe_state(&self, snapshot: UploadStateSnapshot) {
+        if let Self::Enabled(enabled) = self {
+            update_snapshot(&mut enabled.state.lock().expect("lock poisoned"), snapshot);
         }
     }
 
@@ -854,11 +873,9 @@ impl UploadObservability {
         }
 
         let mut state = enabled.state.lock().expect("lock poisoned");
-        if state.latest_snapshot.is_none() {
-            update_snapshot(&mut state, report.state_snapshot);
-        }
-        let terminal_snapshot = state
-            .latest_snapshot
+        update_snapshot(&mut state, report.state_snapshot);
+        let last_active_snapshot = state
+            .last_active_snapshot
             .expect("terminal upload summary must retain a state snapshot");
         let summary = UploadTransferSummary {
             outcome,
@@ -874,17 +891,13 @@ impl UploadObservability {
             requests: state.requests,
             request_total: report.request_total,
             pending: report.pending,
-            state: terminal_snapshot,
+            last_active_state: last_active_snapshot.state,
             multipart: Self::multipart_summary(&state),
         };
         drop(state);
 
         if enabled.emit_events {
-            emit_event(
-                report.transfer_id,
-                UploadEvent::Terminal(outcome),
-                terminal_snapshot,
-            );
+            emit_terminal_details(report.transfer_id, &summary);
         }
         #[cfg(test)]
         {
@@ -931,29 +944,77 @@ impl RequestMetricsAttribution for UploadObservability {
 pub(crate) type UploadRequestMeasurement = AttributedRequestMeasurement<UploadObservability>;
 
 fn update_snapshot(state: &mut UploadObservabilityState, snapshot: UploadStateSnapshot) {
-    state.latest_snapshot = Some(snapshot);
+    if snapshot.state != UploadExecutionState::Done || state.last_active_snapshot.is_none() {
+        state.last_active_snapshot = Some(snapshot);
+    }
     state.max_parts_in_flight = state.max_parts_in_flight.max(snapshot.parts_in_flight);
+    state.parts_completed = state.parts_completed.max(snapshot.completed_parts);
+    state.bytes_read = state.bytes_read.max(snapshot.bytes_read);
+    state.bytes_uploaded = state.bytes_uploaded.max(snapshot.bytes_uploaded);
 }
 
 fn emit_event(transfer_id: TransferId, event: UploadEvent, snapshot: UploadStateSnapshot) {
-    let (event, reason) = event.fields();
-    tracing::trace!(
-        target: crate::telemetry::TARGET_TRANSFER,
-        tid = %transfer_id,
-        event,
-        reason,
-        state = snapshot.state.as_str(),
-        parts_dispatched = snapshot.parts_dispatched,
-        parts_in_flight = snapshot.parts_in_flight,
-        uploads_in_flight = snapshot.uploads_in_flight,
-        pending_reads = snapshot.pending_reads,
-        completed_parts = snapshot.completed_parts,
-        bytes_read = snapshot.bytes_read,
-        bytes_uploaded = snapshot.bytes_uploaded,
-        eof = snapshot.eof,
-        dispatch_closed = snapshot.dispatch_closed,
-        "upload state-machine event",
-    );
+    let (event_name, reason) = event.fields();
+    match event {
+        UploadEvent::PutObjectScheduled
+        | UploadEvent::MultipartUploadScheduled
+        | UploadEvent::MultipartUploadCreated => {
+            tracing::trace!(
+                target: crate::telemetry::TARGET_TRANSFER,
+                tid = %transfer_id,
+                event = event_name,
+                reason,
+                state = snapshot.state.as_str(),
+                "upload state-machine event",
+            );
+        }
+        UploadEvent::NewPartScheduled
+        | UploadEvent::SourceWakeScheduled
+        | UploadEvent::EmptyObjectPartScheduled
+        | UploadEvent::CustomSourceBlocked => {
+            tracing::trace!(
+                target: crate::telemetry::TARGET_TRANSFER,
+                tid = %transfer_id,
+                event = event_name,
+                reason,
+                state = snapshot.state.as_str(),
+                parts_dispatched = snapshot.parts_dispatched,
+                parts_in_flight = snapshot.parts_in_flight,
+                pending_reads = snapshot.pending_reads,
+                "upload state-machine event",
+            );
+        }
+        UploadEvent::SourceExhausted => {
+            tracing::trace!(
+                target: crate::telemetry::TARGET_TRANSFER,
+                tid = %transfer_id,
+                event = event_name,
+                reason,
+                state = snapshot.state.as_str(),
+                parts_in_flight = snapshot.parts_in_flight,
+                pending_reads = snapshot.pending_reads,
+                completed_parts = snapshot.completed_parts,
+                bytes_read = snapshot.bytes_read,
+                dispatch_closed = snapshot.dispatch_closed,
+                "upload state-machine event",
+            );
+        }
+        UploadEvent::CompletionReady | UploadEvent::MultipartCompletionStarted => {
+            tracing::trace!(
+                target: crate::telemetry::TARGET_TRANSFER,
+                tid = %transfer_id,
+                event = event_name,
+                reason,
+                state = snapshot.state.as_str(),
+                parts_in_flight = snapshot.parts_in_flight,
+                uploads_in_flight = snapshot.uploads_in_flight,
+                completed_parts = snapshot.completed_parts,
+                bytes_read = snapshot.bytes_read,
+                bytes_uploaded = snapshot.bytes_uploaded,
+                "upload state-machine event",
+            );
+        }
+    }
 }
 
 fn emit_source_pending(
@@ -1048,126 +1109,134 @@ fn emit_part_completed(
 }
 
 fn emit_terminal_summary(transfer_id: TransferId, summary: &UploadTransferSummary) {
-    let source_pending = summary.pending.category(PendingCategory::Source);
-    let memory_pending = summary.pending.category(PendingCategory::Memory);
-    let consumer_pending = summary.pending.category(PendingCategory::Consumer);
-    let work_pending = summary.pending.category(PendingCategory::InFlightWork);
-    let other_pending = summary.pending.category(PendingCategory::Other);
-    let terminal_category = summary
-        .pending
-        .terminal_cause
-        .map(|cause| cause.category.as_str());
-    let terminal_reason = summary.pending.terminal_cause.map(|cause| cause.reason);
+    if let Some(multipart) = summary.multipart {
+        tracing::debug!(
+            target: crate::telemetry::TARGET_TRANSFER,
+            tid = %transfer_id,
+            outcome = summary.outcome.as_str(),
+            mode = summary.mode.as_str(),
+            source_length = summary.length_kind.as_str(),
+            error_kind = ?summary.error_kind,
+            elapsed = ?summary.elapsed,
+            expected_bytes = summary.metrics.total_bytes,
+            network_tx = summary.metrics.network_tx,
+            disk_read = summary.metrics.disk_read,
+            requests = summary.request_total.requests,
+            request_time_sum = ?summary.request_total.elapsed,
+            request_time_max = ?summary.request_total.max_elapsed,
+            retry_reissues = summary.request_total.retry_reissues,
+            throttle_reissues = summary.request_total.throttle_reissues,
+            hedge_reissues = summary.request_total.hedge_reissues,
+            retry_exhaustions = summary.request_total.retry_exhaustions,
+            backoff_time_sum = ?summary.request_total.backoff_duration,
+            pending_intervals = summary.pending.interval_count(),
+            pending_time_sum = ?summary.pending.pending_duration(),
+            pending_time_max = ?summary.pending.max_pending_duration(),
+            parts_completed = multipart.parts_completed,
+            bytes_read = multipart.bytes_read,
+            bytes_uploaded = multipart.bytes_uploaded,
+            max_parts_in_flight = multipart.max_parts_in_flight,
+            max_uploads_in_flight = multipart.max_uploads_in_flight,
+            "upload transfer terminal",
+        );
+    } else {
+        tracing::debug!(
+            target: crate::telemetry::TARGET_TRANSFER,
+            tid = %transfer_id,
+            outcome = summary.outcome.as_str(),
+            mode = summary.mode.as_str(),
+            source_length = summary.length_kind.as_str(),
+            error_kind = ?summary.error_kind,
+            elapsed = ?summary.elapsed,
+            expected_bytes = summary.metrics.total_bytes,
+            network_tx = summary.metrics.network_tx,
+            disk_read = summary.metrics.disk_read,
+            requests = summary.request_total.requests,
+            request_time_sum = ?summary.request_total.elapsed,
+            request_time_max = ?summary.request_total.max_elapsed,
+            retry_reissues = summary.request_total.retry_reissues,
+            throttle_reissues = summary.request_total.throttle_reissues,
+            hedge_reissues = summary.request_total.hedge_reissues,
+            retry_exhaustions = summary.request_total.retry_exhaustions,
+            backoff_time_sum = ?summary.request_total.backoff_duration,
+            pending_intervals = summary.pending.interval_count(),
+            pending_time_sum = ?summary.pending.pending_duration(),
+            pending_time_max = ?summary.pending.max_pending_duration(),
+            "upload transfer terminal",
+        );
+    }
+}
 
-    tracing::debug!(
+fn emit_terminal_details(transfer_id: TransferId, summary: &UploadTransferSummary) {
+    emit_request_detail(
+        transfer_id,
+        UploadRequestKind::PutObject,
+        summary.requests.put_object,
+    );
+    emit_request_detail(
+        transfer_id,
+        UploadRequestKind::CreateMultipartUpload,
+        summary.requests.create_multipart_upload,
+    );
+    emit_request_detail(
+        transfer_id,
+        UploadRequestKind::UploadPart,
+        summary.requests.upload_part,
+    );
+    emit_request_detail(
+        transfer_id,
+        UploadRequestKind::CompleteMultipartUpload,
+        summary.requests.complete_multipart_upload,
+    );
+    emit_pending_details(transfer_id, &summary.pending);
+
+    if let Some(multipart) = summary.multipart {
+        tracing::trace!(
+            target: crate::telemetry::TARGET_TRANSFER,
+            tid = %transfer_id,
+            last_active_state = summary.last_active_state.as_str(),
+            parts_completed = multipart.parts_completed,
+            bytes_read = multipart.bytes_read,
+            bytes_uploaded = multipart.bytes_uploaded,
+            segmented_parts = multipart.segmented_parts,
+            presentation_segments = multipart.presentation_segments,
+            max_presentation_segments = multipart.max_presentation_segments,
+            max_parts_in_flight = multipart.max_parts_in_flight,
+            max_uploads_in_flight = multipart.max_uploads_in_flight,
+            create_mpu_time_sum = ?multipart.create_mpu_duration,
+            source_read_time_sum = ?multipart.source_read_duration,
+            source_read_time_max = ?multipart.max_source_read_duration,
+            read_pending_polls = multipart.read_pending_polls,
+            read_pending_parts = multipart.read_pending_parts,
+            read_pending_time_sum = ?multipart.read_pending_duration,
+            upload_part_time_sum = ?multipart.upload_request_duration,
+            upload_part_time_max = ?multipart.max_upload_request_duration,
+            body_time = ?multipart.body_duration,
+            drain_time = ?multipart.drain_duration,
+            complete_mpu_request_time_sum = ?multipart.complete_mpu_request_duration,
+            complete_mpu_time = ?multipart.complete_mpu_duration,
+            "upload multipart detail",
+        );
+    }
+}
+
+fn emit_request_detail(transfer_id: TransferId, kind: UploadRequestKind, metrics: RequestMetrics) {
+    if metrics.requests == 0 {
+        return;
+    }
+    tracing::trace!(
         target: crate::telemetry::TARGET_TRANSFER,
         tid = %transfer_id,
-        outcome = summary.outcome.as_str(),
-        mode = summary.mode.as_str(),
-        source_length = summary.length_kind.as_str(),
-        state = summary.state.state.as_str(),
-        error_kind = ?summary.error_kind,
-        elapsed_us = duration_micros(summary.elapsed),
-        expected_bytes = summary.metrics.total_bytes,
-        network_tx = summary.metrics.network_tx,
-        disk_read = summary.metrics.disk_read,
-        requests = summary.request_total.requests,
-        request_elapsed_us = duration_micros(summary.request_total.elapsed),
-        max_request_elapsed_us = duration_micros(summary.request_total.max_elapsed),
-        retry_reissues = summary.request_total.retry_reissues,
-        throttle_reissues = summary.request_total.throttle_reissues,
-        hedge_reissues = summary.request_total.hedge_reissues,
-        retry_exhaustions = summary.request_total.retry_exhaustions,
-        backoff_duration_us = duration_micros(summary.request_total.backoff_duration),
-        put_object_requests = summary.requests.put_object.requests,
-        put_object_elapsed_us = duration_micros(summary.requests.put_object.elapsed),
-        put_object_max_elapsed_us = duration_micros(summary.requests.put_object.max_elapsed),
-        put_object_retry_reissues = summary.requests.put_object.retry_reissues,
-        put_object_throttle_reissues = summary.requests.put_object.throttle_reissues,
-        put_object_hedge_reissues = summary.requests.put_object.hedge_reissues,
-        put_object_retry_exhaustions = summary.requests.put_object.retry_exhaustions,
-        put_object_backoff_us = duration_micros(summary.requests.put_object.backoff_duration),
-        create_mpu_requests = summary.requests.create_multipart_upload.requests,
-        create_mpu_elapsed_us = duration_micros(summary.requests.create_multipart_upload.elapsed),
-        create_mpu_max_elapsed_us =
-            duration_micros(summary.requests.create_multipart_upload.max_elapsed),
-        create_mpu_retry_reissues = summary.requests.create_multipart_upload.retry_reissues,
-        create_mpu_throttle_reissues =
-            summary.requests.create_multipart_upload.throttle_reissues,
-        create_mpu_hedge_reissues = summary.requests.create_multipart_upload.hedge_reissues,
-        create_mpu_retry_exhaustions =
-            summary.requests.create_multipart_upload.retry_exhaustions,
-        create_mpu_backoff_us =
-            duration_micros(summary.requests.create_multipart_upload.backoff_duration),
-        upload_part_requests = summary.requests.upload_part.requests,
-        upload_part_elapsed_us = duration_micros(summary.requests.upload_part.elapsed),
-        upload_part_max_elapsed_us = duration_micros(summary.requests.upload_part.max_elapsed),
-        upload_part_retry_reissues = summary.requests.upload_part.retry_reissues,
-        upload_part_throttle_reissues = summary.requests.upload_part.throttle_reissues,
-        upload_part_hedge_reissues = summary.requests.upload_part.hedge_reissues,
-        upload_part_retry_exhaustions = summary.requests.upload_part.retry_exhaustions,
-        upload_part_backoff_us = duration_micros(summary.requests.upload_part.backoff_duration),
-        complete_mpu_requests = summary.requests.complete_multipart_upload.requests,
-        complete_mpu_elapsed_us =
-            duration_micros(summary.requests.complete_multipart_upload.elapsed),
-        complete_mpu_max_elapsed_us =
-            duration_micros(summary.requests.complete_multipart_upload.max_elapsed),
-        complete_mpu_retry_reissues =
-            summary.requests.complete_multipart_upload.retry_reissues,
-        complete_mpu_throttle_reissues =
-            summary.requests.complete_multipart_upload.throttle_reissues,
-        complete_mpu_hedge_reissues =
-            summary.requests.complete_multipart_upload.hedge_reissues,
-        complete_mpu_retry_exhaustions =
-            summary.requests.complete_multipart_upload.retry_exhaustions,
-        complete_mpu_backoff_us =
-            duration_micros(summary.requests.complete_multipart_upload.backoff_duration),
-        source_pending = source_pending.count,
-        source_pending_us = duration_micros(source_pending.pending_to_repoll),
-        source_max_pending_us = duration_micros(source_pending.max_pending_to_repoll),
-        memory_pending = memory_pending.count,
-        memory_pending_us = duration_micros(memory_pending.pending_to_repoll),
-        memory_max_pending_us = duration_micros(memory_pending.max_pending_to_repoll),
-        consumer_pending = consumer_pending.count,
-        consumer_pending_us = duration_micros(consumer_pending.pending_to_repoll),
-        consumer_max_pending_us = duration_micros(consumer_pending.max_pending_to_repoll),
-        in_flight_work_pending = work_pending.count,
-        in_flight_work_pending_us = duration_micros(work_pending.pending_to_repoll),
-        in_flight_work_max_pending_us = duration_micros(work_pending.max_pending_to_repoll),
-        other_pending = other_pending.count,
-        other_pending_us = duration_micros(other_pending.pending_to_repoll),
-        other_max_pending_us = duration_micros(other_pending.max_pending_to_repoll),
-        terminal_pending_category = terminal_category,
-        terminal_pending_reason = terminal_reason,
-        multipart_parts = summary.multipart.map(|part| part.snapshot.completed_parts),
-        multipart_bytes = summary.multipart.map(|part| part.snapshot.bytes_uploaded),
-        segmented_parts = summary.multipart.map(|part| part.segmented_parts),
-        presentation_segments = summary.multipart.map(|part| part.presentation_segments),
-        max_presentation_segments =
-            summary.multipart.map(|part| part.max_presentation_segments),
-        max_parts_in_flight = summary.multipart.map(|part| part.max_parts_in_flight),
-        max_uploads_in_flight = summary.multipart.map(|part| part.max_uploads_in_flight),
-        create_mpu_duration_us =
-            summary.multipart.map(|part| duration_micros(part.create_mpu_duration)),
-        source_read_duration_us =
-            summary.multipart.map(|part| duration_micros(part.source_read_duration)),
-        max_source_read_duration_us =
-            summary.multipart.map(|part| duration_micros(part.max_source_read_duration)),
-        read_pending_polls = summary.multipart.map(|part| part.read_pending_polls),
-        read_pending_parts = summary.multipart.map(|part| part.read_pending_parts),
-        read_pending_duration_us =
-            summary.multipart.map(|part| duration_micros(part.read_pending_duration)),
-        upload_request_duration_us =
-            summary.multipart.map(|part| duration_micros(part.upload_request_duration)),
-        max_upload_request_duration_us =
-            summary.multipart.map(|part| duration_micros(part.max_upload_request_duration)),
-        body_duration_us = summary.multipart.map(|part| duration_micros(part.body_duration)),
-        drain_duration_us = summary.multipart.map(|part| duration_micros(part.drain_duration)),
-        complete_mpu_request_duration_us =
-            summary.multipart.map(|part| duration_micros(part.complete_mpu_request_duration)),
-        complete_mpu_duration_us =
-            summary.multipart.map(|part| duration_micros(part.complete_mpu_duration)),
-        "upload transfer terminal",
+        request_kind = kind.as_str(),
+        requests = metrics.requests,
+        request_time_sum = ?metrics.elapsed,
+        request_time_max = ?metrics.max_elapsed,
+        retry_reissues = metrics.retry_reissues,
+        throttle_reissues = metrics.throttle_reissues,
+        hedge_reissues = metrics.hedge_reissues,
+        retry_exhaustions = metrics.retry_exhaustions,
+        backoff_time_sum = ?metrics.backoff_duration,
+        "upload request detail",
     );
 }
 
@@ -1306,7 +1375,10 @@ mod tests {
         let summary = observability
             .test_summary(snapshot())
             .expect("summary detail should produce a report");
-        assert_eq!(summary.snapshot.uploads_in_flight, 0);
+        assert_eq!(summary.last_active_snapshot.uploads_in_flight, 0);
+        assert_eq!(summary.parts_completed, 1);
+        assert_eq!(summary.bytes_read, 8 * 1024 * 1024);
+        assert_eq!(summary.bytes_uploaded, 8 * 1024 * 1024);
         assert_eq!(summary.segmented_parts, 1);
         assert_eq!(summary.presentation_segments, 3);
         assert_eq!(summary.max_presentation_segments, 3);
@@ -1360,28 +1432,12 @@ mod tests {
             ("completion_ready", "multipart_drained")
         );
         assert_eq!(
-            UploadEvent::Pending(PartTransferPendingReason::SourceUnavailable).fields(),
-            ("poll_pending", "source_unavailable")
-        );
-        assert_eq!(
-            UploadEvent::Pending(PartTransferPendingReason::DispatchClosed).fields(),
-            ("poll_pending", "dispatch_closed")
-        );
-        assert_eq!(
-            UploadEvent::Pending(PartTransferPendingReason::NoReadyPart).fields(),
-            ("poll_pending", "no_ready_part")
-        );
-        assert_eq!(
             UploadEvent::CustomSourceBlocked.fields(),
             ("work_retracted", "custom_source_blocked")
         );
         assert_eq!(
             UploadEvent::MultipartCompletionStarted.fields(),
             ("request_started", "complete_multipart_upload")
-        );
-        assert_eq!(
-            UploadEvent::Terminal(UploadTerminalOutcome::Completed).fields(),
-            ("terminal", "completed")
         );
     }
 
@@ -1403,7 +1459,12 @@ mod tests {
             RequestMetrics::default(),
             UploadStateSnapshot::inactive(UploadExecutionState::PutObjectInFlight),
         ));
-        assert_eq!(first.expect("first report").mode, UploadMode::PutObject);
+        let first = first.expect("first report");
+        assert_eq!(first.mode, UploadMode::PutObject);
+        assert_eq!(
+            first.last_active_state,
+            UploadExecutionState::PutObjectInFlight
+        );
         assert!(second.is_none());
     }
 

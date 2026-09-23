@@ -16,9 +16,8 @@ use std::time::Duration;
 use crate::config::TransferDiagnosticsConfig;
 use crate::error::ErrorKind;
 use crate::metrics::RequestMetrics;
-use crate::operation::download::context::DownloadPendingReason;
 use crate::transfer::{
-    AttributedRequestMeasurement, PendingCategory, RequestMetricsAttribution, TransferContext,
+    emit_pending_details, AttributedRequestMeasurement, RequestMetricsAttribution, TransferContext,
     TransferId, TransferPendingStats,
 };
 use crate::types::{ChecksumValidation, TransferMetrics, TransferStatus};
@@ -52,6 +51,17 @@ pub(crate) enum DownloadRequestKind {
     DiscoveryPart,
     /// GetObject request for one post-discovery byte range.
     Range,
+}
+
+impl DownloadRequestKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::DiscoveryHead => "discovery_head",
+            Self::DiscoveryRange => "discovery_range",
+            Self::DiscoveryPart => "discovery_part",
+            Self::Range => "range",
+        }
+    }
 }
 
 /// Copyable execution-state projection of
@@ -168,16 +178,12 @@ pub(crate) enum DownloadEvent {
     RangeCompleted,
     /// Every object range has been issued.
     AllRangesIssued,
-    /// No download work can be produced until local state changes.
-    Pending(DownloadPendingReason),
     /// A disk drain was scheduled to release resident memory.
     MemoryReliefScheduled,
     /// A disk drain released resident memory.
     MemoryReliefCompleted,
     /// The destination was finalized for successful completion.
     DestinationFinalized,
-    /// The download reached one terminal outcome.
-    Terminal(DownloadTerminalOutcome),
 }
 
 impl DownloadEvent {
@@ -188,20 +194,9 @@ impl DownloadEvent {
             Self::RangeScheduled => ("work_scheduled", "range"),
             Self::RangeCompleted => ("work_completed", "range"),
             Self::AllRangesIssued => ("dispatch_closed", "all_ranges_issued"),
-            Self::Pending(DownloadPendingReason::Discovery) => ("poll_pending", "discovery"),
-            Self::Pending(DownloadPendingReason::ReadAhead) => ("poll_pending", "read_ahead"),
-            Self::Pending(DownloadPendingReason::MemoryAdmission) => {
-                ("poll_pending", "memory_admission")
-            }
-            Self::Pending(DownloadPendingReason::RangeCompletion) => {
-                ("poll_pending", "range_completion")
-            }
             Self::MemoryReliefScheduled => ("work_scheduled", "memory_relief"),
             Self::MemoryReliefCompleted => ("work_completed", "memory_relief"),
             Self::DestinationFinalized => ("state_changed", "destination_finalized"),
-            Self::Terminal(DownloadTerminalOutcome::Completed) => ("terminal", "completed"),
-            Self::Terminal(DownloadTerminalOutcome::Failed) => ("terminal", "failed"),
-            Self::Terminal(DownloadTerminalOutcome::Cancelled) => ("terminal", "cancelled"),
         }
     }
 }
@@ -271,8 +266,8 @@ pub(crate) struct DownloadTransferSummary {
     pub(crate) request_total: RequestMetrics,
     /// Scheduler pending intervals attributed by common category.
     pub(crate) pending: TransferPendingStats,
-    /// Last coherent download state observed before terminal reporting.
-    pub(crate) state: DownloadStateSnapshot,
+    /// Last coherent active state observed before terminal reporting.
+    pub(crate) last_active_snapshot: DownloadStateSnapshot,
     /// Object ranges admitted for execution.
     pub(crate) ranges_scheduled: u64,
     /// Object ranges retired after delivery or failure.
@@ -326,7 +321,7 @@ pub(crate) struct EnabledDownloadObservability {
 #[derive(Clone, Debug)]
 struct DownloadObservabilityState {
     destination: DownloadDestination,
-    latest_snapshot: Option<DownloadStateSnapshot>,
+    last_active_snapshot: Option<DownloadStateSnapshot>,
     ranges_scheduled: u64,
     ranges_completed: u64,
     max_ranges_in_flight: usize,
@@ -346,7 +341,7 @@ impl DownloadObservability {
             terminal_reported: AtomicBool::new(false),
             state: Mutex::new(DownloadObservabilityState {
                 destination,
-                latest_snapshot: None,
+                last_active_snapshot: None,
                 ranges_scheduled: 0,
                 ranges_completed: 0,
                 max_ranges_in_flight: 0,
@@ -478,6 +473,13 @@ impl DownloadObservability {
         }
     }
 
+    /// Retains coherent state without emitting a direction-specific event.
+    pub(crate) fn observe_state(&self, snapshot: DownloadStateSnapshot) {
+        if let Self::Enabled(enabled) = self {
+            update_snapshot(&mut enabled.state.lock().expect("lock poisoned"), snapshot);
+        }
+    }
+
     /// Finalizes and emits the download terminal summary once.
     pub(crate) fn report_terminal(
         &self,
@@ -493,8 +495,8 @@ impl DownloadObservability {
 
         let mut state = enabled.state.lock().expect("lock poisoned");
         update_snapshot(&mut state, report.state_snapshot);
-        let terminal_snapshot = state
-            .latest_snapshot
+        let last_active_snapshot = state
+            .last_active_snapshot
             .expect("terminal download summary must retain a state snapshot");
         let summary = DownloadTransferSummary {
             outcome,
@@ -509,7 +511,7 @@ impl DownloadObservability {
             requests: state.requests,
             request_total: report.request_total,
             pending: report.pending,
-            state: terminal_snapshot,
+            last_active_snapshot,
             ranges_scheduled: state.ranges_scheduled,
             ranges_completed: state.ranges_completed,
             max_ranges_in_flight: state.max_ranges_in_flight,
@@ -520,11 +522,7 @@ impl DownloadObservability {
         drop(state);
 
         if enabled.emit_events {
-            emit_event(
-                report.transfer_id,
-                DownloadEvent::Terminal(outcome),
-                terminal_snapshot,
-            );
+            emit_terminal_details(report.transfer_id, &summary);
         }
         #[cfg(test)]
         {
@@ -545,11 +543,8 @@ impl DownloadObservability {
 }
 
 fn update_snapshot(state: &mut DownloadObservabilityState, snapshot: DownloadStateSnapshot) {
-    // Preserve the last state that carried download progress. A finalization
-    // failure or duplicate terminal callback can observe `Terminal` after the
-    // range-election winner already recorded the useful preterminal counters.
-    if snapshot.state != DownloadExecutionState::Terminal || state.latest_snapshot.is_none() {
-        state.latest_snapshot = Some(snapshot);
+    if snapshot.state != DownloadExecutionState::Terminal || state.last_active_snapshot.is_none() {
+        state.last_active_snapshot = Some(snapshot);
     }
     state.max_ranges_in_flight = state.max_ranges_in_flight.max(snapshot.ranges_in_flight);
     state.max_resident_parts = state.max_resident_parts.max(snapshot.resident_parts);
@@ -567,116 +562,189 @@ impl RequestMetricsAttribution for DownloadObservability {
 pub(crate) type DownloadRequestMeasurement = AttributedRequestMeasurement<DownloadObservability>;
 
 fn emit_event(transfer_id: TransferId, event: DownloadEvent, snapshot: DownloadStateSnapshot) {
-    let (event, reason) = event.fields();
-    tracing::trace!(
-        target: crate::telemetry::TARGET_TRANSFER,
-        tid = %transfer_id,
-        event,
-        reason,
-        state = snapshot.state.as_str(),
-        remaining_bytes = snapshot.remaining_bytes,
-        ranges_in_flight = snapshot.ranges_in_flight,
-        ranges_issued = snapshot.ranges_issued,
-        ranges_released = snapshot.ranges_released,
-        resident_parts = snapshot.resident_parts,
-        read_ahead_window = snapshot.read_ahead_window,
-        memory_claim_pending = snapshot.memory_claim_pending,
-        "download state-machine event",
-    );
+    let (event_name, reason) = event.fields();
+    match event {
+        DownloadEvent::DiscoveryScheduled | DownloadEvent::DiscoveryCompleted => {
+            tracing::trace!(
+                target: crate::telemetry::TARGET_TRANSFER,
+                tid = %transfer_id,
+                event = event_name,
+                reason,
+                state = snapshot.state.as_str(),
+                remaining_bytes = snapshot.remaining_bytes,
+                "download state-machine event",
+            );
+        }
+        DownloadEvent::RangeScheduled
+        | DownloadEvent::RangeCompleted
+        | DownloadEvent::AllRangesIssued => {
+            tracing::trace!(
+                target: crate::telemetry::TARGET_TRANSFER,
+                tid = %transfer_id,
+                event = event_name,
+                reason,
+                state = snapshot.state.as_str(),
+                remaining_bytes = snapshot.remaining_bytes,
+                ranges_in_flight = snapshot.ranges_in_flight,
+                ranges_issued = snapshot.ranges_issued,
+                ranges_released = snapshot.ranges_released,
+                resident_parts = snapshot.resident_parts,
+                "download state-machine event",
+            );
+        }
+        DownloadEvent::MemoryReliefScheduled | DownloadEvent::MemoryReliefCompleted => {
+            tracing::trace!(
+                target: crate::telemetry::TARGET_TRANSFER,
+                tid = %transfer_id,
+                event = event_name,
+                reason,
+                state = snapshot.state.as_str(),
+                ranges_in_flight = snapshot.ranges_in_flight,
+                resident_parts = snapshot.resident_parts,
+                memory_claim_pending = snapshot.memory_claim_pending,
+                "download state-machine event",
+            );
+        }
+        DownloadEvent::DestinationFinalized => {
+            tracing::trace!(
+                target: crate::telemetry::TARGET_TRANSFER,
+                tid = %transfer_id,
+                event = event_name,
+                reason,
+                state = snapshot.state.as_str(),
+                "download state-machine event",
+            );
+        }
+    }
 }
 
 fn emit_terminal_summary(transfer_id: TransferId, summary: &DownloadTransferSummary) {
-    let source_pending = summary.pending.category(PendingCategory::Source);
-    let memory_pending = summary.pending.category(PendingCategory::Memory);
-    let consumer_pending = summary.pending.category(PendingCategory::Consumer);
-    let work_pending = summary.pending.category(PendingCategory::InFlightWork);
-    let other_pending = summary.pending.category(PendingCategory::Other);
-    let terminal_category = summary
-        .pending
-        .terminal_cause
-        .map(|cause| cause.category.as_str());
-    let terminal_reason = summary.pending.terminal_cause.map(|cause| cause.reason);
-
-    tracing::debug!(
-        target: crate::telemetry::TARGET_TRANSFER,
-        tid = %transfer_id,
-        outcome = summary.outcome.as_str(),
-        destination = summary.destination.as_str(),
-        error_kind = ?summary.error_kind,
-        elapsed_us = duration_micros(summary.elapsed),
-        expected_bytes = summary.metrics.total_bytes,
-        network_rx = summary.metrics.network_rx,
-        disk_write = summary.metrics.disk_write,
-        requests = summary.request_total.requests,
-        request_elapsed_us = duration_micros(summary.request_total.elapsed),
-        max_request_elapsed_us = duration_micros(summary.request_total.max_elapsed),
-        retry_reissues = summary.request_total.retry_reissues,
-        throttle_reissues = summary.request_total.throttle_reissues,
-        hedge_reissues = summary.request_total.hedge_reissues,
-        retry_exhaustions = summary.request_total.retry_exhaustions,
-        backoff_duration_us = duration_micros(summary.request_total.backoff_duration),
-        discovery_head_requests = summary.requests.discovery_head.requests,
-        discovery_head_elapsed_us = duration_micros(summary.requests.discovery_head.elapsed),
-        discovery_head_retry_reissues = summary.requests.discovery_head.retry_reissues,
-        discovery_range_requests = summary.requests.discovery_range.requests,
-        discovery_range_elapsed_us = duration_micros(summary.requests.discovery_range.elapsed),
-        discovery_range_retry_reissues = summary.requests.discovery_range.retry_reissues,
-        discovery_range_hedge_reissues = summary.requests.discovery_range.hedge_reissues,
-        discovery_part_requests = summary.requests.discovery_part.requests,
-        discovery_part_elapsed_us = duration_micros(summary.requests.discovery_part.elapsed),
-        discovery_part_retry_reissues = summary.requests.discovery_part.retry_reissues,
-        range_requests = summary.requests.range.requests,
-        range_elapsed_us = duration_micros(summary.requests.range.elapsed),
-        range_max_elapsed_us = duration_micros(summary.requests.range.max_elapsed),
-        range_retry_reissues = summary.requests.range.retry_reissues,
-        range_throttle_reissues = summary.requests.range.throttle_reissues,
-        range_hedge_reissues = summary.requests.range.hedge_reissues,
-        range_retry_exhaustions = summary.requests.range.retry_exhaustions,
-        range_backoff_us = duration_micros(summary.requests.range.backoff_duration),
-        source_pending = source_pending.count,
-        source_pending_us = duration_micros(source_pending.pending_to_repoll),
-        source_max_pending_us = duration_micros(source_pending.max_pending_to_repoll),
-        memory_pending = memory_pending.count,
-        memory_pending_us = duration_micros(memory_pending.pending_to_repoll),
-        memory_max_pending_us = duration_micros(memory_pending.max_pending_to_repoll),
-        consumer_pending = consumer_pending.count,
-        consumer_pending_us = duration_micros(consumer_pending.pending_to_repoll),
-        consumer_max_pending_us = duration_micros(consumer_pending.max_pending_to_repoll),
-        in_flight_work_pending = work_pending.count,
-        in_flight_work_pending_us = duration_micros(work_pending.pending_to_repoll),
-        in_flight_work_max_pending_us = duration_micros(work_pending.max_pending_to_repoll),
-        other_pending = other_pending.count,
-        other_pending_us = duration_micros(other_pending.pending_to_repoll),
-        other_max_pending_us = duration_micros(other_pending.max_pending_to_repoll),
-        terminal_pending_category = terminal_category,
-        terminal_pending_reason = terminal_reason,
-        state = summary.state.state.as_str(),
-        remaining_bytes = summary.state.remaining_bytes,
-        ranges_in_flight = summary.state.ranges_in_flight,
-        ranges_issued = summary.state.ranges_issued,
-        ranges_released = summary.state.ranges_released,
-        resident_parts = summary.state.resident_parts,
-        read_ahead_window = summary.state.read_ahead_window,
-        memory_claim_pending = summary.state.memory_claim_pending,
-        ranges_scheduled = summary.ranges_scheduled,
-        ranges_completed = summary.ranges_completed,
-        max_ranges_in_flight = summary.max_ranges_in_flight,
-        max_resident_parts = summary.max_resident_parts,
-        destination_prepared = summary.destination_work.prepared,
-        file_finalized = summary.destination_work.file_finalized,
-        finalization_failed = summary.destination_work.finalization_failed,
-        batched_drain_parts = summary.destination_work.batched_drain_parts,
-        memory_relief_drains = summary.destination_work.memory_relief_drains,
-        memory_relief_parts = summary.destination_work.memory_relief_parts,
-        terminal_drain_parts = summary.destination_work.terminal_drain_parts,
-        terminal_drain_failed = summary.destination_work.terminal_drain_failed,
-        checksum_validation = ?summary.checksum_validation,
-        "download transfer terminal",
-    );
+    if summary.destination == DownloadDestination::File {
+        tracing::debug!(
+            target: crate::telemetry::TARGET_TRANSFER,
+            tid = %transfer_id,
+            outcome = summary.outcome.as_str(),
+            destination = summary.destination.as_str(),
+            error_kind = ?summary.error_kind,
+            elapsed = ?summary.elapsed,
+            expected_bytes = summary.metrics.total_bytes,
+            network_rx = summary.metrics.network_rx,
+            disk_write = summary.metrics.disk_write,
+            requests = summary.request_total.requests,
+            request_time_sum = ?summary.request_total.elapsed,
+            request_time_max = ?summary.request_total.max_elapsed,
+            retry_reissues = summary.request_total.retry_reissues,
+            throttle_reissues = summary.request_total.throttle_reissues,
+            hedge_reissues = summary.request_total.hedge_reissues,
+            retry_exhaustions = summary.request_total.retry_exhaustions,
+            backoff_time_sum = ?summary.request_total.backoff_duration,
+            pending_intervals = summary.pending.interval_count(),
+            pending_time_sum = ?summary.pending.pending_duration(),
+            pending_time_max = ?summary.pending.max_pending_duration(),
+            ranges_scheduled = summary.ranges_scheduled,
+            ranges_completed = summary.ranges_completed,
+            max_ranges_in_flight = summary.max_ranges_in_flight,
+            max_resident_parts = summary.max_resident_parts,
+            destination_prepared = summary.destination_work.prepared,
+            file_finalized = summary.destination_work.file_finalized,
+            checksum_validation = ?summary.checksum_validation,
+            "download transfer terminal",
+        );
+    } else {
+        tracing::debug!(
+            target: crate::telemetry::TARGET_TRANSFER,
+            tid = %transfer_id,
+            outcome = summary.outcome.as_str(),
+            destination = summary.destination.as_str(),
+            error_kind = ?summary.error_kind,
+            elapsed = ?summary.elapsed,
+            expected_bytes = summary.metrics.total_bytes,
+            network_rx = summary.metrics.network_rx,
+            requests = summary.request_total.requests,
+            request_time_sum = ?summary.request_total.elapsed,
+            request_time_max = ?summary.request_total.max_elapsed,
+            retry_reissues = summary.request_total.retry_reissues,
+            throttle_reissues = summary.request_total.throttle_reissues,
+            hedge_reissues = summary.request_total.hedge_reissues,
+            retry_exhaustions = summary.request_total.retry_exhaustions,
+            backoff_time_sum = ?summary.request_total.backoff_duration,
+            pending_intervals = summary.pending.interval_count(),
+            pending_time_sum = ?summary.pending.pending_duration(),
+            pending_time_max = ?summary.pending.max_pending_duration(),
+            ranges_scheduled = summary.ranges_scheduled,
+            ranges_completed = summary.ranges_completed,
+            max_ranges_in_flight = summary.max_ranges_in_flight,
+            max_resident_parts = summary.max_resident_parts,
+            checksum_validation = ?summary.checksum_validation,
+            "download transfer terminal",
+        );
+    }
 }
 
-fn duration_micros(duration: Duration) -> u64 {
-    duration.as_micros().min(u64::MAX as u128) as u64
+fn emit_terminal_details(transfer_id: TransferId, summary: &DownloadTransferSummary) {
+    emit_request_detail(
+        transfer_id,
+        DownloadRequestKind::DiscoveryHead,
+        summary.requests.discovery_head,
+    );
+    emit_request_detail(
+        transfer_id,
+        DownloadRequestKind::DiscoveryRange,
+        summary.requests.discovery_range,
+    );
+    emit_request_detail(
+        transfer_id,
+        DownloadRequestKind::DiscoveryPart,
+        summary.requests.discovery_part,
+    );
+    emit_request_detail(
+        transfer_id,
+        DownloadRequestKind::Range,
+        summary.requests.range,
+    );
+    emit_pending_details(transfer_id, &summary.pending);
+
+    if summary.destination == DownloadDestination::File {
+        let destination = summary.destination_work;
+        tracing::trace!(
+            target: crate::telemetry::TARGET_TRANSFER,
+            tid = %transfer_id,
+            last_active_state = summary.last_active_snapshot.state.as_str(),
+            prepared = destination.prepared,
+            file_finalized = destination.file_finalized,
+            finalization_failed = destination.finalization_failed,
+            batched_drain_parts = destination.batched_drain_parts,
+            memory_relief_drains = destination.memory_relief_drains,
+            memory_relief_parts = destination.memory_relief_parts,
+            terminal_drain_parts = destination.terminal_drain_parts,
+            terminal_drain_failed = destination.terminal_drain_failed,
+            "download file destination detail",
+        );
+    }
+}
+
+fn emit_request_detail(
+    transfer_id: TransferId,
+    kind: DownloadRequestKind,
+    metrics: RequestMetrics,
+) {
+    if metrics.requests == 0 {
+        return;
+    }
+    tracing::trace!(
+        target: crate::telemetry::TARGET_TRANSFER,
+        tid = %transfer_id,
+        request_kind = kind.as_str(),
+        requests = metrics.requests,
+        request_time_sum = ?metrics.elapsed,
+        request_time_max = ?metrics.max_elapsed,
+        retry_reissues = metrics.retry_reissues,
+        throttle_reissues = metrics.throttle_reissues,
+        hedge_reissues = metrics.hedge_reissues,
+        retry_exhaustions = metrics.retry_exhaustions,
+        backoff_time_sum = ?metrics.backoff_duration,
+        "download request detail",
+    );
 }
 
 #[cfg(test)]
@@ -806,7 +874,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_state_does_not_erase_the_last_progress_snapshot() {
+    fn terminal_summary_retains_an_explicit_last_active_snapshot() {
         let observability = DownloadObservability::new(config(1), DownloadDestination::Stream);
         observability.observe_event(
             TransferId {
@@ -823,7 +891,7 @@ mod tests {
         let summary = observability
             .report_terminal(report)
             .expect("terminal report");
-        assert_eq!(summary.state, snapshot());
+        assert_eq!(summary.last_active_snapshot, snapshot());
     }
 
     #[test]
@@ -857,16 +925,8 @@ mod tests {
             ("work_scheduled", "discovery")
         );
         assert_eq!(
-            DownloadEvent::Pending(DownloadPendingReason::ReadAhead).fields(),
-            ("poll_pending", "read_ahead")
-        );
-        assert_eq!(
             DownloadEvent::MemoryReliefCompleted.fields(),
             ("work_completed", "memory_relief")
-        );
-        assert_eq!(
-            DownloadEvent::Terminal(DownloadTerminalOutcome::Completed).fields(),
-            ("terminal", "completed")
         );
     }
 }

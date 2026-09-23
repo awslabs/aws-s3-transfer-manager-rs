@@ -10,11 +10,11 @@
 //! boundaries for diagnostics without participating in scheduling decisions.
 //!
 //! ```text
-//! set_pending()             first wake                 begin_poll()
+//! set_pending()             first wake              next poll starts
 //!      |-------------------------|--------------------------|
-//!           pending_to_wake             wake_to_repoll
+//!           pending_to_wake             scheduler_delay
 //!      |----------------------------------------------------|
-//!                         pending_to_repoll
+//!                         pending_duration
 //! ```
 
 use std::time::{Duration, Instant};
@@ -43,6 +43,15 @@ pub(crate) enum PendingCategory {
 }
 
 impl PendingCategory {
+    /// Common categories in stable diagnostic order.
+    pub(crate) const ALL: [Self; PENDING_CATEGORY_COUNT] = [
+        Self::Source,
+        Self::Memory,
+        Self::Consumer,
+        Self::InFlightWork,
+        Self::Other,
+    ];
+
     const fn index(self) -> usize {
         match self {
             Self::Source => 0,
@@ -80,7 +89,7 @@ impl PendingCause {
         Self { category, reason }
     }
 
-    /// Creates a cause for dispatched work that must retire before repolling.
+    /// Creates a cause for dispatched work that must retire before the next poll.
     pub(crate) const fn in_flight_work(reason: &'static str) -> Self {
         Self::new(PendingCategory::InFlightWork, reason)
     }
@@ -101,14 +110,14 @@ pub(crate) struct PendingCategoryStats {
     pub(crate) pending_to_wake: Duration,
     /// Longest pending-to-first-wake duration.
     pub(crate) max_pending_to_wake: Duration,
-    /// Sum of first-wake-to-repoll durations.
-    pub(crate) wake_to_repoll: Duration,
-    /// Longest first-wake-to-repoll duration.
-    pub(crate) max_wake_to_repoll: Duration,
-    /// Sum of pending-to-repoll durations.
-    pub(crate) pending_to_repoll: Duration,
-    /// Longest pending-to-repoll duration.
-    pub(crate) max_pending_to_repoll: Duration,
+    /// Sum of first-wake-to-next-poll scheduler delays.
+    pub(crate) scheduler_delay: Duration,
+    /// Longest first-wake-to-next-poll scheduler delay.
+    pub(crate) max_scheduler_delay: Duration,
+    /// Sum of pending intervals closed by a later poll.
+    pub(crate) pending_duration: Duration,
+    /// Longest pending interval closed by a later poll.
+    pub(crate) max_pending_duration: Duration,
 }
 
 /// Accumulated pending intervals for one transfer.
@@ -117,6 +126,8 @@ pub(crate) struct TransferPendingStats {
     categories: [PendingCategoryStats; PENDING_CATEGORY_COUNT],
     /// Cause that remained pending when the transfer became terminal.
     pub(crate) terminal_cause: Option<PendingCause>,
+    /// Duration of the interval closed by terminal transfer state.
+    pub(crate) terminal_duration: Option<Duration>,
 }
 
 impl Default for TransferPendingStats {
@@ -124,6 +135,7 @@ impl Default for TransferPendingStats {
         Self {
             categories: [PendingCategoryStats::default(); PENDING_CATEGORY_COUNT],
             terminal_cause: None,
+            terminal_duration: None,
         }
     }
 }
@@ -132,6 +144,36 @@ impl TransferPendingStats {
     /// Returns the accumulated values for one common category.
     pub(crate) fn category(&self, category: PendingCategory) -> PendingCategoryStats {
         self.categories[category.index()]
+    }
+
+    /// Returns the number of pending intervals entered by this transfer.
+    pub(crate) fn interval_count(&self) -> u64 {
+        self.categories
+            .iter()
+            .fold(0, |total, category| total.saturating_add(category.count))
+    }
+
+    /// Returns the total duration of all pending intervals.
+    ///
+    /// An interval ends when the next poll begins or the transfer becomes
+    /// terminal.
+    pub(crate) fn pending_duration(&self) -> Duration {
+        self.categories
+            .iter()
+            .fold(Duration::ZERO, |total, category| {
+                total.saturating_add(category.pending_duration)
+            })
+            .saturating_add(self.terminal_duration.unwrap_or(Duration::ZERO))
+    }
+
+    /// Returns the longest completed or terminally closed pending interval.
+    pub(crate) fn max_pending_duration(&self) -> Duration {
+        self.categories
+            .iter()
+            .fold(Duration::ZERO, |longest, category| {
+                longest.max(category.max_pending_duration)
+            })
+            .max(self.terminal_duration.unwrap_or(Duration::ZERO))
     }
 }
 
@@ -145,7 +187,7 @@ enum PendingIntervalState {
         cause: PendingCause,
         pending_at: Instant,
     },
-    /// The first wake was observed and the scheduler has not repolled.
+    /// The first wake was observed and the scheduler has not started the next poll.
     Woken {
         cause: PendingCause,
         pending_at: Instant,
@@ -192,7 +234,7 @@ impl TransferPendingState {
 
     /// Opens one pending interval if no interval is currently active.
     ///
-    /// Repeated calls before a wake and repoll are ignored.
+    /// Repeated calls before a wake and the next poll are ignored.
     pub(crate) fn record_pending(&self, id: TransferId, cause: PendingCause) {
         if self.interval_open.load(Ordering::Acquire) {
             return;
@@ -226,35 +268,49 @@ impl TransferPendingState {
                     tid = %id,
                     category = cause.category.as_str(),
                     reason = cause.reason,
-                    pending_to_wake = ?elapsed,
+                    wait = ?elapsed,
                     "pending transfer woke",
                 );
             }
         }
     }
 
-    /// Records that the scheduler is beginning another poll.
+    /// Records that the scheduler is beginning the next poll.
     ///
     /// An open interval is closed at this boundary and contributes its
-    /// pending-to-wake, wake-to-repoll, and pending-to-repoll measurements.
+    /// pending-to-wake, scheduler-delay, and pending-duration measurements.
     /// Calls without an open interval avoid the lock and clock.
-    pub(crate) fn begin_poll(&self, id: TransferId) {
+    pub(crate) fn record_poll_started(&self, id: TransferId) {
         if !self.interval_open.load(Ordering::Acquire) {
             return;
         }
 
-        if let Some(interval) = self.record_repoll_at(Instant::now()) {
+        if let Some(interval) = self.record_poll_started_at(Instant::now()) {
             if self.emit_events {
-                tracing::trace!(
-                    target: crate::telemetry::TARGET_TRANSFER,
-                    tid = %id,
-                    category = interval.cause.category.as_str(),
-                    reason = interval.cause.reason,
-                    pending_to_wake = ?interval.pending_to_wake,
-                    wake_to_repoll = ?interval.wake_to_repoll,
-                    pending_to_repoll = ?interval.pending_to_repoll,
-                    "pending transfer repolled",
-                );
+                if let (Some(wait), Some(scheduler_delay)) =
+                    (interval.pending_to_wake, interval.scheduler_delay)
+                {
+                    tracing::trace!(
+                        target: crate::telemetry::TARGET_TRANSFER,
+                        tid = %id,
+                        category = interval.cause.category.as_str(),
+                        reason = interval.cause.reason,
+                        wait = ?wait,
+                        scheduler_delay = ?scheduler_delay,
+                        pending_time = ?interval.pending_duration,
+                        "pending transfer poll started",
+                    );
+                } else {
+                    tracing::trace!(
+                        target: crate::telemetry::TARGET_TRANSFER,
+                        tid = %id,
+                        category = interval.cause.category.as_str(),
+                        reason = interval.cause.reason,
+                        wake_observed = false,
+                        pending_time = ?interval.pending_duration,
+                        "pending transfer poll started",
+                    );
+                }
             }
         }
     }
@@ -275,7 +331,7 @@ impl TransferPendingState {
                     tid = %id,
                     category = cause.category.as_str(),
                     reason = cause.reason,
-                    pending_to_terminal = ?elapsed,
+                    pending_time = ?elapsed,
                     "pending transfer became terminal",
                 );
             }
@@ -320,7 +376,7 @@ impl TransferPendingState {
         Some((cause, elapsed))
     }
 
-    fn record_repoll_at(&self, now: Instant) -> Option<PendingInterval> {
+    fn record_poll_started_at(&self, now: Instant) -> Option<PendingInterval> {
         if !self.interval_open.swap(false, Ordering::AcqRel) {
             return None;
         }
@@ -332,8 +388,8 @@ impl TransferPendingState {
             PendingIntervalState::Pending { cause, pending_at } => PendingInterval {
                 cause,
                 pending_to_wake: None,
-                wake_to_repoll: None,
-                pending_to_repoll: now.saturating_duration_since(pending_at),
+                scheduler_delay: None,
+                pending_duration: now.saturating_duration_since(pending_at),
             },
             PendingIntervalState::Woken {
                 cause,
@@ -342,21 +398,20 @@ impl TransferPendingState {
             } => PendingInterval {
                 cause,
                 pending_to_wake: Some(woken_at.saturating_duration_since(pending_at)),
-                wake_to_repoll: Some(now.saturating_duration_since(woken_at)),
-                pending_to_repoll: now.saturating_duration_since(pending_at),
+                scheduler_delay: Some(now.saturating_duration_since(woken_at)),
+                pending_duration: now.saturating_duration_since(pending_at),
             },
         };
 
         let category = &mut data.stats.categories[interval.cause.category.index()];
-        category.pending_to_repoll = category
-            .pending_to_repoll
-            .saturating_add(interval.pending_to_repoll);
-        category.max_pending_to_repoll = category
-            .max_pending_to_repoll
-            .max(interval.pending_to_repoll);
-        if let Some(elapsed) = interval.wake_to_repoll {
-            category.wake_to_repoll = category.wake_to_repoll.saturating_add(elapsed);
-            category.max_wake_to_repoll = category.max_wake_to_repoll.max(elapsed);
+        category.pending_duration = category
+            .pending_duration
+            .saturating_add(interval.pending_duration);
+        category.max_pending_duration =
+            category.max_pending_duration.max(interval.pending_duration);
+        if let Some(elapsed) = interval.scheduler_delay {
+            category.scheduler_delay = category.scheduler_delay.saturating_add(elapsed);
+            category.max_scheduler_delay = category.max_scheduler_delay.max(elapsed);
         }
         Some(interval)
     }
@@ -375,8 +430,10 @@ impl TransferPendingState {
                 cause, pending_at, ..
             } => (cause, pending_at),
         };
+        let elapsed = now.saturating_duration_since(pending_at);
         data.stats.terminal_cause = Some(cause);
-        Some((cause, now.saturating_duration_since(pending_at)))
+        data.stats.terminal_duration = Some(elapsed);
+        Some((cause, elapsed))
     }
 
     /// Returns a copy of the accumulated statistics.
@@ -385,12 +442,45 @@ impl TransferPendingState {
     }
 }
 
+/// Emits detail for pending categories entered by one transfer.
+pub(crate) fn emit_pending_details(id: TransferId, stats: &TransferPendingStats) {
+    for category in PendingCategory::ALL {
+        let category_stats = stats.category(category);
+        if category_stats.count == 0 {
+            continue;
+        }
+        let terminal_duration = stats
+            .terminal_cause
+            .filter(|cause| cause.category == category)
+            .and(stats.terminal_duration);
+        let terminal_reason = stats
+            .terminal_cause
+            .filter(|cause| cause.category == category)
+            .map(|cause| cause.reason);
+        tracing::trace!(
+            target: crate::telemetry::TARGET_TRANSFER,
+            tid = %id,
+            category = category.as_str(),
+            intervals = category_stats.count,
+            wait_to_wake_sum = ?category_stats.pending_to_wake,
+            wait_to_wake_max = ?category_stats.max_pending_to_wake,
+            scheduler_delay_sum = ?category_stats.scheduler_delay,
+            scheduler_delay_max = ?category_stats.max_scheduler_delay,
+            pending_time_sum = ?category_stats.pending_duration,
+            pending_time_max = ?category_stats.max_pending_duration,
+            terminal_time = ?terminal_duration,
+            terminal_reason,
+            "transfer pending detail",
+        );
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct PendingInterval {
     cause: PendingCause,
     pending_to_wake: Option<Duration>,
-    wake_to_repoll: Option<Duration>,
-    pending_to_repoll: Duration,
+    scheduler_delay: Option<Duration>,
+    pending_duration: Duration,
 }
 
 #[cfg(test)]
@@ -402,28 +492,30 @@ mod tests {
     }
 
     #[test]
-    fn pending_wake_repoll_records_one_interval() {
+    fn pending_wake_and_next_poll_record_one_interval() {
         let pending = TransferPendingState::new(false);
         let start = Instant::now();
         let wake = start + Duration::from_millis(7);
-        let repoll = wake + Duration::from_millis(3);
+        let next_poll = wake + Duration::from_millis(3);
 
         assert!(pending.record_pending_at(cause(PendingCategory::Memory), start));
         assert_eq!(
             pending.record_wake_at(wake),
             Some((cause(PendingCategory::Memory), Duration::from_millis(7)))
         );
-        let interval = pending.record_repoll_at(repoll).expect("active interval");
-        assert_eq!(interval.pending_to_repoll, Duration::from_millis(10));
+        let interval = pending
+            .record_poll_started_at(next_poll)
+            .expect("active interval");
+        assert_eq!(interval.pending_duration, Duration::from_millis(10));
 
         let stats = pending.snapshot().category(PendingCategory::Memory);
         assert_eq!(stats.count, 1);
         assert_eq!(stats.pending_to_wake, Duration::from_millis(7));
         assert_eq!(stats.max_pending_to_wake, Duration::from_millis(7));
-        assert_eq!(stats.wake_to_repoll, Duration::from_millis(3));
-        assert_eq!(stats.max_wake_to_repoll, Duration::from_millis(3));
-        assert_eq!(stats.pending_to_repoll, Duration::from_millis(10));
-        assert_eq!(stats.max_pending_to_repoll, Duration::from_millis(10));
+        assert_eq!(stats.scheduler_delay, Duration::from_millis(3));
+        assert_eq!(stats.max_scheduler_delay, Duration::from_millis(3));
+        assert_eq!(stats.pending_duration, Duration::from_millis(10));
+        assert_eq!(stats.max_pending_duration, Duration::from_millis(10));
     }
 
     #[test]
@@ -440,12 +532,12 @@ mod tests {
             None
         );
         pending
-            .record_repoll_at(start + Duration::from_millis(10))
+            .record_poll_started_at(start + Duration::from_millis(10))
             .expect("active interval");
 
         let stats = pending.snapshot().category(PendingCategory::Source);
         assert_eq!(stats.pending_to_wake, Duration::from_millis(2));
-        assert_eq!(stats.wake_to_repoll, Duration::from_millis(8));
+        assert_eq!(stats.scheduler_delay, Duration::from_millis(8));
     }
 
     #[test]
@@ -463,7 +555,7 @@ mod tests {
             None
         );
         pending
-            .record_repoll_at(start + Duration::from_millis(3))
+            .record_poll_started_at(start + Duration::from_millis(3))
             .expect("active interval");
 
         let stats = pending.snapshot().category(PendingCategory::Consumer);
@@ -485,13 +577,43 @@ mod tests {
             pending.record_terminal_at(start + Duration::from_millis(6)),
             None
         );
-        assert_eq!(pending.snapshot().terminal_cause, Some(cause));
+        let stats = pending.snapshot();
+        assert_eq!(stats.terminal_cause, Some(cause));
+        assert_eq!(stats.terminal_duration, Some(Duration::from_millis(5)));
+        assert_eq!(stats.interval_count(), 1);
+        assert_eq!(stats.pending_duration(), Duration::from_millis(5));
+        assert_eq!(stats.max_pending_duration(), Duration::from_millis(5));
     }
 
     #[test]
-    fn idle_repolls_do_not_create_intervals() {
+    fn aggregate_pending_time_includes_polled_and_terminal_intervals() {
         let pending = TransferPendingState::new(false);
-        assert!(pending.record_repoll_at(Instant::now()).is_none());
+        let start = Instant::now();
+
+        assert!(pending.record_pending_at(cause(PendingCategory::Memory), start));
+        pending
+            .record_wake_at(start + Duration::from_millis(2))
+            .expect("memory wake");
+        pending
+            .record_poll_started_at(start + Duration::from_millis(5))
+            .expect("memory poll");
+
+        let source_start = start + Duration::from_millis(10);
+        assert!(pending.record_pending_at(cause(PendingCategory::Source), source_start));
+        pending
+            .record_terminal_at(source_start + Duration::from_millis(7))
+            .expect("source terminal");
+
+        let stats = pending.snapshot();
+        assert_eq!(stats.interval_count(), 2);
+        assert_eq!(stats.pending_duration(), Duration::from_millis(12));
+        assert_eq!(stats.max_pending_duration(), Duration::from_millis(7));
+    }
+
+    #[test]
+    fn idle_polls_do_not_create_intervals() {
+        let pending = TransferPendingState::new(false);
+        assert!(pending.record_poll_started_at(Instant::now()).is_none());
         assert_eq!(
             pending.snapshot(),
             TransferPendingStats::default(),
@@ -530,7 +652,7 @@ mod loom_tests {
             // The descriptor release-and-recheck path performs this idempotent
             // backfill after `poll_work` has published Pending.
             pending.record_wake_at(now);
-            pending.record_repoll_at(now);
+            pending.record_poll_started_at(now);
 
             let stats = pending.snapshot().category(PendingCategory::Memory);
             assert_eq!(stats.count, 1);
