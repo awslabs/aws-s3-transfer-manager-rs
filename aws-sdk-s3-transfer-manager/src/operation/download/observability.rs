@@ -9,7 +9,6 @@
 //! measurements from discovery and range transfer. The disabled variant avoids
 //! optional allocation, clocks, counters, and event snapshots.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -312,7 +311,6 @@ pub(crate) enum DownloadObservability {
 #[derive(Debug)]
 pub(crate) struct EnabledDownloadObservability {
     emit_events: bool,
-    terminal_reported: AtomicBool,
     state: Mutex<DownloadObservabilityState>,
     #[cfg(test)]
     last_summary: Mutex<Option<DownloadTransferSummary>>,
@@ -338,7 +336,6 @@ impl DownloadObservability {
         }
         Self::Enabled(Arc::new(EnabledDownloadObservability {
             emit_events: config.events_enabled(),
-            terminal_reported: AtomicBool::new(false),
             state: Mutex::new(DownloadObservabilityState {
                 destination,
                 last_active_snapshot: None,
@@ -480,18 +477,16 @@ impl DownloadObservability {
         }
     }
 
-    /// Finalizes and emits the download terminal summary once.
+    /// Finalizes and emits the download terminal projection.
     pub(crate) fn report_terminal(
         &self,
         report: DownloadTerminalReport,
     ) -> Option<DownloadTransferSummary> {
+        let outcome = DownloadTerminalOutcome::from_status(report.status)?;
         let Self::Enabled(enabled) = self else {
+            emit_terminal_lifecycle(&report, outcome);
             return None;
         };
-        let outcome = DownloadTerminalOutcome::from_status(report.status)?;
-        if enabled.terminal_reported.swap(true, Ordering::AcqRel) {
-            return None;
-        }
 
         let mut state = enabled.state.lock().expect("lock poisoned");
         update_snapshot(&mut state, report.state_snapshot);
@@ -616,6 +611,25 @@ fn emit_event(transfer_id: TransferId, event: DownloadEvent, snapshot: DownloadS
             );
         }
     }
+}
+
+fn emit_terminal_lifecycle(report: &DownloadTerminalReport, outcome: DownloadTerminalOutcome) {
+    let elapsed = report
+        .metrics
+        .finished_at
+        .map(|finished_at| finished_at.saturating_duration_since(report.metrics.started_at))
+        .unwrap_or_default();
+    tracing::debug!(
+        target: crate::telemetry::TARGET_TRANSFER,
+        tid = %report.transfer_id,
+        outcome = outcome.as_str(),
+        error_kind = ?report.error_kind,
+        elapsed = ?elapsed,
+        expected_bytes = report.metrics.total_bytes,
+        network_rx = report.metrics.network_rx,
+        disk_write = report.metrics.disk_write,
+        "download transfer terminal",
+    );
 }
 
 fn emit_terminal_summary(transfer_id: TransferId, summary: &DownloadTransferSummary) {
@@ -854,14 +868,9 @@ mod tests {
     }
 
     #[test]
-    fn terminal_summary_is_reported_once() {
+    fn terminal_summary_records_destination() {
         let observability = DownloadObservability::new(config(1), DownloadDestination::File);
         let first = observability.report_terminal(terminal_report(
-            2,
-            TransferStatus::Completed,
-            RequestMetrics::default(),
-        ));
-        let second = observability.report_terminal(terminal_report(
             2,
             TransferStatus::Completed,
             RequestMetrics::default(),
@@ -870,7 +879,6 @@ mod tests {
             first.expect("first report").destination,
             DownloadDestination::File
         );
-        assert!(second.is_none());
     }
 
     #[test]

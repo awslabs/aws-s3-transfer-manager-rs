@@ -158,6 +158,9 @@ impl UploadTransfer {
     /// Emits the upload terminal summary before notifying the owning handle.
     fn report_terminal(&self) {
         self.inner.ctx.finalize_terminal_metrics();
+        if !self.inner.ctx.claim_terminal_report() {
+            return;
+        }
         let state_snapshot = {
             let state = self.inner.state.lock().expect("lock poisoned");
             snapshot_state(&state)

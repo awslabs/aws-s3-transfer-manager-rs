@@ -13,7 +13,7 @@ use std::any::Any;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Wake, Waker};
 use std::time::Instant;
@@ -439,6 +439,7 @@ pub(crate) struct MetricsState {
     total_bytes: std::sync::OnceLock<u64>,
     started_at: std::time::Instant,
     finished_at: std::sync::OnceLock<std::time::Instant>,
+    terminal_reported: AtomicBool,
     request_metrics: crate::metrics::RequestMetricsState,
 }
 
@@ -452,6 +453,7 @@ impl MetricsState {
             total_bytes: std::sync::OnceLock::new(),
             started_at: std::time::Instant::now(),
             finished_at: std::sync::OnceLock::new(),
+            terminal_reported: AtomicBool::new(false),
             request_metrics: crate::metrics::RequestMetricsState::default(),
         }
     }
@@ -476,6 +478,14 @@ impl MetricsState {
     /// Mark the transfer as finished. No-op if already set.
     pub(crate) fn set_finished(&self) {
         let _ = self.finished_at.set(std::time::Instant::now());
+    }
+
+    /// Claims the single terminal tracing record for this transfer.
+    ///
+    /// Normal completion, failure, cancellation, and scheduler-owned cleanup
+    /// may converge on terminal reporting. Only the first caller emits.
+    pub(crate) fn claim_terminal_report(&self) -> bool {
+        !self.terminal_reported.swap(true, Ordering::AcqRel)
     }
 
     /// Merge one completed service-request measurement.
@@ -1070,6 +1080,11 @@ impl TransferContext {
         }
     }
 
+    /// Claims the single terminal tracing record for this transfer.
+    pub(crate) fn claim_terminal_report(&self) -> bool {
+        self.metrics.claim_terminal_report()
+    }
+
     /// Snapshot current transfer metrics.
     pub(crate) fn metrics(&self) -> crate::types::TransferMetrics {
         self.metrics.snapshot()
@@ -1415,6 +1430,14 @@ mod tests {
             let stats = ctx.pending_stats().expect("summary diagnostics enabled");
             assert_eq!(stats.terminal_cause, Some(cause));
             assert_eq!(stats.category(PendingCategory::InFlightWork).count, 1);
+        }
+
+        #[test]
+        fn terminal_report_can_be_claimed_once() {
+            let (ctx, _rx) = TransferContext::new(test_handle());
+
+            assert!(ctx.claim_terminal_report());
+            assert!(!ctx.claim_terminal_report());
         }
 
         #[cfg_attr(miri, ignore)]

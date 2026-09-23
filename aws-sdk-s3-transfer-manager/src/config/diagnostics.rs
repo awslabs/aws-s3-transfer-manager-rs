@@ -214,7 +214,8 @@ impl TransferDiagnosticsConfig {
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 #[repr(u8)]
 enum TransferDiagnosticDetail {
-    /// No optional transfer-state collection.
+    /// No optional transfer-state collection. Ordinary terminal tracing still
+    /// reports always-on lifecycle metrics when its target is enabled.
     #[default]
     Disabled = 0,
     /// Aggregate timings and counters reported once per transfer.
