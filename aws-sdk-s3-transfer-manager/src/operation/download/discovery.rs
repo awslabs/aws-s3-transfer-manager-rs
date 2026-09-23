@@ -120,6 +120,16 @@ pub(super) async fn discover_obj(
     // SDK to validate. Only for: validation on, no user range, a multipart object
     // (ETag carries `-N`), and the user did not pin an explicit part size.
     //
+    // Alignment alone is not enough, which is why the fold below is not an `else`:
+    // S3 returns a per-part checksum only for a COMPOSITE object. For a multipart
+    // object stored with a FULL_OBJECT checksum -- what `ChecksumStrategy`'s CRC
+    // strategies produce, so the common case for anything this crate uploaded --
+    // no range GET of any shape returns a checksum, aligned or not, and only the
+    // object-level value exists. Verified against real S3 (us-west-2, GP): same
+    // bytes and algorithm uploaded twice differing only in checksum type; the
+    // aligned range and `partNumber=1` both returned a value for the COMPOSITE
+    // object and nothing at all for the FULL_OBJECT one.
+    //
     // The initial ranged discovery fetched `[0, configured)`, whose chunk length
     // is the CONFIGURED size, not the stored part size, so it cannot tell us the
     // stored layout. Re-issue via partNumber=1, whose response reports the exact
@@ -151,21 +161,29 @@ pub(super) async fn discover_obj(
         );
         aligned.effective_part_size = stored_part_size;
         discovery = aligned;
-    } else if validation_enabled && input.range().is_none() && discovery.remaining.is_some() {
-        // Not aligned, so no chunk will carry a checksum of its own: either the
-        // caller pinned a part size that cannot land on stored boundaries, or the
-        // object has no stored parts to align to. If S3 holds a byte-covering
-        // value for the whole object, the transfer hashes the delivered bytes and
-        // compares at completion -- the only way corruption here is detectable.
-        //
-        // A ranged request is excluded above: the stored value covers the whole
-        // object, so there is nothing to compare a sub-range against.
-        //
-        // Gated on the same condition as the align branch, not on the request
-        // having set `ChecksumMode::Enabled`: with validation on, corruption must
-        // fail the download whether or not the caller asked about integrity
-        // explicitly. That costs one `HeadObject` here, the same trade the align
-        // branch above already makes with its extra GET.
+    }
+
+    // Hash the delivered bytes ourselves and compare against the object's own
+    // checksum at completion. This is the only thing that detects corruption
+    // wherever no chunk carries a checksum of its own, which per the note above is
+    // every multi-chunk download of a FULL_OBJECT-checksum object -- whether its
+    // ranges align or not -- plus a caller-pinned part size that cannot land on
+    // stored boundaries, and a large single-PUT object split into ranges.
+    //
+    // Runs alongside alignment rather than instead of it. For a COMPOSITE object
+    // `fetch_object_crc` returns `None` (a checksum of part checksums reproduces no
+    // byte hash) and the per-part validation alignment bought is the only evidence
+    // there is; for a FULL_OBJECT one this is.
+    //
+    // Excluded for a ranged request: the stored value covers the whole object, so
+    // there is nothing to compare a sub-range against.
+    //
+    // Gated on validation being on, not on the request having set
+    // `ChecksumMode::Enabled`: validation is on by default, so gating on the
+    // explicit opt-in would leave the majority of downloads returning `Ok` over
+    // corrupt bytes. Costs one `HeadObject`, the same trade the align branch makes
+    // with its extra GET.
+    if validation_enabled && input.range().is_none() && discovery.remaining.is_some() {
         let etag = discovery.object_meta.e_tag.clone();
         discovery.object_crc = fetch_object_crc(transfer, input, etag.as_deref()).await?;
     }
@@ -634,7 +652,11 @@ mod tests {
                     .body(ByteStream::from_static(&[0u8; 8]))
                     .build()
             });
-        let client = mock_client!(aws_sdk_s3, &[&ranged, &part1]);
+        // The object-checksum lookup a validating multi-chunk download also makes.
+        // Answered without a checksum here, so this test stays about alignment.
+        let head = mock!(Client::head_object)
+            .then_output(|| HeadObjectOutput::builder().content_length(0).build());
+        let client = mock_client!(aws_sdk_s3, &[&ranged, &part1, &head]);
 
         let request = DownloadInput::builder()
             .bucket("test-bucket")
