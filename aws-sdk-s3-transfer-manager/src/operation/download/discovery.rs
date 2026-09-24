@@ -577,6 +577,49 @@ mod tests {
         assert_eq!(0..=499, remaining);
     }
 
+    /// A suffix or open-ended range is discovered by HEAD, and S3 answers that HEAD
+    /// with 206: `Content-Length` is the range's length and `Content-Range` says where
+    /// it sits. The range to fetch is those offsets -- the same byte count anchored at
+    /// 0 is a different part of the object, and the download would return bytes the
+    /// caller did not ask for.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_discover_obj_with_head_ranged_keeps_the_offsets() {
+        let total = 10 * ByteUnit::Mebibyte.as_bytes_u64();
+        // `Range: bytes=-500`: the LAST 500 bytes of a 10MiB object.
+        let head_obj_rule = mock!(Client::head_object).then_output(move || {
+            HeadObjectOutput::builder()
+                .content_length(500)
+                .content_range(format!("bytes {}-{}/{total}", total - 500, total - 1))
+                .build()
+        });
+        let client = mock_client!(aws_sdk_s3, &[&head_obj_rule]);
+
+        let input = DownloadInput::builder()
+            .bucket("test-bucket")
+            .key("test-key")
+            .range("bytes=-500")
+            .build()
+            .unwrap();
+
+        let transfer = test_transfer(
+            test_handle(client, 5 * ByteUnit::Mebibyte.as_bytes_u64()),
+            &input,
+        );
+
+        let discovery = discover_obj_with_head(&transfer, &input).await.unwrap();
+        assert_eq!(
+            Some((total - 500)..=(total - 1)),
+            discovery.remaining,
+            "the range to fetch is the one S3 reported, not its length anchored at 0"
+        );
+        assert_eq!(
+            total,
+            discovery.object_meta.total_object_size(),
+            "a 206 HEAD reports the range's length, so the object's size comes from the range total"
+        );
+    }
+
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_discover_obj_with_get_full_range() {

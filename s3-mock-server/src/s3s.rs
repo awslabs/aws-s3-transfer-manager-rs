@@ -19,6 +19,12 @@ use s3s::dto::{ETag, HeadBucketInput, HeadBucketOutput, StreamingBlob};
 use s3s::{S3Request, S3Response, S3Result};
 use std::str::FromStr;
 
+/// The `Content-Range` header for a range answered out of an object of `total` bytes.
+/// `range` is half-open; the header's end is inclusive.
+fn content_range_header(range: &std::ops::Range<u64>, total: u64) -> String {
+    format!("bytes {}-{}/{}", range.start, range.end - 1, total)
+}
+
 /// Convert a quoted etag string (e.g. `"\"abc123\""`) to `ETag::Strong("abc123")`.
 fn etag_from_quoted(s: &str) -> ETag {
     ETag::Strong(s.trim_matches('"').to_owned())
@@ -422,12 +428,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             let range_size = range.end - range.start;
             output.content_length = Some(range_size as i64);
             // Set content_range header to indicate what range is being returned
-            output.content_range = Some(format!(
-                "bytes {}-{}/{}",
-                range.start,
-                range.end - 1,
-                metadata.content_length
-            ));
+            output.content_range = Some(content_range_header(&range, metadata.content_length));
         } else {
             // For full object requests, content_length is the full object size
             output.content_length = Some(metadata.content_length as i64);
@@ -488,15 +489,40 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         tracing::trace!(%bucket, %key, "HeadObject");
 
         // Get object metadata from storage
-        let metadata = match self.storage.head_object(bucket, key).await? {
+        let mut metadata = match self.storage.head_object(bucket, key).await? {
             Some(metadata) => metadata,
             None => return Err(Error::NoSuchKey.into()),
         };
 
+        // A HEAD carrying a `Range` is answered 206: `Content-Length` is the range's
+        // length and `Content-Range` names the offsets, which is the only thing that
+        // tells a caller WHERE a suffix or open-ended range landed. Checksums follow
+        // the same rule as a ranged GET.
+        let range = input
+            .range
+            .as_ref()
+            .map(|range_dto| {
+                range_dto
+                    .check(metadata.content_length)
+                    .map_err(|_| Error::InvalidRange)
+            })
+            .transpose()?;
+        let content_range = range
+            .as_ref()
+            .map(|r| content_range_header(r, metadata.content_length));
+        if let Some(r) = range.as_ref() {
+            metadata.apply_range_checksums(r.start, r.end);
+        }
+
         // Build response
         let content_type = metadata.content_type.and_then(|ct| ct.parse().ok());
+        let content_length = range
+            .as_ref()
+            .map(|r| r.end - r.start)
+            .unwrap_or(metadata.content_length);
         let mut output = s3s::dto::HeadObjectOutput {
-            content_length: Some(metadata.content_length as i64),
+            content_length: Some(content_length as i64),
+            content_range,
             e_tag: Some(etag_from_quoted(&metadata.etag)),
             last_modified: Some(Timestamp::from(metadata.last_modified)),
             content_type,

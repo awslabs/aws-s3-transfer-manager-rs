@@ -1215,6 +1215,50 @@ async fn whole_object_explicit_range_validates_real_gp() {
     whole_object_explicit_range_validates(Target::real_gp()).await;
 }
 
+/// A suffix range of every byte but the first delivers the object's tail, which the
+/// whole-object checksum does not describe -- so the download reports not-validated
+/// and returns those bytes.
+///
+/// The byte count alone matches nothing here, but it comes within one byte of the
+/// object's size, which is what makes this the shape that separates "the delivered
+/// bytes are the object's" from "there are as many of them".
+async fn tail_suffix_range_is_not_reported_corrupt(target: Target) {
+    let t = target.connect_with(Some(UPLOAD_PART_SIZE)).await;
+    let data = multipart_data();
+    t.put(
+        "obj",
+        data.clone(),
+        ChecksumStrategy::with_calculated_crc32(),
+    )
+    .await;
+
+    let tail = data.len() - 1;
+    let (bytes, output) = t
+        .download_range_with(
+            &t.tm_with_part_size(MISALIGNED_DOWNLOAD_PART_SIZE),
+            "obj",
+            Some(ChecksumMode::Enabled),
+            Some(&format!("bytes=-{tail}")),
+        )
+        .await
+        .expect("a range the checksum does not cover is not an error");
+
+    assert_same_content(&data[1..], &bytes);
+    assert_not_validated(&output, NotValidatedReason::RangeNotCovered);
+
+    t.shutdown().await;
+}
+
+#[tokio::test]
+async fn tail_suffix_range_is_not_reported_corrupt_mock_gp() {
+    tail_suffix_range_is_not_reported_corrupt(Target::mock_gp()).await;
+}
+#[cfg(e2e_test)]
+#[tokio::test]
+async fn tail_suffix_range_is_not_reported_corrupt_real_gp() {
+    tail_suffix_range_is_not_reported_corrupt(Target::real_gp()).await;
+}
+
 /// A tampered chunk of a misaligned-part-size download fails the download. No
 /// chunk carries a checksum of its own here, so the SDK validates nothing; the
 /// transfer manager hashes the delivered bytes and compares against the object's
