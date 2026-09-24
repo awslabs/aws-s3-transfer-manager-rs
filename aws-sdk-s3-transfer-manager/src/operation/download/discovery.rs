@@ -125,10 +125,9 @@ pub(super) async fn discover_obj(
     // object stored with a FULL_OBJECT checksum -- what `ChecksumStrategy`'s CRC
     // strategies produce, so the common case for anything this crate uploaded --
     // no range GET of any shape returns a checksum, aligned or not, and only the
-    // object-level value exists. Verified against real S3 (us-west-2, GP): same
-    // bytes and algorithm uploaded twice differing only in checksum type; the
-    // aligned range and `partNumber=1` both returned a value for the COMPOSITE
-    // object and nothing at all for the FULL_OBJECT one.
+    // object-level value exists. Confirmed against real S3: an aligned range and a
+    // `partNumber=1` GET each return a value for a COMPOSITE object and no checksum
+    // header at all for a FULL_OBJECT one.
     //
     // The initial ranged discovery fetched `[0, configured)`, whose chunk length
     // is the CONFIGURED size, not the stored part size, so it cannot tell us the
@@ -175,15 +174,47 @@ pub(super) async fn discover_obj(
     // byte hash) and the per-part validation alignment bought is the only evidence
     // there is; for a FULL_OBJECT one this is.
     //
-    // Excluded for a ranged request: the stored value covers the whole object, so
-    // there is nothing to compare a sub-range against.
-    //
     // Gated on validation being on, not on the request having set
     // `ChecksumMode::Enabled`: validation is on by default, so gating on the
     // explicit opt-in would leave the majority of downloads returning `Ok` over
     // corrupt bytes. Costs one `HeadObject`, the same trade the align branch makes
     // with its extra GET.
-    if validation_enabled && input.range().is_none() && discovery.remaining.is_some() {
+    //
+    // The condition is that this transfer delivers the WHOLE object, not that the
+    // request carried no range: the value S3 holds covers every byte, so comparing
+    // it against a hash of a subset is a guaranteed false mismatch, while a range
+    // that happens to span the object is as validatable as no range at all. Stating
+    // it as coverage rather than as `range.is_none()` is also what keeps the
+    // comparison in `resolve_verdict` sound -- the total it folds up to is the
+    // transfer's byte count, which equals the object size exactly when this holds.
+    let delivered = discovery
+        .chunk_meta
+        .as_ref()
+        .and_then(|m| m.content_length)
+        .unwrap_or(0) as u64
+        + discovery
+            .remaining
+            .as_ref()
+            .map_or(0, |r| r.end() - r.start() + 1);
+    let covers_whole_object = delivered == discovery.object_meta.total_object_size();
+
+    // Nothing to learn when per-part validation is already in play. A chunk that
+    // carried a byte-covering checksum of its own means the object is composite --
+    // only a composite object has per-part values -- and a composite value is a
+    // checksum of part checksums, which no byte hash reproduces, so the fold could
+    // not use it anyway. Saves a request on every aligned composite download.
+    let per_part_validation = discovery.chunk_meta.as_ref().is_some_and(|m| {
+        matches!(
+            super::coverage::classify(m),
+            super::coverage::ChunkCoverage::Validated(_)
+        )
+    });
+
+    if validation_enabled
+        && covers_whole_object
+        && discovery.remaining.is_some()
+        && !per_part_validation
+    {
         let etag = discovery.object_meta.e_tag.clone();
         discovery.object_crc = fetch_object_crc(transfer, input, etag.as_deref()).await?;
     }
@@ -242,12 +273,15 @@ async fn fetch_object_crc(
     .instrument(tracing::debug_span!("send-head-object-for-object-checksum"))
     .await?;
 
-    // Priority order matches the SDK's: the cheapest algorithm first. Only one is
-    // ever present for a given object.
+    // The SDK's own order (`CHECKSUM_ALGORITHMS_IN_PRIORITY_ORDER`, cheapest first),
+    // restricted to the algorithms that combine. Picking a different one than the
+    // SDK would for a response carrying several would fold against one value while
+    // the SDK's per-chunk path checked another; S3 returns one per object, so this
+    // is about not diverging rather than about a case seen in practice.
     let candidates = [
         (ObjectCrcAlgorithm::Crc64Nvme, resp.checksum_crc64_nvme()),
-        (ObjectCrcAlgorithm::Crc32, resp.checksum_crc32()),
         (ObjectCrcAlgorithm::Crc32C, resp.checksum_crc32_c()),
+        (ObjectCrcAlgorithm::Crc32, resp.checksum_crc32()),
     ];
     let found = candidates
         .into_iter()

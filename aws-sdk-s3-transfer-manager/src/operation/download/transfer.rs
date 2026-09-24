@@ -124,6 +124,14 @@ struct DownloadTransferInner {
     /// whether the bytes were validated is a fact about the whole transfer. Unset
     /// when validation was off, or when the transfer never completed.
     resolved_validation: std::sync::OnceLock<crate::types::ChecksumValidation>,
+    /// Whether validation is in effect, resolved once at discovery.
+    ///
+    /// Cached rather than recomputed at the terminal transition because that read
+    /// happens under the state mutex, and `validation_enabled` reaches into the S3
+    /// client's config -- a foreign call whose internals this crate does not own has
+    /// no business nesting under that lock (the same rule the budget lock is held to
+    /// in [`DownloadState::enter_terminal`](super::context::DownloadState::enter_terminal)).
+    validation_enabled: std::sync::OnceLock<bool>,
 }
 
 impl DownloadTransfer {
@@ -154,6 +162,7 @@ impl DownloadTransfer {
             object_crc_algorithm: std::sync::OnceLock::new(),
             object_crc_mismatch: std::sync::OnceLock::new(),
             resolved_validation: std::sync::OnceLock::new(),
+            validation_enabled: std::sync::OnceLock::new(),
         });
         Self { inner }
     }
@@ -619,6 +628,8 @@ impl DownloadTransfer {
         // WhenRequired (WhenSupported, the default, and unknown values enable it).
         // Computed before discovery because it drives range alignment.
         let validation_enabled = self.validation_enabled(input);
+        // Cached for the terminal verdict, which reads it under the state lock.
+        let _ = self.inner.validation_enabled.set(validation_enabled);
 
         let discovery = match discover_obj(self, input, validation_enabled).await {
             Ok(d) => d,
@@ -1162,7 +1173,7 @@ impl DownloadTransfer {
         acc: Option<&super::object_crc::ObjectCrc>,
         coverage: &super::coverage::CoverageTally,
     ) {
-        if !self.validation_enabled(self.inner.request.as_ref()) {
+        if self.inner.validation_enabled.get() != Some(&true) {
             return;
         }
 
@@ -1199,7 +1210,10 @@ impl DownloadTransfer {
             }
         }
 
-        let verdict = coverage.resolve(folded_ok);
+        // A request-shaped reason, not an object-shaped one: reading the request is a
+        // field access on state this transfer owns, so it is safe under this lock.
+        let ranged = self.inner.request.range.is_some();
+        let verdict = coverage.resolve(folded_ok, ranged);
         tracing::debug!(?verdict, "resolved checksum validation verdict");
         let _ = self.inner.resolved_validation.set(verdict);
     }

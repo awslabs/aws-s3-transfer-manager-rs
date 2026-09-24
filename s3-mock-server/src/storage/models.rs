@@ -151,19 +151,48 @@ impl ObjectMetadata {
         if start == 0 && end == self.content_length {
             return;
         }
-        let mut offset = 0u64;
-        for part in &self.parts {
-            if start == offset && end == offset + part.size {
-                self.crc32 = part.crc32.clone();
-                self.crc32c = part.crc32c.clone();
-                self.crc64nvme = part.crc64nvme.clone();
-                self.sha1 = part.sha1.clone();
-                self.sha256 = part.sha256.clone();
-                return;
+        // A per-part checksum exists only for a COMPOSITE object, whose stored value
+        // IS the combination of the part checksums. An object stored with a
+        // FULL_OBJECT checksum has one value over all bytes and no per-part values,
+        // so S3 returns nothing for any sub-range of it -- aligned or not.
+        //
+        // Verified against real S3 (us-west-2, general purpose): an aligned range and a
+        // `partNumber=1` GET each return a checksum for a COMPOSITE object and no
+        // checksum header at all for a FULL_OBJECT one.
+        if self.has_composite_checksum() {
+            let mut offset = 0u64;
+            for part in &self.parts {
+                if start == offset && end == offset + part.size {
+                    self.crc32 = part.crc32.clone();
+                    self.crc32c = part.crc32c.clone();
+                    self.crc64nvme = part.crc64nvme.clone();
+                    self.sha1 = part.sha1.clone();
+                    self.sha256 = part.sha256.clone();
+                    return;
+                }
+                offset += part.size;
             }
-            offset += part.size;
         }
         self.clear_checksums();
+    }
+
+    /// Whether the stored object-level checksum is a composite one, carrying the
+    /// `-<part count>` suffix. That suffix is what distinguishes a checksum *of part
+    /// checksums* from one over the object's bytes.
+    fn has_composite_checksum(&self) -> bool {
+        [
+            self.crc32.as_deref(),
+            self.crc32c.as_deref(),
+            self.crc64nvme.as_deref(),
+            self.sha1.as_deref(),
+            self.sha256.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|v| {
+            v.rsplit_once('-')
+                .is_some_and(|(_, n)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        })
     }
 
     /// Byte range `[start, end)` of the 1-based `part_number` for a completed

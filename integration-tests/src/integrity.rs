@@ -888,10 +888,20 @@ async fn tampered_multipart_errors(target: Target) {
     // ranges match the uploaded part boundaries without relying on auto-alignment
     // (auto-alignment only fires for an Auto part size). Each aligned chunk carries
     // a per-part checksum the SDK validates, so a tampered checksum fails.
+    //
+    // COMPOSITE on purpose: per-part checksums exist only for a composite object.
+    // A FULL_OBJECT object has one value over all bytes and none per part, so S3
+    // returns no checksum for an aligned range of one and there is nothing for this
+    // fault to tamper with -- see `multipart_full_object_default_tamper_caught`,
+    // which covers that shape through the mechanism that does apply to it.
     let t = target.connect_with(Some(ALIGNED_PART_SIZE)).await;
     let data = multipart_data();
-    t.put("obj", data, ChecksumStrategy::with_calculated_crc32())
-        .await;
+    t.put(
+        "obj",
+        data,
+        ChecksumStrategy::with_calculated_sha256_composite_if_multipart(),
+    )
+    .await;
 
     let mock = t.mock().expect("tamper faults require the mock backend");
     // Fail every chunk for a deterministic transfer outcome.
@@ -972,8 +982,15 @@ async fn multipart_aligned_round_trips_real_express() {
 async fn multipart_default_tamper_caught(target: Target) {
     let t = target.connect().await; // default (Auto) part size -> auto-aligned
     let data = multipart_data();
-    t.put("obj", data, ChecksumStrategy::with_calculated_crc32())
-        .await;
+    // COMPOSITE, so the auto-aligned ranges carry per-part checksums for the fault
+    // to tamper with; see `tampered_multipart_errors` for why FULL_OBJECT cannot be
+    // tested through this fault.
+    t.put(
+        "obj",
+        data,
+        ChecksumStrategy::with_calculated_sha256_composite_if_multipart(),
+    )
+    .await;
 
     let mock = t.mock().expect("requires the mock backend");
     mock.insert_fault(
@@ -993,6 +1010,35 @@ async fn multipart_default_tamper_caught(target: Target) {
 #[tokio::test]
 async fn multipart_default_tamper_caught_mock_gp() {
     multipart_default_tamper_caught(Target::mock_gp()).await;
+}
+
+/// The default multipart download of a FULL_OBJECT-checksum object — what this
+/// crate's own CRC upload strategies produce — fails on corruption.
+///
+/// This is the shape with no per-part checksums at all, so alignment buys nothing and
+/// the transfer's own fold over the delivered bytes is the only thing that can catch
+/// it. The sibling tamper tests cannot cover this shape: they corrupt a stored
+/// checksum, and this one has none to corrupt per range.
+#[tokio::test]
+async fn multipart_full_object_default_tamper_caught_mock_gp() {
+    let t = Target::mock_gp().connect().await; // Auto part size -> auto-aligned
+    let data = multipart_data();
+    t.put("obj", data, ChecksumStrategy::with_calculated_crc32())
+        .await;
+
+    let mock = t.mock().expect("requires the mock backend");
+    mock.insert_fault(
+        t.bucket(),
+        &t.key("obj"),
+        FaultType::CorruptBody,
+        0,
+        Occurrence::Always,
+    );
+
+    let result = t.download("obj", Some(ChecksumMode::Enabled)).await;
+    assert_integrity_error(result);
+
+    t.shutdown().await;
 }
 
 // large single-PUT object split for throughput ---------------------------------
@@ -1108,7 +1154,9 @@ async fn explicit_range_reports_not_validated(target: Target) {
         .expect("download");
 
     assert_eq!(bytes, data[1048576..=3145727], "requested range contents");
-    assert_not_validated(&output, NotValidatedReason::Unavailable);
+    // The reason names the request, not the object: this object does carry a
+    // checksum, and the same bytes validate when asked for without a range.
+    assert_not_validated(&output, NotValidatedReason::RangeNotCovered);
 
     t.shutdown().await;
 }
@@ -1121,6 +1169,50 @@ async fn explicit_range_reports_not_validated_mock_gp() {
 #[tokio::test]
 async fn explicit_range_reports_not_validated_real_gp() {
     explicit_range_reports_not_validated(Target::real_gp()).await;
+}
+
+/// A range that happens to span the whole object is as validatable as no range at
+/// all, and is validated.
+///
+/// The bytes are identical either way, so a verdict that depended on how the caller
+/// spelled the request would be reporting on syntax rather than on the data. This is
+/// what gating the fold on "does this transfer deliver the whole object" buys over
+/// gating it on "did the request carry a range".
+async fn whole_object_explicit_range_validates(target: Target) {
+    let t = target.connect_with(Some(UPLOAD_PART_SIZE)).await;
+    let data = multipart_data();
+    t.put(
+        "obj",
+        data.clone(),
+        ChecksumStrategy::with_calculated_crc32(),
+    )
+    .await;
+
+    let last = data.len() - 1;
+    let (bytes, output) = t
+        .download_range_with(
+            &t.tm_with_part_size(MISALIGNED_DOWNLOAD_PART_SIZE),
+            "obj",
+            Some(ChecksumMode::Enabled),
+            Some(&format!("bytes=0-{last}")),
+        )
+        .await
+        .expect("download");
+
+    assert_same_content(&data, &bytes);
+    assert_validated(&output, aws_sdk_s3::types::ChecksumAlgorithm::Crc32);
+
+    t.shutdown().await;
+}
+
+#[tokio::test]
+async fn whole_object_explicit_range_validates_mock_gp() {
+    whole_object_explicit_range_validates(Target::mock_gp()).await;
+}
+#[cfg(e2e_test)]
+#[tokio::test]
+async fn whole_object_explicit_range_validates_real_gp() {
+    whole_object_explicit_range_validates(Target::real_gp()).await;
 }
 
 /// A tampered chunk of a misaligned-part-size download fails the download. No
@@ -1225,7 +1317,7 @@ async fn explicit_range_tamper_not_caught_but_never_validated_mock_gp() {
         data[1048576..=3145727],
         "the fault must actually have corrupted the delivered bytes"
     );
-    assert_not_validated(&output, NotValidatedReason::Unavailable);
+    assert_not_validated(&output, NotValidatedReason::RangeNotCovered);
 
     t.shutdown().await;
 }
