@@ -146,28 +146,49 @@ folder shows up in the browser — MUST be invisible to sync on both sides: neve
 deleted, never treated as a directory.
 *`[CLI]` `filegenerator.py` → `FileGenerator.list_objects` yields such keys only when `operation_name == 'delete'`, and sync's reverse generator uses `''`, so markers are filtered on both sides.*
 
-**FR-Enum-3** Walking the local tree MUST skip a single *entry* rather than fail the whole run when
-that entry cannot be transferred or cannot be read, and the two cases MUST be told apart:
+**FR-Enum-3** Walking the local tree MUST skip a single *entry* rather than fail the whole run when that
+entry cannot be transferred, cannot be read, or has no key it could take, and the three cases MUST be
+told apart:
 
 - **Nothing to transfer** — a device (`/dev/null`), a FIFO, or a socket. No setting makes these
   transferable, and reading one may never finish. A warning under either policy. A symlink sync was told
-  not to follow belongs here too (FR-Enum-4), as does a local name that is not valid UTF-8: an S3 object
-  key is Unicode encoded as UTF-8, so there is no key such a name could take.
-
-  Such a name MUST NOT be converted lossily to make a key. Two names differing only in invalid bytes would
-  collapse onto one key, and sync would then treat two files as one. The entry MUST be skipped and named,
-  so a caller can see which file it was.
+  not to follow belongs here too (FR-Enum-4).
 - **Should have been readable and was not** — missing, deleted mid-run, unreadable, or a symlink pointing
   at nothing: a failure, following the global policy (FR-Fail-9).
+- **No key it could take** — a local name that is not valid UTF-8. An S3 object key is Unicode encoded as
+  UTF-8, so no key corresponds to such a name. It MUST be reported as `skipped-with-warning`, naming the
+  file with its invalid bytes escaped. It MUST NOT be converted lossily to make a key: two names
+  differing only in invalid bytes would collapse onto one, and sync would then treat two files as one.
 
-Neither kind may be dropped silently. If sync left these entries out of the list, anything reading that
-list would conclude the name is unused — and delete whatever sits at the matching name on the other side
+The first two kinds MUST reach the comparison. If sync left them out, anything reading that list would
+conclude the name is unused — and delete whatever sits at the matching name on the other side
 (FR-Fail-7). A FIFO is never transferred, but the fact that *something occupies that name* is what has to
 stop the destination object from being deleted.
 
+The third kind cannot reach it, because occupying a name means holding a key and this entry has none. It
+therefore takes no part in the comparison, and sync MUST NOT hold anything back on its behalf. An object
+written under a key derived lossily from such a name has a source side that is genuinely absent — no local
+file carries that key — so FR-Fail-7's distinction never arises and delete mode (FR-Exec-2) removes it as
+it would any other object with no counterpart.
+
+This library writes such objects today: `upload_objects` derives its key with a lossy conversion, so the
+two operations run against the same pair are in conflict. Uploading a directory writes an object at the
+lossy key, syncing the same directory with delete mode removes it, and sync never replaces it because
+enumeration will not produce a key for the file. The local file is never replicated by sync, and
+alternating the two operations writes and removes the object indefinitely. That cost is accepted here, and
+this requirement is what makes it visible; changing the upload path is out of scope for sync.
+
+A hold was designed before it was rejected. Sync cannot recover which file an object came from, but it can
+bound where that file must be: keys under the same parent whose remaining bytes match the valid part of
+the name, with a replacement character wherever the invalid bytes were. That set contains the object and
+usually little else. It was rejected on cost: the hold protects an object that may correspond to any of
+several files or to none, so what it buys is the survival of an arbitrary one, and paying for that means
+every caller carrying the machinery to bound and release the set. Paying that to protect an object that
+may correspond to any of several files, or to none, costs more than the delete.
+
 This is about one entry at a time. Failing to read an entire directory is a different problem
 (FR-Enum-12).
-*`[ISSUE]` [#487](https://github.com/aws/aws-cli/issues/487) — "S3 sync will exit when a broken symlink are present" (sic) — and its mirror [#425](https://github.com/aws/aws-cli/issues/425), where a filesystem exception makes the CLI "exit silently, and with a non-error (0) exit status", stopping "prematurely … before all files had been sync'ed up". The requirement is skip-and-warn: not skip-and-stop, and not fail. `[CLI]` the two categories are `filegenerator.py` → `is_special_file` versus `is_readable`; a name the filesystem encoding cannot decode is skipped with a warning naming its raw bytes (`should_ignore_file_with_decoding_warnings` → `FileDecodingError`). That check is locale-dependent, which a UTF-8 validity test is not.*
+*`[ISSUE]` [#487](https://github.com/aws/aws-cli/issues/487) — "S3 sync will exit when a broken symlink are present" (sic) — and its mirror [#425](https://github.com/aws/aws-cli/issues/425), where a filesystem exception makes the CLI "exit silently, and with a non-error (0) exit status", stopping "prematurely … before all files had been sync'ed up". The requirement is skip-and-warn: not skip-and-stop, and not fail. `[CLI]` the two categories are `filegenerator.py` → `is_special_file` versus `is_readable`; a name the filesystem encoding cannot decode is skipped with a warning naming its raw bytes (`should_ignore_file_with_decoding_warnings` → `FileDecodingError`). That check is locale-dependent, which a UTF-8 validity test is not. `[TM]` directory upload disagrees across implementations, so an object at a lossily-derived key is something sync will meet: this crate's `upload_objects` and the Java v2 transfer manager both build the key with a lossy conversion, the Go transfer manager passes the raw filename bytes through because a Go string need not be valid UTF-8, and boto3 and the JavaScript SDK have no directory upload at all.*
 
 **FR-Enum-4** Following symlinks MUST be a setting, and MUST default to **not** following them. With
 following turned on, sync transfers what the link points at, filed under the link's own name rather than
@@ -301,8 +322,10 @@ uses itself.
 - **A comparison MUST be able to do work before it answers.** Comparing checksums (FR-Cmp-9) or properties
   (FR-Cmp-11) means reading bytes or making a request first, so the interface MUST accept "not yet, ask me
   again" instead of demanding an immediate decision — including in the first release, where every built-in
-  mode does answer immediately. Answers that arrive late arrive out of order, and MUST be applied in key
-  order so FR-Cmp-8 still holds.
+  mode does answer immediately. A comparison answering immediately produces answers in key order, because
+  the merge hands it keys in that order. A deferred answer carries no such promise, and none is required:
+  FR-Cmp-8 is about what a plan contains, not the sequence it is handed over in, and a consumer needing
+  order sorts what it collects.
 - The comparison MUST be given the **entries themselves**. A checksum or ETag check
   needs listing fields that only the entry carries. Whatever it decides MUST come back with the reason
   attached (FR-Obs-1).
@@ -313,9 +336,15 @@ the fraction of a second a local filesystem records and S3 does not. Once a file
 MUST keep agreeing: repeated runs over an unchanged pair MUST NOT flip between transferring and skipping.
 *`[CLI]` `subscribers.py` → `ProvideLastModifiedTimeSubscriber` writes back `int(time.mktime(last_modified.timetuple()))` — whole seconds — via `utils.set_file_utime`; `syncstrategy/base.py` → `total_seconds` yields float seconds, so `ExactTimestampsSync` demands exact equality. `[DERIVED]` non-oscillation follows only because S3 `LastModified` is second-granular and the write-back matches it.*
 
-**FR-Cmp-8** The same side states and the same options MUST always produce the same plan. Both sides arrive
-in key order (FR-Enum-13); beyond that, the plan MUST NOT depend on how the two interleave, or on the order
-in which earlier transfers finished.
+**FR-Cmp-8** The same side states and the same options MUST always produce the same plan. Both sides
+arrive in key order (FR-Enum-13); beyond that, the plan MUST NOT depend on how the two interleave, or on
+the order in which earlier transfers finished.
+
+"The same plan" means the same decision and the same reason for every key. It does not mean the same
+sequence: FR-Exec-12 lets transfers happen in any order, so nothing downstream depends on the order
+decisions are handed over in, and the destination reaches the same state either way. A consumer that needs
+an ordered plan — diffing two dry runs, say — MUST sort what it collects rather than assume the order it
+arrived in.
 *`[DERIVED]` from `comparator.py` → `Comparator.call`, whose merge join requires both sides "listed in the same order, least to greatest in collation order", and `filegenerator.py` → `list_files` + `normalize_sort`, which emulate S3 byte order locally by suffixing directory names with the path separator before sorting.*
 
 **FR-Cmp-9 (checksum mode)** Sync MUST offer an opt-in mode that compares the checksums both sides have
@@ -584,15 +613,26 @@ half-written destination entry looking like a finished one, and MUST report what
 
 What happens when an entry, a directory, or a listing cannot be handled, and what the caller is told.
 
-**FR-Fail-1** An object sitting in an archival storage class, not currently restored, MUST be skipped with
-a warning on `Download` and `Copy` — its bytes are not retrievable, so trying is a guaranteed failure. Two
-separate switches MUST exist: one to attempt the transfer anyway, one to stop warning about it. `Upload` is
-unaffected.
+**FR-Fail-1** An object in `GLACIER` or `DEEP_ARCHIVE` with no restored copy MUST be skipped with a
+warning on `Download` and `Copy` — its bytes are not retrievable, so trying is a guaranteed failure. An
+object whose restore is under way MUST be skipped and reported as such, separately: the bytes arrive when
+it finishes, so a later run gets them, and a caller told only that it was archived would think asking
+again is pointless. Two separate switches MUST exist: one to attempt the transfer anyway, one to stop
+warning about it. `Upload` is unaffected, because writing over an object never reads what is already
+there.
+
+Those two classes are the only ones a listing can answer for, and the names are a poor guide. `GLACIER_IR`
+reads in real time and never carries a restore status, so treating every Glacier-named class as archived
+would skip every one of those objects on every run. `INTELLIGENT_TIERING` reports the same class whether
+or not the object currently sits in an archive tier, so a listing cannot tell; sync finds out when a
+transfer comes back `InvalidObjectState`.
 
 Storage class comes back in a listing. Restore state only comes back when the listing asks for it, so sync
-MUST request `RestoreStatus` on every listing — which keeps the check free of per-entry requests
-(FR-Cmp-5). It has to be every listing: leave the header off and the field is simply missing, which looks
-identical to an object that was never restored.
+MUST request `RestoreStatus` on every listing it makes — which keeps the check free of per-entry requests
+(FR-Cmp-5). It has to be every one: leave the parameter off and the field is simply missing, which looks
+identical to an object that was never restored, so a comparison MUST treat a listing that did not ask as
+saying nothing about whether an object is reachable. The parameter is unsupported for directory buckets,
+and sync MUST NOT turn it on for listings made on behalf of other operations.
 *`[CLI]` `s3handler.py` → `_warn_glacier` (checked in `DownloadRequestSubmitter` and `CopyRequestSubmitter` warning handlers); `fileinfo.py` → `is_glacier_compatible` / `_is_glacier_object` (`GLACIER`, `DEEP_ARCHIVE`). The restore half is a departure: `_is_restored` tests for `ongoing-request="false"` in `Restore`, a HeadObject header, against data that came from a listing, and the CLI never sends `OptionalObjectAttributes`. So the test always fails during a sync and a restored object is skipped with a warning even though its bytes are available. `[DOC]` `--force-glacier-transfer`, `--ignore-glacier-warnings` (including its effect on the exit code); `ListObjectsV2` carries `RestoreStatus` (`IsRestoreInProgress`, `RestoreExpiryDate`) when the request sends `x-amz-optional-object-attributes: RestoreStatus`.*
 
 **FR-Fail-2** Sync MUST offer two failure policies, continue and abort, and MUST default to continue.
@@ -634,6 +674,12 @@ at least one warning; clean.
 **FR-Fail-6** Failing to list a root at all MUST fail the run, and MUST be reported differently from an
 individual entry failing. One entry failing leaves a usable run; a root that cannot be listed means sync
 never knew what was there.
+
+A `Download` destination that does not exist yet is not this case, and MUST NOT fail the run. Nothing was
+listed there because nothing is there: every key the source holds is missing at the destination, which is
+a complete answer rather than an absent one, and the directory is created as entries are written
+(FR-Exec-3). A destination root that exists and cannot be read, or exists and is not a directory, still
+ends the run — neither can be written into, and neither says the destination is empty.
 *`[CLI]` `filegenerator.py` → `list_objects` / `_list_single_object` let `ClientError` propagate out of the generator, failing the command rather than producing an empty side.*
 
 **FR-Fail-7** A key whose side state is unknown on either side MUST get no action, and MUST be reported as
@@ -669,10 +715,13 @@ happens: ignore (default), warn, skip, or fail.
 happen: an entry that could not be listed, a directory that could not be read, a listing page that could
 not be fetched, an object that could not be transferred or copied, a key that could not be deleted.
 
-One policy, so a caller reasons about failure once. Two things sit outside it:
+One policy, so a caller reasons about failure once. Three things sit outside it:
 
-- An entry that could never be transferred whatever the settings — device, FIFO, socket, a symlink sync was
-  told not to follow — is a warning under either policy (FR-Enum-3).
+- An entry that could never be transferred whatever the settings — device, FIFO, socket, a symlink sync
+  was told not to follow — is a warning under either policy (FR-Enum-3).
+- A local name with no key it could take is a warning under either policy too, for the same reason: no
+  setting makes it transferable, and aborting a run over a name sync was never going to send would stop a
+  transfer of everything else for nothing (FR-Enum-3).
 - A failure that leaves nothing to carry on with — a source root that is unreadable or is not a directory
   (FR-Fail-6) — ends the run under either policy. Not because the policy is overridden, but because there
   is nothing left to continue doing.
@@ -708,6 +757,11 @@ dry runs included.
 
 They MUST carry enough that a caller can print the familiar `upload:` / `download:` / `copy:` / `delete:`
 lines from them alone.
+
+An entry with no key it could take (FR-Enum-3) is the one exception to carrying a key, since none exists
+to carry. It MUST be identified by its name with the invalid bytes escaped, which is what the warning for
+it already names, and everything else on the value is unchanged. Reporting it is what tells a caller a
+name was seen and skipped; leaving it out would make the run look like it covered a tree it did not.
 
 Delivery MUST be bounded, so a caller that reads slowly MAY miss events and the run MUST NOT slow down
 waiting. The result stays complete either way (FR-Fail-4). A dry run is the exception, where the events are

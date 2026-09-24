@@ -16,7 +16,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use aws_sdk_s3::types::Object;
+use aws_sdk_s3::types::{Object, ObjectStorageClass};
+
+use crate::io::FileType;
 
 use super::filter::KeyFilter;
 use super::{derive_object_key, DEFAULT_DELIMITER};
@@ -44,6 +46,46 @@ pub(crate) struct EntryMeta {
     //
     // Note that the S3 side always produces `Some`.
     pub(crate) last_modified_secs: Option<i64>,
+    // What stops this item taking part in a transfer, where the walk or the listing already
+    // shows it. `None` for an ordinary file or object.
+    pub(crate) obstruction: Option<Obstruction>,
+}
+
+// Why an item cannot take part in a transfer.
+//
+// The name still has to reach a comparison, because a taken name is what keeps the matching key
+// on the other side from being deleted. What a comparison needs beyond that is why nothing can
+// be sent, and the causes differ in whether anything can be done about them.
+//
+// Some obstructions never appear here. A retention lock, a legal hold, and which tier an
+// Intelligent-Tiering object currently sits in each need a request per object, so they arrive as
+// a failed transfer. Conditions on the action instead of the item arrive the same way — a key no
+// filename on the destination platform can hold, a path too long, a full disk — because where the
+// destination lacks the key there is no item here to hang them on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Obstruction {
+    // A socket, a device, a named pipe, or a symlink the walk was told not to follow: the name is
+    // taken and holds nothing a transfer could read, and reading one may never finish.
+    NothingToRead,
+    // An object whose bytes sit in an archive with no restored copy to read.
+    Archived,
+    // A restore is under way. The bytes arrive when it finishes, so a later run gets them.
+    BeingRestored,
+}
+
+impl Obstruction {
+    // Whether this also stops the item being written over.
+    //
+    // A name with nothing behind it does: replacing a device is not what anyone asked for, and
+    // writing to a pipe nobody reads never returns.
+    pub(crate) fn blocks_overwrite(&self) -> bool {
+        match self {
+            Self::NothingToRead => true,
+            // Writing over an object never reads what is already there, so an upload to a key
+            // holding an archived object goes ahead and replaces it.
+            Self::Archived | Self::BeingRestored => false,
+        }
+    }
 }
 
 // An item a walker produced, carried under the key a comparison pairs it by, with the metadata
@@ -64,8 +106,8 @@ pub(crate) struct Entry<T> {
 pub(crate) enum StreamError {
     // The underlying walk failed. Whether it ends the run is the walk's own answer.
     Walk(WalkError),
-    // A local name that is not valid UTF-8, so no S3 key could carry it. One name, and the walk
-    // read it fine.
+    // A local name that is not valid UTF-8, so no key could carry it. The walk read the name
+    // without trouble; it is the conversion that has nowhere to go.
     UnkeyableName(PathBuf),
     // A listed object without a field a comparison needs. The key is named where the listing gave
     // one, so a consumer can hold back the action for that key alone.
@@ -76,8 +118,8 @@ pub(crate) enum StreamError {
 }
 
 impl StreamError {
-    // Whether nothing is left to carry on with. Only a walk can say so: a name that cannot be
-    // keyed and an object missing a field each cost one key.
+    // Whether the run has anything left to carry on with. Only a walk can end it: a name that
+    // cannot be keyed and an object missing a field each cost one key and no more.
     pub(crate) fn is_fatal(&self) -> bool {
         match self {
             StreamError::Walk(err) => err.is_fatal(),
@@ -131,6 +173,15 @@ pub(crate) trait KeyStream {
     fn next_entry(
         &mut self,
     ) -> impl Future<Output = Option<Result<Entry<Self::Source>, StreamError>>> + Send;
+
+    // Whether the stream has stopped, whether because it reached the end or because a
+    // failure ended it.
+    //
+    // A consumer needs this to tell those apart from the failure it was just handed: a
+    // stream that stopped answers `None` from here on, and position alone reads that as
+    // "no key is there". Classifying the error instead would put a second opinion in the
+    // consumer, and `WalkErrorKind` is `#[non_exhaustive]`, so the two could disagree.
+    fn is_done(&self) -> bool;
 }
 
 // What a failure cost the side that hit it.
@@ -139,15 +190,13 @@ pub(crate) trait KeyStream {
 // other side" it has to know whether the side it is reading is still able to account for its keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KeysLost {
-    // One key, and the keys around it are known. Whether a consumer can act on that one key alone
+    // One key, and the keys around it are known. How precisely a consumer can place that key
     // depends on which failure produced it.
     //
-    // A listing names the key it dropped. A name no key can carry names the file itself, at that
-    // file's own position, so it is just as identifiable — what it cannot do is produce a key to
-    // match against the other side, which is why nothing can be sent for it even though the name is
-    // taken. A walk failure is the weak one: it carries an absolute path nothing here turns into a
-    // key, and it arrives at the position of the directory holding it, so all a consumer learns is
-    // that some key inside that directory is gone.
+    // A listing names the key it dropped, and a name no key can carry names the file at its own
+    // position, so both point at something identifiable. A walk failure gives less: it carries an
+    // absolute path this layer cannot turn into a key, reported at the position of the directory
+    // holding it, so a consumer learns only that some key inside that directory is gone.
     OneKey,
     // An unknown range. A subtree went unenumerated, or the side stopped before its end, so
     // absence cannot be read from position at all.
@@ -174,14 +223,7 @@ impl StreamError {
                 | WalkErrorKind::PermissionDenied
                 | WalkErrorKind::BrokenSymlink => KeysLost::OneKey,
             },
-            // One entry, like the devices and sockets it is grouped with, and not a range — losing a
-            // whole directory is a separate case. What it costs is this: the name is taken, and no key
-            // can carry it, so the upload path's lossy derivation may already have put an object
-            // where a walk cannot look. Not `Nothing`, which would license deleting that object.
-            //
-            // The truthful state is narrower than either: the key is occupied and nothing can be
-            // sent for it. Saying so needs an answer beside transfer and skip, which the comparison
-            // owns; until then this is the conservative half of it.
+            // Exactly one name went unaccounted for, and the report names it.
             StreamError::UnkeyableName(_) => KeysLost::OneKey,
             // The object was listed and then dropped, so its key is absent from this side while
             // the keys around it arrived.
@@ -252,6 +294,24 @@ fn key_for_relative_path(relative: &std::path::Path) -> Option<Cow<'_, str>> {
     )
 }
 
+// The key a path would take, given the root it sits under.
+//
+// A walk reports a failure by absolute path, and the rules for turning one into a key live
+// here — a name that is not valid UTF-8 has no key, and case and Unicode form pass through
+// untouched. The root has to be supplied, because a stream is handed a walker that already
+// knows its root and never says what it is.
+pub(crate) fn key_under_root(root: &std::path::Path, path: &std::path::Path) -> Option<String> {
+    let relative = path.strip_prefix(root).ok()?;
+    // The root itself is not a key under it, the same answer `relative_key` gives for its own
+    // root. An empty remainder would otherwise become the empty key, and a caller deriving a
+    // bound from that gets one that matches nothing while sorting below every real key — so the
+    // range it stands for would be let go at the first name the side produced.
+    if relative.as_os_str().is_empty() {
+        return None;
+    }
+    key_for_relative_path(relative).map(Cow::into_owned)
+}
+
 // Predicates that apply one rule set to both sides.
 //
 // Both derive the key the same way the streams do, so a rule cannot decide one thing
@@ -312,6 +372,10 @@ pub(crate) fn s3_predicate(
 impl KeyStream for FsWalk {
     type Source = FsEntry;
 
+    fn is_done(&self) -> bool {
+        FsWalk::is_done(self)
+    }
+
     async fn next_entry(&mut self) -> Option<Result<Entry<FsEntry>, StreamError>> {
         match self.next().await? {
             Ok(entry) => {
@@ -327,6 +391,12 @@ impl KeyStream for FsWalk {
                     last_modified_secs: entry
                         .metadata()
                         .and_then(|m| secs_since_epoch(m.modified())),
+                    obstruction: match entry.file_type() {
+                        FileType::Regular => None,
+                        // A special file, or a symlink left unresolved. The walk yields it so the
+                        // name counts as taken; nothing can be read from it.
+                        _ => Some(Obstruction::NothingToRead),
+                    },
                 };
                 Some(Ok(Entry {
                     key,
@@ -342,23 +412,31 @@ impl KeyStream for FsWalk {
 impl KeyStream for S3Walk {
     type Source = Object;
 
+    fn is_done(&self) -> bool {
+        S3Walk::is_done(self)
+    }
+
     async fn next_entry(&mut self) -> Option<Result<Entry<Object>, StreamError>> {
+        let restore_status_asked_for = self.requests_restore_status();
         loop {
             match self.next().await? {
                 Err(err) => return Some(Err(err.into())),
-                Ok(obj) => match key_and_meta(&obj, &root_prefix(self.prefix())) {
-                    Ok(None) => continue,
-                    Ok(Some((key, meta))) => {
-                        return Some(Ok(Entry {
-                            key,
-                            meta,
-                            source: obj,
-                        }))
+                Ok(obj) => {
+                    match key_and_meta(&obj, &root_prefix(self.prefix()), restore_status_asked_for)
+                    {
+                        Ok(None) => continue,
+                        Ok(Some((key, meta))) => {
+                            return Some(Ok(Entry {
+                                key,
+                                meta,
+                                source: obj,
+                            }))
+                        }
+                        // One key that cannot be compared. The listing itself arrived, so the run
+                        // carries on with the keys around it.
+                        Err(err) => return Some(Err(err)),
                     }
-                    // One key that cannot be compared. The listing itself arrived, so the run
-                    // carries on with the keys around it.
-                    Err(err) => return Some(Err(err)),
-                },
+                }
             }
         }
     }
@@ -415,6 +493,44 @@ pub(crate) fn relative_key<'a>(key: &'a str, root_prefix: &str) -> Option<&'a st
     (!relative.is_empty()).then_some(relative)
 }
 
+// What stops a listed object being read.
+//
+// Two answers come from one pair of fields, because neither settles it alone. A restore status is
+// reported only for an object that has one, so its absence says nothing: a STANDARD object and a
+// Glacier object nobody ever restored both arrive without it.
+//
+// Only two classes keep their bytes out of reach. The names are a poor guide — `GLACIER_IR` reads
+// in real time and never carries a restore status, so treating every Glacier-named class as
+// archived would skip every one of those objects on every run. `INTELLIGENT_TIERING` reports the
+// same value whether or not the object currently sits in an archive tier, so it cannot be answered
+// from a listing at all; a transfer finds out and fails.
+fn object_obstruction(obj: &Object, restore_status_asked_for: bool) -> Option<Obstruction> {
+    match obj.storage_class() {
+        Some(ObjectStorageClass::Glacier) | Some(ObjectStorageClass::DeepArchive) => {}
+        _ => return None,
+    }
+    // An absent restore status means "no copy was asked for" only where the listing asked for the
+    // field. A listing that did not carries none for any object, so claiming to know would skip
+    // every restored object for as long as the bucket holds it — worse than a transfer that fails,
+    // because nothing would happen and nothing would say why.
+    if !restore_status_asked_for {
+        return None;
+    }
+    match obj.restore_status() {
+        // Nobody asked for a copy.
+        None => Some(Obstruction::Archived),
+        Some(status) if status.is_restore_in_progress() == Some(true) => {
+            Some(Obstruction::BeingRestored)
+        }
+        // A finished restore, readable until its copy expires. The answer is a snapshot either
+        // way: an expiry can pass between this listing and the transfer, and then the transfer
+        // meets the same refusal it would have met without the check.
+        Some(status) if status.restore_expiry_date().is_some() => None,
+        // Neither under way nor carrying an expiry, so nothing here says the bytes are reachable.
+        Some(_) => Some(Obstruction::Archived),
+    }
+}
+
 // `Ok(None)` is the prefix itself, a folder marker, or a key outside the root. `Err` means
 // the listing was not what the API documents.
 //
@@ -427,6 +543,7 @@ pub(crate) fn relative_key<'a>(key: &'a str, root_prefix: &str) -> Option<&'a st
 fn key_and_meta(
     obj: &Object,
     root_prefix: &str,
+    restore_status_asked_for: bool,
 ) -> Result<Option<(String, EntryMeta)>, StreamError> {
     if !exclude_s3_folder_markers(obj) {
         return Ok(None);
@@ -460,6 +577,7 @@ fn key_and_meta(
             size: Some(size),
             // Always present: a listing without one is rejected above.
             last_modified_secs: Some(last_modified_secs),
+            obstruction: object_obstruction(obj, restore_status_asked_for),
         },
     )))
 }
@@ -819,7 +937,7 @@ mod tests {
             .key("data/a/b.txt")
             .last_modified(DateTime::from_secs(1))
             .build();
-        match key_and_meta(&no_size, "data/") {
+        match key_and_meta(&no_size, "data/", true) {
             Err(StreamError::MalformedListing {
                 key: Some(key),
                 what,
@@ -857,7 +975,7 @@ mod tests {
             .last_modified(DateTime::from_secs(1))
             .build();
         assert!(matches!(
-            key_and_meta(&no_key, "data/"),
+            key_and_meta(&no_key, "data/", true),
             Err(StreamError::MalformedListing { key: None, .. })
         ));
     }
@@ -1019,13 +1137,15 @@ mod tests {
     // The reason this layer exists. A source that could not read one subdirectory must not let the
     // destination's keys under that name be deleted: they may still exist on the source, inside the
     // part nobody could see.
-    // One key the source could not describe must not license deleting its counterpart. The name is
-    // taken on both sides; the source simply cannot say what is behind it. A range is not the only
-    // kind of loss that has to hold a delete back.
+    //
+    // A key the source could not describe is reported as a loss covering one key, which is what lets
+    // a consumer hold back that key's delete. The name is taken on both sides; the source simply
+    // cannot say what is behind it. What this pins is the report, and the coarse consumer above acting
+    // on it — whether sync holds one key or a stretch is decided and tested in `sync::Walk`.
     #[cfg(unix)]
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
-    async fn one_lost_key_on_the_source_holds_back_its_delete() {
+    async fn one_lost_key_on_the_source_is_reported_so_a_delete_can_be_held() {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("a.txt"), "x").unwrap();
         // Followed, and pointing at nothing, so the walk can name it but not describe it.
@@ -1077,7 +1197,7 @@ mod tests {
     #[cfg(unix)]
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
-    async fn a_lost_range_on_the_source_holds_back_every_delete() {
+    async fn a_lost_range_on_the_source_is_reported_as_covering_every_later_key() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempdir().unwrap();
@@ -1150,6 +1270,10 @@ mod tests {
         async fn next_entry(&mut self) -> Option<Result<Entry<()>, StreamError>> {
             self.0.pop_front()
         }
+
+        fn is_done(&self) -> bool {
+            self.0.is_empty()
+        }
     }
 
     fn keyed(key: &str) -> Result<Entry<()>, StreamError> {
@@ -1158,30 +1282,23 @@ mod tests {
             meta: EntryMeta {
                 size: Some(1),
                 last_modified_secs: Some(1_700_000_000),
+                obstruction: None,
             },
             source: (),
         })
     }
 
-    // A name no key can carry still has an object waiting for it, because the upload path derives
-    // keys with `to_string_lossy` — so this crate writes an object at the lossy key and a later walk
-    // cannot name the file that produced it. Reading that as costing nothing licenses deleting the
-    // object while the file is still there.
     #[tokio::test]
-    async fn a_name_no_key_can_carry_does_not_license_a_delete() {
-        let mut src = Scripted::new(vec![
-            keyed("a.txt"),
-            Err(StreamError::UnkeyableName(PathBuf::from(
-                "/data/caf\u{FFFD}.txt",
-            ))),
-        ]);
-        let mut dest = Scripted::new(vec![keyed("a.txt"), keyed("caf\u{FFFD}.txt")]);
-
-        let (plan, lost) = merge_respecting_loss(&mut src, &mut dest).await;
-        assert!(lost, "a name the walk could not key is a gap: {plan:?}");
+    async fn a_name_no_key_can_carry_costs_one_key_and_names_the_file() {
+        // The walk cannot produce a key for it, so all it can do is say one key's worth went
+        // unaccounted for and which file it was. A range would overstate that: the names around
+        // this one were read normally.
+        let path = PathBuf::from("/data/caf\u{FFFD}.txt");
+        let err = StreamError::UnkeyableName(path.clone());
+        assert_eq!(err.keys_lost(), KeysLost::OneKey);
         assert!(
-            !plan.iter().any(|(_, action)| *action == Action::Delete),
-            "the object at the lossy key must not be deleted: {plan:?}"
+            err.to_string().contains("caf"),
+            "the file has to be identifiable from the report: {err}"
         );
     }
 
@@ -1201,15 +1318,13 @@ mod tests {
                     None => return None,
                     Some(Ok(entry)) => return Some(entry),
                     Some(Err(err)) => match err.keys_lost() {
-                        // Both answers collapse to the same action here. A range is unnameable by
-                        // definition, and one key is unnameable in practice on the local side: the
-                        // failure carries an absolute path, nothing here turns that into a key, and
-                        // it arrives at the position of the directory holding it rather than its
-                        // own. So neither can suppress the delete of just the key that went
-                        // missing, and holding every delete back is the safe reading left. The cost
-                        // is that a key genuinely absent from the source keeps its counterpart too,
-                        // which a per-key mechanism recovers once a failure can name a relative
-                        // key.
+                        // This model collapses both answers, which is the coarsest reading the contract
+                        // allows and deliberately not what sync does. `sync::Walk` holds per key where a
+                        // failure names one and per stretch otherwise, and that policy is tested there,
+                        // against the real merge. What these tests are for is the half the contract owes:
+                        // a failure reports a loss at all, and says whether it covers one key or a
+                        // stretch. A consumer choosing to act on that coarsely is still a consumer that
+                        // could not have been misled.
                         KeysLost::OneKey | KeysLost::UnknownRange => *lost = true,
                     },
                 }
@@ -1343,7 +1458,7 @@ mod tests {
 
     #[test]
     fn object_keys_lose_the_root_prefix() {
-        let (key, meta) = key_and_meta(&object("data/a/b.txt", 3), "data/")
+        let (key, meta) = key_and_meta(&object("data/a/b.txt", 3), "data/", true)
             .unwrap()
             .unwrap();
         assert_eq!(key, "a/b.txt");
@@ -1404,13 +1519,15 @@ mod tests {
 
     #[test]
     fn an_unprefixed_listing_keeps_whole_keys() {
-        let (key, _) = key_and_meta(&object("a/b.txt", 1), "").unwrap().unwrap();
+        let (key, _) = key_and_meta(&object("a/b.txt", 1), "", true)
+            .unwrap()
+            .unwrap();
         assert_eq!(key, "a/b.txt");
     }
 
     #[test]
     fn the_prefix_itself_is_not_an_entry() {
-        assert!(key_and_meta(&object("data/", 0), "data/")
+        assert!(key_and_meta(&object("data/", 0), "data/", true)
             .unwrap()
             .is_none());
     }
@@ -1421,10 +1538,128 @@ mod tests {
             .key("data/a")
             .last_modified(DateTime::from_secs(1))
             .build();
-        assert!(key_and_meta(&no_size, "data/").is_err());
+        assert!(key_and_meta(&no_size, "data/", true).is_err());
 
         let no_time = Object::builder().key("data/a").size(1).build();
-        assert!(key_and_meta(&no_time, "data/").is_err());
+        assert!(key_and_meta(&no_time, "data/", true).is_err());
+    }
+
+    #[test]
+    fn a_name_holding_nothing_stops_a_read_and_an_overwrite() {
+        assert!(Obstruction::NothingToRead.blocks_overwrite());
+    }
+
+    #[test]
+    fn an_archive_stops_a_read_and_allows_an_overwrite() {
+        // Writing over an object never reads what is already there, so an upload to a key holding
+        // an archived object replaces it. Answering both roles alike would refuse that upload for
+        // every archived key in a bucket.
+        assert!(!Obstruction::Archived.blocks_overwrite());
+        assert!(!Obstruction::BeingRestored.blocks_overwrite());
+    }
+
+    // The classification for a listing that asked for restore status, which is what sync's does.
+    fn object_obstruction_asked(obj: &Object) -> Option<Obstruction> {
+        object_obstruction(obj, true)
+    }
+
+    // A listed object in the class and restore state a test names.
+    fn listed(class: Option<ObjectStorageClass>, restore: Option<RestoreStatus>) -> Object {
+        let mut obj = Object::builder().key("data/a").size(1);
+        if let Some(class) = class {
+            obj = obj.storage_class(class);
+        }
+        if let Some(restore) = restore {
+            obj = obj.restore_status(restore);
+        }
+        obj.build()
+    }
+
+    #[test]
+    fn an_archived_object_with_no_restored_copy_cannot_be_read() {
+        for class in [ObjectStorageClass::Glacier, ObjectStorageClass::DeepArchive] {
+            assert_eq!(
+                object_obstruction_asked(&listed(Some(class.clone()), None)),
+                Some(Obstruction::Archived),
+                "{class:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_object_being_restored_cannot_be_read_yet() {
+        let restore = RestoreStatus::builder()
+            .is_restore_in_progress(true)
+            .build();
+        assert_eq!(
+            object_obstruction_asked(&listed(Some(ObjectStorageClass::Glacier), Some(restore))),
+            Some(Obstruction::BeingRestored)
+        );
+    }
+
+    #[test]
+    fn a_restored_object_can_be_read_until_its_copy_expires() {
+        let restore = RestoreStatus::builder()
+            .is_restore_in_progress(false)
+            .restore_expiry_date(DateTime::from_secs(1_800_000_000))
+            .build();
+        assert_eq!(
+            object_obstruction_asked(&listed(Some(ObjectStorageClass::Glacier), Some(restore))),
+            None
+        );
+    }
+
+    #[test]
+    fn a_restore_status_saying_neither_reads_as_archived() {
+        // Nothing here says the bytes are reachable, so the answer stays the conservative one.
+        let restore = RestoreStatus::builder().build();
+        assert_eq!(
+            object_obstruction_asked(&listed(Some(ObjectStorageClass::Glacier), Some(restore))),
+            Some(Obstruction::Archived)
+        );
+    }
+
+    #[test]
+    fn a_listing_that_did_not_ask_claims_nothing_about_an_archive() {
+        // Without the field every object arrives without a restore status, so a restored one and
+        // one nobody restored look the same. Claiming the first is unreachable would skip it for as
+        // long as the bucket holds it, and nothing would say why; a transfer that fails at least
+        // reports.
+        let archived = listed(Some(ObjectStorageClass::Glacier), None);
+        assert_eq!(object_obstruction(&archived, false), None);
+        assert_eq!(
+            object_obstruction(&archived, true),
+            Some(Obstruction::Archived),
+            "the same object, where the listing did ask"
+        );
+    }
+
+    #[test]
+    fn glacier_instant_retrieval_reads_in_real_time() {
+        // The name says Glacier and the bytes are there. Treating every Glacier-named class as
+        // archived would skip every one of these objects on every run, forever.
+        assert_eq!(
+            object_obstruction_asked(&listed(Some(ObjectStorageClass::GlacierIr), None)),
+            None
+        );
+    }
+
+    #[test]
+    fn intelligent_tiering_is_not_answered_from_a_listing() {
+        // The class reads the same whether or not the object sits in an archive tier, so a
+        // listing cannot tell. A transfer finds out and fails.
+        assert_eq!(
+            object_obstruction_asked(&listed(Some(ObjectStorageClass::IntelligentTiering), None)),
+            None
+        );
+    }
+
+    #[test]
+    fn an_ordinary_listed_object_can_be_read() {
+        // The listing side's answer has one home, so a cause added there without thinking about
+        // the ordinary case shows up here.
+        let obj = Object::builder().key("data/a").size(1).build();
+        assert_eq!(object_obstruction(&obj, true), None);
     }
 
     // Readability is decided from the listing, without a HeadObject per key.
@@ -1446,6 +1681,7 @@ mod tests {
             meta: EntryMeta {
                 size: Some(1),
                 last_modified_secs: Some(1),
+                obstruction: None,
             },
             source: obj,
         };
@@ -1853,6 +2089,7 @@ mod tests {
             meta: EntryMeta {
                 size,
                 last_modified_secs: secs,
+                obstruction: None,
             },
             source: (),
         };
@@ -1881,6 +2118,7 @@ mod tests {
             meta: EntryMeta {
                 size: None,
                 last_modified_secs: None,
+                obstruction: None,
             },
             source: (),
         };
@@ -1889,6 +2127,7 @@ mod tests {
             meta: EntryMeta {
                 size: Some(0),
                 last_modified_secs: Some(1_700_000_000),
+                obstruction: None,
             },
             source: (),
         };
@@ -1905,7 +2144,7 @@ mod tests {
             .size(-1)
             .last_modified(DateTime::from_secs(1))
             .build();
-        match key_and_meta(&negative, "data/") {
+        match key_and_meta(&negative, "data/", true) {
             Err(StreamError::MalformedListing {
                 key: Some(key),
                 what,
