@@ -483,6 +483,33 @@ where
     Error::new(ErrorKind::IOError, boxed)
 }
 
+/// A mismatch the transfer manager found itself, by hashing the delivered bytes
+/// and comparing against the object's stored checksum.
+///
+/// Distinct from [`body_read_error`]'s path only in origin: that one unwraps a
+/// mismatch the SDK detected per response, this one reports a whole-object
+/// comparison the SDK could not make because no single response covered the
+/// object. Both surface as [`ErrorKind::IntegrityError`], so a caller
+/// distinguishes corruption from transport failure the same way regardless.
+pub(crate) fn object_checksum_mismatch(
+    algorithm: ChecksumAlgorithm,
+    expected: String,
+    computed: String,
+) -> Error {
+    let message = format!(
+        "object checksum mismatch: expected {expected}, computed {computed} over the delivered bytes"
+    );
+    Error {
+        kind: ErrorKind::IntegrityError(IntegrityError {
+            algorithm: Some(algorithm),
+            expected: Some(expected),
+            computed: Some(computed),
+        }),
+        source: message.into(),
+        extra: None,
+    }
+}
+
 /// Walks the source chain for a smithy checksum-mismatch error, returning its
 /// expected and computed checksums base64-encoded.
 ///

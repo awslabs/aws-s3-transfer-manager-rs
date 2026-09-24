@@ -13,6 +13,7 @@ use tracing::Instrument;
 
 use super::chunk_meta::ChunkMetadata;
 use super::input::copy_fields_to_get_object_request;
+use super::object_crc::ObjectCrcAlgorithm;
 use super::object_meta::ObjectMetadata;
 use super::transfer::DownloadTransfer;
 use super::DownloadInput;
@@ -47,6 +48,12 @@ pub(super) struct ObjectDiscovery {
     /// object's stored part size so every range aligns to a stored part boundary
     /// (the precondition for per-part download validation).
     pub(super) effective_part_size: u64,
+
+    /// The object's own checksum and algorithm, present only when the transfer
+    /// must validate the delivered bytes itself: validation is on, no chunk will
+    /// carry a checksum of its own, and the object's stored value covers bytes
+    /// (not part checksums). `None` leaves validation to the SDK's per-chunk path.
+    pub(super) object_crc: Option<(ObjectCrcAlgorithm, String)>,
 }
 
 /// Parse the stored part count from an MPU ETag of the form `"<hash>-<N>"`.
@@ -113,6 +120,15 @@ pub(super) async fn discover_obj(
     // SDK to validate. Only for: validation on, no user range, a multipart object
     // (ETag carries `-N`), and the user did not pin an explicit part size.
     //
+    // Alignment alone is not enough, which is why the fold below is not an `else`:
+    // S3 returns a per-part checksum only for a COMPOSITE object. For a multipart
+    // object stored with a FULL_OBJECT checksum -- what `ChecksumStrategy`'s CRC
+    // strategies produce, so the common case for anything this crate uploaded --
+    // no range GET of any shape returns a checksum, aligned or not, and only the
+    // object-level value exists. Confirmed against real S3: an aligned range and a
+    // `partNumber=1` GET each return a value for a COMPOSITE object and no checksum
+    // header at all for a FULL_OBJECT one.
+    //
     // The initial ranged discovery fetched `[0, configured)`, whose chunk length
     // is the CONFIGURED size, not the stored part size, so it cannot tell us the
     // stored layout. Re-issue via partNumber=1, whose response reports the exact
@@ -146,6 +162,63 @@ pub(super) async fn discover_obj(
         discovery = aligned;
     }
 
+    // Hash the delivered bytes ourselves and compare against the object's own
+    // checksum at completion. This is the only thing that detects corruption
+    // wherever no chunk carries a checksum of its own, which per the note above is
+    // every multi-chunk download of a FULL_OBJECT-checksum object -- whether its
+    // ranges align or not -- plus a caller-pinned part size that cannot land on
+    // stored boundaries, and a large single-PUT object split into ranges.
+    //
+    // Runs alongside alignment rather than instead of it. For a COMPOSITE object
+    // `fetch_object_crc` returns `None` (a checksum of part checksums reproduces no
+    // byte hash) and the per-part validation alignment bought is the only evidence
+    // there is; for a FULL_OBJECT one this is.
+    //
+    // Gated on validation being on, not on the request having set
+    // `ChecksumMode::Enabled`: validation is on by default, so gating on the
+    // explicit opt-in would leave the majority of downloads returning `Ok` over
+    // corrupt bytes. Costs one `HeadObject`, the same trade the align branch makes
+    // with its extra GET.
+    //
+    // The condition is that this transfer delivers the WHOLE object, not that the
+    // request carried no range: the value S3 holds covers every byte, so comparing
+    // it against a hash of a subset is a guaranteed false mismatch, while a range
+    // that happens to span the object is as validatable as no range at all. Stating
+    // it as coverage rather than as `range.is_none()` is also what keeps the
+    // comparison in `resolve_verdict` sound -- the total it folds up to is the
+    // transfer's byte count, which equals the object size exactly when this holds.
+    let delivered = discovery
+        .chunk_meta
+        .as_ref()
+        .and_then(|m| m.content_length)
+        .unwrap_or(0) as u64
+        + discovery
+            .remaining
+            .as_ref()
+            .map_or(0, |r| r.end() - r.start() + 1);
+    let covers_whole_object = delivered == discovery.object_meta.total_object_size();
+
+    // Nothing to learn when per-part validation is already in play. A chunk that
+    // carried a byte-covering checksum of its own means the object is composite --
+    // only a composite object has per-part values -- and a composite value is a
+    // checksum of part checksums, which no byte hash reproduces, so the fold could
+    // not use it anyway. Saves a request on every aligned composite download.
+    let per_part_validation = discovery.chunk_meta.as_ref().is_some_and(|m| {
+        matches!(
+            super::coverage::classify(m),
+            super::coverage::ChunkCoverage::Validated(_)
+        )
+    });
+
+    if validation_enabled
+        && covers_whole_object
+        && discovery.remaining.is_some()
+        && !per_part_validation
+    {
+        let etag = discovery.object_meta.e_tag.clone();
+        discovery.object_crc = fetch_object_crc(transfer, input, etag.as_deref()).await?;
+    }
+
     tracing::trace!(
         remaining = ?discovery.remaining,
         initial_chunk = discovery.initial_chunk.is_some(),
@@ -154,6 +227,77 @@ pub(super) async fn discover_obj(
     );
 
     Ok(discovery)
+}
+
+/// Fetch the object's own checksum, for a transfer that must validate its bytes
+/// itself.
+///
+/// `HeadObject` rather than a GET because only the object-level response carries
+/// the whole-object value: a ranged GET of a multipart object reports the part's
+/// checksum. Returns `None` -- leaving the download unvalidated but honest --
+/// when the object has no checksum, or has only a composite one, which is a
+/// checksum of part checksums and so cannot be reproduced from bytes.
+///
+/// `etag` is the one discovery observed, pinned here the same way every chunk GET
+/// pins it. Without it a replacement landing between discovery and this HEAD
+/// yields the new object's checksum for the old object's bytes, and the fold
+/// reports corruption on a download that was never corrupt.
+async fn fetch_object_crc(
+    transfer: &DownloadTransfer,
+    input: &DownloadInput,
+    etag: Option<&str>,
+) -> Result<Option<(ObjectCrcAlgorithm, String)>, error::Error> {
+    let resp = crate::retry::retry(crate::retry::classify_discovery_retry, |_allow_hedge| {
+        let mut builder = super::input::copy_fields_to_head_object_request(
+            input,
+            transfer.ctx().s3_client().head_object(),
+        )
+        // Validation may be on through client config alone, with the request's
+        // mode unset; the object's checksum is the whole point of this request.
+        .checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled);
+        if let Some(etag) = etag {
+            builder = builder.if_match(etag);
+        }
+        let req = builder.customize().config_override(
+            transfer
+                .ctx()
+                .handle
+                .bucket_partition_override(input.bucket()),
+        );
+        async move {
+            req.send()
+                .await
+                .map_err(|e| crate::retry::GuardError::Inner(error::Error::from(e)))
+        }
+    })
+    .instrument(tracing::debug_span!("send-head-object-for-object-checksum"))
+    .await?;
+
+    // The SDK's own order (`CHECKSUM_ALGORITHMS_IN_PRIORITY_ORDER`, cheapest first),
+    // restricted to the algorithms that combine. Picking a different one than the
+    // SDK would for a response carrying several would fold against one value while
+    // the SDK's per-chunk path checked another; S3 returns one per object, so this
+    // is about not diverging rather than about a case seen in practice.
+    let candidates = [
+        (ObjectCrcAlgorithm::Crc64Nvme, resp.checksum_crc64_nvme()),
+        (ObjectCrcAlgorithm::Crc32C, resp.checksum_crc32_c()),
+        (ObjectCrcAlgorithm::Crc32, resp.checksum_crc32()),
+    ];
+    let found = candidates
+        .into_iter()
+        .find_map(|(alg, value)| value.map(|v| (alg, v)))
+        .filter(|(_, value)| !super::object_crc::is_composite_value(value));
+
+    match found {
+        Some((alg, value)) => {
+            tracing::debug!(
+                ?alg,
+                "validating delivered bytes against the object checksum"
+            );
+            Ok(Some((alg, value.to_string())))
+        }
+        None => Ok(None),
+    }
 }
 
 async fn discover_obj_with_get_first_part(
@@ -193,20 +337,20 @@ async fn discover_obj_with_head(
     input: &DownloadInput,
 ) -> Result<ObjectDiscovery, crate::error::Error> {
     let resp = crate::retry::retry(crate::retry::classify_discovery_retry, |_allow_hedge| {
-        let req = transfer
-            .ctx()
-            .s3_client()
-            .head_object()
-            .set_range(input.range.clone())
-            .set_bucket(input.bucket().map(str::to_string))
-            .set_key(input.key().map(str::to_string))
-            .customize()
-            .config_override(
-                transfer
-                    .ctx()
-                    .handle
-                    .bucket_partition_override(input.bucket()),
-            );
+        let req = super::input::copy_fields_to_head_object_request(
+            input,
+            transfer.ctx().s3_client().head_object(),
+        )
+        // Discovery describes the range the caller asked for, so the HEAD carries
+        // it: the response's Content-Range is what bounds the transfer.
+        .set_range(input.range.clone())
+        .customize()
+        .config_override(
+            transfer
+                .ctx()
+                .handle
+                .bucket_partition_override(input.bucket()),
+        );
         async move {
             req.send()
                 .await
@@ -228,6 +372,7 @@ async fn discover_obj_with_head(
         initial_chunk: None,
         // Filled in by discover_obj (configured size, or stored size when aligning).
         effective_part_size: 0,
+        object_crc: None,
     })
 }
 
@@ -317,6 +462,7 @@ fn first_chunk_response_handler(
         initial_chunk,
         // Filled in by discover_obj (configured size, or stored size when aligning).
         effective_part_size: 0,
+        object_crc: None,
     })
 }
 
@@ -431,6 +577,49 @@ mod tests {
         assert_eq!(0..=499, remaining);
     }
 
+    /// A suffix or open-ended range is discovered by HEAD, and S3 answers that HEAD
+    /// with 206: `Content-Length` is the range's length and `Content-Range` says where
+    /// it sits. The range to fetch is those offsets -- the same byte count anchored at
+    /// 0 is a different part of the object, and the download would return bytes the
+    /// caller did not ask for.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_discover_obj_with_head_ranged_keeps_the_offsets() {
+        let total = 10 * ByteUnit::Mebibyte.as_bytes_u64();
+        // `Range: bytes=-500`: the LAST 500 bytes of a 10MiB object.
+        let head_obj_rule = mock!(Client::head_object).then_output(move || {
+            HeadObjectOutput::builder()
+                .content_length(500)
+                .content_range(format!("bytes {}-{}/{total}", total - 500, total - 1))
+                .build()
+        });
+        let client = mock_client!(aws_sdk_s3, &[&head_obj_rule]);
+
+        let input = DownloadInput::builder()
+            .bucket("test-bucket")
+            .key("test-key")
+            .range("bytes=-500")
+            .build()
+            .unwrap();
+
+        let transfer = test_transfer(
+            test_handle(client, 5 * ByteUnit::Mebibyte.as_bytes_u64()),
+            &input,
+        );
+
+        let discovery = discover_obj_with_head(&transfer, &input).await.unwrap();
+        assert_eq!(
+            Some((total - 500)..=(total - 1)),
+            discovery.remaining,
+            "the range to fetch is the one S3 reported, not its length anchored at 0"
+        );
+        assert_eq!(
+            total,
+            discovery.object_meta.total_object_size(),
+            "a 206 HEAD reports the range's length, so the object's size comes from the range total"
+        );
+    }
+
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_discover_obj_with_get_full_range() {
@@ -540,7 +729,11 @@ mod tests {
                     .body(ByteStream::from_static(&[0u8; 8]))
                     .build()
             });
-        let client = mock_client!(aws_sdk_s3, &[&ranged, &part1]);
+        // The object-checksum lookup a validating multi-chunk download also makes.
+        // Answered without a checksum here, so this test stays about alignment.
+        let head = mock!(Client::head_object)
+            .then_output(|| HeadObjectOutput::builder().content_length(0).build());
+        let client = mock_client!(aws_sdk_s3, &[&ranged, &part1, &head]);
 
         let request = DownloadInput::builder()
             .bucket("test-bucket")

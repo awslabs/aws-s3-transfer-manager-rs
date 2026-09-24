@@ -91,8 +91,7 @@ impl DownloadHandleInner {
         let integrity_checks = self
             .transfer
             .integrity_checks()
-            .expect("integrity_checks must be set on successful completion")
-            .clone();
+            .expect("integrity_checks must be set on successful completion");
         Ok(DownloadOutput::new(
             object_meta,
             ctx.metrics(),

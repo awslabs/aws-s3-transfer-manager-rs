@@ -211,6 +211,12 @@ pub(crate) struct TmTestClient {
     key_prefix: String,
     /// Present for mock targets. Owns the server; held until `shutdown`.
     mock: Option<MockBackend>,
+    /// The S3 client the transfer manager was built over, retained so a test can
+    /// build a SECOND transfer manager against the same backend with a different
+    /// part size. One `Config` carries one `part_size` for both directions, so a
+    /// download whose ranges misalign with an object's stored parts can only be
+    /// expressed as two clients: upload through one, download through the other.
+    s3: aws_sdk_s3::Client,
     /// Present for real-S3 targets; used for direct SDK calls (e.g. HeadObject).
     #[cfg(e2e_test)]
     s3_client: Option<aws_sdk_s3::Client>,
@@ -255,7 +261,7 @@ impl TmTestClient {
             .send()
             .await
             .ok();
-        let mut builder = aws_sdk_s3_transfer_manager::Config::builder().client(s3_client);
+        let mut builder = aws_sdk_s3_transfer_manager::Config::builder().client(s3_client.clone());
         if let Some(ps) = part_size {
             builder = builder.part_size(ps);
         }
@@ -264,6 +270,7 @@ impl TmTestClient {
             bucket: "test-bucket".to_string(),
             key_prefix: format!("it-{}", uuid::Uuid::new_v4()),
             mock: Some(MockBackend { server, handle }),
+            s3: s3_client,
             #[cfg(e2e_test)]
             s3_client: None,
         }
@@ -295,6 +302,7 @@ impl TmTestClient {
             bucket,
             key_prefix: format!("it-{}", uuid::Uuid::new_v4()),
             mock: None,
+            s3: s3_client.clone(),
             s3_client: Some(s3_client),
         }
     }
@@ -317,6 +325,67 @@ impl TmTestClient {
     /// real-S3 target (faults cannot be injected into real S3).
     pub(crate) fn mock(&self) -> Option<&S3MockServer> {
         self.mock.as_ref().map(|m| &m.server)
+    }
+
+    /// A second transfer manager over the same backend, pinned to `part_size`.
+    ///
+    /// For downloads whose ranges must NOT line up with an object's stored part
+    /// boundaries. One `Config` carries a single `part_size` used for both
+    /// directions, so the only way to upload at one size and download at another
+    /// is two clients. Pinning also suppresses the download's stored-part
+    /// auto-alignment, which is gated on the part size being `Auto`.
+    pub(crate) fn tm_with_part_size(
+        &self,
+        part_size: aws_sdk_s3_transfer_manager::types::PartSize,
+    ) -> TmClient {
+        TmClient::new(
+            aws_sdk_s3_transfer_manager::Config::builder()
+                .client(self.s3.clone())
+                .part_size(part_size)
+                .build(),
+        )
+    }
+
+    /// Download with an explicit `Range` header, through an arbitrary transfer
+    /// manager, draining the body the way [`download`](Self::download) does.
+    ///
+    /// Separate from `download` rather than an added parameter: `download` has 51
+    /// call sites and neither a range nor a caller-supplied client is wanted at
+    /// any of them.
+    pub(crate) async fn download_range_with(
+        &self,
+        tm: &TmClient,
+        key: &str,
+        checksum_mode: Option<aws_sdk_s3::types::ChecksumMode>,
+        range: Option<&str>,
+    ) -> Result<
+        (
+            Vec<u8>,
+            aws_sdk_s3_transfer_manager::operation::download::DownloadOutput,
+        ),
+        aws_sdk_s3_transfer_manager::error::Error,
+    > {
+        let mut builder = tm.download().bucket(&self.bucket).key(self.key(key));
+        if let Some(mode) = checksum_mode {
+            builder = builder.checksum_mode(mode);
+        }
+        if let Some(range) = range {
+            builder = builder.range(range);
+        }
+        let mut handle = builder.initiate().expect("initiate download");
+
+        let mut data = Vec::new();
+        while let Some(chunk) = handle.body_mut().next().await {
+            match chunk {
+                Ok(chunk) => data.extend_from_slice(&chunk.data.into_bytes()),
+                Err(e) => {
+                    // Drive the transfer to terminal so join() surfaces the real error.
+                    return Err(handle.join().await.err().unwrap_or(e));
+                }
+            }
+        }
+        let output = handle.join().await?;
+        Ok((data, output))
     }
 
     /// The raw S3 client for direct SDK calls (e.g. HeadObject). Only available

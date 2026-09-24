@@ -48,6 +48,28 @@ pub(crate) enum DownloadState {
         /// taken once the budget grants. Dropping the state on terminal releases the
         /// slot and cancels the wait.
         pending: Option<PendingClaim>,
+        /// Folds each chunk's CRC into the object's checksum, for a transfer whose
+        /// chunks carry no checksum of their own. `None` when the SDK validates
+        /// per chunk, or when the object has no byte-covering stored value.
+        ///
+        /// Plain (non-atomic) state for the same reason as `gate`: it is reached
+        /// only through the `MutexGuard` on the transfer's `state`, and every
+        /// chunk records into it in the same lock acquisition that decrements
+        /// `ranges_in_flight`. That is what makes "the fold saw every chunk" true
+        /// for the thread that observes the count reach zero -- it acquired this
+        /// mutex after every other chunk released it.
+        ///
+        /// Boxed to keep this variant small: the accumulator carries a map and the
+        /// expected value, and `DownloadState` is matched on every poll.
+        object_crc: Option<Box<super::object_crc::ObjectCrc>>,
+        /// Counts, per chunk, whether the chunk carried a checksum the SDK
+        /// validated it against. Read once at terminal to resolve the transfer's
+        /// verdict, which is a statement about every delivered byte and so cannot
+        /// be made before the last chunk lands.
+        ///
+        /// Plain state under this mutex for the same reason as `object_crc`, and
+        /// recorded in the same acquisition as both it and `ranges_in_flight`.
+        coverage: super::coverage::CoverageTally,
     },
 
     /// Terminal state - transfer ended (success, failure, or cancelled)

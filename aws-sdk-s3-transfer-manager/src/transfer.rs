@@ -802,6 +802,11 @@ impl TransferContext {
         self.metrics.set_total_bytes(n);
     }
 
+    /// Total payload bytes, once discovery has resolved it.
+    pub(crate) fn total_bytes(&self) -> Option<u64> {
+        self.metrics.snapshot().total_bytes
+    }
+
     /// Get current transfer status as a public enum.
     pub(crate) fn transfer_status(&self) -> crate::types::TransferStatus {
         use crate::types::TransferStatus;

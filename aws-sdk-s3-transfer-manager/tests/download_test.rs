@@ -44,38 +44,57 @@ fn dummy_expected_request() -> http::Request<SdkBody> {
         .unwrap()
 }
 
+/// A `HeadObject` response carrying no checksum, which is the object-checksum
+/// lookup a multi-chunk download makes when its ranges cannot align to stored
+/// part boundaries. No checksum in the response means the transfer has nothing to
+/// validate the delivered bytes against, so the download proceeds unvalidated --
+/// what every test using this connector assumes.
+fn no_checksum_head(len: usize) -> http::Response<SdkBody> {
+    http::Response::builder()
+        .status(200)
+        .header("Content-Length", format!("{len}"))
+        .header("ETag", "my-etag")
+        .body(SdkBody::empty())
+        .unwrap()
+}
+
 /// Create a static replay client (http connector) for an object of the given size.
 ///
 /// Assumptions:
 ///     1. Expected requests are not created. A dummy placeholder is used. Callers need to make
 ///        assertions directly on the captured requests.
 ///     2. Object discovery goes through ranged get which will fetch the first part.
-///     3. Concurrency of 1 is used since responses for a static replay client are just returned in
+///     3. A multi-chunk object takes a `HeadObject` after discovery (request index 1) to look up
+///        the object's checksum. It is answered without one here, so nothing validates.
+///     4. Concurrency of 1 is used since responses for a static replay client are just returned in
 ///        the order given.
 fn simple_object_connector(data: &Bytes, part_size: usize) -> StaticReplayClient {
-    let events = data
-        .chunks(part_size)
-        .enumerate()
-        .map(|(idx, chunk)| {
-            let start = idx * part_size;
-            let end = std::cmp::min(start + part_size, data.len()) - 1;
-            ReplayEvent::new(
-                // NOTE: Rather than try to recreate all the expected requests we just put in placeholders and
-                // make our own assertions against the captured requests.
+    let mut events = Vec::new();
+    for (idx, chunk) in data.chunks(part_size).enumerate() {
+        let start = idx * part_size;
+        let end = std::cmp::min(start + part_size, data.len()) - 1;
+        events.push(ReplayEvent::new(
+            // NOTE: Rather than try to recreate all the expected requests we just put in placeholders and
+            // make our own assertions against the captured requests.
+            dummy_expected_request(),
+            http::Response::builder()
+                .status(200)
+                .header("Content-Length", format!("{}", end - start + 1))
+                .header(
+                    "Content-Range",
+                    format!("bytes {start}-{end}/{}", data.len()),
+                )
+                .header("ETag", "my-etag")
+                .body(SdkBody::from(chunk))
+                .unwrap(),
+        ));
+        if idx == 0 && data.len() > part_size {
+            events.push(ReplayEvent::new(
                 dummy_expected_request(),
-                http::Response::builder()
-                    .status(200)
-                    .header("Content-Length", format!("{}", end - start + 1))
-                    .header(
-                        "Content-Range",
-                        format!("bytes {start}-{end}/{}", data.len()),
-                    )
-                    .header("ETag", "my-etag")
-                    .body(SdkBody::from(chunk))
-                    .unwrap(),
-            )
-        })
-        .collect();
+                no_checksum_head(data.len()),
+            ));
+        }
+    }
 
     StaticReplayClient::new(events)
 }
@@ -129,15 +148,18 @@ async fn test_download_ranges() {
 
     assert_eq!(data.len(), body.len());
     let requests = http_client.actual_requests().collect::<Vec<_>>();
-    assert_eq!(3, requests.len());
+    assert_eq!(4, requests.len());
 
     assert_eq!(requests[0].headers().get("Range"), Some("bytes=0-5242879"));
+    // The object-checksum lookup: a HEAD over the whole object, no range.
+    assert_eq!(requests[1].method(), "HEAD");
+    assert_eq!(requests[1].headers().get("Range"), None);
     assert_eq!(
-        requests[1].headers().get("Range"),
+        requests[2].headers().get("Range"),
         Some("bytes=5242880-10485759")
     );
     assert_eq!(
-        requests[2].headers().get("Range"),
+        requests[3].headers().get("Range"),
         Some("bytes=10485760-12582911")
     );
 }
@@ -245,6 +267,8 @@ async fn test_retry_failed_chunk() {
                 .body(SdkBody::from(data.slice(0..part_size)))
                 .unwrap(),
         ),
+        // the object-checksum lookup, answered with no checksum
+        ReplayEvent::new(dummy_expected_request(), no_checksum_head(data.len())),
         // fail the second chunk after reading some of it
         ReplayEvent::new(
             dummy_expected_request(),
@@ -290,7 +314,7 @@ async fn test_retry_failed_chunk() {
 
     assert_eq!(data.len(), body.len());
     let requests = http_client.actual_requests().collect::<Vec<_>>();
-    assert_eq!(3, requests.len());
+    assert_eq!(4, requests.len());
 }
 
 const ERROR_RESPONSE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -423,13 +447,15 @@ async fn test_download_if_match() {
     let _ = drain(&mut handle).await.unwrap();
 
     let requests = http_client.actual_requests().collect::<Vec<_>>();
-    assert_eq!(3, requests.len());
+    assert_eq!(4, requests.len());
 
     // The first request is to discover the object meta data and should not have any if-match
     assert_eq!(requests[0].headers().get("If-Match"), None);
-    // All the following requests should have the if-match header
+    // All the following requests should have the if-match header, the checksum
+    // HEAD at index 1 included -- it must describe the version discovery saw.
     assert_eq!(requests[1].headers().get("If-Match"), Some("my-etag"));
     assert_eq!(requests[2].headers().get("If-Match"), Some("my-etag"));
+    assert_eq!(requests[3].headers().get("If-Match"), Some("my-etag"));
 }
 
 const OBJECT_MODIFIED_RESPONSE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -694,13 +720,14 @@ const HELLO: &[u8] = b"hello world";
 const HELLO_CRC32: &str = "DUoRhQ==";
 
 /// Default checksum_mode (unset): the SDK auto-enables validation when the client
-/// resolves ResponseChecksumValidation to WhenSupported (the default), so the
-/// verdict is Unavailable (validation attempted) — NOT Disabled. See
-/// `test_integrity_checks_disabled_when_validation_when_required` for the only
-/// genuinely-disabled case.
+/// resolves ResponseChecksumValidation to WhenSupported (the default), so the bytes
+/// are compared against the returned checksum and the verdict is Validated — NOT
+/// Disabled. See `test_integrity_checks_disabled_when_validation_when_required` for
+/// the only genuinely-disabled case.
 #[tokio::test]
 async fn test_integrity_checks_default_mode_attempts_validation() {
-    use aws_sdk_s3_transfer_manager::types::{ChecksumValidation, NotValidatedReason};
+    use aws_sdk_s3::types::ChecksumAlgorithm;
+    use aws_sdk_s3_transfer_manager::types::ChecksumValidation;
 
     let data = Bytes::from_static(HELLO);
     let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
@@ -716,10 +743,10 @@ async fn test_integrity_checks_default_mode_attempts_validation() {
     let output = handle.join().await.unwrap();
 
     match output.integrity_checks().checksum_validation() {
-        ChecksumValidation::NotValidated { reason, .. } => {
-            assert_eq!(*reason, NotValidatedReason::Unavailable);
+        ChecksumValidation::Validated { algorithm, .. } => {
+            assert_eq!(*algorithm, ChecksumAlgorithm::Crc32);
         }
-        other => panic!("expected NotValidated{{Unavailable}}, got {other:?}"),
+        other => panic!("expected Validated{{Crc32}}, got {other:?}"),
     }
 }
 
@@ -767,16 +794,19 @@ async fn test_integrity_checks_disabled_when_validation_when_required() {
     }
 }
 
-/// checksum_mode on → reported as NotValidated (never falsely Validated) until
-/// the SDK surfaces a positive validation outcome. Guards that an unconfirmed
-/// chunk MUST NOT read Validated.
+/// checksum_mode on, but the response carried no checksum: nothing compared these
+/// bytes to anything, so the verdict MUST NOT read Validated.
+///
+/// This is the direction that matters. A false `Validated` is attested to a caller
+/// who then skips their own check, so asking for validation must never by itself
+/// produce a positive verdict — only a checksum that actually covered the bytes can.
 #[tokio::test]
 async fn test_integrity_checks_enabled_not_falsely_validated() {
-    use aws_sdk_s3_transfer_manager::types::ChecksumValidation;
+    use aws_sdk_s3_transfer_manager::types::{ChecksumValidation, NotValidatedReason};
 
     let data = Bytes::from_static(HELLO);
     let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
-    let tm = test_tm(single_part_connector(&data, Some(HELLO_CRC32)), part_size);
+    let tm = test_tm(single_part_connector(&data, None), part_size);
 
     let mut handle = tm
         .download()
@@ -788,13 +818,41 @@ async fn test_integrity_checks_enabled_not_falsely_validated() {
     let _ = drain(&mut handle).await.unwrap();
     let output = handle.join().await.unwrap();
 
-    assert!(
-        !matches!(
-            output.integrity_checks().checksum_validation(),
-            ChecksumValidation::Validated { .. }
-        ),
-        "must not report Validated without an SDK-confirmed outcome"
-    );
+    match output.integrity_checks().checksum_validation() {
+        ChecksumValidation::NotValidated { reason, .. } => {
+            assert_eq!(*reason, NotValidatedReason::Unavailable);
+        }
+        other => panic!("expected NotValidated{{Unavailable}}, got {other:?}"),
+    }
+}
+
+/// A composite (`-N`) value is a checksum of part checksums, which the SDK refuses
+/// to validate a body against — so a chunk carrying only one is not coverage, and
+/// the verdict names composite as the reason rather than claiming validation.
+#[tokio::test]
+async fn test_integrity_checks_composite_value_is_not_coverage() {
+    use aws_sdk_s3_transfer_manager::types::{ChecksumValidation, NotValidatedReason};
+
+    let data = Bytes::from_static(HELLO);
+    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let tm = test_tm(single_part_connector(&data, Some("DUoRhQ==-3")), part_size);
+
+    let mut handle = tm
+        .download()
+        .bucket("test-bucket")
+        .key("test-object")
+        .checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled)
+        .initiate()
+        .unwrap();
+    let _ = drain(&mut handle).await.unwrap();
+    let output = handle.join().await.unwrap();
+
+    match output.integrity_checks().checksum_validation() {
+        ChecksumValidation::NotValidated { reason, .. } => {
+            assert_eq!(*reason, NotValidatedReason::CompositeChecksum);
+        }
+        other => panic!("expected NotValidated{{CompositeChecksum}}, got {other:?}"),
+    }
 }
 
 /// Whole object in the discovery chunk → the response checksum IS the object's,

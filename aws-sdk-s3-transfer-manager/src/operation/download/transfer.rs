@@ -19,7 +19,9 @@ use crate::io::AggregatedBytes;
 use crate::operation::download::body::{BodySlot, BodyWriter, ChunkOutput};
 use crate::operation::download::chunk_meta::ChunkMetadata;
 use crate::operation::download::context::{DownloadState, PendingClaim};
+use crate::operation::download::coverage::ChunkReport;
 use crate::operation::download::discovery::{discover_obj, ObjectDiscovery};
+use crate::operation::download::object_crc::ChunkCrc;
 use crate::operation::download::object_meta::ObjectMetadata;
 use crate::operation::download::read_ahead::ReadAhead;
 use crate::operation::download::recv_buffer::{DrainMode, FillOutcome};
@@ -60,7 +62,7 @@ macro_rules! bail_if_terminal {
         if !$self.inner.ctx.is_active() {
             // Bailing before any drain: no occupancy freed on this path. The transfer is
             // already terminal so `decrement_in_flight` will find `Terminal` and return false.
-            let _ = $self.decrement_in_flight(0);
+            let _ = $self.decrement_in_flight(0, None);
             return WorkOutcome::Cancelled;
         }
     };
@@ -98,6 +100,38 @@ struct DownloadTransferInner {
     integrity_checks: std::sync::OnceLock<crate::types::IntegrityChecks>,
     /// Notified when discovery completes (success or failure)
     discovery_notify: tokio::sync::Notify,
+    /// The algorithm each chunk hashes itself with, when the transfer validates
+    /// the delivered bytes itself. Set at discovery, alongside the accumulator in
+    /// `DownloadState::Transferring`.
+    ///
+    /// Held here rather than read back out of the state mutex because the hash is
+    /// computed while draining a chunk's body, off the lock; taking the state lock
+    /// per body read to learn a value fixed at discovery would serialize the
+    /// chunk paths against each other for nothing.
+    object_crc_algorithm: std::sync::OnceLock<super::object_crc::ObjectCrcAlgorithm>,
+    /// Set when the transfer's own whole-object hash disagreed with the object's
+    /// stored checksum. Resolved under the state lock at the terminal completion,
+    /// then read by `finalize_completion` once the lock is released -- comparing
+    /// is pure arithmetic, but failing a transfer is not, and `fail` takes the
+    /// same lock.
+    object_crc_mismatch:
+        std::sync::OnceLock<(aws_sdk_s3::types::ChecksumAlgorithm, String, String)>,
+    /// The verdict over the delivered bytes, resolved at the terminal completion
+    /// once every chunk's contribution is visible.
+    ///
+    /// Separate from `integrity_checks` because the two are known at different
+    /// moments: the checksum *values* S3 reported are available at discovery, while
+    /// whether the bytes were validated is a fact about the whole transfer. Unset
+    /// when validation was off, or when the transfer never completed.
+    resolved_validation: std::sync::OnceLock<crate::types::ChecksumValidation>,
+    /// Whether validation is in effect, resolved once at discovery.
+    ///
+    /// Cached rather than recomputed at the terminal transition because that read
+    /// happens under the state mutex, and `validation_enabled` reaches into the S3
+    /// client's config -- a foreign call whose internals this crate does not own has
+    /// no business nesting under that lock (the same rule the budget lock is held to
+    /// in [`DownloadState::enter_terminal`](super::context::DownloadState::enter_terminal)).
+    validation_enabled: std::sync::OnceLock<bool>,
 }
 
 impl DownloadTransfer {
@@ -125,6 +159,10 @@ impl DownloadTransfer {
             object_meta: std::sync::OnceLock::new(),
             integrity_checks: std::sync::OnceLock::new(),
             discovery_notify: tokio::sync::Notify::new(),
+            object_crc_algorithm: std::sync::OnceLock::new(),
+            object_crc_mismatch: std::sync::OnceLock::new(),
+            resolved_validation: std::sync::OnceLock::new(),
+            validation_enabled: std::sync::OnceLock::new(),
         });
         Self { inner }
     }
@@ -201,9 +239,18 @@ impl DownloadTransfer {
         self.inner.object_meta.get()
     }
 
-    /// Object-integrity result from discovery.
-    pub(crate) fn integrity_checks(&self) -> Option<&crate::types::IntegrityChecks> {
-        self.inner.integrity_checks.get()
+    /// The transfer's object-integrity result.
+    ///
+    /// Composed from the two moments it is knowable in: discovery supplies the
+    /// checksum values S3 reported, and the terminal completion supplies the
+    /// verdict over the delivered bytes. Returns the discovery-time verdict when no
+    /// verdict was resolved -- validation off, or the transfer did not complete.
+    pub(crate) fn integrity_checks(&self) -> Option<crate::types::IntegrityChecks> {
+        let base = self.inner.integrity_checks.get()?.clone();
+        Some(match self.inner.resolved_validation.get() {
+            Some(verdict) => base.with_validation(verdict.clone()),
+            None => base,
+        })
     }
 
     /// Notified when discovery completes.
@@ -264,6 +311,8 @@ impl DownloadTransfer {
                 part_size,
                 gate,
                 pending,
+                object_crc: _,
+                coverage: _,
             } => {
                 // Resolve the slot to issue into this poll, if one is ready. Two gates
                 // compose in order — the per-transfer read-ahead window, then the global
@@ -579,6 +628,8 @@ impl DownloadTransfer {
         // WhenRequired (WhenSupported, the default, and unknown values enable it).
         // Computed before discovery because it drives range alignment.
         let validation_enabled = self.validation_enabled(input);
+        // Cached for the terminal verdict, which reads it under the state lock.
+        let _ = self.inner.validation_enabled.set(validation_enabled);
 
         let discovery = match discover_obj(self, input, validation_enabled).await {
             Ok(d) => d,
@@ -594,6 +645,7 @@ impl DownloadTransfer {
             initial_chunk,
             chunk_meta,
             effective_part_size,
+            object_crc,
         } = discovery;
 
         // Store object_meta for object_meta() and join()
@@ -672,6 +724,11 @@ impl DownloadTransfer {
                 part_size: effective_part_size,
                 gate: super::context::OccupancyGate::with_issued(initial),
                 pending: None,
+                object_crc: object_crc.map(|(alg, expected)| {
+                    let _ = self.inner.object_crc_algorithm.set(alg);
+                    Box::new(super::object_crc::ObjectCrc::new(alg, expected))
+                }),
+                coverage: super::coverage::CoverageTally::default(),
             };
         }
 
@@ -716,6 +773,7 @@ impl DownloadTransfer {
         // — so it skips the `guarded` timer entirely (timing/recording a ~0µs
         // "send" would drag the TTFB mean toward zero). Only a genuine re-issue
         // goes through `guarded`, which times and records its TTFB.
+        let crc_algorithm = self.inner.object_crc_algorithm.get().copied();
         let result = crate::retry::retry(crate::retry::classify_body_retry, |allow_hedge| {
             let pre_issued = initial.take();
             let etag = etag.clone();
@@ -763,7 +821,7 @@ impl DownloadTransfer {
                     }
                 };
                 // Untimed: drain the body. Errors here are inner (retryable IO).
-                Self::read_body_stream(&ctx, body)
+                Self::read_body_stream(&ctx, body, crc_algorithm)
                     .await
                     .map_err(crate::retry::GuardError::Inner)
             }
@@ -775,7 +833,7 @@ impl DownloadTransfer {
         ))
         .await;
 
-        let (segmented, bytes_received) = match result {
+        let (segmented, bytes_received, chunk_crc) = match result {
             Ok(val) => val,
             // Go terminal before any wake: fail() sets Terminal under the lock, so
             // a woken poll_work cannot observe ranges_in_flight==0 and complete()
@@ -787,14 +845,25 @@ impl DownloadTransfer {
             }
         };
 
+        let chunk_offset = chunk_meta
+            .content_range
+            .as_deref()
+            .and_then(crate::http::header::parse_content_range)
+            .map(|r| *r.start())
+            .unwrap_or(0);
+        // Classified before `chunk_meta` moves into the chunk: the headers are what
+        // say whether the SDK validated this body.
+        let report = ChunkReport {
+            crc: chunk_crc.map(|crc| ChunkCrc {
+                offset: chunk_offset,
+                crc,
+                len: bytes_received,
+            }),
+            coverage: super::coverage::classify(&chunk_meta),
+        };
         let chunk = ChunkOutput {
             seq,
-            offset: chunk_meta
-                .content_range
-                .as_deref()
-                .and_then(crate::http::header::parse_content_range)
-                .map(|r| *r.start())
-                .unwrap_or(0),
+            offset: chunk_offset,
             data: AggregatedBytes(segmented),
             metadata: chunk_meta,
             // The slot carries the reservation; fill() moves it into the chunk.
@@ -829,7 +898,7 @@ impl DownloadTransfer {
             ..Default::default()
         });
 
-        let reached_terminal = self.decrement_in_flight(freed);
+        let reached_terminal = self.decrement_in_flight(freed, Some(report));
         if reached_terminal {
             return self.finalize_completion();
         }
@@ -845,17 +914,28 @@ impl DownloadTransfer {
     /// to avoid masking corruption), any other stream failure becomes
     /// [`ErrorKind::IOError`] (the body-read class the classifier re-issues). A
     /// cancellation observed mid-read maps to [`ErrorKind::OperationCancelled`].
+    ///
+    /// `crc_algorithm` hashes the chunk's bytes as they arrive, for a transfer that
+    /// validates the delivered bytes itself. Hashing here rather than over the
+    /// assembled buffer keeps it to the pass the bytes already make, and means a
+    /// body that fails partway never contributes: this whole function runs inside
+    /// the retry closure, so only a fully-drained chunk yields a CRC.
     async fn read_body_stream(
         ctx: &TransferContext,
         body: aws_sdk_s3::primitives::ByteStream,
-    ) -> Result<(SegmentedBuf<bytes::Bytes>, u64), crate::error::Error> {
+        crc_algorithm: Option<super::object_crc::ObjectCrcAlgorithm>,
+    ) -> Result<(SegmentedBuf<bytes::Bytes>, u64, Option<u64>), crate::error::Error> {
         let mut segmented = SegmentedBuf::new();
         let mut bytes_received: u64 = 0;
         let mut body_stream = body;
+        let mut digest = crc_algorithm.map(|alg| alg.digest());
 
         while let Some(result) = body_stream.next().await {
             let data = result.map_err(|e| crate::error::body_read_error(e, None))?;
             bytes_received += data.len() as u64;
+            if let Some(digest) = digest.as_mut() {
+                digest.update(&data);
+            }
             segmented.push(data);
             if !ctx.is_active() {
                 return Err(crate::error::Error::new(
@@ -865,7 +945,7 @@ impl DownloadTransfer {
             }
         }
 
-        Ok((segmented, bytes_received))
+        Ok((segmented, bytes_received, digest.map(|d| d.finalize())))
     }
 
     async fn execute_get_range(
@@ -886,6 +966,7 @@ impl DownloadTransfer {
         // stream is caught by stalled-stream protection. A `GuardError`
         // (deadline timeout OR inner error from either phase) is classified by
         // the retry loop.
+        let crc_algorithm = self.inner.object_crc_algorithm.get().copied();
         let result = crate::retry::retry(crate::retry::classify_body_retry, |allow_hedge| {
             let rh = range_header.clone();
             let etag = etag.clone();
@@ -915,13 +996,15 @@ impl DownloadTransfer {
                     .await?;
                 // Untimed: drain the body. Errors here are inner (retryable IO).
                 let chunk_meta = ChunkMetadata::from(&resp);
-                let (segmented, bytes_received) = Self::read_body_stream(&ctx, resp.body)
-                    .await
-                    .map_err(crate::retry::GuardError::Inner)?;
+                let (segmented, bytes_received, chunk_crc) =
+                    Self::read_body_stream(&ctx, resp.body, crc_algorithm)
+                        .await
+                        .map_err(crate::retry::GuardError::Inner)?;
                 Ok::<_, crate::retry::GuardError<crate::error::Error>>((
                     chunk_meta,
                     segmented,
                     bytes_received,
+                    chunk_crc,
                 ))
             }
         })
@@ -932,7 +1015,7 @@ impl DownloadTransfer {
         ))
         .await;
 
-        let (chunk_meta, segmented, bytes_received) = match result {
+        let (chunk_meta, segmented, bytes_received, chunk_crc) = match result {
             Ok(val) => val,
             Err(e) => {
                 return self.fail_range(ChunkRef::new(seq, Some(*range.start()..=*range.end())), e)
@@ -940,6 +1023,16 @@ impl DownloadTransfer {
         };
 
         bail_if_terminal!(self);
+        // Classified before `chunk_meta` moves into the chunk: the headers are what
+        // say whether the SDK validated this body.
+        let report = ChunkReport {
+            crc: chunk_crc.map(|crc| ChunkCrc {
+                offset: *range.start(),
+                crc,
+                len: bytes_received,
+            }),
+            coverage: super::coverage::classify(&chunk_meta),
+        };
         let chunk = ChunkOutput {
             seq,
             offset: *range.start(),
@@ -979,7 +1072,7 @@ impl DownloadTransfer {
             ..Default::default()
         });
 
-        let reached_terminal = self.decrement_in_flight(freed);
+        let reached_terminal = self.decrement_in_flight(freed, Some(report));
         if reached_terminal {
             return self.finalize_completion();
         }
@@ -1013,7 +1106,7 @@ impl DownloadTransfer {
     /// `set_pending` under is what orders this completion's release against the issuer's
     /// park (the mutator protocol `lock -> mutate -> unlock -> try_wake`). `freed` is the
     /// disk drain's freed count (0 if this fill did not hit a drain edge).
-    fn decrement_in_flight(&self, freed: u64) -> bool {
+    fn decrement_in_flight(&self, freed: u64, chunk: Option<ChunkReport>) -> bool {
         let (terminal, pending) = {
             let mut work = self.inner.state.lock().unwrap();
             match &mut *work {
@@ -1021,13 +1114,31 @@ impl DownloadTransfer {
                     ranges_in_flight,
                     gate,
                     remaining,
+                    object_crc,
+                    coverage,
                     ..
                 } => {
+                    // Record what this chunk contributed in the SAME acquisition
+                    // that decrements the count and claims the terminal
+                    // transition. That is what makes both the fold and the tally
+                    // complete for whoever observes the count reach zero: it took
+                    // this mutex after every other chunk released it, so every
+                    // record is visible to it.
+                    if let Some(report) = chunk {
+                        if let (Some(acc), Some(crc)) = (object_crc.as_mut(), report.crc) {
+                            acc.record(crc);
+                        }
+                        coverage.record(report.coverage);
+                    }
                     *ranges_in_flight = ranges_in_flight.saturating_sub(1);
                     gate.release(freed);
                     if remaining.is_none() && *ranges_in_flight == 0 {
                         // Terminal: claim the transition under this lock so a
                         // concurrently-woken poll_work cannot also complete.
+                        //
+                        // The verdict is resolved here, before `enter_terminal`
+                        // drops the accumulator and the tally with the state.
+                        self.resolve_verdict(object_crc.as_deref(), coverage);
                         (true, work.enter_terminal())
                     } else {
                         (false, None)
@@ -1045,6 +1156,68 @@ impl DownloadTransfer {
         terminal
     }
 
+    /// Resolve what this transfer can say about the bytes it delivered: a mismatch
+    /// for `finalize_completion` to fail on, and otherwise the verdict the download
+    /// reports.
+    ///
+    /// Called with the state lock held, so it only computes and stores -- no I/O,
+    /// no second lock. This is the only place the verdict can be resolved: it needs
+    /// every chunk's contribution, and the completing thread is the first one for
+    /// which all of them are visible.
+    ///
+    /// Does nothing when validation is off. The verdict is then `Disabled`, which
+    /// discovery already recorded, and which the tally cannot express -- with no
+    /// checksums requested every chunk looks merely uncovered.
+    fn resolve_verdict(
+        &self,
+        acc: Option<&super::object_crc::ObjectCrc>,
+        coverage: &super::coverage::CoverageTally,
+    ) {
+        if self.inner.validation_enabled.get() != Some(&true) {
+            return;
+        }
+
+        // The fold's verdict, when it reached one. `None` means the delivered
+        // chunks never covered a contiguous `[0, total)`, which is not a mismatch:
+        // nothing is claimed either way, and the tally decides alone.
+        let mut folded_ok = None;
+        if let (Some(acc), Some(total)) = (acc, self.inner.ctx.total_bytes()) {
+            match acc.matches(total) {
+                Some(false) => {
+                    let computed = acc
+                        .computed(total)
+                        .unwrap_or_else(|| "<unavailable>".to_string());
+                    tracing::error!(
+                        expected = acc.expected(),
+                        computed = %computed,
+                        "delivered bytes do not match the object checksum"
+                    );
+                    let _ = self.inner.object_crc_mismatch.set((
+                        acc.algorithm().sdk_algorithm(),
+                        acc.expected().to_string(),
+                        computed,
+                    ));
+                    // A mismatch fails the transfer, so no verdict is published.
+                    return;
+                }
+                Some(true) => {
+                    tracing::debug!("delivered bytes match the object checksum");
+                    folded_ok = Some(acc.algorithm().sdk_algorithm());
+                }
+                None => tracing::debug!(
+                    "no whole-object verdict: delivered chunks did not cover the object"
+                ),
+            }
+        }
+
+        // A request-shaped reason, not an object-shaped one: reading the request is a
+        // field access on state this transfer owns, so it is safe under this lock.
+        let ranged = self.inner.request.range.is_some();
+        let verdict = coverage.resolve(folded_ok, ranged);
+        tracing::debug!(?verdict, "resolved checksum validation verdict");
+        let _ = self.inner.resolved_validation.set(verdict);
+    }
+
     /// Finalize a transfer that reached its terminal completion in `execute`: flush the
     /// tail to disk (releasing the last reservations as their `ChunkOutput`s drop), set the
     /// terminal status, and signal waiters. The state is already `Terminal` (claimed under
@@ -1052,6 +1225,18 @@ impl DownloadTransfer {
     /// never happens under it. Symmetric with `fail`, which error paths already call from
     /// `execute`.
     fn finalize_completion(&self) -> WorkOutcome {
+        // A checksum mismatch fails the transfer rather than completing it. Checked
+        // before `writer.finalize()` so a file sink never publishes corrupt bytes
+        // to the destination path.
+        if let Some((algorithm, expected, computed)) = self.inner.object_crc_mismatch.get() {
+            let e = crate::error::object_checksum_mismatch(
+                algorithm.clone(),
+                expected.clone(),
+                computed.clone(),
+            );
+            let guard = self.inner.state.lock().unwrap();
+            return self.fail(guard, e);
+        }
         if let Err(e) = self.inner.writer.finalize() {
             // Finalize failed: transition to failed. The state is already Terminal; `fail`
             // calls `enter_terminal` which is idempotent on Terminal (returns None).
@@ -1189,12 +1374,12 @@ fn validate_content_range(
 /// the discovery chunk, the one case where the chunk checksum is the object
 /// checksum. Otherwise value members are left `None`.
 ///
-/// Validation is reported `Disabled` when not requested, else
-/// `NotValidated{Unavailable}`. `Validated{algorithm}` requires a per-response
-/// validation outcome the Rust SDK does not currently expose.
-// TODO(vnext): resolve `Validated{algorithm}` from an SDK-reported per-response
-// validation outcome once the SDK exposes one, instead of always reporting
-// NotValidated when validation is enabled.
+/// The verdict here is provisional, and deliberately the weakest one: discovery
+/// runs before any bytes move, so it cannot describe coverage it has not observed.
+/// `resolve_verdict` replaces it at the terminal completion, which is the first
+/// moment every chunk's contribution is visible. `Disabled` is the exception — with
+/// validation off there is nothing to observe later, so that verdict is already
+/// final here.
 fn build_integrity_checks(
     chunk_meta: Option<&ChunkMetadata>,
     whole_object_in_chunk: bool,
@@ -1263,9 +1448,11 @@ mod tests {
         );
     }
 
+    /// The discovery-time verdict claims nothing, even for a chunk that carries a
+    /// checksum: no bytes have been delivered yet, so `resolve_verdict` is the only
+    /// thing entitled to say they were validated.
     #[test]
     fn integrity_unavailable_when_enabled_pending_sdk_signal() {
-        // TODO(vnext): becomes Validated once the SDK reports a validation outcome.
         let ic = build_integrity_checks(Some(&chunk_with_crc32("DUoRhQ==")), true, true);
         assert_eq!(
             *ic.checksum_validation(),
@@ -1289,6 +1476,17 @@ mod tests {
         assert_eq!(multipart.checksum_type(), None);
     }
 
+    /// A `HeadObject` rule reporting no checksum, so the whole-object validation
+    /// path stays off for tests that are about scheduling rather than integrity.
+    ///
+    /// Needed because a multi-chunk download with a pinned part size cannot align
+    /// its ranges to stored parts, so it asks the object for a checksum to hash
+    /// against. Without a rule the mock client rejects that request.
+    fn no_checksum_head() -> aws_smithy_mocks::Rule {
+        mock!(aws_sdk_s3::Client::head_object)
+            .then_output(|| aws_sdk_s3::operation::head_object::HeadObjectOutput::builder().build())
+    }
+
     fn create_download(object_size: u64, part_size: u64) -> DownloadTransfer {
         let chunk = vec![0u8; part_size as usize];
         let get_obj = mock!(aws_sdk_s3::Client::get_object).then_output(move || {
@@ -1300,7 +1498,11 @@ mod tests {
                 .build()
         });
         create_download_with_client(
-            mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get_obj]),
+            mock_client!(
+                aws_sdk_s3,
+                RuleMode::MatchAny,
+                &[get_obj, no_checksum_head()]
+            ),
             part_size,
         )
     }
@@ -1544,7 +1746,11 @@ mod tests {
                 .body(ByteStream::from(chunk.clone()))
                 .build()
         });
-        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get_obj]);
+        let client = mock_client!(
+            aws_sdk_s3,
+            RuleMode::MatchAny,
+            &[get_obj, no_checksum_head()]
+        );
 
         let config = crate::Config::builder()
             .client(client)
@@ -1841,7 +2047,11 @@ mod tests {
                 .body(ByteStream::from(chunk.clone()))
                 .build()
         });
-        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get_obj]);
+        let client = mock_client!(
+            aws_sdk_s3,
+            RuleMode::MatchAny,
+            &[get_obj, no_checksum_head()]
+        );
 
         let config = crate::Config::builder()
             .client(client)
@@ -2017,7 +2227,11 @@ mod tests {
             )
         });
         let config = crate::Config::builder()
-            .client(mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get_obj]))
+            .client(mock_client!(
+                aws_sdk_s3,
+                RuleMode::MatchAny,
+                &[get_obj, no_checksum_head()]
+            ))
             .part_size(crate::types::PartSize::Target(part_size))
             .build();
         let handle = crate::client::Handle::test_handle_tokio(config);
@@ -2094,7 +2308,11 @@ mod tests {
             )
         });
         let config = crate::Config::builder()
-            .client(mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get_obj]))
+            .client(mock_client!(
+                aws_sdk_s3,
+                RuleMode::MatchAny,
+                &[get_obj, no_checksum_head()]
+            ))
             .part_size(crate::types::PartSize::Target(part_size))
             .build();
         let handle = crate::client::Handle::test_handle_tokio(config);
@@ -2161,7 +2379,11 @@ mod tests {
                     .build()
             });
             let config = crate::Config::builder()
-                .client(mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get_obj]))
+                .client(mock_client!(
+                    aws_sdk_s3,
+                    RuleMode::MatchAny,
+                    &[get_obj, no_checksum_head()]
+                ))
                 .part_size(crate::types::PartSize::Target(8 * MB))
                 .read_ahead(client_mode)
                 .build();
@@ -2314,9 +2536,14 @@ mod tests {
             });
 
             create_download_with_client(
-                mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get_obj], |conf| {
-                    conf.retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
-                }),
+                mock_client!(
+                    aws_sdk_s3,
+                    RuleMode::MatchAny,
+                    &[get_obj, no_checksum_head()],
+                    |conf| {
+                        conf.retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
+                    }
+                ),
                 part_size,
             )
         }

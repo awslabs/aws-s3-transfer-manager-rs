@@ -453,8 +453,19 @@ pub enum NotValidatedReason {
     CompositeChecksum,
     /// Some delivered bytes were validated but not the whole object.
     PartialCoverage,
-    /// No checksum covered the delivered bytes (object has no stored checksum,
-    /// or the requested range did not align to a stored part).
+    /// The request asked for a byte range that no stored checksum covers.
+    ///
+    /// S3's checksum for an object spans all of its bytes, and a per-part checksum
+    /// exists only for a part of a composite object, so a range that is neither the
+    /// whole object nor exactly a stored part has nothing to be checked against.
+    /// Unlike [`Unavailable`](Self::Unavailable) this is a property of the request
+    /// rather than of the object: the same bytes are validated if downloaded without
+    /// a range, or with one aligned to a stored part boundary.
+    RangeNotCovered,
+    /// No checksum covered the delivered bytes because the object has none stored.
+    ///
+    /// Nothing the caller changes about the request will validate this object; it
+    /// was uploaded without a checksum.
     Unavailable,
 }
 
@@ -478,5 +489,15 @@ impl IntegrityChecks {
             checksum_type,
             checksum_validation,
         }
+    }
+
+    /// Replace the verdict, keeping the reported checksum values.
+    ///
+    /// The values S3 reported are known as soon as the object is discovered;
+    /// whether the delivered bytes were validated is only known once the last chunk
+    /// lands. This is the seam between those two moments.
+    pub(crate) fn with_validation(mut self, checksum_validation: ChecksumValidation) -> Self {
+        self.checksum_validation = checksum_validation;
+        self
     }
 }
