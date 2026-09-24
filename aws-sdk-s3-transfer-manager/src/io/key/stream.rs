@@ -106,8 +106,8 @@ pub(crate) struct Entry<T> {
 pub(crate) enum StreamError {
     // The underlying walk failed. Whether it ends the run is the walk's own answer.
     Walk(WalkError),
-    // A local name that is not valid UTF-8, so no S3 key could carry it. One name, and the walk
-    // read it fine.
+    // A local name that is not valid UTF-8, so no key could carry it. The walk read the name
+    // without trouble; it is the conversion that has nowhere to go.
     UnkeyableName(PathBuf),
     // A listed object without a field a comparison needs. The key is named where the listing gave
     // one, so a consumer can hold back the action for that key alone.
@@ -118,8 +118,8 @@ pub(crate) enum StreamError {
 }
 
 impl StreamError {
-    // Whether nothing is left to carry on with. Only a walk can say so: a name that cannot be
-    // keyed and an object missing a field each cost one key.
+    // Whether the run has anything left to carry on with. Only a walk can end it: a name that
+    // cannot be keyed and an object missing a field each cost one key and no more.
     pub(crate) fn is_fatal(&self) -> bool {
         match self {
             StreamError::Walk(err) => err.is_fatal(),
@@ -190,15 +190,13 @@ pub(crate) trait KeyStream {
 // other side" it has to know whether the side it is reading is still able to account for its keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KeysLost {
-    // One key, and the keys around it are known. Whether a consumer can act on that one key alone
+    // One key, and the keys around it are known. How precisely a consumer can place that key
     // depends on which failure produced it.
     //
-    // A listing names the key it dropped. A name no key can carry names the file itself, at that
-    // file's own position, so it is just as identifiable — what it cannot do is produce a key to
-    // match against the other side, which is why nothing can be sent for it even though the name is
-    // taken. A walk failure is the weak one: it carries an absolute path nothing here turns into a
-    // key, and it arrives at the position of the directory holding it, so all a consumer learns is
-    // that some key inside that directory is gone.
+    // A listing names the key it dropped, and a name no key can carry names the file at its own
+    // position, so both point at something identifiable. A walk failure gives less: it carries an
+    // absolute path this layer cannot turn into a key, reported at the position of the directory
+    // holding it, so a consumer learns only that some key inside that directory is gone.
     OneKey,
     // An unknown range. A subtree went unenumerated, or the side stopped before its end, so
     // absence cannot be read from position at all.
