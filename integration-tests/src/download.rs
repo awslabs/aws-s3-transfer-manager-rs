@@ -357,6 +357,47 @@ async fn test_download_write_to_path_ranged() {
     m.handle.shutdown().await.expect("shutdown");
 }
 
+/// A suffix (`bytes=-N`) and an open-ended (`bytes=N-`) range are discovered by
+/// HeadObject rather than by a ranged GET, so the offsets to fetch come from that
+/// response's `Content-Range`. Both ask for the object's tail; delivering the same
+/// number of leading bytes instead has the right length and the wrong content, which
+/// is why these assert bytes rather than sizes.
+#[tokio::test]
+async fn test_download_tail_ranges_deliver_the_tail() {
+    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let m = setup_concurrent(part_size, 8).await;
+
+    let size = 10 * ByteUnit::Mebibyte.as_bytes_usize();
+    let content = deterministic_data(size);
+    m.server
+        .add_object("test-bucket", "tail-key", content.clone(), None)
+        .await
+        .expect("add object");
+
+    for (range, start) in [
+        ("bytes=-3000000", size - 3_000_000),
+        ("bytes=7000000-", 7_000_000),
+    ] {
+        let mut handle = m
+            .client
+            .download()
+            .bucket("test-bucket")
+            .key("tail-key")
+            .range(range)
+            .initiate()
+            .unwrap();
+        let body = drain_body(&mut handle).await.unwrap();
+        handle.join().await.unwrap();
+        assert_eq!(
+            &body[..],
+            &content[start..],
+            "{range} delivered other bytes"
+        );
+    }
+
+    m.handle.shutdown().await.expect("shutdown");
+}
+
 /// Test single-part download to file (2 MB object, 5 MB part size — no range splitting).
 #[cfg(any(unix, windows))]
 #[tokio::test]

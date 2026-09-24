@@ -412,6 +412,75 @@ async fn test_object_download_range() {
     }
 }
 
+/// Pins what S3 answers a ranged HEAD with, and that a tail range delivers the tail.
+///
+/// A suffix (`bytes=-N`) or open-ended (`bytes=N-`) range is discovered by HeadObject,
+/// and S3 answers that 206: `Content-Length` is the range's length, so the offsets are
+/// only in `Content-Range`. A download that reads the length but not the offsets asks
+/// for the right number of bytes from the wrong place, which a length assertion cannot
+/// see -- so the bytes are compared against the same range read directly through the
+/// SDK. This is the behavior `s3-mock-server` imitates for HeadObject.
+#[tokio::test]
+async fn test_object_download_tail_ranges() {
+    let _logs = show_test_logs();
+    let (tm, s3) = test_tm().await;
+    let (bucket_name, _) = get_bucket_names();
+    let object_key = "pre-existing-10MB";
+
+    let head = s3
+        .head_object()
+        .bucket(&bucket_name)
+        .key(object_key)
+        .range("bytes=-500")
+        .send()
+        .await
+        .unwrap();
+    let content_range = head.content_range().expect("a 206 carries content-range");
+    let total: u64 = content_range
+        .rsplit('/')
+        .next()
+        .and_then(|t| t.parse().ok())
+        .expect("content-range names the object size");
+    assert_eq!(
+        Some(500),
+        head.content_length(),
+        "206 reports the range's length, not the object's"
+    );
+    assert_eq!(
+        format!("bytes {}-{}/{total}", total - 500, total - 1),
+        content_range,
+        "the offsets are only in content-range"
+    );
+
+    for range in ["bytes=-3000000", "bytes=7000000-"] {
+        let expected = s3
+            .get_object()
+            .bucket(&bucket_name)
+            .key(object_key)
+            .range(range)
+            .send()
+            .await
+            .unwrap()
+            .body
+            .collect()
+            .await
+            .unwrap()
+            .to_vec();
+
+        let mut handle = tm
+            .download()
+            .bucket(&bucket_name)
+            .key(object_key)
+            .range(range)
+            .initiate()
+            .unwrap();
+        let body = drain(&mut handle).await.unwrap();
+
+        assert_eq!(expected.len(), body.len(), "range {range}");
+        assert_eq!(expected, body, "range {range} delivered other bytes");
+    }
+}
+
 #[tokio::test]
 async fn test_object_download_range_failures() {
     let _logs = show_test_logs();
