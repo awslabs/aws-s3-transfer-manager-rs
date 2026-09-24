@@ -113,6 +113,147 @@ impl<T> Head<T> {
     }
 }
 
+// One side of the merge: its stream, the key it is holding, and what it could not account for.
+//
+// Both sides keep identical bookkeeping, so it lives here once rather than as a matched pair of
+// fields on the merge. Recording what a failure cost is the same work whichever side reported it,
+// so it is written once here and the two sides cannot drift apart.
+struct Side<K: KeyStream> {
+    stream: K,
+    head: Head<K::Source>,
+    // What a survivable failure cost, held until the merge is past the keys it hid.
+    //
+    // Anything the other side holds inside that stretch is a key this one could not account for.
+    // Reading such a key as absent is what allows it to be deleted, which is the whole reason the
+    // answer is carried here.
+    gap: Stretches,
+    // Keys this side named as lost, held until the merge reaches each one.
+    //
+    // A failure costing one key arrives before that key sorts, so the answer cannot be given
+    // where it is heard. Reading a directory already collects every child before any is handed
+    // over, and the errors from that read are queued with them, so these keys are a subset of
+    // what the walk holds anyway.
+    //
+    // Ordered by key and not by arrival, because a walk reports the failures from one directory
+    // in whatever order the filesystem listed it. Two unreadable children arriving as `z` then
+    // `a` would leave `a` unmatched against a queue drained from the front, and an unmatched key
+    // reads as absent — a delete for a file sitting on disk whose loss was reported.
+    lost: BTreeSet<String>,
+    // Set when this side lost one key and could not say which.
+    //
+    // A listing names the key it dropped. A walk names a path, and the failure arrives at the
+    // position of the directory holding it while the key sorts later, somewhere inside — so the
+    // one key at risk cannot be picked out here. So every later key on this side is answered
+    // unknown, which is the only answer that cannot delete an object whose file was merely
+    // unreadable.
+    lost_unnamed: bool,
+    // The root this side's paths are taken under, when it walks a filesystem.
+    //
+    // A walk names the file it could not read by absolute path, and turning that into a key
+    // needs the root it sits under. The stream that reported the failure was handed a walker
+    // which never says what its root is, so the answer comes from here — which is what makes one
+    // lost key nameable here, where a layer down has no root to name it against.
+    root: Option<PathBuf>,
+}
+
+impl<K: KeyStream> Side<K> {
+    fn new(stream: K) -> Self {
+        Self {
+            stream,
+            head: Head::Unread,
+            gap: Stretches::default(),
+            lost: BTreeSet::new(),
+            lost_unnamed: false,
+            root: None,
+        }
+    }
+
+    // Read one entry if the head is empty, recording what any failure cost.
+    //
+    // The failure comes back so the merge can report it. Nothing is recorded for a failure that
+    // ended the side, because no later key arrives from it for the merge to answer at.
+    async fn fill(&mut self) -> Option<StreamError> {
+        if !matches!(self.head, Head::Unread) {
+            return None;
+        }
+        match self.stream.next_entry().await {
+            Some(Ok(entry)) => {
+                self.head = Head::Entry(entry);
+                None
+            }
+            // The stream says whether that failure ended it. Asking is what the enumeration
+            // layer offers for this; classifying the error here would put a second opinion
+            // beside the walk's own, and the two could drift apart.
+            Some(Err(err)) => {
+                if !self.stream.is_done() {
+                    match cost_of(&err, self.root.as_deref()) {
+                        Cost::Key(key) => {
+                            self.lost.insert(key);
+                        }
+                        Cost::UnnamedKey => self.lost_unnamed = true,
+                        Cost::Stretch(stretch) => self.gap.add(stretch),
+                        Cost::Nothing => {}
+                    }
+                }
+                Some(err)
+            }
+            None => {
+                self.head = Head::Finished;
+                None
+            }
+        }
+    }
+
+    fn is_done(&self) -> bool {
+        self.stream.is_done()
+    }
+
+    fn is_finished(&self) -> bool {
+        matches!(self.head, Head::Finished)
+    }
+
+    // Take the entry at the head, releasing every stretch the merge has now passed.
+    //
+    // A key inside a stretch, or one sorting before it, releases nothing: the failure was heard
+    // early and what it cost is still ahead.
+    fn take(&mut self) -> Entry<K::Source> {
+        if let Some(entry) = self.head.entry() {
+            let key = entry.key.clone();
+            self.gap.release_passed(&key);
+        }
+        match std::mem::replace(&mut self.head, Head::Unread) {
+            Head::Entry(entry) => entry,
+            _ => unreachable!("taken only with an entry at the head"),
+        }
+    }
+
+    // What this side says about a key it did not produce. Absent while it is accounting for
+    // itself, unknown while a failure has left it unable to, and unknown for a key it named as
+    // lost.
+    fn missing(&mut self, key: &str) -> SideState<K::Source> {
+        self.release_before(key);
+        if self.lost.remove(key) {
+            return SideState::Unknown(KeysLost::OneKey);
+        }
+        match self.gap.covers(key) {
+            true => SideState::Unknown(KeysLost::UnknownRange),
+            // A range, because the conclusion here is that absence cannot be read from
+            // position on this side any more. `OneKey` says the keys around it are known,
+            // which a consumer would act on by holding back one key and trusting the rest.
+            false if self.lost_unnamed => SideState::Unknown(KeysLost::UnknownRange),
+            false => SideState::Absent,
+        }
+    }
+
+    // Drop every held key sorting before this one.
+    //
+    // The merge runs in key order, so a key still held below this one was passed without either
+    // side reaching it, and nothing will ever ask for a decision about it.
+    fn release_before(&mut self, key: &str) {
+        self.lost = self.lost.split_off(key);
+    }
+}
+
 // A stretch of keys one failure hid, bounded by a prefix taken from the failure's own path.
 //
 // The bound matters because a failure does not always arrive where the keys it hid would sort. A
@@ -121,8 +262,8 @@ impl<T> Head<T> {
 // earlier than the subtree it cost. Releasing the stretch at the side's next key would let such a
 // sibling stand in for keys nobody enumerated.
 //
-// Every stretch costs an unknown range. A failure costing one key is held as that key, or as the
-// whole side where the key could not be worked out, so neither reaches here.
+// A stretch always costs an unknown range. A failure costing one key is held as that key, or as
+// the side's whole account where the key could not be worked out, so neither reaches here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Stretch {
     // `None` where no prefix could be worked out, which holds the rest of the side: a stretch
@@ -189,47 +330,8 @@ fn at_or_under(key: &str, name: &str) -> bool {
 
 // Two key-ordered streams merged into one pairing per key.
 pub(crate) struct Walk<S: KeyStream, D: KeyStream> {
-    source: S,
-    destination: D,
-    src: Head<S::Source>,
-    dst: Head<D::Source>,
-    // What a side's survivable failure cost, held until the merge is past the keys it hid.
-    //
-    // Anything the other side holds inside that stretch is a key this one could not account for.
-    // Reading such a key as absent is what allows it to be deleted, which is the whole reason the
-    // answer is carried here.
-    src_gap: Stretches,
-    dst_gap: Stretches,
-    // Keys a side named as lost, held until the merge reaches each one.
-    //
-    // A failure costing one key arrives before that key sorts, so the answer cannot be given
-    // where it is heard. Reading a directory already collects every child before any is handed
-    // over, and the errors from that read are queued with them, so these keys are a subset of what
-    // the walk holds anyway.
-    //
-    // Ordered by key and not by arrival, because a walk reports the failures from one directory in
-    // whatever order the filesystem listed it. Two unreadable children arriving as `z` then `a`
-    // would leave `a` unmatched against a queue drained from the front, and an unmatched key reads
-    // as absent — a delete for a file sitting on disk whose loss was reported.
-    src_lost: BTreeSet<String>,
-    dst_lost: BTreeSet<String>,
-    // Set when a side lost one key and could not say which.
-    //
-    // A listing names the key it dropped. A walk names a path, and the failure arrives at the
-    // position of the directory holding it while the key sorts later, somewhere inside — so
-    // the one key at risk cannot be picked out from here. Holding the side's whole account
-    // open is the answer that cannot delete the wrong object, and narrowing it needs the walk
-    // root, which arrives with the next change.
-    src_lost_unnamed: bool,
-    dst_lost_unnamed: bool,
-    // The root a side's paths are taken under, when that side walks a filesystem.
-    //
-    // A walk names the file it could not read by absolute path, and turning that into a key
-    // needs the root it sits under. The stream that reported the failure was handed a walker
-    // which never says what its root is, so the answer comes from here — which is what makes
-    // one lost key nameable at this layer and not a layer down.
-    src_root: Option<PathBuf>,
-    dst_root: Option<PathBuf>,
+    src: Side<S>,
+    dst: Side<D>,
     // Set when a key went unaccounted for, so a caller can tell a whole plan from a partial
     // one. A run that lost keys and reports a clean plan is one whose caller cannot know it
     // acted on less than it was asked about.
@@ -246,18 +348,8 @@ pub(crate) struct Walk<S: KeyStream, D: KeyStream> {
 impl<S: KeyStream, D: KeyStream> Walk<S, D> {
     pub(crate) fn new(source: S, destination: D) -> Self {
         Self {
-            source,
-            destination,
-            src: Head::Unread,
-            dst: Head::Unread,
-            src_gap: Stretches::default(),
-            dst_gap: Stretches::default(),
-            src_lost: BTreeSet::new(),
-            dst_lost: BTreeSet::new(),
-            src_lost_unnamed: false,
-            dst_lost_unnamed: false,
-            src_root: None,
-            dst_root: None,
+            src: Side::new(source),
+            dst: Side::new(destination),
             incomplete: false,
             ended_by_failure: false,
         }
@@ -274,55 +366,22 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
         if self.ended_by_failure {
             return None;
         }
-        if matches!(self.src, Head::Unread) {
-            match self.source.next_entry().await {
-                Some(Ok(entry)) => self.src = Head::Entry(entry),
-                // The stream says whether that failure ended it. Asking is what the
-                // enumeration layer offers for this; classifying the error here would put a
-                // second opinion beside the walk's own, and the two could drift apart.
-                Some(Err(err)) => {
-                    self.incomplete = true;
-                    if self.source.is_done() {
-                        self.ended_by_failure = true;
-                    } else {
-                        match cost_of(&err, self.src_root.as_deref()) {
-                            Cost::Key(key) => {
-                                self.src_lost.insert(key);
-                            }
-                            Cost::UnnamedKey => self.src_lost_unnamed = true,
-                            Cost::Stretch(stretch) => self.src_gap.add(stretch),
-                            Cost::Nothing => {}
-                        }
-                    }
-                    return Some(Err(err));
-                }
-                None => self.src = Head::Finished,
+        if let Some(err) = self.src.fill().await {
+            self.incomplete = true;
+            if self.src.is_done() {
+                self.ended_by_failure = true;
             }
+            return Some(Err(err));
         }
-        if matches!(self.dst, Head::Unread) {
-            match self.destination.next_entry().await {
-                Some(Ok(entry)) => self.dst = Head::Entry(entry),
-                Some(Err(err)) => {
-                    self.incomplete = true;
-                    if self.destination.is_done() {
-                        self.ended_by_failure = true;
-                    } else {
-                        match cost_of(&err, self.dst_root.as_deref()) {
-                            Cost::Key(key) => {
-                                self.dst_lost.insert(key);
-                            }
-                            Cost::UnnamedKey => self.dst_lost_unnamed = true,
-                            Cost::Stretch(stretch) => self.dst_gap.add(stretch),
-                            Cost::Nothing => {}
-                        }
-                    }
-                    return Some(Err(err));
-                }
-                None => self.dst = Head::Finished,
+        if let Some(err) = self.dst.fill().await {
+            self.incomplete = true;
+            if self.dst.is_done() {
+                self.ended_by_failure = true;
             }
+            return Some(Err(err));
         }
 
-        match (&self.src, &self.dst) {
+        match (&self.src.head, &self.dst.head) {
             (Head::Finished, Head::Finished) => None,
             // A key one side reached while the other has run out is absent there. A side
             // sorting later says the same thing: reaching a key past this one settles
@@ -347,8 +406,8 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
         source: Option<PathBuf>,
         destination: Option<PathBuf>,
     ) -> Self {
-        self.src_root = source;
-        self.dst_root = destination;
+        self.src.root = source;
+        self.dst.root = destination;
         self
     }
 
@@ -365,17 +424,12 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
     // A walk that has not been advanced answers `false`, since neither side has said yet
     // whether it holds anything. That matches what the two walkers underneath do.
     pub(crate) fn is_done(&self) -> bool {
-        self.ended_by_failure || matches!((&self.src, &self.dst), (Head::Finished, Head::Finished))
+        self.ended_by_failure || (self.src.is_finished() && self.dst.is_finished())
     }
 
     fn take_source_only(&mut self) -> Pairing<S::Source, D::Source> {
-        let entry = self.take_src();
-        let destination = Self::missing(
-            &self.dst_gap,
-            &mut self.dst_lost,
-            self.dst_lost_unnamed,
-            &entry.key,
-        );
+        let entry = self.src.take();
+        let destination = self.dst.missing(&entry.key);
         Pairing {
             key: entry.key.clone(),
             source: SideState::Present(entry),
@@ -384,13 +438,8 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
     }
 
     fn take_destination_only(&mut self) -> Pairing<S::Source, D::Source> {
-        let entry = self.take_dst();
-        let source = Self::missing(
-            &self.src_gap,
-            &mut self.src_lost,
-            self.src_lost_unnamed,
-            &entry.key,
-        );
+        let entry = self.dst.take();
+        let source = self.src.missing(&entry.key);
         Pairing {
             key: entry.key.clone(),
             source,
@@ -398,66 +447,18 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
         }
     }
 
-    // What a side that did not produce this key is saying. Absent while it is accounting for
-    // itself, unknown while a failure has left it unable to, and unknown for a key it named as
-    // lost.
-    fn missing<T>(
-        gap: &Stretches,
-        lost: &mut BTreeSet<String>,
-        lost_unnamed: bool,
-        key: &str,
-    ) -> SideState<T> {
-        let_go_before(lost, key);
-        if lost.remove(key) {
-            return SideState::Unknown(KeysLost::OneKey);
-        }
-        match gap.covers(key) {
-            true => SideState::Unknown(KeysLost::UnknownRange),
-            // A range, because the conclusion here is that absence cannot be read from
-            // position on this side any more. `OneKey` says the keys around it are known,
-            // which a consumer would act on by holding back one key and trusting the rest.
-            false if lost_unnamed => SideState::Unknown(KeysLost::UnknownRange),
-            false => SideState::Absent,
-        }
-    }
-
     fn take_both(&mut self) -> Pairing<S::Source, D::Source> {
         // Neither side is missing here, so neither has anything to answer for — but a key held
         // from earlier has now been passed, and keeping it would grow the set for the length of
         // the run.
-        let src = self.take_src();
-        let dst = self.take_dst();
-        let_go_before(&mut self.src_lost, &src.key);
-        let_go_before(&mut self.dst_lost, &src.key);
+        let src = self.src.take();
+        let dst = self.dst.take();
+        self.src.release_before(&src.key);
+        self.dst.release_before(&src.key);
         Pairing {
             key: src.key.clone(),
             source: SideState::Present(src),
             destination: SideState::Present(dst),
-        }
-    }
-
-    fn take_src(&mut self) -> Entry<S::Source> {
-        // Producing a key releases every stretch the merge has passed. A key inside one, or one
-        // sorting before it, releases nothing: the failure was heard early and what it cost is
-        // still ahead.
-        if let Some(entry) = self.src.entry() {
-            let key = entry.key.clone();
-            self.src_gap.release_passed(&key);
-        }
-        match std::mem::replace(&mut self.src, Head::Unread) {
-            Head::Entry(entry) => entry,
-            _ => unreachable!("taken only with an entry at the head"),
-        }
-    }
-
-    fn take_dst(&mut self) -> Entry<D::Source> {
-        if let Some(entry) = self.dst.entry() {
-            let key = entry.key.clone();
-            self.dst_gap.release_passed(&key);
-        }
-        match std::mem::replace(&mut self.dst, Head::Unread) {
-            Head::Entry(entry) => entry,
-            _ => unreachable!("taken only with an entry at the head"),
         }
     }
 }
@@ -573,14 +574,6 @@ impl Walker {
         );
         walk
     }
-}
-
-// Let go of every held key sorting before this one.
-//
-// The merge runs in key order, so a key still held below this one was passed without either side
-// reaching it, and no decision will ever be owed for it.
-fn let_go_before(lost: &mut BTreeSet<String>, key: &str) {
-    *lost = lost.split_off(key);
 }
 
 // What a failure the side survived costs the merge.
@@ -904,8 +897,8 @@ mod tests {
     async fn one_pairing_reads_one_entry_from_each_side() {
         let mut walk = Walk::new(Scripted::of(&["a.txt", "b.txt"]), Scripted::of(&["a.txt"]));
         let _ = walk.next().await.expect("a pairing for a.txt");
-        assert_eq!(walk.source.reads, 1, "the source is read once");
-        assert_eq!(walk.destination.reads, 1, "the destination is read once");
+        assert_eq!(walk.src.stream.reads, 1, "the source is read once");
+        assert_eq!(walk.dst.stream.reads, 1, "the destination is read once");
     }
 
     #[tokio::test]
@@ -916,7 +909,7 @@ mod tests {
         let _ = walk.next().await.expect("a.txt");
         let _ = walk.next().await.expect("b.txt");
         assert_eq!(
-            walk.destination.reads, 1,
+            walk.dst.stream.reads, 1,
             "the waiting side is read once, not once per pairing"
         );
     }
@@ -1105,11 +1098,52 @@ mod tests {
             Scripted::from(vec![Err(a_lost_key("m.txt")), Ok(entry("z.txt"))]),
         );
         let _ = walk.next().await.expect("the failure");
-        assert_eq!(walk.dst_lost.len(), 1, "the key is held when it is named");
+        assert_eq!(walk.dst.lost.len(), 1, "the key is held when it is named");
         let _ = walk.next().await.expect("z.txt");
         assert!(
-            walk.dst_lost.is_empty(),
+            walk.dst.lost.is_empty(),
             "a key the merge passed without reaching is no longer held"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_held_key_is_let_go_while_answering_for_the_absent_side() {
+        // The same bound, on the path where the other side has nothing at this key. Pairing two
+        // present sides is what released the key above; here that never runs, so the release has
+        // to happen while the absent side is being answered for.
+        let mut walk = Walk::new(
+            Scripted::of(&["z.txt"]),
+            Scripted::from(vec![Err(a_lost_key("m.txt"))]),
+        );
+        let _ = walk.next().await.expect("the failure");
+        assert_eq!(walk.dst.lost.len(), 1, "the key is held when it is named");
+        let _ = walk.next().await.expect("z.txt");
+        assert!(
+            walk.dst.lost.is_empty(),
+            "a key passed while the absent side was answered for is no longer held"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stretch_the_merge_has_passed_is_no_longer_held() {
+        // Stretches are bounded the same way. A key that is past the prefix and outside it puts
+        // everything the failure hid behind the merge, and holding on would grow the list for the
+        // length of the run.
+        let mut walk = Walk::new(
+            Scripted::from(vec![Err(a_lost_directory()), Ok(entry("z.txt"))]),
+            Scripted::of(&["z.txt"]),
+        )
+        .with_roots(Some(PathBuf::from("/root")), None);
+        let _ = walk.next().await.expect("the failure");
+        assert_eq!(
+            walk.src.gap.0.len(),
+            1,
+            "the stretch is held where it is reported"
+        );
+        let _ = walk.next().await.expect("z.txt");
+        assert!(
+            walk.src.gap.0.is_empty(),
+            "a stretch the merge is past is no longer held"
         );
     }
 
@@ -1759,12 +1793,12 @@ mod tests {
         // Without this the local side cannot turn a failure's path into a key, and one
         // unreadable file would hold that side's whole account open.
         assert_eq!(
-            walk.src_root.as_deref(),
+            walk.src.root.as_deref(),
             Some(dir.path()),
             "the side that walks a filesystem is told the root it walks"
         );
         assert_eq!(
-            walk.dst_root, None,
+            walk.dst.root, None,
             "a listing names its own lost keys, so it needs no root"
         );
     }
