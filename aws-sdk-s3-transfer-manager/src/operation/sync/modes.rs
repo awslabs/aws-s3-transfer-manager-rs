@@ -322,11 +322,14 @@ mod tests {
 
     #[test]
     fn a_size_difference_is_reported_ahead_of_a_time_difference() {
-        // Both differ here. Size is the answer, because two sizes settle it without knowing
-        // anything about clocks.
+        // The times here say leave it alone — the destination was written later — and the sizes
+        // disagree. That combination is what makes the order matter: asking about the times first
+        // would answer "unchanged" and leave a destination of the wrong length that way for good.
+        // A pair where both tests point the same way proves nothing about which one ran.
         assert_eq!(
-            SizeAndTime.compare(&copying(object(1, 100), object(2, 50))),
-            send(TransferReason::SizeDiffers)
+            SizeAndTime.compare(&copying(object(1, 50), object(2, 100))),
+            send(TransferReason::SizeDiffers),
+            "a length that disagrees is a difference no timestamp can excuse"
         );
     }
 
@@ -547,6 +550,18 @@ mod tests {
         assert_eq!(
             ExactTimestamps.compare(&downloading(object(1, 100), local(1, 100, fs))),
             unchanged()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_size_difference_decides_even_where_the_times_say_leave_it() {
+        // The same precedence on the upload path, which reaches it through its own impl. The copy
+        // test above carries why the order matters.
+        let (_dir, fs) = a_local_entry().await;
+        assert_eq!(
+            SizeAndTime.compare(&uploading(local(1, 100, fs), object(9, 200))),
+            send(TransferReason::SizeDiffers),
+            "a length that disagrees is a difference no timestamp can excuse"
         );
     }
 

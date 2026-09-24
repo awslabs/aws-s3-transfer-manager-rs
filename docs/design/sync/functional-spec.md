@@ -674,6 +674,12 @@ at least one warning; clean.
 **FR-Fail-6** Failing to list a root at all MUST fail the run, and MUST be reported differently from an
 individual entry failing. One entry failing leaves a usable run; a root that cannot be listed means sync
 never knew what was there.
+
+A `Download` destination that does not exist yet is not this case, and MUST NOT fail the run. Nothing was
+listed there because nothing is there: every key the source holds is missing at the destination, which is
+a complete answer rather than an absent one, and the directory is created as entries are written
+(FR-Exec-3). A destination root that exists and cannot be read, or exists and is not a directory, still
+ends the run — neither can be written into, and neither says the destination is empty.
 *`[CLI]` `filegenerator.py` → `list_objects` / `_list_single_object` let `ClientError` propagate out of the generator, failing the command rather than producing an empty side.*
 
 **FR-Fail-7** A key whose side state is unknown on either side MUST get no action, and MUST be reported as

@@ -519,6 +519,21 @@ mod tests {
     }
 
     #[test]
+    fn the_coarser_loss_is_reported_whichever_side_lost_the_range() {
+        // The mirror of the case above. Reading only one side would downgrade a source that lost a
+        // whole subtree to the one key the destination lost, and a consumer acting on one name
+        // trusts every other position on both sides.
+        let (verdict, _) = decide(
+            SideState::Unknown(KeysLost::UnknownRange),
+            SideState::Unknown(KeysLost::OneKey),
+        );
+        let Verdict::Decided(Decision::Skip(skip)) = verdict else {
+            panic!("expected a skip, got {verdict:?}")
+        };
+        assert_eq!(skip.keys_lost(), Some(KeysLost::UnknownRange));
+    }
+
+    #[test]
     fn two_sides_that_each_lost_one_key_report_one_key() {
         let (verdict, _) = decide(
             SideState::Unknown(KeysLost::OneKey),

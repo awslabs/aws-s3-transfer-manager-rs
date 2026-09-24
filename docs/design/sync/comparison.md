@@ -93,8 +93,11 @@ holds only while both sides arrive in the same order. A directory bucket does no
 alphabetical order, so it is the configuration that has to be refused. **FR-Exec-5** wants a
 download to stamp the file with the object's time, and one of the comparisons below,
 `ExactTimestamps`, is only correct once something does. Nothing stamps it today, so on a download
-that comparison never reaches an equal pair and sends every key on every run. **FR-Dry-2** wants a
-dry run to go through the same comparison as a real run, so this layer stops at a decision. And
+that comparison never reaches an equal pair and sends every key on every run. **FR-Fail-6** ends a
+run when a root cannot be listed, and a download destination that does not exist yet is the one
+thing that looks like that case without being it: nothing was listed there because nothing is
+there, so every key the source holds is missing and the plan is whole. **FR-Dry-2** wants a dry
+run to go through the same comparison as a real run, so this layer stops at a decision. And
 **NFR-Mem-1** and **NFR-Tput-2** are the memory and per-key bounds behind two things: a comparison
 that keeps nothing at all, and a merge whose own bookkeeping is bounded by the directories it has
 open rather than by the number of keys. That second bound holds because the names a merge holds
@@ -154,13 +157,11 @@ that last part, a name excluded from one side but not the other looks like a fil
 Sorting the whole tree costs three things, all following from one fact: a file cannot be handed
 over until every subdirectory sorting ahead of it has been read, because one of those subtrees may
 hold a key that sorts earlier. So time-to-first-decision grows with the tree, and on a deep one
-the walk is nearly finished before anything comes out. That sits against **NFR-Lat-1**, which asks
-for the first transfer to start as promptly on a million keys as on ten — the listing side meets
-it, and a local walk in this order does not. Claiming a subtree to walk in parallel is unavailable
-for the same reason: a subtree handed to another worker cannot know where its keys belong among
-the ones still unread. The merge itself would be one step at a time regardless, since pairing two
-ordered streams means looking at one key from each. The third cost is memory, and it stays small.
-The walk holds the children of every directory on its way down, which
+the walk is nearly finished before anything comes out. Claiming a subtree to walk in parallel is
+unavailable for the same reason: a subtree handed to another worker cannot know where its keys
+belong among the ones still unread. The merge itself would be one step at a time regardless, since
+pairing two ordered streams means looking at one key from each. The third cost is memory, and it
+stays small. The walk holds the children of every directory on its way down, which
 [`enumeration.md`](enumeration.md) prices. The merge adds one entry per side plus whatever names a
 failure put at risk (D7), so this layer is a small constant on top of the shape of the tree.
 
@@ -259,9 +260,9 @@ it today.
 
 Because nothing produces it, whatever ends up driving the comparison should treat one as a bug. It
 should skip the name, say why, and mark the plan incomplete: a name that should have been
-transferred and was not is the same hole D8 describes. No new reason is needed to say so, because
-the skip reason for a pair nothing could describe already covers it. The driver does not live
-here, and `Walk` does not name a single one of the comparison's types.
+transferred and was not is the same hole D8 describes. No new reason is needed to say so: a skip
+already carries `Deferred` for exactly this, added alongside the answer type itself. The driver
+does not live here, and `Walk` does not name a single one of the comparison's types.
 
 **D7. A failure has to become specific names, or absence cannot be trusted again.**
 When something goes wrong, the walk says whether it cost one name or a whole stretch of them.
@@ -401,8 +402,9 @@ a directory bucket, where the parameter would be refused. Turning it on for ever
 those callers. Sync asks for it on its own listings and leaves
 the shared default alone.
 
-The rules are applied where the listing is read, and what reaches the comparison is
-a single obstruction saying the object cannot be read (D3). A comparison is generic over the two
+The rules are applied where the listing is read, and what reaches the comparison is an obstruction
+saying the object cannot be read — archived, or a restore that has not finished, kept apart so a
+caller learns whether asking again is worth it (D3). A comparison is generic over the two
 side types, so reading the storage class directly would mean either carrying the rules through the
 interface or repeating the check in every comparison — and one that forgot would dispatch a
 transfer that fails.
@@ -476,6 +478,7 @@ The left column already existed in enumeration, the right is new here:
                                      Walker, …Builder        what a run was configured with
                                      LocalAndBucket, …Builder  one local root, one bucket
                                      Walk                    the run in progress
+                                     LocalDestination        a download's local side; may be absent
 ```
 
 Enumeration gains two things, both on the metadata it already attaches to every entry.

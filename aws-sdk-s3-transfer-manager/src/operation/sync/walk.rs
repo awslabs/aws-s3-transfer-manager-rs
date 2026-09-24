@@ -221,6 +221,11 @@ impl<K: KeyStream> Side<K> {
         if let Some(entry) = self.head.entry() {
             let key = entry.key.clone();
             self.gap.release_passed(&key);
+            // The side answering for a key it did not produce prunes in `missing`; this is the
+            // other path. Without it the side producing keys never lets go of the ones it held,
+            // and the set grows for the length of the run instead of staying inside what the
+            // directories currently open are holding.
+            self.release_before(&key);
         }
         match std::mem::replace(&mut self.head, Head::Unread) {
             Head::Entry(entry) => entry,
@@ -309,10 +314,18 @@ impl Stretch {
     }
 
     // Whether the merge reaching this key has passed everything the failure hid.
+    //
+    // Not simply the negation of `covers`. The covered set runs from the name itself to the end of
+    // `name/`, so a key extending the name with a byte below `/` — `link.txt` against `link`, where
+    // `.` is 0x2E and `/` is 0x2F — is neither covered nor past it: the whole subtree is still
+    // ahead. Releasing there would read every key the failure hid as absent.
     fn passed_by(&self, key: &str) -> bool {
         match &self.under {
             None => false,
-            Some(name) => !at_or_under(key, name) && key > name.as_str(),
+            Some(name) => match key.strip_prefix(name.as_str()) {
+                Some(rest) => rest.as_bytes().first().is_some_and(|b| *b > b'/'),
+                None => key > name.as_str(),
+            },
         }
     }
 }
@@ -449,13 +462,9 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
     }
 
     fn take_both(&mut self) -> Pairing<S::Source, D::Source> {
-        // Neither side is missing here, so neither has anything to answer for — but a key held
-        // from earlier has now been passed, and keeping it would grow the set for the length of
-        // the run.
+        // Neither side is missing here, so neither has anything to answer for.
         let src = self.src.take();
         let dst = self.dst.take();
-        self.src.release_before(&src.key);
-        self.dst.release_before(&src.key);
         Pairing {
             key: src.key.clone(),
             source: SideState::Present(src),
@@ -1075,7 +1084,11 @@ mod tests {
         let m = walk.next().await.expect("m.txt").expect("a pairing");
         assert_eq!(m.key(), "m.txt");
         let z = walk.next().await.expect("z.txt").expect("a pairing");
-        assert_eq!(at(z.source()), At::Gone, "the gap closed at m.txt");
+        assert_eq!(
+            at(z.source()),
+            At::Gone,
+            "`z.txt` is past everything the failure hid, so the source is simply absent"
+        );
     }
 
     // A listing that dropped one object and named which.
@@ -1166,6 +1179,24 @@ mod tests {
         assert!(
             walk.dst.lost.is_empty(),
             "a key the merge passed without reaching is no longer held"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_side_producing_keys_lets_go_of_its_own_held_ones() {
+        // The third pairing path. Answering for a key a side did not produce prunes that side, and
+        // pairing two present sides prunes both — but a side producing keys while the other has
+        // none was pruning nothing, so its held set grew for the whole run.
+        let mut walk = Walk::new(
+            Scripted::from(vec![Err(a_lost_key("m.txt")), Ok(entry("z.txt"))]),
+            Scripted::of(&[]),
+        );
+        let _ = walk.next().await.expect("the failure");
+        assert_eq!(walk.src.lost.len(), 1, "the key is held when it is named");
+        let _ = walk.next().await.expect("z.txt");
+        assert!(
+            walk.src.lost.is_empty(),
+            "a key the producing side has passed is no longer held"
         );
     }
 
@@ -1888,6 +1919,66 @@ mod tests {
                 ("zzz.txt", At::Here, At::Here),
             ]),
             "a failure naming the root hid every key under it"
+        );
+    }
+
+    #[test]
+    fn a_stretch_is_held_across_its_whole_span_and_let_go_after_it() {
+        // The span is the name and everything under `name/`. What makes this worth a unit test is
+        // that the two boundaries sit one byte apart: `/` is 0x2F, so `.` `-` `!` and a space all
+        // extend the name into keys sorting *before* the subtree, while `0` onwards sort after it.
+        let stretch = Stretch {
+            under: Some("link".to_string()),
+        };
+        for key in ["link", "link/inner.txt", "link/a/b/c"] {
+            assert!(stretch.covers(key), "{key} is one of the keys it hid");
+            assert!(!stretch.passed_by(key), "{key} does not settle the span");
+        }
+        for key in ["link.txt", "link-old", "link!", "link 2"] {
+            assert!(
+                !stretch.covers(key),
+                "{key} is a neighbour, not a key it hid"
+            );
+            assert!(
+                !stretch.passed_by(key),
+                "{key} sorts below the subtree, so it settles nothing"
+            );
+        }
+        for key in ["link0", "linkfoo", "zzz.txt"] {
+            assert!(!stretch.covers(key), "{key} is a neighbour");
+            assert!(stretch.passed_by(key), "{key} sorts past the whole span");
+        }
+        assert!(
+            !stretch.passed_by("a.txt"),
+            "a key before the name settles nothing either"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sibling_sorting_below_the_subtree_does_not_release_it() {
+        // `link.txt` extends the lost name with `.`, which is 0x2E, and a key order puts that
+        // before `/` at 0x2F — so the whole subtree is still ahead when this sibling arrives.
+        // Releasing here reads every key the failure hid as absent, and delete mode removes the
+        // lot. The same shape costs a whole tree when the lost name is a directory: `photos.zip`
+        // beside an unreadable `photos/` would give up every object under it.
+        let err = StreamError::Walk(WalkError::new(
+            Some(PathBuf::from("/root/link")),
+            WalkErrorKind::DirectoryUnreadable,
+            Box::from("permission denied"),
+        ));
+        let walk = Walk::new(
+            Scripted::from(vec![Err(err), Ok(entry("link.txt"))]),
+            Scripted::of(&["link.txt", "link/inner.txt", "zzz.txt"]),
+        )
+        .with_roots(Some(PathBuf::from("/root")), None);
+        assert_eq!(
+            drain(walk).await,
+            plan(&[
+                ("link.txt", At::Here, At::Here),
+                ("link/inner.txt", At::UnknownRange, At::Here),
+                ("zzz.txt", At::Gone, At::Here),
+            ]),
+            "a key that sorts below the subtree settles nothing about it"
         );
     }
 
