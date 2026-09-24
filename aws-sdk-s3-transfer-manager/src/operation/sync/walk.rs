@@ -1688,6 +1688,9 @@ mod tests {
         seen
     }
 
+    // `mkfifo` is a foreign function Miri has no shim for, and there is no way to make one of
+    // these without it.
+    #[cfg_attr(miri, ignore)]
     #[cfg(unix)]
     #[tokio::test]
     async fn a_named_pipe_is_walked_and_cannot_have_its_bytes_sent() {
