@@ -1306,6 +1306,7 @@ mod tests {
         }
     }
 
+    #[cfg_attr(miri, ignore)]
     #[cfg(unix)]
     #[tokio::test]
     async fn a_real_walk_failure_is_named_against_the_root_the_walk_reports() {
@@ -1350,6 +1351,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore)]
     #[cfg(unix)]
     #[tokio::test]
     async fn two_keys_lost_from_one_directory_are_both_unknown() {
@@ -1399,6 +1401,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore)]
     #[cfg(unix)]
     #[tokio::test]
     async fn two_stretches_lost_from_one_side_are_both_covered() {
@@ -1448,6 +1451,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore)]
     #[cfg(unix)]
     #[tokio::test]
     async fn a_loss_reported_before_its_own_position_still_covers_the_keys_it_hid() {
@@ -1688,8 +1692,6 @@ mod tests {
         seen
     }
 
-    // `mkfifo` is a foreign function Miri has no shim for, and there is no way to make one of
-    // these without it.
     #[cfg_attr(miri, ignore)]
     #[cfg(unix)]
     #[tokio::test]
@@ -1833,7 +1835,7 @@ mod tests {
     async fn a_destination_that_appeared_after_the_check_still_ends_the_run() {
         let dir = tempfile::tempdir().expect("a temp dir");
         let root = dir.path().join("appeared");
-        tokio::fs::write(&root, b"x").await.expect("write the file");
+        std::fs::write(&root, b"x").expect("write the file");
         let walker = Walker::builder().build();
         let local = LocalDestination {
             walk: walker.local_walk(root.clone()),
@@ -1859,7 +1861,7 @@ mod tests {
     async fn a_download_into_a_file_still_ends_the_run() {
         let dir = tempfile::tempdir().expect("a temp dir");
         let file = dir.path().join("not-a-dir");
-        tokio::fs::write(&file, b"x").await.expect("write the file");
+        std::fs::write(&file, b"x").expect("write the file");
         let walker = Walker::builder().build();
         let local = LocalDestination::new(walker.local_walk(file.clone()), &file);
         let mut walk = Walk::new(Scripted::of(&["a.txt"]), local).with_roots(None, Some(file));
