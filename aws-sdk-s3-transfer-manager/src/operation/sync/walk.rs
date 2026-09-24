@@ -24,7 +24,8 @@ use crate::io::key::stream::{
     key_under_root, local_predicate, s3_predicate, Entry, KeyStream, KeysLost, StreamError,
 };
 use crate::io::walk::{
-    FsWalk, FsWalkContext, FsWalker, S3Walk, S3WalkContext, S3Walker, SortOrder,
+    FsEntry, FsWalk, FsWalkContext, FsWalker, S3Walk, S3WalkContext, S3Walker, SortOrder,
+    WalkErrorKind,
 };
 
 // What one side holds at the key the merge has reached.
@@ -511,16 +512,28 @@ impl Walker {
 
     // Build both streams against the two roots and start the merge for an upload.
     //
-    // TODO(sync): `downloading` and `copying` to follow. `Mode` already picks a comparison for
-    // each of the three, and the merge is generic over both side types, so a download is this
-    // function with the two streams swapped. A copy needs a different context first, because one
-    // `bucket` field cannot name a source and a destination bucket.
-    pub(crate) fn uploading(&self, ctx: WalkContext) -> Walk<FsWalk, S3Walk> {
+    // TODO(sync): `copying` to follow, once there is a context that can hold two endpoints. Its
+    // two roots may sit in different regions and different accounts, so it needs two clients, and
+    // the copy request itself goes to the destination while naming the source — which means the
+    // destination credentials have to be able to read the source object.
+    pub(crate) fn uploading(&self, ctx: LocalAndBucket) -> Walk<FsWalk, S3Walk> {
         let root = ctx.local_root.clone();
         let local = self.local_walk(ctx.local_root);
         let remote = self.remote_walk(ctx.client, ctx.bucket, ctx.prefix);
-        // Only the source walks a filesystem here; a listing names its own lost keys.
+        // Only the source walks a filesystem; a listing names its own lost keys.
         Walk::new(local, remote).with_roots(Some(root), None)
+    }
+
+    // The same two roots the other way round: the listing is the source and the local tree is
+    // where entries land.
+    //
+    // The root moves to the destination side, because that is the side whose failures name an
+    // absolute path this layer has to turn into a key.
+    pub(crate) fn downloading(&self, ctx: LocalAndBucket) -> Walk<S3Walk, LocalDestination> {
+        let root = ctx.local_root.clone();
+        let remote = self.remote_walk(ctx.client, ctx.bucket, ctx.prefix);
+        let local = LocalDestination::new(self.local_walk(ctx.local_root), &root);
+        Walk::new(remote, local).with_roots(None, Some(root))
     }
 
     // The merge depends on all three of these, so this layer fixes them and a caller never
@@ -640,30 +653,80 @@ fn cost_of(err: &StreamError, root: Option<&Path>) -> Cost {
     }
 }
 
-// The two roots one run compares.
+// The local side of a download, which may name a directory that does not exist yet.
+//
+// Syncing a bucket into a directory nobody has created is a supported starting state: nothing is
+// there, and the directory appears as entries are written. A walk reports a root it cannot open as
+// the failure that ends a run, which is the right answer for a side being read from and the wrong
+// one here — every listed key is simply missing, and the plan is whole.
+//
+// Only an absent root is swallowed. A root that exists and is not a directory still ends the run,
+// because nothing can be written into it either, and a root that could not be read is a permission
+// problem the caller has to hear about.
+pub(crate) struct LocalDestination {
+    walk: FsWalk,
+    absent: bool,
+}
+
+impl LocalDestination {
+    // Asked before the walk starts, because afterwards there is no telling a root that was never
+    // there from one that could not be read. `Ok(false)` is the only answer that means absent: an
+    // error leaves the walk to report it.
+    fn new(walk: FsWalk, root: &Path) -> Self {
+        Self {
+            walk,
+            absent: matches!(root.try_exists(), Ok(false)),
+        }
+    }
+}
+
+impl KeyStream for LocalDestination {
+    type Source = FsEntry;
+
+    fn is_done(&self) -> bool {
+        self.walk.is_done()
+    }
+
+    async fn next_entry(&mut self) -> Option<Result<Entry<FsEntry>, StreamError>> {
+        match self.walk.next_entry().await {
+            Some(Err(StreamError::Walk(err)))
+                if self.absent && err.kind() == WalkErrorKind::SourceUnreadable =>
+            {
+                None
+            }
+            other => other,
+        }
+    }
+}
+
+// One local directory and one bucket, which is what an upload and a download each need. Which of
+// the two is the source is the method's business, not this type's.
+//
+// A copy needs neither field and both endpoints: its two roots may sit in different regions and
+// different accounts, so it takes two clients rather than two bucket names.
 #[derive(Debug)]
-pub(crate) struct WalkContext {
+pub(crate) struct LocalAndBucket {
     local_root: PathBuf,
     client: aws_sdk_s3::Client,
     bucket: String,
     prefix: Option<String>,
 }
 
-impl WalkContext {
-    pub(crate) fn builder() -> WalkContextBuilder {
-        WalkContextBuilder::default()
+impl LocalAndBucket {
+    pub(crate) fn builder() -> LocalAndBucketBuilder {
+        LocalAndBucketBuilder::default()
     }
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct WalkContextBuilder {
+pub(crate) struct LocalAndBucketBuilder {
     local_root: Option<PathBuf>,
     client: Option<aws_sdk_s3::Client>,
     bucket: Option<String>,
     prefix: Option<String>,
 }
 
-impl WalkContextBuilder {
+impl LocalAndBucketBuilder {
     // The directory the local side walks. Required.
     #[must_use]
     pub(crate) fn local_root(mut self, root: impl Into<PathBuf>) -> Self {
@@ -696,8 +759,8 @@ impl WalkContextBuilder {
     //
     // Panics if `local_root`, `client` or `bucket` has not been set.
     #[must_use]
-    pub(crate) fn build(self) -> WalkContext {
-        WalkContext {
+    pub(crate) fn build(self) -> LocalAndBucket {
+        LocalAndBucket {
             local_root: self
                 .local_root
                 .expect("required field `local_root` should be set"),
@@ -1729,6 +1792,82 @@ mod tests {
         );
     }
 
+    // The window between asking whether the root exists and walking it. If something appears at
+    // that name in between, the walk fails for a reason absence does not excuse, and swallowing it
+    // would plan a transfer for every key into a place nothing can be written.
+    #[tokio::test]
+    async fn a_destination_that_appeared_after_the_check_still_ends_the_run() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let root = dir.path().join("appeared");
+        tokio::fs::write(&root, b"x").await.expect("write the file");
+        let walker = Walker::builder().build();
+        let local = LocalDestination {
+            walk: walker.local_walk(root.clone()),
+            absent: true,
+        };
+        let mut walk = Walk::new(Scripted::of(&["a.txt"]), local).with_roots(None, Some(root));
+        let mut errors = 0;
+        while let Some(next) = walk.next().await {
+            if next.is_err() {
+                errors += 1;
+            }
+        }
+        assert_eq!(
+            (errors, walk.is_plan_complete()),
+            (1, false),
+            "only a root that is genuinely missing is treated as holding no keys"
+        );
+    }
+
+    // A destination that exists and is not a directory is still fatal: nothing can be written
+    // into it, so carrying on would plan transfers that cannot land.
+    #[tokio::test]
+    async fn a_download_into_a_file_still_ends_the_run() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let file = dir.path().join("not-a-dir");
+        tokio::fs::write(&file, b"x").await.expect("write the file");
+        let walker = Walker::builder().build();
+        let local = LocalDestination::new(walker.local_walk(file.clone()), &file);
+        let mut walk = Walk::new(Scripted::of(&["a.txt"]), local).with_roots(None, Some(file));
+        let mut errors = 0;
+        let mut pairings = 0;
+        while let Some(next) = walk.next().await {
+            match next {
+                Ok(_) => pairings += 1,
+                Err(_) => errors += 1,
+            }
+        }
+        assert_eq!(
+            (pairings, errors, walk.is_plan_complete()),
+            (0, 1, false),
+            "a destination that is not a directory ends the run and says the plan is partial"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_download_into_a_missing_root_plans_every_key() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let missing = dir.path().join("newdir");
+        let walker = Walker::builder().build();
+        let local = LocalDestination::new(walker.local_walk(missing.clone()), &missing);
+        let listing = Scripted::of(&["a.txt", "b.txt", "c.txt"]);
+        let mut walk = Walk::new(listing, local).with_roots(None, Some(missing));
+        let mut pairings = 0;
+        let mut errors = 0;
+        while let Some(next) = walk.next().await {
+            match next {
+                Ok(_) => pairings += 1,
+                Err(_) => errors += 1,
+            }
+        }
+        assert_eq!(
+            (pairings, errors, walk.is_plan_complete()),
+            (3, 0, true),
+            "a destination directory that does not exist yet holds no keys, \
+             so every listed key is missing there and the plan is whole"
+        );
+    }
+
     #[tokio::test]
     async fn a_loss_naming_the_root_itself_covers_every_key_under_it() {
         let err = StreamError::Walk(WalkError::new(
@@ -1779,7 +1918,7 @@ mod tests {
     async fn a_walk_is_built_against_both_roots() {
         let dir = tempfile::tempdir().expect("a temp dir");
         let walk = Walker::builder().build().uploading(
-            WalkContext::builder()
+            LocalAndBucket::builder()
                 .local_root(dir.path())
                 .client(a_client())
                 .bucket("amzn-s3-demo-bucket")
@@ -1800,6 +1939,59 @@ mod tests {
         assert_eq!(
             walk.dst.root, None,
             "a listing names its own lost keys, so it needs no root"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_prefix_reaches_the_listing_in_either_direction() {
+        // The prefix is what roots the S3 side. Dropping it lists the whole bucket, and under
+        // delete mode every object outside the prefix then reads as a key the source does not
+        // have — a delete planned for each one.
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let context = || {
+            LocalAndBucket::builder()
+                .local_root(dir.path())
+                .client(a_client())
+                .bucket("amzn-s3-demo-bucket")
+                .prefix("photos/")
+                .build()
+        };
+        let up = Walker::builder().build().uploading(context());
+        assert_eq!(
+            up.dst.stream.prefix(),
+            Some("photos/"),
+            "an upload lists the destination under the prefix it was given"
+        );
+        let down = Walker::builder().build().downloading(context());
+        assert_eq!(
+            down.src.stream.prefix(),
+            Some("photos/"),
+            "a download lists the source under the same prefix"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_download_walks_the_same_two_roots_the_other_way_round() {
+        // The same context serves both directions, so the thing worth pinning is which side is
+        // told the local root. Getting it backwards would leave a download unable to name the
+        // key behind an unreadable local file, and one such file would take the whole
+        // destination side out of the comparison.
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let walk = Walker::builder().build().downloading(
+            LocalAndBucket::builder()
+                .local_root(dir.path())
+                .client(a_client())
+                .bucket("amzn-s3-demo-bucket")
+                .build(),
+        );
+        assert_eq!(
+            walk.src.root, None,
+            "the listing is the source here, and it names its own lost keys"
+        );
+        assert_eq!(
+            walk.dst.root.as_deref(),
+            Some(dir.path()),
+            "the local tree is the destination here, so it is the side told the root"
         );
     }
 }
