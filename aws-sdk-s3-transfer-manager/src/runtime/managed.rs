@@ -93,6 +93,12 @@ struct ThreadHandle {
 /// from the task executing the operation, so the thread-local
 /// [`MANAGED_THREAD_CPU`] identifies the partition that owns local reuse for
 /// that request.
+///
+/// Some operations are sent from outside the managed threads, for example
+/// [`UploadHandle::abort`](crate::operation::upload::UploadHandle::abort)
+/// runs on the caller's runtime. Those requests use a randomly selected
+/// partition: establishment and protocol drivers still run on that partition's
+/// thread, and the calling task only awaits the response.
 #[derive(Debug, Clone)]
 struct ManagedHttpClient {
     /// One client per managed thread, indexed by thread (and partition) index.
@@ -118,10 +124,10 @@ impl HttpClient for ManagedHttpClient {
         settings: &HttpConnectorSettings,
         components: &SmithyRuntimeComponents,
     ) -> SharedHttpConnector {
-        let cpu_index = MANAGED_THREAD_CPU
+        let index = MANAGED_THREAD_CPU
             .with(|c| c.get())
-            .expect("ManagedHttpClient used from a non-managed thread");
-        self.clients[cpu_index].http_connector(settings, components)
+            .unwrap_or_else(|| fastrand::usize(..self.clients.len()));
+        self.clients[index].http_connector(settings, components)
     }
 
     fn connector_metadata(&self) -> Option<ConnectorMetadata> {
