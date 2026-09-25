@@ -323,8 +323,8 @@ impl ManagedThreadRuntime {
             .collect();
 
         let mut components = RuntimeComponents::default();
-        if http.is_some() {
-            components.set_http_client(build_http_client(&threads));
+        if let Some(http) = http {
+            components.set_http_client(build_http_client(&threads, &http));
         }
         components.set_direct_io(true);
 
@@ -348,7 +348,15 @@ impl ManagedThreadRuntime {
 /// maintenance on its thread's runtime, so a connection's I/O stays on the
 /// thread that opened it. Partition identity is the thread index, which is also
 /// the index [`ManagedHttpClient`] reads from [`MANAGED_THREAD_CPU`].
-fn build_http_client(threads: &[ThreadHandle]) -> SharedHttpClient {
+///
+/// When network interfaces are configured, each partition binds its
+/// connections to the interface [`partition_interface`] assigns its thread.
+///
+/// # Panics
+///
+/// Panics if the pool rejects its configuration, for example an interface name
+/// containing a NUL byte.
+fn build_http_client(threads: &[ThreadHandle], options: &RuntimeHttpOptions) -> SharedHttpClient {
     debug_assert!(
         threads.iter().enumerate().all(|(i, th)| th.id.0 == i),
         "thread ids must be dense indices"
@@ -362,24 +370,89 @@ fn build_http_client(threads: &[ThreadHandle]) -> SharedHttpClient {
     );
     #[cfg(not(target_os = "android"))]
     let dns_resolver = ShufflingDnsResolver::new(aws_smithy_dns::HickoryDnsResolver::default());
+
     let partitions = threads.iter().map(|th| {
-        Partition::new(
+        let partition = Partition::new(
             PartitionId::from_index(th.id.0),
             TokioDriverSpawner::from_handle(th.runtime_handle.clone()),
-        )
+        );
+        bind_interface(partition, th.id, &options.network_interfaces)
     });
     let pool = ConnectionPool::builder()
         .dns_resolver(dns_resolver)
         .partitions(partitions)
         .tls_provider(Provider::Rustls(CryptoMode::AwsLc))
         .build_https()
-        .expect("connection pool configuration is valid for a non-empty topology");
+        .expect("failed to build the managed runtime connection pool");
     let clients = threads
         .iter()
         .map(|th| pool::Client::from_partition(&pool, PartitionId::from_index(th.id.0)))
         .collect::<Result<Arc<[_]>, _>>()
         .expect("every managed thread has a declared partition");
     ManagedHttpClient { clients }.into_shared()
+}
+
+/// Bind `partition` to the interface [`partition_interface`] assigns `thread`.
+#[cfg(any(
+    target_os = "android",
+    target_os = "fuchsia",
+    target_os = "illumos",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "solaris",
+    target_os = "tvos",
+    target_os = "visionos",
+    target_os = "watchos",
+))]
+fn bind_interface(partition: Partition, thread: Cpu, interfaces: &[String]) -> Partition {
+    match partition_interface(thread, interfaces) {
+        Some(interface) => partition.interface(interface),
+        None => partition,
+    }
+}
+
+/// Interface binding is unavailable on this platform, and the public setters
+/// that populate `interfaces` are not compiled.
+#[cfg(not(any(
+    target_os = "android",
+    target_os = "fuchsia",
+    target_os = "illumos",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "solaris",
+    target_os = "tvos",
+    target_os = "visionos",
+    target_os = "watchos",
+)))]
+fn bind_interface(partition: Partition, _thread: Cpu, _interfaces: &[String]) -> Partition {
+    partition
+}
+
+/// The network interface a managed thread's partition binds to: interfaces are
+/// assigned to threads round-robin in configuration order. `None` when no
+/// interfaces are configured, leaving selection to OS routing.
+///
+/// Threads are not pinned to NUMA nodes, so assignment cannot follow NIC
+/// locality; round-robin spreads threads evenly across interfaces.
+#[cfg(any(
+    target_os = "android",
+    target_os = "fuchsia",
+    target_os = "illumos",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "solaris",
+    target_os = "tvos",
+    target_os = "visionos",
+    target_os = "watchos",
+))]
+fn partition_interface(thread: Cpu, interfaces: &[String]) -> Option<&str> {
+    if interfaces.is_empty() {
+        return None;
+    }
+    Some(&interfaces[thread.0 % interfaces.len()])
 }
 
 /// Builder for [`ManagedThreadRuntime`].
@@ -580,6 +653,54 @@ mod tests {
         );
         let rt = rt_holder.get().unwrap().clone();
         (handle, rt)
+    }
+
+    #[cfg(any(
+        target_os = "android",
+        target_os = "fuchsia",
+        target_os = "illumos",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "solaris",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos",
+    ))]
+    #[test]
+    fn partition_interface_assigns_round_robin() {
+        let interfaces = ["ens5".to_string(), "ens6".to_string()];
+        let assigned: Vec<_> = (0..5)
+            .map(|i| partition_interface(Cpu(i), &interfaces))
+            .collect();
+        assert_eq!(
+            assigned,
+            [
+                Some("ens5"),
+                Some("ens6"),
+                Some("ens5"),
+                Some("ens6"),
+                Some("ens5")
+            ]
+        );
+    }
+
+    #[cfg(any(
+        target_os = "android",
+        target_os = "fuchsia",
+        target_os = "illumos",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "solaris",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos",
+    ))]
+    #[test]
+    fn partition_interface_unbound_without_interfaces() {
+        assert_eq!(partition_interface(Cpu(0), &[]), None);
+        assert_eq!(partition_interface(Cpu(3), &[]), None);
     }
 
     #[test]

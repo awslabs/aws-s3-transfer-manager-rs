@@ -6,13 +6,14 @@
 use aws_config::BehaviorVersion;
 use aws_runtime::user_agent::FrameworkMetadata;
 
-use crate::config::{Builder, Config};
+use crate::config::{Builder, Config, S3ClientConfig};
 use crate::types::{ConcurrencyMode, MemoryConfig, PartSize, RuntimeMode};
 
 /// Load transfer manager [`Config`] from the environment.
 #[derive(Default, Debug)]
 pub struct ConfigLoader {
     builder: Builder,
+    network_interfaces: Vec<String>,
 }
 
 impl ConfigLoader {
@@ -67,6 +68,47 @@ impl ConfigLoader {
         self
     }
 
+    /// Bind the runtime-provided HTTP transport's connections to these network
+    /// interfaces.
+    ///
+    /// See [`S3ClientConfig::network_interfaces`] for assignment, scope, and
+    /// platform availability.
+    #[cfg(any(
+        target_os = "android",
+        target_os = "fuchsia",
+        target_os = "illumos",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "solaris",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos",
+    ))]
+    #[cfg_attr(
+        docsrs,
+        doc(cfg(any(
+            target_os = "android",
+            target_os = "fuchsia",
+            target_os = "illumos",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "solaris",
+            target_os = "tvos",
+            target_os = "visionos",
+            target_os = "watchos",
+        )))
+    )]
+    pub fn network_interfaces<I, S>(mut self, interfaces: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.network_interfaces = interfaces.into_iter().map(Into::into).collect();
+        self
+    }
+
     /// Sets the framework metadata for the transfer manager.
     ///
     /// This _optional_ name is used to identify the framework using transfer manager in the user agent that
@@ -100,10 +142,12 @@ impl ConfigLoader {
 
         let sdk_client_builder = aws_sdk_s3::config::Builder::from(&shared_config);
 
+        let mut s3_config = S3ClientConfig::new(sdk_client_builder);
+        s3_config.network_interfaces = self.network_interfaces;
         let builder = self
             .builder
             .machine_profile(Some(profile))
-            .s3_config(crate::config::S3ClientConfig::new(sdk_client_builder));
+            .s3_config(s3_config);
         builder.build()
     }
 }
@@ -236,6 +280,29 @@ mod tests {
             .machine_profile()
             .expect("loader populates a machine profile");
         assert!(profile.vcpus >= 1);
+    }
+
+    #[cfg(any(
+        target_os = "android",
+        target_os = "fuchsia",
+        target_os = "illumos",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "solaris",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos",
+    ))]
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn load_applies_network_interfaces() {
+        let config = crate::from_env()
+            .network_interfaces(["ens5", "ens6"])
+            .load()
+            .await;
+        let http = config.runtime_http().expect("loader enables runtime HTTP");
+        assert_eq!(http.network_interfaces, ["ens5", "ens6"]);
     }
 
     // Tests the pure parser, so it never touches the process environment and

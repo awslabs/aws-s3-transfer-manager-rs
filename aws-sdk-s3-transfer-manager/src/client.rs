@@ -308,9 +308,16 @@ impl Client {
                     }
                     Arc::new(builder.build())
                 }
-                RuntimeMode::MultiThreadTokio => Arc::new(
-                    crate::runtime::TokioMultiThreadRuntime::new(weak_handle.clone()),
-                ),
+                RuntimeMode::MultiThreadTokio => {
+                    if runtime_http.is_some_and(|http| !http.network_interfaces.is_empty()) {
+                        tracing::warn!(
+                            "network interfaces are ignored under RuntimeMode::MultiThreadTokio"
+                        );
+                    }
+                    Arc::new(crate::runtime::TokioMultiThreadRuntime::new(
+                        weak_handle.clone(),
+                    ))
+                }
             };
 
             let s3_client = match config.take_s3_client_source() {
