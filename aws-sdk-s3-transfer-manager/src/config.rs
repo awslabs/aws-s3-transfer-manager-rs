@@ -175,6 +175,18 @@ impl Config {
         self.framework_metadata.as_ref()
     }
 
+    /// HTTP options for the runtime-provided transport, or `None` when the
+    /// runtime's HTTP client would not be installed: a finished S3 client was
+    /// supplied, or runtime HTTP is disabled.
+    pub(crate) fn runtime_http(&self) -> Option<crate::runtime::RuntimeHttpOptions> {
+        match self.s3_client_source.as_ref()? {
+            S3ClientSource::FromConfig(config) if config.enable_runtime_http => {
+                Some(crate::runtime::RuntimeHttpOptions {})
+            }
+            _ => None,
+        }
+    }
+
     /// Consume the S3 client source, returning it.
     pub(crate) fn take_s3_client_source(&mut self) -> S3ClientSource {
         self.s3_client_source
@@ -406,5 +418,28 @@ mod tests {
 
         let from_builder: S3ClientConfig = s3_config_builder().into();
         assert!(from_builder.enable_runtime_http);
+    }
+
+    #[test]
+    fn runtime_http_present_for_s3_config() {
+        let config = Config::builder().s3_config(s3_config_builder()).build();
+        assert!(config.runtime_http().is_some());
+    }
+
+    #[test]
+    fn runtime_http_absent_without_runtime_transport() {
+        let disabled = Config::builder()
+            .s3_config(S3ClientConfig::new(s3_config_builder()).enable_runtime_http(false))
+            .build();
+        assert!(disabled.runtime_http().is_none());
+
+        let provided = Config::builder()
+            .client(aws_sdk_s3::Client::from_conf(
+                s3_config_builder()
+                    .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+                    .build(),
+            ))
+            .build();
+        assert!(provided.runtime_http().is_none());
     }
 }

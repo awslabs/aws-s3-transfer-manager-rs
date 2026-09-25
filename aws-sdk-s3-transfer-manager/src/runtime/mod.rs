@@ -58,6 +58,13 @@ pub(crate) trait ExecutionRuntime: Send + Sync + std::fmt::Debug {
     fn components(&self) -> &RuntimeComponents;
 }
 
+/// Options for the HTTP transport a runtime provides to the S3 client.
+///
+/// Present only when that transport will be installed, so a runtime given
+/// `None` builds no HTTP client.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RuntimeHttpOptions {}
+
 /// Components provided by the execution runtime to the rest of the system.
 ///
 /// The runtime populates these based on its execution model.
