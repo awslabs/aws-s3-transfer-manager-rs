@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use aws_smithy_http_client::pool::{
     self, ConnectionPool, Partition, PartitionId, TokioDriverSpawner,
 };
+use aws_smithy_http_client::proxy::ProxyConfig;
 use aws_smithy_http_client::tls::{rustls_provider::CryptoMode, Provider};
 use aws_smithy_runtime_api::box_error::BoxError;
 use aws_smithy_runtime_api::client::connector_metadata::ConnectorMetadata;
@@ -352,6 +353,10 @@ impl ManagedThreadRuntime {
 /// When network interfaces are configured, each partition binds its
 /// connections to the interface [`partition_interface`] assigns its thread.
 ///
+/// Proxy selection follows the standard environment variables (`HTTP_PROXY`,
+/// `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`), matching the SDK's default HTTPS
+/// client.
+///
 /// # Panics
 ///
 /// Panics if the pool rejects its configuration, for example an interface name
@@ -380,6 +385,7 @@ fn build_http_client(threads: &[ThreadHandle], options: &RuntimeHttpOptions) -> 
     });
     let pool = ConnectionPool::builder()
         .dns_resolver(dns_resolver)
+        .proxy_config(ProxyConfig::from_env())
         .partitions(partitions)
         .tls_provider(Provider::Rustls(CryptoMode::AwsLc))
         .build_https()
