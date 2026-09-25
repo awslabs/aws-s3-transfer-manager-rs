@@ -32,7 +32,7 @@ tokio-util = "0.7.13"
 crossbeam-skiplist = "0.1.3"
 crossbeam-utils = "0.8"
 parking_lot = "0.12"
-aws-smithy-http-client = { workspace = true, features = ["rustls-aws-lc"] }
+aws-smithy-http-client = { workspace = true, features = ["rustls-aws-lc", "rt-tokio"] }
 aws-smithy-dns = { workspace = true, features = ["hickory-dns"] }
 fastrand = "2.4"
 hdrhistogram = "7"
