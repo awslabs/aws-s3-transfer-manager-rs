@@ -25,8 +25,8 @@ harness = false
 [dependencies]
 criterion = { version = "0.7", features = ["html_reports"] }
 tokio = { version = "1", features = ["full"] }
-aws-sdk-s3 = "1"
-aws-config = "1"
+aws-sdk-s3 = { workspace = true }
+aws-config = { workspace = true }
 s3-mock-server = { path = "../s3-mock-server" }
 aws-sdk-s3-transfer-manager = { path = "../aws-sdk-s3-transfer-manager" }
 bytes = "1"
