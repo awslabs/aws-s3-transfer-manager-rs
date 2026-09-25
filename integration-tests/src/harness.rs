@@ -18,7 +18,15 @@
 //! Real-S3 targets are compiled only under `--cfg e2e_test` and require the
 //! account setup the existing e2e tests use (`S3_TEST_BUCKET_NAME_RS`). Mock
 //! targets run in normal CI.
+//!
+//! Both paths let the transfer manager build its S3 client from an
+//! [`S3ClientConfig`], as it does by default in production, so requests use the
+//! HTTP transport the runtime installs (the managed runtime's connection pool)
+//! rather than a client supplied by the test.
+//!
+//! [`S3ClientConfig`]: aws_sdk_s3_transfer_manager::config::S3ClientConfig
 
+use aws_sdk_s3_transfer_manager::config::S3ClientConfig;
 use aws_sdk_s3_transfer_manager::types::RuntimeMode;
 use aws_sdk_s3_transfer_manager::Client as TmClient;
 use s3_mock_server::S3MockServer;
@@ -87,8 +95,8 @@ pub(crate) async fn mock_tm_with(
         .build()
         .expect("build mock server");
     let handle = server.start().await.expect("start mock server");
-    let s3_client = handle.client().await;
-    let cfg = configure(aws_sdk_s3_transfer_manager::Config::builder().client(s3_client))
+    let s3_config = mock_s3_config(&handle).await;
+    let cfg = configure(aws_sdk_s3_transfer_manager::Config::builder().s3_config(s3_config))
         .runtime_mode(runtime)
         .build();
     MockTm {
@@ -96,6 +104,13 @@ pub(crate) async fn mock_tm_with(
         handle,
         client: TmClient::new(cfg),
     }
+}
+
+/// S3 client configuration for the mock server: its endpoint, test
+/// credentials, region, and path-style addressing. The transfer manager builds
+/// the client from it and installs the runtime's HTTP transport.
+async fn mock_s3_config(handle: &s3_mock_server::ServerHandle) -> S3ClientConfig {
+    S3ClientConfig::new(handle.client().await.config().to_builder())
 }
 
 // ---------------------------------------------------------------------------
@@ -172,8 +187,9 @@ impl Target {
 
     /// Mock-only escape hatch: connect with an arbitrary override applied to the
     /// mock S3 client's config builder, for tests that need a non-default client
-    /// (checksum validation, stalled-stream protection, timeouts, ...). Builds the
-    /// mock client, applies `configure`, then wires it into the transfer manager.
+    /// (checksum validation, stalled-stream protection, timeouts, ...). Applies
+    /// `configure` to the mock client's config, which the transfer manager then
+    /// builds its S3 client from.
     pub(crate) async fn connect_mock_configured(
         self,
         part_size: Option<aws_sdk_s3_transfer_manager::types::PartSize>,
@@ -253,7 +269,8 @@ impl TmTestClient {
             .send()
             .await
             .ok();
-        let mut builder = aws_sdk_s3_transfer_manager::Config::builder().client(s3_client);
+        let mut builder = aws_sdk_s3_transfer_manager::Config::builder()
+            .s3_config(S3ClientConfig::new(s3_client.config().to_builder()));
         if let Some(ps) = part_size {
             builder = builder.part_size(ps);
         }
