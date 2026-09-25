@@ -11,14 +11,29 @@ members = [
 exclude = ["fuzz"]
 
 [workspace.dependencies]
-aws-config = "1.12.0"
-aws-runtime = "1.9.2"
-aws-sdk-s3 = "1.146.1"
-aws-smithy-checksums = "0.65.0"
-aws-smithy-dns = "0.2.0"
-aws-smithy-http-client = "1.4.0"
-aws-smithy-mocks = "0.3.0"
-aws-smithy-runtime = "1.14.0"
-aws-smithy-runtime-api = "1.16.0"
-aws-smithy-types = "1.6.3"
-aws-types = "1.6.0"
+# TEMP(conn-pool): the aws-* crates resolve to the assembled smithy-rs SDK
+# (`./gradlew :aws:sdk:assemble` in smithy-rs) until the connection pool is released.
+# Restore the crates.io requirements below when reverting.
+aws-config = { path = "/local/home/todaaron/rs/smithy-rs/aws/sdk/build/aws-sdk/sdk/aws-config" }
+aws-runtime = { path = "/local/home/todaaron/rs/smithy-rs/aws/sdk/build/aws-sdk/sdk/aws-runtime" }
+aws-sdk-s3 = { path = "/local/home/todaaron/rs/smithy-rs/aws/sdk/build/aws-sdk/sdk/s3" }
+aws-smithy-checksums = { path = "/local/home/todaaron/rs/smithy-rs/aws/sdk/build/aws-sdk/sdk/aws-smithy-checksums" }
+aws-smithy-dns = { path = "/local/home/todaaron/rs/smithy-rs/aws/sdk/build/aws-sdk/sdk/aws-smithy-dns" }
+aws-smithy-http-client = { path = "/local/home/todaaron/rs/smithy-rs/aws/sdk/build/aws-sdk/sdk/aws-smithy-http-client" }
+aws-smithy-mocks = { path = "/local/home/todaaron/rs/smithy-rs/aws/sdk/build/aws-sdk/sdk/aws-smithy-mocks" }
+aws-smithy-runtime = { path = "/local/home/todaaron/rs/smithy-rs/aws/sdk/build/aws-sdk/sdk/aws-smithy-runtime" }
+aws-smithy-runtime-api = { path = "/local/home/todaaron/rs/smithy-rs/aws/sdk/build/aws-sdk/sdk/aws-smithy-runtime-api" }
+aws-smithy-types = { path = "/local/home/todaaron/rs/smithy-rs/aws/sdk/build/aws-sdk/sdk/aws-smithy-types" }
+aws-types = { path = "/local/home/todaaron/rs/smithy-rs/aws/sdk/build/aws-sdk/sdk/aws-types" }
+#
+# aws-config = "1.12.0"
+# aws-runtime = "1.9.2"
+# aws-sdk-s3 = "1.146.1"
+# aws-smithy-checksums = "0.65.0"
+# aws-smithy-dns = "0.2.0"
+# aws-smithy-http-client = "1.4.0"
+# aws-smithy-mocks = "0.3.0"
+# aws-smithy-runtime = "1.14.0"
+# aws-smithy-runtime-api = "1.16.0"
+# aws-smithy-types = "1.6.3"
+# aws-types = "1.6.0"
