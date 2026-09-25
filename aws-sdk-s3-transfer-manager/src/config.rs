@@ -27,16 +27,28 @@ pub(crate) const MIN_MULTIPART_PART_SIZE_BYTES: u64 = 5 * ByteUnit::Mebibyte.as_
 /// Wraps an `aws_sdk_s3::config::Builder` with transfer-manager-specific
 /// options. The transfer manager builds the S3 client from this configuration,
 /// injecting runtime-optimized HTTP transport by default.
+///
+/// Converts from shared AWS configuration or an S3 config builder:
+///
+/// ```no_run
+/// # async fn example() {
+/// let sdk_config = aws_config::load_from_env().await;
+/// let config = aws_sdk_s3_transfer_manager::Config::builder()
+///     .s3_config(&sdk_config)
+///     .build();
+/// # }
+/// ```
 pub struct S3ClientConfig {
     pub(crate) builder: aws_sdk_s3::config::Builder,
     pub(crate) enable_runtime_http: bool,
 }
 
 impl S3ClientConfig {
-    /// Create a new `S3ClientConfig` from an SDK config builder.
-    pub fn new(builder: aws_sdk_s3::config::Builder) -> Self {
+    /// Create a new `S3ClientConfig` from an S3 config builder or from shared
+    /// AWS configuration (`&SdkConfig`).
+    pub fn new(builder: impl Into<aws_sdk_s3::config::Builder>) -> Self {
         Self {
-            builder,
+            builder: builder.into(),
             enable_runtime_http: true,
         }
     }
@@ -50,6 +62,18 @@ impl S3ClientConfig {
     pub fn enable_runtime_http(mut self, enable: bool) -> Self {
         self.enable_runtime_http = enable;
         self
+    }
+}
+
+impl From<&aws_types::SdkConfig> for S3ClientConfig {
+    fn from(sdk_config: &aws_types::SdkConfig) -> Self {
+        Self::new(sdk_config)
+    }
+}
+
+impl From<aws_sdk_s3::config::Builder> for S3ClientConfig {
+    fn from(builder: aws_sdk_s3::config::Builder) -> Self {
+        Self::new(builder)
     }
 }
 
@@ -314,8 +338,8 @@ impl Builder {
     /// [`S3ClientConfig::enable_runtime_http`] to opt out.
     ///
     /// Either this or [`client`](Self::client) must be set.
-    pub fn s3_config(mut self, config: S3ClientConfig) -> Self {
-        self.s3_client_config = Some(config);
+    pub fn s3_config(mut self, config: impl Into<S3ClientConfig>) -> Self {
+        self.s3_client_config = Some(config.into());
         self
     }
 
@@ -363,5 +387,24 @@ impl Builder {
             #[cfg(feature = "dial9")]
             telemetry_guard: self.telemetry_guard,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn s3_config_builder() -> aws_sdk_s3::config::Builder {
+        aws_sdk_s3::config::Builder::new()
+    }
+
+    #[test]
+    fn s3_client_config_converts_from_sdk_config_and_builder() {
+        let sdk_config = aws_types::SdkConfig::builder().build();
+        let from_sdk = S3ClientConfig::from(&sdk_config);
+        assert!(from_sdk.enable_runtime_http);
+
+        let from_builder: S3ClientConfig = s3_config_builder().into();
+        assert!(from_builder.enable_runtime_http);
     }
 }
