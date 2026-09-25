@@ -9,3 +9,16 @@ members = [
     "integration-tests"
 ]
 exclude = ["fuzz"]
+
+[workspace.dependencies]
+aws-config = "1.12.0"
+aws-runtime = "1.9.2"
+aws-sdk-s3 = "1.146.1"
+aws-smithy-checksums = "0.65.0"
+aws-smithy-dns = "0.2.0"
+aws-smithy-http-client = "1.4.0"
+aws-smithy-mocks = "0.3.0"
+aws-smithy-runtime = "1.14.0"
+aws-smithy-runtime-api = "1.16.0"
+aws-smithy-types = "1.6.3"
+aws-types = "1.6.0"
