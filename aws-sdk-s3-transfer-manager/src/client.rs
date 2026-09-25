@@ -292,12 +292,16 @@ impl Client {
             .expect("memory configuration must resolve to supported pool geometry"),
             MemoryConfig::Explicit(pool) => pool.clone(),
         };
+        // Runtime HTTP is built only when it will be installed on an S3 client
+        // this transfer manager constructs.
+        let runtime_http = config.runtime_http();
         let handle = Arc::new_cyclic(|weak_handle| {
             let scheduler = Scheduler::new(weak_handle.clone());
             let runtime: Arc<dyn ExecutionRuntime> = match config.runtime_mode() {
                 RuntimeMode::Managed => {
                     #[allow(unused_mut)]
-                    let mut builder = ManagedThreadRuntime::builder(weak_handle.clone());
+                    let mut builder =
+                        ManagedThreadRuntime::builder(weak_handle.clone()).http(runtime_http);
                     #[cfg(feature = "dial9")]
                     if let Some(guard) = telemetry_guard {
                         builder = builder.telemetry_guard(guard);
@@ -567,10 +571,47 @@ fn resolve_concurrency_target(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aws_smithy_runtime_api::client::http::SharedHttpClient;
 
     fn test_config() -> crate::Config {
         let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
         crate::Config::builder().client(s3_client).build()
+    }
+
+    fn runtime_http_client(client: &Client) -> Option<&SharedHttpClient> {
+        client.handle.runtime.components().http_client()
+    }
+
+    fn mock_s3_config() -> crate::config::S3ClientConfig {
+        let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
+        crate::config::S3ClientConfig::new(s3_client.config().to_builder())
+    }
+
+    // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn managed_runtime_builds_http_for_s3_config() {
+        let client = Client::new(crate::Config::builder().s3_config(mock_s3_config()).build());
+        assert!(runtime_http_client(&client).is_some());
+    }
+
+    // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn managed_runtime_skips_http_for_provided_client() {
+        let client = Client::new(test_config());
+        assert!(runtime_http_client(&client).is_none());
+    }
+
+    // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn managed_runtime_skips_http_when_runtime_http_disabled() {
+        let config = crate::Config::builder()
+            .s3_config(mock_s3_config().enable_runtime_http(false))
+            .build();
+        let client = Client::new(config);
+        assert!(runtime_http_client(&client).is_none());
     }
 
     // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)

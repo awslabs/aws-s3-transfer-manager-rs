@@ -36,7 +36,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::topology::Cpu;
 use super::Topology;
-use super::{ExecutionRuntime, RuntimeComponents, ScheduledWork};
+use super::{ExecutionRuntime, RuntimeComponents, RuntimeHttpOptions, ScheduledWork};
 use crate::runtime::sync::SubmissionGuard;
 use crate::scheduler::Scheduler;
 use crate::transfer::{TransferId, WorkOutcome};
@@ -252,25 +252,18 @@ impl ManagedThreadRuntime {
     ///
     /// Spawns one OS thread per core in the topology. Each thread creates its
     /// own tokio current-thread runtime (the I/O driver binds to the creating
-    /// thread).
+    /// thread). Builds an HTTP client only when `http` is present.
     fn new(
         handle: Weak<crate::client::Handle>,
         topology: Topology,
         pin_threads: bool,
+        http: Option<RuntimeHttpOptions>,
         #[cfg(feature = "dial9")] telemetry_guard: Option<
             std::sync::Arc<dial9_tokio_telemetry::telemetry::TelemetryGuard>,
         >,
     ) -> Self {
         let shutdown_token = CancellationToken::new();
 
-        #[cfg(target_os = "android")]
-        let dns_resolver = ShufflingDnsResolver::new(
-            // Hickory reads /etc/resolv.conf on Unix. Android routes libc
-            // resolution through netd and does not provide that file.
-            aws_smithy_runtime::client::dns::TokioDnsResolver::new(),
-        );
-        #[cfg(not(target_os = "android"))]
-        let dns_resolver = ShufflingDnsResolver::new(aws_smithy_dns::HickoryDnsResolver::default());
         // spawn and initialize concurrently
         let pending: Vec<_> = topology
             .thread_ids()
@@ -329,9 +322,10 @@ impl ManagedThreadRuntime {
             })
             .collect();
 
-        let http_client = build_http_client(&threads, dns_resolver);
         let mut components = RuntimeComponents::default();
-        components.set_http_client(http_client);
+        if http.is_some() {
+            components.set_http_client(build_http_client(&threads));
+        }
         components.set_direct_io(true);
 
         Self {
@@ -354,14 +348,20 @@ impl ManagedThreadRuntime {
 /// maintenance on its thread's runtime, so a connection's I/O stays on the
 /// thread that opened it. Partition identity is the thread index, which is also
 /// the index [`ManagedHttpClient`] reads from [`MANAGED_THREAD_CPU`].
-fn build_http_client(
-    threads: &[ThreadHandle],
-    dns_resolver: impl ResolveDns + 'static,
-) -> SharedHttpClient {
+fn build_http_client(threads: &[ThreadHandle]) -> SharedHttpClient {
     debug_assert!(
         threads.iter().enumerate().all(|(i, th)| th.id.0 == i),
         "thread ids must be dense indices"
     );
+
+    #[cfg(target_os = "android")]
+    let dns_resolver = ShufflingDnsResolver::new(
+        // Hickory reads /etc/resolv.conf on Unix. Android routes libc
+        // resolution through netd and does not provide that file.
+        aws_smithy_runtime::client::dns::TokioDnsResolver::new(),
+    );
+    #[cfg(not(target_os = "android"))]
+    let dns_resolver = ShufflingDnsResolver::new(aws_smithy_dns::HickoryDnsResolver::default());
     let partitions = threads.iter().map(|th| {
         Partition::new(
             PartitionId::from_index(th.id.0),
@@ -387,6 +387,7 @@ pub(crate) struct ManagedThreadRuntimeBuilder {
     handle: Weak<crate::client::Handle>,
     topology: Option<Topology>,
     pin_threads: bool,
+    http: Option<RuntimeHttpOptions>,
     #[cfg(feature = "dial9")]
     telemetry_guard: Option<std::sync::Arc<dial9_tokio_telemetry::telemetry::TelemetryGuard>>,
 }
@@ -397,6 +398,7 @@ impl ManagedThreadRuntimeBuilder {
             handle,
             topology: None,
             pin_threads: false,
+            http: None,
             #[cfg(feature = "dial9")]
             telemetry_guard: None,
         }
@@ -417,6 +419,13 @@ impl ManagedThreadRuntimeBuilder {
     #[allow(dead_code)] // TODO: expose on public config
     pub(crate) fn topology(mut self, topology: Topology) -> Self {
         self.topology = Some(topology);
+        self
+    }
+
+    /// Provide an HTTP client for the S3 client, configured by `options`.
+    /// Default: `None`, which builds no HTTP client.
+    pub(crate) fn http(mut self, options: Option<RuntimeHttpOptions>) -> Self {
+        self.http = options;
         self
     }
 
@@ -441,6 +450,7 @@ impl ManagedThreadRuntimeBuilder {
             self.handle,
             topology,
             self.pin_threads,
+            self.http,
             #[cfg(feature = "dial9")]
             self.telemetry_guard,
         )
