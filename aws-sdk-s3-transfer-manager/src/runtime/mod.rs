@@ -63,7 +63,11 @@ pub(crate) trait ExecutionRuntime: Send + Sync + std::fmt::Debug {
 /// Present only when that transport will be installed, so a runtime given
 /// `None` builds no HTTP client.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct RuntimeHttpOptions {}
+pub(crate) struct RuntimeHttpOptions {
+    /// Interfaces to bind connections to, assigned to worker threads
+    /// round-robin. Empty leaves interface selection to OS routing.
+    pub(crate) network_interfaces: Vec<String>,
+}
 
 /// Components provided by the execution runtime to the rest of the system.
 ///

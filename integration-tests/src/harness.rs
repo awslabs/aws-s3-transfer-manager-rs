@@ -89,13 +89,26 @@ pub(crate) async fn mock_tm_with(
         aws_sdk_s3_transfer_manager::config::Builder,
     ) -> aws_sdk_s3_transfer_manager::config::Builder,
 ) -> MockTm {
+    mock_tm_with_s3_config(runtime, |s3| s3, configure).await
+}
+
+/// Build a mock TM, applying `configure_s3` to the mock server's
+/// [`S3ClientConfig`] (runtime-HTTP options) and `configure` to the TM Config
+/// builder.
+pub(crate) async fn mock_tm_with_s3_config(
+    runtime: RuntimeMode,
+    configure_s3: impl FnOnce(S3ClientConfig) -> S3ClientConfig,
+    configure: impl FnOnce(
+        aws_sdk_s3_transfer_manager::config::Builder,
+    ) -> aws_sdk_s3_transfer_manager::config::Builder,
+) -> MockTm {
     init_test_logs();
     let server = S3MockServer::builder()
         .with_in_memory_store()
         .build()
         .expect("build mock server");
     let handle = server.start().await.expect("start mock server");
-    let s3_config = mock_s3_config(&handle).await;
+    let s3_config = configure_s3(mock_s3_config(&handle).await);
     let cfg = configure(aws_sdk_s3_transfer_manager::Config::builder().s3_config(s3_config))
         .runtime_mode(runtime)
         .build();
