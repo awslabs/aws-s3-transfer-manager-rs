@@ -26,7 +26,9 @@ use bytes::buf::UninitSlice;
 use bytes::{BufMut, Bytes};
 use smallvec::SmallVec;
 
-use super::acquisition::{acquire_count, allocation_failure_injected, AcquireError, CarrierGuard};
+use super::acquisition::{
+    acquire_count, allocation_failure_injected, AcquireError, CarrierGuard, OwnerReturn,
+};
 use super::admission::ReservationState;
 use super::block::CarrierLocation;
 use super::geometry::GeometryError;
@@ -264,16 +266,16 @@ impl PooledBufMut {
 
     /// Ends growth and transfers initialized unpublished ranges.
     ///
-    /// Wholly unused carriers return immediately. An initialized prefix in a
-    /// partially used carrier retains that carrier and discards its writable
-    /// suffix. The operation does not copy initialized bytes.
-    pub fn freeze(self) -> SegmentedBytes {
+    /// Wholly unused carriers return immediately, together, as the buffer
+    /// drops. An initialized prefix in a partially used carrier retains that
+    /// carrier and discards its writable suffix. The operation does not copy
+    /// initialized bytes.
+    pub fn freeze(mut self) -> SegmentedBytes {
         let pool = Arc::clone(self.growth.pool());
-        let Self { runs, .. } = self;
         let mut builder = SegmentedBytesBuilder::for_pool(pool);
 
-        for run in runs {
-            for mut carrier in run.carriers {
+        for run in &mut self.runs {
+            for carrier in &mut run.carriers {
                 if carrier.initialized == 0 {
                     continue;
                 }
@@ -472,6 +474,43 @@ impl PooledBufMut {
             }
         }
     }
+}
+
+/// Returns every carrier the buffer still owns as one whole-value return.
+///
+/// Carriers return together so a queued reservation observes the complete
+/// return rather than a partial one. A carrier whose prefix was published
+/// stays owned by that published value.
+impl Drop for PooledBufMut {
+    fn drop(&mut self) {
+        let Some(first) = first_retained_guard(&self.runs) else {
+            return;
+        };
+        let mut owner_return = OwnerReturn::begin(first);
+        if !owner_return.is_batched() {
+            // Return carriers before the registration ends so overlapping
+            // returns observe this whole-value return as active.
+            self.runs.clear();
+            return;
+        }
+        for run in &mut self.runs {
+            for carrier in &mut run.carriers {
+                if let Some(guard) = carrier.guard.take() {
+                    owner_return.push(guard);
+                }
+            }
+        }
+    }
+}
+
+/// Returns the first retained carrier guard when `runs` retain several.
+fn first_retained_guard(runs: &CarrierRuns) -> Option<&CarrierGuard> {
+    let mut guards = runs
+        .iter()
+        .flat_map(|run| &run.carriers)
+        .filter_map(|carrier| carrier.guard.as_deref());
+    let first = guards.next()?;
+    guards.next().map(|_| first)
 }
 
 impl std::fmt::Debug for PooledBufMut {
@@ -823,8 +862,65 @@ mod tests {
 
     use bytes::{Buf, BufMut, BytesMut};
 
-    use super::super::test_util::{test_pool, write_pooled};
+    use std::task::{Poll, Waker};
+
+    use super::super::test_util::{poll_reserve, test_pool, write_pooled};
+    use super::super::{BufferPool, ReserveFuture};
     use super::*;
+
+    /// Sets up a queued reservation that can be granted only after an unused
+    /// buffer returns.
+    ///
+    /// The pool has 4-carrier blocks and admits at most 6 carriers. The buffer
+    /// takes 4 carriers without a reservation, preparing one block. A
+    /// 3-carrier reservation would raise admission to 7, so it queues.
+    ///
+    /// Returning all 4 carriers together leaves 3 admitted, which the prepared
+    /// block covers. Returning them one at a time grants the reservation after
+    /// the first carrier, while 3 + 3 = 6 carriers are admitted, and prepares
+    /// a second block that the rest of the return makes unnecessary.
+    fn buffer_ahead_of_queued_reservation() -> (BufferPool, usize, PooledBufMut, ReserveFuture) {
+        let (pool, carrier_size) = test_pool(4, 6);
+        let mutable = pool.acquire_unreserved(carrier_size * 4).unwrap();
+        assert_eq!(
+            pool.metrics().prepared_capacity_bytes(),
+            (carrier_size * 4) as u64
+        );
+        let mut queued = pool.reserve(carrier_size * 3);
+        assert!(poll_reserve(&mut queued, Waker::noop()).is_pending());
+        (pool, carrier_size, mutable, queued)
+    }
+
+    /// Completes the queued reservation and checks it prepared no new block.
+    fn assert_granted_within_prepared_block(
+        pool: &BufferPool,
+        carrier_size: usize,
+        queued: &mut ReserveFuture,
+    ) {
+        let Poll::Ready(Ok(_reservation)) = poll_reserve(queued, Waker::noop()) else {
+            panic!("queued reservation was not granted after the buffer returned");
+        };
+        assert_eq!(
+            pool.metrics().prepared_capacity_bytes(),
+            (carrier_size * 4) as u64,
+            "grant observed a partial buffer return and prepared an unneeded block"
+        );
+    }
+
+    #[test]
+    fn test_freeze_returns_unused_carriers_before_queued_grant() {
+        let (pool, carrier_size, mutable, mut queued) = buffer_ahead_of_queued_reservation();
+        let frozen = mutable.freeze();
+        assert_eq!(frozen.remaining(), 0);
+        assert_granted_within_prepared_block(&pool, carrier_size, &mut queued);
+    }
+
+    #[test]
+    fn test_drop_returns_carriers_before_queued_grant() {
+        let (pool, carrier_size, mutable, mut queued) = buffer_ahead_of_queued_reservation();
+        drop(mutable);
+        assert_granted_within_prepared_block(&pool, carrier_size, &mut queued);
+    }
 
     /// Checks the aggregate fields and cursors against per-carrier state.
     fn assert_buffer_invariants(buffer: &PooledBufMut) {
