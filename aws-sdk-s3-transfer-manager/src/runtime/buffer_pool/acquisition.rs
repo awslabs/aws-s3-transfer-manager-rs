@@ -407,6 +407,64 @@ impl Drop for CarrierReturnBatch {
     }
 }
 
+/// One whole-value return of pooled carrier owners.
+///
+/// Registers the return with the pool for its lifetime so overlapping returns
+/// can observe it. When a reservation is waiting or another whole-value return
+/// overlaps, [`push`](Self::push) collects uniquely held owners that share the
+/// first owner's accounting provenance into one batch. The batch releases
+/// physical ownership and then publishes one aggregate return when this value
+/// drops, so admission observes the complete return at once. Otherwise the
+/// caller returns owners individually while this registration remains active.
+pub(super) struct OwnerReturn {
+    // Field order is drop order: the batch publishes while the permit is held.
+    /// Collected owners, present only when batching is warranted.
+    batch: Option<CarrierReturnBatch>,
+    /// Pool registration for the duration of the return.
+    _permit: OwnerReturnPermit,
+}
+
+impl OwnerReturn {
+    /// Starts a whole-value return whose accounting provenance is `first`'s.
+    pub(super) fn begin(first: &CarrierGuard) -> Self {
+        let permit = first.begin_owner_return();
+        let batch = permit
+            .should_batch()
+            .then(|| CarrierReturnBatch::for_guard(first));
+        Self {
+            batch,
+            _permit: permit,
+        }
+    }
+
+    /// Returns whether owners should be passed to [`push`](Self::push).
+    ///
+    /// When `false`, the caller drops its owners individually before this
+    /// value drops.
+    pub(super) fn is_batched(&self) -> bool {
+        self.batch.is_some()
+    }
+
+    /// Adds one owner to the batch, or drops it when it cannot be batched.
+    ///
+    /// An owner still shared with another value, or with different accounting
+    /// provenance, drops without joining the batch.
+    pub(super) fn push(&mut self, owner: Arc<CarrierGuard>) {
+        let Some(batch) = self.batch.as_mut() else {
+            drop(owner);
+            return;
+        };
+        if !batch.accepts(&owner) {
+            drop(owner);
+            return;
+        }
+        match Arc::try_unwrap(owner) {
+            Ok(owner) => batch.push(owner.into_return()),
+            Err(shared) => drop(shared),
+        }
+    }
+}
+
 /// Returns whether two optional owners name the same reservation state.
 fn option_arc_ptr_eq<T>(left: Option<&Arc<T>>, right: Option<&Arc<T>>) -> bool {
     match (left, right) {

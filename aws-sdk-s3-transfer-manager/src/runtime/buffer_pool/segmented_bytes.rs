@@ -22,7 +22,7 @@ use std::ptr::NonNull;
 
 use bytes::{Buf, Bytes, BytesMut};
 
-use super::acquisition::{CarrierGuard, CarrierReturnBatch};
+use super::acquisition::{CarrierGuard, OwnerReturn};
 use super::block::BlockSlot;
 use super::invariant_violation;
 use super::BufferPool;
@@ -312,17 +312,15 @@ impl Drop for SegmentedBytes {
         ) else {
             return;
         };
-        let permit = first.begin_owner_return();
-        if !permit.should_batch() {
-            // Return owners before releasing the permit so overlapping drops
-            // observe this whole-value return as active.
+        let mut owner_return = OwnerReturn::begin(first);
+        if !owner_return.is_batched() {
+            // Return owners before the registration ends so overlapping
+            // returns observe this whole-value return as active.
             self.segments.clear();
             return;
         }
-
-        let mut batch = CarrierReturnBatch::for_guard(first);
         for segment in &mut self.segments {
-            transfer_batchable_owners(&mut segment.owners, &mut batch);
+            return_owners(&mut segment.owners, &mut owner_return);
         }
     }
 }
@@ -577,20 +575,11 @@ fn first_pooled_owner<'a>(
     None
 }
 
-/// Transfers uniquely held matching owners into one physical-first batch.
-fn transfer_batchable_owners(owners: &mut VecDeque<OwnedRange>, batch: &mut CarrierReturnBatch) {
+/// Passes pooled owners to a batched whole-value return; views drop in place.
+fn return_owners(owners: &mut VecDeque<OwnedRange>, owner_return: &mut OwnerReturn) {
     while let Some(owner) = owners.pop_front() {
         match owner.hold {
-            Hold::Pooled(guard) => {
-                if !batch.accepts(&guard) {
-                    drop(guard);
-                    continue;
-                }
-                match Arc::try_unwrap(guard) {
-                    Ok(guard) => batch.push(guard.into_return()),
-                    Err(guard) => drop(guard),
-                }
-            }
+            Hold::Pooled(guard) => owner_return.push(guard),
             Hold::View(view) => drop(view),
         }
     }
@@ -819,16 +808,14 @@ impl Drop for ContiguousOwner {
         let Some(first) = first_pooled_owner(self.owners.iter()) else {
             return;
         };
-        let permit = first.begin_owner_return();
-        if !permit.should_batch() {
-            // Return owners before releasing the permit so overlapping drops
-            // observe this whole-value return as active.
+        let mut owner_return = OwnerReturn::begin(first);
+        if !owner_return.is_batched() {
+            // Return owners before the registration ends so overlapping
+            // returns observe this whole-value return as active.
             self.owners.clear();
             return;
         }
-
-        let mut batch = CarrierReturnBatch::for_guard(first);
-        transfer_batchable_owners(&mut self.owners, &mut batch);
+        return_owners(&mut self.owners, &mut owner_return);
     }
 }
 
