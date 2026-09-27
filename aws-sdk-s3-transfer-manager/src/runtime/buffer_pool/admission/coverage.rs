@@ -46,6 +46,26 @@ pub(in crate::runtime::buffer_pool) struct CoverageDebit {
     pub(in crate::runtime::buffer_pool) uncovered_added: CarrierCount,
 }
 
+impl CoverageDebit {
+    /// Describes a debit satisfied entirely from available coverage.
+    pub(in crate::runtime::buffer_pool) fn covered() -> Self {
+        Self {
+            uncovered_added: CarrierCount::ZERO,
+        }
+    }
+
+    /// Commits one provisional charge to a carrier guard.
+    pub(in crate::runtime::buffer_pool) fn commit_one(&mut self) {
+        if self.uncovered_added == CarrierCount::ZERO {
+            return;
+        }
+        self.uncovered_added = self
+            .uncovered_added
+            .checked_sub(CarrierCount::new(1))
+            .unwrap_or_else(|| invariant_violation("coverage debit contribution underflowed"));
+    }
+}
+
 /// Result of retiring aggregate acquisition charges.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::runtime::buffer_pool) struct CoverageReturn {
@@ -150,6 +170,61 @@ impl CoverageState {
             ))
         })
         .unwrap_or_else(|_| invariant_violation("aggregate return exceeds packed accounting"))
+    }
+
+    /// Reverses charges that did not become carrier owners.
+    ///
+    /// Rollback first removes the original debit's uncovered contribution.
+    /// A concurrent close may require removing more to keep restored
+    /// availability within current active demand.
+    pub(in crate::runtime::buffer_pool) fn rollback_debit(
+        &self,
+        count: CarrierCount,
+        debit: CoverageDebit,
+        active_planned_demand: CarrierCount,
+    ) -> CoverageReturn {
+        if checked_lane(count).is_err() {
+            invariant_violation("rolled-back carrier count exceeds packed accounting");
+        }
+        if debit.uncovered_added > count {
+            invariant_violation("coverage debit contribution exceeds rolled-back charges");
+        }
+        if checked_lane(active_planned_demand).is_err() {
+            invariant_violation("active demand exceeds packed accounting during rollback");
+        }
+        self.update(|snapshot| {
+            let nominally_uncovered =
+                CarrierCount::new(debit.uncovered_added.get().min(snapshot.uncovered.get()));
+            let coverage_room = active_planned_demand
+                .checked_sub(snapshot.available)
+                .ok_or(CoverageOverflow)?;
+            let required_for_active = count
+                .checked_sub(coverage_room)
+                .unwrap_or(CarrierCount::ZERO);
+            let uncovered_removed = nominally_uncovered.max(required_for_active);
+            if uncovered_removed > count || uncovered_removed > snapshot.uncovered {
+                return Err(CoverageOverflow);
+            }
+            let restored = count
+                .checked_sub(uncovered_removed)
+                .ok_or(CoverageOverflow)?;
+            let available = snapshot
+                .available
+                .checked_add(restored)
+                .ok_or(CoverageOverflow)?;
+            let uncovered = snapshot
+                .uncovered
+                .checked_sub(uncovered_removed)
+                .ok_or(CoverageOverflow)?;
+            Ok((
+                CoverageSnapshot {
+                    available,
+                    uncovered,
+                },
+                CoverageReturn { uncovered_removed },
+            ))
+        })
+        .unwrap_or_else(|_| invariant_violation("aggregate rollback exceeds packed accounting"))
     }
 
     /// Publishes unused coverage from one newly active envelope.
@@ -328,6 +403,46 @@ mod tests {
     }
 
     #[test]
+    fn test_covered_rollback_does_not_reclassify_preexisting_uncovered_charges() {
+        let state = CoverageState::new();
+        state
+            .debit(CarrierCount::new(2), MAX_PACKED_CARRIERS)
+            .unwrap();
+        state.add_coverage(CarrierCount::new(4)).unwrap();
+        let before = state.snapshot();
+
+        assert!(state.try_debit_covered(CarrierCount::new(1)).unwrap());
+        let returned = state.rollback_debit(
+            CarrierCount::new(1),
+            CoverageDebit::covered(),
+            CarrierCount::new(4),
+        );
+
+        assert_eq!(returned.uncovered_removed, CarrierCount::ZERO);
+        assert_eq!(state.snapshot(), before);
+    }
+
+    #[test]
+    fn test_covered_rollback_retires_charge_reclassified_by_close() {
+        let state = state_with(0, 1);
+
+        let returned = state.rollback_debit(
+            CarrierCount::new(1),
+            CoverageDebit::covered(),
+            CarrierCount::ZERO,
+        );
+
+        assert_eq!(returned.uncovered_removed, CarrierCount::new(1));
+        assert_eq!(
+            state.snapshot(),
+            CoverageSnapshot {
+                available: CarrierCount::ZERO,
+                uncovered: CarrierCount::ZERO,
+            }
+        );
+    }
+
+    #[test]
     fn test_new_envelope_does_not_absorb_existing_uncovered_charge() {
         let state = state_with(0, 1);
 
@@ -397,6 +512,25 @@ mod tests {
     }
 
     #[test]
+    fn test_close_removes_coverage_restored_after_the_direct_snapshot() {
+        let state = state_with(1, 0);
+
+        state.remove_coverage(
+            CarrierCount::new(1),
+            CarrierCount::new(1),
+            CarrierCount::ZERO,
+        );
+
+        assert_eq!(
+            state.snapshot(),
+            CoverageSnapshot {
+                available: CarrierCount::ZERO,
+                uncovered: CarrierCount::ZERO,
+            }
+        );
+    }
+
+    #[test]
     fn test_small_debit_space_matches_transition_equations() {
         for available in 0..=4 {
             for uncovered in 0..=4 {
@@ -446,13 +580,38 @@ mod tests {
     }
 
     #[test]
+    fn test_small_debit_space_rolls_back_to_the_prior_classification() {
+        for available in 0..=4 {
+            for uncovered in 0..=4 {
+                for occupied_coverage in 0..=2 {
+                    for count in 0..=6 {
+                        let state = state_with(available, uncovered);
+                        let before = state.snapshot();
+                        let debit = state
+                            .debit(CarrierCount::new(count), CarrierCount::new(10))
+                            .unwrap();
+
+                        state.rollback_debit(
+                            CarrierCount::new(count),
+                            debit,
+                            CarrierCount::new(available + occupied_coverage),
+                        );
+
+                        assert_eq!(state.snapshot(), before);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn test_small_close_space_matches_transition_equations() {
         for available in 0..=4 {
             for uncovered in 0..=4 {
                 for envelope in 0..=6 {
                     for direct_outstanding in 0..=envelope {
                         for remaining_active in 0..=4 {
-                            if available + direct_outstanding > remaining_active + envelope {
+                            if available > remaining_active + envelope {
                                 continue;
                             }
                             let state = state_with(available, uncovered);
@@ -461,16 +620,20 @@ mod tests {
                                 CarrierCount::new(direct_outstanding),
                                 CarrierCount::new(remaining_active),
                             );
-                            let potentially_unused = envelope - direct_outstanding;
-                            let nominally_unused = potentially_unused.min(available);
-                            let required_for_active = available.saturating_sub(remaining_active);
-                            let removed = nominally_unused.max(required_for_active);
+                            let active = remaining_active + envelope;
+                            let charged = active + uncovered - available;
+                            let removable_unused = envelope - direct_outstanding;
+                            let expected_available = available
+                                .saturating_sub(removable_unused)
+                                .min(remaining_active);
+                            let expected_covered = remaining_active - expected_available;
+                            let expected_uncovered = charged - expected_covered;
 
                             assert_eq!(
                                 state.snapshot(),
                                 CoverageSnapshot {
-                                    available: CarrierCount::new(available - removed),
-                                    uncovered: CarrierCount::new(uncovered + envelope - removed),
+                                    available: CarrierCount::new(expected_available),
+                                    uncovered: CarrierCount::new(expected_uncovered),
                                 }
                             );
                         }

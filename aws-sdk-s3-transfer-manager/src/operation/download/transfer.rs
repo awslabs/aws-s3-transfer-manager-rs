@@ -2094,8 +2094,8 @@ mod tests {
         skip_discovery(&transfer).await;
 
         // The completed discovery payload remains charged while part 1 retains
-        // open acquisition authority. Part 2 therefore waits normally rather
-        // than using idle-only admission.
+        // open acquisition authority. Part 2 therefore waits for that retained
+        // ownership to return.
         let _part_1 = assert_ready(transfer.poll_work());
 
         // Because this is stream mode, the relief path is off: poll_work

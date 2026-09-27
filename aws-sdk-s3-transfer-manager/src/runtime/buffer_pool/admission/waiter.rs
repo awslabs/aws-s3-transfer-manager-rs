@@ -67,7 +67,8 @@ enum ReserveFutureState {
 /// The first poll either returns an immediate result or enters the pool-wide
 /// FIFO. Dropping a queued future cancels it. Dropping a granted but unobserved
 /// future retires the transferred reservation. Invalid requests and physical
-/// preparation failures resolve to [`ReserveError`].
+/// preparation failures resolve to [`ReserveError`]. A request larger than the
+/// configured pool capacity fails without entering the FIFO.
 #[must_use = "a reservation request does nothing unless polled or awaited"]
 pub struct ReserveFuture {
     state: ReserveFutureState,
@@ -271,29 +272,50 @@ mod tests {
     }
 
     #[test]
-    fn test_oversized_fifo_head_waits_for_idle_and_blocks_later_work() {
+    fn test_oversized_request_fails_without_entering_fifo() {
         let (pool, carrier_size) = test_pool(1, 1);
-        let holder = pool
+        let (large_waker, large_wakes) = counting_waker();
+        let mut large = pool.reserve(carrier_size * 2);
+
+        assert!(matches!(
+            poll_reserve(&mut large, &large_waker),
+            Poll::Ready(Err(ReserveError::ExceedsCapacity))
+        ));
+        let admission = pool.inner.admission.lock();
+        assert!(admission.waiters_is_empty());
+        assert_eq!(admission.reservation_enqueues_total(), 0);
+        assert_eq!(admission.ledger.prepared_capacity, CarrierCount::ZERO);
+        assert_eq!(wake_count(&large_wakes), 0);
+    }
+
+    #[test]
+    fn test_retained_ownership_blocks_fifo_until_final_return() {
+        let (pool, carrier_size) = test_pool(1, 1);
+        let reservation = pool
             .try_reserve(carrier_size)
             .unwrap()
             .expect("initial reservation");
-        let (large_waker, large_wakes) = counting_waker();
-        let (small_waker, small_wakes) = counting_waker();
-        let mut large = pool.reserve(carrier_size * 2);
-        let mut small = pool.reserve(carrier_size);
-        assert_pending(&mut large, &large_waker);
-        assert_pending(&mut small, &small_waker);
+        let retained = pool.acquire(&reservation, carrier_size).unwrap();
+        reservation.close_acquisition();
 
-        drop(holder);
-
-        assert_eq!(wake_count(&large_wakes), 1);
-        assert_eq!(wake_count(&small_wakes), 0);
-        let large_reservation = take_ready(&mut large, &large_waker);
+        let (waker, wakes) = counting_waker();
+        let mut next = pool.reserve(carrier_size);
+        assert_pending(&mut next, &waker);
         assert_eq!(pool.inner.admission.lock().waiter_count(), 1);
 
-        drop(large_reservation);
-        assert_eq!(wake_count(&small_wakes), 1);
-        drop(take_ready(&mut small, &small_waker));
+        drop(retained);
+
+        assert_eq!(wake_count(&wakes), 1);
+        drop(take_ready(&mut next, &waker));
+        let audit = pool.audit_quiescent();
+        assert_eq!(audit.active_planned_demand, CarrierCount::ZERO);
+        assert_eq!(audit.available_coverage, CarrierCount::ZERO);
+        assert_eq!(audit.uncovered_charges, CarrierCount::ZERO);
+        assert_eq!(audit.charged_capacity, CarrierCount::ZERO);
+        assert_eq!(audit.live_carriers, CarrierCount::ZERO);
+        assert_eq!(audit.queued_reservations, 0);
+        assert_eq!(audit.cleanup_pending_blocks, 0);
+        assert_eq!(audit.prepared_capacity, CarrierCount::new(1));
     }
 
     #[test]
@@ -393,7 +415,7 @@ mod tests {
 
     #[test]
     fn test_queued_preparation_failure_fails_head_and_grants_next() {
-        let (pool, carrier_size) = test_pool(2, 2);
+        let (pool, carrier_size) = test_pool(2, 3);
         let holder = pool
             .try_reserve(carrier_size * 2)
             .unwrap()
@@ -437,6 +459,34 @@ mod tests {
         assert!(admission.waiters_is_empty());
         assert_eq!(admission.reservation_enqueues_total(), 0);
         assert_eq!(wake_count(&wake_state), 0);
+    }
+
+    #[test]
+    fn test_queue_metadata_failure_publishes_no_waiter_and_pool_remains_usable() {
+        let (pool, carrier_size) = test_pool(1, 1);
+        let holder = pool
+            .try_reserve(carrier_size)
+            .unwrap()
+            .expect("initial reservation");
+        pool.inject_reservation_queue_allocation_failure();
+        let (waker, wake_state) = counting_waker();
+        let mut future = pool.reserve(carrier_size);
+
+        assert!(matches!(
+            poll_reserve(&mut future, &waker),
+            Poll::Ready(Err(ReserveError::MetadataAllocationFailed))
+        ));
+        assert_eq!(wake_count(&wake_state), 0);
+        assert_eq!(pool.metrics().queued_reservations(), 0);
+        assert_eq!(pool.metrics().reservation_enqueues_total(), 0);
+        assert!(!pool.inner.reservation_drain.is_armed());
+
+        drop(holder);
+        let retry = pool
+            .try_reserve(carrier_size)
+            .unwrap()
+            .expect("pool remains usable after queue metadata failure");
+        drop(retry);
     }
 
     #[test]
@@ -549,7 +599,7 @@ mod loom_tests {
                 .unwrap()
                 .expect("initial reservation");
             let (waker, _) = counting_waker();
-            let mut future = pool.reserve(carrier_size * 2);
+            let mut future = pool.reserve(carrier_size);
             assert!(poll_reserve(&mut future, &waker).is_pending());
 
             let granting = thread::spawn(move || drop(holder));

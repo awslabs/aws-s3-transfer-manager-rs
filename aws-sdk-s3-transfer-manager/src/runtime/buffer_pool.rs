@@ -35,15 +35,17 @@ mod maintenance;
 mod metrics;
 mod pooled_buf;
 mod segmented_bytes;
-#[cfg(test)]
+#[cfg(any(test, s3_tm_fuzz))]
 mod test_util;
+#[cfg(all(test, not(s3_tm_loom)))]
+mod tests;
 mod virtual_memory;
 
 use crate::types::MemoryBudgetConfig;
 use acquisition::acquire_count;
 pub use acquisition::AcquireError;
 use admission::{
-    wake_all, AdmissionGuard, AdmissionState, CoverageState, ReservationDrainSignal,
+    wake_all, AdmissionGuard, AdmissionState, CoverageDebit, CoverageState, ReservationDrainSignal,
     ReservationPoll, WaitSlot, WaitState, Waiter, MAX_PACKED_CARRIERS,
 };
 pub use admission::{Reservation, ReserveError, ReserveFuture};
@@ -59,6 +61,13 @@ use pooled_buf::GrowthAuthority;
 pub use pooled_buf::PooledBufMut;
 pub use segmented_bytes::SegmentedBytes;
 
+#[cfg(s3_tm_fuzz)]
+pub(crate) fn run_fuzz_input(data: &[u8]) {
+    let _ = test_util::model_harness::run_fuzz_input(data);
+}
+
+#[cfg(all(test, not(s3_tm_loom)))]
+pub(crate) use test_util::test_pool;
 #[cfg(test)]
 use test_util::TestHooks;
 
@@ -103,21 +112,25 @@ impl BufferPool {
         diagnostics: MemoryDiagnosticsConfig,
     ) -> Result<Self, BufferPoolBuildError> {
         let resolved = PoolConfig::resolve(capacity, detected_memory)?;
-        Ok(Self::from_parts_with_diagnostics(
+        let arena_options = ArenaOptions::new(
+            resolved.optimistic_scan_words,
+            diagnostics.enable_detailed_counters(),
+        );
+        Ok(Self::from_parts_with_arena_options(
             resolved.geometry,
             resolved.configured_capacity,
-            resolved.optimistic_scan_words,
             diagnostics,
+            arena_options,
         )
         .unwrap_or_else(|_| invariant_violation("validated pool configuration was rejected")))
     }
 
-    /// Constructs a pool with one already resolved diagnostic policy.
-    fn from_parts_with_diagnostics(
+    /// Constructs a pool with explicit internal arena policy.
+    fn from_parts_with_arena_options(
         geometry: PoolGeometry,
         configured_capacity: CarrierCount,
-        optimistic_scan_words: usize,
         diagnostics: MemoryDiagnosticsConfig,
+        arena_options: ArenaOptions,
     ) -> Result<Self, ArenaError> {
         if configured_capacity == CarrierCount::ZERO {
             invariant_violation("configured capacity must be nonzero");
@@ -130,11 +143,12 @@ impl BufferPool {
             .get()
             .checked_mul(geometry.carrier_size())
             .unwrap_or_else(|| invariant_violation("configured byte capacity overflowed"));
+        let optimistic_scan_words = arena_options.optimistic_scan_words();
         let inner = Arc::new(PoolInner::new(
             geometry,
             configured_capacity,
-            optimistic_scan_words,
             diagnostics,
+            arena_options,
         )?);
         inner.maintenance.start_periodic_diagnostics(&inner);
         tracing::debug!(
@@ -156,7 +170,8 @@ impl BufferPool {
     ///
     /// `Ok(None)` reports an older FIFO request or current admission pressure.
     /// A successful grant has already prepared storage through its complete
-    /// admission floor.
+    /// admission floor. A request whose carrier-rounded envelope exceeds the
+    /// configured pool capacity returns [`ReserveError::ExceedsCapacity`].
     pub fn try_reserve(&self, bytes: usize) -> Result<Option<Reservation>, ReserveError> {
         let envelope = self.reservation_envelope(bytes)?;
         PoolInner::try_reserve_count(&self.inner, envelope)
@@ -166,7 +181,8 @@ impl BufferPool {
     ///
     /// The first poll either returns an immediate result or enters the
     /// pool-wide FIFO. Invalid requests and physical preparation failures
-    /// resolve through the future's `ReserveError`.
+    /// resolve through the future's `ReserveError`. A request larger than the
+    /// configured pool capacity fails without entering the FIFO.
     pub fn reserve(&self, bytes: usize) -> ReserveFuture {
         ReserveFuture::new(self.clone(), bytes)
     }
@@ -312,8 +328,8 @@ impl PoolInner {
     fn new(
         geometry: PoolGeometry,
         configured_capacity: CarrierCount,
-        optimistic_scan_words: usize,
         diagnostics: MemoryDiagnosticsConfig,
+        arena_options: ArenaOptions,
     ) -> Result<Self, ArenaError> {
         Ok(Self {
             geometry,
@@ -322,13 +338,7 @@ impl PoolInner {
             #[cfg(not(all(test, s3_tm_loom)))]
             active_owner_returns: AtomicUsize::new(0),
             coverage: CoverageState::new(),
-            arena: Arena::new(
-                geometry,
-                ArenaOptions::new(
-                    optimistic_scan_words,
-                    diagnostics.enable_detailed_counters(),
-                ),
-            )?,
+            arena: Arena::new(geometry, arena_options)?,
             maintenance: MaintenanceCoordinator::new(
                 configured_capacity,
                 geometry,
@@ -408,24 +418,25 @@ impl PoolInner {
         pool: &Arc<Self>,
         admission: &mut AdmissionGuard<'_>,
         count: CarrierCount,
-    ) -> Result<(), ReserveError> {
-        pool.coverage
+    ) -> Result<CoverageDebit, ReserveError> {
+        let debit = pool
+            .coverage
             .debit(count, admission.maximum_uncovered())
             .map_err(|_| ReserveError::CapacityOverflow)?;
 
         let floor = match admission.acquisition_floor(&pool.coverage) {
             Ok(floor) => floor,
             Err(error) => {
-                admission.rollback_acquisition(&pool.coverage, count);
+                admission.rollback_acquisition(&pool.coverage, count, debit);
                 return Err(error);
             }
         };
         if let Err(error) = pool.arena.prepare_to(admission, floor) {
-            admission.rollback_acquisition(&pool.coverage, count);
+            admission.rollback_acquisition(&pool.coverage, count, debit);
             Self::request_cleanup_after_arena_error(pool, &error);
             return Err(map_preparation_error(error));
         }
-        Ok(())
+        Ok(debit)
     }
 
     /// Attempts one immediate grant without bypassing the FIFO.
@@ -441,6 +452,7 @@ impl PoolInner {
         }
 
         let mut admission = AdmissionGuard::new(pool.admission.lock());
+        admission.validate_envelope(envelope)?;
         if !admission.inner.waiters_is_empty() {
             return Ok(None);
         }
@@ -470,6 +482,7 @@ impl PoolInner {
         }
 
         let mut admission = AdmissionGuard::new(pool.admission.lock());
+        admission.validate_envelope(envelope)?;
         pool.reservation_drain.arm();
         let coverage = pool.coverage.snapshot();
         if admission.inner.waiters_is_empty() && admission.can_grant(coverage, envelope) {
@@ -481,6 +494,12 @@ impl PoolInner {
         }
 
         let slot = Arc::new(WaitSlot::new(waker));
+        #[cfg(test)]
+        if pool.test_hooks.take_reservation_queue_allocation_failure() {
+            pool.reservation_drain
+                .publish_waiter_state(!admission.inner.waiters_is_empty());
+            return Err(ReserveError::MetadataAllocationFailed);
+        }
         let queue_became_nonempty = match admission.inner.enqueue_waiter(
             Waiter {
                 envelope,
@@ -619,7 +638,37 @@ impl PoolInner {
     /// invokes wakers only after unlocking.
     fn release_acquisition_charges(pool: &Arc<Self>, count: CarrierCount) {
         let returned = pool.coverage.release(count);
-        if returned.uncovered_removed == CarrierCount::ZERO
+        Self::drain_after_coverage_return(pool, returned.uncovered_removed);
+    }
+
+    /// Reverses charges that never became carrier owners.
+    fn rollback_acquisition_charges(pool: &Arc<Self>, count: CarrierCount, debit: CoverageDebit) {
+        let drained = {
+            let mut admission = AdmissionGuard::new(pool.admission.lock());
+            let returned = pool.coverage.rollback_debit(
+                count,
+                debit,
+                admission.inner.ledger.active_planned_demand,
+            );
+            let drained = (returned.uncovered_removed != CarrierCount::ZERO)
+                .then(|| Self::drain_fifo_locked(pool, &mut admission, false));
+            admission
+                .inner
+                .ledger
+                .assert_invariants(pool.coverage.snapshot());
+            drained
+        };
+        if let Some(drained) = drained {
+            if let Some(sample) = drained.queue_sample {
+                pool.log_reservation_queue_transition(sample);
+            }
+            wake_all(drained.wakers);
+        }
+    }
+
+    /// Reconsiders reservation admission after uncovered pressure decreases.
+    fn drain_after_coverage_return(pool: &Arc<Self>, uncovered_removed: CarrierCount) {
+        if uncovered_removed == CarrierCount::ZERO
             || !pool.reservation_drain.repayment_requires_drain()
         {
             return;

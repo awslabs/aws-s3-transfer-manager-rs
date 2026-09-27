@@ -141,7 +141,7 @@ pub(crate) struct MemoryDiagnosticsConfig {
 
 impl MemoryDiagnosticsConfig {
     /// Constructs an explicit policy for deterministic internal tests.
-    #[cfg(test)]
+    #[cfg(any(test, s3_tm_fuzz))]
     pub(crate) fn for_test(snapshot_interval: Option<Duration>, detail_level: u64) -> Self {
         Self {
             snapshot_interval,

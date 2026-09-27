@@ -202,10 +202,9 @@ gate reacts to the free-buffer-space subtraction directly, which is both simpler
 
 The read-ahead window limits speculative occupancy for one transfer. The buffer pool independently
 admits the planned memory envelope for each work item across its complete sharing domain. Configured
-capacity is the normal admission ceiling rather than a hard RSS limit; owned carriers remain
-accounted after reservation close, and the pool's idle-only rule preserves progress when retained
-ownership blocks normal admission. The [memory design](./memory.md#admission-and-accounting) defines
-that accounting.
+capacity is the reservation admission ceiling rather than a hard RSS limit. Owned carriers remain
+accounted after reservation close and can delay later reservations until they return. The
+[memory design](./memory.md#admission-and-accounting) defines that accounting.
 
 In `poll_work` the two compose in a fixed order — window first, budget second — so issuance takes
 their min:
@@ -405,9 +404,10 @@ work that advances disk consumption and returns carrier ownership.
 **Mechanism.** A transfer retains the pending `ReserveFuture` and its claimed empty slot. Before
 returning `Pending`, it emits a `DrainResident` work item when a resident run is drainable. The drain
 runs in `execute` — `poll_work` does no I/O — and its completion re-polls the transfer. Assignment of
-the queued reservation independently wakes the transfer. Buffer-pool liveness does not require
-resident bytes to return: once earlier active planned demand closes, idle-only admission can grant
-the FIFO head while existing byte owners remain charged.
+the queued reservation independently wakes the transfer. Buffer-pool progress may require resident
+bytes to return. The drain path ensures a disk-backed transfer does not hide releasable resident
+ownership behind its own reservation wait. Stream-backed transfers instead rely on consumer
+progress, so retained output intentionally applies backpressure to later reservations.
 
 ### Caller obligation
 
