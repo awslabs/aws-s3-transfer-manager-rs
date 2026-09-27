@@ -21,8 +21,12 @@ pub enum PartSize {
     Target(u64),
 }
 
-/// Upper bound on memory the transfer manager uses for in-flight and buffered
-/// transfer data. At the limit transfers backpressure rather than fail.
+/// Configured capacity for reservation-based pooled transfer data.
+///
+/// Requests that fit within the resolved capacity backpressure when capacity
+/// is unavailable. A single reservation larger than the resolved capacity is
+/// rejected. Unreserved acquisition and process or runtime overhead are
+/// outside this ceiling.
 #[non_exhaustive]
 #[derive(Debug, Clone, Default)]
 pub enum MemoryBudgetConfig {
@@ -40,9 +44,16 @@ pub enum MemoryBudgetConfig {
     Fraction(f64),
     /// An explicit byte limit that bypasses memory detection.
     ///
-    /// The value must fund at least one carrier. Use the [`ByteUnit`] helpers,
-    /// for example
+    /// The resolved capacity never exceeds this value and may be smaller by
+    /// less than one platform allocation unit. Values too small to fund one
+    /// allocation unit are rejected. The resolved capacity is reported by
+    /// [`MemoryMetrics::configured_capacity_bytes`].
+    ///
+    /// Use the [`ByteUnit`] helpers, for example
     /// `Limit(2 * ByteUnit::Gibibyte.as_bytes_usize())`.
+    ///
+    /// [`MemoryMetrics::configured_capacity_bytes`]:
+    ///     crate::metrics::MemoryMetrics::configured_capacity_bytes
     Limit(usize),
 }
 

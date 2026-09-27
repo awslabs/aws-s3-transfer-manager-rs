@@ -341,14 +341,17 @@ mod tests {
     }
 
     #[test]
-    fn test_limit_rounds_down_to_complete_carriers() {
-        let resolved = PoolConfig::resolve_for_page(
-            MemoryBudgetConfig::Limit(DEFAULT_CARRIER_BYTES + 123),
-            None,
-            4096,
-        )
-        .unwrap();
+    fn test_non_aligned_limit_cannot_fund_same_sized_reservation() {
+        // Capacity rounds down so it never exceeds the byte limit, while a
+        // reservation must cover its complete allocation unit.
+        let limit = DEFAULT_CARRIER_BYTES + 123;
+        let resolved =
+            PoolConfig::resolve_for_page(MemoryBudgetConfig::Limit(limit), None, 4096).unwrap();
+        let envelope = resolved.geometry.carriers_for_bytes(limit).unwrap();
+
         assert_eq!(resolved.configured_capacity, CarrierCount::new(1));
+        assert_eq!(envelope, CarrierCount::new(2));
+        assert!(envelope > resolved.configured_capacity);
     }
 
     #[test]

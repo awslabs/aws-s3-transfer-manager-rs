@@ -458,6 +458,10 @@ impl AdmissionLedger {
 
     /// Rejects an envelope that can never fit under normal admission.
     fn validate_envelope(&self, envelope: CarrierCount) -> Result<(), ReserveError> {
+        // TODO(memory): Evaluate admitting one oversized FIFO-head reservation
+        // when aggregate admission use is zero. Define retained-owner blocking,
+        // serialization, memory-overage, and metrics semantics before relaxing
+        // the configured-capacity ceiling.
         if envelope > self.configured_capacity {
             return Err(ReserveError::ExceedsCapacity);
         }
