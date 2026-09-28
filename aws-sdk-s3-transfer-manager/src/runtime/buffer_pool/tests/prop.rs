@@ -11,7 +11,11 @@ use proptest::prelude::*;
 use super::super::test_util::model_harness::{run_sequence, SequenceReport};
 use super::super::test_util::operation_sequence::{
     Operation, ALL_REMAINING_SELECTOR, COMPACT_PROFILE, GROW_ONE_CARRIER_SELECTOR,
-    PLACEMENT_ACQUISITION_CARRIERS, PLACEMENT_PROFILE, PLACEMENT_RESERVATION_CARRIERS,
+    PLACEMENT_PROFILE,
+};
+#[cfg(not(miri))]
+use super::super::test_util::operation_sequence::{
+    PLACEMENT_ACQUISITION_CARRIERS, PLACEMENT_RESERVATION_CARRIERS,
 };
 
 #[cfg(not(miri))]
