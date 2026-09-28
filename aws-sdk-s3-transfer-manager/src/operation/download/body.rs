@@ -270,8 +270,8 @@ enum Mode {
     /// Positioned writes land at `chunk.offset - object_range_start` in the sink.
     Disk {
         sink: Box<dyn SinkWrite>,
-        /// Start of the S3 byte range for this transfer.
-        object_range_start: u64,
+        /// Start of the resolved S3 byte range for this transfer.
+        object_range_start: std::sync::OnceLock<u64>,
     },
 }
 
@@ -395,8 +395,20 @@ impl BodyWriter {
             object_range_start,
         } = &*self.mode
         {
+            let Some(object_range_start) = object_range_start.get().copied() else {
+                // Cancellation can terminate a disk transfer before discovery
+                // establishes its range. A fill before preparation violates the
+                // transfer ordering and cannot be positioned safely.
+                if self.buffer.has_undrained_fills() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "disk payload arrived before destination preparation",
+                    ));
+                }
+                return Ok(0);
+            };
             while let Some(sw) = self.buffer.take_drain_run(mode) {
-                write_run(sink.as_ref(), *object_range_start, &sw)?;
+                write_run(sink.as_ref(), object_range_start, &sw)?;
                 freed = freed.saturating_add(sw.complete());
             }
         }
@@ -460,9 +472,21 @@ impl BodyWriter {
         self.notify.notify_one();
     }
 
-    /// Request best-effort allocation for a manager-owned disk target.
-    pub(crate) fn prepare(&self, expected_download_len: u64) -> std::io::Result<()> {
-        if let Mode::Disk { sink, .. } = &*self.mode {
+    /// Fix the resolved object-range origin and prepare a disk target.
+    pub(crate) fn prepare(
+        &self,
+        object_range_start: u64,
+        expected_download_len: u64,
+    ) -> std::io::Result<()> {
+        if let Mode::Disk {
+            sink,
+            object_range_start: configured_start,
+        } = &*self.mode
+        {
+            assert!(
+                configured_start.set(object_range_start).is_ok(),
+                "disk destination prepared more than once"
+            );
             sink.prepare(expected_download_len)?;
         }
         Ok(())
@@ -535,18 +559,16 @@ pub(crate) fn new_recv_body() -> (BodyWriter, RecvBodyConsumer) {
 /// Issuance backpressure is owned by the per-transfer [`ReadAhead`] controller.
 ///
 /// [`ReadAhead`]: super::read_ahead::ReadAhead
-fn new_recv_body_with_disk_mode(
-    sink: Box<dyn SinkWrite>,
-    object_range_start: u64,
-) -> (BodyWriter, RecvBodyConsumer) {
+fn new_recv_body_with_disk_mode(sink: Box<dyn SinkWrite>) -> (BodyWriter, RecvBodyConsumer) {
     let (buffer, consumer) = PagedRecvBuffer::new_with_segment_size(SEG_SIZE);
     let notify = Arc::new(WakeNotify::new());
+    let resolved_range_start = std::sync::OnceLock::new();
     let writer = BodyWriter {
         buffer,
         notify: notify.clone(),
         mode: Arc::new(Mode::Disk {
             sink,
-            object_range_start,
+            object_range_start: resolved_range_start,
         }),
     };
     let slot_consumer = RecvBodyConsumer { consumer, notify };
@@ -556,10 +578,9 @@ fn new_recv_body_with_disk_mode(
 /// Create a producer/consumer pair with a file sink for download-to-file.
 pub(crate) fn new_recv_body_with_sink(
     file: std::fs::File,
-    object_range_start: u64,
     owns_file: bool,
 ) -> (BodyWriter, RecvBodyConsumer) {
-    new_recv_body_with_disk_mode(Box::new(FileSink { file, owns_file }), object_range_start)
+    new_recv_body_with_disk_mode(Box::new(FileSink { file, owns_file }))
 }
 
 /// Stream of [ChunkOutput] representing an Amazon S3 Object's contents and metadata.
@@ -924,9 +945,42 @@ mod tests {
                 self.0.write_all_at(buf, pos)
             }
         }
-        let (writer, consumer) =
-            new_recv_body_with_disk_mode(Box::new(Shared(sink.clone())), object_range_start);
+        let (writer, consumer) = new_recv_body_with_disk_mode(Box::new(Shared(sink.clone())));
+        writer.prepare(object_range_start, 0).unwrap();
         (writer, consumer, sink)
+    }
+
+    fn new_test_recv_body_with_sink(
+        file: std::fs::File,
+        object_range_start: u64,
+    ) -> (Writer, RecvBodyConsumer) {
+        let (writer, consumer) = new_recv_body_with_sink(file, false);
+        writer.prepare(object_range_start, 0).unwrap();
+        (writer, consumer)
+    }
+
+    /// Cancellation can terminally drain a disk transfer before discovery has
+    /// resolved its object range. No payload exists at that point.
+    #[test]
+    fn disk_terminal_drain_before_prepare_is_empty() {
+        let file = tempfile::tempfile().unwrap();
+        let (writer, _consumer) = new_recv_body_with_sink(file, false);
+
+        assert_eq!(writer.terminal_drain().unwrap(), 0);
+    }
+
+    /// A filled payload before destination preparation has no safe file
+    /// position and must not be discarded as an empty cancellation.
+    #[test]
+    fn disk_terminal_drain_before_prepare_rejects_payload() {
+        let file = tempfile::tempfile().unwrap();
+        let (writer, _consumer) = new_recv_body_with_sink(file, false);
+        writer.claim().fill(chunk_at(0, 0, b"payload"));
+
+        let error = writer
+            .terminal_drain()
+            .expect_err("unpositioned payload must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     }
 
     /// `has_drainable_resident` gates memory-pressure draining. It is true only on the
@@ -999,7 +1053,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("out");
         let file = std::fs::File::create(&path).unwrap();
-        let (writer, _consumer) = new_recv_body_with_sink(file, 0, false);
+        let (writer, _consumer) = new_test_recv_body_with_sink(file, 0);
 
         let mut expected = Vec::with_capacity(SEG_SIZE * CHUNK_LEN);
         for i in 0..SEG_SIZE as u64 {
@@ -1021,7 +1075,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("out");
         let file = std::fs::File::create(&path).unwrap();
-        let (writer, _consumer) = new_recv_body_with_sink(file, 0, false);
+        let (writer, _consumer) = new_test_recv_body_with_sink(file, 0);
 
         let partial = SEG_SIZE / 2;
         let mut expected = Vec::with_capacity(partial * CHUNK_LEN);
@@ -1048,9 +1102,8 @@ mod tests {
             .write(true)
             .open(&path)
             .unwrap();
-        let (writer, _consumer) = new_recv_body_with_sink(file, 0, false);
-
-        writer.prepare(3).unwrap();
+        let (writer, _consumer) = new_recv_body_with_sink(file, false);
+        writer.prepare(0, 3).unwrap();
         assert_eq!(
             std::fs::metadata(&path).unwrap().len(),
             ORIGINAL.len() as u64,
@@ -1075,9 +1128,8 @@ mod tests {
         let path = dir.path().join("out");
         std::fs::write(&path, b"existing").unwrap();
         let file = std::fs::File::open(&path).unwrap();
-        let (writer, _consumer) = new_recv_body_with_sink(file, 0, false);
-
-        writer.prepare(3).unwrap();
+        let (writer, _consumer) = new_recv_body_with_sink(file, false);
+        writer.prepare(0, 3).unwrap();
         writer
             .finalize(3)
             .expect_err("a read-only caller file cannot be finalized");
@@ -1094,9 +1146,8 @@ mod tests {
             .write(true)
             .open(&path)
             .unwrap();
-        let (writer, _consumer) = new_recv_body_with_sink(file, 0, false);
-
-        writer.prepare(0).unwrap();
+        let (writer, _consumer) = new_recv_body_with_sink(file, false);
+        writer.prepare(0, 0).unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 8);
 
         writer.finalize(0).unwrap();
@@ -1124,7 +1175,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("out");
         let file = std::fs::File::create(&path).unwrap();
-        let (writer, _consumer) = new_recv_body_with_sink(file, 0, false);
+        let (writer, _consumer) = new_test_recv_body_with_sink(file, 0);
 
         let total = SEG_SIZE + 2;
         let mut expected = Vec::with_capacity(total * CHUNK_LEN);
@@ -1147,7 +1198,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("out");
         let file = std::fs::File::create(&path).unwrap();
-        let (writer, _consumer) = new_recv_body_with_sink(file, 1000, false);
+        let (writer, _consumer) = new_test_recv_body_with_sink(file, 1000);
 
         let n = SEG_SIZE;
         let mut expected = Vec::with_capacity(n * CHUNK_LEN);
@@ -1171,7 +1222,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("out");
         let file = std::fs::File::create(&path).unwrap();
-        let (writer, _consumer) = new_recv_body_with_sink(file, 0, false);
+        let (writer, _consumer) = new_test_recv_body_with_sink(file, 0);
 
         let n = SEG_SIZE;
         let mut handles = Vec::new();
@@ -1218,7 +1269,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("out");
         let file = std::fs::File::create(&path).unwrap();
-        let (writer, _consumer) = new_recv_body_with_sink(file, 0, false);
+        let (writer, _consumer) = new_test_recv_body_with_sink(file, 0);
 
         // Fill two full segments, draining on the DrainReady edge after each fill — the
         // disk path's steady-state loop. Bounded iteration, so a regression fails fast.
@@ -1444,7 +1495,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("out");
         let file = std::fs::File::create(&path).unwrap();
-        let (writer, _consumer) = new_recv_body_with_sink(file, 0, false);
+        let (writer, _consumer) = new_test_recv_body_with_sink(file, 0);
 
         let reservation = pool
             .try_reserve(chunk_bytes)

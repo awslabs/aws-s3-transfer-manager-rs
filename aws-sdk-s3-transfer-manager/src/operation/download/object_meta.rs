@@ -130,13 +130,14 @@ impl ObjectMetadata {
 
     /// <p>Parse the content-range header to the inclusive range..</p>
     pub(crate) fn range_from_content_range(&self) -> Option<RangeInclusive<u64>> {
-        match self.total_object_size().checked_sub(1) {
-            Some(object_end) => match self.content_range.as_ref() {
-                Some(range) => crate::http::header::parse_content_range(range),
-                // When S3 doesn't provide a content-range header, we can infer the total size from the content-length header.
-                None => Some(0..=object_end),
-            },
-            None => None,
+        match self.content_range.as_deref() {
+            Some(range) => crate::http::header::parse_content_range(range),
+            // Without Content-Range, Content-Length describes the complete object.
+            None => self
+                .content_length
+                .and_then(|length| u64::try_from(length).ok())
+                .and_then(|length| length.checked_sub(1))
+                .map(|end| 0..=end),
         }
     }
 }

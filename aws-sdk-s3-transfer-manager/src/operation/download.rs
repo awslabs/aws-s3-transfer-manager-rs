@@ -107,8 +107,7 @@ impl Download {
             .map_err(|e| error::from_kind(error::ErrorKind::IOError)(e))?;
         let file = tokio_file.into_std().await;
 
-        let range_start = object_range_start_from_input(&input);
-        let inner = Self::orchestrate_with_sink(handle, input, file, range_start, true, parent_id)?;
+        let inner = Self::orchestrate_with_sink(handle, input, file, true, parent_id)?;
         Ok(ManagedDownloadHandle::new(inner, temp_path, dest_path))
     }
 
@@ -119,8 +118,7 @@ impl Download {
         input: DownloadInput,
         file: std::fs::File,
     ) -> Result<ManagedDownloadHandle, error::Error> {
-        let range_start = object_range_start_from_input(&input);
-        let inner = Self::orchestrate_with_sink(handle, input, file, range_start, false, None)?;
+        let inner = Self::orchestrate_with_sink(handle, input, file, false, None)?;
         // No temp/dest paths — caller manages the file lifecycle
         Ok(ManagedDownloadHandle::new_unmanaged(inner))
     }
@@ -131,7 +129,6 @@ impl Download {
         handle: Arc<crate::client::Handle>,
         input: DownloadInput,
         file: std::fs::File,
-        object_range_start: u64,
         owns_file: bool,
         parent_id: Option<u64>,
     ) -> Result<DownloadHandleInner, error::Error> {
@@ -144,8 +141,7 @@ impl Download {
         let bucket_type =
             BucketType::from_bucket_name(input.bucket().expect("bucket is available"));
 
-        let (writer, _consumer) =
-            body::new_recv_body_with_sink(file, object_range_start, owns_file);
+        let (writer, _consumer) = body::new_recv_body_with_sink(file, owns_file);
 
         let (ctx, completion_rx) = match parent_id {
             Some(pid) => TransferContext::new_child(handle.clone(), pid),
@@ -162,19 +158,4 @@ impl Download {
             completion_rx: Some(completion_rx),
         })
     }
-}
-
-/// Extract the byte range start from the user's range header, if present.
-/// Returns 0 for no range or non-inclusive ranges (suffix, open-ended).
-fn object_range_start_from_input(input: &DownloadInput) -> u64 {
-    use crate::http::header;
-    use std::str::FromStr;
-    input
-        .range()
-        .and_then(|r| header::Range::from_str(r).ok())
-        .map(|r| match r.0 {
-            header::ByteRange::Inclusive(start, _) => start,
-            _ => 0,
-        })
-        .unwrap_or(0)
 }

@@ -811,6 +811,18 @@ impl<T> PagedRecvBuffer<T> {
         })
     }
 
+    /// Whether the block surface retains any filled payload.
+    ///
+    /// Published fills increase `filled_count`; completing a claimed drain run
+    /// increases `drained_count`. The difference includes fills waiting behind
+    /// an earlier gap as well as fills in an actively written run.
+    pub(crate) fn has_undrained_fills(&self) -> bool {
+        let guard = self.inner.locked.lock();
+        guard.segments.iter().any(|seg| {
+            seg.filled_count.load(Ordering::Acquire) > seg.drained_count.load(Ordering::Acquire)
+        })
+    }
+
     /// The in-order delivery cursor: the next sequence the consumer will deliver, i.e.
     /// the count of sequences already delivered. Lock-free read of the shared cursor.
     ///

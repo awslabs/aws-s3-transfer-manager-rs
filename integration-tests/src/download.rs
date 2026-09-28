@@ -440,6 +440,55 @@ async fn test_download_tail_ranges_deliver_the_tail() {
     m.handle.shutdown().await.expect("shutdown");
 }
 
+/// File destinations place the first requested byte at destination offset zero.
+///
+/// HeadObject resolves open-ended and suffix ranges to absolute object offsets.
+/// The disk path must subtract that resolved start before writing and finalize
+/// the file to the downloaded length.
+#[cfg(any(unix, windows))]
+#[tokio::test]
+async fn test_download_tail_ranges_to_files_start_at_zero() {
+    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let m = setup_concurrent(part_size, 8).await;
+
+    let size = 10 * ByteUnit::Mebibyte.as_bytes_usize();
+    let content = deterministic_data(size);
+    m.server
+        .add_object("test-bucket", "tail-file-key", content.clone(), None)
+        .await
+        .expect("add object");
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("open-ended.dat");
+    let handle = m
+        .client
+        .download()
+        .bucket("test-bucket")
+        .key("tail-file-key")
+        .range("bytes=7000000-")
+        .write_to_path(&path)
+        .await
+        .unwrap();
+    handle.join().await.unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), &content[7_000_000..]);
+
+    let path = dir.path().join("suffix.dat");
+    let file = std::fs::File::create(&path).unwrap();
+    file.set_len(3_000_000 + 4096).unwrap();
+    let handle = m
+        .client
+        .download()
+        .bucket("test-bucket")
+        .key("tail-file-key")
+        .range("bytes=-3000000")
+        .write_to_file(file)
+        .unwrap();
+    handle.join().await.unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), &content[size - 3_000_000..]);
+
+    m.handle.shutdown().await.expect("shutdown");
+}
+
 /// Test single-part download to file (2 MB object, 5 MB part size — no range splitting).
 #[cfg(any(unix, windows))]
 #[tokio::test]
