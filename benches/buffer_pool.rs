@@ -796,6 +796,49 @@ enum PartReplacementSchedule {
     Overlapped,
 }
 
+/// Long-lived allocation mix retained while whole parts churn.
+#[derive(Clone, Copy)]
+enum PartTrafficShape {
+    /// Every live owner is one whole transfer part.
+    Homogeneous,
+    /// Small public-pool owners remain live beside transfer parts.
+    PersistentSmall,
+}
+
+impl PartTrafficShape {
+    const SMALL_CARRIERS: [usize; 3] = [1, 17, 63];
+
+    /// Returns a stable suffix without renaming the established controls.
+    fn benchmark_name(self, base: String) -> String {
+        match self {
+            Self::Homogeneous => base,
+            Self::PersistentSmall => format!("{base}_mixed_small"),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Homogeneous => "homogeneous",
+            Self::PersistentSmall => "persistent-small",
+        }
+    }
+
+    fn retained_bytes(self) -> usize {
+        match self {
+            Self::Homogeneous => 0,
+            Self::PersistentSmall => Self::SMALL_CARRIERS.iter().sum::<usize>() * FRAME_BYTES,
+        }
+    }
+
+    fn part_count(self, part_bytes: usize) -> usize {
+        (CHURN_CAPACITY_BYTES - self.retained_bytes()) / part_bytes
+    }
+
+    fn unallocated_tail_bytes(self, part_bytes: usize) -> usize {
+        (CHURN_CAPACITY_BYTES - self.retained_bytes()) % part_bytes
+    }
+}
+
 impl PartReplacementSchedule {
     /// Returns a stable name while preserving the established control names.
     fn benchmark_name(self, order: PartReleaseOrder) -> String {
@@ -841,6 +884,8 @@ impl PartChurnMeasurements {
 /// queueing or uncovered-return accounting.
 struct WholePartChurn {
     state: PreparedPool,
+    /// Small mutable owners that deliberately damage complete bitmap words.
+    _small: Vec<PooledBufMut>,
     parts: Vec<Option<SegmentedBytes>>,
     release_indices: Vec<usize>,
     ordered_start: usize,
@@ -850,10 +895,43 @@ struct WholePartChurn {
 
 impl WholePartChurn {
     /// Fills a four-block cohort with initialized immutable parts.
-    fn new(part_bytes: usize) -> Self {
-        assert_eq!(CHURN_CAPACITY_BYTES % part_bytes, 0);
+    ///
+    /// The mixed profile retains 1, 17, and 63 carriers. These values cover a
+    /// tiny public allocation, a mid-word multi-frame owner, and the final
+    /// carrier before a complete 64-carrier bitmap word. Acquiring them after
+    /// the reservation prepares the complete pool lets the rotating cursor
+    /// place them in separate words, matching mixed independent users.
+    fn new(part_bytes: usize, traffic: PartTrafficShape) -> Self {
         let state = PreparedPool::new(CHURN_CAPACITY_BYTES);
-        let part_count = CHURN_CAPACITY_BYTES / part_bytes;
+        let carrier_size = state.pool.carrier_size();
+        let small = match traffic {
+            PartTrafficShape::Homogeneous => Vec::new(),
+            PartTrafficShape::PersistentSmall => PartTrafficShape::SMALL_CARRIERS
+                .into_iter()
+                .map(|carriers| {
+                    state
+                        .pool
+                        .acquire(&state.reservation, carriers * carrier_size)
+                        .expect("mixed-traffic benchmark acquisition")
+                })
+                .collect::<Vec<_>>(),
+        };
+        let small_bytes = small.iter().map(PooledBufMut::capacity).sum::<usize>();
+        assert_eq!(small_bytes, traffic.retained_bytes());
+        let part_count = traffic.part_count(part_bytes);
+        assert!(part_count != 0);
+        let unallocated_tail_bytes = traffic.unallocated_tail_bytes(part_bytes);
+        assert!(unallocated_tail_bytes < part_bytes);
+        let charged_bytes = small_bytes + part_count * part_bytes;
+        assert!(
+            charged_bytes >= CHURN_CAPACITY_BYTES * 95 / 100,
+            "whole-part churn must remain at least 95% charged"
+        );
+        /*
+         * Integer part counts leave at most one sub-part suffix unowned. Keep
+         * that slack explicit instead of adding a fourth persistent small
+         * owner and changing the three-damaged-word topology under test.
+         */
         let mut parts = Vec::with_capacity(part_count);
         for _ in 0..part_count {
             parts.push(Some(Self::acquire_part(
@@ -865,6 +943,7 @@ impl WholePartChurn {
 
         Self {
             state,
+            _small: small,
             parts,
             release_indices: Vec::with_capacity(part_count),
             ordered_start: 0,
@@ -1012,6 +1091,7 @@ fn report_whole_part_preflight(
     order: PartReleaseOrder,
     schedule: PartReplacementSchedule,
     part_name: &str,
+    traffic: PartTrafficShape,
 ) {
     let mut preflight = PartChurnMeasurements::default();
     for _ in 0..CHURN_PREFLIGHT_BATCHES {
@@ -1021,12 +1101,22 @@ fn report_whole_part_preflight(
     assert!(total != 0, "whole-part preflight produced no acquisitions");
     let contiguous_percent = preflight.contiguous as f64 * 100.0 / total as f64;
     let acquisition_ns = preflight.acquisition_time.as_nanos() / u128::from(preflight.acquisitions);
+    let prepared_bytes = churn.state.pool.metrics().prepared_capacity_bytes();
+    let charged_bytes = churn.state.pool.metrics().charged_capacity_bytes();
+    let occupancy_percent = charged_bytes as f64 * 100.0 / prepared_bytes as f64;
+    let part_count = traffic.part_count(churn.part_bytes);
+    let unallocated_tail_bytes = traffic.unallocated_tail_bytes(churn.part_bytes);
     eprintln!(
         "buffer-pool whole-part topology: part={part_name} schedule={} order={} \
+         traffic={} \
+         part_count={part_count} unallocated_tail_bytes={unallocated_tail_bytes} \
          acquisitions={} acquisition_mean_ns={acquisition_ns} \
+         charged_bytes={charged_bytes} prepared_bytes={prepared_bytes} \
+         occupancy_percent={occupancy_percent:.2} \
          contiguous={} segmented={} contiguous_percent={contiguous_percent:.2}",
         schedule.benchmark_name(order),
         order.name(),
+        traffic.name(),
         preflight.acquisitions,
         preflight.contiguous,
         preflight.segmented,
@@ -1053,36 +1143,50 @@ fn benchmark_whole_part_churn(c: &mut Criterion) {
     group.warm_up_time(Duration::from_secs(2));
     group.measurement_time(Duration::from_secs(5));
 
-    for (part_name, part_bytes) in [("8m", 8 * MIB), ("16m", 16 * MIB)] {
-        let replacement_bytes = CHURN_CAPACITY_BYTES / 2;
-        group.throughput(Throughput::Bytes(replacement_bytes as u64));
+    for traffic in [
+        PartTrafficShape::Homogeneous,
+        PartTrafficShape::PersistentSmall,
+    ] {
+        for (part_name, part_bytes) in [("8m", 8 * MIB), ("16m", 16 * MIB)] {
+            let replacement_bytes = traffic.part_count(part_bytes) / 2 * part_bytes;
+            group.throughput(Throughput::Bytes(replacement_bytes as u64));
 
-        for schedule in [
-            PartReplacementSchedule::ReleasedFirst,
-            PartReplacementSchedule::Overlapped,
-        ] {
-            for order in [PartReleaseOrder::Ordered, PartReleaseOrder::Shuffled] {
-                let mut preflight_reported = false;
-                group.bench_with_input(
-                    BenchmarkId::new(schedule.benchmark_name(order), part_name),
-                    &part_bytes,
-                    |b, &part_bytes| {
-                        if !preflight_reported {
-                            let mut preflight = WholePartChurn::new(part_bytes);
-                            report_whole_part_preflight(&mut preflight, order, schedule, part_name);
-                            preflight_reported = true;
-                        }
-
-                        let mut churn = WholePartChurn::new(part_bytes);
-                        b.iter_custom(|iterations| {
-                            let started = Instant::now();
-                            for _ in 0..iterations {
-                                black_box(churn.replace_batch(order, schedule));
+            for schedule in [
+                PartReplacementSchedule::ReleasedFirst,
+                PartReplacementSchedule::Overlapped,
+            ] {
+                for order in [PartReleaseOrder::Ordered, PartReleaseOrder::Shuffled] {
+                    let mut preflight_reported = false;
+                    group.bench_with_input(
+                        BenchmarkId::new(
+                            traffic.benchmark_name(schedule.benchmark_name(order)),
+                            part_name,
+                        ),
+                        &part_bytes,
+                        |b, &part_bytes| {
+                            if !preflight_reported {
+                                let mut preflight = WholePartChurn::new(part_bytes, traffic);
+                                report_whole_part_preflight(
+                                    &mut preflight,
+                                    order,
+                                    schedule,
+                                    part_name,
+                                    traffic,
+                                );
+                                preflight_reported = true;
                             }
-                            started.elapsed()
-                        });
-                    },
-                );
+
+                            let mut churn = WholePartChurn::new(part_bytes, traffic);
+                            b.iter_custom(|iterations| {
+                                let started = Instant::now();
+                                for _ in 0..iterations {
+                                    black_box(churn.replace_batch(order, schedule));
+                                }
+                                started.elapsed()
+                            });
+                        },
+                    );
+                }
             }
         }
     }

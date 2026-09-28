@@ -61,9 +61,22 @@ use pooled_buf::GrowthAuthority;
 pub use pooled_buf::PooledBufMut;
 pub use segmented_bytes::SegmentedBytes;
 
+/// Executes one compact accounting and ownership fuzz sequence.
+///
+/// The target decodes public pool operations and checks every transition
+/// against the shared reference model and quiescent audit.
 #[cfg(s3_tm_fuzz)]
 pub(crate) fn run_fuzz_input(data: &[u8]) {
     let _ = test_util::model_harness::run_fuzz_input(data);
+}
+
+/// Executes one large-geometry bitmap-placement fuzz sequence.
+///
+/// The target uses the shared reference model plus the independent free-word
+/// oracle to verify contiguous-first placement and legal fragmented fallback.
+#[cfg(s3_tm_fuzz)]
+pub(crate) fn run_placement_fuzz_input(data: &[u8]) {
+    let _ = test_util::model_harness::run_placement_fuzz_input(data);
 }
 
 #[cfg(all(test, not(s3_tm_loom)))]

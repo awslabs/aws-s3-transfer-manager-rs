@@ -40,6 +40,9 @@ does not become bounded merely because its caller shares the pool.
 
 FIFO order and eligibility are pool-wide. One component's head request may block later requests
 from every component; the shared domain provides no per-component latency isolation.
+Scheduler priority does not reorder this FIFO. It controls which transfer may generate and
+dispatch more work, while requests that have entered shared-pool admission retain arrival order.
+A later high-priority transfer may therefore wait behind an older lower-priority reservation.
 
 Transfer-manager shutdown releases only that manager's state. It does not close a pool retained by
 another caller.
@@ -1227,28 +1230,40 @@ those operations.
 One arena acquisition requests a complete carrier batch. It returns every requested carrier or an
 error; no partial batch is exposed.
 
-The common path performs a bounded amount of optimistic bitmap work from a rotating origin:
+The common path performs a bounded amount of optimistic bitmap work from a rotating origin.
+Requests use one of two claim modes:
 
 1. Load one immutable registry generation.
-2. Inspect at most the configured number of bitmap words across `Active` blocks.
-3. Keep every bit won from each atomic bitmap operation.
-4. Confirm that each touched block remains `Active` after the bitmap mutation.
-5. Return the batch when enough carriers have been won.
+2. Select a preferred whole-word run when the request is nonzero, is an exact multiple of 64
+   carriers, fits within one block, and its complete run fits within the optimistic scan budget.
+3. For a preferred run, inspect at most the configured number of bitmap words across `Active`
+   blocks. Publish ownership only after winning every word in one consecutive run. A collision
+   rolls back every word already won by that attempt.
+4. For every other request, claim free bits across the same bounded window and retain every bit won
+   from each atomic bitmap operation.
+5. Confirm that each touched block remains `Active` after the bitmap mutation.
+6. Return the batch when enough carriers have been won.
 
 The scan bound limits common-path work, not usable capacity. A miss can be false because free
 carriers may exist outside the inspected locations or may have been returned concurrently.
+Preferred-run failure does not fall through to fragmented claiming within the same optimistic
+attempt. A run larger than the complete optimistic budget cannot succeed in that attempt and skips
+optimistic bitmap work instead. Serialized fallback can then search the complete registry without
+first fragmenting the request.
 
-After an optimistic miss, acquisition retains its provisional bits. For a shortfall path, the
+After an optimistic miss, acquisition retains any provisional bits. For a shortfall path, the
 published charge and prepared-capacity floor remain in force. Both covered and shortfall paths
 acquire a fresh `AdmissionGuard` at this point, then call the same serialized fallback:
 
 1. Acquire `ArenaState`.
-2. Exhaustively scan every `Active` block and retain successful provisional claims.
-3. If the batch remains incomplete, establish a writable block and fresh incarnation privately.
-4. Set the fallback claimant's required bits in the unpublished incarnation.
-5. Add the whole block to `prepared_capacity`.
-6. Publish the incarnation and its remaining free carriers as `Active`.
-7. Repeat preparation until the batch is complete or preparation fails.
+2. When an eligible whole-word request has no provisional ownership, scan every `Active` block for
+   one complete run.
+3. Exhaustively scan every `Active` block and retain successful fragmented claims.
+4. If the batch remains incomplete, establish a writable block and fresh incarnation privately.
+5. Set the fallback claimant's required bits in the unpublished incarnation.
+6. Add the whole block to `prepared_capacity`.
+7. Publish the incarnation and its remaining free carriers as `Active`.
+8. Repeat preparation until the batch is complete or preparation fails.
 
 Preclaiming the missing carriers before publication prevents lock-free claimants from consuming the
 new capacity and forcing the serialized claimant to grow repeatedly. The fallback therefore

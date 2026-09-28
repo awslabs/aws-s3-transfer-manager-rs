@@ -6,4 +6,5 @@
 //! Cross-module generated and replay validation.
 
 mod fuzz_replay;
+mod placement;
 mod prop;
