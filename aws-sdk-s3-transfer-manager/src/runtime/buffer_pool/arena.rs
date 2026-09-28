@@ -344,6 +344,10 @@ impl Arena {
         let origin_stride = if budget == total_positions { 1 } else { budget };
         let origin = self.scan_origin.fetch_add(origin_stride, Ordering::Relaxed) % total_positions;
         if let Some(word_count) = self.contiguous_word_count(required) {
+            if word_count > budget {
+                self.diagnostics.record_optimistic_scan(0, true);
+                return Ok(batch);
+            }
             while batch.inspected_words < budget && !batch.is_complete() {
                 let position = wrapped_position(origin, batch.inspected_words, total_positions);
                 let slot_index = position / words_per_slot;
@@ -1681,6 +1685,35 @@ mod tests {
     }
 
     #[test]
+    fn whole_word_claim_larger_than_budget_skips_impossible_scan() {
+        /*
+         * A two-word request cannot complete inside a one-word optimistic
+         * budget. Preserve the request for serialized run-first fallback
+         * without scanning, allocating claim storage, or fragmenting it.
+         */
+        const WORD_CARRIERS: usize = u64::BITS as usize;
+
+        let arena = test_arena(geometry_with_carriers(WORD_CARRIERS * 2), 1).unwrap();
+        let slot = prepare_slots(&arena, 1).pop().unwrap();
+        let batch = arena
+            .claim_optimistic(CarrierCount::new(WORD_CARRIERS * 2))
+            .unwrap();
+        let diagnostics = arena.diagnostics();
+        let detailed = diagnostics
+            .detailed
+            .expect("test arena must collect detailed scan counters");
+
+        assert_eq!(batch.claimed(), CarrierCount::ZERO);
+        assert!(!batch.is_complete());
+        assert_eq!(detailed.optimistic_scans, 1);
+        assert_eq!(detailed.optimistic_scan_words, 0);
+        assert_eq!(diagnostics.optimistic_misses, 1);
+
+        drop(batch);
+        assert_fully_free(&slot);
+    }
+
+    #[test]
     fn serialized_contiguous_scan_starts_from_the_rotating_cursor() {
         let arena = test_arena(geometry_with_carriers(192), 1).unwrap();
         let slots = prepare_slots(&arena, 2);
@@ -2349,7 +2382,7 @@ mod tests {
         const WORDS_PER_SLOT: usize = 2;
         const REQUEST: usize = WORDS_PER_SLOT * u64::BITS as usize;
 
-        let arena = test_arena(geometry_with_carriers(REQUEST), 1).unwrap();
+        let arena = test_arena(geometry_with_carriers(REQUEST), WORDS_PER_SLOT).unwrap();
         let slots = prepare_slots(&arena, SLOTS);
         let mut blockers = Vec::new();
         for slot in &slots {
