@@ -182,18 +182,31 @@ impl Buf for DiskWriteCursor<'_> {
 /// in-memory capture, and so an alternative write strategy (e.g. O_DIRECT/io_uring)
 /// can replace the file write without touching the buffer or the drain logic.
 ///
-/// `write_all_at` writes the whole buffer at an absolute file position; `preallocate`
-/// is a best-effort size hint. Implementations are shared across the issuer and the
-/// drain task, hence `Send + Sync`.
+/// Positions passed to `write_all_at` are relative to the downloaded payload.
+/// `prepare` may reserve storage before writes begin, while `finalize` establishes
+/// the destination layout after every payload write succeeds. Implementations are
+/// shared across the issuer and the drain task, hence `Send + Sync`.
 trait SinkWrite: Send + Sync + std::fmt::Debug {
-    /// Write the entire buffer at `pos` bytes into the target.
+    /// Write the entire buffer at `pos` bytes from the payload's destination start.
     fn write_all_at(&self, buf: &mut DiskWriteCursor<'_>, pos: u64) -> std::io::Result<()>;
 
-    /// Best-effort preallocation of `len` bytes. Default no-op.
-    fn preallocate(&self, _len: u64) {}
+    /// Prepare a target for an expected download of `expected_download_len` bytes.
+    fn prepare(&self, _expected_download_len: u64) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    /// Establish the target's successful layout for the complete payload.
+    fn finalize(&self, _expected_download_len: u64) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
-/// File-backed [`SinkWrite`]: positioned writes via `pwritev`.
+/// File-backed [`SinkWrite`] using the current replace-from-zero policy.
+///
+/// Payload-relative positions map directly to file positions and successful
+/// finalization truncates the file to the payload length. A future append or
+/// write-at policy belongs here: it can translate the relative positions and
+/// final length without changing transfer scheduling or object-range arithmetic.
 struct FileSink {
     file: std::fs::File,
     /// Whether the transfer manager created this file (vs caller-provided). Only an
@@ -207,17 +220,46 @@ impl std::fmt::Debug for FileSink {
     }
 }
 
+/// Returns whether failure to reserve storage makes the download futile.
+///
+/// Unsupported preallocation remains best effort because the subsequent
+/// positioned writes may still succeed. Linux storage and quota exhaustion
+/// cannot recover without external intervention and should fail before the
+/// transfer spends network and memory resources on the object body.
+fn preallocation_failure_is_fatal(error: &std::io::Error) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        matches!(
+            error.raw_os_error(),
+            Some(libc::ENOSPC) | Some(libc::EDQUOT)
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = error;
+        false
+    }
+}
+
 impl SinkWrite for FileSink {
     fn write_all_at(&self, buf: &mut DiskWriteCursor<'_>, pos: u64) -> std::io::Result<()> {
         crate::io::fs::write_all_at(&self.file, buf, pos)
     }
 
-    fn preallocate(&self, len: u64) {
+    fn prepare(&self, expected_download_len: u64) -> std::io::Result<()> {
         if self.owns_file {
-            if let Err(e) = crate::io::fs::preallocate(&self.file, len) {
+            if let Err(e) = crate::io::fs::preallocate(&self.file, expected_download_len) {
+                if preallocation_failure_is_fatal(&e) {
+                    return Err(e);
+                }
                 tracing::warn!(error = %e, "failed to preallocate file space");
             }
         }
+        Ok(())
+    }
+
+    fn finalize(&self, expected_download_len: u64) -> std::io::Result<()> {
+        self.file.set_len(expected_download_len)
     }
 }
 
@@ -228,8 +270,8 @@ enum Mode {
     /// Positioned writes land at `chunk.offset - object_range_start` in the sink.
     Disk {
         sink: Box<dyn SinkWrite>,
-        /// Start of the S3 byte range for this transfer.
-        object_range_start: u64,
+        /// Start of the resolved S3 byte range for this transfer.
+        object_range_start: std::sync::OnceLock<u64>,
     },
 }
 
@@ -261,7 +303,8 @@ pub(crate) struct BodySlot {
     /// Memory reservation held from claim through response collection. A
     /// successful fill closes acquisition authority; the immutable payload then
     /// owns every live carrier charge directly. `None` until
-    /// [`attach_reservation`], and on paths that do not reserve (tests).
+    /// [`BodySlot::attach_reservation`], and on paths that do not reserve
+    /// (tests).
     reservation: Option<Reservation>,
 }
 
@@ -352,19 +395,32 @@ impl BodyWriter {
             object_range_start,
         } = &*self.mode
         {
+            let Some(object_range_start) = object_range_start.get().copied() else {
+                // Cancellation can terminate a disk transfer before discovery
+                // establishes its range. A fill before preparation violates the
+                // transfer ordering and cannot be positioned safely.
+                if self.buffer.has_undrained_fills() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "disk payload arrived before destination preparation",
+                    ));
+                }
+                return Ok(0);
+            };
             while let Some(sw) = self.buffer.take_drain_run(mode) {
-                write_run(sink.as_ref(), *object_range_start, &sw)?;
+                write_run(sink.as_ref(), object_range_start, &sw)?;
                 freed = freed.saturating_add(sw.complete());
             }
         }
         Ok(freed)
     }
 
-    /// Terminal drain: flush every remaining filled run, including a partial final
-    /// segment below the drain batch. Called once from `complete()` / `on_terminal()`.
-    /// Returns the parts freed by this terminal pass (the tail left resident below the
-    /// drain batch) so the caller can release the last of the read-ahead occupancy.
-    pub(crate) fn finalize(&self) -> Result<u64, std::io::Error> {
+    /// Flush every remaining filled run at a terminal transition, including a partial
+    /// final segment below the drain batch.
+    ///
+    /// Success, failure, and cancellation all use this operation to release resident
+    /// payload ownership. It does not establish the target's successful final shape.
+    pub(crate) fn terminal_drain(&self) -> Result<u64, std::io::Error> {
         if !matches!(&*self.mode, Mode::Disk { .. }) {
             return Ok(0);
         }
@@ -374,6 +430,15 @@ impl BodyWriter {
             terminal_parts,
             "terminal drain complete; tail flushed to disk",
         );
+        Ok(terminal_parts)
+    }
+
+    /// Flush terminal payloads and establish the successful disk target length.
+    pub(crate) fn finalize(&self, expected_download_len: u64) -> Result<u64, std::io::Error> {
+        let terminal_parts = self.terminal_drain()?;
+        if let Mode::Disk { sink, .. } = &*self.mode {
+            sink.finalize(expected_download_len)?;
+        }
         Ok(terminal_parts)
     }
 
@@ -407,11 +472,24 @@ impl BodyWriter {
         self.notify.notify_one();
     }
 
-    /// Best-effort pre-allocation of disk space.
-    pub(crate) fn preallocate(&self, len: u64) {
-        if let Mode::Disk { sink, .. } = &*self.mode {
-            sink.preallocate(len);
+    /// Fix the resolved object-range origin and prepare a disk target.
+    pub(crate) fn prepare(
+        &self,
+        object_range_start: u64,
+        expected_download_len: u64,
+    ) -> std::io::Result<()> {
+        if let Mode::Disk {
+            sink,
+            object_range_start: configured_start,
+        } = &*self.mode
+        {
+            assert!(
+                configured_start.set(object_range_start).is_ok(),
+                "disk destination prepared more than once"
+            );
+            sink.prepare(expected_download_len)?;
         }
+        Ok(())
     }
 }
 
@@ -481,18 +559,16 @@ pub(crate) fn new_recv_body() -> (BodyWriter, RecvBodyConsumer) {
 /// Issuance backpressure is owned by the per-transfer [`ReadAhead`] controller.
 ///
 /// [`ReadAhead`]: super::read_ahead::ReadAhead
-fn new_recv_body_with_disk_mode(
-    sink: Box<dyn SinkWrite>,
-    object_range_start: u64,
-) -> (BodyWriter, RecvBodyConsumer) {
+fn new_recv_body_with_disk_mode(sink: Box<dyn SinkWrite>) -> (BodyWriter, RecvBodyConsumer) {
     let (buffer, consumer) = PagedRecvBuffer::new_with_segment_size(SEG_SIZE);
     let notify = Arc::new(WakeNotify::new());
+    let resolved_range_start = std::sync::OnceLock::new();
     let writer = BodyWriter {
         buffer,
         notify: notify.clone(),
         mode: Arc::new(Mode::Disk {
             sink,
-            object_range_start,
+            object_range_start: resolved_range_start,
         }),
     };
     let slot_consumer = RecvBodyConsumer { consumer, notify };
@@ -502,10 +578,9 @@ fn new_recv_body_with_disk_mode(
 /// Create a producer/consumer pair with a file sink for download-to-file.
 pub(crate) fn new_recv_body_with_sink(
     file: std::fs::File,
-    object_range_start: u64,
     owns_file: bool,
 ) -> (BodyWriter, RecvBodyConsumer) {
-    new_recv_body_with_disk_mode(Box::new(FileSink { file, owns_file }), object_range_start)
+    new_recv_body_with_disk_mode(Box::new(FileSink { file, owns_file }))
 }
 
 /// Stream of [ChunkOutput] representing an Amazon S3 Object's contents and metadata.
@@ -870,9 +945,42 @@ mod tests {
                 self.0.write_all_at(buf, pos)
             }
         }
-        let (writer, consumer) =
-            new_recv_body_with_disk_mode(Box::new(Shared(sink.clone())), object_range_start);
+        let (writer, consumer) = new_recv_body_with_disk_mode(Box::new(Shared(sink.clone())));
+        writer.prepare(object_range_start, 0).unwrap();
         (writer, consumer, sink)
+    }
+
+    fn new_test_recv_body_with_sink(
+        file: std::fs::File,
+        object_range_start: u64,
+    ) -> (Writer, RecvBodyConsumer) {
+        let (writer, consumer) = new_recv_body_with_sink(file, false);
+        writer.prepare(object_range_start, 0).unwrap();
+        (writer, consumer)
+    }
+
+    /// Cancellation can terminally drain a disk transfer before discovery has
+    /// resolved its object range. No payload exists at that point.
+    #[test]
+    fn disk_terminal_drain_before_prepare_is_empty() {
+        let file = tempfile::tempfile().unwrap();
+        let (writer, _consumer) = new_recv_body_with_sink(file, false);
+
+        assert_eq!(writer.terminal_drain().unwrap(), 0);
+    }
+
+    /// A filled payload before destination preparation has no safe file
+    /// position and must not be discarded as an empty cancellation.
+    #[test]
+    fn disk_terminal_drain_before_prepare_rejects_payload() {
+        let file = tempfile::tempfile().unwrap();
+        let (writer, _consumer) = new_recv_body_with_sink(file, false);
+        writer.claim().fill(chunk_at(0, 0, b"payload"));
+
+        let error = writer
+            .terminal_drain()
+            .expect_err("unpositioned payload must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     }
 
     /// `has_drainable_resident` gates memory-pressure draining. It is true only on the
@@ -908,7 +1016,7 @@ mod tests {
         writer.claim().fill(chunk_at(0, 100, b"ab"));
         writer.claim().fill(chunk_at(1, 102, b"cdef"));
 
-        assert_eq!(writer.finalize().unwrap(), 2);
+        assert_eq!(writer.terminal_drain().unwrap(), 2);
         assert_eq!(sink.write_count(), 1);
         assert_eq!(sink.assembled(), b"abcdef");
     }
@@ -920,7 +1028,9 @@ mod tests {
             writer.claim().fill(chunk_at(0, 0, b"ab"));
             writer.claim().fill(chunk_at(1, second_offset, b"cd"));
 
-            let error = writer.finalize().expect_err("offsets are not contiguous");
+            let error = writer
+                .terminal_drain()
+                .expect_err("offsets are not contiguous");
             assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
             assert_eq!(sink.write_count(), 0);
         }
@@ -931,7 +1041,7 @@ mod tests {
         let (writer, _consumer, sink) = new_recv_body_with_capture(0);
         writer.claim().fill(chunk_at(0, 0, b""));
 
-        let error = writer.finalize().expect_err("disk payload is empty");
+        let error = writer.terminal_drain().expect_err("disk payload is empty");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert_eq!(sink.write_count(), 0);
     }
@@ -943,7 +1053,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("out");
         let file = std::fs::File::create(&path).unwrap();
-        let (writer, _consumer) = new_recv_body_with_sink(file, 0, false);
+        let (writer, _consumer) = new_test_recv_body_with_sink(file, 0);
 
         let mut expected = Vec::with_capacity(SEG_SIZE * CHUNK_LEN);
         for i in 0..SEG_SIZE as u64 {
@@ -965,7 +1075,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("out");
         let file = std::fs::File::create(&path).unwrap();
-        let (writer, _consumer) = new_recv_body_with_sink(file, 0, false);
+        let (writer, _consumer) = new_test_recv_body_with_sink(file, 0);
 
         let partial = SEG_SIZE / 2;
         let mut expected = Vec::with_capacity(partial * CHUNK_LEN);
@@ -977,8 +1087,85 @@ mod tests {
             slot.fill(chunk_at(i, offset, &data));
         }
 
-        writer.finalize().unwrap();
+        writer.finalize(expected.len() as u64).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), expected);
+    }
+
+    #[test]
+    fn disk_finalize_removes_an_existing_file_tail() {
+        const ORIGINAL: &[u8] = b"old contents with a stale tail";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out");
+        std::fs::write(&path, ORIGINAL).unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let (writer, _consumer) = new_recv_body_with_sink(file, false);
+        writer.prepare(0, 3).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            ORIGINAL.len() as u64,
+            "preparing a caller-owned file must not resize it"
+        );
+
+        writer.claim().fill(chunk_at(0, 0, b"new"));
+        writer.terminal_drain().unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            ORIGINAL.len() as u64,
+            "terminal cleanup must not establish the successful length"
+        );
+
+        writer.finalize(3).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+    }
+
+    #[test]
+    fn disk_finalize_propagates_resize_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out");
+        std::fs::write(&path, b"existing").unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let (writer, _consumer) = new_recv_body_with_sink(file, false);
+        writer.prepare(0, 3).unwrap();
+        writer
+            .finalize(3)
+            .expect_err("a read-only caller file cannot be finalized");
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 8);
+    }
+
+    #[test]
+    fn disk_finalize_truncates_an_empty_download() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out");
+        std::fs::write(&path, b"existing").unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let (writer, _consumer) = new_recv_body_with_sink(file, false);
+        writer.prepare(0, 0).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 8);
+
+        writer.finalize(0).unwrap();
+        assert!(std::fs::read(&path).unwrap().is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_preallocation_fails_only_for_storage_exhaustion() {
+        assert!(super::preallocation_failure_is_fatal(
+            &std::io::Error::from_raw_os_error(libc::ENOSPC)
+        ));
+        assert!(super::preallocation_failure_is_fatal(
+            &std::io::Error::from_raw_os_error(libc::EDQUOT)
+        ));
+        assert!(!super::preallocation_failure_is_fatal(
+            &std::io::Error::from_raw_os_error(libc::EOPNOTSUPP)
+        ));
     }
 
     #[test]
@@ -988,7 +1175,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("out");
         let file = std::fs::File::create(&path).unwrap();
-        let (writer, _consumer) = new_recv_body_with_sink(file, 0, false);
+        let (writer, _consumer) = new_test_recv_body_with_sink(file, 0);
 
         let total = SEG_SIZE + 2;
         let mut expected = Vec::with_capacity(total * CHUNK_LEN);
@@ -1000,7 +1187,7 @@ mod tests {
             slot.fill(chunk_at(i, offset, &data));
         }
 
-        writer.finalize().unwrap();
+        writer.finalize(expected.len() as u64).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), expected);
     }
 
@@ -1011,7 +1198,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("out");
         let file = std::fs::File::create(&path).unwrap();
-        let (writer, _consumer) = new_recv_body_with_sink(file, 1000, false);
+        let (writer, _consumer) = new_test_recv_body_with_sink(file, 1000);
 
         let n = SEG_SIZE;
         let mut expected = Vec::with_capacity(n * CHUNK_LEN);
@@ -1035,7 +1222,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("out");
         let file = std::fs::File::create(&path).unwrap();
-        let (writer, _consumer) = new_recv_body_with_sink(file, 0, false);
+        let (writer, _consumer) = new_test_recv_body_with_sink(file, 0);
 
         let n = SEG_SIZE;
         let mut handles = Vec::new();
@@ -1054,7 +1241,7 @@ mod tests {
             h.await.unwrap();
         }
 
-        writer.finalize().unwrap();
+        writer.finalize((n * CHUNK_LEN) as u64).unwrap();
 
         let contents = std::fs::read(&path).unwrap();
         for seq in 0..n as u64 {
@@ -1082,7 +1269,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("out");
         let file = std::fs::File::create(&path).unwrap();
-        let (writer, _consumer) = new_recv_body_with_sink(file, 0, false);
+        let (writer, _consumer) = new_test_recv_body_with_sink(file, 0);
 
         // Fill two full segments, draining on the DrainReady edge after each fill — the
         // disk path's steady-state loop. Bounded iteration, so a regression fails fast.
@@ -1097,7 +1284,7 @@ mod tests {
             }
         }
         // A terminal drain flushes any sub-batch tail so the total accounts for every part.
-        freed_total += writer.finalize().unwrap();
+        freed_total += writer.terminal_drain().unwrap();
 
         // Resident occupancy is `issued - released` = total - freed_total. Every part has
         // been written to disk and its memory freed, so it must be 0 — otherwise the gate
@@ -1190,7 +1377,7 @@ mod tests {
 
         // Terminal drain flushes the partial final segment and any straggler runs.
         freed_total.fetch_add(
-            writer.finalize().unwrap(),
+            writer.terminal_drain().unwrap(),
             std::sync::atomic::Ordering::Relaxed,
         );
 
@@ -1308,7 +1495,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("out");
         let file = std::fs::File::create(&path).unwrap();
-        let (writer, _consumer) = new_recv_body_with_sink(file, 0, false);
+        let (writer, _consumer) = new_test_recv_body_with_sink(file, 0);
 
         let reservation = pool
             .try_reserve(chunk_bytes)
@@ -1327,7 +1514,7 @@ mod tests {
         assert_eq!(pool.metrics().active_planned_demand_bytes(), 0);
         assert_eq!(pool.metrics().charged_capacity_bytes(), chunk_bytes as u64);
 
-        writer.finalize().unwrap();
+        writer.terminal_drain().unwrap();
         assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
         assert_eq!(pool.metrics().admission_used_bytes(), 0);
         assert_eq!(&std::fs::read(&path).unwrap()[..7], b"flushed");

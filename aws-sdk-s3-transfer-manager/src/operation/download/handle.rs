@@ -294,8 +294,8 @@ impl DownloadHandle {
 
     /// Runtime I/O controls for this download.
     ///
-    /// See [`DownloadIoCtl`](crate::operation::download::DownloadIoCtl) for available
-    /// controls (e.g. adjusting read-ahead on a running transfer).
+    /// See [`DownloadIoCtl`] for available controls (e.g. adjusting read-ahead on a
+    /// running transfer).
     pub fn io_ctl(&self) -> crate::operation::download::DownloadIoCtl<'_> {
         self.inner.io_ctl()
     }
@@ -334,6 +334,11 @@ impl Drop for DownloadHandle {
 /// transfer. On successful completion via [`join`](Self::join), the temporary
 /// file is atomically renamed to the destination path. On failure,
 /// cancellation, or drop, the temporary file is deleted.
+///
+/// Success means the operating system accepted every byte and, for a managed
+/// path, completed the rename. The transfer manager does not call `sync_data`,
+/// `sync_all`, or synchronize the parent directory, so success is not a
+/// persistence guarantee across a system crash or power loss.
 #[derive(Debug)]
 pub struct ManagedDownloadHandle {
     inner: DownloadHandleInner,
@@ -379,7 +384,8 @@ impl ManagedDownloadHandle {
     /// Wait for the download to complete.
     ///
     /// On success, atomically renames the temporary file to the destination
-    /// path. On failure or cancellation, deletes the temporary file.
+    /// path. On failure or cancellation, deletes the temporary file. This does
+    /// not add a filesystem durability barrier.
     pub async fn join(
         mut self,
     ) -> Result<crate::operation::download::output::DownloadOutput, error::Error> {
@@ -416,8 +422,8 @@ impl ManagedDownloadHandle {
 
     /// Runtime I/O controls for this download.
     ///
-    /// See [`DownloadIoCtl`](crate::operation::download::DownloadIoCtl) for available
-    /// controls (e.g. adjusting read-ahead on a running transfer).
+    /// See [`DownloadIoCtl`] for available controls (e.g. adjusting read-ahead on a
+    /// running transfer).
     pub fn io_ctl(&self) -> crate::operation::download::DownloadIoCtl<'_> {
         self.inner.io_ctl()
     }
@@ -434,9 +440,10 @@ impl ManagedDownloadHandle {
 
     async fn finalize(&self) -> std::io::Result<()> {
         if let (Some(temp), Some(dest)) = (&self.temp_path, &self.dest_path) {
-            // TODO: consider optional fsync before rename for durability guarantees.
-            // Without fsync, a crash between rename and OS writeback leaves a corrupt
-            // file at the destination. CRT does not fsync. Fsync of 32 GiB adds ~8s.
+            // TODO(vnext): consider an opt-in download durability policy. Managed
+            // path downloads would sync file data before rename and the parent
+            // directory after rename where supported. The latency and cross-platform
+            // semantics make this a client/API policy rather than the default.
             tokio::fs::rename(temp, dest).await?;
         }
         Ok(())

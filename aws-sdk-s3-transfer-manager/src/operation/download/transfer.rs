@@ -62,6 +62,8 @@ struct DownloadTransferInner {
     object_meta: std::sync::OnceLock<ObjectMetadata>,
     /// Object-integrity result (set once discovery completes)
     integrity_checks: std::sync::OnceLock<crate::types::IntegrityChecks>,
+    /// Expected total bytes produced by this download, discovered from the response.
+    expected_download_len: std::sync::OnceLock<u64>,
     /// Notified when discovery completes (success or failure)
     discovery_notify: tokio::sync::Notify,
 }
@@ -117,6 +119,7 @@ impl DownloadTransfer {
             writer,
             object_meta: std::sync::OnceLock::new(),
             integrity_checks: std::sync::OnceLock::new(),
+            expected_download_len: std::sync::OnceLock::new(),
             discovery_notify: tokio::sync::Notify::new(),
         });
         Self { inner }
@@ -572,6 +575,7 @@ impl DownloadTransfer {
 
         let ObjectDiscovery {
             remaining,
+            object_range_start,
             object_meta,
             initial_chunk,
             chunk_meta,
@@ -597,18 +601,31 @@ impl DownloadTransfer {
 
         let etag: Option<Arc<str>> = object_meta.e_tag.as_deref().map(Arc::from);
 
-        // Optimization: Preallocate space for the full object/download size if there is a
-        // destination/sink and it supports it. e.g. pre-allocate disk space for the full
-        // download to avoid per-write metadata updates and late ENOSPC errors.
+        // Prepare the destination before range writes begin. Owned temporary files
+        // request best-effort allocation to reduce per-write metadata work. Linux
+        // storage or quota exhaustion is terminal here; other preallocation failures
+        // are logged and writes proceed. Successful completion establishes the exact
+        // logical length after the terminal drain.
         let chunk_content_len = chunk_meta
             .as_ref()
             .and_then(|m| m.content_length)
             .and_then(|length| u64::try_from(length).ok())
             .unwrap_or(0);
-        let total_size =
+        let expected_download_len =
             chunk_content_len + remaining.as_ref().map_or(0, |r| r.end() - r.start() + 1);
-        self.inner.writer.preallocate(total_size);
-        self.inner.ctx.set_total_bytes(total_size);
+        if let Err(error) = self
+            .inner
+            .writer
+            .prepare(object_range_start, expected_download_len)
+        {
+            let guard = self.inner.state.lock().unwrap();
+            return self.fail(
+                guard,
+                crate::error::Error::new(crate::error::ErrorKind::IOError, error),
+            );
+        }
+        let _ = self.inner.expected_download_len.set(expected_download_len);
+        self.inner.ctx.set_total_bytes(expected_download_len);
 
         // If there's an initial chunk, claim seq BEFORE waking to prevent race
         // where poll_work exhausts the window before we can claim our seq.
@@ -1042,7 +1059,12 @@ impl DownloadTransfer {
     /// never happens under it. Symmetric with `fail`, which error paths already call from
     /// `execute`.
     fn finalize_completion(&self) -> WorkOutcome {
-        if let Err(e) = self.inner.writer.finalize() {
+        let expected_len = *self
+            .inner
+            .expected_download_len
+            .get()
+            .expect("completed download must have a discovered length");
+        if let Err(e) = self.inner.writer.finalize(expected_len) {
             // Finalize failed: transition to failed. The state is already Terminal; `fail`
             // calls `enter_terminal` which is idempotent on Terminal (returns None).
             let guard = self.inner.state.lock().unwrap();
@@ -1074,7 +1096,7 @@ impl DownloadTransfer {
         drop(pending);
         // Wake all waiters
         self.inner.discovery_notify.notify_waiters();
-        let _ = self.inner.writer.finalize();
+        let _ = self.inner.writer.terminal_drain();
         self.inner.writer.notify_consumer();
         self.inner.ctx.signal_terminal();
         WorkOutcome::Failed { classification }
@@ -1082,7 +1104,12 @@ impl DownloadTransfer {
 
     /// Transition to terminal success state. Requires holding the work lock.
     fn complete(&self, mut guard: std::sync::MutexGuard<'_, DownloadState>) {
-        if let Err(e) = self.inner.writer.finalize() {
+        let expected_len = *self
+            .inner
+            .expected_download_len
+            .get()
+            .expect("completed download must have a discovered length");
+        if let Err(e) = self.inner.writer.finalize(expected_len) {
             self.fail(guard, error::Error::new(error::ErrorKind::IOError, e));
             return;
         }
@@ -1122,7 +1149,7 @@ impl Transfer for DownloadTransfer {
         drop(pending);
 
         self.inner.discovery_notify.notify_waiters();
-        let _ = self.inner.writer.finalize();
+        let _ = self.inner.writer.terminal_drain();
         self.inner.writer.notify_consumer();
     }
 }
@@ -1676,10 +1703,14 @@ mod tests {
         transfer.execute(work).await
     }
 
-    /// Run discovery to completion
-    async fn skip_discovery(transfer: &DownloadTransfer) {
+    /// Complete discovery and assert that the transfer accepted its result.
+    async fn assert_discovery_succeeds(transfer: &DownloadTransfer) {
         let mut work = assert_ready(transfer.poll_work());
-        execute(transfer, &mut work).await;
+        let outcome = execute(transfer, &mut work).await;
+        assert!(
+            matches!(outcome, WorkOutcome::Success { .. }),
+            "discovery failed: {outcome:?}"
+        );
     }
 
     // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
@@ -1705,7 +1736,7 @@ mod tests {
     #[tokio::test]
     async fn test_generates_ranges_after_discovery() {
         let transfer = create_download(24 * MB, 8 * MB);
-        skip_discovery(&transfer).await;
+        assert_discovery_succeeds(&transfer).await;
 
         let mut work = assert_ready(transfer.poll_work());
         let data = work.data_mut::<DownloadWork>();
@@ -1716,7 +1747,7 @@ mod tests {
     #[tokio::test]
     async fn test_seq_starts_at_one_with_initial_chunk() {
         let transfer = create_download(24 * MB, 8 * MB);
-        skip_discovery(&transfer).await;
+        assert_discovery_succeeds(&transfer).await;
 
         let mut work = assert_ready(transfer.poll_work());
         let data = work.data_mut::<DownloadWork>();
@@ -1738,6 +1769,7 @@ mod tests {
         let head_obj = mock!(aws_sdk_s3::Client::head_object).then_output(|| {
             aws_sdk_s3::operation::head_object::HeadObjectOutput::builder()
                 .content_length(24 * MB as i64)
+                .content_range(format!("bytes 0-{}/{}", 24 * MB - 1, 24 * MB))
                 .e_tag("test-etag")
                 .build()
         });
@@ -1769,7 +1801,7 @@ mod tests {
         let (ctx, _completion_rx) = TransferContext::new(handle);
         let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, writer);
 
-        skip_discovery(&transfer).await;
+        assert_discovery_succeeds(&transfer).await;
 
         let mut work = assert_ready(transfer.poll_work());
         let data = work.data_mut::<DownloadWork>();
@@ -1789,7 +1821,7 @@ mod tests {
     #[tokio::test]
     async fn test_seq_increments_sequentially() {
         let transfer = create_download(32 * MB, 8 * MB);
-        skip_discovery(&transfer).await;
+        assert_discovery_succeeds(&transfer).await;
 
         let mut seqs = Vec::new();
         while let PollWork::Ready { io: mut w, .. } = transfer.poll_work() {
@@ -1809,7 +1841,7 @@ mod tests {
     #[tokio::test]
     async fn test_pending_when_range_in_flight() {
         let transfer = create_download(12 * MB, 8 * MB);
-        skip_discovery(&transfer).await;
+        assert_discovery_succeeds(&transfer).await;
 
         // generate range work but don't complete
         let _range = assert_ready(transfer.poll_work());
@@ -1821,7 +1853,7 @@ mod tests {
     #[tokio::test]
     async fn test_done_when_all_complete() {
         let transfer = create_download(12 * MB, 8 * MB);
-        skip_discovery(&transfer).await;
+        assert_discovery_succeeds(&transfer).await;
 
         let mut range = assert_ready(transfer.poll_work());
         execute(&transfer, &mut range).await;
@@ -1833,7 +1865,7 @@ mod tests {
     #[tokio::test]
     async fn test_out_of_order_completion() {
         let transfer = create_download(24 * MB, 8 * MB);
-        skip_discovery(&transfer).await;
+        assert_discovery_succeeds(&transfer).await;
 
         let mut range1 = assert_ready(transfer.poll_work()); // seq=1
         let mut range2 = assert_ready(transfer.poll_work()); // seq=2
@@ -1852,7 +1884,7 @@ mod tests {
         // Fail seq 1 (first range after discovery)
         let transfer = FailureConfig::new(24 * MB, 8 * MB).fail(1).build();
 
-        skip_discovery(&transfer).await;
+        assert_discovery_succeeds(&transfer).await;
 
         let mut range = assert_ready(transfer.poll_work());
         let outcome = execute(&transfer, &mut range).await;
@@ -1865,7 +1897,7 @@ mod tests {
     #[tokio::test]
     async fn test_cancellation_transitions_to_cancelled() {
         let transfer = create_download(24 * MB, 8 * MB);
-        skip_discovery(&transfer).await;
+        assert_discovery_succeeds(&transfer).await;
 
         transfer.ctx().set_cancelled();
         transfer.ctx().signal_terminal();
@@ -1936,7 +1968,7 @@ mod tests {
     #[tokio::test]
     async fn test_read_ahead_gate_bounds_issuance() {
         let (transfer, _consumer) = create_download_for_gate(128 * MB, 8 * MB);
-        skip_discovery(&transfer).await;
+        assert_discovery_succeeds(&transfer).await;
         // Force a small window so a few polls exercise the gate; the default is large.
         transfer.read_ahead().force_window(3);
         let w = transfer.read_ahead().window();
@@ -1964,7 +1996,7 @@ mod tests {
     #[tokio::test]
     async fn test_consume_reopens_gate() {
         let (transfer, mut consumer) = create_download_for_gate(128 * MB, 8 * MB);
-        skip_discovery(&transfer).await;
+        assert_discovery_succeeds(&transfer).await;
         transfer.read_ahead().force_window(3);
         // Fill the window.
         while let PollWork::Ready { .. } = transfer.poll_work() {}
@@ -1997,7 +2029,7 @@ mod tests {
         let (transfer, mut consumer) =
             create_download_for_gate_with_capacity(object_size, part_size, Some(capacity_bytes));
 
-        skip_discovery(&transfer).await;
+        assert_discovery_succeeds(&transfer).await;
         let pool = transfer.ctx().handle.buffer_pool.clone();
         assert_eq!(
             pool.metrics().active_planned_demand_bytes(),
@@ -2057,7 +2089,7 @@ mod tests {
     #[tokio::test]
     async fn test_memory_reservation_failure_terminates_without_dispatch() {
         let (transfer, _consumer) = create_download_for_gate(3 * 8 * MB, 8 * MB);
-        skip_discovery(&transfer).await;
+        assert_discovery_succeeds(&transfer).await;
         transfer
             .ctx()
             .handle
@@ -2091,7 +2123,7 @@ mod tests {
             Some(2 * part_size as usize),
         );
 
-        skip_discovery(&transfer).await;
+        assert_discovery_succeeds(&transfer).await;
 
         // The completed discovery payload remains charged while part 1 retains
         // open acquisition authority. Part 2 therefore waits for that retained
@@ -2124,7 +2156,7 @@ mod tests {
             Some(2 * part_size as usize),
         );
 
-        skip_discovery(&transfer).await;
+        assert_discovery_succeeds(&transfer).await;
         let pool = transfer.ctx().handle.buffer_pool.clone();
 
         // Poll 1 issues part 1; poll 2 queues part 2 for memory.
@@ -2220,7 +2252,7 @@ mod tests {
             Some(2 * part_size as usize),
         );
 
-        skip_discovery(&transfer).await;
+        assert_discovery_succeeds(&transfer).await;
         let pool = transfer.ctx().handle.buffer_pool.clone();
 
         // Poll 1 issues part 1; poll 2 queues part 2 for memory.
@@ -2305,7 +2337,7 @@ mod tests {
         let path = dir.path().join("out");
         let file = std::fs::File::create(&path).unwrap();
         let (writer, _consumer) =
-            crate::operation::download::body::new_recv_body_with_sink(file, 0, false);
+            crate::operation::download::body::new_recv_body_with_sink(file, false);
         let (ctx, _completion_rx) = TransferContext::new(handle);
         let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, writer);
 
@@ -2362,7 +2394,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = std::fs::File::create(dir.path().join("out")).unwrap();
         let (writer, consumer) =
-            crate::operation::download::body::new_recv_body_with_sink(file, 0, false);
+            crate::operation::download::body::new_recv_body_with_sink(file, false);
         let (ctx, _completion_rx) = TransferContext::new(handle);
         let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, writer);
         (transfer, consumer, dir)
@@ -2560,7 +2592,7 @@ mod tests {
         // discovery fills seq 0, then (resident-1) range GETs fill seqs 1.. . Each fill's
         // in-execute Batched drain frees nothing (below batch), so all stay resident.
         async fn fill_resident(t: &DownloadTransfer, resident: u64) {
-            skip_discovery(t).await; // seq 0 filled + reserved
+            assert_discovery_succeeds(t).await; // seq 0 filled + reserved
             for _ in 1..resident {
                 let mut w = assert_ready(t.poll_work());
                 execute(t, &mut w).await;
@@ -2651,7 +2683,7 @@ mod tests {
     #[tokio::test]
     async fn test_io_ctl_set_read_ahead_resizes_window() {
         let (transfer, _consumer) = create_download_for_gate(128 * MB, 8 * MB);
-        skip_discovery(&transfer).await;
+        assert_discovery_succeeds(&transfer).await;
 
         // Parts(n) resolves to n + 1 (n speculative parts plus the demand part).
         transfer

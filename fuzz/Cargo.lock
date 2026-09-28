@@ -202,6 +202,7 @@ dependencies = [
  "aws-smithy-checksums",
  "aws-smithy-dns",
  "aws-smithy-http-client",
+ "aws-smithy-runtime",
  "aws-smithy-runtime-api",
  "aws-smithy-types",
  "aws-types",

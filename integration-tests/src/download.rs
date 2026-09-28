@@ -298,6 +298,11 @@ async fn test_download_write_to_file() {
     let dir = tempfile::tempdir().unwrap();
     let file_path = dir.path().join("file_output.dat");
     let file = std::fs::File::create(&file_path).unwrap();
+    file.set_len((size + 4096) as u64).unwrap();
+    assert_eq!(
+        std::fs::metadata(&file_path).unwrap().len(),
+        (size + 4096) as u64
+    );
 
     let handle = m
         .client
@@ -312,6 +317,43 @@ async fn test_download_write_to_file() {
     let written = std::fs::read(&file_path).unwrap();
     assert_eq!(written.len(), content.len(), "size mismatch");
     assert_eq!(written, content, "data integrity check failed");
+
+    m.handle.shutdown().await.expect("shutdown");
+}
+
+/// A caller-provided file that cannot be written or finalized wakes joiners.
+#[cfg(any(unix, windows))]
+#[tokio::test]
+async fn test_download_write_to_read_only_file_fails() {
+    let m = setup().await;
+    let content = deterministic_data(1024);
+    m.server
+        .add_object("test-bucket", "write-to-read-only-file-key", content, None)
+        .await
+        .expect("add object");
+
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("read_only_output.dat");
+    std::fs::write(&file_path, b"existing").unwrap();
+    let file = std::fs::File::open(&file_path).unwrap();
+
+    let handle = m
+        .client
+        .download()
+        .bucket("test-bucket")
+        .key("write-to-read-only-file-key")
+        .write_to_file(file)
+        .unwrap();
+
+    let error = tokio::time::timeout(std::time::Duration::from_secs(5), handle.join())
+        .await
+        .expect("destination write failure should wake the download joiner")
+        .expect_err("download to a read-only file should fail");
+    assert_eq!(
+        error.kind(),
+        &aws_sdk_s3_transfer_manager::error::ErrorKind::IOError
+    );
+    assert_eq!(std::fs::read(&file_path).unwrap(), b"existing");
 
     m.handle.shutdown().await.expect("shutdown");
 }
@@ -353,6 +395,96 @@ async fn test_download_write_to_path_ranged() {
         &content[10_000_000..=59_999_999],
         "ranged data integrity check failed"
     );
+
+    m.handle.shutdown().await.expect("shutdown");
+}
+
+/// A suffix (`bytes=-N`) and an open-ended (`bytes=N-`) range are discovered by
+/// HeadObject rather than by a ranged GET, so the offsets to fetch come from that
+/// response's `Content-Range`. Both ask for the object's tail; delivering the same
+/// number of leading bytes instead has the right length and the wrong content, which
+/// is why these assert bytes rather than sizes.
+#[tokio::test]
+async fn test_download_tail_ranges_deliver_the_tail() {
+    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let m = setup_concurrent(part_size, 8).await;
+
+    let size = 10 * ByteUnit::Mebibyte.as_bytes_usize();
+    let content = deterministic_data(size);
+    m.server
+        .add_object("test-bucket", "tail-key", content.clone(), None)
+        .await
+        .expect("add object");
+
+    for (range, start) in [
+        ("bytes=-3000000", size - 3_000_000),
+        ("bytes=7000000-", 7_000_000),
+    ] {
+        let mut handle = m
+            .client
+            .download()
+            .bucket("test-bucket")
+            .key("tail-key")
+            .range(range)
+            .initiate()
+            .unwrap();
+        let body = drain_body(&mut handle).await.unwrap();
+        handle.join().await.unwrap();
+        assert_eq!(
+            &body[..],
+            &content[start..],
+            "{range} delivered other bytes"
+        );
+    }
+
+    m.handle.shutdown().await.expect("shutdown");
+}
+
+/// File destinations place the first requested byte at destination offset zero.
+///
+/// HeadObject resolves open-ended and suffix ranges to absolute object offsets.
+/// The disk path must subtract that resolved start before writing and finalize
+/// the file to the downloaded length.
+#[cfg(any(unix, windows))]
+#[tokio::test]
+async fn test_download_tail_ranges_to_files_start_at_zero() {
+    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let m = setup_concurrent(part_size, 8).await;
+
+    let size = 10 * ByteUnit::Mebibyte.as_bytes_usize();
+    let content = deterministic_data(size);
+    m.server
+        .add_object("test-bucket", "tail-file-key", content.clone(), None)
+        .await
+        .expect("add object");
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("open-ended.dat");
+    let handle = m
+        .client
+        .download()
+        .bucket("test-bucket")
+        .key("tail-file-key")
+        .range("bytes=7000000-")
+        .write_to_path(&path)
+        .await
+        .unwrap();
+    handle.join().await.unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), &content[7_000_000..]);
+
+    let path = dir.path().join("suffix.dat");
+    let file = std::fs::File::create(&path).unwrap();
+    file.set_len(3_000_000 + 4096).unwrap();
+    let handle = m
+        .client
+        .download()
+        .bucket("test-bucket")
+        .key("tail-file-key")
+        .range("bytes=-3000000")
+        .write_to_file(file)
+        .unwrap();
+    handle.join().await.unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), &content[size - 3_000_000..]);
 
     m.handle.shutdown().await.expect("shutdown");
 }

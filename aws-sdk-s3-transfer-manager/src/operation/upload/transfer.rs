@@ -663,6 +663,12 @@ impl UploadTransfer {
         ))
         .await;
         let request_elapsed = request_timer.elapsed();
+        // The original retry body retains every immutable payload owner even
+        // after the successful request clone has been consumed. Release it
+        // before publishing part completion: the final part can wake
+        // CompleteMultipartUpload on another worker, and that operation may
+        // signal `join()` before this work item otherwise unwinds.
+        drop(sdk_body);
         let resp = match result {
             Ok(resp) => resp,
             Err(e) => {
