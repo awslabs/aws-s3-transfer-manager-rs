@@ -555,7 +555,10 @@ enum Hold {
     View(Bytes),
 }
 
-/// Returns the first pooled owner when a value has several owner boundaries.
+/// Finds a carrier guard when dropping more than one owner.
+///
+/// A view may also keep a carrier alive, but [`Bytes`] does not expose that
+/// carrier. Only a pooled owner gives us a guard for a grouped return.
 fn first_pooled_owner<'a>(
     owners: impl IntoIterator<Item = &'a OwnedRange>,
 ) -> Option<&'a CarrierGuard> {
@@ -575,7 +578,10 @@ fn first_pooled_owner<'a>(
     None
 }
 
-/// Passes pooled owners to a batched whole-value return; views drop in place.
+/// Groups pooled owners for return and drops views normally.
+///
+/// A view may point into this pool, but its carrier is hidden inside [`Bytes`]
+/// and cannot be moved into the group.
 fn return_owners(owners: &mut VecDeque<OwnedRange>, owner_return: &mut OwnerReturn) {
     while let Some(owner) = owners.pop_front() {
         match owner.hold {
