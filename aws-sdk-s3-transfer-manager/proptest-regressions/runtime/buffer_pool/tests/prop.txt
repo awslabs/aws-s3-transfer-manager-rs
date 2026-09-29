@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 1318641ba676f406dd1c47a81bd45775226b0c4b4818d4827d0557a6c7771e71 # shrinks to operations = [Acquire { reservation: 0, buffer: 4, carriers: 128, unreserved: true }, StartReserve { slot: 3, envelope: 65 }, PollReserve { request: 3, reservation: 0 }, Freeze { buffer: 0, value: 0 }]
+cc e91c7b3977e854d3db86736bcd9188caac3241d18efd61288aeadea9f9789307 # shrinks to operations = [TryReserve { slot: 0, envelope: 0 }, Acquire { reservation: 0, buffer: 1, carriers: 128, unreserved: true }, StartReserve { slot: 6, envelope: 65 }, PollReserve { request: 6, reservation: 0 }, DropBuffer { slot: 1 }]
