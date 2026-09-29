@@ -719,15 +719,13 @@ impl TransferContext {
         &self.handle.s3_client
     }
 
-    /// The token used by execution runtimes to interrupt terminal work.
+    /// The cancellation token for this transfer
     pub(crate) fn cancellation_token(&self) -> &tokio_util::sync::CancellationToken {
         &self.cancellation_token
     }
 
-    /// Mark the transfer failed, store its error, and interrupt executing work.
-    ///
-    /// The first terminal transition wins. A late failure leaves the existing
-    /// outcome and its work-interruption decision unchanged.
+    /// Mark transfer as failed and store the error.
+    /// First-write-wins - returns true if this call set the status.
     ///
     /// Setting the status alone is not observable to the owning handle: a
     /// terminal transition must be signalled via [`signal_terminal`] (directly,
@@ -739,7 +737,6 @@ impl TransferContext {
     pub(crate) fn set_failed(&self, err: impl Into<error::Error>) -> bool {
         if self.status.set_failed() {
             *self.error.lock().unwrap() = Some(Box::new(err.into()));
-            self.cancellation_token.cancel();
             true
         } else {
             false
@@ -754,18 +751,10 @@ impl TransferContext {
     }
 
     /// Mark transfer as cancelled.
-    ///
-    /// The first terminal transition wins. A successful transition interrupts
-    /// executing work; a late cancellation leaves the existing outcome and its
-    /// work-interruption decision unchanged.
+    /// First-write-wins - returns true if this call set the status.
     #[inline]
     pub(crate) fn set_cancelled(&self) -> bool {
-        if self.status.set_cancelled() {
-            self.cancellation_token.cancel();
-            true
-        } else {
-            false
-        }
+        self.status.set_cancelled()
     }
 
     /// Take the error if transfer failed. Returns None if not failed or already taken.
@@ -1055,51 +1044,6 @@ mod tests {
             assert_eq!(
                 ctx.transfer_status(),
                 crate::types::TransferStatus::Cancelled
-            );
-        }
-
-        #[cfg_attr(miri, ignore)]
-        #[test]
-        fn cancelled_transition_interrupts_execution() {
-            let handle = test_handle();
-            let (ctx, _rx) = TransferContext::new(handle);
-
-            assert!(!ctx.cancellation_token().is_cancelled());
-            assert!(ctx.set_cancelled());
-            assert!(ctx.cancellation_token().is_cancelled());
-        }
-
-        #[cfg_attr(miri, ignore)]
-        #[test]
-        fn failed_transition_interrupts_execution_and_preserves_error() {
-            let handle = test_handle();
-            let (ctx, _rx) = TransferContext::new(handle);
-
-            assert!(ctx.set_failed(crate::error::Error::new(
-                crate::error::ErrorKind::InputInvalid,
-                "first failure",
-            )));
-            assert!(ctx.cancellation_token().is_cancelled());
-            assert!(!ctx.set_cancelled());
-            assert_eq!(
-                ctx.error_kind(),
-                Some(crate::error::ErrorKind::InputInvalid)
-            );
-            assert_eq!(ctx.transfer_status(), crate::types::TransferStatus::Failed);
-        }
-
-        #[cfg_attr(miri, ignore)]
-        #[test]
-        fn completed_transition_rejects_late_execution_cancellation() {
-            let handle = test_handle();
-            let (ctx, _rx) = TransferContext::new(handle);
-
-            assert!(ctx.set_completed());
-            assert!(!ctx.set_cancelled());
-            assert!(!ctx.cancellation_token().is_cancelled());
-            assert_eq!(
-                ctx.transfer_status(),
-                crate::types::TransferStatus::Completed
             );
         }
 
