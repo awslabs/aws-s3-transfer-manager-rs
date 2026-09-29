@@ -98,8 +98,6 @@ struct UploadTransferInner {
     // TODO(vnext): unify bucket representation (name + kind) across operations.
     #[allow(dead_code)]
     bucket_type: BucketType,
-    /// Notified when CreateMPU completes (success or failure)
-    create_mpu_complete: tokio::sync::Notify,
     /// Stored result for handle to retrieve
     result: Mutex<Option<UploadOutput>>,
 }
@@ -129,7 +127,6 @@ impl UploadTransfer {
             }),
             request: Arc::new(request),
             bucket_type,
-            create_mpu_complete: tokio::sync::Notify::new(),
             result: Mutex::new(None),
         });
 
@@ -168,23 +165,6 @@ impl UploadTransfer {
     /// Take the stored result (used by handle after completion).
     pub(crate) fn take_result(&self) -> Option<UploadOutput> {
         self.inner.result.lock().expect("lock poisoned").take()
-    }
-
-    /// Check if CreateMPU is currently in flight.
-    pub(crate) fn is_create_mpu_in_flight(&self) -> bool {
-        let state = self.inner.state.lock().expect("lock poisoned");
-        matches!(
-            &*state,
-            UploadState::PendingInit {
-                init_in_flight: true,
-                ..
-            }
-        )
-    }
-
-    /// Get notified when CreateMPU completes.
-    pub(crate) fn create_mpu_complete_notified(&self) -> tokio::sync::futures::Notified<'_> {
-        self.inner.create_mpu_complete.notified()
     }
 
     /// Poll for the next work item.
@@ -303,8 +283,6 @@ impl UploadTransfer {
 
     async fn execute_create_mpu(&self) -> WorkOutcome {
         let outcome = self.do_execute_create_mpu().await;
-        // unblock any waiters that CreateMPU is complete (success or failure)
-        self.inner.create_mpu_complete.notify_waiters();
         // state changed - try to wake if we were pending
         self.inner.ctx.try_wake();
         outcome

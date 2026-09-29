@@ -12,6 +12,7 @@ use crate::runtime::sync::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use crate::runtime::sync::sync::Arc;
 
 use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 
 use crate::transfer::{BoxTransfer, Transfer, TransferId};
 
@@ -168,6 +169,10 @@ struct Inner {
     transfer: BoxTransfer,
     idle_notify: Notify,
     claim_state: ClaimState,
+    /// Cancels this transfer's executing work. Fired by
+    /// `Scheduler::cancel_descriptor`; the execution runtimes race each
+    /// `execute` future against it.
+    cancellation_token: CancellationToken,
 }
 
 impl std::fmt::Debug for TransferDescriptor {
@@ -199,6 +204,7 @@ impl TransferDescriptor {
             transfer,
             idle_notify: Notify::new(),
             claim_state: ClaimState::new(),
+            cancellation_token: CancellationToken::new(),
         }))
     }
 
@@ -224,6 +230,11 @@ impl TransferDescriptor {
 
     pub(crate) fn transfer(&self) -> &dyn Transfer {
         self.0.transfer.as_ref()
+    }
+
+    /// Token that cancels this transfer's executing work.
+    pub(crate) fn cancellation_token(&self) -> &CancellationToken {
+        &self.0.cancellation_token
     }
 
     pub(crate) fn id(&self) -> TransferId {

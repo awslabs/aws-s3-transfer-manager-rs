@@ -44,7 +44,7 @@ use crate::types::FailedMultipartUploadPolicy;
 /// When the handle is dropped without calling `join()` or `abort()`:
 /// - The transfer is marked as cancelled
 /// - Queued work is purged from the scheduler
-/// - In-flight work may be interrupted at await points
+/// - In-flight work is interrupted at its next await point
 /// - `AbortMultipartUpload` is **not** called (multipart uploads may be left incomplete)
 /// - Drop returns immediately without waiting for in-flight work
 ///
@@ -57,7 +57,7 @@ use crate::types::FailedMultipartUploadPolicy;
 /// When [`abort`](Self::abort) is called:
 /// - The transfer is marked as cancelled
 /// - Queued work is purged from the scheduler
-/// - Waits for all in-flight work to complete
+/// - In-flight work is interrupted; waits for it to stop
 /// - Calls `AbortMultipartUpload` if a multipart upload was started
 /// - Returns only after all cleanup is complete
 ///
@@ -88,6 +88,9 @@ impl UploadHandle {
     /// Returns the uploaded object output on success. Returns an error
     /// when the transfer failed (with the recorded failure cause) or when
     /// the transfer was cancelled (with `ErrorKind::OperationCancelled`).
+    ///
+    /// Before reporting a failed or cancelled outcome, waits for the
+    /// transfer's executing work to stop.
     pub async fn join(mut self) -> Result<UploadOutput, Error> {
         if let Some(rx) = self.completion_rx.take() {
             let _ = rx.await;
@@ -95,12 +98,15 @@ impl UploadHandle {
 
         let ctx = self.transfer.ctx();
 
-        if ctx.is_failed() {
+        if ctx.is_failed() || ctx.is_cancelled() {
             ctx.handle
                 .scheduler
                 .cancel_transfer(ctx.id)
                 .wait_for_idle()
                 .await;
+        }
+
+        if ctx.is_failed() {
             let err = ctx.take_error().expect("failed transfer must have error");
             return Err(err);
         }
@@ -122,7 +128,7 @@ impl UploadHandle {
     ///
     /// This will:
     /// 1. Cancel the transfer in the scheduler
-    /// 2. Wait for any in-flight work to complete
+    /// 2. Interrupt in-flight work and wait for it to stop
     /// 3. Call AbortMultipartUpload if MPU was started
     ///
     /// When this method returns, all work for this transfer has been
@@ -132,26 +138,18 @@ impl UploadHandle {
     pub async fn abort(self) -> Result<AbortedUpload, Error> {
         let ctx = self.transfer.ctx();
 
-        // Register waiter before checking state to avoid missing notification
-        let notified = self.transfer.create_mpu_complete_notified();
-        // TODO: There's an edge case where CreateMPU HTTP request is in-flight,
-        // we cancel, but the server still processes the request. The MPU would be
-        // orphaned. This is the same behavior as the old implementation. S3 lifecycle
-        // rules can clean up incomplete MPUs. To fully fix this would require waiting
-        // for the HTTP response even after cancellation.
-        let create_mpu_in_flight = self.transfer.is_create_mpu_in_flight();
-
-        // Cancel the transfer (purge queued work) and wait for any executing work to complete.
+        // Cancel the transfer and wait for idle: queued work is purged, and
+        // executing work, including an in-flight CreateMultipartUpload, is either
+        // finished or dropped by the time this returns.
+        //
+        // A CreateMultipartUpload dropped mid-flight leaves no upload ID here even
+        // if S3 created the upload; that empty upload is orphaned until a
+        // lifecycle rule removes it.
         ctx.handle
             .scheduler
             .cancel_transfer(ctx.id)
             .wait_for_idle()
             .await;
-
-        // If CreateMPU was in flight, wait for it to complete or be cancelled
-        if create_mpu_in_flight {
-            notified.await;
-        }
 
         // Check if we have an upload_id to abort
         let upload_id = self.transfer.upload_id();

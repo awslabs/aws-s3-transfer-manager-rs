@@ -46,7 +46,7 @@ use crate::transfer::StateMachineTerminalReceiver;
 /// When the handle is dropped without calling `join()` or `abort()`:
 /// - The transfer is marked as cancelled
 /// - Queued work is purged from the scheduler
-/// - In-flight child uploads may be interrupted at their next await point
+/// - In-flight child uploads are interrupted at their next await point
 /// - Drop returns immediately without waiting for in-flight work to settle
 ///
 /// Because `Drop` cannot be async, any child uploads that are mid-HTTP-
