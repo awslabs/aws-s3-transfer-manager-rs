@@ -108,12 +108,100 @@ mod test {
     use aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput;
     use aws_sdk_s3::operation::upload_part::UploadPartOutput;
     use aws_smithy_mocks::{mock, mock_client, RuleMode};
+    use aws_smithy_runtime_api::client::http::{
+        http_client_fn, HttpConnector, HttpConnectorFuture, SharedHttpConnector,
+    };
+    use aws_smithy_runtime_api::client::orchestrator::{HttpRequest, HttpResponse};
+    use aws_smithy_runtime_api::client::result::ConnectorError;
     use bytes::Bytes;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::Semaphore;
 
     use crate::io::InputStream;
     use crate::metrics::unit::ByteUnit;
     use crate::operation::upload::UploadInput;
-    use crate::types::{ConcurrencyMode, PartSize};
+    use crate::types::{ConcurrencyMode, PartSize, RuntimeMode};
+
+    /// Connector that keeps CreateMultipartUpload active until its future is
+    /// interrupted by the transfer runtime.
+    #[derive(Debug)]
+    struct StalledCreateMpuConnector {
+        create_started: Arc<Semaphore>,
+    }
+
+    impl HttpConnector for StalledCreateMpuConnector {
+        fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
+            assert_eq!("POST", request.method());
+            assert!(
+                request.uri().contains("uploads"),
+                "unexpected request: {}",
+                request.uri()
+            );
+
+            let create_started = self.create_started.clone();
+            HttpConnectorFuture::new(async move {
+                create_started.add_permits(1);
+                std::future::pending::<Result<HttpResponse, ConnectorError>>().await
+            })
+        }
+    }
+
+    /// Abort must terminate after CreateMultipartUpload enters execution.
+    async fn abort_stalled_create_mpu(runtime_mode: RuntimeMode) {
+        let create_started = Arc::new(Semaphore::new(0));
+        let connector = SharedHttpConnector::new(StalledCreateMpuConnector {
+            create_started: create_started.clone(),
+        });
+        let http_client = http_client_fn(move |_, _| connector.clone());
+        let client = aws_sdk_s3::Client::from_conf(
+            aws_sdk_s3::config::Config::builder()
+                .http_client(http_client)
+                .region(aws_sdk_s3::config::Region::new("us-west-2"))
+                .with_test_defaults()
+                .build(),
+        );
+
+        let tm_config = crate::Config::builder()
+            .concurrency(ConcurrencyMode::Explicit(1))
+            .runtime_mode(runtime_mode)
+            .set_multipart_threshold(PartSize::Target(10))
+            .set_target_part_size(PartSize::Target(5 * ByteUnit::Mebibyte.as_bytes_u64()))
+            .client(client)
+            .build();
+        let tm = crate::Client::new(tm_config);
+        let handle = UploadInput::builder()
+            .bucket("test-bucket")
+            .key("test-key")
+            .body(InputStream::from(Bytes::from_static(
+                b"force multipart upload",
+            )))
+            .initiate_with(&tm)
+            .unwrap();
+
+        let permit = tokio::time::timeout(Duration::from_secs(5), create_started.acquire())
+            .await
+            .expect("CreateMultipartUpload did not start")
+            .expect("start semaphore closed");
+        permit.forget();
+
+        tokio::time::timeout(Duration::from_secs(1), handle.abort())
+            .await
+            .expect("abort hung after CreateMultipartUpload entered execution")
+            .expect("abort failed");
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abort_stalled_create_mpu_on_tokio_runtime() {
+        abort_stalled_create_mpu(RuntimeMode::MultiThreadTokio).await;
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn abort_stalled_create_mpu_on_managed_runtime() {
+        abort_stalled_create_mpu(RuntimeMode::Managed).await;
+    }
 
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
