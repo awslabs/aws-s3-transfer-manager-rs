@@ -5,11 +5,37 @@
 
 pub(crate) mod latency;
 
+pub use crate::runtime::buffer_pool::MemoryMetrics;
+
 use std::fmt::{self, Display};
 use std::ops;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+/// Point-in-time operational metrics for one transfer-manager client.
+///
+/// Metric groups are sampled independently. The representation remains private
+/// so additional client-level metric groups can be added without changing
+/// callers.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClientMetrics {
+    memory: MemoryMetrics,
+}
+
+impl ClientMetrics {
+    pub(crate) fn new(memory: MemoryMetrics) -> Self {
+        Self { memory }
+    }
+
+    /// Returns the shared payload-memory pool sample.
+    ///
+    /// If the client uses an explicit pool shared with another client or
+    /// component, this sample describes that complete shared pool.
+    pub fn memory(&self) -> &MemoryMetrics {
+        &self.memory
+    }
+}
 
 /// Units of measurement
 pub mod unit {

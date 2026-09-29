@@ -7,7 +7,7 @@ use aws_config::BehaviorVersion;
 use aws_runtime::user_agent::FrameworkMetadata;
 
 use crate::config::{Builder, Config};
-use crate::types::{ConcurrencyMode, MemoryBudgetConfig, PartSize, RuntimeMode};
+use crate::types::{ConcurrencyMode, MemoryConfig, PartSize, RuntimeMode};
 
 /// Load transfer manager [`Config`] from the environment.
 #[derive(Default, Debug)]
@@ -59,11 +59,11 @@ impl ConfigLoader {
         self
     }
 
-    /// Set the memory budget: an upper bound on memory used for in-flight and
-    /// buffered transfer data. At the limit transfers backpressure rather than
-    /// fail. Default is [`MemoryBudgetConfig::Auto`].
-    pub fn memory_budget(mut self, budget: MemoryBudgetConfig) -> Self {
-        self.builder = self.builder.memory_budget(budget);
+    /// Set the payload-memory configuration.
+    ///
+    /// Default is [`MemoryConfig::Auto`].
+    pub fn memory(mut self, memory: MemoryConfig) -> Self {
+        self.builder = self.builder.memory(memory);
         self
     }
 

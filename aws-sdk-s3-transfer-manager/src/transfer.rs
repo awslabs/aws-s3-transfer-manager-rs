@@ -13,6 +13,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Wake, Waker};
 
 /// Edge-triggered wake flag for transfer state machines.
 ///
@@ -228,6 +229,10 @@ impl PollWork {
 ///
 /// Contract between transfer state machines and the scheduler:
 /// - `Success`: Work completed. Scheduler continues polling the transfer for more work.
+/// - `Yielded`: Dispatched execution retired without completing a reportable I/O operation or
+///   reporting a failure. Transfer state has retained any continuation or has retracted or retired
+///   the speculative operation. The scheduler releases the execution slot without producing a
+///   concurrency-controller sample.
 /// - `Failed`: Transfer has already transitioned itself to terminal state (via `set_failed` +
 ///   `signal_terminal`). Scheduler will not poll it again and will remove it once idle.
 /// - `Cancelled`: Transfer is already terminal (failed or cancelled by another work item).
@@ -235,6 +240,13 @@ impl PollWork {
 pub(crate) enum WorkOutcome {
     /// Work completed successfully.
     Success { data: Option<Box<dyn WorkData>> },
+    /// Dispatched execution retired without completing an I/O operation or reporting a failure.
+    ///
+    /// Before returning, transfer state must reconcile the work exactly once. If it retains a
+    /// continuation, that continuation must retain its progress and future wake path. The scheduler
+    /// releases the execution slot but does not report a completion sample to the concurrency
+    /// controller.
+    Yielded,
     /// Work failed. Transfer must have called `set_failed` + `signal_terminal` before returning.
     Failed { classification: Option<ErrorKind> },
     /// Work was skipped or aborted because the transfer is already terminal.
@@ -248,6 +260,7 @@ impl std::fmt::Debug for WorkOutcome {
                 .debug_struct("Success")
                 .field("has_data", &data.is_some())
                 .finish(),
+            WorkOutcome::Yielded => write!(f, "Yielded"),
             WorkOutcome::Failed { classification } => f
                 .debug_struct("Failed")
                 .field("classification", classification)
@@ -507,6 +520,28 @@ pub(crate) struct TransferContext {
     pub(crate) metrics: Arc<MetricsState>,
 }
 
+/// Task wake adapter for futures polled from a transfer's synchronous state machine.
+///
+/// This deliberately enters the scheduler directly instead of using
+/// [`TransferContext::try_wake`]. The scheduler's descriptor claim records a wake
+/// that races the active `poll_work` call, so the future can register this waker
+/// before `poll_work` returns `Pending` without relying on the edge-triggered
+/// [`wake_flag::WakeFlag`].
+struct SchedulerWake {
+    scheduler: crate::scheduler::Scheduler,
+    id: TransferId,
+}
+
+impl Wake for SchedulerWake {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.scheduler.wake(self.id);
+    }
+}
+
 impl fmt::Display for TransferContext {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Transfer(id={}, status={})", self.id.id, self.status)
@@ -663,6 +698,20 @@ impl TransferContext {
                 "ctx.try_wake.skipped",
             );
         }
+    }
+
+    /// Returns a task waker that requeues this transfer in the scheduler.
+    ///
+    /// Use this for a `Future` polled inside `poll_work`. Its wake is level-like
+    /// at the scheduler boundary: a wake concurrent with the current poll is
+    /// retained by the descriptor's release-and-recheck protocol. Ordinary
+    /// state mutations should continue to use [`Self::set_pending`] and
+    /// [`Self::try_wake`] under their shared state lock.
+    pub(crate) fn scheduler_waker(&self) -> Waker {
+        Waker::from(Arc::new(SchedulerWake {
+            scheduler: self.handle.scheduler.clone(),
+            id: self.id,
+        }))
     }
 
     /// The S3 client to use for SDK operations

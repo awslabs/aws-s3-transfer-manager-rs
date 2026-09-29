@@ -4,17 +4,24 @@
  */
 
 use crate::operation::download::body::BodySlot;
-use crate::runtime::memory::WaitTicket;
+use crate::runtime::buffer_pool::ReserveFuture;
 
-/// A claimed slot whose backing memory is not yet reserved. Held while a transfer
-/// is budget-blocked: the read-ahead gate admitted the slot (`gate.try_issue`
-/// already counted it as issued) and it was claimed from the buffer, but it cannot be
-/// filled until the budget grants `ticket`. Dropping it (on terminal) releases the
-/// slot and cancels the budget wait.
-#[derive(Debug)]
+/// A claimed slot waiting for shared memory admission.
+///
+/// The read-ahead gate already counted the slot as issued. Dropping this value
+/// releases the slot and cancellation-safely removes its reservation future
+/// from the memory-admission FIFO.
 pub(crate) struct PendingClaim {
     pub(crate) slot: BodySlot,
-    pub(crate) ticket: WaitTicket,
+    pub(crate) reservation: ReserveFuture,
+}
+
+impl std::fmt::Debug for PendingClaim {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingClaim")
+            .field("slot", &self.slot)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Mutable state for tracking download work progress
@@ -42,11 +49,11 @@ pub(crate) enum DownloadState {
         /// Read-ahead occupancy accounting. Bounds resident memory by gating
         /// issuance on `issued - released < window`.
         gate: OccupancyGate,
-        /// A claimed-but-unfilled slot whose memory reservation is still pending,
-        /// held only while budget-blocked. `Some` after the gate admitted a slot
-        /// (already counted in `gate.issued`) but the budget queued the reservation;
-        /// taken once the budget grants. Dropping the state on terminal releases the
-        /// slot and cancels the wait.
+        /// A claimed-but-unfilled slot whose memory reservation is still pending.
+        /// `Some` after the gate admitted a slot (already counted in
+        /// `gate.issued`) but memory admission queued the reservation; taken once
+        /// capacity is granted. Dropping terminal state releases the slot and
+        /// cancellation-safely removes the future from the FIFO.
         pending: Option<PendingClaim>,
     },
 
@@ -60,11 +67,12 @@ impl DownloadState {
         DownloadState::PendingDiscovery
     }
 
-    /// The sanctioned transition to `Terminal`. Extracts a budget-parked claim, if any, so the
-    /// caller can drop it AFTER releasing the state lock. `WaitTicket::drop` takes the budget
-    /// lock, which must never nest under the state lock this state is guarded by; returning the
-    /// claim here makes releasing the lock first the only way to use this method. Assign
-    /// `Terminal` through this method rather than directly.
+    /// Transitions this state to `Terminal`.
+    ///
+    /// Returns any pending claim so its reservation future can be cancelled
+    /// after the caller releases the state lock. Cancellation enters memory
+    /// admission, which must not be nested under this lock. Assign `Terminal`
+    /// through this method rather than directly.
     #[must_use = "drop the returned PendingClaim only after releasing the state lock"]
     pub(crate) fn enter_terminal(&mut self) -> Option<PendingClaim> {
         let pending = match self {

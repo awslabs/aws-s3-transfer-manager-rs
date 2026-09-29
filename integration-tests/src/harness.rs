@@ -23,20 +23,16 @@ use aws_sdk_s3_transfer_manager::types::RuntimeMode;
 use aws_sdk_s3_transfer_manager::Client as TmClient;
 use s3_mock_server::S3MockServer;
 
-/// Install a process-global tracing subscriber for e2e diagnosis, once.
+/// Installs a process-global tracing subscriber for test diagnosis, once.
 ///
-/// A failing real-S3 test otherwise surfaces only a panic string; this makes the
-/// run debuggable from its own logs, no re-run needed. Honors `RUST_LOG`;
-/// defaults to a curated filter over the transfer manager's diagnostic targets —
-/// the adaptive concurrency target (is it ramping?), scheduler/memory-budget
-/// admission (is a reserve parking?), and transfer lifecycle. Deliberately omits
-/// the per-work-item `execution` target (768 GETs × chunks is a firehose); reach
-/// for it with `RUST_LOG` when a specific run needs it.
+/// Libtest captures events and prints them when a test fails or output capture
+/// is disabled. `RUST_LOG` overrides the curated default. The default omits the
+/// per-work-item `execution` target; enable it with `RUST_LOG` when needed.
 ///
 /// Global (not a thread-local `set_default`) so it captures events from the
 /// managed threads and tokio workers the transfer runs on, not just the test
 /// thread. Idempotent: the first call wins, later calls are no-ops.
-pub(crate) fn init_e2e_logs() {
+pub(crate) fn init_test_logs() {
     use std::sync::Once;
     static INIT: Once = Once::new();
     INIT.call_once(|| {
@@ -44,6 +40,7 @@ pub(crate) fn init_e2e_logs() {
             aws_sdk_s3_transfer_manager::concurrency=debug,\
             aws_sdk_s3_transfer_manager::scheduling=debug,\
             aws_sdk_s3_transfer_manager::transfer=debug";
+
         let filter = tracing_subscriber::EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(DEFAULT_FILTER));
         // try_init: another test (or the process) may have set a subscriber
@@ -51,6 +48,7 @@ pub(crate) fn init_e2e_logs() {
         let _ = tracing_subscriber::fmt()
             .with_env_filter(filter)
             .with_target(true)
+            .with_test_writer()
             .try_init();
     });
 }
@@ -83,7 +81,7 @@ pub(crate) async fn mock_tm_with(
         aws_sdk_s3_transfer_manager::config::Builder,
     ) -> aws_sdk_s3_transfer_manager::config::Builder,
 ) -> MockTm {
-    init_e2e_logs();
+    init_test_logs();
     let server = S3MockServer::builder()
         .with_in_memory_store()
         .build()
@@ -238,7 +236,7 @@ impl TmTestClient {
         part_size: Option<aws_sdk_s3_transfer_manager::types::PartSize>,
         configure: Option<impl FnOnce(aws_sdk_s3::config::Builder) -> aws_sdk_s3::config::Builder>,
     ) -> Self {
-        init_e2e_logs();
+        init_test_logs();
         let server = S3MockServer::builder()
             .with_in_memory_store()
             .build()
@@ -259,6 +257,16 @@ impl TmTestClient {
         if let Some(ps) = part_size {
             builder = builder.part_size(ps);
         }
+        #[cfg(s3_tm_tsan)]
+        {
+            // TSan instruments both the client and the in-process mock server.
+            // Auto's 32-request floor can then starve request bodies on the
+            // four-vCPU hosted runner until stalled-stream protection fires.
+            // Four requests preserve concurrent execution without making
+            // sanitizer overhead look like a transport stall.
+            builder = builder
+                .concurrency(aws_sdk_s3_transfer_manager::types::ConcurrencyMode::Explicit(4));
+        }
         Self {
             tm: TmClient::new(builder.build()),
             bucket: "test-bucket".to_string(),
@@ -274,7 +282,7 @@ impl TmTestClient {
         kind: BucketKind,
         part_size: Option<aws_sdk_s3_transfer_manager::types::PartSize>,
     ) -> Self {
-        init_e2e_logs();
+        init_test_logs();
         let bucket_name = option_env!("S3_TEST_BUCKET_NAME_RS")
             .unwrap_or("aws-s3-transfer-manager-rs-test-bucket")
             .to_owned();
@@ -395,7 +403,7 @@ impl TmTestClient {
         let mut data = Vec::new();
         while let Some(chunk) = handle.body_mut().next().await {
             match chunk {
-                Ok(chunk) => data.extend_from_slice(&chunk.data.into_bytes()),
+                Ok(chunk) => data.extend_from_slice(&chunk.data.into_contiguous()),
                 Err(e) => {
                     // Drive the transfer to terminal so join() surfaces the real error.
                     return Err(handle.join().await.err().unwrap_or(e));

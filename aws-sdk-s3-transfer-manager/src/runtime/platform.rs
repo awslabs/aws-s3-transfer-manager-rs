@@ -3,12 +3,11 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Machine-resource detection for sizing the connection and memory budgets.
+//! Machine-resource detection for runtime and memory-pool configuration.
 //!
-//! Detection is best-effort: a failure yields a conservative cap, never an
-//! unbounded one.
+//! Detection is best-effort. Failure returns no value so each caller can apply
+//! its documented fallback policy.
 
-use crate::metrics::unit::ByteUnit;
 use std::path::{Path, PathBuf};
 
 // Connection-cap sizing from the descriptor limit and memory budget. The
@@ -85,110 +84,12 @@ fn fd_limit() -> Option<usize> {
     None
 }
 
-/// Share of detected RAM the memory budget may take under `Auto`. The budget is
-/// a good-citizen ceiling: the remainder is left for the OS page cache
-/// (download-to-disk), the rest of this process, and any co-tenant on the box.
-const SAFE_MEM_FRACTION: f64 = 0.25;
-
-/// Floor on the resolved budget. Funds a usable prefetch pipeline (64 chunks at
-/// the 8 MiB accounting unit) on a small or memory-constrained box.
-const MIN_BUDGET_BYTES: usize = 512 * ByteUnit::Mebibyte.as_bytes_usize();
-
-/// Ceiling on the resolved budget. Beyond this, more buffer does not raise
-/// sustained throughput, so a larger box gains nothing and its unclaimed share
-/// stays available to everything else. Caps the effective fraction on big boxes.
-const MAX_BUDGET_BYTES: usize = 32 * ByteUnit::Gibibyte.as_bytes_usize();
-
-/// Budget when RAM cannot be detected (non-Linux, or a read failure). Bounded,
-/// large enough for one transfer's pipeline.
-const UNDETECTABLE_MEM_BYTES: usize = 2 * ByteUnit::Gibibyte.as_bytes_usize();
-
-/// Memory budget under `MemoryBudgetConfig::Auto`: `SAFE_MEM_FRACTION` of
-/// detected RAM, rounded to a power of two and clamped to
-/// `[MIN_BUDGET_BYTES, MAX_BUDGET_BYTES]`; `UNDETECTABLE_MEM_BYTES` when RAM is
-/// unknown. `ram_bytes` comes from the [`MachineProfile`] so detection happens
-/// once, not re-read here.
+/// Usable RAM from Linux-compatible procfs and cgroup interfaces.
 ///
-/// The budget is a backstop, not the operating point: the concurrency
-/// controller settles at line rate well below it, and it binds only when a slow
-/// consumer backs parts up in the prefetch buffer. RAM is an imprecise proxy for
-/// that ceiling — network bandwidth sets the real pipeline depth, and bandwidth
-/// is uncorrelated with RAM across instance families (m5.24xlarge and
-/// m5n.24xlarge share 384 GiB of RAM but differ 4x in bandwidth). The clamp
-/// keeps the estimate safe at both ends; NIC-aware sizing is a separate refinement.
-pub(crate) fn machine_safe_mem(ram_bytes: Option<usize>) -> usize {
-    auto_budget(ram_bytes)
-}
-
-/// `Auto` policy as a pure function of detected RAM.
-fn auto_budget(ram: Option<usize>) -> usize {
-    match ram {
-        Some(bytes) => {
-            round_pow2(scale(bytes, SAFE_MEM_FRACTION)).clamp(MIN_BUDGET_BYTES, MAX_BUDGET_BYTES)
-        }
-        None => UNDETECTABLE_MEM_BYTES,
-    }
-}
-
-/// Memory budget for an explicit `MemoryBudgetConfig::Fraction`. The fraction is
-/// clamped to `(0.0, 1.0]` (a non-finite or non-positive value falls back to
-/// `SAFE_MEM_FRACTION`); the result is floored at `MIN_BUDGET_BYTES` but not
-/// capped — an explicit fraction is taken at the caller's word.
-/// `UNDETECTABLE_MEM_BYTES` when RAM is unknown. `ram_bytes` comes from the
-/// [`MachineProfile`].
-pub(crate) fn mem_for_fraction(ram_bytes: Option<usize>, fraction: f64) -> usize {
-    if !(fraction.is_finite() && fraction > 0.0) || fraction > 1.0 {
-        tracing::debug!(
-            requested = fraction,
-            "memory budget fraction outside (0.0, 1.0]; clamping"
-        );
-    }
-    mem_for_fraction_from(ram_bytes, fraction)
-}
-
-/// `Fraction` policy as a pure function of detected RAM.
-fn mem_for_fraction_from(ram: Option<usize>, fraction: f64) -> usize {
-    let fraction = if fraction.is_finite() && fraction > 0.0 {
-        fraction.min(1.0)
-    } else {
-        SAFE_MEM_FRACTION
-    };
-    match ram {
-        Some(bytes) => scale(bytes, fraction).max(MIN_BUDGET_BYTES),
-        None => UNDETECTABLE_MEM_BYTES,
-    }
-}
-
-/// Apply a fraction to a byte count. The `f64` cast saturates rather than
-/// overflowing; callers validate the fraction first.
-fn scale(bytes: usize, fraction: f64) -> usize {
-    (bytes as f64 * fraction) as usize
-}
-
-/// Round to the nearer power of two; ties round up. `0` maps to `0`. Rounding to
-/// nearest (rather than `next_power_of_two`'s round-up) keeps the budget near the
-/// intended fraction instead of overshooting when the input sits just above a
-/// power of two.
-fn round_pow2(n: usize) -> usize {
-    match n.checked_next_power_of_two() {
-        Some(upper) if upper == n => n,
-        Some(upper) => {
-            let lower = upper >> 1;
-            if n - lower < upper - n {
-                lower
-            } else {
-                upper
-            }
-        }
-        // `n` exceeds the largest power of two: that power is the nearest.
-        None => 1usize << (usize::BITS - 1),
-    }
-}
-
-/// Usable RAM: the smaller of the cgroup memory limit and physical RAM. Linux
-/// only; `None` elsewhere or on a read failure, in which case the caller falls
-/// back to a conservative default.
-#[cfg(target_os = "linux")]
+/// Android exposes the same kernel interfaces even though its runtime page
+/// size and userspace environment may differ from a conventional Linux host.
+/// The smaller of physical memory and the process limit wins when both exist.
+#[cfg(any(target_os = "android", target_os = "linux"))]
 pub(crate) fn available_ram() -> Option<usize> {
     match (meminfo_total(), cgroup_mem_limit()) {
         (Some(total), Some(cgroup)) => Some(total.min(cgroup)),
@@ -197,9 +98,39 @@ pub(crate) fn available_ram() -> Option<usize> {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+#[cfg(not(any(
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "windows"
+)))]
 pub(crate) fn available_ram() -> Option<usize> {
     None
+}
+
+#[cfg(target_os = "freebsd")]
+pub(crate) fn available_ram() -> Option<usize> {
+    // hw.physmem is physical memory in bytes.
+    // Ref: sysctlbyname(3)
+    // <https://man.freebsd.org/cgi/man.cgi?query=sysctlbyname&sektion=3>
+    let mut bytes: u64 = 0;
+    let mut len = std::mem::size_of::<u64>();
+    // SAFETY: `bytes` is writable for the input value of `len`; `hw.physmem`
+    // is nul-terminated, and null `newp` with zero `newlen` performs a read.
+    let result = unsafe {
+        libc::sysctlbyname(
+            c"hw.physmem".as_ptr(),
+            (&mut bytes as *mut u64).cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if result != 0 || len != std::mem::size_of::<u64>() || bytes == 0 {
+        return None;
+    }
+    usize::try_from(bytes).ok()
 }
 
 #[cfg(target_os = "macos")]
@@ -245,7 +176,7 @@ pub(crate) fn available_ram() -> Option<usize> {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "android", target_os = "linux"))]
 fn meminfo_total() -> Option<usize> {
     parse_meminfo_total(&std::fs::read_to_string("/proc/meminfo").ok()?)
 }
@@ -257,10 +188,10 @@ fn meminfo_total() -> Option<usize> {
 /// parent cgroup may impose a tighter limit). Tries v2, then v1 (hybrid). `None`
 /// when no limit is set, then `available_ram` uses physical RAM.
 ///
-/// Refs: cgroups(7) /proc/[pid]/cgroup <https://man7.org/linux/man-pages/man7/cgroups.7.html>;
+/// Refs: cgroups(7) `/proc/<pid>/cgroup` <https://man7.org/linux/man-pages/man7/cgroups.7.html>;
 /// cgroup v2 memory.max <https://docs.kernel.org/admin-guide/cgroup-v2.html>;
 /// cgroup v1 memory.limit_in_bytes <https://docs.kernel.org/admin-guide/cgroup-v1/memory.html>
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "android", target_os = "linux"))]
 fn cgroup_mem_limit() -> Option<usize> {
     let proc_cgroup = std::fs::read_to_string("/proc/self/cgroup").ok()?;
     let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
@@ -271,7 +202,7 @@ fn cgroup_mem_limit() -> Option<usize> {
 /// Read each candidate limit file and return the smallest real limit; "max" and
 /// the v1 unlimited sentinel are ignored ("max" via `parse_cgroup_limit`, the
 /// sentinel via `min` with physical RAM in `available_ram`).
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "android", target_os = "linux"))]
 fn min_limit(files: &[PathBuf]) -> Option<usize> {
     files
         .iter()
@@ -284,7 +215,7 @@ fn min_limit(files: &[PathBuf]) -> Option<usize> {
 /// this value in kB.
 ///
 /// Ref: proc_meminfo(5) <https://man7.org/linux/man-pages/man5/proc_meminfo.5.html>
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
 fn parse_meminfo_total(meminfo: &str) -> Option<usize> {
     let line = meminfo.lines().find(|l| l.starts_with("MemTotal:"))?;
     line.split_whitespace()
@@ -297,7 +228,7 @@ fn parse_meminfo_total(meminfo: &str) -> Option<usize> {
 /// Parse a cgroup memory-limit value into bytes. "max" (v2 unlimited) yields
 /// `None`. The v1 unlimited sentinel is a huge number that `available_ram`
 /// discards via `min` with physical RAM, so it needs no special case.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
 fn parse_cgroup_limit(raw: &str) -> Option<usize> {
     let raw = raw.trim();
     if raw == "max" {
@@ -308,7 +239,7 @@ fn parse_cgroup_limit(raw: &str) -> Option<usize> {
 
 /// `memory.max` candidate paths for the cgroup v2 unified hierarchy, leaf-first.
 /// Empty when this process has no v2 cgroup line.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
 fn cgroup_v2_files(proc_cgroup: &str, mountinfo: &str) -> Vec<PathBuf> {
     let Some(path) = cgroup_v2_path(proc_cgroup) else {
         return Vec::new();
@@ -320,7 +251,7 @@ fn cgroup_v2_files(proc_cgroup: &str, mountinfo: &str) -> Vec<PathBuf> {
 
 /// `memory.limit_in_bytes` candidate paths for the cgroup v1 memory controller,
 /// leaf-first. Empty when this process has no v1 memory cgroup line.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
 fn cgroup_v1_files(proc_cgroup: &str, mountinfo: &str) -> Vec<PathBuf> {
     let Some(path) = cgroup_v1_memory_path(proc_cgroup) else {
         return Vec::new();
@@ -331,7 +262,7 @@ fn cgroup_v1_files(proc_cgroup: &str, mountinfo: &str) -> Vec<PathBuf> {
 }
 
 /// The cgroup path from a v2 unified line (`0::<path>`).
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
 fn cgroup_v2_path(proc_cgroup: &str) -> Option<String> {
     proc_cgroup.lines().find_map(|line| {
         let mut fields = line.splitn(3, ':');
@@ -344,7 +275,7 @@ fn cgroup_v2_path(proc_cgroup: &str) -> Option<String> {
 
 /// The cgroup path from the v1 line whose controllers include `memory`
 /// (`<id>:<controllers>:<path>`).
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
 fn cgroup_v1_memory_path(proc_cgroup: &str) -> Option<String> {
     proc_cgroup.lines().find_map(|line| {
         let mut fields = line.splitn(3, ':');
@@ -361,7 +292,7 @@ fn cgroup_v1_memory_path(proc_cgroup: &str) -> Option<String> {
 /// into `<...> mountpoint options [optional]` and `<fstype> <source> <superopts>`.
 ///
 /// Ref: proc_pid_mountinfo(5) <https://man7.org/linux/man-pages/man5/proc_pid_mountinfo.5.html>
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
 fn mountinfo_mount(mountinfo: &str, fstype: &str, super_opt: Option<&str>) -> Option<String> {
     mountinfo.lines().find_map(|line| {
         let (left, right) = line.split_once(" - ")?;
@@ -382,7 +313,7 @@ fn mountinfo_mount(mountinfo: &str, fstype: &str, super_opt: Option<&str>) -> Op
 
 /// Limit-file paths from `<mount><cgroup_path>` up to `<mount>`, leaf-first, so a
 /// tighter parent limit is included.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
 fn walk_paths(mount: &str, cgroup_path: &str, filename: &str) -> Vec<PathBuf> {
     let mount = Path::new(mount);
     let rel = cgroup_path.trim_start_matches('/');
@@ -423,7 +354,7 @@ fn walk_paths(mount: &str, cgroup_path: &str, filename: &str) -> Vec<PathBuf> {
 
 /// Assumed goodput per in-flight request, in Gbps. Matches CRT's per-connection
 /// figure (`100 / 250`).
-const GBPS_PER_CONN: f64 = 0.4;
+pub(crate) const GBPS_PER_CONN: f64 = 0.4;
 
 /// In-flight requests per vCPU for the fallback seed, used when the instance
 /// family is unknown (unrecognized type, or detection failed / off-EC2). Without
@@ -640,25 +571,62 @@ pub(crate) fn seed_from_gbps(gbps: f64) -> usize {
     (n as usize).clamp(MIN_CONN, ABSOLUTE_MAX_CONN)
 }
 
-/// Resolve the `Auto` concurrency seed from detected machine facts.
+/// Source used to resolve [`ConcurrencyMode::Auto`].
 ///
-/// Recognized family -> bandwidth estimate (`per_vcpu x vcpus`) -> connection
-/// derivation, clamped `[MIN_CONN, ABSOLUTE_MAX_CONN]`. Unknown/undetected ->
-/// `FALLBACK_INFLIGHT_PER_VCPU x vcpus` (a concurrency heuristic, not a bandwidth
-/// estimate), clamped `[FALLBACK_MIN, ABSOLUTE_MAX_CONN]` so an unknown box gets a
-/// usable default. Pure function of its inputs.
-pub(crate) fn auto_concurrency_seed(instance_type: Option<&str>, vcpus: usize) -> usize {
+/// [`ConcurrencyMode::Auto`]: crate::types::ConcurrencyMode::Auto
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AutoConcurrencySource {
+    /// The detected EC2 family supplied a network-bandwidth estimate.
+    InstanceFamily,
+    /// No family estimate was available, so the target scales with usable vCPUs.
+    VcpuFallback,
+}
+
+impl AutoConcurrencySource {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::InstanceFamily => "instance_family",
+            Self::VcpuFallback => "vcpu_fallback",
+        }
+    }
+}
+
+/// Result of resolving automatic concurrency from one detected machine profile.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ResolvedAutoConcurrency {
+    /// Fixed in-flight work target installed in the scheduler.
+    pub(crate) target: usize,
+    /// Estimated network bandwidth when the instance family was recognized.
+    pub(crate) estimated_gbps: Option<f64>,
+    /// Machine signal from which the target was derived.
+    pub(crate) source: AutoConcurrencySource,
+}
+
+/// Resolve automatic concurrency while retaining its diagnostic inputs.
+pub(crate) fn resolve_auto_concurrency(
+    instance_type: Option<&str>,
+    vcpus: usize,
+) -> ResolvedAutoConcurrency {
     match instance_type.and_then(family_gbps_per_vcpu) {
-        Some(per_vcpu) => seed_from_gbps(per_vcpu * vcpus as f64),
-        None => (FALLBACK_INFLIGHT_PER_VCPU * vcpus).clamp(FALLBACK_MIN, ABSOLUTE_MAX_CONN),
+        Some(per_vcpu) => {
+            let estimated_gbps = per_vcpu * vcpus as f64;
+            ResolvedAutoConcurrency {
+                target: seed_from_gbps(estimated_gbps),
+                estimated_gbps: Some(estimated_gbps),
+                source: AutoConcurrencySource::InstanceFamily,
+            }
+        }
+        None => ResolvedAutoConcurrency {
+            target: (FALLBACK_INFLIGHT_PER_VCPU * vcpus).clamp(FALLBACK_MIN, ABSOLUTE_MAX_CONN),
+            estimated_gbps: None,
+            source: AutoConcurrencySource::VcpuFallback,
+        },
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const GIB: usize = 1024 * 1024 * 1024;
 
     #[test]
     fn test_cap_none_is_absolute_max() {
@@ -714,87 +682,6 @@ mod tests {
         let chunk = 8 * 1024 * 1024;
         let cap = connection_cap_with_memory(16 * chunk, chunk);
         assert!((MIN_CONN..=16).contains(&cap));
-    }
-
-    const MIB: usize = 1024 * 1024;
-
-    #[test]
-    fn test_auto_budget_undetectable_fallback() {
-        assert_eq!(auto_budget(None), UNDETECTABLE_MEM_BYTES);
-    }
-
-    #[test]
-    fn test_auto_budget_tiers() {
-        // Reported RAM runs a little under the marketed size (firmware/kernel
-        // reserve), so 0.25x lands just under a power of two; nearest-rounding
-        // recovers the intended tier. (marketed GiB, reported GiB, expected budget)
-        let cases = [
-            (1.0, 1.0, 512 * MIB),    // floor
-            (2.0, 1.8, 512 * MIB),    // 0.45 GiB -> 512 MiB
-            (4.0, 3.7, GIB),          // 0.93 GiB -> 1 GiB
-            (8.0, 7.7, 2 * GIB),      // 1.93 GiB -> 2 GiB
-            (16.0, 15.3, 4 * GIB),    // 3.83 GiB -> 4 GiB
-            (32.0, 30.6, 8 * GIB),    // 7.65 GiB -> 8 GiB
-            (64.0, 61.0, 16 * GIB),   // 15.25 GiB -> 16 GiB
-            (128.0, 123.0, 32 * GIB), // 30.75 GiB -> 32 GiB (cap)
-            (256.0, 250.0, 32 * GIB), // would be 62 GiB -> capped
-            (512.0, 504.0, 32 * GIB), // capped
-        ];
-        for (marketed, reported_gib, expected) in cases {
-            let ram = (reported_gib * GIB as f64) as usize;
-            assert_eq!(
-                auto_budget(Some(ram)),
-                expected,
-                "marketed {marketed} GiB (reported {reported_gib})"
-            );
-        }
-    }
-
-    #[test]
-    fn test_auto_budget_floor_and_cap_bind() {
-        assert_eq!(auto_budget(Some(0)), MIN_BUDGET_BYTES);
-        assert_eq!(auto_budget(Some(usize::MAX)), MAX_BUDGET_BYTES);
-    }
-
-    #[test]
-    fn test_fraction_applied_uncapped() {
-        // An explicit fraction is taken at the caller's word: no power-of-two
-        // rounding, no ceiling.
-        assert_eq!(mem_for_fraction_from(Some(64 * GIB), 0.5), 32 * GIB);
-        assert_eq!(mem_for_fraction_from(Some(200 * GIB), 0.25), 50 * GIB);
-    }
-
-    #[test]
-    fn test_fraction_floored() {
-        // 1 GiB x 0.25 = 256 MiB -> floored.
-        assert_eq!(mem_for_fraction_from(Some(GIB), 0.25), MIN_BUDGET_BYTES);
-    }
-
-    #[test]
-    fn test_fraction_invalid_falls_back_to_safe() {
-        // Non-finite, non-positive, or >1.0 fall back / clamp rather than
-        // producing a zero or unbounded budget.
-        for bad in [f64::NAN, f64::INFINITY, -1.0, 0.0] {
-            assert_eq!(
-                mem_for_fraction_from(Some(64 * GIB), bad),
-                mem_for_fraction_from(Some(64 * GIB), SAFE_MEM_FRACTION),
-                "fraction {bad} should fall back to SAFE_MEM_FRACTION"
-            );
-        }
-        assert_eq!(mem_for_fraction_from(Some(64 * GIB), 2.0), 64 * GIB);
-    }
-
-    #[test]
-    fn test_round_pow2() {
-        assert_eq!(round_pow2(0), 0);
-        assert_eq!(round_pow2(1), 1);
-        assert_eq!(round_pow2(2), 2);
-        assert_eq!(round_pow2(3), 4); // tie-ish, closer to 4
-        assert_eq!(round_pow2(5), 4);
-        assert_eq!(round_pow2(6), 8); // tie rounds up
-        assert_eq!(round_pow2(7), 8);
-        assert_eq!(round_pow2(100), 128);
-        assert_eq!(round_pow2(usize::MAX), 1usize << (usize::BITS - 1));
     }
 
     #[test]
@@ -878,18 +765,29 @@ mod tests {
         );
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "windows"
+    ))]
     #[test]
     #[cfg_attr(
         miri,
         ignore = "available_ram reads /proc and calls platform syscalls miri cannot emulate"
     )]
     fn test_available_ram_detected_on_supported_platforms() {
+        const GIB: usize = 1024 * 1024 * 1024;
+
         // The detected machine has at least 1 GiB; guards the platform syscall.
         assert!(available_ram().expect("RAM detected") >= GIB);
     }
 
     // --- concurrency seeding ---
+
+    fn auto_concurrency_seed(instance_type: Option<&str>, vcpus: usize) -> usize {
+        resolve_auto_concurrency(instance_type, vcpus).target
+    }
 
     #[test]
     fn test_family_lookup_parses_family_from_type() {
@@ -913,6 +811,34 @@ mod tests {
         assert_eq!(auto_concurrency_seed(Some("m6idn.32xlarge"), 128), 500);
         // c8gn: 3.125 Gbps/vCPU. 16xlarge = 64 vCPU -> 200 Gbps -> 500.
         assert_eq!(auto_concurrency_seed(Some("c8gn.16xlarge"), 64), 500);
+    }
+
+    #[test]
+    fn test_auto_resolution_reports_family_estimate() {
+        let resolved = resolve_auto_concurrency(Some("m6idn.16xlarge"), 64);
+        assert_eq!(
+            resolved,
+            ResolvedAutoConcurrency {
+                target: 250,
+                estimated_gbps: Some(100.0),
+                source: AutoConcurrencySource::InstanceFamily,
+            }
+        );
+        assert_eq!(resolved.source.as_str(), "instance_family");
+    }
+
+    #[test]
+    fn test_auto_resolution_reports_vcpu_fallback() {
+        let resolved = resolve_auto_concurrency(Some("unknown.16xlarge"), 64);
+        assert_eq!(
+            resolved,
+            ResolvedAutoConcurrency {
+                target: 320,
+                estimated_gbps: None,
+                source: AutoConcurrencySource::VcpuFallback,
+            }
+        );
+        assert_eq!(resolved.source.as_str(), "vcpu_fallback");
     }
 
     #[test]
@@ -1040,14 +966,6 @@ mod tests {
         assert!(p.vcpus >= 1);
         // No IMDS on this path: off-EC2, instance_type must be None (DMI-only).
         // On EC2 it may be Some; either is valid, so this is not asserted here.
-    }
-
-    #[test]
-    fn test_machine_safe_mem_takes_ram_from_caller() {
-        // The wrapper no longer reads the environment; it sizes from the passed
-        // RAM (from the MachineProfile). 64 GiB -> 25% -> 16 GiB (pow2, in range).
-        assert_eq!(machine_safe_mem(Some(64 * GIB)), 16 * GIB);
-        assert_eq!(machine_safe_mem(None), UNDETECTABLE_MEM_BYTES);
     }
 
     #[cfg(not(target_os = "linux"))]
