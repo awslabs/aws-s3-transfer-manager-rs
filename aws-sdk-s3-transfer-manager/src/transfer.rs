@@ -986,9 +986,17 @@ impl TransferContext {
     ///
     /// [`signal_terminal`]: Self::signal_terminal
     /// [`set_failed_and_signal`]: Self::set_failed_and_signal
+    ///
+    /// The status transition happens while the error slot is held, so a reader that
+    /// observes `Failed` and then takes the same lock cannot find the slot empty. The
+    /// CAS still decides the winner, so holding the lock across it does not weaken
+    /// first-write-wins; it only stops `Failed` from becoming visible before the error
+    /// that explains it. Storing before the CAS would be the other way to order this
+    /// and is wrong, because a losing caller would overwrite the winner's error.
     pub(crate) fn set_failed(&self, err: impl Into<error::Error>) -> bool {
+        let mut slot = self.error.lock().unwrap();
         if self.status.set_failed() {
-            *self.error.lock().unwrap() = Some(Box::new(err.into()));
+            *slot = Some(Box::new(err.into()));
             true
         } else {
             false
@@ -1009,16 +1017,24 @@ impl TransferContext {
         self.status.set_cancelled()
     }
 
-    /// Take the error if transfer failed. Returns None if not failed or already taken.
-    pub(crate) fn take_error(&self) -> Option<error::Error> {
+    /// Clone the error if the transfer failed. `None` means the transfer did not fail.
+    ///
+    /// The only way to read the error, and non-destructive, so every reader gets the
+    /// same value however many there are and in whatever order they run. Cheap —
+    /// [`error::Error`] is `Clone` over an `Arc` source.
+    ///
+    /// A `Failed` status always has an error behind it: [`Self::set_failed`] publishes
+    /// the status while holding this slot, so observing `Failed` and then taking the
+    /// lock cannot find it empty.
+    pub(crate) fn error(&self) -> Option<error::Error> {
         if self.status.is_failed() {
-            self.error.lock().unwrap().take().map(|e| *e)
+            self.error.lock().unwrap().as_ref().map(|e| (**e).clone())
         } else {
             None
         }
     }
 
-    /// Peek at the error kind if transfer failed. Returns None if not failed or already taken.
+    /// Peek at the error kind if transfer failed. `None` means the transfer did not fail.
     pub(crate) fn error_kind(&self) -> Option<error::ErrorKind> {
         if self.status.is_failed() {
             self.error
@@ -1390,6 +1406,65 @@ mod tests {
             assert_eq!(stats.network_rx, 220);
             assert_eq!(stats.disk_read, 330);
             assert_eq!(stats.disk_write, 440);
+        }
+
+        /// Every reader of a failed transfer's error gets the real one.
+        ///
+        /// The scheduler releases the joining caller before the terminal is claimed, so
+        /// `join()` and a reporting path read the same slot in an order neither controls.
+        /// While one of them consumed it, whichever ran second saw an empty slot and the
+        /// emit site substituted a constructed error -- so a 403 or an integrity failure
+        /// reached the consumer as a generic "child operation failed" and anything
+        /// branching on `kind()` took the wrong arm.
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn error_survives_every_reader() {
+            let (ctx, _rx) = TransferContext::new(test_handle());
+            assert!(ctx.set_failed(crate::error::Error::new(
+                crate::error::ErrorKind::ObjectNotDiscoverable,
+                "the real cause",
+            )));
+
+            // The joining caller reads first, as it does in the live ordering.
+            let joined = ctx.error().expect("a failed transfer has an error");
+            // Then the emit site, after the joiner was already released.
+            let emitted = ctx
+                .error()
+                .expect("the error a reporting path reads must survive the join");
+
+            assert!(
+                matches!(
+                    joined.kind(),
+                    crate::error::ErrorKind::ObjectNotDiscoverable
+                ),
+                "the joiner must get the real kind, got {:?}",
+                joined.kind()
+            );
+            assert!(
+                matches!(
+                    emitted.kind(),
+                    crate::error::ErrorKind::ObjectNotDiscoverable
+                ),
+                "the emit site must get the same kind, got {:?}",
+                emitted.kind()
+            );
+            // And a third reader, because nothing about this is once-only.
+            assert!(ctx.error().is_some(), "the slot is never emptied by a read");
+        }
+
+        /// A transfer that did not fail has no error to read, so `None` means exactly
+        /// that and never "someone already took it".
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn error_is_none_only_when_not_failed() {
+            let (ctx, _rx) = TransferContext::new(test_handle());
+            assert!(ctx.error().is_none(), "an active transfer has not failed");
+            assert!(ctx.set_completed());
+            assert!(ctx.error().is_none(), "a completed transfer has not failed");
+
+            let (ctx, _rx) = TransferContext::new(test_handle());
+            assert!(ctx.set_cancelled());
+            assert!(ctx.error().is_none(), "a cancelled transfer has not failed");
         }
 
         #[cfg_attr(miri, ignore)]

@@ -101,7 +101,7 @@ impl UploadHandle {
                 .cancel_transfer(ctx.id)
                 .wait_for_idle()
                 .await;
-            let err = ctx.take_error().expect("failed transfer must have error");
+            let err = ctx.error().expect("failed transfer must have error");
             return Err(err);
         }
 
