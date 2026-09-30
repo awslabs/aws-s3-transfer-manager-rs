@@ -823,6 +823,15 @@ impl UploadObjectsTransfer {
             // entry whose orchestration failed. Without this the counts report it
             // and the stream does not, and two observers of the same transfer
             // disagree about how many objects there were.
+            // An abandoned entry settles: it is no longer pending, and the walker counted
+            // it into the enumerated total when it produced it.
+            //
+            // Counted before the sink is consulted, because counting is not an observer's
+            // concern. `entries_settled()` is reachable through `metrics()` with no sink
+            // registered at all, so a run with an observer and a run without one have to
+            // report the same number. Falling short here is what holds a progress bar
+            // below its total for the life of the process on every cancelled run.
+            self.inner.ctx.metrics.record_entry_settled();
             if let Some(root) = &root {
                 let lc = crate::events::TransferLifecycle::new(
                     root.child_sink(),
@@ -834,11 +843,6 @@ impl UploadObjectsTransfer {
                 );
                 lc.announce();
                 if let Some(emit) = lc.finish(crate::events::Outcome::Cancelled {}) {
-                    // An abandoned entry settles too: it is no longer pending, and it was
-                    // counted into the enumerated total when the walker produced it. Not
-                    // counting it here would leave `entries_settled()` permanently short of
-                    // `EntryTotal::Final` on every cancelled run.
-                    self.inner.ctx.metrics.record_entry_settled();
                     out.push(emit);
                 }
             }

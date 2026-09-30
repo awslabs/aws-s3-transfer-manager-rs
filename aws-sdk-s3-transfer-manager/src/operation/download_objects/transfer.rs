@@ -488,13 +488,22 @@ impl DownloadObjectsTransfer {
         // Taken once, not per entry. Cloning the root sink per abandoned entry is
         // the per-iteration cost this loop keeps small; it runs under the state
         // guard and is bounded by the entry buffer's high-water mark.
-        let Some(root) = self.inner.lifecycle.lock().clone() else {
-            state.pending_entries.clear();
-            return;
-        };
+        let root = self.inner.lifecycle.lock().clone();
         let abandoned: Vec<_> = state.pending_entries.drain(..).collect();
         for obj in abandoned {
             let Some(key) = obj.key() else {
+                continue;
+            };
+            // An abandoned entry settles: it is no longer pending, and listing counted it
+            // into the enumerated total when it produced it.
+            //
+            // Counted before the sink is consulted, because counting is not an observer's
+            // concern. `entries_settled()` is reachable through `metrics()` with no sink
+            // registered at all, so a run with an observer and a run without one have to
+            // report the same number. Falling short here is what holds a progress bar
+            // below its total for the life of the process on every cancelled run.
+            self.inner.ctx.metrics.record_entry_settled();
+            let Some(root) = &root else {
                 continue;
             };
             let transfer = crate::events::TransferRef::download(
@@ -514,11 +523,6 @@ impl DownloadObjectsTransfer {
             );
             lc.announce();
             if let Some(emit) = lc.finish(crate::events::Outcome::Cancelled {}) {
-                // An abandoned entry settles too: it is no longer pending, and it was counted
-                // into the enumerated total when listing produced it. Not counting it here
-                // would leave `entries_settled()` permanently short of `EntryTotal::Final` on
-                // every cancelled run.
-                self.inner.ctx.metrics.record_entry_settled();
                 out.push(emit);
             }
         }
@@ -1695,6 +1699,58 @@ mod tests {
              left if the root is taken before it runs"
         );
         drop(reservation);
+    }
+
+    /// The abandoned-entry sweep owes the settled count whether or not a sink exists.
+    ///
+    /// The sweep used to take the root sink first and return early when there was none,
+    /// clearing `pending_entries` without counting any of them. `entries_settled` then
+    /// depended on who was watching, so it could not reach `EntryTotal::Final` on a run
+    /// with no observer — and "a re-read quantity is exact" is the premise the whole
+    /// push-lifecycle/pull-quantity split rests on, so a quantity that moves with the
+    /// observer defeats the premise and not just the number.
+    ///
+    /// Same principle as `announce_child_still_emits_after_the_root_is_taken`: the count
+    /// is owed regardless of the event.
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn abandoned_entries_settle_with_no_sink_registered() {
+        let dest = tempdir().unwrap();
+        let (transfer, _rx) = setup(dest.path(), FailedTransferPolicy::Abort, mock_s3_success());
+
+        // No sink at all: `lifecycle` is `None`, which is the early return the sweep took.
+        assert!(
+            transfer.inner.lifecycle.lock().is_none(),
+            "this test is about the no-sink path"
+        );
+
+        let mut state = transfer.inner.state.lock();
+        for i in 0..3 {
+            state.pending_entries.push_back(
+                aws_sdk_s3::types::Object::builder()
+                    .key(format!("p/{i:04}.bin"))
+                    .size(1)
+                    .build(),
+            );
+        }
+
+        let before = transfer.inner.ctx.metrics.entries_settled();
+        let mut emits = Vec::new();
+        transfer.record_abandoned_entries(&mut state, &mut emits);
+
+        assert!(
+            state.pending_entries.is_empty(),
+            "the sweep drains what it swept"
+        );
+        assert!(
+            emits.is_empty(),
+            "no sink means no event to send, which is the half that may depend on a sink"
+        );
+        assert_eq!(
+            before + 3,
+            transfer.inner.ctx.metrics.entries_settled(),
+            "all three abandoned entries must be counted as settled with no sink registered"
+        );
     }
 
     /// `announce_child` must still emit once the root has been taken.
