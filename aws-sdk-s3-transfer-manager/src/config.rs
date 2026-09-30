@@ -521,12 +521,10 @@ mod tests {
             .build();
         assert!(disabled.runtime_http(64).is_none());
 
+        // A mock client: a real one would build the default HTTPS client, whose
+        // TLS initialization is foreign code that miri cannot run.
         let provided = Config::builder()
-            .client(aws_sdk_s3::Client::from_conf(
-                s3_config_builder()
-                    .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
-                    .build(),
-            ))
+            .client(aws_smithy_mocks::mock_client!(aws_sdk_s3, []))
             .build();
         assert!(provided.runtime_http(64).is_none());
     }
