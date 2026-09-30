@@ -12,8 +12,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::transfer::{
-    IoRequest, PollWork, StateMachineTerminalReceiver, Transfer, TransferContext, TransferId,
-    WorkOutcome,
+    IoRequest, PendingCause, PollWork, StateMachineTerminalReceiver, Transfer, TransferContext,
+    TransferId, WorkOutcome,
 };
 
 /// Trait for mock state machines that drive transfer behavior.
@@ -78,7 +78,11 @@ impl MockTransfer {
     }
 
     pub(crate) fn poll_work(&self) -> PollWork {
-        self.state_machine.poll_work(self.id)
+        let work = self.state_machine.poll_work(self.id);
+        if matches!(work, PollWork::Pending) {
+            self.ctx.set_pending(PendingCause::other("mock"));
+        }
+        work
     }
 
     pub(crate) async fn execute(&self, work: &mut IoRequest) -> WorkOutcome {
@@ -549,7 +553,7 @@ impl Transfer for ChildMockTransfer {
             // All work generated. Follow the wake protocol:
             // lock → set_pending → check condition → unlock
             let _guard = self.state_lock.lock().unwrap();
-            self.ctx.set_pending();
+            self.ctx.set_pending(PendingCause::other("test"));
             if self.completed.load(Ordering::SeqCst) >= self.total {
                 // All completed
                 drop(_guard);
@@ -809,7 +813,7 @@ impl Transfer for CompositeMock {
 
         // Still waiting for children to complete
         drop(state);
-        self.ctx.set_pending();
+        self.ctx.set_pending(PendingCause::other("test"));
         PollWork::Pending
     }
 
@@ -981,7 +985,7 @@ impl Transfer for NoopChild {
     }
 
     fn poll_work(&self) -> PollWork {
-        self.ctx.set_pending();
+        self.ctx.set_pending(PendingCause::other("test"));
         PollWork::Pending
     }
 
@@ -1049,7 +1053,7 @@ impl Transfer for TerminalWithoutSignalMock {
             return PollWork::ready(IoRequest { data: None });
         }
         // No further work; the transfer is already terminal (set in execute).
-        self.ctx.set_pending();
+        self.ctx.set_pending(PendingCause::other("test"));
         PollWork::Pending
     }
 
@@ -1281,7 +1285,7 @@ impl Transfer for SingleTicketCompositeMock {
 
         // Cannot spawn (at memory cap or all spawned but not all terminated).
         drop(state);
-        self.ctx.set_pending();
+        self.ctx.set_pending(PendingCause::other("test"));
         PollWork::Pending
     }
 

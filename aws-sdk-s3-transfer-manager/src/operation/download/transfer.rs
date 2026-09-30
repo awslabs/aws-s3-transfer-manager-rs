@@ -19,9 +19,13 @@ use super::input::copy_fields_to_get_object_request;
 use crate::error::{self, ChunkRef, Error};
 use crate::operation::download::body::{BodySlot, BodyWriter, ChunkOutput};
 use crate::operation::download::chunk_meta::ChunkMetadata;
-use crate::operation::download::context::{DownloadState, PendingClaim};
+use crate::operation::download::context::{DownloadPendingReason, DownloadState, PendingClaim};
 use crate::operation::download::discovery::{discover_obj, ObjectDiscovery};
 use crate::operation::download::object_meta::ObjectMetadata;
+use crate::operation::download::observability::{
+    DownloadDestination, DownloadEvent, DownloadExecutionState, DownloadObservability,
+    DownloadRequestKind, DownloadRequestMeasurement, DownloadStateSnapshot, DownloadTerminalReport,
+};
 use crate::operation::download::read_ahead::ReadAhead;
 use crate::operation::download::recv_buffer::{DrainMode, FillOutcome};
 use crate::operation::download::DownloadInput;
@@ -47,6 +51,8 @@ struct DownloadTransferInner {
     ctx: TransferContext,
     /// State machine for work progression
     state: Mutex<DownloadState>,
+    /// Direction-specific observation kept outside correctness state.
+    observability: DownloadObservability,
     /// The original request
     request: Arc<DownloadInput>,
     /// Type of S3 bucket targeted by this operation.
@@ -110,10 +116,18 @@ impl DownloadTransfer {
         // Couple the disk drain batch to the initial window, so a window below the
         // segment size drains in smaller runs from the first part.
         writer.sync_drain_batch(window);
+        let destination = if writer.has_sink() {
+            DownloadDestination::File
+        } else {
+            DownloadDestination::Stream
+        };
+        let observability =
+            DownloadObservability::new(ctx.handle.config.diagnostics().transfer(), destination);
         let inner = Arc::new(DownloadTransferInner {
             read_ahead,
             ctx,
             state: Mutex::new(DownloadState::new()),
+            observability,
             request: Arc::new(input),
             bucket_type,
             writer,
@@ -128,6 +142,51 @@ impl DownloadTransfer {
     /// Access the transfer context.
     pub(crate) fn ctx(&self) -> &TransferContext {
         &self.inner.ctx
+    }
+
+    /// Starts one request measurement attributed to download request kind.
+    pub(crate) fn start_request(&self, kind: DownloadRequestKind) -> DownloadRequestMeasurement {
+        self.inner
+            .observability
+            .start_request(&self.inner.ctx, kind)
+    }
+
+    fn snapshot(&self, state: &DownloadState) -> DownloadStateSnapshot {
+        snapshot_state(state, self.inner.read_ahead.window())
+    }
+
+    fn observe_event(&self, event: DownloadEvent, state: &DownloadState) {
+        let snapshot = self.snapshot(state);
+        self.inner
+            .observability
+            .observe_event(self.inner.ctx.id, event, snapshot);
+    }
+
+    /// Emits the download terminal summary before notifying the owning handle.
+    fn report_terminal(&self, state_snapshot: DownloadStateSnapshot) {
+        self.inner.ctx.finalize_terminal_metrics();
+        if !self.inner.ctx.claim_terminal_report() {
+            return;
+        }
+        let pending = self.inner.ctx.pending_stats().unwrap_or_default();
+        let checksum_validation = self
+            .inner
+            .integrity_checks
+            .get()
+            .map(|checks| checks.checksum_validation().clone());
+        let _ = self
+            .inner
+            .observability
+            .report_terminal(DownloadTerminalReport {
+                transfer_id: self.inner.ctx.id,
+                status: self.inner.ctx.transfer_status(),
+                error_kind: self.inner.ctx.error_kind(),
+                metrics: self.inner.ctx.metrics(),
+                request_total: self.inner.ctx.metrics.request_metrics(),
+                pending,
+                checksum_validation,
+                state_snapshot,
+            });
     }
 
     /// Get the transfer ID.
@@ -146,6 +205,14 @@ impl DownloadTransfer {
     #[cfg(test)]
     pub(crate) fn read_ahead(&self) -> &ReadAhead {
         &self.inner.read_ahead
+    }
+
+    /// Returns the terminal diagnostic report emitted by this transfer.
+    #[cfg(test)]
+    pub(crate) fn test_terminal_summary(
+        &self,
+    ) -> Option<crate::operation::download::observability::DownloadTransferSummary> {
+        self.inner.observability.test_terminal_summary()
     }
 
     /// I/O controls for this transfer, for exercising the public control surface in
@@ -245,12 +312,16 @@ impl DownloadTransfer {
         match &mut *state {
             DownloadState::PendingDiscovery => {
                 *state = DownloadState::DiscoveryInFlight;
+                self.observe_event(DownloadEvent::DiscoveryScheduled, &state);
                 PollWork::ready(IoRequest {
                     data: Some(Box::new(DownloadWork::Discovery)),
                 })
             }
             DownloadState::DiscoveryInFlight => {
-                self.inner.ctx.set_pending();
+                self.inner.ctx.set_pending(DownloadPendingReason::Discovery);
+                self.inner
+                    .observability
+                    .observe_state(self.snapshot(&state));
                 PollWork::Pending
             }
             DownloadState::Transferring {
@@ -275,7 +346,16 @@ impl DownloadTransfer {
                         // Not granted yet; the reservation future registered the
                         // scheduler waker. Flush any resident run first so it
                         // does not retain memory while this claim is blocked.
-                        Ok(None) => return self.poll_memory_blocked(),
+                        Ok(None) => {
+                            let snapshot = transferring_snapshot(
+                                remaining.as_ref(),
+                                *ranges_in_flight,
+                                gate,
+                                self.inner.read_ahead.window(),
+                                pending.is_some(),
+                            );
+                            return self.poll_memory_blocked(snapshot);
+                        }
                         Err(error) => return self.fail_memory_admission(state, error),
                     }
                 } else if let Some(range) = remaining.as_ref() {
@@ -306,7 +386,14 @@ impl DownloadTransfer {
                             window,
                             "read-ahead gate closed: issuance paused until the consumer drains",
                         );
-                        return self.park();
+                        let snapshot = transferring_snapshot(
+                            remaining.as_ref(),
+                            *ranges_in_flight,
+                            gate,
+                            window,
+                            pending.is_some(),
+                        );
+                        return self.park(DownloadPendingReason::ReadAhead, snapshot);
                     }
                     // Gate admitted (and counted) the slot. Claim it from the buffer and
                     // reserve its backing memory against the shared budget. A grant issues now;
@@ -319,12 +406,28 @@ impl DownloadTransfer {
                         Ok(Some(slot)) => slot,
                         // Memory-blocked; `pending` now holds the claimed slot.
                         // Flush any resident run before returning `Pending`.
-                        Ok(None) => return self.poll_memory_blocked(),
+                        Ok(None) => {
+                            let snapshot = transferring_snapshot(
+                                remaining.as_ref(),
+                                *ranges_in_flight,
+                                gate,
+                                self.inner.read_ahead.window(),
+                                pending.is_some(),
+                            );
+                            return self.poll_memory_blocked(snapshot);
+                        }
                         Err(error) => return self.fail_memory_admission(state, error),
                     }
                 } else if *ranges_in_flight > 0 {
                     // All ranges generated, waiting for in-flight to complete.
-                    return self.park();
+                    let snapshot = transferring_snapshot(
+                        remaining.as_ref(),
+                        *ranges_in_flight,
+                        gate,
+                        self.inner.read_ahead.window(),
+                        pending.is_some(),
+                    );
+                    return self.park(DownloadPendingReason::RangeCompletion, snapshot);
                 } else {
                     // No-data completion: the object carried no ranges (0-byte object
                     // whose discovery produced no initial chunk). Data-carrying terminal
@@ -350,18 +453,42 @@ impl DownloadTransfer {
 
                 *ranges_in_flight += 1;
 
+                let all_ranges_issued;
                 if chunk_end < end {
                     *remaining = Some((chunk_end + 1)..=end);
+                    all_ranges_issued = false;
                 } else {
                     // The final range was just issued: issuance is done and the transfer
                     // drains its in-flight tail, completing on the next empty poll with
                     // nothing in flight. Logged once per transfer.
                     *remaining = None;
+                    all_ranges_issued = true;
                     tracing::debug!(
                         target: crate::telemetry::TARGET_TRANSFER,
                         issued = gate.issued(),
                         ranges_in_flight = *ranges_in_flight,
                         "all ranges issued; draining in-flight tail",
+                    );
+                }
+
+                let snapshot = transferring_snapshot(
+                    remaining.as_ref(),
+                    *ranges_in_flight,
+                    gate,
+                    self.inner.read_ahead.window(),
+                    pending.is_some(),
+                );
+                self.inner.observability.record_range_scheduled();
+                self.inner.observability.observe_event(
+                    self.inner.ctx.id,
+                    DownloadEvent::RangeScheduled,
+                    snapshot,
+                );
+                if all_ranges_issued {
+                    self.inner.observability.observe_event(
+                        self.inner.ctx.id,
+                        DownloadEvent::AllRangesIssued,
+                        snapshot,
                     );
                 }
 
@@ -381,8 +508,9 @@ impl DownloadTransfer {
     /// waker re-readies it: the consumer freeing occupancy, or a GET
     /// completion decrementing the in-flight count. Memory reservations use their
     /// own scheduler-backed task waker.
-    fn park(&self) -> PollWork {
-        self.inner.ctx.set_pending();
+    fn park(&self, reason: DownloadPendingReason, snapshot: DownloadStateSnapshot) -> PollWork {
+        self.inner.ctx.set_pending(reason);
+        self.inner.observability.observe_state(snapshot);
         PollWork::Pending
     }
 
@@ -394,17 +522,27 @@ impl DownloadTransfer {
     /// transfers this can deadlock. Flush the resident run first, and return
     /// `Pending` only when there is nothing to flush.
     ///
-    /// The pending reservation future has already registered a scheduler waker,
-    /// so this path does not arm the transfer context's separate edge-triggered
-    /// wake flag. A `has_drainable_resident` guard keeps it from emitting empty
-    /// drains when an in-flight gap blocks the prefix or stream delivery owns
-    /// progress.
-    fn poll_memory_blocked(&self) -> PollWork {
+    /// The pending reservation future has already registered the context's
+    /// scheduler waker. This path still records and arms the common pending
+    /// state; the registered wake and `try_wake` paths reconcile through the
+    /// same descriptor protocol. A `has_drainable_resident` guard keeps it from
+    /// emitting empty drains when an in-flight gap blocks the prefix or stream
+    /// delivery owns progress.
+    fn poll_memory_blocked(&self, snapshot: DownloadStateSnapshot) -> PollWork {
         if self.inner.writer.has_drainable_resident() {
+            self.inner.observability.observe_event(
+                self.inner.ctx.id,
+                DownloadEvent::MemoryReliefScheduled,
+                snapshot,
+            );
             PollWork::ready(IoRequest {
                 data: Some(Box::new(DownloadWork::DrainResident)),
             })
         } else {
+            self.inner
+                .ctx
+                .set_pending(DownloadPendingReason::MemoryAdmission);
+            self.inner.observability.observe_state(snapshot);
             PollWork::Pending
         }
     }
@@ -418,7 +556,7 @@ impl DownloadTransfer {
         &self,
         pending: &mut Option<PendingClaim>,
     ) -> Result<Option<BodySlot>, ReserveError> {
-        let waker = self.inner.ctx.scheduler_waker();
+        let waker = self.inner.ctx.waker();
         let mut context = Context::from_waker(&waker);
         let reservation =
             match Pin::new(&mut pending.as_mut().unwrap().reservation).poll(&mut context) {
@@ -443,7 +581,7 @@ impl DownloadTransfer {
     ) -> Result<Option<BodySlot>, ReserveError> {
         let mut slot = self.inner.writer.claim();
         let mut reservation = self.inner.ctx.handle.buffer_pool.reserve(range_len);
-        let waker = self.inner.ctx.scheduler_waker();
+        let waker = self.inner.ctx.waker();
         let mut context = Context::from_waker(&waker);
 
         match Pin::new(&mut reservation).poll(&mut context) {
@@ -545,12 +683,21 @@ impl DownloadTransfer {
                 return self.fail(guard, error::Error::new(error::ErrorKind::IOError, e));
             }
         };
-        {
+        let snapshot = {
             let mut work = self.inner.state.lock().unwrap();
             if let DownloadState::Transferring { gate, .. } = &mut *work {
                 gate.release(freed);
             }
-        }
+            self.snapshot(&work)
+        };
+        self.inner
+            .observability
+            .record_memory_relief_completed(freed);
+        self.inner.observability.observe_event(
+            self.inner.ctx.id,
+            DownloadEvent::MemoryReliefCompleted,
+            snapshot,
+        );
         self.inner.ctx.try_wake();
         WorkOutcome::Success { data: None }
     }
@@ -624,6 +771,7 @@ impl DownloadTransfer {
                 crate::error::Error::new(crate::error::ErrorKind::IOError, error),
             );
         }
+        self.inner.observability.destination_prepared();
         let _ = self.inner.expected_download_len.set(expected_download_len);
         self.inner.ctx.set_total_bytes(expected_download_len);
 
@@ -641,11 +789,14 @@ impl DownloadTransfer {
         // not `poll_work`).
         let initial_work = match (initial_chunk, chunk_meta) {
             (Some(initial), Some(meta)) => {
+                let req_metrics = initial
+                    .request_metrics
+                    .expect("ranged discovery body carries its request measurement");
                 let mut slot = self.inner.writer.claim();
                 match self.reserve_discovery_chunk(initial.expected_len).await {
                     Ok(Some(reservation)) => {
                         slot.attach_reservation(reservation);
-                        Some((initial.body, initial.expected_len, meta, slot))
+                        Some((initial.body, initial.expected_len, req_metrics, meta, slot))
                     }
                     // Terminal (cancel/fail by another path) while reserving the discovery
                     // chunk: the transfer is already in its terminal state, so drop the
@@ -671,7 +822,9 @@ impl DownloadTransfer {
             }
         };
 
-        {
+        let has_initial_work = initial_work.is_some();
+        let all_ranges_issued = remaining.is_none();
+        let discovery_snapshot = {
             // The discovery chunk, if present, is one claimed part already in flight.
             let initial = u64::from(initial_work.is_some());
             let mut work = self.inner.state.lock().unwrap();
@@ -683,6 +836,22 @@ impl DownloadTransfer {
                 gate: super::context::OccupancyGate::with_issued(initial),
                 pending: None,
             };
+            self.snapshot(&work)
+        };
+        if has_initial_work {
+            self.inner.observability.record_range_scheduled();
+        }
+        self.inner.observability.observe_event(
+            self.inner.ctx.id,
+            DownloadEvent::DiscoveryCompleted,
+            discovery_snapshot,
+        );
+        if all_ranges_issued {
+            self.inner.observability.observe_event(
+                self.inner.ctx.id,
+                DownloadEvent::AllRangesIssued,
+                discovery_snapshot,
+            );
         }
 
         // State changed from DiscoveryInFlight - try to wake
@@ -690,9 +859,16 @@ impl DownloadTransfer {
 
         // If discovery returned an initial chunk, process it
         match initial_work {
-            Some((stream, expected_len, chunk_meta, slot)) => {
-                self.execute_read_discovery_body(stream, expected_len, slot, chunk_meta, etag)
-                    .await
+            Some((stream, expected_len, request, chunk_meta, slot)) => {
+                self.execute_read_discovery_body(
+                    stream,
+                    expected_len,
+                    request,
+                    slot,
+                    chunk_meta,
+                    etag,
+                )
+                .await
             }
             None => WorkOutcome::Success { data: None },
         }
@@ -702,10 +878,12 @@ impl DownloadTransfer {
         &self,
         stream: aws_sdk_s3::primitives::ByteStream,
         expected_len: usize,
+        mut req_metrics: DownloadRequestMeasurement,
         slot: BodySlot,
         chunk_meta: ChunkMetadata,
         etag: Option<Arc<str>>,
     ) -> WorkOutcome {
+        req_metrics.resume();
         let seq = slot.seq();
         let input = self.inner.request.as_ref();
         // The discovery GET already received this chunk's response headers; the
@@ -728,7 +906,8 @@ impl DownloadTransfer {
         // "send" would drag the TTFB mean toward zero). Only a genuine re-issue
         // goes through `guarded`, which times and records its TTFB.
         let reservation = slot.reservation();
-        let result = crate::retry::retry(crate::retry::classify_body_retry, |allow_hedge| {
+        let retry_classify = crate::retry::classify_body_retry;
+        let result = crate::retry::retry(req_metrics.metrics_mut(), retry_classify, |allow_hedge| {
             let pre_issued = initial.take();
             let etag = etag.clone();
             let ctx = self.inner.ctx.clone();
@@ -759,10 +938,12 @@ impl DownloadTransfer {
                         // range cannot appear on a re-issue, so retrying would
                         // deterministically fail again and waste a backoff.
                         if reissue_range.is_none() {
-                            return Err(crate::retry::GuardError::Inner(crate::error::Error::new(
-                                crate::error::ErrorKind::RuntimeError,
-                                "cannot re-issue discovery chunk: response carried no content-range",
-                            )));
+                            return Err(crate::retry::GuardError::Inner(
+                                crate::error::Error::new(
+                                    crate::error::ErrorKind::RuntimeError,
+                                    "cannot re-issue discovery chunk: response carried no content-range",
+                                ),
+                            ));
                         }
                         recv_latencies
                             .guarded(allow_hedge, async {
@@ -782,8 +963,8 @@ impl DownloadTransfer {
                     expected_len,
                     || ctx.is_active(),
                 )
-                    .await
-                    .map_err(crate::retry::GuardError::Inner)
+                .await
+                .map_err(crate::retry::GuardError::Inner)
             }
         })
         .instrument(tracing::debug_span!(
@@ -792,6 +973,7 @@ impl DownloadTransfer {
             tid = %self.id()
         ))
         .await;
+        let _ = req_metrics.finish();
 
         let bytes = match result {
             Ok(val) => val,
@@ -891,53 +1073,57 @@ impl DownloadTransfer {
         // stream is caught by stalled-stream protection. A `GuardError`
         // (deadline timeout OR inner error from either phase) is classified by
         // the retry loop.
-        let result = crate::retry::retry(crate::retry::classify_body_retry, |allow_hedge| {
-            let rh = range_header.clone();
-            let etag = etag.clone();
-            let ctx = self.inner.ctx.clone();
-            // Every chunk GET must carry the same request fields as discovery
-            // (checksum_mode, SSE-C key, version_id, ...). Derive from the input
-            // conversion, then pin this chunk's range and the discovered etag.
-            let mut builder =
-                copy_fields_to_get_object_request(input, ctx.s3_client().get_object());
-            builder = builder.set_range(Some(rh.clone()));
-            if let Some(etag) = etag.as_ref() {
-                builder = builder.if_match(etag.as_ref());
-            }
-            let req = builder
-                .customize()
-                .config_override(ctx.handle.download_get_override(input.bucket()));
-            async move {
-                // Timed (TTFB): obtain response headers. Validate the range here
-                // so a mismatch is classified before we commit to the body read.
-                let rh_validate = rh.clone();
-                let resp = recv_latencies
-                    .guarded(allow_hedge, async move {
-                        let resp = req.send().await.map_err(crate::error::Error::from)?;
-                        validate_content_range(&rh_validate, resp.content_range())?;
-                        Ok::<_, crate::error::Error>(resp)
-                    })
-                    .await?;
-                // Untimed: drain the body. Errors here are inner (retryable IO).
-                let chunk_meta = ChunkMetadata::from(&resp);
-                let bytes = collect_response_body(
-                    &ctx.handle.buffer_pool,
-                    resp.body,
-                    reservation,
-                    expected_len,
-                    || ctx.is_active(),
-                )
-                .await
-                .map_err(crate::retry::GuardError::Inner)?;
-                Ok::<_, crate::retry::GuardError<crate::error::Error>>((chunk_meta, bytes))
-            }
-        })
-        .instrument(tracing::debug_span!(
-            target: crate::telemetry::TARGET_TRANSFER,
-            "download-part-reissue",
-            tid = %self.id()
-        ))
-        .await;
+        let mut req_metrics = self.start_request(DownloadRequestKind::Range);
+        let retry_classify = crate::retry::classify_body_retry;
+        let result =
+            crate::retry::retry(req_metrics.metrics_mut(), retry_classify, |allow_hedge| {
+                let rh = range_header.clone();
+                let etag = etag.clone();
+                let ctx = self.inner.ctx.clone();
+                // Every chunk GET must carry the same request fields as discovery
+                // (checksum_mode, SSE-C key, version_id, ...). Derive from the input
+                // conversion, then pin this chunk's range and the discovered etag.
+                let mut builder =
+                    copy_fields_to_get_object_request(input, ctx.s3_client().get_object());
+                builder = builder.set_range(Some(rh.clone()));
+                if let Some(etag) = etag.as_ref() {
+                    builder = builder.if_match(etag.as_ref());
+                }
+                let req = builder
+                    .customize()
+                    .config_override(ctx.handle.download_get_override(input.bucket()));
+                async move {
+                    // Timed (TTFB): obtain response headers. Validate the range here
+                    // so a mismatch is classified before we commit to the body read.
+                    let rh_validate = rh.clone();
+                    let resp = recv_latencies
+                        .guarded(allow_hedge, async move {
+                            let resp = req.send().await.map_err(crate::error::Error::from)?;
+                            validate_content_range(&rh_validate, resp.content_range())?;
+                            Ok::<_, crate::error::Error>(resp)
+                        })
+                        .await?;
+                    // Untimed: drain the body. Errors here are inner (retryable IO).
+                    let chunk_meta = ChunkMetadata::from(&resp);
+                    let bytes = collect_response_body(
+                        &ctx.handle.buffer_pool,
+                        resp.body,
+                        reservation,
+                        expected_len,
+                        || ctx.is_active(),
+                    )
+                    .await
+                    .map_err(crate::retry::GuardError::Inner)?;
+                    Ok::<_, crate::retry::GuardError<crate::error::Error>>((chunk_meta, bytes))
+                }
+            })
+            .instrument(tracing::debug_span!(
+                target: crate::telemetry::TARGET_TRANSFER,
+                "download-part-reissue",
+                tid = %self.id()
+            ))
+            .await;
+        let _ = req_metrics.finish();
 
         let (chunk_meta, bytes) = match result {
             Ok(val) => val,
@@ -1021,29 +1207,45 @@ impl DownloadTransfer {
     /// park (the mutator protocol `lock -> mutate -> unlock -> try_wake`). `freed` is the
     /// disk drain's freed count (0 if this fill did not hit a drain edge).
     fn decrement_in_flight(&self, freed: u64) -> bool {
-        let (terminal, pending) = {
+        let (terminal, pending, snapshot) = {
             let mut work = self.inner.state.lock().unwrap();
             match &mut *work {
                 DownloadState::Transferring {
                     ranges_in_flight,
                     gate,
                     remaining,
+                    pending,
                     ..
                 } => {
                     *ranges_in_flight = ranges_in_flight.saturating_sub(1);
                     gate.release(freed);
+                    let snapshot = transferring_snapshot(
+                        remaining.as_ref(),
+                        *ranges_in_flight,
+                        gate,
+                        self.inner.read_ahead.window(),
+                        pending.is_some(),
+                    );
                     if remaining.is_none() && *ranges_in_flight == 0 {
                         // Terminal: claim the transition under this lock so a
                         // concurrently-woken poll_work cannot also complete.
-                        (true, work.enter_terminal())
+                        (true, work.enter_terminal(), Some(snapshot))
                     } else {
-                        (false, None)
+                        (false, None, Some(snapshot))
                     }
                 }
-                _ => (false, None),
+                _ => (false, None, None),
             }
         };
         drop(pending);
+        if let Some(snapshot) = snapshot {
+            self.inner.observability.record_range_completed(freed);
+            self.inner.observability.observe_event(
+                self.inner.ctx.id,
+                DownloadEvent::RangeCompleted,
+                snapshot,
+            );
+        }
         // Wake the issuer on every non-terminal completion so a pending poll_work can
         // issue more. A terminal completion is finalized by the caller in `execute`.
         if !terminal {
@@ -1064,14 +1266,30 @@ impl DownloadTransfer {
             .expected_download_len
             .get()
             .expect("completed download must have a discovered length");
-        if let Err(e) = self.inner.writer.finalize(expected_len) {
+        let finalization = self.inner.writer.finalize(expected_len);
+        self.inner
+            .observability
+            .destination_finalized(&finalization);
+        if let Err(e) = finalization {
             // Finalize failed: transition to failed. The state is already Terminal; `fail`
             // calls `enter_terminal` which is idempotent on Terminal (returns None).
             let guard = self.inner.state.lock().unwrap();
             return self.fail(guard, error::Error::new(error::ErrorKind::IOError, e));
         }
+        let state_snapshot = {
+            let state = self.inner.state.lock().expect("lock poisoned");
+            self.snapshot(&state)
+        };
+        if self.inner.writer.has_sink() {
+            self.inner.observability.observe_event(
+                self.inner.ctx.id,
+                DownloadEvent::DestinationFinalized,
+                state_snapshot,
+            );
+        }
         self.inner.ctx.set_completed();
         self.inner.writer.notify_consumer();
+        self.report_terminal(state_snapshot);
         self.inner.ctx.signal_terminal();
         WorkOutcome::Success { data: None }
     }
@@ -1089,6 +1307,7 @@ impl DownloadTransfer {
         let classification = crate::scheduler::classify_error(&error);
         // Order matters: set status/error before any wakeups
         self.inner.ctx.set_failed(error);
+        let snapshot = self.snapshot(&guard);
         // Transition to Terminal, taking any memory-blocked claim so cancelling
         // its reservation future happens after releasing the state lock.
         let pending = guard.enter_terminal();
@@ -1096,8 +1315,10 @@ impl DownloadTransfer {
         drop(pending);
         // Wake all waiters
         self.inner.discovery_notify.notify_waiters();
-        let _ = self.inner.writer.terminal_drain();
+        let drain = self.inner.writer.terminal_drain();
+        self.inner.observability.terminal_drain_completed(&drain);
         self.inner.writer.notify_consumer();
+        self.report_terminal(snapshot);
         self.inner.ctx.signal_terminal();
         WorkOutcome::Failed { classification }
     }
@@ -1109,15 +1330,28 @@ impl DownloadTransfer {
             .expected_download_len
             .get()
             .expect("completed download must have a discovered length");
-        if let Err(e) = self.inner.writer.finalize(expected_len) {
+        let finalization = self.inner.writer.finalize(expected_len);
+        self.inner
+            .observability
+            .destination_finalized(&finalization);
+        if let Err(e) = finalization {
             self.fail(guard, error::Error::new(error::ErrorKind::IOError, e));
             return;
+        }
+        let snapshot = self.snapshot(&guard);
+        if self.inner.writer.has_sink() {
+            self.inner.observability.observe_event(
+                self.inner.ctx.id,
+                DownloadEvent::DestinationFinalized,
+                snapshot,
+            );
         }
         self.inner.ctx.set_completed();
         let pending = guard.enter_terminal();
         drop(guard); // release lock before dropping the claim and signaling waiters
         drop(pending);
         self.inner.writer.notify_consumer();
+        self.report_terminal(snapshot);
         self.inner.ctx.signal_terminal();
     }
 }
@@ -1142,15 +1376,78 @@ impl Transfer for DownloadTransfer {
         // Release a memory-blocked claim if one is held. External cancellation
         // does not run `fail` or `complete`, so it must explicitly extract the
         // claim and cancel its reservation future after releasing state.
-        let pending = {
-            let mut state = self.inner.state.lock().unwrap();
-            state.enter_terminal()
+        let (pending, snapshot) = {
+            // The transfer is already terminal: snapshot and take the pending
+            // claim even if a panic left the state inconsistent.
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let snapshot = self.snapshot(&state);
+            (state.enter_terminal(), snapshot)
         };
         drop(pending);
 
         self.inner.discovery_notify.notify_waiters();
-        let _ = self.inner.writer.terminal_drain();
+        let drain = self.inner.writer.terminal_drain();
+        self.inner.observability.terminal_drain_completed(&drain);
         self.inner.writer.notify_consumer();
+        self.report_terminal(snapshot);
+    }
+}
+
+fn snapshot_state(state: &DownloadState, read_ahead_window: u64) -> DownloadStateSnapshot {
+    match state {
+        DownloadState::PendingDiscovery => DownloadStateSnapshot::inactive(
+            DownloadExecutionState::PendingDiscovery,
+            read_ahead_window,
+        ),
+        DownloadState::DiscoveryInFlight => DownloadStateSnapshot::inactive(
+            DownloadExecutionState::DiscoveryInFlight,
+            read_ahead_window,
+        ),
+        DownloadState::Transferring {
+            remaining,
+            ranges_in_flight,
+            gate,
+            pending,
+            ..
+        } => transferring_snapshot(
+            remaining.as_ref(),
+            *ranges_in_flight,
+            gate,
+            read_ahead_window,
+            pending.is_some(),
+        ),
+        DownloadState::Terminal => {
+            DownloadStateSnapshot::inactive(DownloadExecutionState::Terminal, read_ahead_window)
+        }
+    }
+}
+
+fn transferring_snapshot(
+    remaining: Option<&std::ops::RangeInclusive<u64>>,
+    ranges_in_flight: usize,
+    gate: &super::context::OccupancyGate,
+    read_ahead_window: u64,
+    memory_claim_pending: bool,
+) -> DownloadStateSnapshot {
+    DownloadStateSnapshot {
+        state: DownloadExecutionState::Transferring,
+        remaining_bytes: remaining.map(|range| {
+            range
+                .end()
+                .checked_sub(*range.start())
+                .and_then(|length| length.checked_add(1))
+                .expect("download state contains an invalid remaining range")
+        }),
+        ranges_in_flight,
+        ranges_issued: gate.issued(),
+        ranges_released: gate.released(),
+        resident_parts: gate.resident(),
+        read_ahead_window,
+        memory_claim_pending,
     }
 }
 
@@ -1337,12 +1634,54 @@ mod tests {
     use crate::transfer::TransferContext;
     use crate::transfer::{IoRequest, WorkOutcome};
     use crate::types::{BucketType, ChecksumValidation, NotValidatedReason};
+    use aws_sdk_s3::operation::get_object::GetObjectError;
     use aws_sdk_s3::operation::get_object::GetObjectOutput;
     use aws_sdk_s3::primitives::ByteStream;
     use aws_sdk_s3::types::ChecksumType;
     use aws_smithy_mocks::{mock, mock_client, RuleMode};
+    use aws_smithy_types::error::metadata::ErrorMetadata;
 
     const MB: u64 = 1024 * 1024;
+
+    #[test]
+    fn download_state_snapshot_classifies_execution_and_occupancy() {
+        assert_eq!(
+            snapshot_state(&DownloadState::PendingDiscovery, 4),
+            DownloadStateSnapshot::inactive(DownloadExecutionState::PendingDiscovery, 4)
+        );
+        assert_eq!(
+            snapshot_state(&DownloadState::DiscoveryInFlight, 4),
+            DownloadStateSnapshot::inactive(DownloadExecutionState::DiscoveryInFlight, 4)
+        );
+        assert_eq!(
+            snapshot_state(&DownloadState::Terminal, 4),
+            DownloadStateSnapshot::inactive(DownloadExecutionState::Terminal, 4)
+        );
+
+        let mut gate = super::super::context::OccupancyGate::with_issued(3);
+        gate.release(1);
+        let transferring = DownloadState::Transferring {
+            remaining: Some(8..=15),
+            ranges_in_flight: 2,
+            etag: None,
+            part_size: 8,
+            gate,
+            pending: None,
+        };
+        assert_eq!(
+            snapshot_state(&transferring, 4),
+            DownloadStateSnapshot {
+                state: DownloadExecutionState::Transferring,
+                remaining_bytes: Some(8),
+                ranges_in_flight: 2,
+                ranges_issued: 3,
+                ranges_released: 1,
+                resident_parts: 2,
+                read_ahead_window: 4,
+                memory_claim_pending: false,
+            }
+        );
+    }
 
     /// Deterministic multi-frame body separating transport frames from carriers.
     struct TestFrameBody {
@@ -1663,6 +2002,14 @@ mod tests {
     }
 
     fn create_download(object_size: u64, part_size: u64) -> DownloadTransfer {
+        create_download_with_detail(object_size, part_size, 0)
+    }
+
+    fn create_download_with_detail(
+        object_size: u64,
+        part_size: u64,
+        detail: u64,
+    ) -> DownloadTransfer {
         let chunk = vec![0u8; part_size as usize];
         let get_obj = mock!(aws_sdk_s3::Client::get_object).then_output(move || {
             GetObjectOutput::builder()
@@ -1672,16 +2019,22 @@ mod tests {
                 .body(ByteStream::from(chunk.clone()))
                 .build()
         });
-        create_download_with_client(
+        create_download_with_client_and_detail(
             mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get_obj]),
             part_size,
+            detail,
         )
     }
 
-    fn create_download_with_client(client: aws_sdk_s3::Client, part_size: u64) -> DownloadTransfer {
+    fn create_download_with_client_and_detail(
+        client: aws_sdk_s3::Client,
+        part_size: u64,
+        detail: u64,
+    ) -> DownloadTransfer {
         let config = crate::Config::builder()
             .client(client)
             .part_size(crate::types::PartSize::Target(part_size))
+            .diagnostics_for_test(crate::config::MemoryDiagnosticsConfig::default(), detail)
             .build();
 
         let handle = crate::client::Handle::test_handle_tokio(config);
@@ -1737,10 +2090,167 @@ mod tests {
     async fn test_generates_ranges_after_discovery() {
         let transfer = create_download(24 * MB, 8 * MB);
         assert_discovery_succeeds(&transfer).await;
+        assert_eq!(
+            transfer.ctx().metrics.request_metrics().requests,
+            1,
+            "discovery headers and its lazy response body are one request"
+        );
 
         let mut work = assert_ready(transfer.poll_work());
         let data = work.data_mut::<DownloadWork>();
         assert!(matches!(data, DownloadWork::GetObjectRange { .. }));
+    }
+
+    /// Transfer diagnostic levels must not alter the download outcome. Summary
+    /// levels report S3 receive completion while the stream still owns its
+    /// unread resident chunk.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn diagnostic_levels_preserve_stream_download_outcome() {
+        for detail in 0..=2 {
+            let transfer = create_download_with_detail(8 * MB, 8 * MB, detail);
+            assert_discovery_succeeds(&transfer).await;
+
+            assert_eq!(
+                transfer.ctx().transfer_status(),
+                crate::types::TransferStatus::Completed
+            );
+
+            let summary = transfer.test_terminal_summary();
+            if detail == 0 {
+                assert!(summary.is_none());
+                continue;
+            }
+
+            let summary = summary.expect("summary diagnostics enabled");
+            assert_eq!(
+                summary.outcome,
+                crate::operation::download::observability::DownloadTerminalOutcome::Completed
+            );
+            assert_eq!(summary.destination, DownloadDestination::Stream);
+            assert_eq!(summary.metrics.network_rx, 8 * MB);
+            assert_eq!(summary.metrics.disk_write, 0);
+            assert_eq!(summary.requests.discovery_range.requests, 1);
+            assert_eq!(summary.requests.range.requests, 0);
+            assert_eq!(summary.request_total.requests, 1);
+            assert_eq!(summary.ranges_scheduled, 1);
+            assert_eq!(summary.ranges_completed, 1);
+            assert_eq!(
+                summary.last_active_snapshot.resident_parts, 1,
+                "terminal receive does not imply stream-consumer delivery"
+            );
+            assert!(!summary.destination_work.file_finalized);
+        }
+    }
+
+    /// Empty-object discovery falls back from an invalid initial range to
+    /// part-number discovery, then completes without synthesizing range work.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn empty_download_summary_records_discovery_without_ranges() {
+        let part_size = 8 * MB;
+        let expected_range = format!("bytes=0-{}", part_size - 1);
+        let ranged = mock!(aws_sdk_s3::Client::get_object)
+            .match_requests(move |request| request.range() == Some(expected_range.as_str()))
+            .then_error(|| {
+                GetObjectError::generic(ErrorMetadata::builder().code("InvalidRange").build())
+            });
+        let part = mock!(aws_sdk_s3::Client::get_object)
+            .match_requests(|request| request.part_number() == Some(1))
+            .then_output(|| GetObjectOutput::builder().content_length(0).build());
+        let client = mock_client!(aws_sdk_s3, &[&ranged, &part]);
+        let transfer = create_download_with_client_and_detail(client, part_size, 1);
+
+        assert_discovery_succeeds(&transfer).await;
+        assert_done(transfer.poll_work());
+
+        let summary = transfer
+            .test_terminal_summary()
+            .expect("summary diagnostics enabled");
+        assert_eq!(
+            summary.outcome,
+            crate::operation::download::observability::DownloadTerminalOutcome::Completed
+        );
+        assert_eq!(summary.metrics.total_bytes, Some(0));
+        assert_eq!(summary.metrics.network_rx, 0);
+        assert_eq!(summary.requests.discovery_range.requests, 1);
+        assert_eq!(summary.requests.discovery_part.requests, 1);
+        assert_eq!(summary.request_total.requests, 2);
+        assert_eq!(summary.ranges_scheduled, 0);
+        assert_eq!(summary.ranges_completed, 0);
+    }
+
+    /// The terminal hook completes cleanup and reports a summary when a worker
+    /// panicked while holding the state lock.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn on_terminal_tolerates_poisoned_state() {
+        let transfer = create_download_with_detail(24 * MB, 8 * MB, 1);
+        let _discovery = assert_ready(transfer.poll_work());
+        std::thread::scope(|scope| {
+            let poisoner = scope.spawn(|| {
+                let _guard = transfer.inner.state.lock().unwrap();
+                panic!("invalid discovery state");
+            });
+            assert!(poisoner.join().is_err());
+        });
+        assert!(
+            transfer.inner.state.lock().is_err(),
+            "state should be poisoned"
+        );
+        transfer.ctx().set_failed(error::Error::new(
+            error::ErrorKind::RuntimeError,
+            "worker panic during execute",
+        ));
+
+        let cleanup =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| transfer.on_terminal()));
+        assert!(
+            cleanup.is_ok(),
+            "on_terminal must tolerate a poisoned state"
+        );
+
+        let summary = transfer
+            .test_terminal_summary()
+            .expect("poisoned state should still emit a terminal summary");
+        assert_eq!(
+            summary.outcome,
+            crate::operation::download::observability::DownloadTerminalOutcome::Failed
+        );
+    }
+
+    /// External cancellation must close pending diagnostics and report one
+    /// terminal summary through the scheduler-owned terminal hook.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn external_cancellation_reports_pending_discovery_once() {
+        let transfer = create_download_with_detail(24 * MB, 8 * MB, 1);
+        let _discovery = assert_ready(transfer.poll_work());
+        assert_pending(transfer.poll_work());
+
+        transfer.ctx().set_cancelled();
+        transfer.on_terminal();
+        transfer.ctx().signal_terminal();
+        transfer.on_terminal();
+
+        let summary = transfer
+            .test_terminal_summary()
+            .expect("cancellation summary");
+        assert_eq!(
+            summary.outcome,
+            crate::operation::download::observability::DownloadTerminalOutcome::Cancelled
+        );
+        assert_eq!(
+            summary
+                .pending
+                .category(crate::transfer::PendingCategory::InFlightWork)
+                .count,
+            1
+        );
+        assert_eq!(
+            summary.last_active_snapshot.state,
+            DownloadExecutionState::DiscoveryInFlight
+        );
     }
 
     #[cfg_attr(miri, ignore)]
@@ -1859,6 +2369,7 @@ mod tests {
         execute(&transfer, &mut range).await;
 
         assert_done(transfer.poll_work());
+        assert_eq!(transfer.ctx().metrics.request_metrics().requests, 2);
     }
 
     #[cfg_attr(miri, ignore)]
@@ -1882,7 +2393,10 @@ mod tests {
     async fn test_failure_transitions_to_failed() {
         let _logs = show_test_logs();
         // Fail seq 1 (first range after discovery)
-        let transfer = FailureConfig::new(24 * MB, 8 * MB).fail(1).build();
+        let transfer = FailureConfig::new(24 * MB, 8 * MB)
+            .fail(1)
+            .detail(1)
+            .build();
 
         assert_discovery_succeeds(&transfer).await;
 
@@ -1891,6 +2405,242 @@ mod tests {
 
         assert!(matches!(outcome, WorkOutcome::Failed { .. }));
         assert!(transfer.ctx().is_failed());
+        let summary = transfer
+            .test_terminal_summary()
+            .expect("failure summary diagnostics enabled");
+        assert_eq!(
+            summary.outcome,
+            crate::operation::download::observability::DownloadTerminalOutcome::Failed
+        );
+        assert_eq!(summary.requests.discovery_range.requests, 1);
+        assert_eq!(summary.requests.range.requests, 1);
+        assert_eq!(summary.requests.range.retry_reissues, 0);
+        assert_eq!(summary.requests.range.retry_exhaustions, 0);
+        assert_eq!(summary.ranges_scheduled, 2);
+        assert_eq!(summary.ranges_completed, 1);
+    }
+
+    /// Discovery and post-discovery range requests retain separate request
+    /// aggregates while contributing to the same transfer total.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn multi_range_summary_separates_discovery_and_range_requests() {
+        let transfer = FailureConfig::new(12 * MB, 8 * MB).detail(1).build();
+
+        assert_discovery_succeeds(&transfer).await;
+        let mut range = assert_ready(transfer.poll_work());
+        let outcome = execute(&transfer, &mut range).await;
+
+        assert!(matches!(outcome, WorkOutcome::Success { .. }));
+        let summary = transfer
+            .test_terminal_summary()
+            .expect("summary diagnostics enabled");
+        assert_eq!(summary.requests.discovery_range.requests, 1);
+        assert_eq!(summary.requests.range.requests, 1);
+        assert_eq!(summary.request_total.requests, 2);
+        assert_eq!(summary.ranges_scheduled, 2);
+        assert_eq!(summary.ranges_completed, 2);
+        assert_eq!(summary.metrics.network_rx, 12 * MB);
+    }
+
+    /// A ranged discovery request remains one logical request while its lazy
+    /// body is validated and reissued. The reissue is attributed to that
+    /// discovery kind rather than counted as a second standalone request.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn discovery_body_reissue_stays_with_discovery_request_metrics() {
+        let part_size = 8 * MB;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let get_obj = mock!(aws_sdk_s3::Client::get_object).then_compute_response({
+            let calls = Arc::clone(&calls);
+            move |_| {
+                let call = calls.fetch_add(1, Ordering::SeqCst);
+                let body_len = if call == 0 { part_size / 2 } else { part_size };
+                MockResponse::Output(
+                    GetObjectOutput::builder()
+                        .content_length(part_size as i64)
+                        .content_range(format!("bytes 0-{}/{}", part_size - 1, part_size))
+                        .e_tag("test-etag")
+                        .body(ByteStream::from(vec![0u8; body_len as usize]))
+                        .build(),
+                )
+            }
+        });
+        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get_obj], |conf| {
+            conf.retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
+        });
+        let transfer = create_download_with_client_and_detail(client, part_size, 1);
+
+        assert_discovery_succeeds(&transfer).await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let summary = transfer
+            .test_terminal_summary()
+            .expect("summary diagnostics enabled");
+        assert_eq!(summary.requests.discovery_range.requests, 1);
+        assert_eq!(summary.requests.discovery_range.retry_reissues, 1);
+        assert_eq!(summary.request_total.requests, 1);
+        assert_eq!(summary.request_total.retry_reissues, 1);
+        assert_eq!(summary.requests.range.requests, 0);
+    }
+
+    /// Time a discovery body spends waiting for memory admission is not part of
+    /// the discovery request's elapsed time.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test(start_paused = true)]
+    async fn discovery_memory_wait_is_excluded_from_request_elapsed() {
+        let part_size = 8 * MB;
+        let memory_wait = std::time::Duration::from_secs(10);
+        let (transfer, _consumer) =
+            create_download_for_gate_with_capacity(part_size, part_size, Some(part_size as usize));
+        let pool = transfer.ctx().handle.buffer_pool.clone();
+        let blocker = pool
+            .try_reserve(part_size as usize)
+            .unwrap()
+            .expect("test blocker");
+
+        let mut work = assert_ready(transfer.poll_work());
+        let executing = transfer.clone();
+        let task = tokio::spawn(async move { execute(&executing, &mut work).await });
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while pool.metrics().queued_reservations() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("discovery reservation should enter the memory FIFO");
+
+        tokio::time::sleep(memory_wait).await;
+        drop(blocker);
+
+        assert!(matches!(task.await.unwrap(), WorkOutcome::Success { .. }));
+        let requests = transfer.ctx().metrics.request_metrics();
+        assert_eq!(requests.requests, 1);
+        assert!(
+            requests.max_elapsed < memory_wait / 10,
+            "discovery request elapsed {:?} includes the {memory_wait:?} memory wait",
+            requests.max_elapsed,
+        );
+    }
+
+    /// S3 connector for a two-part multipart object whose `partNumber=1`
+    /// response is delayed. Ranged GETs are answered immediately with the
+    /// requested bytes.
+    #[derive(Debug)]
+    struct DelayedFirstPartConnector {
+        object_size: u64,
+        stored_part_size: u64,
+        part_delay: std::time::Duration,
+    }
+
+    impl aws_smithy_runtime_api::client::http::HttpConnector for DelayedFirstPartConnector {
+        fn call(
+            &self,
+            request: aws_smithy_runtime_api::client::orchestrator::HttpRequest,
+        ) -> aws_smithy_runtime_api::client::http::HttpConnectorFuture {
+            use aws_smithy_runtime_api::client::http::HttpConnectorFuture;
+            use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
+
+            let is_part_request = request.uri().contains("partNumber=1");
+            let (start, end) = if is_part_request {
+                (0, self.stored_part_size - 1)
+            } else {
+                request
+                    .headers()
+                    .get("range")
+                    .and_then(parse_byte_range)
+                    .unwrap_or_else(|| panic!("unexpected request: {}", request.uri()))
+            };
+            let len = end - start + 1;
+            let mut response = HttpResponse::new(
+                206.try_into().unwrap(),
+                aws_smithy_types::body::SdkBody::from(vec![0u8; len as usize]),
+            );
+            let headers = response.headers_mut();
+            headers.insert("Content-Length", len.to_string());
+            headers.insert(
+                "Content-Range",
+                format!("bytes {start}-{end}/{}", self.object_size),
+            );
+            headers.insert("ETag", "\"abc-2\"");
+
+            if is_part_request {
+                let delay = self.part_delay;
+                HttpConnectorFuture::new(async move {
+                    tokio::time::sleep(delay).await;
+                    Ok(response)
+                })
+            } else {
+                HttpConnectorFuture::ready(Ok(response))
+            }
+        }
+    }
+
+    /// The multipart realignment re-issue belongs to the `partNumber=1`
+    /// discovery request. The superseded ranged discovery must not accrue the
+    /// re-issue's latency while its unread body is held.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test(start_paused = true)]
+    async fn discovery_realign_reissue_is_excluded_from_first_discovery_elapsed() {
+        let stored_part_size = 8 * MB;
+        let part_delay = std::time::Duration::from_secs(10);
+        let connector = aws_smithy_runtime_api::client::http::SharedHttpConnector::new(
+            DelayedFirstPartConnector {
+                object_size: 2 * stored_part_size,
+                stored_part_size,
+                part_delay,
+            },
+        );
+        let http_client =
+            aws_smithy_runtime_api::client::http::http_client_fn(move |_, _| connector.clone());
+        let client = aws_sdk_s3::Client::from_conf(
+            aws_sdk_s3::config::Config::builder()
+                .http_client(http_client)
+                .region(aws_sdk_s3::config::Region::new("us-west-2"))
+                .with_test_defaults()
+                .build(),
+        );
+        // No explicit part size: discovery issues the Auto-sized ranged GET,
+        // then realigns to the stored part size via partNumber=1.
+        let config = crate::Config::builder()
+            .client(client)
+            .diagnostics_for_test(crate::config::MemoryDiagnosticsConfig::default(), 1)
+            .build();
+        let handle = crate::client::Handle::test_handle_tokio(config);
+        assert!(!handle.user_set_part_size());
+        let input = DownloadInput::builder()
+            .bucket("test-bucket")
+            .key("test-key")
+            .build()
+            .unwrap();
+        let (writer, _consumer) = crate::operation::download::body::new_recv_body();
+        let (ctx, _completion_rx) = TransferContext::new(handle);
+        let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, writer);
+
+        assert_discovery_succeeds(&transfer).await;
+        let mut range = assert_ready(transfer.poll_work());
+        assert!(matches!(
+            execute(&transfer, &mut range).await,
+            WorkOutcome::Success { .. }
+        ));
+
+        let summary = transfer
+            .test_terminal_summary()
+            .expect("summary diagnostics enabled");
+        assert_eq!(summary.requests.discovery_range.requests, 1);
+        assert_eq!(summary.requests.discovery_part.requests, 1);
+        assert_eq!(summary.requests.range.requests, 1);
+        assert!(
+            summary.requests.discovery_part.elapsed >= part_delay,
+            "the delayed re-issue accrues to its own request: {:?}",
+            summary.requests.discovery_part.elapsed,
+        );
+        assert!(
+            summary.requests.discovery_range.elapsed < part_delay / 10,
+            "superseded discovery elapsed {:?} includes the {part_delay:?} re-issue",
+            summary.requests.discovery_range.elapsed,
+        );
     }
 
     #[cfg_attr(miri, ignore)]
@@ -2322,6 +3072,7 @@ mod tests {
             .client(client)
             .part_size(crate::types::PartSize::Target(part_size))
             .memory(crate::types::MemoryConfig::Explicit(pool.clone()))
+            .diagnostics_for_test(crate::config::MemoryDiagnosticsConfig::default(), 1)
             .build();
 
         let handle = crate::client::Handle::test_handle_tokio(config);
@@ -2365,6 +3116,14 @@ mod tests {
             !transfer.ctx().is_active(),
             "transfer must be completed after terminal execute"
         );
+        let summary = transfer
+            .test_terminal_summary()
+            .expect("file summary diagnostics enabled");
+        assert_eq!(summary.destination, DownloadDestination::File);
+        assert!(summary.destination_work.prepared);
+        assert!(summary.destination_work.file_finalized);
+        assert_eq!(summary.destination_work.terminal_drain_parts, 1);
+        assert_eq!(summary.metrics.disk_write, part_size);
 
         // Verify data landed on disk.
         let written = std::fs::read(&path).unwrap();
@@ -2729,6 +3488,7 @@ mod tests {
         object_size: u64,
         part_size: u64,
         failures: HashMap<u64, FailureBehavior>,
+        detail: u64,
     }
 
     impl FailureConfig {
@@ -2737,6 +3497,7 @@ mod tests {
                 object_size,
                 part_size,
                 failures: HashMap::new(),
+                detail: 0,
             }
         }
 
@@ -2746,9 +3507,15 @@ mod tests {
             self
         }
 
+        fn detail(mut self, detail: u64) -> Self {
+            self.detail = detail;
+            self
+        }
+
         fn build(self) -> DownloadTransfer {
             let object_size = self.object_size;
             let part_size = self.part_size;
+            let detail = self.detail;
             let failures = Arc::new(self.failures);
             let call_counts: Arc<std::sync::Mutex<HashMap<u64, usize>>> =
                 Arc::new(std::sync::Mutex::new(HashMap::new()));
@@ -2797,11 +3564,12 @@ mod tests {
                 }
             });
 
-            create_download_with_client(
+            create_download_with_client_and_detail(
                 mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get_obj], |conf| {
                     conf.retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
                 }),
                 part_size,
+                detail,
             )
         }
     }

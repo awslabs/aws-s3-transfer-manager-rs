@@ -204,8 +204,8 @@ impl TransferDiagnosticsConfig {
         self.detail >= TransferDiagnosticDetail::Summary
     }
 
-    /// Returns whether individual transfer-state transitions are reported.
-    pub(crate) fn enable_transitions(self) -> bool {
+    /// Returns whether individual transfer state-machine events are reported.
+    pub(crate) fn events_enabled(self) -> bool {
         self.detail >= TransferDiagnosticDetail::Transitions
     }
 }
@@ -214,12 +214,13 @@ impl TransferDiagnosticsConfig {
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 #[repr(u8)]
 enum TransferDiagnosticDetail {
-    /// No optional transfer-state collection.
+    /// No optional transfer-state collection. Ordinary terminal tracing still
+    /// reports always-on lifecycle metrics when its target is enabled.
     #[default]
     Disabled = 0,
     /// Aggregate timings and counters reported once per transfer.
     Summary = 1,
-    /// Summary collection plus individual state-transition records.
+    /// Summary collection plus individual state-machine event records.
     Transitions = 2,
 }
 
@@ -402,17 +403,17 @@ mod tests {
         let disabled = DiagnosticsConfig::parse("transfer.detail=0").transfer();
         assert_eq!(disabled.detail_level(), 0);
         assert!(!disabled.enable_summaries());
-        assert!(!disabled.enable_transitions());
+        assert!(!disabled.events_enabled());
 
         let summary = DiagnosticsConfig::parse("transfer.detail=1").transfer();
         assert_eq!(summary.detail_level(), 1);
         assert!(summary.enable_summaries());
-        assert!(!summary.enable_transitions());
+        assert!(!summary.events_enabled());
 
-        let transitions = DiagnosticsConfig::parse("transfer.detail=2").transfer();
-        assert_eq!(transitions.detail_level(), 2);
-        assert!(transitions.enable_summaries());
-        assert!(transitions.enable_transitions());
+        let events = DiagnosticsConfig::parse("transfer.detail=2").transfer();
+        assert_eq!(events.detail_level(), 2);
+        assert!(events.enable_summaries());
+        assert!(events.events_enabled());
 
         assert_eq!(
             DiagnosticsConfig::parse("transfer.detail=3")

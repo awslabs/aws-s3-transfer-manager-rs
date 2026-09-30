@@ -22,6 +22,7 @@ pub(crate) mod recv_buffer;
 pub(crate) mod read_ahead;
 
 mod context;
+mod observability;
 
 pub(crate) mod discovery;
 

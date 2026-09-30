@@ -14,12 +14,36 @@ use smallvec::SmallVec;
 use crate::io::part_reader::{NextPartFuture, PartReader};
 use crate::io::{InputStream, SizeHint};
 #[cfg(test)]
-use crate::operation::upload::diagnostics::PartTransferSummary;
-use crate::operation::upload::diagnostics::{
-    PartTransferPendingReason, PartTransferSnapshot, SourceReadObservation, UploadPartTiming,
-    UploadTransferDiagnostics,
+use crate::operation::upload::observability::MultipartTransferSummary;
+use crate::operation::upload::observability::{
+    SourceReadObservation, UploadExecutionState, UploadObservability, UploadPartTiming,
+    UploadStateSnapshot,
 };
 use crate::operation::upload::UploadOutputBuilder;
+use crate::transfer::{PendingCategory, PendingCause};
+
+/// Why multipart dispatch cannot schedule another source part.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PartTransferPendingReason {
+    /// A caller-provided source operation is retained until its registered wake.
+    SourceUnavailable,
+    /// Every known part was dispatched or the source reported end-of-stream.
+    DispatchClosed,
+    /// No retained source operation is ready and no new operation can start.
+    NoReadyPart,
+}
+
+impl From<PartTransferPendingReason> for PendingCause {
+    fn from(reason: PartTransferPendingReason) -> Self {
+        match reason {
+            PartTransferPendingReason::SourceUnavailable => {
+                Self::new(PendingCategory::Source, "source_unavailable")
+            }
+            PartTransferPendingReason::DispatchClosed => Self::in_flight_work("part_completion"),
+            PartTransferPendingReason::NoReadyPart => Self::in_flight_work("part_work"),
+        }
+    }
+}
 
 /// Multipart dispatch boundary and source-size declaration.
 ///
@@ -334,8 +358,8 @@ pub(crate) struct PartTransferState {
     bytes_read: u64,
     /// Bytes accepted by completed UploadPart requests.
     bytes_uploaded: u64,
-    /// Optional aggregate collection and transition-reporting policy.
-    diagnostics: UploadTransferDiagnostics,
+    /// Optional aggregate collection and event-reporting policy.
+    observability: UploadObservability,
 }
 
 impl PartTransferState {
@@ -343,7 +367,7 @@ impl PartTransferState {
         part_reader: Arc<PartReader>,
         plan: PartPlan,
         completed_parts_capacity: usize,
-        diagnostics: UploadTransferDiagnostics,
+        observability: UploadObservability,
     ) -> Self {
         Self {
             part_reader,
@@ -356,7 +380,7 @@ impl PartTransferState {
             parts_read: 0,
             bytes_read: 0,
             bytes_uploaded: 0,
-            diagnostics,
+            observability,
         }
     }
 
@@ -380,7 +404,7 @@ impl PartTransferState {
             .checked_add(1)
             .expect("multipart in-flight count overflow");
         self.record_dispatch_closed();
-        Some(UploadPartWork::fresh(self.diagnostics.part_scheduled()))
+        Some(UploadPartWork::fresh(self.observability.part_scheduled()))
     }
 
     /// Retracts a fresh dispatch that could not begin a source operation.
@@ -403,7 +427,7 @@ impl PartTransferState {
 
     /// Records one source-future poll that could not yet produce a part.
     pub(crate) fn record_read_pending(&mut self, timing: &mut UploadPartTiming) {
-        self.diagnostics.record_read_pending(timing);
+        self.observability.record_read_pending(timing);
     }
 
     /// Moves one active part from source preparation to UploadPart transmission.
@@ -412,7 +436,8 @@ impl PartTransferState {
         presentation_segments: usize,
         timing: UploadPartTiming,
     ) -> SourceReadObservation {
-        self.diagnostics.begin_upload(presentation_segments, timing)
+        self.observability
+            .begin_upload(presentation_segments, timing)
     }
 
     /// Records one source part before its UploadPart request starts.
@@ -451,12 +476,7 @@ impl PartTransferState {
     }
 
     /// Records one successfully uploaded part.
-    pub(crate) fn complete_part(
-        &mut self,
-        part: CompletedPart,
-        bytes_uploaded: u64,
-        request_elapsed: Option<std::time::Duration>,
-    ) {
+    pub(crate) fn complete_part(&mut self, part: CompletedPart, bytes_uploaded: u64) {
         self.completed_parts.push(part);
         self.bytes_uploaded = self
             .bytes_uploaded
@@ -466,7 +486,7 @@ impl PartTransferState {
             .parts_in_flight
             .checked_sub(1)
             .expect("multipart in-flight completion underflow");
-        self.diagnostics.complete_upload(request_elapsed);
+        self.observability.complete_upload();
     }
 
     /// Returns whether source part count is discovered by reading through EOF.
@@ -513,7 +533,7 @@ impl PartTransferState {
             .expect("multipart in-flight count overflow");
         self.record_dispatch_closed();
         Some(UploadPartWork::empty_object(
-            self.diagnostics.part_scheduled(),
+            self.observability.part_scheduled(),
         ))
     }
 
@@ -523,7 +543,7 @@ impl PartTransferState {
     }
 
     /// Consumes drained multipart state.
-    pub(crate) fn into_completion(mut self) -> MultipartCompletion {
+    pub(crate) fn into_completion(self) -> MultipartCompletion {
         assert!(
             self.is_complete(),
             "multipart state completed while work remained"
@@ -533,34 +553,30 @@ impl PartTransferState {
             "multipart completion lost or duplicated source bytes"
         );
         let final_snapshot = self.snapshot();
-        self.diagnostics.finish_body();
+        self.observability.finish_body();
         MultipartCompletion {
             part_reader: self.part_reader,
             plan: self.plan,
             completed_parts: self.completed_parts,
             bytes_read: self.bytes_read,
             final_snapshot,
-            diagnostics: self.diagnostics,
         }
     }
 
     /// Returns a coherent view while the caller holds the upload-state lock.
-    pub(crate) fn snapshot(&self) -> PartTransferSnapshot {
-        PartTransferSnapshot {
+    pub(crate) fn snapshot(&self) -> UploadStateSnapshot {
+        UploadStateSnapshot {
+            state: UploadExecutionState::Transferring,
             parts_dispatched: self.parts_dispatched,
             parts_in_flight: self.parts_in_flight,
-            uploads_in_flight: self.diagnostics.uploads_in_flight(),
+            uploads_in_flight: self.observability.uploads_in_flight(),
             pending_reads: self.pending_reads.entries.len(),
             completed_parts: self.completed_parts.len(),
+            bytes_read: self.bytes_read,
             bytes_uploaded: self.bytes_uploaded,
             eof: self.eof,
             dispatch_closed: self.plan.all_dispatched(self.parts_dispatched, self.eof),
         }
-    }
-
-    /// Returns a coherent snapshot only when transition reporting is enabled.
-    pub(crate) fn transition_snapshot(&self) -> Option<PartTransferSnapshot> {
-        self.diagnostics.transition_snapshot(self.snapshot())
     }
 
     /// Classifies why `poll_work` cannot schedule another part from this state.
@@ -575,7 +591,7 @@ impl PartTransferState {
     }
 
     fn record_dispatch_closed(&mut self) {
-        self.diagnostics
+        self.observability
             .set_dispatch_closed(self.plan.all_dispatched(self.parts_dispatched, self.eof));
     }
 
@@ -589,8 +605,8 @@ impl PartTransferState {
     }
 
     #[cfg(test)]
-    pub(crate) fn test_summary(&self) -> PartTransferSummary {
-        self.diagnostics
+    pub(crate) fn test_summary(&self) -> MultipartTransferSummary {
+        self.observability
             .test_summary(self.snapshot())
             .expect("test transfer diagnostics should be enabled")
     }
@@ -602,8 +618,7 @@ pub(crate) struct MultipartCompletion {
     pub(crate) plan: PartPlan,
     pub(crate) completed_parts: Vec<CompletedPart>,
     pub(crate) bytes_read: u64,
-    pub(crate) final_snapshot: PartTransferSnapshot,
-    pub(crate) diagnostics: UploadTransferDiagnostics,
+    pub(crate) final_snapshot: UploadStateSnapshot,
 }
 
 /// State machine for tracking upload work progress.

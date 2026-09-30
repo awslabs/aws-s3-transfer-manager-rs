@@ -355,6 +355,129 @@ pub(crate) struct IoSample {
     pub disk_write: u64,
 }
 
+/// Aggregate measurements for transfer-manager service requests.
+///
+/// One logical request may include multiple transfer-manager reissues. SDK
+/// attempts hidden inside one `send()` are intentionally not inferred here.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RequestMetrics {
+    pub(crate) requests: u64,
+    pub(crate) elapsed: Duration,
+    pub(crate) max_elapsed: Duration,
+    pub(crate) retry_reissues: u64,
+    pub(crate) throttle_reissues: u64,
+    pub(crate) hedge_reissues: u64,
+    pub(crate) retry_exhaustions: u64,
+    pub(crate) backoff_duration: Duration,
+}
+
+impl RequestMetrics {
+    /// Complete one logical request after its final response or failure.
+    pub(crate) fn record_request(&mut self, elapsed: Duration) {
+        self.requests = self.requests.saturating_add(1);
+        self.elapsed = self.elapsed.saturating_add(elapsed);
+        self.max_elapsed = self.max_elapsed.max(elapsed);
+    }
+
+    /// Record an ordinary transport reissue and its selected backoff.
+    pub(crate) fn record_retry_reissue(&mut self, backoff: Duration) {
+        self.retry_reissues = self.retry_reissues.saturating_add(1);
+        self.record_backoff(backoff);
+    }
+
+    /// Record a throttling reissue and its selected backoff.
+    pub(crate) fn record_throttle_reissue(&mut self, backoff: Duration) {
+        self.throttle_reissues = self.throttle_reissues.saturating_add(1);
+        self.record_backoff(backoff);
+    }
+
+    /// Record the one deadline-driven hedge and its selected backoff.
+    pub(crate) fn record_hedge_reissue(&mut self, backoff: Duration) {
+        self.hedge_reissues = self.hedge_reissues.saturating_add(1);
+        self.record_backoff(backoff);
+    }
+
+    /// Record that a retryable failure reached the transfer-manager budget.
+    pub(crate) fn record_retry_exhaustion(&mut self) {
+        self.retry_exhaustions = self.retry_exhaustions.saturating_add(1);
+    }
+
+    fn record_backoff(&mut self, backoff: Duration) {
+        self.backoff_duration = self.backoff_duration.saturating_add(backoff);
+    }
+}
+
+impl ops::AddAssign<&Self> for RequestMetrics {
+    fn add_assign(&mut self, rhs: &Self) {
+        self.requests = self.requests.saturating_add(rhs.requests);
+        self.elapsed = self.elapsed.saturating_add(rhs.elapsed);
+        self.max_elapsed = self.max_elapsed.max(rhs.max_elapsed);
+        self.retry_reissues = self.retry_reissues.saturating_add(rhs.retry_reissues);
+        self.throttle_reissues = self.throttle_reissues.saturating_add(rhs.throttle_reissues);
+        self.hedge_reissues = self.hedge_reissues.saturating_add(rhs.hedge_reissues);
+        self.retry_exhaustions = self.retry_exhaustions.saturating_add(rhs.retry_exhaustions);
+        self.backoff_duration = self.backoff_duration.saturating_add(rhs.backoff_duration);
+    }
+}
+
+/// Lock-free aggregate backing transfer- and client-level request metrics.
+#[derive(Debug, Default)]
+pub(crate) struct RequestMetricsState {
+    requests: AtomicU64,
+    elapsed_ns: AtomicU64,
+    max_elapsed_ns: AtomicU64,
+    retry_reissues: AtomicU64,
+    throttle_reissues: AtomicU64,
+    hedge_reissues: AtomicU64,
+    retry_exhaustions: AtomicU64,
+    backoff_ns: AtomicU64,
+}
+
+impl RequestMetricsState {
+    /// Merge one completed request measurement into this aggregate.
+    pub(crate) fn record(&self, metrics: &RequestMetrics) {
+        saturating_fetch_add(&self.requests, metrics.requests);
+        let elapsed_ns = duration_ns(metrics.elapsed);
+        saturating_fetch_add(&self.elapsed_ns, elapsed_ns);
+        self.max_elapsed_ns
+            .fetch_max(duration_ns(metrics.max_elapsed), Ordering::Relaxed);
+        saturating_fetch_add(&self.retry_reissues, metrics.retry_reissues);
+        saturating_fetch_add(&self.throttle_reissues, metrics.throttle_reissues);
+        saturating_fetch_add(&self.hedge_reissues, metrics.hedge_reissues);
+        saturating_fetch_add(&self.retry_exhaustions, metrics.retry_exhaustions);
+        saturating_fetch_add(&self.backoff_ns, duration_ns(metrics.backoff_duration));
+    }
+
+    /// Return a point-in-time aggregate.
+    pub(crate) fn snapshot(&self) -> RequestMetrics {
+        RequestMetrics {
+            requests: self.requests.load(Ordering::Relaxed),
+            elapsed: Duration::from_nanos(self.elapsed_ns.load(Ordering::Relaxed)),
+            max_elapsed: Duration::from_nanos(self.max_elapsed_ns.load(Ordering::Relaxed)),
+            retry_reissues: self.retry_reissues.load(Ordering::Relaxed),
+            throttle_reissues: self.throttle_reissues.load(Ordering::Relaxed),
+            hedge_reissues: self.hedge_reissues.load(Ordering::Relaxed),
+            retry_exhaustions: self.retry_exhaustions.load(Ordering::Relaxed),
+            backoff_duration: Duration::from_nanos(self.backoff_ns.load(Ordering::Relaxed)),
+        }
+    }
+}
+
+fn duration_ns(duration: Duration) -> u64 {
+    duration.as_nanos().try_into().unwrap_or(u64::MAX)
+}
+
+fn saturating_fetch_add(value: &AtomicU64, increment: u64) {
+    let mut current = value.load(Ordering::Relaxed);
+    loop {
+        let next = current.saturating_add(increment);
+        match value.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 /// Number of buckets to use for calculating IO windows
 const IO_WINDOW_BUCKETS: usize = 10;
 
@@ -551,11 +674,127 @@ impl fmt::Debug for IOCounters {
 
 #[cfg(test)]
 mod tests {
-    use std::{str::FromStr, time::Duration};
+    use std::{str::FromStr, sync::Arc, time::Duration};
 
     use crate::metrics::unit::ByteCountDisplayContext;
 
     use super::{unit::ByteUnit, Throughput};
+
+    #[test]
+    fn request_metrics_merge_preserves_counts_totals_and_maximum() {
+        let mut aggregate = super::RequestMetrics::default();
+        aggregate.record_request(Duration::from_millis(10));
+        aggregate.record_retry_reissue(Duration::from_millis(2));
+
+        let mut next = super::RequestMetrics::default();
+        next.record_request(Duration::from_millis(30));
+        next.record_throttle_reissue(Duration::from_millis(4));
+        next.record_hedge_reissue(Duration::from_millis(1));
+        next.record_retry_exhaustion();
+
+        aggregate += &next;
+
+        assert_eq!(
+            aggregate,
+            super::RequestMetrics {
+                requests: 2,
+                elapsed: Duration::from_millis(40),
+                max_elapsed: Duration::from_millis(30),
+                retry_reissues: 1,
+                throttle_reissues: 1,
+                hedge_reissues: 1,
+                retry_exhaustions: 1,
+                backoff_duration: Duration::from_millis(7),
+            }
+        );
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn request_metrics_state_merges_concurrent_updates_exactly() {
+        const THREADS: u64 = 8;
+        const UPDATES: u64 = 1_000;
+
+        let state = Arc::new(super::RequestMetricsState::default());
+        let sample = super::RequestMetrics {
+            requests: 1,
+            elapsed: Duration::from_micros(20),
+            max_elapsed: Duration::from_micros(20),
+            retry_reissues: 1,
+            throttle_reissues: 2,
+            hedge_reissues: 3,
+            retry_exhaustions: 4,
+            backoff_duration: Duration::from_micros(5),
+        };
+
+        let threads: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let state = state.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..UPDATES {
+                        state.record(&sample);
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        let updates = THREADS * UPDATES;
+        assert_eq!(
+            state.snapshot(),
+            super::RequestMetrics {
+                requests: updates,
+                elapsed: Duration::from_micros(20 * updates),
+                max_elapsed: Duration::from_micros(20),
+                retry_reissues: updates,
+                throttle_reissues: 2 * updates,
+                hedge_reissues: 3 * updates,
+                retry_exhaustions: 4 * updates,
+                backoff_duration: Duration::from_micros(5 * updates),
+            }
+        );
+    }
+
+    #[test]
+    fn request_metrics_state_saturates_duration_and_counter_overflow() {
+        let state = super::RequestMetricsState::default();
+        state.record(&super::RequestMetrics {
+            requests: u64::MAX,
+            elapsed: Duration::MAX,
+            max_elapsed: Duration::MAX,
+            retry_reissues: u64::MAX,
+            throttle_reissues: u64::MAX,
+            hedge_reissues: u64::MAX,
+            retry_exhaustions: u64::MAX,
+            backoff_duration: Duration::MAX,
+        });
+        state.record(&super::RequestMetrics {
+            requests: 1,
+            elapsed: Duration::from_nanos(1),
+            max_elapsed: Duration::from_nanos(1),
+            retry_reissues: 1,
+            throttle_reissues: 1,
+            hedge_reissues: 1,
+            retry_exhaustions: 1,
+            backoff_duration: Duration::from_nanos(1),
+        });
+
+        assert_eq!(
+            state.snapshot(),
+            super::RequestMetrics {
+                requests: u64::MAX,
+                elapsed: Duration::from_nanos(u64::MAX),
+                max_elapsed: Duration::from_nanos(u64::MAX),
+                retry_reissues: u64::MAX,
+                throttle_reissues: u64::MAX,
+                hedge_reissues: u64::MAX,
+                retry_exhaustions: u64::MAX,
+                backoff_duration: Duration::from_nanos(u64::MAX),
+            }
+        );
+    }
 
     #[test]
     fn test_throughput_display() {
