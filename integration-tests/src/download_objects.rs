@@ -1875,6 +1875,89 @@ async fn test_download_objects_a_consumer_reaches_full_progress_by_banking_faile
     );
 }
 
+/// A run that failed must report `Failed`, carrying its cause, and never `Cancelled`.
+///
+/// `Cancelled` carries no cause, so reporting a failure as one tells a consumer nothing
+/// about why the run ended while `join()` hands the caller the real error. A consumer
+/// branching `Failed => alert or retry` against `Cancelled => the user stopped it, do
+/// nothing` takes the wrong arm on every failure, and the crate's own renderer prints
+/// nothing at all for a cancellation.
+#[tokio::test]
+async fn test_download_objects_failure_reports_failed_not_cancelled() {
+    timeout(TEST_TIMEOUT, async {
+        let m = mock_tm(RuntimeMode::Managed).await;
+
+        let bucket = "test-bucket";
+        let prefix = "failed-not-cancelled/";
+        seed_bucket(&m.server, bucket, prefix, 8, 1024).await;
+
+        // A plain file where a directory belongs: `validate_destination` fails on the
+        // first walker advance, so the root goes Failed without anyone cancelling it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let not_a_dir = dir.path().join("regular-file");
+        std::fs::write(&not_a_dir, b"x").expect("write file");
+
+        let (sink, mut stream) = aws_sdk_s3_transfer_manager::events::channel(
+            std::num::NonZeroUsize::new(64).expect("capacity > 0"),
+        );
+
+        let handle = m
+            .client
+            .download_objects()
+            .bucket(bucket)
+            .destination(&not_a_dir)
+            .key_prefix(prefix)
+            .events(sink)
+            .initiate()
+            .expect("initiate download_objects");
+
+        let collector = tokio::spawn(async move {
+            let mut root_outcome = None;
+            while let Some(ev) = stream.next().await {
+                if let TransferEvent::Ended(e) = ev {
+                    if e.parent().is_none() {
+                        root_outcome = Some(e.outcome().clone());
+                    }
+                }
+            }
+            root_outcome
+        });
+
+        let joined = handle.join().await;
+        let root_outcome = collector
+            .await
+            .expect("collector")
+            .expect("the root must report a terminal outcome");
+
+        assert!(
+            joined.is_err(),
+            "a non-directory destination must fail the transfer"
+        );
+        assert!(
+            matches!(root_outcome, Outcome::Failed { .. }),
+            "the run failed, so the event must say so; got {root_outcome:?}"
+        );
+
+        // And the cause must be the one the caller received, not a constructed stand-in.
+        let Outcome::Failed { error, .. } = &root_outcome else {
+            unreachable!("asserted above")
+        };
+        let joined_err = joined.expect_err("asserted above");
+        assert_eq!(
+            std::mem::discriminant(joined_err.kind()),
+            std::mem::discriminant(error.kind()),
+            "the reported cause must be the cause join() returned, not a substitute: \
+             join gave {:?}, the event gave {:?}",
+            joined_err.kind(),
+            error.kind()
+        );
+
+        m.handle.shutdown().await.expect("shutdown");
+    })
+    .await
+    .expect("test_download_objects_failure_reports_failed_not_cancelled timed out");
+}
+
 /// A run whose listing never completed publishes no entry total, for the same reason it
 /// publishes no byte total: nobody knows how many objects there were.
 ///

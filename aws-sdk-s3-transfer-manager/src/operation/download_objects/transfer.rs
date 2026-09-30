@@ -584,16 +584,7 @@ impl DownloadObjectsTransfer {
             // now never run; reporting it `Cancelled` would tell a consumer to
             // discard a file that is complete on disk.
             let child_outcome = match state.children.get(&child_id) {
-                Some(child) => match child.handle.status() {
-                    crate::types::TransferStatus::Completed => crate::events::Outcome::Succeeded {},
-                    crate::types::TransferStatus::Failed => crate::events::Outcome::Failed {
-                        error: Error::new(
-                            ErrorKind::ChildOperationFailed,
-                            format!("download of {} failed", child.key),
-                        ),
-                    },
-                    _ => crate::events::Outcome::Cancelled {},
-                },
+                Some(child) => child.handle.terminal_outcome(),
                 None => crate::events::Outcome::Cancelled {},
             };
             if let Some(emit) = lc.finish(child_outcome) {
@@ -1092,7 +1083,10 @@ impl DownloadObjectsTransfer {
                 // only listed-but-unspawned entries can still be owed a Ended.
                 self.record_abandoned_entries(state, out);
                 self.inner.ctx.signal_terminal();
-                self.finish_root(state, crate::events::Outcome::Cancelled {}, out);
+                // Derived, not assumed: the guard above is `!is_active()`, which a failed
+                // root satisfies as readily as a cancelled one, and a cancellation carries
+                // no cause for a consumer to branch on.
+                self.finish_root(state, self.inner.ctx.terminal_outcome(), out);
                 return Some(PollWork::Done);
             }
             return None;
@@ -1436,15 +1430,7 @@ impl Transfer for DownloadObjectsTransfer {
         // The outcome is derived from the status rather than assumed: the panic path
         // sets `Failed` first, and hardcoding `Cancelled` would report a panicked
         // transfer as one the caller stopped.
-        let outcome = match self.inner.ctx.transfer_status() {
-            crate::types::TransferStatus::Completed => crate::events::Outcome::Succeeded {},
-            crate::types::TransferStatus::Failed => crate::events::Outcome::Failed {
-                error: self.inner.ctx.error().unwrap_or_else(|| {
-                    Error::new(ErrorKind::ChildOperationFailed, "download_objects failed")
-                }),
-            },
-            _ => crate::events::Outcome::Cancelled {},
-        };
+        let outcome = self.inner.ctx.terminal_outcome();
         let mut emits = Vec::new();
         {
             let mut state = self.inner.state.lock();

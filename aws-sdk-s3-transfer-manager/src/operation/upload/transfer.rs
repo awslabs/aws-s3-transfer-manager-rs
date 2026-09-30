@@ -919,19 +919,7 @@ impl Transfer for UploadTransfer {
         let Some(lc) = &self.inner.lifecycle else {
             return;
         };
-        let outcome = match self.inner.ctx.transfer_status() {
-            crate::types::TransferStatus::Completed => crate::events::Outcome::Succeeded {},
-            crate::types::TransferStatus::Failed => crate::events::Outcome::Failed {
-                error: self.inner.ctx.error().unwrap_or_else(|| {
-                    crate::error::Error::new(
-                        crate::error::ErrorKind::ChildOperationFailed,
-                        "upload failed",
-                    )
-                }),
-            },
-            _ => crate::events::Outcome::Cancelled {},
-        };
-        if let Some(emit) = lc.finish(outcome) {
+        if let Some(emit) = lc.finish(self.inner.ctx.terminal_outcome()) {
             emit.send();
         }
     }

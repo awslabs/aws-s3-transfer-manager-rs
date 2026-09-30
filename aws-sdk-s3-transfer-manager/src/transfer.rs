@@ -965,6 +965,39 @@ impl TransferContext {
         }
     }
 
+    /// The event outcome this transfer's terminal state implies.
+    ///
+    /// Derived here, from one read of the status and one of the error, rather than
+    /// written as a literal at each emit site. An emit site that names its own outcome
+    /// has to re-derive the mapping, and a site that guards on "not active" has already
+    /// lost the distinction it needs: `Failed` and `Cancelled` are both inactive, so a
+    /// literal `Cancelled` reports a transfer that broke as one the caller stopped —
+    /// and since a cancellation carries no cause, it reports nothing at all about why.
+    /// A consumer branching `Failed => retry or alert` against
+    /// `Cancelled => the user stopped it, do nothing` then takes the wrong arm on every
+    /// failure.
+    ///
+    /// Taking no status or error argument is the point: no caller can pass a pair that
+    /// disagrees.
+    ///
+    /// `Failed` always carries its error, because [`Self::set_failed`] is the only way
+    /// to reach that status and it publishes the status while holding the error slot.
+    ///
+    /// A still-`Active` transfer reports `Cancelled`. Every caller is on a terminal
+    /// path, so `Active` means the status transition lost its race to another terminal
+    /// site, and that site emits the outcome it set.
+    pub(crate) fn terminal_outcome(&self) -> crate::events::Outcome {
+        match self.transfer_status() {
+            crate::types::TransferStatus::Completed => crate::events::Outcome::Succeeded {},
+            crate::types::TransferStatus::Failed => crate::events::Outcome::Failed {
+                error: self
+                    .error()
+                    .expect("a Failed status is only reachable through set_failed"),
+            },
+            _ => crate::events::Outcome::Cancelled {},
+        }
+    }
+
     /// Peek at the error kind if transfer failed. `None` means the transfer did not fail.
     pub(crate) fn error_kind(&self) -> Option<error::ErrorKind> {
         if self.status.is_failed() {
@@ -1332,6 +1365,46 @@ mod tests {
             assert_eq!(stats.network_rx, 220);
             assert_eq!(stats.disk_read, 330);
             assert_eq!(stats.disk_write, 440);
+        }
+
+        /// The status-to-outcome mapping lives in exactly one place, and each terminal
+        /// maps to the outcome that licenses what a consumer may do with it.
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn terminal_outcome_derives_each_terminal() {
+            let (ctx, _rx) = TransferContext::new(test_handle());
+            assert!(ctx.set_completed());
+            assert!(
+                matches!(
+                    ctx.terminal_outcome(),
+                    crate::events::Outcome::Succeeded { .. }
+                ),
+                "a completed transfer licenses deleting a source"
+            );
+
+            let (ctx, _rx) = TransferContext::new(test_handle());
+            assert!(ctx.set_cancelled());
+            assert!(
+                matches!(
+                    ctx.terminal_outcome(),
+                    crate::events::Outcome::Cancelled { .. }
+                ),
+                "a cancelled transfer licenses no retry and no alert"
+            );
+
+            let (ctx, _rx) = TransferContext::new(test_handle());
+            assert!(ctx.set_failed(crate::error::Error::new(
+                crate::error::ErrorKind::ObjectNotDiscoverable,
+                "the real cause",
+            )));
+            match ctx.terminal_outcome() {
+                crate::events::Outcome::Failed { error, .. } => assert!(
+                    matches!(error.kind(), crate::error::ErrorKind::ObjectNotDiscoverable),
+                    "a failure carries the cause a caller would branch on, got {:?}",
+                    error.kind()
+                ),
+                other => panic!("a failed transfer must report Failed, got {other:?}"),
+            }
         }
 
         /// Every reader of a failed transfer's error gets the real one.
