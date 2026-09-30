@@ -115,6 +115,9 @@ jobs:
           path: python/dist
       - run: uv sync --locked --no-install-project
       - run: uv pip install aws-s3-transfer --no-index --no-deps --find-links dist
+      # Keep cold Rust compilation outside pytest's per-test timeout.
+      - name: Build mock S3 server
+        run: cargo build --locked --manifest-path ../Cargo.toml -p s3-mock-server --bin s3-mock-server
       - run: uv run --no-sync pytest
 
   test-sdist:
@@ -140,4 +143,7 @@ jobs:
           path: python/dist
       - run: uv sync --locked --no-install-project
       - run: uv pip install --no-deps dist/*.tar.gz
+      # Keep cold Rust compilation outside pytest's per-test timeout.
+      - name: Build mock S3 server
+        run: cargo build --locked --manifest-path ../Cargo.toml -p s3-mock-server --bin s3-mock-server
       - run: uv run --no-sync pytest
