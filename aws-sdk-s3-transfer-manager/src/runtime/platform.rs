@@ -96,14 +96,19 @@ fn descriptor_limit() -> Option<DescriptorLimit> {
 
 /// Interpret raw `getrlimit` values. An infinite soft limit means no limit; an
 /// infinite hard limit means the soft limit can be raised without bound.
+///
+/// Generic over the limit type because `rlim_t` is unsigned on most platforms
+/// and signed on FreeBSD. Infinity is compared in that type before conversion.
 #[cfg_attr(not(unix), allow(dead_code))]
-fn parse_descriptor_limit(soft: u64, hard: u64, infinity: u64) -> Option<DescriptorLimit> {
-    if soft == 0 || soft == infinity {
-        return None;
-    }
+fn parse_descriptor_limit<T>(soft: T, hard: T, infinity: T) -> Option<DescriptorLimit>
+where
+    T: Copy + PartialEq + TryInto<usize>,
+{
+    let finite = |limit: T| (limit != infinity).then(|| limit.try_into().unwrap_or(usize::MAX));
+    let soft = finite(soft).filter(|&soft| soft > 0)?;
     Some(DescriptorLimit {
-        soft: usize::try_from(soft).unwrap_or(usize::MAX),
-        hard: (hard != infinity).then(|| usize::try_from(hard).unwrap_or(usize::MAX)),
+        soft,
+        hard: finite(hard),
     })
 }
 
@@ -728,6 +733,20 @@ mod tests {
         // Infinite or zero soft limit: no usable limit.
         assert_eq!(parse_descriptor_limit(INF, INF, INF), None);
         assert_eq!(parse_descriptor_limit(0, 1024, INF), None);
+    }
+
+    #[test]
+    fn test_parse_signed_descriptor_limit() {
+        // FreeBSD's `rlim_t` is signed, with `RLIM_INFINITY == i64::MAX`.
+        const INF: i64 = i64::MAX;
+        assert_eq!(
+            parse_descriptor_limit(1024, INF, INF),
+            Some(DescriptorLimit {
+                soft: 1024,
+                hard: None
+            })
+        );
+        assert_eq!(parse_descriptor_limit(INF, INF, INF), None);
     }
 
     #[test]
