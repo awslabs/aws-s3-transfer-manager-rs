@@ -1,5 +1,5 @@
 [build-system]
-requires = ["maturin>=1.9,<2"]
+requires = ["maturin>=1.15,<2"]
 build-backend = "maturin"
 
 [project]
@@ -7,6 +7,7 @@ name = "aws-s3-transfer"
 description = "An experimental high-performance transfer manager for Amazon S3"
 readme = "README.md"
 license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
 authors = [{ name = "Amazon Web Services" }]
 requires-python = ">=3.11"
 keywords = ["aws", "amazon", "s3", "transfer-manager"]
@@ -33,7 +34,7 @@ Issues = "https://github.com/awslabs/aws-s3-transfer-manager-rs/issues"
 [dependency-groups]
 dev = [
     "boto3>=1.35",
-    "maturin>=1.9,<2",
+    "maturin>=1.15,<2",
     "mypy>=1.15",
     "pytest>=8",
     "pytest-timeout>=2.3",
@@ -43,10 +44,22 @@ dev = [
 [tool.maturin]
 python-source = "python"
 module-name = "aws_s3_transfer._core"
+locked = true
 strip = true
 exclude = [
     { path = "**/__pycache__/**", format = "wheel" },
     { path = "dist/**", format = "sdist" },
+]
+
+[tool.uv]
+# Rebuild the extension when Rust sources change, including the transfer manager crate.
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "Cargo.toml" },
+    { file = "Cargo.lock" },
+    { file = "src/**/*.rs" },
+    { file = "../aws-sdk-s3-transfer-manager/Cargo.toml" },
+    { file = "../aws-sdk-s3-transfer-manager/src/**/*.rs" },
 ]
 
 [tool.pytest.ini_options]

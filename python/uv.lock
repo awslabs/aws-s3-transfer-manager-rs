@@ -90,7 +90,7 @@ dev = [
 [package.metadata.requires-dev]
 dev = [
     { name = "boto3", specifier = ">=1.35" },
-    { name = "maturin", specifier = ">=1.9,<2" },
+    { name = "maturin", specifier = ">=1.15,<2" },
     { name = "mypy", specifier = ">=1.15" },
     { name = "pytest", specifier = ">=8" },
     { name = "pytest-timeout", specifier = ">=2.3" },
