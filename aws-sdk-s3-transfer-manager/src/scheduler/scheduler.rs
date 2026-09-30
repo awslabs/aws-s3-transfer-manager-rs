@@ -433,7 +433,9 @@ impl Scheduler {
         if ctx.is_active() {
             ctx.set_cancelled();
         }
-        desc.transfer().on_terminal();
+        // Runs from handle `Drop`, so an `on_terminal` panic must not escape
+        // or skip the steps that release the handle and reach idle.
+        let cleanup_completed = run_on_terminal(&desc);
         desc.cancellation_token().cancel();
         ctx.signal_terminal();
         let purged = self.handle().runtime.remove_pending_for_transfer(id);
@@ -441,6 +443,13 @@ impl Scheduler {
         desc.work_purged(purged);
         desc.notify_idle();
         tracing::debug!(target: telemetry::TARGET_SCHEDULING, tid = %id, purged, "transfer cancelled");
+        if !cleanup_completed {
+            tracing::error!(
+                target: telemetry::TARGET_SCHEDULING,
+                tid = %id,
+                "on_terminal panicked; transfer cleanup is incomplete",
+            );
+        }
     }
 
     /// Set the priority of a transfer.
@@ -552,7 +561,10 @@ impl Scheduler {
             "worker panic during execute",
         );
         ctx.set_failed(err);
-        desc.transfer().on_terminal();
+        // Already handling a worker panic: a second panic from `on_terminal`
+        // (e.g. a state lock poisoned by that worker) must not skip the steps
+        // that release the handle and reach idle.
+        let cleanup_completed = run_on_terminal(desc);
         ctx.signal_terminal();
 
         let is_idle = desc.work_finished();
@@ -576,6 +588,13 @@ impl Scheduler {
             }
         }
         desc.notify_idle();
+        if !cleanup_completed {
+            tracing::error!(
+                target: telemetry::TARGET_SCHEDULING,
+                tid = %desc.id(),
+                "on_terminal panicked; transfer cleanup is incomplete",
+            );
+        }
 
         // The panicking work item released a concurrency slot. A peer may already be queued behind
         // it, including at target=1 where no other completion can re-drive generation.
@@ -939,6 +958,18 @@ impl Scheduler {
         self.0.dispatched.load(Ordering::Relaxed)
     }
 }
+
+/// Runs the transfer's `on_terminal` cleanup, containing any panic it raises.
+///
+/// Returns `false` if `on_terminal` panicked; its cleanup may be partial. The
+/// panic is not re-raised, so the caller's remaining terminal steps always run.
+fn run_on_terminal(desc: &TransferDescriptor) -> bool {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        desc.transfer().on_terminal()
+    }))
+    .is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use crate::client::Handle;
@@ -1158,6 +1189,141 @@ mod tests {
         completion_rx
             .await
             .expect("panic handling should signal terminal");
+        handle.runtime.shutdown();
+    }
+
+    /// Transfer whose `on_terminal` panics on a state mutex poisoned by an
+    /// earlier panic, as a state machine's hook does after `execute` panics
+    /// while holding its state lock.
+    #[derive(Debug)]
+    struct PoisonedTerminalTransfer {
+        ctx: TransferContext,
+        state: Arc<std::sync::Mutex<u32>>,
+    }
+
+    impl Transfer for PoisonedTerminalTransfer {
+        fn ctx(&self) -> &TransferContext {
+            &self.ctx
+        }
+
+        fn poll_work(&self) -> PollWork {
+            self.ctx.set_pending(PendingCause::other("test"));
+            PollWork::Pending
+        }
+
+        fn execute<'a>(
+            &'a self,
+            _work: &'a mut IoRequest,
+        ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
+            Box::pin(async { unreachable!("test transfer produces no work") })
+        }
+
+        fn on_terminal(&self) {
+            let _guard = self.state.lock().unwrap();
+        }
+    }
+
+    /// Returns a mutex poisoned by a thread that panicked while holding it.
+    fn poisoned_state() -> Arc<std::sync::Mutex<u32>> {
+        let state = Arc::new(std::sync::Mutex::new(0u32));
+        let poisoner = Arc::clone(&state);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("invalid discovery state");
+        })
+        .join();
+        assert!(state.lock().is_err(), "mutex should be poisoned");
+        state
+    }
+
+    /// A panicking `on_terminal` during worker-panic handling still signals
+    /// terminal and drains the descriptor to idle without re-raising.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn panic_poisoning_state_still_signals_terminal() {
+        let handle = test_handle(1);
+        let id = TransferId {
+            id: 40_009,
+            parent: None,
+        };
+        let (ctx, completion_rx) = TransferContext::with_id(id, handle.clone());
+        let _handle_side_ctx = ctx.clone();
+        let state = poisoned_state();
+        let descriptor = TransferDescriptor::new(Box::new(PoisonedTerminalTransfer {
+            ctx,
+            state: Arc::clone(&state),
+        }));
+        descriptor.work_queued();
+        descriptor.work_started();
+        let observer = descriptor.clone();
+        handle.scheduler.0.dispatched.store(1, Ordering::Relaxed);
+        let work = ScheduledWork {
+            item: IoRequest { data: None },
+            descriptor,
+        };
+
+        let scheduler = handle.scheduler.clone();
+        let tokio_handle = tokio::runtime::Handle::current();
+        let panicker = std::thread::spawn(move || {
+            let _runtime = tokio_handle.enter();
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| scheduler.on_panic(work)))
+                .is_err()
+        });
+        let signalled = tokio::time::timeout(Duration::from_secs(3), completion_rx).await;
+        let on_panic_panicked = panicker.join().unwrap();
+        let received = signalled.expect("join() never released");
+        assert!(
+            received.is_ok(),
+            "terminal never signalled (on_panic panicked: {on_panic_panicked})"
+        );
+        assert!(!on_panic_panicked, "on_panic must not re-raise");
+        assert!(observer.is_idle(), "descriptor should reach idle");
+        handle.runtime.shutdown();
+    }
+
+    /// A panicking `on_terminal` during cancellation still cancels the token,
+    /// signals terminal, and reaches idle without escaping `cancel_transfer`.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn cancel_poisoning_state_still_signals_terminal() {
+        let handle = test_handle(1);
+        let id = TransferId {
+            id: 40_010,
+            parent: None,
+        };
+        let (ctx, completion_rx) = TransferContext::with_id(id, handle.clone());
+        let state = poisoned_state();
+        handle
+            .scheduler
+            .enqueue_transfer(Box::new(PoisonedTerminalTransfer {
+                ctx,
+                state: Arc::clone(&state),
+            }));
+
+        let scheduler = handle.scheduler.clone();
+        let canceller = std::thread::spawn(move || {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                scheduler.cancel_transfer(id)
+            }))
+        });
+        let signalled = tokio::time::timeout(Duration::from_secs(3), completion_rx).await;
+        let cancellation = canceller
+            .join()
+            .unwrap()
+            .expect("cancel_transfer must not re-raise");
+        let received = signalled.expect("join() never released");
+        assert!(received.is_ok(), "terminal never signalled");
+        let target = cancellation
+            .target
+            .clone()
+            .expect("cancelled transfer should be registered");
+        assert!(
+            target.cancellation_token().is_cancelled(),
+            "cancellation token should fire"
+        );
+        tokio::time::timeout(Duration::from_secs(3), cancellation.wait_for_idle())
+            .await
+            .expect("cancelled transfer should reach idle");
         handle.runtime.shutdown();
     }
 

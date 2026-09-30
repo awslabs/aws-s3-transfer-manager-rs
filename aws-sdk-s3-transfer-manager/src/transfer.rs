@@ -16,7 +16,6 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Wake, Waker};
-use std::time::Instant;
 
 use pending::TransferPendingState;
 pub(crate) use pending::{
@@ -567,10 +566,20 @@ pub(crate) struct TransferContext {
 /// keeps early returns and cancellation paths from losing a request after it
 /// started. A ranged discovery may carry the guard with its response body so
 /// headers and validated body collection remain one logical request.
+///
+/// The published elapsed time is the sum of the intervals during which the
+/// measurement was running. A measurement starts running and accrues nothing
+/// while paused.
+///
+/// Time is read from [`tokio::time::Instant`], which follows the tokio test
+/// clock when it is paused and the system monotonic clock otherwise.
 #[derive(Debug)]
 pub(crate) struct RequestMeasurement {
     ctx: TransferContext,
-    started_at: Instant,
+    /// Elapsed time accrued by completed running intervals.
+    accrued: std::time::Duration,
+    /// Start of the current running interval; `None` while paused.
+    running_since: Option<tokio::time::Instant>,
     metrics: crate::metrics::RequestMetrics,
     published: bool,
 }
@@ -579,7 +588,8 @@ impl RequestMeasurement {
     fn new(ctx: TransferContext) -> Self {
         Self {
             ctx,
-            started_at: Instant::now(),
+            accrued: std::time::Duration::ZERO,
+            running_since: Some(tokio::time::Instant::now()),
             metrics: crate::metrics::RequestMetrics::default(),
             published: false,
         }
@@ -588,6 +598,33 @@ impl RequestMeasurement {
     /// Return the request aggregate updated by the retry loop.
     pub(crate) fn metrics_mut(&mut self) -> &mut crate::metrics::RequestMetrics {
         &mut self.metrics
+    }
+
+    /// Stop accruing elapsed time while the request's work is not in progress,
+    /// e.g. while its response body waits for memory before being read.
+    ///
+    /// No-op when already paused.
+    pub(crate) fn pause(&mut self) {
+        if let Some(since) = self.running_since.take() {
+            self.accrued += since.elapsed();
+        }
+    }
+
+    /// Resume accruing elapsed time.
+    ///
+    /// No-op when already running.
+    pub(crate) fn resume(&mut self) {
+        if self.running_since.is_none() {
+            self.running_since = Some(tokio::time::Instant::now());
+        }
+    }
+
+    /// Elapsed time accrued so far, including the current running interval.
+    fn elapsed(&self) -> std::time::Duration {
+        self.accrued
+            + self
+                .running_since
+                .map_or(std::time::Duration::ZERO, |s| s.elapsed())
     }
 
     /// Complete and publish this logical request.
@@ -600,7 +637,7 @@ impl RequestMeasurement {
         if self.published {
             return;
         }
-        self.metrics.record_request(self.started_at.elapsed());
+        self.metrics.record_request(self.elapsed());
         self.ctx.record_request_metrics(&self.metrics);
         self.published = true;
     }
@@ -649,6 +686,27 @@ impl<A: RequestMetricsAttribution> AttributedRequestMeasurement<A> {
             .as_mut()
             .expect("request measurement already finished")
             .metrics_mut()
+    }
+
+    /// Stop accruing elapsed time while the request's work is not in progress,
+    /// e.g. while its response body waits for memory before being read.
+    ///
+    /// No-op when already paused.
+    pub(crate) fn pause(&mut self) {
+        self.measurement
+            .as_mut()
+            .expect("request measurement already finished")
+            .pause();
+    }
+
+    /// Resume accruing elapsed time.
+    ///
+    /// No-op when already running.
+    pub(crate) fn resume(&mut self) {
+        self.measurement
+            .as_mut()
+            .expect("request measurement already finished")
+            .resume();
     }
 
     /// Publishes the request measurement to both aggregate scopes.
@@ -1366,6 +1424,98 @@ mod tests {
             drop(ctx.start_request_metrics());
 
             assert_eq!(ctx.metrics.request_metrics().requests, 2);
+        }
+
+        #[cfg_attr(miri, ignore)]
+        #[tokio::test(start_paused = true)]
+        async fn request_measurement_excludes_paused_time() {
+            use std::time::Duration;
+            let (ctx, _rx) = TransferContext::new(test_handle());
+
+            let mut measurement = ctx.start_request_metrics();
+            tokio::time::advance(Duration::from_secs(1)).await;
+            measurement.pause();
+            tokio::time::advance(Duration::from_secs(10)).await;
+            measurement.resume();
+            tokio::time::advance(Duration::from_secs(2)).await;
+            let metrics = measurement.finish();
+
+            assert_eq!(metrics.elapsed, Duration::from_secs(3));
+            assert_eq!(metrics.max_elapsed, Duration::from_secs(3));
+            assert_eq!(
+                ctx.metrics.request_metrics().elapsed,
+                Duration::from_secs(3)
+            );
+        }
+
+        #[cfg_attr(miri, ignore)]
+        #[tokio::test(start_paused = true)]
+        async fn request_measurement_repeated_pause_and_resume_are_noops() {
+            use std::time::Duration;
+            let (ctx, _rx) = TransferContext::new(test_handle());
+
+            let mut measurement = ctx.start_request_metrics();
+            tokio::time::advance(Duration::from_secs(1)).await;
+            measurement.pause();
+            tokio::time::advance(Duration::from_secs(5)).await;
+            // A second pause must not accrue the paused interval.
+            measurement.pause();
+            tokio::time::advance(Duration::from_secs(5)).await;
+            measurement.resume();
+            tokio::time::advance(Duration::from_secs(1)).await;
+            // A second resume must not restart the running interval.
+            measurement.resume();
+            tokio::time::advance(Duration::from_secs(1)).await;
+
+            assert_eq!(measurement.finish().elapsed, Duration::from_secs(3));
+        }
+
+        #[cfg_attr(miri, ignore)]
+        #[tokio::test(start_paused = true)]
+        async fn request_measurement_published_while_paused_counts_active_time() {
+            use std::time::Duration;
+            let (ctx, _rx) = TransferContext::new(test_handle());
+
+            let mut finished = ctx.start_request_metrics();
+            tokio::time::advance(Duration::from_secs(2)).await;
+            finished.pause();
+            tokio::time::advance(Duration::from_secs(10)).await;
+            assert_eq!(finished.finish().elapsed, Duration::from_secs(2));
+
+            let mut dropped = ctx.start_request_metrics();
+            tokio::time::advance(Duration::from_secs(3)).await;
+            dropped.pause();
+            tokio::time::advance(Duration::from_secs(10)).await;
+            drop(dropped);
+
+            let total = ctx.metrics.request_metrics();
+            assert_eq!(total.requests, 2);
+            assert_eq!(total.elapsed, Duration::from_secs(5));
+            assert_eq!(total.max_elapsed, Duration::from_secs(3));
+        }
+
+        #[cfg_attr(miri, ignore)]
+        #[tokio::test(start_paused = true)]
+        async fn attributed_request_measurement_forwards_pause_and_resume() {
+            use std::time::Duration;
+            let (ctx, _rx) = TransferContext::new(test_handle());
+            let attribution = TestRequestAttribution::default();
+
+            let mut measurement = AttributedRequestMeasurement::new(&ctx, attribution.clone(), 1);
+            tokio::time::advance(Duration::from_secs(1)).await;
+            measurement.pause();
+            tokio::time::advance(Duration::from_secs(10)).await;
+            measurement.resume();
+            tokio::time::advance(Duration::from_secs(1)).await;
+            drop(measurement);
+
+            let records = attribution.records.lock().unwrap();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].1.elapsed, Duration::from_secs(2));
+            assert_eq!(
+                ctx.metrics.request_metrics().elapsed,
+                Duration::from_secs(2)
+            );
         }
 
         #[cfg_attr(miri, ignore)]

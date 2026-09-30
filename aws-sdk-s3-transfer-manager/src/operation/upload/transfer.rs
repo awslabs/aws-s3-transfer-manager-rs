@@ -167,7 +167,13 @@ impl UploadTransfer {
             return;
         }
         let state_snapshot = {
-            let state = self.inner.state.lock().expect("lock poisoned");
+            // The transfer is already terminal: snapshot the state even if a
+            // panic left it inconsistent.
+            let state = self
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             snapshot_state(&state)
         };
         let pending = self.inner.ctx.pending_stats().unwrap_or_default();
@@ -1790,6 +1796,45 @@ mod tests {
         assert_eq!(summary.outcome, UploadTerminalOutcome::Cancelled);
         assert_eq!(summary.mode, UploadMode::PutObject);
         assert_eq!(summary.request_total.requests, 0);
+    }
+
+    #[test]
+    fn on_terminal_tolerates_poisoned_state() {
+        let transfer = create_test_transfer(
+            mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[]),
+            vec![0u8; 1024],
+        );
+        let _work = assert_ready(transfer.poll_work());
+        std::thread::scope(|scope| {
+            let poisoner = scope.spawn(|| {
+                let _guard = transfer.inner.state.lock().expect("lock poisoned");
+                panic!("unexpected state");
+            });
+            assert!(poisoner.join().is_err());
+        });
+        assert!(
+            transfer.inner.state.lock().is_err(),
+            "state should be poisoned"
+        );
+        transfer.ctx().set_failed(Error::new(
+            ErrorKind::RuntimeError,
+            "worker panic during execute",
+        ));
+
+        let cleanup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Transfer::on_terminal(&transfer)
+        }));
+        assert!(
+            cleanup.is_ok(),
+            "on_terminal must tolerate a poisoned state"
+        );
+
+        let summary = transfer
+            .inner
+            .observability
+            .test_terminal_summary()
+            .expect("poisoned state should still emit a terminal summary");
+        assert_eq!(summary.outcome, UploadTerminalOutcome::Failed);
     }
 
     #[test]

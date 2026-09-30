@@ -416,14 +416,18 @@ async fn discover_obj_with_get(
 
 /// Keep a ranged discovery request open until its lazy body is validated.
 ///
-/// Empty responses have no deferred body work, so their measurement completes
-/// at discovery.
+/// The measurement is paused while the body is parked on the initial chunk, so
+/// only request and body-read time accrue. Empty responses have no deferred
+/// body work, so their measurement completes at discovery.
 fn attach_request_measurement(
     mut discovery: ObjectDiscovery,
-    req_metrics: DownloadRequestMeasurement,
+    mut req_metrics: DownloadRequestMeasurement,
 ) -> ObjectDiscovery {
     match discovery.initial_chunk.as_mut() {
-        Some(initial) => initial.request_metrics = Some(req_metrics),
+        Some(initial) => {
+            req_metrics.pause();
+            initial.request_metrics = Some(req_metrics);
+        }
         None => {
             req_metrics.finish();
         }

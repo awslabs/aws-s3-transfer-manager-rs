@@ -883,6 +883,7 @@ impl DownloadTransfer {
         chunk_meta: ChunkMetadata,
         etag: Option<Arc<str>>,
     ) -> WorkOutcome {
+        req_metrics.resume();
         let seq = slot.seq();
         let input = self.inner.request.as_ref();
         // The discovery GET already received this chunk's response headers; the
@@ -1376,7 +1377,13 @@ impl Transfer for DownloadTransfer {
         // does not run `fail` or `complete`, so it must explicitly extract the
         // claim and cancel its reservation future after releasing state.
         let (pending, snapshot) = {
-            let mut state = self.inner.state.lock().unwrap();
+            // The transfer is already terminal: snapshot and take the pending
+            // claim even if a panic left the state inconsistent.
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let snapshot = self.snapshot(&state);
             (state.enter_terminal(), snapshot)
         };
@@ -2173,6 +2180,45 @@ mod tests {
         assert_eq!(summary.ranges_completed, 0);
     }
 
+    /// The terminal hook completes cleanup and reports a summary when a worker
+    /// panicked while holding the state lock.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn on_terminal_tolerates_poisoned_state() {
+        let transfer = create_download_with_detail(24 * MB, 8 * MB, 1);
+        let _discovery = assert_ready(transfer.poll_work());
+        std::thread::scope(|scope| {
+            let poisoner = scope.spawn(|| {
+                let _guard = transfer.inner.state.lock().unwrap();
+                panic!("invalid discovery state");
+            });
+            assert!(poisoner.join().is_err());
+        });
+        assert!(
+            transfer.inner.state.lock().is_err(),
+            "state should be poisoned"
+        );
+        transfer.ctx().set_failed(error::Error::new(
+            error::ErrorKind::RuntimeError,
+            "worker panic during execute",
+        ));
+
+        let cleanup =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| transfer.on_terminal()));
+        assert!(
+            cleanup.is_ok(),
+            "on_terminal must tolerate a poisoned state"
+        );
+
+        let summary = transfer
+            .test_terminal_summary()
+            .expect("poisoned state should still emit a terminal summary");
+        assert_eq!(
+            summary.outcome,
+            crate::operation::download::observability::DownloadTerminalOutcome::Failed
+        );
+    }
+
     /// External cancellation must close pending diagnostics and report one
     /// terminal summary through the scheduler-owned terminal hook.
     #[cfg_attr(miri, ignore)]
@@ -2436,6 +2482,165 @@ mod tests {
         assert_eq!(summary.request_total.requests, 1);
         assert_eq!(summary.request_total.retry_reissues, 1);
         assert_eq!(summary.requests.range.requests, 0);
+    }
+
+    /// Time a discovery body spends waiting for memory admission is not part of
+    /// the discovery request's elapsed time.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test(start_paused = true)]
+    async fn discovery_memory_wait_is_excluded_from_request_elapsed() {
+        let part_size = 8 * MB;
+        let memory_wait = std::time::Duration::from_secs(10);
+        let (transfer, _consumer) =
+            create_download_for_gate_with_capacity(part_size, part_size, Some(part_size as usize));
+        let pool = transfer.ctx().handle.buffer_pool.clone();
+        let blocker = pool
+            .try_reserve(part_size as usize)
+            .unwrap()
+            .expect("test blocker");
+
+        let mut work = assert_ready(transfer.poll_work());
+        let executing = transfer.clone();
+        let task = tokio::spawn(async move { execute(&executing, &mut work).await });
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while pool.metrics().queued_reservations() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("discovery reservation should enter the memory FIFO");
+
+        tokio::time::sleep(memory_wait).await;
+        drop(blocker);
+
+        assert!(matches!(task.await.unwrap(), WorkOutcome::Success { .. }));
+        let requests = transfer.ctx().metrics.request_metrics();
+        assert_eq!(requests.requests, 1);
+        assert!(
+            requests.max_elapsed < memory_wait / 10,
+            "discovery request elapsed {:?} includes the {memory_wait:?} memory wait",
+            requests.max_elapsed,
+        );
+    }
+
+    /// S3 connector for a two-part multipart object whose `partNumber=1`
+    /// response is delayed. Ranged GETs are answered immediately with the
+    /// requested bytes.
+    #[derive(Debug)]
+    struct DelayedFirstPartConnector {
+        object_size: u64,
+        stored_part_size: u64,
+        part_delay: std::time::Duration,
+    }
+
+    impl aws_smithy_runtime_api::client::http::HttpConnector for DelayedFirstPartConnector {
+        fn call(
+            &self,
+            request: aws_smithy_runtime_api::client::orchestrator::HttpRequest,
+        ) -> aws_smithy_runtime_api::client::http::HttpConnectorFuture {
+            use aws_smithy_runtime_api::client::http::HttpConnectorFuture;
+            use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
+
+            let is_part_request = request.uri().contains("partNumber=1");
+            let (start, end) = if is_part_request {
+                (0, self.stored_part_size - 1)
+            } else {
+                request
+                    .headers()
+                    .get("range")
+                    .and_then(parse_byte_range)
+                    .unwrap_or_else(|| panic!("unexpected request: {}", request.uri()))
+            };
+            let len = end - start + 1;
+            let mut response = HttpResponse::new(
+                206.try_into().unwrap(),
+                aws_smithy_types::body::SdkBody::from(vec![0u8; len as usize]),
+            );
+            let headers = response.headers_mut();
+            headers.insert("Content-Length", len.to_string());
+            headers.insert(
+                "Content-Range",
+                format!("bytes {start}-{end}/{}", self.object_size),
+            );
+            headers.insert("ETag", "\"abc-2\"");
+
+            if is_part_request {
+                let delay = self.part_delay;
+                HttpConnectorFuture::new(async move {
+                    tokio::time::sleep(delay).await;
+                    Ok(response)
+                })
+            } else {
+                HttpConnectorFuture::ready(Ok(response))
+            }
+        }
+    }
+
+    /// The multipart realignment re-issue belongs to the `partNumber=1`
+    /// discovery request. The superseded ranged discovery must not accrue the
+    /// re-issue's latency while its unread body is held.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test(start_paused = true)]
+    async fn discovery_realign_reissue_is_excluded_from_first_discovery_elapsed() {
+        let stored_part_size = 8 * MB;
+        let part_delay = std::time::Duration::from_secs(10);
+        let connector = aws_smithy_runtime_api::client::http::SharedHttpConnector::new(
+            DelayedFirstPartConnector {
+                object_size: 2 * stored_part_size,
+                stored_part_size,
+                part_delay,
+            },
+        );
+        let http_client =
+            aws_smithy_runtime_api::client::http::http_client_fn(move |_, _| connector.clone());
+        let client = aws_sdk_s3::Client::from_conf(
+            aws_sdk_s3::config::Config::builder()
+                .http_client(http_client)
+                .region(aws_sdk_s3::config::Region::new("us-west-2"))
+                .with_test_defaults()
+                .build(),
+        );
+        // No explicit part size: discovery issues the Auto-sized ranged GET,
+        // then realigns to the stored part size via partNumber=1.
+        let config = crate::Config::builder()
+            .client(client)
+            .diagnostics_for_test(crate::config::MemoryDiagnosticsConfig::default(), 1)
+            .build();
+        let handle = crate::client::Handle::test_handle_tokio(config);
+        assert!(!handle.user_set_part_size());
+        let input = DownloadInput::builder()
+            .bucket("test-bucket")
+            .key("test-key")
+            .build()
+            .unwrap();
+        let (writer, _consumer) = crate::operation::download::body::new_recv_body();
+        let (ctx, _completion_rx) = TransferContext::new(handle);
+        let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, writer);
+
+        assert_discovery_succeeds(&transfer).await;
+        let mut range = assert_ready(transfer.poll_work());
+        assert!(matches!(
+            execute(&transfer, &mut range).await,
+            WorkOutcome::Success { .. }
+        ));
+
+        let summary = transfer
+            .test_terminal_summary()
+            .expect("summary diagnostics enabled");
+        assert_eq!(summary.requests.discovery_range.requests, 1);
+        assert_eq!(summary.requests.discovery_part.requests, 1);
+        assert_eq!(summary.requests.range.requests, 1);
+        assert!(
+            summary.requests.discovery_part.elapsed >= part_delay,
+            "the delayed re-issue accrues to its own request: {:?}",
+            summary.requests.discovery_part.elapsed,
+        );
+        assert!(
+            summary.requests.discovery_range.elapsed < part_delay / 10,
+            "superseded discovery elapsed {:?} includes the {part_delay:?} re-issue",
+            summary.requests.discovery_range.elapsed,
+        );
     }
 
     #[cfg_attr(miri, ignore)]
