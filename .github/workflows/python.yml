@@ -1,5 +1,8 @@
 on:
   pull_request:
+    paths:
+      - "python/**"
+      - ".github/workflows/python*.yml"
 
 name: Python
 

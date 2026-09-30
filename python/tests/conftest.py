@@ -48,15 +48,12 @@ def _mock_server_binary() -> str:
 
 @pytest.fixture(scope="session")
 def endpoint_url() -> Iterator[str]:
-    server = subprocess.Popen(
+    # Exiting closes the server's pipes, which stops it, and waits for it to exit.
+    with subprocess.Popen(
         [_mock_server_binary()], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True
-    )
-    assert server.stdout is not None and server.stdin is not None
-    try:
+    ) as server:
+        assert server.stdout is not None
         yield server.stdout.readline().strip()
-    finally:
-        server.stdin.close()
-        server.wait(timeout=10)
 
 
 @pytest.fixture(scope="session")
