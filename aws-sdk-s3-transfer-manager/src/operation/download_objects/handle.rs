@@ -44,7 +44,7 @@ impl DownloadObjectsHandle {
                 .cancel_transfer(ctx.id)
                 .wait_for_idle()
                 .await;
-            let err = ctx.take_error().expect("failed transfer must have error");
+            let err = ctx.error().expect("failed transfer must have error");
             // The per-object failures would otherwise be unreachable on the Err
             // path; attach them so a caller can inspect what failed under Abort.
             return Err(err.with_failed_downloads(self.transfer.take_failed().unwrap_or_default()));
