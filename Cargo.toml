@@ -8,4 +8,4 @@ members = [
     "benches",
     "integration-tests"
 ]
-exclude = ["fuzz"]
+exclude = ["fuzz", "python"]

@@ -1,0 +1,7 @@
+.venv/
+dist/
+*.so
+*.pyd
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/

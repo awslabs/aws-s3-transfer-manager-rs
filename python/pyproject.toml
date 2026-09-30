@@ -1,0 +1,70 @@
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "aws-s3-transfer"
+description = "An experimental high-performance transfer manager for Amazon S3"
+readme = "README.md"
+license = "Apache-2.0"
+authors = [{ name = "Amazon Web Services" }]
+requires-python = ">=3.11"
+keywords = ["aws", "amazon", "s3", "transfer-manager"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Developers",
+    "Framework :: AsyncIO",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
+    "Programming Language :: Rust",
+    "Typing :: Typed",
+]
+dynamic = ["version"]
+
+[project.urls]
+Repository = "https://github.com/awslabs/aws-s3-transfer-manager-rs"
+Issues = "https://github.com/awslabs/aws-s3-transfer-manager-rs/issues"
+
+[dependency-groups]
+dev = [
+    "boto3>=1.35",
+    "maturin>=1.9,<2",
+    "mypy>=1.15",
+    "pytest>=8",
+    "pytest-timeout>=2.3",
+    "ruff>=0.11",
+]
+
+[tool.maturin]
+python-source = "python"
+module-name = "aws_s3_transfer._core"
+strip = true
+exclude = [
+    { path = "**/__pycache__/**", format = "wheel" },
+    { path = "dist/**", format = "sdist" },
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+timeout = 120
+
+[tool.mypy]
+strict = true
+files = ["python", "tests"]
+
+[[tool.mypy.overrides]]
+module = ["boto3", "botocore.*"]
+ignore_missing_imports = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["python", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
