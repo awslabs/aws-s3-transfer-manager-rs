@@ -32,9 +32,14 @@ download_objects        --+         `----> Ended -------+     lossy)
 
 ### Report the identity and outcome of each entry
 
+`aws s3 sync` draws progress by overwriting one line with a carriage return, unreadable once the output
+is a log file, and its `--no-progress` flag then prints nothing at all. The standing request is a third
+mode that logs one line per object as it transfers — `aws/aws-cli#4190`, open since 2019. That consumer
+wants the name of each object and how it ended, which is what decides this layer pushes per-entry facts
+rather than only exposing counters to poll: neither a repainting bar nor a count names an object.
+
 Each entry of an operation is announced once and, when its action is attempted, reported once more
-with a terminal outcome. A consumer keyed on identity acts on that report. An aggregate count cannot
-serve it, because the action is per object and a count names none.
+with a terminal outcome. A consumer keyed on identity acts on that report.
 
 An entry whose decision attempts nothing has no terminal to report. Its announcement is the complete
 record of it.
@@ -316,7 +321,15 @@ and collides with `TransferStatus::Completed`, which under
 [Report a terminal only when its effect has committed](#report-a-terminal-only-when-its-effect-has-committed)
 is a different fact.
 
-`TransferRef` names both ends of an entry, each an `Endpoint`:
+`TransferRef` names both ends of an entry, each an `Endpoint`, and which way the bytes move:
+
+```rust
+impl TransferRef {
+    pub fn direction(&self) -> Direction;
+    pub fn source(&self) -> &Endpoint;
+    pub fn destination(&self) -> &Endpoint;
+}
+```
 
 ```text
 Endpoint
@@ -325,6 +338,10 @@ Endpoint
 +-- Stream                    a body the caller owns and drains
 `-- Unresolved                no address this layer can know
 ```
+
+Naming both ends is what lets a consumer key its own state off the event rather than off a side map
+it maintains: the key a download read from is on the event's source, so a caller deleting each source
+as it commits never has to remember which id was which.
 
 `Unresolved` is not a placeholder for an unknown value. A download to a caller-supplied open file is
 never told that file's path, so naming one would report an address the transfer manager cannot know.
