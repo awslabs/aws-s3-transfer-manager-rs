@@ -205,7 +205,7 @@ mod tests {
     use crate::types::PartSize;
     use aws_config::Region;
     use aws_sdk_s3::config::Intercept;
-    use aws_smithy_runtime::client::http::test_util::capture_request;
+    use aws_smithy_http_client::test_util::capture_request;
 
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
