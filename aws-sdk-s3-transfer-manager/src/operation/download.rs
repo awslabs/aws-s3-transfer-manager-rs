@@ -125,10 +125,17 @@ impl Download {
 
         let (ctx, completion_rx) = TransferContext::new(handle.clone());
 
-        // A streaming download has no local path: the caller owns the body.
+        // A streaming download has no local path: the caller owns the body, so there is
+        // no destination of its own to commit to.
         let lifecycle = Self::lifecycle_for(&ctx, &input, events);
-        let transfer =
-            DownloadTransfer::new(ctx.clone(), bucket_type, input, writer, lifecycle.clone());
+        let transfer = DownloadTransfer::new(
+            ctx.clone(),
+            bucket_type,
+            input,
+            writer,
+            lifecycle.clone(),
+            None,
+        );
         if let Some(lc) = &lifecycle {
             lc.announce();
         }
@@ -178,8 +185,12 @@ impl Download {
             parent,
             events,
             None,
+            Some(transfer::CommitTarget {
+                temp: temp_path.clone(),
+                dest: dest_path,
+            }),
         )?;
-        Ok(ManagedDownloadHandle::new(inner, temp_path, dest_path))
+        Ok(ManagedDownloadHandle::new(inner, temp_path))
     }
 
     /// Orchestrate a download that writes to a caller-provided file.
@@ -202,8 +213,9 @@ impl Download {
             None,
             events,
             None,
+            None,
         )?;
-        // No temp/dest paths — caller manages the file lifecycle
+        // No temp path and nothing to commit — caller manages the file lifecycle
         Ok(ManagedDownloadHandle::new_unmanaged(inner))
     }
 
@@ -221,6 +233,7 @@ impl Download {
         parent: Option<&crate::transfer::TransferContext>,
         events: Option<EventRegistration>,
         known_size: Option<u64>,
+        commit: Option<transfer::CommitTarget>,
     ) -> Result<DownloadHandleInner, error::Error> {
         use crate::transfer::TransferContext;
 
@@ -256,8 +269,14 @@ impl Download {
         }
 
         let lifecycle = Self::lifecycle_for(&ctx, &input, events);
-        let transfer =
-            DownloadTransfer::new(ctx.clone(), bucket_type, input, writer, lifecycle.clone());
+        let transfer = DownloadTransfer::new(
+            ctx.clone(),
+            bucket_type,
+            input,
+            writer,
+            lifecycle.clone(),
+            commit,
+        );
         if let Some(lc) = &lifecycle {
             lc.announce();
         }

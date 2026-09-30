@@ -943,11 +943,15 @@ impl DownloadObjectsTransfer {
             // registering one here would announce every child twice.
             None,
             listed_size,
+            // The child commits its own bytes before it reports Completed. The orphan
+            // drain reads that status without joining, so a rename deferred to `join()`
+            // would have it report a destination that never appears.
+            Some(crate::operation::download::transfer::CommitTarget {
+                temp: temp_path.clone(),
+                dest: dest_path.clone(),
+            }),
         )?;
-        Ok((
-            ManagedDownloadHandle::new(inner, temp_path, dest_path.clone()),
-            dest_path,
-        ))
+        Ok((ManagedDownloadHandle::new(inner, temp_path), dest_path))
     }
 
     /// Merge results of child spawning back into state. Inserts each child into

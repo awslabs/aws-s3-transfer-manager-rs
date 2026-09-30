@@ -553,7 +553,7 @@ mod tests {
         let (ctx, _) = TransferContext::new(tm.handle.clone());
         let (writer, consumer) = new_recv_body();
         let transfer =
-            DownloadTransfer::new(ctx, BucketType::Standard, input, writer.clone(), None);
+            DownloadTransfer::new(ctx, BucketType::Standard, input, writer.clone(), None, None);
         (Body::new(consumer, transfer.clone()), transfer, writer)
     }
 

@@ -330,27 +330,21 @@ impl Drop for DownloadHandle {
 /// this handle does not expose a body — the transfer manager writes data
 /// directly to disk.
 ///
-/// Data is written to a temporary file (`{dest}.s3tmp.{id}`) during the
-/// transfer. On successful completion via [`join`](Self::join), the temporary
-/// file is atomically renamed to the destination path. On failure,
+/// Data is written to a temporary file (`{dest}.s3tmp.{id}`) during the transfer,
+/// and renamed to the destination path by the transfer itself, so the rename
+/// precedes the completed status rather than waiting for a join. On failure,
 /// cancellation, or drop, the temporary file is deleted.
 #[derive(Debug)]
 pub struct ManagedDownloadHandle {
     inner: DownloadHandleInner,
     temp_path: Option<std::path::PathBuf>,
-    dest_path: Option<std::path::PathBuf>,
 }
 
 impl ManagedDownloadHandle {
-    pub(crate) fn new(
-        inner: DownloadHandleInner,
-        temp_path: std::path::PathBuf,
-        dest_path: std::path::PathBuf,
-    ) -> Self {
+    pub(crate) fn new(inner: DownloadHandleInner, temp_path: std::path::PathBuf) -> Self {
         Self {
             inner,
             temp_path: Some(temp_path),
-            dest_path: Some(dest_path),
         }
     }
 
@@ -358,7 +352,6 @@ impl ManagedDownloadHandle {
         Self {
             inner,
             temp_path: None,
-            dest_path: None,
         }
     }
 
@@ -383,25 +376,16 @@ impl ManagedDownloadHandle {
 
     /// Wait for the download to complete.
     ///
-    /// On success, atomically renames the temporary file to the destination
-    /// path. On failure or cancellation, deletes the temporary file.
+    /// The rename to the destination path already happened, before the transfer set
+    /// its completed status, so a successful join has nothing left to commit. On
+    /// failure or cancellation this deletes the temporary file.
     pub async fn join(
         mut self,
     ) -> Result<crate::operation::download::output::DownloadOutput, error::Error> {
         let result = self.inner.join().await;
-
-        match &result {
-            Ok(_) => {
-                if let Err(e) = self.finalize().await {
-                    self.cleanup().await;
-                    return Err(error::from_kind(error::ErrorKind::IOError)(e));
-                }
-            }
-            Err(_) => {
-                self.cleanup().await;
-            }
+        if result.is_err() {
+            self.cleanup().await;
         }
-
         result
     }
 
@@ -437,16 +421,12 @@ impl ManagedDownloadHandle {
         self.inner.transfer.ctx().metrics()
     }
 
-    async fn finalize(&self) -> std::io::Result<()> {
-        if let (Some(temp), Some(dest)) = (&self.temp_path, &self.dest_path) {
-            // TODO: consider optional fsync before rename for durability guarantees.
-            // Without fsync, a crash between rename and OS writeback leaves a corrupt
-            // file at the destination. CRT does not fsync. Fsync of 32 GiB adds ~8s.
-            tokio::fs::rename(temp, dest).await?;
-        }
-        Ok(())
-    }
-
+    // The rename lives on the transfer, in `commit_destination`, because every path
+    // that reports the transfer reads its status and cannot join it.
+    //
+    // TODO: consider optional fsync before rename for durability guarantees. Without
+    // fsync, a crash between rename and OS writeback leaves a corrupt file at the
+    // destination. CRT does not fsync. Fsync of 32 GiB adds ~8s.
     async fn cleanup(&self) {
         if let Some(temp) = &self.temp_path {
             let _ = tokio::fs::remove_file(temp).await;
@@ -464,8 +444,13 @@ impl Drop for ManagedDownloadHandle {
                 .scheduler
                 .cancel_transfer(self.inner.transfer.id());
         }
-        if let Some(temp) = &self.temp_path {
-            let _ = std::fs::remove_file(temp);
+        // Only a transfer that did not commit still owns a temporary file. A completed
+        // download renamed it away in `commit_destination`, and unlinking unconditionally
+        // here is what let a reported-as-succeeded download lose its bytes.
+        if ctx.transfer_status() != crate::types::TransferStatus::Completed {
+            if let Some(temp) = &self.temp_path {
+                let _ = std::fs::remove_file(temp);
+            }
         }
     }
 }
@@ -513,7 +498,7 @@ mod tests {
         let (writer, consumer) = new_recv_body();
         let (ctx, completion_rx) = TransferContext::new(handle);
         let transfer =
-            DownloadTransfer::new(ctx.clone(), BucketType::Standard, input, writer, None);
+            DownloadTransfer::new(ctx.clone(), BucketType::Standard, input, writer, None, None);
 
         ctx.set_cancelled();
         ctx.signal_terminal();
@@ -554,7 +539,7 @@ mod tests {
         std::fs::write(&temp, b"partial").unwrap();
 
         let (inner, _consumer) = make_cancelled_download_inner();
-        let managed = ManagedDownloadHandle::new(inner, temp.clone(), dest.clone());
+        let managed = ManagedDownloadHandle::new(inner, temp.clone());
 
         let err = managed
             .join()
