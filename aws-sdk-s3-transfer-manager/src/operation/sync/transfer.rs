@@ -9,6 +9,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::io::key::stream::{KeyStream, StreamError};
+use crate::operation::sync::compare::{Compare, Decision, Verdict};
 use crate::operation::sync::walk::Walk;
 use crate::transfer::{IoRequest, PollWork, Transfer, TransferContext, WorkOutcome};
 
@@ -42,6 +43,24 @@ impl<S: KeyStream, D: KeyStream> fmt::Debug for SyncWork<S, D> {
     }
 }
 
+// What a run decided, by kind. Every pairing yields exactly one decision, so these sum to
+// `paired`. Grouped because a work item counts its own batch and then folds it into the run in one
+// step.
+#[derive(Debug, Default)]
+struct Decided {
+    transfers: u64,
+    deletes: u64,
+    skips: u64,
+}
+
+impl std::ops::AddAssign for Decided {
+    fn add_assign(&mut self, batch: Self) {
+        self.transfers += batch.transfers;
+        self.deletes += batch.deletes;
+        self.skips += batch.skips;
+    }
+}
+
 struct State<S: KeyStream, D: KeyStream> {
     // `None` only while a work item holds the merge. `Walk::next` needs `&mut`, and holding the
     // state lock across it would block every poll on this transfer, so the merge moves out of the
@@ -49,16 +68,34 @@ struct State<S: KeyStream, D: KeyStream> {
     walk: Option<Walk<S, D>>,
     merge_in_flight: bool,
     paired: u64,
+    decided: Decided,
+    // Set when a comparison answers something the run cannot act on.
+    plan_incomplete: bool,
+    // What the walk knew when a work item last handed it back. A work item holds the walk for as
+    // long as it runs, so the run copies the answer out as each item returns.
+    //
+    // The run adds to this flag and never overwrites it, so a hole stays reported whatever the
+    // walk says later. Overwriting would hold only if nothing ever cleared the walk's own flag,
+    // and another module could.
+    walk_plan_incomplete: bool,
     // Capped by `FAILURES_KEPT`; anything past that is counted in `failures_dropped`.
     failures: Vec<StreamError>,
     failures_dropped: u64,
 }
 
-pub(crate) struct SyncTransfer<S: KeyStream, D: KeyStream> {
+pub(crate) struct SyncTransfer<S: KeyStream, D: KeyStream>
+where
+    S::Source: 'static,
+    D::Source: 'static,
+{
     inner: Arc<Inner<S, D>>,
 }
 
-impl<S: KeyStream, D: KeyStream> Clone for SyncTransfer<S, D> {
+impl<S: KeyStream, D: KeyStream> Clone for SyncTransfer<S, D>
+where
+    S::Source: 'static,
+    D::Source: 'static,
+{
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
@@ -66,37 +103,68 @@ impl<S: KeyStream, D: KeyStream> Clone for SyncTransfer<S, D> {
     }
 }
 
-impl<S: KeyStream, D: KeyStream> fmt::Debug for SyncTransfer<S, D> {
+impl<S: KeyStream, D: KeyStream> fmt::Debug for SyncTransfer<S, D>
+where
+    S::Source: 'static,
+    D::Source: 'static,
+{
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SyncTransfer").finish_non_exhaustive()
     }
 }
 
-struct Inner<S: KeyStream, D: KeyStream> {
+struct Inner<S: KeyStream, D: KeyStream>
+where
+    S::Source: 'static,
+    D::Source: 'static,
+{
     ctx: TransferContext,
     state: Mutex<State<S, D>>,
+    // Which comparison to ask. The caller passes it in, because an upload and a download
+    // disagree about which side being newer wins.
+    comparison: &'static (dyn Compare<S::Source, D::Source> + Send + Sync),
 }
 
 impl<S, D> SyncTransfer<S, D>
 where
     S: KeyStream + Send + 'static,
     D: KeyStream + Send + 'static,
-    S::Source: Send,
-    D::Source: Send,
+    S::Source: Send + 'static,
+    D::Source: Send + 'static,
 {
-    pub(crate) fn new(ctx: TransferContext, walk: Walk<S, D>) -> Self {
+    pub(crate) fn new(
+        ctx: TransferContext,
+        walk: Walk<S, D>,
+        comparison: &'static (dyn Compare<S::Source, D::Source> + Send + Sync),
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 ctx,
+                comparison,
                 state: Mutex::new(State {
                     walk: Some(walk),
                     merge_in_flight: false,
                     paired: 0,
+                    decided: Decided::default(),
+                    plan_incomplete: false,
+                    walk_plan_incomplete: false,
                     failures: Vec::new(),
                     failures_dropped: 0,
                 }),
             }),
         }
+    }
+
+    // Whether every key was decided. Two things leave holes, and they are independent. First, a
+    // stream the walk could not finish reading. Second, a comparison the run could not act on.
+    // Either one alone means the plan has holes.
+    //
+    // The run reads both flags from its own state and never asks the walk. An absent walk answers
+    // nothing, so asking the question would let the same run report its plan as complete at one
+    // moment and incomplete at another.
+    pub(crate) fn is_plan_complete(&self) -> bool {
+        let state = self.inner.state.lock();
+        !state.plan_incomplete && !state.walk_plan_incomplete
     }
 
     pub(crate) fn poll_work(&self) -> PollWork {
@@ -186,20 +254,42 @@ where
         }
 
         let mut paired = 0u64;
+        let mut decided = Decided::default();
+        let mut deferred = false;
         let mut failures = Vec::new();
 
         for _ in 0..MERGE_BATCH {
             match walk.next().await {
-                Some(Ok(_pairing)) => paired += 1,
+                Some(Ok(pairing)) => {
+                    paired += 1;
+                    match self.inner.comparison.compare(&pairing) {
+                        Verdict::Decided(Decision::Transfer(_)) => decided.transfers += 1,
+                        Verdict::Decided(Decision::Delete(_)) => decided.deletes += 1,
+                        Verdict::Decided(Decision::Skip(_)) => decided.skips += 1,
+                        // Nothing shipped here defers, so one arriving is a defect in whatever
+                        // comparison produced it. The key is skipped and the plan is marked short
+                        // of the keys it should have covered. Sending the key or dropping it
+                        // without a word would turn the defect into either wasted bandwidth or a
+                        // file nobody was told about. Which key deferred is not recorded: what
+                        // survives here is a count and a run-level flag.
+                        Verdict::Deferred(_) => {
+                            decided.skips += 1;
+                            deferred = true;
+                        }
+                    }
+                }
                 Some(Err(err)) => failures.push(err),
                 None => break,
             }
         }
 
         let mut state = self.inner.state.lock();
+        state.walk_plan_incomplete |= !walk.is_plan_complete();
         state.walk = Some(walk);
         state.merge_in_flight = false;
         state.paired += paired;
+        state.decided += decided;
+        state.plan_incomplete |= deferred;
         for failure in failures {
             if state.failures.len() < FAILURES_KEPT {
                 state.failures.push(failure);
@@ -227,8 +317,8 @@ impl<S, D> Transfer for SyncTransfer<S, D>
 where
     S: KeyStream + Send + Sync + fmt::Debug + 'static,
     D: KeyStream + Send + Sync + fmt::Debug + 'static,
-    S::Source: Send,
-    D::Source: Send,
+    S::Source: Send + 'static,
+    D::Source: Send + 'static,
 {
     fn ctx(&self) -> &TransferContext {
         &self.inner.ctx
@@ -266,6 +356,7 @@ mod tests {
     use aws_smithy_mocks::{mock, mock_client, RuleMode};
 
     use crate::io::walk::{FsWalk, S3Walk};
+    use crate::operation::sync::modes::Mode;
     use crate::operation::sync::walk::{LocalAndBucket, Walker};
 
     use super::*;
@@ -322,7 +413,10 @@ mod tests {
                     .build(),
             )
             .expect("an ordinary bucket builds");
-        (SyncTransfer::new(ctx.clone(), walk), ctx)
+        (
+            SyncTransfer::new(ctx.clone(), walk, Mode::default().uploading()),
+            ctx,
+        )
     }
 
     // Drive the loop the way the scheduler does, under a deadline. A lost signal shows up as a
@@ -346,6 +440,142 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(20), run)
             .await
             .expect("the run parked: a poll answered Pending with no wake to follow")
+    }
+
+    // A comparison that never answers, so a test can reach the deferred arm. Nothing sync ships
+    // defers, so reaching the arm needs a double written here.
+    struct AlwaysDefers;
+
+    impl Compare<crate::io::walk::FsEntry, aws_sdk_s3::types::Object> for AlwaysDefers {
+        fn compare_described(
+            &self,
+            _source: crate::operation::sync::compare::Described<'_, crate::io::walk::FsEntry>,
+            _destination: crate::operation::sync::compare::Described<'_, aws_sdk_s3::types::Object>,
+        ) -> Verdict {
+            unreachable!("compare is overridden, so no arm reaches a described pair")
+        }
+
+        fn compare(
+            &self,
+            _pairing: &crate::operation::sync::walk::Pairing<
+                crate::io::walk::FsEntry,
+                aws_sdk_s3::types::Object,
+            >,
+        ) -> Verdict {
+            Verdict::Deferred(crate::operation::sync::compare::Deferred {})
+        }
+    }
+
+    // Every pairing produces exactly one decision, so the three counts account for every key the
+    // merge paired. A key counted twice or not at all would show here.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn every_pairing_yields_exactly_one_decision() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        a_local_tree(dir.path(), &["a.txt", "b.txt", "nested/c.txt"]);
+        let (transfer, _ctx) = uploading(dir.path(), &["b.txt", "d.txt"]);
+
+        let paired = drive(&transfer).await;
+        let state = transfer.inner.state.lock();
+        assert_eq!(
+            state.decided.transfers + state.decided.deletes + state.decided.skips,
+            paired,
+            "the decisions do not account for every key that was paired"
+        );
+        assert_eq!(state.decided.deletes, 1, "d.txt is on the bucket alone");
+    }
+
+    // A verdict the run cannot act on carries two obligations. First, the run skips the key.
+    // Second, the run records the plan as incomplete. Counting the key while calling the plan
+    // complete would report a complete plan missing a key.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn a_deferred_verdict_is_skipped_and_shortens_the_plan() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        a_local_tree(dir.path(), &["a.txt", "b.txt"]);
+
+        let client = a_bucket_holding(&[]);
+        let config = crate::Config::builder().client(client.clone()).build();
+        let handle = crate::client::Handle::test_handle_tokio(config);
+        let (ctx, _rx) = TransferContext::new(handle);
+        let walk = Walker::builder()
+            .build()
+            .uploading(
+                LocalAndBucket::builder()
+                    .local_root(dir.path())
+                    .client(client)
+                    .bucket("amzn-s3-demo-bucket")
+                    .build(),
+            )
+            .expect("an ordinary bucket builds");
+        let transfer = SyncTransfer::new(ctx, walk, &AlwaysDefers);
+
+        let paired = drive(&transfer).await;
+        assert_eq!(paired, 2);
+        let state = transfer.inner.state.lock();
+        assert_eq!(state.decided.skips, 2, "a deferred key was not skipped");
+        assert_eq!(state.decided.transfers, 0);
+        assert!(
+            state.plan_incomplete,
+            "the plan is short two keys and does not say so"
+        );
+    }
+
+    // The two flags are independent, and either alone leaves the plan short.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn the_plan_is_whole_only_when_neither_flag_is_set() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let (transfer, _ctx) = uploading(dir.path(), &[]);
+
+        for (mine, walks, whole) in [
+            (false, false, true),
+            (true, false, false),
+            (false, true, false),
+            (true, true, false),
+        ] {
+            {
+                let mut state = transfer.inner.state.lock();
+                state.plan_incomplete = mine;
+                state.walk_plan_incomplete = walks;
+            }
+            assert_eq!(
+                transfer.is_plan_complete(),
+                whole,
+                "a deferred verdict of {mine} and an unread stream of {walks} answered wrongly"
+            );
+        }
+    }
+
+    // The answer is about the plan, not about what is happening right now, so taking the merge away
+    // for a work item must not change it.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn taking_the_merge_away_does_not_change_the_answer() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        a_local_tree(dir.path(), &["a.txt"]);
+        let (transfer, _ctx) = uploading(dir.path(), &[]);
+
+        let before = transfer.is_plan_complete();
+        let mut work = match transfer.poll_work() {
+            PollWork::Ready { io, .. } => io,
+            other => panic!("expected a work item, got {other:?}"),
+        };
+        assert!(
+            transfer.inner.state.lock().walk.is_none(),
+            "the merge is still in state, so nothing was taken away"
+        );
+        assert_eq!(
+            transfer.is_plan_complete(),
+            before,
+            "the answer changed while a work item held the merge"
+        );
+
+        transfer.execute(&mut work).await;
+        assert!(
+            transfer.is_plan_complete(),
+            "a clean run reported a short plan"
+        );
     }
 
     #[cfg_attr(miri, ignore)]
@@ -394,7 +624,7 @@ mod tests {
                     .build(),
             )
             .expect("an ordinary bucket builds");
-        let transfer = SyncTransfer::new(ctx, walk);
+        let transfer = SyncTransfer::new(ctx, walk, Mode::default().uploading());
 
         assert_eq!(
             drive(&transfer).await,
@@ -405,6 +635,13 @@ mod tests {
             transfer.inner.state.lock().failures.len(),
             1,
             "the run ended without keeping what it could not account for"
+        );
+        // The walk sets its own flag for this, so the plan is short by the key nobody could
+        // describe. This is the half the four-case table cannot reach: that one sets both flags by
+        // hand, so it proves how they combine and not where either value came from.
+        assert!(
+            !transfer.is_plan_complete(),
+            "a key the listing described badly left the plan looking whole"
         );
     }
 
@@ -468,7 +705,7 @@ mod tests {
                     .build(),
             )
             .expect("an ordinary bucket builds");
-        let transfer = SyncTransfer::new(ctx.clone(), walk);
+        let transfer = SyncTransfer::new(ctx.clone(), walk, Mode::default().uploading());
 
         ctx.handle
             .scheduler
@@ -543,7 +780,7 @@ mod tests {
                     .build(),
             )
             .expect("an ordinary bucket builds");
-        let transfer = SyncTransfer::new(ctx, walk);
+        let transfer = SyncTransfer::new(ctx, walk, Mode::default().uploading());
 
         let mut work = match transfer.poll_work() {
             PollWork::Ready { io, .. } => io,
