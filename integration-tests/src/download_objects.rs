@@ -842,7 +842,7 @@ async fn test_upload_then_download_objects_roundtrip_tokio_mt() {
 // below are the regression guard for exactly that.
 // ---------------------------------------------------------------------------
 
-/// One `Decided` per object plus the root, each finishing exactly once, with
+/// One `Planned` per object plus the root, each finishing exactly once, with
 /// byte counts that match what was actually downloaded.
 #[tokio::test]
 async fn test_download_objects_events_pair_and_report_bytes() {
@@ -856,7 +856,7 @@ async fn test_download_objects_events_pair_and_report_bytes() {
         seed_bucket(&m.server, bucket, prefix, count, size).await;
 
         let dest = tempfile::tempdir().expect("tempdir");
-        // 2 per transfer (Decided + Settled) plus the root's pair, so nothing
+        // 2 per transfer (Planned + Ended) plus the root's pair, so nothing
         // is dropped for want of room and the counts below are exact.
         let (sink, mut stream) = aws_sdk_s3_transfer_manager::events::channel(
             std::num::NonZeroUsize::new(2 * (count + 1)).expect("capacity > 0"),
@@ -901,17 +901,19 @@ async fn test_download_objects_events_pair_and_report_bytes() {
                 "every event of a download_objects run decides a transfer: {ev:?}"
             );
             match ev {
-                TransferEvent::Decided { id, parent, .. } => {
+                TransferEvent::Planned(p) => {
+                    let id = p.id();
                     assert!(
-                        decided.insert(*id, dest_path).is_none(),
+                        decided.insert(id, dest_path).is_none(),
                         "id {id} announced twice"
                     );
-                    if parent.is_none() {
-                        root_id = Some(*id);
+                    if p.parent().is_none() {
+                        root_id = Some(id);
                     }
                 }
-                TransferEvent::Settled { id, outcome, .. } => {
-                    *settled.entry(*id).or_default() += 1;
+                TransferEvent::Ended(e) => {
+                    let (id, outcome) = (e.id(), e.outcome());
+                    *settled.entry(id).or_default() += 1;
                     assert!(
                         matches!(outcome, Outcome::Succeeded { .. }),
                         "id {id} must succeed, got {outcome:?}"
@@ -970,7 +972,7 @@ async fn test_download_objects_events_pair_and_report_bytes() {
     .expect("test_download_objects_events_pair_and_report_bytes timed out");
 }
 
-/// The view handed out on `Decided` is what makes per-object progress readable, and it
+/// The view handed out on `Planned` is what makes per-object progress readable, and it
 /// has to keep working after `join(self)` has consumed the operation handle.
 ///
 /// This is the one assertion that exercises the pull half of the design end to end: the
@@ -1012,11 +1014,8 @@ async fn test_download_objects_views_report_per_object_progress() {
         let collector = tokio::spawn(async move {
             let mut views = Vec::new();
             while let Some(ev) = stream.next().await {
-                if let TransferEvent::Decided {
-                    id, parent, view, ..
-                } = ev
-                {
-                    views.push((id, parent, view));
+                if let TransferEvent::Planned(p) = ev {
+                    views.push((p.id(), p.parent(), p.view().cloned()));
                 }
             }
             views
@@ -1028,7 +1027,7 @@ async fn test_download_objects_views_report_per_object_progress() {
         assert_eq!(
             count + 1,
             views.len(),
-            "one Decided per object plus the root"
+            "one Planned per object plus the root"
         );
 
         let expected_total = (count * size) as u64;
@@ -1087,7 +1086,7 @@ async fn test_download_objects_views_report_per_object_progress() {
 /// and a failed object leaves it short by exactly the bytes that never moved.
 ///
 /// This is what `examples/cp.rs --progress` renders, asserted rather than eyeballed. The
-/// root view is read at every child `Settled` — a real mid-flight moment, and one per
+/// root view is read at every child `Ended` — a real mid-flight moment, and one per
 /// object, so the sample count is fixed rather than dependent on a tick landing inside the
 /// transfer. A time-sampled version of this test would pass vacuously whenever the mock
 /// finished between ticks.
@@ -1102,7 +1101,7 @@ async fn test_download_objects_views_report_per_object_progress() {
 /// makes the shortfall reconstructible rather than merely absent.
 ///
 /// A consumer that wants a bar reaching 100% adds the abandoned payload back, per child, as
-/// `byte_total() - network_rx` at its `Settled` — the AWS CLI's
+/// `byte_total() - network_rx` at its `Ended` — the AWS CLI's
 /// `ResultRecorder._record_failure_result` arithmetic. Not asserted here: this test pins the
 /// root counter's meaning, which is what that reconstruction depends on.
 #[tokio::test]
@@ -1152,12 +1151,10 @@ async fn test_download_objects_bar_is_monotonic_and_short_by_what_never_moved() 
             let mut samples: Vec<(u64, ByteTotal)> = Vec::new();
             while let Some(ev) = stream.next().await {
                 match ev {
-                    TransferEvent::Decided {
-                        parent: None, view, ..
-                    } => root = view,
-                    TransferEvent::Settled {
-                        parent: Some(_), ..
-                    } => {
+                    TransferEvent::Planned(p) if p.parent().is_none() => {
+                        root = p.view().cloned();
+                    }
+                    TransferEvent::Ended(e) if e.parent().is_some() => {
                         if let Some(view) = &root {
                             samples.push((view.metrics().network_rx, view.byte_total()));
                         }
@@ -1279,12 +1276,10 @@ async fn test_download_objects_entry_count_reaches_its_total_with_failures() {
             let mut settled_events = 0usize;
             while let Some(ev) = stream.next().await {
                 match ev {
-                    TransferEvent::Decided {
-                        parent: None, view, ..
-                    } => root = view,
-                    TransferEvent::Settled {
-                        parent: Some(_), ..
-                    } => settled_events += 1,
+                    TransferEvent::Planned(p) if p.parent().is_none() => {
+                        root = p.view().cloned();
+                    }
+                    TransferEvent::Ended(e) if e.parent().is_some() => settled_events += 1,
                     _ => {}
                 }
             }
@@ -1400,7 +1395,7 @@ async fn test_download_objects_a_caller_can_rebuild_the_callbacks_from_the_strea
 
         let output = handle.join().await.expect("join download_objects");
 
-        // The caller's own dispatch loop: the `Decided` view is the pull handle, so the
+        // The caller's own dispatch loop: the `Planned` view is the pull handle, so the
         // numbers come off it rather than out of an event.
         let mut views: HashMap<u64, TransferView> = HashMap::new();
         let (mut initiated, mut complete, mut failed, mut cancelled) = (0u64, 0u64, 0u64, 0u64);
@@ -1417,18 +1412,17 @@ async fn test_download_objects_a_caller_can_rebuild_the_callbacks_from_the_strea
                 );
             }
             match stream.try_next() {
-                Ok(TransferEvent::Decided {
-                    id, decision, view, ..
-                }) => {
-                    if matches!(decision, Decision::Skip { .. }) {
+                Ok(TransferEvent::Planned(p)) => {
+                    if matches!(p.decision(), Decision::Skip { .. }) {
                         continue;
                     }
                     initiated += 1;
-                    if let Some(v) = view {
-                        views.insert(id, v);
+                    if let Some(v) = p.view() {
+                        views.insert(p.id(), v.clone());
                     }
                 }
-                Ok(TransferEvent::Settled { id, outcome, .. }) => {
+                Ok(TransferEvent::Ended(e)) => {
+                    let (id, outcome) = (e.id(), e.outcome());
                     if let Some(v) = views.remove(&id) {
                         last_bytes = last_bytes.max(v.metrics().network_rx);
                         files_done = files_done.max(v.entries_settled());
@@ -1550,8 +1544,8 @@ async fn test_download_objects_client_and_request_sinks_both_receive_everything(
                     && tokio::time::Instant::now() < deadline
                 {
                     match s.try_next() {
-                        Ok(TransferEvent::Decided { .. }) => decided += 1,
-                        Ok(TransferEvent::Settled { .. }) => settled += 1,
+                        Ok(TransferEvent::Planned(_)) => decided += 1,
+                        Ok(TransferEvent::Ended(_)) => settled += 1,
                         Ok(_) => {}
                         Err(aws_sdk_s3_transfer_manager::events::TryNextError::Empty) => {
                             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1592,11 +1586,11 @@ async fn test_download_objects_client_and_request_sinks_both_receive_everything(
             );
             assert_eq!(
                 expected, decided,
-                "{name} must see one Decided per entry plus the root"
+                "{name} must see one Planned per entry plus the root"
             );
             assert_eq!(
                 expected, settled,
-                "{name} must see one Settled per entry plus the root"
+                "{name} must see one Ended per entry plus the root"
             );
         }
 
@@ -1641,12 +1635,10 @@ async fn test_download_objects_reports_events_via_the_input_builder() {
             let mut children = 0usize;
             while let Some(ev) = stream.next().await {
                 match ev {
-                    TransferEvent::Decided {
-                        parent: None, view, ..
-                    } => root = view,
-                    TransferEvent::Settled {
-                        parent: Some(_), ..
-                    } => children += 1,
+                    TransferEvent::Planned(p) if p.parent().is_none() => {
+                        root = p.view().cloned();
+                    }
+                    TransferEvent::Ended(e) if e.parent().is_some() => children += 1,
                     _ => {}
                 }
             }
@@ -1732,7 +1724,7 @@ async fn test_download_objects_a_consumer_reaches_full_progress_by_banking_faile
             .expect("initiate download_objects");
 
         // The consumer the design describes: a per-entry map keyed on id, populated from
-        // `Decided` and read on `Settled`. Exactly the map a CLI already keeps for its
+        // `Planned` and read on `Ended`. Exactly the map a CLI already keeps for its
         // per-file output lines, so the arithmetic costs it no extra state.
         let collector = tokio::spawn(async move {
             let mut live: HashMap<u64, aws_sdk_s3_transfer_manager::types::TransferView> =
@@ -1745,22 +1737,16 @@ async fn test_download_objects_a_consumer_reaches_full_progress_by_banking_faile
 
             while let Some(ev) = stream.next().await {
                 match ev {
-                    TransferEvent::Decided {
-                        id, parent, view, ..
-                    } => match parent {
-                        None => root = view,
+                    TransferEvent::Planned(p) => match p.parent() {
+                        None => root = p.view().cloned(),
                         Some(_) => {
-                            if let Some(v) = view {
-                                live.insert(id, v);
+                            if let Some(v) = p.view() {
+                                live.insert(p.id(), v.clone());
                             }
                         }
                     },
-                    TransferEvent::Settled {
-                        id,
-                        parent: Some(_),
-                        ..
-                    } => {
-                        if let Some(v) = live.remove(&id) {
+                    TransferEvent::Ended(e) if e.parent().is_some() => {
+                        if let Some(v) = live.remove(&e.id()) {
                             at_settle.push((v.byte_total(), v.metrics().network_rx));
                             retained.push(v);
                         }
@@ -1865,7 +1851,7 @@ async fn test_download_objects_a_consumer_reaches_full_progress_by_banking_faile
             "the sum over entries equals the root's numerator at quiescence"
         );
 
-        // A reading taken at `Settled` is already final for that entry: re-reading the same
+        // A reading taken at `Ended` is already final for that entry: re-reading the same
         // views after `join()` returns gives the same numbers. This is what lets a consumer
         // bank the shortfall once, at the terminal, instead of re-scanning every entry.
         let after: Vec<(ByteTotal, u64)> = retained
@@ -1926,11 +1912,10 @@ async fn test_download_objects_does_not_seal_an_entry_total_when_listing_never_r
         let collector = tokio::spawn(async move {
             let mut root = None;
             while let Some(ev) = stream.next().await {
-                if let TransferEvent::Decided {
-                    parent: None, view, ..
-                } = ev
-                {
-                    root = view;
+                if let TransferEvent::Planned(p) = ev {
+                    if p.parent().is_none() {
+                        root = p.view().cloned();
+                    }
                 }
             }
             root
@@ -2022,14 +2007,12 @@ async fn test_download_objects_events_report_per_object_failure() {
                 other => panic!("a download reads from S3, got {other:?}"),
             };
             match ev {
-                TransferEvent::Decided { .. } => announced += 1,
-                TransferEvent::Settled {
-                    outcome, parent, ..
-                } => {
+                TransferEvent::Planned(_) => announced += 1,
+                TransferEvent::Ended(e) => {
                     finished += 1;
-                    match outcome {
+                    match e.outcome() {
                         Outcome::Failed { .. } => failed_keys.push(key),
-                        Outcome::Succeeded { .. } if parent.is_some() => succeeded += 1,
+                        Outcome::Succeeded { .. } if e.parent().is_some() => succeeded += 1,
                         _ => {}
                     }
                 }
@@ -2131,8 +2114,8 @@ async fn test_download_objects_events_abandoned_entries_still_settle() {
 
         // Pairing: every announced id settles exactly once. The sweep announces and
         // finishes an abandoned entry in one step, so a swept key contributes one of
-        // each; the two-lock reorder bug (a late Decided landing in a drained map)
-        // would surface here as a Decided with no Settled.
+        // each; the two-lock reorder bug (a late Planned landing in a drained map)
+        // would surface here as a Planned with no Ended.
         let mut decided: HashMap<u64, bool> = HashMap::new();
         let mut settled: HashMap<u64, usize> = HashMap::new();
         // Completeness: the distinct S3 keys of child events. This is the sweep's
@@ -2145,17 +2128,18 @@ async fn test_download_objects_events_abandoned_entries_still_settle() {
                 other => panic!("a download reads from S3, got {other:?}"),
             };
             match ev {
-                TransferEvent::Decided { id, parent, .. } => {
+                TransferEvent::Planned(p) => {
+                    let id = p.id();
                     assert!(
-                        decided.insert(*id, parent.is_some()).is_none(),
+                        decided.insert(id, p.parent().is_some()).is_none(),
                         "id {id} announced twice"
                     );
-                    if parent.is_some() {
+                    if p.parent().is_some() {
                         child_keys.insert(key);
                     }
                 }
-                TransferEvent::Settled { id, .. } => {
-                    *settled.entry(*id).or_default() += 1;
+                TransferEvent::Ended(e) => {
+                    *settled.entry(e.id()).or_default() += 1;
                 }
                 _ => {}
             }
@@ -2192,9 +2176,7 @@ async fn test_download_objects_events_abandoned_entries_still_settle() {
         let root_view = events
             .iter()
             .find_map(|ev| match ev {
-                TransferEvent::Decided {
-                    parent: None, view, ..
-                } => view.clone(),
+                TransferEvent::Planned(p) if p.parent().is_none() => p.view().cloned(),
                 _ => None,
             })
             .expect("the root announces itself, and it carries a view");

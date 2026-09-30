@@ -286,7 +286,7 @@ struct DownloadObjectsTransferInner {
     lifecycle: Mutex<Option<Arc<crate::events::TransferLifecycle>>>,
     /// One lifecycle per announced child, removed by whichever of reap or
     /// `finish_root` reaches it first. A child left here at the root's terminal
-    /// was announced and never reaped, and `finish_root` owes it a `Settled`.
+    /// was announced and never reaped, and `finish_root` owes it a `Ended`.
     child_lifecycles: Mutex<HashMap<TransferId, Arc<crate::events::TransferLifecycle>>>,
 }
 
@@ -337,7 +337,7 @@ impl DownloadObjectsTransfer {
     ///
     /// A child whose orchestration failed is announced too, then finished
     /// immediately: it is a real fact about a real key, and suppressing it would
-    /// make `Decided` and `Settled` counts disagree for a reason a consumer
+    /// make `Planned` and `Ended` counts disagree for a reason a consumer
     /// cannot see. It gets no entry in the child map because there is nothing to
     /// reap.
     /// `batch_sink` is the sink cloned when this batch was claimed, used only if the root has
@@ -356,7 +356,7 @@ impl DownloadObjectsTransfer {
         // still live and the insert into `child_lifecycles` are one critical section.
         //
         // Cloning the root and releasing first admits this interleaving, which loses a
-        // `Settled` for good:
+        // `Ended` for good:
         //
         //   A (walk thread, announce_child)      B (terminal path, finish_root)
         //   ---------------------------------    -----------------------------------
@@ -365,7 +365,7 @@ impl DownloadObjectsTransfer {
         //   .                                    lock child_lifecycles, drain (empty)
         //   .                                    unlock
         //   .                                    lock lifecycle, take -> None
-        //   .                                    unlock; root Settled emitted
+        //   .                                    unlock; root Ended emitted
         //   lock child_lifecycles, insert        .
         //   unlock  <-- nothing drains this map again
         //
@@ -380,7 +380,7 @@ impl DownloadObjectsTransfer {
         // below stops compiling instead, which is the failure we want for an edit that breaks the
         // invariant that this decision and the sink choice are the same instant.
         //
-        // Whether the root is still live decides where the `Settled` comes from, not whether
+        // Whether the root is still live decides where the `Ended` comes from, not whether
         // there is one. A live root means `finish_root` has not run, so the orphan drain will
         // still read `child_lifecycles` and owes this child its terminal. A taken root means
         // that drain has already happened and will not happen again, so this child must finish
@@ -431,7 +431,7 @@ impl DownloadObjectsTransfer {
                     // orphan drain: that drain runs at the root's terminal and can find a child
                     // that already succeeded, but this child was spawned microseconds ago and
                     // the cascade that took the root cancels it next. Inserting instead would
-                    // put it in a map nothing reads again, costing it the `Settled` its
+                    // put it in a map nothing reads again, costing it the `Ended` its
                     // `announce` above already owes.
                     self.inner.ctx.metrics.record_entry_settled();
                     emit.send();
@@ -456,7 +456,7 @@ impl DownloadObjectsTransfer {
                 );
                 lc.announce();
                 if let Some(emit) = lc.finish(crate::events::Outcome::Failed { error: e.clone() }) {
-                    // Settled without ever being a child: orchestration failed. Still one of
+                    // Ended without ever being a child: orchestration failed. Still one of
                     // the enumerated entries, and still no longer pending.
                     self.inner.ctx.metrics.record_entry_settled();
                     emit.send();
@@ -469,7 +469,7 @@ impl DownloadObjectsTransfer {
     ///
     /// `check_terminal` abandons `pending_entries` on the cancel/failure branch:
     /// once the transfer is inactive the ladder never spawns them, so they reach
-    /// no child and no `Settled`, which is indistinguishable to a consumer from
+    /// no child and no `Ended`, which is indistinguishable to a consumer from
     /// the transfer having had fewer objects than it listed. Draining is
     /// idempotent, so this is safe from more than one terminal site.
     ///
@@ -552,7 +552,7 @@ impl DownloadObjectsTransfer {
     ///
     /// The root's terminal is the only place that can discharge children which were
     /// announced but never reaped -- under `Abort` those children are cancelled with
-    /// their handles dropped, so no reap runs and their `Settled` would otherwise
+    /// their handles dropped, so no reap runs and their `Ended` would otherwise
     /// never be emitted. Releasing the sink clones is what lets the stream end.
     ///
     /// Emits are pushed onto `out` rather than sent, and the root's goes last, so a
@@ -1085,7 +1085,7 @@ impl DownloadObjectsTransfer {
                     "download_objects terminal (cancelled/failed), signaling",
                 );
                 // Children are provably empty on this branch (the gate above), so
-                // only listed-but-unspawned entries can still be owed a Settled.
+                // only listed-but-unspawned entries can still be owed a Ended.
                 self.record_abandoned_entries(state, out);
                 self.inner.ctx.signal_terminal();
                 self.finish_root(state, crate::events::Outcome::Cancelled {}, out);
@@ -1779,8 +1779,8 @@ mod tests {
         let mut settled = 0;
         while let Some(ev) = stream.next().await {
             match ev {
-                crate::events::TransferEvent::Decided { .. } => decided += 1,
-                crate::events::TransferEvent::Settled { .. } => settled += 1,
+                crate::events::TransferEvent::Planned(_) => decided += 1,
+                crate::events::TransferEvent::Ended(_) => settled += 1,
             }
         }
         assert_eq!(
@@ -1853,8 +1853,8 @@ mod tests {
         let mut settled = 0;
         while let Some(ev) = stream.next().await {
             match ev {
-                crate::events::TransferEvent::Decided { .. } => decided += 1,
-                crate::events::TransferEvent::Settled { .. } => settled += 1,
+                crate::events::TransferEvent::Planned(_) => decided += 1,
+                crate::events::TransferEvent::Ended(_) => settled += 1,
             }
         }
         assert_eq!(

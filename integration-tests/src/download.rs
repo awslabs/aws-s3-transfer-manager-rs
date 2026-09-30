@@ -327,7 +327,7 @@ async fn test_download_write_to_file() {
 /// Covered as a table over every single-object download entry point rather than as one
 /// test for the one that was broken, because the defect is *per entry point* and a fourth
 /// would be just as silent. A single-object transfer is one entry, so the shape is the same
-/// for all of them: one `Decided` with no parent carrying a view, one `Settled` succeeding, and
+/// for all of them: one `Planned` with no parent carrying a view, one `Ended` succeeding, and
 /// the view's counter reaching the object size.
 ///
 /// `InitiateWith` is the fourth, and it was silent for the same reason with a different cause:
@@ -407,7 +407,7 @@ async fn test_download_single_object_entry_points_all_report_events() {
             }
         }
 
-        // A single-object transfer's `Settled` is emitted from `on_terminal`, which the
+        // A single-object transfer's `Ended` is emitted from `on_terminal`, which the
         // scheduler runs *after* `join()` has returned — `signal_terminal` wakes the joiner
         // first. So a consumer-facing fact: `join()` returning does not mean the terminal
         // event has been delivered. Polled with a deadline rather than awaiting stream
@@ -420,15 +420,11 @@ async fn test_download_single_object_entry_points_all_report_events() {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         while settled == 0 && tokio::time::Instant::now() < deadline {
             match stream.try_next() {
-                Ok(TransferEvent::Decided {
-                    parent: None,
-                    view: v,
-                    ..
-                }) => {
+                Ok(TransferEvent::Planned(p)) if p.parent().is_none() => {
                     decided += 1;
-                    view = v;
+                    view = p.view().cloned();
                 }
-                Ok(TransferEvent::Settled { parent: None, .. }) => settled += 1,
+                Ok(TransferEvent::Ended(e)) if e.parent().is_none() => settled += 1,
                 Ok(_) => continue,
                 // Empty: the terminal has not been emitted yet. Disconnected: every sink is
                 // gone, so nothing more is coming and the loop should stop.
@@ -441,9 +437,9 @@ async fn test_download_single_object_entry_points_all_report_events() {
 
         assert_eq!(
             1, decided,
-            "{variant:?}: a registered sink must receive exactly one Decided"
+            "{variant:?}: a registered sink must receive exactly one Planned"
         );
-        assert_eq!(1, settled, "{variant:?}: and exactly one Settled");
+        assert_eq!(1, settled, "{variant:?}: and exactly one Ended");
         let view = view.unwrap_or_else(|| panic!("{variant:?}: a real transfer owes a view"));
         assert_eq!(
             size as u64,
@@ -951,7 +947,7 @@ async fn test_download_bytes_streamed_conserves_against_network_rx() {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while view.is_none() && tokio::time::Instant::now() < deadline {
         match stream.try_next() {
-            Ok(TransferEvent::Decided { view: Some(v), .. }) => view = Some(v),
+            Ok(TransferEvent::Planned(p)) if p.view().is_some() => view = p.view().cloned(),
             Ok(_) => continue,
             Err(aws_sdk_s3_transfer_manager::events::TryNextError::Empty) => {
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1009,7 +1005,7 @@ async fn test_upload_leaves_bytes_streamed_at_zero() {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while view.is_none() && tokio::time::Instant::now() < deadline {
         match stream.try_next() {
-            Ok(TransferEvent::Decided { view: Some(v), .. }) => view = Some(v),
+            Ok(TransferEvent::Planned(p)) if p.view().is_some() => view = p.view().cloned(),
             Ok(_) => continue,
             Err(aws_sdk_s3_transfer_manager::events::TryNextError::Empty) => {
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1083,7 +1079,7 @@ async fn test_download_stalled_on_read_ahead_reports_the_reason() {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while view.is_none() && tokio::time::Instant::now() < deadline {
         match stream.try_next() {
-            Ok(TransferEvent::Decided { view: Some(v), .. }) => view = Some(v),
+            Ok(TransferEvent::Planned(p)) if p.view().is_some() => view = p.view().cloned(),
             Ok(_) => continue,
             Err(aws_sdk_s3_transfer_manager::events::TryNextError::Empty) => {
                 tokio::time::sleep(Duration::from_millis(20)).await;

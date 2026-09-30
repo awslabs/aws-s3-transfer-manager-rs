@@ -504,7 +504,7 @@ impl UploadObjectsTransfer {
     ///
     /// An entry whose orchestration failed is announced too, then finished
     /// immediately: it is a real fact about a real entry, and suppressing it
-    /// would make `Decided` and `Settled` counts disagree for a reason a
+    /// would make `Planned` and `Ended` counts disagree for a reason a
     /// consumer cannot see. It gets no lifecycle in the child map because there
     /// is no child to reap.
     /// `batch_sink` comes from `claim_one`, captured under the same state guard that popped this
@@ -523,7 +523,7 @@ impl UploadObjectsTransfer {
         // still live and the insert into `child_lifecycles` are one critical section.
         //
         // Cloning the root and releasing first admits this interleaving, which loses a
-        // `Settled` for good:
+        // `Ended` for good:
         //
         //   A (walk thread, announce_child)      B (terminal path, finish_root)
         //   ---------------------------------    -----------------------------------
@@ -532,7 +532,7 @@ impl UploadObjectsTransfer {
         //   .                                    lock child_lifecycles, drain (empty)
         //   .                                    unlock
         //   .                                    lock lifecycle, take -> None
-        //   .                                    unlock; root Settled emitted
+        //   .                                    unlock; root Ended emitted
         //   lock child_lifecycles, insert        .
         //   unlock  <-- nothing drains this map again
         //
@@ -541,7 +541,7 @@ impl UploadObjectsTransfer {
         // nesting is this function's lifecycle -> child_lifecycles; no path takes them in
         // the other order, so there is no inversion. `announce()` is a non-blocking
         // `try_send` with no `.await`, so holding the guard across it is bounded.
-        // Whether the root is still live decides where the `Settled` comes from, not whether
+        // Whether the root is still live decides where the `Ended` comes from, not whether
         // there is one. A live root means `finish_root` has not run, so the orphan drain will
         // still read `child_lifecycles` and owes this child its terminal. A taken root means that
         // drain has already happened and will not happen again, so this child finishes here --
@@ -586,7 +586,7 @@ impl UploadObjectsTransfer {
                     // that already committed its object, but this child was orchestrated
                     // microseconds ago and the cascade that took the root cancels it next.
                     // Inserting instead would put it in a map nothing reads again, costing it the
-                    // `Settled` its `announce` above already owes.
+                    // `Ended` its `announce` above already owes.
                     self.inner.ctx.metrics.record_entry_settled();
                     emit.send();
                 }
@@ -606,7 +606,7 @@ impl UploadObjectsTransfer {
                 );
                 lc.announce();
                 if let Some(emit) = lc.finish(crate::events::Outcome::Failed { error: e.clone() }) {
-                    // Settled without ever being a child: orchestration failed. Still one of
+                    // Ended without ever being a child: orchestration failed. Still one of
                     // the enumerated entries, and still no longer pending.
                     self.inner.ctx.metrics.record_entry_settled();
                     emit.send();
@@ -723,12 +723,12 @@ impl UploadObjectsTransfer {
     /// First, the root's terminal is the only place that can discharge children
     /// which were announced but never reaped -- under `Abort` those children are
     /// cancelled with their handles dropped, so no reap ever runs and their
-    /// `Settled` would otherwise never be emitted. Second, the sink clones must
+    /// `Ended` would otherwise never be emitted. Second, the sink clones must
     /// be released, or the stream never ends.
     ///
     /// Emits are pushed onto `out` rather than sent, and the root's goes last.
     /// The caller sends the whole vector after releasing the state guard, which is
-    /// what makes "the root's `Settled` is the end of the operation" true: a
+    /// what makes "the root's `Ended` is the end of the operation" true: a
     /// caller that reaped children in the same pass already has their emits in
     /// `out`, so they precede the root's.
     ///
@@ -1146,7 +1146,7 @@ impl UploadObjectsTransfer {
                     Ok(k) => k.into_owned(),
                     Err(e) => {
                         // Before the policy branch, so the entry settles under `Abort`
-                        // too, and so its `Settled` precedes the root's -- `abort`
+                        // too, and so its `Ended` precedes the root's -- `abort`
                         // pushes the root's emit onto the same `out`.
                         self.settle_unprepared_entry(
                             root.as_deref(),
@@ -1901,7 +1901,7 @@ impl Transfer for UploadObjectsTransfer {
             // cancel path, where no further `poll_work` re-enters `check_terminal` to
             // sweep — so without this, a cancelled `upload_objects` emits nothing at all
             // for entries the walker had already buffered, and a consumer keying
-            // per-entry state off `Decided` holds them open forever.
+            // per-entry state off `Planned` holds them open forever.
             self.record_abandoned_entries(&mut state, &mut emits);
             UploadObjectsTransfer::finish_root(self, &state, outcome, &mut emits);
         }
@@ -2222,8 +2222,8 @@ mod tests {
         let mut settled = 0;
         while let Some(ev) = stream.next().await {
             match ev {
-                crate::events::TransferEvent::Decided { .. } => decided += 1,
-                crate::events::TransferEvent::Settled { .. } => settled += 1,
+                crate::events::TransferEvent::Planned(_) => decided += 1,
+                crate::events::TransferEvent::Ended(_) => settled += 1,
             }
         }
         assert_eq!(
@@ -3401,8 +3401,8 @@ mod tests {
         let mut settled = 0;
         while let Some(ev) = stream.next().await {
             match ev {
-                crate::events::TransferEvent::Decided { .. } => decided += 1,
-                crate::events::TransferEvent::Settled { .. } => settled += 1,
+                crate::events::TransferEvent::Planned(_) => decided += 1,
+                crate::events::TransferEvent::Ended(_) => settled += 1,
             }
         }
         assert_eq!(

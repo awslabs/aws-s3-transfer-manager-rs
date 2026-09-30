@@ -7,9 +7,9 @@
 //!
 //! An *entry* is one thing a run acts on: an object uploaded, an object
 //! downloaded, the root of a directory operation. Every entry produces one
-//! [`TransferEvent::Decided`] the moment its action is chosen, and — only if that
-//! action was attempted — one [`TransferEvent::Settled`] when the attempt ends. A
-//! skip attempts nothing, so its `Decided` is its terminal; a run that decides
+//! [`TransferEvent::Planned`] the moment its action is chosen, and — only if that
+//! action was attempted — one [`TransferEvent::Ended`] when the attempt ends. A
+//! skip attempts nothing, so its `Planned` is its terminal; a run that decides
 //! without attempting produces decisions only, which is the absence of the second
 //! event rather than a flag on the first.
 //!
@@ -18,7 +18,7 @@
 //! [`Decision`] appear on both variants, and a consumer needs no side map.
 //!
 //! **Lifecycle is pushed; quantities are pulled.** No event carries a byte count or an
-//! object count. Each [`TransferEvent::Decided`] instead hands over a
+//! object count. Each [`TransferEvent::Planned`] instead hands over a
 //! [`TransferView`](crate::types::TransferView) — a read-only handle you keep and read
 //! whenever you want to repaint. Nothing pushes a number at you.
 //!
@@ -28,11 +28,11 @@
 //! *summed from* a lossy stream is a lower bound that silently disagrees with the
 //! operation's own result, where a counter read off a view is the number the operation
 //! reports — which is why `entries_settled()` exists rather than leaving a consumer to tally
-//! `Settled` events itself.
+//! `Ended` events itself.
 //!
 //! **Two invariants carry the transport.**
 //!
-//! *At most one `Settled` per `Decided`.* Announcing an entry takes an obligation;
+//! *At most one `Ended` per `Planned`.* Announcing an entry takes an obligation;
 //! whichever of the four terminal sites claims it first wins the swap and the rest
 //! are no-ops. The status CAS answers a different question — who *transitioned* —
 //! and the two come apart, because the transitioner is often the scheduler, which
@@ -50,12 +50,12 @@
 //! /// `upload: <src> to <dest>` / `download:` / `copy:` / `delete: <dest>`.
 //! ///
 //! /// `dry_run` is the caller's own fact, not the event's: a run that attempts
-//! /// nothing produces the same `Decided` a run that attempts everything does, so
+//! /// nothing produces the same `Planned` a run that attempts everything does, so
 //! /// the events carry no mode flag for whoever chose the mode to read back.
 //! fn line(event: &TransferEvent, dry_run: bool) -> Option<String> {
 //!     let transfer = event.transfer();
-//!     // Every pattern takes `{ .. }`: that is what per-variant `#[non_exhaustive]`
-//!     // costs an external consumer, and what keeps a later field additive.
+//!     // Every pattern takes `{ .. }`: that is what `#[non_exhaustive]` costs an
+//!     // external consumer, and what keeps a later variant additive.
 //!     let verb = match event.decision() {
 //!         Decision::Delete { .. } => "delete",
 //!         // A skip prints a warning or nothing, never one of the four lines.
@@ -74,7 +74,7 @@
 //!     };
 //!     Some(match event.outcome() {
 //!         None if dry_run => format!("(dryrun) {verb}: {location}"),
-//!         // Decided, and the attempt is still to come: the line prints at `Settled`.
+//!         // Planned, and the attempt is still to come: the line prints at `Ended`.
 //!         None => return None,
 //!         Some(Outcome::Failed { error, .. }) => format!("{verb} failed: {location} {error}"),
 //!         Some(Outcome::Cancelled { .. }) => return None,
@@ -97,8 +97,10 @@
 //! fn repaint(stream: &mut TransferEventStream, root: &mut Option<TransferView>) -> Option<String> {
 //!     loop {
 //!         match stream.try_next() {
-//!             // `Decided` for the root carries the view the bar is drawn from.
-//!             Ok(TransferEvent::Decided { parent: None, view, .. }) => *root = view,
+//!             // `Planned` for the root carries the view the bar is drawn from.
+//!             Ok(TransferEvent::Planned(p)) if p.parent().is_none() => {
+//!                 *root = p.view().cloned();
+//!             }
 //!             Ok(_) => continue,
 //!             // Nothing new. The view is still live, so draw from what is already held.
 //!             Err(TryNextError::Empty) => break,
@@ -406,7 +408,7 @@ pub enum Decision {
     #[non_exhaustive]
     Delete {},
     /// Leave the entry alone. Nothing is attempted, so this decision is terminal on
-    /// arrival and no [`TransferEvent::Settled`] follows it.
+    /// arrival and no [`TransferEvent::Ended`] follows it.
     ///
     /// Hidden until `sync` produces it, which is also why its [`SkipReason`] payload is
     /// hidden — a visible variant carrying a hidden type is the inconsistency this removes.
@@ -467,69 +469,122 @@ pub enum Outcome {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum TransferEvent {
-    /// An action was decided for the entry. Exactly one per entry.
-    #[non_exhaustive]
-    Decided {
-        /// Opaque entry id, unique within the client.
-        id: u64,
-        /// The id of the directory operation this entry belongs to, or `None` when
-        /// this event *is* that operation.
-        parent: Option<u64>,
-        /// The entry, and where its two ends are.
-        transfer: TransferRef,
-        /// What was decided, and why.
-        decision: Decision,
-        /// Read-only view of this entry's byte counters, for as long as you keep it.
-        ///
-        /// `None` when the entry never became a transfer — a skip, or an entry the
-        /// operation abandoned before it could be started — so there are no counters
-        /// to read. Distinct from a live transfer sitting at zero bytes.
-        view: Option<crate::types::TransferView>,
-    },
-    /// An attempted action reached a terminal state. At most one per
-    /// [`TransferEvent::Decided`], and none at all for a decision that attempts
-    /// nothing.
-    #[non_exhaustive]
-    Settled {
-        /// Opaque entry id, matching the `Decided` this settles.
-        id: u64,
-        /// The id of the directory operation this entry belongs to, or `None` when
-        /// this event *is* that operation.
-        parent: Option<u64>,
-        /// The entry. Repeated so no consumer needs a side map.
-        transfer: TransferRef,
-        /// Repeated for the same reason: a lost `Decided` must not cost the caller
-        /// the verb it prints or the reason it reports.
-        decision: Decision,
-        /// How it ended.
-        outcome: Outcome,
-    },
+    /// An action was planned for the entry. Exactly one per entry.
+    Planned(Planned),
+    /// A planned action reached a terminal state. At most one per
+    /// [`TransferEvent::Planned`], and none at all for a plan that attempts nothing.
+    Ended(Ended),
+}
+
+/// An action was planned for one entry.
+///
+/// The fields are private and read through accessors, so a later field is additive and
+/// the representation stays free after the first release. That is also what permits an
+/// opaque id that can grow a generation without breaking a caller's pattern.
+#[derive(Debug, Clone)]
+pub struct Planned {
+    id: u64,
+    parent: Option<u64>,
+    transfer: TransferRef,
+    decision: Decision,
+    view: Option<crate::types::TransferView>,
+}
+
+impl Planned {
+    /// Opaque entry id, unique within the client.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// The id of the directory operation this entry belongs to, or `None` when this
+    /// event *is* that operation.
+    pub fn parent(&self) -> Option<u64> {
+        self.parent
+    }
+
+    /// The entry, and where its two ends are.
+    pub fn transfer(&self) -> &TransferRef {
+        &self.transfer
+    }
+
+    /// What was planned, and why.
+    pub fn decision(&self) -> &Decision {
+        &self.decision
+    }
+
+    /// Read-only view of this entry's byte counters, for as long as you keep it.
+    ///
+    /// `None` when the entry never became a transfer — a skip, or an entry the
+    /// operation abandoned before it could be started — so there are no counters to
+    /// read. Distinct from a live transfer sitting at zero bytes.
+    pub fn view(&self) -> Option<&crate::types::TransferView> {
+        self.view.as_ref()
+    }
+}
+
+/// A planned action reached a terminal state.
+///
+/// Private fields for the same reason as [`Planned`].
+#[derive(Debug, Clone)]
+pub struct Ended {
+    id: u64,
+    parent: Option<u64>,
+    transfer: TransferRef,
+    decision: Decision,
+    outcome: Outcome,
+}
+
+impl Ended {
+    /// Opaque entry id, matching the [`Planned`] this ends.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// The id of the directory operation this entry belongs to, or `None` when this
+    /// event *is* that operation.
+    pub fn parent(&self) -> Option<u64> {
+        self.parent
+    }
+
+    /// The entry. Repeated so no consumer needs a side map.
+    pub fn transfer(&self) -> &TransferRef {
+        &self.transfer
+    }
+
+    /// Repeated for the same reason: a lost [`Planned`] must not cost the caller the
+    /// verb it prints or the reason it reports.
+    pub fn decision(&self) -> &Decision {
+        &self.decision
+    }
+
+    /// How it ended.
+    pub fn outcome(&self) -> &Outcome {
+        &self.outcome
+    }
 }
 
 impl TransferEvent {
     /// The entry this event is about. Present on every variant.
     pub fn transfer(&self) -> &TransferRef {
         match self {
-            TransferEvent::Decided { transfer, .. } | TransferEvent::Settled { transfer, .. } => {
-                transfer
-            }
+            TransferEvent::Planned(e) => e.transfer(),
+            TransferEvent::Ended(e) => e.transfer(),
         }
     }
 
-    /// What was decided for the entry, and why. Present on every variant.
+    /// What was planned for the entry, and why. Present on every variant.
     pub fn decision(&self) -> &Decision {
         match self {
-            TransferEvent::Decided { decision, .. } | TransferEvent::Settled { decision, .. } => {
-                decision
-            }
+            TransferEvent::Planned(e) => e.decision(),
+            TransferEvent::Ended(e) => e.decision(),
         }
     }
 
-    /// How the attempt ended, or `None` if this event is the decision itself.
+    /// How the attempt ended, or `None` if this event is the plan itself.
     pub fn outcome(&self) -> Option<&Outcome> {
         match self {
-            TransferEvent::Decided { .. } => None,
-            TransferEvent::Settled { outcome, .. } => Some(outcome),
+            TransferEvent::Planned(_) => None,
+            TransferEvent::Ended(e) => Some(e.outcome()),
         }
     }
 }
@@ -754,7 +809,7 @@ impl std::error::Error for TryNextError {}
 /// Per-entry emitter, owning the terminal obligation.
 ///
 /// The obligation is deliberately **not** the transfer status. A status CAS says
-/// which thread won the transition; this flag says whether a `Settled` is still
+/// which thread won the transition; this flag says whether a `Ended` is still
 /// owed. They come apart in both directions: an entry refused by the failure
 /// policy has an obligation and no status, and a transfer that was never announced
 /// has a status and no obligation.
@@ -825,28 +880,28 @@ impl TransferLifecycle {
 
     /// Announce the decision and take on the terminal obligation.
     ///
-    /// The obligation is taken even if the send is dropped, so a lost `Decided`
-    /// cannot silently cancel the matching `Settled`. That keeps the two counts
+    /// The obligation is taken even if the send is dropped, so a lost `Planned`
+    /// cannot silently cancel the matching `Ended`. That keeps the two counts
     /// comparable, which is what makes a dropped event visible.
     ///
     /// A [`Decision::Skip`] takes no obligation, which is what enforces that variant's
-    /// "no `Settled` follows it": `finish` cannot answer for a lifecycle that never owed a
+    /// "no `Ended` follows it": `finish` cannot answer for a lifecycle that never owed a
     /// terminal, so no shared terminal path can emit one for an entry nothing was attempted
-    /// on. That matters to a consumer keying per-entry state off `Decided` and freeing it on
-    /// `Settled`: a terminal for an entry that was never attempted is state it never
+    /// on. That matters to a consumer keying per-entry state off `Planned` and freeing it on
+    /// `Ended`: a terminal for an entry that was never attempted is state it never
     /// allocated, and the decision alone is what tells the two shapes apart.
     /// Currently unreachable — [`new`](Self::new) constructs only `Transfer`.
     pub(crate) fn announce(&self) {
         if !matches!(self.decision, Decision::Skip { .. }) {
             self.owes_finish.store(true, Ordering::Release);
         }
-        self.sink.emit(TransferEvent::Decided {
+        self.sink.emit(TransferEvent::Planned(Planned {
             id: self.id,
             parent: self.parent,
             transfer: self.transfer.clone(),
             decision: self.decision.clone(),
             view: self.view.clone(),
-        });
+        }));
     }
 
     /// Claim the terminal obligation. Returns the emit as a value; sending is the
@@ -861,13 +916,13 @@ impl TransferLifecycle {
         Some(PendingEmit {
             sink: self.sink.clone(),
             owes_finish: self.owes_finish.clone(),
-            event: Some(TransferEvent::Settled {
+            event: Some(TransferEvent::Ended(Ended {
                 id: self.id,
                 parent: self.parent,
                 transfer: self.transfer.clone(),
                 decision: self.decision.clone(),
                 outcome,
-            }),
+            })),
         })
     }
 }
@@ -912,7 +967,7 @@ impl Drop for PendingEmit {
     ///
     /// Without this, an early `return` or a `?` on a path that has already
     /// claimed consumes the obligation with a value that never reached the
-    /// channel: `finish` returns `None` forever after, so the `Settled` is lost
+    /// channel: `finish` returns `None` forever after, so the `Ended` is lost
     /// and nothing records that it was owed. Re-arming makes the loss recoverable
     /// by the next terminal site instead.
     ///
@@ -993,14 +1048,14 @@ mod tests {
         })
     }
 
-    fn settled(transfer: TransferRef, decision: Decision, outcome: Outcome) -> TransferEvent {
-        TransferEvent::Settled {
+    fn ended(transfer: TransferRef, decision: Decision, outcome: Outcome) -> TransferEvent {
+        TransferEvent::Ended(Ended {
             id: 1,
             parent: Some(0),
             transfer,
             decision,
             outcome,
-        }
+        })
     }
 
     fn forced() -> Decision {
@@ -1013,14 +1068,14 @@ mod tests {
     fn every_printed_line_comes_from_one_event() {
         let ok = Outcome::Succeeded {};
         assert_eq!(
-            line(&settled(upload_ref(), forced(), ok.clone()), false).as_deref(),
+            line(&ended(upload_ref(), forced(), ok.clone()), false).as_deref(),
             Some("upload: ./a.txt to s3://bucket/k/a.txt"),
             "an upload's line must be printable from the event alone"
         );
 
         let down = TransferRef::download(s3("bucket", "k/a.txt"), local("./a.txt"));
         assert_eq!(
-            line(&settled(down, forced(), ok.clone()), false).as_deref(),
+            line(&ended(down, forced(), ok.clone()), false).as_deref(),
             Some("download: s3://bucket/k/a.txt to ./a.txt"),
             "a download's line must name the S3 side as the source"
         );
@@ -1035,7 +1090,7 @@ mod tests {
             destination: s3("dst", "k"),
         };
         assert_eq!(
-            line(&settled(copy, forced(), ok.clone()), false).as_deref(),
+            line(&ended(copy, forced(), ok.clone()), false).as_deref(),
             Some("copy: s3://src/k to s3://dst/k"),
             "a copy's line must name both S3 ends"
         );
@@ -1046,7 +1101,7 @@ mod tests {
             destination: s3("dst", "gone"),
         };
         assert_eq!(
-            line(&settled(del.clone(), Decision::Delete {}, ok), false).as_deref(),
+            line(&ended(del.clone(), Decision::Delete {}, ok), false).as_deref(),
             Some("delete: s3://dst/gone"),
             "a delete's line must name only the end it removes"
         );
@@ -1055,27 +1110,27 @@ mod tests {
         // the chain wraps it in `DisplayErrorContext` -- so what the line carries is
         // whatever the error prints, from the same event as the entry.
         assert_eq!(
-            line(&settled(upload_ref(), forced(), failed()), false).as_deref(),
+            line(&ended(upload_ref(), forced(), failed()), false).as_deref(),
             Some("upload failed: ./a.txt to s3://bucket/k/a.txt child operation failed"),
             "a failure must print the entry and the error from the same event"
         );
 
         // A dry run's only event is the decision, and whether the run is dry is the
         // caller's own fact, which is why nothing on the event says so.
-        let decided = TransferEvent::Decided {
+        let planned = TransferEvent::Planned(Planned {
             id: 1,
             parent: Some(0),
             transfer: upload_ref(),
             decision: forced(),
             view: None,
-        };
+        });
         assert_eq!(
-            line(&decided, true).as_deref(),
+            line(&planned, true).as_deref(),
             Some("(dryrun) upload: ./a.txt to s3://bucket/k/a.txt"),
             "a decision must print the same line without an outcome"
         );
         assert_eq!(
-            line(&decided, false),
+            line(&planned, false),
             None,
             "outside a dry run the line prints at the terminal, not the decision"
         );
@@ -1130,7 +1185,7 @@ mod tests {
         ];
 
         for (expected, transfer, decision) in cases {
-            let event = settled(transfer, decision, ok.clone());
+            let event = ended(transfer, decision, ok.clone());
             assert_eq!(
                 line(&event, false).as_deref(),
                 Some(expected),
@@ -1249,7 +1304,7 @@ mod tests {
         assert!(
             lc.finish(failed()).is_some(),
             "an abandoned claim must re-arm: otherwise the obligation is consumed \
-             by a value that never reached the channel, and the `Settled` is lost \
+             by a value that never reached the channel, and the `Ended` is lost \
              with nothing recording that it was owed"
         );
     }
@@ -1275,7 +1330,7 @@ mod tests {
 
         let ev = stream.try_next().expect("the decision reached the channel");
         assert!(
-            matches!(ev, TransferEvent::Decided { id: 7, .. }),
+            matches!(&ev, TransferEvent::Planned(p) if p.id() == 7),
             "the first event through an empty channel is the decision: {ev:?}"
         );
         assert_eq!(
@@ -1300,14 +1355,16 @@ mod tests {
     #[test]
     fn dropped_counts_a_full_channel_but_not_a_closed_one() {
         let (sink, mut stream) = channel(NonZeroUsize::new(1).unwrap());
-        let ev = || TransferEvent::Decided {
-            id: 1,
-            parent: None,
-            transfer: upload_ref(),
-            decision: Decision::Transfer {
-                reason: TransferReason::Forced {},
-            },
-            view: None,
+        let ev = || {
+            TransferEvent::Planned(Planned {
+                id: 1,
+                parent: None,
+                transfer: upload_ref(),
+                decision: Decision::Transfer {
+                    reason: TransferReason::Forced {},
+                },
+                view: None,
+            })
         };
 
         assert!(sink.emit(ev()), "the first event fits");
@@ -1347,7 +1404,7 @@ mod tests {
         let resolved =
             resolve_sink(Some(&sink), Some(sink.clone())).expect("both levels registered");
 
-        resolved.emit(TransferEvent::Settled {
+        resolved.emit(TransferEvent::Ended(Ended {
             id: 7,
             parent: Some(1),
             transfer: TransferRef::download(Endpoint::Stream {}, Endpoint::Stream {}),
@@ -1355,13 +1412,13 @@ mod tests {
                 reason: TransferReason::Forced {},
             },
             outcome: Outcome::Succeeded {},
-        });
+        }));
         drop(resolved);
         drop(sink);
 
         let mut settled = 0;
         while let Some(ev) = stream.next().await {
-            if matches!(ev, TransferEvent::Settled { .. }) {
+            if matches!(ev, TransferEvent::Ended(_)) {
                 settled += 1;
             }
         }
@@ -1386,7 +1443,7 @@ mod tests {
         let (b, mut sb) = channel(std::num::NonZeroUsize::new(8).expect("capacity > 0"));
         let merged = a.merge(b);
 
-        merged.emit(TransferEvent::Settled {
+        merged.emit(TransferEvent::Ended(Ended {
             id: 9,
             parent: None,
             transfer: TransferRef::download(Endpoint::Stream {}, Endpoint::Stream {}),
@@ -1394,7 +1451,7 @@ mod tests {
                 reason: TransferReason::Forced {},
             },
             outcome: Outcome::Succeeded {},
-        });
+        }));
         drop(merged);
 
         let count = |s: &mut TransferEventStream| {

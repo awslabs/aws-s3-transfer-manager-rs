@@ -27,7 +27,7 @@ async fn setup() -> MockTm {
 /// `initiate_with` builds a fresh fluent builder and copies only the input, so a sink was
 /// structurally unreachable through it.
 ///
-/// Asserted per arm: exactly one `Decided` carrying a view, exactly one `Settled`, and the
+/// Asserted per arm: exactly one `Planned` carrying a view, exactly one `Ended`, and the
 /// view reporting the payload on `network_tx` — the upload numerator — against a `Final` total
 /// the leaf knows from its own size hint before a byte moves.
 #[tokio::test]
@@ -75,7 +75,7 @@ async fn test_upload_single_object_entry_points_all_report_events() {
 
         handle.join().await.expect("join upload");
 
-        // `Settled` comes from `on_terminal`, which the scheduler runs after `join()` has
+        // `Ended` comes from `on_terminal`, which the scheduler runs after `join()` has
         // already returned, so this polls to a deadline rather than awaiting stream
         // termination — the handle is gone but the crate's sink clone is released later.
         let mut decided = 0usize;
@@ -84,15 +84,11 @@ async fn test_upload_single_object_entry_points_all_report_events() {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         while settled == 0 && tokio::time::Instant::now() < deadline {
             match stream.try_next() {
-                Ok(TransferEvent::Decided {
-                    parent: None,
-                    view: v,
-                    ..
-                }) => {
+                Ok(TransferEvent::Planned(p)) if p.parent().is_none() => {
                     decided += 1;
-                    view = v;
+                    view = p.view().cloned();
                 }
-                Ok(TransferEvent::Settled { parent: None, .. }) => settled += 1,
+                Ok(TransferEvent::Ended(e)) if e.parent().is_none() => settled += 1,
                 Ok(_) => continue,
                 Err(aws_sdk_s3_transfer_manager::events::TryNextError::Empty) => {
                     tokio::time::sleep(Duration::from_millis(20)).await;
@@ -103,9 +99,9 @@ async fn test_upload_single_object_entry_points_all_report_events() {
 
         assert_eq!(
             1, decided,
-            "{variant:?}: a registered sink must receive exactly one Decided"
+            "{variant:?}: a registered sink must receive exactly one Planned"
         );
-        assert_eq!(1, settled, "{variant:?}: and exactly one Settled");
+        assert_eq!(1, settled, "{variant:?}: and exactly one Ended");
         let view = view.unwrap_or_else(|| panic!("{variant:?}: a real transfer owes a view"));
         assert_eq!(
             ByteTotal::Final(size as u64),
@@ -131,8 +127,8 @@ async fn test_upload_single_object_entry_points_all_report_events() {
 ///
 /// What this rules out: a 0-byte entry that a consumer cannot distinguish from one that never
 /// started. The evidence has to be readable rather than inferable — a bar drawn from
-/// `network_tx / byte_total()` is `0 / 0` for this transfer, so the entry's own `Decided`,
-/// its `Settled { Succeeded }`, and a `Final(0)` denominator are what say "this happened and
+/// `network_tx / byte_total()` is `0 / 0` for this transfer, so the entry's own `Planned`,
+/// its `Ended { Succeeded }`, and a `Final(0)` denominator are what say "this happened and
 /// moved nothing" instead of "nothing happened".
 #[tokio::test]
 async fn test_upload_empty_object_is_observable_as_zero_bytes() {
@@ -158,16 +154,16 @@ async fn test_upload_empty_object_is_observable_as_zero_bytes() {
 
     handle.join().await.expect("join upload");
 
-    // `Settled` is emitted from `on_terminal`, which the scheduler runs after `join()` has
+    // `Ended` is emitted from `on_terminal`, which the scheduler runs after `join()` has
     // returned, so drain to a deadline rather than waiting for the stream to end.
     let mut view = None;
     let mut settled = None;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         match stream.try_next() {
-            Ok(TransferEvent::Decided { view: v, .. }) => view = v,
-            Ok(TransferEvent::Settled { outcome, .. }) => {
-                settled = Some(outcome);
+            Ok(TransferEvent::Planned(p)) => view = p.view().cloned(),
+            Ok(TransferEvent::Ended(e)) => {
+                settled = Some(e.outcome().clone());
                 break;
             }
             Ok(_) => continue,

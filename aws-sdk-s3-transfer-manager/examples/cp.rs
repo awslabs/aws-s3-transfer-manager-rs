@@ -320,8 +320,8 @@ impl Numerator {
 /// byte leaves this bar short by its whole size. Bytes from a failure mid-body do count.
 ///
 /// Reaching 100% on a run with failures is possible and this example does not do it. It
-/// costs a `HashMap<u64, TransferView>` of child views kept from `Decided`: on a child's
-/// `Settled { outcome: Failed }`, `byte_total() - metrics().network_rx` is the payload that
+/// costs a `HashMap<u64, TransferView>` of child views kept from `Planned`: on a child's
+/// `Ended { outcome: Failed }`, `byte_total() - metrics().network_rx` is the payload that
 /// will now never move, and a bar drawn against `moved + abandoned` completes. That is what
 /// the AWS CLI does (`ResultRecorder._record_failure_result`). Kept out of here so the
 /// example stays one view and one loop; a CLI wants the map anyway for its per-file lines.
@@ -404,15 +404,17 @@ async fn draw_progress(
                 // event has been handed over.
                 let Some(ev) = ev else { break };
                 match ev {
-                    TransferEvent::Decided { parent: None, view, .. } => root = view,
-                    TransferEvent::Settled { parent: Some(_), outcome, transfer, .. } => {
-                        match outcome {
+                    TransferEvent::Planned(p) if p.parent().is_none() => {
+                        root = p.view().cloned();
+                    }
+                    TransferEvent::Ended(e) if e.parent().is_some() => {
+                        match e.outcome() {
                             Outcome::Failed { error, .. } => {
                                 failed += 1;
                                 // Printed above the bar, which the next tick redraws. Erased
                                 // first for the same reason the bar is: this line lands on top
                                 // of a bar frame that is usually wider than it.
-                                println!("\r\x1b[K{} failed: {error}", transfer.source());
+                                println!("\r\x1b[K{} failed: {error}", e.transfer().source());
                             }
                             _ => ok += 1,
                         }

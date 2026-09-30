@@ -469,7 +469,7 @@ pub(crate) struct MetricsState {
     /// Entries enumerated so far, counted at the same site and under the same lock as
     /// `discovered_bytes`, from the same batch. Always 0 for a leaf.
     discovered_entries: AtomicU64,
-    /// Entries that reached a terminal state, counted where the entry's `Settled` is
+    /// Entries that reached a terminal state, counted where the entry's `Ended` is
     /// claimed rather than where its status transitions — so this equals the number of
     /// terminal events the stream would have delivered had none been dropped.
     ///
@@ -607,7 +607,7 @@ impl MetricsState {
     /// Record that one entry reached a terminal state.
     ///
     /// Called where the entry's terminal event is *claimed*, so the exactly-once swap that
-    /// makes `Settled` unique makes this count unique too, on every terminal path, without
+    /// makes `Ended` unique makes this count unique too, on every terminal path, without
     /// a second mechanism to keep in step.
     pub(crate) fn record_entry_settled(&self) {
         self.settled_entries.fetch_add(1, Ordering::Relaxed);

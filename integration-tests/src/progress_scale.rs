@@ -204,14 +204,14 @@ async fn run(
     };
     for ev in &events_seen {
         match ev {
-            TransferEvent::Decided { id, .. } => {
+            TransferEvent::Planned(p) => {
                 r.initiated += 1;
-                *init.entry(*id).or_default() += 1;
+                *init.entry(p.id()).or_default() += 1;
             }
-            TransferEvent::Settled { id, outcome, .. } => {
+            TransferEvent::Ended(e) => {
                 r.finished += 1;
-                *fin.entry(*id).or_default() += 1;
-                match outcome {
+                *fin.entry(e.id()).or_default() += 1;
+                match e.outcome() {
                     Outcome::Succeeded { .. } => r.succeeded += 1,
                     Outcome::Failed { .. } => r.failed += 1,
                     Outcome::Cancelled { .. } => r.cancelled += 1,

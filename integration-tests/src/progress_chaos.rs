@@ -592,8 +592,8 @@ async fn mv_from_todays_surface_is_safe_under_continue() {
 //
 // Delivery is bounded and lossy: the sink sends with `try_send` and nothing is
 // reserved, so `stream.dropped()` is the exact price of a consumer that reads too
-// slowly. The pairing assertion is the real test: every `Decided` must be matched
-// by exactly one `Settled` for the same id, and no id may settle twice.
+// slowly. The pairing assertion is the real test: every `Planned` must be matched
+// by exactly one `Ended` for the same id, and no id may settle twice.
 // ---------------------------------------------------------------------------
 
 use aws_sdk_s3_transfer_manager::events::{self, Outcome, TransferEvent};
@@ -610,7 +610,7 @@ struct Drained {
     double_finished: Vec<u64>,
     /// Ids announced but never finished.
     unfinished: Vec<u64>,
-    /// Settled without a matching Decided.
+    /// Ended without a matching Planned.
     orphan_finished: Vec<u64>,
     dropped: u64,
 }
@@ -693,14 +693,14 @@ async fn run_with_events(
     };
     for ev in &seen {
         match ev {
-            TransferEvent::Decided { id, .. } => {
+            TransferEvent::Planned(p) => {
                 d.initiated += 1;
-                *init_ids.entry(*id).or_default() += 1;
+                *init_ids.entry(p.id()).or_default() += 1;
             }
-            TransferEvent::Settled { id, outcome, .. } => {
+            TransferEvent::Ended(e) => {
                 d.finished += 1;
-                *fin_ids.entry(*id).or_default() += 1;
-                match outcome {
+                *fin_ids.entry(e.id()).or_default() += 1;
+                match e.outcome() {
                     Outcome::Succeeded { .. } => d.succeeded += 1,
                     Outcome::Failed { .. } => d.failed += 1,
                     Outcome::Cancelled { .. } => d.cancelled += 1,

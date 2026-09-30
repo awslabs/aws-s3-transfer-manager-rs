@@ -91,12 +91,10 @@ async fn test_upload_objects_seals_both_denominators_via_the_input_builder() {
             let mut children = 0usize;
             while let Some(ev) = stream.next().await {
                 match ev {
-                    TransferEvent::Decided {
-                        parent: None, view, ..
-                    } => root = view,
-                    TransferEvent::Settled {
-                        parent: Some(_), ..
-                    } => children += 1,
+                    TransferEvent::Planned(p) if p.parent().is_none() => {
+                        root = p.view().cloned();
+                    }
+                    TransferEvent::Ended(e) if e.parent().is_some() => children += 1,
                     _ => {}
                 }
             }
@@ -913,24 +911,23 @@ async fn test_upload_objects_events_caller_abort_settles_abandoned_entries() {
                 other => panic!("an upload writes to S3, got {other:?}"),
             };
             match ev {
-                TransferEvent::Decided {
-                    id, parent, view, ..
-                } => {
+                TransferEvent::Planned(p) => {
+                    let id = p.id();
                     assert!(
-                        decided.insert(*id, parent.is_some()).is_none(),
+                        decided.insert(id, p.parent().is_some()).is_none(),
                         "id {id} announced twice"
                     );
-                    if parent.is_some() {
+                    if p.parent().is_some() {
                         child_keys.insert(key);
-                        if view.is_none() {
+                        if p.view().is_none() {
                             viewless_children += 1;
                         }
                     } else {
-                        root_view = view.clone();
+                        root_view = p.view().cloned();
                     }
                 }
-                TransferEvent::Settled { id, .. } => {
-                    *settled.entry(*id).or_default() += 1;
+                TransferEvent::Ended(e) => {
+                    *settled.entry(e.id()).or_default() += 1;
                 }
                 _ => {}
             }
@@ -984,7 +981,7 @@ async fn test_upload_objects_events_caller_abort_settles_abandoned_entries() {
         assert_eq!(
             settled.len() as u64,
             root_view.entries_settled() + 1,
-            "the stream also carries the root's own Settled, which is not one of the entries"
+            "the stream also carries the root's own Ended, which is not one of the entries"
         );
 
         m.handle.shutdown().await.expect("shutdown");
@@ -1068,21 +1065,19 @@ async fn test_upload_objects_abort_never_reports_a_committed_object_as_cancelled
 
         let _ = handle.join().await;
 
-        // Collect every terminal with the key it names. `Settled` repeats the `TransferRef`
+        // Collect every terminal with the key it names. `Ended` repeats the `TransferRef`
         // precisely so no side map is needed here.
         let mut cancelled_keys: Vec<String> = Vec::new();
         let mut succeeded_keys: Vec<String> = Vec::new();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
         loop {
             match stream.try_next() {
-                Ok(TransferEvent::Settled {
-                    transfer, outcome, ..
-                }) => {
-                    let key = match transfer.destination() {
+                Ok(TransferEvent::Ended(e)) => {
+                    let key = match e.transfer().destination() {
                         Endpoint::S3 { key, .. } => key.to_string(),
                         _ => continue,
                     };
-                    match outcome {
+                    match e.outcome() {
                         Outcome::Cancelled { .. } => cancelled_keys.push(key),
                         Outcome::Succeeded { .. } => succeeded_keys.push(key),
                         _ => {}
@@ -1192,22 +1187,17 @@ async fn test_upload_objects_an_unpreparable_entry_still_settles() {
             let mut unresolved_failures: Vec<String> = Vec::new();
             while let Some(ev) = stream.next().await {
                 match ev {
-                    TransferEvent::Decided {
-                        parent: None, view, ..
-                    } => root = view,
-                    TransferEvent::Settled {
-                        parent: Some(_),
-                        transfer,
-                        outcome,
-                        ..
-                    } => {
+                    TransferEvent::Planned(p) if p.parent().is_none() => {
+                        root = p.view().cloned();
+                    }
+                    TransferEvent::Ended(e) if e.parent().is_some() => {
                         settled += 1;
                         // A key that never derived has no destination to name, so
                         // `Unresolved` is how this entry is distinguishable on the stream.
-                        if matches!(outcome, Outcome::Failed { .. })
-                            && matches!(transfer.destination(), Endpoint::Unresolved { .. })
+                        if matches!(e.outcome(), Outcome::Failed { .. })
+                            && matches!(e.transfer().destination(), Endpoint::Unresolved { .. })
                         {
-                            if let Endpoint::Local { path, .. } = transfer.source() {
+                            if let Endpoint::Local { path, .. } = e.transfer().source() {
                                 unresolved_failures.push(path.to_string_lossy().to_string());
                             }
                         }

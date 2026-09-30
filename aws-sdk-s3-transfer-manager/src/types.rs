@@ -349,12 +349,12 @@ pub struct TransferMetrics {
 
 /// Detached, read-only view of one transfer's live byte counters.
 ///
-/// Handed out on [`TransferEvent::Decided`](crate::events::TransferEvent::Decided). Owns
+/// Handed out on [`TransferEvent::Planned`](crate::events::TransferEvent::Planned). Owns
 /// nothing the caller can act with and borrows nothing, so it outlives the `join(self)`
 /// that consumes the operation handle. Read it whenever you repaint; nothing pushes.
 ///
 /// Drop it once that entry's
-/// [`TransferEvent::Settled`](crate::events::TransferEvent::Settled) arrives — it keeps
+/// [`TransferEvent::Ended`](crate::events::TransferEvent::Ended) arrives — it keeps
 /// one small allocation alive until then, so retaining every view of a million-object
 /// directory transfer retains a million of them.
 #[derive(Debug, Clone)]
@@ -428,7 +428,7 @@ impl TransferView {
     /// would show work remaining forever on a run with failures.
     ///
     /// Incremented at the same instant the entry's
-    /// [`TransferEvent::Settled`](crate::events::TransferEvent::Settled) is claimed, so
+    /// [`TransferEvent::Ended`](crate::events::TransferEvent::Ended) is claimed, so
     /// this is exactly what a consumer would tally from the stream if no event were ever
     /// dropped — and unlike that tally, it stays exact when events are.
     ///
