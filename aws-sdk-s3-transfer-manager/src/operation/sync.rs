@@ -15,4 +15,5 @@
 
 pub(crate) mod compare;
 pub(crate) mod modes;
+pub(crate) mod transfer;
 pub(crate) mod walk;

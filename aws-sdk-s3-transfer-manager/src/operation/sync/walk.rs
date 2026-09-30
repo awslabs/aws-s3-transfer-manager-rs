@@ -761,6 +761,7 @@ fn cost_of(err: &StreamError, root: Option<&Path>) -> Cost {
 // Only an absent root is swallowed. A root that exists and is not a directory still ends the run,
 // because nothing can be written into it either, and a root that could not be read is a permission
 // problem the caller has to hear about.
+#[derive(Debug)]
 pub(crate) struct LocalDestination {
     walk: FsWalk,
     absent: bool,
