@@ -13,7 +13,7 @@ use std::any::Any;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Wake, Waker};
 
@@ -345,7 +345,9 @@ pub(crate) type StateMachineTerminalReceiver = tokio::sync::oneshot::Receiver<()
 /// | Failed    | Yes (take once) | No               |
 /// | Cancelled | No              | No               |
 #[derive(Clone)]
-pub(crate) struct StateMachineStatus(Arc<AtomicU8>);
+pub(crate) struct StateMachineStatus(
+    crate::runtime::sync::sync::Arc<crate::runtime::sync::sync::atomic::AtomicU8>,
+);
 
 // Status constants
 const STATUS_ACTIVE: u8 = 0;
@@ -357,7 +359,9 @@ impl StateMachineStatus {
     /// Create a new status in the Active state
     #[inline]
     pub(crate) fn new() -> Self {
-        Self(Arc::new(AtomicU8::new(STATUS_ACTIVE)))
+        Self(crate::runtime::sync::sync::Arc::new(
+            crate::runtime::sync::sync::atomic::AtomicU8::new(STATUS_ACTIVE),
+        ))
     }
 
     /// Transition to Completed. Returns true if this call made the transition.
@@ -549,7 +553,7 @@ pub(crate) struct TransferContext {
     /// Transfer lifecycle status
     status: StateMachineStatus,
     /// Error storage (only used when status == Failed)
-    error: Arc<Mutex<Option<Box<error::Error>>>>,
+    error: Arc<crate::runtime::sync::Mutex<Option<Box<error::Error>>>>,
     /// Completion signal sender - signals "state machine reached terminal state"
     completion_tx: Arc<Mutex<Option<StateMachineTerminalSender>>>,
     /// Set when `poll_work` returns `Pending`, cleared by a wake or resumed poll.
@@ -816,7 +820,7 @@ impl TransferContext {
             metrics: Arc::new(MetricsState::new()),
             handle,
             status: StateMachineStatus::new(),
-            error: Arc::new(Mutex::new(None)),
+            error: Arc::new(crate::runtime::sync::Mutex::new(None)),
             completion_tx: Arc::new(Mutex::new(Some(completion_tx))),
             wake_flag: Arc::new(wake_flag::WakeFlag::new()),
             pending_state,
@@ -994,7 +998,7 @@ impl TransferContext {
     /// that explains it. Storing before the CAS would be the other way to order this
     /// and is wrong, because a losing caller would overwrite the winner's error.
     pub(crate) fn set_failed(&self, err: impl Into<error::Error>) -> bool {
-        let mut slot = self.error.lock().unwrap();
+        let mut slot = self.error.lock();
         if self.status.set_failed() {
             *slot = Some(Box::new(err.into()));
             true
@@ -1028,7 +1032,7 @@ impl TransferContext {
     /// lock cannot find it empty.
     pub(crate) fn error(&self) -> Option<error::Error> {
         if self.status.is_failed() {
-            self.error.lock().unwrap().as_ref().map(|e| (**e).clone())
+            self.error.lock().as_ref().map(|e| (**e).clone())
         } else {
             None
         }
@@ -1037,11 +1041,7 @@ impl TransferContext {
     /// Peek at the error kind if transfer failed. `None` means the transfer did not fail.
     pub(crate) fn error_kind(&self) -> Option<error::ErrorKind> {
         if self.status.is_failed() {
-            self.error
-                .lock()
-                .unwrap()
-                .as_ref()
-                .map(|e| e.kind().clone())
+            self.error.lock().as_ref().map(|e| e.kind().clone())
         } else {
             None
         }
@@ -1704,6 +1704,107 @@ mod loom_tests {
     use loom::sync::atomic::{AtomicBool, Ordering};
     use loom::sync::{Arc, Mutex};
     use loom::thread;
+
+    /// A status that reads `Failed` always has its error behind it.
+    ///
+    /// Harness over the real [`StateMachineStatus`](super::StateMachineStatus) and the
+    /// real error slot, both of which resolve to loom types under `s3_tm_loom` through
+    /// `runtime::sync`. Mirrors `TransferContext::set_failed` and `error` without
+    /// building a whole `TransferContext`, which needs a client `Handle`.
+    ///
+    /// The property: across every interleaving, a reader that observes `Failed` and then
+    /// takes the slot finds an error. Publishing the status outside the slot's lock makes
+    /// that false in the window between the two, and a reader landing there sees `Failed`
+    /// with nothing behind it — which is what let an emit site substitute a constructed
+    /// error for the real cause.
+    struct FailHarness {
+        status: super::StateMachineStatus,
+        error: Mutex<Option<u32>>,
+    }
+
+    impl FailHarness {
+        fn new() -> Self {
+            Self {
+                status: super::StateMachineStatus::new(),
+                error: Mutex::new(None),
+            }
+        }
+
+        /// `set_failed`'s ordering: the slot is held across the CAS, so the status cannot
+        /// become visible before the error that explains it.
+        fn set_failed(&self, err: u32) -> bool {
+            let mut slot = self.error.lock().unwrap();
+            if self.status.set_failed() {
+                *slot = Some(err);
+                true
+            } else {
+                false
+            }
+        }
+
+        /// `error()`'s ordering: check the status, then take the lock.
+        ///
+        /// The outer `Option` is whether the reader observed `Failed` at all; the inner
+        /// one is what the slot then held. `Some(None)` is the defect, and separating the
+        /// two is the whole point — collapsing them into one `Option` makes the defect
+        /// indistinguishable from a transfer that simply had not failed yet.
+        fn error(&self) -> Option<Option<u32>> {
+            if self.status.is_failed() {
+                Some(*self.error.lock().unwrap())
+            } else {
+                None
+            }
+        }
+    }
+
+    /// Two callers race to fail one transfer while a third reads. Whoever wins the CAS
+    /// stores the error, the loser stores nothing, and the reader never sees `Failed`
+    /// with an empty slot.
+    #[test]
+    fn set_failed_loom_publishes_status_after_its_error() {
+        loom::model(|| {
+            let h = Arc::new(FailHarness::new());
+
+            let h2 = h.clone();
+            let first = thread::spawn(move || h2.set_failed(1));
+
+            let h3 = h.clone();
+            let second = thread::spawn(move || h3.set_failed(2));
+
+            let h4 = h.clone();
+            let reader = thread::spawn(move || h4.error());
+
+            let won_first = first.join().unwrap();
+            let won_second = second.join().unwrap();
+            let seen = reader.join().unwrap();
+
+            assert!(
+                won_first ^ won_second,
+                "exactly one caller wins the CAS: first={won_first} second={won_second}"
+            );
+
+            // The reader either ran before the winner's CAS, or after it -- never between
+            // the CAS and the store, which is the interleaving the lock removes. If it
+            // observed `Failed`, the slot was populated.
+            if let Some(slot) = seen {
+                let err = slot.expect(
+                    "observed Failed with an empty error slot: the status was published \
+                     before the error that explains it",
+                );
+                assert!(
+                    err == 1 || err == 2,
+                    "a reader that saw Failed must see one of the two real errors, got {err}"
+                );
+            }
+
+            // And once every writer is done, the error is unconditionally there.
+            assert_eq!(
+                Some(true),
+                h.error().map(|slot| slot.is_some()),
+                "a Failed status must always have an error behind it"
+            );
+        });
+    }
 
     /// Harness wrapping the real `WakeFlag` with a simulated gated
     /// resource (a `Mutex<u32>` where 0 = blocked and non-zero = unblocked).
