@@ -342,6 +342,13 @@ impl ManagedThreadRuntime {
     }
 }
 
+/// How long a pooled connection may sit idle before the pool closes it.
+///
+/// S3 closes idle connections server-side. Retiring them first avoids reusing a
+/// connection the server is closing, which fails before the request is accepted
+/// and costs a retry on a fresh connection.
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// Build one connection pool with a partition per managed thread and return an
 /// HTTP client that dispatches each request through the calling thread's
 /// partition.
@@ -386,6 +393,7 @@ fn build_http_client(threads: &[ThreadHandle], options: &RuntimeHttpOptions) -> 
     });
     let pool = ConnectionPool::builder()
         .dns_resolver(dns_resolver)
+        .idle_timeout(POOL_IDLE_TIMEOUT)
         .proxy_config(ProxyConfig::from_env())
         .partitions(partitions)
         .tls_provider(Provider::Rustls(CryptoMode::AwsLc))
