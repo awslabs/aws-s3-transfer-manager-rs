@@ -2776,7 +2776,6 @@ mod tests {
         assert_eq!(0, state.children_reserved, "Drop must saturate, not panic");
     }
 
-    #[cfg_attr(miri, ignore)]
     /// A child that is mid-reap must report the outcome it actually reached.
     ///
     /// `drain_terminal_children` removes a child from `state.children` before the reap
@@ -2902,6 +2901,7 @@ mod tests {
         ids
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_reaping_batch_consume_decrements_counter() {
         let dir = tempdir().unwrap();
