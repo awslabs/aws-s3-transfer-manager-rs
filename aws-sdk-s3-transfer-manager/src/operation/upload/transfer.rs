@@ -947,18 +947,21 @@ impl UploadTransfer {
         } = completion;
         let transfer_diagnostics = self.inner.ctx.handle.config.diagnostics().transfer();
         let completion_timer = UploadDiagnosticTimer::start(transfer_diagnostics);
-        let (upload_id, snapshot) = {
+        let upload_id = {
             let state = self.inner.state.lock().expect("lock poisoned");
-            let snapshot = snapshot_state(&state);
             match &*state {
-                UploadState::CompleteInFlight { upload_id } => (upload_id.clone(), snapshot),
+                UploadState::CompleteInFlight { upload_id } => upload_id.clone(),
                 _ => panic!("unexpected state for complete_mpu"),
             }
         };
+        // The part state is held by this work item rather than by `CompleteInFlight`,
+        // so its measurements come from here.
         self.inner.observability.observe_event(
             self.inner.ctx.id,
             UploadEvent::MultipartCompletionStarted,
-            snapshot,
+            parts
+                .snapshot()
+                .with_state(UploadExecutionState::CompleteMultipartUploadInFlight),
         );
 
         let MultipartCompletion {
