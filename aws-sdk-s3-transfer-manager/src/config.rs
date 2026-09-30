@@ -235,11 +235,15 @@ impl Config {
     /// HTTP options for the runtime-provided transport, or `None` when the
     /// runtime's HTTP client would not be installed: a finished S3 client was
     /// supplied, or runtime HTTP is disabled.
-    pub(crate) fn runtime_http(&self) -> Option<crate::runtime::RuntimeHttpOptions> {
+    pub(crate) fn runtime_http(
+        &self,
+        max_connections_per_host: usize,
+    ) -> Option<crate::runtime::RuntimeHttpOptions> {
         match self.s3_client_source.as_ref()? {
             S3ClientSource::FromConfig(config) if config.enable_runtime_http => {
                 Some(crate::runtime::RuntimeHttpOptions {
                     network_interfaces: config.network_interfaces.clone(),
+                    max_connections_per_host,
                 })
             }
             _ => None,
@@ -499,14 +503,15 @@ mod tests {
                 S3ClientConfig::new(s3_config_builder()).network_interfaces(["ens5", "ens6"]),
             )
             .build();
-        let http = config.runtime_http().expect("runtime HTTP enabled");
+        let http = config.runtime_http(64).expect("runtime HTTP enabled");
         assert_eq!(http.network_interfaces, ["ens5", "ens6"]);
+        assert_eq!(http.max_connections_per_host, 64);
     }
 
     #[test]
     fn runtime_http_present_for_s3_config() {
         let config = Config::builder().s3_config(s3_config_builder()).build();
-        assert!(config.runtime_http().is_some());
+        assert!(config.runtime_http(64).is_some());
     }
 
     #[test]
@@ -514,7 +519,7 @@ mod tests {
         let disabled = Config::builder()
             .s3_config(S3ClientConfig::new(s3_config_builder()).enable_runtime_http(false))
             .build();
-        assert!(disabled.runtime_http().is_none());
+        assert!(disabled.runtime_http(64).is_none());
 
         let provided = Config::builder()
             .client(aws_sdk_s3::Client::from_conf(
@@ -523,6 +528,6 @@ mod tests {
                     .build(),
             ))
             .build();
-        assert!(provided.runtime_http().is_none());
+        assert!(provided.runtime_http(64).is_none());
     }
 }

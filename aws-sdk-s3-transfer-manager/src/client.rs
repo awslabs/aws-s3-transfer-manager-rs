@@ -294,7 +294,11 @@ impl Client {
         };
         // Runtime HTTP is built only when it will be installed on an S3 client
         // this transfer manager constructs.
-        let runtime_http = config.runtime_http();
+        let connection_cap = crate::runtime::platform::ConnectionCap::detect();
+        let runtime_http = config.runtime_http(connection_cap.max_per_host);
+        if runtime_http.is_some() && matches!(config.runtime_mode(), RuntimeMode::Managed) {
+            log_connection_cap(&connection_cap, controller.target());
+        }
         let handle = Arc::new_cyclic(|weak_handle| {
             let scheduler = Scheduler::new(weak_handle.clone());
             let runtime: Arc<dyn ExecutionRuntime> = match config.runtime_mode() {
@@ -508,6 +512,33 @@ impl Client {
         crate::operation::upload_objects::builders::UploadObjectsFluentBuilder::new(
             self.handle.clone(),
         )
+    }
+}
+
+/// Report the per-host connection cap, and warn when the descriptor limit holds
+/// it below the concurrency target.
+fn log_connection_cap(cap: &crate::runtime::platform::ConnectionCap, target: usize) {
+    let soft = cap.descriptors.map(|limit| limit.soft);
+    let hard = cap.descriptors.and_then(|limit| limit.hard);
+    if cap.limited_by_descriptors() && cap.max_per_host < target {
+        tracing::warn!(
+            target: crate::telemetry::TARGET_CONCURRENCY,
+            max_connections_per_host = cap.max_per_host,
+            concurrency_target = target,
+            soft_descriptor_limit = ?soft,
+            hard_descriptor_limit = ?hard,
+            "per-host connection cap is below the concurrency target because it is limited to half \
+             the soft file-descriptor limit (RLIMIT_NOFILE); raise the soft limit to allow more connections",
+        );
+    } else {
+        tracing::debug!(
+            target: crate::telemetry::TARGET_CONCURRENCY,
+            max_connections_per_host = cap.max_per_host,
+            concurrency_target = target,
+            soft_descriptor_limit = ?soft,
+            hard_descriptor_limit = ?hard,
+            "resolved per-host connection cap",
+        );
     }
 }
 

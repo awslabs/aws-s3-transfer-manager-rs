@@ -394,6 +394,7 @@ fn build_http_client(threads: &[ThreadHandle], options: &RuntimeHttpOptions) -> 
     let pool = ConnectionPool::builder()
         .dns_resolver(dns_resolver)
         .idle_timeout(POOL_IDLE_TIMEOUT)
+        .max_connections_per_host(options.max_connections_per_host)
         .proxy_config(ProxyConfig::from_env())
         .partitions(partitions)
         .tls_provider(Provider::Rustls(CryptoMode::AwsLc))

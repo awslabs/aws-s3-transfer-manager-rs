@@ -301,7 +301,9 @@ mod tests {
             .network_interfaces(["ens5", "ens6"])
             .load()
             .await;
-        let http = config.runtime_http().expect("loader enables runtime HTTP");
+        let http = config
+            .runtime_http(64)
+            .expect("loader enables runtime HTTP");
         assert_eq!(http.network_interfaces, ["ens5", "ens6"]);
     }
 
