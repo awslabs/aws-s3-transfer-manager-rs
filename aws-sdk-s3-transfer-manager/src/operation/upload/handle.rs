@@ -88,9 +88,6 @@ impl UploadHandle {
     /// Returns the uploaded object output on success. Returns an error
     /// when the transfer failed (with the recorded failure cause) or when
     /// the transfer was cancelled (with `ErrorKind::OperationCancelled`).
-    ///
-    /// Before reporting a failed or cancelled outcome, waits for the
-    /// transfer's executing work to stop.
     pub async fn join(mut self) -> Result<UploadOutput, Error> {
         if let Some(rx) = self.completion_rx.take() {
             let _ = rx.await;
@@ -98,15 +95,12 @@ impl UploadHandle {
 
         let ctx = self.transfer.ctx();
 
-        if ctx.is_failed() || ctx.is_cancelled() {
+        if ctx.is_failed() {
             ctx.handle
                 .scheduler
                 .cancel_transfer(ctx.id)
                 .wait_for_idle()
                 .await;
-        }
-
-        if ctx.is_failed() {
             let err = ctx.take_error().expect("failed transfer must have error");
             return Err(err);
         }
@@ -139,20 +133,21 @@ impl UploadHandle {
         let ctx = self.transfer.ctx();
 
         // Cancel the transfer and wait for idle: queued work is purged, and
-        // executing work, including an in-flight CreateMultipartUpload, is either
-        // finished or dropped by the time this returns.
+        // executing work is either finished or dropped by the time this returns.
         //
         // A CreateMultipartUpload dropped mid-flight leaves no upload ID here even
-        // if S3 created the upload; that empty upload is orphaned until a
-        // lifecycle rule removes it.
+        // if S3 created the upload; that empty upload remains until a lifecycle
+        // rule removes it. A CompleteMultipartUpload dropped mid-flight leaves the
+        // multipart upload open, so it is aborted below, but S3 may already
+        // have created the object (see #191).
         ctx.handle
             .scheduler
             .cancel_transfer(ctx.id)
             .wait_for_idle()
             .await;
 
-        // Check if we have an upload_id to abort
-        let upload_id = self.transfer.upload_id();
+        // Check if we have an open multipart upload to abort
+        let upload_id = self.transfer.open_upload_id();
 
         if let Some(upload_id) = upload_id {
             let abort_policy = self

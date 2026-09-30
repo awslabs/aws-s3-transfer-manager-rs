@@ -113,15 +113,16 @@ mod test {
     };
     use aws_smithy_runtime_api::client::orchestrator::{HttpRequest, HttpResponse};
     use aws_smithy_runtime_api::client::result::ConnectorError;
+    use aws_smithy_types::body::SdkBody;
     use bytes::Bytes;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tokio::sync::Semaphore;
 
     use crate::io::InputStream;
     use crate::metrics::unit::ByteUnit;
     use crate::operation::upload::UploadInput;
-    use crate::types::{ConcurrencyMode, PartSize, RuntimeMode};
+    use crate::types::{ConcurrencyMode, PartSize, RuntimeMode, TransferStatus};
 
     /// Connector that keeps CreateMultipartUpload active until its future is
     /// interrupted by the transfer runtime.
@@ -201,6 +202,173 @@ mod test {
     #[tokio::test]
     async fn abort_stalled_create_mpu_on_managed_runtime() {
         abort_stalled_create_mpu(RuntimeMode::Managed).await;
+    }
+
+    /// How [`CompleteMpuConnector`] answers CompleteMultipartUpload.
+    #[derive(Debug, Clone, Copy)]
+    enum CompleteMpuBehavior {
+        /// Never respond; the request stays active until interrupted.
+        Stall,
+        /// Respond with a non-retryable error.
+        Fail,
+    }
+
+    /// Connector that serves a single-part multipart upload, applies
+    /// [`CompleteMpuBehavior`] to CompleteMultipartUpload, and records the
+    /// upload ID of every AbortMultipartUpload.
+    #[derive(Debug)]
+    struct CompleteMpuConnector {
+        behavior: CompleteMpuBehavior,
+        complete_started: Arc<Semaphore>,
+        abort_uris: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl HttpConnector for CompleteMpuConnector {
+        fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
+            let uri = request.uri().to_string();
+            let has_upload_id = uri.contains("uploadId=");
+            let response = match (request.method(), has_upload_id) {
+                ("POST", false) if uri.contains("uploads") => HttpResponse::new(
+                    200.try_into().unwrap(),
+                    SdkBody::from(
+                        r#"<?xml version="1.0" encoding="UTF-8"?>
+                            <InitiateMultipartUploadResult>
+                                <Bucket>test-bucket</Bucket>
+                                <Key>test-key</Key>
+                                <UploadId>test-upload-id</UploadId>
+                            </InitiateMultipartUploadResult>"#,
+                    ),
+                ),
+                ("PUT", true) if uri.contains("partNumber=") => {
+                    let mut response = HttpResponse::new(200.try_into().unwrap(), SdkBody::empty());
+                    response.headers_mut().insert("ETag", "\"test-etag\"");
+                    response
+                }
+                ("POST", true) => {
+                    let complete_started = self.complete_started.clone();
+                    let behavior = self.behavior;
+                    return HttpConnectorFuture::new(async move {
+                        complete_started.add_permits(1);
+                        match behavior {
+                            CompleteMpuBehavior::Stall => {
+                                std::future::pending::<Result<HttpResponse, ConnectorError>>().await
+                            }
+                            CompleteMpuBehavior::Fail => Ok(HttpResponse::new(
+                                400.try_into().unwrap(),
+                                SdkBody::from(
+                                    r#"<?xml version="1.0" encoding="UTF-8"?>
+                                    <Error>
+                                        <Code>InvalidPart</Code>
+                                        <Message>One or more of the specified parts could not be found.</Message>
+                                    </Error>"#,
+                                ),
+                            )),
+                        }
+                    });
+                }
+                ("DELETE", true) => {
+                    self.abort_uris.lock().unwrap().push(uri);
+                    HttpResponse::new(204.try_into().unwrap(), SdkBody::empty())
+                }
+                _ => panic!("unexpected request: {} {uri}", request.method()),
+            };
+            HttpConnectorFuture::ready(Ok(response))
+        }
+    }
+
+    /// Abort after CompleteMultipartUpload started must still abort the upload,
+    /// whether the completion is interrupted or has already failed.
+    async fn abort_during_complete_mpu(runtime_mode: RuntimeMode, behavior: CompleteMpuBehavior) {
+        let complete_started = Arc::new(Semaphore::new(0));
+        let abort_uris = Arc::new(Mutex::new(Vec::new()));
+        let connector = SharedHttpConnector::new(CompleteMpuConnector {
+            behavior,
+            complete_started: complete_started.clone(),
+            abort_uris: abort_uris.clone(),
+        });
+        let http_client = http_client_fn(move |_, _| connector.clone());
+        let client = aws_sdk_s3::Client::from_conf(
+            aws_sdk_s3::config::Config::builder()
+                .http_client(http_client)
+                .region(aws_sdk_s3::config::Region::new("us-west-2"))
+                .with_test_defaults()
+                .build(),
+        );
+
+        let tm_config = crate::Config::builder()
+            .concurrency(ConcurrencyMode::Explicit(1))
+            .runtime_mode(runtime_mode)
+            .set_multipart_threshold(PartSize::Target(10))
+            .set_target_part_size(PartSize::Target(5 * ByteUnit::Mebibyte.as_bytes_u64()))
+            .client(client)
+            .build();
+        let tm = crate::Client::new(tm_config);
+        let handle = UploadInput::builder()
+            .bucket("test-bucket")
+            .key("test-key")
+            .body(InputStream::from(Bytes::from_static(
+                b"force multipart upload",
+            )))
+            .initiate_with(&tm)
+            .unwrap();
+
+        let permit = tokio::time::timeout(Duration::from_secs(5), complete_started.acquire())
+            .await
+            .expect("CompleteMultipartUpload did not start")
+            .expect("start semaphore closed");
+        permit.forget();
+
+        if let CompleteMpuBehavior::Fail = behavior {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while handle.status() != TransferStatus::Failed {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("upload did not fail after CompleteMultipartUpload error");
+        }
+
+        let aborted = tokio::time::timeout(Duration::from_secs(5), handle.abort())
+            .await
+            .expect("abort hung after CompleteMultipartUpload started")
+            .expect("abort failed");
+
+        let abort_uris = abort_uris.lock().unwrap();
+        assert_eq!(
+            abort_uris.len(),
+            1,
+            "expected one AbortMultipartUpload: {abort_uris:?}"
+        );
+        assert!(
+            abort_uris[0].contains("uploadId=test-upload-id"),
+            "AbortMultipartUpload for the wrong upload: {}",
+            abort_uris[0]
+        );
+        assert_eq!(aborted.upload_id(), Some("test-upload-id"));
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abort_during_complete_mpu_aborts_upload_on_tokio_runtime() {
+        abort_during_complete_mpu(RuntimeMode::MultiThreadTokio, CompleteMpuBehavior::Stall).await;
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn abort_during_complete_mpu_aborts_upload_on_managed_runtime() {
+        abort_during_complete_mpu(RuntimeMode::Managed, CompleteMpuBehavior::Stall).await;
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abort_after_failed_complete_mpu_aborts_upload_on_tokio_runtime() {
+        abort_during_complete_mpu(RuntimeMode::MultiThreadTokio, CompleteMpuBehavior::Fail).await;
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn abort_after_failed_complete_mpu_aborts_upload_on_managed_runtime() {
+        abort_during_complete_mpu(RuntimeMode::Managed, CompleteMpuBehavior::Fail).await;
     }
 
     #[cfg_attr(miri, ignore)]

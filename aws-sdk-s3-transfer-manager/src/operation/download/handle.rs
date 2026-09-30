@@ -58,9 +58,6 @@ impl DownloadHandleInner {
     }
 
     /// Core join logic: wait for completion, handle failure/cancellation/success.
-    ///
-    /// Before reporting a failed or cancelled outcome, waits for the
-    /// transfer's executing work to stop.
     pub(crate) async fn join(&mut self) -> Result<DownloadOutput, error::Error> {
         // Wait for transfer state machine to reach terminal state
         if let Some(rx) = self.completion_rx.take() {
@@ -72,17 +69,14 @@ impl DownloadHandleInner {
         let ctx = self.transfer.ctx();
         let id = self.transfer.id();
 
-        if ctx.is_failed() || ctx.is_cancelled() {
+        if ctx.is_failed() {
             tracing::debug!(tid = %ctx.id, "join: cancelling and waiting for idle");
             ctx.handle
                 .scheduler
                 .cancel_transfer(id)
                 .wait_for_idle()
                 .await;
-            tracing::debug!(tid = %ctx.id, "join: idle");
-        }
-
-        if ctx.is_failed() {
+            tracing::debug!(tid = %ctx.id, "join: idle, returning error");
             // take the actual error (only we should do this)
             let err = ctx.take_error().expect("error taken outside of join()");
             return Err(err);

@@ -176,6 +176,13 @@ impl IoRequest {
             .downcast_mut::<T>()
             .expect("work data type mismatch")
     }
+
+    /// Take the data as a concrete type, leaving the request without data.
+    /// For work whose payload `execute` consumes. Panics if wrong type or None.
+    pub(crate) fn take_data<T: 'static>(&mut self) -> T {
+        let data: Box<dyn Any> = self.data.take().expect("work item has no data");
+        *data.downcast::<T>().expect("work data type mismatch")
+    }
 }
 
 /// Result of polling a transfer for work.
