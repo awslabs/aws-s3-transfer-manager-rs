@@ -1,0 +1,56 @@
+on:
+  pull_request:
+    paths:
+      - "python/**"
+      - ".github/workflows/python*.yml"
+
+name: Python
+
+# Allow one instance of this workflow per pull request, and cancel older runs when new changes are pushed
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+env:
+  RUST_BACKTRACE: 1
+  rust_stable: stable
+
+defaults:
+  run:
+    shell: bash
+    working-directory: python
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$rust_stable" --profile minimal --component clippy,rustfmt
+          rustup default "$rust_stable"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: python -> ../target
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.11"
+      - run: cargo fmt --check
+      - run: uv sync --locked
+      - run: cargo clippy --locked --all-targets -- -D warnings
+        env:
+          PYO3_PYTHON: ${{ github.workspace }}/python/.venv/bin/python
+      - run: uv run --no-sync ruff format --check
+      - run: uv run --no-sync ruff check
+      - run: uv run --no-sync mypy
+
+  build:
+    name: build
+    uses: $/.github/workflows/python-build.yml
