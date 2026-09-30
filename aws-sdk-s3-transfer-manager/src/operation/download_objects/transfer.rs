@@ -72,7 +72,7 @@ impl std::fmt::Debug for DownloadObjectsWork {
             Self::AdvanceWalker { .. } => f.debug_struct("AdvanceWalker").finish_non_exhaustive(),
             Self::JoinChildren { batch } => f
                 .debug_struct("JoinChildren")
-                .field("count", &batch.as_ref().map(|b| b.count))
+                .field("count", &batch.as_ref().map(|b| b.ids.len()))
                 .finish(),
         }
     }
@@ -150,14 +150,16 @@ pub(crate) struct ReapingBatch {
     /// [`Self::take_children`]; the counter is still owned by the batch until
     /// `consume()` is called or `Drop` runs.
     children: Option<Vec<ChildTransfer>>,
-    count: usize,
+    /// The ids this batch owns in [`State::reaping_in_flight`], kept separately because
+    /// `take_children` moves the handles out before `consume` runs.
+    ids: Vec<TransferId>,
     consumed: bool,
 }
 
 impl fmt::Debug for ReapingBatch {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ReapingBatch")
-            .field("count", &self.count)
+            .field("count", &self.ids.len())
             .field("consumed", &self.consumed)
             .field("children_len", &self.children.as_ref().map(|c| c.len()))
             .finish_non_exhaustive()
@@ -173,20 +175,20 @@ impl ReapingBatch {
             .expect("ReapingBatch::take_children called twice or after consume")
     }
 
-    /// Caller holds `state.lock`. Decrements `reaping_in_flight` by the owned
-    /// count and marks the batch consumed.
+    /// Caller holds `state.lock`. Releases the ids this batch owns in
+    /// `reaping_in_flight` and marks the batch consumed.
     fn consume(mut self, state: &mut State) {
         debug_assert!(
             !self.consumed,
             "ReapingBatch::consume called on already-consumed batch"
         );
-        debug_assert!(
-            state.reaping_in_flight >= self.count,
-            "reaping_in_flight underflow: have {}, releasing {}",
-            state.reaping_in_flight,
-            self.count,
-        );
-        state.reaping_in_flight -= self.count;
+        for id in &self.ids {
+            let released = state.reaping_in_flight.remove(id);
+            debug_assert!(
+                released.is_some(),
+                "reaping_in_flight missing {id:?} on consume",
+            );
+        }
         self.consumed = true;
     }
 }
@@ -195,11 +197,13 @@ impl Drop for ReapingBatch {
     fn drop(&mut self) {
         if !self.consumed {
             let mut state = self.transfer.state.lock();
-            state.reaping_in_flight = state.reaping_in_flight.saturating_sub(self.count);
+            for id in &self.ids {
+                state.reaping_in_flight.remove(id);
+            }
             tracing::warn!(
                 target: crate::telemetry::TARGET_TRANSFER,
                 tid = %self.transfer.ctx.id,
-                count = self.count,
+                count = self.ids.len(),
                 "ReapingBatch dropped unconsumed; reaping_in_flight recovered"
             );
             // Children Vec (if still present) drops here. Each
@@ -246,7 +250,15 @@ struct State {
     children_reserved: usize,
 
     /// JoinChildren batches currently executing.
-    reaping_in_flight: usize,
+    /// Children drained out of `children` and not yet joined, each with the terminal
+    /// outcome it already had when it was drained.
+    ///
+    /// A map rather than a count because a mid-reap child is in neither `children` nor
+    /// `child_lifecycles`, so a sweep that only had a count could not tell it apart from
+    /// an entry that never existed and reported a complete file as cancelled. Recording
+    /// the outcome is sound because a child is drained only once it is no longer
+    /// `Active`, so what is recorded here is already final.
+    reaping_in_flight: std::collections::HashMap<TransferId, crate::events::Outcome>,
 
     /// Failed downloads (for FailedTransferPolicy::Continue).
     failed: Vec<FailedDownload>,
@@ -316,7 +328,7 @@ impl DownloadObjectsTransfer {
                     pending_entries: std::collections::VecDeque::new(),
                     children: HashMap::new(),
                     children_reserved: 0,
-                    reaping_in_flight: 0,
+                    reaping_in_flight: std::collections::HashMap::new(),
                     failed: Vec::new(),
                     successful_downloads: 0,
                 }),
@@ -589,7 +601,16 @@ impl DownloadObjectsTransfer {
             // discard a file that is complete on disk.
             let child_outcome = match state.children.get(&child_id) {
                 Some(child) => child.handle.terminal_outcome(),
-                None => crate::events::Outcome::Cancelled {},
+                // Mid-reap: drained out of `children` and not yet joined, so this map is
+                // the only place its outcome still exists. Falling straight through to
+                // `Cancelled` is what reported files that are complete on disk as
+                // cancelled, telling a sync consumer to fetch them again and a cleanup
+                // consumer to delete them.
+                None => state
+                    .reaping_in_flight
+                    .get(&child_id)
+                    .cloned()
+                    .unwrap_or(crate::events::Outcome::Cancelled {}),
             };
             if let Some(emit) = lc.finish(child_outcome) {
                 // An orphan discharged here settles like any other entry. Under `Abort` this
@@ -746,16 +767,19 @@ impl DownloadObjectsTransfer {
             remaining_children = state.children.len(),
             "download_objects draining terminal children",
         );
-        let count = batch.len();
-        // Reserve reaping_in_flight by the child count (not 1 per batch): the
-        // terminal-check guards compare reaping_in_flight == 0, so the counter
-        // must track children in flight, released 1:1 by the batch's consume()
-        // or Drop.
-        state.reaping_in_flight += count;
+        // Recorded per child, not as a count: the terminal-check guards ask whether any
+        // reap is in flight, and the orphan sweep asks about one specific child, which a
+        // count cannot answer. Released 1:1 by the batch's consume() or Drop.
+        let ids: Vec<TransferId> = batch.iter().map(|c| c.handle.transfer_id()).collect();
+        for (id, child) in ids.iter().zip(batch.iter()) {
+            state
+                .reaping_in_flight
+                .insert(*id, child.handle.terminal_outcome());
+        }
         Some(ReapingBatch {
             transfer: self.inner.clone(),
             children: Some(batch),
-            count,
+            ids,
             consumed: false,
         })
     }
@@ -1073,7 +1097,7 @@ impl DownloadObjectsTransfer {
             // Wait for all in-flight work to drain
             if state.children.is_empty()
                 && state.children_reserved == 0
-                && state.reaping_in_flight == 0
+                && state.reaping_in_flight.is_empty()
                 && !state.walk_in_flight
             {
                 tracing::debug!(
@@ -1102,7 +1126,7 @@ impl DownloadObjectsTransfer {
             && state.pending_entries.is_empty()
             && state.children.is_empty()
             && state.children_reserved == 0
-            && state.reaping_in_flight == 0
+            && state.reaping_in_flight.is_empty()
         {
             tracing::debug!(
                 target: crate::telemetry::TARGET_TRANSFER,
@@ -2753,6 +2777,131 @@ mod tests {
     }
 
     #[cfg_attr(miri, ignore)]
+    /// A child that is mid-reap must report the outcome it actually reached.
+    ///
+    /// `drain_terminal_children` removes a child from `state.children` before the reap
+    /// claims its outcome, so between those two points it is in neither `children` nor
+    /// `child_lifecycles`. A sweep that looked it up found nothing and fell through to
+    /// `Cancelled` — for a file that is complete on disk at exactly the path the event
+    /// names. A sync consumer re-downloads it; a cleanup consumer deletes it as partial
+    /// garbage.
+    ///
+    /// The window is constructed rather than raced for: `drain_terminal_children` is
+    /// called directly, which is the same state a concurrent sweep would observe.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn a_mid_reap_child_reports_its_real_outcome() {
+        let dir = tempdir().unwrap();
+        let (transfer, _rx) = setup(
+            dir.path(),
+            FailedTransferPolicy::Continue,
+            mock_s3_success(),
+        );
+
+        let (sink, mut stream) =
+            crate::events::channel(std::num::NonZeroUsize::new(16).expect("capacity > 0"));
+        let root = Arc::new(crate::events::TransferLifecycle::new(
+            sink,
+            transfer.inner.ctx.id.id,
+            None,
+            crate::events::TransferRef::download(
+                crate::events::Endpoint::S3 {
+                    bucket: Arc::from("test-bucket"),
+                    key: Arc::from("p/"),
+                },
+                crate::events::Endpoint::Local {
+                    path: Arc::from(dir.path()),
+                },
+            ),
+            None,
+        ));
+        *transfer.inner.lifecycle.lock() = Some(root.clone());
+
+        // A child that succeeded, was drained for reaping, and so is off `children`.
+        let child_id;
+        let never_existed;
+        {
+            let mut state = transfer.inner.state.lock();
+            child_id = seed_reaping(&mut state, 1)[0];
+            assert!(
+                !state.children.contains_key(&child_id),
+                "a drained child is off `children`, which is the whole window"
+            );
+
+            // Both children need a lifecycle for the sweep to reach them.
+            never_existed = crate::transfer::next_transfer_id();
+            for (id, key) in [(child_id, "p/reaped.bin"), (never_existed, "p/never.bin")] {
+                let lc = Arc::new(crate::events::TransferLifecycle::new(
+                    root.child_sink(),
+                    id.id,
+                    Some(transfer.inner.ctx.id.id),
+                    crate::events::TransferRef::download(
+                        crate::events::Endpoint::S3 {
+                            bucket: Arc::from("test-bucket"),
+                            key: Arc::from(key),
+                        },
+                        crate::events::Endpoint::Unresolved {},
+                    ),
+                    None,
+                ));
+                lc.announce();
+                transfer.inner.child_lifecycles.lock().insert(id, lc);
+            }
+        }
+
+        // The sweep itself.
+        let mut emits = Vec::new();
+        {
+            let state = transfer.inner.state.lock();
+            transfer.finish_root(&state, crate::events::Outcome::Cancelled {}, &mut emits);
+        }
+        for emit in emits {
+            emit.send();
+        }
+        drop(root);
+        drop(transfer);
+
+        let mut outcomes = std::collections::HashMap::new();
+        while let Some(ev) = stream.next().await {
+            if let crate::events::TransferEvent::Ended(e) = ev {
+                outcomes.insert(e.id(), e.outcome().clone());
+            }
+        }
+
+        assert!(
+            matches!(
+                outcomes.get(&child_id.id),
+                Some(crate::events::Outcome::Succeeded { .. })
+            ),
+            "a mid-reap child must report the outcome it reached, not Cancelled; got {:?}",
+            outcomes.get(&child_id.id)
+        );
+        // The other half: an entry with no recorded outcome is still Cancelled, so this
+        // does not paper over a real cancellation.
+        assert!(
+            matches!(
+                outcomes.get(&never_existed.id),
+                Some(crate::events::Outcome::Cancelled { .. })
+            ),
+            "an entry that never ran must still report Cancelled; got {:?}",
+            outcomes.get(&never_existed.id)
+        );
+    }
+
+    /// Seed `reaping_in_flight` with `n` synthetic ids and return them, standing in for
+    /// children that `drain_terminal_children` moved into a batch.
+    fn seed_reaping(state: &mut State, n: usize) -> Vec<TransferId> {
+        let ids: Vec<TransferId> = (0..n)
+            .map(|_| crate::transfer::next_transfer_id())
+            .collect();
+        for id in &ids {
+            state
+                .reaping_in_flight
+                .insert(*id, crate::events::Outcome::Succeeded {});
+        }
+        ids
+    }
+
     #[tokio::test]
     async fn test_reaping_batch_consume_decrements_counter() {
         let dir = tempdir().unwrap();
@@ -2762,28 +2911,32 @@ mod tests {
             mock_s3_success(),
         );
 
+        let ids;
         {
             let mut state = transfer.inner.state.lock();
-            state.reaping_in_flight = 3;
+            ids = seed_reaping(&mut state, 3);
         }
 
         let batch = ReapingBatch {
             transfer: transfer.inner.clone(),
             children: Some(Vec::new()),
-            count: 3,
+            ids: ids.clone(),
             consumed: false,
         };
 
         {
             let mut state = transfer.inner.state.lock();
             batch.consume(&mut state);
-            assert_eq!(0, state.reaping_in_flight, "consume must decrement");
+            assert!(
+                state.reaping_in_flight.is_empty(),
+                "consume must release every id"
+            );
         }
 
         let state = transfer.inner.state.lock();
-        assert_eq!(
-            0, state.reaping_in_flight,
-            "Drop after consume must not double-decrement"
+        assert!(
+            state.reaping_in_flight.is_empty(),
+            "Drop after consume must not release anything twice"
         );
     }
 
@@ -2797,9 +2950,10 @@ mod tests {
             mock_s3_success(),
         );
 
+        let ids;
         {
             let mut state = transfer.inner.state.lock();
-            state.reaping_in_flight = 3;
+            ids = seed_reaping(&mut state, 3);
         }
 
         // Simulates the scheduler dropping a JoinChildren work item without
@@ -2808,15 +2962,15 @@ mod tests {
             let _batch = ReapingBatch {
                 transfer: transfer.inner.clone(),
                 children: Some(Vec::new()),
-                count: 3,
+                ids: ids.clone(),
                 consumed: false,
             };
         }
 
         let state = transfer.inner.state.lock();
-        assert_eq!(
-            0, state.reaping_in_flight,
-            "Drop on unconsumed ReapingBatch must recover the counter"
+        assert!(
+            state.reaping_in_flight.is_empty(),
+            "Drop on unconsumed ReapingBatch must release every id"
         );
     }
 
@@ -2832,15 +2986,16 @@ mod tests {
             mock_s3_success(),
         );
 
+        let ids;
         {
             let mut state = transfer.inner.state.lock();
-            state.reaping_in_flight = 2;
+            ids = seed_reaping(&mut state, 2);
         }
 
         let mut batch = ReapingBatch {
             transfer: transfer.inner.clone(),
             children: Some(Vec::new()),
-            count: 2,
+            ids: ids.clone(),
             consumed: false,
         };
 
@@ -2849,7 +3004,7 @@ mod tests {
         {
             let mut state = transfer.inner.state.lock();
             batch.consume(&mut state);
-            assert_eq!(0, state.reaping_in_flight);
+            assert!(state.reaping_in_flight.is_empty());
         }
     }
 
