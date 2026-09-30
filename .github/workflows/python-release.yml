@@ -18,66 +18,14 @@ permissions:
   contents: read
 
 jobs:
-  wheels:
-    name: wheel (${{ matrix.os }}, ${{ matrix.target }})
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-24.04
-            target: x86_64
-            manylinux: "2_28"
-          - os: ubuntu-24.04-arm
-            target: aarch64
-            manylinux: "2_28"
-          - os: macos-15-intel
-            target: x86_64
-          - os: macos-15
-            target: aarch64
-          - os: windows-2022
-            target: x64
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: "3.11"
-      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
-        with:
-          working-directory: python
-          target: ${{ matrix.target }}
-          manylinux: ${{ matrix.manylinux }}
-          args: --release --out dist
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: dist-${{ matrix.os }}-${{ matrix.target }}
-          path: python/dist
-
-  sdist:
-    name: sdist
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
-        with:
-          working-directory: python
-          command: sdist
-          args: --out dist
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: dist-sdist
-          path: python/dist
+  build:
+    name: build
+    uses: $/.github/workflows/python-build.yml
 
   publish:
     name: publish
     if: ${{ !inputs.dry_run }}
-    needs: [wheels, sdist]
+    needs: [build]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     environment: pypi

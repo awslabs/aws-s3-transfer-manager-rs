@@ -48,41 +48,6 @@ jobs:
       - run: uv run --no-sync ruff check
       - run: uv run --no-sync mypy
 
-  test:
-    name: test (${{ matrix.os }}, Python ${{ matrix.python }})
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-24.04]
-        python: ["3.11", "3.12", "3.13", "3.14", "3.15"]
-        include:
-          - os: ubuntu-24.04-arm
-            python: "3.15"
-          - os: macos-15
-            python: "3.11"
-          - os: macos-15
-            python: "3.15"
-          - os: windows-2022
-            python: "3.11"
-          - os: windows-2022
-            python: "3.15"
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: Install Rust
-        run: |
-          rustup toolchain install "$rust_stable" --profile minimal
-          rustup default "$rust_stable"
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          workspaces: |
-            . -> target
-            python -> ../target
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
-        with:
-          python-version: ${{ matrix.python }}
-      - run: uv sync --locked
-      - run: uv run --no-sync pytest
+  build:
+    name: build
+    uses: $/.github/workflows/python-build.yml

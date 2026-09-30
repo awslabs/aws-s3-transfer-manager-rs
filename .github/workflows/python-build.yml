@@ -1,0 +1,143 @@
+name: Python build
+
+# Builds the distributions exactly as they are released, then installs and tests them.
+# Called by pull request CI and by the release workflow, which publishes only if this passes.
+on:
+  workflow_call:
+
+env:
+  RUST_BACKTRACE: 1
+  rust_stable: stable
+
+defaults:
+  run:
+    shell: bash
+    working-directory: python
+
+permissions:
+  contents: read
+
+jobs:
+  wheels:
+    name: wheel (${{ matrix.os }}, ${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64
+            manylinux: "2_28"
+          - os: ubuntu-24.04-arm
+            target: aarch64
+            manylinux: "2_28"
+          - os: macos-15-intel
+            target: x86_64
+          - os: macos-15
+            target: aarch64
+          - os: windows-2022
+            target: x64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          working-directory: python
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --out dist
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist-${{ matrix.os }}-${{ matrix.target }}
+          path: python/dist
+
+  sdist:
+    name: sdist
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          working-directory: python
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist-sdist
+          path: python/dist
+
+  test-wheels:
+    name: test wheel (${{ matrix.platform.os }}, Python ${{ matrix.python }})
+    needs: [wheels]
+    runs-on: ${{ matrix.platform.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - { os: ubuntu-24.04, target: x86_64 }
+          - { os: ubuntu-24.04-arm, target: aarch64 }
+          - { os: macos-15-intel, target: x86_64 }
+          - { os: macos-15, target: aarch64 }
+          - { os: windows-2022, target: x64 }
+        python: ["3.11", "3.15"]
+        include:
+          - platform: { os: ubuntu-24.04, target: x86_64 }
+            python: "3.12"
+          - platform: { os: ubuntu-24.04, target: x86_64 }
+            python: "3.13"
+          - platform: { os: ubuntu-24.04, target: x86_64 }
+            python: "3.14"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The tests run against a mock S3 server built from this workspace.
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$rust_stable" --profile minimal
+          rustup default "$rust_stable"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist-${{ matrix.platform.os }}-${{ matrix.platform.target }}
+          path: python/dist
+      - run: uv sync --locked --no-install-project
+      - run: uv pip install aws-s3-transfer --no-index --no-deps --find-links dist
+      - run: uv run --no-sync pytest
+
+  test-sdist:
+    name: test sdist
+    needs: [sdist]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$rust_stable" --profile minimal
+          rustup default "$rust_stable"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.11"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist-sdist
+          path: python/dist
+      - run: uv sync --locked --no-install-project
+      - run: uv pip install --no-deps dist/*.tar.gz
+      - run: uv run --no-sync pytest
