@@ -60,11 +60,13 @@ async fn test_managed_runtime_http_uses_environment_proxy() {
 
     let (proxy_addr, proxy_connections) = start_relay_proxy(handle.socket_addr()).await;
     // This binary contains only this test, so nothing else observes the
-    // environment change.
-    std::env::set_var("HTTP_PROXY", format!("http://{proxy_addr}"));
+    // environment change. Clear the other spellings first: Windows variable
+    // names are case-insensitive, so removing `http_proxy` after setting
+    // `HTTP_PROXY` would remove the proxy just set.
     std::env::remove_var("http_proxy");
     std::env::remove_var("NO_PROXY");
     std::env::remove_var("no_proxy");
+    std::env::set_var("HTTP_PROXY", format!("http://{proxy_addr}"));
 
     let s3_config = handle.client().await.config().to_builder();
     let tm = aws_sdk_s3_transfer_manager::Client::new(
