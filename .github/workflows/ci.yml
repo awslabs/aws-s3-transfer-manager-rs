@@ -638,7 +638,10 @@ jobs:
           components: miri
       - uses: Swatinem/rust-cache@v2
       # Run miri on all lib tests. Tests that need tokio's I/O driver
-      # (epoll/kqueue FFI) are marked #[cfg_attr(miri, ignore)].
+      # (epoll/kqueue FFI) are marked #[cfg_attr(miri, ignore)], as are tests
+      # that construct a client handle: dropping it drops the ready set's
+      # crossbeam skiplist, whose inline tower array is rejected by Stacked
+      # Borrows.
       # Mutex/Condvar fall back to std::sync under miri (parking_lot uses
       # integer-to-pointer casts incompatible with strict provenance).
       - name: miri

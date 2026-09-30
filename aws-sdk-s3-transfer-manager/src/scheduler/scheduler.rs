@@ -1086,6 +1086,8 @@ mod tests {
     }
 
     /// A wake retained during `poll_work` is attributed after Pending is visible.
+    // Builds a client handle: dropping the scheduler's ready set is not miri-clean.
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn wake_before_pending_is_backfilled_and_repolled() {
         let handle = test_handle_with_diagnostics(1, 1);

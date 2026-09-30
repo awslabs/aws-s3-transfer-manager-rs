@@ -1776,6 +1776,8 @@ mod tests {
         }
     }
 
+    // Builds a client handle: dropping the scheduler's ready set is not miri-clean.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn external_terminal_paths_emit_one_upload_summary() {
         let transfer = create_test_transfer(
@@ -1798,6 +1800,8 @@ mod tests {
         assert_eq!(summary.request_total.requests, 0);
     }
 
+    // Builds a client handle: dropping the scheduler's ready set is not miri-clean.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn on_terminal_tolerates_poisoned_state() {
         let transfer = create_test_transfer(
@@ -1837,6 +1841,8 @@ mod tests {
         assert_eq!(summary.outcome, UploadTerminalOutcome::Failed);
     }
 
+    // Builds a client handle: dropping the scheduler's ready set is not miri-clean.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn dropped_request_measurement_reaches_upload_request_kind_summary() {
         let transfer = create_test_transfer(

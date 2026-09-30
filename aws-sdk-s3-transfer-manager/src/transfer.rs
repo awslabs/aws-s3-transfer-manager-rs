@@ -1546,6 +1546,8 @@ mod tests {
             assert_eq!(ctx.metrics.request_metrics().retry_reissues, 1);
         }
 
+        // Builds a client handle: dropping the scheduler's ready set is not miri-clean.
+        #[cfg_attr(miri, ignore)]
         #[test]
         fn disabled_diagnostics_do_not_allocate_pending_stats() {
             let (ctx, _rx) = TransferContext::new(test_handle());
@@ -1556,6 +1558,8 @@ mod tests {
             assert_eq!(ctx.pending_stats(), None);
         }
 
+        // Builds a client handle: dropping the scheduler's ready set is not miri-clean.
+        #[cfg_attr(miri, ignore)]
         #[test]
         fn pending_cause_is_accounted_across_wake_and_next_poll() {
             let (ctx, _rx) = TransferContext::new(test_handle_with_diagnostics(1));
@@ -1570,6 +1574,8 @@ mod tests {
             assert_eq!(stats.terminal_cause, None);
         }
 
+        // Builds a client handle: dropping the scheduler's ready set is not miri-clean.
+        #[cfg_attr(miri, ignore)]
         #[test]
         fn terminal_signal_closes_pending_interval_once() {
             let (ctx, _rx) = TransferContext::new(test_handle_with_diagnostics(1));
@@ -1584,6 +1590,8 @@ mod tests {
             assert_eq!(stats.category(PendingCategory::InFlightWork).count, 1);
         }
 
+        // Builds a client handle: dropping the scheduler's ready set is not miri-clean.
+        #[cfg_attr(miri, ignore)]
         #[test]
         fn terminal_report_can_be_claimed_once() {
             let (ctx, _rx) = TransferContext::new(test_handle());
