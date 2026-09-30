@@ -5,16 +5,28 @@
 
 use aws_config::Region;
 use aws_sdk_s3_transfer_manager::{
-    error::BoxError,
+    error::{BoxError, ErrorKind},
     metrics::unit::ByteUnit,
-    types::{ConcurrencyMode, PartSize},
+    types::{ConcurrencyMode, PartSize, RuntimeMode, TransferStatus},
 };
+use aws_smithy_runtime_api::client::http::{
+    http_client_fn, HttpConnector, HttpConnectorFuture, SharedHttpConnector,
+};
+use aws_smithy_runtime_api::client::orchestrator::{HttpRequest, HttpResponse};
+use aws_smithy_runtime_api::client::result::ConnectorError;
+use aws_smithy_runtime_api::http::StatusCode;
 use pin_project_lite::pin_project;
 use std::{
     cmp,
     iter::{self, repeat_with},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     task::Poll,
+    time::Duration,
 };
+use tokio::sync::Semaphore;
 
 use aws_smithy_http_client::test_util::{ReplayEvent, StaticReplayClient};
 use aws_smithy_runtime::test_util::capture_test_logs::show_test_logs;
@@ -160,12 +172,30 @@ async fn test_body_not_consumed() {
     let _ = handle.body_mut().next().await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_abort_download() {
-    let data = rand_data(25 * ByteUnit::Mebibyte.as_bytes_usize());
-    let part_size = ByteUnit::Mebibyte.as_bytes_usize();
+/// Connector answering the discovery GET with S3's `NoSuchKey` error, so
+/// discovery fails immediately.
+fn no_such_key_connector() -> StaticReplayClient {
+    StaticReplayClient::new(vec![ReplayEvent::new(
+        dummy_expected_request(),
+        http::Response::builder()
+            .status(404)
+            .header("Content-Type", "application/xml")
+            .body(SdkBody::from(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message><Key>test-object</Key><RequestId>test-request-id</RequestId></Error>"#,
+            ))
+            .unwrap(),
+    )])
+}
 
-    let (tm, http_client) = simple_test_tm(&data, part_size);
+/// `object_meta()` called after discovery has already failed must return
+/// `ObjectNotDiscoverable` rather than wait for a discovery notification that
+/// was delivered before the caller started waiting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_object_meta_after_discovery_failure() {
+    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let http_client = no_such_key_connector();
+    let tm = test_tm(http_client.clone(), part_size);
 
     let handle = tm
         .download()
@@ -173,10 +203,151 @@ async fn test_abort_download() {
         .key("test-object")
         .initiate()
         .unwrap();
-    let _ = handle.object_meta().await;
-    handle.abort().await;
-    let requests = http_client.actual_requests().collect::<Vec<_>>();
-    assert!(requests.len() < data.len() / part_size);
+
+    // Force the ordering where discovery fails before `object_meta()` is called.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while handle.status() != TransferStatus::Failed {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("discovery did not fail on NoSuchKey");
+
+    let kind = tokio::time::timeout(Duration::from_secs(1), handle.object_meta())
+        .await
+        .expect("object_meta() did not return after discovery failed")
+        .expect_err("object_meta() must fail when discovery failed")
+        .kind()
+        .clone();
+    assert_eq!(ErrorKind::ObjectNotDiscoverable, kind);
+
+    tokio::time::timeout(Duration::from_secs(1), handle.abort())
+        .await
+        .expect("abort hung after discovery failed");
+
+    assert_eq!(1, http_client.actual_requests().count());
+}
+
+/// Connector modelling a ranged-GET object store for an object of `total`
+/// bytes.
+///
+/// The first GET is answered with the requested range. Every later GET stays
+/// in flight until its future is dropped; each one adds a permit to
+/// `parked_started` when it begins.
+#[derive(Debug)]
+struct ParkAfterDiscoveryConnector {
+    total: usize,
+    requests: Arc<AtomicUsize>,
+    parked_started: Arc<Semaphore>,
+}
+
+impl ParkAfterDiscoveryConnector {
+    fn discovery_response(&self, request: &HttpRequest) -> HttpResponse {
+        let range = request
+            .headers()
+            .get("Range")
+            .expect("discovery GET must be ranged");
+        let (start, end) = range
+            .strip_prefix("bytes=")
+            .and_then(|r| r.split_once('-'))
+            .map(|(s, e)| (s.parse::<usize>().unwrap(), e.parse::<usize>().unwrap()))
+            .unwrap_or_else(|| panic!("unexpected Range header: {range}"));
+        let end = cmp::min(end, self.total - 1);
+        let len = end - start + 1;
+
+        let mut response = HttpResponse::new(
+            StatusCode::try_from(206).unwrap(),
+            SdkBody::from(rand_data(len)),
+        );
+        let headers = response.headers_mut();
+        headers.insert("Content-Length", len.to_string());
+        headers.insert(
+            "Content-Range",
+            format!("bytes {start}-{end}/{}", self.total),
+        );
+        headers.insert("ETag", "my-etag");
+        response
+    }
+}
+
+impl HttpConnector for ParkAfterDiscoveryConnector {
+    fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
+        assert_eq!("GET", request.method());
+        let seq = self.requests.fetch_add(1, Ordering::SeqCst);
+        if seq == 0 {
+            let response = self.discovery_response(&request);
+            return HttpConnectorFuture::ready(Ok(response));
+        }
+
+        let parked_started = self.parked_started.clone();
+        HttpConnectorFuture::new(async move {
+            parked_started.add_permits(1);
+            std::future::pending::<Result<HttpResponse, ConnectorError>>().await
+        })
+    }
+}
+
+/// `abort()` must return once ranged GETs following discovery are executing,
+/// without waiting for those requests to complete on their own.
+///
+/// The body is never consumed.
+async fn abort_download_with_executing_gets(runtime_mode: RuntimeMode) {
+    let total = 25 * ByteUnit::Mebibyte.as_bytes_usize();
+    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let requests = Arc::new(AtomicUsize::new(0));
+    let parked_started = Arc::new(Semaphore::new(0));
+    let connector = SharedHttpConnector::new(ParkAfterDiscoveryConnector {
+        total,
+        requests: requests.clone(),
+        parked_started: parked_started.clone(),
+    });
+    let s3_client = aws_sdk_s3::Client::from_conf(
+        aws_sdk_s3::config::Config::builder()
+            .http_client(http_client_fn(move |_, _| connector.clone()))
+            .region(Region::from_static("us-west-2"))
+            .with_test_defaults()
+            .build(),
+    );
+    let config = aws_sdk_s3_transfer_manager::Config::builder()
+        .client(s3_client)
+        .part_size(PartSize::Target(part_size as u64))
+        .concurrency(ConcurrencyMode::Explicit(2))
+        .runtime_mode(runtime_mode)
+        .build();
+    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+
+    let handle = tm
+        .download()
+        .bucket("test-bucket")
+        .key("test-object")
+        .initiate()
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(5), parked_started.acquire())
+        .await
+        .expect("no GET after discovery started")
+        .expect("start semaphore closed")
+        .forget();
+
+    tokio::time::timeout(Duration::from_secs(1), handle.abort())
+        .await
+        .expect("abort hung while a ranged GET was executing");
+
+    let requests = requests.load(Ordering::SeqCst);
+    assert!(
+        requests < total / part_size,
+        "expected fewer requests than parts, got {requests}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_abort_download_on_tokio_runtime() {
+    abort_download_with_executing_gets(RuntimeMode::MultiThreadTokio).await;
+}
+
+#[tokio::test]
+async fn test_abort_download_on_managed_runtime() {
+    abort_download_with_executing_gets(RuntimeMode::Managed).await;
 }
 
 pin_project! {

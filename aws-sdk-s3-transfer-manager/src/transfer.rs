@@ -94,13 +94,16 @@ pub(crate) mod wake_flag {
 ///   re-queue the transfer if intra-execute state changes unblock work.
 /// - The concurrency slot is held for the duration of this future; the
 ///   scheduler only decrements its dispatched counter after `execute` returns.
+/// - Cancelling the transfer drops this future at its next `.await`. State
+///   visible to other work or to the handle must be consistent at every
+///   `.await` point.
 ///
 /// ## `on_terminal` — external termination hook
 /// - Called from outside the normal lifecycle (panic, cancellation, drop) to
 ///   let the transfer release held resources and notify waiters.
 /// - Must be short and must not block.
 pub(crate) trait Transfer: Send + Sync + std::fmt::Debug {
-    /// The transfer's shared context (id, handle, status, cancellation).
+    /// The transfer's shared context (id, handle, status).
     fn ctx(&self) -> &TransferContext;
 
     /// Poll for the next IO request. Returns `Ready` with work, `Pending` if
@@ -172,6 +175,13 @@ impl IoRequest {
             .as_any_mut()
             .downcast_mut::<T>()
             .expect("work data type mismatch")
+    }
+
+    /// Take the data as a concrete type, leaving the request without data.
+    /// For work whose payload `execute` consumes. Panics if wrong type or None.
+    pub(crate) fn take_data<T: 'static>(&mut self) -> T {
+        let data: Box<dyn Any> = self.data.take().expect("work item has no data");
+        *data.downcast::<T>().expect("work data type mismatch")
     }
 }
 
@@ -514,8 +524,6 @@ pub(crate) struct TransferContext {
     completion_tx: Arc<Mutex<Option<StateMachineTerminalSender>>>,
     /// Set when poll_work returns Pending, cleared on try_wake
     wake_flag: Arc<wake_flag::WakeFlag>,
-    /// Cancellation token for cooperative cancellation
-    cancellation_token: tokio_util::sync::CancellationToken,
     /// Per-transfer metrics backing store
     pub(crate) metrics: Arc<MetricsState>,
 }
@@ -592,7 +600,6 @@ impl TransferContext {
             error: Arc::new(Mutex::new(None)),
             completion_tx: Arc::new(Mutex::new(Some(completion_tx))),
             wake_flag: Arc::new(wake_flag::WakeFlag::new()),
-            cancellation_token: tokio_util::sync::CancellationToken::new(),
         };
         (ctx, completion_rx)
     }
@@ -613,7 +620,6 @@ impl TransferContext {
             error: Arc::new(Mutex::new(None)),
             completion_tx: Arc::new(Mutex::new(Some(completion_tx))),
             wake_flag: Arc::new(wake_flag::WakeFlag::new()),
-            cancellation_token: tokio_util::sync::CancellationToken::new(),
         };
         (ctx, completion_rx)
     }
@@ -717,11 +723,6 @@ impl TransferContext {
     /// The S3 client to use for SDK operations
     pub(crate) fn s3_client(&self) -> &aws_sdk_s3::Client {
         &self.handle.s3_client
-    }
-
-    /// The cancellation token for this transfer
-    pub(crate) fn cancellation_token(&self) -> &tokio_util::sync::CancellationToken {
-        &self.cancellation_token
     }
 
     /// Mark transfer as failed and store the error.

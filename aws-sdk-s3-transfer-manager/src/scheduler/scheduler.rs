@@ -173,8 +173,8 @@ pub(crate) struct Cancellation {
 }
 
 impl Cancellation {
-    /// Wait for the cancelled parent and all cancelled children to
-    /// finish any work that was already dispatched at cancellation time.
+    /// Wait until the cancelled parent and each cancelled child report idle
+    /// (no queued or executing work), checking each descriptor in turn.
     pub(crate) async fn wait_for_idle(self) {
         if let Some(d) = self.target {
             d.wait_for_idle().await;
@@ -352,8 +352,9 @@ impl Scheduler {
     /// Cancels the target transfer first, then cancels all transfers whose
     /// `TransferId.parent == Some(id.id)` (depth-1 children only). Each
     /// cancelled transfer has its status set to cancelled, pending work
-    /// purged, and idle notification sent. Outstanding work already being
-    /// executed will complete naturally.
+    /// purged, and idle notification sent. Work already being executed is
+    /// interrupted: the runtime drops its `execute` future at the next await
+    /// point.
     ///
     /// Returns a [`Cancellation`] carrying the cancelled descriptors.
     /// Drop it for fire-and-forget; await
@@ -422,7 +423,8 @@ impl Scheduler {
     }
 
     /// Cancel a single transfer descriptor: set cancelled, signal terminal,
-    /// clean up on_terminal, purge pending work, and notify idle.
+    /// clean up on_terminal, interrupt executing work, purge pending work,
+    /// and notify idle.
     fn cancel_descriptor(&self, desc: TransferDescriptor) {
         let id = desc.id();
         let ctx = desc.transfer().ctx();
@@ -431,6 +433,7 @@ impl Scheduler {
         }
         ctx.signal_terminal();
         desc.transfer().on_terminal();
+        desc.cancellation_token().cancel();
         let purged = self.handle().runtime.remove_pending_for_transfer(id);
         self.release_dispatched(purged);
         desc.work_purged(purged);
@@ -1365,6 +1368,623 @@ mod tests {
         ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
             Box::pin(async { unreachable!("PendingForever never generates work") })
         }
+    }
+
+    /// Execution that remains active until the test releases it.
+    #[derive(Debug)]
+    struct BlockingExecute {
+        generated: AtomicBool,
+        started: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    impl BlockingExecute {
+        fn new() -> Self {
+            Self {
+                generated: AtomicBool::new(false),
+                started: tokio::sync::Notify::new(),
+                release: tokio::sync::Notify::new(),
+            }
+        }
+    }
+
+    impl MockStateMachine for BlockingExecute {
+        fn poll_work(&self, _id: TransferId) -> PollWork {
+            if self.generated.swap(true, Ordering::SeqCst) {
+                PollWork::Pending
+            } else {
+                PollWork::ready(IoRequest { data: None })
+            }
+        }
+
+        fn execute<'a>(
+            &'a self,
+            _work: &'a mut IoRequest,
+        ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
+            Box::pin(async move {
+                self.started.notify_one();
+                self.release.notified().await;
+                WorkOutcome::Success { data: None }
+            })
+        }
+    }
+
+    async fn cancellation_interrupts_executing_work(handle: Arc<Handle>) {
+        let scheduler = &handle.scheduler;
+        let id = TransferId {
+            id: 1,
+            parent: None,
+        };
+        let state = Arc::new(BlockingExecute::new());
+        scheduler.enqueue_transfer(Box::new(MockTransfer::new_with_handle(
+            id,
+            state.clone(),
+            handle.clone(),
+        )));
+
+        tokio::time::timeout(Duration::from_secs(5), state.started.notified())
+            .await
+            .expect("work did not enter execute");
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            scheduler.cancel_transfer(id).wait_for_idle(),
+        )
+        .await;
+
+        if result.is_err() {
+            state.release.notify_waiters();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !scheduler.is_idle() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("scheduler did not drain released work");
+        }
+
+        handle.runtime.shutdown();
+        result.expect("cancellation did not interrupt executing transfer work");
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn cancellation_interrupts_executing_work_on_tokio_runtime() {
+        cancellation_interrupts_executing_work(test_handle(1)).await;
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[cfg_attr(s3_tm_asan, ignore)]
+    #[tokio::test]
+    async fn cancellation_interrupts_executing_work_on_managed_runtime() {
+        cancellation_interrupts_executing_work(test_handle_managed(1)).await;
+    }
+
+    /// Concurrency controller with a fixed target that counts completion reports.
+    ///
+    /// `Scheduler::on_completion` reports to the controller exactly once per
+    /// call and `Scheduler::on_panic` never does, so the count is the number of
+    /// `on_completion` calls the scheduler has observed.
+    #[derive(Debug)]
+    struct CompletionCounter {
+        target: usize,
+        completions: AtomicUsize,
+    }
+
+    impl CompletionCounter {
+        fn completions(&self) -> usize {
+            self.completions.load(Ordering::SeqCst)
+        }
+    }
+
+    impl crate::scheduler::ConcurrencyController for CompletionCounter {
+        fn target(&self) -> usize {
+            self.target
+        }
+
+        fn on_completion(&self, _sample: Option<&crate::scheduler::CompletionSample>) {
+            self.completions.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Execution runtime backing a [`counted_handle`].
+    #[derive(Clone, Copy, Debug)]
+    enum TestRuntime {
+        /// Workers are spawned onto the tokio runtime that performs the first dispatch.
+        Tokio,
+        /// Managed OS threads, one per topology core.
+        Managed { threads: usize },
+    }
+
+    fn counted_handle(
+        runtime: TestRuntime,
+        target: usize,
+    ) -> (Arc<Handle>, Arc<CompletionCounter>) {
+        let controller = Arc::new(CompletionCounter {
+            target,
+            completions: AtomicUsize::new(0),
+        });
+        let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
+        let config = crate::Config::builder().client(s3_client).build();
+        let handle =
+            Handle::new_for_test_with_runtime(
+                config,
+                controller.clone(),
+                move |weak| match runtime {
+                    TestRuntime::Tokio => {
+                        Arc::new(crate::runtime::TokioMultiThreadRuntime::new(weak))
+                            as Arc<dyn crate::runtime::ExecutionRuntime>
+                    }
+                    TestRuntime::Managed { threads } => Arc::new(
+                        crate::runtime::ManagedThreadRuntime::builder(weak)
+                            .topology(crate::runtime::Topology::uniform(threads))
+                            .build(),
+                    ),
+                },
+            );
+        (handle, controller)
+    }
+
+    fn registered_descriptor(
+        handle: &Handle,
+        id: TransferId,
+    ) -> crate::scheduler::descriptor::TransferDescriptor {
+        handle
+            .scheduler
+            .0
+            .transfers
+            .read()
+            .unwrap()
+            .get(&id)
+            .cloned()
+            .expect("transfer is not registered with the scheduler")
+    }
+
+    async fn wait_for_scheduler_idle(handle: &Handle) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !handle.scheduler.is_idle() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("scheduler did not drain");
+    }
+
+    /// Bounds `desc.wait_for_idle()` and checks the packed counter is back at
+    /// zero queued and zero executing.
+    async fn expect_descriptor_idle(desc: &crate::scheduler::descriptor::TransferDescriptor) {
+        tokio::time::timeout(Duration::from_secs(5), desc.wait_for_idle())
+            .await
+            .expect("a dispatched work item never reported completion");
+        assert!(
+            desc.is_idle(),
+            "queued/executing counter must return to (0, 0)"
+        );
+    }
+
+    /// Single-work transfer whose execute waits for the test to release it.
+    ///
+    /// `poll_work` yields one work item, returns `Pending` until that item's
+    /// execute returns, then returns `Done`. Execute panics instead of
+    /// returning when constructed with [`GatedSingleWork::panicking`].
+    #[derive(Debug)]
+    struct GatedSingleWork {
+        generated: AtomicBool,
+        finished: AtomicBool,
+        panics: bool,
+        started: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    impl GatedSingleWork {
+        fn succeeding() -> Self {
+            Self::new(false)
+        }
+
+        fn panicking() -> Self {
+            Self::new(true)
+        }
+
+        fn new(panics: bool) -> Self {
+            Self {
+                generated: AtomicBool::new(false),
+                finished: AtomicBool::new(false),
+                panics,
+                started: tokio::sync::Notify::new(),
+                release: tokio::sync::Notify::new(),
+            }
+        }
+    }
+
+    impl MockStateMachine for GatedSingleWork {
+        fn poll_work(&self, _id: TransferId) -> PollWork {
+            if !self.generated.swap(true, Ordering::SeqCst) {
+                PollWork::ready(IoRequest { data: None })
+            } else if self.finished.load(Ordering::SeqCst) {
+                PollWork::Done
+            } else {
+                PollWork::Pending
+            }
+        }
+
+        fn execute<'a>(
+            &'a self,
+            _work: &'a mut IoRequest,
+        ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
+            Box::pin(async move {
+                self.started.notify_one();
+                self.release.notified().await;
+                if self.panics {
+                    panic!("intentional execute panic");
+                }
+                self.finished.store(true, Ordering::SeqCst);
+                WorkOutcome::Success { data: None }
+            })
+        }
+    }
+
+    /// Single-work transfer whose execute blocks its OS thread until released.
+    ///
+    /// On a single managed thread, work dispatched while this execute is
+    /// blocked stays queued behind it. The block gives up after ten seconds so
+    /// a failing test cannot wedge the thread indefinitely. `poll_work` yields
+    /// one work item and then `Pending`, so the transfer stays registered until
+    /// cancelled.
+    #[derive(Debug)]
+    struct ThreadBlockingExecute {
+        generated: AtomicBool,
+        started: tokio::sync::Notify,
+        released: std::sync::Mutex<bool>,
+        release_cv: std::sync::Condvar,
+    }
+
+    impl ThreadBlockingExecute {
+        fn new() -> Self {
+            Self {
+                generated: AtomicBool::new(false),
+                started: tokio::sync::Notify::new(),
+                released: std::sync::Mutex::new(false),
+                release_cv: std::sync::Condvar::new(),
+            }
+        }
+
+        fn release(&self) {
+            *self.released.lock().unwrap() = true;
+            self.release_cv.notify_all();
+        }
+    }
+
+    impl MockStateMachine for ThreadBlockingExecute {
+        fn poll_work(&self, _id: TransferId) -> PollWork {
+            if self.generated.swap(true, Ordering::SeqCst) {
+                PollWork::Pending
+            } else {
+                PollWork::ready(IoRequest { data: None })
+            }
+        }
+
+        fn execute<'a>(
+            &'a self,
+            _work: &'a mut IoRequest,
+        ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
+            Box::pin(async move {
+                self.started.notify_one();
+                let released = self.released.lock().unwrap();
+                let (_released, _timeout) = self
+                    .release_cv
+                    .wait_timeout_while(released, Duration::from_secs(10), |released| !*released)
+                    .unwrap();
+                WorkOutcome::Success { data: None }
+            })
+        }
+    }
+
+    const BLOCKER_ID: TransferId = TransferId {
+        id: 100,
+        parent: None,
+    };
+
+    /// Occupies the only thread of a single-thread managed runtime with
+    /// [`ThreadBlockingExecute`] and returns once its execute has started.
+    async fn occupy_managed_thread(
+        handle: &Arc<Handle>,
+    ) -> (
+        Arc<ThreadBlockingExecute>,
+        crate::scheduler::descriptor::TransferDescriptor,
+    ) {
+        let blocker = Arc::new(ThreadBlockingExecute::new());
+        handle
+            .scheduler
+            .enqueue_transfer(Box::new(MockTransfer::new(BLOCKER_ID, blocker.clone())));
+        tokio::time::timeout(Duration::from_secs(5), blocker.started.notified())
+            .await
+            .expect("blocking work did not enter execute");
+        (blocker, registered_descriptor(handle, BLOCKER_ID))
+    }
+
+    async fn normal_completion_finishes_work_once(runtime: TestRuntime) {
+        let (handle, counter) = counted_handle(runtime, 1);
+        let id = TransferId {
+            id: 1,
+            parent: None,
+        };
+        let state = Arc::new(GatedSingleWork::succeeding());
+        handle
+            .scheduler
+            .enqueue_transfer(Box::new(MockTransfer::new(id, state.clone())));
+        tokio::time::timeout(Duration::from_secs(5), state.started.notified())
+            .await
+            .expect("work did not enter execute");
+        let desc = registered_descriptor(&handle, id);
+
+        state.release.notify_one();
+
+        expect_descriptor_idle(&desc).await;
+        wait_for_scheduler_idle(&handle).await;
+        assert!(desc.is_idle());
+        assert_eq!(counter.completions(), 1);
+        handle.runtime.shutdown();
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn normal_completion_finishes_work_once_on_tokio_runtime() {
+        normal_completion_finishes_work_once(TestRuntime::Tokio).await;
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[cfg_attr(s3_tm_asan, ignore)]
+    #[tokio::test]
+    async fn normal_completion_finishes_work_once_on_managed_runtime() {
+        normal_completion_finishes_work_once(TestRuntime::Managed { threads: 4 }).await;
+    }
+
+    /// Work dispatched for a transfer that turns terminal before a worker picks
+    /// it up completes through the terminal-skip path without executing.
+    ///
+    /// The tokio variant relies on the current-thread test runtime: the worker
+    /// spawned by the first dispatch cannot run until the test yields.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn terminal_skip_finishes_work_once_on_tokio_runtime() {
+        let (handle, counter) = counted_handle(TestRuntime::Tokio, 1);
+        let id = TransferId {
+            id: 1,
+            parent: None,
+        };
+        let state = Arc::new(FixedWorkCount::new(1));
+        let transfer = MockTransfer::new(id, state.clone());
+        let ctx = transfer.ctx().clone();
+        handle.scheduler.enqueue_transfer(Box::new(transfer));
+        let desc = registered_descriptor(&handle, id);
+        assert!(!desc.is_idle(), "work item should be queued");
+
+        ctx.set_cancelled();
+
+        expect_descriptor_idle(&desc).await;
+        wait_for_scheduler_idle(&handle).await;
+        assert!(desc.is_idle());
+        assert_eq!(counter.completions(), 1);
+        assert_eq!(state.completed_count(), 0, "terminal work must not execute");
+        handle.runtime.shutdown();
+    }
+
+    /// Managed variant of [`terminal_skip_finishes_work_once_on_tokio_runtime`].
+    ///
+    /// A single managed thread is held by [`ThreadBlockingExecute`] so the
+    /// target transfer's work stays queued while the transfer turns terminal.
+    #[cfg_attr(miri, ignore)]
+    #[cfg_attr(s3_tm_asan, ignore)]
+    #[tokio::test]
+    async fn terminal_skip_finishes_work_once_on_managed_runtime() {
+        let (handle, counter) = counted_handle(TestRuntime::Managed { threads: 1 }, 2);
+        let (blocker, blocker_desc) = occupy_managed_thread(&handle).await;
+
+        let id = TransferId {
+            id: 1,
+            parent: None,
+        };
+        let state = Arc::new(FixedWorkCount::new(1));
+        let transfer = MockTransfer::new(id, state.clone());
+        let ctx = transfer.ctx().clone();
+        handle.scheduler.enqueue_transfer(Box::new(transfer));
+        let desc = registered_descriptor(&handle, id);
+        assert!(!desc.is_idle(), "work item should be queued");
+
+        ctx.set_cancelled();
+        blocker.release();
+
+        expect_descriptor_idle(&desc).await;
+        expect_descriptor_idle(&blocker_desc).await;
+        handle.scheduler.cancel_transfer(BLOCKER_ID);
+        wait_for_scheduler_idle(&handle).await;
+        assert!(desc.is_idle());
+        // One for the blocker's execute, one for the skipped item.
+        assert_eq!(counter.completions(), 2);
+        assert_eq!(state.completed_count(), 0, "terminal work must not execute");
+        handle.runtime.shutdown();
+    }
+
+    async fn execute_panic_finishes_work_once(runtime: TestRuntime) {
+        let (handle, counter) = counted_handle(runtime, 1);
+        let id = TransferId {
+            id: 1,
+            parent: None,
+        };
+        let state = Arc::new(GatedSingleWork::panicking());
+        let transfer = MockTransfer::new(id, state.clone());
+        let ctx = transfer.ctx().clone();
+        handle.scheduler.enqueue_transfer(Box::new(transfer));
+        tokio::time::timeout(Duration::from_secs(5), state.started.notified())
+            .await
+            .expect("work did not enter execute");
+        let desc = registered_descriptor(&handle, id);
+
+        state.release.notify_one();
+
+        expect_descriptor_idle(&desc).await;
+        wait_for_scheduler_idle(&handle).await;
+        assert!(desc.is_idle());
+        assert!(ctx.is_failed());
+        assert_eq!(
+            counter.completions(),
+            0,
+            "a panicked work item is reported by on_panic, not on_completion"
+        );
+        handle.runtime.shutdown();
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[cfg_attr(s3_tm_asan, ignore)]
+    #[tokio::test]
+    async fn execute_panic_finishes_work_once_on_tokio_runtime() {
+        let _logs = show_test_logs();
+        execute_panic_finishes_work_once(TestRuntime::Tokio).await;
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[cfg_attr(s3_tm_asan, ignore)]
+    #[tokio::test]
+    async fn execute_panic_finishes_work_once_on_managed_runtime() {
+        let _logs = show_test_logs();
+        execute_panic_finishes_work_once(TestRuntime::Managed { threads: 4 }).await;
+    }
+
+    async fn cancel_while_executing_finishes_work_once(runtime: TestRuntime) {
+        let (handle, counter) = counted_handle(runtime, 1);
+        let id = TransferId {
+            id: 1,
+            parent: None,
+        };
+        let state = Arc::new(GatedSingleWork::succeeding());
+        handle
+            .scheduler
+            .enqueue_transfer(Box::new(MockTransfer::new(id, state.clone())));
+        tokio::time::timeout(Duration::from_secs(5), state.started.notified())
+            .await
+            .expect("work did not enter execute");
+        let desc = registered_descriptor(&handle, id);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            handle.scheduler.cancel_transfer(id).wait_for_idle(),
+        )
+        .await;
+        if result.is_err() {
+            state.release.notify_one();
+            wait_for_scheduler_idle(&handle).await;
+            handle.runtime.shutdown();
+        }
+        result.expect("cancellation did not interrupt executing transfer work");
+
+        wait_for_scheduler_idle(&handle).await;
+        assert!(desc.is_idle());
+        assert_eq!(counter.completions(), 1);
+        handle.runtime.shutdown();
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn cancel_while_executing_finishes_work_once_on_tokio_runtime() {
+        cancel_while_executing_finishes_work_once(TestRuntime::Tokio).await;
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[cfg_attr(s3_tm_asan, ignore)]
+    #[tokio::test]
+    async fn cancel_while_executing_finishes_work_once_on_managed_runtime() {
+        cancel_while_executing_finishes_work_once(TestRuntime::Managed { threads: 4 }).await;
+    }
+
+    /// Cancelling a transfer whose work is still in the worker pool purges the
+    /// item; no worker ever picks it up.
+    ///
+    /// The tokio variant relies on the current-thread test runtime: the worker
+    /// spawned by the first dispatch cannot run until the test yields. A second
+    /// transfer is then run to completion; the pool is FIFO with one worker, so
+    /// its completion proves the worker drained past the purged slot.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn cancel_while_queued_finishes_work_once_on_tokio_runtime() {
+        let (handle, counter) = counted_handle(TestRuntime::Tokio, 1);
+        let id = TransferId {
+            id: 1,
+            parent: None,
+        };
+        let state = Arc::new(FixedWorkCount::new(1));
+        handle
+            .scheduler
+            .enqueue_transfer(Box::new(MockTransfer::new(id, state.clone())));
+        let desc = registered_descriptor(&handle, id);
+        assert!(!desc.is_idle(), "work item should be queued");
+
+        let cancellation = handle.scheduler.cancel_transfer(id);
+        tokio::time::timeout(Duration::from_secs(5), cancellation.wait_for_idle())
+            .await
+            .expect("purging queued work did not reach idle");
+        assert!(desc.is_idle());
+
+        let follower_id = TransferId {
+            id: 2,
+            parent: None,
+        };
+        let follower = Arc::new(FixedWorkCount::new(1));
+        handle
+            .scheduler
+            .enqueue_transfer(Box::new(MockTransfer::new(follower_id, follower.clone())));
+        wait_for_scheduler_idle(&handle).await;
+        assert!(follower.is_complete());
+
+        assert!(desc.is_idle());
+        assert_eq!(state.completed_count(), 0, "purged work must not execute");
+        assert_eq!(
+            counter.completions(),
+            1,
+            "only the follower's work item should report completion"
+        );
+        handle.runtime.shutdown();
+    }
+
+    /// Managed variant of [`cancel_while_queued_finishes_work_once_on_tokio_runtime`].
+    ///
+    /// Managed dispatch spawns each item as a task, so cancellation purges
+    /// nothing; the queued task completes through the terminal-skip path
+    /// once the thread is released.
+    #[cfg_attr(miri, ignore)]
+    #[cfg_attr(s3_tm_asan, ignore)]
+    #[tokio::test]
+    async fn cancel_while_queued_finishes_work_once_on_managed_runtime() {
+        let (handle, counter) = counted_handle(TestRuntime::Managed { threads: 1 }, 2);
+        let (blocker, blocker_desc) = occupy_managed_thread(&handle).await;
+
+        let id = TransferId {
+            id: 1,
+            parent: None,
+        };
+        let state = Arc::new(FixedWorkCount::new(1));
+        handle
+            .scheduler
+            .enqueue_transfer(Box::new(MockTransfer::new(id, state.clone())));
+        let desc = registered_descriptor(&handle, id);
+        assert!(!desc.is_idle(), "work item should be queued");
+
+        let cancellation = handle.scheduler.cancel_transfer(id);
+        blocker.release();
+        tokio::time::timeout(Duration::from_secs(5), cancellation.wait_for_idle())
+            .await
+            .expect("cancelled queued work never reported completion");
+
+        expect_descriptor_idle(&blocker_desc).await;
+        handle.scheduler.cancel_transfer(BLOCKER_ID);
+        wait_for_scheduler_idle(&handle).await;
+        assert!(desc.is_idle());
+        assert_eq!(
+            state.completed_count(),
+            0,
+            "cancelled work must not execute"
+        );
+        // One for the blocker's execute, one for the skipped item.
+        assert_eq!(counter.completions(), 2);
+        handle.runtime.shutdown();
     }
 
     /// Mock that generates infinite work and counts executions.

@@ -131,7 +131,7 @@ async fn execute_work(work: &mut ScheduledWork, scheduler: &Scheduler) -> Execut
     let transfer = work.descriptor.transfer();
     let started = Instant::now();
 
-    let token = transfer.ctx().cancellation_token().clone();
+    let token = work.descriptor.cancellation_token().clone();
     let outcome = AssertUnwindSafe(async {
         tokio::select! {
             biased;

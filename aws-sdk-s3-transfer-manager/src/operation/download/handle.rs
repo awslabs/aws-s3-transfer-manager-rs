@@ -30,7 +30,9 @@ impl DownloadHandleInner {
             return Ok(meta);
         }
 
-        // Register interest before checking again
+        // Register interest before checking again. `discovery_notify` fires
+        // with `notify_waiters`, which stores no permit: a notification sent
+        // before this registration is lost.
         let notified = self.transfer.discovery_notify().notified();
 
         // Double-check after registering
@@ -38,7 +40,12 @@ impl DownloadHandleInner {
             return Ok(meta);
         }
 
-        notified.await;
+        // Discovery already ended without metadata (failed or cancelled). Its
+        // notification may have fired before `notified` was registered; waiting
+        // would never return.
+        if self.transfer.ctx().is_active() {
+            notified.await;
+        }
 
         // Check result
         self.transfer.object_meta().ok_or_else(|| {
@@ -108,7 +115,8 @@ impl DownloadHandleInner {
         ctx.set_cancelled();
         self.transfer.writer().notify_consumer();
 
-        // Cancel transfer (purges queued work) and wait for any executing work to complete.
+        // Cancel transfer (purges queued work, interrupts executing work) and
+        // wait for executing work to stop.
         ctx.handle
             .scheduler
             .cancel_transfer(id)
@@ -196,7 +204,7 @@ impl<'a> DownloadIoCtl<'a> {
 /// When the handle is dropped without calling `join()` or `abort()`:
 /// - The transfer is marked as cancelled
 /// - Queued work is purged from the scheduler
-/// - In-flight work may be interrupted at await points
+/// - In-flight work is interrupted at its next await point
 /// - Drop returns immediately without waiting for in-flight work
 ///
 /// ## Calling `abort()`
@@ -204,13 +212,13 @@ impl<'a> DownloadIoCtl<'a> {
 /// When [`abort`](Self::abort) is called:
 /// - The transfer is marked as cancelled
 /// - Queued work is purged from the scheduler
-/// - Waits for all in-flight work to complete
+/// - In-flight work is interrupted; waits for it to stop
 /// - Returns only after all cleanup is complete
 ///
 /// ## Calling `join()` after failure
 ///
 /// If the download fails, [`join`](Self::join) will cancel any remaining work,
-/// wait for in-flight work to complete, and return the error.
+/// wait for in-flight work to stop, and return the error.
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct DownloadHandle {

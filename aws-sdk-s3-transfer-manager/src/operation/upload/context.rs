@@ -607,6 +607,9 @@ pub(crate) struct MultipartCompletion {
 }
 
 /// State machine for tracking upload work progress.
+///
+/// A multipart upload ID is held from `Transferring` through `CompleteInFlight`
+/// and leaves the state only when CompleteMultipartUpload succeeds.
 #[derive(Debug)]
 pub(crate) enum UploadState {
     /// Waiting to start CreateMPU or PutObject.
@@ -621,16 +624,20 @@ pub(crate) enum UploadState {
         parts: PartTransferState,
         response_builder: UploadOutputBuilder,
     },
-    /// All parts are done and CompleteMultipartUpload remains.
+    /// All parts are done; CompleteMultipartUpload has not been dispatched.
     Completing {
-        upload_id: Option<String>,
-        parts: Option<PartTransferState>,
-        response_builder: Option<UploadOutputBuilder>,
-        complete_in_flight: bool,
+        upload_id: String,
+        parts: PartTransferState,
+        response_builder: UploadOutputBuilder,
     },
+    /// CompleteMultipartUpload has been dispatched and has not succeeded.
+    ///
+    /// The multipart upload remains open in this state, including after the
+    /// request fails or its execution is dropped, so it can still be aborted.
+    CompleteInFlight { upload_id: String },
     /// PutObject is in flight.
     PutObjectInFlight,
-    /// The upload has completed.
+    /// S3 has committed the object; no multipart upload remains open.
     Done,
 }
 
