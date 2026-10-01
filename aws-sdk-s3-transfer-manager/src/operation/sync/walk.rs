@@ -239,17 +239,21 @@ impl<K: KeyStream> Side<K> {
     fn missing(&mut self, key: &str) -> SideState<K::Source> {
         self.release_before(key);
         self.gap.release_passed(key);
-        if self.lost.remove(key) {
+        // The key leaves the set whatever gets reported, or it stays held until something sorts past
+        // it and the side keeps answering unknown for a key it has already answered for.
+        let named = self.lost.remove(key);
+        // A range outranks one key, and both can be true at once: a directory that stopped part way
+        // through and a child of it that could not be stat'd cost this side both at the same
+        // position. Reporting the key would tell a consumer the keys around this one are accounted
+        // for, and on a side that lost a range they are not — so the coarser answer is the one that
+        // goes out, the same way the comparison takes the coarser of its two sides.
+        if self.gap.covers(key) || self.lost_unnamed {
+            return SideState::Unknown(KeysLost::UnknownRange);
+        }
+        if named {
             return SideState::Unknown(KeysLost::OneKey);
         }
-        match self.gap.covers(key) {
-            true => SideState::Unknown(KeysLost::UnknownRange),
-            // A range, because the conclusion here is that absence cannot be read from
-            // position on this side any more. `OneKey` says the keys around it are known,
-            // which a consumer would act on by holding back one key and trusting the rest.
-            false if self.lost_unnamed => SideState::Unknown(KeysLost::UnknownRange),
-            false => SideState::Absent,
-        }
+        SideState::Absent
     }
 
     // Drop every held key sorting before this one.
@@ -1191,6 +1195,46 @@ mod tests {
             at(z.source()),
             At::Gone,
             "`z.txt` is past everything the failure hid, so the source is simply absent"
+        );
+    }
+
+    // Both kinds of loss can land on one side at the same position: a listing that named the object
+    // it dropped, and a failure whose extent could not be worked out. The named one is the finer
+    // answer and reporting it would tell a consumer the keys around it are accounted for, which on a
+    // side that also lost a range they are not.
+    #[tokio::test]
+    async fn a_named_loss_inside_an_unknown_range_reports_the_range() {
+        // The unnameable failure first, so the side is already holding a range when the named one
+        // arrives. Order does not matter to the answer, only that both are held.
+        let unnameable = StreamError::MalformedListing {
+            key: None,
+            what: "size",
+        };
+        let mut walk = Walk::new(
+            Scripted::from(vec![
+                Err(unnameable),
+                Err(a_lost_key("m.txt")),
+                Ok(entry("z.txt")),
+            ]),
+            Scripted::of(&["m.txt", "z.txt"]),
+        );
+
+        let mut reported = None;
+        while let Some(next) = walk.next().await {
+            if let Ok(pairing) = next {
+                if pairing.key() == "m.txt" {
+                    reported = Some(match pairing.source() {
+                        SideState::Unknown(lost) => *lost,
+                        other => panic!("m.txt read as {other:?} rather than unknown"),
+                    });
+                }
+            }
+        }
+
+        assert_eq!(
+            reported,
+            Some(KeysLost::UnknownRange),
+            "a key named as lost on a side that also lost a range reported only itself"
         );
     }
 
