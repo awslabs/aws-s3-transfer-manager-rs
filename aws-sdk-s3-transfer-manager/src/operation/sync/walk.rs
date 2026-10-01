@@ -717,9 +717,9 @@ pub(crate) struct LocalDestination {
 }
 
 impl LocalDestination {
-    // Asked before the walk starts, because afterwards there is no telling a root that was never
-    // there from one that could not be read. `Ok(false)` is the only answer that means absent: an
-    // error leaves the walk to report it.
+    // Asked before the walk starts, because a root appearing part way through a run is not the
+    // starting state this swallows for. `Ok(false)` is the only answer that means absent: an error
+    // leaves the walk to report it.
     fn new(walk: FsWalk, root: &Path) -> Self {
         Self {
             walk,
@@ -738,13 +738,28 @@ impl KeyStream for LocalDestination {
     async fn next_entry(&mut self) -> Option<Result<Entry<FsEntry>, StreamError>> {
         match self.walk.next_entry().await {
             Some(Err(StreamError::Walk(err)))
-                if self.absent && err.kind() == WalkErrorKind::SourceUnreadable =>
+                if self.absent
+                    && err.kind() == WalkErrorKind::SourceUnreadable
+                    && nothing_was_there(&err) =>
             {
                 None
             }
             other => other,
         }
     }
+}
+
+// Whether the reason a root could not be opened was that it was not there.
+//
+// The kind cannot answer this. A walk calls anything that stopped it opening its root
+// `SourceUnreadable`, so a missing directory and one that refuses to be read arrive the same way,
+// and the reason has to come from the error underneath. Reading a refusal as absence would report
+// every key as missing from a destination nobody could look at, and send all of them without asking
+// the comparison anything.
+fn nothing_was_there(err: &crate::io::walk::WalkError) -> bool {
+    std::error::Error::source(err)
+        .and_then(|source| source.downcast_ref::<std::io::Error>())
+        .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
 }
 
 // One local directory and one bucket, which is what an upload and a download each need. Which of
@@ -1371,6 +1386,54 @@ mod tests {
             ]),
             "every later key stays unknown on the side that lost one it could not name"
         );
+    }
+
+    // A destination that was not there when the run started, and by the time the walk reached it was
+    // there and would not open. Only absence licenses treating every key as missing; a refusal has to
+    // reach the caller, because reading it as absence sends the whole source without asking the
+    // comparison about any of it.
+    #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn a_destination_that_appears_unreadable_is_not_read_as_absent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let root = dir.path().join("appears-later");
+
+        // Built while nothing is there, which is the state the swallow is for.
+        let destination = LocalDestination::new(
+            FsWalker::builder()
+                .sort(SortOrder::WholeWalk)
+                .recursive(true)
+                .build()
+                .walk(FsWalkContext::builder().root(&root).build()),
+            &root,
+        );
+
+        // Then it turns up, and will not open.
+        std::fs::create_dir(&root).expect("a directory");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        let readable = std::fs::read_dir(&root).is_ok();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        if readable {
+            // Running as a user the mode does not bind, so there is nothing to test.
+            return;
+        }
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+
+        let mut destination = destination;
+        let first = destination.next_entry().await;
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+
+        match first {
+            Some(Err(StreamError::Walk(err))) => {
+                assert_eq!(err.kind(), WalkErrorKind::SourceUnreadable);
+            }
+            Some(Ok(entry)) => panic!("an unreadable destination produced {:?}", entry.key),
+            Some(Err(other)) => panic!("an unexpected failure: {other}"),
+            None => panic!("a destination that refused to be read was reported as empty"),
+        }
     }
 
     // A directory that lists but whose children cannot be stat'd: readable, not searchable.
