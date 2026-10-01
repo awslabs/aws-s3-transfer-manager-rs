@@ -148,6 +148,14 @@ struct Side<K: KeyStream> {
     // unknown, which is the only answer that cannot delete an object whose file was merely
     // unreadable.
     lost_unnamed: bool,
+    // The last key this side produced, which the next one has to sort after.
+    //
+    // The merge reads absence from position, so a side going backwards is read as absence and then
+    // as presence: one key handed both a delete and a transfer, by a plan calling itself whole. A
+    // debug assertion on the one root known to list unordered covers development and compiles out,
+    // where a listing whose collation differs or a derivation that changes produces this in a
+    // release build.
+    last: Option<String>,
     // The root this side's paths are taken under, when it walks a filesystem.
     //
     // A walk names the file it could not read by absolute path, and turning that into a key
@@ -162,6 +170,7 @@ impl<K: KeyStream> Side<K> {
         Self {
             stream,
             head: Head::Unread,
+            last: None,
             gap: Stretches::default(),
             lost: BTreeSet::new(),
             lost_unnamed: false,
@@ -179,6 +188,22 @@ impl<K: KeyStream> Side<K> {
         }
         match self.stream.next_entry().await {
             Some(Ok(entry)) => {
+                // Checked before the entry is taken rather than when it is handed over, because a
+                // key read as absent here is one the other side may already have been told about.
+                if let Some(last) = &self.last {
+                    if entry.key.as_str() <= last.as_str() {
+                        let err = StreamError::OutOfOrder {
+                            key: entry.key.clone(),
+                            after: last.clone(),
+                        };
+                        // The entry is dropped. Its position is what made it answerable, and the
+                        // cost recorded below answers every later key on this side as unknown, so
+                        // nothing is deleted or overwritten on the strength of where it sat.
+                        self.gap.add(Stretch { under: None });
+                        return Some(err);
+                    }
+                }
+                self.last = Some(entry.key.clone());
                 self.head = Head::Entry(entry);
                 None
             }
@@ -1235,6 +1260,65 @@ mod tests {
             reported,
             Some(KeysLost::UnknownRange),
             "a key named as lost on a side that also lost a range reported only itself"
+        );
+    }
+
+    // A side going backwards would have a key read as absent and then as present, so one key would
+    // collect both a delete and a transfer while the plan called itself whole. The only guard on the
+    // one root known to list unordered is a debug assertion, which compiles out, so the merge checks
+    // what it actually depends on: that each side's keys strictly increase.
+    #[tokio::test]
+    async fn a_side_going_backwards_does_not_give_one_key_two_actions() {
+        // The source goes backwards, and the destination holds a key after that point. That key is
+        // the one the guarantee is about: without the check it reads as absent from the source, and
+        // absence is what licenses removing it.
+        let mut walk = Walk::new(
+            Scripted::of(&["b.txt", "a.txt"]),
+            Scripted::of(&["a.txt", "b.txt", "d.txt"]),
+        );
+
+        // Which side of the failure each decision fell on. Nothing can recall a key decided before
+        // the disorder surfaced — the merge had no way to know yet — so the guarantee is about the
+        // keys after it.
+        let mut decided: Vec<(String, At, At, bool)> = Vec::new();
+        let mut failures = 0;
+        while let Some(next) = walk.next().await {
+            match next {
+                Ok(pairing) => decided.push((
+                    pairing.key().to_string(),
+                    at(pairing.source()),
+                    at(pairing.destination()),
+                    failures > 0,
+                )),
+                Err(_) => failures += 1,
+            }
+        }
+
+        assert_eq!(failures, 1, "the disorder was not reported");
+        assert!(
+            !walk.is_plan_complete(),
+            "a run that could not read one side's positions called its plan whole"
+        );
+        // No key may appear twice, which is how one would collect two actions.
+        let mut keys: Vec<&str> = decided.iter().map(|(k, _, _, _)| k.as_str()).collect();
+        keys.sort();
+        let before = keys.len();
+        keys.dedup();
+        assert_eq!(before, keys.len(), "a key was decided twice: {decided:?}");
+        // Nothing decided after the disorder reads as absent on the side that caused it, since
+        // absence is what licenses a delete.
+        for (key, source, _, after) in &decided {
+            if *after {
+                assert_ne!(
+                    *source,
+                    At::Gone,
+                    "{key} read as absent on a side whose positions had stopped meaning anything"
+                );
+            }
+        }
+        assert!(
+            decided.iter().any(|(_, _, _, after)| *after),
+            "the test decided nothing after the disorder, so it proved nothing"
         );
     }
 

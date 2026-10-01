@@ -115,6 +115,16 @@ pub(crate) enum StreamError {
         key: Option<String>,
         what: &'static str,
     },
+    // A key that did not sort after the one before it on the same side.
+    //
+    // The merge reads absence from position, so a side going backwards would have a key read as
+    // absent and then as present — one key given both a delete and a transfer, with the plan
+    // reporting itself whole. A listing whose collation is not the one assumed, or a derivation that
+    // changes, produces this.
+    OutOfOrder {
+        key: String,
+        after: String,
+    },
 }
 
 impl StreamError {
@@ -124,6 +134,11 @@ impl StreamError {
         match self {
             StreamError::Walk(err) => err.is_fatal(),
             StreamError::UnkeyableName(_) | StreamError::MalformedListing { .. } => false,
+            // Not fatal. The side carries on and every later key it does not produce reads unknown,
+            // which costs the rest of its keys their actions and nothing already on either side.
+            // Ending the run instead would throw away every key decided before the disorder for the
+            // sake of the ones after it.
+            StreamError::OutOfOrder { .. } => false,
         }
     }
 }
@@ -144,6 +159,10 @@ impl std::fmt::Display for StreamError {
                 write!(f, "{what}: {key}")
             }
             StreamError::MalformedListing { key: None, what } => write!(f, "{what}"),
+            StreamError::OutOfOrder { key, after } => write!(
+                f,
+                "key '{key}' arrived after '{after}', which the merge cannot read positions from"
+            ),
         }
     }
 }
@@ -152,7 +171,9 @@ impl std::error::Error for StreamError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             StreamError::Walk(err) => Some(err),
-            StreamError::UnkeyableName(_) | StreamError::MalformedListing { .. } => None,
+            StreamError::UnkeyableName(_)
+            | StreamError::MalformedListing { .. }
+            | StreamError::OutOfOrder { .. } => None,
         }
     }
 }
@@ -231,6 +252,9 @@ impl StreamError {
             // No key to name, so a consumer cannot hold back the action for it. One key is gone and
             // which one is unknowable, which is a range of one.
             StreamError::MalformedListing { key: None, .. } => KeysLost::UnknownRange,
+            // Not one key but every later one: once a side's positions cannot be trusted, nothing
+            // after this says anything about absence.
+            StreamError::OutOfOrder { .. } => KeysLost::UnknownRange,
         }
     }
 }
