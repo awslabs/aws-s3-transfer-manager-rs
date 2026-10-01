@@ -221,10 +221,10 @@ impl<K: KeyStream> Side<K> {
         if let Some(entry) = self.head.entry() {
             let key = entry.key.clone();
             self.gap.release_passed(&key);
-            // The side answering for a key it did not produce prunes in `missing`; this is the
-            // other path. Without it the side producing keys never lets go of the ones it held,
-            // and the set grows for the length of the run instead of staying inside what the
-            // directories currently open are holding.
+            // `missing` is the other path, for a side answering about a key it did not produce, and
+            // it prunes both of these too. Either path alone leaves the other's keys growing the set
+            // for the length of the run instead of keeping it inside what the directories currently
+            // open are holding.
             self.release_before(&key);
         }
         match std::mem::replace(&mut self.head, Head::Unread) {
@@ -238,6 +238,7 @@ impl<K: KeyStream> Side<K> {
     // lost.
     fn missing(&mut self, key: &str) -> SideState<K::Source> {
         self.release_before(key);
+        self.gap.release_passed(key);
         if self.lost.remove(key) {
             return SideState::Unknown(KeysLost::OneKey);
         }
@@ -284,23 +285,61 @@ struct Stretch {
 // whose name sorts earlier. Keeping one at a time forgets whichever arrived first, and the keys it
 // covered go back to reading absent.
 #[derive(Debug, Clone, Default)]
-struct Stretches(Vec<Stretch>);
+struct Stretches {
+    // The names bounded stretches sit under, in key order.
+    //
+    // A set rather than a list because every one of the three things asked of this is asked once per
+    // key or once per failure, and a scan makes each of them cost what the whole run has held. With N
+    // unreadable directories ahead of M keys, a list costs N² to fill and N·M to consult.
+    under: BTreeSet<String>,
+    // A stretch bounding nothing covers every later key and is never passed, so it needs no name and
+    // no ordering — only to be remembered.
+    everything: bool,
+}
 
 impl Stretches {
     fn add(&mut self, stretch: Stretch) {
-        if !self.0.contains(&stretch) {
-            self.0.push(stretch);
+        match stretch.under {
+            None => self.everything = true,
+            Some(name) => {
+                self.under.insert(name);
+            }
         }
     }
 
     // Whether any stretch still owes an answer for this key.
     fn covers(&self, key: &str) -> bool {
-        self.0.iter().any(|s| s.covers(key))
+        if self.everything {
+            return true;
+        }
+        // A bounded stretch covers this key when its name is the key or an ancestor of it. So the
+        // names worth looking for are the key and its ancestors — a handful — rather than every name
+        // being held.
+        if self.under.contains(key) {
+            return true;
+        }
+        key.bytes()
+            .enumerate()
+            .any(|(at, byte)| byte == b'/' && self.under.contains(&key[..at]))
     }
 
     // Drop every stretch the merge has passed.
     fn release_passed(&mut self, key: &str) {
-        self.0.retain(|s| !s.passed_by(key));
+        // Everything sorting before the key is behind the merge, with one exception: a name the key
+        // extends without entering its subtree — `link` against `link.txt`, where `.` sorts below `/`
+        // — is neither covered nor passed, because the whole subtree is still ahead. Those are put
+        // back, and there are at most as many as the key is long.
+        let at_or_after = self.under.split_off(key);
+        let held: Vec<String> = key
+            .bytes()
+            .enumerate()
+            .filter(|(_, byte)| *byte <= b'/')
+            .map(|(at, _)| &key[..at])
+            .filter(|prefix| self.under.contains(*prefix))
+            .map(str::to_string)
+            .collect();
+        self.under = at_or_after;
+        self.under.extend(held);
     }
 }
 
@@ -1023,6 +1062,55 @@ mod tests {
         assert_eq!(at(after.destination()), At::Here);
     }
 
+    // The other path out of a stretch. The test above has the side that reported the failure produce
+    // the key that passes it; here the failure's side produces nothing more, and the key comes from
+    // the other side. That side is the one asking, so the answer has to prune as it goes — otherwise
+    // every later key is compared against every stretch the run has ever held, and deciding one key
+    // costs what the whole run lost rather than a fixed amount.
+    #[tokio::test]
+    async fn stretches_are_released_by_the_side_that_asks_about_them() {
+        let failures: Vec<Result<Entry<()>, StreamError>> = (0..8)
+            .map(|i| {
+                Err(StreamError::Walk(WalkError::new(
+                    Some(PathBuf::from(format!("/root/d{i}"))),
+                    WalkErrorKind::DirectoryUnreadable,
+                    Box::from("permission denied"),
+                )))
+            })
+            .collect();
+        // The failing side ends after its failures; every key comes from the other side.
+        let mut walk = Walk::new(
+            Scripted::from(failures),
+            Scripted::of(&["z0.txt", "z1.txt", "z2.txt"]),
+        )
+        .with_roots(Some(PathBuf::from("/root")), None);
+
+        for _ in 0..8 {
+            let _ = walk.next().await.expect("a failure");
+        }
+        assert_eq!(
+            walk.src.gap.under.len(),
+            8,
+            "each failure should be held where it is reported"
+        );
+
+        // One key from the other side, sorting past all of them.
+        let _ = walk.next().await.expect("z0.txt");
+        assert!(
+            walk.src.gap.under.is_empty(),
+            "the side being asked about kept {} stretches the merge is past",
+            walk.src.gap.under.len()
+        );
+
+        // And the keys after it still decide, which is what the pruning must not break.
+        let mut remaining = 0;
+        while let Some(result) = walk.next().await {
+            assert!(result.is_ok(), "a later key stopped deciding");
+            remaining += 1;
+        }
+        assert_eq!(remaining, 2, "the run did not finish the other side");
+    }
+
     // A directory nobody could open, taken from the design's own example.
     fn a_lost_directory() -> StreamError {
         StreamError::Walk(WalkError::new(
@@ -1230,13 +1318,13 @@ mod tests {
         .with_roots(Some(PathBuf::from("/root")), None);
         let _ = walk.next().await.expect("the failure");
         assert_eq!(
-            walk.src.gap.0.len(),
+            walk.src.gap.under.len(),
             1,
             "the stretch is held where it is reported"
         );
         let _ = walk.next().await.expect("z.txt");
         assert!(
-            walk.src.gap.0.is_empty(),
+            walk.src.gap.under.is_empty(),
             "a stretch the merge is past is no longer held"
         );
     }
@@ -1957,6 +2045,56 @@ mod tests {
             !stretch.passed_by("a.txt"),
             "a key before the name settles nothing either"
         );
+    }
+
+    // Every name against every key, over an alphabet picked to straddle the delimiter: `.` sorts just
+    // below `/` and `0` just above, which is where releasing a stretch too early or too late shows up.
+    //
+    // Two things have to agree. `passed_by` says whether one stretch is behind a key, and
+    // `release_passed` drops a whole set at once by splitting it — a different calculation that has to
+    // reach the same answer, or a stretch is let go while the keys it hid are still ahead.
+    #[test]
+    fn releasing_a_set_of_stretches_agrees_with_asking_about_each_one() {
+        let alphabet = ["!", ".", "/", "0", "a", "b", "é"];
+        let mut keys = vec![String::new()];
+        for _ in 0..3 {
+            let longer: Vec<String> = keys
+                .iter()
+                .flat_map(|k| alphabet.iter().map(move |c| format!("{k}{c}")))
+                .collect();
+            keys.extend(longer);
+        }
+        keys.sort();
+        keys.dedup();
+        let names: Vec<&String> = keys.iter().filter(|k| !k.is_empty()).collect();
+
+        for key in &keys {
+            // What asking one at a time says.
+            let mut expected: Vec<&str> = names
+                .iter()
+                .filter(|name| {
+                    !Stretch {
+                        under: Some((**name).clone()),
+                    }
+                    .passed_by(key)
+                })
+                .map(|name| name.as_str())
+                .collect();
+            expected.sort_unstable();
+
+            // What dropping the whole set at once says.
+            let mut stretches = Stretches::default();
+            for name in &names {
+                stretches.add(Stretch {
+                    under: Some((*name).clone()),
+                });
+            }
+            stretches.release_passed(key);
+            let mut kept: Vec<&str> = stretches.under.iter().map(String::as_str).collect();
+            kept.sort_unstable();
+
+            assert_eq!(kept, expected, "the two disagree at key {key:?}");
+        }
     }
 
     #[tokio::test]
