@@ -15,17 +15,18 @@ delivery is bounded and lossy with loss counted per consumer; quantities are not
 be lost.
 
 ```text
-operation                          this design                     consumer
----------                          -----------                     --------
-upload / download       --+
-                          +--> Lifecycle --> Planned --+--> channel --> recv()
-upload_objects            |         |                  |    (bounded,
-download_objects        --+         `----> Ended -------+     lossy)
-  one entry per object              |
-                                    `----> TransferView <------------- read on demand
-                                                 ^
-                                                 | same counters
-                                            metrics()
+  operation                      this design                      consumer
+  ─────────                      ───────────                      ────────
+
+  upload / download ──┐
+                      ├──► Lifecycle ──► Planned ──┐
+  upload_objects      │         │                  ├──► channel ──► recv()
+  download_objects ───┘         ├──► Ended ────────┘    (bounded, lossy)
+    one entry per object        │
+                                └──► TransferView ◄──── read on demand
+                                          ▲
+                                          │ same counters
+                                      metrics()
 ```
 
 ## Requirements
@@ -166,14 +167,14 @@ sink and the entry's identity, and a `TransferView` holds a read-only borrow of 
 
 ```text
 Lifecycle
-+-- TransferEventSink
-|   `-- one bounded channel per registered consumer, each with its own loss count
-+-- entry identity
-|   `-- id, parent id, TransferRef, Decision
-+-- terminal obligation
-|   `-- armed at announcement, discharged once
-`-- TransferView
-    `-- borrow of the entry's MetricsState, carried on the announcement
+├── TransferEventSink
+│   └── one bounded channel per registered consumer, each with its own loss count
+├── entry identity
+│   └── id, parent id, TransferRef, Decision
+├── terminal obligation
+│   └── armed at announcement, discharged once
+└── TransferView
+    └── borrow of the entry's MetricsState, carried on the announcement
 ```
 
 Lifecycle is pushed and quantities are pulled. An event carries identity, decision, and outcome. It
@@ -226,13 +227,17 @@ caller succeeds. A claim yields the event as a value rather than sending it, and
 dropped unsent restores the obligation.
 
 ```text
-Unarmed
-  `-- announce -----------------> Armed
-                                   +-- claim ------> Discharged
-                                   |                  `-- send -> delivered or counted as lost
-                                   +-- claim again -> no value, no second event
-                                   `-- claim, then drop the value unsent
-                                                    `-- Armed, the next path claims it
+  Unarmed
+     │
+     └── announce ──► Armed
+                        │
+                        ├── claim ─────────► Discharged
+                        │                      └── send ──► delivered, or counted as lost
+                        │
+                        ├── claim again ───► no value, no second event
+                        │
+                        └── claim, drop the value unsent
+                                               └──► Armed; the next path claims it
 ```
 
 The obligation is not derived from the transfer's status transition. An entry refused by a failure
@@ -333,10 +338,10 @@ impl TransferRef {
 
 ```text
 Endpoint
-+-- S3 { bucket, key }        either end of a transfer, a copy, or a delete
-+-- Local { path }            a file or a directory the caller named
-+-- Stream                    a body the caller owns and drains
-`-- Unresolved                no address this layer can know
+├── S3 { bucket, key }        either end of a transfer, a copy, or a delete
+├── Local { path }            a file or a directory the caller named
+├── Stream                    a body the caller owns and drains
+└── Unresolved                no address this layer can know
 ```
 
 Naming both ends is what lets a consumer key its own state off the event rather than off a side map
@@ -406,13 +411,13 @@ A sink is registered on the client, on a request, or on both. Each registered co
 bounded channel and one loss count, read through `dropped()`.
 
 ```text
-Config::builder().events(sink_a)  --+
-                                    +--> merge --+--> channel A  cap, dropped()
-request.events(sink_a.clone())    --+            |
-                                                 |
-request.events(sink_b)            ---------------+--> channel B  cap, dropped()
+  Config::builder().events(sink_a) ──┐
+                                     ├──► merge ──┬──► channel A   cap, dropped()
+  request.events(sink_a.clone()) ────┘            │
+                                                  │
+  request.events(sink_b) ─────────────────────────┴──► channel B   cap, dropped()
 
-sink_a registered twice is one consumer: one channel, one loss count
+  sink_a registered twice is one consumer: one channel, one loss count
 ```
 
 Registering one sink at both levels yields one consumer, not two. Registration at both levels is the
@@ -430,12 +435,12 @@ would hold a stream open past the operation that created it.
 A terminal is published after the joining caller is released:
 
 ```text
-worker thread                          caller thread
--------------                          -------------
-transfer reaches terminal
-release the joiner  ------------------> join() returns
-claim the terminal
-send it                                a consumer that drains here
+  worker thread                        caller thread
+  ─────────────                        ─────────────
+  transfer reaches terminal
+  release the joiner ────────────────► join() returns
+  claim the terminal
+  send it                              a consumer that drains here
                                        has not seen the last terminals
 ```
 
@@ -530,11 +535,11 @@ follows an await:
 ```text
 reap batch removed from the child collection
     |
-    +-- child joined, outcome claimed            reported with its own outcome
+    ├── child joined, outcome claimed            reported with its own outcome
     |
-    `-- child not yet joined, operation ends     absent from the collection, so a
+    └── child not yet joined, operation ends     absent from the collection, so a
             |                                    sweep would read "never existed"
-            `-- the outcome is captured at drain, so the sweep reads it
+            └── the outcome is captured at drain, so the sweep reads it
 ```
 
 A mid-reap entry is therefore tracked with the outcome it already reached, captured in the same step
@@ -564,67 +569,99 @@ The obligations in Architecture and Integration constrain individual mechanisms.
 properties constrain their composition across announcement, terminal discharge, accounting, and
 cancellation, and are what a consumer may rely on.
 
-### Each entry is announced once and reported at most once more
+### Exactly-once announcement, at-most-once terminal
 
-An announcement occurs once per entry. A terminal occurs at most once, and occurs on every path that
-ends an operation, including cancellation and a sibling's failure under an abort policy.
-[Lifecycle obligation](#lifecycle-obligation) arms the obligation at announcement, and one claim
-discharges it. [Terminal sweeps](#terminal-sweeps) reaches every entry that holds one.
+**Invariant.** An announcement occurs once per entry. A terminal occurs at most once per
+announcement, and occurs on every path that ends an operation, including cancellation and a sibling's
+failure under an abort policy.
 
-This prevents a consumer waiting on a terminal no path emits, and prevents a consumer acting twice on
-one entry.
+**What it rules out.** An entry announced with no terminal leaves a consumer's per-entry state
+unresolved forever: a sync tool holding `in-flight` for a file nothing will ever settle, a progress
+display whose remaining count never reaches zero. A second terminal for one entry is the mirror —
+a cleanup consumer deletes twice, and the second delete lands on whatever now holds that path.
+
+**Mechanism.** [Lifecycle obligation](#lifecycle-obligation) arms the obligation at announcement and
+one claim discharges it; the claim is the single atomic that decides the winner.
+[Terminal sweeps](#terminal-sweeps) reaches each of the three places a claimed entry can sit, so no
+path ends an operation while leaving an obligation armed.
 
 ### A successful terminal names an effect that has committed
 
-A successful terminal names a destination that exists. [Commit placement](#commit-placement) orders
-the durability step ahead of the status that every reporting path reads.
+**Invariant.** A terminal reporting success names a destination that exists.
 
-This prevents a consumer from deleting a source whose destination has not been created, and prevents a
-caller that trusts a terminal instead of joining from discarding a completed transfer.
+**What it rules out.** A managed path download writes `dest.s3tmp.XXXX` and renames it. With the
+rename after the status, every reporting path reads `Completed` and names `dest` → a sync consumer
+deletes the source it has just been told arrived → the rename then fails, or the handle is dropped
+and the temporary file is unlinked → neither source nor destination exists. The event cannot
+retract, because it already said succeeded.
+
+**Mechanism.** [Commit placement](#commit-placement) moves the rename into the transfer's completion
+path, immediately ahead of the status every reporting path reads. A failed rename routes to the
+failure transition instead, so the terminal names the failure rather than a destination.
 
 ### A terminal names the outcome of its own entry
 
-An entry's outcome describes that entry, including when its terminal is claimed while the operation is
-ending for an unrelated reason. [Terminal sweeps](#terminal-sweeps) tracks the identities under reap,
-so a sweep does not label an entry by the operation's ending.
+**Invariant.** An entry's outcome describes that entry, including when its terminal is claimed while
+the operation is ending for an unrelated reason.
 
-This prevents a consumer that cleans up after a cancelled entry from removing complete data.
+**What it rules out.** A reap removes a child from the collection before its outcome is claimed. An
+operation ending during that window finds no child, falls through to `Cancelled`, and reports a file
+that is complete on disk as cancelled → a sync consumer re-fetches it, a cleanup consumer deletes it.
+
+**Mechanism.** [Terminal sweeps](#terminal-sweeps) captures each child's outcome in the same step
+that drains it, so a sweep reads what the child reached rather than inferring from the operation's
+ending.
 
 ### An outcome and its cause are read together
 
-An outcome is computed from the status and the error, and a failure carries the error its operation's
-join returns. [Lifecycle obligation](#lifecycle-obligation) removes both the outcome literal and the
-fallback error. The status transition is published while the error slot is held, so a reader that
-observes `Failed` and then takes the same lock cannot find it empty.
+**Invariant.** An outcome is computed from the status and the error, never written as a literal, and
+a failure carries the error its operation's join returns.
 
-The ordering is the mechanism and it sits on the writer; no reader-side rule recovers a fact the writer
-has not stored yet. Setting the status before storing the error leaves a window where `Failed` is
-visible over an empty slot, and a reader there either panics on the unwrap or invents a cause. Storing
-before the transition is the other candidate and is wrong in the other direction: the first-write-wins
-CAS has not picked a winner yet, so a losing caller overwrites the winner's error.
+**What it rules out.** Two failures, with different shapes. A literal `Cancelled` at an emit site
+covers more states than it names, because failure and cancellation both leave a transfer inactive, so
+a consumer branching `Failed => alert` against `Cancelled => the user stopped it` takes the wrong arm
+on every failure and loses the cause entirely. Separately, a status published before the error it
+explains leaves a window where `Failed` is visible over an empty slot, and a reader there either
+panics on the unwrap or constructs a plausible error that no join will ever return.
 
-This prevents a failed operation reporting as cancelled and therefore reporting no cause, prevents a
-consumer branching on error kind from reading a constructed error, and prevents a terminal that names a
-failure it cannot explain.
+**Mechanism.** [Lifecycle obligation](#lifecycle-obligation) derives the outcome from the status and
+removes the fallback error, so there is no branch left to construct one. The status transition is
+published while the error slot is held, so a reader observing `Failed` and then taking the same lock
+cannot find it empty. The ordering sits on the writer because no reader-side rule recovers a fact the
+writer has not stored yet; storing before the transition is the other candidate and is wrong in the
+other direction, because the first-write-wins CAS has not picked a winner and a losing caller would
+overwrite the winner's error.
 
-### A reported quantity describes the run
+### A reported quantity describes the run, not its audience
 
-Every quantity on `TransferView` and on the metrics snapshot has one value for a run whether or not a
-sink was registered, and the settled-entry count reaches the enumerated total on every run that ends.
-[Counting](#counting) places the increment on the claim and outside any sink-conditioned branch.
+**Invariant.** Every quantity on `TransferView` and on the metrics snapshot has one value for a run
+whether or not a sink was registered, and the settled-entry count reaches the enumerated total on
+every run that ends.
 
-This prevents an operation from disagreeing with itself, and prevents a progress display from showing
-outstanding work after an operation has ended.
+**What it rules out.** A count incremented inside a branch conditioned on a sink makes the number a
+property of who was watching. Without an observer the settled count stops short of the total, so
+`entries_settled == entry_total` never holds, and a display polling for completion shows outstanding
+work after the operation has ended — on a run where nothing went wrong.
+
+**Mechanism.** [Counting](#counting) places the increment where the terminal is claimed, which occurs
+once per entry, and outside any sink-conditioned branch. Counting is not an observer's concern, so
+the guard that reads the sink sits below it.
 
 ### A consumer is isolated from other consumers and from the operation
 
-Each consumer holds its own channel, capacity, and loss count.
-[Registration and fan-out](#registration-and-fan-out) establishes one channel per consumer and
-deduplicates a doubly-registered sink. [Publication ordering](#publication-ordering) keeps consumer
-progress out of the join path.
+**Invariant.** Each consumer holds its own channel, capacity, and loss count, and no consumer's
+progress gates the operation.
 
-This prevents one slow observer from throttling an operation or from appearing to corrupt another
-observer's stream.
+**What it rules out.** One channel shared across consumers makes a slow consumer's backlog the other
+consumers' loss, which reads as a corrupted stream rather than as a slow reader. A sink registered at
+both the client and the request level delivers every event twice to one consumer, which double-counts
+every tally built from the stream. And publication inside `join` places one consumer's channel
+progress in the join path of every caller of that operation.
+
+**Mechanism.** [Registration and fan-out](#registration-and-fan-out) establishes one channel per
+consumer and deduplicates on the channel rather than on the sink, because a sink is `Clone` and two
+clones are one consumer. [Publication ordering](#publication-ordering) releases the joiner before
+claiming the terminal.
 
 ## Open Questions
 
