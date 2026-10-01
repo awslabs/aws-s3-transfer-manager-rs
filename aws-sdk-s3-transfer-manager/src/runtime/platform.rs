@@ -10,78 +10,106 @@
 
 use std::path::{Path, PathBuf};
 
-// Connection-cap sizing from the descriptor limit and memory budget. The
-// consumer is the managed-runtime connection pool, which caps `max_connections`
-// from these. The pool wiring does not exist yet, so the fd-budget items below
-// carry `#[allow(dead_code)]`; `MIN_CONN`/`ABSOLUTE_MAX_CONN` are already live as
-// the concurrency-seed bounds (in-flight requests are connection-bound under
-// HTTP/1, so the connection bounds bound the seed too).
+// Per-host connection cap for the managed-runtime connection pool, derived from
+// the process descriptor limit and bounded by a fixed ceiling.
 
-/// Fraction of the process file-descriptor limit the connection pool may use.
-/// The remainder is headroom for disk sinks, the directory walker, logging, and
-/// other descriptors the process holds.
-#[allow(dead_code)]
+/// Fraction of the soft descriptor limit the connection pool may use. The
+/// remainder is headroom for disk sinks, the directory walker, logging, and other
+/// descriptors the process holds; bulk disk transfers can hold one open file per
+/// in-flight connection.
 const POOL_FD_BUDGET_FRACTION: f64 = 0.5;
 
-/// Ceiling on pooled connections regardless of descriptor headroom, and the
-/// upper bound on the concurrency seed. Bounds request fan-out against a single
-/// S3 endpoint, and is the cap on platforms with no low descriptor limit.
-const ABSOLUTE_MAX_CONN: usize = 10_000;
-
-/// Floor so a low descriptor limit does not cap the pool below a usable count,
-/// and the lower bound on the concurrency seed.
-const MIN_CONN: usize = 10;
-
-/// Global cap on pooled connections from the descriptor limit alone, used where
-/// the memory budget is not yet known (the runtime-builder default). Machine-
-/// derived and independent of the throughput target. `clamp(POOL_FD_BUDGET_FRACTION
-/// x RLIMIT_NOFILE, MIN_CONN, ABSOLUTE_MAX_CONN)` on Unix; `ABSOLUTE_MAX_CONN`
-/// where there is no low descriptor limit or detection fails.
-#[allow(dead_code)]
-pub(crate) fn connection_cap() -> usize {
-    cap(fd_limit(), usize::MAX)
-}
-
-/// Global connection cap including the memory term: a connection that can never
-/// hold a chunk is wasted, so the budget caps connections at the chunk count it
-/// can fund. `clamp(min(fd_budget, budget_capacity / chunk), MIN_CONN,
-/// ABSOLUTE_MAX_CONN)`.
-#[allow(dead_code)]
-pub(crate) fn connection_cap_with_memory(
-    budget_capacity_bytes: usize,
-    chunk_bytes: usize,
-) -> usize {
-    cap(fd_limit(), budget_capacity_bytes / chunk_bytes.max(1))
-}
-
-/// Apply the descriptor fraction, take the smaller of it and the memory-funded
-/// connection count, and clamp to `[MIN_CONN, ABSOLUTE_MAX_CONN]`.
-#[allow(dead_code)]
-fn cap(fd_limit: Option<usize>, mem_conns: usize) -> usize {
-    let fd_budget = fd_limit
-        .map(|n| (n as f64 * POOL_FD_BUDGET_FRACTION) as usize)
-        .unwrap_or(ABSOLUTE_MAX_CONN);
-    fd_budget.min(mem_conns).clamp(MIN_CONN, ABSOLUTE_MAX_CONN)
-}
-
-/// Soft `RLIMIT_NOFILE` on Unix; `None` where there is no low descriptor limit
-/// or detection fails.
+/// Ceiling on connections to one origin across all managed threads.
 ///
-/// Ref: getrlimit(2) <https://man7.org/linux/man-pages/man2/getrlimit.2.html>
-#[allow(dead_code)]
-#[cfg(unix)]
-fn fd_limit() -> Option<usize> {
-    use nix::sys::resource::{getrlimit, Resource};
-    match getrlimit(Resource::RLIMIT_NOFILE) {
-        Ok((soft, _hard)) if soft > 0 => usize::try_from(soft).ok(),
-        _ => None,
+/// Above every concurrency target outside the largest accelerator families,
+/// where the per-connection throughput assumed by the seed understates what a
+/// connection delivers.
+pub(crate) const MAX_CONNECTIONS_PER_HOST: usize = 4096;
+
+/// Floor so a low descriptor limit does not cap the pool below a usable count.
+const MIN_CONNECTIONS_PER_HOST: usize = 10;
+
+/// The process's `RLIMIT_NOFILE`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DescriptorLimit {
+    /// Soft limit, the one enforced on this process.
+    pub(crate) soft: usize,
+    /// Hard limit the soft limit can be raised to, or `None` when unlimited.
+    pub(crate) hard: Option<usize>,
+}
+
+/// The per-host connection cap and the descriptor limit it was derived from.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ConnectionCap {
+    /// Maximum connections to one origin across all managed threads.
+    pub(crate) max_per_host: usize,
+    /// Descriptor limit detected at construction, if any.
+    pub(crate) descriptors: Option<DescriptorLimit>,
+}
+
+impl ConnectionCap {
+    /// Detect the descriptor limit and derive the cap from it.
+    pub(crate) fn detect() -> Self {
+        Self::from_descriptor_limit(descriptor_limit())
+    }
+
+    /// `clamp(soft × POOL_FD_BUDGET_FRACTION, MIN_CONNECTIONS_PER_HOST,
+    /// MAX_CONNECTIONS_PER_HOST)`, or the ceiling when no limit is known.
+    pub(crate) fn from_descriptor_limit(descriptors: Option<DescriptorLimit>) -> Self {
+        let max_per_host = descriptors
+            .map_or(MAX_CONNECTIONS_PER_HOST, |limit| {
+                descriptor_budget(limit.soft)
+            })
+            .clamp(MIN_CONNECTIONS_PER_HOST, MAX_CONNECTIONS_PER_HOST);
+        Self {
+            max_per_host,
+            descriptors,
+        }
+    }
+
+    /// Whether the descriptor budget, rather than the fixed ceiling, set the cap.
+    pub(crate) fn limited_by_descriptors(&self) -> bool {
+        self.max_per_host < MAX_CONNECTIONS_PER_HOST
     }
 }
 
-#[allow(dead_code)]
+/// Connections the descriptor budget allows for a soft limit.
+fn descriptor_budget(soft: usize) -> usize {
+    (soft as f64 * POOL_FD_BUDGET_FRACTION) as usize
+}
+
+/// `RLIMIT_NOFILE` on Unix; `None` where there is no descriptor limit or
+/// detection fails.
+///
+/// Ref: getrlimit(2) <https://man7.org/linux/man-pages/man2/getrlimit.2.html>
+#[cfg(unix)]
+fn descriptor_limit() -> Option<DescriptorLimit> {
+    use nix::sys::resource::{getrlimit, Resource};
+    let (soft, hard) = getrlimit(Resource::RLIMIT_NOFILE).ok()?;
+    parse_descriptor_limit(soft, hard, nix::sys::resource::RLIM_INFINITY)
+}
+
 #[cfg(not(unix))]
-fn fd_limit() -> Option<usize> {
+fn descriptor_limit() -> Option<DescriptorLimit> {
     None
+}
+
+/// Interpret raw `getrlimit` values. An infinite soft limit means no limit; an
+/// infinite hard limit means the soft limit can be raised without bound.
+///
+/// Generic over the limit type because `rlim_t` is unsigned on most platforms
+/// and signed on FreeBSD. Infinity is compared in that type before conversion.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn parse_descriptor_limit<T>(soft: T, hard: T, infinity: T) -> Option<DescriptorLimit>
+where
+    T: Copy + PartialEq + TryInto<usize>,
+{
+    let finite = |limit: T| (limit != infinity).then(|| limit.try_into().unwrap_or(usize::MAX));
+    let soft = finite(soft).filter(|&soft| soft > 0)?;
+    Some(DescriptorLimit {
+        soft,
+        hard: finite(hard),
+    })
 }
 
 /// Usable RAM from Linux-compatible procfs and cgroup interfaces.
@@ -345,12 +373,15 @@ fn walk_paths(mount: &str, cgroup_path: &str, filename: &str) -> Vec<PathBuf> {
 // (NIC bandwidth scales linearly with vCPU count within a family), and
 // `target = ceil(gbps / GBPS_PER_CONN)`.
 //
-// `N` is target *in-flight requests* (the scheduler's `poll_work` gate), which
-// the pool sizes connections separately from. In-flight work is nonetheless
-// connection-bound under HTTP/1 (one request per connection on the wire), so the
-// connection bounds `[MIN_CONN, ABSOLUTE_MAX_CONN]` are the correct bounds for
-// the seed and are reused rather than duplicated.
+// `N` is target *in-flight work* (the scheduler's `poll_work` gate). The
+// connection pool is capped separately, per host (`ConnectionCap`).
 // ---------------------------------------------------------------------------
+
+/// Floor on the concurrency seed derived from a throughput estimate.
+const MIN_CONCURRENCY_SEED: usize = 10;
+
+/// Ceiling on the concurrency seed.
+const MAX_CONCURRENCY_SEED: usize = 10_000;
 
 /// Assumed goodput per in-flight request, in Gbps. Matches CRT's per-connection
 /// figure (`100 / 250`).
@@ -360,14 +391,14 @@ pub(crate) const GBPS_PER_CONN: f64 = 0.4;
 /// family is unknown (unrecognized type, or detection failed / off-EC2). Without
 /// a NIC estimate the seed can't be bandwidth-derived, so it scales concurrency
 /// directly by vCPU. In-flight requests are roughly connection-count, so the
-/// slope is kept modest; the `[FALLBACK_MIN, ABSOLUTE_MAX_CONN]` clamp keeps a
+/// slope is kept modest; the `[FALLBACK_MIN, MAX_CONCURRENCY_SEED]` clamp keeps a
 /// small box off the floor and a large one bounded.
 const FALLBACK_INFLIGHT_PER_VCPU: usize = 5;
 
 /// Floor for the fallback seed. A small unknown box (2-6 vCPU) would otherwise
 /// seed below common general-purpose defaults (CRT's 10 Gbps target resolves to
 /// 25 connections). Floors the fallback so an unknown box gets a usable default,
-/// while the recognized-family estimate keeps its own lower `MIN_CONN` floor (a
+/// while the recognized-family estimate keeps its own lower `MIN_CONCURRENCY_SEED` floor (a
 /// genuinely small recognized box should seed low).
 const FALLBACK_MIN: usize = 32;
 
@@ -564,11 +595,11 @@ fn family_gbps_per_vcpu(instance_type: &str) -> Option<f64> {
 }
 
 /// In-flight-request target from a throughput estimate: `ceil(gbps /
-/// GBPS_PER_CONN)`, clamped to `[MIN_CONN, ABSOLUTE_MAX_CONN]`.
+/// GBPS_PER_CONN)`, clamped to `[MIN_CONCURRENCY_SEED, MAX_CONCURRENCY_SEED]`.
 pub(crate) fn seed_from_gbps(gbps: f64) -> usize {
     let n = (gbps / GBPS_PER_CONN).ceil();
     // f64 -> usize saturates negatives/NaN to 0; the clamp floor fixes that.
-    (n as usize).clamp(MIN_CONN, ABSOLUTE_MAX_CONN)
+    (n as usize).clamp(MIN_CONCURRENCY_SEED, MAX_CONCURRENCY_SEED)
 }
 
 /// Source used to resolve [`ConcurrencyMode::Auto`].
@@ -617,7 +648,7 @@ pub(crate) fn resolve_auto_concurrency(
             }
         }
         None => ResolvedAutoConcurrency {
-            target: (FALLBACK_INFLIGHT_PER_VCPU * vcpus).clamp(FALLBACK_MIN, ABSOLUTE_MAX_CONN),
+            target: (FALLBACK_INFLIGHT_PER_VCPU * vcpus).clamp(FALLBACK_MIN, MAX_CONCURRENCY_SEED),
             estimated_gbps: None,
             source: AutoConcurrencySource::VcpuFallback,
         },
@@ -628,60 +659,104 @@ pub(crate) fn resolve_auto_concurrency(
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_cap_none_is_absolute_max() {
-        // No detection (non-Unix, or getrlimit failed) -> absolute ceiling.
-        assert_eq!(cap(None, usize::MAX), ABSOLUTE_MAX_CONN);
+    fn soft(soft: usize) -> Option<DescriptorLimit> {
+        Some(DescriptorLimit { soft, hard: None })
     }
 
     #[test]
-    fn test_cap_low_fd_floored() {
-        // 8 descriptors -> 4 by fraction -> floored to MIN_CONN.
-        assert_eq!(cap(Some(8), usize::MAX), MIN_CONN);
+    fn test_cap_without_descriptor_limit_is_ceiling() {
+        // No detection (non-Unix, getrlimit failed, or unlimited) -> the ceiling.
+        let cap = ConnectionCap::from_descriptor_limit(None);
+        assert_eq!(cap.max_per_host, MAX_CONNECTIONS_PER_HOST);
+        assert!(!cap.limited_by_descriptors());
     }
 
     #[test]
-    fn test_cap_mid_fd_is_fraction() {
-        assert_eq!(cap(Some(1024), usize::MAX), 512);
+    fn test_cap_low_descriptor_limit_is_floored() {
+        // 8 descriptors -> 4 by fraction -> floored.
+        let cap = ConnectionCap::from_descriptor_limit(soft(8));
+        assert_eq!(cap.max_per_host, MIN_CONNECTIONS_PER_HOST);
+        assert!(cap.limited_by_descriptors());
     }
 
     #[test]
-    fn test_cap_high_fd_clamped() {
-        // 40k descriptors -> 20k by fraction -> clamped to the absolute ceiling.
-        assert_eq!(cap(Some(40_000), usize::MAX), ABSOLUTE_MAX_CONN);
+    fn test_cap_macos_default_limit() {
+        // launchd's default soft limit of 256 -> 128 connections.
+        assert_eq!(
+            ConnectionCap::from_descriptor_limit(soft(256)).max_per_host,
+            128
+        );
     }
 
     #[test]
-    fn test_cap_infinite_fd_saturates() {
-        // RLIM_INFINITY surfaces as usize::MAX; the fraction saturates, then clamps.
-        assert_eq!(cap(Some(usize::MAX), usize::MAX), ABSOLUTE_MAX_CONN);
+    fn test_cap_mid_descriptor_limit_is_fraction() {
+        let cap = ConnectionCap::from_descriptor_limit(soft(1024));
+        assert_eq!(cap.max_per_host, 512);
+        assert!(cap.limited_by_descriptors());
     }
 
     #[test]
-    fn test_cap_memory_term_binds() {
-        // FD allows 512 (1024 x 0.5) but the budget funds only 100 chunks.
-        assert_eq!(cap(Some(1024), 100), 100);
+    fn test_cap_high_descriptor_limit_is_ceiling() {
+        // 524288 descriptors -> 262144 by fraction -> the ceiling.
+        let cap = ConnectionCap::from_descriptor_limit(soft(524_288));
+        assert_eq!(cap.max_per_host, MAX_CONNECTIONS_PER_HOST);
+        assert!(!cap.limited_by_descriptors());
+    }
+
+    #[test]
+    fn test_cap_at_ceiling_boundary() {
+        // Exactly 2 x ceiling descriptors reaches the ceiling, which is not
+        // reported as descriptor-limited.
+        let cap = ConnectionCap::from_descriptor_limit(soft(2 * MAX_CONNECTIONS_PER_HOST));
+        assert_eq!(cap.max_per_host, MAX_CONNECTIONS_PER_HOST);
+        assert!(!cap.limited_by_descriptors());
+    }
+
+    #[test]
+    fn test_parse_descriptor_limit() {
+        const INF: u64 = u64::MAX;
+        assert_eq!(
+            parse_descriptor_limit(1024, 524_288, INF),
+            Some(DescriptorLimit {
+                soft: 1024,
+                hard: Some(524_288)
+            })
+        );
+        // Infinite hard limit: soft can be raised without bound.
+        assert_eq!(
+            parse_descriptor_limit(1024, INF, INF),
+            Some(DescriptorLimit {
+                soft: 1024,
+                hard: None
+            })
+        );
+        // Infinite or zero soft limit: no usable limit.
+        assert_eq!(parse_descriptor_limit(INF, INF, INF), None);
+        assert_eq!(parse_descriptor_limit(0, 1024, INF), None);
+    }
+
+    #[test]
+    fn test_parse_signed_descriptor_limit() {
+        // FreeBSD's `rlim_t` is signed, with `RLIM_INFINITY == i64::MAX`.
+        const INF: i64 = i64::MAX;
+        assert_eq!(
+            parse_descriptor_limit(1024, INF, INF),
+            Some(DescriptorLimit {
+                soft: 1024,
+                hard: None
+            })
+        );
+        assert_eq!(parse_descriptor_limit(INF, INF, INF), None);
     }
 
     #[test]
     #[cfg_attr(
         miri,
-        ignore = "connection_cap calls getrlimit, a syscall miri cannot emulate"
+        ignore = "descriptor detection calls getrlimit, a syscall miri cannot emulate"
     )]
-    fn test_connection_cap_within_bounds() {
-        assert!((MIN_CONN..=ABSOLUTE_MAX_CONN).contains(&connection_cap()));
-    }
-
-    #[test]
-    #[cfg_attr(
-        miri,
-        ignore = "connection_cap_with_memory calls getrlimit, a syscall miri cannot emulate"
-    )]
-    fn test_connection_cap_with_memory_is_bounded_by_chunks() {
-        // 16-chunk budget caps connections at 16 (or lower if descriptors are scarce).
-        let chunk = 8 * 1024 * 1024;
-        let cap = connection_cap_with_memory(16 * chunk, chunk);
-        assert!((MIN_CONN..=16).contains(&cap));
+    fn test_detected_cap_within_bounds() {
+        let cap = ConnectionCap::detect();
+        assert!((MIN_CONNECTIONS_PER_HOST..=MAX_CONNECTIONS_PER_HOST).contains(&cap.max_per_host));
     }
 
     #[test]
@@ -895,22 +970,25 @@ mod tests {
         // Tiny unknown machine: fallback floors to FALLBACK_MIN (32).
         assert_eq!(auto_concurrency_seed(None, 1), FALLBACK_MIN);
         assert_eq!(auto_concurrency_seed(Some("t3.micro"), 2), FALLBACK_MIN);
-        // Recognized tiny estimate floors to the lower MIN_CONN (a genuinely
+        // Recognized tiny estimate floors to the lower MIN_CONCURRENCY_SEED (a genuinely
         // small recognized box should seed low, unlike the unknown-box default).
-        assert_eq!(auto_concurrency_seed(Some("i4i.large"), 2), MIN_CONN);
-        // Enormous estimate caps at ABSOLUTE_MAX_CONN.
+        assert_eq!(
+            auto_concurrency_seed(Some("i4i.large"), 2),
+            MIN_CONCURRENCY_SEED
+        );
+        // Enormous estimate caps at MAX_CONCURRENCY_SEED.
         assert_eq!(
             auto_concurrency_seed(Some("p6-b300.48xlarge"), 100_000),
-            ABSOLUTE_MAX_CONN
+            MAX_CONCURRENCY_SEED
         );
     }
 
     #[test]
     fn test_seed_from_gbps_edges() {
         assert_eq!(seed_from_gbps(100.0), 250);
-        assert_eq!(seed_from_gbps(0.0), MIN_CONN); // floors, no underflow
-        assert_eq!(seed_from_gbps(f64::NAN), MIN_CONN); // NaN -> 0 -> floor
-        assert_eq!(seed_from_gbps(1.0e9), ABSOLUTE_MAX_CONN); // caps
+        assert_eq!(seed_from_gbps(0.0), MIN_CONCURRENCY_SEED); // floors, no underflow
+        assert_eq!(seed_from_gbps(f64::NAN), MIN_CONCURRENCY_SEED); // NaN -> 0 -> floor
+        assert_eq!(seed_from_gbps(1.0e9), MAX_CONCURRENCY_SEED); // caps
     }
 
     #[test]
