@@ -20,10 +20,10 @@ use crate::transfer::{IoRequest, PollWork, Transfer, TransferContext, WorkOutcom
 // executor slot, and one slot is a share of what the whole client has.
 const MERGE_BATCH: usize = 64;
 
-// How many failures a run keeps. The walk reports most failures per entry and carries on, so a
-// tree where every entry fails would otherwise put the number of entries into peak memory. Past
-// the cap the run counts a failure and holds none of it. A result reports the count, and the
-// reporting layer names each key.
+// How many failures a run keeps. The walk reports most failures per entry and carries on, so a tree
+// where every entry fails would otherwise put the number of entries into peak memory. Past the cap
+// the run counts a failure and holds none of it. A result reports the count, and the reporting
+// layer names each key.
 //
 // The sample holds the first failures seen, not a representative spread. Where failures cluster in
 // one early subtree, the whole sample comes from there. A reader taking the sample as typical of
@@ -39,9 +39,253 @@ pub(crate) trait SpawnChild<S>: Send + Sync {
         -> Result<ChildHandle, crate::error::Error>;
 }
 
-// Sync asks a child two things: whether it finished, and what it moved. An upload handle and a
-// download handle have different types and return different outputs, and both carry the part sync
-// needs in the same field.
+// How many keys go in one delete request. `DeleteObjects` takes no more, and batching at all is what
+// makes a large delete affordable: a thousand keys sent singly cost a thousand round trips and a
+// thousand dispatch charges, together one of each.
+const DELETE_BATCH: usize = 1000;
+
+// How many times a batch asks again about keys S3 refused for load.
+//
+// Two loops wrap one delete because the unit of failure and the unit of request differ here, which is
+// true of no other request this crate makes. The inner loop re-issues a request that failed whole and
+// cannot narrow what it sends; this one re-sends a smaller set of keys, which is the only way to stop a
+// retry from naming keys the service already removed. Neither replaces the other: a request can fail
+// with no key refused, and a key can be refused by a request that succeeded.
+//
+// Their bounds therefore multiply, and a batch can cost nine requests. That is accepted rather than
+// trimmed: the two bounds cover different failure modes, and the wait between asks now dominates the
+// cost, so a smaller bound would buy nothing and give up coverage.
+const DELETE_REFUSAL_ATTEMPTS: u32 = 3;
+
+// What became of one key: removed, or refused with a reason naming it.
+type KeyOutcome = Result<String, String>;
+
+// Whether a run may remove keys from the destination. Named rather than passed as a bare bool, because
+// a caller reading `true` at a call site cannot see what it turns on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeleteMode {
+    On,
+    Off,
+}
+
+// Where keys go when they leave the destination. A third thing that differs by direction, and it
+// differs more deeply than the other two: a bucket takes a thousand keys in one request, a local tree
+// takes them one file at a time. So the caller hands over a whole batch and the destination decides
+// what one request means.
+//
+// Two destinations exist, a bucket and a recorder, with a local tree still to come. A value rather
+// than a trait object because nothing here varies by type: a key is a key on either side, which is
+// what separates this from `SpawnChild`, whose implementations each accept one walk entry type.
+// Holding it as a value also keeps the future unboxed and lets `delete` take anything a key can be
+// read from.
+pub(crate) enum Deleter {
+    Bucket(DeleteFromBucket),
+    // Named rather than inlined, unlike `ChildInner::Controlled`, because the assertions are built on
+    // this double's accessors. Inlining its fields would cost them. `ChildInner` can inline because
+    // `ChildHandle` hides it, where this enum is named by whoever builds a transfer and has nowhere
+    // to hide a payload.
+    #[cfg(test)]
+    Recording(Arc<tests::RecordDeletes>),
+}
+
+impl Deleter {
+    // How many keys to collect before sending. A destination with no batch request answers one.
+    pub(crate) fn batch_size(&self) -> usize {
+        match self {
+            Deleter::Bucket(d) => d.batch_size(),
+            #[cfg(test)]
+            Deleter::Recording(d) => d.batch_size(),
+        }
+    }
+
+    // Remove these keys, reporting what happened to each. The count of outcomes equals the count of
+    // keys: "the batch failed" tells a caller nothing about which keys survived.
+    //
+    // The keys are collected here rather than by each destination, because every one of them needs a
+    // length up front and a key at a known position to name an outcome against.
+    pub(crate) async fn delete<K, I>(&self, keys: I) -> Vec<KeyOutcome>
+    where
+        K: Into<String>,
+        I: IntoIterator<Item = K>,
+    {
+        let keys: Vec<String> = keys.into_iter().map(Into::into).collect();
+        match self {
+            Deleter::Bucket(d) => d.delete(keys).await,
+            #[cfg(test)]
+            Deleter::Recording(d) => d.delete(keys).await,
+        }
+    }
+}
+
+// Deletes keys from a bucket. One request per batch, retried on throttling and transient transport
+// failure like any other request sync makes on its own behalf — a child gets that from the SDK client
+// it is built with, and a request issued here has no such inheritance.
+pub(crate) struct DeleteFromBucket {
+    client: aws_sdk_s3::Client,
+    bucket: String,
+    // As in `SpawnUpload`: keys arrive relative to the run's root, so the root goes back on before
+    // naming an object. Deleting a relative key would reach for something at the bucket root.
+    root: String,
+}
+
+impl DeleteFromBucket {
+    pub(crate) fn new(
+        client: aws_sdk_s3::Client,
+        bucket: impl Into<String>,
+        prefix: Option<&str>,
+    ) -> Self {
+        Self {
+            client,
+            bucket: bucket.into(),
+            root: crate::io::key::stream::root_prefix(prefix).into_owned(),
+        }
+    }
+
+    // The object a relative key names under this run's root.
+    pub(crate) fn object_key(&self, key: &str) -> String {
+        format!("{}{}", self.root, key)
+    }
+
+    fn batch_size(&self) -> usize {
+        DELETE_BATCH
+    }
+
+    async fn delete(&self, keys: Vec<String>) -> Vec<KeyOutcome> {
+        // The object each relative key names, in the same order, so a response entry can be
+        // attributed to the key it answers rather than to whatever sits at the same offset.
+        let addressed: Vec<String> = keys.iter().map(|k| self.object_key(k)).collect();
+        let mut at_object = std::collections::HashMap::with_capacity(addressed.len());
+        for (at, object) in addressed.iter().enumerate() {
+            at_object.insert(object.as_str(), at);
+        }
+
+        let unnamed = |at: usize, why: &str| Err(format!("{}: {why}", keys[at]));
+        let mut settled: Vec<Option<KeyOutcome>> = vec![None; keys.len()];
+        // Which keys still have no answer. S3 reports partial throttling against individual keys
+        // rather than by failing the request, so a key refused that way is asked again with
+        // whichever others were refused the same way, and nothing already removed is named again.
+        let mut outstanding: Vec<usize> = (0..keys.len()).collect();
+
+        for attempt in 0..DELETE_REFUSAL_ATTEMPTS {
+            if outstanding.is_empty() {
+                break;
+            }
+            let last_attempt = attempt + 1 == DELETE_REFUSAL_ATTEMPTS;
+            // A refusal for load is answered on the schedule the request-level retry would use for
+            // the same code, so how long a throttle waits does not depend on whether it arrived
+            // against the request or against one key. Asking again immediately is how shedding load
+            // turns into more of it.
+            if attempt > 0 {
+                let delay = crate::retry::Backoff::throttle().delay(attempt - 1, fastrand::f64());
+                tokio::time::sleep(delay).await;
+            }
+
+            let mut identifiers = Vec::with_capacity(outstanding.len());
+            for &at in &outstanding {
+                match aws_sdk_s3::types::ObjectIdentifier::builder()
+                    .key(addressed[at].clone())
+                    .build()
+                {
+                    Ok(id) => identifiers.push(id),
+                    // A key this layer produced that the API will not name is this layer's fault,
+                    // so it is reported against that key rather than failing the batch around it.
+                    Err(err) => settled[at] = Some(unnamed(at, &err.to_string())),
+                }
+            }
+            if identifiers.is_empty() {
+                break;
+            }
+            let delete = match aws_sdk_s3::types::Delete::builder()
+                .set_objects(Some(identifiers))
+                // Set rather than left to the server default, because reading the outcomes depends
+                // on it: a quiet response names only refusals, so every removed key would arrive
+                // unmentioned and a batch that fully succeeded would be reported as fully failed.
+                .quiet(false)
+                .build()
+            {
+                Ok(delete) => delete,
+                Err(err) => {
+                    for &at in &outstanding {
+                        settled[at].get_or_insert_with(|| unnamed(at, &err.to_string()));
+                    }
+                    break;
+                }
+            };
+
+            let sent = crate::retry::retry(crate::retry::classify_discovery_retry, |_| {
+                let delete = delete.clone();
+                async move {
+                    self.client
+                        .delete_objects()
+                        .bucket(&self.bucket)
+                        .delete(delete)
+                        .send()
+                        .await
+                        // `Error::from` rather than wrapping by kind: only the conversion carries
+                        // the service metadata, which is what the classifier reads to tell a
+                        // throttle from a refusal.
+                        .map_err(|err| {
+                            crate::retry::GuardError::Inner(crate::error::Error::from(err))
+                        })
+                }
+            })
+            .await;
+
+            match sent {
+                // The response's two lists are what tell a caller which keys survived, so they are
+                // read apart rather than collapsed into one verdict.
+                Ok(output) => {
+                    for deleted in output.deleted() {
+                        if let Some(&at) = deleted.key().and_then(|k| at_object.get(k)) {
+                            settled[at] = Some(Ok(keys[at].clone()));
+                        }
+                    }
+                    let mut refused_again = Vec::new();
+                    for error in output.errors() {
+                        let Some(&at) = error.key().and_then(|k| at_object.get(k)) else {
+                            continue;
+                        };
+                        let why = error.message().unwrap_or("no reason given");
+                        // The crate's own set, rather than a wider one for this path: a refusal
+                        // declined here leaves the object in place and the next run decides it
+                        // again from a whole view, so reading the set narrowly costs one deferred
+                        // delete. Treating a code as retryable here and terminal elsewhere would
+                        // cost a reader one answer to what the code means.
+                        if !last_attempt && crate::retry::is_throttle_code(error.code()) {
+                            refused_again.push(at);
+                        } else {
+                            settled[at] = Some(unnamed(at, why));
+                        }
+                    }
+                    outstanding = refused_again;
+                }
+                // The request itself failed and has already exhausted its own attempts, so every
+                // key still waiting on it is answered with that failure.
+                Err(err) => {
+                    let why = err.to_string();
+                    for &at in &outstanding {
+                        settled[at].get_or_insert_with(|| unnamed(at, &why));
+                    }
+                    break;
+                }
+            }
+        }
+
+        // A key the response never mentioned is named rather than left out, because the count of
+        // outcomes has to match the count of keys and an unexplained key is worse than a failed one.
+        settled
+            .into_iter()
+            .enumerate()
+            .map(|(at, outcome)| {
+                outcome.unwrap_or_else(|| unnamed(at, "the response did not mention this key"))
+            })
+            .collect()
+    }
+}
+
+// What sync asks of any child, which is all it asks: whether the child finished, and what it moved.
+// An upload handle and a download handle are unrelated types returning different outputs, and both
+// carry the part sync needs in the same field.
 pub(crate) struct ChildHandle {
     id: crate::transfer::TransferId,
     inner: ChildInner,
@@ -49,6 +293,9 @@ pub(crate) struct ChildHandle {
 
 enum ChildInner {
     Upload(crate::operation::upload::UploadHandle),
+    // A child a test controls, for tests about the loop rather than about the transfer. Without it a
+    // test would have to run a real child through the scheduler to assert anything about spawning or
+    // reaping, and could not hold one open to watch the parent park.
     #[cfg(test)]
     Controlled {
         ended: Arc<std::sync::atomic::AtomicBool>,
@@ -68,8 +315,8 @@ impl ChildHandle {
         self.id
     }
 
-    // Only children that have reached an end go to a reap. Joining one still running would hold a
-    // work item open for the length of the transfer.
+    // Whether the child has reached an end, of any kind. A reap has to wait for this, because
+    // joining one that has not is what would hold a work item open.
     pub(crate) fn is_finished(&self) -> bool {
         match &self.inner {
             ChildInner::Upload(handle) => handle.status().is_terminal(),
@@ -123,8 +370,7 @@ impl SpawnUpload {
         }
     }
 
-    // The object a relative key names under this run's root. Used by `spawn` and asserted on
-    // directly, so a test cannot be checking a different rule from the one that runs.
+    // The object a relative key names under this run's root.
     pub(crate) fn object_key(&self, key: &str) -> String {
         format!("{}{}", self.root, key)
     }
@@ -170,6 +416,9 @@ pub(crate) enum SyncWork<S: KeyStream, D: KeyStream> {
     // Children that have reached an end. Joining one waits, so collecting them is a work item like
     // any other, and they leave `State::children` as the item takes them.
     ReapChildren { children: Vec<ChildHandle> },
+    // Keys to remove from the destination. They leave `State::pending_deletes` when this is built,
+    // so `deletes_in_flight` has to stand in for them.
+    DeleteKeys { keys: Vec<String> },
 }
 
 impl<S: KeyStream, D: KeyStream> fmt::Debug for SyncWork<S, D> {
@@ -179,6 +428,7 @@ impl<S: KeyStream, D: KeyStream> fmt::Debug for SyncWork<S, D> {
             SyncWork::ReapChildren { children } => {
                 write!(f, "ReapChildren({})", children.len())
             }
+            SyncWork::DeleteKeys { keys } => write!(f, "DeleteKeys({})", keys.len()),
         }
     }
 }
@@ -194,6 +444,11 @@ struct Decided {
     transfers: u64,
     deletes: u64,
     skips: u64,
+    // Keys the comparison marked for removal, counted whether or not the run was allowed to act on them.
+    // Independent of the mode on purpose: it gives both modes the same denominator, so a caller can
+    // reconcile what was removed and what was refused against what was intended, and can ask how much a
+    // delete would take away before allowing one.
+    deletable: u64,
 }
 
 impl std::ops::AddAssign for Decided {
@@ -201,6 +456,7 @@ impl std::ops::AddAssign for Decided {
         self.transfers += batch.transfers;
         self.deletes += batch.deletes;
         self.skips += batch.skips;
+        self.deletable += batch.deletable;
     }
 }
 
@@ -218,31 +474,49 @@ struct State<S: KeyStream, D: KeyStream> {
     waiting: VecDeque<Qualified<S::Source, D::Source>>,
     // Children enqueued and not yet reaped.
     children: std::collections::HashMap<crate::transfer::TransferId, ChildHandle>,
-    // Children handed to a reap and not yet joined. They have left `children`, so without this
-    // count a poll would see no children and call the run over while their outcomes were still
-    // coming back.
+    // Children handed to a reap and not yet joined. They have left `children`, so without this a
+    // poll would see no children and call the run over while their outcomes were still coming back.
     reap_in_flight: usize,
+    // Keys decided for deletion and not yet sent. A key joins here when it is decided, and the batch
+    // leaves when it is full or when the run ends cleanly.
+    pending_deletes: Vec<String>,
+    // A batch handed to a work item. Like `reap_in_flight`, it stands in for keys that have left the
+    // buffer and whose outcomes are still coming back.
+    deletes_in_flight: usize,
+    deleted: u64,
+    delete_failures: u64,
     bytes_moved: u64,
     // Transfers that arrived, one per child the reap joins. `decided.transfers` counts the other
     // end, when the comparison picks a key out. A caller reconciling the run against the
-    // destination reads this one. Deriving arrivals from the decision count means subtracting every
-    // population in between and trusting them not to overlap.
+    // destination reads this one: the decision count answers a different question, and deriving
+    // arrivals from it means subtracting every population that intervened and knowing those do
+    // not overlap.
     transferred: u64,
-    // A child the run could not enqueue, or one that ended badly. The run counts each failure and
-    // keeps none of them, because naming the key that failed belongs to the reporting layer.
+    // A child that could not be enqueued, or that ended badly. Counted rather than kept: a
+    // `StreamError` describes a walk and says nothing about a transfer, and naming the key that
+    // failed is the reporting layer's job.
     transfer_failures: u64,
-    // Set when a comparison answers something the run cannot act on.
+    // Set when a comparison answers something this layer cannot act on. Kept here rather than
+    // written into the walk, whose own flag means a stream went unread and is set nowhere but
+    // inside its `next`.
     plan_incomplete: bool,
-    // What the walk knew when a work item last handed it back. A work item holds the walk for as
-    // long as it runs, so the run copies the answer out as each item returns.
+    // What the walk knew when a work item last handed it back. Read from the walk rather than
+    // asked of it on demand, because the walk is away while an item holds it and an absent walk
+    // has no answer to give — a plan either has holes or it does not, and that cannot depend on
+    // whether a batch happens to be in flight.
     //
-    // The run adds to this flag and never overwrites it, so a hole stays reported whatever the
-    // walk says later. Overwriting would hold only if nothing ever cleared the walk's own flag,
-    // and another module could.
+    // Accumulated rather than assigned, so a hole stays reported whatever the walk says later.
+    // Assigning would be correct only while the walk's own flag is never cleared, which is not this
+    // module's invariant to rely on.
     walk_plan_incomplete: bool,
-    // `FAILURES_KEPT` caps the list, and `failures_dropped` counts the rest.
+    // Capped by `FAILURES_KEPT`; anything past that is counted in `failures_dropped`.
     failures: Vec<StreamError>,
     failures_dropped: u64,
+    // Why individual keys were not removed, each naming its key. A count alone cannot answer which key
+    // survived, which is the question a per-key outcome exists to answer. Capped at `FAILURES_KEPT`,
+    // and needing no dropped counter of its own: `delete_failures` already holds the exact total, so
+    // what this sample leaves out is the difference between the two.
+    refusals: Vec<String>,
 }
 
 pub(crate) struct SyncTransfer<S: KeyStream, D: KeyStream>
@@ -282,15 +556,21 @@ where
 {
     ctx: TransferContext,
     state: Mutex<State<S, D>>,
-    // Which comparison to ask. The caller passes it in, because an upload and a download
-    // disagree about which side being newer wins.
+    // Which comparison to ask. One of the two things that differ by direction, passed in rather
+    // than chosen here: an upload and a download disagree about which side being newer wins.
     comparison: &'static (dyn Compare<S::Source, D::Source> + Send + Sync),
     // The other one. Unlike the comparison this holds state, because building a child needs the
     // client and the bucket.
     spawner: Arc<dyn SpawnChild<S::Source>>,
+    // How keys leave the destination. A third direction-specific thing, and the one that differs most
+    // between a bucket and a local tree.
+    deleter: Deleter,
     // How many children may be live at once. One slot is a share of what the whole client has, so
     // whoever starts a run sets it.
     max_children: usize,
+    // Whether a key the source does not have may be removed. Deleting is the one thing here that
+    // destroys data the caller never handed over, so nobody gets it without asking.
+    delete_mode: DeleteMode,
 }
 
 impl<S, D> SyncTransfer<S, D>
@@ -305,14 +585,18 @@ where
         walk: Walk<S, D>,
         comparison: &'static (dyn Compare<S::Source, D::Source> + Send + Sync),
         spawner: Arc<dyn SpawnChild<S::Source>>,
+        deleter: Deleter,
         max_children: usize,
+        delete_mode: DeleteMode,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 ctx,
                 comparison,
                 spawner,
+                deleter,
                 max_children: max_children.max(1),
+                delete_mode,
                 state: Mutex::new(State {
                     walk: Some(walk),
                     merge_in_flight: false,
@@ -321,6 +605,10 @@ where
                     waiting: VecDeque::new(),
                     children: std::collections::HashMap::new(),
                     reap_in_flight: 0,
+                    pending_deletes: Vec::new(),
+                    deletes_in_flight: 0,
+                    deleted: 0,
+                    delete_failures: 0,
                     bytes_moved: 0,
                     transferred: 0,
                     transfer_failures: 0,
@@ -328,6 +616,7 @@ where
                     walk_plan_incomplete: false,
                     failures: Vec::new(),
                     failures_dropped: 0,
+                    refusals: Vec::new(),
                 }),
             }),
         }
@@ -358,6 +647,12 @@ where
             }
         }
 
+        if active {
+            if let Some(work) = self.dispatch_deletes(&mut state) {
+                return work;
+            }
+        }
+
         // Reaping runs whether or not the transfer is still active: a child that has ended has an
         // outcome owed to the run, and cancelling does not make it go away.
         if let Some(work) = self.dispatch_reap(&mut state) {
@@ -368,9 +663,9 @@ where
             return done;
         }
 
-        // Mark the transfer as waiting before returning. `try_wake` only signals a transfer
-        // already marked, so without the mark a finishing work item signals nothing. The transfer
-        // would then sit outside the ready set with nothing to put it back.
+        // Mark the transfer as waiting before returning. `try_wake` only signals a transfer already
+        // marked, so without the mark a finishing work item signals nothing. The transfer would
+        // then sit outside the ready set with nothing to put it back.
         self.inner.ctx.set_pending();
         PollWork::Pending
     }
@@ -381,11 +676,21 @@ where
     fn check_terminal(&self, state: &mut State<S, D>) -> Option<PollWork> {
         if !self.inner.ctx.is_active() {
             // Everything dispatched is still owed an answer, however the run ended.
-            if state.merge_in_flight || state.reap_in_flight > 0 || !state.children.is_empty() {
+            if state.merge_in_flight
+                || state.reap_in_flight > 0
+                || state.deletes_in_flight > 0
+                || !state.children.is_empty()
+            {
                 return None;
             }
-            // Cancelled or failed: the run already recorded the outcome, so the only thing left
-            // is to signal the caller.
+            // Whatever has not been sent is let go. A key reached this buffer by being absent from
+            // the source, and absence is read from the merge having passed its position — so a run
+            // that stopped early judged these keys against a stream with a hole in it. The next run
+            // decides them again from a whole view, where sending them now could remove a file that
+            // exists.
+            state.pending_deletes.clear();
+            // Cancelled or failed: the run already recorded the outcome, so the only thing left is
+            // to signal the caller.
             self.inner.ctx.signal_terminal();
             return Some(PollWork::Done);
         }
@@ -394,6 +699,8 @@ where
             && state.waiting.is_empty()
             && state.children.is_empty()
             && state.reap_in_flight == 0
+            && state.pending_deletes.is_empty()
+            && state.deletes_in_flight == 0
             && state.walk.as_ref().is_some_and(Walk::is_done)
         {
             self.inner.ctx.set_completed();
@@ -440,6 +747,26 @@ where
             }
         }
         false
+    }
+
+    // Send a batch of deletes when it is full, or when nothing else will add to it. Holding a part
+    // batch until the merge is done is what lets a thousand keys cost one request.
+    fn dispatch_deletes(&self, state: &mut State<S, D>) -> Option<PollWork> {
+        let size = self.inner.deleter.batch_size();
+        let merge_done = state.walk.as_ref().is_some_and(Walk::is_done);
+        let full = state.pending_deletes.len() >= size;
+        // A part batch waits until nothing can grow it. Sending early would cost a request per
+        // handful of keys for no gain.
+        let last_call = merge_done && !state.merge_in_flight && !state.pending_deletes.is_empty();
+        if !full && !last_call {
+            return None;
+        }
+        let take = state.pending_deletes.len().min(size);
+        let keys: Vec<String> = state.pending_deletes.drain(..take).collect();
+        state.deletes_in_flight += keys.len();
+        Some(PollWork::ready(IoRequest {
+            data: Some(Box::new(SyncWork::<S, D>::DeleteKeys { keys })),
+        }))
     }
 
     // Collect children that have ended into a work item. They leave `children` here, so
@@ -500,7 +827,42 @@ where
                 let children = std::mem::take(children);
                 self.execute_reap(children).await
             }
+            SyncWork::DeleteKeys { keys } => {
+                let keys = std::mem::take(keys);
+                self.execute_deletes(keys).await
+            }
         }
+    }
+
+    async fn execute_deletes(&self, keys: Vec<String>) -> WorkOutcome {
+        let sent = keys.len();
+        let outcomes = self.inner.deleter.delete(keys).await;
+
+        let mut gone = 0u64;
+        let mut refused = Vec::new();
+        for outcome in &outcomes {
+            match outcome {
+                Ok(_) => gone += 1,
+                Err(why) => refused.push(why.clone()),
+            }
+        }
+
+        let mut state = self.inner.state.lock();
+        state.deletes_in_flight -= sent;
+        state.deleted += gone;
+        state.delete_failures += refused.len() as u64;
+        for why in refused {
+            if state.refusals.len() < FAILURES_KEPT {
+                state.refusals.push(why);
+            }
+        }
+        if self.check_terminal(&mut state).is_some() {
+            drop(state);
+            return WorkOutcome::Success { data: None };
+        }
+        drop(state);
+        self.inner.ctx.try_wake();
+        WorkOutcome::Success { data: None }
     }
 
     async fn execute_reap(&self, children: Vec<ChildHandle>) -> WorkOutcome {
@@ -545,6 +907,7 @@ where
         let mut deferred = false;
         let mut failures = Vec::new();
         let mut batch = VecDeque::new();
+        let mut pending_deletes = Vec::new();
 
         for _ in 0..MERGE_BATCH {
             match walk.next().await {
@@ -557,16 +920,28 @@ where
                             decided.transfers += 1;
                             batch.push_back((pairing, decision));
                         }
-                        // Counted and let go: nothing here issues a delete, so buffering one
-                        // would hold the run open for work that has no home yet.
-                        Verdict::Decided(Decision::Delete(_)) => decided.deletes += 1,
+                        // A delete decision says the destination holds a key the source does not.
+                        // Acting on that is this layer's business rather than the comparison's, so an
+                        // unasked-for delete becomes a skip — counted and reported like any other key,
+                        // which keeps it out of the buffer rather than merely out of a request.
+                        Verdict::Decided(Decision::Delete(_)) => {
+                            decided.deletable += 1;
+                            match self.inner.delete_mode {
+                                DeleteMode::On => {
+                                    decided.deletes += 1;
+                                    pending_deletes.push(pairing.key().to_string());
+                                }
+                                DeleteMode::Off => decided.skips += 1,
+                            }
+                        }
                         // A skip needs nothing done to it, so it never waits for a slot.
                         Verdict::Decided(Decision::Skip(_)) => decided.skips += 1,
                         // Nothing shipped here defers, so one arriving is a defect in whatever
-                        // comparison produced it. The run skips the key and records the plan as
-                        // incomplete. Sending the key would waste bandwidth, and dropping it
-                        // silently would leave a file nobody hears about. The run keeps a count and
-                        // a flag, and names no key.
+                        // comparison produced it. The key is skipped and the plan is marked short
+                        // of the keys it should have covered. Sending the key or dropping it
+                        // without a word would turn the defect into either wasted bandwidth or a
+                        // file nobody was told about. Which key deferred is not recorded: what
+                        // survives here is a count and a run-level flag.
                         Verdict::Deferred(_) => {
                             decided.skips += 1;
                             deferred = true;
@@ -586,6 +961,7 @@ where
         state.decided += decided;
         state.plan_incomplete |= deferred;
         state.waiting.append(&mut batch);
+        state.pending_deletes.append(&mut pending_deletes);
         for failure in failures {
             if state.failures.len() < FAILURES_KEPT {
                 state.failures.push(failure);
@@ -594,16 +970,16 @@ where
             }
         }
 
-        // Draining the last batch makes this work item end the run, so it tells the caller here
-        // and nothing has to poll again.
+        // Draining the last batch makes this work item the one that ends the run, so it
+        // signals here rather than leaving a waiter for one more poll.
         if self.check_terminal(&mut state).is_some() {
             drop(state);
             return WorkOutcome::Success { data: None };
         }
         drop(state);
 
-        // Without the signal the run waits forever. The poll handing this item over answered
-        // `Pending`, the transfer left the scheduler's ready set, and nothing else puts it back.
+        // Without this the run parks: the poll that dispatched this item answered `Pending`
+        // and left the ready set, and nothing else puts it back.
         self.inner.ctx.try_wake();
         WorkOutcome::Success { data: None }
     }
@@ -657,6 +1033,8 @@ mod tests {
 
     use super::*;
 
+    // A bucket that answers one page and nothing more. Every object carries a last-modified,
+    // without which the walk reports the listing malformed rather than producing the key.
     fn a_bucket_holding(keys: &[&str]) -> aws_sdk_s3::Client {
         let contents: Vec<Object> = keys
             .iter()
@@ -680,6 +1058,38 @@ mod tests {
         mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&list, &put])
     }
 
+    // The same bucket, but keeping the key each write named. Asserting on a helper that builds a key
+    // proves only that the helper is right; what a caller needs is the key the request carried.
+    fn a_bucket_recording_puts(keys: &[&str]) -> (aws_sdk_s3::Client, Arc<Mutex<Vec<String>>>) {
+        let contents: Vec<Object> = keys
+            .iter()
+            .map(|k| {
+                Object::builder()
+                    .key(*k)
+                    .size(0)
+                    .last_modified(aws_smithy_types::DateTime::from_secs(1_600_000_000))
+                    .build()
+            })
+            .collect();
+        let list = mock!(aws_sdk_s3::Client::list_objects_v2).then_output(move || {
+            ListObjectsV2Output::builder()
+                .set_contents(Some(contents.clone()))
+                .build()
+        });
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+        let put = mock!(aws_sdk_s3::Client::put_object)
+            .match_requests(move |req| {
+                if let Some(key) = req.key() {
+                    recorder.lock().push(key.to_string());
+                }
+                true
+            })
+            .then_output(|| aws_sdk_s3::operation::put_object::PutObjectOutput::builder().build());
+        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&list, &put]);
+        (client, seen)
+    }
+
     fn a_local_tree(root: &Path, keys: &[&str]) {
         for key in keys {
             let path = root.join(key);
@@ -690,6 +1100,8 @@ mod tests {
         }
     }
 
+    // An upload-direction transfer over a real local tree and a mocked bucket, registered with
+    // the scheduler so a poll answering `Pending` is parked the way production parks it.
     fn uploading(
         local: &Path,
         bucket_keys: &[&str],
@@ -715,14 +1127,16 @@ mod tests {
                 walk,
                 Mode::default().uploading(),
                 Arc::new(SpawnEnded::new(0, false)),
+                Deleter::Recording(Arc::new(RecordDeletes::new(DELETE_BATCH))),
                 2,
+                DeleteMode::On,
             ),
             ctx,
         )
     }
 
-    // Drive the loop the way the scheduler does, under a deadline. A lost signal shows up as a
-    // hang and not a failure, so without the deadline the test would never report.
+    // Drive the loop the way the scheduler does, under a deadline. A lost wake shows up as a
+    // hang rather than a failure, so without the deadline this test would never report.
     async fn drive(transfer: &SyncTransfer<FsWalk, S3Walk>) -> u64 {
         let run = async {
             loop {
@@ -744,6 +1158,62 @@ mod tests {
             .expect("the run parked: a poll answered Pending with no wake to follow")
     }
 
+    // Records the batches it was asked to send, so a test can see how many requests a run would
+    // have cost and which keys were in each.
+    pub(crate) struct RecordDeletes {
+        batch: usize,
+        sent: Mutex<Vec<Vec<String>>>,
+        refuse: bool,
+    }
+
+    impl RecordDeletes {
+        fn new(batch: usize) -> Self {
+            Self {
+                batch,
+                sent: Mutex::new(Vec::new()),
+                refuse: false,
+            }
+        }
+
+        fn refusing(batch: usize) -> Self {
+            Self {
+                batch,
+                sent: Mutex::new(Vec::new()),
+                refuse: true,
+            }
+        }
+
+        fn batches(&self) -> Vec<Vec<String>> {
+            self.sent.lock().clone()
+        }
+
+        fn keys_sent(&self) -> usize {
+            self.sent.lock().iter().map(Vec::len).sum()
+        }
+    }
+
+    impl RecordDeletes {
+        pub(crate) fn batch_size(&self) -> usize {
+            self.batch
+        }
+
+        pub(crate) async fn delete(&self, keys: Vec<String>) -> Vec<KeyOutcome> {
+            self.sent.lock().push(keys.clone());
+            let refuse = self.refuse;
+            keys.into_iter()
+                .map(|key| {
+                    if refuse {
+                        Err(format!("{key}: refused"))
+                    } else {
+                        Ok(key)
+                    }
+                })
+                .collect()
+        }
+    }
+
+    // Hands back children that have already ended, so a test can assert on spawning and reaping
+    // without a scheduler to run real ones. Counts what it was asked to spawn.
     struct SpawnEnded {
         moved: u64,
         fails: bool,
@@ -871,7 +1341,9 @@ mod tests {
             walk,
             &AlwaysDefers,
             Arc::new(SpawnEnded::new(0, false)),
+            Deleter::Recording(Arc::new(RecordDeletes::new(DELETE_BATCH))),
             2,
+            DeleteMode::On,
         );
 
         let paired = drive(&transfer).await;
@@ -993,7 +1465,9 @@ mod tests {
             walk,
             Mode::default().uploading(),
             Arc::new(SpawnEnded::new(0, false)),
+            Deleter::Recording(Arc::new(RecordDeletes::new(DELETE_BATCH))),
             2,
+            DeleteMode::On,
         );
 
         assert_eq!(
@@ -1046,10 +1520,10 @@ mod tests {
         );
     }
 
-    // The only test leaving the re-polling to the scheduler. Every other one calls `poll_work` in
-    // a loop and never needs a signal to come back. So this is the one test failing if a work item
-    // finishes without signalling. The tree has to be larger than one batch: a run finishing
-    // inside a single work item signals from `execute` and never waits.
+    // The only test leaving the re-polling to the scheduler. Every other one calls `poll_work` in a
+    // loop and never needs a signal to come back. So this is the one test failing if a work item
+    // finishes without signalling. The tree has to be larger than one batch: a run finishing inside
+    // a single work item signals from `execute` and never waits.
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn the_scheduler_gets_the_run_to_the_end_on_its_own() {
@@ -1081,7 +1555,9 @@ mod tests {
             walk,
             Mode::default().uploading(),
             Arc::new(SpawnEnded::new(0, false)),
+            Deleter::Recording(Arc::new(RecordDeletes::new(DELETE_BATCH))),
             2,
+            DeleteMode::On,
         );
 
         ctx.handle
@@ -1164,7 +1640,9 @@ mod tests {
             walk,
             Mode::default().uploading(),
             Arc::new(SpawnEnded::new(0, false)),
+            Deleter::Recording(Arc::new(RecordDeletes::new(DELETE_BATCH))),
             2,
+            DeleteMode::On,
         );
 
         let mut work = match transfer.poll_work() {
@@ -1225,6 +1703,9 @@ mod tests {
         );
     }
 
+    // Spawn until the poll answers something else, handing that answer back. Looping on
+    // `matches!(poll(), Spawned)` instead would poll once more than it consumes and silently discard
+    // the work item that poll produced.
     fn spawn_until_something_else(transfer: &SyncTransfer<FsWalk, S3Walk>) -> PollWork {
         loop {
             match transfer.poll_work() {
@@ -1287,12 +1768,21 @@ mod tests {
                     .build(),
             )
             .expect("an ordinary bucket builds");
-        let transfer =
-            SyncTransfer::new(ctx.clone(), walk, Mode::default().uploading(), spawner, cap);
+        let transfer = SyncTransfer::new(
+            ctx.clone(),
+            walk,
+            Mode::default().uploading(),
+            spawner,
+            Deleter::Recording(Arc::new(RecordDeletes::new(DELETE_BATCH))),
+            cap,
+            DeleteMode::On,
+        );
         (transfer, ctx)
     }
 
-    // Each term below holds the run open on its own.
+    // Each of these holds the run open on its own. Adding a term to the completion test and not a
+    // test for it is how a run reports itself finished with work still owed, which is the symptom
+    // that made the completion test subtle in the first place.
 
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
@@ -1379,8 +1869,8 @@ mod tests {
         assert!(matches!(transfer.poll_work(), PollWork::Done));
     }
 
-    // The cap is the caller's share of the client, so it bounds live children and not the number
-    // the run has asked for.
+    // The cap is the caller's share of the client, so it has to bound what is live rather than what
+    // has been asked for.
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn no_more_children_are_live_than_the_cap_allows() {
@@ -1422,6 +1912,7 @@ mod tests {
         );
     }
 
+    // Answers transfer for every key, including ones with no source to send.
     struct AlwaysTransfers;
 
     impl Compare<crate::io::walk::FsEntry, aws_sdk_s3::types::Object> for AlwaysTransfers {
@@ -1443,9 +1934,9 @@ mod tests {
         }
     }
 
-    // A key with nothing to send cannot become a child, and the run has to carry on past it.
-    // Answering the poll with nothing enqueued leaves the run waiting, with the rest of the buffer
-    // still in it and no work item left to signal. The run hangs and reports nothing.
+    // A key with nothing to send cannot become a child. The run has to carry on past it: answering
+    // the poll without enqueueing anything parks the run with the rest of the buffer still in it and
+    // no work item left to wake it, which hangs rather than fails.
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn a_transfer_decided_on_an_absent_source_does_not_strand_the_rest() {
@@ -1468,7 +1959,15 @@ mod tests {
             )
             .expect("an ordinary bucket builds");
         let spawner = Arc::new(SpawnEnded::new(0, false));
-        let transfer = SyncTransfer::new(ctx, walk, &AlwaysTransfers, spawner.clone(), 4);
+        let transfer = SyncTransfer::new(
+            ctx,
+            walk,
+            &AlwaysTransfers,
+            spawner.clone(),
+            Deleter::Recording(Arc::new(RecordDeletes::new(DELETE_BATCH))),
+            4,
+            DeleteMode::On,
+        );
 
         // `drive` panics on `Pending`, and a stranded buffer produces a `Pending`.
         let paired = drive(&transfer).await;
@@ -1526,46 +2025,429 @@ mod tests {
         );
     }
 
-    // Both sides compare on keys relative to their own root. The listing strips the run's prefix
-    // off, so naming an object means putting the prefix back. A mocked `PutObject` accepts any key,
-    // so a test watching only for the call cannot tell writing under the prefix from writing to the
-    // bucket root.
+    // Both sides compare on keys relative to their own root, which the listing produces by stripping the
+    // run's prefix off, so naming an object means putting the prefix back. The assertion watches the key
+    // each write carried rather than a key a helper computes, because a mocked `PutObject` accepts any
+    // key and a helper can be correct while its caller ignores it.
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn an_uploaded_key_is_named_under_the_runs_prefix() {
         let dir = tempfile::tempdir().expect("a temp dir");
-        std::fs::write(dir.path().join("a.txt"), b"x").expect("a file");
+        a_local_tree(dir.path(), &["a.txt", "nested/c.txt"]);
 
-        let mut walked = crate::io::walk::FsWalker::builder().build().walk(
-            crate::io::walk::FsWalkContext::builder()
-                .root(dir.path())
-                .build(),
+        let (client, puts) = a_bucket_recording_puts(&[]);
+        let config = crate::Config::builder().client(client.clone()).build();
+        let handle = crate::client::Handle::test_handle_managed(config);
+        let (ctx, completion_rx) = TransferContext::new(handle);
+        let walk = Walker::builder()
+            .build()
+            .uploading(
+                LocalAndBucket::builder()
+                    .local_root(dir.path())
+                    .client(client)
+                    .bucket("amzn-s3-demo-bucket")
+                    .prefix("data")
+                    .build(),
+            )
+            .expect("an ordinary bucket builds");
+        let transfer = SyncTransfer::new(
+            ctx.clone(),
+            walk,
+            Mode::default().uploading(),
+            Arc::new(SpawnUpload::new(
+                ctx.handle.clone(),
+                "amzn-s3-demo-bucket",
+                Some("data"),
+            )),
+            Deleter::Recording(Arc::new(RecordDeletes::new(DELETE_BATCH))),
+            4,
+            DeleteMode::On,
         );
-        let entry = match walked.next().await {
-            Some(Ok(entry)) => entry,
-            other => panic!("expected one file, got {other:?}"),
-        };
 
-        let config = crate::Config::builder()
-            .client(a_bucket_holding(&[]))
-            .build();
+        ctx.handle
+            .scheduler
+            .enqueue_transfer(Box::new(transfer.clone()));
+        tokio::time::timeout(Duration::from_secs(20), completion_rx)
+            .await
+            .expect("the run did not finish")
+            .expect("the terminal signal was dropped");
+
+        let mut written = puts.lock().clone();
+        written.sort();
+        assert_eq!(
+            written,
+            vec!["data/a.txt".to_string(), "data/nested/c.txt".to_string()],
+            "the writes did not land under the run's prefix"
+        );
+    }
+
+    // Builds a transfer whose deletes a test can watch.
+    fn deleting(
+        local: &Path,
+        bucket_keys: &[&str],
+        deleter: Arc<RecordDeletes>,
+    ) -> (SyncTransfer<FsWalk, S3Walk>, TransferContext) {
+        deleting_with(local, bucket_keys, deleter, DeleteMode::On)
+    }
+
+    // The same, with the mode a test's subject.
+    fn deleting_with(
+        local: &Path,
+        bucket_keys: &[&str],
+        deleter: Arc<RecordDeletes>,
+        delete_mode: DeleteMode,
+    ) -> (SyncTransfer<FsWalk, S3Walk>, TransferContext) {
+        let client = a_bucket_holding(bucket_keys);
+        let config = crate::Config::builder().client(client.clone()).build();
         let handle = crate::client::Handle::test_handle_tokio(config);
+        let (ctx, _rx) = TransferContext::new(handle);
+        let walk = Walker::builder()
+            .build()
+            .uploading(
+                LocalAndBucket::builder()
+                    .local_root(local)
+                    .client(client)
+                    .bucket("amzn-s3-demo-bucket")
+                    .build(),
+            )
+            .expect("an ordinary bucket builds");
+        let transfer = SyncTransfer::new(
+            ctx.clone(),
+            walk,
+            Mode::default().uploading(),
+            Arc::new(SpawnEnded::new(0, false)),
+            Deleter::Recording(deleter),
+            4,
+            delete_mode,
+        );
+        (transfer, ctx)
+    }
 
-        for (prefix, expected) in [
-            (None, "a.txt"),
-            (Some("data"), "data/a.txt"),
-            (Some("data/"), "data/a.txt"),
-            (Some(""), "a.txt"),
-        ] {
-            let spawner = SpawnUpload::new(handle.clone(), "amzn-s3-demo-bucket", prefix);
-            let key = spawner.object_key("a.txt");
-            assert_eq!(
-                key, expected,
-                "a run under prefix {prefix:?} would have written to {key}"
+    // Keys the source does not have reach the destination's delete path, batched rather than sent one
+    // at a time, and each one's outcome comes back on its own.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn destination_only_keys_are_deleted_in_batches() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let keys: Vec<String> = (0..7).map(|n| format!("gone{n}.txt")).collect();
+        let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+        // A batch of three, so seven keys cannot come out as one request by accident.
+        let deleter = Arc::new(RecordDeletes::new(3));
+        let (transfer, _ctx) = deleting(dir.path(), &refs, deleter.clone());
+
+        drive(&transfer).await;
+
+        let batches = deleter.batches();
+        assert_eq!(
+            deleter.keys_sent(),
+            7,
+            "not every key reached the delete path"
+        );
+        assert!(
+            batches.len() > 1,
+            "seven keys went out in {} request(s), so nothing was batched",
+            batches.len()
+        );
+        assert!(
+            batches.iter().all(|b| b.len() <= 3),
+            "a batch exceeded the limit: {batches:?}"
+        );
+        let state = transfer.inner.state.lock();
+        assert_eq!(state.deleted, 7, "each key's outcome was not counted");
+        // The same count in both modes, so a caller can reconcile what happened against what was meant.
+        assert_eq!(
+            state.decided.deletable, 7,
+            "a run allowed to delete does not report what the comparison marked"
+        );
+        assert_eq!(state.delete_failures, 0);
+    }
+
+    // A batch that fails partially has to say which keys survived, so the two counts are kept apart.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn a_refused_delete_is_counted_against_its_own_key() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let deleter = Arc::new(RecordDeletes::refusing(DELETE_BATCH));
+        let (transfer, _ctx) = deleting(dir.path(), &["a.txt", "b.txt"], deleter.clone());
+
+        drive(&transfer).await;
+
+        let state = transfer.inner.state.lock();
+        assert_eq!(
+            state.delete_failures, 2,
+            "a refusal was not attributed per key"
+        );
+        assert_eq!(state.deleted, 0, "a refused key was counted as removed");
+        // The reason reaches the run's record naming its key, because a count cannot answer which key
+        // survived and that is the question a per-key outcome exists to answer.
+        assert!(
+            state.refusals.iter().any(|why| why.starts_with("a.txt:"))
+                && state.refusals.iter().any(|why| why.starts_with("b.txt:")),
+            "the refusal did not reach the record naming its key: {:?}",
+            state.refusals
+        );
+    }
+
+    // Deleting destroys data the caller never handed over, so a run that was not asked to delete leaves
+    // the key alone. Reporting is the other half: the key is still accounted for, as a skip, because a
+    // destination-only key that no column mentions is indistinguishable from one sync never saw.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn a_run_not_asked_to_delete_leaves_the_key_and_still_counts_it() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let deleter = Arc::new(RecordDeletes::new(DELETE_BATCH));
+        let (transfer, _ctx) = deleting_with(
+            dir.path(),
+            &["gone-a.txt", "gone-b.txt"],
+            deleter.clone(),
+            DeleteMode::Off,
+        );
+
+        drive(&transfer).await;
+
+        assert_eq!(
+            deleter.keys_sent(),
+            0,
+            "a run that was not asked to delete issued {} keys anyway",
+            deleter.keys_sent()
+        );
+        let state = transfer.inner.state.lock();
+        assert_eq!(state.deleted, 0, "a key was reported as removed");
+        assert_eq!(state.decided.deletes, 0, "a delete was decided");
+        assert_eq!(
+            state.decided.skips, 2,
+            "the two keys left alone were not accounted for"
+        );
+        // How much a run with deletion on would remove is the number a caller wants before turning it
+        // on, so it survives separately from the skips it is folded into.
+        assert_eq!(
+            state.decided.deletable, 2,
+            "the run cannot say how many objects turning deletion on would remove"
+        );
+        assert!(state.pending_deletes.is_empty());
+    }
+
+    // The shipped deleter, driven against a mocked bucket. Every other delete test substitutes
+    // `RecordDeletes`, which exercises the loop's batching and never the request: the payload, the
+    // retry, and reading the response's two lists apart all live here and nowhere else.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn the_deleter_reports_each_key_from_the_response_it_got() {
+        use aws_sdk_s3::operation::delete_objects::DeleteObjectsOutput;
+        use aws_sdk_s3::types::{DeletedObject, Error as S3Error};
+
+        // One key removed, one refused for good, and one the response never mentions.
+        let quiet_flags = Arc::new(Mutex::new(Vec::<Option<bool>>::new()));
+        let quiet_recorder = quiet_flags.clone();
+        let answered = mock!(aws_sdk_s3::Client::delete_objects)
+            .match_requests(move |req| {
+                quiet_recorder
+                    .lock()
+                    .push(req.delete().and_then(|d| d.quiet()));
+                true
+            })
+            .then_output(|| {
+                DeleteObjectsOutput::builder()
+                    .set_deleted(Some(vec![DeletedObject::builder()
+                        .key("data/gone.txt")
+                        .build()]))
+                    .set_errors(Some(vec![S3Error::builder()
+                        .key("data/held.txt")
+                        .code("AccessDenied")
+                        .message("denied")
+                        .build()]))
+                    .build()
+            });
+        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&answered]);
+
+        let deleter = Deleter::Bucket(DeleteFromBucket::new(
+            client,
+            "amzn-s3-demo-bucket",
+            Some("data"),
+        ));
+        let outcomes = deleter.delete(["gone.txt", "held.txt", "silent.txt"]).await;
+
+        assert_eq!(
+            outcomes.len(),
+            3,
+            "the outcomes do not account for every key sent"
+        );
+        // Each outcome sits at its own key's position, and each names that key.
+        assert_eq!(outcomes[0], Ok("gone.txt".to_string()));
+        let held = outcomes[1]
+            .as_ref()
+            .expect_err("a refusal was read as success");
+        assert!(
+            held.starts_with("held.txt:") && held.contains("denied"),
+            "a refusal did not name its key and reason: {held}"
+        );
+        let silent = outcomes[2]
+            .as_ref()
+            .expect_err("a key the response skipped was read as success");
+        assert!(
+            silent.starts_with("silent.txt:"),
+            "an unmentioned key was not named: {silent}"
+        );
+        // Treating an unmentioned key as unexplained is only sound while the response names its
+        // successes, so the guard sits in the test that exercises the unmentioned path: under a quiet
+        // response every removed key would arrive here and a whole successful batch would read as failed.
+        assert!(
+            quiet_flags.lock().iter().all(|q| *q == Some(false)),
+            "the request left the response's verbosity to chance: {:?}",
+            quiet_flags.lock()
+        );
+    }
+
+    // A refusal S3 reports against one key is the normal way it sheds load, so that key is asked about
+    // again rather than counted as lost. The keys the same response removed are not named again, and the
+    // second ask waits: answering a request for less load with an immediate retry asks for more of it.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test(start_paused = true)]
+    async fn a_key_refused_for_load_is_asked_about_again() {
+        use aws_sdk_s3::operation::delete_objects::DeleteObjectsOutput;
+        use aws_sdk_s3::types::{DeletedObject, Error as S3Error};
+
+        let asked = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+        let recorder = asked.clone();
+        let quiet_flags = Arc::new(Mutex::new(Vec::<Option<bool>>::new()));
+        let quiet_recorder = quiet_flags.clone();
+        let first = mock!(aws_sdk_s3::Client::delete_objects)
+            .match_requests(move |req| {
+                let names = req
+                    .delete()
+                    .map(|d| {
+                        d.objects()
+                            .iter()
+                            .map(|o| o.key().to_string())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                recorder.lock().push(names);
+                quiet_recorder
+                    .lock()
+                    .push(req.delete().and_then(|d| d.quiet()));
+                true
+            })
+            .sequence()
+            .output(|| {
+                DeleteObjectsOutput::builder()
+                    .set_deleted(Some(vec![DeletedObject::builder().key("gone.txt").build()]))
+                    .set_errors(Some(vec![S3Error::builder()
+                        .key("busy.txt")
+                        .code("SlowDown")
+                        .message("slow down")
+                        .build()]))
+                    .build()
+            })
+            .output(|| {
+                DeleteObjectsOutput::builder()
+                    .set_deleted(Some(vec![DeletedObject::builder().key("busy.txt").build()]))
+                    .build()
+            })
+            .build();
+        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&first]);
+
+        let deleter = Deleter::Bucket(DeleteFromBucket::new(client, "amzn-s3-demo-bucket", None));
+        let started = tokio::time::Instant::now();
+        let outcomes = deleter.delete(["gone.txt", "busy.txt"]).await;
+        let waited = started.elapsed();
+
+        assert_eq!(
+            outcomes,
+            vec![Ok("gone.txt".to_string()), Ok("busy.txt".to_string())],
+            "a key refused for load was not asked about again"
+        );
+        let batches = asked.lock().clone();
+        assert_eq!(
+            batches.len(),
+            2,
+            "the refusal did not cost a second request"
+        );
+        assert_eq!(
+            batches[1],
+            vec!["busy.txt".to_string()],
+            "the second request named keys the first had already removed"
+        );
+        // The schedule is full-jittered, so only its presence is assertable, not its length. Zero means
+        // no wait at all, which is the defect this guards.
+        assert!(
+            waited > Duration::ZERO,
+            "the refused key was asked about again with no wait"
+        );
+        // Reading the outcomes depends on the response naming successes, which a quiet response does not
+        // do, so the request says so rather than trusting a server default to stay put.
+        assert!(
+            quiet_flags.lock().iter().all(|q| *q == Some(false)),
+            "a request left the response's verbosity to chance: {:?}",
+            quiet_flags.lock()
+        );
+    }
+
+    // A batch still out holds the run open, like every other kind of outstanding work.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn a_delete_still_out_holds_the_run_open() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let deleter = Arc::new(RecordDeletes::new(DELETE_BATCH));
+        let (transfer, _ctx) = deleting(dir.path(), &["a.txt"], deleter);
+
+        // Drain the merge, which leaves one key waiting to be deleted.
+        while let PollWork::Ready { io: mut work, .. } = transfer.poll_work() {
+            let is_delete = matches!(
+                work.data.as_ref().map(|d| format!("{d:?}")),
+                Some(ref s) if s.starts_with("DeleteKeys")
             );
-            // The whole path still has to build, so this covers more than the key.
-            assert!(spawner.spawn("a.txt", &entry, 1).is_ok());
+            if is_delete {
+                {
+                    let state = transfer.inner.state.lock();
+                    assert!(
+                        state.pending_deletes.is_empty(),
+                        "the keys did not leave the buffer when the batch was built"
+                    );
+                    assert_eq!(state.deletes_in_flight, 1);
+                }
+                assert!(
+                    matches!(transfer.poll_work(), PollWork::Pending),
+                    "a delete still out did not hold the run open"
+                );
+                transfer.execute(&mut work).await;
+                break;
+            }
+            transfer.execute(&mut work).await;
         }
+        assert!(matches!(transfer.poll_work(), PollWork::Done));
+    }
+
+    // Cancelling lets the pending batch go. A key reached that buffer by being absent from the source,
+    // and absence is read from the merge having passed its position — so a run that stopped early
+    // judged these keys against a stream with a hole in it.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn cancelling_lets_the_pending_batch_go() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let deleter = Arc::new(RecordDeletes::new(DELETE_BATCH));
+        let (transfer, ctx) = deleting(dir.path(), &["a.txt", "b.txt"], deleter.clone());
+
+        // Advance the merge once so both keys are decided and waiting, without letting the flush run.
+        let mut work = match transfer.poll_work() {
+            PollWork::Ready { io, .. } => io,
+            other => panic!("expected the merge, got {other:?}"),
+        };
+        transfer.execute(&mut work).await;
+        assert_eq!(
+            transfer.inner.state.lock().pending_deletes.len(),
+            2,
+            "the keys were not waiting, so this proves nothing"
+        );
+
+        ctx.set_cancelled();
+        assert!(matches!(transfer.poll_work(), PollWork::Done));
+        assert_eq!(
+            deleter.keys_sent(),
+            0,
+            "a cancelled run still issued deletes judged against an incomplete source"
+        );
+        assert!(transfer.inner.state.lock().pending_deletes.is_empty());
     }
 
     // The only test using the real spawner. Every other one hands back a controlled child, so no
@@ -1596,8 +2478,15 @@ mod tests {
             "amzn-s3-demo-bucket",
             None,
         ));
-        let transfer =
-            SyncTransfer::new(ctx.clone(), walk, Mode::default().uploading(), spawner, 4);
+        let transfer = SyncTransfer::new(
+            ctx.clone(),
+            walk,
+            Mode::default().uploading(),
+            spawner,
+            Deleter::Recording(Arc::new(RecordDeletes::new(DELETE_BATCH))),
+            4,
+            DeleteMode::On,
+        );
 
         ctx.handle
             .scheduler

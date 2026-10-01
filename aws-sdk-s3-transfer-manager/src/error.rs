@@ -10,6 +10,7 @@ use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::operation::abort_multipart_upload::AbortMultipartUploadError;
 use aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadError;
 use aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadError;
+use aws_sdk_s3::operation::delete_objects::DeleteObjectsError;
 use aws_sdk_s3::operation::get_object::GetObjectError;
 use aws_sdk_s3::operation::head_object::HeadObjectError;
 use aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Error;
@@ -622,6 +623,7 @@ from_sdk_error!(CreateMultipartUploadError, "CreateMultipartUpload");
 from_sdk_error!(CompleteMultipartUploadError, "CompleteMultipartUpload");
 from_sdk_error!(AbortMultipartUploadError, "AbortMultipartUpload");
 from_sdk_error!(ListObjectsV2Error, "ListObjectsV2");
+from_sdk_error!(DeleteObjectsError, "DeleteObjects");
 
 impl From<crate::io::walk::WalkError> for Error {
     /// Maps a directory-walk failure to a transfer error, preserving the
