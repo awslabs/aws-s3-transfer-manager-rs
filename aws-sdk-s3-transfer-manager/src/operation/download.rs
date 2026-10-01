@@ -22,6 +22,7 @@ pub(crate) mod recv_buffer;
 pub(crate) mod read_ahead;
 
 mod context;
+mod observability;
 
 pub(crate) mod discovery;
 
@@ -67,16 +68,16 @@ pub(crate) struct EventRegistration {
 
 /// The file a download writes into, and the two facts that only travel with it.
 ///
-/// Grouped rather than passed as three parameters because none of them is meaningful
-/// without the others: the offset says what the file's byte 0 means, and `owns_file`
-/// says who closes it. Keeping them together is also what holds
-/// [`Download::orchestrate_with_sink`] inside clippy's argument limit now that the
-/// listing's `known_size` travels with it.
+/// Grouped rather than passed as two parameters because neither is meaningful without
+/// the other: the file is the destination and `owns_file` says who closes it. Keeping
+/// them together is also what holds [`Download::orchestrate_with_sink`] inside clippy's
+/// argument limit now that the listing's `known_size` travels with it.
+///
+/// The object-range origin is not here: the writer learns it from discovery through
+/// `BodyWriter::prepare`, which is the only point at which a ranged download's origin is
+/// known.
 pub(crate) struct FileSink {
     pub(crate) file: std::fs::File,
-    /// Offset in the *object* that this file's offset 0 corresponds to — non-zero only
-    /// for a ranged download.
-    pub(crate) object_range_start: u64,
     /// `true` when the transfer manager created the file and must clean it up (the
     /// temp-file-then-rename path); `false` when the caller opened it and owns it.
     pub(crate) owns_file: bool,
@@ -172,14 +173,12 @@ impl Download {
             .map_err(|e| error::from_kind(error::ErrorKind::IOError)(e))?;
         let file = tokio_file.into_std().await;
 
-        let range_start = object_range_start_from_input(&input);
         // No listing behind this entry point, so the size comes from discovery as before.
         let inner = Self::orchestrate_with_sink(
             handle,
             input,
             FileSink {
                 file,
-                object_range_start: range_start,
                 owns_file: true,
             },
             parent,
@@ -201,13 +200,11 @@ impl Download {
         file: std::fs::File,
         events: Option<EventRegistration>,
     ) -> Result<ManagedDownloadHandle, error::Error> {
-        let range_start = object_range_start_from_input(&input);
         let inner = Self::orchestrate_with_sink(
             handle,
             input,
             FileSink {
                 file,
-                object_range_start: range_start,
                 owns_file: false,
             },
             None,
@@ -244,8 +241,7 @@ impl Download {
         let bucket_type =
             BucketType::from_bucket_name(input.bucket().expect("bucket is available"));
 
-        let (writer, _consumer) =
-            body::new_recv_body_with_sink(sink.file, sink.object_range_start, sink.owns_file);
+        let (writer, _consumer) = body::new_recv_body_with_sink(sink.file, sink.owns_file);
 
         let (ctx, completion_rx) = match parent {
             Some(parent) => TransferContext::new_child(handle.clone(), parent),
@@ -289,19 +285,4 @@ impl Download {
             completion_rx: Some(completion_rx),
         })
     }
-}
-
-/// Extract the byte range start from the user's range header, if present.
-/// Returns 0 for no range or non-inclusive ranges (suffix, open-ended).
-fn object_range_start_from_input(input: &DownloadInput) -> u64 {
-    use crate::http::header;
-    use std::str::FromStr;
-    input
-        .range()
-        .and_then(|r| header::Range::from_str(r).ok())
-        .map(|r| match r.0 {
-            header::ByteRange::Inclusive(start, _) => start,
-            _ => 0,
-        })
-        .unwrap_or(0)
 }

@@ -82,6 +82,88 @@ fn doomed_keys(prefix: &str, percent: usize) -> BTreeSet<String> {
         .collect()
 }
 
+/// A parent holds a completed part's bytes before any child has terminated.
+///
+/// This is the deterministic form of the claim the chaos floors used to carry. Those floors
+/// needed a doomed child to lose a race (record a part, then be failed by its sibling), so they
+/// read 0 on healthy runs under load. Here the window is held open instead of raced for: part 2
+/// of the only file stalls forever inside the mock, so the child cannot reach a terminal state
+/// and therefore cannot have been reaped.
+///
+/// What it rules out: folding a child's bytes into the parent at reap, in the success arm. Under
+/// that fold the parent reads 0 for as long as the child is live -- which is the entire life of
+/// this test -- so the assertion below is 0 on every run. A bar built on `metrics()` would sit at
+/// 0% through a transfer that has demonstrably moved 5 MiB.
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn parent_counts_a_completed_part_while_the_child_is_still_in_flight() {
+    timeout(TEST_TIMEOUT, async {
+        let m = setup().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("000.bin"), vec![7u8; FILE_SIZE]).expect("write file");
+
+        // Skip one so `UploadPart` #1 completes and records; the next part is read to 0 bytes and
+        // then never completes, which is what pins the child in flight.
+        m.server.insert_fault(
+            BUCKET,
+            "inflight/000.bin",
+            FaultType::StallRequestRead { after_bytes: 0 },
+            FAULT_SKIP,
+            Occurrence::Always,
+        );
+
+        let handle = m
+            .client
+            .upload_objects()
+            .bucket(BUCKET)
+            .source(dir.path())
+            .walker(FsWalker::builder().recursive(true).build())
+            .key_prefix("inflight/")
+            .failure_policy(FailedTransferPolicy::Continue)
+            .initiate()
+            .expect("initiate");
+
+        // Poll rather than sleep a fixed amount: the wait is for part 1 to land, and a fixed
+        // delay either flakes or is slower than it needs to be.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let mut observed = 0u64;
+        while tokio::time::Instant::now() < deadline {
+            observed = handle.metrics().network_tx;
+            if observed >= PART {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let status = handle.status();
+
+        println!(
+            "\n=== one child, part 2 held open ===\n\
+             parent network_tx .............. {observed}\n\
+             one part ....................... {PART}\n\
+             status while still in flight ... {status:?}\n"
+        );
+
+        // The child is pinned by the stall, so `Active` is what makes the reading meaningful:
+        // nothing has been reaped, so anything the parent holds arrived as the bytes moved.
+        assert_eq!(
+            aws_sdk_s3_transfer_manager::types::TransferStatus::Active,
+            status,
+            "the stalled part must keep the run active, or this proves nothing about reap"
+        );
+        assert!(
+            observed >= PART,
+            "the parent must hold a completed part's bytes while its child is still live; \
+             {observed} < {PART} means child bytes only reach the parent at reap"
+        );
+
+        // Never joined: the stall never completes. Abort so the run stops before shutdown.
+        handle.abort().await;
+        m.handle.shutdown().await.expect("shutdown");
+    })
+    .await
+    .expect("test timed out");
+}
+
 /// One run of the chaos scenario at a given failure rate.
 struct Run {
     /// What `handle.metrics()` reported after `join()` returned.
@@ -215,12 +297,23 @@ async fn assert_chaos(percent: usize, prefix: &str) {
         "the scenario must actually fail some children, or it proves nothing"
     );
     // Bounds against what the run reported, never against what the fault pattern predicted.
-    // The lower bound is the load-bearing one: a parent holding more than the successful
-    // children's own bytes can only have gotten the difference from a child that failed.
+    //
+    // The floor is `>=`, not `>`, because a doomed child's partial bytes are not guaranteed to
+    // exist. `FAULT_SKIP` makes one `UploadPart` pass *at the server*, but `record_io` runs
+    // after the response is awaited (upload/transfer.rs:804), and the sibling part's failure can
+    // fail the child first — cancelling that await before the bytes are recorded. Measured on
+    // this scenario: of two doomed children, one records a part and one records nothing, run
+    // after run; under full-suite load both record nothing, and a `>` floor then reports a
+    // working rollup as a regression.
+    //
+    // The regression this floor was reaching for -- folding child bytes at reap, in the success
+    // arm only -- is pinned instead by
+    // `parent_counts_a_completed_part_while_the_child_is_still_in_flight`, which holds a part
+    // open so no child can have been reaped and the fold has nowhere to hide.
     assert!(
-        r.network_tx_at_join > success_bytes(r.uploaded),
-        "the parent must count bytes pushed by children that later failed; {} <= {} means \
-         the rollup regressed to a success-arm fold",
+        r.network_tx_at_join >= success_bytes(r.uploaded),
+        "the parent must hold at least every successful child's own bytes; {} < {} means bytes \
+         are being lost on the way up",
         r.network_tx_at_join,
         success_bytes(r.uploaded)
     );
@@ -413,13 +506,18 @@ async fn chaos_abort_parent_counts_bytes_that_land_after_terminal() {
             r.status_at_terminal, r.polls_to_terminal, r.tx_at_terminal, r.tx_settled, moved,
         );
 
-        // The rollup reaches the parent on the abort path, not only the happy one. This is the
-        // assertion that fails if `record_io` stops walking the parent chain -- reverting that
-        // walk reads 0 here, which is exactly what the pre-rollup defect looked like.
-        assert!(
-            r.tx_at_terminal > 0,
-            "a parent must count its children's bytes as they move, including under Abort; \
-             0 means the rollup regressed to a reap-time fold"
+        // The ceiling is asserted below. The floor is not: `tx_at_terminal > 0` needs some child
+        // to have recorded bytes before the abort cascade reached it, and that is a scheduling
+        // outcome. A fault that fires on a doomed child's first-arriving part aborts the run
+        // while every sibling is still mid-request, and `record_io` has then run nowhere --
+        // 0 is the correct reading, not a regression. Observed under full-suite load.
+        //
+        // That `record_io` walks the parent chain at all is pinned by
+        // `parent_counts_a_completed_part_while_the_child_is_still_in_flight`, where a held-open
+        // part makes the in-flight window deterministic instead of a race.
+        println!(
+            "network_tx at terminal ......... {} (printed, not asserted: see the comment above)",
+            r.tx_at_terminal
         );
 
         // `moved` is printed and deliberately not asserted, in either direction.

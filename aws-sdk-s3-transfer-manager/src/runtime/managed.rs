@@ -16,14 +16,26 @@ use std::sync::{Arc, Mutex, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use aws_smithy_http_client::pool::{self, ConnectionPool, DriverSpawner, Partition, PartitionId};
+use aws_smithy_http_client::proxy::ProxyConfig;
+use aws_smithy_http_client::tls::{rustls_provider::CryptoMode, Provider};
+use aws_smithy_runtime_api::box_error::BoxError;
+use aws_smithy_runtime_api::client::connector_metadata::ConnectorMetadata;
 use aws_smithy_runtime_api::client::dns::{DnsFuture, ResolveDns};
-use aws_smithy_runtime_api::client::http::{http_client_fn, HttpClient, SharedHttpClient};
+use aws_smithy_runtime_api::client::http::{
+    HttpClient, HttpConnectorSettings, SharedHttpClient, SharedHttpConnector,
+};
+use aws_smithy_runtime_api::client::runtime_components::{
+    RuntimeComponents as SmithyRuntimeComponents, RuntimeComponentsBuilder,
+};
+use aws_smithy_runtime_api::shared::IntoShared;
+use aws_smithy_types::config_bag::ConfigBag;
 use futures_util::FutureExt;
 use tokio_util::sync::CancellationToken;
 
 use super::topology::Cpu;
 use super::Topology;
-use super::{ExecutionRuntime, RuntimeComponents, ScheduledWork};
+use super::{ExecutionRuntime, RuntimeComponents, RuntimeHttpOptions, ScheduledWork};
 use crate::runtime::sync::SubmissionGuard;
 use crate::scheduler::Scheduler;
 use crate::transfer::{TransferId, WorkOutcome};
@@ -33,7 +45,8 @@ use crate::transfer::{TransferId, WorkOutcome};
 ///
 /// hyper tries resolved IPs sequentially, so without shuffling all connections
 /// land on the first IP. Shuffling gives each connection a random starting IP,
-/// spreading load across all resolved addresses.
+/// spreading load across all resolved addresses. The connection pool's
+/// transport has the same sequential behavior, so shuffling still applies.
 #[derive(Debug, Clone)]
 struct ShufflingDnsResolver<R> {
     inner: R,
@@ -57,7 +70,8 @@ impl<R: ResolveDns + 'static> ResolveDns for ShufflingDnsResolver<R> {
 
 std::thread_local! {
     /// Identifies which managed thread the current OS thread corresponds to.
-    /// Set once during thread startup, read by the per-thread HTTP client dispatch.
+    /// Set once during thread startup, read by [`ManagedHttpClient`] to select
+    /// the calling thread's pool partition.
     static MANAGED_THREAD_CPU: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
@@ -67,7 +81,60 @@ struct ThreadHandle {
     runtime_handle: tokio::runtime::Handle,
     join_handle: Mutex<Option<JoinHandle<()>>>,
     in_flight: Arc<AtomicUsize>,
-    http_client: SharedHttpClient,
+}
+
+/// HTTP client that routes each operation to the calling managed thread's
+/// connection pool partition.
+///
+/// The SDK client holds a single [`HttpClient`], but the pool binds each
+/// [`pool::Client`] to one partition whose connections and protocol drivers
+/// live on one managed thread's runtime. Smithy requests an HTTP connector
+/// from the task executing the operation, so the thread-local
+/// [`MANAGED_THREAD_CPU`] identifies the partition that owns local reuse for
+/// that request.
+///
+/// Some operations are sent from outside the managed threads, for example
+/// [`UploadHandle::abort`](crate::operation::upload::UploadHandle::abort)
+/// runs on the caller's runtime. Those requests use a randomly selected
+/// partition: establishment and protocol drivers still run on that partition's
+/// thread, and the calling task only awaits the response.
+#[derive(Debug, Clone)]
+struct ManagedHttpClient {
+    /// One client per managed thread, indexed by thread (and partition) index.
+    clients: Arc<[pool::Client]>,
+}
+
+impl HttpClient for ManagedHttpClient {
+    fn validate_base_client_config(
+        &self,
+        runtime_components: &RuntimeComponentsBuilder,
+        cfg: &ConfigBag,
+    ) -> Result<(), BoxError> {
+        // Transport preflight builds and caches the TLS connectors (loading
+        // native trust roots) so that work happens here, when the S3 client is
+        // built, instead of on a managed thread's first connection. It needs no
+        // runtime context. Connectors are cached by interface binding, so
+        // visiting every partition covers each distinct interface; unbound
+        // partitions share one connector and repeat visits are cache hits.
+        self.clients
+            .iter()
+            .try_for_each(|client| client.validate_base_client_config(runtime_components, cfg))
+    }
+
+    fn http_connector(
+        &self,
+        settings: &HttpConnectorSettings,
+        components: &SmithyRuntimeComponents,
+    ) -> SharedHttpConnector {
+        let index = MANAGED_THREAD_CPU
+            .with(|c| c.get())
+            .unwrap_or_else(|| fastrand::usize(..self.clients.len()));
+        self.clients[index].http_connector(settings, components)
+    }
+
+    fn connector_metadata(&self) -> Option<ConnectorMetadata> {
+        self.clients.first()?.connector_metadata()
+    }
 }
 
 impl std::fmt::Debug for ThreadHandle {
@@ -131,7 +198,7 @@ async fn execute_work(work: &mut ScheduledWork, scheduler: &Scheduler) -> Execut
     let transfer = work.descriptor.transfer();
     let started = Instant::now();
 
-    let token = transfer.ctx().cancellation_token().clone();
+    let token = work.descriptor.cancellation_token().clone();
     let outcome = AssertUnwindSafe(async {
         tokio::select! {
             biased;
@@ -187,18 +254,18 @@ impl ManagedThreadRuntime {
     ///
     /// Spawns one OS thread per core in the topology. Each thread creates its
     /// own tokio current-thread runtime (the I/O driver binds to the creating
-    /// thread).
+    /// thread). Builds an HTTP client only when `http` is present.
     fn new(
         handle: Weak<crate::client::Handle>,
         topology: Topology,
         pin_threads: bool,
+        http: Option<RuntimeHttpOptions>,
         #[cfg(feature = "dial9")] telemetry_guard: Option<
             std::sync::Arc<dial9_tokio_telemetry::telemetry::TelemetryGuard>,
         >,
     ) -> Self {
         let shutdown_token = CancellationToken::new();
 
-        let dns_resolver = ShufflingDnsResolver::new(aws_smithy_dns::HickoryDnsResolver::default());
         // spawn and initialize concurrently
         let pending: Vec<_> = topology
             .thread_ids()
@@ -207,7 +274,6 @@ impl ManagedThreadRuntime {
                 let (tx, rx) = std::sync::mpsc::channel();
                 let cpu_index = id.0;
 
-                let resolver = dns_resolver.clone();
                 #[cfg(feature = "dial9")]
                 let telemetry_guard = telemetry_guard.clone();
 
@@ -235,16 +301,7 @@ impl ManagedThreadRuntime {
                             .build()
                             .expect("failed to create tokio current-thread runtime");
 
-                        // Create per-thread HTTP client on this thread's runtime.
-                        // The TLS connector and connection pool bind to this thread's reactor.
-                        let http_client = aws_smithy_http_client::Builder::new()
-                            .tls_provider(aws_smithy_http_client::tls::Provider::Rustls(
-                                aws_smithy_http_client::tls::rustls_provider::CryptoMode::AwsLc,
-                            ))
-                            // .tls_provider(aws_smithy_http_client::tls::Provider::S2nTls)
-                            .build_with_resolver(resolver);
-
-                        let _ = tx.send((rt.handle().clone(), http_client));
+                        let _ = tx.send(rt.handle().clone());
                         MANAGED_THREAD_CPU.set(Some(cpu_index));
                         rt.block_on(shutdown.cancelled());
                     })
@@ -257,32 +314,20 @@ impl ManagedThreadRuntime {
         let threads: Vec<_> = pending
             .into_iter()
             .map(|(id, rx, join_handle)| {
-                let (runtime_handle, http_client) =
-                    rx.recv().expect("managed thread failed to start");
+                let runtime_handle = rx.recv().expect("managed thread failed to start");
                 ThreadHandle {
                     id,
                     runtime_handle,
                     join_handle: Mutex::new(Some(join_handle)),
                     in_flight: Arc::new(AtomicUsize::new(0)),
-                    http_client,
                 }
             })
             .collect();
 
-        // Build an http_client_fn that dispatches to the per-thread HTTP client
-        // based on which managed thread is calling.
-        let per_thread_clients: Arc<Vec<SharedHttpClient>> =
-            Arc::new(threads.iter().map(|th| th.http_client.clone()).collect());
-
-        let shared_http_client = http_client_fn(move |settings, components| {
-            let cpu_index = MANAGED_THREAD_CPU
-                .with(|c| c.get())
-                .expect("http_client_fn called from non-managed thread");
-            per_thread_clients[cpu_index].http_connector(settings, components)
-        });
-
         let mut components = RuntimeComponents::default();
-        components.set_http_client(shared_http_client);
+        if let Some(http) = http {
+            components.set_http_client(build_http_client(&threads, &http));
+        }
         components.set_direct_io(true);
 
         Self {
@@ -297,11 +342,141 @@ impl ManagedThreadRuntime {
     }
 }
 
+/// How long a pooled connection may sit idle before the pool closes it.
+///
+/// S3 closes idle connections server-side. Retiring them first avoids reusing a
+/// connection the server is closing, which fails before the request is accepted
+/// and costs a retry on a fresh connection.
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Build one connection pool with a partition per managed thread and return an
+/// HTTP client that dispatches each request through the calling thread's
+/// partition.
+///
+/// Each partition spawns connection establishment, protocol drivers, and idle
+/// maintenance on its thread's runtime, so a connection's I/O stays on the
+/// thread that opened it. Partition identity is the thread index, which is also
+/// the index [`ManagedHttpClient`] reads from [`MANAGED_THREAD_CPU`].
+///
+/// When network interfaces are configured, each partition binds its
+/// connections to the interface [`partition_interface`] assigns its thread.
+///
+/// Proxy selection follows the standard environment variables (`HTTP_PROXY`,
+/// `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`), matching the SDK's default HTTPS
+/// client.
+///
+/// # Panics
+///
+/// Panics if the pool rejects its configuration, for example an interface name
+/// containing a NUL byte.
+fn build_http_client(threads: &[ThreadHandle], options: &RuntimeHttpOptions) -> SharedHttpClient {
+    debug_assert!(
+        threads.iter().enumerate().all(|(i, th)| th.id.0 == i),
+        "thread ids must be dense indices"
+    );
+
+    #[cfg(target_os = "android")]
+    let dns_resolver = ShufflingDnsResolver::new(
+        // Hickory reads /etc/resolv.conf on Unix. Android routes libc
+        // resolution through netd and does not provide that file.
+        aws_smithy_runtime::client::dns::TokioDnsResolver::new(),
+    );
+    #[cfg(not(target_os = "android"))]
+    let dns_resolver = ShufflingDnsResolver::new(aws_smithy_dns::HickoryDnsResolver::default());
+
+    let partitions = threads.iter().map(|th| {
+        let partition = Partition::new(
+            PartitionId::from_index(th.id.0),
+            DriverSpawner::tokio(th.runtime_handle.clone()),
+        );
+        bind_interface(partition, th.id, &options.network_interfaces)
+    });
+    let pool = ConnectionPool::builder()
+        .dns_resolver(dns_resolver)
+        .idle_timeout(POOL_IDLE_TIMEOUT)
+        .max_connections_per_host(options.max_connections_per_host)
+        .proxy_config(ProxyConfig::from_env())
+        .partitions(partitions)
+        .tls_provider(Provider::Rustls(CryptoMode::AwsLc))
+        .build_https()
+        .expect("failed to build the managed runtime connection pool");
+    let clients = threads
+        .iter()
+        .map(|th| pool::Client::from_partition(&pool, PartitionId::from_index(th.id.0)))
+        .collect::<Result<Arc<[_]>, _>>()
+        .expect("every managed thread has a declared partition");
+    ManagedHttpClient { clients }.into_shared()
+}
+
+/// Bind `partition` to the interface [`partition_interface`] assigns `thread`.
+#[cfg(any(
+    target_os = "android",
+    target_os = "fuchsia",
+    target_os = "illumos",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "solaris",
+    target_os = "tvos",
+    target_os = "visionos",
+    target_os = "watchos",
+))]
+fn bind_interface(partition: Partition, thread: Cpu, interfaces: &[String]) -> Partition {
+    match partition_interface(thread, interfaces) {
+        Some(interface) => partition.interface(interface),
+        None => partition,
+    }
+}
+
+/// Interface binding is unavailable on this platform, and the public setters
+/// that populate `interfaces` are not compiled.
+#[cfg(not(any(
+    target_os = "android",
+    target_os = "fuchsia",
+    target_os = "illumos",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "solaris",
+    target_os = "tvos",
+    target_os = "visionos",
+    target_os = "watchos",
+)))]
+fn bind_interface(partition: Partition, _thread: Cpu, _interfaces: &[String]) -> Partition {
+    partition
+}
+
+/// The network interface a managed thread's partition binds to: interfaces are
+/// assigned to threads round-robin in configuration order. `None` when no
+/// interfaces are configured, leaving selection to OS routing.
+///
+/// Threads are not pinned to NUMA nodes, so assignment cannot follow NIC
+/// locality; round-robin spreads threads evenly across interfaces.
+#[cfg(any(
+    target_os = "android",
+    target_os = "fuchsia",
+    target_os = "illumos",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "solaris",
+    target_os = "tvos",
+    target_os = "visionos",
+    target_os = "watchos",
+))]
+fn partition_interface(thread: Cpu, interfaces: &[String]) -> Option<&str> {
+    if interfaces.is_empty() {
+        return None;
+    }
+    Some(&interfaces[thread.0 % interfaces.len()])
+}
+
 /// Builder for [`ManagedThreadRuntime`].
 pub(crate) struct ManagedThreadRuntimeBuilder {
     handle: Weak<crate::client::Handle>,
     topology: Option<Topology>,
     pin_threads: bool,
+    http: Option<RuntimeHttpOptions>,
     #[cfg(feature = "dial9")]
     telemetry_guard: Option<std::sync::Arc<dial9_tokio_telemetry::telemetry::TelemetryGuard>>,
 }
@@ -312,6 +487,7 @@ impl ManagedThreadRuntimeBuilder {
             handle,
             topology: None,
             pin_threads: false,
+            http: None,
             #[cfg(feature = "dial9")]
             telemetry_guard: None,
         }
@@ -332,6 +508,13 @@ impl ManagedThreadRuntimeBuilder {
     #[allow(dead_code)] // TODO: expose on public config
     pub(crate) fn topology(mut self, topology: Topology) -> Self {
         self.topology = Some(topology);
+        self
+    }
+
+    /// Provide an HTTP client for the S3 client, configured by `options`.
+    /// Default: `None`, which builds no HTTP client.
+    pub(crate) fn http(mut self, options: Option<RuntimeHttpOptions>) -> Self {
+        self.http = options;
         self
     }
 
@@ -356,6 +539,7 @@ impl ManagedThreadRuntimeBuilder {
             self.handle,
             topology,
             self.pin_threads,
+            self.http,
             #[cfg(feature = "dial9")]
             self.telemetry_guard,
         )
@@ -460,7 +644,6 @@ mod tests {
             runtime_handle: rt.handle().clone(),
             join_handle: Mutex::new(None),
             in_flight: Arc::new(AtomicUsize::new(in_flight_count)),
-            http_client: http_client_fn(|_, _| unreachable!("test http client")),
         };
         (th, rt)
     }
@@ -486,6 +669,54 @@ mod tests {
         );
         let rt = rt_holder.get().unwrap().clone();
         (handle, rt)
+    }
+
+    #[cfg(any(
+        target_os = "android",
+        target_os = "fuchsia",
+        target_os = "illumos",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "solaris",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos",
+    ))]
+    #[test]
+    fn partition_interface_assigns_round_robin() {
+        let interfaces = ["ens5".to_string(), "ens6".to_string()];
+        let assigned: Vec<_> = (0..5)
+            .map(|i| partition_interface(Cpu(i), &interfaces))
+            .collect();
+        assert_eq!(
+            assigned,
+            [
+                Some("ens5"),
+                Some("ens6"),
+                Some("ens5"),
+                Some("ens6"),
+                Some("ens5")
+            ]
+        );
+    }
+
+    #[cfg(any(
+        target_os = "android",
+        target_os = "fuchsia",
+        target_os = "illumos",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "solaris",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos",
+    ))]
+    #[test]
+    fn partition_interface_unbound_without_interfaces() {
+        assert_eq!(partition_interface(Cpu(0), &[]), None);
+        assert_eq!(partition_interface(Cpu(3), &[]), None);
     }
 
     #[test]

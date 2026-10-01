@@ -22,7 +22,9 @@ use std::sync::Arc;
 use crate::error::{self, Error, ErrorKind};
 use crate::io::walk::S3Walk;
 use crate::operation::download::{Download, DownloadInput, ManagedDownloadHandle};
-use crate::transfer::{IoRequest, PollWork, Transfer, TransferContext, TransferId, WorkOutcome};
+use crate::transfer::{
+    IoRequest, PendingCause, PollWork, Transfer, TransferContext, TransferId, WorkOutcome,
+};
 use crate::types::{FailedDownload, FailedTransferPolicy};
 
 /// Maximum terminal children drained into a single `JoinChildren` work item per
@@ -736,7 +738,9 @@ impl DownloadObjectsTransfer {
         if let Some(result) = self.check_terminal(&mut state, emits) {
             return result;
         }
-        self.inner.ctx.set_pending();
+        self.inner
+            .ctx
+            .set_pending(PendingCause::in_flight_work("bulk_work_completion"));
         PollWork::Pending
     }
 
@@ -954,7 +958,6 @@ impl DownloadObjectsTransfer {
             input,
             crate::operation::download::FileSink {
                 file,
-                object_range_start: 0,
                 owns_file: true,
             },
             Some(&self.inner.ctx),

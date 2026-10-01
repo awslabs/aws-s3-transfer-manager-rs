@@ -130,13 +130,14 @@ impl ObjectMetadata {
 
     /// <p>Parse the content-range header to the inclusive range..</p>
     pub(crate) fn range_from_content_range(&self) -> Option<RangeInclusive<u64>> {
-        match self.total_object_size().checked_sub(1) {
-            Some(object_end) => match self.content_range.as_ref() {
-                Some(range) => crate::http::header::parse_content_range(range),
-                // When S3 doesn't provide a content-range header, we can infer the total size from the content-length header.
-                None => Some(0..=object_end),
-            },
-            None => None,
+        match self.content_range.as_deref() {
+            Some(range) => crate::http::header::parse_content_range(range),
+            // Without Content-Range, Content-Length describes the complete object.
+            None => self
+                .content_length
+                .and_then(|length| u64::try_from(length).ok())
+                .and_then(|length| length.checked_sub(1))
+                .map(|end| 0..=end),
         }
     }
 }
@@ -199,7 +200,13 @@ impl From<HeadObjectOutput> for ObjectMetadata {
             content_disposition: value.content_disposition,
             content_encoding: value.content_encoding,
             content_language: value.content_language,
-            content_range: None,
+            // A HEAD carrying a `Range` answers 206 with `Content-Range`, and its
+            // `Content-Length` is then the range's length, not the object's. Dropping
+            // the range leaves `total_object_size` reporting that length and
+            // `range_from_content_range` falling back to `0..=length-1`, which is the
+            // right count at the wrong offset -- so a suffix or open-ended range
+            // downloads the object's leading bytes instead of the ones asked for.
+            content_range: value.content_range,
             content_type: value.content_type,
             expires_string: value.expires_string,
             website_redirect_location: value.website_redirect_location,

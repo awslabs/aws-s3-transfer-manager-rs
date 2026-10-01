@@ -60,6 +60,71 @@
 //! * [`upload`](crate::Client::upload) - upload a single object
 //! * [`download_objects`](crate::Client::download_objects) - download an entire bucket or prefix to a local directory
 //! * [`upload_objects`](crate::Client::upload_objects) - upload an entire local directory to a bucket
+//!
+//! # Runtime diagnostics
+//!
+//! `AWS_S3_TM_DIAGNOSTICS` enables optional diagnostic collection without
+//! changing the client configuration API. Settings are namespaced by subsystem
+//! and resolved once when a client configuration is built. A standalone
+//! [`memory::BufferPool`] resolves only the memory settings.
+//!
+//! The value is a comma-separated list of case-sensitive `key=value` settings:
+//!
+//! ```text
+//! AWS_S3_TM_DIAGNOSTICS=memory.snapshot=1000ms,memory.detail=1,transfer.detail=1
+//! ```
+//!
+//! Whitespace around entries, keys, and values is ignored. Later valid
+//! assignments replace earlier ones. Unknown keys are ignored for forward
+//! compatibility. A malformed recognized setting produces a warning and keeps
+//! the preceding value. Unsupported detail levels use the highest level
+//! understood by this version and produce a warning.
+//!
+//! The environment variable controls collection cost. Tracing filters
+//! independently control whether collected records are emitted.
+//!
+//! ## Memory pool
+//!
+//! Memory diagnostics report pool capacity, admission pressure, allocation
+//! fallback, preparation, and reclamation.
+//!
+//! - `memory.snapshot=off` disables periodic reports. A positive integer
+//!   followed by `ms` enables reports; values below `100ms` use `100ms`.
+//! - `memory.detail=0` uses counters updated only at pressure and lifecycle
+//!   boundaries.
+//! - `memory.detail=1` also counts every optimistic allocation attempt and
+//!   bitmap word inspected, adding relaxed atomic updates to the acquisition
+//!   path.
+//!
+//! Memory snapshots use the `aws_sdk_s3_transfer_manager::memory` tracing target
+//! at `DEBUG`:
+//!
+//! ```text
+//! AWS_S3_TM_DIAGNOSTICS=memory.snapshot=1000ms
+//! RUST_LOG=aws_sdk_s3_transfer_manager::memory=debug
+//! ```
+//!
+//! Snapshot reporting reuses the memory pool's maintenance thread. It does not
+//! create a diagnostics-only thread. Detailed counters and periodic reporting
+//! are independent; both are disabled by default.
+//!
+//! ## Transfer state machines
+//!
+//! Transfer diagnostics report where an operation spends time and how work
+//! moves through its direction-specific state machine.
+//!
+//! - `transfer.detail=0` disables optional transfer-state collection.
+//! - `transfer.detail=1` collects aggregate summaries from supported transfer
+//!   state machines. Multipart uploads currently provide this summary.
+//! - `transfer.detail=2` also collects individual state transitions.
+//!
+//! Transfer summaries use the `aws_sdk_s3_transfer_manager::transfer` tracing
+//! target at `DEBUG`; level-2 transitions use the same target at `TRACE`:
+//!
+//! ```text
+//! AWS_S3_TM_DIAGNOSTICS=transfer.detail=1
+//! RUST_LOG=aws_sdk_s3_transfer_manager::transfer=debug
+//! ```
 
 /// Error types emitted by `aws-sdk-s3-transfer-manager`
 pub mod error;
@@ -83,6 +148,40 @@ pub mod operation;
 
 /// Transfer manager configuration
 pub mod config;
+
+/// Payload-memory configuration and shared pooled storage.
+///
+/// Transfer-manager clients construct a pool automatically by default.
+/// Applications that need to share one memory budget across clients or another
+/// component can construct a [`BufferPool`](crate::memory::BufferPool) and
+/// install it through
+/// [`MemoryConfig::Explicit`](crate::memory::MemoryConfig::Explicit).
+///
+/// [`BufferPool::metrics`](crate::memory::BufferPool::metrics) returns current
+/// accounting gauges without enabling diagnostic sampling. Buffer-pool events
+/// use the `aws_sdk_s3_transfer_manager::memory` tracing target.
+pub mod memory {
+    pub use crate::runtime::buffer_pool::{
+        AcquireError, BufferPool, BufferPoolBuildError, BufferPoolBuilder, PooledBufMut,
+        Reservation, ReserveError, ReserveFuture, SegmentedBytes,
+    };
+    pub use crate::types::{MemoryBudgetConfig, MemoryConfig};
+}
+
+/// Test-only entry points used by external fuzz targets.
+#[cfg(s3_tm_fuzz)]
+#[doc(hidden)]
+pub mod __fuzz {
+    /// Runs one encoded buffer-pool operation sequence.
+    pub fn buffer_pool_operations(data: &[u8]) {
+        crate::runtime::buffer_pool::run_fuzz_input(data);
+    }
+
+    /// Runs one encoded buffer-pool placement sequence.
+    pub fn buffer_pool_placement(data: &[u8]) {
+        crate::runtime::buffer_pool::run_placement_fuzz_input(data);
+    }
+}
 
 /// HTTP related components and utils
 pub(crate) mod http;

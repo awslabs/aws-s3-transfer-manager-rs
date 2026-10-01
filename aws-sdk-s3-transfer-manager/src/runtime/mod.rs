@@ -16,7 +16,8 @@ pub(crate) use managed::ManagedThreadRuntime;
 mod topology;
 pub(crate) use topology::Topology;
 
-pub(crate) mod memory;
+#[allow(dead_code)]
+pub(crate) mod buffer_pool;
 pub(crate) mod platform;
 pub(crate) mod sync;
 
@@ -57,15 +58,22 @@ pub(crate) trait ExecutionRuntime: Send + Sync + std::fmt::Debug {
     fn components(&self) -> &RuntimeComponents;
 }
 
+/// Options for the HTTP transport a runtime provides to the S3 client.
+///
+/// Present only when that transport will be installed, so a runtime given
+/// `None` builds no HTTP client.
+#[derive(Debug, Clone)]
+pub(crate) struct RuntimeHttpOptions {
+    /// Interfaces to bind connections to, assigned to worker threads
+    /// round-robin. Empty leaves interface selection to OS routing.
+    pub(crate) network_interfaces: Vec<String>,
+    /// Maximum connections to one origin across all worker threads.
+    pub(crate) max_connections_per_host: usize,
+}
+
 /// Components provided by the execution runtime to the rest of the system.
 ///
 /// The runtime populates these based on its execution model.
-// TODO(vnext): When migrating to hyper-util composable pools (pool::cache), the
-// Cached<S>::Drop unconditionally returns connections to the pool with no health
-// check. Mid-flight connections dropped via timeout will go back in broken. Need
-// to either contribute an is_ready check upstream or explicitly close the
-// connection before dropping. The legacy pool's Pooled::Drop checks is_open()
-// which correctly destroys mid-flight connections.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RuntimeComponents {
     http_client: Option<SharedHttpClient>,
