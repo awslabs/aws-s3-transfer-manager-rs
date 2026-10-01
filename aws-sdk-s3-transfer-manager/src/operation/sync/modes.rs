@@ -82,6 +82,10 @@ pub(crate) enum Mode {
 
 // Picking one, per direction.
 //
+// The bounds travel with the reference. A caller holds one of these across the await that advances
+// the merge, and a work item carrying it moves between threads, so a reference without them cannot be
+// kept — only consulted and dropped before the next yield.
+//
 // `Mode` deliberately does not implement `Compare`. An impl would have to forward each method, and
 // a method added later would go unforwarded — `Mode` would answer the trait's default while the
 // selected mode's override sat unused, which is the bug this selector exists to avoid, one level
@@ -91,7 +95,9 @@ macro_rules! picker {
     ($picker:ident, $source:ty, $destination:ty, $doc:literal) => {
         impl Mode {
             #[doc = $doc]
-            pub(crate) fn $picker(&self) -> &'static dyn Compare<$source, $destination> {
+            pub(crate) fn $picker(
+                &self,
+            ) -> &'static (dyn Compare<$source, $destination> + Send + Sync) {
                 match self {
                     Self::SizeAndTime => &SizeAndTime,
                     Self::SizeOnly => &SizeOnly,
@@ -121,6 +127,16 @@ picker!(
     Object,
     "The comparison this mode makes for a copy between two buckets."
 );
+
+// The bounds are the point of the return type, and nothing in this crate would stop compiling without
+// them — a caller that only consults a comparison and drops it needs neither. So the requirement is
+// written down here instead of waiting for whoever first tries to hold one.
+const _: fn() = || {
+    fn kept_across_a_yield<T: Send + Sync + ?Sized>(_: &'static T) {}
+    kept_across_a_yield(Mode::SizeAndTime.uploading());
+    kept_across_a_yield(Mode::SizeAndTime.downloading());
+    kept_across_a_yield(Mode::SizeAndTime.copying());
+};
 
 // How much later the destination was written than the source. Negative when the source is newer.
 fn delta<S, D>(source: &Described<'_, S>, destination: &Described<'_, D>) -> i64 {
