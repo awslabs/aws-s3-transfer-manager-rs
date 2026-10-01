@@ -353,6 +353,50 @@ renders it; the bytes are the fact.
 `view()` returns `None` when the entry never became a transfer, which is a skip or an entry abandoned
 before it started. That is distinct from a live transfer at zero bytes.
 
+#### The park cause is derived, not set twice
+
+A view reports why a transfer is producing no work. That cause already exists crate-privately, as the
+pending state the request-observability layer records (`DownloadPendingReason`,
+`operation/download/context.rs`, added by #188 and on `main` as of `6528c2a`). Its four causes —
+discovery, read-ahead, memory admission, range completion — are one-to-one with the four a consumer
+needs, so the public `StallReason` is a `From` conversion over the private enum and a park site names
+its cause once:
+
+```rust
+fn park(&self, reason: DownloadPendingReason, snapshot: DownloadStateSnapshot) -> PollWork {
+    self.inner.ctx.set_stall(Some(reason.into()));
+    self.inner.ctx.set_pending(reason);
+    ...
+```
+
+What that rules out: two vocabularies set independently at each park site. A site that records the
+private cause and forgets the public one leaves a consumer reading "no reason" on a transfer that is
+demonstrably parked, and nothing fails to compile — the omission is invisible to review and to the
+type system both. Deriving one from the other makes the pairing unforgeable.
+
+Verified, not proposed: the conversion and the single-naming park site compile and pass the suite on a
+local merge of this work with `main` at `6528c2a`. That merge is not part of this design and is not
+proposed for review; it is where the claim was measured.
+
+`Outcome` is the terminal fact, one variant per terminal status:
+
+```rust
+#[non_exhaustive]
+pub enum Outcome {
+    #[non_exhaustive] Succeeded {},
+    #[non_exhaustive] Failed { error: Error },
+    #[non_exhaustive] Cancelled {},
+}
+```
+
+`Cancelled` stays separate from `Failed` because one interrupt is one cancellation, not N per-entry
+failures; [Deriving an outcome](#deriving-an-outcome) covers what merging them costs a consumer.
+Whether `error` remains a public field is the open question below.
+
+The clone that section requires is not available today: `Error` is not `Clone` and its only reader
+empties the slot. The prerequisite is an `Arc` source inside `Error`, which is a change to the error
+layer and lands before the types.
+
 `TransferRef`, `Endpoint`, `Decision`, and `Outcome` are `#[non_exhaustive]`. The lifecycle, the
 sink's internals, and the emit machinery are crate-private.
 
@@ -454,8 +498,9 @@ join() -> rename -> dest
 ```
 
 The rename therefore moves into the transfer's own completion path, ahead of the status, alongside the
-final flush. A completion path that runs while holding the state guard emits a commit work item
-instead of performing the rename, because the state guard is not a place to perform disk I/O.
+final flush. Both completion paths perform it directly, including the one holding the state guard: that
+path already flushes the file under the same guard, and a rename is a cheaper metadata operation than
+the flush it follows. Deferring it to a work item would add a scheduling hop to buy nothing.
 
 Every reporting path reads a status and cannot join. A status that means "flushed" rather than
 "committed" therefore makes every one of them report a destination that does not exist.
@@ -489,11 +534,14 @@ reap batch removed from the child collection
     |
     `-- child not yet joined, operation ends     absent from the collection, so a
             |                                    sweep would read "never existed"
-            `-- identities under reap are tracked, so the sweep reads its status
+            `-- the outcome is captured at drain, so the sweep reads it
 ```
 
-The identities under reap are therefore tracked, so a cancellation sweep separates an entry that is
-mid-reap from one that never existed and reads its status rather than assuming cancellation.
+A mid-reap entry is therefore tracked with the outcome it already reached, captured in the same step
+that drains it out of the child collection. Tracking the identity alone is not enough and is the
+tempting half-fix: once the entry leaves the collection its handle is gone, so there is no status left
+to read, and a sweep that recognises the identity still has nothing to report for it. Carrying the
+outcome is what lets the sweep separate an entry that is mid-reap from one that never existed.
 
 ### Counting
 
@@ -544,12 +592,20 @@ This prevents a consumer that cleans up after a cancelled entry from removing co
 
 ### An outcome and its cause are read together
 
-An outcome is computed from a status and an error read in one access, and a failure carries the error
-its operation's join returns. [Lifecycle obligation](#lifecycle-obligation) removes both the outcome
-literal and the fallback error.
+An outcome is computed from the status and the error, and a failure carries the error its operation's
+join returns. [Lifecycle obligation](#lifecycle-obligation) removes both the outcome literal and the
+fallback error. The status transition is published while the error slot is held, so a reader that
+observes `Failed` and then takes the same lock cannot find it empty.
 
-This prevents a failed operation reporting as cancelled and therefore reporting no cause, and prevents
-a consumer branching on error kind from reading a constructed error.
+The ordering is the mechanism and it sits on the writer; no reader-side rule recovers a fact the writer
+has not stored yet. Setting the status before storing the error leaves a window where `Failed` is
+visible over an empty slot, and a reader there either panics on the unwrap or invents a cause. Storing
+before the transition is the other candidate and is wrong in the other direction: the first-write-wins
+CAS has not picked a winner yet, so a losing caller overwrites the winner's error.
+
+This prevents a failed operation reporting as cancelled and therefore reporting no cause, prevents a
+consumer branching on error kind from reading a constructed error, and prevents a terminal that names a
+failure it cannot explain.
 
 ### A reported quantity describes the run
 
@@ -572,14 +628,15 @@ observer's stream.
 
 ## Open Questions
 
-**Whether the park-cause vocabulary is public.** The cause a view reports originates in the pending
-state an operation records when a poll cannot produce work, which is crate-private and shaped for
-aggregate diagnostics: a small set of categories paired with a static reason string, accumulated per
-category with its own timings. A consumer-facing accessor needs a type that survives a 1.0 freeze, and
-a static string paired with an aggregation category is not obviously that type. Publishing the internal
-vocabulary, wrapping it, and reporting only the coarse category are all open, and the choice belongs
-with the pending-state layer rather than here. This layer requires only that a view report a cause and
-never invent one.
+**Whether `Outcome::Failed` carries its error in a public field or behind an accessor.** The
+extensibility argument says accessor: a variant that carries a payload should hold it in a private
+struct, so the payload can gain a field or change a type after 1.0. The consumer argument says
+field, and it is concrete — the `--only-show-errors` mode this design is partly for is written
+`Outcome::Failed { error, .. }`, which compiles only while the field is public, and an accessor
+makes the same filter two lines and a binding. `#[non_exhaustive]` on the variant already makes an
+added field non-breaking, so the accessor buys only the freedom to change `error`'s type, and that
+type is this crate's own. The two asks came from the same reviewer, one on the enum and one in a
+consumer sketch, so the resolution is theirs rather than derivable here.
 
 **Channel capacity has no measured floor.** Capacity stands for how far a consumer may fall behind
 before it loses events — its render interval multiplied by the operation's entry rate — and the library
