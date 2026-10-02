@@ -112,6 +112,11 @@ struct UploadTransferInner {
     bucket_type: BucketType,
     /// Stored result for handle to retrieve
     result: Mutex<Option<UploadOutput>>,
+    /// Lifecycle emitter, `None` unless a caller registered a sink.
+    ///
+    /// A single-object upload has no children, so one emitter is the whole story:
+    /// announced by `orchestrate`, discharged by `on_terminal`.
+    lifecycle: Option<Arc<crate::events::TransferLifecycle>>,
 }
 
 impl UploadTransfer {
@@ -120,6 +125,7 @@ impl UploadTransfer {
         bucket_type: BucketType,
         request: UploadInput,
         stream: InputStream,
+        lifecycle: Option<Arc<crate::events::TransferLifecycle>>,
     ) -> Result<Self, Error> {
         let size_hint = stream.size_hint();
         validate_size_hint(size_hint).map_err(crate::error::invalid_input)?;
@@ -143,6 +149,7 @@ impl UploadTransfer {
             request: Arc::new(request),
             bucket_type,
             result: Mutex::new(None),
+            lifecycle,
         });
 
         Ok(Self { inner })
@@ -1133,8 +1140,20 @@ impl Transfer for UploadTransfer {
         Box::pin(UploadTransfer::execute(self, work))
     }
 
+    /// The one terminal emit for a single-object upload.
+    ///
+    /// Every removal path routes through here -- normal completion, cancellation,
+    /// a worker panic, and completion-driven removal -- so no per-path emit is
+    /// needed. Reaching it more than once is harmless: the obligation is claimed
+    /// by exactly one caller.
     fn on_terminal(&self) {
         self.report_terminal();
+        let Some(lc) = &self.inner.lifecycle else {
+            return;
+        };
+        if let Some(emit) = lc.finish(self.inner.ctx.terminal_outcome()) {
+            emit.send();
+        }
     }
 }
 
@@ -1181,7 +1200,7 @@ mod tests {
             .unwrap();
 
         let (ctx, _completion_rx) = TransferContext::new(handle);
-        UploadTransfer::try_new(ctx, BucketType::Standard, input, stream).unwrap()
+        UploadTransfer::try_new(ctx, BucketType::Standard, input, stream, None).unwrap()
     }
 
     fn mock_s3_client_for_mpu() -> aws_sdk_s3::Client {
@@ -2074,7 +2093,8 @@ mod tests {
             .unwrap();
         let stream = InputStream::from_path(tmp.path()).unwrap();
         let (ctx, _completion_rx) = TransferContext::new(handle);
-        let transfer = UploadTransfer::try_new(ctx, BucketType::Standard, input, stream).unwrap();
+        let transfer =
+            UploadTransfer::try_new(ctx, BucketType::Standard, input, stream, None).unwrap();
 
         let mut work = assert_ready(transfer.poll_work());
         assert!(matches!(

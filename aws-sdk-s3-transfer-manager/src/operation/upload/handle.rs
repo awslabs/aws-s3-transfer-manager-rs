@@ -101,7 +101,7 @@ impl UploadHandle {
                 .cancel_transfer(ctx.id)
                 .wait_for_idle()
                 .await;
-            let err = ctx.take_error().expect("failed transfer must have error");
+            let err = ctx.error().expect("failed transfer must have error");
             return Err(err);
         }
 
@@ -191,6 +191,17 @@ impl UploadHandle {
         self.transfer.ctx().id
     }
 
+    /// The event outcome this child's terminal state implies, read from the child's own
+    /// context so a parent reporting it never has to guess.
+    pub(crate) fn terminal_outcome(&self) -> crate::events::Outcome {
+        self.transfer.ctx().terminal_outcome()
+    }
+
+    /// A read-only view of this upload's counters, for a parent to hand to observers.
+    pub(crate) fn view(&self) -> crate::types::TransferView {
+        self.transfer.ctx().view()
+    }
+
     /// Get scheduling controls for this transfer.
     pub fn scheduling(&self) -> crate::transfer::SchedulingCtl<'_> {
         self.transfer.ctx().scheduling()
@@ -260,7 +271,8 @@ mod tests {
         let stream = InputStream::from(Vec::<u8>::new());
         let (ctx, completion_rx) = TransferContext::new(handle);
         let transfer =
-            UploadTransfer::try_new(ctx.clone(), BucketType::Standard, input, stream).unwrap();
+            UploadTransfer::try_new(ctx.clone(), BucketType::Standard, input, stream, None)
+                .unwrap();
 
         // Drive to Cancelled terminal state.
         ctx.set_cancelled();

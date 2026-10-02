@@ -77,8 +77,7 @@ impl DownloadHandleInner {
                 .wait_for_idle()
                 .await;
             tracing::debug!(tid = %ctx.id, "join: idle, returning error");
-            // take the actual error (only we should do this)
-            let err = ctx.take_error().expect("error taken outside of join()");
+            let err = ctx.error().expect("error taken outside of join()");
             return Err(err);
         }
 
@@ -338,9 +337,9 @@ impl Drop for DownloadHandle {
 /// this handle does not expose a body — the transfer manager writes data
 /// directly to disk.
 ///
-/// Data is written to a temporary file (`{dest}.s3tmp.{id}`) during the
-/// transfer. On successful completion via [`join`](Self::join), the temporary
-/// file is atomically renamed to the destination path. On failure,
+/// Data is written to a temporary file (`{dest}.s3tmp.{id}`) during the transfer,
+/// and renamed to the destination path by the transfer itself, so the rename
+/// precedes the completed status rather than waiting for a join. On failure,
 /// cancellation, or drop, the temporary file is deleted.
 ///
 /// Success means the operating system accepted every byte and, for a managed
@@ -351,19 +350,13 @@ impl Drop for DownloadHandle {
 pub struct ManagedDownloadHandle {
     inner: DownloadHandleInner,
     temp_path: Option<std::path::PathBuf>,
-    dest_path: Option<std::path::PathBuf>,
 }
 
 impl ManagedDownloadHandle {
-    pub(crate) fn new(
-        inner: DownloadHandleInner,
-        temp_path: std::path::PathBuf,
-        dest_path: std::path::PathBuf,
-    ) -> Self {
+    pub(crate) fn new(inner: DownloadHandleInner, temp_path: std::path::PathBuf) -> Self {
         Self {
             inner,
             temp_path: Some(temp_path),
-            dest_path: Some(dest_path),
         }
     }
 
@@ -371,13 +364,23 @@ impl ManagedDownloadHandle {
         Self {
             inner,
             temp_path: None,
-            dest_path: None,
         }
     }
 
     /// The transfer ID for this child download.
     pub(crate) fn transfer_id(&self) -> TransferId {
         self.inner.transfer.id()
+    }
+
+    /// The event outcome this child's terminal state implies, read from the child's own
+    /// context so a parent reporting it never has to guess.
+    pub(crate) fn terminal_outcome(&self) -> crate::events::Outcome {
+        self.inner.transfer.ctx().terminal_outcome()
+    }
+
+    /// A read-only view of this download's counters, for a parent to hand to observers.
+    pub(crate) fn view(&self) -> crate::types::TransferView {
+        self.inner.transfer.ctx().view()
     }
 
     /// Object metadata.
@@ -391,26 +394,17 @@ impl ManagedDownloadHandle {
 
     /// Wait for the download to complete.
     ///
-    /// On success, atomically renames the temporary file to the destination
-    /// path. On failure or cancellation, deletes the temporary file. This does
-    /// not add a filesystem durability barrier.
+    /// The rename to the destination path already happened, before the transfer set
+    /// its completed status, so a successful join has nothing left to commit. On
+    /// failure or cancellation this deletes the temporary file. Neither path adds a
+    /// filesystem durability barrier.
     pub async fn join(
         mut self,
     ) -> Result<crate::operation::download::output::DownloadOutput, error::Error> {
         let result = self.inner.join().await;
-
-        match &result {
-            Ok(_) => {
-                if let Err(e) = self.finalize().await {
-                    self.cleanup().await;
-                    return Err(error::from_kind(error::ErrorKind::IOError)(e));
-                }
-            }
-            Err(_) => {
-                self.cleanup().await;
-            }
+        if result.is_err() {
+            self.cleanup().await;
         }
-
         result
     }
 
@@ -446,16 +440,13 @@ impl ManagedDownloadHandle {
         self.inner.transfer.ctx().metrics()
     }
 
-    async fn finalize(&self) -> std::io::Result<()> {
-        if let (Some(temp), Some(dest)) = (&self.temp_path, &self.dest_path) {
-            // TODO(vnext): consider an opt-in download durability policy. Managed
-            // path downloads would sync file data before rename and the parent
-            // directory after rename where supported. The latency and cross-platform
-            // semantics make this a client/API policy rather than the default.
-            tokio::fs::rename(temp, dest).await?;
-        }
-        Ok(())
-    }
+    // The rename lives on the transfer, in `commit_destination`, because every path
+    // that reports the transfer reads its status and cannot join it.
+    //
+    // TODO(vnext): consider an opt-in download durability policy. Managed path
+    // downloads would sync file data before rename and the parent directory after
+    // rename where supported. The latency and cross-platform semantics make this a
+    // client/API policy rather than the default.
 
     async fn cleanup(&self) {
         if let Some(temp) = &self.temp_path {
@@ -474,8 +465,13 @@ impl Drop for ManagedDownloadHandle {
                 .scheduler
                 .cancel_transfer(self.inner.transfer.id());
         }
-        if let Some(temp) = &self.temp_path {
-            let _ = std::fs::remove_file(temp);
+        // Only a transfer that did not commit still owns a temporary file. A completed
+        // download renamed it away in `commit_destination`, and unlinking unconditionally
+        // here is what let a reported-as-succeeded download lose its bytes.
+        if ctx.transfer_status() != crate::types::TransferStatus::Completed {
+            if let Some(temp) = &self.temp_path {
+                let _ = std::fs::remove_file(temp);
+            }
         }
     }
 }
@@ -522,7 +518,8 @@ mod tests {
             .unwrap();
         let (writer, consumer) = new_recv_body();
         let (ctx, completion_rx) = TransferContext::new(handle);
-        let transfer = DownloadTransfer::new(ctx.clone(), BucketType::Standard, input, writer);
+        let transfer =
+            DownloadTransfer::new(ctx.clone(), BucketType::Standard, input, writer, None, None);
 
         ctx.set_cancelled();
         ctx.signal_terminal();
@@ -563,7 +560,7 @@ mod tests {
         std::fs::write(&temp, b"partial").unwrap();
 
         let (inner, _consumer) = make_cancelled_download_inner();
-        let managed = ManagedDownloadHandle::new(inner, temp.clone(), dest.clone());
+        let managed = ManagedDownloadHandle::new(inner, temp.clone());
 
         let err = managed
             .join()

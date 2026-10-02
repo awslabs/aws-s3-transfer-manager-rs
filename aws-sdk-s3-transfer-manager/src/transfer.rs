@@ -161,9 +161,15 @@ pub(crate) struct TransferId {
 }
 
 impl std::fmt::Display for TransferId {
+    /// `parent/child`, or just the id for a root.
+    ///
+    /// Parent first, so a `tid` sorts and reads outside-in like a path, and the two numbers
+    /// are not transposable by eye. The separator is `/` and not `-` because `-` already
+    /// means a byte range throughout this crate (`bytes 1024-2047/4096`), so `7-3` reads as
+    /// a range, or as subtraction, rather than as a parent link.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.parent {
-            Some(parent) => write!(f, "{}-{}", self.id, parent),
+            Some(parent) => write!(f, "{}/{}", parent, self.id),
             None => write!(f, "{}", self.id),
         }
     }
@@ -345,7 +351,9 @@ pub(crate) type StateMachineTerminalReceiver = tokio::sync::oneshot::Receiver<()
 /// | Failed    | Yes (take once) | No               |
 /// | Cancelled | No              | No               |
 #[derive(Clone)]
-pub(crate) struct StateMachineStatus(Arc<AtomicU8>);
+pub(crate) struct StateMachineStatus(
+    crate::runtime::sync::sync::Arc<crate::runtime::sync::sync::atomic::AtomicU8>,
+);
 
 // Status constants
 const STATUS_ACTIVE: u8 = 0;
@@ -357,7 +365,9 @@ impl StateMachineStatus {
     /// Create a new status in the Active state
     #[inline]
     pub(crate) fn new() -> Self {
-        Self(Arc::new(AtomicU8::new(STATUS_ACTIVE)))
+        Self(crate::runtime::sync::sync::Arc::new(
+            crate::runtime::sync::sync::atomic::AtomicU8::new(STATUS_ACTIVE),
+        ))
     }
 
     /// Transition to Completed. Returns true if this call made the transition.
@@ -441,11 +451,71 @@ impl fmt::Debug for StateMachineStatus {
 
 /// Per-transfer cumulative metrics.
 pub(crate) struct MetricsState {
+    /// The composite this transfer rolls up into, if any. Set once at construction and
+    /// never mutated, so the chain is immutable for the life of the transfer.
+    parent: Option<Arc<MetricsState>>,
     network_tx: AtomicU64,
     network_rx: AtomicU64,
     disk_read: AtomicU64,
     disk_write: AtomicU64,
+    /// Payload bytes read off a socket, counted as each chunk arrives rather than at
+    /// confirmed success.
+    ///
+    /// Exists because `network_rx` is recorded once per *part*, so a single-part transfer
+    /// moves 0 → done with nothing in between — and at the 5 MiB download default that is
+    /// most of a small-file workload, which is exactly where a per-file progress line is
+    /// read. This counter moves during the body read, so a consumer has a numerator that
+    /// advances inside a part.
+    ///
+    /// **Monotonic and never decremented, which is what makes it correct under
+    /// cancellation.** The alternative — add on read, subtract on confirm-or-fail — cannot
+    /// be made leak-free here: both body-read sites run inside a `retry::retry` closure with
+    /// hedging enabled, so the losing attempt's future is *dropped* mid-read and no release
+    /// path on it ever runs. Every dropped hedge would strand its partial bytes in the
+    /// counter, and the strand rolls up to the parent, so a directory transfer would report
+    /// phantom in-flight bytes that never clear.
+    ///
+    /// The cost of that choice: a retried or hedged attempt's partial bytes are counted and
+    /// never removed, so this can exceed the payload actually received, and after a retry it
+    /// can exceed `total_bytes`. It is an optimistic numerator for smoothing, never an
+    /// accounting figure — `network_rx` remains the exact one.
+    bytes_streamed: AtomicU64,
+    /// Why this transfer produced no work on its most recent poll, as a
+    /// [`StallReason`](crate::types::StallReason) discriminant; 0 for "not stalled".
+    ///
+    /// Not rolled up to the parent, unlike every byte counter here: a composite's own poll
+    /// parks for its own reasons, and inheriting a child's reason would report a directory as
+    /// read-ahead-blocked because one of nine hundred objects is.
+    ///
+    /// Lives here rather than beside the wake flag because [`TransferView`] already carries an
+    /// `Arc<MetricsState>` and carries nothing else, and because the wake flag's `pending` bit
+    /// is consumed by a destructive swap — a reader that peeked at it would race the
+    /// scheduler's wake.
+    stall: AtomicU8,
+    /// Running sum of the payload sizes of the entries enumerated so far, for a
+    /// composite; always 0 for a leaf, which learns its total in one piece.
+    ///
+    /// Written only by the owning composite and only while it holds its own `State`
+    /// lock, so that lock — not this atomic — is what orders an accumulation against
+    /// the seal that reads it. The atomic exists to publish the value to a reader on
+    /// another thread, which is `byte_total` and nothing else.
+    discovered_bytes: AtomicU64,
+    /// Entries enumerated so far, counted at the same site and under the same lock as
+    /// `discovered_bytes`, from the same batch. Always 0 for a leaf.
+    discovered_entries: AtomicU64,
+    /// Entries that reached a terminal state, counted where the entry's `Ended` is
+    /// claimed rather than where its status transitions — so this equals the number of
+    /// terminal events the stream would have delivered had none been dropped.
+    ///
+    /// Counts every ending, not only success: an entry that failed, was cancelled, or was
+    /// abandoned before it started is no longer pending, and a consumer subtracting this
+    /// from the total to show "remaining" would otherwise never reach zero.
+    settled_entries: AtomicU64,
     total_bytes: std::sync::OnceLock<u64>,
+    /// Sealed from `discovered_entries` by the same call that seals `total_bytes`, so one
+    /// enumeration-complete fact serves both denominators and they cannot disagree about
+    /// whether listing finished.
+    total_entries: std::sync::OnceLock<u64>,
     started_at: std::time::Instant,
     finished_at: std::sync::OnceLock<std::time::Instant>,
     terminal_reported: AtomicBool,
@@ -453,13 +523,28 @@ pub(crate) struct MetricsState {
 }
 
 impl MetricsState {
-    pub(crate) fn new() -> Self {
+    /// Root of a rollup chain, or a link in one.
+    ///
+    /// `Arc` and not `Weak`: `MetricsState` holds only counters and timestamps, with no
+    /// pointer to a child, to a `TransferContext`, or to the client `Handle`, so a parent
+    /// edge makes this a chain and a cycle is not constructible. `Weak` would add an
+    /// `upgrade()` per sample and a `None` arm reachable exactly under `Abort`, where
+    /// cancelled siblings are still recording after the parent has gone terminal — and a
+    /// child's bytes would vanish there with nothing to show it happened.
+    pub(crate) fn with_parent(parent: Option<Arc<MetricsState>>) -> Self {
         Self {
+            parent,
             network_tx: AtomicU64::new(0),
             network_rx: AtomicU64::new(0),
             disk_read: AtomicU64::new(0),
             disk_write: AtomicU64::new(0),
+            bytes_streamed: AtomicU64::new(0),
+            stall: AtomicU8::new(0),
+            discovered_bytes: AtomicU64::new(0),
+            discovered_entries: AtomicU64::new(0),
+            settled_entries: AtomicU64::new(0),
             total_bytes: std::sync::OnceLock::new(),
+            total_entries: std::sync::OnceLock::new(),
             started_at: std::time::Instant::now(),
             finished_at: std::sync::OnceLock::new(),
             terminal_reported: AtomicBool::new(false),
@@ -467,21 +552,152 @@ impl MetricsState {
         }
     }
 
-    /// Record an IO sample (per-transfer cumulative counters only).
+    /// Record an IO sample into this transfer and every composite above it.
+    ///
+    /// The child add precedes the parent add, so a parent counter is a lower bound on the
+    /// sum of its children at every instant rather than an over-count: every parent
+    /// counter only ever receives a non-negative `fetch_add` and is therefore
+    /// non-decreasing under any interleaving. A reader *can* observe
+    /// `parent < sum(children)` mid-flight — the window is the instructions between two
+    /// adds — so equality holds only at quiescence.
+    ///
+    /// A loop rather than a single `if let`: the depth is 1 today (only leaf operations
+    /// call `new_child`), and a loop needs no re-audit if a composite ever becomes a
+    /// child of another.
     pub(crate) fn record_io(&self, sample: &crate::metrics::IoSample) {
-        self.network_tx
-            .fetch_add(sample.network_tx, Ordering::Relaxed);
-        self.network_rx
-            .fetch_add(sample.network_rx, Ordering::Relaxed);
-        self.disk_read
-            .fetch_add(sample.disk_read, Ordering::Relaxed);
-        self.disk_write
-            .fetch_add(sample.disk_write, Ordering::Relaxed);
+        let mut cur = Some(self);
+        while let Some(m) = cur {
+            m.network_tx.fetch_add(sample.network_tx, Ordering::Relaxed);
+            m.network_rx.fetch_add(sample.network_rx, Ordering::Relaxed);
+            m.disk_read.fetch_add(sample.disk_read, Ordering::Relaxed);
+            m.disk_write.fetch_add(sample.disk_write, Ordering::Relaxed);
+            cur = m.parent.as_deref();
+        }
+    }
+
+    /// Record payload bytes read off a socket, into this transfer and every composite above
+    /// it.
+    ///
+    /// Separate from [`record_io`](Self::record_io) and deliberately not folded into
+    /// `IoSample`: every other counter there is recorded once per part at confirmed success,
+    /// and this one is recorded per chunk on the body-read path. Sharing the sample type
+    /// would mean every existing call site had to pass a zero for a field whose recording
+    /// discipline is not theirs, and one that forgot would silently report streamed bytes it
+    /// never saw.
+    ///
+    /// Never feeds `IOWindow` or the adaptive concurrency controller: those sample
+    /// confirmed-success bytes deliberately, and mixing in a counter that overcounts under
+    /// retry would make the goodput signal optimistic exactly when the link is worst.
+    pub(crate) fn record_bytes_streamed(&self, n: u64) {
+        let mut cur = Some(self);
+        while let Some(m) = cur {
+            m.bytes_streamed.fetch_add(n, Ordering::Relaxed);
+            cur = m.parent.as_deref();
+        }
+    }
+
+    /// Record why this transfer produced no work, or clear it with `None`.
+    ///
+    /// Written on every poll by the operation's `poll_work` — cleared at entry, set again if
+    /// that poll parks — so the value describes the most recent poll and cannot go stale while
+    /// the transfer is running.
+    pub(crate) fn set_stall(&self, reason: Option<crate::types::StallReason>) {
+        use crate::types::StallReason as R;
+        let code = match reason {
+            None => 0u8,
+            Some(R::ReadAheadWindow {}) => 1,
+            Some(R::MemoryBudget {}) => 2,
+            Some(R::PendingDiscovery {}) => 3,
+            Some(R::AwaitingCompletion {}) => 4,
+        };
+        self.stall.store(code, Ordering::Relaxed);
+    }
+
+    /// Why this transfer last produced no work, if it did not.
+    pub(crate) fn stall_reason(&self) -> Option<crate::types::StallReason> {
+        use crate::types::StallReason as R;
+        match self.stall.load(Ordering::Relaxed) {
+            1 => Some(R::ReadAheadWindow {}),
+            2 => Some(R::MemoryBudget {}),
+            3 => Some(R::PendingDiscovery {}),
+            4 => Some(R::AwaitingCompletion {}),
+            _ => None,
+        }
     }
 
     /// Set the expected total payload bytes. No-op if already set.
     pub(crate) fn set_total_bytes(&self, n: u64) {
         let _ = self.total_bytes.set(n);
+    }
+
+    /// Add a just-enumerated batch to the running totals: its payload bytes and how many
+    /// entries it holds.
+    ///
+    /// One call for both, because they come from one batch and must agree — a batch counted
+    /// for bytes but not for entries, or the reverse, leaves the two denominators describing
+    /// different work. Caller is the owning composite, holding its own `State` lock.
+    pub(crate) fn add_discovered(&self, bytes: u64, entries: u64) {
+        self.discovered_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.discovered_entries
+            .fetch_add(entries, Ordering::Relaxed);
+    }
+
+    /// Record that one entry reached a terminal state.
+    ///
+    /// Called where the entry's terminal event is *claimed*, so the exactly-once swap that
+    /// makes `Ended` unique makes this count unique too, on every terminal path, without
+    /// a second mechanism to keep in step.
+    pub(crate) fn record_entry_settled(&self) {
+        self.settled_entries.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Promote both running enumerated totals to final ones. No-op if already set.
+    ///
+    /// Reads the accumulators rather than taking values, so each number sealed is by
+    /// construction the number a concurrent `byte_total`/`entry_total` was already
+    /// reporting as provisional, and they cannot name different totals for the same walk.
+    pub(crate) fn seal_total(&self) {
+        let _ = self
+            .total_bytes
+            .set(self.discovered_bytes.load(Ordering::Relaxed));
+        let _ = self
+            .total_entries
+            .set(self.discovered_entries.load(Ordering::Relaxed));
+    }
+
+    /// Entries that reached a terminal state.
+    pub(crate) fn entries_settled(&self) -> u64 {
+        self.settled_entries.load(Ordering::Relaxed)
+    }
+
+    /// This transfer's byte denominator and how far to trust it.
+    ///
+    /// `total_bytes` is read first and short-circuits, so the three states come from one
+    /// `MetricsState` and cannot contradict each other. A seal landing between the two
+    /// loads can only make this reading conservative — a `Provisional` equal to the value
+    /// that just became final — never an overstatement.
+    pub(crate) fn byte_total(&self) -> crate::types::ByteTotal {
+        use crate::types::ByteTotal;
+        if let Some(n) = self.total_bytes.get().copied() {
+            return ByteTotal::Final(n);
+        }
+        match self.discovered_bytes.load(Ordering::Relaxed) {
+            0 => ByteTotal::Unknown,
+            n => ByteTotal::Provisional(n),
+        }
+    }
+
+    /// This transfer's entry denominator. Same three states and same ordering rule as
+    /// [`byte_total`](Self::byte_total), reading the pair sealed by the same call.
+    pub(crate) fn entry_total(&self) -> crate::types::EntryTotal {
+        use crate::types::EntryTotal;
+        if let Some(n) = self.total_entries.get().copied() {
+            return EntryTotal::Final(n);
+        }
+        match self.discovered_entries.load(Ordering::Relaxed) {
+            0 => EntryTotal::Unknown,
+            n => EntryTotal::Provisional(n),
+        }
     }
 
     /// Mark the transfer as finished. No-op if already set.
@@ -514,6 +730,7 @@ impl MetricsState {
             network_rx: self.network_rx.load(Ordering::Relaxed),
             disk_read: self.disk_read.load(Ordering::Relaxed),
             disk_write: self.disk_write.load(Ordering::Relaxed),
+            bytes_streamed: self.bytes_streamed.load(Ordering::Relaxed),
             total_bytes: self.total_bytes.get().copied(),
             started_at: self.started_at,
             finished_at: self.finished_at.get().copied(),
@@ -549,7 +766,7 @@ pub(crate) struct TransferContext {
     /// Transfer lifecycle status
     status: StateMachineStatus,
     /// Error storage (only used when status == Failed)
-    error: Arc<Mutex<Option<Box<error::Error>>>>,
+    error: Arc<crate::runtime::sync::Mutex<Option<Box<error::Error>>>>,
     /// Completion signal sender - signals "state machine reached terminal state"
     completion_tx: Arc<Mutex<Option<StateMachineTerminalSender>>>,
     /// Set when `poll_work` returns `Pending`, cleared by a wake or resumed poll.
@@ -784,27 +1001,34 @@ impl TransferContext {
     /// Create a new transfer context.
     /// Returns the context and a receiver for terminal state notification.
     pub(crate) fn new(handle: Arc<crate::client::Handle>) -> (Self, StateMachineTerminalReceiver) {
-        Self::new_inner(handle, next_transfer_id())
+        Self::new_inner(handle, next_transfer_id(), None)
     }
 
-    /// Returns a context + receiver for a child transfer linked to `parent_id`.
+    /// Returns a context + receiver for a child transfer of `parent`, linked by id and by
+    /// metrics.
     ///
-    /// Child transfers share the scheduler with their parent. `signal_terminal`
-    /// on the child wakes the parent so the parent state machine can reap it.
-    /// `scheduler.cancel_transfer(parent_id)` cascades to children via the
-    /// parent linkage.
+    /// Child transfers share the scheduler with their parent. `signal_terminal` on the
+    /// child wakes the parent so the parent state machine can reap it, and
+    /// `scheduler.cancel_transfer` on the parent cascades to children via the same
+    /// linkage. Bytes the child records roll up into the parent's counters as they move.
+    ///
+    /// Takes the parent context rather than its id so the two linkages cannot drift: a
+    /// child whose bytes do not roll up is indistinguishable from one that transferred
+    /// nothing, and the composite's counters would under-report by exactly that child's
+    /// payload.
     pub(crate) fn new_child(
         handle: Arc<crate::client::Handle>,
-        parent_id: u64,
+        parent: &TransferContext,
     ) -> (Self, StateMachineTerminalReceiver) {
         let mut id = next_transfer_id();
-        id.parent = Some(parent_id);
-        Self::new_inner(handle, id)
+        id.parent = Some(parent.id.id);
+        Self::new_inner(handle, id, Some(parent.metrics.clone()))
     }
 
     fn new_inner(
         handle: Arc<crate::client::Handle>,
         id: TransferId,
+        parent_metrics: Option<Arc<MetricsState>>,
     ) -> (Self, StateMachineTerminalReceiver) {
         let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
         let diagnostics = handle.config.diagnostics().transfer();
@@ -813,10 +1037,10 @@ impl TransferContext {
             .then(|| Arc::new(TransferPendingState::new(diagnostics.events_enabled())));
         let ctx = Self {
             id,
-            metrics: Arc::new(MetricsState::new()),
+            metrics: Arc::new(MetricsState::with_parent(parent_metrics)),
             handle,
             status: StateMachineStatus::new(),
-            error: Arc::new(Mutex::new(None)),
+            error: Arc::new(crate::runtime::sync::Mutex::new(None)),
             completion_tx: Arc::new(Mutex::new(Some(completion_tx))),
             wake_flag: Arc::new(wake_flag::WakeFlag::new()),
             pending_state,
@@ -831,7 +1055,7 @@ impl TransferContext {
         id: TransferId,
         handle: Arc<crate::client::Handle>,
     ) -> (Self, StateMachineTerminalReceiver) {
-        Self::new_inner(handle, id)
+        Self::new_inner(handle, id, None)
     }
 
     /// Record that `poll_work` is about to return `Pending`.
@@ -986,9 +1210,19 @@ impl TransferContext {
     ///
     /// [`signal_terminal`]: Self::signal_terminal
     /// [`set_failed_and_signal`]: Self::set_failed_and_signal
+    ///
+    /// The status transition happens while the error slot is held, so a reader that
+    /// observes `Failed` and then takes the same lock cannot find the slot empty. The
+    /// CAS still decides the winner, so holding the lock across it does not weaken
+    /// first-write-wins; it only stops `Failed` from becoming visible before the error
+    /// that explains it. Storing before the CAS would be the other way to order this
+    /// and is wrong, because a losing caller would overwrite the winner's error.
     pub(crate) fn set_failed(&self, err: impl Into<error::Error>) -> bool {
+        let mut slot = self.error.lock();
         if self.status.set_failed() {
-            *self.error.lock().unwrap() = Some(Box::new(err.into()));
+            *slot = Some(Box::new(err.into()));
+            drop(slot);
+            self.metrics.set_finished();
             true
         } else {
             false
@@ -999,33 +1233,80 @@ impl TransferContext {
     /// First-write-wins - returns true if this call set the status.
     #[inline]
     pub(crate) fn set_completed(&self) -> bool {
-        self.status.set_completed()
+        if self.status.set_completed() {
+            self.metrics.set_finished();
+            true
+        } else {
+            false
+        }
     }
 
     /// Mark transfer as cancelled.
     /// First-write-wins - returns true if this call set the status.
     #[inline]
     pub(crate) fn set_cancelled(&self) -> bool {
-        self.status.set_cancelled()
+        if self.status.set_cancelled() {
+            self.metrics.set_finished();
+            true
+        } else {
+            false
+        }
     }
 
-    /// Take the error if transfer failed. Returns None if not failed or already taken.
-    pub(crate) fn take_error(&self) -> Option<error::Error> {
+    /// Clone the error if the transfer failed. `None` means the transfer did not fail.
+    ///
+    /// The only way to read the error, and non-destructive, so every reader gets the
+    /// same value however many there are and in whatever order they run. Cheap —
+    /// [`error::Error`] is `Clone` over an `Arc` source.
+    ///
+    /// A `Failed` status always has an error behind it: [`Self::set_failed`] publishes
+    /// the status while holding this slot, so observing `Failed` and then taking the
+    /// lock cannot find it empty.
+    pub(crate) fn error(&self) -> Option<error::Error> {
         if self.status.is_failed() {
-            self.error.lock().unwrap().take().map(|e| *e)
+            self.error.lock().as_ref().map(|e| (**e).clone())
         } else {
             None
         }
     }
 
-    /// Peek at the error kind if transfer failed. Returns None if not failed or already taken.
+    /// The event outcome this transfer's terminal state implies.
+    ///
+    /// Derived here, from one read of the status and one of the error, rather than
+    /// written as a literal at each emit site. An emit site that names its own outcome
+    /// has to re-derive the mapping, and a site that guards on "not active" has already
+    /// lost the distinction it needs: `Failed` and `Cancelled` are both inactive, so a
+    /// literal `Cancelled` reports a transfer that broke as one the caller stopped —
+    /// and since a cancellation carries no cause, it reports nothing at all about why.
+    /// A consumer branching `Failed => retry or alert` against
+    /// `Cancelled => the user stopped it, do nothing` then takes the wrong arm on every
+    /// failure.
+    ///
+    /// Taking no status or error argument is the point: no caller can pass a pair that
+    /// disagrees.
+    ///
+    /// `Failed` always carries its error, because [`Self::set_failed`] is the only way
+    /// to reach that status and it publishes the status while holding the error slot.
+    ///
+    /// A still-`Active` transfer reports `Cancelled`. Every caller is on a terminal
+    /// path, so `Active` means the status transition lost its race to another terminal
+    /// site, and that site emits the outcome it set.
+    pub(crate) fn terminal_outcome(&self) -> crate::events::Outcome {
+        match self.transfer_status() {
+            crate::types::TransferStatus::Completed => crate::events::Outcome::Succeeded {},
+            crate::types::TransferStatus::Failed => crate::events::Outcome::Failed {
+                error: self
+                    .error()
+                    .expect("a Failed status is only reachable through set_failed"),
+            },
+            _ => crate::events::Outcome::Cancelled {},
+        }
+    }
+
+    /// Peek at the error kind if transfer failed. `None` means the transfer did not fail.
     pub(crate) fn error_kind(&self) -> Option<error::ErrorKind> {
         if self.status.is_failed() {
-            self.error
-                .lock()
-                .unwrap()
-                .as_ref()
-                .map(|e| e.kind().clone())
+            self.error.lock().as_ref().map(|e| e.kind().clone())
         } else {
             None
         }
@@ -1061,6 +1342,10 @@ impl TransferContext {
     /// transition must therefore reach exactly one `signal_terminal`. It is safe
     /// to call while in-flight work is still draining.
     pub(crate) fn signal_terminal(&self) {
+        // A backstop for the timestamp, not its source: `finished_at` is stamped by the
+        // winning status CAS, because a handle's `Drop` reaches terminal through
+        // `set_cancelled` and never arrives here. `set_finished` is `OnceLock::set`, so
+        // whichever runs first wins.
         self.finalize_terminal_metrics();
         if let Some(tx) = self.completion_tx.lock().unwrap().take() {
             let _ = tx.send(());
@@ -1111,6 +1396,20 @@ impl TransferContext {
         self.handle.telemetry.io_counters.record(sample);
     }
 
+    /// Record payload bytes read off a socket, per chunk.
+    ///
+    /// Per-transfer metrics only, and deliberately not `handle.telemetry.io_counters`: those
+    /// counters are the client-wide confirmed-success totals that the goodput signal reads,
+    /// and this counter overcounts under retry.
+    pub(crate) fn record_bytes_streamed(&self, n: u64) {
+        self.metrics.record_bytes_streamed(n);
+    }
+
+    /// Record why this transfer produced no work on this poll, or clear it with `None`.
+    pub(crate) fn set_stall(&self, reason: Option<crate::types::StallReason>) {
+        self.metrics.set_stall(reason);
+    }
+
     /// Record one request in the transfer aggregate.
     pub(crate) fn record_request_metrics(&self, metrics: &crate::metrics::RequestMetrics) {
         self.metrics.record_request(metrics);
@@ -1124,6 +1423,26 @@ impl TransferContext {
     /// Set the expected total payload bytes for this transfer.
     pub(crate) fn set_total_bytes(&self, n: u64) {
         self.metrics.set_total_bytes(n);
+    }
+
+    /// Record a size this transfer's *parent* learned for it, before the transfer has
+    /// confirmed its own.
+    ///
+    /// A composite knows each entry's size from its listing, which is the only place that
+    /// size exists for an object refused before its own `GetObject` returns. It goes to the
+    /// provisional accumulator rather than to `set_total_bytes`, and the difference is load
+    /// bearing: `total_bytes` is a `OnceLock`, so seeding it would make the listed size
+    /// unretractable and turn discovery's own write into a no-op. An object overwritten
+    /// between the listing page and this transfer's `GetObject` would then move more bytes
+    /// than its denominator admits — a bar past 100%, and an underflow in any consumer
+    /// computing `total - moved` on `u64`.
+    ///
+    /// Through the accumulator instead, the entry reads `Provisional(listed)` until discovery
+    /// promotes it to `Final(actual)`, which is the honest sequence: the listed size *is* an
+    /// estimate until the object is opened. Entries are passed as 0 because a leaf has none;
+    /// only a composite counts entries.
+    pub(crate) fn set_expected_bytes(&self, n: u64) {
+        self.metrics.add_discovered(n, 0);
     }
 
     /// Get current transfer status as a public enum.
@@ -1148,6 +1467,15 @@ impl TransferContext {
     /// Snapshot current transfer metrics.
     pub(crate) fn metrics(&self) -> crate::types::TransferMetrics {
         self.metrics.snapshot()
+    }
+
+    /// A detached, read-only view of this transfer's counters.
+    ///
+    /// Clones the metrics `Arc` only. Nothing else from the context comes along — in
+    /// particular not `handle`, whose `Drop` shuts the runtime down, so a view parked in
+    /// a slow consumer's queue cannot defer that shutdown.
+    pub(crate) fn view(&self) -> crate::types::TransferView {
+        crate::types::TransferView::new(self.metrics.clone())
     }
 
     /// Get scheduling controls for this transfer.
@@ -1392,6 +1720,105 @@ mod tests {
             assert_eq!(stats.disk_write, 440);
         }
 
+        /// The status-to-outcome mapping lives in exactly one place, and each terminal
+        /// maps to the outcome that licenses what a consumer may do with it.
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn terminal_outcome_derives_each_terminal() {
+            let (ctx, _rx) = TransferContext::new(test_handle());
+            assert!(ctx.set_completed());
+            assert!(
+                matches!(
+                    ctx.terminal_outcome(),
+                    crate::events::Outcome::Succeeded { .. }
+                ),
+                "a completed transfer licenses deleting a source"
+            );
+
+            let (ctx, _rx) = TransferContext::new(test_handle());
+            assert!(ctx.set_cancelled());
+            assert!(
+                matches!(
+                    ctx.terminal_outcome(),
+                    crate::events::Outcome::Cancelled { .. }
+                ),
+                "a cancelled transfer licenses no retry and no alert"
+            );
+
+            let (ctx, _rx) = TransferContext::new(test_handle());
+            assert!(ctx.set_failed(crate::error::Error::new(
+                crate::error::ErrorKind::ObjectNotDiscoverable,
+                "the real cause",
+            )));
+            match ctx.terminal_outcome() {
+                crate::events::Outcome::Failed { error, .. } => assert!(
+                    matches!(error.kind(), crate::error::ErrorKind::ObjectNotDiscoverable),
+                    "a failure carries the cause a caller would branch on, got {:?}",
+                    error.kind()
+                ),
+                other => panic!("a failed transfer must report Failed, got {other:?}"),
+            }
+        }
+
+        /// Every reader of a failed transfer's error gets the real one.
+        ///
+        /// The scheduler releases the joining caller before the terminal is claimed, so
+        /// `join()` and a reporting path read the same slot in an order neither controls.
+        /// While one of them consumed it, whichever ran second saw an empty slot and the
+        /// emit site substituted a constructed error -- so a 403 or an integrity failure
+        /// reached the consumer as a generic "child operation failed" and anything
+        /// branching on `kind()` took the wrong arm.
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn error_survives_every_reader() {
+            let (ctx, _rx) = TransferContext::new(test_handle());
+            assert!(ctx.set_failed(crate::error::Error::new(
+                crate::error::ErrorKind::ObjectNotDiscoverable,
+                "the real cause",
+            )));
+
+            // The joining caller reads first, as it does in the live ordering.
+            let joined = ctx.error().expect("a failed transfer has an error");
+            // Then the emit site, after the joiner was already released.
+            let emitted = ctx
+                .error()
+                .expect("the error a reporting path reads must survive the join");
+
+            assert!(
+                matches!(
+                    joined.kind(),
+                    crate::error::ErrorKind::ObjectNotDiscoverable
+                ),
+                "the joiner must get the real kind, got {:?}",
+                joined.kind()
+            );
+            assert!(
+                matches!(
+                    emitted.kind(),
+                    crate::error::ErrorKind::ObjectNotDiscoverable
+                ),
+                "the emit site must get the same kind, got {:?}",
+                emitted.kind()
+            );
+            // And a third reader, because nothing about this is once-only.
+            assert!(ctx.error().is_some(), "the slot is never emptied by a read");
+        }
+
+        /// A transfer that did not fail has no error to read, so `None` means exactly
+        /// that and never "someone already took it".
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn error_is_none_only_when_not_failed() {
+            let (ctx, _rx) = TransferContext::new(test_handle());
+            assert!(ctx.error().is_none(), "an active transfer has not failed");
+            assert!(ctx.set_completed());
+            assert!(ctx.error().is_none(), "a completed transfer has not failed");
+
+            let (ctx, _rx) = TransferContext::new(test_handle());
+            assert!(ctx.set_cancelled());
+            assert!(ctx.error().is_none(), "a cancelled transfer has not failed");
+        }
+
         #[cfg_attr(miri, ignore)]
         #[test]
         fn request_metrics_merge_into_transfer_aggregate() {
@@ -1611,6 +2038,128 @@ mod tests {
             assert!(ctx.metrics().finished_at.is_some());
         }
 
+        /// `finished_at` is stamped by the status transition itself, not by
+        /// `signal_terminal`.
+        ///
+        /// A handle's `Drop` reaches terminal through `set_cancelled` and never calls
+        /// `signal_terminal` (`upload/handle.rs`, `upload_objects/handle.rs`,
+        /// `download/handle.rs`, `download_objects/handle.rs`). While `set_finished` was
+        /// reachable only from `signal_terminal`, a consumer that read a terminal status
+        /// and then unwrapped `finished_at` panicked on every dropped handle.
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn finished_at_set_without_signal_terminal() {
+            for transition in ["cancelled", "completed", "failed"] {
+                let (ctx, _rx) = TransferContext::new(test_handle());
+                assert!(ctx.metrics().finished_at.is_none());
+                match transition {
+                    "cancelled" => assert!(ctx.set_cancelled()),
+                    "completed" => assert!(ctx.set_completed()),
+                    _ => assert!(ctx.set_failed(crate::error::Error::new(
+                        crate::error::ErrorKind::ChildOperationFailed,
+                        "test",
+                    ))),
+                }
+                assert!(
+                    ctx.metrics().finished_at.is_some(),
+                    "{transition} must stamp finished_at without signal_terminal"
+                );
+                assert!(ctx.transfer_status().is_terminal());
+            }
+        }
+
+        /// The stamp is first-write-wins, like the status CAS it rides on, so a losing
+        /// transition cannot move a time the winner already published.
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn finished_at_is_first_write_wins() {
+            let (ctx, _rx) = TransferContext::new(test_handle());
+            assert!(ctx.set_completed());
+            let first = ctx.metrics().finished_at.expect("stamped by set_completed");
+            assert!(!ctx.set_cancelled(), "second transition must lose");
+            ctx.signal_terminal();
+            assert_eq!(
+                Some(first),
+                ctx.metrics().finished_at,
+                "a losing transition, and signal_terminal, must not re-stamp"
+            );
+        }
+
+        /// A child's bytes reach its parent as they are recorded, and the parent equals
+        /// the sum of its children once everything is quiescent.
+        ///
+        /// This is what replaced the reap-time folds in both composites. Those folded on
+        /// the success arm only, so a child that moved bytes and then failed contributed
+        /// nothing — permanently, not late.
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn record_io_rolls_up_into_the_parent() {
+            let sample = |n: u64| crate::metrics::IoSample {
+                network_tx: n,
+                network_rx: 2 * n,
+                disk_read: 3 * n,
+                disk_write: 4 * n,
+            };
+
+            let parent = Arc::new(MetricsState::with_parent(None));
+            let child_a = MetricsState::with_parent(Some(parent.clone()));
+            let child_b = MetricsState::with_parent(Some(parent.clone()));
+
+            child_a.record_io(&sample(10));
+            child_b.record_io(&sample(7));
+            child_a.record_io(&sample(3));
+
+            // Each child keeps its own total.
+            assert_eq!(13, child_a.snapshot().network_tx);
+            assert_eq!(7, child_b.snapshot().network_tx);
+
+            // The parent is the sum, on every counter.
+            let p = parent.snapshot();
+            assert_eq!(20, p.network_tx);
+            assert_eq!(40, p.network_rx);
+            assert_eq!(60, p.disk_read);
+            assert_eq!(80, p.disk_write);
+        }
+
+        /// A parent that also has a parent rolls the whole way up, which is why
+        /// `record_io` walks a loop rather than checking one level.
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn record_io_rolls_up_through_more_than_one_level() {
+            let root = Arc::new(MetricsState::with_parent(None));
+            let mid = Arc::new(MetricsState::with_parent(Some(root.clone())));
+            let leaf = MetricsState::with_parent(Some(mid.clone()));
+
+            leaf.record_io(&crate::metrics::IoSample {
+                network_tx: 5,
+                network_rx: 0,
+                disk_read: 0,
+                disk_write: 0,
+            });
+
+            assert_eq!(5, leaf.snapshot().network_tx);
+            assert_eq!(5, mid.snapshot().network_tx);
+            assert_eq!(5, root.snapshot().network_tx, "the root must see it too");
+        }
+
+        /// The rollup is bytes only. `total_bytes` and `finished_at` are per-transfer
+        /// facts: a child's own denominator is not a contribution to its parent's, and a
+        /// child finishing does not finish the parent.
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn rollup_does_not_propagate_total_bytes_or_finished_at() {
+            let parent = Arc::new(MetricsState::with_parent(None));
+            let child = MetricsState::with_parent(Some(parent.clone()));
+
+            child.set_total_bytes(999);
+            child.set_finished();
+
+            assert_eq!(Some(999), child.snapshot().total_bytes);
+            assert_eq!(None, parent.snapshot().total_bytes);
+            assert!(child.snapshot().finished_at.is_some());
+            assert!(parent.snapshot().finished_at.is_none());
+        }
+
         #[cfg_attr(miri, ignore)]
         #[test]
         fn set_total_bytes() {
@@ -1619,6 +2168,198 @@ mod tests {
             assert_eq!(ctx.metrics().total_bytes, None);
             ctx.set_total_bytes(42);
             assert_eq!(ctx.metrics().total_bytes, Some(42));
+        }
+
+        /// The three states of a denominator, in the order a directory operation walks
+        /// them. `Unknown` and `Provisional(0)` are deliberately the same state: a walk
+        /// that has listed only empty objects knows no more about the total than one that
+        /// has listed nothing, and a bar drawn against 0 divides by zero either way.
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn byte_total_walks_unknown_then_provisional_then_final() {
+            let m = MetricsState::with_parent(None);
+            assert_eq!(crate::types::ByteTotal::Unknown, m.byte_total());
+
+            m.add_discovered(100, 1);
+            assert_eq!(
+                crate::types::ByteTotal::Provisional(100),
+                m.byte_total(),
+                "enumeration is still running, so the total is a lower bound"
+            );
+
+            m.add_discovered(50, 1);
+            assert_eq!(crate::types::ByteTotal::Provisional(150), m.byte_total());
+
+            m.seal_total();
+            assert_eq!(
+                crate::types::ByteTotal::Final(150),
+                m.byte_total(),
+                "the seal promotes whatever was accumulated, unchanged"
+            );
+        }
+
+        /// A leaf that learns its length in one piece reports `Final` without ever being
+        /// `Provisional`, and a second seal cannot move it.
+        ///
+        /// The no-op-on-reseal half is what stops a late walker batch from rewriting a
+        /// published denominator: `total_bytes` is a `OnceLock`, so the first value wins
+        /// and a consumer's bar cannot be made to jump after it reached 100%.
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn byte_total_is_final_once_and_does_not_move() {
+            let m = MetricsState::with_parent(None);
+            m.set_total_bytes(64);
+            assert_eq!(crate::types::ByteTotal::Final(64), m.byte_total());
+
+            m.add_discovered(1_000, 1);
+            m.seal_total();
+            assert_eq!(
+                crate::types::ByteTotal::Final(64),
+                m.byte_total(),
+                "a total already published must not be rewritten"
+            );
+        }
+
+        /// A parent's denominator is its own. `add_discovered` counts what the composite
+        /// enumerated; a child's contribution arrives as bytes through `record_io`, not as
+        /// a second denominator, or the parent would count every object twice.
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn discovered_bytes_do_not_roll_up() {
+            let parent = Arc::new(MetricsState::with_parent(None));
+            let child = MetricsState::with_parent(Some(parent.clone()));
+
+            child.add_discovered(7, 1);
+
+            assert_eq!(crate::types::ByteTotal::Provisional(7), child.byte_total());
+            assert_eq!(crate::types::ByteTotal::Unknown, parent.byte_total());
+        }
+
+        /// One seal, two denominators. The entry count walks the same three states as the
+        /// byte total and is promoted by the same call, so a reader can never see one of
+        /// them `Final` while the other is still `Provisional` — which is what would let a
+        /// consumer render "900 of 900 files" beside a byte bar still claiming to be
+        /// counting.
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn one_seal_finalises_both_denominators_together() {
+            use crate::types::{ByteTotal, EntryTotal};
+            let m = MetricsState::with_parent(None);
+            assert_eq!(ByteTotal::Unknown, m.byte_total());
+            assert_eq!(EntryTotal::Unknown, m.entry_total());
+
+            m.add_discovered(4096, 2);
+            assert_eq!(ByteTotal::Provisional(4096), m.byte_total());
+            assert_eq!(EntryTotal::Provisional(2), m.entry_total());
+
+            m.add_discovered(2048, 1);
+            assert_eq!(ByteTotal::Provisional(6144), m.byte_total());
+            assert_eq!(EntryTotal::Provisional(3), m.entry_total());
+
+            m.seal_total();
+            assert_eq!(ByteTotal::Final(6144), m.byte_total());
+            assert_eq!(
+                EntryTotal::Final(3),
+                m.entry_total(),
+                "the same call that sealed bytes must have sealed the count"
+            );
+        }
+
+        /// The numerator counts every ending, and reaches the denominator.
+        ///
+        /// This is the property a `N of M` display depends on and the one a bytes-only
+        /// numerator cannot offer: bytes stop short when an entry fails before moving any,
+        /// where a settled *count* does not care how the entry ended.
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn settled_entries_reach_the_sealed_total_regardless_of_outcome() {
+            use crate::types::EntryTotal;
+            let m = MetricsState::with_parent(None);
+            m.add_discovered(3000, 3);
+            m.seal_total();
+
+            assert_eq!(0, m.entries_settled());
+            // Three entries, three different endings, one count.
+            m.record_entry_settled(); // succeeded
+            m.record_entry_settled(); // failed before its first byte
+            m.record_entry_settled(); // abandoned, never started
+
+            assert_eq!(EntryTotal::Final(3), m.entry_total());
+            assert_eq!(
+                3,
+                m.entries_settled(),
+                "an entry that failed or was abandoned is still no longer pending"
+            );
+        }
+
+        /// A leaf reports `Unknown` forever: it is one entry, not a set of them.
+        ///
+        /// `EntryTotal::Provisional(1)` would be worse than `Unknown` here — it would invite
+        /// a caller to draw a one-entry progress bar that is either 0% or 100%.
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn a_leaf_has_no_entry_total() {
+            let handle = test_handle();
+            let (ctx, _rx) = TransferContext::new(handle);
+            ctx.set_total_bytes(512);
+
+            let view = ctx.view();
+            assert_eq!(crate::types::ByteTotal::Final(512), view.byte_total());
+            assert_eq!(
+                crate::types::EntryTotal::Unknown,
+                view.entry_total(),
+                "a single-object transfer enumerates nothing"
+            );
+            assert_eq!(0, view.entries_settled());
+        }
+
+        /// Entry counts do not roll up, for the same reason byte totals do not: a child's
+        /// own denominator is not a contribution to its parent's.
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn entry_counts_do_not_roll_up() {
+            let parent = Arc::new(MetricsState::with_parent(None));
+            let child = MetricsState::with_parent(Some(parent.clone()));
+
+            child.add_discovered(10, 5);
+            child.record_entry_settled();
+
+            assert_eq!(
+                crate::types::EntryTotal::Provisional(5),
+                child.entry_total()
+            );
+            assert_eq!(1, child.entries_settled());
+            assert_eq!(crate::types::EntryTotal::Unknown, parent.entry_total());
+            assert_eq!(
+                0,
+                parent.entries_settled(),
+                "a composite counts the entries it enumerated, not its children's"
+            );
+        }
+
+        /// A view outlives the context it came from, and still reads the live counters.
+        ///
+        /// This is the property the public API rests on: `join(self)` consumes the
+        /// operation handle, so a view that borrowed anything would be unusable exactly
+        /// when a caller wants to read the final numbers.
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn a_view_outlives_its_context_and_still_reads() {
+            let handle = test_handle();
+            let (ctx, _rx) = TransferContext::new(handle);
+            let view = ctx.view();
+
+            ctx.record_io(&crate::metrics::IoSample {
+                network_tx: 11,
+                network_rx: 0,
+                disk_read: 0,
+                disk_write: 0,
+            });
+            ctx.set_total_bytes(11);
+            drop(ctx);
+
+            assert_eq!(11, view.metrics().network_tx);
+            assert_eq!(crate::types::ByteTotal::Final(11), view.byte_total());
         }
     }
 }
@@ -1629,6 +2370,107 @@ mod loom_tests {
     use loom::sync::atomic::{AtomicBool, Ordering};
     use loom::sync::{Arc, Mutex};
     use loom::thread;
+
+    /// A status that reads `Failed` always has its error behind it.
+    ///
+    /// Harness over the real [`StateMachineStatus`](super::StateMachineStatus) and the
+    /// real error slot, both of which resolve to loom types under `s3_tm_loom` through
+    /// `runtime::sync`. Mirrors `TransferContext::set_failed` and `error` without
+    /// building a whole `TransferContext`, which needs a client `Handle`.
+    ///
+    /// The property: across every interleaving, a reader that observes `Failed` and then
+    /// takes the slot finds an error. Publishing the status outside the slot's lock makes
+    /// that false in the window between the two, and a reader landing there sees `Failed`
+    /// with nothing behind it — which is what let an emit site substitute a constructed
+    /// error for the real cause.
+    struct FailHarness {
+        status: super::StateMachineStatus,
+        error: Mutex<Option<u32>>,
+    }
+
+    impl FailHarness {
+        fn new() -> Self {
+            Self {
+                status: super::StateMachineStatus::new(),
+                error: Mutex::new(None),
+            }
+        }
+
+        /// `set_failed`'s ordering: the slot is held across the CAS, so the status cannot
+        /// become visible before the error that explains it.
+        fn set_failed(&self, err: u32) -> bool {
+            let mut slot = self.error.lock().unwrap();
+            if self.status.set_failed() {
+                *slot = Some(err);
+                true
+            } else {
+                false
+            }
+        }
+
+        /// `error()`'s ordering: check the status, then take the lock.
+        ///
+        /// The outer `Option` is whether the reader observed `Failed` at all; the inner
+        /// one is what the slot then held. `Some(None)` is the defect, and separating the
+        /// two is the whole point — collapsing them into one `Option` makes the defect
+        /// indistinguishable from a transfer that simply had not failed yet.
+        fn error(&self) -> Option<Option<u32>> {
+            if self.status.is_failed() {
+                Some(*self.error.lock().unwrap())
+            } else {
+                None
+            }
+        }
+    }
+
+    /// Two callers race to fail one transfer while a third reads. Whoever wins the CAS
+    /// stores the error, the loser stores nothing, and the reader never sees `Failed`
+    /// with an empty slot.
+    #[test]
+    fn set_failed_loom_publishes_status_after_its_error() {
+        loom::model(|| {
+            let h = Arc::new(FailHarness::new());
+
+            let h2 = h.clone();
+            let first = thread::spawn(move || h2.set_failed(1));
+
+            let h3 = h.clone();
+            let second = thread::spawn(move || h3.set_failed(2));
+
+            let h4 = h.clone();
+            let reader = thread::spawn(move || h4.error());
+
+            let won_first = first.join().unwrap();
+            let won_second = second.join().unwrap();
+            let seen = reader.join().unwrap();
+
+            assert!(
+                won_first ^ won_second,
+                "exactly one caller wins the CAS: first={won_first} second={won_second}"
+            );
+
+            // The reader either ran before the winner's CAS, or after it -- never between
+            // the CAS and the store, which is the interleaving the lock removes. If it
+            // observed `Failed`, the slot was populated.
+            if let Some(slot) = seen {
+                let err = slot.expect(
+                    "observed Failed with an empty error slot: the status was published \
+                     before the error that explains it",
+                );
+                assert!(
+                    err == 1 || err == 2,
+                    "a reader that saw Failed must see one of the two real errors, got {err}"
+                );
+            }
+
+            // And once every writer is done, the error is unconditionally there.
+            assert_eq!(
+                Some(true),
+                h.error().map(|slot| slot.is_some()),
+                "a Failed status must always have an error behind it"
+            );
+        });
+    }
 
     /// Harness wrapping the real `WakeFlag` with a simulated gated
     /// resource (a `Mutex<u32>` where 0 = blocked and non-zero = unblocked).

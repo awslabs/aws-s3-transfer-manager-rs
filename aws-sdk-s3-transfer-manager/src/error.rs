@@ -5,6 +5,7 @@
 
 use std::fmt;
 use std::ops::RangeInclusive;
+use std::sync::Arc;
 
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::operation::abort_multipart_upload::AbortMultipartUploadError;
@@ -30,26 +31,32 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 ///
 /// NOTE: Use [`aws_smithy_types::error::display::DisplayErrorContext`] or similar to display
 /// the entire error cause/source chain.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Error {
     kind: ErrorKind,
-    source: BoxError,
+    /// Shared rather than uniquely owned so an [`Error`] can be cloned: a
+    /// transfer's error is reported to an observer while `join()` still owes the
+    /// same error to the caller, so exactly one owner is not enough.
+    source: Arc<dyn std::error::Error + Send + Sync>,
     /// Optional metadata. `None` unless a builder attached service, chunk, or
-    /// bulk-failure detail. Boxed to keep [`Error`] small.
-    extra: Option<Box<ErrorExtra>>,
+    /// bulk-failure detail. Behind a pointer to keep [`Error`] small, and shared
+    /// so cloning is a refcount bump rather than an allocation.
+    extra: Option<Arc<ErrorExtra>>,
 }
 
 /// Optional metadata attached to an [`Error`].
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct ErrorExtra {
     /// Set when the error originated from an S3 service call.
     service: Option<ServiceMetadata>,
     /// Set when the error is attributable to a specific chunk of an object.
     location: Option<ChunkRef>,
     /// Per-object upload failures when this error aggregates a bulk upload.
-    failed_uploads: Option<Vec<FailedUpload>>,
+    /// Shared rather than owned: `FailedUpload` is not `Clone`.
+    failed_uploads: Option<Arc<Vec<FailedUpload>>>,
     /// Per-object download failures when this error aggregates a bulk download.
-    failed_downloads: Option<Vec<FailedDownload>>,
+    /// Shared for the same reason: `FailedDownload` is not `Clone`.
+    failed_downloads: Option<Arc<Vec<FailedDownload>>>,
     /// `true` when the underlying `SdkError` was a transient transport failure
     /// (a connect/read/write IO error or a client-side timeout) rather than a
     /// service response — a re-issuable failure the SDK's own retry may not have
@@ -159,7 +166,7 @@ impl ChunkRef {
 }
 
 /// Service-call detail read from the concrete `SdkError`.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct ServiceMetadata {
     operation: &'static str,
     code: Option<String>,
@@ -176,7 +183,7 @@ impl Error {
     {
         Error {
             kind,
-            source: err.into(),
+            source: Arc::from(err.into()),
             extra: None,
         }
     }
@@ -193,8 +200,8 @@ impl Error {
     pub(crate) fn test_transient_transport() -> Error {
         Error {
             kind: ErrorKind::ServiceError,
-            source: "injected transient transport".into(),
-            extra: Some(Box::new(ErrorExtra {
+            source: Arc::from(BoxError::from("injected transient transport")),
+            extra: Some(Arc::new(ErrorExtra {
                 transient_transport: true,
                 ..Default::default()
             })),
@@ -209,8 +216,8 @@ impl Error {
     pub(crate) fn test_service_error(code: &str) -> Error {
         Error {
             kind: ErrorKind::ServiceError,
-            source: "injected service error".into(),
-            extra: Some(Box::new(ErrorExtra {
+            source: Arc::from(BoxError::from("injected service error")),
+            extra: Some(Arc::new(ErrorExtra {
                 service: Some(ServiceMetadata {
                     operation: "TestOperation",
                     code: Some(code.to_owned()),
@@ -227,10 +234,10 @@ impl Error {
         self.extra.as_ref().and_then(|e| e.service.as_ref())
     }
 
-    /// Lazily get a mutable reference to the boxed extra, allocating it on first use.
+    /// Mutable access to the extra, allocating it on first use. `make_mut` copies
+    /// only when the extra is genuinely shared with a clone.
     fn extra_mut(&mut self) -> &mut ErrorExtra {
-        self.extra
-            .get_or_insert_with(|| Box::new(ErrorExtra::default()))
+        Arc::make_mut(self.extra.get_or_insert_with(Default::default))
     }
 
     /// The S3 operation that produced this error, if it originated from a service
@@ -287,14 +294,16 @@ impl Error {
     pub fn failed_uploads(&self) -> Option<&[FailedUpload]> {
         self.extra
             .as_ref()
-            .and_then(|e| e.failed_uploads.as_deref())
+            .and_then(|e| e.failed_uploads.as_ref())
+            .map(|v| v.as_slice())
     }
 
     /// Per-object download failures, when this error aggregates a bulk download.
     pub fn failed_downloads(&self) -> Option<&[FailedDownload]> {
         self.extra
             .as_ref()
-            .and_then(|e| e.failed_downloads.as_deref())
+            .and_then(|e| e.failed_downloads.as_ref())
+            .map(|v| v.as_slice())
     }
 
     /// Attaches chunk location, preserving kind and source.
@@ -305,13 +314,13 @@ impl Error {
 
     /// Attaches per-object upload failures, preserving kind and source.
     pub(crate) fn with_failed_uploads(mut self, failed: Vec<FailedUpload>) -> Self {
-        self.extra_mut().failed_uploads = Some(failed);
+        self.extra_mut().failed_uploads = Some(Arc::new(failed));
         self
     }
 
     /// Attaches per-object download failures, preserving kind and source.
     pub(crate) fn with_failed_downloads(mut self, failed: Vec<FailedDownload>) -> Self {
-        self.extra_mut().failed_downloads = Some(failed);
+        self.extra_mut().failed_downloads = Some(Arc::new(failed));
         self
     }
 }
@@ -476,7 +485,7 @@ where
                 expected: Some(expected),
                 computed: Some(computed),
             }),
-            source: boxed,
+            source: Arc::from(boxed),
             extra: None,
         };
     }
@@ -591,8 +600,8 @@ where
     let transient_transport = is_sdk_transient_transport(&e);
     Error {
         kind: ErrorKind::ServiceError,
-        source: Box::new(e),
-        extra: Some(Box::new(ErrorExtra {
+        source: Arc::new(e),
+        extra: Some(Arc::new(ErrorExtra {
             service: Some(service),
             transient_transport,
             ..Default::default()
@@ -670,8 +679,8 @@ mod tests {
     ) -> Error {
         Error {
             kind: ErrorKind::ServiceError,
-            source: "boom".into(),
-            extra: Some(Box::new(ErrorExtra {
+            source: Arc::from(BoxError::from("boom")),
+            extra: Some(Arc::new(ErrorExtra {
                 service: Some(ServiceMetadata {
                     operation,
                     code: code.map(str::to_owned),
@@ -734,7 +743,7 @@ mod tests {
                 expected: Some("AAAA".to_owned()),
                 computed: Some("BBBB".to_owned()),
             }),
-            source: "mismatch".into(),
+            source: Arc::from(BoxError::from("mismatch")),
             extra: None,
         };
         // Algorithm is shown; expected/computed are reached via accessors/source.

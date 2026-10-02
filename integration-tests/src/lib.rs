@@ -19,6 +19,8 @@ mod integrity;
 mod metrics;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod network_interfaces;
+mod progress_chaos;
+mod progress_scale;
 mod upload;
 mod upload_objects;
 mod upload_retry;

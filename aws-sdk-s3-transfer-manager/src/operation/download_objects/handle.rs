@@ -44,7 +44,7 @@ impl DownloadObjectsHandle {
                 .cancel_transfer(ctx.id)
                 .wait_for_idle()
                 .await;
-            let err = ctx.take_error().expect("failed transfer must have error");
+            let err = ctx.error().expect("failed transfer must have error");
             // The per-object failures would otherwise be unreachable on the Err
             // path; attach them so a caller can inspect what failed under Abort.
             return Err(err.with_failed_downloads(self.transfer.take_failed().unwrap_or_default()));
@@ -83,7 +83,16 @@ impl DownloadObjectsHandle {
         self.transfer.ctx().transfer_status()
     }
 
-    /// Snapshot of aggregated transfer metrics across every completed child.
+    /// Snapshot of this operation's byte counters, aggregated across all of its children.
+    ///
+    /// Live: a child's bytes are counted as they move, not when the child is reaped, so
+    /// this advances continuously rather than in whole-object jumps. Bytes moved by a
+    /// child that later failed are included — they were transferred, and omitting them
+    /// would make the total unreachable by any denominator.
+    ///
+    /// [`TransferMetrics::total_bytes`](crate::types::TransferMetrics::total_bytes) is
+    /// `Some` once listing has completed, and stays `None` on a run whose listing was
+    /// cancelled or failed — nobody knows the total in that case.
     pub fn metrics(&self) -> crate::types::TransferMetrics {
         self.transfer.ctx().metrics()
     }
