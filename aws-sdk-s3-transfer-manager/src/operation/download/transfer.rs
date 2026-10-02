@@ -35,6 +35,7 @@ use crate::runtime::buffer_pool::{
 };
 use crate::transfer::{IoRequest, PollWork, Transfer, TransferContext, TransferId, WorkOutcome};
 use crate::types::BucketType;
+use aws_smithy_types::error::display::DisplayErrorContext;
 use tracing::Instrument;
 
 /// Download transfer that generates and executes download work.
@@ -332,6 +333,7 @@ impl DownloadTransfer {
             DownloadState::Transferring {
                 remaining,
                 ranges_in_flight,
+                drains_in_flight,
                 etag,
                 part_size,
                 gate,
@@ -359,7 +361,7 @@ impl DownloadTransfer {
                                 self.inner.read_ahead.window(),
                                 pending.is_some(),
                             );
-                            return self.poll_memory_blocked(snapshot);
+                            return self.poll_memory_blocked(drains_in_flight, snapshot);
                         }
                         Err(error) => return self.fail_memory_admission(state, error),
                     }
@@ -419,7 +421,7 @@ impl DownloadTransfer {
                                 self.inner.read_ahead.window(),
                                 pending.is_some(),
                             );
-                            return self.poll_memory_blocked(snapshot);
+                            return self.poll_memory_blocked(drains_in_flight, snapshot);
                         }
                         Err(error) => return self.fail_memory_admission(state, error),
                     }
@@ -433,6 +435,18 @@ impl DownloadTransfer {
                         pending.is_some(),
                     );
                     return self.park(DownloadPendingReason::RangeCompletion, snapshot);
+                } else if *drains_in_flight > 0 {
+                    // Every range retired, but the memory-relief item is still in
+                    // flight and may hold a claimed run that finalization cannot see.
+                    // It completes the transfer when it retires.
+                    let snapshot = transferring_snapshot(
+                        remaining.as_ref(),
+                        *ranges_in_flight,
+                        gate,
+                        self.inner.read_ahead.window(),
+                        pending.is_some(),
+                    );
+                    return self.park(DownloadPendingReason::DrainCompletion, snapshot);
                 } else {
                     // No-data completion: the object carried no ranges (0-byte object
                     // whose discovery produced no initial chunk). Data-carrying terminal
@@ -527,14 +541,25 @@ impl DownloadTransfer {
     /// transfers this can deadlock. Flush the resident run first, and return
     /// `Pending` only when there is nothing to flush.
     ///
+    /// A relief item is counted in `drains_in_flight` here, when it is issued,
+    /// and at most one is in flight. While one is, this parks on
+    /// `MemoryAdmission` as it does when nothing is drainable: the item in
+    /// flight drains every drainable run, and its completion wakes the
+    /// transfer.
+    ///
     /// The pending reservation future has already registered the context's
     /// scheduler waker. This path still records and arms the common pending
     /// state; the registered wake and `try_wake` paths reconcile through the
     /// same descriptor protocol. A `has_drainable_resident` guard keeps it from
     /// emitting empty drains when an in-flight gap blocks the prefix or stream
     /// delivery owns progress.
-    fn poll_memory_blocked(&self, snapshot: DownloadStateSnapshot) -> PollWork {
-        if self.inner.writer.has_drainable_resident() {
+    fn poll_memory_blocked(
+        &self,
+        drains_in_flight: &mut u32,
+        snapshot: DownloadStateSnapshot,
+    ) -> PollWork {
+        if *drains_in_flight == 0 && self.inner.writer.has_drainable_resident() {
+            *drains_in_flight += 1;
             self.inner.observability.observe_event(
                 self.inner.ctx.id,
                 DownloadEvent::MemoryReliefScheduled,
@@ -673,6 +698,16 @@ impl DownloadTransfer {
     /// then release the freed read-ahead occupancy. Emitted when a transfer
     /// would otherwise wait for memory admission while retaining a resident run.
     ///
+    /// The item was counted in `drains_in_flight` when `poll_memory_blocked`
+    /// issued it, and is uncounted here, under the state lock, once it has
+    /// written every run it claimed. Success therefore cannot be claimed while
+    /// the item is queued or a claimed run is still being written, and whichever
+    /// item retires last, the final range or the relief item, claims the
+    /// terminal transition exactly once. A relief item that finds the transfer
+    /// already terminal writes nothing: its count went with the `Transferring`
+    /// state, and the terminal drain owns any resident run. A failed write
+    /// fails the transfer.
+    ///
     /// Unlike a fill-triggered drain, no GET completed here, so `ranges_in_flight` is
     /// untouched; only occupancy is released (matching the gate side of
     /// [`decrement_in_flight`](Self::decrement_in_flight), under the same state lock so
@@ -681,30 +716,62 @@ impl DownloadTransfer {
     /// re-grants FIFO; the `on_completion -> generate_work` after this returns
     /// re-polls this transfer.
     fn execute_drain_resident(&self) -> WorkOutcome {
+        if !matches!(
+            *self.inner.state.lock().unwrap(),
+            DownloadState::Transferring { .. }
+        ) {
+            return WorkOutcome::Cancelled;
+        }
+
         let flushed = self.inner.writer.flush_resident();
         self.record_disk_write();
-        let freed = match flushed {
-            Ok(drained) => drained.parts,
-            Err(e) => {
-                let guard = self.inner.state.lock().unwrap();
-                return self.fail(guard, error::Error::new(error::ErrorKind::IOError, e));
-            }
+
+        let mut work = self.inner.state.lock().unwrap();
+        if let DownloadState::Transferring {
+            drains_in_flight, ..
+        } = &mut *work
+        {
+            *drains_in_flight -= 1;
+        }
+        let drained = match flushed {
+            Ok(drained) => drained,
+            Err(e) => return self.fail(work, error::Error::new(error::ErrorKind::IOError, e)),
         };
-        let snapshot = {
-            let mut work = self.inner.state.lock().unwrap();
-            if let DownloadState::Transferring { gate, .. } = &mut *work {
-                gate.release(freed);
+        let terminal = match &mut *work {
+            DownloadState::Transferring {
+                remaining,
+                ranges_in_flight,
+                drains_in_flight,
+                gate,
+                ..
+            } => {
+                gate.release(drained.parts);
+                remaining.is_none() && *ranges_in_flight == 0 && *drains_in_flight == 0
             }
-            self.snapshot(&work)
+            _ => false,
         };
+        let snapshot = self.snapshot(&work);
+        // Claim the terminal transition under this lock, as `decrement_in_flight`
+        // does, so a concurrently woken poll_work cannot also complete.
+        let pending = if terminal {
+            work.enter_terminal()
+        } else {
+            None
+        };
+        drop(work);
+        drop(pending);
+
         self.inner
             .observability
-            .record_memory_relief_completed(freed);
+            .record_memory_relief_completed(drained.parts);
         self.inner.observability.observe_event(
             self.inner.ctx.id,
             DownloadEvent::MemoryReliefCompleted,
             snapshot,
         );
+        if terminal {
+            return self.finalize_completion();
+        }
         self.inner.ctx.try_wake();
         WorkOutcome::Success { data: None }
     }
@@ -838,6 +905,7 @@ impl DownloadTransfer {
             *work = DownloadState::Transferring {
                 remaining,
                 ranges_in_flight: initial as usize,
+                drains_in_flight: 0,
                 etag: etag.clone(),
                 part_size: effective_part_size,
                 gate: super::context::OccupancyGate::with_issued(initial),
@@ -1193,9 +1261,10 @@ impl DownloadTransfer {
 
     /// Complete one in-flight range: drop `ranges_in_flight`, release `freed` parts of
     /// read-ahead occupancy, and report whether this was the terminal completion (issuance
-    /// done and nothing left in flight). Both counters move under the state lock so the
-    /// terminal transition is claimed exactly once: the caller that observes `true` owns
-    /// completion, and any concurrently-woken `poll_work` sees `Terminal`.
+    /// done, no range in flight, and no memory-relief item in flight). Both counters move
+    /// under the state lock so the terminal transition is claimed exactly once: the caller
+    /// that observes `true` owns completion, and any concurrently-woken `poll_work` sees
+    /// `Terminal`.
     ///
     /// Releasing the occupancy under the same lock `poll_work` reads the gate and arms
     /// `set_pending` under is what orders this completion's release against the issuer's
@@ -1207,6 +1276,7 @@ impl DownloadTransfer {
             match &mut *work {
                 DownloadState::Transferring {
                     ranges_in_flight,
+                    drains_in_flight,
                     gate,
                     remaining,
                     pending,
@@ -1221,7 +1291,7 @@ impl DownloadTransfer {
                         self.inner.read_ahead.window(),
                         pending.is_some(),
                     );
-                    if remaining.is_none() && *ranges_in_flight == 0 {
+                    if remaining.is_none() && *ranges_in_flight == 0 && *drains_in_flight == 0 {
                         // Terminal: claim the transition under this lock so a
                         // concurrently-woken poll_work cannot also complete.
                         (true, work.enter_terminal(), Some(snapshot))
@@ -1292,13 +1362,26 @@ impl DownloadTransfer {
         mut guard: std::sync::MutexGuard<'_, DownloadState>,
         error: Error,
     ) -> WorkOutcome {
+        let description = DisplayErrorContext(&error).to_string();
         tracing::debug!(
             target: crate::telemetry::TARGET_TRANSFER,
+            error = %description,
             "download failed",
         );
         let classification = crate::scheduler::classify_error(&error);
         // Order matters: set status/error before any wakeups
-        self.inner.ctx.set_failed(error);
+        if !self.inner.ctx.set_failed(error)
+            && self.inner.ctx.transfer_status() == crate::types::TransferStatus::Completed
+        {
+            // Status is first-write-wins: the caller has been told the download
+            // succeeded, and this error can no longer reach it.
+            tracing::error!(
+                target: crate::telemetry::TARGET_TRANSFER,
+                tid = %self.inner.ctx.id,
+                error = %description,
+                "download failed after it had completed; the failure is not reported to the caller",
+            );
+        }
         let snapshot = self.snapshot(&guard);
         // Transition to Terminal, taking any memory-blocked claim so cancelling
         // its reservation future happens after releasing the state lock.
@@ -1672,12 +1755,13 @@ mod tests {
     use crate::operation::download::chunk_meta::ChunkMetadata;
     use crate::operation::download::sink::FileSinkFactory;
     use crate::operation::download::test_util::fixtures::{
-        disk_test_handle, disk_transfer, object_client_failing_at,
+        assert_discovery_succeeds, disk_test_handle, disk_transfer, execute, finalize_started,
+        object_client_failing_at, relief_scenario, spawn_relief,
     };
     use crate::operation::download::DownloadInput;
     use crate::scheduler::test_util::{assert_done, assert_pending, assert_ready};
     use crate::transfer::TransferContext;
-    use crate::transfer::{IoRequest, WorkOutcome};
+    use crate::transfer::WorkOutcome;
     use crate::types::{BucketType, ChecksumValidation, NotValidatedReason};
     use aws_sdk_s3::operation::get_object::GetObjectError;
     use aws_sdk_s3::operation::get_object::GetObjectOutput;
@@ -1708,6 +1792,7 @@ mod tests {
         let transferring = DownloadState::Transferring {
             remaining: Some(8..=15),
             ranges_in_flight: 2,
+            drains_in_flight: 0,
             etag: None,
             part_size: 8,
             gate,
@@ -2094,21 +2179,6 @@ mod tests {
         let (ctx, _completion_rx) = TransferContext::new(handle);
 
         DownloadTransfer::new(ctx, BucketType::Standard, input, writer)
-    }
-
-    /// Execute work using DownloadTransfer directly.
-    async fn execute(transfer: &DownloadTransfer, work: &mut IoRequest) -> WorkOutcome {
-        transfer.execute(work).await
-    }
-
-    /// Complete discovery and assert that the transfer accepted its result.
-    async fn assert_discovery_succeeds(transfer: &DownloadTransfer) {
-        let mut work = assert_ready(transfer.poll_work());
-        let outcome = execute(transfer, &mut work).await;
-        assert!(
-            matches!(outcome, WorkOutcome::Success { .. }),
-            "discovery failed: {outcome:?}"
-        );
     }
 
     // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
@@ -3389,6 +3459,387 @@ mod tests {
         assert_eq!(
             std::fs::read(dir.path().join("out")).unwrap(),
             &object[..part_size as usize]
+        );
+    }
+
+    /// How long a test waits for a scripted hold to start.
+    const HOLD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// The final range retiring while a memory-relief write is still landing does
+    /// not complete the transfer: finalization cannot see the run that write
+    /// claimed. The relief write completes the transfer when it retires, and the
+    /// destination then holds the whole object.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn final_range_waits_for_an_in_flight_relief_write() {
+        use crate::operation::download::test_util::sink::{Action, Match, Op, WriteScript};
+
+        let script = Arc::new(WriteScript::default()).on(Match::NthWrite(1), Action::Hold);
+        let scenario = relief_scenario(&script).await;
+        let (transfer, path, object) = (&scenario.transfer, &scenario.path, &scenario.object);
+
+        let relief = spawn_relief(transfer, scenario.relief);
+        let held = script.wait_held(HOLD_TIMEOUT);
+        assert_eq!(
+            held.op(),
+            Op::Write {
+                pos: 0,
+                len: scenario.part_size as usize
+            }
+        );
+
+        // Memory freed outside the transfer admits the final range while the relief
+        // write still holds the first part.
+        drop(scenario.blocker);
+        let mut last = assert_ready(transfer.poll_work());
+        let outcome = execute(transfer, &mut last).await;
+        assert!(matches!(outcome, WorkOutcome::Success { .. }));
+
+        assert!(
+            transfer.ctx().is_active(),
+            "the transfer completed while a destination write was in flight"
+        );
+        assert_pending(transfer.poll_work());
+        assert_eq!(
+            std::fs::metadata(path).unwrap().len(),
+            0,
+            "the destination was resized while a destination write was in flight"
+        );
+        assert!(!finalize_started(&script.events()));
+
+        held.release();
+        let outcome = relief.join().unwrap();
+        assert!(matches!(outcome, WorkOutcome::Success { .. }));
+        assert_eq!(
+            transfer.ctx().transfer_status(),
+            crate::types::TransferStatus::Completed
+        );
+        assert_eq!(std::fs::read(path).unwrap(), &object[..]);
+        assert_eq!(transfer.ctx().metrics().disk_write, object.len() as u64);
+        assert_done(transfer.poll_work());
+    }
+
+    /// A memory-relief write that fails after every range has retired fails the
+    /// transfer instead of being discarded behind a completion.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn failed_relief_write_after_final_range_fails_the_transfer() {
+        use crate::operation::download::test_util::sink::{Action, Match, WriteScript};
+
+        let script = Arc::new(WriteScript::default()).on(Match::NthWrite(1), Action::Hold);
+        let scenario = relief_scenario(&script).await;
+        let transfer = &scenario.transfer;
+
+        let relief = spawn_relief(transfer, scenario.relief);
+        let held = script.wait_held(HOLD_TIMEOUT);
+        drop(scenario.blocker);
+        let mut last = assert_ready(transfer.poll_work());
+        execute(transfer, &mut last).await;
+        assert!(transfer.ctx().is_active());
+
+        held.release_err(std::io::ErrorKind::StorageFull);
+        let outcome = relief.join().unwrap();
+        assert!(matches!(outcome, WorkOutcome::Failed { .. }));
+        assert!(transfer.ctx().is_failed());
+        let error = transfer
+            .ctx()
+            .take_error()
+            .expect("the failure is reported");
+        assert_eq!(error.kind(), &crate::error::ErrorKind::IOError);
+        assert!(
+            !finalize_started(&script.events()),
+            "a failed transfer must not finalize its destination"
+        );
+        assert_eq!(
+            transfer.ctx().metrics().disk_write,
+            scenario.part_size,
+            "only the final part, written by the terminal drain, reached the destination"
+        );
+    }
+
+    /// A relief item that starts after the transfer went terminal writes nothing.
+    /// The terminal drain already took the resident run.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn relief_after_terminal_transition_writes_nothing() {
+        use crate::operation::download::test_util::sink::WriteScript;
+
+        let script = Arc::new(WriteScript::default());
+        let scenario = relief_scenario(&script).await;
+        let transfer = &scenario.transfer;
+
+        assert!(transfer.ctx().set_cancelled());
+        transfer.on_terminal();
+        let events = script.events();
+
+        let outcome = spawn_relief(transfer, scenario.relief).join().unwrap();
+        assert!(matches!(outcome, WorkOutcome::Cancelled));
+        assert_eq!(script.events(), events, "a moot relief item must not write");
+    }
+
+    /// A poll of a memory-blocked transfer whose relief item is queued parks
+    /// instead of issuing a second relief item for the same resident run.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn memory_blocked_poll_with_a_queued_relief_item_parks() {
+        use crate::operation::download::test_util::sink::{Event, Op, WriteScript};
+
+        let script = Arc::new(WriteScript::default());
+        let mut scenario = relief_scenario(&script).await;
+        let transfer = &scenario.transfer;
+        assert!(
+            transfer.writer().has_drainable_resident(),
+            "the queued item has not drained the first part yet"
+        );
+
+        assert_pending(transfer.poll_work());
+
+        let outcome = execute(transfer, &mut scenario.relief).await;
+        assert!(matches!(outcome, WorkOutcome::Success { .. }));
+        let first_part = Op::Write {
+            pos: 0,
+            len: scenario.part_size as usize,
+        };
+        assert_eq!(
+            script.events(),
+            [
+                Event::Started(first_part),
+                Event::Finished(first_part, Ok(()))
+            ],
+            "one relief item drained the resident run"
+        );
+    }
+
+    /// The final range retiring while a relief item is queued does not complete
+    /// the transfer, since the item has yet to claim and write the run it
+    /// relieves. The relief item completes the transfer when it retires.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn final_range_waits_for_a_queued_relief_item() {
+        use crate::operation::download::test_util::sink::WriteScript;
+
+        let script = Arc::new(WriteScript::default());
+        let mut scenario = relief_scenario(&script).await;
+        let transfer = &scenario.transfer;
+
+        drop(scenario.blocker);
+        let mut last = assert_ready(transfer.poll_work());
+        let outcome = execute(transfer, &mut last).await;
+        assert!(matches!(outcome, WorkOutcome::Success { .. }));
+        assert!(
+            transfer.ctx().is_active(),
+            "the transfer completed while a relief item was queued"
+        );
+        assert_pending(transfer.poll_work());
+        assert!(!finalize_started(&script.events()));
+
+        let outcome = execute(transfer, &mut scenario.relief).await;
+        assert!(matches!(outcome, WorkOutcome::Success { .. }));
+        assert_eq!(
+            transfer.ctx().transfer_status(),
+            crate::types::TransferStatus::Completed
+        );
+        assert_eq!(std::fs::read(&scenario.path).unwrap(), &scenario.object[..]);
+        assert_done(transfer.poll_work());
+    }
+
+    /// Result of [`write_to_path_with_held_relief_write`].
+    struct HeldReliefDownload {
+        result: Result<crate::operation::download::DownloadOutput, crate::error::Error>,
+        object: std::sync::Arc<[u8]>,
+        dest: std::path::PathBuf,
+        dir: tempfile::TempDir,
+    }
+
+    /// Runs a path download of a two-part object, orchestrated as
+    /// `write_to_path` does, on the managed runtime with the first destination
+    /// write held.
+    ///
+    /// The memory budget fits two parts and a reservation outside the transfer
+    /// holds one, so the second part's claim waits on memory and the first
+    /// destination write is the memory relief for the discovery part. Once that
+    /// write is held, the reservation is dropped so the final range is received.
+    /// `join` must then stay pending for 200 ms without publishing the
+    /// destination. The held write is then released, failing with
+    /// `release_err` if given.
+    ///
+    /// A concurrency target of 2 lets the final range dispatch while the held
+    /// write occupies one slot, and keeps it off the held write's thread.
+    /// Relief is issued one item at a time, so the held write is the only
+    /// relief item, and the final range gets the second slot only once
+    /// discovery has retired. The held write's thread is then the only loaded
+    /// one, and routing, which picks the less loaded of two threads, picks
+    /// another.
+    async fn write_to_path_with_held_relief_write(
+        release_err: Option<std::io::ErrorKind>,
+    ) -> HeldReliefDownload {
+        use crate::operation::download::test_util::fixtures::{
+            managed_test_handle, object_bytes, object_client,
+        };
+        use crate::operation::download::test_util::sink::{
+            Action, Match, Op, ScriptedSinkFactory, WriteScript,
+        };
+        use crate::operation::download::Download;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        const TIMEOUT: Duration = Duration::from_secs(5);
+        let part_size = 8 * 1024 * 1024;
+        let object = object_bytes(2 * part_size);
+        let pool = crate::memory::BufferPool::builder()
+            .memory_budget(crate::types::MemoryBudgetConfig::Limit(2 * part_size))
+            .build()
+            .expect("test pool");
+        let blocker = pool
+            .try_reserve(part_size)
+            .unwrap()
+            .expect("the budget fits the blocker");
+        let script = Arc::new(WriteScript::default()).on(Match::NthWrite(1), Action::Hold);
+        let config = crate::Config::builder()
+            .client(object_client(Arc::clone(&object)))
+            .part_size(crate::types::PartSize::Target(part_size as u64))
+            .memory(crate::types::MemoryConfig::Explicit(pool))
+            .build();
+        let handle = managed_test_handle(config, 2);
+        let input = DownloadInput::builder()
+            .bucket("test-bucket")
+            .key("test-key")
+            .build()
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("object");
+
+        let download = Download::orchestrate_to_path(
+            Arc::clone(&handle),
+            input,
+            dest.clone(),
+            None,
+            &ScriptedSinkFactory(Arc::clone(&script)),
+        )
+        .await
+        .unwrap();
+
+        let held = tokio::task::spawn_blocking({
+            let script = Arc::clone(&script);
+            move || script.wait_held(TIMEOUT)
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            held.op(),
+            Op::Write {
+                pos: 0,
+                len: part_size
+            }
+        );
+
+        drop(blocker);
+        tokio::time::timeout(TIMEOUT, async {
+            while download.metrics().network_rx < 2 * part_size as u64 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the final range is received while the relief write is held");
+
+        let join = tokio::spawn(download.join());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !join.is_finished(),
+            "join returned while a destination write was in flight"
+        );
+        assert!(
+            !dest.exists(),
+            "the destination was published while a destination write was in flight"
+        );
+
+        match release_err {
+            None => held.release(),
+            Some(kind) => held.release_err(kind),
+        }
+        let result = tokio::time::timeout(TIMEOUT, join)
+            .await
+            .expect("join returns once the write is released")
+            .unwrap();
+        HeldReliefDownload {
+            result,
+            object,
+            dest,
+            dir,
+        }
+    }
+
+    /// `join` waits for an in-flight memory-relief write, then publishes the
+    /// complete object.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn write_to_path_join_waits_for_a_held_relief_write() {
+        let download = write_to_path_with_held_relief_write(None).await;
+        download.result.expect("the download succeeds");
+        assert_eq!(std::fs::read(&download.dest).unwrap(), &download.object[..]);
+    }
+
+    /// A memory-relief write that fails after the final range was received fails
+    /// `join` with an I/O error and leaves no destination or temporary file.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn write_to_path_fails_without_publishing_when_a_relief_write_fails() {
+        let download =
+            write_to_path_with_held_relief_write(Some(std::io::ErrorKind::StorageFull)).await;
+        let error = download.result.expect_err("the relief write failed");
+        assert_eq!(error.kind(), &crate::error::ErrorKind::IOError);
+        assert!(
+            !download.dest.exists(),
+            "a failed download must not publish"
+        );
+        assert_eq!(
+            std::fs::read_dir(download.dir.path()).unwrap().count(),
+            0,
+            "the temporary file must be removed"
+        );
+    }
+
+    /// A failure that arrives after the transfer completed cannot reach the
+    /// caller, so it is logged at error level with its cause.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn failure_after_completion_is_logged_with_its_cause() {
+        use aws_smithy_runtime::test_util::capture_test_logs::capture_test_logs;
+
+        // A single-part object: discovery receives it whole and completes.
+        let transfer = create_download(8 * MB, 8 * MB);
+        assert_discovery_succeeds(&transfer).await;
+        assert_eq!(
+            transfer.ctx().transfer_status(),
+            crate::types::TransferStatus::Completed
+        );
+
+        let (_guard, logs) = capture_test_logs();
+        let guard = transfer.inner.state.lock().unwrap();
+        let _ = transfer.fail(
+            guard,
+            error::Error::new(
+                error::ErrorKind::IOError,
+                std::io::Error::other("late destination failure"),
+            ),
+        );
+
+        assert_eq!(
+            transfer.ctx().transfer_status(),
+            crate::types::TransferStatus::Completed
+        );
+        let logs = logs.contents();
+        let logged = |level: &str, message: &str| {
+            logs.lines().any(|line| {
+                line.contains(level)
+                    && line.contains(message)
+                    && line.contains("late destination failure")
+            })
+        };
+        assert!(logged("DEBUG", "download failed"), "{logs}");
+        assert!(
+            logged("ERROR", "download failed after it had completed"),
+            "{logs}"
         );
     }
 

@@ -7,10 +7,14 @@
 
 use std::sync::Arc;
 
+use super::sink::{Event, Op, ScriptedSinkFactory, WriteScript};
 use crate::operation::download::body::{new_recv_body_with_disk_mode, RecvBodyConsumer};
 use crate::operation::download::sink::SinkFactory;
+use crate::operation::download::transfer::DownloadWork;
 use crate::operation::download::{DownloadInput, DownloadTransfer};
-use crate::transfer::TransferContext;
+use crate::runtime::buffer_pool::Reservation;
+use crate::scheduler::test_util::assert_ready;
+use crate::transfer::{IoRequest, TransferContext, WorkOutcome};
 use crate::types::BucketType;
 
 /// Deterministic object contents of `len` bytes, distinct from the zeros an
@@ -149,4 +153,115 @@ pub(crate) fn disk_transfer(
     let (ctx, _completion_rx) = TransferContext::new(handle);
     let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, writer);
     (transfer, consumer, dir)
+}
+
+/// Executes `work` on `transfer` and returns its outcome.
+pub(crate) async fn execute(transfer: &DownloadTransfer, work: &mut IoRequest) -> WorkOutcome {
+    transfer.execute(work).await
+}
+
+/// Polls `transfer` for discovery, executes it, and asserts that the transfer
+/// accepted the result.
+///
+/// Panics if the poll does not return work or the discovery does not succeed.
+pub(crate) async fn assert_discovery_succeeds(transfer: &DownloadTransfer) {
+    let mut work = assert_ready(transfer.poll_work());
+    let outcome = execute(transfer, &mut work).await;
+    assert!(
+        matches!(outcome, WorkOutcome::Success { .. }),
+        "discovery failed: {outcome:?}"
+    );
+}
+
+/// A two-part disk download writing through a scripted sink, stopped where
+/// `poll_work` has issued memory relief for the resident first part.
+pub(crate) struct ReliefScenario {
+    /// The download, its second part's claim waiting on memory.
+    pub(crate) transfer: DownloadTransfer,
+    /// The `DrainResident` item `poll_work` returned, not yet executed.
+    pub(crate) relief: IoRequest,
+    /// Holds the memory the second part needs. Dropping it admits that part.
+    pub(crate) blocker: Reservation,
+    /// Length of each of the object's two parts.
+    pub(crate) part_size: u64,
+    /// The object the S3 client serves.
+    pub(crate) object: Arc<[u8]>,
+    /// The destination file.
+    pub(crate) path: std::path::PathBuf,
+    /// The body consumer, kept for the transfer's lifetime.
+    _consumer: RecvBodyConsumer,
+    /// The directory holding `path`, removed on drop.
+    _dir: tempfile::TempDir,
+}
+
+/// Builds a [`ReliefScenario`] whose destination writes go through `script`.
+///
+/// The memory budget fits two parts, and a reservation outside the transfer
+/// holds one of them. Discovery fills the first part below the drain batch,
+/// the second part's claim then waits on memory, and `poll_work` relieves the
+/// resident first part.
+pub(crate) async fn relief_scenario(script: &Arc<WriteScript>) -> ReliefScenario {
+    let part_size = 8 * 1024 * 1024;
+    let object = object_bytes(2 * part_size as usize);
+    let pool = crate::memory::BufferPool::builder()
+        .memory_budget(crate::types::MemoryBudgetConfig::Limit(
+            2 * part_size as usize,
+        ))
+        .build()
+        .expect("test pool");
+    let blocker = pool
+        .try_reserve(part_size as usize)
+        .unwrap()
+        .expect("the budget fits the blocker");
+    let config = crate::Config::builder()
+        .client(object_client(Arc::clone(&object)))
+        .part_size(crate::types::PartSize::Target(part_size))
+        .memory(crate::types::MemoryConfig::Explicit(pool))
+        .build();
+    let handle = crate::client::Handle::test_handle_tokio(config);
+    let (transfer, consumer, dir) = disk_transfer(handle, &ScriptedSinkFactory(Arc::clone(script)));
+    let path = dir.path().join("out");
+
+    assert_discovery_succeeds(&transfer).await;
+    let mut relief = assert_ready(transfer.poll_work());
+    assert!(
+        matches!(
+            relief.data_mut::<DownloadWork>(),
+            DownloadWork::DrainResident
+        ),
+        "a memory-blocked claim with a resident part schedules relief"
+    );
+    ReliefScenario {
+        transfer,
+        relief,
+        blocker,
+        part_size,
+        object,
+        path,
+        _consumer: consumer,
+        _dir: dir,
+    }
+}
+
+/// Executes a relief item on its own thread. Relief writes are synchronous, so
+/// the item completes in one poll, blocking the thread for as long as its
+/// write is held.
+///
+/// The thread panics if the item suspends.
+pub(crate) fn spawn_relief(
+    transfer: &DownloadTransfer,
+    mut relief: IoRequest,
+) -> std::thread::JoinHandle<WorkOutcome> {
+    let transfer = transfer.clone();
+    std::thread::spawn(move || {
+        futures_util::FutureExt::now_or_never(transfer.execute(&mut relief))
+            .expect("memory relief completes without suspending")
+    })
+}
+
+/// Whether `events` include the start of a finalizing resize.
+pub(crate) fn finalize_started(events: &[Event]) -> bool {
+    events
+        .iter()
+        .any(|event| matches!(event, Event::Started(Op::Finalize { .. })))
 }

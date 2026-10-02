@@ -18,6 +18,9 @@ pub(crate) enum DownloadPendingReason {
     MemoryAdmission,
     /// Every range was issued and in-flight range work must retire.
     RangeCompletion,
+    /// Every range retired, and in-flight drains (memory-relief writes) must
+    /// finish before the destination can be finalized.
+    DrainCompletion,
 }
 
 impl From<DownloadPendingReason> for PendingCause {
@@ -29,6 +32,7 @@ impl From<DownloadPendingReason> for PendingCause {
                 Self::new(PendingCategory::Memory, "memory_admission")
             }
             DownloadPendingReason::RangeCompletion => Self::in_flight_work("range_completion"),
+            DownloadPendingReason::DrainCompletion => Self::in_flight_work("drain_completion"),
         }
     }
 }
@@ -66,6 +70,12 @@ pub(crate) enum DownloadState {
         remaining: Option<std::ops::RangeInclusive<u64>>,
         /// Number of ranges currently in flight
         ranges_in_flight: usize,
+        /// Memory-relief items in flight: counted when `poll_work` issues one
+        /// and uncounted when it retires, after writing every run it claimed.
+        /// A claimed run is invisible to the terminal drain, so the transfer
+        /// completes only when this is zero. At most one is in flight, since
+        /// one item drains every drainable run.
+        drains_in_flight: u32,
         /// ETag for consistency (shared across all range requests)
         etag: Option<std::sync::Arc<str>>,
         /// Per-chunk size used to slice `remaining`. Normally the configured
@@ -251,6 +261,11 @@ mod tests {
                 DownloadPendingReason::RangeCompletion,
                 PendingCategory::InFlightWork,
                 "range_completion",
+            ),
+            (
+                DownloadPendingReason::DrainCompletion,
+                PendingCategory::InFlightWork,
+                "drain_completion",
             ),
         ];
 
