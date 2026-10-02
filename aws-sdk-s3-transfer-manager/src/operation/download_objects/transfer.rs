@@ -565,8 +565,14 @@ impl DownloadObjectsTransfer {
             )
         })?;
 
-        let inner =
-            Download::orchestrate_with_sink(handle.clone(), input, file, true, Some(parent_id))?;
+        let inner = Download::orchestrate_with_sink(
+            handle.clone(),
+            input,
+            file,
+            true,
+            Some(parent_id),
+            &crate::operation::download::sink::FileSinkFactory,
+        )?;
         Ok(ManagedDownloadHandle::new(inner, temp_path, dest_path))
     }
 

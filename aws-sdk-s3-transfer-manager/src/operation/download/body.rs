@@ -41,7 +41,7 @@ impl WakeNotify {
 ///
 /// The claimed receive-buffer slots retain ownership until the write
 /// completes. This cursor presents their bytes without cloning owner metadata.
-struct DiskWriteCursor<'a> {
+pub(crate) struct DiskWriteCursor<'a> {
     write: &'a SegmentWrite<ChunkOutput>,
     payload_index: usize,
     payload_offset: usize,
@@ -186,7 +186,7 @@ impl Buf for DiskWriteCursor<'_> {
 /// `prepare` may reserve storage before writes begin, while `finalize` establishes
 /// the destination layout after every payload write succeeds. Implementations are
 /// shared across the issuer and the drain task, hence `Send + Sync`.
-trait SinkWrite: Send + Sync + std::fmt::Debug {
+pub(crate) trait SinkWrite: Send + Sync + std::fmt::Debug {
     /// Write the entire buffer at `pos` bytes from the payload's destination start.
     fn write_all_at(&self, buf: &mut DiskWriteCursor<'_>, pos: u64) -> std::io::Result<()>;
 
@@ -207,11 +207,19 @@ trait SinkWrite: Send + Sync + std::fmt::Debug {
 /// finalization truncates the file to the payload length. A future append or
 /// write-at policy belongs here: it can translate the relative positions and
 /// final length without changing transfer scheduling or object-range arithmetic.
-struct FileSink {
+pub(crate) struct FileSink {
     file: std::fs::File,
     /// Whether the transfer manager created this file (vs caller-provided). Only an
     /// owned file is preallocated.
     owns_file: bool,
+}
+
+impl FileSink {
+    /// Wraps `file`. `owns_file` is true when the transfer manager created the
+    /// file, which permits preallocating it.
+    pub(crate) fn new(file: std::fs::File, owns_file: bool) -> Self {
+        Self { file, owns_file }
+    }
 }
 
 impl std::fmt::Debug for FileSink {
@@ -559,7 +567,9 @@ pub(crate) fn new_recv_body() -> (BodyWriter, RecvBodyConsumer) {
 /// Issuance backpressure is owned by the per-transfer [`ReadAhead`] controller.
 ///
 /// [`ReadAhead`]: super::read_ahead::ReadAhead
-fn new_recv_body_with_disk_mode(sink: Box<dyn SinkWrite>) -> (BodyWriter, RecvBodyConsumer) {
+pub(crate) fn new_recv_body_with_disk_mode(
+    sink: Box<dyn SinkWrite>,
+) -> (BodyWriter, RecvBodyConsumer) {
     let (buffer, consumer) = PagedRecvBuffer::new_with_segment_size(SEG_SIZE);
     let notify = Arc::new(WakeNotify::new());
     let resolved_range_start = std::sync::OnceLock::new();
@@ -575,12 +585,13 @@ fn new_recv_body_with_disk_mode(sink: Box<dyn SinkWrite>) -> (BodyWriter, RecvBo
     (writer, slot_consumer)
 }
 
-/// Create a producer/consumer pair with a file sink for download-to-file.
+/// Create a producer/consumer pair writing directly to `file` through a [`FileSink`].
+#[cfg(test)]
 pub(crate) fn new_recv_body_with_sink(
     file: std::fs::File,
     owns_file: bool,
 ) -> (BodyWriter, RecvBodyConsumer) {
-    new_recv_body_with_disk_mode(Box::new(FileSink { file, owns_file }))
+    new_recv_body_with_disk_mode(Box::new(FileSink::new(file, owns_file)))
 }
 
 /// Stream of [ChunkOutput] representing an Amazon S3 Object's contents and metadata.

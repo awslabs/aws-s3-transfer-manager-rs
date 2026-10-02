@@ -18,6 +18,12 @@ pub use body::{Body, ChunkOutput};
 /// In-order delivery buffer (out-of-order arrival → in-order stream).
 pub(crate) mod recv_buffer;
 
+/// Positioned-write targets for disk downloads.
+pub(crate) mod sink;
+
+#[cfg(test)]
+pub(crate) mod test_util;
+
 /// Read-ahead window — the occupancy bound on speculative issuance.
 pub(crate) mod read_ahead;
 
@@ -93,6 +99,7 @@ impl Download {
         input: DownloadInput,
         dest_path: std::path::PathBuf,
         parent_id: Option<u64>,
+        sinks: &dyn sink::SinkFactory,
     ) -> Result<ManagedDownloadHandle, error::Error> {
         // Generate temp file in the same directory as destination
         let unique_id = fastrand::u32(..);
@@ -108,7 +115,7 @@ impl Download {
             .map_err(|e| error::from_kind(error::ErrorKind::IOError)(e))?;
         let file = tokio_file.into_std().await;
 
-        let inner = Self::orchestrate_with_sink(handle, input, file, true, parent_id)?;
+        let inner = Self::orchestrate_with_sink(handle, input, file, true, parent_id, sinks)?;
         Ok(ManagedDownloadHandle::new(inner, temp_path, dest_path))
     }
 
@@ -118,13 +125,15 @@ impl Download {
         handle: Arc<crate::client::Handle>,
         input: DownloadInput,
         file: std::fs::File,
+        sinks: &dyn sink::SinkFactory,
     ) -> Result<ManagedDownloadHandle, error::Error> {
-        let inner = Self::orchestrate_with_sink(handle, input, file, false, None)?;
+        let inner = Self::orchestrate_with_sink(handle, input, file, false, None, sinks)?;
         // No temp/dest paths — caller manages the file lifecycle
         Ok(ManagedDownloadHandle::new_unmanaged(inner))
     }
 
-    /// Shared orchestration for file-sink downloads.
+    /// Shared orchestration for file-sink downloads. The destination sink over
+    /// `file` is opened through `sinks`.
     #[cfg(any(unix, windows))]
     pub(crate) fn orchestrate_with_sink(
         handle: Arc<crate::client::Handle>,
@@ -132,6 +141,7 @@ impl Download {
         file: std::fs::File,
         owns_file: bool,
         parent_id: Option<u64>,
+        sinks: &dyn sink::SinkFactory,
     ) -> Result<DownloadHandleInner, error::Error> {
         use crate::transfer::TransferContext;
 
@@ -142,7 +152,8 @@ impl Download {
         let bucket_type =
             BucketType::from_bucket_name(input.bucket().expect("bucket is available"));
 
-        let (writer, _consumer) = body::new_recv_body_with_sink(file, owns_file);
+        let sink = sinks.open(file, owns_file);
+        let (writer, _consumer) = body::new_recv_body_with_disk_mode(sink);
 
         let (ctx, completion_rx) = match parent_id {
             Some(pid) => TransferContext::new_child(handle.clone(), pid),
