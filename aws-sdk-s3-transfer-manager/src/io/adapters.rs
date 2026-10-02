@@ -22,6 +22,9 @@ pin_project! {
     /// shared memory pool. Partial bytes and their reservation remain live
     /// across `Poll::Pending`; a completed part is published without copying.
     ///
+    /// The inner reader must fill the [`ReadBuf`](tokio::io::ReadBuf) it is
+    /// given. A read that fills a different buffer fails the upload.
+    ///
     /// # Examples
     ///
     /// ```
@@ -94,13 +97,27 @@ where
             // SAFETY: `ReadBuf` and `poll_read` promise not to set any uninitialized bytes into `dst`.
             let dst = unsafe { part_buffer.chunk_mut().as_uninit_slice_mut() };
             let mut buf = tokio::io::ReadBuf::uninit(dst);
+            let lent_ptr = buf.filled().as_ptr();
+            let lent_len = buf.capacity();
 
             match this.inner.as_mut().poll_read(cx, &mut buf) {
                 Poll::Ready(result) => match result {
                     Ok(_) => {
                         let n = buf.filled().len();
+                        // A reader that assigns another `ReadBuf` to `*buf` reports bytes that were
+                        // never written to `dst`; advancing by them would publish pooled memory.
+                        // tokio's `read_buf` makes the same check.
+                        if buf.filled().as_ptr() != lent_ptr || n > lent_len {
+                            *this.buffer = None;
+                            return Poll::Ready(Some(Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "TokioIo reader replaced the ReadBuf it was given",
+                            ))));
+                        }
                         if n > 0 {
-                            // SAFETY: we just read that many bytes into the uninitialized part of the buffer
+                            // SAFETY: the filled region is the first `n` bytes of `dst`.
+                            // `ReadBuf::uninit` marked none of `dst` initialized, and `ReadBuf`
+                            // only marks initialized bytes as filled, so this read wrote them.
                             unsafe {
                                 part_buffer.advance_mut(n);
                             }
@@ -152,8 +169,9 @@ mod tests {
     use crate::memory::BufferPool;
     use crate::types::MemoryBudgetConfig;
     use futures_test::task::new_count_waker;
-    use std::pin::pin;
-    use std::task::Context;
+    use std::pin::{pin, Pin};
+    use std::task::{Context, Poll};
+    use tokio::io::ReadBuf;
     use tokio_test::io::Builder;
     use tokio_test::{assert_pending, assert_ready};
 
@@ -268,5 +286,63 @@ mod tests {
         let result = assert_ready!(io.as_mut().poll_part(&mut task_cx, &stream_cx));
         assert!(result.is_none());
         assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+    }
+
+    /// A safe reader that, on its first read, replaces the `ReadBuf` it was given with a leaked
+    /// buffer of its own and marks `claim` bytes filled there. Later reads report end-of-file.
+    struct ReplacingReader {
+        claim: usize,
+        replaced: bool,
+    }
+
+    impl tokio::io::AsyncRead for ReplacingReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if !self.replaced {
+                self.replaced = true;
+                let replacement = Box::leak(vec![b'B'; self.claim].into_boxed_slice());
+                *buf = ReadBuf::new(replacement);
+                buf.set_filled(self.claim);
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Polls a `TokioIo` over a `ReplacingReader` once and asserts the read fails with
+    /// `InvalidData` and returns its pooled storage.
+    fn assert_replaced_buffer_rejected(stream_cx: &StreamContext, pool: &BufferPool, claim: usize) {
+        let reader = ReplacingReader {
+            claim,
+            replaced: false,
+        };
+        let mut io = pin!(TokioIo::new(reader, SizeHint::default()));
+        let (waker, _) = new_count_waker();
+        let mut task_cx = Context::from_waker(&waker);
+
+        let error = assert_ready!(io.as_mut().poll_part(&mut task_cx, stream_cx))
+            .expect("a replaced buffer must be reported, not treated as end-of-stream")
+            .expect_err("a replaced buffer must fail the read");
+        assert_eq!(std::io::ErrorKind::InvalidData, error.kind());
+        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn test_tokio_adapter_rejects_replaced_read_buf() {
+        let (stream_cx, pool) = test_stream_cx(10);
+        assert_replaced_buffer_rejected(&stream_cx, &pool, 3);
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn test_tokio_adapter_rejects_claim_beyond_lent_buffer() {
+        // The adapter lends one carrier at a time, so a part spanning several carriers leaves
+        // room in the part for a claim larger than the lent slice.
+        let carrier_size = test_stream_cx(1).1.carrier_size();
+        let (stream_cx, pool) = test_stream_cx(4 * carrier_size);
+        assert_replaced_buffer_rejected(&stream_cx, &pool, 2 * carrier_size);
     }
 }
