@@ -931,6 +931,16 @@ impl Transfer for DownloadObjectsTransfer {
 
 /// Derive the local filesystem path for a given S3 key.
 ///
+// TODO(vnext): two keys can end up as the same local file. `path_clean` sends `a//b`, `a/./b` and
+// `a/b` to one path, and a case-insensitive filesystem folds `Photos/x` onto `photos/x`, leaving a
+// download to write one file and report a success for each key. S3 GetObject keeps the keys apart
+// and serves each one by name, but preserving them as they are in a filename may not be allowed by
+// the OS, which collapses `//` to `/`. Currently the transfer manager preemptively normalizes them
+// to avoid a collision, but that shouldn't happen. If there is a collision, it is a write failure
+// and should follow the failure policy. `derive_object_key` breaks the same way in the other
+// direction, turning two local names into one key.
+// See https://github.com/awslabs/aws-s3-transfer-manager-rs/pull/184#discussion_r4149427294
+///
 /// Strips the configured prefix, replaces the delimiter with the OS path
 /// separator, joins with the destination root, normalizes via `path_clean`,
 /// and validates the result stays within the root (path traversal guard).
