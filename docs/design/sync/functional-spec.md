@@ -153,8 +153,10 @@ told apart:
 - **Nothing to transfer** — a device (`/dev/null`), a FIFO, or a socket. No setting makes these
   transferable, and reading one may never finish. A warning under either policy. A symlink sync was told
   not to follow belongs here too (FR-Enum-4).
-- **Should have been readable and was not** — missing, deleted mid-run, unreadable, or a symlink pointing
-  at nothing: a failure, following the global policy (FR-Fail-9).
+- **Should have been readable and was not** — unreadable, or a symlink pointing at nothing: a
+  failure, following the global policy (FR-Fail-9). The entry is still there, still naming something
+  a run was asked to copy, so a destination without it does not match the source. A file that went
+  away is the other case, and FR-Enum-8 has it.
 - **No key it could take** — a local name that is not valid UTF-8. An S3 object key is Unicode encoded as
   UTF-8, so no key corresponds to such a name. It MUST be reported as `skipped-with-warning`, naming the
   file with its invalid bytes escaped. It MUST NOT be converted lossily to make a key: two names

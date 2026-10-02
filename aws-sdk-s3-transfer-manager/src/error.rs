@@ -661,6 +661,7 @@ impl From<crate::io::walk::WalkError> for Error {
                 Error::new(ErrorKind::InputInvalid, e)
             }
             WalkErrorKind::Io
+            | WalkErrorKind::Vanished
             | WalkErrorKind::PermissionDenied
             | WalkErrorKind::DirectoryUnreadable
             | WalkErrorKind::BrokenSymlink

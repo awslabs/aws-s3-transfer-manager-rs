@@ -222,6 +222,11 @@ pub(crate) enum KeysLost {
     // An unknown range. A subtree went unenumerated, or the side stopped before its end, so
     // absence cannot be read from position at all.
     UnknownRange,
+    // Nothing. The failure cost this side no knowledge, so absence stays readable from position
+    // either side of it. A file deleted before it could be read is the case: its key is not missing
+    // from this side's account, it is genuinely not there, and a consumer that protected it would
+    // be protecting a key the source no longer has.
+    Nothing,
 }
 
 impl StreamError {
@@ -243,6 +248,8 @@ impl StreamError {
                 WalkErrorKind::Io
                 | WalkErrorKind::PermissionDenied
                 | WalkErrorKind::BrokenSymlink => KeysLost::OneKey,
+                // Gone, which is an answer rather than the lack of one.
+                WalkErrorKind::Vanished => KeysLost::Nothing,
             },
             // Exactly one name went unaccounted for, and the report names it.
             StreamError::UnkeyableName(_) => KeysLost::OneKey,
@@ -1038,6 +1045,10 @@ mod tests {
             (walk_err(WalkErrorKind::Io), KeysLost::OneKey),
             (walk_err(WalkErrorKind::PermissionDenied), KeysLost::OneKey),
             (walk_err(WalkErrorKind::BrokenSymlink), KeysLost::OneKey),
+            // An entry that went away between being named and being read. Its key is not missing
+            // from this side's account, it is genuinely not there, so absence stays readable on
+            // either side of it.
+            (walk_err(WalkErrorKind::Vanished), KeysLost::Nothing),
             // Listed, then dropped: the key is gone from this side.
             (
                 StreamError::MalformedListing {
@@ -1346,6 +1357,9 @@ mod tests {
                     None => return None,
                     Some(Ok(entry)) => return Some(entry),
                     Some(Err(err)) => match err.keys_lost() {
+                        // Reported a failure and cost the view nothing, so the view stays
+                        // trustworthy and the loop reads on.
+                        KeysLost::Nothing => continue,
                         // This model collapses both answers, which is the coarsest reading the contract
                         // allows and deliberately not what sync does. `sync::Walk` holds per key where a
                         // failure names one and per stretch otherwise, and that policy is tested there,

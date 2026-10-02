@@ -332,7 +332,9 @@ pub(crate) trait Compare<S, D> {
 fn coarser(source: KeysLost, destination: KeysLost) -> KeysLost {
     match (source, destination) {
         (KeysLost::UnknownRange, _) | (_, KeysLost::UnknownRange) => KeysLost::UnknownRange,
-        (KeysLost::OneKey, KeysLost::OneKey) => KeysLost::OneKey,
+        (KeysLost::OneKey, _) | (_, KeysLost::OneKey) => KeysLost::OneKey,
+        // Neither side lost anything, so the pair has not either.
+        (KeysLost::Nothing, KeysLost::Nothing) => KeysLost::Nothing,
     }
 }
 

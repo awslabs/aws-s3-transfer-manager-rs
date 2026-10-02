@@ -696,6 +696,13 @@ fn cost_of(err: &StreamError, root: Option<&Path>) -> Cost {
         // A name no key can carry takes no part in the comparison, so there is no key here to
         // answer for. What it cost a run shows up as the plan coming out incomplete.
         StreamError::UnkeyableName(_) => Cost::Nothing,
+        // A file that went away costs the comparison nothing to know, so there is no position to
+        // hold open. Placed ahead of the arms below because the tail they fall to is the coarsest
+        // answer there is, and this is the finest.
+        StreamError::Walk(walk) if walk.kind() == WalkErrorKind::Vanished => {
+            tracing::debug!(path = ?walk.path(), "a file went away before it could be read");
+            Cost::Nothing
+        }
         // A walk names a path, which is a key only once the root it sits under is known. Three
         // things can stop that: no root was supplied, the error carries no path, or the root and
         // the walk disagree about the path's form — a root left uncanonicalized against a walk
@@ -974,12 +981,44 @@ mod tests {
         UnknownRange,
     }
 
+    // A file that went away holds nothing back. Worth pinning because the answer it must not give
+    // is the one the arms below it would reach: a failure that names no lost key falls through to
+    // the whole side's account staying open, which would stop every later key from being decided
+    // over a file that is simply gone.
+    #[test]
+    fn a_file_that_went_away_holds_nothing_back() {
+        let gone = StreamError::Walk(WalkError::new(
+            Some(std::path::PathBuf::from("/root/a.txt")),
+            WalkErrorKind::Vanished,
+            Box::from("not there any more"),
+        ));
+        assert!(matches!(
+            cost_of(&gone, Some(Path::new("/root"))),
+            Cost::Nothing
+        ));
+        // With no root to name the key against, the answer is the same: there is no key to hold.
+        assert!(matches!(cost_of(&gone, None), Cost::Nothing));
+        // A file that is there and could not be read still holds its own key.
+        let denied = StreamError::Walk(WalkError::new(
+            Some(std::path::PathBuf::from("/root/b.txt")),
+            WalkErrorKind::PermissionDenied,
+            Box::from("denied"),
+        ));
+        match cost_of(&denied, Some(Path::new("/root"))) {
+            Cost::Key(key) => assert_eq!(key, "b.txt"),
+            other => panic!("a file that is there should hold its own key, got {other:?}"),
+        }
+    }
+
     fn at<T>(side: &SideState<T>) -> At {
         match side {
             SideState::Present(_) => At::Here,
             SideState::Absent => At::Gone,
             SideState::Unknown(KeysLost::OneKey) => At::UnknownKey,
             SideState::Unknown(KeysLost::UnknownRange) => At::UnknownRange,
+            // A failure that cost this side nothing leaves the position readable, which is the
+            // same thing a consumer learns from the side simply not having a key there.
+            SideState::Unknown(KeysLost::Nothing) => At::Gone,
         }
     }
 
