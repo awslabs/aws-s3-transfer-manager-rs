@@ -458,7 +458,7 @@ mod tests {
                     true
                 }
             })
-            .then_output(|| UploadPartOutput::builder().build());
+            .then_output(|| UploadPartOutput::builder().e_tag("test-etag").build());
 
         let client = mock_client!(aws_sdk_s3, RuleMode::Sequential, &[&upload_part_mock]);
         let upload_part_builder = client.upload_part().upload_id("test-id").part_number(1);

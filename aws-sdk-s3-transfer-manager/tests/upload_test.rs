@@ -23,7 +23,7 @@ use aws_sdk_s3_transfer_manager::memory::{
 };
 use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
 use aws_sdk_s3_transfer_manager::operation::upload::ChecksumStrategy;
-use aws_smithy_mocks::{mock, mock_client, RuleMode};
+use aws_smithy_mocks::{mock, mock_client, Rule, RuleMode};
 use aws_smithy_runtime::test_util::capture_test_logs::capture_test_logs;
 use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
 use aws_smithy_runtime_api::client::result::SdkError;
@@ -311,7 +311,7 @@ fn mock_s3_client_for_multipart_upload() -> aws_sdk_s3::Client {
             let upload_id = upload_id.clone();
             move |input| input.upload_id.as_ref() == Some(&upload_id)
         })
-        .then_output(|| UploadPartOutput::builder().build());
+        .then_output(|| UploadPartOutput::builder().e_tag("test-etag").build());
 
     let complete_mpu = mock!(aws_sdk_s3::Client::complete_multipart_upload)
         .match_requests({
@@ -507,8 +507,8 @@ async fn assert_ranged_mpu_object_size(size_hint: SizeHint, actual: usize) {
                 .build()
         }
     });
-    let upload_part =
-        mock!(aws_sdk_s3::Client::upload_part).then_output(|| UploadPartOutput::builder().build());
+    let upload_part = mock!(aws_sdk_s3::Client::upload_part)
+        .then_output(|| UploadPartOutput::builder().e_tag("test-etag").build());
     let complete_mpu = mock!(aws_sdk_s3::Client::complete_multipart_upload)
         .match_requests(move |req| req.mpu_object_size() == Some(actual as i64))
         .then_output(|| CompleteMultipartUploadOutput::builder().build());
@@ -770,8 +770,8 @@ async fn test_complete_mpu_sends_mpu_object_size() {
         }
     });
 
-    let upload_part =
-        mock!(aws_sdk_s3::Client::upload_part).then_output(|| UploadPartOutput::builder().build());
+    let upload_part = mock!(aws_sdk_s3::Client::upload_part)
+        .then_output(|| UploadPartOutput::builder().e_tag("test-etag").build());
 
     // Match only when MpuObjectSize equals the full content length. With the
     // field absent (or wrong) no rule matches and the upload fails, so the
@@ -912,8 +912,8 @@ async fn test_unknown_length_mpu_object_size_is_running_sum() {
                 .build()
         }
     });
-    let upload_part =
-        mock!(aws_sdk_s3::Client::upload_part).then_output(|| UploadPartOutput::builder().build());
+    let upload_part = mock!(aws_sdk_s3::Client::upload_part)
+        .then_output(|| UploadPartOutput::builder().e_tag("test-etag").build());
     let complete_mpu = mock!(aws_sdk_s3::Client::complete_multipart_upload)
         .match_requests(move |req| req.mpu_object_size() == Some(total as i64))
         .then_output(|| CompleteMultipartUploadOutput::builder().build());
@@ -966,8 +966,8 @@ async fn test_bounded_length_sends_validated_actual_size() {
                 .build()
         }
     });
-    let upload_part =
-        mock!(aws_sdk_s3::Client::upload_part).then_output(|| UploadPartOutput::builder().build());
+    let upload_part = mock!(aws_sdk_s3::Client::upload_part)
+        .then_output(|| UploadPartOutput::builder().e_tag("test-etag").build());
     let complete_mpu = mock!(aws_sdk_s3::Client::complete_multipart_upload)
         .match_requests(move |req| req.mpu_object_size() == Some(actual as i64))
         .then_output(|| CompleteMultipartUploadOutput::builder().build());
@@ -1019,8 +1019,8 @@ async fn test_exact_length_rejects_early_end_of_stream() {
                 .build()
         }
     });
-    let upload_part =
-        mock!(aws_sdk_s3::Client::upload_part).then_output(|| UploadPartOutput::builder().build());
+    let upload_part = mock!(aws_sdk_s3::Client::upload_part)
+        .then_output(|| UploadPartOutput::builder().e_tag("test-etag").build());
     let complete_mpu = mock!(aws_sdk_s3::Client::complete_multipart_upload)
         .then_output(|| CompleteMultipartUploadOutput::builder().build());
     let client = mock_client!(
@@ -1066,8 +1066,8 @@ async fn test_exact_length_rejects_overflow_before_upload_part() {
                 .build()
         }
     });
-    let upload_part =
-        mock!(aws_sdk_s3::Client::upload_part).then_output(|| UploadPartOutput::builder().build());
+    let upload_part = mock!(aws_sdk_s3::Client::upload_part)
+        .then_output(|| UploadPartOutput::builder().e_tag("test-etag").build());
     let complete_mpu = mock!(aws_sdk_s3::Client::complete_multipart_upload)
         .then_output(|| CompleteMultipartUploadOutput::builder().build());
     let client = mock_client!(
@@ -1424,8 +1424,8 @@ async fn test_unknown_length_forwards_full_object_checksum() {
                 .build()
         }
     });
-    let upload_part =
-        mock!(aws_sdk_s3::Client::upload_part).then_output(|| UploadPartOutput::builder().build());
+    let upload_part = mock!(aws_sdk_s3::Client::upload_part)
+        .then_output(|| UploadPartOutput::builder().e_tag("test-etag").build());
     let complete_mpu = mock!(aws_sdk_s3::Client::complete_multipart_upload)
         .match_requests(move |req| req.checksum_crc32() == Some(expected_checksum))
         .then_output(|| CompleteMultipartUploadOutput::builder().build());
@@ -1592,8 +1592,8 @@ async fn test_unknown_length_many_parts_grows_part_list() {
                 .build()
         }
     });
-    let upload_part =
-        mock!(aws_sdk_s3::Client::upload_part).then_output(|| UploadPartOutput::builder().build());
+    let upload_part = mock!(aws_sdk_s3::Client::upload_part)
+        .then_output(|| UploadPartOutput::builder().e_tag("test-etag").build());
     let complete_mpu = mock!(aws_sdk_s3::Client::complete_multipart_upload)
         .match_requests(move |req| req.mpu_object_size() == Some(expected_total))
         .then_output(|| CompleteMultipartUploadOutput::builder().build());
@@ -1884,6 +1884,119 @@ async fn test_positive_lower_bound_never_synthesizes_empty_part() {
     assert_eq!(0, complete_mpu.num_calls());
 }
 
+// --- UploadPart responses ----------------------------------------------------
+
+/// Uploads parts 1 to 3, where `part_two`, a rule matching only part 2's UploadPart, answers it
+/// without a usable ETag. Checks that the upload fails with a `ServiceError` reporting no ETag
+/// for part 2, without re-sending part 2 or completing, and returns the upload's error.
+async fn upload_failing_on_part_two(part_two: Rule) -> Error {
+    let other_parts = mock!(aws_sdk_s3::Client::upload_part)
+        .then_output(|| UploadPartOutput::builder().e_tag("test-etag").build());
+    let create_mpu = mock!(aws_sdk_s3::Client::create_multipart_upload).then_output(|| {
+        CreateMultipartUploadOutput::builder()
+            .upload_id("test-upload-id")
+            .build()
+    });
+    let complete_mpu = mock!(aws_sdk_s3::Client::complete_multipart_upload)
+        .then_output(|| CompleteMultipartUploadOutput::builder().build());
+    let client = mock_client!(
+        aws_sdk_s3,
+        RuleMode::MatchAny,
+        &[&create_mpu, &part_two, &other_parts, &complete_mpu]
+    );
+    let tm = aws_sdk_s3_transfer_manager::Client::new(
+        aws_sdk_s3_transfer_manager::Config::builder()
+            .client(client)
+            .build(),
+    );
+
+    let error = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .body(InputStream::from_part_stream(NumberedPartStream::new(&[
+            1, 2, 3,
+        ])))
+        .initiate()
+        .unwrap()
+        .join()
+        .await
+        .expect_err("a part without an ETag must fail the upload");
+
+    assert_eq!(ErrorKind::ServiceError, *error.kind());
+    let message = format!(
+        "{}",
+        aws_smithy_types::error::display::DisplayErrorContext(&error)
+    );
+    assert!(
+        message.contains("UploadPart returned no ETag for part 2"),
+        "error must name the operation and part, got: {message}"
+    );
+    assert_eq!(1, part_two.num_calls(), "part 2 must not be re-sent");
+    assert_eq!(0, complete_mpu.num_calls());
+    error
+}
+
+/// Uploads parts 1 to 3, where the UploadPart response for part 2 carries `part_two_e_tag`, and
+/// checks that the upload fails without re-sending part 2 or completing.
+async fn assert_upload_fails_on_part_two_e_tag(part_two_e_tag: Option<&'static str>) {
+    let part_two = mock!(aws_sdk_s3::Client::upload_part)
+        .match_requests(|req| req.part_number() == Some(2))
+        .then_output(move || {
+            UploadPartOutput::builder()
+                .set_e_tag(part_two_e_tag.map(str::to_owned))
+                .build()
+        });
+    upload_failing_on_part_two(part_two).await;
+}
+
+/// A successful UploadPart response without an ETag fails the upload before
+/// CompleteMultipartUpload, which could not list the part.
+#[tokio::test]
+async fn test_upload_part_without_e_tag_fails_upload() {
+    assert_upload_fails_on_part_two_e_tag(None).await;
+}
+
+/// An empty ETag identifies no part, and is treated as a missing one.
+#[tokio::test]
+async fn test_upload_part_with_empty_e_tag_fails_upload() {
+    assert_upload_fails_on_part_two_e_tag(Some("")).await;
+}
+
+/// The error for an UploadPart response without an ETag carries the operation name and the
+/// response's request ids, as an error from a failed UploadPart does.
+#[tokio::test]
+async fn test_upload_part_without_e_tag_error_carries_request_ids() {
+    const REQUEST_ID: &str = "upload-part-request-id";
+    const EXTENDED_REQUEST_ID: &str = "upload-part-extended-request-id";
+    // The output builder cannot set request ids, so part 2 is answered with a raw 200 response
+    // that carries them and no ETag.
+    let part_two = mock!(aws_sdk_s3::Client::upload_part)
+        .match_requests(|req| req.part_number() == Some(2))
+        .then_http_response(|| {
+            let mut response =
+                HttpResponse::new(StatusCode::try_from(200).unwrap(), SdkBody::empty());
+            response
+                .headers_mut()
+                .insert("x-amz-request-id", REQUEST_ID);
+            response
+                .headers_mut()
+                .insert("x-amz-id-2", EXTENDED_REQUEST_ID);
+            response
+        });
+
+    let error = upload_failing_on_part_two(part_two).await;
+
+    assert_eq!(Some("UploadPart"), error.operation_name());
+    assert_eq!(Some(REQUEST_ID), error.request_id());
+    assert_eq!(Some(EXTENDED_REQUEST_ID), error.extended_request_id());
+    let display = error.to_string();
+    assert!(
+        display.contains(REQUEST_ID),
+        "Display must include the request id, got: {display}"
+    );
+}
+
 // --- Request body ------------------------------------------------------------
 
 /// An upload without a body fails at `initiate()` and sends nothing, rather than storing an empty
@@ -2051,8 +2164,8 @@ async fn test_complete_mpu_forwards_if_match() {
         }
     });
 
-    let upload_part =
-        mock!(aws_sdk_s3::Client::upload_part).then_output(|| UploadPartOutput::builder().build());
+    let upload_part = mock!(aws_sdk_s3::Client::upload_part)
+        .then_output(|| UploadPartOutput::builder().e_tag("test-etag").build());
 
     let expected_etag = "\"expected-etag\"";
     let complete_mpu = mock!(aws_sdk_s3::Client::complete_multipart_upload)
@@ -2106,8 +2219,8 @@ async fn test_complete_mpu_412_surfaces_precondition_failed_code() {
                 .build()
         }
     });
-    let upload_part =
-        mock!(aws_sdk_s3::Client::upload_part).then_output(|| UploadPartOutput::builder().build());
+    let upload_part = mock!(aws_sdk_s3::Client::upload_part)
+        .then_output(|| UploadPartOutput::builder().e_tag("test-etag").build());
     let complete_mpu =
         mock!(aws_sdk_s3::Client::complete_multipart_upload).then_http_response(|| {
             HttpResponse::new(

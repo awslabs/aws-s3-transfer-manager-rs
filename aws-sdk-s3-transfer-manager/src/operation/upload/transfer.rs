@@ -750,6 +750,19 @@ impl UploadTransfer {
         // CompleteMultipartUpload on another worker, and that operation may
         // signal `join()` before this work item otherwise unwinds.
         drop(sdk_body);
+        // CompleteMultipartUpload identifies each part by its ETag, so a response without one is
+        // a failed part. The check runs after the retry loop, so the part is not re-sent.
+        let result = result.and_then(|resp| {
+            if resp.e_tag().is_some_and(|e_tag| !e_tag.is_empty()) {
+                Ok(resp)
+            } else {
+                Err(crate::error::invalid_service_response(
+                    "UploadPart",
+                    &resp,
+                    format!("UploadPart returned no ETag for part {part_number}"),
+                ))
+            }
+        });
         let resp = match result {
             Ok(resp) => resp,
             Err(e) => {
