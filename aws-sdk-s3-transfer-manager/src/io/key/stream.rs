@@ -300,6 +300,10 @@ fn secs_since_epoch(modified: std::io::Result<SystemTime>) -> Option<i64> {
 // Case and Unicode form pass through untouched. Folding `README` onto `readme`, or
 // rewriting a name into a different normal form, would make a key match an object
 // that is not the same object.
+// TODO(vnext): this refuses a name that is not valid UTF-8, where `upload_objects` converts it
+// lossily and sends it, so the two disagree about the same file. The transfer managers do not agree
+// with each other either, and which answer is right belongs to all of them at once.
+// See https://github.com/awslabs/aws-s3-transfer-manager-rs/pull/184#discussion_r4160494277
 fn local_key(entry: &FsEntry) -> Result<String, StreamError> {
     key_for_relative_path(entry.relative_path())
         .map(Cow::into_owned)
