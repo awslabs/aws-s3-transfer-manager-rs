@@ -158,6 +158,89 @@ impl fmt::Display for SizeHintViolation {
 
 impl std::error::Error for SizeHintViolation {}
 
+/// Largest part number S3 accepts. Part numbers run from 1 to this value.
+const MAX_PART_NUMBER: u64 = 10_000;
+
+/// A source part's number cannot identify a distinct position in the object.
+#[derive(Debug)]
+pub(crate) enum PartNumberViolation {
+    /// The number is 0; part numbers start at 1.
+    Zero,
+    /// The number is above [`MAX_PART_NUMBER`].
+    ///
+    /// Parts are claimed under the state lock after their reads return, which need not be the
+    /// order the stream yielded them. A stream that yields more than [`MAX_PART_NUMBER`] parts can
+    /// therefore have its part numbered `MAX_PART_NUMBER + 1` claimed before the part-count limit
+    /// trips, so the message names that limit and its remedy as well.
+    AboveMaximum { part_number: u64 },
+    /// The number was already used by an earlier part of the same upload.
+    Repeated { part_number: u64 },
+}
+
+impl fmt::Display for PartNumberViolation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Zero => write!(
+                formatter,
+                "upload stream produced part number 0; part numbers start at 1"
+            ),
+            Self::AboveMaximum { part_number } => write!(
+                formatter,
+                "upload stream produced part number {part_number}, above the maximum of \
+                 {MAX_PART_NUMBER} parts; number parts from 1 to {MAX_PART_NUMBER}, and combine \
+                 source data into fewer, larger parts if there are more"
+            ),
+            Self::Repeated { part_number } => write!(
+                formatter,
+                "upload stream produced part number {part_number} more than once"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PartNumberViolation {}
+
+/// Number of 64-bit words needed for one bit per valid part number.
+const PART_NUMBER_WORDS: usize = (MAX_PART_NUMBER as usize).div_ceil(u64::BITS as usize);
+
+/// The part numbers claimed so far in one multipart upload.
+///
+/// S3 uses a part's number both to identify the part and to place it in the object, so each number
+/// may be used once. One bit per valid number keeps each claim constant-time and the set's size
+/// fixed, in whatever order the numbers arrive.
+#[derive(Debug)]
+struct PartNumberSet {
+    words: Box<[u64; PART_NUMBER_WORDS]>,
+}
+
+impl PartNumberSet {
+    fn new() -> Self {
+        Self {
+            words: Box::new([0; PART_NUMBER_WORDS]),
+        }
+    }
+
+    /// Records `part_number`, or rejects it if it is out of range or already recorded.
+    ///
+    /// A rejected number leaves the set unchanged.
+    fn claim(&mut self, part_number: u64) -> Result<(), PartNumberViolation> {
+        if part_number == 0 {
+            return Err(PartNumberViolation::Zero);
+        }
+        if part_number > MAX_PART_NUMBER {
+            return Err(PartNumberViolation::AboveMaximum { part_number });
+        }
+        let index = (part_number - 1) as usize;
+        let word = &mut self.words[index / u64::BITS as usize];
+        let bit = 1u64 << (index % u64::BITS as usize);
+        if *word & bit != 0 {
+            return Err(PartNumberViolation::Repeated { part_number });
+        }
+        *word |= bit;
+        Ok(())
+    }
+}
+
 /// Validates the bounds captured before source polling begins.
 pub(crate) fn validate_size_hint(size_hint: SizeHint) -> Result<(), SizeHintViolation> {
     if let Some(upper) = size_hint.upper() {
@@ -354,6 +437,8 @@ pub(crate) struct PartTransferState {
     completed_parts: Vec<CompletedPart>,
     /// Number of `PartData` values returned by source reads.
     parts_read: u64,
+    /// Part numbers of source parts accepted for upload.
+    part_numbers: PartNumberSet,
     /// Bytes returned by source reads before UploadPart submission.
     bytes_read: u64,
     /// Bytes accepted by completed UploadPart requests.
@@ -378,6 +463,7 @@ impl PartTransferState {
             pending_reads: PendingPartReads::default(),
             completed_parts: Vec::with_capacity(completed_parts_capacity),
             parts_read: 0,
+            part_numbers: PartNumberSet::new(),
             bytes_read: 0,
             bytes_uploaded: 0,
             observability,
@@ -452,6 +538,17 @@ impl PartTransferState {
             .expect("source byte count overflow");
         self.plan.validate_progress(self.bytes_read)?;
         Ok(self.parts_read)
+    }
+
+    /// Claims a source part's number before its UploadPart request starts.
+    ///
+    /// The number is the part's position in the object. It must be between 1 and 10,000 and not
+    /// already claimed in this upload; numbers may be claimed in any order.
+    pub(crate) fn claim_part_number(
+        &mut self,
+        part_number: u64,
+    ) -> Result<(), PartNumberViolation> {
+        self.part_numbers.claim(part_number)
     }
 
     /// Records end-of-stream and returns whether this call changed source state.
@@ -708,6 +805,27 @@ mod tests {
             size_hint: SizeHint::default().with_lower(5).with_upper(Some(10)),
         };
         assert_eq!(7, bounded.mpu_object_size(7).unwrap());
+    }
+
+    #[test]
+    fn part_numbers_are_claimed_once_within_range_in_any_order() {
+        let mut numbers = PartNumberSet::new();
+        for part_number in [MAX_PART_NUMBER, 65, 64, 1, 2] {
+            numbers.claim(part_number).unwrap();
+        }
+        for part_number in [MAX_PART_NUMBER, 65, 64, 1, 2] {
+            assert!(matches!(
+                numbers.claim(part_number),
+                Err(PartNumberViolation::Repeated { part_number: n }) if n == part_number
+            ));
+        }
+        assert!(matches!(numbers.claim(0), Err(PartNumberViolation::Zero)));
+        for part_number in [MAX_PART_NUMBER + 1, (1 << 32) + 1, u64::MAX] {
+            assert!(matches!(
+                numbers.claim(part_number),
+                Err(PartNumberViolation::AboveMaximum { part_number: n }) if n == part_number
+            ));
+        }
     }
 
     #[test]

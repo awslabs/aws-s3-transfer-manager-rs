@@ -310,6 +310,13 @@ impl PartData {
     ///
     /// The data is retained without copying and uses the SDK's native
     /// contiguous request-body path.
+    ///
+    /// `part_number` is the part's position in the object: S3 assembles the
+    /// object in part-number order, whatever order the parts are produced in.
+    /// It must be between 1 and 10,000 and unique within the upload; numbers
+    /// need not be consecutive. A part that breaks this fails the upload with
+    /// [`ErrorKind::InputInvalid`](crate::error::ErrorKind::InputInvalid)
+    /// before it is sent.
     pub fn new(part_number: u64, data: impl Into<Bytes>) -> Self {
         Self::from_segmented(part_number, SegmentedBytes::from(data.into()))
     }
@@ -318,11 +325,14 @@ impl PartData {
     ///
     /// The transfer manager retains the payload's immutable owners through
     /// request retries without gathering its presentation segments.
+    ///
+    /// `part_number` is the part's position in the object: S3 assembles the
+    /// object in part-number order, whatever order the parts are produced in.
+    /// It must be between 1 and 10,000 and unique within the upload; numbers
+    /// need not be consecutive. A part that breaks this fails the upload with
+    /// [`ErrorKind::InputInvalid`](crate::error::ErrorKind::InputInvalid)
+    /// before it is sent.
     pub fn from_segmented(part_number: u64, data: SegmentedBytes) -> Self {
-        debug_assert!(
-            part_number > 0,
-            "part numbers are 1-indexed and must be greater than zero"
-        );
         Self {
             part_number,
             data,
@@ -370,6 +380,9 @@ pub trait PartStream {
     /// be shorter. Returns [`Poll::Ready(None)`](std::task::Poll::Ready) at end-of-stream. The
     /// transfer manager does not poll the stream again after end-of-stream or an error.
     ///
+    /// Each part's number is its position in the object, between 1 and 10,000 and unique within
+    /// the upload. Parts may be returned in any order (see [`PartData::new`]).
+    ///
     /// Returns [`Poll::Pending`](std::task::Poll::Pending) when the next part is not ready. Before
     /// returning `Pending`, the implementation must arrange for `cx.waker()` to be notified when
     /// polling may make progress. Partial reads, pending futures, and acquired storage must be
@@ -407,6 +420,8 @@ pub trait PartStream {
     ///
     /// Return the base64 encoding of the big-endian checksum value of the full object's data,
     /// using the algorithm specified in the [ChecksumStrategy](crate::operation::upload::ChecksumStrategy)).
+    /// The value must cover the object's bytes in part-number order, which is the order S3
+    /// assembles them in, not necessarily the order the parts were returned.
     fn full_object_checksum(&self) -> Option<String> {
         None
     }

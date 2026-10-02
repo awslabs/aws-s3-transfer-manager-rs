@@ -605,6 +605,10 @@ impl UploadTransfer {
                     ),
                 ));
             }
+            if let Err(error) = parts.claim_part_number(data.part_number) {
+                drop(state);
+                return self.fail(crate::error::invalid_input(error));
+            }
         }
 
         // A custom source that was blocked is available again. Refill the work withheld while the
@@ -665,7 +669,8 @@ impl UploadTransfer {
             }
         };
 
-        let part_num_i32 = part_number as i32;
+        let part_num_i32 = i32::try_from(part_number)
+            .expect("part numbers are checked against 1..=10,000 before UploadPart");
         self.inner.observability.observe_part_started(
             self.inner.ctx.id,
             part_number,

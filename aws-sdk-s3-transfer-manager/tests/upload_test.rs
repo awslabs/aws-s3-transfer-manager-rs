@@ -4,7 +4,7 @@
  */
 
 use std::cmp;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::ready;
 use std::{task::Poll, time::Duration};
 
@@ -14,7 +14,7 @@ use aws_sdk_s3::operation::complete_multipart_upload::{
 use aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput;
 use aws_sdk_s3::operation::put_object::{PutObjectError, PutObjectOutput};
 use aws_sdk_s3::operation::upload_part::UploadPartOutput;
-use aws_sdk_s3_transfer_manager::error::ErrorKind;
+use aws_sdk_s3_transfer_manager::error::{Error, ErrorKind};
 use aws_sdk_s3_transfer_manager::io::{
     InputStream, PartBuffer, PartData, PartStream, SizeHint, StreamContext,
 };
@@ -325,6 +325,125 @@ fn mock_s3_client_for_multipart_upload() -> aws_sdk_s3::Client {
         RuleMode::MatchAny,
         &[create_mpu, upload_part, complete_mpu]
     )
+}
+
+/// Requests a recording multipart mock received, for asserting what reached the wire.
+#[derive(Debug, Default)]
+struct MultipartRecord {
+    /// `(part number, content length)` of each UploadPart, in arrival order.
+    upload_parts: Mutex<Vec<(i32, i64)>>,
+    /// The part numbers each CompleteMultipartUpload listed.
+    completions: Mutex<Vec<Vec<i32>>>,
+}
+
+/// Builds a client whose multipart operations succeed and are recorded in `record`.
+fn recording_multipart_client(record: &Arc<MultipartRecord>) -> aws_sdk_s3::Client {
+    let create_mpu = mock!(aws_sdk_s3::Client::create_multipart_upload).then_output(|| {
+        CreateMultipartUploadOutput::builder()
+            .upload_id("test-upload-id")
+            .build()
+    });
+    let upload_part = mock!(aws_sdk_s3::Client::upload_part).then_compute_output({
+        let record = Arc::clone(record);
+        move |req| {
+            let part_number = req.part_number().expect("UploadPart carries a part number");
+            let content_length = req
+                .content_length()
+                .expect("UploadPart carries a content length");
+            record
+                .upload_parts
+                .lock()
+                .unwrap()
+                .push((part_number, content_length));
+            UploadPartOutput::builder()
+                .e_tag(format!("etag-{part_number}"))
+                .build()
+        }
+    });
+    let complete_mpu = mock!(aws_sdk_s3::Client::complete_multipart_upload).then_compute_output({
+        let record = Arc::clone(record);
+        move |req| {
+            let listed = req
+                .multipart_upload()
+                .map(|upload| {
+                    upload
+                        .parts()
+                        .iter()
+                        .filter_map(|part| part.part_number())
+                        .collect()
+                })
+                .unwrap_or_default();
+            record.completions.lock().unwrap().push(listed);
+            CompleteMultipartUploadOutput::builder().build()
+        }
+    });
+    mock_client!(
+        aws_sdk_s3,
+        RuleMode::MatchAny,
+        &[create_mpu, upload_part, complete_mpu]
+    )
+}
+
+/// A `PartStream` that yields one part per scripted part number, in script order, then
+/// end-of-stream.
+///
+/// The part at script position `i` holds `i + 1` bytes, so a recorded UploadPart's content length
+/// identifies which scripted part it carried.
+#[derive(Debug)]
+struct NumberedPartStream {
+    part_numbers: std::collections::VecDeque<u64>,
+    yielded: usize,
+}
+
+impl NumberedPartStream {
+    fn new(part_numbers: &[u64]) -> Self {
+        Self {
+            part_numbers: part_numbers.iter().copied().collect(),
+            yielded: 0,
+        }
+    }
+}
+
+impl PartStream for NumberedPartStream {
+    fn poll_part(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        _stream_cx: &StreamContext,
+    ) -> Poll<Option<std::io::Result<PartData>>> {
+        let Some(part_number) = self.part_numbers.pop_front() else {
+            return Poll::Ready(None);
+        };
+        self.yielded += 1;
+        let data = vec![0u8; self.yielded];
+        Poll::Ready(Some(Ok(PartData::new(part_number, data))))
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::default()
+    }
+}
+
+/// Uploads a `NumberedPartStream` for `part_numbers` and returns the outcome with the mock's record.
+async fn upload_numbered_parts(part_numbers: &[u64]) -> (Result<(), Error>, Arc<MultipartRecord>) {
+    let record = Arc::new(MultipartRecord::default());
+    let tm = aws_sdk_s3_transfer_manager::Client::new(
+        aws_sdk_s3_transfer_manager::Config::builder()
+            .client(recording_multipart_client(&record))
+            .build(),
+    );
+    let result = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .body(InputStream::from_part_stream(NumberedPartStream::new(
+            part_numbers,
+        )))
+        .initiate()
+        .unwrap()
+        .join()
+        .await
+        .map(|_| ());
+    (result, record)
 }
 
 /// Runs one valid zero-byte multipart source and verifies that the transfer sends exactly one empty
@@ -1496,6 +1615,77 @@ async fn test_unknown_length_exactly_max_parts_succeeds() {
         .join()
         .await
         .expect("a stream of exactly the maximum part count must upload");
+}
+
+/// A part number S3 cannot use as a distinct position fails the upload before that part is sent.
+///
+/// 0 and 10,001 are outside S3's range. 2^32 + 1 is too, and narrowing it to 32 bits would place
+/// the part at position 1. A repeated number would replace the earlier part.
+#[tokio::test]
+async fn test_part_numbers_outside_range_or_repeated_fail_before_upload_part() {
+    for (part_numbers, rejected) in [
+        (&[0][..], 0u64),
+        (&[10_001], 10_001),
+        (&[(1 << 32) + 1], (1 << 32) + 1),
+        (&[1, 1], 1),
+    ] {
+        let (result, record) = upload_numbered_parts(part_numbers).await;
+
+        let error = result.expect_err("an unusable part number must fail the upload");
+        assert_eq!(
+            ErrorKind::InputInvalid,
+            *error.kind(),
+            "part numbers {part_numbers:?}"
+        );
+        let message = format!(
+            "{}",
+            aws_smithy_types::error::display::DisplayErrorContext(&error)
+        );
+        assert!(
+            message.contains(&format!("part number {rejected}")),
+            "error must name the rejected part number, got: {message}"
+        );
+
+        // Only a part claimed before the rejected one may have been sent.
+        let upload_parts = record.upload_parts.lock().unwrap().clone();
+        let valid_prefix = part_numbers.len() - 1;
+        assert!(
+            upload_parts.len() <= valid_prefix,
+            "part numbers {part_numbers:?} sent {upload_parts:?}"
+        );
+        assert!(
+            record.completions.lock().unwrap().is_empty(),
+            "part numbers {part_numbers:?} must not complete the upload"
+        );
+    }
+}
+
+/// Part numbers within S3's range reach UploadPart and CompleteMultipartUpload unchanged, with each
+/// part's data, whatever order the stream yields them in.
+#[tokio::test]
+async fn test_part_numbers_in_range_reach_the_wire_in_any_order() {
+    for part_numbers in [&[1, 2, 3][..], &[2, 1]] {
+        let (result, record) = upload_numbered_parts(part_numbers).await;
+        result.expect("unique part numbers within range must upload");
+
+        let mut expected: Vec<(i32, i64)> = part_numbers
+            .iter()
+            .enumerate()
+            .map(|(position, &part_number)| (part_number as i32, position as i64 + 1))
+            .collect();
+        expected.sort_unstable();
+        let mut upload_parts = record.upload_parts.lock().unwrap().clone();
+        upload_parts.sort_unstable();
+        assert_eq!(expected, upload_parts, "part numbers {part_numbers:?}");
+
+        let mut listed: Vec<i32> = part_numbers.iter().map(|&n| n as i32).collect();
+        listed.sort_unstable();
+        assert_eq!(
+            vec![listed],
+            *record.completions.lock().unwrap(),
+            "CompleteMultipartUpload must list every part in part-number order"
+        );
+    }
 }
 
 /// A positive lower bound rejects an empty source without synthesizing a part.
