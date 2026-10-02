@@ -45,7 +45,13 @@ pub struct UploadInput {
     pub content_encoding: Option<String>,
     /// <p>The language the content is in.</p>
     pub content_language: Option<String>,
-    /// <p>Size of the body in bytes. This parameter is useful when the size of the body cannot be determined automatically. For more information, see <a href="https://www.rfc-editor.org/rfc/rfc9110.html#name-content-length">https://www.rfc-editor.org/rfc/rfc9110.html#name-content-length</a>.</p>
+    /// The exact size of the body in bytes.
+    ///
+    /// When set, the body must produce exactly this many bytes, and a mismatch fails the upload.
+    /// A negative value, or one outside the body's [size hint](crate::io::InputStream::size_hint),
+    /// fails when the upload is initiated. A [`PartStream`](crate::io::PartStream) body that runs
+    /// past the value fails before the part that exceeds it is sent, and one that ends short of
+    /// it fails before CompleteMultipartUpload is sent.
     pub content_length: Option<i64>,
     /// <p>The base64-encoded 128-bit MD5 digest of the message (without the headers) according to RFC 1864. This header can be used as a message integrity check to verify that the data is the same data that was originally sent. Although it is optional, we recommend using the Content-MD5 mechanism as an end-to-end integrity check. For more information about REST request authentication, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/dev/RESTAuthentication.html">REST Authentication</a>.</p><note>
     /// <p>The <code>Content-MD5</code> header is required for any request to upload an object with a retention period configured using Amazon S3 Object Lock. For more information about Amazon S3 Object Lock, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/dev/object-lock-overview.html">Amazon S3 Object Lock Overview</a> in the <i>Amazon S3 User Guide</i>.</p>
@@ -236,7 +242,13 @@ impl UploadInput {
     pub fn content_language(&self) -> Option<&str> {
         self.content_language.as_deref()
     }
-    /// <p>Size of the body in bytes. This parameter is useful when the size of the body cannot be determined automatically. For more information, see <a href="https://www.rfc-editor.org/rfc/rfc9110.html#name-content-length">https://www.rfc-editor.org/rfc/rfc9110.html#name-content-length</a>.</p>
+    /// The exact size of the body in bytes.
+    ///
+    /// When set, the body must produce exactly this many bytes, and a mismatch fails the upload.
+    /// A negative value, or one outside the body's [size hint](crate::io::InputStream::size_hint),
+    /// fails when the upload is initiated. A [`PartStream`](crate::io::PartStream) body that runs
+    /// past the value fails before the part that exceeds it is sent, and one that ends short of
+    /// it fails before CompleteMultipartUpload is sent.
     pub fn content_length(&self) -> Option<i64> {
         self.content_length
     }
@@ -685,17 +697,35 @@ impl UploadInputBuilder {
     pub fn get_content_language(&self) -> Option<&str> {
         self.content_language.as_deref()
     }
-    /// <p>Size of the body in bytes. This parameter is useful when the size of the body cannot be determined automatically. For more information, see <a href="https://www.rfc-editor.org/rfc/rfc9110.html#name-content-length">https://www.rfc-editor.org/rfc/rfc9110.html#name-content-length</a>.</p>
+    /// The exact size of the body in bytes.
+    ///
+    /// When set, the body must produce exactly this many bytes, and a mismatch fails the upload.
+    /// A negative value, or one outside the body's [size hint](crate::io::InputStream::size_hint),
+    /// fails when the upload is initiated. A [`PartStream`](crate::io::PartStream) body that runs
+    /// past the value fails before the part that exceeds it is sent, and one that ends short of
+    /// it fails before CompleteMultipartUpload is sent.
     pub fn content_length(mut self, input: i64) -> Self {
         self.content_length = Some(input);
         self
     }
-    /// <p>Size of the body in bytes. This parameter is useful when the size of the body cannot be determined automatically. For more information, see <a href="https://www.rfc-editor.org/rfc/rfc9110.html#name-content-length">https://www.rfc-editor.org/rfc/rfc9110.html#name-content-length</a>.</p>
+    /// The exact size of the body in bytes.
+    ///
+    /// When set, the body must produce exactly this many bytes, and a mismatch fails the upload.
+    /// A negative value, or one outside the body's [size hint](crate::io::InputStream::size_hint),
+    /// fails when the upload is initiated. A [`PartStream`](crate::io::PartStream) body that runs
+    /// past the value fails before the part that exceeds it is sent, and one that ends short of
+    /// it fails before CompleteMultipartUpload is sent.
     pub fn set_content_length(mut self, input: Option<i64>) -> Self {
         self.content_length = input;
         self
     }
-    /// <p>Size of the body in bytes. This parameter is useful when the size of the body cannot be determined automatically. For more information, see <a href="https://www.rfc-editor.org/rfc/rfc9110.html#name-content-length">https://www.rfc-editor.org/rfc/rfc9110.html#name-content-length</a>.</p>
+    /// The exact size of the body in bytes.
+    ///
+    /// When set, the body must produce exactly this many bytes, and a mismatch fails the upload.
+    /// A negative value, or one outside the body's [size hint](crate::io::InputStream::size_hint),
+    /// fails when the upload is initiated. A [`PartStream`](crate::io::PartStream) body that runs
+    /// past the value fails before the part that exceeds it is sent, and one that ends short of
+    /// it fails before CompleteMultipartUpload is sent.
     pub fn get_content_length(&self) -> &Option<i64> {
         &self.content_length
     }

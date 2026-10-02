@@ -44,8 +44,8 @@ use crate::error::{Error, ErrorKind};
 use crate::io::part_reader::{Builder as PartReaderBuilder, PartReadStart};
 use crate::io::{InputStream, PartData};
 use crate::operation::upload::context::{
-    validate_size_hint, MultipartCompletion, PartPlan, PartReadWake, PartTransferState,
-    PendingPartRead, UploadPartWork, UploadState,
+    apply_content_length, validate_size_hint, MultipartCompletion, PartPlan, PartReadWake,
+    PartTransferState, PendingPartRead, UploadPartWork, UploadState,
 };
 use crate::operation::upload::input::convert::{
     copy_fields_to_mpu_request, copy_fields_to_upload_part_request,
@@ -123,6 +123,10 @@ impl UploadTransfer {
     ) -> Result<Self, Error> {
         let size_hint = stream.size_hint();
         validate_size_hint(size_hint).map_err(crate::error::invalid_input)?;
+        // A declared content length replaces the body's bounds, so the size checks while reading
+        // and at completion hold the body to exactly that many bytes.
+        let size_hint = apply_content_length(size_hint, request.content_length())
+            .map_err(crate::error::invalid_input)?;
         let observability =
             UploadObservability::new(ctx.handle.config.diagnostics().transfer(), size_hint);
 

@@ -127,12 +127,31 @@ impl PartPlan {
     }
 }
 
-/// A caller-provided stream contradicted its declared size bounds.
+/// A caller's size declarations contradict each other, or the stream contradicted them.
 #[derive(Debug)]
 pub(crate) enum SizeHintViolation {
-    InvalidBounds { lower: u64, upper: u64 },
-    BelowLower { actual: u64, lower: u64 },
-    AboveUpper { actual: u64, upper: u64 },
+    InvalidBounds {
+        lower: u64,
+        upper: u64,
+    },
+    BelowLower {
+        actual: u64,
+        lower: u64,
+    },
+    AboveUpper {
+        actual: u64,
+        upper: u64,
+    },
+    /// The request's `content_length` is negative.
+    NegativeContentLength {
+        content_length: i64,
+    },
+    /// The request's `content_length` lies outside the body's own size bounds.
+    ContentLengthOutsideBounds {
+        content_length: u64,
+        lower: u64,
+        upper: Option<u64>,
+    },
 }
 
 impl fmt::Display for SizeHintViolation {
@@ -141,6 +160,39 @@ impl fmt::Display for SizeHintViolation {
             Self::InvalidBounds { lower, upper } => write!(
                 formatter,
                 "upload stream lower size bound {lower} exceeds upper bound {upper}"
+            ),
+            Self::NegativeContentLength { content_length } => {
+                write!(
+                    formatter,
+                    "upload content_length {content_length} is negative"
+                )
+            }
+            Self::ContentLengthOutsideBounds {
+                content_length,
+                lower,
+                upper: Some(upper),
+            } if lower == upper => write!(
+                formatter,
+                "upload content_length {content_length} does not match the body's size of \
+                 {lower} bytes"
+            ),
+            Self::ContentLengthOutsideBounds {
+                content_length,
+                lower,
+                upper: Some(upper),
+            } => write!(
+                formatter,
+                "upload content_length {content_length} is outside the body's size bounds of \
+                 {lower} to {upper} bytes"
+            ),
+            Self::ContentLengthOutsideBounds {
+                content_length,
+                lower,
+                upper: None,
+            } => write!(
+                formatter,
+                "upload content_length {content_length} is below the body's lower size bound of \
+                 {lower} bytes"
             ),
             Self::BelowLower { actual, lower } => write!(
                 formatter,
@@ -252,6 +304,32 @@ pub(crate) fn validate_size_hint(size_hint: SizeHint) -> Result<(), SizeHintViol
         }
     }
     Ok(())
+}
+
+/// Narrows a body's size bounds to the request's declared `content_length`.
+///
+/// A declared length is the exact number of bytes the body must produce, so the result is
+/// [`SizeHint::exact`] of that length; with no declaration, `size_hint` is returned unchanged.
+/// `size_hint` must already have passed [`validate_size_hint`]. A negative length, or one outside
+/// `size_hint`'s bounds, is rejected.
+pub(crate) fn apply_content_length(
+    size_hint: SizeHint,
+    content_length: Option<i64>,
+) -> Result<SizeHint, SizeHintViolation> {
+    let Some(content_length) = content_length else {
+        return Ok(size_hint);
+    };
+    let declared = u64::try_from(content_length)
+        .map_err(|_| SizeHintViolation::NegativeContentLength { content_length })?;
+    let within_upper = size_hint.upper().is_none_or(|upper| declared <= upper);
+    if declared < size_hint.lower() || !within_upper {
+        return Err(SizeHintViolation::ContentLengthOutsideBounds {
+            content_length: declared,
+            lower: size_hint.lower(),
+            upper: size_hint.upper(),
+        });
+    }
+    Ok(SizeHint::exact(declared))
 }
 
 /// Preserves source wakeups while a pending part read moves back into transfer state.
@@ -805,6 +883,38 @@ mod tests {
             size_hint: SizeHint::default().with_lower(5).with_upper(Some(10)),
         };
         assert_eq!(7, bounded.mpu_object_size(7).unwrap());
+    }
+
+    #[test]
+    fn content_length_narrows_bounds_to_an_exact_size() {
+        let bounds = |hint: SizeHint| (hint.lower(), hint.upper());
+        let bounded = SizeHint::default().with_lower(5).with_upper(Some(10));
+        assert_eq!(
+            (5, Some(10)),
+            bounds(apply_content_length(bounded, None).unwrap())
+        );
+        for content_length in [5, 7, 10] {
+            let declared = content_length as u64;
+            assert_eq!(
+                (declared, Some(declared)),
+                bounds(apply_content_length(bounded, Some(content_length)).unwrap())
+            );
+        }
+        for content_length in [4, 11] {
+            assert!(matches!(
+                apply_content_length(bounded, Some(content_length)),
+                Err(SizeHintViolation::ContentLengthOutsideBounds { .. })
+            ));
+        }
+        assert!(matches!(
+            apply_content_length(SizeHint::default(), Some(-1)),
+            Err(SizeHintViolation::NegativeContentLength { content_length: -1 })
+        ));
+        let largest = i64::MAX as u64;
+        assert_eq!(
+            (largest, Some(largest)),
+            bounds(apply_content_length(SizeHint::default(), Some(i64::MAX)).unwrap())
+        );
     }
 
     #[test]

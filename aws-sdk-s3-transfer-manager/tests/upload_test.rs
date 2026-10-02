@@ -1154,6 +1154,135 @@ fn test_stream_rejects_lower_bound_above_upper_bound() {
     assert_eq!(*error.kind(), ErrorKind::InputInvalid);
 }
 
+/// Outcome of [`upload_with_content_length`].
+struct DeclaredLengthUpload {
+    result: Result<(), Error>,
+    upload_part_calls: usize,
+    /// `MpuObjectSize` of each CompleteMultipartUpload sent.
+    completions: Vec<Option<i64>>,
+}
+
+/// Uploads `produced` bytes, as one part, from a stream with no size bounds, on a request that
+/// declares `content_length`.
+async fn upload_with_content_length(content_length: i64, produced: usize) -> DeclaredLengthUpload {
+    let create_mpu = mock!(aws_sdk_s3::Client::create_multipart_upload).then_output(|| {
+        CreateMultipartUploadOutput::builder()
+            .upload_id("test-upload-id")
+            .build()
+    });
+    let upload_part = mock!(aws_sdk_s3::Client::upload_part)
+        .then_output(|| UploadPartOutput::builder().e_tag("test-etag").build());
+    let completions = Arc::new(Mutex::new(Vec::new()));
+    let complete_mpu = mock!(aws_sdk_s3::Client::complete_multipart_upload).then_compute_output({
+        let completions = Arc::clone(&completions);
+        move |req| {
+            completions.lock().unwrap().push(req.mpu_object_size());
+            CompleteMultipartUploadOutput::builder().build()
+        }
+    });
+    let client = mock_client!(
+        aws_sdk_s3,
+        RuleMode::MatchAny,
+        &[&create_mpu, &upload_part, &complete_mpu]
+    );
+    let tm = aws_sdk_s3_transfer_manager::Client::new(
+        aws_sdk_s3_transfer_manager::Config::builder()
+            .client(client)
+            .build(),
+    );
+
+    let (tx, rx) = mpsc::channel(1);
+    let handle = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .content_length(content_length)
+        .body(InputStream::from_part_stream(TestStream::with_size_hint(
+            rx,
+            SizeHint::default(),
+        )))
+        .initiate()
+        .unwrap();
+    tx.send(Bytes::from(vec![0u8; produced])).await.unwrap();
+    drop(tx);
+    let result = handle.join().await.map(|_| ());
+
+    let completions = completions.lock().unwrap().clone();
+    DeclaredLengthUpload {
+        result,
+        upload_part_calls: upload_part.num_calls(),
+        completions,
+    }
+}
+
+/// A stream with no size bounds that ends short of the declared `content_length` fails before
+/// CompleteMultipartUpload, rather than storing the short object.
+#[tokio::test]
+async fn test_content_length_rejects_short_stream_before_completion() {
+    let upload = upload_with_content_length(10, 5).await;
+    let error = upload
+        .result
+        .expect_err("a stream ending below its content_length must fail");
+    assert_eq!(ErrorKind::InputInvalid, *error.kind());
+    assert!(upload.completions.is_empty());
+}
+
+/// A stream with no size bounds that runs past the declared `content_length` fails before the part
+/// that exceeds it is sent.
+#[tokio::test]
+async fn test_content_length_rejects_long_stream_before_upload_part() {
+    let upload = upload_with_content_length(10, 11).await;
+    let error = upload
+        .result
+        .expect_err("a stream running past its content_length must fail");
+    assert_eq!(ErrorKind::InputInvalid, *error.kind());
+    assert_eq!(0, upload.upload_part_calls);
+    assert!(upload.completions.is_empty());
+}
+
+/// A stream that produces exactly the declared `content_length` uploads, and CompleteMultipartUpload
+/// carries the declaration as `MpuObjectSize`.
+#[tokio::test]
+async fn test_content_length_matching_stream_uploads() {
+    let upload = upload_with_content_length(10, 10).await;
+    upload
+        .result
+        .expect("a stream producing exactly its content_length must upload");
+    assert_eq!(vec![Some(10)], upload.completions);
+}
+
+/// A `content_length` that is negative or contradicts the body's own size fails at `initiate()`.
+#[tokio::test]
+async fn test_content_length_contradicting_body_fails_at_initiate() {
+    let tm = aws_sdk_s3_transfer_manager::Client::new(
+        aws_sdk_s3_transfer_manager::Config::builder()
+            .client(mock_client!(aws_sdk_s3, []))
+            .build(),
+    );
+    let initiate = |content_length: i64, body: InputStream| {
+        tm.upload()
+            .bucket("test-bucket")
+            .key("test-key")
+            .content_length(content_length)
+            .body(body)
+            .initiate()
+            .map(|_| ())
+    };
+
+    let (_tx, rx) = mpsc::channel(1);
+    let exact_stream = InputStream::from_part_stream(TestStream::exact(rx, 5));
+    let error = initiate(10, exact_stream).expect_err("content_length above an exact hint");
+    assert_eq!(ErrorKind::InputInvalid, *error.kind());
+
+    let error = initiate(5, InputStream::from_static(b"abc"))
+        .expect_err("content_length above an in-memory body's length");
+    assert_eq!(ErrorKind::InputInvalid, *error.kind());
+
+    let error =
+        initiate(-1, InputStream::from_static(b"abc")).expect_err("negative content_length");
+    assert_eq!(ErrorKind::InputInvalid, *error.kind());
+}
+
 /// A stream that yields data must never *also* send an empty part 1.
 ///
 /// The empty-part rule only applies when the stream turned out to be empty. Parts
