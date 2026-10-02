@@ -14,6 +14,13 @@ descriptions for more information.
 
 ## Development
 
+### Modeled API tooling
+
+Developer-only model tooling is documented in
+[s3-tm-model-codegen](tools/codegen/s3-tm-model-codegen/README.md).
+Run `just --list` for available shorthand commands. Normal Cargo builds do not
+run this tooling.
+
 **Run all tests**
 
 ```sh

@@ -1,0 +1,14 @@
+#!/bin/sh
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+set -eu
+project_directory=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+if [ -n "${JAVA_HOME:-}" ]; then
+    java_command="$JAVA_HOME/bin/java"
+else
+    java_command=java
+fi
+exec "$java_command" -Xmx64m -Xms64m \
+    -classpath "$project_directory/gradle/wrapper/gradle-wrapper.jar" \
+    org.gradle.wrapper.GradleWrapperMain "$@"
