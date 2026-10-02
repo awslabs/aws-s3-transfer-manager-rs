@@ -52,6 +52,7 @@ jobs:
       - dial9-build
       - miri
       - loom
+      - semver
     steps:
       - name: Verify required results
         env:
@@ -566,18 +567,26 @@ jobs:
           if-no-files-found: ignore
           retention-days: 30
 
-  # TODO - re-enable semver check once released
-  # semver:
-  #   name: semver
-  #   needs: basics
-  #   runs-on: ubuntu-24.04
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - name: Check semver
-  #       uses: obi1kenobi/cargo-semver-checks-action@v2
-  #       with:
-  #         rust-toolchain: ${{ env.rust_stable }}
-  #         release-type: minor
+  semver:
+    name: semver
+    needs: basics
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      # The checker includes optional features; dial9 needs Tokio's unstable API.
+      RUSTFLAGS: "-Dwarnings --cfg tokio_unstable"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check semver
+        uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          manifest-path: aws-sdk-s3-transfer-manager/Cargo.toml
+          package: aws-sdk-s3-transfer-manager
+          feature-group: all-features
+          rust-toolchain: ${{ env.rust_stable }}
+          # Use the latest published version as the baseline and infer the
+          # required compatibility from the crate's version bump. This permits
+          # intentional 0.x minor and 1.x major breaking releases.
 
   features:
     name: features
