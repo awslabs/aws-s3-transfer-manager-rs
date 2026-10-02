@@ -66,6 +66,12 @@ impl DownloadFluentBuilder {
     /// removing any previous tail. The file cursor is ignored. Append and
     /// nonzero destination offsets are not supported by this operation.
     ///
+    /// On Unix platforms, a file that is open in append mode (`O_APPEND`, as
+    /// set by [`OpenOptions::append`](std::fs::OpenOptions::append)) when this
+    /// method is called is rejected with
+    /// [`ErrorKind::InputInvalid`](crate::error::ErrorKind::InputInvalid). No
+    /// request is sent, and the file is not modified.
+    ///
     /// On failure or cancellation, the file may contain a noncontiguous mixture
     /// of downloaded and previous data, and positioned writes may have extended
     /// it. Treat its contents as invalid unless [`ManagedDownloadHandle::join`]

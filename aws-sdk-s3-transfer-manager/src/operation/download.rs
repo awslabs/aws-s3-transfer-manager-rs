@@ -127,6 +127,11 @@ impl Download {
     ///
     /// The destination sink is created by `sinks` over `file`. The caller owns
     /// `file`, so it is not preallocated.
+    ///
+    /// Returns [`ErrorKind::InputInvalid`](error::ErrorKind::InputInvalid)
+    /// when [`check_positional_destination`](crate::io::fs::check_positional_destination)
+    /// fails for `file`. That happens before the transfer is scheduled, so no
+    /// request is sent and `file` is not written.
     #[cfg(any(unix, windows))]
     pub(crate) fn orchestrate_to_file(
         handle: Arc<crate::client::Handle>,
@@ -134,6 +139,7 @@ impl Download {
         file: std::fs::File,
         sinks: &dyn sink::SinkFactory,
     ) -> Result<ManagedDownloadHandle, error::Error> {
+        crate::io::fs::check_positional_destination(&file).map_err(error::invalid_input)?;
         let inner = Self::orchestrate_with_sink(handle, input, sinks.create(file, false), None)?;
         // No temp/dest paths — caller manages the file lifecycle
         Ok(ManagedDownloadHandle::new_unmanaged(inner))

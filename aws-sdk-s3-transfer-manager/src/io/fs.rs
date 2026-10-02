@@ -189,6 +189,20 @@ pub(crate) fn preallocate(file: &File, len: u64) -> io::Result<()> {
     sys::preallocate(file, len)
 }
 
+/// Confirms that positioned writes to `file` will land at their offsets.
+///
+/// On Unix, returns [`io::ErrorKind::InvalidInput`] when the open file
+/// description has `O_APPEND` set. Linux and Android append every positioned
+/// write to such a file regardless of its offset, so written ranges would be
+/// reordered without an error. A failure to read the descriptor's flags is
+/// returned as is.
+///
+/// The result describes the flags at the time of the call. Other platforms,
+/// and Miri, return `Ok(())` without inspecting the handle.
+pub(crate) fn check_positional_destination(file: &File) -> io::Result<()> {
+    sys::check_positional_destination(file)
+}
+
 #[cfg(all(unix, not(miri)))]
 mod sys {
     //! Native Unix positioned I/O.
@@ -238,6 +252,20 @@ mod sys {
     pub(super) fn preallocate(file: &File, len: u64) -> io::Result<()> {
         file.set_len(len)
     }
+
+    /// Rejects a descriptor whose status flags include `O_APPEND`.
+    pub(super) fn check_positional_destination(file: &File) -> io::Result<()> {
+        use nix::fcntl::{fcntl, FcntlArg, OFlag};
+
+        let flags = fcntl(file.as_fd(), FcntlArg::F_GETFL).map_err(io::Error::from)?;
+        if OFlag::from_bits_truncate(flags).contains(OFlag::O_APPEND) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "destination file is open in append mode, which write_to_file does not support",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(all(unix, miri))]
@@ -266,6 +294,10 @@ mod sys {
 
     pub(super) fn preallocate(file: &File, len: u64) -> io::Result<()> {
         file.set_len(len)
+    }
+
+    pub(super) fn check_positional_destination(_file: &File) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -298,6 +330,13 @@ mod sys {
         // posix_fallocate guarantees ENOSPC at preallocate time.
         file.set_len(len)
     }
+
+    pub(super) fn check_positional_destination(_file: &File) -> io::Result<()> {
+        // Windows has no O_APPEND: std's append mode opens the handle with
+        // append-only access instead. Detecting that needs a query of the
+        // handle's granted access, which this module does not make.
+        Ok(())
+    }
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -323,6 +362,10 @@ mod sys {
     }
 
     pub(super) fn preallocate(_file: &File, _len: u64) -> io::Result<()> {
+        Ok(())
+    }
+
+    pub(super) fn check_positional_destination(_file: &File) -> io::Result<()> {
         Ok(())
     }
 }
@@ -489,6 +532,55 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert_eq!(input.as_ref(), b"x");
         assert_eq!(tmp.as_file().metadata().unwrap().len(), 0);
+    }
+
+    #[cfg(unix)]
+    #[cfg_attr(miri, ignore)] // the Miri build does not inspect descriptor flags
+    #[test]
+    fn check_positional_destination_rejects_append_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = File::options()
+            .append(true)
+            .create(true)
+            .open(dir.path().join("out.bin"))
+            .unwrap();
+
+        let error = check_positional_destination(&file).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[cfg(unix)]
+    #[cfg_attr(miri, ignore)] // the Miri build does not inspect descriptor flags
+    #[test]
+    fn check_positional_destination_rejects_append_flag_set_after_open() {
+        use nix::fcntl::{fcntl, FcntlArg, OFlag};
+        use std::os::unix::io::AsFd;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = File::create(dir.path().join("out.bin")).unwrap();
+        check_positional_destination(&file).unwrap();
+
+        let flags = OFlag::from_bits_truncate(fcntl(file.as_fd(), FcntlArg::F_GETFL).unwrap());
+        fcntl(file.as_fd(), FcntlArg::F_SETFL(flags | OFlag::O_APPEND)).unwrap();
+        let error = check_positional_destination(&file).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[cfg(unix)]
+    #[cfg_attr(miri, ignore)] // the Miri build does not inspect descriptor flags
+    #[test]
+    fn check_positional_destination_accepts_positional_handles() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.bin");
+
+        let created = File::create(&path).unwrap();
+        check_positional_destination(&created).unwrap();
+        let read_write = File::options().read(true).write(true).open(&path).unwrap();
+        check_positional_destination(&read_write).unwrap();
+        let read_only = File::open(&path).unwrap();
+        check_positional_destination(&read_only).unwrap();
     }
 
     #[test]

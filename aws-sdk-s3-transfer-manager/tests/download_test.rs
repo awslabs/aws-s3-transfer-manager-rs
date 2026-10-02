@@ -808,6 +808,37 @@ async fn test_download_write_to_path_error_cleans_up() {
     assert!(tmp_files.is_empty(), "leftover temp files: {:?}", tmp_files);
 }
 
+/// `write_to_file` rejects a destination opened in append mode before sending
+/// any request, and leaves the file's contents as they were.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_download_write_to_file_rejects_append_mode() {
+    let data = rand_data(10 * ByteUnit::Mebibyte.as_bytes_usize());
+    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let (tm, http_client) = simple_test_tm(&data, part_size);
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("output.dat");
+    let header = rand_data(4096);
+    std::fs::write(&path, &header).unwrap();
+    let file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap();
+
+    let error = tm
+        .download()
+        .bucket("test-bucket")
+        .key("test-object")
+        .write_to_file(file)
+        .expect_err("an append-mode destination must be rejected");
+
+    assert_eq!(error.kind(), &ErrorKind::InputInvalid);
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), header.len() as u64);
+    assert_eq!(std::fs::read(&path).unwrap(), header.as_ref());
+    assert_eq!(http_client.actual_requests().count(), 0);
+}
+
 /// Download requests carry `x-amz-checksum-mode: ENABLED` by default. The SDK's
 /// GetObject operation auto-enables it when the client resolves
 /// `ResponseChecksumValidation` to `WHEN_SUPPORTED` (the default), so the TM gets
