@@ -23,7 +23,9 @@ pin_project! {
     /// across `Poll::Pending`; a completed part is published without copying.
     ///
     /// The inner reader must fill the [`ReadBuf`](tokio::io::ReadBuf) it is
-    /// given. A read that fills a different buffer fails the upload.
+    /// given. A read that fills a different buffer fails the upload. The first
+    /// read that returns no data ends the stream, and the reader is not polled
+    /// after it.
     ///
     /// # Examples
     ///
@@ -43,6 +45,9 @@ pin_project! {
         size_hint: SizeHint,
         buffer: Option<PartBuffer>,
         next_part: u64,
+        // Set by the first zero-byte read. The reader is not polled again after it, so data a
+        // source produces after end-of-file is never uploaded.
+        eof: bool,
     }
 }
 
@@ -54,6 +59,7 @@ impl<T> TokioIo<T> {
             size_hint,
             buffer: None,
             next_part: 1,
+            eof: false,
         }
     }
 
@@ -79,6 +85,9 @@ where
     ) -> std::task::Poll<Option<std::io::Result<PartData>>> {
         use bytes::BufMut;
         let mut this = self.project();
+        if *this.eof {
+            return Poll::Ready(None);
+        }
         let part_buffer = this.buffer.get_or_insert_with(|| stream_cx.part_buffer());
         match part_buffer.poll_acquire(cx, stream_cx.part_size()) {
             Poll::Pending => return Poll::Pending,
@@ -114,7 +123,9 @@ where
                                 "TokioIo reader replaced the ReadBuf it was given",
                             ))));
                         }
-                        if n > 0 {
+                        if n == 0 {
+                            *this.eof = true;
+                        } else {
                             // SAFETY: the filled region is the first `n` bytes of `dst`.
                             // `ReadBuf::uninit` marked none of `dst` initialized, and `ReadBuf`
                             // only marks initialized bytes as filled, so this read wrote them.
@@ -134,8 +145,8 @@ where
                                 .freeze();
                             let part_number = *this.next_part;
                             *this.next_part += 1;
-                            // We don't know whether this is the last part data, since determining that
-                            // would require an additional `poll_read`.
+                            // Parts are not marked last: for a full part, that would need another
+                            // `poll_read`.
                             let part = PartData::from_segmented(part_number, data);
                             return Poll::Ready(Some(Ok(part)));
                         } else if n == 0 {
@@ -344,5 +355,56 @@ mod tests {
         let carrier_size = test_stream_cx(1).1.carrier_size();
         let (stream_cx, pool) = test_stream_cx(4 * carrier_size);
         assert_replaced_buffer_rejected(&stream_cx, &pool, 2 * carrier_size);
+    }
+
+    /// A reader that plays back a script of reads, where `Some(bytes)` returns those bytes and
+    /// `None` reports end-of-file, and counts how often it is polled.
+    struct ScriptedReader {
+        script: std::collections::VecDeque<Option<&'static [u8]>>,
+        polls: usize,
+    }
+
+    impl tokio::io::AsyncRead for ScriptedReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            self.polls += 1;
+            if let Some(Some(bytes)) = self.script.pop_front() {
+                buf.put_slice(bytes);
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// The adapter stops at the reader's first end-of-file, as tokio-util's `ReaderStream` does,
+    /// so data the source produces afterwards is not uploaded.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn test_tokio_adapter_stops_at_first_end_of_file() {
+        let (stream_cx, pool) = test_stream_cx(10);
+        let reader = ScriptedReader {
+            script: [Some(&b"abc"[..]), None, Some(&b"def"[..]), None].into(),
+            polls: 0,
+        };
+        let mut io = pin!(TokioIo::new(reader, SizeHint::default()));
+        let (waker, _) = new_count_waker();
+        let mut task_cx = Context::from_waker(&waker);
+
+        let part = assert_ready!(io.as_mut().poll_part(&mut task_cx, &stream_cx))
+            .unwrap()
+            .unwrap();
+        assert_eq!(PartData::new(1, "abc"), part);
+        drop(part);
+
+        let result = assert_ready!(io.as_mut().poll_part(&mut task_cx, &stream_cx));
+        assert!(result.is_none(), "expected end-of-stream, got {result:?}");
+        assert_eq!(
+            2,
+            io.inner().polls,
+            "the reader must not be read after end-of-file"
+        );
+        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
     }
 }
