@@ -446,13 +446,20 @@ impl ManagedDownloadHandle {
         self.inner.transfer.ctx().metrics()
     }
 
-    async fn finalize(&self) -> std::io::Result<()> {
+    /// Renames the temporary file to the destination, if this handle has one.
+    ///
+    /// After a successful rename the handle no longer holds the temporary
+    /// path, so neither [`cleanup`](Self::cleanup) nor drop removes a file at
+    /// that name. Once renamed, the name is free, and another download may
+    /// have created its own file there.
+    async fn finalize(&mut self) -> std::io::Result<()> {
         if let (Some(temp), Some(dest)) = (&self.temp_path, &self.dest_path) {
             // TODO(vnext): consider an opt-in download durability policy. Managed
             // path downloads would sync file data before rename and the parent
             // directory after rename where supported. The latency and cross-platform
             // semantics make this a client/API policy rather than the default.
             tokio::fs::rename(temp, dest).await?;
+            self.temp_path = None;
         }
         Ok(())
     }
@@ -578,5 +585,29 @@ mod tests {
             !dest.exists(),
             "dest file must not be created on cancellation"
         );
+    }
+
+    /// Once `finalize` has renamed the temporary file, dropping the handle
+    /// must not remove a file another download has since created under the
+    /// same temporary name. `join` consumes the handle right after
+    /// `finalize`, so this drives `finalize` and the drop directly.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_managed_download_drop_after_rename_keeps_file_at_temp_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out.dat");
+        let temp = dir.path().join("out.dat.s3tmp.0000abcd");
+        std::fs::write(&temp, b"object").unwrap();
+
+        let (inner, _consumer) = make_cancelled_download_inner();
+        let mut managed = ManagedDownloadHandle::new(inner, temp.clone(), dest.clone());
+        managed.finalize().await.unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"object");
+
+        std::fs::write(&temp, b"another download").unwrap();
+        drop(managed);
+
+        assert_eq!(std::fs::read(&temp).unwrap(), b"another download");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"object");
     }
 }

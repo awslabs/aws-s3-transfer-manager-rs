@@ -44,6 +44,8 @@ pub use output::DownloadOutput;
 pub(crate) mod transfer;
 pub(crate) use transfer::DownloadTransfer;
 
+pub(crate) mod temp_file;
+
 /// Provides metadata for each chunk during an object download.
 mod chunk_meta;
 pub use chunk_meta::ChunkMetadata;
@@ -105,18 +107,12 @@ impl Download {
         sinks: &dyn sink::SinkFactory,
     ) -> Result<ManagedDownloadHandle, error::Error> {
         // Generate temp file in the same directory as destination
-        let unique_id = fastrand::u32(..);
-        let temp_name = format!(
-            "{}.s3tmp.{:08x}",
-            dest_path.file_name().unwrap_or_default().to_string_lossy(),
-            unique_id
-        );
-        let temp_path = dest_path.with_file_name(temp_name);
-
-        let tokio_file = tokio::fs::File::create(&temp_path)
-            .await
-            .map_err(|e| error::from_kind(error::ErrorKind::IOError)(e))?;
-        let file = tokio_file.into_std().await;
+        let (file, temp_path) = temp_file::create_temp_file_async(
+            &dest_path,
+            std::iter::repeat_with(|| fastrand::u32(..)),
+        )
+        .await
+        .map_err(|e| error::from_kind(error::ErrorKind::IOError)(e))?;
 
         let inner =
             Self::orchestrate_with_sink(handle, input, sinks.create(file, true), parent_id)?;
