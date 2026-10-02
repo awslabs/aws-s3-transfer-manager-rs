@@ -8,6 +8,7 @@ use std::io::IoSlice;
 use bytes::Buf;
 
 use crate::runtime::buffer_pool::{Reservation, SegmentedBytes};
+use crate::runtime::sync::sync::atomic::{AtomicU64, Ordering};
 use crate::runtime::sync::sync::Arc;
 
 use super::chunk_meta::ChunkMetadata;
@@ -280,7 +281,25 @@ enum Mode {
         sink: Box<dyn SinkWrite>,
         /// Start of the resolved S3 byte range for this transfer.
         object_range_start: std::sync::OnceLock<u64>,
+        /// Bytes the sink has accepted across every drain. Only completed run
+        /// writes are counted, so this never exceeds what reached the sink.
+        written: AtomicU64,
     },
+}
+
+/// Destination work done by one drain call.
+///
+/// A run is counted only after the sink accepted all of it. A drain that fails
+/// returns an error instead, and the writer's running total
+/// ([`BodyWriter::written`]) still counts the runs it wrote before the failing
+/// one.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Drained {
+    /// Parts whose payloads were written and freed: the read-ahead occupancy
+    /// the caller releases.
+    pub(crate) parts: u64,
+    /// Bytes the sink accepted.
+    pub(crate) bytes: u64,
 }
 
 /// Producer handle to the download body buffer. Held at `self.inner.writer`
@@ -377,6 +396,18 @@ impl BodyWriter {
         matches!(&*self.mode, Mode::Disk { .. })
     }
 
+    /// Bytes the destination sink has accepted across every drain, including
+    /// drains that went on to fail. Stream mode: 0.
+    ///
+    /// Counts only runs the sink fully accepted, so it never exceeds what
+    /// reached the sink.
+    pub(crate) fn written(&self) -> u64 {
+        match &*self.mode {
+            Mode::Disk { written, .. } => written.load(Ordering::Acquire),
+            Mode::Stream => 0,
+        }
+    }
+
     /// Claim the next slot. The read-ahead gate lives in poll_work (tracks
     /// `issued` under the state lock) — this is the unconditional claim.
     pub(crate) fn claim(&self) -> BodySlot {
@@ -393,14 +424,15 @@ impl BodyWriter {
     /// edge from execute tasks. A non-terminal drain claims only runs that reach the
     /// drain batch, coalescing each into one positioned write. Stream mode: no-op.
     ///
-    /// Returns the number of parts freed across the runs drained by this call.
-    /// The download layer releases that read-ahead occupancy under its state
-    /// lock.
-    pub(crate) fn drain(&self, mode: DrainMode) -> Result<u64, std::io::Error> {
-        let mut freed = 0u64;
+    /// Returns the parts freed and the bytes written across the runs drained by
+    /// this call. The download layer releases that read-ahead occupancy under
+    /// its state lock.
+    pub(crate) fn drain(&self, mode: DrainMode) -> Result<Drained, std::io::Error> {
+        let mut drained = Drained::default();
         if let Mode::Disk {
             sink,
             object_range_start,
+            written,
         } = &*self.mode
         {
             let Some(object_range_start) = object_range_start.get().copied() else {
@@ -413,14 +445,16 @@ impl BodyWriter {
                         "disk payload arrived before destination preparation",
                     ));
                 }
-                return Ok(0);
+                return Ok(drained);
             };
             while let Some(sw) = self.buffer.take_drain_run(mode) {
-                write_run(sink.as_ref(), object_range_start, &sw)?;
-                freed = freed.saturating_add(sw.complete());
+                let bytes = write_run(sink.as_ref(), object_range_start, &sw)?;
+                written.fetch_add(bytes, Ordering::Release);
+                drained.bytes = drained.bytes.saturating_add(bytes);
+                drained.parts = drained.parts.saturating_add(sw.complete());
             }
         }
-        Ok(freed)
+        Ok(drained)
     }
 
     /// Flush every remaining filled run at a terminal transition, including a partial
@@ -428,26 +462,29 @@ impl BodyWriter {
     ///
     /// Success, failure, and cancellation all use this operation to release resident
     /// payload ownership. It does not establish the target's successful final shape.
-    pub(crate) fn terminal_drain(&self) -> Result<u64, std::io::Error> {
+    pub(crate) fn terminal_drain(&self) -> Result<Drained, std::io::Error> {
         if !matches!(&*self.mode, Mode::Disk { .. }) {
-            return Ok(0);
+            return Ok(Drained::default());
         }
-        let terminal_parts = self.drain(DrainMode::Eager)?;
+        let drained = self.drain(DrainMode::Eager)?;
         tracing::debug!(
             target: crate::telemetry::TARGET_TRANSFER,
-            terminal_parts,
+            terminal_parts = drained.parts,
+            terminal_bytes = drained.bytes,
             "terminal drain complete; tail flushed to disk",
         );
-        Ok(terminal_parts)
+        Ok(drained)
     }
 
     /// Flush terminal payloads and establish the successful disk target length.
-    pub(crate) fn finalize(&self, expected_download_len: u64) -> Result<u64, std::io::Error> {
-        let terminal_parts = self.terminal_drain()?;
+    ///
+    /// Returns what the terminal drain wrote.
+    pub(crate) fn finalize(&self, expected_download_len: u64) -> Result<Drained, std::io::Error> {
+        let drained = self.terminal_drain()?;
         if let Mode::Disk { sink, .. } = &*self.mode {
             sink.finalize(expected_download_len)?;
         }
-        Ok(terminal_parts)
+        Ok(drained)
     }
 
     /// Whether a forced eager drain would free at least one resident part right now:
@@ -460,9 +497,10 @@ impl BodyWriter {
 
     /// Flush the resident filled prefix to disk now, below the drain batch.
     /// Memory-pressure relief is distinct from terminal `finalize`, but uses
-    /// the same eager take. Returns the parts freed so the caller releases their
-    /// read-ahead occupancy. Not terminal: the transfer keeps issuing after this.
-    pub(crate) fn flush_resident(&self) -> Result<u64, std::io::Error> {
+    /// the same eager take. Returns the parts freed, so the caller releases their
+    /// read-ahead occupancy, and the bytes written. Not terminal: the transfer
+    /// keeps issuing after this.
+    pub(crate) fn flush_resident(&self) -> Result<Drained, std::io::Error> {
         self.drain(DrainMode::Eager)
     }
 
@@ -489,6 +527,7 @@ impl BodyWriter {
         if let Mode::Disk {
             sink,
             object_range_start: configured_start,
+            ..
         } = &*self.mode
         {
             assert!(
@@ -501,7 +540,8 @@ impl BodyWriter {
     }
 }
 
-/// Write one claimed, contiguous payload run at its translated file position.
+/// Write one claimed, contiguous payload run at its translated file position,
+/// returning the run's length in bytes.
 ///
 /// The cursor borrows payloads in place. `complete()` (called by the caller
 /// after this returns) frees their owners.
@@ -509,8 +549,9 @@ fn write_run(
     sink: &dyn SinkWrite,
     object_range_start: u64,
     sw: &SegmentWrite<ChunkOutput>,
-) -> std::io::Result<()> {
+) -> std::io::Result<u64> {
     let (object_offset, mut cursor) = DiskWriteCursor::new(sw)?;
+    let len = cursor.remaining() as u64;
     let file_pos = object_offset
         .checked_sub(object_range_start)
         .ok_or_else(|| {
@@ -519,7 +560,8 @@ fn write_run(
                 "disk-write payload begins before the requested object range",
             )
         })?;
-    sink.write_all_at(&mut cursor, file_pos)
+    sink.write_all_at(&mut cursor, file_pos)?;
+    Ok(len)
 }
 
 /// Consumer wrapper carrying the notify handle alongside the buffer consumer.
@@ -579,6 +621,7 @@ pub(crate) fn new_recv_body_with_disk_mode(
         mode: Arc::new(Mode::Disk {
             sink,
             object_range_start: resolved_range_start,
+            written: AtomicU64::new(0),
         }),
     };
     let slot_consumer = RecvBodyConsumer { consumer, notify };
@@ -864,7 +907,7 @@ mod tests {
 
     use super::{
         new_recv_body_with_disk_mode, new_recv_body_with_sink, BodyWriter as Writer,
-        DiskWriteCursor, DrainMode, RecvBodyConsumer, Reservation, SinkWrite,
+        DiskWriteCursor, DrainMode, Drained, RecvBodyConsumer, Reservation, SinkWrite,
     };
     use bytes::Buf as _;
     use std::collections::BTreeMap;
@@ -977,7 +1020,7 @@ mod tests {
         let file = tempfile::tempfile().unwrap();
         let (writer, _consumer) = new_recv_body_with_sink(file, false);
 
-        assert_eq!(writer.terminal_drain().unwrap(), 0);
+        assert_eq!(writer.terminal_drain().unwrap(), Drained::default());
     }
 
     /// A filled payload before destination preparation has no safe file
@@ -1027,7 +1070,10 @@ mod tests {
         writer.claim().fill(chunk_at(0, 100, b"ab"));
         writer.claim().fill(chunk_at(1, 102, b"cdef"));
 
-        assert_eq!(writer.terminal_drain().unwrap(), 2);
+        assert_eq!(
+            writer.terminal_drain().unwrap(),
+            Drained { parts: 2, bytes: 6 }
+        );
         assert_eq!(sink.write_count(), 1);
         assert_eq!(sink.assembled(), b"abcdef");
     }
@@ -1291,11 +1337,11 @@ mod tests {
             let outcome = slot.fill(chunk_at(i, i, &[i as u8]));
             // Drain on the batch edge, as execute_get_range does.
             if outcome == super::FillOutcome::DrainReady {
-                freed_total += writer.drain(DrainMode::Batched).unwrap();
+                freed_total += writer.drain(DrainMode::Batched).unwrap().parts;
             }
         }
         // A terminal drain flushes any sub-batch tail so the total accounts for every part.
-        freed_total += writer.terminal_drain().unwrap();
+        freed_total += writer.terminal_drain().unwrap().parts;
 
         // Resident occupancy is `issued - released` = total - freed_total. Every part has
         // been written to disk and its memory freed, so it must be 0 — otherwise the gate
@@ -1377,7 +1423,7 @@ mod tests {
                         let outcome = slot.fill(chunk_at(seq as u64, offset, &part_bytes(seq)));
                         // Mirror execute_get_range: drain on the batch edge.
                         if outcome == super::FillOutcome::DrainReady {
-                            let freed = writer.drain(DrainMode::Batched).unwrap();
+                            let freed = writer.drain(DrainMode::Batched).unwrap().parts;
                             freed_total.fetch_add(freed, std::sync::atomic::Ordering::Relaxed);
                         }
                     }
@@ -1388,7 +1434,7 @@ mod tests {
 
         // Terminal drain flushes the partial final segment and any straggler runs.
         freed_total.fetch_add(
-            writer.terminal_drain().unwrap(),
+            writer.terminal_drain().unwrap().parts,
             std::sync::atomic::Ordering::Relaxed,
         );
 

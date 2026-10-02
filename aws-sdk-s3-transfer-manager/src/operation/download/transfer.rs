@@ -8,6 +8,7 @@
 use std::cmp;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
@@ -61,6 +62,9 @@ struct DownloadTransferInner {
     bucket_type: BucketType,
     /// Chunk delivery + disk-write surface.
     writer: BodyWriter,
+    /// The part of `writer`'s running total of destination bytes already
+    /// recorded as `disk_write`. Only rises; see [`unreported`].
+    disk_write_reported: AtomicU64,
     /// Read-ahead window: bounds resident occupancy by holding `issued - released`
     /// under `read_ahead.window()`.
     read_ahead: ReadAhead,
@@ -131,6 +135,7 @@ impl DownloadTransfer {
             request: Arc::new(input),
             bucket_type,
             writer,
+            disk_write_reported: AtomicU64::new(0),
             object_meta: std::sync::OnceLock::new(),
             integrity_checks: std::sync::OnceLock::new(),
             expected_download_len: std::sync::OnceLock::new(),
@@ -676,8 +681,10 @@ impl DownloadTransfer {
     /// re-grants FIFO; the `on_completion -> generate_work` after this returns
     /// re-polls this transfer.
     fn execute_drain_resident(&self) -> WorkOutcome {
-        let freed = match self.inner.writer.flush_resident() {
-            Ok(freed) => freed,
+        let flushed = self.inner.writer.flush_resident();
+        self.record_disk_write();
+        let freed = match flushed {
+            Ok(drained) => drained.parts,
             Err(e) => {
                 let guard = self.inner.state.lock().unwrap();
                 return self.fail(guard, error::Error::new(error::ErrorKind::IOError, e));
@@ -1004,8 +1011,10 @@ impl DownloadTransfer {
         // occupancy this drain released, accounted under the lock in decrement_in_flight.
         let mut freed = 0u64;
         if slot.fill(chunk) == FillOutcome::DrainReady {
-            match self.inner.writer.drain(DrainMode::Batched) {
-                Ok(parts) => freed = parts,
+            let drain = self.inner.writer.drain(DrainMode::Batched);
+            self.record_disk_write();
+            match drain {
+                Ok(drained) => freed = drained.parts,
                 Err(e) => {
                     // Go terminal before any wake (see fail_range).
                     let guard = self.inner.state.lock().unwrap();
@@ -1014,18 +1023,10 @@ impl DownloadTransfer {
             }
         }
 
-        // disk_write reflects bytes committed to the file sink buffer.
-        // Actual disk flushes are batched; disk_write may lead physical
-        // I/O at any snapshot but converges on transfer completion.
         let bytes_received =
             u64::try_from(expected_len).expect("validated discovery length originated from u64");
         self.inner.ctx.record_io(&crate::metrics::IoSample {
             network_rx: bytes_received,
-            disk_write: if self.inner.writer.has_sink() {
-                bytes_received
-            } else {
-                0
-            },
             ..Default::default()
         });
 
@@ -1147,8 +1148,10 @@ impl DownloadTransfer {
         // decrement_in_flight.
         let mut freed = 0u64;
         if slot.fill(chunk) == FillOutcome::DrainReady {
-            match self.inner.writer.drain(DrainMode::Batched) {
-                Ok(parts) => freed = parts,
+            let drain = self.inner.writer.drain(DrainMode::Batched);
+            self.record_disk_write();
+            match drain {
+                Ok(drained) => freed = drained.parts,
                 Err(e) => {
                     // Go terminal before any wake (see fail_range).
                     let guard = self.inner.state.lock().unwrap();
@@ -1157,18 +1160,10 @@ impl DownloadTransfer {
             }
         }
 
-        // disk_write reflects bytes committed to the file sink buffer.
-        // Actual disk flushes are batched; disk_write may lead physical
-        // I/O at any snapshot but converges on transfer completion.
         let bytes_received =
             u64::try_from(expected_len).expect("validated range length originated from u64");
         self.inner.ctx.record_io(&crate::metrics::IoSample {
             network_rx: bytes_received,
-            disk_write: if self.inner.writer.has_sink() {
-                bytes_received
-            } else {
-                0
-            },
             ..Default::default()
         });
 
@@ -1266,10 +1261,7 @@ impl DownloadTransfer {
             .expected_download_len
             .get()
             .expect("completed download must have a discovered length");
-        let finalization = self.inner.writer.finalize(expected_len);
-        self.inner
-            .observability
-            .destination_finalized(&finalization);
+        let finalization = self.finalize_destination(expected_len);
         if let Err(e) = finalization {
             // Finalize failed: transition to failed. The state is already Terminal; `fail`
             // calls `enter_terminal` which is idempotent on Terminal (returns None).
@@ -1315,12 +1307,53 @@ impl DownloadTransfer {
         drop(pending);
         // Wake all waiters
         self.inner.discovery_notify.notify_waiters();
-        let drain = self.inner.writer.terminal_drain();
-        self.inner.observability.terminal_drain_completed(&drain);
+        self.run_terminal_drain();
         self.inner.writer.notify_consumer();
         self.report_terminal(snapshot);
         self.inner.ctx.signal_terminal();
         WorkOutcome::Failed { classification }
+    }
+
+    /// Records as `disk_write` the destination bytes not yet recorded.
+    ///
+    /// Reads the writer's running total rather than a drain's result, so the
+    /// runs a failed drain wrote before its error are counted. Once this
+    /// returns, `disk_write` counts every byte the destination had accepted
+    /// when it was called, and no byte twice.
+    fn record_disk_write(&self) {
+        let bytes = unreported(&self.inner.disk_write_reported, self.inner.writer.written());
+        if bytes > 0 {
+            self.inner.ctx.record_io(&crate::metrics::IoSample {
+                disk_write: bytes,
+                ..Default::default()
+            });
+        }
+    }
+
+    /// Writes every remaining filled run at a terminal transition, recording the
+    /// bytes written and the drain's outcome. A drain error is observed but not
+    /// returned: the transfer is already terminal.
+    fn run_terminal_drain(&self) {
+        let drain = self.inner.writer.terminal_drain();
+        self.record_disk_write();
+        self.inner
+            .observability
+            .terminal_drain_completed(&drain.map(|drained| drained.parts));
+    }
+
+    /// Finalizes the destination for a successful transfer, then records the
+    /// bytes written, whether or not finalization succeeded, and its outcome.
+    fn finalize_destination(&self, expected_len: u64) -> Result<(), std::io::Error> {
+        let finalization = self
+            .inner
+            .writer
+            .finalize(expected_len)
+            .map(|drained| drained.parts);
+        self.record_disk_write();
+        self.inner
+            .observability
+            .destination_finalized(&finalization);
+        finalization.map(|_| ())
     }
 
     /// Transition to terminal success state. Requires holding the work lock.
@@ -1330,10 +1363,7 @@ impl DownloadTransfer {
             .expected_download_len
             .get()
             .expect("completed download must have a discovered length");
-        let finalization = self.inner.writer.finalize(expected_len);
-        self.inner
-            .observability
-            .destination_finalized(&finalization);
+        let finalization = self.finalize_destination(expected_len);
         if let Err(e) = finalization {
             self.fail(guard, error::Error::new(error::ErrorKind::IOError, e));
             return;
@@ -1390,11 +1420,22 @@ impl Transfer for DownloadTransfer {
         drop(pending);
 
         self.inner.discovery_notify.notify_waiters();
-        let drain = self.inner.writer.terminal_drain();
-        self.inner.observability.terminal_drain_completed(&drain);
+        self.run_terminal_drain();
         self.inner.writer.notify_consumer();
         self.report_terminal(snapshot);
     }
+}
+
+/// Raises `reported` to `total` and returns how far it rose: the part of
+/// `total` not yet reported, or 0 if `reported` already covers it.
+///
+/// Drains on different workers read the running total at different times, so
+/// a caller can arrive with a total below one already reported. `fetch_max`
+/// never lowers `reported`, so a stale total returns 0 and each byte is
+/// returned exactly once.
+fn unreported(reported: &AtomicU64, total: u64) -> u64 {
+    let prev = reported.fetch_max(total, Ordering::AcqRel);
+    total.saturating_sub(prev)
 }
 
 fn snapshot_state(state: &DownloadState, read_ahead_window: u64) -> DownloadStateSnapshot {
@@ -1629,6 +1670,10 @@ mod tests {
 
     use super::*;
     use crate::operation::download::chunk_meta::ChunkMetadata;
+    use crate::operation::download::sink::FileSinkFactory;
+    use crate::operation::download::test_util::fixtures::{
+        disk_test_handle, disk_transfer, object_client_failing_at,
+    };
     use crate::operation::download::DownloadInput;
     use crate::scheduler::test_util::{assert_done, assert_pending, assert_ready};
     use crate::transfer::TransferContext;
@@ -3134,29 +3179,161 @@ mod tests {
         );
     }
 
-    /// Build a disk-mode download transfer on an already-constructed (shared) handle,
-    /// so several transfers can contend for one memory budget. Returns the transfer
-    /// plus the tempdir/consumer guards retained for the transfer's lifetime.
-    #[cfg(test)]
-    fn build_disk_transfer_on(
-        handle: Arc<crate::client::Handle>,
-    ) -> (
-        DownloadTransfer,
-        crate::operation::download::body::RecvBodyConsumer,
-        tempfile::TempDir,
-    ) {
-        let input = DownloadInput::builder()
-            .bucket("test-bucket")
-            .key("test-key")
-            .build()
-            .unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let file = std::fs::File::create(dir.path().join("out")).unwrap();
-        let (writer, consumer) =
-            crate::operation::download::body::new_recv_body_with_sink(file, false);
-        let (ctx, _completion_rx) = TransferContext::new(handle);
-        let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, writer);
-        (transfer, consumer, dir)
+    /// `disk_write` counts bytes the destination accepted, not bytes received:
+    /// nothing while every filled part is below the drain batch, then the whole
+    /// object once the completing range's terminal drain has written it.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn disk_write_counts_bytes_written_not_received() {
+        use crate::operation::download::test_util::fixtures::{object_bytes, object_client};
+
+        let part_size = 5 * MB;
+        let object = object_bytes(3 * part_size as usize);
+        let handle = disk_test_handle(object_client(Arc::clone(&object)), part_size);
+        let (transfer, _consumer, dir) = disk_transfer(handle, &FileSinkFactory);
+        let path = dir.path().join("out");
+
+        assert_discovery_succeeds(&transfer).await;
+        let mut second = assert_ready(transfer.poll_work());
+        execute(&transfer, &mut second).await;
+        let metrics = transfer.ctx().metrics();
+        assert_eq!(metrics.network_rx, 2 * part_size);
+        assert_eq!(
+            metrics.disk_write, 0,
+            "two parts received below the drain batch, none written"
+        );
+        assert!(std::fs::read(&path).unwrap().is_empty());
+
+        let mut last = assert_ready(transfer.poll_work());
+        let outcome = execute(&transfer, &mut last).await;
+        assert!(matches!(outcome, WorkOutcome::Success { .. }));
+        assert_eq!(
+            transfer.ctx().transfer_status(),
+            crate::types::TransferStatus::Completed
+        );
+        assert_eq!(transfer.ctx().metrics().disk_write, object.len() as u64);
+        assert_eq!(std::fs::read(&path).unwrap(), &object[..]);
+    }
+
+    /// A drain that fails part-way still counts the runs it wrote before the
+    /// failing one. The failed transfer's terminal drain takes the head run of
+    /// each of three receive-buffer segments, and the destination rejects the
+    /// third.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn disk_write_counts_runs_written_before_a_drain_fails() {
+        use crate::operation::download::recv_buffer::DEFAULT_SEG_SIZE;
+        use crate::operation::download::test_util::fixtures::{object_bytes, object_client};
+        use crate::operation::download::test_util::sink::{
+            Action, Event, Match, Op, ScriptedSinkFactory, WriteScript,
+        };
+
+        const RUN_LEN: u64 = 4;
+        let script = Arc::new(WriteScript::default()).on(
+            Match::NthWrite(3),
+            Action::Fail(std::io::ErrorKind::StorageFull),
+        );
+        let handle = disk_test_handle(object_client(object_bytes(1)), 5 * MB);
+        let (transfer, _consumer, dir) =
+            disk_transfer(handle, &ScriptedSinkFactory(Arc::clone(&script)));
+        let writer = transfer.writer();
+        writer.prepare(0, 3 * RUN_LEN).unwrap();
+
+        // Fill only the first slot of each segment, so an eager drain takes three
+        // separate runs, in order.
+        let seg = DEFAULT_SEG_SIZE as u64;
+        for seq in 0..=2 * seg {
+            let slot = writer.claim();
+            if seq % seg == 0 {
+                let run = seq / seg;
+                slot.fill(ChunkOutput {
+                    seq,
+                    offset: run * RUN_LEN,
+                    data: SegmentedBytes::from(Bytes::from(vec![run as u8 + 1; RUN_LEN as usize])),
+                    metadata: Default::default(),
+                });
+            }
+        }
+
+        let guard = transfer.inner.state.lock().unwrap();
+        let outcome = transfer.fail(
+            guard,
+            error::Error::new(
+                error::ErrorKind::IOError,
+                std::io::Error::other("range failed"),
+            ),
+        );
+        assert!(matches!(outcome, WorkOutcome::Failed { .. }));
+
+        let third = Op::Write {
+            pos: 2 * RUN_LEN,
+            len: RUN_LEN as usize,
+        };
+        assert!(
+            script.events().contains(&Event::Finished(
+                third,
+                Err(std::io::ErrorKind::StorageFull)
+            )),
+            "the terminal drain reached the third run"
+        );
+        let disk_write = transfer.ctx().metrics().disk_write;
+        assert_eq!(
+            disk_write,
+            2 * RUN_LEN,
+            "the two runs written before the failing one are counted"
+        );
+        assert_eq!(disk_write, writer.written());
+        assert_eq!(
+            std::fs::read(dir.path().join("out")).unwrap(),
+            [[1u8; RUN_LEN as usize], [2u8; RUN_LEN as usize]].concat()
+        );
+    }
+
+    /// `unreported` returns each byte of the running total once. A stale total
+    /// that arrives after a higher one returns 0 and leaves the reported value
+    /// in place, so the bytes between them are not returned again.
+    #[test]
+    fn unreported_returns_each_byte_once_despite_stale_totals() {
+        let reported = AtomicU64::new(0);
+        assert_eq!(unreported(&reported, 150), 150);
+        assert_eq!(unreported(&reported, 100), 0);
+        assert_eq!(reported.load(Ordering::Relaxed), 150);
+        assert_eq!(unreported(&reported, 200), 50);
+        assert_eq!(reported.load(Ordering::Relaxed), 200);
+    }
+
+    /// After a failure, `disk_write` is what the terminal drain wrote: the filled
+    /// prefix ahead of the failed range. A part received behind the failed range
+    /// is never written and is not counted.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn disk_write_after_failure_counts_only_bytes_written() {
+        use crate::operation::download::test_util::fixtures::object_bytes;
+
+        let part_size = 5 * MB;
+        let object = object_bytes(3 * part_size as usize);
+        let client = object_client_failing_at(Arc::clone(&object), part_size);
+        let (transfer, _consumer, dir) =
+            disk_transfer(disk_test_handle(client, part_size), &FileSinkFactory);
+
+        assert_discovery_succeeds(&transfer).await;
+        let mut failing = assert_ready(transfer.poll_work());
+        let mut behind = assert_ready(transfer.poll_work());
+        execute(&transfer, &mut behind).await;
+        assert_eq!(transfer.ctx().metrics().disk_write, 0);
+
+        let outcome = execute(&transfer, &mut failing).await;
+        assert!(matches!(outcome, WorkOutcome::Failed { .. }));
+        let metrics = transfer.ctx().metrics();
+        assert_eq!(metrics.network_rx, 2 * part_size);
+        assert_eq!(
+            metrics.disk_write, part_size,
+            "only the part ahead of the failed range was written"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("out")).unwrap(),
+            &object[..part_size as usize]
+        );
     }
 
     /// Drive several transfers under one shared memory budget by round-robin
@@ -3259,8 +3436,8 @@ mod tests {
             .build();
         let handle = crate::client::Handle::test_handle_tokio(config);
 
-        let (a, _ca, _da) = build_disk_transfer_on(handle.clone());
-        let (b, _cb, _db) = build_disk_transfer_on(handle.clone());
+        let (a, _ca, _da) = disk_transfer(handle.clone(), &FileSinkFactory);
+        let (b, _cb, _db) = disk_transfer(handle.clone(), &FileSinkFactory);
 
         // Pre-fix this wedges: both retain an undrainable resident seq-0 while
         // queued for part 1. Post-fix each flushes its resident run before waiting,
@@ -3341,8 +3518,8 @@ mod tests {
             .build();
         let handle = crate::client::Handle::test_handle_tokio(config);
 
-        let (a, _ca, _da) = build_disk_transfer_on(handle.clone());
-        let (b, _cb, _db) = build_disk_transfer_on(handle.clone());
+        let (a, _ca, _da) = disk_transfer(handle.clone(), &FileSinkFactory);
+        let (b, _cb, _db) = disk_transfer(handle.clone(), &FileSinkFactory);
 
         // Memory budget for exactly the resident parts of both transfers, nothing more.
         // Once both fill to that depth neither can reserve another part without a drain.
