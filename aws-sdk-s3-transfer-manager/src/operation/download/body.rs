@@ -478,10 +478,24 @@ impl BodyWriter {
 
     /// Flush terminal payloads and establish the successful disk target length.
     ///
-    /// Returns what the terminal drain wrote.
+    /// Returns what the terminal drain wrote. Fails with
+    /// [`UnexpectedEof`](std::io::ErrorKind::UnexpectedEof), before the target
+    /// is resized, if the sink has not accepted exactly `expected_download_len`
+    /// bytes across every drain. A run claimed by a drain that has not finished
+    /// writing is invisible to the terminal drain, so without this check its
+    /// region would be published holding zeros or the file's previous bytes.
     pub(crate) fn finalize(&self, expected_download_len: u64) -> Result<Drained, std::io::Error> {
         let drained = self.terminal_drain()?;
-        if let Mode::Disk { sink, .. } = &*self.mode {
+        if let Mode::Disk { sink, written, .. } = &*self.mode {
+            let written = written.load(Ordering::Acquire);
+            if written != expected_download_len {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "destination accepted {written} of {expected_download_len} expected bytes"
+                    ),
+                ));
+            }
             sink.finalize(expected_download_len)?;
         }
         Ok(drained)
@@ -909,6 +923,10 @@ mod tests {
         new_recv_body_with_disk_mode, new_recv_body_with_sink, BodyWriter as Writer,
         DiskWriteCursor, DrainMode, Drained, RecvBodyConsumer, Reservation, SinkWrite,
     };
+    use crate::operation::download::sink::SinkFactory;
+    use crate::operation::download::test_util::sink::{
+        Action, Match, Op, ScriptedSinkFactory, WriteScript,
+    };
     use bytes::Buf as _;
     use std::collections::BTreeMap;
     use std::sync::Mutex as StdMutex;
@@ -1179,18 +1197,87 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"new");
     }
 
+    /// A disk body writer over the existing file at `path`, opened for reading
+    /// and writing, whose destination operations go through `script`.
+    fn scripted_writer_over(
+        path: &std::path::Path,
+        script: &Arc<WriteScript>,
+    ) -> (Writer, RecvBodyConsumer) {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        new_recv_body_with_disk_mode(ScriptedSinkFactory(Arc::clone(script)).open(file, false))
+    }
+
+    /// A resize that fails after every byte was written fails finalization
+    /// with the resize's error and leaves the destination's length in place.
     #[test]
     fn disk_finalize_propagates_resize_failure() {
+        let script = Arc::new(WriteScript::default()).on(
+            Match::Finalize,
+            Action::Fail(std::io::ErrorKind::PermissionDenied),
+        );
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("out");
         std::fs::write(&path, b"existing").unwrap();
-        let file = std::fs::File::open(&path).unwrap();
-        let (writer, _consumer) = new_recv_body_with_sink(file, false);
+        let (writer, _consumer) = scripted_writer_over(&path, &script);
         writer.prepare(0, 3).unwrap();
-        writer
+        writer.claim().fill(chunk_at(0, 0, b"new"));
+        writer.drain(DrainMode::Eager).unwrap();
+        assert_eq!(writer.written(), 3, "the whole object was written");
+
+        let error = writer
             .finalize(3)
-            .expect_err("a read-only caller file cannot be finalized");
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), 8);
+            .expect_err("the resize is scripted to fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        let contents = std::fs::read(&path).unwrap();
+        assert_eq!(contents.len(), 8, "a failed resize keeps the length");
+        assert_eq!(&contents[..3], b"new");
+    }
+
+    /// A run claimed by a drain that has not finished writing it leaves the
+    /// destination short. Finalization must fail before the resize that would
+    /// publish the hole, leaving the caller's previous bytes and length in
+    /// place.
+    #[test]
+    fn disk_finalize_rejects_a_short_destination_without_resizing() {
+        const ORIGINAL: &[u8] = b"previous contents";
+        const HOLD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+        let script = Arc::new(WriteScript::default()).on(Match::NthWrite(1), Action::Hold);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out");
+        std::fs::write(&path, ORIGINAL).unwrap();
+        let (writer, _consumer) = scripted_writer_over(&path, &script);
+        writer.prepare(0, 4).unwrap();
+        writer.claim().fill(chunk_at(0, 0, b"ab"));
+
+        std::thread::scope(|scope| {
+            let drain = scope.spawn(|| writer.drain(DrainMode::Eager));
+            let held = script.wait_held(HOLD_TIMEOUT);
+            assert_eq!(held.op(), Op::Write { pos: 0, len: 2 });
+
+            writer.claim().fill(chunk_at(1, 2, b"cd"));
+            let error = writer
+                .finalize(4)
+                .expect_err("two of four bytes reached the destination");
+            assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+            assert!(
+                error.to_string().contains("2 of 4"),
+                "the error names both byte counts: {error}"
+            );
+            let contents = std::fs::read(&path).unwrap();
+            assert_eq!(
+                contents.len(),
+                ORIGINAL.len(),
+                "a short destination must not be resized"
+            );
+            assert_eq!(&contents[..4], b"prcd");
+
+            held.release();
+            drain.join().unwrap().unwrap();
+        });
     }
 
     #[test]

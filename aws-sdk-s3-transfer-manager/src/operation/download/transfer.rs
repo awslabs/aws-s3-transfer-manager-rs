@@ -3302,6 +3302,62 @@ mod tests {
         assert_eq!(reported.load(Ordering::Relaxed), 200);
     }
 
+    /// A finalize that fails its length check still counts the tail its
+    /// terminal drain wrote. A drain the transfer does not track holds the
+    /// first part's run claimed but unwritten when the final range completes,
+    /// so the destination is one part short at finalization.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn disk_write_counts_the_tail_written_by_a_failed_finalize() {
+        use crate::operation::download::test_util::fixtures::{object_bytes, object_client};
+        use crate::operation::download::test_util::sink::{
+            Action, Event, Match, Op, ScriptedSinkFactory, WriteScript,
+        };
+
+        const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+        let part_size = 5 * MB;
+        let object = object_bytes(2 * part_size as usize);
+        let script = Arc::new(WriteScript::default()).on(Match::NthWrite(1), Action::Hold);
+        let handle = disk_test_handle(object_client(Arc::clone(&object)), part_size);
+        let (transfer, _consumer, _dir) =
+            disk_transfer(handle, &ScriptedSinkFactory(Arc::clone(&script)));
+
+        assert_discovery_succeeds(&transfer).await;
+        let writer = transfer.writer().clone();
+        let untracked = std::thread::spawn(move || writer.drain(DrainMode::Eager));
+        let held = script.wait_held(TIMEOUT);
+        assert_eq!(
+            held.op(),
+            Op::Write {
+                pos: 0,
+                len: part_size as usize
+            }
+        );
+
+        let mut last = assert_ready(transfer.poll_work());
+        let outcome = execute(&transfer, &mut last).await;
+        assert!(matches!(outcome, WorkOutcome::Failed { .. }));
+        let error = transfer
+            .ctx()
+            .take_error()
+            .expect("the failure is reported");
+        assert_eq!(error.kind(), &crate::error::ErrorKind::IOError);
+        let tail = Op::Write {
+            pos: part_size,
+            len: part_size as usize,
+        };
+        assert!(
+            script.events().contains(&Event::Finished(tail, Ok(()))),
+            "finalization's terminal drain wrote the tail"
+        );
+        let disk_write = transfer.ctx().metrics().disk_write;
+        assert_eq!(disk_write, part_size, "the tail is counted");
+        assert_eq!(disk_write, transfer.writer().written());
+
+        held.release();
+        untracked.join().unwrap().unwrap();
+    }
+
     /// After a failure, `disk_write` is what the terminal drain wrote: the filled
     /// prefix ahead of the failed range. A part received behind the failed range
     /// is never written and is not counted.
