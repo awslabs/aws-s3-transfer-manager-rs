@@ -345,9 +345,12 @@ impl PartData {
     /// (base64 encoding of the big-endian checksum value for this part's data
     /// using the algorithm specified in the [ChecksumStrategy](crate::operation::upload::ChecksumStrategy)).
     ///
-    /// If you don't set this, the Transfer Manager will calculate one
-    /// automatically, unless you've explicitly disabled checksum calculation
-    /// (see [ChecksumStrategy](crate::operation::upload::ChecksumStrategy)).
+    /// The value is sent with the part only if the upload has a checksum
+    /// strategy, either set on the upload or applied by default; otherwise it is
+    /// ignored. If you don't set it, the SDK calculates the part's checksum as it
+    /// sends the part, when the S3 client's `request_checksum_calculation` is
+    /// `WhenSupported` (the default). See
+    /// [ChecksumStrategy](crate::operation::upload::ChecksumStrategy).
     pub fn with_checksum(mut self, checksum: impl Into<String>) -> Self {
         self.checksum = Some(checksum.into());
         self
