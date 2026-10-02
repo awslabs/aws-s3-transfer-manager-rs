@@ -1755,6 +1755,67 @@ async fn test_positive_lower_bound_never_synthesizes_empty_part() {
     assert_eq!(0, complete_mpu.num_calls());
 }
 
+// --- Request body ------------------------------------------------------------
+
+/// An upload without a body fails at `initiate()` and sends nothing, rather than storing an empty
+/// object over the key. This holds whether the body was never set or was set to `None`.
+#[tokio::test]
+async fn test_upload_without_body_fails_at_initiate() {
+    let put_object = mock!(aws_sdk_s3::Client::put_object)
+        .then_output(|| PutObjectOutput::builder().e_tag("test-etag").build());
+    let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&put_object]);
+    let tm = aws_sdk_s3_transfer_manager::Client::new(
+        aws_sdk_s3_transfer_manager::Config::builder()
+            .client(client)
+            .build(),
+    );
+
+    let never_set = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .content_type("text/plain")
+        .initiate()
+        .expect_err("an upload with no body must not start");
+    assert_eq!(ErrorKind::InputInvalid, *never_set.kind());
+
+    let set_to_none = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .set_body(None)
+        .initiate()
+        .expect_err("an upload whose body was set to None must not start");
+    assert_eq!(ErrorKind::InputInvalid, *set_to_none.kind());
+
+    assert_eq!(0, put_object.num_calls());
+}
+
+/// An explicitly empty body uploads an empty object with one PutObject.
+#[tokio::test]
+async fn test_explicit_empty_body_uploads_empty_object() {
+    let put_object = mock!(aws_sdk_s3::Client::put_object)
+        .match_requests(|req| req.body().bytes() == Some(&b""[..]))
+        .then_output(|| PutObjectOutput::builder().e_tag("test-etag").build());
+    let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&put_object]);
+    let tm = aws_sdk_s3_transfer_manager::Client::new(
+        aws_sdk_s3_transfer_manager::Config::builder()
+            .client(client)
+            .build(),
+    );
+
+    tm.upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .body(InputStream::from_static(b""))
+        .initiate()
+        .unwrap()
+        .join()
+        .await
+        .expect("an explicitly empty body must upload an empty object");
+    assert_eq!(1, put_object.num_calls());
+}
+
 // --- Conditional-write preconditions -----------------------------------------
 //
 // Assertion shape: use `match_requests` to fail the mock unless the request

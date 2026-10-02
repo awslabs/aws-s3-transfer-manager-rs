@@ -1179,11 +1179,13 @@ mod tests {
                 .build(),
         );
 
-        let input = UploadInput::builder()
+        let mut input = UploadInput::builder()
             .bucket("test-bucket")
             .key("test-key")
+            .body(stream)
             .build()
             .unwrap();
+        let stream = input.take_body();
 
         let (ctx, _completion_rx) = TransferContext::new(handle);
         UploadTransfer::try_new(ctx, BucketType::Standard, input, stream).unwrap()
@@ -2072,12 +2074,13 @@ mod tests {
         let handle = crate::client::Handle::test_handle_tokio(
             crate::Config::builder().client(s3_client).build(),
         );
-        let input = UploadInput::builder()
+        let mut input = UploadInput::builder()
             .bucket("test-bucket")
             .key("test-key")
+            .body(InputStream::from_path(tmp.path()).unwrap())
             .build()
             .unwrap();
-        let stream = InputStream::from_path(tmp.path()).unwrap();
+        let stream = input.take_body();
         let (ctx, _completion_rx) = TransferContext::new(handle);
         let transfer = UploadTransfer::try_new(ctx, BucketType::Standard, input, stream).unwrap();
 

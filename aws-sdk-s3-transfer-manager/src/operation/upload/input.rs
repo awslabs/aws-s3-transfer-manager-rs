@@ -577,11 +577,18 @@ impl UploadInputBuilder {
         &self.acl
     }
     /// <p>Object data.</p>
+    ///
+    /// Required: [`build`](Self::build) fails if no body is set. To upload an empty object, pass
+    /// an empty body such as [`InputStream::from_static(b"")`](crate::io::InputStream::from_static).
     pub fn body(mut self, input: crate::io::InputStream) -> Self {
         self.body = Some(input);
         self
     }
     /// <p>Object data.</p>
+    ///
+    /// Required: [`build`](Self::build) fails if no body is set, including after
+    /// `set_body(None)`. To upload an empty object, pass an empty body such as
+    /// [`InputStream::from_static(b"")`](crate::io::InputStream::from_static).
     pub fn set_body(mut self, input: Option<crate::io::InputStream>) -> Self {
         self.body = input;
         self
@@ -1353,6 +1360,8 @@ impl UploadInputBuilder {
     }
 
     /// Consumes the builder and constructs a [`UploadInput`]
+    ///
+    /// Fails if the bucket, key or body is not set.
     pub fn build(self) -> Result<UploadInput, ::aws_smithy_types::error::operation::BuildError> {
         if self.bucket.is_none() {
             return Err(BuildError::missing_field("bucket", "A bucket is required"));
@@ -1362,8 +1371,15 @@ impl UploadInputBuilder {
             return Err(BuildError::missing_field("key", "A key is required"));
         }
 
+        let Some(body) = self.body else {
+            return Err(BuildError::missing_field(
+                "body",
+                "A body is required; to upload an empty object, use `InputStream::from_static(b\"\")`",
+            ));
+        };
+
         Ok(UploadInput {
-            body: self.body.unwrap_or_default(),
+            body,
             acl: self.acl,
             bucket: self.bucket,
             cache_control: self.cache_control,

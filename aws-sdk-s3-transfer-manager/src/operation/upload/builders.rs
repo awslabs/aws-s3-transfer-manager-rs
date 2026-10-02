@@ -77,11 +77,21 @@ impl UploadFluentBuilder {
         self.inner.get_acl()
     }
     /// <p>Object data.</p>
+    ///
+    /// Required: [`initiate`](Self::initiate) fails with
+    /// [`ErrorKind::InputInvalid`](crate::error::ErrorKind::InputInvalid) if no body is set. To
+    /// upload an empty object, pass an empty body such as
+    /// [`InputStream::from_static(b"")`](crate::io::InputStream::from_static).
     pub fn body(mut self, input: crate::io::InputStream) -> Self {
         self.inner = self.inner.body(input);
         self
     }
     /// <p>Object data.</p>
+    ///
+    /// Required: [`initiate`](Self::initiate) fails with
+    /// [`ErrorKind::InputInvalid`](crate::error::ErrorKind::InputInvalid) if no body is set,
+    /// including after `set_body(None)`. To upload an empty object, pass an empty body such as
+    /// [`InputStream::from_static(b"")`](crate::io::InputStream::from_static).
     pub fn set_body(mut self, input: Option<crate::io::InputStream>) -> Self {
         self.inner = self.inner.set_body(input);
         self
