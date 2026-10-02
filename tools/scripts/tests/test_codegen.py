@@ -40,6 +40,10 @@ class CodegenTest(unittest.TestCase):
             artifact = output / codegen.MODEL_ARTIFACT
             artifact.parent.mkdir(parents=True, exist_ok=True)
             artifact.write_text("candidate", encoding="utf-8")
+            if self.property(command, "projectOnly") == "false":
+                rust = output / codegen.RUST_ARTIFACT
+                rust.parent.mkdir(parents=True, exist_ok=True)
+                rust.write_text("pub struct Candidate;", encoding="utf-8")
         return subprocess.CompletedProcess(command, self.status)
 
     @staticmethod
@@ -56,10 +60,13 @@ class CodegenTest(unittest.TestCase):
         self.assertEqual(0, codegen.main([]))
         self.assertIn("codegen", self.calls[0])
         self.assertEqual(str(self.destination), self.property(self.calls[0], "projectionOutput"))
+        self.assertEqual("false", self.property(self.calls[0], "projectOnly"))
 
     def test_project_only_exports_the_model(self):
         self.assertEqual(0, codegen.main(["--project-only"]))
         self.assertEqual("candidate", (self.destination / codegen.MODEL_ARTIFACT).read_text())
+        self.assertEqual("true", self.property(self.calls[0], "projectOnly"))
+        self.assertFalse((self.destination / codegen.RUST_ARTIFACT).exists())
 
     def test_forwards_local_input_output_and_offline_without_shell_splitting(self):
         self.assertEqual(0, codegen.main([
@@ -104,7 +111,11 @@ class CodegenTest(unittest.TestCase):
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
             self.assertEqual(0, codegen.main(["--dry-run"]))
+        scratch = Path(self.property(self.calls[0], "projectionOutput"))
+        self.assertIn(f"Dry run destination: {self.destination} (unchanged)", output.getvalue())
+        self.assertIn(f"Temporary output root: {scratch} (removed after preview)", output.getvalue())
         self.assertIn("Would write:", output.getvalue())
+        self.assertFalse(scratch.exists())
         self.assertFalse(self.destination.exists())
         self.assertEqual(1, len(self.calls))
 
@@ -137,3 +148,28 @@ class CodegenTest(unittest.TestCase):
             self.assertEqual(1, codegen.main([]))
         self.assertIn("wrapper unavailable", output.getvalue())
         self.assertNotIn("Traceback", output.getvalue())
+
+    def test_full_preview_reports_entire_rust_subtree_without_modifying_it(self):
+        self.baseline()
+        rust = self.destination / codegen.RUST_ARTIFACT
+        rust.parent.mkdir(parents=True, exist_ok=True)
+        rust.write_text("old")
+        removed = rust.parent / "removed.rs"
+        removed.write_text("old helper")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(0, codegen.main(["--dry-run"]))
+        self.assertIn("Changed: model/src/model/mod.rs", output.getvalue())
+        self.assertIn("Removed: model/src/model/removed.rs", output.getvalue())
+        self.assertEqual("old", rust.read_text())
+        self.assertEqual("old helper", removed.read_text())
+
+    def test_generated_inventory_excludes_cargo_build_products(self):
+        rust = self.destination / codegen.RUST_ARTIFACT
+        rust.parent.mkdir(parents=True, exist_ok=True)
+        rust.write_text("model")
+        crate = self.destination / "model"
+        (crate / "Cargo.lock").write_text("lock")
+        (crate / "target").mkdir()
+        (crate / "target/output").write_text("binary")
+        self.assertEqual({"src/model/mod.rs": b"model"}, codegen.generated_files(self.destination))

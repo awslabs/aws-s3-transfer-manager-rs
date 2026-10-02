@@ -6,11 +6,11 @@ default:
 fetch-model:
     python3 tools/scripts/fetch-model
 
-# Run acquisition/orchestration, model-loader, and projection fixture tests.
+# Run Python/JVM tooling tests and compile/test generated Rust value fixtures.
 test-codegen:
     tools/codegen/s3-tm-model-codegen/gradlew --project-dir tools/codegen/s3-tm-model-codegen test
 
-# Export and validate the dataplane model; accepts --project-only and --dry-run.
+# Generate standalone modeled values; accepts --project-only and --dry-run.
 [positional-arguments]
 codegen *args:
     python3 tools/scripts/codegen "$@"

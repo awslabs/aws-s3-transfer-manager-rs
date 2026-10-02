@@ -8,6 +8,7 @@ import java.nio.file.Path
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNotEquals
+import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
@@ -38,6 +39,27 @@ class ModelProjectionTest {
             ),
             project(source()).operationShapes.map { it.id.name }.toSet(),
         )
+    }
+
+    @Test
+    fun `operation closure guard rejects unexpected operations`() {
+        val original = source()
+        val operation = original.expectShape(ShapeId.from("com.amazonaws.s3#DeleteBucket"))
+        val projected = project(original).toBuilder().addShape(operation).build()
+        val error = assertThrows(IllegalStateException::class.java) {
+            ModelProjection.validateOperationClosure(original, projected, Path.of("smithy-build.json"))
+        }
+        assertTrue(error.message!!.contains("unexpected=[com.amazonaws.s3#DeleteBucket]"))
+    }
+
+    @Test
+    fun `operation closure guard rejects missing retained operations`() {
+        val original = source()
+        val projected = project(original).toBuilder().removeShape(ShapeId.from("com.amazonaws.s3#GetObject")).build()
+        val error = assertThrows(IllegalStateException::class.java) {
+            ModelProjection.validateOperationClosure(original, projected, Path.of("smithy-build.json"))
+        }
+        assertTrue(error.message!!.contains("missing=[com.amazonaws.s3#GetObject]"))
     }
 
     @Test

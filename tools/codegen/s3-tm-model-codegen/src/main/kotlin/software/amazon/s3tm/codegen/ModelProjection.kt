@@ -7,7 +7,10 @@ package software.amazon.s3tm.codegen
 import java.nio.file.Path
 import software.amazon.smithy.build.ProjectionResult
 import software.amazon.smithy.build.SmithyBuild
+import software.amazon.smithy.build.model.SmithyBuildConfig
 import software.amazon.smithy.model.Model
+import software.amazon.smithy.model.knowledge.TopDownIndex
+import software.amazon.smithy.model.selector.Selector
 import software.amazon.smithy.model.shapes.ServiceShape
 
 object ModelProjection {
@@ -26,7 +29,22 @@ object ModelProjection {
                 .orElseThrow { IllegalStateException("Missing projection: $name") }
         check(!result.isBroken) { result.events.joinToString("\n") }
         result.model.expectShape(ModelLoader.serviceId, ServiceShape::class.java)
+        validateOperationClosure(model, result.model, config)
         return result
+    }
+
+    internal fun validateOperationClosure(source: Model, projected: Model, config: Path) {
+        val projection = SmithyBuildConfig.load(config).projections.getValue(name)
+        val excluded = projection.transforms.filter { it.name == "excludeShapesBySelector" }
+            .flatMap { Selector.parse(it.args.expectStringMember("selector").value).select(source) }.toSet()
+        val service = source.expectShape(ModelLoader.serviceId, ServiceShape::class.java)
+        val expected = TopDownIndex.of(source).getContainedOperations(service)
+            .filterNot { it in excluded }.map { it.id }.toSet()
+        val actual = projected.operationShapes.map { it.id }.toSet()
+        check(actual == expected) {
+            "Dataplane operation closure differs from $config: " +
+                "missing=${expected - actual}, unexpected=${actual - expected}"
+        }
     }
 }
 

@@ -1,12 +1,14 @@
 # S3 TM model tooling
 
-This JVM project loads, projects, and validates S3 Smithy models. A Python
-script acquires model inputs. Normal Cargo builds do not invoke this tooling.
+This JVM project projects S3 Smithy models and generates standalone Rust value
+types using smithy-rs. Python scripts acquire model inputs and drive generation.
+Normal Transfer Manager Cargo builds do not invoke this tooling.
 
 ## Prerequisites
 
-Use Python 3.9+, Java 21, and the checked-in Gradle 8.14.3 wrapper. `just` is
-optional shorthand; the underlying commands work directly. Gradle downloads its
+Use Python 3.9+, Java 21, Cargo with rustfmt, and the checked-in Gradle 8.14.3
+wrapper. `just` is optional shorthand; the underlying commands work directly.
+Gradle downloads its
 distribution and Maven dependencies on first use.
 
 ## Model input
@@ -61,21 +63,74 @@ just codegen --model /absolute/path/to/dev-s3.json --output target/codegen/dev
 just codegen --dry-run
 ```
 
-`codegen` and `codegen --project-only` resolve the input, export the dataplane
-Smithy model, and independently reload the exported JSON through Smithy's
-assembler. `--model` selects a read-only local input; `--output` selects the
+Each invocation resolves the input, exports the dataplane Smithy model, and
+independently reload the exported JSON through Smithy's assembler.
+`codegen` also generates the standalone Rust artifact;
+`--project-only` stops after model export/validation.
+`--model` selects a read-only local input; `--output` selects the
 artifact directory. Relative paths resolve from the repository root.
 `--offline` forbids dependency and model fetching; `--pinned-only` rejects local
 input overrides.
 
-`--dry-run` exports and validates in temporary storage without changing the
+The output summary identifies the input path and whether it is a verified pin or
+local override, the projection configuration and exported model path, and the
+retained operations. Full generation also reports the intermediate codegen
+directory, standalone crate, and generated module path. Dry-run output labels
+the unchanged destination separately from the temporary output.
+
+`--dry-run` runs the selected pipeline in temporary storage without changing the
 destination. If an exported model exists there, it compares the candidate using
 Smithy's compatibility diff; otherwise it reports the model that would be
-written. Temporary output is removed on completion or failure. Dependency and
-model caches can still be populated unless `--offline` is selected.
+written. Full generation also reports added, changed, and removed generated
+files, comparing the complete Rust source subtree, manifest, and member-source
+mapping. Cargo lockfiles/build products are excluded. Temporary output is
+removed on completion or failure. Dependency and model caches can still be
+populated unless `--offline` is selected.
 
 The underlying entry point is `python3 tools/scripts/codegen`.
 `just --dry-run codegen` only prints the command and does not execute this preview.
+
+## Rust artifact
+
+`TmModelProjection.kt` defines the value roots and TM-specific names and metadata
+aggregation. The roots include `Object`, `Owner`, `RestoreStatus`,
+`ChecksumAlgorithm`, `ChecksumType`, and `ObjectStorageClass`. `GetObjectRequest`
+keeps its Smithy identity and all modeled input members, and is named
+`DownloadInput` in Rust. `ObjectMetadata` contains the union of GET/HEAD response
+members, excluding `Body`. Shared members' targets and non-documentation traits
+must agree; a conflict fails generation with the member name. New modeled
+members and their reachable nested types flow through generation without a
+field allowlist. Mixins are flattened through Smithy's transformer.
+`member-sources.json` records each operation member's correspondence, including
+GET-only and HEAD-only metadata.
+
+`ModelGenerator.kt` calls smithy-rs's symbol provider, structure/builder
+generators, and client-compatible infallible enum generator. Required download
+input fields are checked at builder construction while retaining their optional
+field representation. Timestamps use `aws_smithy_types::DateTime`; enum strings,
+defaults, sensitivity, and documentation follow the modeled traits.
+
+Intermediate generated files live under this Gradle project's
+`build/model-codegen`. `ModelArtifact.kt` assembles and formats the standalone
+crate at `target/codegen/projections/model`:
+
+```text
+model/
+  Cargo.toml
+  member-sources.json
+  src/
+    lib.rs
+    model/
+      mod.rs
+      builders.rs
+      error.rs
+      sealed_enum_unknown.rs
+      _*.rs
+```
+
+The entire `src/model` subtree, including exports and enum helpers, is generated.
+The standalone crate depends on `aws-smithy-types`, not `aws-sdk-s3`. Generation
+does not install files into Transfer Manager's source tree.
 
 ## Tests
 
@@ -83,19 +138,25 @@ The underlying entry point is `python3 tools/scripts/codegen`.
 just test-codegen
 ```
 
-`test-codegen` runs Python acquisition/orchestration tests along with JVM model-loader and
-projection fixtures. Acquisition tests check pin/digest verification,
+`test-codegen` runs Python acquisition/orchestration tests along with JVM
+model-loader and projection fixtures. Acquisition tests check pin/digest verification,
 cache preservation, local overrides, offline errors, and fetch failures using
 local fixtures and mocked network responses. No tests need the full S3 model or
-a live download after build dependencies are available.
+a live model download. Maven and Rust dependencies must be available locally
+or downloadable.
 
-The separately resolved codegen configuration can be checked explicitly:
+`src/test/resources/s3-example-model.smithy` is a small synthetic model for
+generation tests, not the production S3 input. It covers inherited input
+members, shared and one-sided response metadata, and modeled values/traits.
+Projection tests check additive field/nested-type evolution and conflicting
+GET/HEAD metadata, as well as the operation closure defined by `smithy-build.json`.
 
-```sh
-tools/codegen/s3-tm-model-codegen/gradlew \
-  --project-dir tools/codegen/s3-tm-model-codegen \
-  verifyCodegenDependencies
-```
+The test suite also generates a standalone crate from this example model and runs
+Rust consumer tests for unknown enums, collections/timestamps, required/default
+fields, builders, sensitivity, and public paths. These fixtures use the same
+generation/assembly path as the full S3 model. Rust dependencies are cached at
+`target/codegen/cargo-home`, with compilation output at
+`target/codegen/cargo-target`.
 
 ## Compare projected models
 
