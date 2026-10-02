@@ -3,8 +3,9 @@
 
 use aws_smithy_types::DateTime;
 use s3_tm_model::model::{
-    builders::DownloadInputBuilder, ChecksumAlgorithm, ChecksumType, DownloadInput, Object,
-    ObjectMetadata, ObjectStorageClass, Owner, RestoreStatus, StorageClass,
+    builders::DownloadInputBuilder, ChecksumAlgorithm, ChecksumType, ChunkMetadata, DownloadInput,
+    Object, ObjectMetadata, ObjectStorageClass, Owner, RestoreStatus, StorageClass, UploadInput,
+    UploadOutput,
 };
 
 #[test]
@@ -44,7 +45,23 @@ fn nested_values_have_optional_fields_and_collection_builders() {
         object.restore_status().unwrap().restore_expiry_date(),
         Some(&time)
     );
-    assert!(!RestoreStatus::builder().build().is_restore_in_progress());
+    assert_eq!(
+        RestoreStatus::builder().build().is_restore_in_progress(),
+        None
+    );
+    assert_eq!(
+        RestoreStatus::builder()
+            .is_restore_in_progress(false)
+            .build()
+            .is_restore_in_progress(),
+        Some(false)
+    );
+    assert_eq!(empty.size(), None);
+    assert_eq!(Object::builder().size(0).build().size(), Some(0));
+    assert_eq!(
+        Object::builder().size(i64::MAX).build().size(),
+        Some(i64::MAX)
+    );
     assert!(Object::builder()
         .set_checksum_algorithm(None)
         .build()
@@ -99,7 +116,6 @@ fn metadata_has_maps_timestamps_and_no_response_body() {
     let output = ObjectMetadata::builder()
         .last_modified(time)
         .metadata("user-key", "value")
-        .content_length(42)
         .get_only("GET metadata")
         .head_only("HEAD metadata")
         .storage_class(StorageClass::Standard)
@@ -113,8 +129,78 @@ fn metadata_has_maps_timestamps_and_no_response_body() {
         Some("value")
     );
     assert_eq!(output.last_modified(), Some(&time));
-    assert_eq!(output.content_length(), Some(42));
+    // Raw response length is public on chunks, but crate-only on aggregate object metadata.
+    let chunk = ChunkMetadata::builder().content_length(42).build();
+    assert_eq!(chunk.content_length(), Some(42));
     assert_eq!(output.get_only(), Some("GET metadata"));
     assert_eq!(output.head_only(), Some("HEAD metadata"));
     assert_eq!(output.storage_class(), Some(&StorageClass::Standard));
+}
+
+#[test]
+fn upload_values_compile_without_tm_runtime_and_validate_required_members() {
+    assert!(UploadInput::builder().build().is_err());
+    assert!(UploadInput::builder().bucket("bucket").build().is_err());
+    let input = UploadInput::builder()
+        .bucket("bucket")
+        .key("key")
+        .additional_upload("new modeled value")
+        .sse_kms_key_id("secret-key")
+        .build()
+        .unwrap();
+    assert_eq!(input.additional_upload(), Some("new modeled value"));
+    assert_eq!(input.sse_kms_key_id(), Some("secret-key"));
+    assert!(!format!("{input:?}").contains("secret-key"));
+    let output = UploadOutput::builder()
+        .e_tag("tag")
+        .upload_id("upload")
+        .location("location")
+        .checksum_sha256("checksum")
+        .build()
+        .unwrap();
+    assert_eq!(output.upload_id(), Some("upload"));
+    assert_eq!(output.location(), Some("location"));
+    assert_eq!(output.e_tag(), Some("tag"));
+}
+
+#[test]
+fn expiration_preserves_upload_timestamps_and_raw_response_strings() {
+    let time = DateTime::from_secs(123);
+    let builder = UploadInput::builder().expires(time);
+    assert_eq!(builder.get_expires(), &Some(time));
+    let input = builder.bucket("bucket").key("key").build().unwrap();
+    let expires: Option<&DateTime> = input.expires();
+    assert_eq!(expires, Some(&time));
+    let input = UploadInput::builder()
+        .bucket("bucket")
+        .key("key")
+        .set_expires(None)
+        .build()
+        .unwrap();
+    assert_eq!(input.expires(), None);
+    let response = DownloadInput::builder()
+        .bucket("bucket")
+        .key("key")
+        .response_expires(time)
+        .build()
+        .unwrap();
+    assert_eq!(response.response_expires(), Some(&time));
+    let metadata = ObjectMetadata::builder()
+        .expires_string("not a valid HTTP date")
+        .build();
+    assert_eq!(metadata.expires_string(), Some("not a valid HTTP date"));
+    let chunk = ChunkMetadata::builder()
+        .expires_string("also not a date")
+        .build();
+    assert_eq!(chunk.expires_string(), Some("also not a date"));
+}
+
+#[test]
+fn request_identifiers_are_available_without_sdk_traits() {
+    let object = ObjectMetadata::builder().build();
+    let chunk = ChunkMetadata::builder().build();
+    assert_eq!(object.request_id(), None);
+    assert_eq!(object.extended_request_id(), None);
+    assert_eq!(chunk.request_id(), None);
+    assert_eq!(chunk.extended_request_id(), None);
 }

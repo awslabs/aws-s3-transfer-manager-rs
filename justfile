@@ -10,7 +10,7 @@ fetch-model:
 test-codegen:
     tools/codegen/s3-tm-model-codegen/gradlew --project-dir tools/codegen/s3-tm-model-codegen test
 
-# Generate standalone modeled values; accepts --project-only and --dry-run.
+# Generate modeled values; accepts --project-only, --dry-run, and --check.
 [positional-arguments]
 codegen *args:
     python3 tools/scripts/codegen "$@"

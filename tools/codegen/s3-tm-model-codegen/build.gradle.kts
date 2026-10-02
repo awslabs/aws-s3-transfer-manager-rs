@@ -55,12 +55,16 @@ tasks.test {
     useJUnitPlatform()
     doFirst {
         systemProperty("s3tm.modelClasspath", modelDiscovery.asPath)
+        systemProperty("s3tm.smithyVersion", smithyVersion)
+        systemProperty("s3tm.smithyRsVersion", smithyRsVersion)
     }
 }
 
 tasks.withType<JavaExec>().configureEach {
     doFirst {
         systemProperty("s3tm.modelClasspath", modelDiscovery.asPath)
+        systemProperty("s3tm.smithyVersion", smithyVersion)
+        systemProperty("s3tm.smithyRsVersion", smithyRsVersion)
     }
 }
 
@@ -140,6 +144,16 @@ val generateTestModel by tasks.registering(JavaExec::class) {
             from("src/test/resources/model_contract.rs")
             into(layout.buildDirectory.dir("test-model/model/tests"))
         }
+        val harness = layout.buildDirectory.dir("test-model-in-tree").get().asFile
+        copy {
+            from("src/test/resources/in_tree_contract.rs")
+            into(harness.resolve("src"))
+            rename { "lib.rs" }
+        }
+        harness.resolve("Cargo.toml").writeText(
+            layout.buildDirectory.file("test-model/model/Cargo.toml").get().asFile.readText()
+                .replace("name = \"s3-tm-model\"", "name = \"s3-tm-model-in-tree\"")
+        )
     }
 }
 
@@ -158,4 +172,21 @@ val testGeneratedModel by tasks.registering(Exec::class) {
 
 tasks.test {
     dependsOn(testGeneratedModel)
+}
+
+val testInTreeModel by tasks.registering(Exec::class) {
+    dependsOn(generateTestModel)
+    workingDir(repositoryRoot)
+    environment("CARGO_HOME", repositoryRoot.resolve("target/codegen/cargo-home").absolutePath)
+    environment("CARGO_TARGET_DIR", repositoryRoot.resolve("target/codegen/cargo-target").absolutePath)
+    val command = mutableListOf(
+        "cargo", "test", "--quiet", "--manifest-path",
+        layout.buildDirectory.file("test-model-in-tree/Cargo.toml").get().asFile.absolutePath,
+    )
+    if (gradle.startParameter.isOffline) command.add("--offline")
+    commandLine(command)
+}
+
+tasks.test {
+    dependsOn(testInTreeModel)
 }

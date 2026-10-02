@@ -61,10 +61,11 @@ just codegen
 just codegen --project-only
 just codegen --model /absolute/path/to/dev-s3.json --output target/codegen/dev
 just codegen --dry-run
+just codegen --check
 ```
 
 Each invocation resolves the input, exports the dataplane Smithy model, and
-independently reload the exported JSON through Smithy's assembler.
+independently reloads the exported JSON through Smithy's assembler.
 `codegen` also generates the standalone Rust artifact;
 `--project-only` stops after model export/validation.
 `--model` selects a read-only local input; `--output` selects the
@@ -87,6 +88,13 @@ mapping. Cargo lockfiles/build products are excluded. Temporary output is
 removed on completion or failure. Dependency and model caches can still be
 populated unless `--offline` is selected.
 
+`--check` uses fresh temporary generation and compares the canonical model,
+complete Rust subtree, crate manifest/build script, provenance, and policy reports
+byte-for-byte. It returns `0` when identical and `1`
+when files are missing, extra, or changed. It never updates the destination.
+`--project-only --check` compares only the exported model. Unlike `--dry-run`,
+this is an equality check rather than Smithy's semantic compatibility diff.
+
 The underlying entry point is `python3 tools/scripts/codegen`.
 `just --dry-run codegen` only prints the command and does not execute this preview.
 
@@ -96,28 +104,60 @@ The underlying entry point is `python3 tools/scripts/codegen`.
 aggregation. The roots include `Object`, `Owner`, `RestoreStatus`,
 `ChecksumAlgorithm`, `ChecksumType`, and `ObjectStorageClass`. `GetObjectRequest`
 keeps its Smithy identity and all modeled input members, and is named
-`DownloadInput` in Rust. `ObjectMetadata` contains the union of GET/HEAD response
-members, excluding `Body`. Shared members' targets and non-documentation traits
-must agree; a conflict fails generation with the member name. New modeled
+`DownloadInput` in Rust. `PutObjectRequest` is named `UploadInput`; TM controls
+its body and checksum strategy, and excludes unsupported append offsets.
+`UploadOutput` combines PUT, create-multipart-upload, and complete-multipart-upload
+outputs. `ObjectMetadata` contains the union of GET/HEAD response members, and
+`ChunkMetadata` contains GET response members, both excluding `Body`.
+Shared members' targets and value-facing traits must agree; a conflict fails
+generation with the member name. `CodegenModel.kt` flattens mixins and removes
+wire-binding traits once from an in-memory copy before TM projection; these
+values do not implement serialization/deserialization.
+Original shapes and wire traits remain in the exported dataplane model. New modeled
 members and their reachable nested types flow through generation without a
-field allowlist. Mixins are flattened through Smithy's transformer.
-`member-sources.json` records each operation member's correspondence, including
-GET-only and HEAD-only metadata.
+field allowlist. Normalization uses Smithy's model transformer.
+`member-sources.json` records operation and nested-member correspondence.
+`member-policy.json` records custom names/visibility, runtime substitutions,
+construction and redaction policy, and intentional exclusions.
+
+`customizations/` contains S3-specific value policies:
+
+- `S3Expires` uses `DateTime` for upload expiration and preserves raw response
+  strings as `expires_string`, without changing their shared upstream target.
+- `S3Optionality` removes boolean/numeric defaults to preserve absence. Required
+  inputs with service defaults remain omittable through `clientOptional`;
+  ordinary required inputs remain validated.
+- `RequestIdExt` adds modeled `RequestId` and `ExtendedRequestId` members to
+  object/chunk metadata. Their fields and builder setters are internal, while
+  SDK-independent getters are public. Their empty source-member lists identify
+  synthetic values; the policy report records the response header mappings.
 
 `ModelGenerator.kt` calls smithy-rs's symbol provider, structure/builder
-generators, and client-compatible infallible enum generator. Required download
+generators, and client-compatible infallible enum generator. Required
 input fields are checked at builder construction while retaining their optional
 field representation. Timestamps use `aws_smithy_types::DateTime`; enum strings,
-defaults, sensitivity, and documentation follow the modeled traits.
+other defaults, sensitivity, and documentation follow the modeled traits.
+Structure and builder customizations share `MemberPolicy.kt`.
+
+TM-owned references use `#[cfg(not(s3_tm_out_of_tree))]` consistently for fields,
+methods, construction, validation, and Debug. The standalone crate's generated
+`build.rs` selects the reduced compilation shape locally; it does not run codegen.
+Normal TM compilation leaves this cfg unset and uses its existing runtime types.
+Shared Smithy runtime types remain available in both shapes. Derives reflect the
+full runtime shape, including the non-cloneable upload stream.
 
 Intermediate generated files live under this Gradle project's
-`build/model-codegen`. `ModelArtifact.kt` assembles and formats the standalone
+`build/model-codegen/raw`. `ModelArtifact.kt` assembles and formats the standalone
 crate at `target/codegen/projections/model`:
 
 ```text
 model/
   Cargo.toml
+  build.rs
+  dependencies.json
   member-sources.json
+  member-policy.json
+  provenance.json
   src/
     lib.rs
     model/
@@ -131,6 +171,20 @@ model/
 The entire `src/model` subtree, including exports and enum helpers, is generated.
 The standalone crate depends on `aws-smithy-types`, not `aws-sdk-s3`. Generation
 does not install files into Transfer Manager's source tree.
+
+`provenance.json` records input, projection-configuration, projected-model, and
+generator-source digests. `dependencies.json` reports the generated Cargo
+dependency declarations and Smithy/smithy-rs versions. Reports contain no
+timestamps or absolute machine paths.
+
+Generation assembles a fresh candidate before publishing. The artifact's
+`model/src` subtree, manifest, build script, reports, and exported dataplane model
+are disposable generated output. Regeneration replaces their contents and
+removes stale generated files, including local edits. Use `--dry-run` to preview
+changes or `--check` to compare without publishing. Files outside this layout,
+including tests and Cargo lockfiles/build products, are preserved. Symlinks and
+non-directory parents in generated paths are rejected before publication.
+Project-only publication retains an existing generated crate.
 
 ## Tests
 
@@ -153,10 +207,17 @@ GET/HEAD metadata, as well as the operation closure defined by `smithy-build.jso
 
 The test suite also generates a standalone crate from this example model and runs
 Rust consumer tests for unknown enums, collections/timestamps, required/default
-fields, builders, sensitivity, and public paths. These fixtures use the same
+fields, builders, sensitivity, and public paths. A separate crate compiles the
+same generated module with the cfg unset and trait-constrained TM runtime
+doubles, testing runtime fields, metrics, internal metadata construction, and
+builders. S3 customization tests cover upload timestamps, raw expiration
+strings, boolean/numeric absence, synthetic IDs, and collision failures.
+These fixtures use the same
 generation/assembly path as the full S3 model. Rust dependencies are cached at
 `target/codegen/cargo-home`, with compilation output at
 `target/codegen/cargo-target`.
+Tests also cover scoped replacement/removal, stale output, symlinks,
+complete-inventory checks, and deterministic generation in separate directories.
 
 ## Compare projected models
 

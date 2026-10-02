@@ -113,7 +113,7 @@ class CodegenTest(unittest.TestCase):
             self.assertEqual(0, codegen.main(["--dry-run"]))
         scratch = Path(self.property(self.calls[0], "projectionOutput"))
         self.assertIn(f"Dry run destination: {self.destination} (unchanged)", output.getvalue())
-        self.assertIn(f"Temporary output root: {scratch} (removed after preview)", output.getvalue())
+        self.assertIn(f"Temporary output root: {scratch} (removed after comparison)", output.getvalue())
         self.assertIn("Would write:", output.getvalue())
         self.assertFalse(scratch.exists())
         self.assertFalse(self.destination.exists())
@@ -173,3 +173,87 @@ class CodegenTest(unittest.TestCase):
         (crate / "target").mkdir()
         (crate / "target/output").write_text("binary")
         self.assertEqual({"src/model/mod.rs": b"model"}, codegen.generated_files(self.destination))
+
+    def matching_baseline(self):
+        baseline = self.baseline()
+        baseline.write_text("candidate")
+        rust = self.destination / codegen.RUST_ARTIFACT
+        rust.parent.mkdir(parents=True, exist_ok=True)
+        rust.write_text("pub struct Candidate;")
+        return baseline
+
+    def test_check_matching_artifact_is_non_mutating_and_skips_semantic_diff(self):
+        baseline = self.matching_baseline()
+        before = codegen.artifact_files(self.destination)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(0, codegen.main(["--check", "--offline"]))
+        self.assertEqual(before, codegen.artifact_files(self.destination))
+        self.assertEqual("candidate", baseline.read_text())
+        self.assertEqual(1, len(self.calls))
+        self.assertFalse(Path(self.property(self.calls[0], "projectionOutput")).exists())
+
+    def test_check_ignores_obsolete_ownership_metadata_without_modifying_it(self):
+        self.matching_baseline()
+        ledger = self.destination / "generated-files.json"
+        ledger.write_text("obsolete inventory")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(0, codegen.main(["--check"]))
+        self.assertEqual("obsolete inventory", ledger.read_text())
+
+    def test_check_missing_destination_fails_without_creating_it(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(1, codegen.main(["--check"]))
+        self.assertFalse(self.destination.exists())
+
+    def test_check_changed_projection_fails_even_when_smithy_diff_would_succeed(self):
+        self.matching_baseline().write_text("changed canonical model")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(1, codegen.main(["--check"]))
+        self.assertIn(f"Changed: {codegen.MODEL_ARTIFACT}", output.getvalue())
+        self.assertEqual(1, len(self.calls))
+
+    def test_check_changed_or_missing_rust_and_extra_source_are_reported(self):
+        self.matching_baseline()
+        rust = self.destination / codegen.RUST_ARTIFACT
+        rust.write_text("modified Rust")
+        extra = rust.parent / "stale.rs"
+        extra.write_text("extra helper")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(1, codegen.main(["--check"]))
+        self.assertIn("Changed: model/src/model/mod.rs", output.getvalue())
+        self.assertIn("Removed: model/src/model/stale.rs", output.getvalue())
+        self.assertEqual("extra helper", extra.read_text())
+        rust.unlink()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(1, codegen.main(["--check"]))
+        self.assertIn("Added: model/src/model/mod.rs", output.getvalue())
+
+    def test_check_reports_additional_artifact_metadata(self):
+        self.matching_baseline()
+        metadata = self.destination / "model/provenance.json"
+        metadata.write_text("old provenance")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(1, codegen.main(["--check"]))
+        self.assertIn("Removed: model/provenance.json", output.getvalue())
+
+    def test_project_only_check_does_not_compare_an_existing_rust_crate(self):
+        self.matching_baseline()
+        (self.destination / codegen.RUST_ARTIFACT).write_text("irrelevant Rust")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(0, codegen.main(["--check", "--project-only"]))
+
+    def test_check_and_dry_run_are_mutually_exclusive(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            codegen.main(["--check", "--dry-run"])
+        self.assertEqual([], self.calls)
+
+    def test_inventory_rejects_symlinks_without_reading_external_source(self):
+        self.matching_baseline()
+        external = self.root / "external.rs"
+        external.write_text("hand-maintained")
+        (self.destination / "model/src/model/external.rs").symlink_to(external)
+        with self.assertRaises(OSError):
+            codegen.generated_files(self.destination)

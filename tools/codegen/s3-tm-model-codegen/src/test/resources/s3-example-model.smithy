@@ -5,7 +5,7 @@ namespace com.amazonaws.s3
 
 service AmazonS3 {
     version: "2006-03-01"
-    operations: [GetObject, HeadObject, ListObjectsV2]
+    operations: [GetObject, HeadObject, ListObjectsV2, PutObject, CreateMultipartUpload, CompleteMultipartUpload]
 }
 
 operation GetObject {
@@ -14,6 +14,47 @@ operation GetObject {
 }
 operation HeadObject { output: HeadObjectOutput }
 operation ListObjectsV2 { output: ListObjectsV2Output }
+operation PutObject { input: PutObjectRequest, output: PutObjectOutput }
+operation CreateMultipartUpload { input: CreateMultipartUploadRequest, output: CreateMultipartUploadOutput }
+operation CompleteMultipartUpload { output: CompleteMultipartUploadOutput }
+
+@input
+structure PutObjectRequest {
+    @required
+    Bucket: String
+    @required
+    Key: String
+    Body: Blob
+    SSEKMSKeyId: CustomerKey
+    SSEKMSEncryptionContext: CustomerKey
+    ChecksumAlgorithm: ChecksumAlgorithm
+    ChecksumSHA256: String
+    WriteOffsetBytes: Long
+    ContentLength: Long
+    Expires: Expires
+    AdditionalUpload: String
+}
+@input
+structure CreateMultipartUploadRequest { Expires: Expires }
+structure PutObjectOutput {
+    @httpHeader("ETag")
+    ETag: String
+    @httpHeader("x-amz-checksum-sha256")
+    ChecksumSHA256: String
+    SSEKMSKeyId: CustomerKey
+}
+structure CreateMultipartUploadOutput {
+    @xmlName("Bucket")
+    Bucket: String
+    UploadId: String
+    AbortDate: Timestamp
+}
+structure CompleteMultipartUploadOutput {
+    ETag: String
+    ChecksumSHA256: String
+    Bucket: String
+    Location: String
+}
 
 @input
 structure GetObjectRequest with [DownloadExtensions] {
@@ -22,6 +63,7 @@ structure GetObjectRequest with [DownloadExtensions] {
     @required
     Key: String
     IfModifiedSince: Timestamp
+    ResponseExpires: Timestamp
     SSECustomerKey: CustomerKey
     @required
     @default(1)
@@ -44,9 +86,10 @@ structure ResponseMetadata {
     Metadata: Metadata
     SSEKMSKeyId: CustomerKey
     StorageClass: StorageClass
-    Expires: Timestamp
+    Expires: Expires
 }
 
+string Expires
 @sensitive
 string CustomerKey
 map Metadata { key: String, value: String }
@@ -62,6 +105,7 @@ structure Object {
     ETag: String
     ChecksumAlgorithm: ChecksumAlgorithmList
     ChecksumType: ChecksumType
+    @default(0)
     Size: Long
     StorageClass: ObjectStorageClass
     Owner: Owner
