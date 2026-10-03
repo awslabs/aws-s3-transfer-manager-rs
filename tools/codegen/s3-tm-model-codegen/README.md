@@ -169,8 +169,8 @@ model/
 ```
 
 The entire `src/model` subtree, including exports and enum helpers, is generated.
-The standalone crate depends on `aws-smithy-types`, not `aws-sdk-s3`. Generation
-does not install files into Transfer Manager's source tree.
+The standalone crate depends on `aws-smithy-types`, not `aws-sdk-s3`.
+`codegen` publishes only this standalone artifact, not Transfer Manager source.
 
 `provenance.json` records input, projection-configuration, projected-model, and
 generator-source digests. `dependencies.json` reports the generated Cargo
@@ -185,6 +185,45 @@ changes or `--check` to compare without publishing. Files outside this layout,
 including tests and Cargo lockfiles/build products, are preserved. Symlinks and
 non-directory parents in generated paths are rejected before publication.
 Project-only publication retains an existing generated crate.
+
+## Install modeled values
+
+```sh
+just install-model --dry-run
+just install-model
+just install-model --check --pinned-only
+just install-model --overwrite
+```
+
+The underlying entry point is `python3 tools/scripts/install-model`.
+Every invocation generates a fresh standalone artifact in temporary storage and
+compares its complete `model/src/model` subtree with the fixed destination
+`aws-sdk-s3-transfer-manager/src/model`. The installed values are exposed through
+`aws_sdk_s3_transfer_manager::model`; the standalone manifest, build script, and
+reports are not installed. TM uses its runtime types with `s3_tm_out_of_tree`
+unset. Cargo builds use the checked-in files and do not invoke generation.
+
+`--dry-run` reports added, changed, and removed files without changing source.
+`--check` also leaves source unchanged, returning `0` for an identical subtree
+and `1` for missing, extra, or changed files. Both regenerate before comparing.
+`--model`, `--offline`, and `--pinned-only` have the same input/cache semantics as
+`codegen`; temporary output is removed after the command, while dependency and
+model caches can still be populated.
+
+Installation replaces the complete generated subtree and removes stale files.
+It validates that every file is generated Rust source before publication.
+Symlinks, non-directory parents, nonregular entries, and unmarked or handwritten
+files are rejected. Divergent locally edited generated files, including staged,
+unstaged, deleted, and untracked files, require explicit `--overwrite`.
+Byte-identical installs are no-ops; preview/check never require this override.
+`--overwrite` does not bypass the source-tree safety checks.
+Files outside `src/model` are preserved.
+
+An installation lock serializes source publication. A complete candidate is
+written beside the destination before swapping directories; a failed swap
+restores the previous tree. If restoration itself fails, the command reports
+the preserved backup path. After an interrupted installation, inspect that path
+and `target/codegen/install-model.lock` before removing a stale lock.
 
 ## Tests
 
@@ -218,6 +257,18 @@ generation/assembly path as the full S3 model. Rust dependencies are cached at
 `target/codegen/cargo-target`.
 Tests also cover scoped replacement/removal, stale output, symlinks,
 complete-inventory checks, and deterministic generation in separate directories.
+Installer tests cover fresh generation, preview/check, local Git edits,
+handwritten-file protection, concurrent changes, and publication rollback.
+
+The TM tests compile the installed subtree with the real stream, policy, and
+metrics types:
+
+```sh
+cargo test --locked -p aws-sdk-s3-transfer-manager --lib --test model_api_test
+```
+
+The required modeled-generation CI job runs the tooling tests, checks installed
+source against the pinned model, and runs these real-runtime tests.
 
 ## Compare projected models
 

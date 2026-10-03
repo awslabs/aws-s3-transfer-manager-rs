@@ -53,6 +53,7 @@ jobs:
       - miri
       - loom
       - semver
+      - modeled-codegen
     steps:
       - name: Verify required results
         env:
@@ -64,6 +65,49 @@ jobs:
               <<<"$NEEDS_JSON" >&2
             exit 1
           fi
+
+  modeled-codegen:
+    name: Modeled API generation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      GRADLE_USER_HOME: ${{ github.workspace }}/target/codegen/gradle-home
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: corretto
+          java-version: '21'
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Rust ${{ env.rust_min }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.rust_min }}
+          components: rustfmt
+      - name: Cache model tooling dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            target/codegen/gradle-home/caches
+            target/codegen/gradle-home/wrapper
+            target/codegen/cargo-home
+            target/codegen/models
+          key: ${{ runner.os }}-model-tooling-${{ hashFiles('tools/codegen/s3-tm-model-codegen/gradle.properties', 'tools/codegen/s3-tm-model-codegen/gradle/wrapper/gradle-wrapper.properties', 'tools/codegen/s3-tm-model-codegen/settings.gradle.kts', 'tools/codegen/s3-tm-model-codegen/build.gradle.kts') }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Test model tooling and generated fixtures
+        run: |
+          tools/codegen/s3-tm-model-codegen/gradlew \
+            --project-dir tools/codegen/s3-tm-model-codegen test
+      - name: Check installed model against fresh pinned generation
+        run: python3 tools/scripts/install-model --check --pinned-only
+      - name: Test installed values with Transfer Manager runtime types
+        run: |
+          cargo test --locked -p aws-sdk-s3-transfer-manager \
+            --lib --test model_api_test
 
  # Basic actions that must pass before we kick off more expensive tests.
   basics:

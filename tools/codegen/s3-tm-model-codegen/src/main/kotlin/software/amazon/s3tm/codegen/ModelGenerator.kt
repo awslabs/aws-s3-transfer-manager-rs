@@ -130,6 +130,8 @@ object ModelGenerator {
         val crate = RustCrate(manifest, symbols, settings.codegenConfig, docs)
         crate.withModule(modelModule) {
             AllowLintsCustomization().section(LibRsSection.Attributes)(this)
+            // smithy-rs enum formatters omit Formatter's lifetime.
+            rust("##![allow(elided_lifetimes_in_paths)]")
             rust("##![forbid(unsafe_code)]")
         }
         val shapes = projection.roots.flatMap { Walker(source).walkShapes(source.expectShape(it)) }

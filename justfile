@@ -15,6 +15,11 @@ test-codegen:
 codegen *args:
     python3 tools/scripts/codegen "$@"
 
+# Generate fresh values and install src/model; accepts --dry-run, --check, --overwrite.
+[positional-arguments]
+install-model *args:
+    python3 tools/scripts/install-model "$@"
+
 # Compare two projected model files using Smithy's compatibility diff.
 diff-model old new:
     tools/codegen/s3-tm-model-codegen/gradlew --project-dir tools/codegen/s3-tm-model-codegen diffModels -PoldModel={{quote(old)}} -PnewModel={{quote(new)}}

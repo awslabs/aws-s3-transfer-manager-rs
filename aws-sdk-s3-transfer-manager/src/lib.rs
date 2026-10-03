@@ -132,6 +132,9 @@ pub mod error;
 /// Common types used by `aws-sdk-s3-transfer-manager`
 pub mod types;
 
+/// Modeled S3 values and builders.
+pub mod model;
+
 /// Types and helpers for I/O
 pub mod io;
 
@@ -209,3 +212,6 @@ pub use self::transfer::SchedulingCtl;
 pub fn from_env() -> ConfigLoader {
     ConfigLoader::default()
 }
+
+#[cfg(test)]
+mod model_tests;

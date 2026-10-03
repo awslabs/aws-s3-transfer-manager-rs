@@ -44,6 +44,9 @@ class ModelGeneratorTest {
             assertTrue(rust.contains("Unknown("))
         }
         assertTrue(Files.readString(generated.baseDir.resolve("src/model/_owner.rs")).contains("crate::model::LegacyState"))
+        val module = Files.readString(generated.baseDir.resolve("src/model.rs"))
+        assertTrue(module.contains("#![allow(elided_lifetimes_in_paths)]"))
+        assertTrue(module.contains("#![forbid(unsafe_code)]"))
     }
 
     @Test
