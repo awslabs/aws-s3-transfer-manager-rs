@@ -114,13 +114,13 @@ pub struct DownloadInput {
     /// <p>Confirms that the requester knows that they will be charged for the request. Bucket owners need not specify this parameter in their requests. If either the source or destination S3 bucket has Requester Pays enabled, the requester will pay for corresponding charges to copy the object. For information about downloading objects from Requester Pays buckets, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/dev/ObjectsinRequesterPaysBuckets.html">Downloading Objects in Requester Pays Buckets</a> in the <i>Amazon S3 User Guide</i>.</p><note>
     /// <p>This functionality is not supported for directory buckets.</p>
     /// </note>
-    pub request_payer: Option<aws_sdk_s3::types::RequestPayer>,
+    pub request_payer: Option<crate::model::RequestPayer>,
     /// <p>Part number of the object being read. This is a positive integer between 1 and 10,000. Effectively performs a 'ranged' GET request for the part specified. Useful for downloading just a part of an object.</p>
     pub part_number: Option<i32>,
     /// <p>The account ID of the expected bucket owner. If the account ID that you provide does not match the actual owner of the bucket, the request fails with the HTTP status code <code>403 Forbidden</code> (access denied).</p>
     pub expected_bucket_owner: Option<String>,
     /// <p>To retrieve the checksum, this mode must be enabled.</p>
-    pub checksum_mode: Option<aws_sdk_s3::types::ChecksumMode>,
+    pub checksum_mode: Option<crate::model::ChecksumMode>,
     /// How far this download may prefetch ahead of the consumer. `None` uses the
     /// client default from [`Config`](crate::config::Config); `Some` overrides it for
     /// this request.
@@ -261,7 +261,7 @@ impl DownloadInput {
     /// <p>Confirms that the requester knows that they will be charged for the request. Bucket owners need not specify this parameter in their requests. If either the source or destination S3 bucket has Requester Pays enabled, the requester will pay for corresponding charges to copy the object. For information about downloading objects from Requester Pays buckets, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/dev/ObjectsinRequesterPaysBuckets.html">Downloading Objects in Requester Pays Buckets</a> in the <i>Amazon S3 User Guide</i>.</p><note>
     /// <p>This functionality is not supported for directory buckets.</p>
     /// </note>
-    pub fn request_payer(&self) -> Option<&aws_sdk_s3::types::RequestPayer> {
+    pub fn request_payer(&self) -> Option<&crate::model::RequestPayer> {
         self.request_payer.as_ref()
     }
     /// <p>Part number of the object being read. This is a positive integer between 1 and 10,000. Effectively performs a 'ranged' GET request for the part specified. Useful for downloading just a part of an object.</p>
@@ -273,7 +273,7 @@ impl DownloadInput {
         self.expected_bucket_owner.as_deref()
     }
     /// <p>To retrieve the checksum, this mode must be enabled.</p>
-    pub fn checksum_mode(&self) -> Option<&aws_sdk_s3::types::ChecksumMode> {
+    pub fn checksum_mode(&self) -> Option<&crate::model::ChecksumMode> {
         self.checksum_mode.as_ref()
     }
     /// How far this download may prefetch ahead of the consumer, if overridden for
@@ -343,10 +343,10 @@ pub struct DownloadInputBuilder {
     pub(crate) sse_customer_algorithm: Option<String>,
     pub(crate) sse_customer_key: Option<String>,
     pub(crate) sse_customer_key_md5: Option<String>,
-    pub(crate) request_payer: Option<aws_sdk_s3::types::RequestPayer>,
+    pub(crate) request_payer: Option<crate::model::RequestPayer>,
     pub(crate) part_number: Option<i32>,
     pub(crate) expected_bucket_owner: Option<String>,
-    pub(crate) checksum_mode: Option<aws_sdk_s3::types::ChecksumMode>,
+    pub(crate) checksum_mode: Option<crate::model::ChecksumMode>,
     pub(crate) read_ahead: Option<crate::types::ReadAhead>,
 }
 
@@ -783,21 +783,21 @@ impl DownloadInputBuilder {
     /// <p>Confirms that the requester knows that they will be charged for the request. Bucket owners need not specify this parameter in their requests. If either the source or destination S3 bucket has Requester Pays enabled, the requester will pay for corresponding charges to copy the object. For information about downloading objects from Requester Pays buckets, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/dev/ObjectsinRequesterPaysBuckets.html">Downloading Objects in Requester Pays Buckets</a> in the <i>Amazon S3 User Guide</i>.</p><note>
     /// <p>This functionality is not supported for directory buckets.</p>
     /// </note>
-    pub fn request_payer(mut self, input: aws_sdk_s3::types::RequestPayer) -> Self {
+    pub fn request_payer(mut self, input: crate::model::RequestPayer) -> Self {
         self.request_payer = Option::Some(input);
         self
     }
     /// <p>Confirms that the requester knows that they will be charged for the request. Bucket owners need not specify this parameter in their requests. If either the source or destination S3 bucket has Requester Pays enabled, the requester will pay for corresponding charges to copy the object. For information about downloading objects from Requester Pays buckets, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/dev/ObjectsinRequesterPaysBuckets.html">Downloading Objects in Requester Pays Buckets</a> in the <i>Amazon S3 User Guide</i>.</p><note>
     /// <p>This functionality is not supported for directory buckets.</p>
     /// </note>
-    pub fn set_request_payer(mut self, input: Option<aws_sdk_s3::types::RequestPayer>) -> Self {
+    pub fn set_request_payer(mut self, input: Option<crate::model::RequestPayer>) -> Self {
         self.request_payer = input;
         self
     }
     /// <p>Confirms that the requester knows that they will be charged for the request. Bucket owners need not specify this parameter in their requests. If either the source or destination S3 bucket has Requester Pays enabled, the requester will pay for corresponding charges to copy the object. For information about downloading objects from Requester Pays buckets, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/dev/ObjectsinRequesterPaysBuckets.html">Downloading Objects in Requester Pays Buckets</a> in the <i>Amazon S3 User Guide</i>.</p><note>
     /// <p>This functionality is not supported for directory buckets.</p>
     /// </note>
-    pub fn get_request_payer(&self) -> &Option<aws_sdk_s3::types::RequestPayer> {
+    pub fn get_request_payer(&self) -> &Option<crate::model::RequestPayer> {
         &self.request_payer
     }
     /// <p>The account ID of the expected bucket owner. If the account ID that you provide does not match the actual owner of the bucket, the request fails with the HTTP status code <code>403 Forbidden</code> (access denied).</p>
@@ -815,17 +815,17 @@ impl DownloadInputBuilder {
         self.expected_bucket_owner.as_deref()
     }
     /// <p>To retrieve the checksum, this mode must be enabled.</p>
-    pub fn checksum_mode(mut self, input: aws_sdk_s3::types::ChecksumMode) -> Self {
+    pub fn checksum_mode(mut self, input: crate::model::ChecksumMode) -> Self {
         self.checksum_mode = Option::Some(input);
         self
     }
     /// <p>To retrieve the checksum, this mode must be enabled.</p>
-    pub fn set_checksum_mode(mut self, input: Option<aws_sdk_s3::types::ChecksumMode>) -> Self {
+    pub fn set_checksum_mode(mut self, input: Option<crate::model::ChecksumMode>) -> Self {
         self.checksum_mode = input;
         self
     }
     /// <p>To retrieve the checksum, this mode must be enabled.</p>
-    pub fn get_checksum_mode(&self) -> &Option<aws_sdk_s3::types::ChecksumMode> {
+    pub fn get_checksum_mode(&self) -> &Option<crate::model::ChecksumMode> {
         &self.checksum_mode
     }
     /// Override how far this download prefetches ahead of the consumer, replacing the
@@ -940,9 +940,19 @@ pub(crate) fn copy_fields_to_get_object_request(
         .set_sse_customer_algorithm(input.sse_customer_algorithm.clone())
         .set_sse_customer_key(input.sse_customer_key.clone())
         .set_sse_customer_key_md5(input.sse_customer_key_md5.clone())
-        .set_request_payer(input.request_payer.clone())
+        .set_request_payer(
+            input
+                .request_payer
+                .as_ref()
+                .map(crate::sdk_v1::request_payer_to_sdk),
+        )
         .set_expected_bucket_owner(input.expected_bucket_owner.clone())
-        .set_checksum_mode(input.checksum_mode.clone())
+        .set_checksum_mode(
+            input
+                .checksum_mode
+                .as_ref()
+                .map(crate::sdk_v1::checksum_mode_to_sdk),
+        )
 }
 
 /// Copies fields supported by `HeadObject` from a download request.
@@ -972,9 +982,19 @@ pub(crate) fn copy_fields_to_head_object_request(
         .set_sse_customer_algorithm(input.sse_customer_algorithm.clone())
         .set_sse_customer_key(input.sse_customer_key.clone())
         .set_sse_customer_key_md5(input.sse_customer_key_md5.clone())
-        .set_request_payer(input.request_payer.clone())
+        .set_request_payer(
+            input
+                .request_payer
+                .as_ref()
+                .map(crate::sdk_v1::request_payer_to_sdk),
+        )
         .set_expected_bucket_owner(input.expected_bucket_owner.clone())
-        .set_checksum_mode(input.checksum_mode.clone())
+        .set_checksum_mode(
+            input
+                .checksum_mode
+                .as_ref()
+                .map(crate::sdk_v1::checksum_mode_to_sdk),
+        )
 }
 
 impl From<DownloadInput> for DownloadInputBuilder {
@@ -1015,7 +1035,7 @@ mod tests {
     use super::{
         copy_fields_to_get_object_request, copy_fields_to_head_object_request, DownloadInput,
     };
-    use aws_sdk_s3::types::{ChecksumMode, RequestPayer};
+    use crate::model::{ChecksumMode, RequestPayer};
     use aws_smithy_mocks::mock_client;
     use aws_smithy_types::DateTime;
 
@@ -1125,12 +1145,18 @@ mod tests {
                 $input.sse_customer_key_md5(),
                 $request.sse_customer_key_md5()
             );
-            assert_eq!($input.request_payer(), $request.request_payer());
+            assert_eq!(
+                $input.request_payer().map(|v| v.as_str()),
+                $request.request_payer().map(|v| v.as_str())
+            );
             assert_eq!(
                 $input.expected_bucket_owner(),
                 $request.expected_bucket_owner()
             );
-            assert_eq!($input.checksum_mode(), $request.checksum_mode());
+            assert_eq!(
+                $input.checksum_mode().map(|v| v.as_str()),
+                $request.checksum_mode().map(|v| v.as_str())
+            );
 
             // User-selected object parts are unsupported. GET discovery sets
             // its own part number only on requests that require one.

@@ -66,7 +66,7 @@ just codegen --check
 
 Each invocation resolves the input, exports the dataplane Smithy model, and
 independently reloads the exported JSON through Smithy's assembler.
-`codegen` also generates the standalone Rust artifact;
+`codegen` also generates the standalone Rust artifact and SDK v1 adapters;
 `--project-only` stops after model export/validation.
 `--model` selects a read-only local input; `--output` selects the
 artifact directory. Relative paths resolve from the repository root.
@@ -76,7 +76,8 @@ input overrides.
 The output summary identifies the input path and whether it is a verified pin or
 local override, the projection configuration and exported model path, and the
 retained operations. Full generation also reports the intermediate codegen
-directory, standalone crate, and generated module path. Dry-run output labels
+directory, standalone crate, generated module, SDK adapter directory, and
+mapping report paths. Dry-run output labels
 the unchanged destination separately from the temporary output.
 
 `--dry-run` runs the selected pipeline in temporary storage without changing the
@@ -84,12 +85,14 @@ destination. If an exported model exists there, it compares the candidate using
 Smithy's compatibility diff; otherwise it reports the model that would be
 written. Full generation also reports added, changed, and removed generated
 files, comparing the complete Rust source subtree, manifest, and member-source
-mapping. Cargo lockfiles/build products are excluded. Temporary output is
+mapping, plus the SDK adapter subtree and its mapping report.
+Cargo lockfiles/build products are excluded. Temporary output is
 removed on completion or failure. Dependency and model caches can still be
 populated unless `--offline` is selected.
 
 `--check` uses fresh temporary generation and compares the canonical model,
-complete Rust subtree, crate manifest/build script, provenance, and policy reports
+complete Rust and SDK adapter subtrees, crate manifest/build script,
+provenance, and policy reports
 byte-for-byte. It returns `0` when identical and `1`
 when files are missing, extra, or changed. It never updates the destination.
 `--project-only --check` compares only the exported model. Unlike `--dry-run`,
@@ -170,7 +173,26 @@ model/
 
 The entire `src/model` subtree, including exports and enum helpers, is generated.
 The standalone crate depends on `aws-smithy-types`, not `aws-sdk-s3`.
-`codegen` publishes only this standalone artifact, not Transfer Manager source.
+`codegen` publishes generated artifacts, not Transfer Manager source.
+
+SDK v1 adapters are generated separately at
+`target/codegen/projections/sdk_v1`:
+
+```text
+sdk_v1/
+  mod.rs
+  convert.rs
+  compat.rs
+  mapping.json
+```
+
+`convert.rs` contains crate-private enum, nested-value, request-field, and
+response conversions. `mod.rs` re-exports them for internal calls and loads
+`compat.rs` only with the `sdk-v1` Cargo feature. That file contains the public
+`From`/`TryFrom` implementations for SDK v1 enums and nested values.
+The feature selects interoperability, not the SDK backend dependency.
+`mapping.json` records source-member classifications and correspondence;
+it is not installed into TM.
 
 `provenance.json` records input, projection-configuration, projected-model, and
 generator-source digests. `dependencies.json` reports the generated Cargo
@@ -178,15 +200,15 @@ dependency declarations and Smithy/smithy-rs versions. Reports contain no
 timestamps or absolute machine paths.
 
 Generation assembles a fresh candidate before publishing. The artifact's
-`model/src` subtree, manifest, build script, reports, and exported dataplane model
+`model/src` and `sdk_v1` subtrees, manifest, build script, reports, and exported dataplane model
 are disposable generated output. Regeneration replaces their contents and
 removes stale generated files, including local edits. Use `--dry-run` to preview
 changes or `--check` to compare without publishing. Files outside this layout,
 including tests and Cargo lockfiles/build products, are preserved. Symlinks and
 non-directory parents in generated paths are rejected before publication.
-Project-only publication retains an existing generated crate.
+Project-only publication retains existing Rust and SDK adapter artifacts.
 
-## Install modeled values
+## Install modeled values and SDK adapters
 
 ```sh
 just install-model --dry-run
@@ -196,32 +218,35 @@ just install-model --overwrite
 ```
 
 The underlying entry point is `python3 tools/scripts/install-model`.
-Every invocation generates a fresh standalone artifact in temporary storage and
-compares its complete `model/src/model` subtree with the fixed destination
-`aws-sdk-s3-transfer-manager/src/model`. The installed values are exposed through
-`aws_sdk_s3_transfer_manager::model`; the standalone manifest, build script, and
-reports are not installed. TM uses its runtime types with `s3_tm_out_of_tree`
+Every invocation generates fresh artifacts in temporary storage and compares
+their complete Rust source trees with the fixed destinations
+`aws-sdk-s3-transfer-manager/src/model` and
+`aws-sdk-s3-transfer-manager/src/sdk_v1`. The modeled values are exposed through
+`aws_sdk_s3_transfer_manager::model`; the SDK adapter module is crate-private.
+The standalone manifest, build script, and reports are not installed.
+TM uses its runtime types with `s3_tm_out_of_tree`
 unset. Cargo builds use the checked-in files and do not invoke generation.
 
 `--dry-run` reports added, changed, and removed files without changing source.
-`--check` also leaves source unchanged, returning `0` for an identical subtree
+`--check` also leaves source unchanged, returning `0` for identical subtrees
 and `1` for missing, extra, or changed files. Both regenerate before comparing.
 `--model`, `--offline`, and `--pinned-only` have the same input/cache semantics as
 `codegen`; temporary output is removed after the command, while dependency and
 model caches can still be populated.
 
-Installation replaces the complete generated subtree and removes stale files.
+Installation replaces the complete generated subtrees and removes stale files.
 It validates that every file is generated Rust source before publication.
 Symlinks, non-directory parents, nonregular entries, and unmarked or handwritten
 files are rejected. Divergent locally edited generated files, including staged,
 unstaged, deleted, and untracked files, require explicit `--overwrite`.
 Byte-identical installs are no-ops; preview/check never require this override.
 `--overwrite` does not bypass the source-tree safety checks.
-Files outside `src/model` are preserved.
+Files outside `src/model` and `src/sdk_v1` are preserved.
 
-An installation lock serializes source publication. A complete candidate is
-written beside the destination before swapping directories; a failed swap
-restores the previous tree. If restoration itself fails, the command reports
+An installation lock serializes source publication. Both trees are validated
+and staged before swapping directories; a failed swap rolls back both
+destinations. The two-directory publication is not filesystem-atomic.
+If restoration itself fails, the command reports
 the preserved backup path. After an interrupted installation, inspect that path
 and `target/codegen/install-model.lock` before removing a stale lock.
 
@@ -265,7 +290,14 @@ metrics types:
 
 ```sh
 cargo test --locked -p aws-sdk-s3-transfer-manager --lib --test model_api_test
+cargo test --locked -p aws-sdk-s3-transfer-manager \
+  --lib --test sdk_v1_compat_test --features sdk-v1
 ```
+
+Handwritten crate-internal tests live in
+`aws-sdk-s3-transfer-manager/src/tests/{model,sdk_v1}.rs`, outside both generated
+subtrees. The tests under `aws-sdk-s3-transfer-manager/tests` exercise the public
+API as external consumers.
 
 The required modeled-generation CI job runs the tooling tests, checks installed
 source against the pinned model, and runs these real-runtime tests.

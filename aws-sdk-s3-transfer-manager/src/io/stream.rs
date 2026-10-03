@@ -401,7 +401,7 @@ pub trait PartStream {
     ///
     /// This function is called once, after [`PartStream::poll_part()`] yields the final part,
     /// if and only if you used a [ChecksumStrategy](crate::operation::upload::ChecksumStrategy) with
-    /// [ChecksumType::FullObject](aws_sdk_s3::types::ChecksumType) and didn't set its
+    /// [ChecksumType::FullObject](crate::model::ChecksumType) and didn't set its
     /// [full_object_checksum](crate::operation::upload::ChecksumStrategy::full_object_checksum)
     /// value up front.
     ///

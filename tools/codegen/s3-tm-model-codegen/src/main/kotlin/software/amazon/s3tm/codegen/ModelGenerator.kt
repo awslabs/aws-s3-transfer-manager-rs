@@ -11,6 +11,7 @@ import java.nio.file.Path
 import software.amazon.smithy.build.FileManifest
 import software.amazon.smithy.codegen.core.Symbol
 import software.amazon.smithy.model.neighbor.Walker
+import software.amazon.smithy.model.Model
 import software.amazon.smithy.model.node.Node
 import software.amazon.smithy.model.shapes.EnumShape
 import software.amazon.smithy.model.shapes.OperationShape
@@ -39,6 +40,7 @@ import software.amazon.smithy.rust.codegen.core.smithy.ModuleProvider
 import software.amazon.smithy.rust.codegen.core.smithy.ModuleProviderContext
 import software.amazon.smithy.rust.codegen.core.smithy.RustCrate
 import software.amazon.smithy.rust.codegen.core.smithy.RustSymbolProviderConfig
+import software.amazon.smithy.rust.codegen.core.smithy.RustSymbolProvider
 import software.amazon.smithy.rust.codegen.core.smithy.RuntimeType
 import software.amazon.smithy.rust.codegen.core.smithy.WrappingSymbolProvider
 import software.amazon.smithy.rust.codegen.core.smithy.expectRustMetadata
@@ -78,9 +80,8 @@ object ModelGenerator {
             error("Event streams require an explicit TM projection")
     }
 
-    fun generate(projection: TmModelProjection.Result, output: Path, smithyTypesVersion: String): FileManifest {
-        val source = projection.model
-        val settings = ClientRustSettings.from(source, Node.parse(
+    internal fun settings(source: Model, smithyTypesVersion: String) =
+        ClientRustSettings.from(source, Node.parse(
             """
             {
               "service": "${ModelLoader.serviceId}",
@@ -93,20 +94,26 @@ object ModelGenerator {
             }
             """,
         ).expectObjectNode())
+
+    internal fun symbols(source: Model, settings: ClientRustSettings): RustSymbolProvider {
         val symbolConfig =
             RustSymbolProviderConfig(
                 settings.runtimeConfig, settings.codegenConfig.renameExceptions,
                 settings.codegenConfig.nullabilityCheckMode, Modules,
                 nameBuilderFor = { "${it.name}Builder" },
             )
-        fun baseSymbols(model: software.amazon.smithy.model.Model) =
-            RustClientCodegenPlugin.baseSymbolProvider(
-                settings, model, settings.getService(model), symbolConfig,
-                CombinedClientCodegenDecorator(emptyList()),
-            )
-        val policy = MemberPolicy(source, baseSymbols(source))
+        return RustClientCodegenPlugin.baseSymbolProvider(
+            settings, source, settings.getService(source), symbolConfig,
+            CombinedClientCodegenDecorator(emptyList()),
+        )
+    }
+
+    fun generate(projection: TmModelProjection.Result, output: Path, smithyTypesVersion: String): FileManifest {
+        val source = projection.model
+        val settings = settings(source, smithyTypesVersion)
+        val policy = MemberPolicy(source, symbols(source, settings))
         val model = policy.emissionModel()
-        val base = baseSymbols(model)
+        val base = symbols(model, settings)
         val symbols = object : WrappingSymbolProvider(base) {
             override fun toSymbol(shape: Shape): Symbol {
                 val symbol = super.toSymbol(shape)

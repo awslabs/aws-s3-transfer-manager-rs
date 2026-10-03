@@ -83,6 +83,8 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Install just
+        uses: extractions/setup-just@v3
       - name: Install Rust ${{ env.rust_min }}
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -99,15 +101,15 @@ jobs:
           key: ${{ runner.os }}-model-tooling-${{ hashFiles('tools/codegen/s3-tm-model-codegen/gradle.properties', 'tools/codegen/s3-tm-model-codegen/gradle/wrapper/gradle-wrapper.properties', 'tools/codegen/s3-tm-model-codegen/settings.gradle.kts', 'tools/codegen/s3-tm-model-codegen/build.gradle.kts') }}
       - uses: Swatinem/rust-cache@v2
       - name: Test model tooling and generated fixtures
-        run: |
-          tools/codegen/s3-tm-model-codegen/gradlew \
-            --project-dir tools/codegen/s3-tm-model-codegen test
-      - name: Check installed model against fresh pinned generation
-        run: python3 tools/scripts/install-model --check --pinned-only
+        run: just test-codegen
+      - name: Check installed model and SDK adapters against fresh pinned generation
+        run: just install-model --check --pinned-only
       - name: Test installed values with Transfer Manager runtime types
         run: |
           cargo test --locked -p aws-sdk-s3-transfer-manager \
             --lib --test model_api_test
+          cargo test --locked -p aws-sdk-s3-transfer-manager \
+            --lib --test model_api_test --test sdk_v1_compat_test --features sdk-v1
 
  # Basic actions that must pass before we kick off more expensive tests.
   basics:
@@ -627,10 +629,8 @@ jobs:
           manifest-path: aws-sdk-s3-transfer-manager/Cargo.toml
           package: aws-sdk-s3-transfer-manager
           feature-group: all-features
-          rust-toolchain: ${{ env.rust_stable }}
-          # Use the latest published version as the baseline and infer the
-          # required compatibility from the crate's version bump. This permits
-          # intentional 0.x minor and 1.x major breaking releases.
+          rust-toolchain: ${{ env.rust_min }}
+          baseline-version: '0.3.0'
 
   features:
     name: features

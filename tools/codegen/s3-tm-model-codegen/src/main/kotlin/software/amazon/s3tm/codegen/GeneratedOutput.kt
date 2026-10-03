@@ -51,25 +51,30 @@ object GeneratedOutput {
                 "${ModelProjection.name}/model/model.json",
                 "model/Cargo.toml", "model/build.rs", "model/member-sources.json",
                 "model/member-policy.json", "model/provenance.json", "model/dependencies.json",
+                "sdk_v1/mapping.json",
             )
         }
 
     private fun allowedFile(name: String, raw: Boolean): Boolean =
-        name.startsWith(if (raw) "src/" else "model/src/") || name in fixedFiles(raw)
+        name.startsWith(if (raw) "src/" else "model/src/") ||
+            !raw && name.startsWith("sdk_v1/") && name.endsWith(".rs") || name in fixedFiles(raw)
 
     private fun existingFiles(output: Path, projectOnly: Boolean, raw: Boolean): Set<String> {
         val files = mutableSetOf<String>()
         if (!projectOnly) {
-            val source = safePath(output, if (raw) "src" else "model/src")
-            if (Files.exists(source, LinkOption.NOFOLLOW_LINKS)) {
-                require(Files.isDirectory(source, LinkOption.NOFOLLOW_LINKS)) {
-                    "Generated source root is not a directory: $source"
-                }
-                Files.walk(source).use { paths ->
-                    paths.forEach { file ->
-                        val name = output.relativize(file).toString().replace('\\', '/')
-                        safePath(output, name)
-                        if (Files.isRegularFile(file, LinkOption.NOFOLLOW_LINKS)) files.add(name)
+            val roots = if (raw) listOf("src") else listOf("model/src", "sdk_v1")
+            roots.forEach { root ->
+                val source = safePath(output, root)
+                if (Files.exists(source, LinkOption.NOFOLLOW_LINKS)) {
+                    require(Files.isDirectory(source, LinkOption.NOFOLLOW_LINKS)) {
+                        "Generated source root is not a directory: $source"
+                    }
+                    Files.walk(source).use { paths ->
+                        paths.forEach { file ->
+                            val name = output.relativize(file).toString().replace('\\', '/')
+                            safePath(output, name)
+                            if (Files.isRegularFile(file, LinkOption.NOFOLLOW_LINKS)) files.add(name)
+                        }
                     }
                 }
             }

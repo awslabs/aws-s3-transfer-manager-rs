@@ -63,7 +63,7 @@ pub struct ObjectMetadata {
     /// </note>
     pub website_redirect_location: Option<String>,
     /// <p>The server-side encryption algorithm used when you store this object in Amazon S3.</p>
-    pub server_side_encryption: Option<aws_sdk_s3::types::ServerSideEncryption>,
+    pub server_side_encryption: Option<crate::model::ServerSideEncryption>,
     /// <p>A map of metadata to store with the object in S3.</p>
     pub metadata: Option<::std::collections::HashMap<String, String>>,
     /// <p>If server-side encryption with a customer-provided encryption key was requested, the response will include this header to confirm the encryption algorithm that's used.</p><note>
@@ -81,21 +81,21 @@ pub struct ObjectMetadata {
     /// <p>Provides storage class information of the object. Amazon S3 returns this header for all objects except for S3 Standard storage class objects.</p><note>
     /// <p><b>Directory buckets </b> - Only the S3 Express One Zone storage class is supported by directory buckets to store objects.</p>
     /// </note>
-    pub storage_class: Option<aws_sdk_s3::types::StorageClass>,
+    pub storage_class: Option<crate::model::StorageClass>,
     /// <p>If present, indicates that the requester was successfully charged for the request.</p><note>
     /// <p>This functionality is not supported for directory buckets.</p>
     /// </note>
-    pub request_charged: Option<aws_sdk_s3::types::RequestCharged>,
+    pub request_charged: Option<crate::model::RequestCharged>,
     /// <p>Amazon S3 can return this if your request involves a bucket that is either a source or destination in a replication rule.</p><note>
     /// <p>This functionality is not supported for directory buckets.</p>
     /// </note>
-    pub replication_status: Option<aws_sdk_s3::types::ReplicationStatus>,
+    pub replication_status: Option<crate::model::ReplicationStatus>,
     /// <p>The count of parts this object has. This value is only returned if you specify <code>partNumber</code> in your request and the object was uploaded as a multipart upload.</p>
     pub parts_count: Option<i32>,
     /// <p>The Object Lock mode that's currently in place for this object.</p><note>
     /// <p>This functionality is not supported for directory buckets.</p>
     /// </note>
-    pub object_lock_mode: Option<aws_sdk_s3::types::ObjectLockMode>,
+    pub object_lock_mode: Option<crate::model::ObjectLockMode>,
     /// <p>The date and time when this object's Object Lock will expire.</p><note>
     /// <p>This functionality is not supported for directory buckets.</p>
     /// </note>
@@ -103,7 +103,7 @@ pub struct ObjectMetadata {
     /// <p>Indicates whether this object has an active legal hold. This field is only returned if you have permission to view an object's legal hold status.</p><note>
     /// <p>This functionality is not supported for directory buckets.</p>
     /// </note>
-    pub object_lock_legal_hold_status: Option<aws_sdk_s3::types::ObjectLockLegalHoldStatus>,
+    pub object_lock_legal_hold_status: Option<crate::model::ObjectLockLegalHoldStatus>,
     /// <p>The date and time at which the object is no longer cacheable.</p>
     pub expires_string: Option<String>,
 }
@@ -166,19 +166,37 @@ impl From<&GetObjectOutput> for ObjectMetadata {
             content_type: value.content_type.clone(),
             expires_string: value.expires_string.clone(),
             website_redirect_location: value.website_redirect_location.clone(),
-            server_side_encryption: value.server_side_encryption.clone(),
+            server_side_encryption: value
+                .server_side_encryption
+                .as_ref()
+                .map(crate::sdk_v1::server_side_encryption_from_sdk),
             metadata: value.metadata.clone(),
             sse_customer_algorithm: value.sse_customer_algorithm.clone(),
             sse_customer_key_md5: value.sse_customer_key_md5.clone(),
             ssekms_key_id: value.ssekms_key_id.clone(),
             bucket_key_enabled: value.bucket_key_enabled,
-            storage_class: value.storage_class.clone(),
-            replication_status: value.replication_status.clone(),
+            storage_class: value
+                .storage_class
+                .as_ref()
+                .map(crate::sdk_v1::storage_class_from_sdk),
+            replication_status: value
+                .replication_status
+                .as_ref()
+                .map(crate::sdk_v1::replication_status_from_sdk),
             parts_count: value.parts_count,
-            object_lock_mode: value.object_lock_mode.clone(),
+            object_lock_mode: value
+                .object_lock_mode
+                .as_ref()
+                .map(crate::sdk_v1::object_lock_mode_from_sdk),
             object_lock_retain_until_date: value.object_lock_retain_until_date,
-            object_lock_legal_hold_status: value.object_lock_legal_hold_status.clone(),
-            request_charged: value.request_charged.clone(),
+            object_lock_legal_hold_status: value
+                .object_lock_legal_hold_status
+                .as_ref()
+                .map(crate::sdk_v1::object_lock_legal_hold_status_from_sdk),
+            request_charged: value
+                .request_charged
+                .as_ref()
+                .map(crate::sdk_v1::request_charged_from_sdk),
         }
     }
 }
@@ -210,19 +228,37 @@ impl From<HeadObjectOutput> for ObjectMetadata {
             content_type: value.content_type,
             expires_string: value.expires_string,
             website_redirect_location: value.website_redirect_location,
-            server_side_encryption: value.server_side_encryption,
+            server_side_encryption: value
+                .server_side_encryption
+                .as_ref()
+                .map(crate::sdk_v1::server_side_encryption_from_sdk),
             metadata: value.metadata,
             sse_customer_algorithm: value.sse_customer_algorithm,
             sse_customer_key_md5: value.sse_customer_key_md5,
             ssekms_key_id: value.ssekms_key_id,
             bucket_key_enabled: value.bucket_key_enabled,
-            storage_class: value.storage_class,
-            replication_status: value.replication_status,
+            storage_class: value
+                .storage_class
+                .as_ref()
+                .map(crate::sdk_v1::storage_class_from_sdk),
+            replication_status: value
+                .replication_status
+                .as_ref()
+                .map(crate::sdk_v1::replication_status_from_sdk),
             parts_count: value.parts_count,
-            object_lock_mode: value.object_lock_mode,
+            object_lock_mode: value
+                .object_lock_mode
+                .as_ref()
+                .map(crate::sdk_v1::object_lock_mode_from_sdk),
             object_lock_retain_until_date: value.object_lock_retain_until_date,
-            object_lock_legal_hold_status: value.object_lock_legal_hold_status,
-            request_charged: value.request_charged,
+            object_lock_legal_hold_status: value
+                .object_lock_legal_hold_status
+                .as_ref()
+                .map(crate::sdk_v1::object_lock_legal_hold_status_from_sdk),
+            request_charged: value
+                .request_charged
+                .as_ref()
+                .map(crate::sdk_v1::request_charged_from_sdk),
         }
     }
 }

@@ -953,7 +953,7 @@ async fn test_integrity_checks_enabled_not_falsely_validated() {
         .download()
         .bucket("test-bucket")
         .key("test-object")
-        .checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled)
+        .checksum_mode(aws_sdk_s3_transfer_manager::model::ChecksumMode::Enabled)
         .initiate()
         .unwrap();
     let _ = drain(&mut handle).await.unwrap();

@@ -55,7 +55,7 @@ pub struct S3Walker {
     prefix: Option<String>,
     delimiter: Option<String>,
     expected_bucket_owner: Option<String>,
-    request_payer: Option<aws_sdk_s3::types::RequestPayer>,
+    request_payer: Option<crate::model::RequestPayer>,
     filter: Option<FilterFn>,
     start_after: Option<String>,
     continuation_token: Option<String>,
@@ -150,7 +150,7 @@ pub struct S3WalkerBuilder {
     prefix: Option<String>,
     delimiter: Option<String>,
     expected_bucket_owner: Option<String>,
-    request_payer: Option<aws_sdk_s3::types::RequestPayer>,
+    request_payer: Option<crate::model::RequestPayer>,
     filter: Option<FilterFn>,
     start_after: Option<String>,
     continuation_token: Option<String>,
@@ -198,7 +198,7 @@ impl S3WalkerBuilder {
 
     /// Set the request-payer preference for Requester-Pays buckets.
     #[must_use]
-    pub fn request_payer(mut self, payer: aws_sdk_s3::types::RequestPayer) -> Self {
+    pub fn request_payer(mut self, payer: crate::model::RequestPayer) -> Self {
         self.request_payer = Some(payer);
         self
     }
@@ -473,7 +473,7 @@ impl S3Walk {
             req = req.expected_bucket_owner(owner);
         }
         if let Some(payer) = &self.config.request_payer {
-            req = req.request_payer(payer.clone());
+            req = req.request_payer(crate::sdk_v1::request_payer_to_sdk(payer));
         }
         if let Some(page_size) = self.config.page_size {
             req = req.max_keys(page_size);
@@ -940,7 +940,7 @@ mod tests {
         let client = mock_client!(aws_sdk_s3, RuleMode::Sequential, &[&rule]);
 
         let mut walk = walker()
-            .request_payer(aws_sdk_s3::types::RequestPayer::Requester)
+            .request_payer(crate::model::RequestPayer::Requester)
             .build()
             .walk(s3ctx(client, "test-bucket"));
 

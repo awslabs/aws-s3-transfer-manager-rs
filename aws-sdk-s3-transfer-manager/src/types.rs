@@ -182,7 +182,7 @@ pub enum FailedMultipartUploadPolicy {
 #[derive(Debug, Default)]
 pub struct AbortedUpload {
     pub(crate) upload_id: Option<String>,
-    pub(crate) request_charged: Option<aws_sdk_s3::types::RequestCharged>,
+    pub(crate) request_charged: Option<crate::model::RequestCharged>,
 }
 
 impl AbortedUpload {
@@ -197,7 +197,7 @@ impl AbortedUpload {
     ///
     /// This functionality is not supported for directory buckets and is
     /// not present for uploads that did not utilize a multipart upload
-    pub fn request_charged(&self) -> &Option<aws_sdk_s3::types::RequestCharged> {
+    pub fn request_charged(&self) -> &Option<crate::model::RequestCharged> {
         &self.request_charged
     }
 }
@@ -367,7 +367,7 @@ pub struct IntegrityChecks {
     checksum_crc64_nvme: Option<String>,
     checksum_sha1: Option<String>,
     checksum_sha256: Option<String>,
-    checksum_type: Option<aws_sdk_s3::types::ChecksumType>,
+    checksum_type: Option<crate::model::ChecksumType>,
     checksum_validation: ChecksumValidation,
 }
 
@@ -403,7 +403,7 @@ impl IntegrityChecks {
     }
 
     /// The object's checksum type (full-object vs composite), if reported.
-    pub fn checksum_type(&self) -> Option<&aws_sdk_s3::types::ChecksumType> {
+    pub fn checksum_type(&self) -> Option<&crate::model::ChecksumType> {
         self.checksum_type.as_ref()
     }
 }
@@ -420,7 +420,7 @@ pub enum ChecksumValidation {
     #[non_exhaustive]
     Validated {
         /// The algorithm used to validate.
-        algorithm: aws_sdk_s3::types::ChecksumAlgorithm,
+        algorithm: crate::model::ChecksumAlgorithm,
     },
     /// No whole-object validation occurred. `reason` explains why.
     #[non_exhaustive]
@@ -455,7 +455,7 @@ impl IntegrityChecks {
         checksum_crc64_nvme: Option<String>,
         checksum_sha1: Option<String>,
         checksum_sha256: Option<String>,
-        checksum_type: Option<aws_sdk_s3::types::ChecksumType>,
+        checksum_type: Option<crate::model::ChecksumType>,
         checksum_validation: ChecksumValidation,
     ) -> Self {
         Self {

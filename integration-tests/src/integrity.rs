@@ -116,8 +116,8 @@
 
 use crate::assertions::{assert_integrity_error, assert_same_content};
 use crate::harness::Target;
-use aws_sdk_s3::types::ChecksumMode;
 use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
+use aws_sdk_s3_transfer_manager::model::ChecksumMode;
 use aws_sdk_s3_transfer_manager::operation::download::DownloadOutput;
 use aws_sdk_s3_transfer_manager::operation::upload::ChecksumStrategy;
 use aws_sdk_s3_transfer_manager::types::{ChecksumValidation, NotValidatedReason, PartSize};

@@ -182,4 +182,46 @@ class GeneratedOutputTest {
         assertEquals("binary", Files.readString(output.resolve("target/output")))
         assertEquals("manual", Files.readString(output.resolve("README.md")))
     }
+
+    @Test
+    fun `SDK consolidation removes obsolete generated modules and preserves outside files`() {
+        val output = candidate("output", mapOf(
+            "sdk_v1/mod.rs" to "old root",
+            "sdk_v1/enums.rs" to "old enums",
+            "sdk_v1/values.rs" to "old values",
+            "sdk_v1/requests.rs" to "old requests",
+            "sdk_v1/responses.rs" to "old responses",
+            "sdk_v1/compat.rs" to "old compatibility",
+            "sdk_v1/mapping.json" to "old mapping",
+            "model/tests/consumer.rs" to "manual test",
+            "model/Cargo.lock" to "lock",
+        ))
+        GeneratedOutput.publish(candidate("new", mapOf(
+            "sdk_v1/mod.rs" to "new root",
+            "sdk_v1/convert.rs" to "new conversions",
+            "sdk_v1/compat.rs" to "new compatibility",
+            "sdk_v1/mapping.json" to "new mapping",
+        )), output)
+        for (name in listOf("enums", "values", "requests", "responses")) {
+            assertFalse(Files.exists(output.resolve("sdk_v1/$name.rs")), name)
+        }
+        assertEquals("new conversions", Files.readString(output.resolve("sdk_v1/convert.rs")))
+        assertEquals("new compatibility", Files.readString(output.resolve("sdk_v1/compat.rs")))
+        assertEquals("new mapping", Files.readString(output.resolve("sdk_v1/mapping.json")))
+        assertEquals("manual test", Files.readString(output.resolve("model/tests/consumer.rs")))
+        assertEquals("lock", Files.readString(output.resolve("model/Cargo.lock")))
+    }
+
+    @Test
+    fun `project only preserves the complete SDK artifact`() {
+        val modelPath = "${ModelProjection.name}/model/model.json"
+        val sdk = mapOf(
+            "sdk_v1/mod.rs" to "root", "sdk_v1/convert.rs" to "conversions",
+            "sdk_v1/compat.rs" to "compatibility", "sdk_v1/mapping.json" to "mapping",
+        )
+        val output = candidate("output", sdk + (modelPath to "old model"))
+        GeneratedOutput.publish(candidate("new", mapOf(modelPath to "new model")), output, projectOnly = true)
+        sdk.forEach { (name, content) -> assertEquals(content, Files.readString(output.resolve(name))) }
+        assertEquals("new model", Files.readString(output.resolve(modelPath)))
+    }
 }

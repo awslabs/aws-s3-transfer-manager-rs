@@ -44,6 +44,8 @@ smallvec = "1"
 
 [features]
 dial9 = ["dep:dial9-tokio-telemetry"]
+# Conversions between modeled values and AWS SDK for Rust S3 v1 types.
+sdk-v1 = []
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.189"

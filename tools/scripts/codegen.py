@@ -14,6 +14,24 @@ from model_source import REPOSITORY_ROOT
 
 MODEL_ARTIFACT = Path("s3-tm-dataplane/model/model.json")
 RUST_ARTIFACT = Path("model/src/model/mod.rs")
+SDK_ARTIFACT = Path("sdk_v1/mod.rs")
+
+
+def sdk_files(directory: Path) -> dict:
+    """Inventory the module-only SDK artifact, including its mapping report."""
+    root = directory / "sdk_v1"
+    if root.is_symlink():
+        raise OSError(f"refusing symlink SDK artifact directory: {root}")
+    files = {}
+    if root.is_dir():
+        for path in sorted(root.rglob("*")):
+            if path.is_symlink():
+                raise OSError(f"refusing symlink SDK artifact entry: {path}")
+            if path.is_file():
+                if path.suffix != ".rs" and path != root / "mapping.json":
+                    raise OSError(f"unexpected SDK artifact file: {path}")
+                files[path.relative_to(directory).as_posix()] = path.read_bytes()
+    return files
 
 
 def generated_files(directory: Path) -> dict:
@@ -43,14 +61,15 @@ def generated_files(directory: Path) -> dict:
 
 
 def report_generated_changes(baseline: Path, candidate: Path) -> bool:
-    old, new = generated_files(baseline), generated_files(candidate)
+    old = {f"model/{name}": value for name, value in generated_files(baseline).items()} | sdk_files(baseline)
+    new = {f"model/{name}": value for name, value in generated_files(candidate).items()} | sdk_files(candidate)
     for file in sorted(old.keys() | new.keys()):
         if file not in old:
-            print(f"Added: model/{file}")
+            print(f"Added: {file}")
         elif file not in new:
-            print(f"Removed: model/{file}")
+            print(f"Removed: {file}")
         elif old[file] != new[file]:
-            print(f"Changed: model/{file}")
+            print(f"Changed: {file}")
     if old == new:
         print("Generated Rust artifact unchanged.")
     return old != new
@@ -66,6 +85,7 @@ def artifact_files(directory: Path, project_only: bool = False) -> dict:
         files[MODEL_ARTIFACT.as_posix()] = file.read_bytes()
     if not project_only:
         files.update({f"model/{name}": value for name, value in generated_files(directory).items()})
+        files.update(sdk_files(directory))
     return files
 
 
@@ -133,6 +153,9 @@ def main(argv=None) -> int:
                 return 1
             if not options.project_only and not (scratch / RUST_ARTIFACT).is_file():
                 print("codegen: missing Rust artifact", file=sys.stderr)
+                return 1
+            if not options.project_only and not (scratch / SDK_ARTIFACT).is_file():
+                print("codegen: missing SDK v1 artifact", file=sys.stderr)
                 return 1
             baseline = output / MODEL_ARTIFACT
             print(f"{mode}: destination unchanged: {output}", flush=True)

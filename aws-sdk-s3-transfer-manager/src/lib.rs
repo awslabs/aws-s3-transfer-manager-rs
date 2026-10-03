@@ -134,6 +134,10 @@ pub mod types;
 
 /// Modeled S3 values and builders.
 pub mod model;
+pub(crate) mod sdk_v1;
+#[cfg(test)]
+#[path = "tests/sdk_v1.rs"]
+mod sdk_v1_tests;
 
 /// Types and helpers for I/O
 pub mod io;
@@ -214,4 +218,5 @@ pub fn from_env() -> ConfigLoader {
 }
 
 #[cfg(test)]
+#[path = "tests/model.rs"]
 mod model_tests;

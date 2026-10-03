@@ -45,7 +45,7 @@ impl UploadFluentBuilder {
     /// <p>This functionality is not supported for Amazon S3 on Outposts.</p></li>
     /// </ul>
     /// </note>
-    pub fn acl(mut self, input: aws_sdk_s3::types::ObjectCannedAcl) -> Self {
+    pub fn acl(mut self, input: crate::model::ObjectCannedAcl) -> Self {
         self.inner = self.inner.acl(input);
         self
     }
@@ -59,7 +59,7 @@ impl UploadFluentBuilder {
     /// <p>This functionality is not supported for Amazon S3 on Outposts.</p></li>
     /// </ul>
     /// </note>
-    pub fn set_acl(mut self, input: Option<aws_sdk_s3::types::ObjectCannedAcl>) -> Self {
+    pub fn set_acl(mut self, input: Option<crate::model::ObjectCannedAcl>) -> Self {
         self.inner = self.inner.set_acl(input);
         self
     }
@@ -73,7 +73,7 @@ impl UploadFluentBuilder {
     /// <p>This functionality is not supported for Amazon S3 on Outposts.</p></li>
     /// </ul>
     /// </note>
-    pub fn get_acl(&self) -> &Option<aws_sdk_s3::types::ObjectCannedAcl> {
+    pub fn get_acl(&self) -> &Option<crate::model::ObjectCannedAcl> {
         self.inner.get_acl()
     }
     /// <p>Object data.</p>
@@ -495,10 +495,7 @@ impl UploadFluentBuilder {
     /// <p>The server-side encryption algorithm that was used when you store this object in Amazon S3 (for example, <code>AES256</code>, <code>aws:kms</code>, <code>aws:kms:dsse</code>).</p>
     /// <p><b>General purpose buckets </b> - You have four mutually exclusive options to protect data using server-side encryption in Amazon S3, depending on how you choose to manage the encryption keys. Specifically, the encryption key options are Amazon S3 managed keys (SSE-S3), Amazon Web Services KMS keys (SSE-KMS or DSSE-KMS), and customer-provided keys (SSE-C). Amazon S3 encrypts data with server-side encryption by using Amazon S3 managed keys (SSE-S3) by default. You can optionally tell Amazon S3 to encrypt data at rest by using server-side encryption with other key options. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/dev/UsingServerSideEncryption.html">Using Server-Side Encryption</a> in the <i>Amazon S3 User Guide</i>.</p>
     /// <p><b>Directory buckets </b> - For directory buckets, only the server-side encryption with Amazon S3 managed keys (SSE-S3) (<code>AES256</code>) value is supported.</p>
-    pub fn server_side_encryption(
-        mut self,
-        input: aws_sdk_s3::types::ServerSideEncryption,
-    ) -> Self {
+    pub fn server_side_encryption(mut self, input: crate::model::ServerSideEncryption) -> Self {
         self.inner = self.inner.server_side_encryption(input);
         self
     }
@@ -507,7 +504,7 @@ impl UploadFluentBuilder {
     /// <p><b>Directory buckets </b> - For directory buckets, only the server-side encryption with Amazon S3 managed keys (SSE-S3) (<code>AES256</code>) value is supported.</p>
     pub fn set_server_side_encryption(
         mut self,
-        input: Option<aws_sdk_s3::types::ServerSideEncryption>,
+        input: Option<crate::model::ServerSideEncryption>,
     ) -> Self {
         self.inner = self.inner.set_server_side_encryption(input);
         self
@@ -515,7 +512,7 @@ impl UploadFluentBuilder {
     /// <p>The server-side encryption algorithm that was used when you store this object in Amazon S3 (for example, <code>AES256</code>, <code>aws:kms</code>, <code>aws:kms:dsse</code>).</p>
     /// <p><b>General purpose buckets </b> - You have four mutually exclusive options to protect data using server-side encryption in Amazon S3, depending on how you choose to manage the encryption keys. Specifically, the encryption key options are Amazon S3 managed keys (SSE-S3), Amazon Web Services KMS keys (SSE-KMS or DSSE-KMS), and customer-provided keys (SSE-C). Amazon S3 encrypts data with server-side encryption by using Amazon S3 managed keys (SSE-S3) by default. You can optionally tell Amazon S3 to encrypt data at rest by using server-side encryption with other key options. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/dev/UsingServerSideEncryption.html">Using Server-Side Encryption</a> in the <i>Amazon S3 User Guide</i>.</p>
     /// <p><b>Directory buckets </b> - For directory buckets, only the server-side encryption with Amazon S3 managed keys (SSE-S3) (<code>AES256</code>) value is supported.</p>
-    pub fn get_server_side_encryption(&self) -> &Option<aws_sdk_s3::types::ServerSideEncryption> {
+    pub fn get_server_side_encryption(&self) -> &Option<crate::model::ServerSideEncryption> {
         self.inner.get_server_side_encryption()
     }
     /// <p>By default, Amazon S3 uses the STANDARD Storage Class to store newly created objects. The STANDARD storage class provides high durability and high availability. Depending on performance needs, you can specify a different Storage Class. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/dev/storage-class-intro.html">Storage Classes</a> in the <i>Amazon S3 User Guide</i>.</p><note>
@@ -526,7 +523,7 @@ impl UploadFluentBuilder {
     /// <p>Amazon S3 on Outposts only uses the OUTPOSTS Storage Class.</p></li>
     /// </ul>
     /// </note>
-    pub fn storage_class(mut self, input: aws_sdk_s3::types::StorageClass) -> Self {
+    pub fn storage_class(mut self, input: crate::model::StorageClass) -> Self {
         self.inner = self.inner.storage_class(input);
         self
     }
@@ -538,7 +535,7 @@ impl UploadFluentBuilder {
     /// <p>Amazon S3 on Outposts only uses the OUTPOSTS Storage Class.</p></li>
     /// </ul>
     /// </note>
-    pub fn set_storage_class(mut self, input: Option<aws_sdk_s3::types::StorageClass>) -> Self {
+    pub fn set_storage_class(mut self, input: Option<crate::model::StorageClass>) -> Self {
         self.inner = self.inner.set_storage_class(input);
         self
     }
@@ -550,7 +547,7 @@ impl UploadFluentBuilder {
     /// <p>Amazon S3 on Outposts only uses the OUTPOSTS Storage Class.</p></li>
     /// </ul>
     /// </note>
-    pub fn get_storage_class(&self) -> &Option<aws_sdk_s3::types::StorageClass> {
+    pub fn get_storage_class(&self) -> &Option<crate::model::StorageClass> {
         self.inner.get_storage_class()
     }
     /// <p>If the bucket is configured as a website, redirects requests for this object to another object in the same bucket or to an external URL. Amazon S3 stores the value of this header in the object metadata. For information about object metadata, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/dev/UsingMetadata.html">Object Key and Metadata</a> in the <i>Amazon S3 User Guide</i>.</p>
@@ -714,21 +711,21 @@ impl UploadFluentBuilder {
     /// <p>Confirms that the requester knows that they will be charged for the request. Bucket owners need not specify this parameter in their requests. If either the source or destination S3 bucket has Requester Pays enabled, the requester will pay for corresponding charges to copy the object. For information about downloading objects from Requester Pays buckets, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/dev/ObjectsinRequesterPaysBuckets.html">Downloading Objects in Requester Pays Buckets</a> in the <i>Amazon S3 User Guide</i>.</p><note>
     /// <p>This functionality is not supported for directory buckets.</p>
     /// </note>
-    pub fn request_payer(mut self, input: aws_sdk_s3::types::RequestPayer) -> Self {
+    pub fn request_payer(mut self, input: crate::model::RequestPayer) -> Self {
         self.inner = self.inner.request_payer(input);
         self
     }
     /// <p>Confirms that the requester knows that they will be charged for the request. Bucket owners need not specify this parameter in their requests. If either the source or destination S3 bucket has Requester Pays enabled, the requester will pay for corresponding charges to copy the object. For information about downloading objects from Requester Pays buckets, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/dev/ObjectsinRequesterPaysBuckets.html">Downloading Objects in Requester Pays Buckets</a> in the <i>Amazon S3 User Guide</i>.</p><note>
     /// <p>This functionality is not supported for directory buckets.</p>
     /// </note>
-    pub fn set_request_payer(mut self, input: Option<aws_sdk_s3::types::RequestPayer>) -> Self {
+    pub fn set_request_payer(mut self, input: Option<crate::model::RequestPayer>) -> Self {
         self.inner = self.inner.set_request_payer(input);
         self
     }
     /// <p>Confirms that the requester knows that they will be charged for the request. Bucket owners need not specify this parameter in their requests. If either the source or destination S3 bucket has Requester Pays enabled, the requester will pay for corresponding charges to copy the object. For information about downloading objects from Requester Pays buckets, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/dev/ObjectsinRequesterPaysBuckets.html">Downloading Objects in Requester Pays Buckets</a> in the <i>Amazon S3 User Guide</i>.</p><note>
     /// <p>This functionality is not supported for directory buckets.</p>
     /// </note>
-    pub fn get_request_payer(&self) -> &Option<aws_sdk_s3::types::RequestPayer> {
+    pub fn get_request_payer(&self) -> &Option<crate::model::RequestPayer> {
         self.inner.get_request_payer()
     }
     /// <p>The tag-set for the object. The tag-set must be encoded as URL Query parameters. (For example, "Key1=Value1")</p><note>
@@ -754,24 +751,21 @@ impl UploadFluentBuilder {
     /// <p>The Object Lock mode that you want to apply to this object.</p><note>
     /// <p>This functionality is not supported for directory buckets.</p>
     /// </note>
-    pub fn object_lock_mode(mut self, input: aws_sdk_s3::types::ObjectLockMode) -> Self {
+    pub fn object_lock_mode(mut self, input: crate::model::ObjectLockMode) -> Self {
         self.inner = self.inner.object_lock_mode(input);
         self
     }
     /// <p>The Object Lock mode that you want to apply to this object.</p><note>
     /// <p>This functionality is not supported for directory buckets.</p>
     /// </note>
-    pub fn set_object_lock_mode(
-        mut self,
-        input: Option<aws_sdk_s3::types::ObjectLockMode>,
-    ) -> Self {
+    pub fn set_object_lock_mode(mut self, input: Option<crate::model::ObjectLockMode>) -> Self {
         self.inner = self.inner.set_object_lock_mode(input);
         self
     }
     /// <p>The Object Lock mode that you want to apply to this object.</p><note>
     /// <p>This functionality is not supported for directory buckets.</p>
     /// </note>
-    pub fn get_object_lock_mode(&self) -> &Option<aws_sdk_s3::types::ObjectLockMode> {
+    pub fn get_object_lock_mode(&self) -> &Option<crate::model::ObjectLockMode> {
         self.inner.get_object_lock_mode()
     }
     /// <p>The date and time when you want this object's Object Lock to expire. Must be formatted as a timestamp parameter.</p><note>
@@ -802,7 +796,7 @@ impl UploadFluentBuilder {
     /// </note>
     pub fn object_lock_legal_hold_status(
         mut self,
-        input: aws_sdk_s3::types::ObjectLockLegalHoldStatus,
+        input: crate::model::ObjectLockLegalHoldStatus,
     ) -> Self {
         self.inner = self.inner.object_lock_legal_hold_status(input);
         self
@@ -812,7 +806,7 @@ impl UploadFluentBuilder {
     /// </note>
     pub fn set_object_lock_legal_hold_status(
         mut self,
-        input: Option<aws_sdk_s3::types::ObjectLockLegalHoldStatus>,
+        input: Option<crate::model::ObjectLockLegalHoldStatus>,
     ) -> Self {
         self.inner = self.inner.set_object_lock_legal_hold_status(input);
         self
@@ -822,7 +816,7 @@ impl UploadFluentBuilder {
     /// </note>
     pub fn get_object_lock_legal_hold_status(
         &self,
-    ) -> &Option<aws_sdk_s3::types::ObjectLockLegalHoldStatus> {
+    ) -> &Option<crate::model::ObjectLockLegalHoldStatus> {
         self.inner.get_object_lock_legal_hold_status()
     }
     /// <p>The account ID of the expected bucket owner. If the account ID that you provide does not match the actual owner of the bucket, the request fails with the HTTP status code <code>403 Forbidden</code> (access denied).</p>

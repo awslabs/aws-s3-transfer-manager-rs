@@ -44,12 +44,12 @@ pub struct UploadOutput {
     pub checksum_sha256: Option<String>,
 
     /// <p>This header specifies the checksum type of the object, which determines how part-level checksums are combined to create an object-level checksum for multipart objects. For <code>PutObject</code> uploads, the checksum type is always <code>FULL_OBJECT</code>. You can use this header as a data integrity check to verify that the checksum type that is received is the same checksum that was specified. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html">Checking object integrity in the Amazon S3 User Guide</a>.</p>
-    pub checksum_type: Option<aws_sdk_s3::types::ChecksumType>,
+    pub checksum_type: Option<crate::model::ChecksumType>,
 
     /// <p>The server-side encryption algorithm used when you store this object in Amazon S3 (for example, <code>AES256</code>, <code>aws:kms</code>, <code>aws:kms:dsse</code>).</p><note>
     /// <p>For directory buckets, only server-side encryption with Amazon S3 managed keys (SSE-S3) (<code>AES256</code>) is supported.</p>
     /// </note>
-    pub server_side_encryption: Option<aws_sdk_s3::types::ServerSideEncryption>,
+    pub server_side_encryption: Option<crate::model::ServerSideEncryption>,
 
     /// <p>Version ID of the object.</p>
     /// <p>If you enable versioning for a bucket, Amazon S3 automatically generates a unique version ID for the object being stored. Amazon S3 returns this ID in the response. When you enable versioning for a bucket, if Amazon S3 receives multiple write requests for the same object simultaneously, it stores all of the objects. For more information about versioning, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/dev/AddingObjectstoVersioningEnabledBuckets.html">Adding Objects to Versioning-Enabled Buckets</a> in the <i>Amazon S3 User Guide</i>. For information about returning the versioning state of a bucket, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetBucketVersioning.html">GetBucketVersioning</a>.</p><note>
@@ -85,7 +85,7 @@ pub struct UploadOutput {
     /// <p>If present, indicates that the requester was successfully charged for the request.</p><note>
     /// <p>This functionality is not supported for directory buckets.</p>
     /// </note>
-    pub request_charged: Option<aws_sdk_s3::types::RequestCharged>,
+    pub request_charged: Option<crate::model::RequestCharged>,
 
     /// <p>ID for the initiated multipart upload.</p>
     /// This will not be set for requests that are not split into multipart uploads.
@@ -126,13 +126,13 @@ impl UploadOutput {
         self.checksum_sha256.as_deref()
     }
     /// <p>This header specifies the checksum type of the object, which determines how part-level checksums are combined to create an object-level checksum for multipart objects. For <code>PutObject</code> uploads, the checksum type is always <code>FULL_OBJECT</code>. You can use this header as a data integrity check to verify that the checksum type that is received is the same checksum that was specified. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html">Checking object integrity in the Amazon S3 User Guide</a>.</p>
-    pub fn checksum_type(&self) -> Option<&aws_sdk_s3::types::ChecksumType> {
+    pub fn checksum_type(&self) -> Option<&crate::model::ChecksumType> {
         self.checksum_type.as_ref()
     }
     /// <p>The server-side encryption algorithm used when you store this object in Amazon S3 (for example, <code>AES256</code>, <code>aws:kms</code>, <code>aws:kms:dsse</code>).</p><note>
     /// <p>For directory buckets, only server-side encryption with Amazon S3 managed keys (SSE-S3) (<code>AES256</code>) is supported.</p>
     /// </note>
-    pub fn server_side_encryption(&self) -> Option<&aws_sdk_s3::types::ServerSideEncryption> {
+    pub fn server_side_encryption(&self) -> Option<&crate::model::ServerSideEncryption> {
         self.server_side_encryption.as_ref()
     }
     /// <p>Version ID of the object.</p>
@@ -175,7 +175,7 @@ impl UploadOutput {
     /// <p>If present, indicates that the requester was successfully charged for the request.</p><note>
     /// <p>This functionality is not supported for directory buckets.</p>
     /// </note>
-    pub fn request_charged(&self) -> Option<&aws_sdk_s3::types::RequestCharged> {
+    pub fn request_charged(&self) -> Option<&crate::model::RequestCharged> {
         self.request_charged.as_ref()
     }
 
@@ -226,15 +226,15 @@ pub struct UploadOutputBuilder {
     pub(crate) checksum_crc64_nvme: Option<String>,
     pub(crate) checksum_sha1: Option<String>,
     pub(crate) checksum_sha256: Option<String>,
-    pub(crate) checksum_type: Option<aws_sdk_s3::types::ChecksumType>,
-    pub(crate) server_side_encryption: Option<aws_sdk_s3::types::ServerSideEncryption>,
+    pub(crate) checksum_type: Option<crate::model::ChecksumType>,
+    pub(crate) server_side_encryption: Option<crate::model::ServerSideEncryption>,
     pub(crate) version_id: Option<String>,
     pub(crate) sse_customer_algorithm: Option<String>,
     pub(crate) sse_customer_key_md5: Option<String>,
     pub(crate) sse_kms_key_id: Option<String>,
     pub(crate) sse_kms_encryption_context: Option<String>,
     pub(crate) bucket_key_enabled: Option<bool>,
-    pub(crate) request_charged: Option<aws_sdk_s3::types::RequestCharged>,
+    pub(crate) request_charged: Option<crate::model::RequestCharged>,
     pub(crate) upload_id: Option<String>,
 }
 
@@ -350,26 +350,23 @@ impl UploadOutputBuilder {
         self.checksum_sha256.as_deref()
     }
     /// <p>This header specifies the checksum type of the object, which determines how part-level checksums are combined to create an object-level checksum for multipart objects. For <code>PutObject</code> uploads, the checksum type is always <code>FULL_OBJECT</code>. You can use this header as a data integrity check to verify that the checksum type that is received is the same checksum that was specified. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html">Checking object integrity in the Amazon S3 User Guide</a>.</p>
-    pub fn checksum_type(mut self, input: aws_sdk_s3::types::ChecksumType) -> Self {
+    pub fn checksum_type(mut self, input: crate::model::ChecksumType) -> Self {
         self.checksum_type = Some(input);
         self
     }
     /// <p>This header specifies the checksum type of the object, which determines how part-level checksums are combined to create an object-level checksum for multipart objects. For <code>PutObject</code> uploads, the checksum type is always <code>FULL_OBJECT</code>. You can use this header as a data integrity check to verify that the checksum type that is received is the same checksum that was specified. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html">Checking object integrity in the Amazon S3 User Guide</a>.</p>
-    pub fn set_checksum_type(mut self, input: Option<aws_sdk_s3::types::ChecksumType>) -> Self {
+    pub fn set_checksum_type(mut self, input: Option<crate::model::ChecksumType>) -> Self {
         self.checksum_type = input;
         self
     }
     /// <p>This header specifies the checksum type of the object, which determines how part-level checksums are combined to create an object-level checksum for multipart objects. For <code>PutObject</code> uploads, the checksum type is always <code>FULL_OBJECT</code>. You can use this header as a data integrity check to verify that the checksum type that is received is the same checksum that was specified. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html">Checking object integrity in the Amazon S3 User Guide</a>.</p>
-    pub fn get_checksum_type(&self) -> &Option<aws_sdk_s3::types::ChecksumType> {
+    pub fn get_checksum_type(&self) -> &Option<crate::model::ChecksumType> {
         &self.checksum_type
     }
     /// <p>The server-side encryption algorithm used when you store this object in Amazon S3 (for example, <code>AES256</code>, <code>aws:kms</code>, <code>aws:kms:dsse</code>).</p><note>
     /// <p>For directory buckets, only server-side encryption with Amazon S3 managed keys (SSE-S3) (<code>AES256</code>) is supported.</p>
     /// </note>
-    pub fn server_side_encryption(
-        mut self,
-        input: aws_sdk_s3::types::ServerSideEncryption,
-    ) -> Self {
+    pub fn server_side_encryption(mut self, input: crate::model::ServerSideEncryption) -> Self {
         self.server_side_encryption = Some(input);
         self
     }
@@ -378,7 +375,7 @@ impl UploadOutputBuilder {
     /// </note>
     pub fn set_server_side_encryption(
         mut self,
-        input: Option<aws_sdk_s3::types::ServerSideEncryption>,
+        input: Option<crate::model::ServerSideEncryption>,
     ) -> Self {
         self.server_side_encryption = input;
         self
@@ -386,7 +383,7 @@ impl UploadOutputBuilder {
     /// <p>The server-side encryption algorithm used when you store this object in Amazon S3 (for example, <code>AES256</code>, <code>aws:kms</code>, <code>aws:kms:dsse</code>).</p><note>
     /// <p>For directory buckets, only server-side encryption with Amazon S3 managed keys (SSE-S3) (<code>AES256</code>) is supported.</p>
     /// </note>
-    pub fn get_server_side_encryption(&self) -> &Option<aws_sdk_s3::types::ServerSideEncryption> {
+    pub fn get_server_side_encryption(&self) -> &Option<crate::model::ServerSideEncryption> {
         &self.server_side_encryption
     }
     /// <p>Version ID of the object.</p>
@@ -515,21 +512,21 @@ impl UploadOutputBuilder {
     /// <p>If present, indicates that the requester was successfully charged for the request.</p><note>
     /// <p>This functionality is not supported for directory buckets.</p>
     /// </note>
-    pub fn request_charged(mut self, input: aws_sdk_s3::types::RequestCharged) -> Self {
+    pub fn request_charged(mut self, input: crate::model::RequestCharged) -> Self {
         self.request_charged = Some(input);
         self
     }
     /// <p>If present, indicates that the requester was successfully charged for the request.</p><note>
     /// <p>This functionality is not supported for directory buckets.</p>
     /// </note>
-    pub fn set_request_charged(mut self, input: Option<aws_sdk_s3::types::RequestCharged>) -> Self {
+    pub fn set_request_charged(mut self, input: Option<crate::model::RequestCharged>) -> Self {
         self.request_charged = input;
         self
     }
     /// <p>If present, indicates that the requester was successfully charged for the request.</p><note>
     /// <p>This functionality is not supported for directory buckets.</p>
     /// </note>
-    pub fn get_request_charged(&self) -> &Option<aws_sdk_s3::types::RequestCharged> {
+    pub fn get_request_charged(&self) -> &Option<crate::model::RequestCharged> {
         &self.request_charged
     }
 
@@ -589,11 +586,20 @@ impl From<PutObjectOutput> for UploadOutputBuilder {
             checksum_crc64_nvme: value.checksum_crc64_nvme,
             checksum_sha1: value.checksum_sha1,
             checksum_sha256: value.checksum_sha256,
-            checksum_type: value.checksum_type,
+            checksum_type: value
+                .checksum_type
+                .as_ref()
+                .map(crate::sdk_v1::checksum_type_from_sdk),
             e_tag: value.e_tag,
             expiration: value.expiration,
-            request_charged: value.request_charged,
-            server_side_encryption: value.server_side_encryption,
+            request_charged: value
+                .request_charged
+                .as_ref()
+                .map(crate::sdk_v1::request_charged_from_sdk),
+            server_side_encryption: value
+                .server_side_encryption
+                .as_ref()
+                .map(crate::sdk_v1::server_side_encryption_from_sdk),
             sse_customer_algorithm: value.sse_customer_algorithm,
             sse_customer_key_md5: value.sse_customer_key_md5,
             sse_kms_encryption_context: value.ssekms_encryption_context,
@@ -643,12 +649,21 @@ impl UploadOutputBuilder {
         self.checksum_crc64_nvme = complete_mpu_resp.checksum_crc64_nvme.clone();
         self.checksum_sha1 = complete_mpu_resp.checksum_sha1.clone();
         self.checksum_sha256 = complete_mpu_resp.checksum_sha256.clone();
-        self.checksum_type = complete_mpu_resp.checksum_type.clone();
+        self.checksum_type = complete_mpu_resp
+            .checksum_type
+            .as_ref()
+            .map(crate::sdk_v1::checksum_type_from_sdk);
         self.e_tag = complete_mpu_resp.e_tag.clone();
         self.expiration = complete_mpu_resp.expiration.clone();
-        self.request_charged = complete_mpu_resp.request_charged.clone();
+        self.request_charged = complete_mpu_resp
+            .request_charged
+            .as_ref()
+            .map(crate::sdk_v1::request_charged_from_sdk);
         self.sse_kms_key_id = complete_mpu_resp.ssekms_key_id.clone();
-        self.server_side_encryption = complete_mpu_resp.server_side_encryption.clone();
+        self.server_side_encryption = complete_mpu_resp
+            .server_side_encryption
+            .as_ref()
+            .map(crate::sdk_v1::server_side_encryption_from_sdk);
         self.version_id = complete_mpu_resp.version_id.clone();
         self
     }
@@ -659,14 +674,23 @@ impl From<CreateMultipartUploadOutput> for UploadOutputBuilder {
         UploadOutputBuilder {
             metrics: None,
             upload_id: value.upload_id,
-            server_side_encryption: value.server_side_encryption,
+            server_side_encryption: value
+                .server_side_encryption
+                .as_ref()
+                .map(crate::sdk_v1::server_side_encryption_from_sdk),
             sse_customer_algorithm: value.sse_customer_algorithm,
             sse_customer_key_md5: value.sse_customer_key_md5,
             sse_kms_key_id: value.ssekms_key_id,
             sse_kms_encryption_context: value.ssekms_encryption_context,
             bucket_key_enabled: value.bucket_key_enabled,
-            request_charged: value.request_charged,
-            checksum_type: value.checksum_type,
+            request_charged: value
+                .request_charged
+                .as_ref()
+                .map(crate::sdk_v1::request_charged_from_sdk),
+            checksum_type: value
+                .checksum_type
+                .as_ref()
+                .map(crate::sdk_v1::checksum_type_from_sdk),
             // remaining fields will be set later, from CompleteMultipartUploadOutput
             expiration: None,
             e_tag: None,
@@ -712,14 +736,26 @@ mod tests {
         );
         assert_eq!(complete_mpu_resp.checksum_sha1, sut.checksum_sha1);
         assert_eq!(complete_mpu_resp.checksum_sha256, sut.checksum_sha256);
-        assert_eq!(complete_mpu_resp.checksum_type, sut.checksum_type);
+        assert_eq!(
+            complete_mpu_resp.checksum_type.as_ref().map(|v| v.as_str()),
+            sut.checksum_type.as_ref().map(|v| v.as_str())
+        );
         assert_eq!(complete_mpu_resp.e_tag, sut.e_tag);
         assert_eq!(complete_mpu_resp.expiration, sut.expiration);
-        assert_eq!(complete_mpu_resp.request_charged, sut.request_charged);
+        assert_eq!(
+            complete_mpu_resp
+                .request_charged
+                .as_ref()
+                .map(|v| v.as_str()),
+            sut.request_charged.as_ref().map(|v| v.as_str())
+        );
         assert_eq!(complete_mpu_resp.ssekms_key_id, sut.sse_kms_key_id);
         assert_eq!(
-            complete_mpu_resp.server_side_encryption,
-            sut.server_side_encryption
+            complete_mpu_resp
+                .server_side_encryption
+                .as_ref()
+                .map(|v| v.as_str()),
+            sut.server_side_encryption.as_ref().map(|v| v.as_str())
         );
         assert_eq!(complete_mpu_resp.version_id, sut.version_id);
     }
@@ -752,13 +788,25 @@ mod tests {
         );
         assert_eq!(put_object_output.checksum_sha1, sut.checksum_sha1);
         assert_eq!(put_object_output.checksum_sha256, sut.checksum_sha256);
-        assert_eq!(put_object_output.checksum_type, sut.checksum_type);
+        assert_eq!(
+            put_object_output.checksum_type.as_ref().map(|v| v.as_str()),
+            sut.checksum_type.as_ref().map(|v| v.as_str())
+        );
         assert_eq!(put_object_output.e_tag, sut.e_tag);
         assert_eq!(put_object_output.expiration, sut.expiration);
-        assert_eq!(put_object_output.request_charged, sut.request_charged);
         assert_eq!(
-            put_object_output.server_side_encryption,
-            sut.server_side_encryption
+            put_object_output
+                .request_charged
+                .as_ref()
+                .map(|v| v.as_str()),
+            sut.request_charged.as_ref().map(|v| v.as_str())
+        );
+        assert_eq!(
+            put_object_output
+                .server_side_encryption
+                .as_ref()
+                .map(|v| v.as_str()),
+            sut.server_side_encryption.as_ref().map(|v| v.as_str())
         );
         assert_eq!(
             put_object_output.sse_customer_algorithm,

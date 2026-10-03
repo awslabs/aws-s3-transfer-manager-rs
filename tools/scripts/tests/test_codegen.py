@@ -44,6 +44,9 @@ class CodegenTest(unittest.TestCase):
                 rust = output / codegen.RUST_ARTIFACT
                 rust.parent.mkdir(parents=True, exist_ok=True)
                 rust.write_text("pub struct Candidate;", encoding="utf-8")
+                sdk = output / codegen.SDK_ARTIFACT
+                sdk.parent.mkdir(parents=True, exist_ok=True)
+                sdk.write_text("// SDK candidate", encoding="utf-8")
         return subprocess.CompletedProcess(command, self.status)
 
     @staticmethod
@@ -180,6 +183,9 @@ class CodegenTest(unittest.TestCase):
         rust = self.destination / codegen.RUST_ARTIFACT
         rust.parent.mkdir(parents=True, exist_ok=True)
         rust.write_text("pub struct Candidate;")
+        sdk = self.destination / codegen.SDK_ARTIFACT
+        sdk.parent.mkdir(parents=True, exist_ok=True)
+        sdk.write_text("// SDK candidate")
         return baseline
 
     def test_check_matching_artifact_is_non_mutating_and_skips_semantic_diff(self):
@@ -257,3 +263,26 @@ class CodegenTest(unittest.TestCase):
         (self.destination / "model/src/model/external.rs").symlink_to(external)
         with self.assertRaises(OSError):
             codegen.generated_files(self.destination)
+
+    def test_sdk_changes_are_checked_and_project_only_ignores_them(self):
+        self.matching_baseline()
+        sdk = self.destination / codegen.SDK_ARTIFACT
+        sdk.write_text("changed SDK adapter")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(1, codegen.main(["--check"]))
+            self.assertEqual(0, codegen.main(["--check", "--project-only"]))
+        self.assertIn("Changed: sdk_v1/mod.rs", output.getvalue())
+        self.assertEqual("changed SDK adapter", sdk.read_text())
+
+    def test_sdk_inventory_rejects_symlinks_and_foreign_files(self):
+        root = self.destination / "sdk_v1"
+        root.mkdir(parents=True)
+        foreign = root / "manual.txt"
+        foreign.write_text("foreign")
+        with self.assertRaises(OSError):
+            codegen.sdk_files(self.destination)
+        foreign.unlink()
+        (root / "mod.rs").symlink_to(self.root / "outside")
+        with self.assertRaises(OSError):
+            codegen.sdk_files(self.destination)

@@ -512,21 +512,21 @@ impl DownloadFluentBuilder {
     /// <p>Confirms that the requester knows that they will be charged for the request. Bucket owners need not specify this parameter in their requests. If either the source or destination S3 bucket has Requester Pays enabled, the requester will pay for corresponding charges to copy the object. For information about downloading objects from Requester Pays buckets, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/dev/ObjectsinRequesterPaysBuckets.html">Downloading Objects in Requester Pays Buckets</a> in the <i>Amazon S3 User Guide</i>.</p><note>
     /// <p>This functionality is not supported for directory buckets.</p>
     /// </note>
-    pub fn request_payer(mut self, input: aws_sdk_s3::types::RequestPayer) -> Self {
+    pub fn request_payer(mut self, input: crate::model::RequestPayer) -> Self {
         self.inner = self.inner.request_payer(input);
         self
     }
     /// <p>Confirms that the requester knows that they will be charged for the request. Bucket owners need not specify this parameter in their requests. If either the source or destination S3 bucket has Requester Pays enabled, the requester will pay for corresponding charges to copy the object. For information about downloading objects from Requester Pays buckets, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/dev/ObjectsinRequesterPaysBuckets.html">Downloading Objects in Requester Pays Buckets</a> in the <i>Amazon S3 User Guide</i>.</p><note>
     /// <p>This functionality is not supported for directory buckets.</p>
     /// </note>
-    pub fn set_request_payer(mut self, input: Option<aws_sdk_s3::types::RequestPayer>) -> Self {
+    pub fn set_request_payer(mut self, input: Option<crate::model::RequestPayer>) -> Self {
         self.inner = self.inner.set_request_payer(input);
         self
     }
     /// <p>Confirms that the requester knows that they will be charged for the request. Bucket owners need not specify this parameter in their requests. If either the source or destination S3 bucket has Requester Pays enabled, the requester will pay for corresponding charges to copy the object. For information about downloading objects from Requester Pays buckets, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/dev/ObjectsinRequesterPaysBuckets.html">Downloading Objects in Requester Pays Buckets</a> in the <i>Amazon S3 User Guide</i>.</p><note>
     /// <p>This functionality is not supported for directory buckets.</p>
     /// </note>
-    pub fn get_request_payer(&self) -> &Option<aws_sdk_s3::types::RequestPayer> {
+    pub fn get_request_payer(&self) -> &Option<crate::model::RequestPayer> {
         self.inner.get_request_payer()
     }
     /// <p>The account ID of the expected bucket owner. If the account ID that you provide does not match the actual owner of the bucket, the request fails with the HTTP status code <code>403 Forbidden</code> (access denied).</p>
@@ -544,17 +544,17 @@ impl DownloadFluentBuilder {
         self.inner.get_expected_bucket_owner()
     }
     /// <p>To retrieve the checksum, this mode must be enabled.</p>
-    pub fn checksum_mode(mut self, input: aws_sdk_s3::types::ChecksumMode) -> Self {
+    pub fn checksum_mode(mut self, input: crate::model::ChecksumMode) -> Self {
         self.inner = self.inner.checksum_mode(input);
         self
     }
     /// <p>To retrieve the checksum, this mode must be enabled.</p>
-    pub fn set_checksum_mode(mut self, input: Option<aws_sdk_s3::types::ChecksumMode>) -> Self {
+    pub fn set_checksum_mode(mut self, input: Option<crate::model::ChecksumMode>) -> Self {
         self.inner = self.inner.set_checksum_mode(input);
         self
     }
     /// <p>To retrieve the checksum, this mode must be enabled.</p>
-    pub fn get_checksum_mode(&self) -> &Option<aws_sdk_s3::types::ChecksumMode> {
+    pub fn get_checksum_mode(&self) -> &Option<crate::model::ChecksumMode> {
         self.inner.get_checksum_mode()
     }
     /// Override how far this download prefetches ahead of the consumer, replacing the

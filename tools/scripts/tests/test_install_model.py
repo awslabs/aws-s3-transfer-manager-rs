@@ -28,6 +28,9 @@ class InstallModelTest(unittest.TestCase):
         self.target.parent.mkdir(parents=True)
         self.calls = []
         self.candidate = {"mod.rs": HEADER + b"pub struct Candidate;\n"}
+        self.sdk_candidate = {"mod.rs": HEADER + b"// SDK candidate\n"}
+        self.sdk_target = self.root / install_model.SDK_DESTINATION
+        self.write_tree(self.sdk_target, self.sdk_candidate)
         self.status = 0
         self.addCleanup(patch.stopall)
         patch.object(install_model, "REPOSITORY_ROOT", self.root).start()
@@ -40,6 +43,8 @@ class InstallModelTest(unittest.TestCase):
         if self.status:
             return self.status
         self.write_tree(output / install_model.CANDIDATE, self.candidate)
+        self.write_tree(output / install_model.SDK_CANDIDATE, self.sdk_candidate)
+        (output / install_model.SDK_CANDIDATE / "mapping.json").write_text("{}")
         # These standalone harness files must never be installed.
         (output / "model/Cargo.toml").write_text("[package]\nname='fixture'\n")
         (output / "model/build.rs").write_text("fn main() {}\n")
@@ -329,6 +334,82 @@ class InstallModelTest(unittest.TestCase):
         self.assertIn("models/local input.json", self.calls[0])
         self.assertEqual(0, self.invoke("--pinned-only")[0])
         self.assertIn("--pinned-only", self.calls[1])
+
+    def test_second_destination_preflight_blocks_first_install(self):
+        (self.sdk_target / "manual.txt").write_text("manual")
+        self.assertEqual(1, self.invoke("--overwrite")[0])
+        self.assertFalse(self.target.exists())
+        self.assertEqual([], self.calls)
+
+    def test_second_tree_dirty_conflict_leaves_both_unchanged(self):
+        original = {"mod.rs": HEADER + b"old model\n"}
+        self.write_tree(self.target, original)
+        self.sdk_candidate["mod.rs"] = HEADER + b"new sdk\n"
+        install_model.dirty_files.return_value = {(install_model.SDK_DESTINATION / "mod.rs").as_posix()}
+        self.assertEqual(1, self.invoke()[0])
+        self.assertEqual(original, install_model.inventory(self.target))
+        self.assertNotEqual(self.sdk_candidate, install_model.inventory(self.sdk_target))
+
+    def test_second_swap_failure_rolls_back_first_swap(self):
+        original = {"mod.rs": HEADER + b"old model\n"}
+        self.write_tree(self.target, original)
+        sdk_original = install_model.inventory(self.sdk_target)
+        self.sdk_candidate["mod.rs"] = HEADER + b"new sdk\n"
+        replace = os.replace
+
+        def fail_sdk_candidate(source, target):
+            if Path(source).name == "candidate" and Path(target) == self.sdk_target:
+                raise OSError("second tree swap failed")
+            return replace(source, target)
+
+        with patch.object(install_model.os, "replace", side_effect=fail_sdk_candidate):
+            self.assertEqual(1, self.invoke()[0])
+        self.assertEqual(original, install_model.inventory(self.target))
+        self.assertEqual(sdk_original, install_model.inventory(self.sdk_target))
+        self.assertEqual([], list(self.target.parent.glob(".s3-tm-model-*")))
+
+    def test_sdk_report_is_not_installed_and_missing_sdk_module_blocks_both(self):
+        self.assertEqual(0, self.invoke()[0])
+        self.assertFalse((self.sdk_target / "mapping.json").exists())
+        model_original = install_model.inventory(self.target)
+        self.candidate["mod.rs"] = HEADER + b"changed model\n"
+        self.sdk_candidate = {}
+        self.assertEqual(1, self.invoke()[0])
+        self.assertEqual(model_original, install_model.inventory(self.target))
+
+    def test_interrupt_after_bootstrap_swap_removes_new_destination(self):
+        replace = os.replace
+
+        def interrupt_after_swap(source, target):
+            result = replace(source, target)
+            if Path(source).name == "candidate" and Path(target) == self.target:
+                raise KeyboardInterrupt
+            return result
+
+        with patch.object(install_model.os, "replace", side_effect=interrupt_after_swap):
+            self.assertEqual(130, self.invoke()[0])
+        self.assertFalse(self.target.exists())
+        self.assertEqual(self.sdk_candidate, install_model.inventory(self.sdk_target))
+        self.assertEqual([], list(self.target.parent.glob(".s3-tm-model-*")))
+
+    def test_interrupt_after_second_swap_restores_both_previous_trees(self):
+        original = {"mod.rs": HEADER + b"old model\n"}
+        self.write_tree(self.target, original)
+        sdk_original = install_model.inventory(self.sdk_target)
+        self.sdk_candidate["mod.rs"] = HEADER + b"new SDK\n"
+        replace = os.replace
+
+        def interrupt_after_sdk_swap(source, target):
+            result = replace(source, target)
+            if Path(source).name == "candidate" and Path(target) == self.sdk_target:
+                raise KeyboardInterrupt
+            return result
+
+        with patch.object(install_model.os, "replace", side_effect=interrupt_after_sdk_swap):
+            self.assertEqual(130, self.invoke()[0])
+        self.assertEqual(original, install_model.inventory(self.target))
+        self.assertEqual(sdk_original, install_model.inventory(self.sdk_target))
+        self.assertEqual([], list(self.target.parent.glob(".s3-tm-model-*")))
 
 
 class InstalledGitEditsTest(unittest.TestCase):

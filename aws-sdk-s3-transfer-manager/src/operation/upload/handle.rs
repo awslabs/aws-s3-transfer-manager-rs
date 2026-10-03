@@ -177,7 +177,10 @@ impl UploadHandle {
 
                     Ok(AbortedUpload {
                         upload_id: Some(upload_id),
-                        request_charged: resp.request_charged,
+                        request_charged: resp
+                            .request_charged
+                            .as_ref()
+                            .map(crate::sdk_v1::request_charged_from_sdk),
                     })
                 }
             }

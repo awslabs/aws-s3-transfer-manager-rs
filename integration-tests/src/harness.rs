@@ -416,7 +416,7 @@ impl TmTestClient {
     pub(crate) async fn download(
         &self,
         key: &str,
-        checksum_mode: Option<aws_sdk_s3::types::ChecksumMode>,
+        checksum_mode: Option<aws_sdk_s3_transfer_manager::model::ChecksumMode>,
     ) -> Result<
         (
             Vec<u8>,
@@ -453,7 +453,7 @@ impl TmTestClient {
         &self,
         key: &str,
         dest: &std::path::Path,
-        checksum_mode: Option<aws_sdk_s3::types::ChecksumMode>,
+        checksum_mode: Option<aws_sdk_s3_transfer_manager::model::ChecksumMode>,
     ) -> Result<
         aws_sdk_s3_transfer_manager::operation::download::DownloadOutput,
         aws_sdk_s3_transfer_manager::error::Error,

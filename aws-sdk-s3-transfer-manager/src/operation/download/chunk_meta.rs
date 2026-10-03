@@ -48,7 +48,7 @@ pub struct ChunkMetadata {
     /// <p>The base64-encoded, 256-bit SHA-256 digest of the object. This will only be present if it was uploaded with the object. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html"> Checking object integrity</a> in the <i>Amazon S3 User Guide</i>.</p>
     pub checksum_sha256: Option<String>,
     /// <p>The checksum type, which determines how part-level checksums are combined to create an object-level checksum for multipart objects. You can use this header response to verify that the checksum type that is received is the same checksum type that was specified in the <code>CreateMultipartUpload</code> request. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html">Checking object integrity in the Amazon S3 User Guide</a>.</p>
-    pub checksum_type: Option<aws_sdk_s3::types::ChecksumType>,
+    pub checksum_type: Option<crate::model::ChecksumType>,
     /// <p>This is set to the number of metadata entries not returned in the headers that are prefixed with <code>x-amz-meta-</code>. This can happen if you create metadata using an API like SOAP that supports more flexible metadata than the REST API. For example, using SOAP, you can create metadata whose values are not legal HTTP headers.</p><note>
     /// <p>This functionality is not supported for directory buckets.</p>
     /// </note>
@@ -74,7 +74,7 @@ pub struct ChunkMetadata {
     /// </note>
     pub website_redirect_location: Option<String>,
     /// <p>The server-side encryption algorithm used when you store this object in Amazon S3.</p>
-    pub server_side_encryption: Option<aws_sdk_s3::types::ServerSideEncryption>,
+    pub server_side_encryption: Option<crate::model::ServerSideEncryption>,
     /// <p>A map of metadata to store with the object in S3.</p>
     pub metadata: Option<::std::collections::HashMap<String, String>>,
     /// <p>If server-side encryption with a customer-provided encryption key was requested, the response will include this header to confirm the encryption algorithm that's used.</p><note>
@@ -92,15 +92,15 @@ pub struct ChunkMetadata {
     /// <p>Provides storage class information of the object. Amazon S3 returns this header for all objects except for S3 Standard storage class objects.</p><note>
     /// <p><b>Directory buckets </b> - Only the S3 Express One Zone storage class is supported by directory buckets to store objects.</p>
     /// </note>
-    pub storage_class: Option<aws_sdk_s3::types::StorageClass>,
+    pub storage_class: Option<crate::model::StorageClass>,
     /// <p>If present, indicates that the requester was successfully charged for the request.</p><note>
     /// <p>This functionality is not supported for directory buckets.</p>
     /// </note>
-    pub request_charged: Option<aws_sdk_s3::types::RequestCharged>,
+    pub request_charged: Option<crate::model::RequestCharged>,
     /// <p>Amazon S3 can return this if your request involves a bucket that is either a source or destination in a replication rule.</p><note>
     /// <p>This functionality is not supported for directory buckets.</p>
     /// </note>
-    pub replication_status: Option<aws_sdk_s3::types::ReplicationStatus>,
+    pub replication_status: Option<crate::model::ReplicationStatus>,
     /// <p>The count of parts this object has. This value is only returned if you specify <code>partNumber</code> in your request and the object was uploaded as a multipart upload.</p>
     pub parts_count: Option<i32>,
     /// <p>The number of tags, if any, on the object, when you have the relevant permission to read object tags.</p>
@@ -111,7 +111,7 @@ pub struct ChunkMetadata {
     /// <p>The Object Lock mode that's currently in place for this object.</p><note>
     /// <p>This functionality is not supported for directory buckets.</p>
     /// </note>
-    pub object_lock_mode: Option<aws_sdk_s3::types::ObjectLockMode>,
+    pub object_lock_mode: Option<crate::model::ObjectLockMode>,
     /// <p>The date and time when this object's Object Lock will expire.</p><note>
     /// <p>This functionality is not supported for directory buckets.</p>
     /// </note>
@@ -119,7 +119,7 @@ pub struct ChunkMetadata {
     /// <p>Indicates whether this object has an active legal hold. This field is only returned if you have permission to view an object's legal hold status.</p><note>
     /// <p>This functionality is not supported for directory buckets.</p>
     /// </note>
-    pub object_lock_legal_hold_status: Option<aws_sdk_s3::types::ObjectLockLegalHoldStatus>,
+    pub object_lock_legal_hold_status: Option<crate::model::ObjectLockLegalHoldStatus>,
     /// <p>The date and time at which the object is no longer cacheable.</p>
     pub expires_string: Option<String>,
     _request_id: Option<String>,
@@ -145,7 +145,10 @@ impl From<&GetObjectOutput> for ChunkMetadata {
             checksum_crc64_nvme: value.checksum_crc64_nvme.clone(),
             checksum_sha1: value.checksum_sha1.clone(),
             checksum_sha256: value.checksum_sha256.clone(),
-            checksum_type: value.checksum_type.clone(),
+            checksum_type: value
+                .checksum_type
+                .as_ref()
+                .map(crate::sdk_v1::checksum_type_from_sdk),
             content_disposition: value.content_disposition.clone(),
             content_encoding: value.content_encoding.clone(),
             content_language: value.content_language.clone(),
@@ -159,18 +162,36 @@ impl From<&GetObjectOutput> for ChunkMetadata {
             last_modified: value.last_modified,
             metadata: value.metadata.clone(),
             missing_meta: value.missing_meta,
-            object_lock_legal_hold_status: value.object_lock_legal_hold_status.clone(),
-            object_lock_mode: value.object_lock_mode.clone(),
+            object_lock_legal_hold_status: value
+                .object_lock_legal_hold_status
+                .as_ref()
+                .map(crate::sdk_v1::object_lock_legal_hold_status_from_sdk),
+            object_lock_mode: value
+                .object_lock_mode
+                .as_ref()
+                .map(crate::sdk_v1::object_lock_mode_from_sdk),
             object_lock_retain_until_date: value.object_lock_retain_until_date,
             parts_count: value.parts_count,
-            replication_status: value.replication_status.clone(),
-            request_charged: value.request_charged.clone(),
+            replication_status: value
+                .replication_status
+                .as_ref()
+                .map(crate::sdk_v1::replication_status_from_sdk),
+            request_charged: value
+                .request_charged
+                .as_ref()
+                .map(crate::sdk_v1::request_charged_from_sdk),
             restore: value.restore.clone(),
-            server_side_encryption: value.server_side_encryption.clone(),
+            server_side_encryption: value
+                .server_side_encryption
+                .as_ref()
+                .map(crate::sdk_v1::server_side_encryption_from_sdk),
             sse_customer_algorithm: value.sse_customer_algorithm.clone(),
             sse_customer_key_md5: value.sse_customer_key_md5.clone(),
             ssekms_key_id: value.ssekms_key_id.clone(),
-            storage_class: value.storage_class.clone(),
+            storage_class: value
+                .storage_class
+                .as_ref()
+                .map(crate::sdk_v1::storage_class_from_sdk),
             tag_count: value.tag_count,
             version_id: value.version_id.clone(),
             website_redirect_location: value.website_redirect_location.clone(),
@@ -302,7 +323,10 @@ mod tests {
         assert_eq!(None, chunk_metadata.checksum_crc64_nvme);
         assert_eq!(None, chunk_metadata.checksum_sha1);
         assert_eq!(None, chunk_metadata.checksum_sha256);
-        assert_eq!(Some(ChecksumType::FullObject), chunk_metadata.checksum_type);
+        assert_eq!(
+            Some(crate::model::ChecksumType::FullObject),
+            chunk_metadata.checksum_type
+        );
         assert_eq!(
             Some("attachment".to_string()),
             chunk_metadata.content_disposition
@@ -334,11 +358,11 @@ mod tests {
         );
         assert_eq!(Some(0), chunk_metadata.missing_meta);
         assert_eq!(
-            Some(ObjectLockLegalHoldStatus::On),
+            Some(crate::model::ObjectLockLegalHoldStatus::On),
             chunk_metadata.object_lock_legal_hold_status
         );
         assert_eq!(
-            Some(ObjectLockMode::Governance),
+            Some(crate::model::ObjectLockMode::Governance),
             chunk_metadata.object_lock_mode
         );
         assert_eq!(
@@ -347,16 +371,16 @@ mod tests {
         );
         assert_eq!(Some(1), chunk_metadata.parts_count);
         assert_eq!(
-            Some(ReplicationStatus::Complete),
+            Some(crate::model::ReplicationStatus::Complete),
             chunk_metadata.replication_status
         );
         assert_eq!(
-            Some(RequestCharged::Requester),
+            Some(crate::model::RequestCharged::Requester),
             chunk_metadata.request_charged
         );
         assert_eq!(Some("test-restore".to_string()), chunk_metadata.restore);
         assert_eq!(
-            Some(ServerSideEncryption::Aes256),
+            Some(crate::model::ServerSideEncryption::Aes256),
             chunk_metadata.server_side_encryption
         );
         assert_eq!(
@@ -371,7 +395,10 @@ mod tests {
             Some("test-kms-key".to_string()),
             chunk_metadata.ssekms_key_id
         );
-        assert_eq!(Some(StorageClass::Standard), chunk_metadata.storage_class);
+        assert_eq!(
+            Some(crate::model::StorageClass::Standard),
+            chunk_metadata.storage_class
+        );
         assert_eq!(Some(2), chunk_metadata.tag_count);
         assert_eq!(Some("test-version".to_string()), chunk_metadata.version_id);
         assert_eq!(

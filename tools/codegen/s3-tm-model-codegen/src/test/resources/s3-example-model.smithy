@@ -5,7 +5,7 @@ namespace com.amazonaws.s3
 
 service AmazonS3 {
     version: "2006-03-01"
-    operations: [GetObject, HeadObject, ListObjectsV2, PutObject, CreateMultipartUpload, CompleteMultipartUpload]
+    operations: [GetObject, HeadObject, ListObjectsV2, PutObject, CreateMultipartUpload, UploadPart, CompleteMultipartUpload, AbortMultipartUpload]
 }
 
 operation GetObject {
@@ -16,26 +16,103 @@ operation HeadObject { output: HeadObjectOutput }
 operation ListObjectsV2 { output: ListObjectsV2Output }
 operation PutObject { input: PutObjectRequest, output: PutObjectOutput }
 operation CreateMultipartUpload { input: CreateMultipartUploadRequest, output: CreateMultipartUploadOutput }
-operation CompleteMultipartUpload { output: CompleteMultipartUploadOutput }
+operation UploadPart { input: UploadPartRequest }
+operation CompleteMultipartUpload { input: CompleteMultipartUploadRequest, output: CompleteMultipartUploadOutput }
+operation AbortMultipartUpload { input: AbortMultipartUploadRequest }
 
-@input
-structure PutObjectRequest {
+@mixin
+structure UploadContext {
     @required
     Bucket: String
     @required
     Key: String
-    Body: Blob
-    SSEKMSKeyId: CustomerKey
+    ExpectedBucketOwner: String
+    RequestPayer: String
+}
+@mixin
+structure CustomerEncryption {
+    SSECustomerAlgorithm: String
+    SSECustomerKey: CustomerKey
+    SSECustomerKeyMD5: String
+}
+@mixin
+structure ObjectSetup {
+    ACL: String
+    BucketKeyEnabled: Boolean
+    CacheControl: String
+    ContentDisposition: String
+    ContentEncoding: String
+    ContentLanguage: String
+    ContentType: String
+    Expires: Expires
+    GrantFullControl: String
+    GrantRead: String
+    GrantReadACP: String
+    GrantWriteACP: String
+    Metadata: Metadata
+    ObjectLockLegalHoldStatus: String
+    ObjectLockMode: String
+    ObjectLockRetainUntilDate: Timestamp
     SSEKMSEncryptionContext: CustomerKey
-    ChecksumAlgorithm: ChecksumAlgorithm
+    SSEKMSKeyId: CustomerKey
+    ServerSideEncryption: String
+    StorageClass: StorageClass
+    Tagging: String
+    WebsiteRedirectLocation: String
+}
+@mixin
+structure ChecksumValues {
+    ChecksumCRC32: String
+    ChecksumCRC32C: String
+    ChecksumCRC64NVME: String
+    ChecksumSHA1: String
     ChecksumSHA256: String
+    ChecksumMD5: String
+    ChecksumSHA512: String
+    ChecksumXXHASH64: String
+    ChecksumXXHASH3: String
+    ChecksumXXHASH128: String
+}
+
+@input
+structure PutObjectRequest with [UploadContext, CustomerEncryption, ObjectSetup, ChecksumValues] {
+    Body: Blob
+    ChecksumAlgorithm: ChecksumAlgorithm
     WriteOffsetBytes: Long
     ContentLength: Long
-    Expires: Expires
+    ContentMD5: String
+    IfMatch: String
+    IfNoneMatch: String
     AdditionalUpload: String
 }
 @input
-structure CreateMultipartUploadRequest { Expires: Expires }
+structure CreateMultipartUploadRequest with [UploadContext, CustomerEncryption, ObjectSetup] {
+    ChecksumAlgorithm: ChecksumAlgorithm
+    ChecksumType: ChecksumType
+}
+@input
+structure UploadPartRequest with [UploadContext, CustomerEncryption, ChecksumValues] {
+    Body: Blob
+    ContentLength: Long
+    ContentMD5: String
+    PartNumber: Integer
+    UploadId: String
+    ChecksumAlgorithm: ChecksumAlgorithm
+}
+@input
+structure CompleteMultipartUploadRequest with [UploadContext, CustomerEncryption, ChecksumValues] {
+    IfMatch: String
+    IfNoneMatch: String
+    UploadId: String
+    MultipartUpload: String
+    MpuObjectSize: Long
+    ChecksumType: ChecksumType
+}
+@input
+structure AbortMultipartUploadRequest with [UploadContext] {
+    UploadId: String
+    IfMatchInitiatedTime: Timestamp
+}
 structure PutObjectOutput {
     @httpHeader("ETag")
     ETag: String

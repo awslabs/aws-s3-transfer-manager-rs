@@ -281,7 +281,7 @@ impl DownloadTransfer {
     /// default, and unknown values enable it).
     fn validation_enabled(&self, input: &DownloadInput) -> bool {
         match input.checksum_mode {
-            Some(aws_sdk_s3::types::ChecksumMode::Enabled) => true,
+            Some(crate::model::ChecksumMode::Enabled) => true,
             _ => !matches!(
                 self.ctx()
                     .s3_client()
@@ -1628,6 +1628,7 @@ mod tests {
     use http_body_1x::{Body as HttpBody, Frame, SizeHint};
 
     use super::*;
+    use crate::model::ChecksumType;
     use crate::operation::download::chunk_meta::ChunkMetadata;
     use crate::operation::download::DownloadInput;
     use crate::scheduler::test_util::{assert_done, assert_pending, assert_ready};
@@ -1637,7 +1638,6 @@ mod tests {
     use aws_sdk_s3::operation::get_object::GetObjectError;
     use aws_sdk_s3::operation::get_object::GetObjectOutput;
     use aws_sdk_s3::primitives::ByteStream;
-    use aws_sdk_s3::types::ChecksumType;
     use aws_smithy_mocks::{mock, mock_client, RuleMode};
     use aws_smithy_types::error::metadata::ErrorMetadata;
 

@@ -5,17 +5,15 @@
 
 use std::{str::FromStr, task::Poll};
 
-use aws_sdk_s3::{
-    operation::{
-        complete_multipart_upload::CompleteMultipartUploadOutput,
-        create_multipart_upload::CreateMultipartUploadOutput, put_object::PutObjectOutput,
-        upload_part::UploadPartOutput,
-    },
-    types::{ChecksumAlgorithm, ChecksumType},
+use aws_sdk_s3::operation::{
+    complete_multipart_upload::CompleteMultipartUploadOutput,
+    create_multipart_upload::CreateMultipartUploadOutput, put_object::PutObjectOutput,
+    upload_part::UploadPartOutput,
 };
 use aws_sdk_s3_transfer_manager::{
     io::{InputStream, PartData, PartStream, SizeHint},
     metrics::unit::ByteUnit,
+    model::{ChecksumAlgorithm, ChecksumType},
     operation::upload::{ChecksumStrategy, UploadOutput},
     types::{ConcurrencyMode, PartSize},
 };
@@ -243,12 +241,14 @@ fn mock_s3_client_for_multipart_upload(
                 move |input| {
                     // checksum algorithm and type should only be specified if a strategy is being used
                     assert_eq!(
-                        input.checksum_algorithm(),
-                        request_strategy.as_ref().map(|s| s.algorithm())
+                        input.checksum_algorithm().map(|v| v.as_str()),
+                        request_strategy.as_ref().map(|s| s.algorithm().as_str())
                     );
                     assert_eq!(
-                        input.checksum_type(),
-                        request_strategy.as_ref().map(|s| s.type_if_multipart())
+                        input.checksum_type().map(|v| v.as_str()),
+                        request_strategy
+                            .as_ref()
+                            .map(|s| s.type_if_multipart().as_str())
                     );
                     true
                 }
@@ -260,8 +260,12 @@ fn mock_s3_client_for_multipart_upload(
                 move || {
                     CreateMultipartUploadOutput::builder()
                         .upload_id(&upload_id)
-                        .checksum_algorithm(response_algorithm.clone())
-                        .checksum_type(response_checksum_type.clone())
+                        .checksum_algorithm(aws_sdk_s3::types::ChecksumAlgorithm::from(
+                            response_algorithm.as_str(),
+                        ))
+                        .checksum_type(aws_sdk_s3::types::ChecksumType::from(
+                            response_checksum_type.as_str(),
+                        ))
                         .build()
                 }
             }),
@@ -293,13 +297,16 @@ fn mock_s3_client_for_multipart_upload(
                                 assert_eq!(field_value, part_checksum);
                                 // doesn't matter if algorithm is set too, but if it is, it should be correct
                                 if let Some(input_algorithm) = input.checksum_algorithm() {
-                                    assert_eq!(input_algorithm, request_strategy.algorithm());
+                                    assert_eq!(
+                                        input_algorithm.as_str(),
+                                        request_strategy.algorithm().as_str()
+                                    );
                                 }
                             } else {
                                 assert!(!expect_checksums_from_part_stream);
                                 assert_eq!(
-                                    input.checksum_algorithm(),
-                                    Some(request_strategy.algorithm())
+                                    input.checksum_algorithm().map(|v| v.as_str()),
+                                    Some(request_strategy.algorithm().as_str())
                                 );
                             }
                         } else {
@@ -345,8 +352,8 @@ fn mock_s3_client_for_multipart_upload(
                     let input_checksum_field = get_checksum_value!(input);
                     if let Some(request_strategy) = &request_strategy {
                         assert_eq!(
-                            input.checksum_type(),
-                            Some(request_strategy.type_if_multipart())
+                            input.checksum_type().map(|v| v.as_str()),
+                            Some(request_strategy.type_if_multipart().as_str())
                         );
 
                         if let Some((field_algorithm, field_value)) = &input_checksum_field {
@@ -393,8 +400,9 @@ fn mock_s3_client_for_multipart_upload(
                 let multipart_checksum = multipart_checksum.clone();
                 move || {
                     // As of 2025, S3 always sends a checksum in CompleteMultipartUpload response
-                    let mut req = CompleteMultipartUploadOutput::builder()
-                        .checksum_type(response_checksum_type.clone());
+                    let mut req = CompleteMultipartUploadOutput::builder().checksum_type(
+                        aws_sdk_s3::types::ChecksumType::from(response_checksum_type.as_str()),
+                    );
                     req = set_checksum_value!(req, &response_algorithm, &multipart_checksum);
                     req.build()
                 }
@@ -432,8 +440,8 @@ fn mock_s3_client_for_put_object(
                         } else {
                             // Transfer Manager should set algorithm, so SDK will calculate actual checksum value
                             assert_eq!(
-                                input.checksum_algorithm(),
-                                Some(request_strategy.algorithm())
+                                input.checksum_algorithm().map(|v| v.as_str()),
+                                Some(request_strategy.algorithm().as_str())
                             );
                         }
                     } else {
@@ -453,7 +461,7 @@ fn mock_s3_client_for_put_object(
                     // As of 2025, S3 always sends checksums in PutObject responses
                     let mut resp = PutObjectOutput::builder()
                         .e_tag(&etag)
-                        .checksum_type(ChecksumType::FullObject);
+                        .checksum_type(aws_sdk_s3::types::ChecksumType::FullObject);
                     resp = set_checksum_value!(resp, response_algorithm, &checksum_value);
 
                     resp.build()

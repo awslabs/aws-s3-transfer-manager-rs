@@ -905,7 +905,7 @@ mod tests {
             .sse_customer_algorithm("AES256")
             .sse_customer_key("secret")
             .sse_customer_key_md5("key-md5")
-            .request_payer(aws_sdk_s3::types::RequestPayer::Requester)
+            .request_payer(crate::model::RequestPayer::Requester)
             .expected_bucket_owner("owner")
             .build()
             .unwrap();

@@ -10,6 +10,9 @@ import java.util.logging.Level
 import java.util.logging.Logger
 import software.amazon.smithy.build.FileManifest
 import software.amazon.smithy.model.node.Node
+import software.amazon.s3tm.codegen.sdkv1.SdkV1Generator
+import software.amazon.s3tm.codegen.sdkv1.SdkV1Mapping
+import software.amazon.s3tm.codegen.sdkv1.SdkV1Symbols
 
 /** Assembles a standalone crate with the complete generated subtree at src/model. */
 object ModelArtifact {
@@ -105,6 +108,8 @@ object ModelArtifact {
             appendLine("Codegen work dir:      ${buildOutput.resolve("raw")}")
             appendLine("Generated crate:       ${output.resolve("model")}")
             appendLine("Generated module:      ${output.resolve("model/src/model/mod.rs")}")
+            appendLine("SDK v1 modules:        ${output.resolve("sdk_v1")}")
+            appendLine("SDK mapping report:    ${output.resolve("sdk_v1/mapping.json")}")
         }
     }
 }
@@ -129,6 +134,7 @@ fun main(args: Array<String>) {
         val model = ModelLoader.load(modelFile)
         if (!projectOnly) {
             val projection = TmModelProjection.project(model)
+            val sdkMapping = SdkV1Mapping(projection, SdkV1Symbols(model, projection, args[4]))
             val generated = ModelGenerator.generate(projection, temporary.resolve("raw"), args[4])
             GeneratedOutput.publish(generated.baseDir, buildOutput.resolve("raw"), raw = true)
             val generatorFiles = Files.walk(config.parent.resolve("src/main/kotlin")).use { paths ->
@@ -149,6 +155,7 @@ fun main(args: Array<String>) {
                 .withMember("roots", Node.fromStrings(projection.roots.map { it.toString() }.sorted()))
                 .build()
             ModelArtifact.assemble(generated, candidate, projection, provenance)
+            SdkV1Generator(sdkMapping).generate(candidate)
         }
         GeneratedOutput.publish(candidate, output, projectOnly)
         println(ModelArtifact.summary(

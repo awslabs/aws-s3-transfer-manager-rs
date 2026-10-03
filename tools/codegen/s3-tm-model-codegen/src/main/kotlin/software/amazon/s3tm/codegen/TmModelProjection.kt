@@ -54,7 +54,7 @@ object TmModelProjection {
         val provenance = sortedMapOf<ShapeId, List<ShapeId>>()
         val exclusions = sortedMapOf<ShapeId, String>()
         val download = input(source, get, "downloading", provenance, exclusions)
-        val upload = input(source, put, "uploading", provenance, exclusions, ::uploadExclusion)
+        val upload = input(source, put, "uploading", provenance, exclusions, UploadRequestPolicy::exposureExclusion)
         fun operationOutput(name: String) = source.expectShape(
             source.expectShape(id(name), OperationShape::class.java).output.orElseThrow(), StructureShape::class.java,
         )
@@ -99,13 +99,6 @@ object TmModelProjection {
             }
         }
         return result.build()
-    }
-
-    private fun uploadExclusion(member: MemberShape): String? = when {
-        member.memberName.startsWith("Checksum") ->
-            "Checksum selection and values are controlled by TM ChecksumStrategy."
-        member.memberName == "WriteOffsetBytes" -> "Append uploads are not supported by TM."
-        else -> null
     }
 
     private fun aggregate(
