@@ -5,6 +5,7 @@
 package software.amazon.s3tm.codegen.sdkv1
 
 import java.nio.file.Path
+import software.amazon.s3tm.codegen.customizations.RequestIdExt
 import software.amazon.smithy.build.FileManifest
 import software.amazon.smithy.model.shapes.ListShape
 import software.amazon.smithy.model.shapes.MapShape
@@ -202,6 +203,41 @@ class SdkV1Generator(private val mapping: SdkV1Mapping) {
                     }
                     appendLine("}")
                 }
+            }
+        }
+        mapping.responses.forEach { response ->
+            val operation = response.operation.id.name
+            val name = operation.toSnakeCase()
+            val source = "::aws_sdk_s3::operation::$name::${operation}Output"
+            val outputName = symbols.tmName(response.output)
+            val target = if (outputName == "UploadOutput") "crate::model::builders::UploadOutputBuilder"
+                else "crate::model::$outputName"
+            val function = "${symbols.functionName(response.output)}_from_$name"
+            for (borrowed in listOf(false, true)) {
+                val argument = if (borrowed) "&$source" else source
+                val value = if (borrowed) "value" else "&value"
+                if (!borrowed && operation == "GetObject") {
+                    appendLine("/// Extracts response metadata, dropping the response body without reading it.")
+                }
+                appendLine("impl From<$argument> for $target {")
+                appendLine("    fn from(value: $argument) -> Self { super::convert::$function($value) }")
+                appendLine("}")
+            }
+            if (outputName == "UploadOutput" && operation == "CompleteMultipartUpload") {
+                appendLine("impl $target {")
+                appendLine("    /// Updates completion response fields while retaining other transfer values.")
+                appendLine("    pub fn update_from_complete_mpu(self, output: &$source) -> Self {")
+                appendLine("        super::convert::update_$function(self, output)")
+                appendLine("    }")
+                appendLine("}")
+            }
+        }
+        RequestIdExt.containers.forEach { id ->
+            val target = "crate::model::${symbols.tmName(symbols.tmModel.expectShape(id))}"
+            for ((trait, accessor) in listOf("RequestId" to "request_id", "RequestIdExt" to "extended_request_id")) {
+                appendLine("impl ::aws_sdk_s3::operation::$trait for $target {")
+                appendLine("    fn $accessor(&self) -> Option<&str> { $target::$accessor(self) }")
+                appendLine("}")
             }
         }
     }

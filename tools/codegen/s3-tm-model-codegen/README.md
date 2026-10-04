@@ -189,7 +189,17 @@ sdk_v1/
 `convert.rs` contains crate-private enum, nested-value, request-field, and
 response conversions. `mod.rs` re-exports them for internal calls and loads
 `compat.rs` only with the `sdk-v1` Cargo feature. That file contains the public
-`From`/`TryFrom` implementations for SDK v1 enums and nested values.
+`From`/`TryFrom` implementations for SDK v1 enums and nested values, and
+owned/borrowed upload response conversions into `UploadOutputBuilder`.
+The builder's `update_from_complete_mpu` method applies completion response
+fields while retaining fields present only in the create response.
+Response conversions do not supply transfer metrics; building a TM
+`UploadOutput` still requires metrics supplied by the transfer runtime.
+GET/HEAD responses convert into `ObjectMetadata`, and GET responses also
+convert into `ChunkMetadata`. Borrowed conversions leave the GET body available;
+owned GET conversions discard it without reading it. Both metadata types
+implement the SDK's `RequestId` and `RequestIdExt` traits only with `sdk-v1`;
+their inherent identifier getters do not require the feature.
 The feature selects interoperability, not the SDK backend dependency.
 `mapping.json` records source-member classifications and correspondence;
 it is not installed into TM.

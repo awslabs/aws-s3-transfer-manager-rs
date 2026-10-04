@@ -327,3 +327,116 @@ impl From<&::aws_sdk_s3::types::RestoreStatus> for crate::model::RestoreStatus {
         super::convert::restore_status_from_sdk(value)
     }
 }
+/// Extracts response metadata, dropping the response body without reading it.
+impl From<::aws_sdk_s3::operation::get_object::GetObjectOutput> for crate::model::ObjectMetadata {
+    fn from(value: ::aws_sdk_s3::operation::get_object::GetObjectOutput) -> Self {
+        super::convert::object_metadata_from_get_object(&value)
+    }
+}
+impl From<&::aws_sdk_s3::operation::get_object::GetObjectOutput> for crate::model::ObjectMetadata {
+    fn from(value: &::aws_sdk_s3::operation::get_object::GetObjectOutput) -> Self {
+        super::convert::object_metadata_from_get_object(value)
+    }
+}
+impl From<::aws_sdk_s3::operation::head_object::HeadObjectOutput> for crate::model::ObjectMetadata {
+    fn from(value: ::aws_sdk_s3::operation::head_object::HeadObjectOutput) -> Self {
+        super::convert::object_metadata_from_head_object(&value)
+    }
+}
+impl From<&::aws_sdk_s3::operation::head_object::HeadObjectOutput>
+    for crate::model::ObjectMetadata
+{
+    fn from(value: &::aws_sdk_s3::operation::head_object::HeadObjectOutput) -> Self {
+        super::convert::object_metadata_from_head_object(value)
+    }
+}
+/// Extracts response metadata, dropping the response body without reading it.
+impl From<::aws_sdk_s3::operation::get_object::GetObjectOutput> for crate::model::ChunkMetadata {
+    fn from(value: ::aws_sdk_s3::operation::get_object::GetObjectOutput) -> Self {
+        super::convert::chunk_metadata_from_get_object(&value)
+    }
+}
+impl From<&::aws_sdk_s3::operation::get_object::GetObjectOutput> for crate::model::ChunkMetadata {
+    fn from(value: &::aws_sdk_s3::operation::get_object::GetObjectOutput) -> Self {
+        super::convert::chunk_metadata_from_get_object(value)
+    }
+}
+impl From<::aws_sdk_s3::operation::put_object::PutObjectOutput>
+    for crate::model::builders::UploadOutputBuilder
+{
+    fn from(value: ::aws_sdk_s3::operation::put_object::PutObjectOutput) -> Self {
+        super::convert::upload_output_from_put_object(&value)
+    }
+}
+impl From<&::aws_sdk_s3::operation::put_object::PutObjectOutput>
+    for crate::model::builders::UploadOutputBuilder
+{
+    fn from(value: &::aws_sdk_s3::operation::put_object::PutObjectOutput) -> Self {
+        super::convert::upload_output_from_put_object(value)
+    }
+}
+impl From<::aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput>
+    for crate::model::builders::UploadOutputBuilder
+{
+    fn from(
+        value: ::aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput,
+    ) -> Self {
+        super::convert::upload_output_from_create_multipart_upload(&value)
+    }
+}
+impl From<&::aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput>
+    for crate::model::builders::UploadOutputBuilder
+{
+    fn from(
+        value: &::aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput,
+    ) -> Self {
+        super::convert::upload_output_from_create_multipart_upload(value)
+    }
+}
+impl From<::aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput>
+    for crate::model::builders::UploadOutputBuilder
+{
+    fn from(
+        value: ::aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput,
+    ) -> Self {
+        super::convert::upload_output_from_complete_multipart_upload(&value)
+    }
+}
+impl From<&::aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput>
+    for crate::model::builders::UploadOutputBuilder
+{
+    fn from(
+        value: &::aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput,
+    ) -> Self {
+        super::convert::upload_output_from_complete_multipart_upload(value)
+    }
+}
+impl crate::model::builders::UploadOutputBuilder {
+    /// Updates completion response fields while retaining other transfer values.
+    pub fn update_from_complete_mpu(
+        self,
+        output: &::aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput,
+    ) -> Self {
+        super::convert::update_upload_output_from_complete_multipart_upload(self, output)
+    }
+}
+impl ::aws_sdk_s3::operation::RequestId for crate::model::ObjectMetadata {
+    fn request_id(&self) -> Option<&str> {
+        crate::model::ObjectMetadata::request_id(self)
+    }
+}
+impl ::aws_sdk_s3::operation::RequestIdExt for crate::model::ObjectMetadata {
+    fn extended_request_id(&self) -> Option<&str> {
+        crate::model::ObjectMetadata::extended_request_id(self)
+    }
+}
+impl ::aws_sdk_s3::operation::RequestId for crate::model::ChunkMetadata {
+    fn request_id(&self) -> Option<&str> {
+        crate::model::ChunkMetadata::request_id(self)
+    }
+}
+impl ::aws_sdk_s3::operation::RequestIdExt for crate::model::ChunkMetadata {
+    fn extended_request_id(&self) -> Option<&str> {
+        crate::model::ChunkMetadata::extended_request_id(self)
+    }
+}
