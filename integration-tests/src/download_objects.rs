@@ -1956,8 +1956,13 @@ async fn test_download_objects_failure_reports_failed_not_cancelled() {
             "a transfer that failed must not report Cancelled; got {root_outcome:?}"
         );
         assert!(
-            !format!("{:?}", joined_err.kind()).is_empty(),
-            "join() must still own a readable error after the event was emitted"
+            matches!(
+                joined_err.kind(),
+                aws_sdk_s3_transfer_manager::error::ErrorKind::InputInvalid
+            ),
+            "join() must still name the real cause -- the destination was not a directory -- \
+             after the event was emitted; got {:?}",
+            joined_err.kind()
         );
 
         m.handle.shutdown().await.expect("shutdown");
