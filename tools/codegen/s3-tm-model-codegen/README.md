@@ -204,6 +204,17 @@ The feature selects interoperability, not the SDK backend dependency.
 `mapping.json` records source-member classifications and correspondence;
 it is not installed into TM.
 
+`model/_upload_fluent_builder.rs` contains generated field delegation for the
+handwritten upload fluent wrapper. The module is gated out of standalone
+compilation with `s3_tm_out_of_tree`. Value and fluent builders use smithy-rs
+getter conventions (`&Option<T>`); built-value string accessors borrow `&str`.
+Execution methods and request-specific checksum/body handling remain outside
+the generated roots.
+
+Upload response documentation preserves upstream member or target-shape
+descriptions and adds transfer-path availability and multipart merge semantics.
+Exact source-operation correspondence is recorded in `member-sources.json`.
+
 `provenance.json` records input, projection-configuration, projected-model, and
 generator-source digests. `dependencies.json` reports the generated Cargo
 dependency declarations and Smithy/smithy-rs versions. Reports contain no

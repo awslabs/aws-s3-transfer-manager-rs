@@ -84,6 +84,7 @@ structure PutObjectRequest with [UploadContext, CustomerEncryption, ObjectSetup,
     IfMatch: String
     IfNoneMatch: String
     AdditionalUpload: String
+    AdditionalLabels: StringList
 }
 @input
 structure CreateMultipartUploadRequest with [UploadContext, CustomerEncryption, ObjectSetup] {
@@ -170,6 +171,7 @@ string Expires
 @sensitive
 string CustomerKey
 map Metadata { key: String, value: String }
+list StringList { member: String }
 enum StorageClass {
     STANDARD
 }

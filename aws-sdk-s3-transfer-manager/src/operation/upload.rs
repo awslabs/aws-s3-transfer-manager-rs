@@ -3,11 +3,20 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+//! Single-object uploads using either a single PUT or multipart upload.
+//!
+//! Construct an upload through the client's fluent builder or
+//! [`UploadInput::builder`](crate::model::UploadInput::builder).
+//! Wait for [`UploadHandle::join`](crate::operation::upload::UploadHandle::join) to obtain
+//! [`UploadOutput`](crate::model::UploadOutput), which combines service response metadata with
+//! transfer metrics. Optional response fields depend on the selected path
+//! and the values returned by S3; see [`UploadOutput`](crate::model::UploadOutput)
+//! for their provenance.
+
 /// Operation builders
 pub mod builders;
 mod checksum_strategy;
-mod input;
-mod output;
+mod request;
 
 mod context;
 pub(crate) mod file_body;
@@ -20,13 +29,15 @@ pub use checksum_strategy::{ChecksumStrategy, ChecksumStrategyBuilder};
 pub(crate) use transfer::UploadTransfer;
 
 use crate::error;
+pub use crate::model::builders::UploadInputBuilder;
+pub use crate::model::builders::UploadOutputBuilder;
+/// Request type for uploads to Amazon S3
+pub use crate::model::UploadInput;
+/// Response type for uploads to Amazon S3
+pub use crate::model::UploadOutput;
 use crate::transfer::TransferContext;
 use crate::types::BucketType;
 pub use handle::UploadHandle;
-/// Request type for uploads to Amazon S3
-pub use input::{UploadInput, UploadInputBuilder};
-/// Response type for uploads to Amazon S3
-pub use output::{UploadOutput, UploadOutputBuilder};
 
 use std::sync::Arc;
 

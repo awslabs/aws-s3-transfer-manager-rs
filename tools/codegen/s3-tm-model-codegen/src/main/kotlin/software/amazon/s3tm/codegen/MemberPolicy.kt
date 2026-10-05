@@ -171,7 +171,7 @@ class MemberPolicy(private val source: Model, private val sourceSymbols: RustSym
         if (field.gated) rust("##[cfg(not(s3_tm_out_of_tree))]")
     }
 
-    private fun RustWriter.fieldDocs(field: Field) {
+    internal fun RustWriter.fieldDocs(field: Field) {
         if (field.sourceMember != null) {
             if (field.runtime == null) format(sourceSymbols.toSymbol(field.sourceMember))
             documentShape(field.sourceMember, source)

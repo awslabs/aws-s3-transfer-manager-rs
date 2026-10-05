@@ -27,12 +27,74 @@ pub mod operation {
     pub mod upload {
         #[derive(Debug, Clone)]
         pub struct ChecksumStrategy;
+
+        pub mod builders {
+            #[derive(Debug, Default)]
+            pub struct UploadFluentBuilder {
+                pub(crate) inner: crate::model::builders::UploadInputBuilder,
+            }
+
+            impl UploadFluentBuilder {
+                pub fn build(
+                    self,
+                ) -> Result<crate::model::UploadInput, aws_smithy_types::error::operation::BuildError>
+                {
+                    self.inner.build()
+                }
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{io::InputStream, model::*, operation::upload::ChecksumStrategy, types::*};
+
+    #[test]
+    fn fluent_delegation_covers_modeled_collections_additions_and_runtime_members() {
+        use super::operation::upload::builders::UploadFluentBuilder;
+        let builder = UploadFluentBuilder::default()
+            .bucket("bucket")
+            .key("key")
+            .metadata("one", "1")
+            .metadata("two", "2")
+            .additional_upload("added")
+            .additional_labels("first")
+            .additional_labels("second")
+            .body(InputStream(vec![1, 2, 3]))
+            .checksum_strategy(ChecksumStrategy)
+            .failed_multipart_upload_policy(FailedMultipartUploadPolicy::Abort);
+        assert_eq!(builder.get_bucket(), &Some("bucket".to_owned()));
+        assert_eq!(builder.get_additional_upload().as_deref(), Some("added"));
+        assert_eq!(builder.get_metadata().as_ref().unwrap().len(), 2);
+        assert_eq!(
+            builder.get_additional_labels().as_ref().unwrap(),
+            &["first", "second"]
+        );
+        assert!(builder.get_checksum_strategy().is_some());
+        assert!(builder.get_failed_multipart_upload_policy().is_some());
+        let input = builder.build().unwrap();
+        assert_eq!(input.body().0, vec![1, 2, 3]);
+        assert_eq!(input.additional_upload(), Some("added"));
+        assert_eq!(input.additional_labels(), &["first", "second"]);
+        let input = UploadFluentBuilder::default()
+            .bucket("bucket")
+            .key("key")
+            .set_metadata(None)
+            .set_additional_upload(None)
+            .set_additional_labels(None)
+            .set_body(None)
+            .set_checksum_strategy(None)
+            .set_failed_multipart_upload_policy(None)
+            .build()
+            .unwrap();
+        assert!(input.metadata().is_none());
+        assert!(input.additional_upload().is_none());
+        assert!(input.additional_labels().is_empty());
+        assert!(input.body().0.is_empty());
+        assert!(input.checksum_strategy().is_none());
+        assert!(input.failed_multipart_upload_policy().is_none());
+    }
 
     #[test]
     fn tm_fields_set_unset_get_construct_and_debug_in_both_input_builders() {

@@ -121,6 +121,10 @@ mod _server_side_encryption;
 /// Enum parsing errors.
 mod _storage_class;
 
+/// Upload fluent field delegation.
+#[cfg(not(s3_tm_out_of_tree))]
+mod _upload_fluent_builder;
+
 /// Enum parsing errors.
 mod _upload_input;
 

@@ -7,6 +7,7 @@ package software.amazon.s3tm.codegen
 import software.amazon.s3tm.codegen.customizations.RequestIdExt
 import software.amazon.s3tm.codegen.customizations.S3Expires
 import software.amazon.s3tm.codegen.customizations.S3Optionality
+import software.amazon.s3tm.codegen.customizations.UploadOutputDocumentation
 import software.amazon.smithy.model.Model
 import software.amazon.smithy.model.neighbor.Walker
 import software.amazon.smithy.model.shapes.MemberShape
@@ -74,7 +75,7 @@ object TmModelProjection {
         val customized = RequestIdExt.transform(S3Expires.transform(Result(projected, roots, provenance, exclusions)))
         val memberSources = customized.memberSources.toSortedMap()
         collectCorrespondence(customized.model, roots, memberSources)
-        return customized.copy(memberSources = memberSources)
+        return UploadOutputDocumentation.transform(customized.copy(memberSources = memberSources))
     }
 
     private fun input(

@@ -6,7 +6,6 @@
 use tracing::Instrument;
 
 use crate::error::{Error, ErrorKind};
-use crate::operation::upload::input::convert::copy_fields_to_abort_mpu_request;
 use crate::operation::upload::transfer::UploadTransfer;
 use crate::operation::upload::UploadOutput;
 use crate::transfer::StateMachineTerminalReceiver;
@@ -85,7 +84,11 @@ impl UploadHandle {
 
     /// Consume the handle and wait for upload to complete.
     ///
-    /// Returns the uploaded object output on success. Returns an error
+    /// Returns [`UploadOutput`] metadata and transfer metrics on success.
+    /// Single-request and multipart uploads populate different optional fields;
+    /// see [`UploadOutput`] for response origins and completion merge semantics.
+    ///
+    /// Returns an error
     /// when the transfer failed (with the recorded failure cause) or when
     /// the transfer was cancelled (with `ErrorKind::OperationCancelled`).
     pub async fn join(mut self) -> Result<UploadOutput, Error> {
@@ -160,7 +163,7 @@ impl UploadHandle {
             match abort_policy {
                 FailedMultipartUploadPolicy::Retain => Ok(AbortedUpload::default()),
                 FailedMultipartUploadPolicy::AbortUpload => {
-                    let resp = copy_fields_to_abort_mpu_request(
+                    let resp = crate::sdk_v1::copy_upload_input_fields_to_abort_multipart_upload(
                         self.transfer.request(),
                         ctx.s3_client()
                             .abort_multipart_upload()

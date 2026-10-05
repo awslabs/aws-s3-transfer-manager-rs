@@ -172,6 +172,7 @@ object ModelGenerator {
                     error("Unsupported value shape ${shape.id}: requires an explicit TM projection")
             }
         }
+        FluentBuilderGenerator.render(crate, model, symbols, policy)
         crate.finalize(settings, model, mapOf("workspace" to emptyMap<String, Any>()), emptyList())
         // The client builder leaves optional @required fields for serializer validation.
         // TM validates them at construction while retaining their Option representation.
