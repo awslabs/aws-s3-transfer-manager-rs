@@ -924,13 +924,6 @@ impl UploadTransfer {
             }
         };
 
-        let result = UploadOutputBuilder::from(resp)
-            .metrics(self.inner.ctx.metrics())
-            .build()
-            .expect("valid response");
-
-        *self.inner.result.lock().expect("lock poisoned") = Some(result);
-
         // A successful response means the SDK fully read the body and
         // the bytes made it to the wire. For file-backed sources, the
         // body implementations above have therefore read `content_length`
@@ -938,6 +931,9 @@ impl UploadTransfer {
         // per-chunk inside the body) so that there is a single semantic
         // anchor — "recorded when the SDK confirms success" — consistent
         // with how `network_tx` is attributed.
+        //
+        // Recorded before the output is built, because the output carries a snapshot
+        // of these counters and a caller has no other view of them.
         let disk_read = if is_file_backed { content_length } else { 0 };
         self.inner.ctx.record_io(&crate::metrics::IoSample {
             network_tx: content_length,
@@ -945,9 +941,25 @@ impl UploadTransfer {
             ..Default::default()
         });
 
+        let result = UploadOutputBuilder::from(resp)
+            .metrics(self.inner.ctx.metrics())
+            .build()
+            .expect("valid response");
+
+        *self.inner.result.lock().expect("lock poisoned") = Some(result);
+
         *self.inner.state.lock().expect("lock poisoned") = UploadState::Done;
         self.inner.ctx.set_completed();
         self.report_terminal();
+        // Emit before the joiner is released, not only from `on_terminal`: the scheduler
+        // runs `on_terminal` after this, so a consumer that writes `join().await` and then
+        // drains once would miss this operation's own `Ended`. `finish` is exactly-once, so
+        // whichever of the two paths runs first emits and the other is a no-op.
+        if let Some(lc) = &self.inner.lifecycle {
+            if let Some(emit) = lc.finish(self.inner.ctx.terminal_outcome()) {
+                emit.send();
+            }
+        }
         self.inner.ctx.signal_terminal();
 
         WorkOutcome::Success { data: None }
@@ -1047,6 +1059,15 @@ impl UploadTransfer {
         *self.inner.state.lock().expect("lock poisoned") = UploadState::Done;
         self.inner.ctx.set_completed();
         self.report_terminal();
+        // Emit before the joiner is released, not only from `on_terminal`: the scheduler
+        // runs `on_terminal` after this, so a consumer that writes `join().await` and then
+        // drains once would miss this operation's own `Ended`. `finish` is exactly-once, so
+        // whichever of the two paths runs first emits and the other is a no-op.
+        if let Some(lc) = &self.inner.lifecycle {
+            if let Some(emit) = lc.finish(self.inner.ctx.terminal_outcome()) {
+                emit.send();
+            }
+        }
         self.inner.ctx.signal_terminal();
 
         WorkOutcome::Success { data: None }
@@ -1061,6 +1082,15 @@ impl UploadTransfer {
         let classification = crate::scheduler::classify_error(&error);
         self.inner.ctx.set_failed(error);
         self.report_terminal();
+        // Emit before the joiner is released, not only from `on_terminal`: the scheduler
+        // runs `on_terminal` after this, so a consumer that writes `join().await` and then
+        // drains once would miss this operation's own `Ended`. `finish` is exactly-once, so
+        // whichever of the two paths runs first emits and the other is a no-op.
+        if let Some(lc) = &self.inner.lifecycle {
+            if let Some(emit) = lc.finish(self.inner.ctx.terminal_outcome()) {
+                emit.send();
+            }
+        }
         self.inner.ctx.signal_terminal();
         WorkOutcome::Failed { classification }
     }
@@ -2114,6 +2144,26 @@ mod tests {
             payload.len() as u64,
             metrics.disk_read,
             "disk_read should equal the file size for a file-backed PutObject"
+        );
+
+        // `UploadOutput` is the only view a caller of `upload()` gets, and it used to be
+        // built before the sample above was recorded -- so both counters read 0 in the
+        // output while `ctx().metrics()` read the real numbers, and the two views of one
+        // transfer disagreed.
+        let out = transfer
+            .take_result()
+            .expect("a successful PutObject leaves a result");
+        assert_eq!(
+            payload.len() as u64,
+            out.metrics.network_tx,
+            "the output a caller reads reports {} bytes sent",
+            out.metrics.network_tx
+        );
+        assert_eq!(
+            payload.len() as u64,
+            out.metrics.disk_read,
+            "the output a caller reads reports {} bytes read from disk",
+            out.metrics.disk_read
         );
     }
 

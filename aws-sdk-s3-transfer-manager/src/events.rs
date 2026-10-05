@@ -582,6 +582,11 @@ impl TransferEvent {
     }
 }
 
+/// The largest capacity [`channel`] will honour.
+///
+/// The bound comes from the underlying channel's permit ceiling, not from this crate.
+pub const MAX_CAPACITY: usize = usize::MAX >> 3;
+
 /// Create a sink/stream pair. The caller owns the stream and drains it.
 ///
 /// # Capacity
@@ -595,8 +600,15 @@ impl TransferEvent {
 /// A stream that is never drained is the same case: undrained slots are occupied
 /// slots, and every event after the first `capacity` of them is counted and
 /// discarded.
+///
+/// Capacities above [`MAX_CAPACITY`] are clamped to it rather than panicking. The
+/// underlying channel asserts a ceiling of `usize::MAX >> 3` on its permit count, and
+/// `NonZeroUsize` only excludes the floor -- so every value this signature accepts above
+/// that ceiling would abort the caller's process on a dial whose documented meaning is
+/// "how far behind the consumer may fall". Clamping loses nothing: no consumer falls
+/// `usize::MAX >> 3` events behind.
 pub fn channel(capacity: NonZeroUsize) -> (TransferEventSink, TransferEventStream) {
-    let (tx, rx) = tokio::sync::mpsc::channel(capacity.get());
+    let (tx, rx) = tokio::sync::mpsc::channel(capacity.get().min(MAX_CAPACITY));
     let dropped = Arc::new(AtomicU64::new(0));
     (
         TransferEventSink {

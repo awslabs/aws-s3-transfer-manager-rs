@@ -702,8 +702,16 @@ impl MetricsState {
     }
 
     /// Mark the transfer as finished. No-op if already set.
+    ///
+    /// Clears the stall reason here rather than on each terminal path, because `poll_work`
+    /// is the only other place that clears it and it returns early on `!is_active()` -- so a
+    /// transfer that parked and then went terminal would report the reason it last parked on
+    /// for the rest of its life. A consumer polling the view would read
+    /// "waiting for the last in-flight requests to finish" about a download that already
+    /// failed. Every winning terminal CAS reaches this, so one clear covers them all.
     pub(crate) fn set_finished(&self) {
         let _ = self.finished_at.set(std::time::Instant::now());
+        self.set_stall(None);
     }
 
     /// Claims the single terminal tracing record for this transfer.

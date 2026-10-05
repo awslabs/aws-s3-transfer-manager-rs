@@ -109,6 +109,15 @@ pub(crate) enum DownloadWork {
     /// its carrier charges before the transfer waits for more memory. Handled in
     /// `execute`; carries no data because it operates on the writer.
     DrainResident,
+    /// Terminal completion for an object that carried no ranges -- a 0-byte object whose
+    /// discovery produced no initial chunk.
+    ///
+    /// A work item rather than an inline call, because completing flushes the writer and
+    /// renames the temporary file into place, and `poll_work` is documented as synchronous
+    /// and non-blocking: a slow destination (a network or FUSE mount) would otherwise block
+    /// a dispatch thread once per empty file and starve every transfer sharing it. Carries
+    /// no data for the same reason `DrainResident` does not.
+    FinalizeNoData,
 }
 
 /// Early return if transfer is terminal (failed/cancelled by another work item).
@@ -466,10 +475,18 @@ impl DownloadTransfer {
                     return self.park(DownloadPendingReason::RangeCompletion, snapshot);
                 } else {
                     // No-data completion: the object carried no ranges (0-byte object
-                    // whose discovery produced no initial chunk). Data-carrying terminal
-                    // completions happen in `execute` via `finalize_completion`.
-                    self.complete(state);
-                    return PollWork::Done;
+                    // whose discovery produced no initial chunk). Dispatched to `execute`
+                    // like every data-carrying completion, because completing blocks on the
+                    // writer flush and the rename.
+                    //
+                    // Counted as in flight before the guard is released, so a re-poll before
+                    // `execute` runs takes the `ranges_in_flight > 0` arm above and parks
+                    // instead of dispatching a second completion.
+                    *ranges_in_flight += 1;
+                    drop(state);
+                    return PollWork::ready(IoRequest {
+                        data: Some(Box::new(DownloadWork::FinalizeNoData)),
+                    });
                 };
 
                 // A slot is ready. Commit the range it issues, sliced from the unchanged
@@ -709,6 +726,7 @@ impl DownloadTransfer {
                 .await
             }
             DownloadWork::DrainResident => self.execute_drain_resident(),
+            DownloadWork::FinalizeNoData => self.execute_finalize_no_data(),
         }
     }
 
@@ -723,6 +741,17 @@ impl DownloadTransfer {
     /// `ChunkOutput`s returns their carrier charges, which memory admission
     /// re-grants FIFO; the `on_completion -> generate_work` after this returns
     /// re-polls this transfer.
+    /// Complete an object that carried no ranges.
+    ///
+    /// The blocking half of what `poll_work` used to do inline: `complete` flushes the
+    /// writer and renames the temporary file into place, and this is the thread that may
+    /// block on it.
+    fn execute_finalize_no_data(&self) -> WorkOutcome {
+        let guard = self.inner.state.lock().unwrap();
+        self.complete(guard);
+        WorkOutcome::Success { data: None }
+    }
+
     fn execute_drain_resident(&self) -> WorkOutcome {
         let freed = match self.inner.writer.flush_resident() {
             Ok(freed) => freed,
@@ -1343,9 +1372,22 @@ impl DownloadTransfer {
                 state_snapshot,
             );
         }
-        self.inner.ctx.set_completed();
+        if !self.inner.ctx.set_completed() {
+            // Lost the CAS to a cancel or a failure that landed after the commit. The
+            // status is authoritative, so the committed file must not survive it.
+            self.rollback_destination();
+        }
         self.inner.writer.notify_consumer();
         self.report_terminal(state_snapshot);
+        // Emit before the joiner is released, not only from `on_terminal`: the scheduler
+        // runs `on_terminal` after this, so a consumer that writes `join().await` and then
+        // drains once would miss this operation's own `Ended`. `finish` is exactly-once, so
+        // whichever of the two paths runs first emits and the other is a no-op.
+        if let Some(lc) = &self.inner.lifecycle {
+            if let Some(emit) = lc.finish(self.inner.ctx.terminal_outcome()) {
+                emit.send();
+            }
+        }
         self.inner.ctx.signal_terminal();
         WorkOutcome::Success { data: None }
     }
@@ -1359,6 +1401,22 @@ impl DownloadTransfer {
         match &self.inner.commit {
             Some(target) => std::fs::rename(&target.temp, &target.dest),
             None => Ok(()),
+        }
+    }
+
+    /// Undo a commit whose status transition lost the CAS.
+    ///
+    /// The rename has to precede `set_completed`, because every reporting path reads the
+    /// status without joining and would otherwise name a destination the rename has not
+    /// created. That ordering leaves one window: a `set_cancelled` landing between the two
+    /// makes `set_completed` lose, so the status stays `Cancelled` while the finished object
+    /// sits at the destination -- and `ManagedDownloadHandle::drop` only unlinks the *temp*,
+    /// which the rename already consumed. A caller told its download was cancelled would find
+    /// the complete file there anyway, which is what the design's "Cancelled licenses no
+    /// cleanup" rule promises it will not.
+    fn rollback_destination(&self) {
+        if let Some(target) = &self.inner.commit {
+            let _ = std::fs::remove_file(&target.dest);
         }
     }
 
@@ -1387,6 +1445,15 @@ impl DownloadTransfer {
         self.inner.observability.terminal_drain_completed(&drain);
         self.inner.writer.notify_consumer();
         self.report_terminal(snapshot);
+        // Emit before the joiner is released, not only from `on_terminal`: the scheduler
+        // runs `on_terminal` after this, so a consumer that writes `join().await` and then
+        // drains once would miss this operation's own `Ended`. `finish` is exactly-once, so
+        // whichever of the two paths runs first emits and the other is a no-op.
+        if let Some(lc) = &self.inner.lifecycle {
+            if let Some(emit) = lc.finish(self.inner.ctx.terminal_outcome()) {
+                emit.send();
+            }
+        }
         self.inner.ctx.signal_terminal();
         WorkOutcome::Failed { classification }
     }
@@ -1421,12 +1488,25 @@ impl DownloadTransfer {
                 snapshot,
             );
         }
-        self.inner.ctx.set_completed();
+        if !self.inner.ctx.set_completed() {
+            // Lost the CAS to a cancel or a failure that landed after the commit. The
+            // status is authoritative, so the committed file must not survive it.
+            self.rollback_destination();
+        }
         let pending = guard.enter_terminal();
         drop(guard); // release lock before dropping the claim and signaling waiters
         drop(pending);
         self.inner.writer.notify_consumer();
         self.report_terminal(snapshot);
+        // Emit before the joiner is released, not only from `on_terminal`: the scheduler
+        // runs `on_terminal` after this, so a consumer that writes `join().await` and then
+        // drains once would miss this operation's own `Ended`. `finish` is exactly-once, so
+        // whichever of the two paths runs first emits and the other is a no-op.
+        if let Some(lc) = &self.inner.lifecycle {
+            if let Some(emit) = lc.finish(self.inner.ctx.terminal_outcome()) {
+                emit.send();
+            }
+        }
         self.inner.ctx.signal_terminal();
     }
 }
@@ -2251,6 +2331,19 @@ mod tests {
         let transfer = create_download_with_client_and_detail(client, part_size, 1);
 
         assert_discovery_succeeds(&transfer).await;
+        // The completion is a work item, not an inline call: `complete` flushes the writer
+        // and renames, and `poll_work` must not block on either.
+        let mut work = assert_ready(transfer.poll_work());
+        assert!(matches!(
+            work.data_mut::<DownloadWork>(),
+            DownloadWork::FinalizeNoData
+        ));
+        assert!(matches!(
+            transfer.execute(&mut work).await,
+            WorkOutcome::Success { .. }
+        ));
+        // And the transfer is terminal once it has run, so the next poll is `Done` -- a
+        // second `FinalizeNoData` here would mean a second flush and rename.
         assert_done(transfer.poll_work());
 
         let summary = transfer
@@ -2267,6 +2360,50 @@ mod tests {
         assert_eq!(summary.request_total.requests, 2);
         assert_eq!(summary.ranges_scheduled, 0);
         assert_eq!(summary.ranges_completed, 0);
+    }
+
+    /// A second poll before the completion executes must not dispatch a second one.
+    ///
+    /// The scheduler polls on four edges, not only on work completion -- a concurrency-target
+    /// change re-polls a transfer whose work is still in flight. Without counting the
+    /// dispatched completion as in-flight work, that re-poll takes the same no-ranges arm and
+    /// emits `FinalizeNoData` again, so the writer is flushed twice and the rename runs twice:
+    /// the second finds no temporary file and fails the transfer that had already succeeded.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn an_empty_download_dispatches_one_completion_however_often_it_is_polled() {
+        let part_size = 8 * MB;
+        let expected_range = format!("bytes=0-{}", part_size - 1);
+        let ranged = mock!(aws_sdk_s3::Client::get_object)
+            .match_requests(move |request| request.range() == Some(expected_range.as_str()))
+            .then_error(|| {
+                GetObjectError::generic(ErrorMetadata::builder().code("InvalidRange").build())
+            });
+        let part = mock!(aws_sdk_s3::Client::get_object)
+            .match_requests(|request| request.part_number() == Some(1))
+            .then_output(|| GetObjectOutput::builder().content_length(0).build());
+        let client = mock_client!(aws_sdk_s3, &[&ranged, &part]);
+        let transfer = create_download_with_client_and_detail(client, part_size, 1);
+
+        assert_discovery_succeeds(&transfer).await;
+        let mut work = assert_ready(transfer.poll_work());
+        assert!(matches!(
+            work.data_mut::<DownloadWork>(),
+            DownloadWork::FinalizeNoData
+        ));
+
+        // Re-polled while that completion is still in flight, as a concurrency-target change
+        // would. It must park on the in-flight count, not hand out a second completion.
+        assert!(
+            matches!(transfer.poll_work(), PollWork::Pending),
+            "a re-poll before the completion runs must park, not dispatch a second one"
+        );
+
+        assert!(matches!(
+            transfer.execute(&mut work).await,
+            WorkOutcome::Success { .. }
+        ));
+        assert_done(transfer.poll_work());
     }
 
     /// The terminal hook completes cleanup and reports a summary when a worker
