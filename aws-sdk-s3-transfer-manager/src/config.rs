@@ -399,7 +399,13 @@ impl Builder {
         self
     }
 
-    /// Report [events](crate::events) from every operation this client runs to `sink`.
+    /// Report [events](crate::events) from this client's `upload` and `download` operations
+    /// to `sink`.
+    ///
+    /// `upload_objects` and `download_objects` do not report yet. A client-level sink
+    /// registered before one of those runs stays open and receives nothing, which reads like
+    /// a hang rather than an unwired operation -- so until they are wired, prefer a
+    /// request-level sink on the operations that do report.
     ///
     /// The client level of the SEP's *"a list of progress listeners on both client level
     /// and request level"*. A sink set here is merged with any sink set on an individual

@@ -1343,9 +1343,22 @@ impl DownloadTransfer {
                 state_snapshot,
             );
         }
-        self.inner.ctx.set_completed();
+        if !self.inner.ctx.set_completed() {
+            // Lost the CAS to a cancel or a failure that landed after the commit. The
+            // status is authoritative, so the committed file must not survive it.
+            self.rollback_destination();
+        }
         self.inner.writer.notify_consumer();
         self.report_terminal(state_snapshot);
+        // Emit before the joiner is released, not only from `on_terminal`: the scheduler
+        // runs `on_terminal` after this, so a consumer that writes `join().await` and then
+        // drains once would miss this operation's own `Ended`. `finish` is exactly-once, so
+        // whichever of the two paths runs first emits and the other is a no-op.
+        if let Some(lc) = &self.inner.lifecycle {
+            if let Some(emit) = lc.finish(self.inner.ctx.terminal_outcome()) {
+                emit.send();
+            }
+        }
         self.inner.ctx.signal_terminal();
         WorkOutcome::Success { data: None }
     }
@@ -1359,6 +1372,22 @@ impl DownloadTransfer {
         match &self.inner.commit {
             Some(target) => std::fs::rename(&target.temp, &target.dest),
             None => Ok(()),
+        }
+    }
+
+    /// Undo a commit whose status transition lost the CAS.
+    ///
+    /// The rename has to precede `set_completed`, because every reporting path reads the
+    /// status without joining and would otherwise name a destination the rename has not
+    /// created. That ordering leaves one window: a `set_cancelled` landing between the two
+    /// makes `set_completed` lose, so the status stays `Cancelled` while the finished object
+    /// sits at the destination -- and `ManagedDownloadHandle::drop` only unlinks the *temp*,
+    /// which the rename already consumed. A caller told its download was cancelled would find
+    /// the complete file there anyway, which is what the design's "Cancelled licenses no
+    /// cleanup" rule promises it will not.
+    fn rollback_destination(&self) {
+        if let Some(target) = &self.inner.commit {
+            let _ = std::fs::remove_file(&target.dest);
         }
     }
 
@@ -1387,6 +1416,15 @@ impl DownloadTransfer {
         self.inner.observability.terminal_drain_completed(&drain);
         self.inner.writer.notify_consumer();
         self.report_terminal(snapshot);
+        // Emit before the joiner is released, not only from `on_terminal`: the scheduler
+        // runs `on_terminal` after this, so a consumer that writes `join().await` and then
+        // drains once would miss this operation's own `Ended`. `finish` is exactly-once, so
+        // whichever of the two paths runs first emits and the other is a no-op.
+        if let Some(lc) = &self.inner.lifecycle {
+            if let Some(emit) = lc.finish(self.inner.ctx.terminal_outcome()) {
+                emit.send();
+            }
+        }
         self.inner.ctx.signal_terminal();
         WorkOutcome::Failed { classification }
     }
@@ -1421,12 +1459,25 @@ impl DownloadTransfer {
                 snapshot,
             );
         }
-        self.inner.ctx.set_completed();
+        if !self.inner.ctx.set_completed() {
+            // Lost the CAS to a cancel or a failure that landed after the commit. The
+            // status is authoritative, so the committed file must not survive it.
+            self.rollback_destination();
+        }
         let pending = guard.enter_terminal();
         drop(guard); // release lock before dropping the claim and signaling waiters
         drop(pending);
         self.inner.writer.notify_consumer();
         self.report_terminal(snapshot);
+        // Emit before the joiner is released, not only from `on_terminal`: the scheduler
+        // runs `on_terminal` after this, so a consumer that writes `join().await` and then
+        // drains once would miss this operation's own `Ended`. `finish` is exactly-once, so
+        // whichever of the two paths runs first emits and the other is a no-op.
+        if let Some(lc) = &self.inner.lifecycle {
+            if let Some(emit) = lc.finish(self.inner.ctx.terminal_outcome()) {
+                emit.send();
+            }
+        }
         self.inner.ctx.signal_terminal();
     }
 }
