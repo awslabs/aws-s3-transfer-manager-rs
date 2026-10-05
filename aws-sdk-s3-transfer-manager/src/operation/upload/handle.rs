@@ -191,6 +191,17 @@ impl UploadHandle {
         self.transfer.ctx().id
     }
 
+    /// The event outcome this child's terminal state implies, read from the child's own
+    /// context so a parent reporting it never has to guess.
+    pub(crate) fn terminal_outcome(&self) -> crate::events::Outcome {
+        self.transfer.ctx().terminal_outcome()
+    }
+
+    /// A read-only view of this upload's counters, for a parent to hand to observers.
+    pub(crate) fn view(&self) -> crate::types::TransferView {
+        self.transfer.ctx().view()
+    }
+
     /// Get scheduling controls for this transfer.
     pub fn scheduling(&self) -> crate::transfer::SchedulingCtl<'_> {
         self.transfer.ctx().scheduling()

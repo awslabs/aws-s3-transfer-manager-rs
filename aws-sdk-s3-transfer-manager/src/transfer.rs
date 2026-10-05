@@ -643,6 +643,29 @@ impl MetricsState {
             .fetch_add(entries, Ordering::Relaxed);
     }
 
+    /// Record that one entry reached a terminal state.
+    ///
+    /// Called where the entry's terminal event is *claimed*, so the exactly-once swap that
+    /// makes `Ended` unique makes this count unique too, on every terminal path, without
+    /// a second mechanism to keep in step.
+    pub(crate) fn record_entry_settled(&self) {
+        self.settled_entries.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Promote both running enumerated totals to final ones. No-op if already set.
+    ///
+    /// Reads the accumulators rather than taking values, so each number sealed is by
+    /// construction the number a concurrent `byte_total`/`entry_total` was already
+    /// reporting as provisional, and they cannot name different totals for the same walk.
+    pub(crate) fn seal_total(&self) {
+        let _ = self
+            .total_bytes
+            .set(self.discovered_bytes.load(Ordering::Relaxed));
+        let _ = self
+            .total_entries
+            .set(self.discovered_entries.load(Ordering::Relaxed));
+    }
+
     /// Entries that reached a terminal state.
     pub(crate) fn entries_settled(&self) -> u64 {
         self.settled_entries.load(Ordering::Relaxed)
