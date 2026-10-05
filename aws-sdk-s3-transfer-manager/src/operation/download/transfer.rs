@@ -20,7 +20,9 @@ use super::input::copy_fields_to_get_object_request;
 use crate::error::{self, ChunkRef, Error};
 use crate::operation::download::body::{BodySlot, BodyWriter, ChunkOutput};
 use crate::operation::download::chunk_meta::ChunkMetadata;
-use crate::operation::download::context::{DownloadPendingReason, DownloadState, PendingClaim};
+use crate::operation::download::context::{
+    CompletionClaim, DownloadPendingReason, DownloadState, PendingClaim,
+};
 use crate::operation::download::discovery::{discover_obj, ObjectDiscovery};
 use crate::operation::download::object_meta::ObjectMetadata;
 use crate::operation::download::observability::{
@@ -99,7 +101,8 @@ macro_rules! bail_if_terminal {
     ($self:expr) => {
         if !$self.inner.ctx.is_active() {
             // Bailing before any drain: no occupancy freed on this path. The transfer is
-            // already terminal so `decrement_in_flight` will find `Terminal` and return false.
+            // no longer active, so a completion this retirement claims is dropped rather
+            // than finalized.
             let _ = $self.decrement_in_flight(0);
             return WorkOutcome::Cancelled;
         }
@@ -306,6 +309,11 @@ impl DownloadTransfer {
     /// - `PollWork::Ready { .. }` - work available to execute
     /// - `PollWork::Pending` - waiting for in-flight work to complete
     /// - `PollWork::Done` - transfer complete
+    ///
+    /// This issues work and parks; it never completes a transfer. Each item it
+    /// issues is counted when issued, and the item that retires last with
+    /// nothing left to issue claims completion and finalizes, as
+    /// [`DownloadState`] describes.
     #[tracing::instrument(level = "debug", skip(self), fields(tid = %self.id()))]
     pub(crate) fn poll_work(&self) -> PollWork {
         if !self.inner.ctx.is_active() {
@@ -376,10 +384,11 @@ impl DownloadTransfer {
                     // `set_pending` below (the mutator protocol).
                     //
                     // The gate guards issuance only. Once every range is generated
-                    // (`remaining` is None) the completion path below runs unconditionally,
-                    // so a transfer whose last parts are still resident (e.g. a disk tail
+                    // (`remaining` is None) the branches below never consult it, so a
+                    // transfer whose last parts are still resident (e.g. a disk tail
                     // below the drain batch, freed only by the terminal drain in
-                    // `complete`) does not block on the gate with nothing left to issue.
+                    // `finalize_completion`) does not block on the gate with nothing
+                    // left to issue.
                     let window = self.inner.read_ahead.window();
                     if !gate.try_issue(window) {
                         // Gate closed: issuance is `window` parts ahead of what the
@@ -448,11 +457,15 @@ impl DownloadTransfer {
                     );
                     return self.park(DownloadPendingReason::DrainCompletion, snapshot);
                 } else {
-                    // No-data completion: the object carried no ranges (0-byte object
-                    // whose discovery produced no initial chunk). Data-carrying terminal
-                    // completions happen in `execute` via `finalize_completion`.
-                    self.complete(state);
-                    return PollWork::Done;
+                    // Nothing left to issue and nothing in flight: the work item that
+                    // uncounted the last one claimed completion under this lock and left
+                    // the state `Terminal`, and discovery does the same for an object
+                    // with no ranges. Reaching this is a bookkeeping bug. The scheduler
+                    // contains a `poll_work` panic to this transfer, and `on_terminal`
+                    // tolerates the state lock it poisons.
+                    unreachable!(
+                        "download completion is claimed by the work item that retires last"
+                    );
                 };
 
                 // A slot is ready. Commit the range it issues, sliced from the unchanged
@@ -478,8 +491,8 @@ impl DownloadTransfer {
                     all_ranges_issued = false;
                 } else {
                     // The final range was just issued: issuance is done and the transfer
-                    // drains its in-flight tail, completing on the next empty poll with
-                    // nothing in flight. Logged once per transfer.
+                    // drains its in-flight tail, completed by the item that retires last.
+                    // Logged once per transfer.
                     *remaining = None;
                     all_ranges_issued = true;
                     tracing::debug!(
@@ -737,29 +750,12 @@ impl DownloadTransfer {
             Ok(drained) => drained,
             Err(e) => return self.fail(work, error::Error::new(error::ErrorKind::IOError, e)),
         };
-        let terminal = match &mut *work {
-            DownloadState::Transferring {
-                remaining,
-                ranges_in_flight,
-                drains_in_flight,
-                gate,
-                ..
-            } => {
-                gate.release(drained.parts);
-                remaining.is_none() && *ranges_in_flight == 0 && *drains_in_flight == 0
-            }
-            _ => false,
-        };
+        if let DownloadState::Transferring { gate, .. } = &mut *work {
+            gate.release(drained.parts);
+        }
         let snapshot = self.snapshot(&work);
-        // Claim the terminal transition under this lock, as `decrement_in_flight`
-        // does, so a concurrently woken poll_work cannot also complete.
-        let pending = if terminal {
-            work.enter_terminal()
-        } else {
-            None
-        };
+        let completion = work.try_claim_completion();
         drop(work);
-        drop(pending);
 
         self.inner
             .observability
@@ -769,8 +765,8 @@ impl DownloadTransfer {
             DownloadEvent::MemoryReliefCompleted,
             snapshot,
         );
-        if terminal {
-            return self.finalize_completion();
+        if let Some(claim) = completion {
+            return self.finalize_completion(claim);
         }
         self.inner.ctx.try_wake();
         WorkOutcome::Success { data: None }
@@ -898,7 +894,7 @@ impl DownloadTransfer {
 
         let has_initial_work = initial_work.is_some();
         let all_ranges_issued = remaining.is_none();
-        let discovery_snapshot = {
+        let (discovery_snapshot, completion) = {
             // The discovery chunk, if present, is one claimed part already in flight.
             let initial = u64::from(initial_work.is_some());
             let mut work = self.inner.state.lock().unwrap();
@@ -911,7 +907,16 @@ impl DownloadTransfer {
                 gate: super::context::OccupancyGate::with_issued(initial),
                 pending: None,
             };
-            self.snapshot(&work)
+            let snapshot = self.snapshot(&work);
+            // With no chunk and nothing remaining, discovery is the last work item to
+            // retire, so it claims completion under the lock that publishes the state.
+            // A transfer that is no longer active is not completed.
+            let completion = if self.inner.ctx.is_active() {
+                work.try_claim_completion()
+            } else {
+                None
+            };
+            (snapshot, completion)
         };
         if has_initial_work {
             self.inner.observability.record_range_scheduled();
@@ -927,6 +932,10 @@ impl DownloadTransfer {
                 DownloadEvent::AllRangesIssued,
                 discovery_snapshot,
             );
+        }
+
+        if let Some(claim) = completion {
+            return self.finalize_completion(claim);
         }
 
         // State changed from DiscoveryInFlight - try to wake
@@ -1052,10 +1061,9 @@ impl DownloadTransfer {
 
         let bytes = match result {
             Ok(val) => val,
-            // Go terminal before any wake: fail() sets Terminal under the lock, so
-            // a woken poll_work cannot observe ranges_in_flight==0 and complete()
-            // the transfer over this error. The in-flight count is abandoned with
-            // the Transferring state.
+            // Go terminal without retiring this chunk: fail() sets Terminal under
+            // the lock, so no later retirement can claim completion over this
+            // error. The in-flight count is abandoned with the Transferring state.
             Err(e) => {
                 let guard = self.inner.state.lock().unwrap();
                 return self.fail(guard, e.with_chunk(ChunkRef::new(seq, None)));
@@ -1098,9 +1106,8 @@ impl DownloadTransfer {
             ..Default::default()
         });
 
-        let reached_terminal = self.decrement_in_flight(freed);
-        if reached_terminal {
-            return self.finalize_completion();
+        if let Some(claim) = self.decrement_in_flight(freed) {
+            return self.finalize_completion(claim);
         }
 
         WorkOutcome::Success { data: None }
@@ -1235,9 +1242,8 @@ impl DownloadTransfer {
             ..Default::default()
         });
 
-        let reached_terminal = self.decrement_in_flight(freed);
-        if reached_terminal {
-            return self.finalize_completion();
+        if let Some(claim) = self.decrement_in_flight(freed) {
+            return self.finalize_completion(claim);
         }
 
         tracing::trace!(
@@ -1253,30 +1259,28 @@ impl DownloadTransfer {
     /// Fail a range request with an error, tagging the chunk it belongs to.
     fn fail_range(&self, location: ChunkRef, e: Error) -> WorkOutcome {
         // Go terminal before any wake (see the discovery-body error path). Do not
-        // decrement_in_flight first: that wakes poll_work, which would observe
-        // ranges_in_flight==0 and complete() over this error.
+        // decrement_in_flight first: as the last item to retire it would claim
+        // completion and finalize over this error.
         let guard = self.inner.state.lock().unwrap();
         self.fail(guard, e.with_chunk(location))
     }
 
-    /// Complete one in-flight range: drop `ranges_in_flight`, release `freed` parts of
-    /// read-ahead occupancy, and report whether this was the terminal completion (issuance
-    /// done, no range in flight, and no memory-relief item in flight). Both counters move
-    /// under the state lock so the terminal transition is claimed exactly once: the caller
-    /// that observes `true` owns completion, and any concurrently-woken `poll_work` sees
-    /// `Terminal`.
+    /// Retire one in-flight range: drop `ranges_in_flight` and release `freed` parts of
+    /// read-ahead occupancy, then claim completion if no range remains and no range or
+    /// memory-relief item is still in flight. Both happen under the state lock, so
+    /// completion is claimed exactly once; the caller that receives the claim finalizes
+    /// the transfer.
     ///
     /// Releasing the occupancy under the same lock `poll_work` reads the gate and arms
     /// `set_pending` under is what orders this completion's release against the issuer's
     /// park (the mutator protocol `lock -> mutate -> unlock -> try_wake`). `freed` is the
     /// disk drain's freed count (0 if this fill did not hit a drain edge).
-    fn decrement_in_flight(&self, freed: u64) -> bool {
-        let (terminal, pending, snapshot) = {
+    fn decrement_in_flight(&self, freed: u64) -> Option<CompletionClaim> {
+        let (completion, snapshot) = {
             let mut work = self.inner.state.lock().unwrap();
             match &mut *work {
                 DownloadState::Transferring {
                     ranges_in_flight,
-                    drains_in_flight,
                     gate,
                     remaining,
                     pending,
@@ -1291,18 +1295,11 @@ impl DownloadTransfer {
                         self.inner.read_ahead.window(),
                         pending.is_some(),
                     );
-                    if remaining.is_none() && *ranges_in_flight == 0 && *drains_in_flight == 0 {
-                        // Terminal: claim the transition under this lock so a
-                        // concurrently-woken poll_work cannot also complete.
-                        (true, work.enter_terminal(), Some(snapshot))
-                    } else {
-                        (false, None, Some(snapshot))
-                    }
+                    (work.try_claim_completion(), Some(snapshot))
                 }
-                _ => (false, None, None),
+                _ => (None, None),
             }
         };
-        drop(pending);
         if let Some(snapshot) = snapshot {
             self.inner.observability.record_range_completed(freed);
             self.inner.observability.observe_event(
@@ -1312,20 +1309,22 @@ impl DownloadTransfer {
             );
         }
         // Wake the issuer on every non-terminal completion so a pending poll_work can
-        // issue more. A terminal completion is finalized by the caller in `execute`.
-        if !terminal {
+        // issue more. A claimed completion is finalized by the caller in `execute`.
+        if completion.is_none() {
             self.inner.ctx.try_wake();
         }
-        terminal
+        completion
     }
 
-    /// Finalize a transfer that reached its terminal completion in `execute`: flush the
-    /// tail to disk (returning the last carrier charges as `ChunkOutput`s drop), set the
-    /// terminal status, and signal waiters. The state is already `Terminal` (claimed under
-    /// the lock in `decrement_in_flight`); this runs after the lock is released so disk IO
-    /// never happens under it. Symmetric with `fail`, which error paths already call from
-    /// `execute`.
-    fn finalize_completion(&self) -> WorkOutcome {
+    /// Finalize a transfer whose successful completion `_claim` proves: flush the tail to
+    /// disk (returning the last carrier charges as `ChunkOutput`s drop), establish the
+    /// destination length, set the terminal status, and signal waiters. A finalization
+    /// error fails the transfer with `ErrorKind::IOError` instead.
+    ///
+    /// The state is already `Terminal`, entered when the claim was taken; this runs after
+    /// the state lock is released so disk IO never happens under it. Symmetric with
+    /// `fail`, which error paths call from `execute`.
+    fn finalize_completion(&self, _claim: CompletionClaim) -> WorkOutcome {
         let expected_len = *self
             .inner
             .expected_download_len
@@ -1438,35 +1437,6 @@ impl DownloadTransfer {
             .destination_finalized(&finalization);
         finalization.map(|_| ())
     }
-
-    /// Transition to terminal success state. Requires holding the work lock.
-    fn complete(&self, mut guard: std::sync::MutexGuard<'_, DownloadState>) {
-        let expected_len = *self
-            .inner
-            .expected_download_len
-            .get()
-            .expect("completed download must have a discovered length");
-        let finalization = self.finalize_destination(expected_len);
-        if let Err(e) = finalization {
-            self.fail(guard, error::Error::new(error::ErrorKind::IOError, e));
-            return;
-        }
-        let snapshot = self.snapshot(&guard);
-        if self.inner.writer.has_sink() {
-            self.inner.observability.observe_event(
-                self.inner.ctx.id,
-                DownloadEvent::DestinationFinalized,
-                snapshot,
-            );
-        }
-        self.inner.ctx.set_completed();
-        let pending = guard.enter_terminal();
-        drop(guard); // release lock before dropping the claim and signaling waiters
-        drop(pending);
-        self.inner.writer.notify_consumer();
-        self.report_terminal(snapshot);
-        self.inner.ctx.signal_terminal();
-    }
 }
 
 impl Transfer for DownloadTransfer {
@@ -1487,8 +1457,8 @@ impl Transfer for DownloadTransfer {
 
     fn on_terminal(&self) {
         // Release a memory-blocked claim if one is held. External cancellation
-        // does not run `fail` or `complete`, so it must explicitly extract the
-        // claim and cancel its reservation future after releasing state.
+        // does not run `fail` or claim completion, so it must explicitly extract
+        // the claim and cancel its reservation future after releasing state.
         let (pending, snapshot) = {
             // The transfer is already terminal: snapshot and take the pending
             // claim even if a panic left the state inconsistent.
@@ -2295,6 +2265,49 @@ mod tests {
         assert_eq!(summary.ranges_completed, 0);
     }
 
+    /// A zero-byte object has no ranges, so discovery is the last work item to
+    /// retire: its `execute` claims completion and finalizes the destination,
+    /// and the next poll finds the transfer done.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn zero_byte_object_completes_from_discovery() {
+        use crate::operation::download::test_util::sink::{
+            Event, Op, ScriptedSinkFactory, WriteScript,
+        };
+
+        let part_size = 8 * MB;
+        let expected_range = format!("bytes=0-{}", part_size - 1);
+        let ranged = mock!(aws_sdk_s3::Client::get_object)
+            .match_requests(move |request| request.range() == Some(expected_range.as_str()))
+            .then_error(|| {
+                GetObjectError::generic(ErrorMetadata::builder().code("InvalidRange").build())
+            });
+        let part = mock!(aws_sdk_s3::Client::get_object)
+            .match_requests(|request| request.part_number() == Some(1))
+            .then_output(|| GetObjectOutput::builder().content_length(0).build());
+        let client = mock_client!(aws_sdk_s3, &[&ranged, &part]);
+        let script = Arc::new(WriteScript::default());
+        let (transfer, _consumer, _dir) = disk_transfer(
+            disk_test_handle(client, part_size),
+            &ScriptedSinkFactory(Arc::clone(&script)),
+        );
+
+        let mut discovery = assert_ready(transfer.poll_work());
+        let outcome = execute(&transfer, &mut discovery).await;
+        assert!(matches!(outcome, WorkOutcome::Success { .. }));
+        assert_eq!(
+            transfer.ctx().transfer_status(),
+            crate::types::TransferStatus::Completed
+        );
+        let finalize = Op::Finalize { len: 0 };
+        assert_eq!(
+            script.events(),
+            [Event::Started(finalize), Event::Finished(finalize, Ok(()))],
+            "discovery's execute finalized the destination"
+        );
+        assert_done(transfer.poll_work());
+    }
+
     /// The terminal hook completes cleanup and reports a summary when a worker
     /// panicked while holding the state lock.
     #[cfg_attr(miri, ignore)]
@@ -3009,7 +3022,7 @@ mod tests {
 
     /// Cancelling a transfer while it is waiting for memory must cancel the queued
     /// reservation future and release the held slot. `on_terminal` owns this
-    /// cleanup because external cancellation does not run `fail` or `complete`.
+    /// cleanup because external cancellation does not run `fail` or claim completion.
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_cancel_while_memory_blocked_releases_future_and_slot() {
