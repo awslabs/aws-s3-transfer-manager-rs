@@ -474,7 +474,6 @@ impl DownloadObjectsTransfer {
 
     fn spawn_children(&self, entries: Vec<Object>) -> Vec<(Object, Result<ChildTransfer, Error>)> {
         let handle = &self.inner.ctx.handle;
-        let parent_id = self.inner.ctx.id.id;
 
         tracing::trace!(
             target: crate::telemetry::TARGET_TRANSFER,
@@ -490,7 +489,7 @@ impl DownloadObjectsTransfer {
                     .key()
                     .expect("S3Walk yields objects with keys")
                     .to_string();
-                let result = self.spawn_single_child(handle, &key, parent_id);
+                let result = self.spawn_single_child(handle, &key);
                 (obj, result.map(|h| ChildTransfer { handle: h, key }))
             })
             .collect()
@@ -509,7 +508,6 @@ impl DownloadObjectsTransfer {
         &self,
         handle: &Arc<crate::client::Handle>,
         key: &str,
-        parent_id: u64,
     ) -> Result<ManagedDownloadHandle, Error> {
         let dest_path = local_key_path(
             &self.inner.destination,
@@ -565,9 +563,27 @@ impl DownloadObjectsTransfer {
             )
         })?;
 
-        let inner =
-            Download::orchestrate_with_sink(handle.clone(), input, file, true, Some(parent_id))?;
-        Ok(ManagedDownloadHandle::new(inner, temp_path, dest_path))
+        let inner = Download::orchestrate_with_sink(
+            handle.clone(),
+            input,
+            crate::operation::download::FileSink {
+                file,
+                owns_file: true,
+            },
+            Some(&self.inner.ctx),
+            // No events for a child here: the composite's own event wiring lands with
+            // `download_objects`, which is where a child would be announced.
+            None,
+            None,
+            // The child renames its own temp file before it reports Completed, so a
+            // path that reads the status without joining does not see a destination
+            // the rename has not created.
+            Some(crate::operation::download::transfer::CommitTarget {
+                temp: temp_path.clone(),
+                dest: dest_path,
+            }),
+        )?;
+        Ok(ManagedDownloadHandle::new(inner, temp_path))
     }
 
     /// Merge results of child spawning back into state. Inserts each child into
@@ -850,23 +866,14 @@ impl DownloadObjectsTransfer {
         for child in children {
             let key = child.key;
             // Snapshot metrics before `join()` consumes the handle.
-            let metrics = child.handle.metrics();
             match child.handle.join().await {
                 Ok(_output) => {
                     let mut state = self.inner.state.lock();
                     state.successful_downloads += 1;
                     drop(state);
-                    // Aggregate the child's bytes into the parent's per-transfer
-                    // MetricsState directly (not via record_io on the child's
-                    // context, which already updated the client-level counters
-                    // during the child transfer) so DownloadObjectsOutput.metrics
-                    // reflects the whole directory download without double-counting.
-                    self.inner.ctx.metrics.record_io(&crate::metrics::IoSample {
-                        network_tx: metrics.network_tx,
-                        network_rx: metrics.network_rx,
-                        disk_read: metrics.disk_read,
-                        disk_write: metrics.disk_write,
-                    });
+                    // No manual rollup: the child's context is linked to this one, so
+                    // the child's own `record_io` already walked up to the parent as the
+                    // bytes moved. Adding them again here counted every byte twice.
                 }
                 Err(err) => {
                     let mut state = self.inner.state.lock();

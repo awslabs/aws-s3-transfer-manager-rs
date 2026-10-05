@@ -530,7 +530,7 @@ impl UploadObjectsTransfer {
                                 let outcome = Upload::orchestrate_child(
                                     self.inner.ctx.handle.clone(),
                                     input,
-                                    self.inner.ctx.id.id,
+                                    &self.inner.ctx,
                                 );
                                 (outcome, source_path, key)
                             })
@@ -1125,13 +1125,11 @@ impl UploadObjectsTransfer {
         // the pattern open for handles whose completion signal has not yet
         // fully drained.
         let futures = children.into_iter().map(|child| {
-            // Snapshot metrics before `join()` consumes the handle.
-            let metrics = child.handle.metrics();
             let source_path = child.source_path;
             let key = child.key;
             async move {
                 let result = child.handle.join().await;
-                (result, metrics, source_path, key)
+                (result, source_path, key)
             }
         });
         let results = futures_util::future::join_all(futures).await;
@@ -1141,22 +1139,13 @@ impl UploadObjectsTransfer {
         let reaped = results.len();
         let mut aborted_in_batch = false;
 
-        for (result, metrics, source_path, key) in results {
+        for (result, source_path, key) in results {
             match result {
                 Ok(_output) => {
                     state.successful_uploads += 1;
-                    // Record directly into the parent's `MetricsState` via
-                    // the field (rather than `TransferContext::record_io`)
-                    // so the child's bytes are aggregated into the parent's
-                    // per-transfer metrics without double-counting them in
-                    // the client-level telemetry counters, which the child's
-                    // own context already updated during its transfer.
-                    self.inner.ctx.metrics.record_io(&crate::metrics::IoSample {
-                        network_tx: metrics.network_tx,
-                        network_rx: metrics.network_rx,
-                        disk_read: metrics.disk_read,
-                        disk_write: metrics.disk_write,
-                    });
+                    // No manual rollup: the child's context is linked to this one, so
+                    // the child's own `record_io` already walked up to the parent as the
+                    // bytes moved. Adding them again here counted every byte twice.
                     tracing::trace!(
                         target: crate::telemetry::TARGET_TRANSFER,
                         tid = %self.inner.ctx.id,
