@@ -411,6 +411,17 @@ fn at_or_under(key: &str, name: &str) -> bool {
 }
 
 // Two key-ordered streams merged into one pairing per key.
+// `Progress` tells callers whether the merge can infer absence from key position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Progress {
+    // The merge has not finished. It may produce more pairings.
+    Pairing,
+    // Both streams finished. Every produced key has a pairing.
+    Accounted,
+    // A terminal failure stopped the merge. Later keys cannot read absence from position.
+    Stopped,
+}
+
 pub(crate) struct Walk<S: KeyStream, D: KeyStream> {
     src: Side<S>,
     dst: Side<D>,
@@ -501,12 +512,15 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
         !self.incomplete
     }
 
-    // Whether anything further will be paired.
-    //
-    // A walk that has not been advanced answers `false`, since neither side has said yet
-    // whether it holds anything. That matches what the two walkers underneath do.
-    pub(crate) fn is_done(&self) -> bool {
-        self.ended_by_failure || (self.src.is_finished() && self.dst.is_finished())
+    // Report whether the merge can continue pairing, accounted for every key, or stopped.
+    pub(crate) fn progress(&self) -> Progress {
+        if self.ended_by_failure {
+            Progress::Stopped
+        } else if self.src.is_finished() && self.dst.is_finished() {
+            Progress::Accounted
+        } else {
+            Progress::Pairing
+        }
     }
 
     fn take_source_only(&mut self) -> Pairing<S::Source, D::Source> {
@@ -1048,8 +1062,9 @@ mod tests {
                 at(pairing.destination()),
             ));
         }
-        assert!(
-            walk.is_done(),
+        assert_eq!(
+            walk.progress(),
+            Progress::Accounted,
             "the merge ends only when both sides are done"
         );
         plan
@@ -1929,7 +1944,7 @@ mod tests {
             Scripted::of(&["a.txt", "b.txt", "c.txt"]),
         );
         while walk.next().await.is_some() {}
-        assert!(walk.is_done());
+        assert_eq!(walk.progress(), Progress::Stopped);
         assert!(!walk.is_plan_complete());
     }
 
@@ -1965,7 +1980,7 @@ mod tests {
             walk.next().await.is_none(),
             "a side that has stopped cannot say a key is absent, so nothing more is paired"
         );
-        assert!(walk.is_done());
+        assert_eq!(walk.progress(), Progress::Stopped);
     }
 
     #[tokio::test]
@@ -1980,7 +1995,7 @@ mod tests {
             walk.next().await.is_none(),
             "nothing may be written to or removed from a side nobody could read"
         );
-        assert!(walk.is_done());
+        assert_eq!(walk.progress(), Progress::Stopped);
     }
 
     #[tokio::test]
@@ -2447,8 +2462,9 @@ mod tests {
                     .build(),
             )
             .expect("an ordinary bucket builds");
-        assert!(
-            !walk.is_done(),
+        assert_eq!(
+            walk.progress(),
+            Progress::Pairing,
             "a walk that has read nothing has not finished"
         );
         // Without this the local side cannot turn a failure's path into a key, and one
