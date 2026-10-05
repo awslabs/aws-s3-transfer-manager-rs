@@ -8,7 +8,6 @@
 use std::cmp;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
@@ -18,7 +17,7 @@ use futures_util::future::{select, Either};
 use super::input::copy_fields_to_get_object_request;
 
 use crate::error::{self, ChunkRef, Error};
-use crate::operation::download::body::{BodySlot, BodyWriter, ChunkOutput};
+use crate::operation::download::body::{BodySlot, BodyWriter, ChunkOutput, DrainError, Drained};
 use crate::operation::download::chunk_meta::ChunkMetadata;
 use crate::operation::download::context::{
     CompletionClaim, DownloadPendingReason, DownloadState, PendingClaim,
@@ -65,9 +64,6 @@ struct DownloadTransferInner {
     bucket_type: BucketType,
     /// Chunk delivery + disk-write surface.
     writer: BodyWriter,
-    /// The part of `writer`'s running total of destination bytes already
-    /// recorded as `disk_write`. Only rises; see [`unreported`].
-    disk_write_reported: AtomicU64,
     /// Read-ahead window: bounds resident occupancy by holding `issued - released`
     /// under `read_ahead.window()`.
     read_ahead: ReadAhead,
@@ -139,7 +135,6 @@ impl DownloadTransfer {
             request: Arc::new(input),
             bucket_type,
             writer,
-            disk_write_reported: AtomicU64::new(0),
             object_meta: std::sync::OnceLock::new(),
             integrity_checks: std::sync::OnceLock::new(),
             expected_download_len: std::sync::OnceLock::new(),
@@ -717,7 +712,7 @@ impl DownloadTransfer {
     /// the item is queued or a claimed run is still being written, and whichever
     /// item retires last, the final range or the relief item, claims the
     /// terminal transition exactly once. A relief item that finds the transfer
-    /// already terminal writes nothing: its count went with the `Transferring`
+    /// no longer active writes nothing: its count goes with the `Transferring`
     /// state, and the terminal drain owns any resident run. A failed write
     /// fails the transfer.
     ///
@@ -729,15 +724,20 @@ impl DownloadTransfer {
     /// re-grants FIFO; the `on_completion -> generate_work` after this returns
     /// re-polls this transfer.
     fn execute_drain_resident(&self) -> WorkOutcome {
-        if !matches!(
-            *self.inner.state.lock().unwrap(),
-            DownloadState::Transferring { .. }
-        ) {
+        // Equivalent to checking the state for `Transferring`, without the
+        // state lock. Failure and cancellation move the status off `Active`
+        // before the state enters `Terminal`. The only point at which the state
+        // is `Terminal` while the status is still `Active` is a claimed
+        // completion, which cannot happen while this item is counted in
+        // `drains_in_flight`. A status off `Active` with the state still
+        // `Transferring` means the terminal transition is under way, and its
+        // terminal drain takes the resident run.
+        if !self.inner.ctx.is_active() {
             return WorkOutcome::Cancelled;
         }
 
         let flushed = self.inner.writer.flush_resident();
-        self.record_disk_write();
+        self.record_disk_write(bytes_drained(&flushed));
 
         let mut work = self.inner.state.lock().unwrap();
         if let DownloadState::Transferring {
@@ -748,7 +748,9 @@ impl DownloadTransfer {
         }
         let drained = match flushed {
             Ok(drained) => drained,
-            Err(e) => return self.fail(work, error::Error::new(error::ErrorKind::IOError, e)),
+            Err(e) => {
+                return self.fail(work, error::Error::new(error::ErrorKind::IOError, e.source))
+            }
         };
         if let DownloadState::Transferring { gate, .. } = &mut *work {
             gate.release(drained.parts);
@@ -1088,13 +1090,16 @@ impl DownloadTransfer {
         let mut freed = 0u64;
         if slot.fill(chunk) == FillOutcome::DrainReady {
             let drain = self.inner.writer.drain(DrainMode::Batched);
-            self.record_disk_write();
+            self.record_disk_write(bytes_drained(&drain));
             match drain {
                 Ok(drained) => freed = drained.parts,
                 Err(e) => {
                     // Go terminal before any wake (see fail_range).
                     let guard = self.inner.state.lock().unwrap();
-                    return self.fail(guard, error::Error::new(error::ErrorKind::IOError, e));
+                    return self.fail(
+                        guard,
+                        error::Error::new(error::ErrorKind::IOError, e.source),
+                    );
                 }
             }
         }
@@ -1224,13 +1229,16 @@ impl DownloadTransfer {
         let mut freed = 0u64;
         if slot.fill(chunk) == FillOutcome::DrainReady {
             let drain = self.inner.writer.drain(DrainMode::Batched);
-            self.record_disk_write();
+            self.record_disk_write(bytes_drained(&drain));
             match drain {
                 Ok(drained) => freed = drained.parts,
                 Err(e) => {
                     // Go terminal before any wake (see fail_range).
                     let guard = self.inner.state.lock().unwrap();
-                    return self.fail(guard, error::Error::new(error::ErrorKind::IOError, e));
+                    return self.fail(
+                        guard,
+                        error::Error::new(error::ErrorKind::IOError, e.source),
+                    );
                 }
             }
         }
@@ -1372,8 +1380,17 @@ impl DownloadTransfer {
         if !self.inner.ctx.set_failed(error)
             && self.inner.ctx.transfer_status() == crate::types::TransferStatus::Completed
         {
-            // Status is first-write-wins: the caller has been told the download
-            // succeeded, and this error can no longer reach it.
+            // Unreachable under the counting rule on `DownloadState`: `fail`
+            // runs from a work item that is still counted, from discovery
+            // before `Transferring`, from `poll_work` while the transfer is
+            // active, or from `finalize_completion` before `set_completed`, and
+            // completion requires every counted item to have retired. Release
+            // builds log instead, since a panic would change nothing there:
+            // success was already reported, and the scheduler contains panics.
+            debug_assert!(
+                false,
+                "download failed after it had completed: {description}"
+            );
             tracing::error!(
                 target: crate::telemetry::TARGET_TRANSFER,
                 tid = %self.inner.ctx.id,
@@ -1396,14 +1413,9 @@ impl DownloadTransfer {
         WorkOutcome::Failed { classification }
     }
 
-    /// Records as `disk_write` the destination bytes not yet recorded.
-    ///
-    /// Reads the writer's running total rather than a drain's result, so the
-    /// runs a failed drain wrote before its error are counted. Once this
-    /// returns, `disk_write` counts every byte the destination had accepted
-    /// when it was called, and no byte twice.
-    fn record_disk_write(&self) {
-        let bytes = unreported(&self.inner.disk_write_reported, self.inner.writer.written());
+    /// Records `bytes` the destination accepted as `disk_write`. Zero records
+    /// nothing.
+    fn record_disk_write(&self, bytes: u64) {
         if bytes > 0 {
             self.inner.ctx.record_io(&crate::metrics::IoSample {
                 disk_write: bytes,
@@ -1417,21 +1429,20 @@ impl DownloadTransfer {
     /// returned: the transfer is already terminal.
     fn run_terminal_drain(&self) {
         let drain = self.inner.writer.terminal_drain();
-        self.record_disk_write();
+        self.record_disk_write(bytes_drained(&drain));
         self.inner
             .observability
-            .terminal_drain_completed(&drain.map(|drained| drained.parts));
+            .terminal_drain_completed(&drain.map(|drained| drained.parts).map_err(|e| e.source));
     }
 
     /// Finalizes the destination for a successful transfer, then records the
     /// bytes written, whether or not finalization succeeded, and its outcome.
     fn finalize_destination(&self, expected_len: u64) -> Result<(), std::io::Error> {
-        let finalization = self
-            .inner
-            .writer
-            .finalize(expected_len)
-            .map(|drained| drained.parts);
-        self.record_disk_write();
+        let finalization = self.inner.writer.finalize(expected_len);
+        self.record_disk_write(bytes_drained(&finalization));
+        let finalization = finalization
+            .map(|drained| drained.parts)
+            .map_err(|e| e.source);
         self.inner
             .observability
             .destination_finalized(&finalization);
@@ -1479,16 +1490,16 @@ impl Transfer for DownloadTransfer {
     }
 }
 
-/// Raises `reported` to `total` and returns how far it rose: the part of
-/// `total` not yet reported, or 0 if `reported` already covers it.
+/// Bytes the destination accepted during one drain, whether it succeeded or
+/// failed part-way.
 ///
-/// Drains on different workers read the running total at different times, so
-/// a caller can arrive with a total below one already reported. `fetch_max`
-/// never lowers `reported`, so a stale total returns 0 and each byte is
-/// returned exactly once.
-fn unreported(reported: &AtomicU64, total: u64) -> u64 {
-    let prev = reported.fetch_max(total, Ordering::AcqRel);
-    total.saturating_sub(prev)
+/// Each drain reports only the runs it wrote, so recording this once per drain
+/// counts every accepted byte exactly once.
+fn bytes_drained(drain: &Result<Drained, DrainError>) -> u64 {
+    match drain {
+        Ok(drained) => drained.bytes,
+        Err(e) => e.drained.bytes,
+    }
 }
 
 fn snapshot_state(state: &DownloadState, read_ahead_window: u64) -> DownloadStateSnapshot {
@@ -3372,19 +3383,6 @@ mod tests {
         );
     }
 
-    /// `unreported` returns each byte of the running total once. A stale total
-    /// that arrives after a higher one returns 0 and leaves the reported value
-    /// in place, so the bytes between them are not returned again.
-    #[test]
-    fn unreported_returns_each_byte_once_despite_stale_totals() {
-        let reported = AtomicU64::new(0);
-        assert_eq!(unreported(&reported, 150), 150);
-        assert_eq!(unreported(&reported, 100), 0);
-        assert_eq!(reported.load(Ordering::Relaxed), 150);
-        assert_eq!(unreported(&reported, 200), 50);
-        assert_eq!(reported.load(Ordering::Relaxed), 200);
-    }
-
     /// A finalize that fails its length check still counts the tail its
     /// terminal drain wrote. A drain the transfer does not track holds the
     /// first part's run claimed but unwritten when the final range completes,
@@ -3812,11 +3810,42 @@ mod tests {
         );
     }
 
-    /// A failure that arrives after the transfer completed cannot reach the
-    /// caller, so it is logged at error level with its cause.
+    /// A failure after the transfer completed panics in debug builds. The case
+    /// is unreachable in practice, since completion is claimed only once every
+    /// counted work item has retired. The test reaches it by construction,
+    /// calling `fail` directly on a completed single-part download.
+    #[cfg(debug_assertions)]
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
-    async fn failure_after_completion_is_logged_with_its_cause() {
+    #[should_panic(expected = "download failed after it had completed")]
+    async fn failure_after_completion_panics_in_debug_builds() {
+        // A single-part object: discovery receives it whole and completes.
+        let transfer = create_download(8 * MB, 8 * MB);
+        assert_discovery_succeeds(&transfer).await;
+        assert_eq!(
+            transfer.ctx().transfer_status(),
+            crate::types::TransferStatus::Completed
+        );
+
+        let guard = transfer.inner.state.lock().unwrap();
+        let _ = transfer.fail(
+            guard,
+            error::Error::new(
+                error::ErrorKind::IOError,
+                std::io::Error::other("late destination failure"),
+            ),
+        );
+    }
+
+    /// In release builds, a failure after the transfer completed leaves it
+    /// completed and is logged at error level with its cause. The case is
+    /// unreachable in practice, since completion is claimed only once every
+    /// counted work item has retired. The test reaches it by construction,
+    /// calling `fail` directly on a completed single-part download.
+    #[cfg(not(debug_assertions))]
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn failure_after_completion_is_logged_in_release_builds() {
         use aws_smithy_runtime::test_util::capture_test_logs::capture_test_logs;
 
         // A single-part object: discovery receives it whole and completes.

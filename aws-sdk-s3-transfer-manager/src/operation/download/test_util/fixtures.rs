@@ -133,7 +133,7 @@ pub(crate) fn managed_test_handle(
 }
 
 /// A disk download transfer on `handle`, writing through a sink that `sinks`
-/// opens over a new file named `out` in a fresh temporary directory.
+/// creates over a new file named `out` in a fresh temporary directory.
 ///
 /// Transfers built on one handle share its memory budget. Returns the transfer,
 /// its body consumer, and the directory; the test keeps both for the
@@ -149,7 +149,7 @@ pub(crate) fn disk_transfer(
         .unwrap();
     let dir = tempfile::tempdir().unwrap();
     let file = std::fs::File::create(dir.path().join("out")).unwrap();
-    let (writer, consumer) = new_recv_body_with_disk_mode(sinks.open(file, false));
+    let (writer, consumer) = new_recv_body_with_disk_mode(sinks.create(file, false));
     let (ctx, _completion_rx) = TransferContext::new(handle);
     let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, writer);
     (transfer, consumer, dir)

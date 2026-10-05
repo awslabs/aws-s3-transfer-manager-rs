@@ -15,6 +15,7 @@ use super::chunk_meta::ChunkMetadata;
 use super::recv_buffer::{
     DrainMode, FillOutcome, PagedRecvBuffer, RecvBufferConsumer, SegmentWrite, SlotHandle,
 };
+use super::sink::SinkWrite;
 
 /// Segment size for the paged buffer. Re-exported from `recv_buffer` for test access.
 const SEG_SIZE: usize = super::recv_buffer::DEFAULT_SEG_SIZE;
@@ -178,100 +179,6 @@ impl Buf for DiskWriteCursor<'_> {
     }
 }
 
-/// Positioned-write target for download-to-file. Abstracts the file so the drain
-/// orchestration (run coalescing, offset translation) can be exercised against an
-/// in-memory capture, and so an alternative write strategy (e.g. O_DIRECT/io_uring)
-/// can replace the file write without touching the buffer or the drain logic.
-///
-/// Positions passed to `write_all_at` are relative to the downloaded payload.
-/// `prepare` may reserve storage before writes begin, while `finalize` establishes
-/// the destination layout after every payload write succeeds. Implementations are
-/// shared across the issuer and the drain task, hence `Send + Sync`.
-pub(crate) trait SinkWrite: Send + Sync + std::fmt::Debug {
-    /// Write the entire buffer at `pos` bytes from the payload's destination start.
-    fn write_all_at(&self, buf: &mut DiskWriteCursor<'_>, pos: u64) -> std::io::Result<()>;
-
-    /// Prepare a target for an expected download of `expected_download_len` bytes.
-    fn prepare(&self, _expected_download_len: u64) -> std::io::Result<()> {
-        Ok(())
-    }
-
-    /// Establish the target's successful layout for the complete payload.
-    fn finalize(&self, _expected_download_len: u64) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-/// File-backed [`SinkWrite`] using the current replace-from-zero policy.
-///
-/// Payload-relative positions map directly to file positions and successful
-/// finalization truncates the file to the payload length. A future append or
-/// write-at policy belongs here: it can translate the relative positions and
-/// final length without changing transfer scheduling or object-range arithmetic.
-pub(crate) struct FileSink {
-    file: std::fs::File,
-    /// Whether the transfer manager created this file (vs caller-provided). Only an
-    /// owned file is preallocated.
-    owns_file: bool,
-}
-
-impl FileSink {
-    /// Wraps `file`. `owns_file` is true when the transfer manager created the
-    /// file, which permits preallocating it.
-    pub(crate) fn new(file: std::fs::File, owns_file: bool) -> Self {
-        Self { file, owns_file }
-    }
-}
-
-impl std::fmt::Debug for FileSink {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FileSink").finish_non_exhaustive()
-    }
-}
-
-/// Returns whether failure to reserve storage makes the download futile.
-///
-/// Unsupported preallocation remains best effort because the subsequent
-/// positioned writes may still succeed. Linux storage and quota exhaustion
-/// cannot recover without external intervention and should fail before the
-/// transfer spends network and memory resources on the object body.
-fn preallocation_failure_is_fatal(error: &std::io::Error) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        matches!(
-            error.raw_os_error(),
-            Some(libc::ENOSPC) | Some(libc::EDQUOT)
-        )
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = error;
-        false
-    }
-}
-
-impl SinkWrite for FileSink {
-    fn write_all_at(&self, buf: &mut DiskWriteCursor<'_>, pos: u64) -> std::io::Result<()> {
-        crate::io::fs::write_all_at(&self.file, buf, pos)
-    }
-
-    fn prepare(&self, expected_download_len: u64) -> std::io::Result<()> {
-        if self.owns_file {
-            if let Err(e) = crate::io::fs::preallocate(&self.file, expected_download_len) {
-                if preallocation_failure_is_fatal(&e) {
-                    return Err(e);
-                }
-                tracing::warn!(error = %e, "failed to preallocate file space");
-            }
-        }
-        Ok(())
-    }
-
-    fn finalize(&self, expected_download_len: u64) -> std::io::Result<()> {
-        self.file.set_len(expected_download_len)
-    }
-}
-
 /// Stream vs disk discrimination. Mutually exclusive per transfer.
 #[derive(Debug)]
 enum Mode {
@@ -290,9 +197,7 @@ enum Mode {
 /// Destination work done by one drain call.
 ///
 /// A run is counted only after the sink accepted all of it. A drain that fails
-/// returns an error instead, and the writer's running total
-/// ([`BodyWriter::written`]) still counts the runs it wrote before the failing
-/// one.
+/// returns what it did before the failure in its [`DrainError`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Drained {
     /// Parts whose payloads were written and freed: the read-ahead occupancy
@@ -300,6 +205,14 @@ pub(crate) struct Drained {
     pub(crate) parts: u64,
     /// Bytes the sink accepted.
     pub(crate) bytes: u64,
+}
+
+/// A drain that failed after writing `drained`: the runs the sink accepted before
+/// the failing one, or, from `finalize`, the tail its terminal drain wrote.
+#[derive(Debug)]
+pub(crate) struct DrainError {
+    pub(crate) drained: Drained,
+    pub(crate) source: std::io::Error,
 }
 
 /// Producer handle to the download body buffer. Held at `self.inner.writer`
@@ -401,6 +314,7 @@ impl BodyWriter {
     ///
     /// Counts only runs the sink fully accepted, so it never exceeds what
     /// reached the sink.
+    #[cfg(test)]
     pub(crate) fn written(&self) -> u64 {
         match &*self.mode {
             Mode::Disk { written, .. } => written.load(Ordering::Acquire),
@@ -427,7 +341,11 @@ impl BodyWriter {
     /// Returns the parts freed and the bytes written across the runs drained by
     /// this call. The download layer releases that read-ahead occupancy under
     /// its state lock.
-    pub(crate) fn drain(&self, mode: DrainMode) -> Result<Drained, std::io::Error> {
+    ///
+    /// A run that fails to write ends the drain with a [`DrainError`] carrying
+    /// the runs written before it. A filled payload before
+    /// [`prepare`](Self::prepare) fails the drain with nothing drained.
+    pub(crate) fn drain(&self, mode: DrainMode) -> Result<Drained, DrainError> {
         let mut drained = Drained::default();
         if let Mode::Disk {
             sink,
@@ -440,15 +358,21 @@ impl BodyWriter {
                 // establishes its range. A fill before preparation violates the
                 // transfer ordering and cannot be positioned safely.
                 if self.buffer.has_undrained_fills() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "disk payload arrived before destination preparation",
-                    ));
+                    return Err(DrainError {
+                        drained: Drained::default(),
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "disk payload arrived before destination preparation",
+                        ),
+                    });
                 }
                 return Ok(drained);
             };
             while let Some(sw) = self.buffer.take_drain_run(mode) {
-                let bytes = write_run(sink.as_ref(), object_range_start, &sw)?;
+                let bytes = match write_run(sink.as_ref(), object_range_start, &sw) {
+                    Ok(bytes) => bytes,
+                    Err(source) => return Err(DrainError { drained, source }),
+                };
                 written.fetch_add(bytes, Ordering::Release);
                 drained.bytes = drained.bytes.saturating_add(bytes);
                 drained.parts = drained.parts.saturating_add(sw.complete());
@@ -462,7 +386,8 @@ impl BodyWriter {
     ///
     /// Success, failure, and cancellation all use this operation to release resident
     /// payload ownership. It does not establish the target's successful final shape.
-    pub(crate) fn terminal_drain(&self) -> Result<Drained, std::io::Error> {
+    /// Fails as [`drain`](Self::drain) does.
+    pub(crate) fn terminal_drain(&self) -> Result<Drained, DrainError> {
         if !matches!(&*self.mode, Mode::Disk { .. }) {
             return Ok(Drained::default());
         }
@@ -478,25 +403,31 @@ impl BodyWriter {
 
     /// Flush terminal payloads and establish the successful disk target length.
     ///
-    /// Returns what the terminal drain wrote. Fails with
+    /// Returns what the terminal drain wrote. A failed terminal drain returns its
+    /// [`DrainError`]. Fails with
     /// [`UnexpectedEof`](std::io::ErrorKind::UnexpectedEof), before the target
     /// is resized, if the sink has not accepted exactly `expected_download_len`
     /// bytes across every drain. A run claimed by a drain that has not finished
     /// writing is invisible to the terminal drain, so without this check its
     /// region would be published holding zeros or the file's previous bytes.
-    pub(crate) fn finalize(&self, expected_download_len: u64) -> Result<Drained, std::io::Error> {
+    /// That error, and a failed resize, carry what the terminal drain wrote.
+    pub(crate) fn finalize(&self, expected_download_len: u64) -> Result<Drained, DrainError> {
         let drained = self.terminal_drain()?;
         if let Mode::Disk { sink, written, .. } = &*self.mode {
             let written = written.load(Ordering::Acquire);
             if written != expected_download_len {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    format!(
-                        "destination accepted {written} of {expected_download_len} expected bytes"
+                return Err(DrainError {
+                    drained,
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "destination accepted {written} of {expected_download_len} expected bytes"
+                        ),
                     ),
-                ));
+                });
             }
-            sink.finalize(expected_download_len)?;
+            sink.finalize(expected_download_len)
+                .map_err(|source| DrainError { drained, source })?;
         }
         Ok(drained)
     }
@@ -513,8 +444,8 @@ impl BodyWriter {
     /// Memory-pressure relief is distinct from terminal `finalize`, but uses
     /// the same eager take. Returns the parts freed, so the caller releases their
     /// read-ahead occupancy, and the bytes written. Not terminal: the transfer
-    /// keeps issuing after this.
-    pub(crate) fn flush_resident(&self) -> Result<Drained, std::io::Error> {
+    /// keeps issuing after this. Fails as [`drain`](Self::drain) does.
+    pub(crate) fn flush_resident(&self) -> Result<Drained, DrainError> {
         self.drain(DrainMode::Eager)
     }
 
@@ -642,13 +573,14 @@ pub(crate) fn new_recv_body_with_disk_mode(
     (writer, slot_consumer)
 }
 
-/// Create a producer/consumer pair writing directly to `file` through a [`FileSink`].
+/// Create a producer/consumer pair writing directly to `file` through a
+/// [`FileSink`](super::sink::FileSink).
 #[cfg(test)]
 pub(crate) fn new_recv_body_with_sink(
     file: std::fs::File,
     owns_file: bool,
 ) -> (BodyWriter, RecvBodyConsumer) {
-    new_recv_body_with_disk_mode(Box::new(FileSink::new(file, owns_file)))
+    new_recv_body_with_disk_mode(Box::new(super::sink::FileSink::new(file, owns_file)))
 }
 
 /// Stream of [ChunkOutput] representing an Amazon S3 Object's contents and metadata.
@@ -921,9 +853,9 @@ mod tests {
 
     use super::{
         new_recv_body_with_disk_mode, new_recv_body_with_sink, BodyWriter as Writer,
-        DiskWriteCursor, DrainMode, Drained, RecvBodyConsumer, Reservation, SinkWrite,
+        DiskWriteCursor, DrainMode, Drained, RecvBodyConsumer, Reservation,
     };
-    use crate::operation::download::sink::SinkFactory;
+    use crate::operation::download::sink::{SinkFactory, SinkWrite};
     use crate::operation::download::test_util::sink::{
         Action, Match, Op, ScriptedSinkFactory, WriteScript,
     };
@@ -1052,7 +984,8 @@ mod tests {
         let error = writer
             .terminal_drain()
             .expect_err("unpositioned payload must fail");
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(error.source.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(error.drained, Drained::default());
     }
 
     /// `has_drainable_resident` gates memory-pressure draining. It is true only on the
@@ -1106,7 +1039,7 @@ mod tests {
             let error = writer
                 .terminal_drain()
                 .expect_err("offsets are not contiguous");
-            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+            assert_eq!(error.source.kind(), std::io::ErrorKind::InvalidData);
             assert_eq!(sink.write_count(), 0);
         }
     }
@@ -1117,7 +1050,7 @@ mod tests {
         writer.claim().fill(chunk_at(0, 0, b""));
 
         let error = writer.terminal_drain().expect_err("disk payload is empty");
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(error.source.kind(), std::io::ErrorKind::InvalidData);
         assert_eq!(sink.write_count(), 0);
     }
 
@@ -1208,7 +1141,47 @@ mod tests {
             .write(true)
             .open(path)
             .unwrap();
-        new_recv_body_with_disk_mode(ScriptedSinkFactory(Arc::clone(script)).open(file, false))
+        new_recv_body_with_disk_mode(ScriptedSinkFactory(Arc::clone(script)).create(file, false))
+    }
+
+    /// A drain that fails part-way returns the runs it wrote before the failing
+    /// one. An eager drain takes the head run of each of three receive-buffer
+    /// segments, and the destination rejects the third.
+    #[test]
+    fn failed_drain_returns_the_runs_written_before_it() {
+        use super::SEG_SIZE;
+        const RUN_LEN: u64 = 4;
+        let script = Arc::new(WriteScript::default()).on(
+            Match::NthWrite(3),
+            Action::Fail(std::io::ErrorKind::StorageFull),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out");
+        std::fs::File::create(&path).unwrap();
+        let (writer, _consumer) = scripted_writer_over(&path, &script);
+        writer.prepare(0, 3 * RUN_LEN).unwrap();
+
+        // Fill only the first slot of each segment, so the drain takes three
+        // separate runs, in order.
+        let seg = SEG_SIZE as u64;
+        for seq in 0..=2 * seg {
+            let slot = writer.claim();
+            if seq % seg == 0 {
+                let run = seq / seg;
+                slot.fill(chunk_at(
+                    seq,
+                    run * RUN_LEN,
+                    &[run as u8 + 1; RUN_LEN as usize],
+                ));
+            }
+        }
+
+        let error = writer
+            .drain(DrainMode::Eager)
+            .expect_err("the third write is scripted to fail");
+        assert_eq!(error.source.kind(), std::io::ErrorKind::StorageFull);
+        assert_eq!(error.drained, Drained { parts: 2, bytes: 8 });
+        assert_eq!(writer.written(), 8);
     }
 
     /// A resize that fails after every byte was written fails finalization
@@ -1231,7 +1204,7 @@ mod tests {
         let error = writer
             .finalize(3)
             .expect_err("the resize is scripted to fail");
-        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(error.source.kind(), std::io::ErrorKind::PermissionDenied);
         let contents = std::fs::read(&path).unwrap();
         assert_eq!(contents.len(), 8, "a failed resize keeps the length");
         assert_eq!(&contents[..3], b"new");
@@ -1262,10 +1235,11 @@ mod tests {
             let error = writer
                 .finalize(4)
                 .expect_err("two of four bytes reached the destination");
-            assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+            assert_eq!(error.source.kind(), std::io::ErrorKind::UnexpectedEof);
             assert!(
-                error.to_string().contains("2 of 4"),
-                "the error names both byte counts: {error}"
+                error.source.to_string().contains("2 of 4"),
+                "the error names both byte counts: {}",
+                error.source
             );
             let contents = std::fs::read(&path).unwrap();
             assert_eq!(
@@ -1296,20 +1270,6 @@ mod tests {
 
         writer.finalize(0).unwrap();
         assert!(std::fs::read(&path).unwrap().is_empty());
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn linux_preallocation_fails_only_for_storage_exhaustion() {
-        assert!(super::preallocation_failure_is_fatal(
-            &std::io::Error::from_raw_os_error(libc::ENOSPC)
-        ));
-        assert!(super::preallocation_failure_is_fatal(
-            &std::io::Error::from_raw_os_error(libc::EDQUOT)
-        ));
-        assert!(!super::preallocation_failure_is_fatal(
-            &std::io::Error::from_raw_os_error(libc::EOPNOTSUPP)
-        ));
     }
 
     #[test]

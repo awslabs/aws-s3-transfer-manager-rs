@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use crate::error::{self, Error, ErrorKind};
 use crate::io::walk::S3Walk;
+use crate::operation::download::sink::{FileSinkFactory, SinkFactory};
 use crate::operation::download::{Download, DownloadInput, ManagedDownloadHandle};
 use crate::transfer::{
     IoRequest, PendingCause, PollWork, Transfer, TransferContext, TransferId, WorkOutcome,
@@ -568,10 +569,8 @@ impl DownloadObjectsTransfer {
         let inner = Download::orchestrate_with_sink(
             handle.clone(),
             input,
-            file,
-            true,
+            FileSinkFactory.create(file, true),
             Some(parent_id),
-            &crate::operation::download::sink::FileSinkFactory,
         )?;
         Ok(ManagedDownloadHandle::new(inner, temp_path, dest_path))
     }

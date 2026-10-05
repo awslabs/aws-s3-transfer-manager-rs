@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 
 use bytes::Buf;
 
-use crate::operation::download::body::{DiskWriteCursor, SinkWrite};
-use crate::operation::download::sink::{FileSinkFactory, SinkFactory};
+use crate::operation::download::body::DiskWriteCursor;
+use crate::operation::download::sink::{FileSinkFactory, SinkFactory, SinkWrite};
 
 /// Which destination operation a rule applies to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,7 +66,7 @@ pub(crate) enum Event {
 }
 
 /// Counted fault rules and an operation log, shared by every sink one
-/// [`ScriptedSinkFactory`] opens.
+/// [`ScriptedSinkFactory`] creates.
 ///
 /// Each rule fires at most once, on the first operation it matches. Rules
 /// are checked in the order they were added. Nothing is random.
@@ -275,9 +275,9 @@ impl Drop for Held {
 pub(crate) struct ScriptedSinkFactory(pub(crate) Arc<WriteScript>);
 
 impl SinkFactory for ScriptedSinkFactory {
-    fn open(&self, file: std::fs::File, owns_file: bool) -> Box<dyn SinkWrite> {
+    fn create(&self, file: std::fs::File, owns_file: bool) -> Box<dyn SinkWrite> {
         Box::new(ScriptedSink {
-            inner: FileSinkFactory.open(file, owns_file),
+            inner: FileSinkFactory.create(file, owns_file),
             script: Arc::clone(&self.0),
         })
     }
@@ -334,13 +334,13 @@ mod tests {
     /// How long a test waits for a scripted hold to start.
     const HOLD_TIMEOUT: Duration = Duration::from_secs(5);
 
-    /// A disk body writer over `file` through a sink opened from `script`.
+    /// A disk body writer over `file` through a sink created from `script`.
     fn scripted_writer(
         script: &Arc<WriteScript>,
         file: std::fs::File,
         expected_len: u64,
     ) -> BodyWriter {
-        let sink = ScriptedSinkFactory(Arc::clone(script)).open(file, false);
+        let sink = ScriptedSinkFactory(Arc::clone(script)).create(file, false);
         let (writer, _consumer) = new_recv_body_with_disk_mode(sink);
         writer.prepare(0, expected_len).unwrap();
         writer
@@ -411,7 +411,7 @@ mod tests {
             drain.join().unwrap().expect_err("released with an error")
         });
 
-        assert_eq!(error.kind(), io::ErrorKind::StorageFull);
+        assert_eq!(error.source.kind(), io::ErrorKind::StorageFull);
         assert!(std::fs::read(&path).unwrap().is_empty());
     }
 
@@ -433,7 +433,7 @@ mod tests {
         let error = writer
             .drain(DrainMode::Eager)
             .expect_err("the write at offset 2 is scripted to fail");
-        assert_eq!(error.kind(), io::ErrorKind::StorageFull);
+        assert_eq!(error.source.kind(), io::ErrorKind::StorageFull);
         fill(&writer, 4, b"ef");
         writer.drain(DrainMode::Eager).unwrap();
 
@@ -469,7 +469,7 @@ mod tests {
         let error = writer
             .finalize(3)
             .expect_err("finalize is scripted to fail");
-        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(error.source.kind(), io::ErrorKind::PermissionDenied);
         assert_eq!(std::fs::read(&path).unwrap(), b"newle contents");
         assert_eq!(
             script.events().last(),
