@@ -494,8 +494,6 @@ async fn test_download_objects_abort_terminates() {
 /// downcast to the library's own [`Error`], which a `String` source cannot do.
 #[tokio::test]
 async fn test_download_objects_abort_error_reaches_the_child_cause() {
-    use std::error::Error as _;
-
     timeout(TEST_TIMEOUT, async {
         let m = mock_tm(RuntimeMode::Managed).await;
 
