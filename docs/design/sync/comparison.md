@@ -90,7 +90,10 @@ both sides and puts them back together when it reports. **FR-Exec-2** puts the d
 here while the deleting happens elsewhere. **FR-Root-7** wants a configuration that cannot work
 refused before any work starts, and the reason one exists is here: reading absence from position
 holds only while both sides arrive in the same order. A directory bucket does not list keys in
-alphabetical order, so it is the configuration that has to be refused. **FR-Exec-5** wants a
+alphabetical order, so sync refuses that configuration. Building the remote side refuses it, before
+the first listing goes out and at the earliest point that knows the bucket's name. The walk itself
+still serves a directory bucket, because an operation reading every key handed to it needs no
+order. **FR-Exec-5** wants a
 download to stamp the file with the object's time, and one of the comparisons below,
 `ExactTimestamps`, is only correct once something does. Nothing stamps it today, so on a download
 that comparison never reaches an equal pair and sends every key on every run. **FR-Fail-6** ends a

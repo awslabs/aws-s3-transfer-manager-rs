@@ -593,12 +593,15 @@ impl Walker {
     // two roots may sit in different regions and different accounts, so it needs two clients, and
     // the copy request itself goes to the destination while naming the source — which means the
     // destination credentials have to be able to read the source object.
-    pub(crate) fn uploading(&self, ctx: LocalAndBucket) -> Walk<FsWalk, S3Walk> {
+    pub(crate) fn uploading(
+        &self,
+        ctx: LocalAndBucket,
+    ) -> Result<Walk<FsWalk, S3Walk>, crate::error::Error> {
         let root = ctx.local_root.clone();
         let local = self.local_walk(ctx.local_root);
-        let remote = self.remote_walk(ctx.client, ctx.bucket, ctx.prefix);
+        let remote = self.remote_walk(ctx.client, ctx.bucket, ctx.prefix)?;
         // Only the source walks a filesystem; a listing names its own lost keys.
-        Walk::new(local, remote).with_roots(Some(root), None)
+        Ok(Walk::new(local, remote).with_roots(Some(root), None))
     }
 
     // The same two roots the other way round: the listing is the source and the local tree is
@@ -606,11 +609,14 @@ impl Walker {
     //
     // The root moves to the destination side, because that is the side whose failures name an
     // absolute path this layer has to turn into a key.
-    pub(crate) fn downloading(&self, ctx: LocalAndBucket) -> Walk<S3Walk, LocalDestination> {
+    pub(crate) fn downloading(
+        &self,
+        ctx: LocalAndBucket,
+    ) -> Result<Walk<S3Walk, LocalDestination>, crate::error::Error> {
         let root = ctx.local_root.clone();
-        let remote = self.remote_walk(ctx.client, ctx.bucket, ctx.prefix);
+        let remote = self.remote_walk(ctx.client, ctx.bucket, ctx.prefix)?;
         let local = LocalDestination::new(self.local_walk(ctx.local_root), &root);
-        Walk::new(remote, local).with_roots(None, Some(root))
+        Ok(Walk::new(remote, local).with_roots(None, Some(root)))
     }
 
     // The merge depends on all three of these, so this layer fixes them and a caller never
@@ -637,7 +643,7 @@ impl Walker {
         client: aws_sdk_s3::Client,
         bucket: String,
         prefix: Option<String>,
-    ) -> S3Walk {
+    ) -> Result<S3Walk, crate::error::Error> {
         // Restore status is asked for here and nowhere else. Without it an object in an archive
         // and one with a restored copy look the same, and a comparison would either refuse every
         // archived key or hand execution a transfer that fails.
@@ -647,22 +653,30 @@ impl Walker {
         if let Some(prefix) = prefix {
             walker = walker.prefix(prefix);
         }
+        let bucket_name = bucket.clone();
         let walk = walker.build().walk(
             S3WalkContext::builder()
                 .client(client)
                 .bucket(bucket)
                 .build(),
         );
-        // Absence is read from position, so a listing that is not in key order breaks the
-        // merge without saying anything. A directory bucket is the case that does it, and
-        // the walk can tell from the bucket's name. Refusing such a root belongs where a
-        // caller names one, so this is a development backstop only — it compiles out of a
-        // release build, where a root that got this far still produces an unordered merge.
-        debug_assert!(
-            !walk.is_directory_bucket(),
-            "a directory bucket does not list in key order, which the merge depends on"
-        );
-        walk
+        // The merge reads absence from position, so a listing arriving out of key order reports
+        // a key the other side holds as a key nobody holds, and delete mode removes it. A
+        // directory bucket lists in no defined order, and the walk reads that from the bucket's
+        // name, so the root stops here. The runtime order check cannot stand in for this: it
+        // speaks when the late key arrives, by which time the removal for the key ahead of it
+        // has gone out.
+        //
+        // Refused for this merge and not inside the walk, because sync needs key order and the
+        // directory download does not. An operation that reads every key handed to it stays
+        // usable against these buckets.
+        if walk.is_directory_bucket() {
+            return Err(crate::error::invalid_input(format!(
+                "the bucket '{bucket_name}' is a directory bucket, which lists keys in no \
+                 defined order; sync pairs its two sides by key order",
+            )));
+        }
+        Ok(walk)
     }
 }
 
@@ -2121,11 +2135,13 @@ mod tests {
         let walker = Walker::builder()
             .filter(Arc::new(KeyFilter::new(vec![Rule::exclude("thumbs/*")])))
             .build();
-        let mut walk = walker.remote_walk(
-            client,
-            "amzn-s3-demo-bucket".to_string(),
-            Some("photos/".to_string()),
-        );
+        let mut walk = walker
+            .remote_walk(
+                client,
+                "amzn-s3-demo-bucket".to_string(),
+                Some("photos/".to_string()),
+            )
+            .expect("an ordinary bucket builds");
         let mut keys = Vec::new();
         let mut obstructions = Vec::new();
         while let Some(next) = walk.next_entry().await {
@@ -2378,17 +2394,58 @@ mod tests {
         );
     }
 
+    // A directory bucket does not list in key order, and the merge reads absence from position:
+    // a key the listing holds but reports late reads as a key the source does not have, which
+    // delete mode removes from the destination. The runtime order check cannot save it, because it
+    // fires when the late key finally arrives, after the removal for the key ahead of it went out.
+    // So the merge turns such a root down where a caller names one.
+    #[tokio::test]
+    async fn a_directory_bucket_root_is_refused_in_both_directions() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        for bucket in ["amzn-s3-demo-bucket--usw2-az1--x-s3", "anything--x-s3"] {
+            let ctx = || {
+                LocalAndBucket::builder()
+                    .local_root(dir.path())
+                    .client(a_client())
+                    .bucket(bucket)
+                    .build()
+            };
+            assert!(
+                Walker::builder().build().uploading(ctx()).is_err(),
+                "an upload accepted the directory bucket {bucket}, whose listing has no order"
+            );
+            assert!(
+                Walker::builder().build().downloading(ctx()).is_err(),
+                "a download accepted the directory bucket {bucket}"
+            );
+        }
+        // An ordinary bucket still builds: the refusal names one kind of root.
+        assert!(Walker::builder()
+            .build()
+            .uploading(
+                LocalAndBucket::builder()
+                    .local_root(dir.path())
+                    .client(a_client())
+                    .bucket("amzn-s3-demo-bucket")
+                    .build()
+            )
+            .is_ok());
+    }
+
     #[tokio::test]
     async fn a_walk_is_built_against_both_roots() {
         let dir = tempfile::tempdir().expect("a temp dir");
-        let walk = Walker::builder().build().uploading(
-            LocalAndBucket::builder()
-                .local_root(dir.path())
-                .client(a_client())
-                .bucket("amzn-s3-demo-bucket")
-                .prefix("photos/")
-                .build(),
-        );
+        let walk = Walker::builder()
+            .build()
+            .uploading(
+                LocalAndBucket::builder()
+                    .local_root(dir.path())
+                    .client(a_client())
+                    .bucket("amzn-s3-demo-bucket")
+                    .prefix("photos/")
+                    .build(),
+            )
+            .expect("an ordinary bucket builds");
         assert!(
             !walk.is_done(),
             "a walk that has read nothing has not finished"
@@ -2420,13 +2477,19 @@ mod tests {
                 .prefix("photos/")
                 .build()
         };
-        let up = Walker::builder().build().uploading(context());
+        let up = Walker::builder()
+            .build()
+            .uploading(context())
+            .expect("an ordinary bucket builds");
         assert_eq!(
             up.dst.stream.prefix(),
             Some("photos/"),
             "an upload lists the destination under the prefix it was given"
         );
-        let down = Walker::builder().build().downloading(context());
+        let down = Walker::builder()
+            .build()
+            .downloading(context())
+            .expect("an ordinary bucket builds");
         assert_eq!(
             down.src.stream.prefix(),
             Some("photos/"),
@@ -2441,13 +2504,16 @@ mod tests {
         // key behind an unreadable local file, and one such file would take the whole
         // destination side out of the comparison.
         let dir = tempfile::tempdir().expect("a temp dir");
-        let walk = Walker::builder().build().downloading(
-            LocalAndBucket::builder()
-                .local_root(dir.path())
-                .client(a_client())
-                .bucket("amzn-s3-demo-bucket")
-                .build(),
-        );
+        let walk = Walker::builder()
+            .build()
+            .downloading(
+                LocalAndBucket::builder()
+                    .local_root(dir.path())
+                    .client(a_client())
+                    .bucket("amzn-s3-demo-bucket")
+                    .build(),
+            )
+            .expect("an ordinary bucket builds");
         assert_eq!(
             walk.src.root, None,
             "the listing is the source here, and it names its own lost keys"
