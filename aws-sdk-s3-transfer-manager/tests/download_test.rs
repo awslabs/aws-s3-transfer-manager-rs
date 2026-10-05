@@ -846,7 +846,7 @@ async fn test_download_write_to_path_error_cleans_up() {
 
 /// `write_to_file` rejects a destination opened in append mode before sending
 /// any request, and leaves the file's contents as they were.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[tokio::test]
 async fn test_download_write_to_file_rejects_append_mode() {
     let data = rand_data(10 * ByteUnit::Mebibyte.as_bytes_usize());

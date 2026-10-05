@@ -21,8 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   failure. The value on success is unchanged.
 - `write_to_file` accepted a file opened in append mode. On Linux and Android every write went to
   the end of the file and the final resize cut the result, so `join` returned `Ok` over the wrong
-  bytes. On Unix platforms, an append-mode destination is now rejected with
-  `ErrorKind::InputInvalid` before any request is sent, and the file is left unchanged.
+  bytes. An append-mode destination is now rejected with `ErrorKind::InputInvalid` on every
+  platform, before any request is sent, and the file is left unchanged.
 - `write_to_path` and `download_objects` opened their temporary file with a truncating create. A
   file already at the temporary name was overwritten and published as the download, a symbolic
   link there was followed and its target overwritten, and two downloads to one path that drew

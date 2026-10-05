@@ -1141,7 +1141,11 @@ mod tests {
             .write(true)
             .open(path)
             .unwrap();
-        new_recv_body_with_disk_mode(ScriptedSinkFactory(Arc::clone(script)).create(file, false))
+        new_recv_body_with_disk_mode(
+            ScriptedSinkFactory(Arc::clone(script))
+                .create(file, false)
+                .unwrap(),
+        )
     }
 
     /// A drain that fails part-way returns the runs it wrote before the failing
