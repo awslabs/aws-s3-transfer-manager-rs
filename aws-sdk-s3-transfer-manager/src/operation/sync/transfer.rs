@@ -62,10 +62,58 @@ type KeyOutcome = Result<String, String>;
 
 // Whether a run may remove keys from the destination. Named rather than passed as a bare bool, because
 // a caller reading `true` at a call site cannot see what it turns on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Off by default: the one operation here that destroys data a caller never handed over is the one
+// nobody gets without asking for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum DeleteMode {
     On,
+    #[default]
     Off,
+}
+
+// What a run does when something fails. One answer for the whole run, so a caller reasons about
+// failure once rather than per kind of thing that can go wrong.
+//
+// Continue is the default because a sync converges: it does part of the work and the next run picks
+// up the rest, so stopping at the first failed key throws away progress that the next run has to
+// repeat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum FailurePolicy {
+    #[default]
+    Continue,
+    Abort,
+}
+
+// What a caller chose, as against what the direction decided. Grouped because these answer one
+// question — how this run should behave — where the comparison, the spawner and the deleter answer
+// which direction it goes.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RunSettings {
+    // How many children may be live at once. One slot is a share of what the whole client has, so
+    // whoever starts a run sets it.
+    pub(crate) max_children: usize,
+    pub(crate) delete_mode: DeleteMode,
+    pub(crate) failure_policy: FailurePolicy,
+}
+
+impl Default for RunSettings {
+    fn default() -> Self {
+        Self {
+            max_children: crate::operation::DEFAULT_MAX_CONCURRENT_CHILDREN,
+            delete_mode: DeleteMode::default(),
+            failure_policy: FailurePolicy::default(),
+        }
+    }
+}
+
+// How a run turned out. Three answers rather than two, because a run that met a name nothing could
+// have transferred is not clean and is not broken either, and a caller deciding whether to look into
+// it needs those apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RunOutcome {
+    Failed,
+    Warned,
+    Clean,
 }
 
 // Where keys go when they leave the destination. A third thing that differs by direction, and it
@@ -512,6 +560,11 @@ struct State<S: KeyStream, D: KeyStream> {
     // Capped by `FAILURES_KEPT`; anything past that is counted in `failures_dropped`.
     failures: Vec<StreamError>,
     failures_dropped: u64,
+    // Names nothing could have transferred, which are reported and never acted on. Kept apart from
+    // failures because folding them together would report a run as broken over a name it was never
+    // going to send. Capped like the failures beside them, with the count exact either way.
+    warnings: Vec<StreamError>,
+    warnings_dropped: u64,
     // Why individual keys were not removed, each naming its key. A count alone cannot answer which key
     // survived, which is the question a per-key outcome exists to answer. Capped at `FAILURES_KEPT`,
     // and needing no dropped counter of its own: `delete_failures` already holds the exact total, so
@@ -565,6 +618,9 @@ where
     // How keys leave the destination. A third direction-specific thing, and the one that differs most
     // between a bucket and a local tree.
     deleter: Deleter,
+    // What to do when something fails. Read at every site a failure can arrive, so one answer covers
+    // the run.
+    failure_policy: FailurePolicy,
     // How many children may be live at once. One slot is a share of what the whole client has, so
     // whoever starts a run sets it.
     max_children: usize,
@@ -586,8 +642,7 @@ where
         comparison: &'static (dyn Compare<S::Source, D::Source> + Send + Sync),
         spawner: Arc<dyn SpawnChild<S::Source>>,
         deleter: Deleter,
-        max_children: usize,
-        delete_mode: DeleteMode,
+        settings: RunSettings,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -595,8 +650,9 @@ where
                 comparison,
                 spawner,
                 deleter,
-                max_children: max_children.max(1),
-                delete_mode,
+                max_children: settings.max_children.max(1),
+                delete_mode: settings.delete_mode,
+                failure_policy: settings.failure_policy,
                 state: Mutex::new(State {
                     walk: Some(walk),
                     merge_in_flight: false,
@@ -617,6 +673,8 @@ where
                     failures: Vec::new(),
                     failures_dropped: 0,
                     refusals: Vec::new(),
+                    warnings: Vec::new(),
+                    warnings_dropped: 0,
                 }),
             }),
         }
@@ -670,9 +728,50 @@ where
         PollWork::Pending
     }
 
-    // Signal telling the caller whether the run is over. Answering `Done` with `merge_in_flight`
-    // still set would report a finished run while the scheduler holds a work item, and the keys in
-    // that item would go unreported.
+    // Whether the run is over, and the signal that tells a waiter so. Answering `Done`
+    // while `merge_in_flight` is set would report a finished run with a batch still out, and
+    // the keys in that batch would go unreported.
+    // End the run if the policy says a failure should. The teardown is the one every ended run uses:
+    // `set_failed` takes the run out of the active state, and the next pass through `check_terminal`
+    // answers the waiter and lets the pending batch go. A caller's cancellation travels the same path
+    // and differs only in which status it lands on, which is what a result needs to tell them apart.
+    //
+    // Takes the failure itself rather than a description of it, so a service refusal arrives with its
+    // code, message and request ids intact. A category chosen here would be less than what the site
+    // already had.
+    //
+    // The error that lands is *an* error rather than *the* error: the status is first-write-wins, so
+    // under concurrency whichever site got there first is the one a waiter sees. Every failure is
+    // still in the run's own records, which is where a caller reads the set.
+    //
+    // Must not grow a signal or a wake. Two of the four callers hold the state lock, and a wake runs
+    // `generate_work` into `poll_work`, which takes that same non-reentrant lock. `set_failed` only
+    // compares and swaps a status and writes an error slot, which is why this is safe today; the
+    // signalling variant beside it would not be.
+    fn stop_if_aborting(&self, why: impl Into<crate::error::Error>) {
+        if self.inner.failure_policy == FailurePolicy::Abort {
+            self.inner.ctx.set_failed(why);
+        }
+    }
+
+    // How the run turned out. A failure anywhere outranks a warning, and a warning outranks nothing,
+    // because the three answer different questions: whether to look into it, whether to glance, and
+    // whether to move on.
+    pub(crate) fn outcome(&self) -> RunOutcome {
+        let state = self.inner.state.lock();
+        if !state.failures.is_empty()
+            || state.failures_dropped > 0
+            || state.transfer_failures > 0
+            || state.delete_failures > 0
+        {
+            return RunOutcome::Failed;
+        }
+        if !state.warnings.is_empty() || state.warnings_dropped > 0 {
+            return RunOutcome::Warned;
+        }
+        RunOutcome::Clean
+    }
+
     fn check_terminal(&self, state: &mut State<S, D>) -> Option<PollWork> {
         if !self.inner.ctx.is_active() {
             // Everything dispatched is still owed an answer, however the run ended.
@@ -729,6 +828,10 @@ where
                 // A transfer is only decided for a source that is present, so reaching here means a
                 // comparison answered something it had no grounds for.
                 state.transfer_failures += 1;
+                self.stop_if_aborting(crate::error::Error::new(
+                    crate::error::ErrorKind::RuntimeError,
+                    "a transfer was decided for a key with no source entry",
+                ));
                 continue;
             };
             match self
@@ -740,8 +843,9 @@ where
                     state.children.insert(child.id(), child);
                     return true;
                 }
-                Err(_) => {
+                Err(err) => {
                     state.transfer_failures += 1;
+                    self.stop_if_aborting(err);
                     continue;
                 }
             }
@@ -847,6 +951,16 @@ where
             }
         }
 
+        // Summarised rather than carried: a key S3 refuses is reported inside a successful response
+        // as a code and a message rather than as an error, so there is nothing here to hand over. The
+        // reason naming its key is in the run's own records either way.
+        if let Some(why) = refused.first() {
+            self.stop_if_aborting(crate::error::Error::new(
+                crate::error::ErrorKind::IOError,
+                why.clone(),
+            ));
+        }
+
         let mut state = self.inner.state.lock();
         state.deletes_in_flight -= sent;
         state.deleted += gone;
@@ -870,14 +984,23 @@ where
         let mut moved = 0u64;
         let mut arrived = 0u64;
         let mut failed = 0u64;
+        let mut why = None;
         for child in children {
             match child.join().await {
                 Ok(bytes) => {
                     arrived += 1;
                     moved += bytes;
                 }
-                Err(_) => failed += 1,
+                Err(err) => {
+                    failed += 1;
+                    if why.is_none() {
+                        why = Some(err);
+                    }
+                }
             }
+        }
+        if let Some(why) = why {
+            self.stop_if_aborting(why);
         }
 
         let mut state = self.inner.state.lock();
@@ -962,12 +1085,38 @@ where
         state.plan_incomplete |= deferred;
         state.waiting.append(&mut batch);
         state.pending_deletes.append(&mut pending_deletes);
-        for failure in failures {
+        // A warning and a failure are recorded in different places and only one of them can stop the
+        // run. Both are kept, because a key reported nowhere cannot be told from a key the run never
+        // reached.
+        let mut failed = None;
+        for entry in failures {
+            if entry.is_warning() {
+                if state.warnings.len() < FAILURES_KEPT {
+                    state.warnings.push(entry);
+                } else {
+                    state.warnings_dropped += 1;
+                }
+                continue;
+            }
+            if failed.is_none() {
+                failed = Some(entry.to_string());
+            }
             if state.failures.len() < FAILURES_KEPT {
-                state.failures.push(failure);
+                state.failures.push(entry);
             } else {
                 state.failures_dropped += 1;
             }
+        }
+        // The failure itself goes to the records and a description goes to the waiter, which is the
+        // right way round for one value with two readers. The records are where a caller reads
+        // failures and must hold every one of them; the attached error is one of possibly many,
+        // settled by whichever site got there first. Fidelity belongs to the complete surface, not to
+        // the representative one.
+        if let Some(why) = failed {
+            self.stop_if_aborting(crate::error::Error::new(
+                crate::error::ErrorKind::IOError,
+                why,
+            ));
         }
 
         // Draining the last batch makes this work item the one that ends the run, so it
@@ -1128,8 +1277,11 @@ mod tests {
                 Mode::default().uploading(),
                 Arc::new(SpawnEnded::new(0, false)),
                 Deleter::Recording(Arc::new(RecordDeletes::new(DELETE_BATCH))),
-                2,
-                DeleteMode::On,
+                RunSettings {
+                    max_children: 2,
+                    delete_mode: DeleteMode::On,
+                    failure_policy: FailurePolicy::Continue,
+                },
             ),
             ctx,
         )
@@ -1217,6 +1369,9 @@ mod tests {
     struct SpawnEnded {
         moved: u64,
         fails: bool,
+        // Whether building the child fails, as against the child failing once it runs. The two reach
+        // the parent at different moments and only one of them ever holds a slot.
+        refuses: bool,
         asked: std::sync::atomic::AtomicUsize,
         // Shared by every child it hands out, so a test can hold them all open and then release
         // them together.
@@ -1228,8 +1383,17 @@ mod tests {
             Self {
                 moved,
                 fails,
+                refuses: false,
                 asked: std::sync::atomic::AtomicUsize::new(0),
                 ended: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            }
+        }
+
+        // Refuses to build a child at all.
+        fn refusing_to_spawn() -> Self {
+            Self {
+                refuses: true,
+                ..Self::new(0, false)
             }
         }
 
@@ -1258,6 +1422,12 @@ mod tests {
             _parent: u64,
         ) -> Result<ChildHandle, crate::error::Error> {
             let n = self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.refuses {
+                return Err(crate::error::Error::new(
+                    crate::error::ErrorKind::ObjectNotDiscoverable,
+                    "the child could not be built",
+                ));
+            }
             Ok(ChildHandle {
                 id: crate::transfer::TransferId {
                     id: 900_000 + n as u64,
@@ -1342,8 +1512,11 @@ mod tests {
             &AlwaysDefers,
             Arc::new(SpawnEnded::new(0, false)),
             Deleter::Recording(Arc::new(RecordDeletes::new(DELETE_BATCH))),
-            2,
-            DeleteMode::On,
+            RunSettings {
+                max_children: 2,
+                delete_mode: DeleteMode::On,
+                failure_policy: FailurePolicy::Continue,
+            },
         );
 
         let paired = drive(&transfer).await;
@@ -1436,11 +1609,300 @@ mod tests {
         );
     }
 
+    // A loop is reported and does not make the run look broken, because no setting would have sent it:
+    // following it never terminates, and declining to follow makes it an obstruction the comparison
+    // handles. The same run under abort keeps going for the same reason — stopping here would cost
+    // every other key for something sync was never going to send.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn a_loop_warns_under_either_policy() {
+        for policy in [FailurePolicy::Continue, FailurePolicy::Abort] {
+            let dir = tempfile::tempdir().expect("a temp dir");
+            std::fs::write(dir.path().join("a.txt"), b"x").expect("a file");
+            let inner = dir.path().join("down");
+            std::fs::create_dir(&inner).expect("a directory");
+            // A link back to the directory above it, which has no end to follow.
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(dir.path(), inner.join("up")).expect("a symlink");
+
+            let client = a_bucket_holding(&[]);
+            let config = crate::Config::builder().client(client.clone()).build();
+            let handle = crate::client::Handle::test_handle_tokio(config);
+            let (ctx, _rx) = TransferContext::new(handle);
+            let walk = Walker::builder()
+                .follow_symlinks(true)
+                .build()
+                .uploading(
+                    LocalAndBucket::builder()
+                        .local_root(dir.path())
+                        .client(client)
+                        .bucket("amzn-s3-demo-bucket")
+                        .build(),
+                )
+                .expect("an ordinary bucket builds");
+            let transfer = SyncTransfer::new(
+                ctx.clone(),
+                walk,
+                Mode::default().uploading(),
+                Arc::new(SpawnEnded::new(0, false)),
+                Deleter::Recording(Arc::new(RecordDeletes::new(DELETE_BATCH))),
+                RunSettings {
+                    max_children: 2,
+                    delete_mode: DeleteMode::On,
+                    failure_policy: policy,
+                },
+            );
+
+            drive(&transfer).await;
+
+            let state = transfer.inner.state.lock();
+            assert_eq!(
+                state.warnings.len(),
+                1,
+                "under {policy:?} the loop was not kept where a caller can read it"
+            );
+            assert!(
+                state.failures.is_empty(),
+                "a loop nothing could transfer was filed as a failure: {:?}",
+                state.failures
+            );
+            drop(state);
+            assert_eq!(
+                transfer.outcome(),
+                RunOutcome::Warned,
+                "under {policy:?} the run did not report a warning"
+            );
+            assert!(
+                !ctx.is_failed(),
+                "an aborting run failed over something it was never going to send"
+            );
+        }
+    }
+
+    // A failure is the other half of that split, and under abort it ends the run. The teardown is the
+    // one every ended run uses, so the pending batch goes the same way a cancellation would send it.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn a_failure_ends_an_aborting_run_and_lets_its_batch_go() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let deleter = Arc::new(RecordDeletes::refusing(DELETE_BATCH));
+        let (transfer, ctx) = deleting_with_policy(
+            dir.path(),
+            &["gone-a.txt", "gone-b.txt"],
+            deleter.clone(),
+            DeleteMode::On,
+            FailurePolicy::Abort,
+        );
+
+        drive(&transfer).await;
+
+        assert_eq!(
+            transfer.outcome(),
+            RunOutcome::Failed,
+            "a refused delete did not make the run report a failure"
+        );
+        // Not `!is_active`, which a run that completed normally also satisfies. What distinguishes an
+        // aborted run from a finished one is the status it lands on, and that is what a caller reads.
+        assert!(
+            ctx.is_failed(),
+            "a refused delete ended an aborting run without recording it as failed"
+        );
+        assert!(
+            transfer.inner.state.lock().pending_deletes.is_empty(),
+            "an ended run kept keys judged against a stream it stopped reading"
+        );
+    }
+
+    // The same refusal under the default policy leaves the run going, which is the whole reason the
+    // default is what it is: a sync converges, so one refused key is not worth the rest of the work.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn the_same_failure_leaves_a_continuing_run_going() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let deleter = Arc::new(RecordDeletes::refusing(DELETE_BATCH));
+        let (transfer, ctx) = deleting_with_policy(
+            dir.path(),
+            &["gone-a.txt", "gone-b.txt"],
+            deleter.clone(),
+            DeleteMode::On,
+            FailurePolicy::Continue,
+        );
+
+        drive(&transfer).await;
+
+        assert_eq!(transfer.outcome(), RunOutcome::Failed);
+        assert_eq!(
+            deleter.keys_sent(),
+            2,
+            "a continuing run stopped before asking about every key"
+        );
+        assert!(
+            !ctx.is_active(),
+            "the run should have completed rather than stayed open"
+        );
+        assert!(
+            !ctx.is_failed(),
+            "a continuing run reported itself as failed"
+        );
+    }
+
+    // The fourth site, and the one where a warning and a failure arrive through the same channel: a
+    // listing that left out a field a comparison needs should have carried it, so it is a failure and
+    // it stops an aborting run — where the loop above, on the same channel, does not.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn a_badly_described_key_ends_an_aborting_run() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        // No last-modified, which is what the walk calls a malformed listing.
+        let rule = mock!(aws_sdk_s3::Client::list_objects_v2).then_output(|| {
+            ListObjectsV2Output::builder()
+                .set_contents(Some(vec![Object::builder().key("d.txt").size(0).build()]))
+                .build()
+        });
+        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&rule]);
+        let config = crate::Config::builder().client(client.clone()).build();
+        let handle = crate::client::Handle::test_handle_tokio(config);
+        let (ctx, _rx) = TransferContext::new(handle);
+        let walk = Walker::builder()
+            .build()
+            .uploading(
+                LocalAndBucket::builder()
+                    .local_root(dir.path())
+                    .client(client)
+                    .bucket("amzn-s3-demo-bucket")
+                    .build(),
+            )
+            .expect("an ordinary bucket builds");
+        let transfer = SyncTransfer::new(
+            ctx.clone(),
+            walk,
+            Mode::default().uploading(),
+            Arc::new(SpawnEnded::new(0, false)),
+            Deleter::Recording(Arc::new(RecordDeletes::new(DELETE_BATCH))),
+            RunSettings {
+                max_children: 2,
+                delete_mode: DeleteMode::On,
+                failure_policy: FailurePolicy::Abort,
+            },
+        );
+
+        drive(&transfer).await;
+
+        assert_eq!(transfer.outcome(), RunOutcome::Failed);
+        assert!(
+            ctx.is_failed(),
+            "a failure on the walk's own channel did not end an aborting run"
+        );
+    }
+
+    // One policy means every site asks it, so each site needs its own proof. A child that failed after
+    // it started reaches the parent at the reap, which is a different moment from a child that could
+    // never be built.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn a_child_that_failed_ends_an_aborting_run() {
+        for (policy, expect_failed) in [
+            (FailurePolicy::Continue, false),
+            (FailurePolicy::Abort, true),
+        ] {
+            let dir = tempfile::tempdir().expect("a temp dir");
+            a_local_tree(dir.path(), &["a.txt", "b.txt"]);
+            let (transfer, ctx) = with_spawner(dir.path(), SpawnEnded::new(0, true), policy);
+
+            drive(&transfer).await;
+
+            assert!(
+                transfer.inner.state.lock().transfer_failures > 0,
+                "under {policy:?} the failed child was not counted"
+            );
+            assert_eq!(
+                ctx.is_failed(),
+                expect_failed,
+                "under {policy:?} the run's status does not match the policy"
+            );
+        }
+    }
+
+    // A site holding a real failure hands it over rather than a category of it, so a caller reads the
+    // reason the site had. The kind is the test's subject because that is what a synthesized error
+    // would have replaced.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn an_aborting_run_keeps_the_failure_the_site_had() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        a_local_tree(dir.path(), &["a.txt"]);
+        let (transfer, ctx) = with_spawner(
+            dir.path(),
+            SpawnEnded::refusing_to_spawn(),
+            FailurePolicy::Abort,
+        );
+
+        drive(&transfer).await;
+
+        let err = ctx.take_error().expect("an aborting run attached no error");
+        // A kind sync never synthesizes, so this can only have come from the site that refused.
+        assert_eq!(
+            *err.kind(),
+            crate::error::ErrorKind::ObjectNotDiscoverable,
+            "the run replaced the site's failure with a category of its own"
+        );
+    }
+
+    // The other moment: a child that could not be built at all. It holds no slot and never reaches
+    // the reap, so the site that reports it is the spawn itself.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn a_child_that_could_not_be_built_ends_an_aborting_run() {
+        for (policy, expect_failed) in [
+            (FailurePolicy::Continue, false),
+            (FailurePolicy::Abort, true),
+        ] {
+            let dir = tempfile::tempdir().expect("a temp dir");
+            a_local_tree(dir.path(), &["a.txt", "b.txt"]);
+            let (transfer, ctx) = with_spawner(dir.path(), SpawnEnded::refusing_to_spawn(), policy);
+
+            drive(&transfer).await;
+
+            assert!(
+                transfer.inner.state.lock().transfer_failures > 0,
+                "under {policy:?} the refused spawn was not counted"
+            );
+            assert_eq!(
+                ctx.is_failed(),
+                expect_failed,
+                "under {policy:?} the run's status does not match the policy"
+            );
+        }
+    }
+
+    // Nothing wrong at all is the third answer, and it has to be reachable or the other two mean
+    // nothing.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn a_run_with_nothing_wrong_reports_clean() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let deleter = Arc::new(RecordDeletes::new(DELETE_BATCH));
+        let (transfer, _ctx) = deleting(dir.path(), &["gone.txt"], deleter);
+
+        drive(&transfer).await;
+
+        assert_eq!(transfer.outcome(), RunOutcome::Clean);
+    }
+
+    // The defaults are the answer a caller gets without saying anything, and both are chosen rather
+    // than inherited: deletion off because it destroys data nobody handed over, failure handling on
+    // continue because a sync converges.
+    #[test]
+    fn the_defaults_are_continue_and_no_deleting() {
+        assert_eq!(FailurePolicy::default(), FailurePolicy::Continue);
+        assert_eq!(DeleteMode::default(), DeleteMode::Off);
+    }
+
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn a_key_the_listing_described_badly_is_kept_as_a_failure() {
         let dir = tempfile::tempdir().expect("a temp dir");
-        // No last-modified. The walk calls such a listing malformed.
+        // No last-modified, which is what the walk calls a malformed listing.
         let rule = mock!(aws_sdk_s3::Client::list_objects_v2).then_output(|| {
             ListObjectsV2Output::builder()
                 .set_contents(Some(vec![Object::builder().key("d.txt").size(0).build()]))
@@ -1466,8 +1928,11 @@ mod tests {
             Mode::default().uploading(),
             Arc::new(SpawnEnded::new(0, false)),
             Deleter::Recording(Arc::new(RecordDeletes::new(DELETE_BATCH))),
-            2,
-            DeleteMode::On,
+            RunSettings {
+                max_children: 2,
+                delete_mode: DeleteMode::On,
+                failure_policy: FailurePolicy::Continue,
+            },
         );
 
         assert_eq!(
@@ -1556,8 +2021,11 @@ mod tests {
             Mode::default().uploading(),
             Arc::new(SpawnEnded::new(0, false)),
             Deleter::Recording(Arc::new(RecordDeletes::new(DELETE_BATCH))),
-            2,
-            DeleteMode::On,
+            RunSettings {
+                max_children: 2,
+                delete_mode: DeleteMode::On,
+                failure_policy: FailurePolicy::Continue,
+            },
         );
 
         ctx.handle
@@ -1641,8 +2109,11 @@ mod tests {
             Mode::default().uploading(),
             Arc::new(SpawnEnded::new(0, false)),
             Deleter::Recording(Arc::new(RecordDeletes::new(DELETE_BATCH))),
-            2,
-            DeleteMode::On,
+            RunSettings {
+                max_children: 2,
+                delete_mode: DeleteMode::On,
+                failure_policy: FailurePolicy::Continue,
+            },
         );
 
         let mut work = match transfer.poll_work() {
@@ -1774,8 +2245,11 @@ mod tests {
             Mode::default().uploading(),
             spawner,
             Deleter::Recording(Arc::new(RecordDeletes::new(DELETE_BATCH))),
-            cap,
-            DeleteMode::On,
+            RunSettings {
+                max_children: cap,
+                delete_mode: DeleteMode::On,
+                failure_policy: FailurePolicy::Continue,
+            },
         );
         (transfer, ctx)
     }
@@ -1965,8 +2439,11 @@ mod tests {
             &AlwaysTransfers,
             spawner.clone(),
             Deleter::Recording(Arc::new(RecordDeletes::new(DELETE_BATCH))),
-            4,
-            DeleteMode::On,
+            RunSettings {
+                max_children: 4,
+                delete_mode: DeleteMode::On,
+                failure_policy: FailurePolicy::Continue,
+            },
         );
 
         // `drive` panics on `Pending`, and a stranded buffer produces a `Pending`.
@@ -2060,8 +2537,11 @@ mod tests {
                 Some("data"),
             )),
             Deleter::Recording(Arc::new(RecordDeletes::new(DELETE_BATCH))),
-            4,
-            DeleteMode::On,
+            RunSettings {
+                max_children: 4,
+                delete_mode: DeleteMode::On,
+                failure_policy: FailurePolicy::Continue,
+            },
         );
 
         ctx.handle
@@ -2088,6 +2568,78 @@ mod tests {
         deleter: Arc<RecordDeletes>,
     ) -> (SyncTransfer<FsWalk, S3Walk>, TransferContext) {
         deleting_with(local, bucket_keys, deleter, DeleteMode::On)
+    }
+
+    // A transfer whose spawner is a test's subject, against an empty bucket so every local key is sent.
+    fn with_spawner(
+        local: &Path,
+        spawner: SpawnEnded,
+        failure_policy: FailurePolicy,
+    ) -> (SyncTransfer<FsWalk, S3Walk>, TransferContext) {
+        let client = a_bucket_holding(&[]);
+        let config = crate::Config::builder().client(client.clone()).build();
+        let handle = crate::client::Handle::test_handle_tokio(config);
+        let (ctx, _rx) = TransferContext::new(handle);
+        let walk = Walker::builder()
+            .build()
+            .uploading(
+                LocalAndBucket::builder()
+                    .local_root(local)
+                    .client(client)
+                    .bucket("amzn-s3-demo-bucket")
+                    .build(),
+            )
+            .expect("an ordinary bucket builds");
+        let transfer = SyncTransfer::new(
+            ctx.clone(),
+            walk,
+            Mode::default().uploading(),
+            Arc::new(spawner),
+            Deleter::Recording(Arc::new(RecordDeletes::new(DELETE_BATCH))),
+            RunSettings {
+                max_children: 4,
+                delete_mode: DeleteMode::On,
+                failure_policy,
+            },
+        );
+        (transfer, ctx)
+    }
+
+    // The same, with the policy a test's subject.
+    fn deleting_with_policy(
+        local: &Path,
+        bucket_keys: &[&str],
+        deleter: Arc<RecordDeletes>,
+        delete_mode: DeleteMode,
+        failure_policy: FailurePolicy,
+    ) -> (SyncTransfer<FsWalk, S3Walk>, TransferContext) {
+        let client = a_bucket_holding(bucket_keys);
+        let config = crate::Config::builder().client(client.clone()).build();
+        let handle = crate::client::Handle::test_handle_tokio(config);
+        let (ctx, _rx) = TransferContext::new(handle);
+        let walk = Walker::builder()
+            .build()
+            .uploading(
+                LocalAndBucket::builder()
+                    .local_root(local)
+                    .client(client)
+                    .bucket("amzn-s3-demo-bucket")
+                    .build(),
+            )
+            .expect("an ordinary bucket builds");
+        let transfer = SyncTransfer::new(
+            ctx.clone(),
+            walk,
+            Mode::default().uploading(),
+            Arc::new(SpawnEnded::new(0, false)),
+            Deleter::Recording(deleter),
+            RunSettings {
+                max_children: 4,
+                delete_mode,
+                failure_policy,
+            },
+        );
+        (transfer, ctx)
     }
 
     // The same, with the mode a test's subject.
@@ -2117,8 +2669,11 @@ mod tests {
             Mode::default().uploading(),
             Arc::new(SpawnEnded::new(0, false)),
             Deleter::Recording(deleter),
-            4,
-            delete_mode,
+            RunSettings {
+                max_children: 4,
+                delete_mode,
+                failure_policy: FailurePolicy::Continue,
+            },
         );
         (transfer, ctx)
     }
@@ -2484,8 +3039,11 @@ mod tests {
             Mode::default().uploading(),
             spawner,
             Deleter::Recording(Arc::new(RecordDeletes::new(DELETE_BATCH))),
-            4,
-            DeleteMode::On,
+            RunSettings {
+                max_children: 4,
+                delete_mode: DeleteMode::On,
+                failure_policy: FailurePolicy::Continue,
+            },
         );
 
         ctx.handle

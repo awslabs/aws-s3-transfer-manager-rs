@@ -630,14 +630,12 @@ impl From<crate::io::walk::WalkError> for Error {
     /// `WalkError` as the source so its classification and path remain reachable
     /// via [`std::error::Error::source`].
     ///
-    /// A `ListObjectsV2` service failure is recovered to a full
-    /// [`ErrorKind::ServiceError`] (with operation, code, and request ids); an
-    /// unreadable or non-directory source root is [`ErrorKind::InputInvalid`];
-    /// per-entry filesystem failures and unreadable subdirectories are
-    /// [`ErrorKind::IOError`].
+    /// The kind names its own category, so the mapping lives with the kind and not here. A
+    /// `ListObjectsV2` service failure takes the one extra step: recovering its operation, code
+    /// and request ids needs the error by value, which naming a category does not.
     ///
-    /// A subdirectory that turns out not to be a directory between being listed and being read is
-    /// one of the latter. It used to be [`ErrorKind::InputInvalid`] and end the walk, because the
+    /// A subdirectory that turns out not to be a directory between being listed and being read
+    /// reads as a filesystem failure. It used to be invalid input and end the walk, because the
     /// kind came from the error itself rather than from where it happened; a walk that has already
     /// produced entries has no reason to stop over one name, so it now costs the keys beneath that
     /// directory instead of the run.
@@ -649,25 +647,28 @@ impl From<crate::io::walk::WalkError> for Error {
         use crate::io::walk::WalkErrorKind;
         match e.kind() {
             WalkErrorKind::Service => {
-                // The S3 walker's only service call is ListObjectsV2, so the
-                // boxed source downcasts to that SdkError.
-                match e.into_source().downcast::<SdkError<
+                // The S3 walker's only service call is ListObjectsV2, so an unretried send's boxed
+                // source downcasts to that SdkError.
+                let source = e.into_source();
+                match source.downcast::<SdkError<
                     ListObjectsV2Error,
                     aws_smithy_runtime_api::client::orchestrator::HttpResponse,
                 >>() {
                     Ok(sdk) => Error::from(*sdk),
-                    Err(src) => Error::new(ErrorKind::ObjectNotDiscoverable, src),
+                    // A retried send arrives already converted, because the classifier that decides
+                    // whether to send again reads the service code, and only the conversion carries
+                    // it. Taking that error as it is keeps the operation, code and request ids that
+                    // the fallback below would drop.
+                    Err(source) => match source.downcast::<Error>() {
+                        Ok(converted) => *converted,
+                        Err(source) => Error::new(ErrorKind::ObjectNotDiscoverable, source),
+                    },
                 }
             }
-            WalkErrorKind::SourceUnreadable | WalkErrorKind::NotADirectory => {
-                Error::new(ErrorKind::InputInvalid, e)
-            }
-            WalkErrorKind::Io
-            | WalkErrorKind::Vanished
-            | WalkErrorKind::PermissionDenied
-            | WalkErrorKind::DirectoryUnreadable
-            | WalkErrorKind::BrokenSymlink
-            | WalkErrorKind::SymlinkCycle => Error::new(ErrorKind::IOError, e),
+            // Every other kind takes the category the kind itself names. The service arm above is
+            // separate because recovering its metadata needs the error by value, where naming a
+            // category needs only the kind.
+            other => Error::new(other.category(), e),
         }
     }
 }
