@@ -260,7 +260,8 @@ mod tests {
         let stream = InputStream::from(Vec::<u8>::new());
         let (ctx, completion_rx) = TransferContext::new(handle);
         let transfer =
-            UploadTransfer::try_new(ctx.clone(), BucketType::Standard, input, stream).unwrap();
+            UploadTransfer::try_new(ctx.clone(), BucketType::Standard, input, stream, None)
+                .unwrap();
 
         // Drive to Cancelled terminal state.
         ctx.set_cancelled();

@@ -33,6 +33,23 @@ impl From<DownloadPendingReason> for PendingCause {
     }
 }
 
+impl From<DownloadPendingReason> for crate::types::StallReason {
+    /// The public name for the same cause the aggregate diagnostics record.
+    ///
+    /// Derived rather than set alongside, so a park site names its cause once. Two
+    /// vocabularies set independently drift: a site that records one and forgets the
+    /// other leaves a consumer reading "no reason" on a transfer that is demonstrably
+    /// parked, and nothing fails to compile.
+    fn from(reason: DownloadPendingReason) -> Self {
+        match reason {
+            DownloadPendingReason::Discovery => Self::PendingDiscovery {},
+            DownloadPendingReason::ReadAhead => Self::ReadAheadWindow {},
+            DownloadPendingReason::MemoryAdmission => Self::MemoryBudget {},
+            DownloadPendingReason::RangeCompletion => Self::AwaitingCompletion {},
+        }
+    }
+}
+
 /// A claimed slot waiting for shared memory admission.
 ///
 /// The read-ahead gate already counted the slot as issued. Dropping this value

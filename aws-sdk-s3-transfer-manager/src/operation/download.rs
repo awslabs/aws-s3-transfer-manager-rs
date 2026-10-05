@@ -55,12 +55,63 @@ use std::sync::Arc;
 #[derive(Clone, Default, Debug)]
 pub(crate) struct Download;
 
+/// Where a download's events go, and the end it writes to.
+///
+/// One value rather than two parameters: a sink is only ever useful alongside the
+/// destination to report with it, and only the entry point that chose the
+/// destination knows what it is — a file for `write_to_path`, the caller's own body
+/// for a streaming download.
+pub(crate) struct EventRegistration {
+    pub(crate) sink: crate::events::TransferEventSink,
+    pub(crate) destination: crate::events::Endpoint,
+}
+
+/// The file a download writes into, and the two facts that only travel with it.
+///
+/// Grouped rather than passed as two parameters because neither is meaningful without
+/// the other: the file is the destination and `owns_file` says who closes it. Keeping
+/// them together is also what holds [`Download::orchestrate_with_sink`] inside clippy's
+/// argument limit now that the listing's `known_size` travels with it.
+///
+/// The object-range origin is not here: the writer learns it from discovery through
+/// `BodyWriter::prepare`, which is the only point at which a ranged download's origin is
+/// known.
+pub(crate) struct FileSink {
+    pub(crate) file: std::fs::File,
+    /// `true` when the transfer manager created the file and must clean it up (the
+    /// temp-file-then-rename path); `false` when the caller opened it and owns it.
+    pub(crate) owns_file: bool,
+}
+
 impl Download {
+    fn lifecycle_for(
+        ctx: &crate::transfer::TransferContext,
+        input: &DownloadInput,
+        events: Option<EventRegistration>,
+    ) -> Option<Arc<crate::events::TransferLifecycle>> {
+        events.map(|reg| {
+            Arc::new(crate::events::TransferLifecycle::new(
+                reg.sink,
+                ctx.id.id,
+                None,
+                crate::events::TransferRef::download(
+                    crate::events::Endpoint::S3 {
+                        bucket: Arc::from(input.bucket().unwrap_or_default()),
+                        key: Arc::from(input.key().unwrap_or_default()),
+                    },
+                    reg.destination,
+                ),
+                Some(ctx.view()),
+            ))
+        })
+    }
+
     /// Execute a single `Download` transfer operation
     pub(crate) fn orchestrate(
         handle: Arc<crate::client::Handle>,
         input: DownloadInput,
         _use_current_span_as_parent_for_tasks: bool,
+        events: Option<EventRegistration>,
     ) -> Result<DownloadHandle, error::Error> {
         use crate::transfer::TransferContext;
 
@@ -75,7 +126,20 @@ impl Download {
 
         let (ctx, completion_rx) = TransferContext::new(handle.clone());
 
-        let transfer = DownloadTransfer::new(ctx.clone(), bucket_type, input, writer);
+        // A streaming download has no local path: the caller owns the body, so there is
+        // no destination of its own to commit to.
+        let lifecycle = Self::lifecycle_for(&ctx, &input, events);
+        let transfer = DownloadTransfer::new(
+            ctx.clone(),
+            bucket_type,
+            input,
+            writer,
+            lifecycle.clone(),
+            None,
+        );
+        if let Some(lc) = &lifecycle {
+            lc.announce();
+        }
         handle
             .scheduler
             .enqueue_transfer(Box::new(transfer.clone()));
@@ -85,14 +149,15 @@ impl Download {
 
     /// Orchestrate a download that writes to a file path (temp file + rename).
     ///
-    /// When `parent_id` is `Some`, the transfer is linked as a child of the
+    /// When `parent` is `Some`, the transfer is linked as a child of the
     /// given composite transfer via [`TransferContext::new_child`](crate::transfer::TransferContext::new_child).
     #[cfg(any(unix, windows))]
     pub(crate) async fn orchestrate_to_path(
         handle: Arc<crate::client::Handle>,
         input: DownloadInput,
         dest_path: std::path::PathBuf,
-        parent_id: Option<u64>,
+        parent: Option<&crate::transfer::TransferContext>,
+        events: Option<EventRegistration>,
     ) -> Result<ManagedDownloadHandle, error::Error> {
         // Generate temp file in the same directory as destination
         let unique_id = fastrand::u32(..);
@@ -108,8 +173,23 @@ impl Download {
             .map_err(|e| error::from_kind(error::ErrorKind::IOError)(e))?;
         let file = tokio_file.into_std().await;
 
-        let inner = Self::orchestrate_with_sink(handle, input, file, true, parent_id)?;
-        Ok(ManagedDownloadHandle::new(inner, temp_path, dest_path))
+        // No listing behind this entry point, so the size comes from discovery as before.
+        let inner = Self::orchestrate_with_sink(
+            handle,
+            input,
+            FileSink {
+                file,
+                owns_file: true,
+            },
+            parent,
+            events,
+            None,
+            Some(transfer::CommitTarget {
+                temp: temp_path.clone(),
+                dest: dest_path,
+            }),
+        )?;
+        Ok(ManagedDownloadHandle::new(inner, temp_path))
     }
 
     /// Orchestrate a download that writes to a caller-provided file.
@@ -118,20 +198,39 @@ impl Download {
         handle: Arc<crate::client::Handle>,
         input: DownloadInput,
         file: std::fs::File,
+        events: Option<EventRegistration>,
     ) -> Result<ManagedDownloadHandle, error::Error> {
-        let inner = Self::orchestrate_with_sink(handle, input, file, false, None)?;
-        // No temp/dest paths — caller manages the file lifecycle
+        let inner = Self::orchestrate_with_sink(
+            handle,
+            input,
+            FileSink {
+                file,
+                owns_file: false,
+            },
+            None,
+            events,
+            None,
+            None,
+        )?;
+        // No temp path and nothing to commit — caller manages the file lifecycle
         Ok(ManagedDownloadHandle::new_unmanaged(inner))
     }
 
     /// Shared orchestration for file-sink downloads.
+    ///
+    /// `known_size` is the object's size when the caller already learned it — a composite
+    /// has it from its listing. Seeding it here rather than waiting for discovery is what
+    /// gives the entry a byte denominator it keeps even if its own `GetObject` never
+    /// succeeds; see the note at the `set_total_bytes` call below.
     #[cfg(any(unix, windows))]
     pub(crate) fn orchestrate_with_sink(
         handle: Arc<crate::client::Handle>,
         input: DownloadInput,
-        file: std::fs::File,
-        owns_file: bool,
-        parent_id: Option<u64>,
+        sink: FileSink,
+        parent: Option<&crate::transfer::TransferContext>,
+        events: Option<EventRegistration>,
+        known_size: Option<u64>,
+        commit: Option<transfer::CommitTarget>,
     ) -> Result<DownloadHandleInner, error::Error> {
         use crate::transfer::TransferContext;
 
@@ -142,14 +241,41 @@ impl Download {
         let bucket_type =
             BucketType::from_bucket_name(input.bucket().expect("bucket is available"));
 
-        let (writer, _consumer) = body::new_recv_body_with_sink(file, owns_file);
+        let (writer, _consumer) = body::new_recv_body_with_sink(sink.file, sink.owns_file);
 
-        let (ctx, completion_rx) = match parent_id {
-            Some(pid) => TransferContext::new_child(handle.clone(), pid),
+        let (ctx, completion_rx) = match parent {
+            Some(parent) => TransferContext::new_child(handle.clone(), parent),
             None => TransferContext::new(handle.clone()),
         };
 
-        let transfer = DownloadTransfer::new(ctx.clone(), bucket_type, input, writer);
+        // Before `enqueue_transfer`, so the value is in place by the time the transfer can be
+        // polled and no reader sees an entry with no denominator at all.
+        //
+        // The listed size is what the entry is *expected* to move. An object refused before
+        // its first body byte — a 403, an integrity failure — never reaches discovery, so
+        // without this its denominator would stay `Unknown` and a consumer could not tell how
+        // much that entry failed to transfer. That shortfall is what the AWS CLI banks into
+        // `bytes_failed_to_transfer` to reach 100% on a run with failures.
+        //
+        // `set_expected_bytes` and not `set_total_bytes`: see its doc comment. The short
+        // version is that the listed size is an estimate until the object is opened, so it
+        // reads `Provisional` and discovery still gets to publish the real total.
+        if let Some(size) = known_size {
+            ctx.set_expected_bytes(size);
+        }
+
+        let lifecycle = Self::lifecycle_for(&ctx, &input, events);
+        let transfer = DownloadTransfer::new(
+            ctx.clone(),
+            bucket_type,
+            input,
+            writer,
+            lifecycle.clone(),
+            commit,
+        );
+        if let Some(lc) = &lifecycle {
+            lc.announce();
+        }
         handle
             .scheduler
             .enqueue_transfer(Box::new(transfer.clone()));

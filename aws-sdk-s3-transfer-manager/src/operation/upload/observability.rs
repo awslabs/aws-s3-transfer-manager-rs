@@ -1290,6 +1290,7 @@ mod tests {
             network_rx: 0,
             disk_read: 0,
             disk_write: 0,
+            bytes_streamed: 0,
             total_bytes: Some(8 * 1024 * 1024),
             started_at: now,
             finished_at: Some(now),

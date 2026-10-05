@@ -72,6 +72,28 @@ struct DownloadTransferInner {
     expected_download_len: std::sync::OnceLock<u64>,
     /// Notified when discovery completes (success or failure)
     discovery_notify: tokio::sync::Notify,
+    /// Lifecycle emitter, `None` unless a caller registered a sink.
+    lifecycle: Option<Arc<crate::events::TransferLifecycle>>,
+    /// Where the downloaded bytes are committed, for a managed path download.
+    ///
+    /// `None` for a caller-supplied file or a streamed body: those have no commit
+    /// step of their own, so their terminal status already means what it says the
+    /// moment the tail is flushed.
+    commit: Option<CommitTarget>,
+}
+
+/// The rename that makes a managed path download's bytes reachable at the
+/// destination the caller named.
+///
+/// This lives on the transfer rather than on the handle because every path that
+/// reports the transfer reads its status and cannot join it. A rename performed in
+/// `join()` is reachable only by the one caller who joins, so every other reader —
+/// a metrics snapshot, an event consumer, the orphan drain — sees `Completed` for a
+/// destination that does not exist yet.
+#[derive(Debug, Clone)]
+pub(crate) struct CommitTarget {
+    pub(crate) temp: std::path::PathBuf,
+    pub(crate) dest: std::path::PathBuf,
 }
 
 /// Download-specific work data.
@@ -107,6 +129,8 @@ impl DownloadTransfer {
         bucket_type: BucketType,
         input: DownloadInput,
         writer: BodyWriter,
+        lifecycle: Option<Arc<crate::events::TransferLifecycle>>,
+        commit: Option<CommitTarget>,
     ) -> Self {
         // Resolve the read-ahead knob (per-request override, else client default)
         // to a window in parts before `ctx` and `input` are moved into the struct.
@@ -135,6 +159,8 @@ impl DownloadTransfer {
             integrity_checks: std::sync::OnceLock::new(),
             expected_download_len: std::sync::OnceLock::new(),
             discovery_notify: tokio::sync::Notify::new(),
+            lifecycle,
+            commit,
         });
         Self { inner }
     }
@@ -306,6 +332,11 @@ impl DownloadTransfer {
             tracing::debug!("not active, returning Done");
             return PollWork::Done;
         }
+        // Cleared at entry and set again by whichever park site this poll reaches, so the
+        // reason describes the most recent poll rather than the last one that happened to
+        // park. Without the clear, a transfer that parked once would report that reason for
+        // the rest of its life, including while moving bytes.
+        self.inner.ctx.set_stall(None);
 
         let mut state = self.inner.state.lock().unwrap();
 
@@ -318,6 +349,11 @@ impl DownloadTransfer {
                 })
             }
             DownloadState::DiscoveryInFlight => {
+                self.inner
+                    .ctx
+                    .set_stall(Some(crate::types::StallReason::from(
+                        DownloadPendingReason::Discovery,
+                    )));
                 self.inner.ctx.set_pending(DownloadPendingReason::Discovery);
                 self.inner
                     .observability
@@ -508,7 +544,11 @@ impl DownloadTransfer {
     /// waker re-readies it: the consumer freeing occupancy, or a GET
     /// completion decrementing the in-flight count. Memory reservations use their
     /// own scheduler-backed task waker.
+    ///
+    /// The cause is named once and reaches both readers: the aggregate diagnostics and
+    /// the public [`StallReason`](crate::types::StallReason) a view reports.
     fn park(&self, reason: DownloadPendingReason, snapshot: DownloadStateSnapshot) -> PollWork {
+        self.inner.ctx.set_stall(Some(reason.into()));
         self.inner.ctx.set_pending(reason);
         self.inner.observability.observe_state(snapshot);
         PollWork::Pending
@@ -539,6 +579,14 @@ impl DownloadTransfer {
                 data: Some(Box::new(DownloadWork::DrainResident)),
             })
         } else {
+            // Not routed through `park`: the reservation future has already registered
+            // its own waker, so this path arms the pending state without park's wake
+            // contract. The public cause still has to be set, by the same derivation.
+            self.inner
+                .ctx
+                .set_stall(Some(crate::types::StallReason::from(
+                    DownloadPendingReason::MemoryAdmission,
+                )));
             self.inner
                 .ctx
                 .set_pending(DownloadPendingReason::MemoryAdmission);
@@ -962,6 +1010,7 @@ impl DownloadTransfer {
                     reservation,
                     expected_len,
                     || ctx.is_active(),
+                    |n| ctx.record_bytes_streamed(n),
                 )
                 .await
                 .map_err(crate::retry::GuardError::Inner)
@@ -1111,6 +1160,7 @@ impl DownloadTransfer {
                         reservation,
                         expected_len,
                         || ctx.is_active(),
+                        |n| ctx.record_bytes_streamed(n),
                     )
                     .await
                     .map_err(crate::retry::GuardError::Inner)?;
@@ -1276,6 +1326,12 @@ impl DownloadTransfer {
             let guard = self.inner.state.lock().unwrap();
             return self.fail(guard, error::Error::new(error::ErrorKind::IOError, e));
         }
+        // Commit before the status, not after: `join()` is the only caller that could
+        // rename afterwards, and no reporting path can call it.
+        if let Err(e) = self.commit_destination() {
+            let guard = self.inner.state.lock().unwrap();
+            return self.fail(guard, error::Error::new(error::ErrorKind::IOError, e));
+        }
         let state_snapshot = {
             let state = self.inner.state.lock().expect("lock poisoned");
             self.snapshot(&state)
@@ -1292,6 +1348,18 @@ impl DownloadTransfer {
         self.report_terminal(state_snapshot);
         self.inner.ctx.signal_terminal();
         WorkOutcome::Success { data: None }
+    }
+
+    /// Make the downloaded bytes reachable at the destination the caller named.
+    ///
+    /// Runs immediately before the completed status on every path that sets it, so no
+    /// reporting path can observe `Completed` for a destination that does not exist. A
+    /// no-op when the caller owns the file.
+    fn commit_destination(&self) -> std::io::Result<()> {
+        match &self.inner.commit {
+            Some(target) => std::fs::rename(&target.temp, &target.dest),
+            None => Ok(()),
+        }
     }
 
     /// Transition to terminal failed state. Requires holding the work lock.
@@ -1335,6 +1403,13 @@ impl DownloadTransfer {
             .observability
             .destination_finalized(&finalization);
         if let Err(e) = finalization {
+            self.fail(guard, error::Error::new(error::ErrorKind::IOError, e));
+            return;
+        }
+        // Same ordering as `finalize_completion`. The rename runs under the state guard
+        // here because `writer.finalize` above already does, and a rename is a cheaper
+        // metadata operation than the flush it follows.
+        if let Err(e) = self.commit_destination() {
             self.fail(guard, error::Error::new(error::ErrorKind::IOError, e));
             return;
         }
@@ -1394,6 +1469,13 @@ impl Transfer for DownloadTransfer {
         self.inner.observability.terminal_drain_completed(&drain);
         self.inner.writer.notify_consumer();
         self.report_terminal(snapshot);
+
+        // The terminal event, from the same hook every removal path reaches.
+        if let Some(lc) = &self.inner.lifecycle {
+            if let Some(emit) = lc.finish(self.inner.ctx.terminal_outcome()) {
+                emit.send();
+            }
+        }
     }
 }
 
@@ -1475,6 +1557,7 @@ async fn collect_response_body(
     reservation: &Reservation,
     expected_len: usize,
     is_active: impl Fn() -> bool,
+    on_bytes: impl Fn(u64),
 ) -> Result<SegmentedBytes, Error> {
     if expected_len == 0 {
         return Err(response_length_error(0, 0));
@@ -1501,6 +1584,11 @@ async fn collect_response_body(
             debug_assert!(pooled.remaining_mut() >= data.len());
             pooled.put_slice(&data);
             bytes_received += data.len();
+            // Per chunk, not per part: the only counter that moves inside a part, and the
+            // one that lets a single-part transfer show progress between 0 and done. This
+            // is the single body path for both the ranged and the discovery read, so one
+            // hook covers both.
+            on_bytes(data.len() as u64);
         }
 
         if !is_active() {
@@ -1774,6 +1862,7 @@ mod tests {
             reservation,
             expected_len,
             is_active,
+            |_| {},
         ));
         let mut context = Context::from_waker(Waker::noop());
         match future.as_mut().poll(&mut context) {
@@ -2048,7 +2137,7 @@ mod tests {
         let (writer, _consumer) = crate::operation::download::body::new_recv_body();
         let (ctx, _completion_rx) = TransferContext::new(handle);
 
-        DownloadTransfer::new(ctx, BucketType::Standard, input, writer)
+        DownloadTransfer::new(ctx, BucketType::Standard, input, writer, None, None)
     }
 
     /// Execute work using DownloadTransfer directly.
@@ -2309,7 +2398,7 @@ mod tests {
 
         let (writer, _consumer) = crate::operation::download::body::new_recv_body();
         let (ctx, _completion_rx) = TransferContext::new(handle);
-        let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, writer);
+        let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, writer, None, None);
 
         assert_discovery_succeeds(&transfer).await;
 
@@ -2616,7 +2705,7 @@ mod tests {
             .unwrap();
         let (writer, _consumer) = crate::operation::download::body::new_recv_body();
         let (ctx, _completion_rx) = TransferContext::new(handle);
-        let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, writer);
+        let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, writer, None, None);
 
         assert_discovery_succeeds(&transfer).await;
         let mut range = assert_ready(transfer.poll_work());
@@ -2707,7 +2796,7 @@ mod tests {
 
         let (writer, consumer) = crate::operation::download::body::new_recv_body();
         let (ctx, _completion_rx) = TransferContext::new(handle);
-        let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, writer);
+        let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, writer, None, None);
         (transfer, consumer)
     }
 
@@ -3090,7 +3179,7 @@ mod tests {
         let (writer, _consumer) =
             crate::operation::download::body::new_recv_body_with_sink(file, false);
         let (ctx, _completion_rx) = TransferContext::new(handle);
-        let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, writer);
+        let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, writer, None, None);
 
         assert_eq!(pool.metrics().active_planned_demand_bytes(), 0);
 
@@ -3138,6 +3227,94 @@ mod tests {
     /// so several transfers can contend for one memory budget. Returns the transfer
     /// plus the tempdir/consumer guards retained for the transfer's lifetime.
     #[cfg(test)]
+    /// A managed path download must have committed its destination by the time any
+    /// reader can observe `Completed`.
+    ///
+    /// The assertion deliberately never joins. `join()` is reachable by exactly one
+    /// caller, so a rename performed there leaves every other reader -- a metrics
+    /// snapshot, an event consumer, the composite's orphan drain -- reading
+    /// `Completed` for a path that does not exist. Reading the status is the only thing
+    /// a reporting path can do, so the status is what the destination has to be ready
+    /// for.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_destination_exists_when_status_reads_completed() {
+        let part_size = 8 * MB;
+        let object_size = part_size;
+
+        let chunk = vec![0u8; part_size as usize];
+        let get_obj = mock!(aws_sdk_s3::Client::get_object).then_output(move || {
+            GetObjectOutput::builder()
+                .content_length(part_size as i64)
+                .content_range(format!("bytes 0-{}/{}", part_size - 1, object_size))
+                .e_tag("test-etag")
+                .body(ByteStream::from(chunk.clone()))
+                .build()
+        });
+        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get_obj]);
+
+        let config = crate::Config::builder()
+            .client(client)
+            .part_size(crate::types::PartSize::Target(part_size))
+            .build();
+        let handle = crate::client::Handle::test_handle_tokio(config);
+
+        let input = DownloadInput::builder()
+            .bucket("test-bucket")
+            .key("test-key")
+            .build()
+            .unwrap();
+
+        // The same temp/dest split `orchestrate_to_path` sets up.
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out.dat");
+        let temp = dir.path().join("out.dat.s3tmp.deadbeef");
+        let file = std::fs::File::create(&temp).unwrap();
+        let (writer, _consumer) =
+            crate::operation::download::body::new_recv_body_with_sink(file, true);
+        let (ctx, _completion_rx) = TransferContext::new(handle);
+        let transfer = DownloadTransfer::new(
+            ctx,
+            BucketType::Standard,
+            input,
+            writer,
+            None,
+            Some(CommitTarget {
+                temp: temp.clone(),
+                dest: dest.clone(),
+            }),
+        );
+
+        // Single chunk: discovery fetches the whole object and the terminal completion
+        // runs inside this one execute.
+        let mut work = assert_ready(transfer.poll_work());
+        let outcome = execute(&transfer, &mut work).await;
+        assert!(
+            matches!(outcome, WorkOutcome::Success { .. }),
+            "expected Success, got {outcome:?}"
+        );
+
+        // No join() anywhere above. This is what every reporting path sees.
+        assert_eq!(
+            transfer.ctx().transfer_status(),
+            crate::types::TransferStatus::Completed,
+            "the terminal execute must have set the completed status"
+        );
+        assert!(
+            dest.exists(),
+            "status reads Completed but the destination does not exist"
+        );
+        assert!(
+            !temp.exists(),
+            "the temp file must have been renamed away, not copied"
+        );
+        assert_eq!(
+            std::fs::read(&dest).unwrap().len(),
+            part_size as usize,
+            "the committed destination must hold every byte"
+        );
+    }
+
     fn build_disk_transfer_on(
         handle: Arc<crate::client::Handle>,
     ) -> (
@@ -3155,7 +3332,7 @@ mod tests {
         let (writer, consumer) =
             crate::operation::download::body::new_recv_body_with_sink(file, false);
         let (ctx, _completion_rx) = TransferContext::new(handle);
-        let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, writer);
+        let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, writer, None, None);
         (transfer, consumer, dir)
     }
 
@@ -3417,7 +3594,7 @@ mod tests {
                 .unwrap();
             let (writer, _consumer) = crate::operation::download::body::new_recv_body();
             let (ctx, _rx) = TransferContext::new(handle);
-            DownloadTransfer::new(ctx, BucketType::Standard, input, writer)
+            DownloadTransfer::new(ctx, BucketType::Standard, input, writer, None, None)
         };
 
         // No request override: the client default resolves.
