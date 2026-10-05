@@ -17,7 +17,9 @@ pub(crate) mod stream;
 // Both notions live here, and `strip_key_prefix` and `relative_key` are where they part.
 
 use std::borrow::Cow;
-use std::path::{MAIN_SEPARATOR, MAIN_SEPARATOR_STR};
+use std::path::{Component, Path, PathBuf, MAIN_SEPARATOR, MAIN_SEPARATOR_STR};
+
+use path_clean::PathClean;
 
 use crate::error;
 
@@ -119,9 +121,184 @@ pub(crate) fn replace_delim<'a>(
     }
 }
 
+/// Derive the local filesystem path for a given S3 key.
+///
+/// Strips the configured prefix, replaces the delimiter with the OS path
+/// separator, joins with the destination root, normalizes via `path_clean`,
+/// and validates the result stays within the root (path traversal guard).
+// TODO(vnext): two keys can end up as the same local file. `path_clean` sends `a//b`, `a/./b` and
+// `a/b` to one path, and a case-insensitive filesystem folds `Photos/x` onto `photos/x`, leaving a
+// download to write one file and report a success for each key. S3 GetObject keeps the keys apart
+// and serves each one by name, but preserving them as they are in a filename may not be allowed by
+// the OS, which collapses `//` to `/`. Currently the transfer manager preemptively normalizes them
+// to avoid a collision, but that shouldn't happen. If there is a collision, it is a write failure
+// and should follow the failure policy. `derive_object_key` breaks the same way in the other
+// direction, turning two local names into one key.
+// See https://github.com/awslabs/aws-s3-transfer-manager-rs/pull/184#discussion_r4149427294
+pub(crate) fn local_key_path(
+    root_dir: &Path,
+    key: &str,
+    prefix: Option<&str>,
+    delimiter: Option<&str>,
+) -> Result<PathBuf, crate::error::Error> {
+    let stripped = strip_key_prefix(key, prefix, delimiter);
+    let relative_path = replace_delim(stripped, delimiter, std::path::MAIN_SEPARATOR_STR);
+
+    let local_path = root_dir.join(relative_path.as_ref()).clean();
+    validate_path(root_dir, &local_path, key)?;
+
+    Ok(local_path)
+}
+
+// The part of a derived path lying below `root`, or `None` when the path lies outside it.
+//
+// Both sides cleaned, because only one of them arrives that way: the derivation normalises the
+// path before it gets here, and the root reaches this as the caller wrote it. A root carrying a `.`
+// or a `..` would otherwise make every key inside it look like an escape. A root that cleans to `.` leaves no prefix on
+// the path at all — cleaning strips it — so the whole path is the remainder.
+//
+// Strictly below, not at or below. An empty remainder names the root itself, and a caller building a
+// temporary name beside that path builds one beside the root. A remainder opening with anything but
+// an ordinary name sits outside: a `..` climbs out, a `.` repeats the directory, and a root or a
+// drive prefix never was relative to the root, because `Path::join` drops the left side when the
+// right one is absolute.
+//
+// One answer for two callers. Containment asks whether a remainder exists; the local deleter asks
+// whether the remainder still reads as the key it came from. Deriving it separately in each place is
+// how one of them came to accept `/etc/passwd` as a key.
+pub(crate) fn below_root<'p>(root: &Path, path: &'p Path) -> Option<&'p Path> {
+    let root = root.clean();
+    let rest = if root == Path::new(".") {
+        path
+    } else {
+        path.strip_prefix(root).ok()?
+    };
+    matches!(rest.components().next(), Some(Component::Normal(_))).then_some(rest)
+}
+
+fn validate_path(root_dir: &Path, local_path: &Path, key: &str) -> Result<(), crate::error::Error> {
+    if below_root(root_dir, local_path).is_none() {
+        return Err(error::Error::new(
+            error::ErrorKind::InputInvalid,
+            format!(
+                "Unable to download key: '{key}', its relative path resolves \
+                 outside the target destination directory"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    // A root is whatever a caller passed, and a caller may pass one with a `.` or a `..` in it. The
+    // key is cleaned before the comparison, so the root has to be too, or every key looks like it
+    // escapes a root that it is in fact inside.
+    #[test]
+    fn a_root_written_the_long_way_round_still_holds_its_keys() {
+        for root in ["/tmp/./root", "/tmp/other/../root", "/tmp/root/"] {
+            assert_eq!(
+                local_key_path(Path::new(root), "a/b", None, None)
+                    .unwrap_or_else(|e| panic!("root {root:?} rejected a key inside it: {e}")),
+                Path::new("/tmp/root/a/b"),
+            );
+        }
+    }
+
+    // A destination given as the working directory holds its keys like any other. `aws s3 sync
+    // s3://bucket .` is the ordinary way to write it, and cleaning leaves the root as a bare `.`,
+    // which no key's cleaned path starts with.
+    #[test]
+    fn the_working_directory_holds_its_keys() {
+        for root in [".", "./", "./."] {
+            assert_eq!(
+                local_key_path(Path::new(root), "a.txt", None, None)
+                    .unwrap_or_else(|e| panic!("root {root:?} rejected a key inside it: {e}")),
+                Path::new("a.txt"),
+            );
+            assert_eq!(
+                local_key_path(Path::new(root), "nested/b.txt", None, None)
+                    .unwrap_or_else(|e| panic!("root {root:?} rejected a nested key: {e}")),
+                Path::new("nested/b.txt"),
+            );
+        }
+        // A key climbing out of the working directory is still refused.
+        assert!(local_key_path(Path::new("."), "../escape.txt", None, None).is_err());
+    }
+
+    // A key naming an absolute path takes the whole path: `Path::join` discards the left side when
+    // the right one is absolute, so the root never appears in the result. Climbing out with `..` is
+    // the way a relative key escapes, and asking only about that lets an absolute one through
+    // without ever being relative to the root at all.
+    #[test]
+    fn a_key_that_names_an_absolute_path_escapes_the_working_directory() {
+        for key in [
+            "/etc/passwd",
+            "/tmp/elsewhere.txt",
+            "//double/slash",
+            "/",
+            // Cleaning cannot make this relative either: the key keeps its leading separator
+            // through the prefix strip and the delimiter replacement.
+            "/nested/under/root.txt",
+        ] {
+            let got = local_key_path(Path::new("."), key, None, None);
+            assert!(
+                got.is_err(),
+                "key {key:?} resolved to {:?}, outside the working directory",
+                got.ok(),
+            );
+        }
+    }
+
+    // The same key against a root that does not clean to `.`, where the containment check refuses
+    // it and the working directory's arm never runs.
+    #[test]
+    fn a_key_that_names_an_absolute_path_escapes_a_named_root() {
+        for root in ["/tmp/root", "relative/root"] {
+            let got = local_key_path(Path::new(root), "/etc/passwd", None, None);
+            assert!(
+                got.is_err(),
+                "root {root:?} accepted an absolute key, resolving it to {:?}",
+                got.ok(),
+            );
+        }
+    }
+
+    // A key that resolves to the root names the directory itself, and there is no file there to
+    // write. Accepting it is worse than useless: the caller builds a temporary name beside the
+    // path it was given, and beside the root is outside the root — so the one key that passes the
+    // containment check is the one that escapes it.
+    #[test]
+    fn a_key_resolving_to_the_root_itself_has_no_local_path() {
+        let root = Path::new("/tmp/root");
+        for key in [".", "a/..", "./.", "a/b/../.."] {
+            assert!(
+                local_key_path(root, key, None, None).is_err(),
+                "key {key:?} resolved to the root itself and was accepted"
+            );
+        }
+        // A key that lands inside is still fine.
+        assert_eq!(
+            local_key_path(root, "a/../b", None, None).expect("inside the root"),
+            Path::new("/tmp/root/b")
+        );
+    }
+
     use super::*;
+
+    // A key naming a place is the caller's business, not this derivation's. The directory download
+    // has shipped accepting such a key: the trailing separator does not survive cleaning, so the
+    // object's bytes land in a file named for the key's last component. Refusing it here would turn
+    // a download that worked into one that fails, and under that operation's default policy it
+    // takes the whole directory with it.
+    #[test]
+    fn a_key_naming_a_place_still_derives_a_path() {
+        assert_eq!(
+            local_key_path(Path::new("/tmp/root"), "photos/2019/", None, None)
+                .expect("a key naming a place"),
+            Path::new("/tmp/root/photos/2019")
+        );
+    }
 
     #[test]
     fn test_strip_key_prefix() {

@@ -121,13 +121,14 @@ pub(crate) enum RunOutcome {
 // takes them one file at a time. So the caller hands over a whole batch and the destination decides
 // what one request means.
 //
-// Two destinations exist, a bucket and a recorder, with a local tree still to come. A value rather
+// Three destinations exist: a bucket, a local tree, and a recorder a test watches. A value rather
 // than a trait object because nothing here varies by type: a key is a key on either side, which is
 // what separates this from `SpawnChild`, whose implementations each accept one walk entry type.
 // Holding it as a value also keeps the future unboxed and lets `delete` take anything a key can be
 // read from.
 pub(crate) enum Deleter {
     Bucket(DeleteFromBucket),
+    LocalTree(DeleteFromLocalTree),
     // Named rather than inlined, unlike `ChildInner::Controlled`, because the assertions are built on
     // this double's accessors. Inlining its fields would cost them. `ChildInner` can inline because
     // `ChildHandle` hides it, where this enum is named by whoever builds a transfer and has nowhere
@@ -141,6 +142,7 @@ impl Deleter {
     pub(crate) fn batch_size(&self) -> usize {
         match self {
             Deleter::Bucket(d) => d.batch_size(),
+            Deleter::LocalTree(d) => d.batch_size(),
             #[cfg(test)]
             Deleter::Recording(d) => d.batch_size(),
         }
@@ -159,9 +161,59 @@ impl Deleter {
         let keys: Vec<String> = keys.into_iter().map(Into::into).collect();
         match self {
             Deleter::Bucket(d) => d.delete(keys).await,
+            Deleter::LocalTree(d) => d.delete(keys).await,
             #[cfg(test)]
             Deleter::Recording(d) => d.delete(keys).await,
         }
+    }
+}
+
+// Removes files from a local tree. One file per call, because there is no request that takes a batch
+// of them and pretending otherwise would hide how much work a batch is.
+//
+// Directories are left where they are, even when the last file under one goes: a directory sync did
+// not create is not sync's to remove, and one it did create may be where a caller puts something else.
+// Pruning them is a separate thing to ask for.
+#[derive(Debug)]
+pub(crate) struct DeleteFromLocalTree {
+    root: std::path::PathBuf,
+}
+
+impl DeleteFromLocalTree {
+    pub(crate) fn new(root: impl Into<std::path::PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    // The file a relative key names under this run's root, refusing one that names anything outside
+    // it. Deleting is where that matters most: a key resolving above the root would remove a file
+    // nobody put in the destination.
+    pub(crate) fn file_path(&self, key: &str) -> Result<std::path::PathBuf, crate::error::Error> {
+        crate::io::key::local_key_path(&self.root, key, None, None)
+    }
+
+    fn batch_size(&self) -> usize {
+        1
+    }
+
+    async fn delete(&self, keys: Vec<String>) -> Vec<KeyOutcome> {
+        let mut outcomes = Vec::with_capacity(keys.len());
+        for key in keys {
+            let path = match self.file_path(&key) {
+                Ok(path) => path,
+                Err(err) => {
+                    outcomes.push(Err(format!("{key}: {err}")));
+                    continue;
+                }
+            };
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => outcomes.push(Ok(key)),
+                // A file already gone is the state the delete wanted, and a run that reports it as a
+                // failure would make a second run over the same tree look worse than the first.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => outcomes.push(Ok(key)),
+                Err(e) => outcomes.push(Err(format!("{key}: {e}"))),
+            }
+        }
+        outcomes
     }
 }
 
@@ -341,6 +393,9 @@ pub(crate) struct ChildHandle {
 
 enum ChildInner {
     Upload(crate::operation::upload::UploadHandle),
+    // Managed, because that handle is what writes to a temporary name and renames once the bytes are
+    // all there — so a download that fails leaves whatever was already at the destination.
+    Download(crate::operation::download::ManagedDownloadHandle),
     // A child a test controls, for tests about the loop rather than about the transfer. Without it a
     // test would have to run a real child through the scheduler to assert anything about spawning or
     // reaping, and could not hold one open to watch the parent park.
@@ -368,6 +423,7 @@ impl ChildHandle {
     pub(crate) fn is_finished(&self) -> bool {
         match &self.inner {
             ChildInner::Upload(handle) => handle.status().is_terminal(),
+            ChildInner::Download(handle) => handle.status().is_terminal(),
             #[cfg(test)]
             ChildInner::Controlled { ended, .. } => ended.load(std::sync::atomic::Ordering::SeqCst),
         }
@@ -378,6 +434,9 @@ impl ChildHandle {
     pub(crate) async fn join(self) -> Result<u64, crate::error::Error> {
         match self.inner {
             ChildInner::Upload(handle) => handle.join().await.map(|out| out.metrics.network_tx),
+            // Joining is also what renames the file into place and stamps it, so this arm is where a
+            // download becomes visible at its final name.
+            ChildInner::Download(handle) => handle.join().await.map(|out| out.metrics.network_rx),
             #[cfg(test)]
             ChildInner::Controlled { moved, failed, .. } => {
                 if failed {
@@ -453,6 +512,124 @@ impl SpawnChild<crate::io::walk::FsEntry> for SpawnUpload {
         Ok(ChildHandle {
             id: handle.id(),
             inner: ChildInner::Upload(handle),
+        })
+    }
+}
+
+// Builds a download child. Named for what it spawns rather than for where it writes, because an
+// upload and a copy both write to a bucket and a name taken from the destination could not tell them
+// apart. The deleter beside it is named the other way round for the opposite reason: deleting does not
+// vary by operation, only by where the key lives, so an upload-direction run and a copy-direction run
+// delete from a bucket with the same code.
+pub(crate) struct SpawnDownload {
+    handle: Arc<crate::client::Handle>,
+    bucket: String,
+    // The place in the bucket the run is against, as in `SpawnUpload`: keys arrive relative to the
+    // run's root and naming an object means putting the root back.
+    root: String,
+    // Where the keys land. The destination address this spawner holds, the way `SpawnUpload` holds a
+    // bucket and prefix.
+    local_root: std::path::PathBuf,
+    // Directories already made, so the ancestor chain is walked once per directory rather than once
+    // per key. `create_dir_all` stats the whole chain, which for many small files in few directories
+    // is the larger per-child cost.
+    //
+    // TODO(sync): this runs inline in `poll_work`, which runs on the dispatch loop, so it blocks every
+    // transfer on the client while it stats. The cost scales with distinct directories rather than
+    // with keys, so the case to measure is one key per directory at depth — a date-partitioned layout
+    // — where this cache never hits. `download_objects` has the same call with the same cache and the
+    // same question outstanding.
+    created_dirs: Mutex<std::collections::HashSet<std::path::PathBuf>>,
+}
+
+impl SpawnDownload {
+    pub(crate) fn new(
+        handle: Arc<crate::client::Handle>,
+        bucket: impl Into<String>,
+        prefix: Option<&str>,
+        local_root: impl Into<std::path::PathBuf>,
+    ) -> Self {
+        Self {
+            handle,
+            bucket: bucket.into(),
+            root: crate::io::key::stream::root_prefix(prefix).into_owned(),
+            local_root: local_root.into(),
+            created_dirs: Mutex::new(std::collections::HashSet::new()),
+        }
+    }
+
+    // The object a relative key names under this run's root.
+    pub(crate) fn object_key(&self, key: &str) -> String {
+        format!("{}{}", self.root, key)
+    }
+
+    // The file a relative key names under this run's root, refusing one that names anything outside it.
+    //
+    // A key is arbitrary text and `..` is ordinary text in one, so a bucket can hold a key that
+    // resolves above the destination. Writing there would put a file where nobody asked for one, and
+    // the directory download already answers this, so its answer is reused rather than restated.
+    pub(crate) fn file_path(&self, key: &str) -> Result<std::path::PathBuf, crate::error::Error> {
+        crate::io::key::local_key_path(&self.local_root, key, None, None)
+    }
+}
+
+impl SpawnChild<aws_sdk_s3::types::Object> for SpawnDownload {
+    fn spawn(
+        &self,
+        key: &str,
+        _source: &aws_sdk_s3::types::Object,
+        parent: u64,
+    ) -> Result<ChildHandle, crate::error::Error> {
+        let dest_path = self.file_path(key)?;
+        if let Some(parent_dir) = dest_path.parent() {
+            // A destination that does not exist yet is not a failure: every key is missing there,
+            // which is a complete answer rather than an absent one, and the directories appear as the
+            // keys that need them do.
+            let known = self.created_dirs.lock().contains(parent_dir);
+            if !known {
+                std::fs::create_dir_all(parent_dir).map_err(|e| {
+                    crate::error::Error::new(
+                        crate::error::ErrorKind::IOError,
+                        format!("could not make a place for '{key}': {e}"),
+                    )
+                })?;
+                self.created_dirs.lock().insert(parent_dir.to_path_buf());
+            }
+        }
+
+        // A name nothing else will take, so two runs over one tree cannot collide on the half-written
+        // file. Built synchronously because this is a poll rather than an async context.
+        let temp_path = dest_path.with_file_name(format!(
+            "{}.s3tmp.{:08x}",
+            dest_path.file_name().unwrap_or_default().to_string_lossy(),
+            fastrand::u32(..)
+        ));
+        let file = std::fs::File::create(&temp_path).map_err(|e| {
+            crate::error::Error::new(
+                crate::error::ErrorKind::IOError,
+                format!("could not open a temporary file for '{key}': {e}"),
+            )
+        })?;
+
+        let input = crate::operation::download::DownloadInput::builder()
+            .bucket(&self.bucket)
+            .key(self.object_key(key))
+            .build()
+            .expect("bucket and key are set");
+        let inner = crate::operation::download::Download::orchestrate_with_sink(
+            self.handle.clone(),
+            input,
+            file,
+            0,
+            true,
+            Some(parent),
+        )?;
+        let handle =
+            crate::operation::download::ManagedDownloadHandle::new(inner, temp_path, dest_path)
+                .stamp_modified_time();
+        Ok(ChildHandle {
+            id: handle.transfer_id(),
+            inner: ChildInner::Download(handle),
         })
     }
 }
@@ -1145,6 +1322,18 @@ where
         &self.inner.ctx
     }
 
+    // Called by the scheduler when the run reaches a terminal status, which is the only notice sync
+    // gets: a terminal transfer is not polled again, so anything owed at that moment has to be
+    // settled here rather than on a later pass.
+    //
+    // What is owed is the children. Each holds the temporary file it opened, and dropping one before
+    // it finished clears that file as it goes, so keeping the handles leaves half-written names in the
+    // destination for as long as anything holds the run. Nothing is lost by letting go: a
+    // cancellation reaches the children before it reaches here, so their answer is already settled.
+    fn on_terminal(&self) {
+        self.inner.state.lock().children.clear();
+    }
+
     fn poll_work(&self) -> PollWork {
         SyncTransfer::poll_work(self)
     }
@@ -1606,6 +1795,458 @@ mod tests {
         assert!(
             transfer.inner.state.lock().failures.is_empty(),
             "a well-formed listing produced a failure"
+        );
+    }
+
+    // A bucket holding keys, and the body every download of them returns.
+    fn a_bucket_to_download(keys: &[&str], at: i64) -> aws_sdk_s3::Client {
+        let contents: Vec<Object> = keys
+            .iter()
+            .map(|k| {
+                Object::builder()
+                    .key(*k)
+                    .size(5)
+                    .last_modified(aws_smithy_types::DateTime::from_secs(at))
+                    .build()
+            })
+            .collect();
+        let list = mock!(aws_sdk_s3::Client::list_objects_v2).then_output(move || {
+            ListObjectsV2Output::builder()
+                .set_contents(Some(contents.clone()))
+                .build()
+        });
+        let get = mock!(aws_sdk_s3::Client::get_object).then_output(move || {
+            aws_sdk_s3::operation::get_object::GetObjectOutput::builder()
+                .content_length(5)
+                .last_modified(aws_smithy_types::DateTime::from_secs(at))
+                .body(aws_sdk_s3::primitives::ByteStream::from_static(b"hello"))
+                .build()
+        });
+        mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&list, &get])
+    }
+
+    // A run whose source is the bucket and whose destination is a local tree.
+    fn downloading_into(
+        local: &Path,
+        client: aws_sdk_s3::Client,
+        delete_mode: DeleteMode,
+    ) -> (
+        SyncTransfer<S3Walk, crate::operation::sync::walk::LocalDestination>,
+        TransferContext,
+        crate::transfer::StateMachineTerminalReceiver,
+    ) {
+        let config = crate::Config::builder().client(client.clone()).build();
+        let handle = crate::client::Handle::test_handle_managed(config);
+        let (ctx, rx) = TransferContext::new(handle);
+        let walk = Walker::builder()
+            .build()
+            .downloading(
+                LocalAndBucket::builder()
+                    .local_root(local)
+                    .client(client)
+                    .bucket("amzn-s3-demo-bucket")
+                    .build(),
+            )
+            .expect("an ordinary bucket builds");
+        let transfer = SyncTransfer::new(
+            ctx.clone(),
+            walk,
+            Mode::default().downloading(),
+            Arc::new(SpawnDownload::new(
+                ctx.handle.clone(),
+                "amzn-s3-demo-bucket",
+                None,
+                local,
+            )),
+            Deleter::LocalTree(DeleteFromLocalTree::new(local)),
+            RunSettings {
+                max_children: 4,
+                delete_mode,
+                failure_policy: FailurePolicy::Continue,
+            },
+        );
+        (transfer, ctx, rx)
+    }
+
+    // Runs a download transfer the way the scheduler would, which is the only way a real child runs.
+    async fn run_managed(
+        transfer: &SyncTransfer<S3Walk, crate::operation::sync::walk::LocalDestination>,
+        ctx: &TransferContext,
+        rx: crate::transfer::StateMachineTerminalReceiver,
+    ) {
+        ctx.handle
+            .scheduler
+            .enqueue_transfer(Box::new(transfer.clone()));
+        tokio::time::timeout(Duration::from_secs(20), rx)
+            .await
+            .expect("the run did not finish inside twenty seconds")
+            .expect("the terminal signal was dropped");
+    }
+
+    // The other direction, end to end: keys become files, under the directories they need, carrying
+    // the time the object had rather than the time they were written. Without that time a later run
+    // reads every file as newer than its object and fetches the lot again.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn a_download_lands_under_its_directories_with_the_objects_time() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let when = 1_600_000_000i64;
+        let client = a_bucket_to_download(&["a.txt", "deep/down/c.txt"], when);
+        let (transfer, ctx, rx) = downloading_into(dir.path(), client, DeleteMode::On);
+
+        run_managed(&transfer, &ctx, rx).await;
+
+        for key in ["a.txt", "deep/down/c.txt"] {
+            let path = dir.path().join(key);
+            let meta = std::fs::metadata(&path)
+                .unwrap_or_else(|e| panic!("{key} did not arrive at its final name: {e}"));
+            let stamped = meta
+                .modified()
+                .expect("a modified time")
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .expect("a time after the epoch")
+                .as_secs();
+            assert_eq!(
+                stamped, when as u64,
+                "{key} kept the time it was written rather than the object's"
+            );
+        }
+        // Nothing half-written is left beside them.
+        let strays: Vec<_> = walkdir_s3tmp(dir.path());
+        assert!(
+            strays.is_empty(),
+            "temporary files were left behind: {strays:?}"
+        );
+    }
+
+    // A time far outside the usual range still leaves the download intact. What makes that true is
+    // structural rather than tested — the stamp has no error to report — because no portable input
+    // makes the underlying call fail: a filesystem that cannot hold a far-future time clamps it. So
+    // this covers the path end to end without being able to force the failure.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn a_time_that_cannot_be_applied_does_not_cost_the_download() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        // Far outside what a filesystem can record, and outside what the arithmetic can represent.
+        let client = a_bucket_to_download(&["a.txt"], i64::MAX);
+        let (transfer, ctx, rx) = downloading_into(dir.path(), client, DeleteMode::On);
+
+        run_managed(&transfer, &ctx, rx).await;
+
+        let path = dir.path().join("a.txt");
+        assert!(
+            path.exists(),
+            "a stamp that could not be applied took the downloaded file with it"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("the file reads"),
+            b"hello",
+            "the file arrived without its contents"
+        );
+        assert!(
+            !ctx.is_failed(),
+            "a stamp that could not be applied failed the run"
+        );
+        // The stamp ran and the platform took what it could of the time. The arithmetic holds
+        // `i64::MAX` seconds, so nothing here declines. The filesystem truncates to the furthest
+        // date it can store — centuries from now, nowhere near the write time. The assertion
+        // measures that distance and not an exact value, because each filesystem truncates to its
+        // own limit.
+        //
+        // This pins the stamp still running. A stamp that silently stopped would leave the file
+        // holding its write time, which this run set a moment ago, and fail here.
+        let stamped = std::fs::metadata(&path)
+            .expect("the file has metadata")
+            .modified()
+            .expect("a modified time")
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .expect("a time after the epoch")
+            .as_secs();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .expect("a clock after the epoch")
+            .as_secs();
+        assert!(
+            stamped > now + 86_400 * 365,
+            "the file is dated {stamped}, within a year of the {now} it was written at, \
+             so the object's time never reached it"
+        );
+    }
+
+    // Deleting into a local tree removes the file and leaves the directory holding it. A directory
+    // sync did not create is not sync's to remove, and pruning is something to ask for separately.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn a_local_delete_removes_the_file_and_leaves_its_directory() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        a_local_tree(dir.path(), &["keep/gone.txt"]);
+        // An empty bucket, so the local file is the key the source does not have.
+        let client = a_bucket_to_download(&[], 1_600_000_000);
+        let (transfer, ctx, rx) = downloading_into(dir.path(), client, DeleteMode::On);
+
+        run_managed(&transfer, &ctx, rx).await;
+
+        assert!(
+            !dir.path().join("keep/gone.txt").exists(),
+            "the file the source does not have is still there"
+        );
+        assert!(
+            dir.path().join("keep").is_dir(),
+            "the directory went with the file"
+        );
+        assert_eq!(transfer.inner.state.lock().deleted, 1);
+    }
+
+    // A key is arbitrary text and `..` is ordinary text in one, so a bucket can hold a key naming a
+    // place above the destination. Neither writing nor removing may follow it there. The delete side
+    // is the sharper half: a run with deletion on would otherwise remove a file nobody put in the
+    // destination at all.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn a_key_naming_somewhere_above_the_root_is_refused() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let root = dir.path().join("inside");
+        std::fs::create_dir(&root).expect("the root");
+        // A file outside the root that no key should be able to reach.
+        let outside = dir.path().join("outside.txt");
+        std::fs::write(&outside, b"not sync's").expect("a file");
+
+        let spawner = SpawnDownload::new(
+            crate::client::Handle::test_handle_tokio(
+                crate::Config::builder()
+                    .client(a_bucket_holding(&[]))
+                    .build(),
+            ),
+            "amzn-s3-demo-bucket",
+            None,
+            &root,
+        );
+        assert!(
+            spawner.file_path("../outside.txt").is_err(),
+            "a download would have written above its destination"
+        );
+
+        let deleter = DeleteFromLocalTree::new(&root);
+        assert!(
+            deleter.file_path("../outside.txt").is_err(),
+            "a delete would have reached above its destination"
+        );
+        let outcomes = deleter.delete(vec!["../outside.txt".to_string()]).await;
+        assert!(
+            outcomes[0].is_err(),
+            "the key was accepted rather than refused"
+        );
+        assert!(
+            outside.exists(),
+            "a file outside the destination was removed"
+        );
+    }
+
+    // A key already absent locally is the state the delete wanted, so a second run over the same tree
+    // does not look worse than the first.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn deleting_a_file_that_is_already_gone_is_not_a_failure() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let deleter = DeleteFromLocalTree::new(dir.path());
+
+        let outcomes = deleter.delete(vec!["never-existed.txt".to_string()]).await;
+
+        assert_eq!(outcomes, vec![Ok("never-existed.txt".to_string())]);
+    }
+
+    // A destination that does not exist yet is not a root that could not be listed: every key is
+    // missing there, which is a complete answer rather than an absent one, and the directories appear
+    // as the keys needing them do.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn a_destination_that_does_not_exist_yet_is_not_a_failure() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let root = dir.path().join("not-there-yet");
+        let client = a_bucket_to_download(&["a.txt"], 1_600_000_000);
+        let (transfer, ctx, rx) = downloading_into(&root, client, DeleteMode::On);
+
+        run_managed(&transfer, &ctx, rx).await;
+
+        assert!(
+            !ctx.is_failed(),
+            "a destination that did not exist yet failed the run"
+        );
+        assert!(
+            root.join("a.txt").exists(),
+            "the key did not arrive under a root that had to be made"
+        );
+        assert_eq!(transfer.outcome(), RunOutcome::Clean);
+    }
+
+    // Every `.s3tmp.` file under a root, so a test can say nothing was left half-written.
+    fn walkdir_s3tmp(root: &Path) -> Vec<std::path::PathBuf> {
+        let mut found = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.to_string_lossy().contains(".s3tmp.") {
+                    found.push(path);
+                }
+            }
+        }
+        found
+    }
+
+    // A cancelled run lets go of the children it was holding, so each one clears the temporary file it
+    // had opened. Holding them keeps those files on disk for as long as anything holds the run, which
+    // is a destination littered with half-written names nobody asked for.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cancelled_run_lets_go_of_the_files_its_children_opened() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+
+        // Filled in once the transfer exists, so the cancellation can land while bodies are moving.
+        let pending: Arc<Mutex<Option<TransferContext>>> = Arc::new(Mutex::new(None));
+        let fetched = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cancel_on_first = pending.clone();
+        let counter = fetched.clone();
+
+        let contents: Vec<Object> = ["a.txt", "b.txt", "c.txt"]
+            .iter()
+            .map(|k| {
+                Object::builder()
+                    .key(*k)
+                    .size(5)
+                    .last_modified(aws_smithy_types::DateTime::from_secs(1_600_000_000))
+                    .build()
+            })
+            .collect();
+        let list = mock!(aws_sdk_s3::Client::list_objects_v2).then_output(move || {
+            ListObjectsV2Output::builder()
+                .set_contents(Some(contents.clone()))
+                .build()
+        });
+        let get = mock!(aws_sdk_s3::Client::get_object).then_output(move || {
+            if counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                if let Some(ctx) = cancel_on_first.lock().as_ref() {
+                    ctx.handle.scheduler.cancel_transfer(ctx.id);
+                }
+            }
+            aws_sdk_s3::operation::get_object::GetObjectOutput::builder()
+                .content_length(5)
+                .last_modified(aws_smithy_types::DateTime::from_secs(1_600_000_000))
+                .body(aws_sdk_s3::primitives::ByteStream::from_static(b"hello"))
+                .build()
+        });
+        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&list, &get]);
+
+        let (transfer, ctx, rx) = downloading_into(dir.path(), client, DeleteMode::On);
+        *pending.lock() = Some(ctx.clone());
+        ctx.handle
+            .scheduler
+            .enqueue_transfer(Box::new(transfer.clone()));
+        let _ = tokio::time::timeout(Duration::from_secs(20), rx).await;
+
+        assert!(
+            fetched.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "nothing was fetched, so the cancellation landed before any child opened a file"
+        );
+        // The terminal signal fires the moment the run is cancelled, which can be while a reap is
+        // still joining the children it took. Those joins are what clear the files of children that
+        // had already left `children`, so the question is only answerable once nothing is outstanding.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let outstanding = {
+                let st = transfer.inner.state.lock();
+                st.reap_in_flight > 0 || st.merge_in_flight || st.deletes_in_flight > 0
+            };
+            if !outstanding || std::time::Instant::now() > deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let strays = walkdir_s3tmp(dir.path());
+        assert!(
+            strays.is_empty(),
+            "a cancelled run is still holding the files its children opened: {strays:?}"
+        );
+    }
+
+    // What a cancelled run owes is to stop starting work, not to stop work already started. A child
+    // already away keeps going, and the run stays open until it ends — so cancelling is prompt about
+    // the one thing it promises and patient about the rest.
+    //
+    // Untested until now because the earlier cancellation tests had the merge and the delete batch
+    // outstanding, never a live child, which is where stopping and reporting meet.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn a_cancelled_run_keeps_the_children_it_already_sent() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        a_local_tree(dir.path(), &["a.txt", "b.txt"]);
+        let spawner = Arc::new(SpawnEnded::holding_children_open());
+        let (transfer, ctx) = uploading_with(dir.path(), spawner.clone(), 4);
+
+        // Decide every key, then send what the comparison qualified.
+        while let PollWork::Ready { io: mut work, .. } = transfer.poll_work() {
+            transfer.execute(&mut work).await;
+        }
+        let spawned = spawn_until_something_else(&transfer);
+        assert!(
+            matches!(spawned, PollWork::Pending),
+            "the run did not park with children live, so this proves nothing"
+        );
+        let live = transfer.inner.state.lock().children.len();
+        assert!(live > 0, "no child is live, so there is nothing to keep");
+
+        ctx.set_cancelled();
+
+        // Still open, because the children it sent are still owed an answer.
+        assert!(
+            matches!(transfer.poll_work(), PollWork::Pending),
+            "a cancelled run called itself over with {live} children still away"
+        );
+        assert_eq!(
+            spawner.asked_count(),
+            live,
+            "a cancelled run asked for another child"
+        );
+
+        // Once they end, the reap collects them and the run answers its waiter.
+        spawner.release();
+        while let PollWork::Ready { io: mut work, .. } = transfer.poll_work() {
+            transfer.execute(&mut work).await;
+        }
+        assert!(
+            matches!(transfer.poll_work(), PollWork::Done),
+            "the children ended and the cancelled run still did not finish"
+        );
+    }
+
+    // Cancelling and failing land on the same status, first write winning, so which one a caller is
+    // told depends on ordering nobody controls. A caller who cancelled should hear that they
+    // cancelled, rather than hearing about a key that failed on the way out.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn cancelling_before_a_failure_still_reports_cancelled() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let deleter = Arc::new(RecordDeletes::refusing(DELETE_BATCH));
+        let (transfer, ctx) = deleting_with_policy(
+            dir.path(),
+            &["gone.txt"],
+            deleter,
+            DeleteMode::On,
+            FailurePolicy::Abort,
+        );
+
+        ctx.set_cancelled();
+        drive(&transfer).await;
+
+        assert!(ctx.is_cancelled(), "the cancellation was lost");
+        assert!(
+            !ctx.is_failed(),
+            "a cancelled run reported itself as failed instead"
         );
     }
 
