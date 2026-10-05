@@ -498,9 +498,6 @@ impl FsWalkerBuilder {
     // device, a symlink left unfollowed. Off by default, because a caller that only uploads what
     // it finds has no use for them, and a tree can hold thousands. A consumer that infers absence
     // from the stream needs them, since a name it never hears about reads as a name that is free.
-    //
-    // Only tests call this until the comparison lands.
-    #[allow(dead_code)] // TODO(sync): the comparison turns this on to hold back a delete
     pub(crate) fn include_special_files(mut self, include: bool) -> Self {
         self.include_special_files = include;
         self
@@ -550,7 +547,6 @@ impl FsWalkerBuilder {
     // Directories are not offered to it: skipping one would skip everything beneath,
     // and a rule written for a file's key says nothing about the keys under a folder
     // of a similar name.
-    #[allow(dead_code)] // TODO(sync): the comparison sets this from its filter rules
     pub(crate) fn path_filter(mut self, f: impl Fn(&Path) -> bool + Send + Sync + 'static) -> Self {
         self.path_filter = Some(Arc::new(f));
         self

@@ -29,6 +29,10 @@ pub enum WalkErrorKind {
     /// here the walk continues with the rest of the tree, but that subtree was never
     /// enumerated.
     DirectoryUnreadable,
+    /// An entry was named by its directory and was not there when it was read. Nothing is broken:
+    /// a file deleted between those two moments leaves nothing to transfer, and a destination
+    /// without that key already matches a source that no longer has it.
+    Vanished,
     /// Symlink encountered with no valid target.
     BrokenSymlink,
     /// Symlink whose target is a directory already on the current descent
@@ -113,6 +117,9 @@ impl WalkError {
         match err.kind() {
             std::io::ErrorKind::PermissionDenied => WalkErrorKind::PermissionDenied,
             std::io::ErrorKind::NotADirectory => WalkErrorKind::NotADirectory,
+            // The name came from the directory holding it, so it existed. Not finding it now means
+            // it went away in between.
+            std::io::ErrorKind::NotFound => WalkErrorKind::Vanished,
             _ => WalkErrorKind::Io,
         }
     }
@@ -153,9 +160,26 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_io_not_found_maps_to_io() {
-        let err = std::io::Error::from(std::io::ErrorKind::NotFound);
+    fn test_classify_io_other_errors_map_to_io() {
+        let err = std::io::Error::other("some other error");
         assert_eq!(WalkError::classify_io(&err), WalkErrorKind::Io);
+    }
+
+    // A file deleted between being named by its directory and being read is routine — an editor
+    // saving atomically, a log being rotated, a build directory being cleaned. Its key is not
+    // missing from this side's account: it is genuinely not there, so absence stays readable either
+    // side of it and nothing needs holding open.
+    #[test]
+    fn a_file_gone_before_it_could_be_read_is_named_as_such() {
+        let gone = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert_eq!(WalkError::classify_io(&gone), WalkErrorKind::Vanished);
+        assert!(!WalkErrorKind::Vanished.is_fatal());
+        // A file that is there and cannot be read is the opposite case and still costs one key.
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            WalkError::classify_io(&denied),
+            WalkErrorKind::PermissionDenied
+        );
     }
 
     #[test]
