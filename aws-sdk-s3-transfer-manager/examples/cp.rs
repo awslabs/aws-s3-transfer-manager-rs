@@ -138,6 +138,14 @@ pub struct Args {
     /// Enable CPU profiling in dial9 traces (Linux only, requires --trace-dir)
     #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue, requires = "trace_dir")]
     cpu_profiling: bool,
+
+    /// Network interfaces to bind S3 connections to, comma-separated (e.g. `ens5,ens6`).
+    ///
+    /// Managed worker threads are assigned interfaces round-robin. Applies only
+    /// to the managed runtime; supported on Linux, Android, Apple platforms,
+    /// illumos, Solaris, and Fuchsia.
+    #[arg(long, value_delimiter = ',')]
+    network_interfaces: Vec<String>,
 }
 
 #[derive(Debug, Clone, clap::Args)]
@@ -509,6 +517,47 @@ async fn run(args: Args) -> Result<(), BoxError> {
             .memory_budget(MemoryBudgetConfig::Limit(bytes))
             .build()?;
         config_loader = config_loader.memory(MemoryConfig::Explicit(pool));
+    }
+
+    let network_interfaces: Vec<&str> = args
+        .network_interfaces
+        .iter()
+        .map(|name| name.trim())
+        .filter(|name| !name.is_empty())
+        .collect();
+    if !network_interfaces.is_empty() {
+        #[cfg(any(
+            target_os = "android",
+            target_os = "fuchsia",
+            target_os = "illumos",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "solaris",
+            target_os = "tvos",
+            target_os = "visionos",
+            target_os = "watchos",
+        ))]
+        {
+            tracing::info!(
+                ?network_interfaces,
+                "binding connections to network interfaces"
+            );
+            config_loader = config_loader.network_interfaces(network_interfaces);
+        }
+        #[cfg(not(any(
+            target_os = "android",
+            target_os = "fuchsia",
+            target_os = "illumos",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "solaris",
+            target_os = "tvos",
+            target_os = "visionos",
+            target_os = "watchos",
+        )))]
+        return Err("--network-interfaces is not supported on this platform".into());
     }
 
     #[cfg(feature = "dial9")]

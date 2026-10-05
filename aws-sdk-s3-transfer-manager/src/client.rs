@@ -292,21 +292,36 @@ impl Client {
             .expect("memory configuration must resolve to supported pool geometry"),
             MemoryConfig::Explicit(pool) => pool.clone(),
         };
+        // Runtime HTTP is built only when it will be installed on an S3 client
+        // this transfer manager constructs.
+        let connection_cap = crate::runtime::platform::ConnectionCap::detect();
+        let runtime_http = config.runtime_http(connection_cap.max_per_host);
+        if runtime_http.is_some() && matches!(config.runtime_mode(), RuntimeMode::Managed) {
+            log_connection_cap(&connection_cap, controller.target());
+        }
         let handle = Arc::new_cyclic(|weak_handle| {
             let scheduler = Scheduler::new(weak_handle.clone());
             let runtime: Arc<dyn ExecutionRuntime> = match config.runtime_mode() {
                 RuntimeMode::Managed => {
                     #[allow(unused_mut)]
-                    let mut builder = ManagedThreadRuntime::builder(weak_handle.clone());
+                    let mut builder =
+                        ManagedThreadRuntime::builder(weak_handle.clone()).http(runtime_http);
                     #[cfg(feature = "dial9")]
                     if let Some(guard) = telemetry_guard {
                         builder = builder.telemetry_guard(guard);
                     }
                     Arc::new(builder.build())
                 }
-                RuntimeMode::MultiThreadTokio => Arc::new(
-                    crate::runtime::TokioMultiThreadRuntime::new(weak_handle.clone()),
-                ),
+                RuntimeMode::MultiThreadTokio => {
+                    if runtime_http.is_some_and(|http| !http.network_interfaces.is_empty()) {
+                        tracing::warn!(
+                            "network interfaces are ignored under RuntimeMode::MultiThreadTokio"
+                        );
+                    }
+                    Arc::new(crate::runtime::TokioMultiThreadRuntime::new(
+                        weak_handle.clone(),
+                    ))
+                }
             };
 
             let s3_client = match config.take_s3_client_source() {
@@ -500,6 +515,33 @@ impl Client {
     }
 }
 
+/// Report the per-host connection cap, and warn when the descriptor limit holds
+/// it below the concurrency target.
+fn log_connection_cap(cap: &crate::runtime::platform::ConnectionCap, target: usize) {
+    let soft = cap.descriptors.map(|limit| limit.soft);
+    let hard = cap.descriptors.and_then(|limit| limit.hard);
+    if cap.limited_by_descriptors() && cap.max_per_host < target {
+        tracing::warn!(
+            target: crate::telemetry::TARGET_CONCURRENCY,
+            max_connections_per_host = cap.max_per_host,
+            concurrency_target = target,
+            soft_descriptor_limit = ?soft,
+            hard_descriptor_limit = ?hard,
+            "per-host connection cap is below the concurrency target because it is limited to half \
+             the soft file-descriptor limit (RLIMIT_NOFILE); raise the soft limit to allow more connections",
+        );
+    } else {
+        tracing::debug!(
+            target: crate::telemetry::TARGET_CONCURRENCY,
+            max_connections_per_host = cap.max_per_host,
+            concurrency_target = target,
+            soft_descriptor_limit = ?soft,
+            hard_descriptor_limit = ?hard,
+            "resolved per-host connection cap",
+        );
+    }
+}
+
 /// Resolve the fixed in-flight concurrency target from the concurrency mode and
 /// the detected machine profile. Called by [`Client::new`] to build the
 /// [`FixedConcurrency`] controller.
@@ -567,10 +609,47 @@ fn resolve_concurrency_target(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aws_smithy_runtime_api::client::http::SharedHttpClient;
 
     fn test_config() -> crate::Config {
         let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
         crate::Config::builder().client(s3_client).build()
+    }
+
+    fn runtime_http_client(client: &Client) -> Option<&SharedHttpClient> {
+        client.handle.runtime.components().http_client()
+    }
+
+    fn mock_s3_config() -> crate::config::S3ClientConfig {
+        let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
+        crate::config::S3ClientConfig::new(s3_client.config().to_builder())
+    }
+
+    // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn managed_runtime_builds_http_for_s3_config() {
+        let client = Client::new(crate::Config::builder().s3_config(mock_s3_config()).build());
+        assert!(runtime_http_client(&client).is_some());
+    }
+
+    // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn managed_runtime_skips_http_for_provided_client() {
+        let client = Client::new(test_config());
+        assert!(runtime_http_client(&client).is_none());
+    }
+
+    // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn managed_runtime_skips_http_when_runtime_http_disabled() {
+        let config = crate::Config::builder()
+            .s3_config(mock_s3_config().enable_runtime_http(false))
+            .build();
+        let client = Client::new(config);
+        assert!(runtime_http_client(&client).is_none());
     }
 
     // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
