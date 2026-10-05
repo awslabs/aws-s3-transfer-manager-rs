@@ -1152,7 +1152,8 @@ async fn test_upload_leaves_bytes_streamed_at_zero() {
             Err(_) => break,
         }
     }
-    let metrics = view.expect("a real transfer owes a view").metrics();
+    let view = view.expect("a real transfer owes a view");
+    let metrics = view.metrics();
 
     assert_eq!(
         size as u64, metrics.network_tx,
@@ -1161,6 +1162,14 @@ async fn test_upload_leaves_bytes_streamed_at_zero() {
     assert_eq!(
         0, metrics.bytes_streamed,
         "bytes_streamed is a download counter and must stay 0 for an upload"
+    );
+    // The other half of the same rule: an upload's park sites are not labelled, so the
+    // reason reads `None` rather than a download reason that would name a window this
+    // transfer does not have.
+    assert!(
+        view.stall_reason().is_none(),
+        "an upload must report no stall reason, not a download's; got {:?}",
+        view.stall_reason()
     );
 
     m.handle.shutdown().await.expect("shutdown");
