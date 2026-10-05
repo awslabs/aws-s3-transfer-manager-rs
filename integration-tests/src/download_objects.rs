@@ -527,21 +527,30 @@ async fn test_download_objects_abort_error_reaches_the_child_cause() {
             .await
             .expect_err("a faulted key under Abort must fail the operation");
 
-        // The root error does not own the child's `Error` -- that needs a shareable error,
-        // which is the TODO in `download_objects/transfer.rs`. What it does owe is the key,
-        // so an operator reading only the top-level failure knows which object broke, and
-        // the child's real error stays reachable beside its input.
-        assert!(
-            format!("{err}").contains("0000.bin") || format!("{:?}", err).contains("0000.bin"),
-            "the root error must name the key that failed: {err}"
-        );
+        // The root error is a constructed `ChildOperationFailed` and does not own the
+        // triggering child's `Error` -- that needs a shareable error, which is the TODO in
+        // `download_objects/transfer.rs`. The per-object record is where the real cause
+        // lives, so that is what this pins: the faulted key, and the service failure that
+        // actually stopped it rather than a substitute.
         let failed = err
             .failed_downloads()
             .expect("Abort records the failed object");
+        let hit = failed
+            .iter()
+            .find(|f| f.input().key() == Some(&format!("{prefix}0000.bin")[..]))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the faulted key must be recorded; got {:?}",
+                    failed.iter().map(|f| f.input().key()).collect::<Vec<_>>()
+                )
+            });
         assert!(
-            failed.iter().any(|f| f.error().source().is_some()),
-            "the child's own error chain must survive on the per-object record, \
-             which is where the status code lives"
+            matches!(
+                hit.error().kind(),
+                aws_sdk_s3_transfer_manager::error::ErrorKind::ServiceError
+            ),
+            "the per-object record must carry the real service failure, not a substitute; got {:?}",
+            hit.error().kind()
         );
 
         m.handle.shutdown().await.expect("shutdown");
