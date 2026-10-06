@@ -120,6 +120,9 @@ impl ConfigLoader {
     }
 
     /// Set a dial9 handle for runtime tracing.
+    ///
+    /// See [`Builder::dial9_handle`](crate::config::Builder::dial9_handle)
+    /// for recorder ownership and shutdown ordering.
     #[cfg(feature = "dial9")]
     pub fn dial9_handle(mut self, handle: dial9::Dial9Handle) -> Self {
         self.builder = self.builder.dial9_handle(handle);

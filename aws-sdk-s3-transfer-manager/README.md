@@ -131,7 +131,7 @@ let response = handle.join().await?;
 The `cp` example supports optional [dial9](https://github.com/dial9-rs/dial9) instrumentation for tracing all internal worker runtimes. This is useful for diagnosing hangs, load imbalance, and poll latency issues.
 
 ```sh
-RUSTFLAGS="--cfg tokio_unstable" cargo build --features dial9 --example cp --release
+RUSTFLAGS="--cfg tokio_unstable -C force-frame-pointers=yes" cargo build --features dial9 --example cp --release
 ```
 
 Then run with `--trace-dir` to enable tracing:

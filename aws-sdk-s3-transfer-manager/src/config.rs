@@ -423,7 +423,6 @@ impl Builder {
     /// this client before calling [`Recorder::graceful_shutdown`],
     /// so the workers flush into the trace.
     ///
-    /// [`Recorder::handle`]: dial9::Recorder::handle
     /// [`Recorder::graceful_shutdown`]: dial9::Recorder::graceful_shutdown
     #[cfg(feature = "dial9")]
     pub fn dial9_handle(mut self, handle: dial9::Dial9Handle) -> Self {
