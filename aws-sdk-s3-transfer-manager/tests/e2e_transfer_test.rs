@@ -14,12 +14,9 @@ use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
 use aws_sdk_s3_transfer_manager::operation::upload::ChecksumStrategy;
 use aws_sdk_s3_transfer_manager::types::PartSize;
 use aws_smithy_runtime::test_util::capture_test_logs::show_test_logs;
-use std::future::Future;
 use std::pin::Pin;
 use std::task::Poll;
-use std::time::Duration;
 use test_common::{create_test_dir, drain, global_uuid_str};
-use tokio::time::Sleep;
 
 const PUT_OBJECT_PREFIX: &str = "upload";
 
@@ -216,102 +213,6 @@ async fn test_single_part_file_checksum_upload() {
 
 // TODO: add checksum validation tests for get object
 
-#[derive(Debug)]
-struct DelayStream {
-    idx: usize,
-    remaining: usize,
-    delay: Option<Pin<Box<Sleep>>>,
-}
-
-impl DelayStream {
-    fn new(total_size: usize) -> Self {
-        let delay = Box::pin(tokio::time::sleep(Duration::from_secs(5)));
-        Self {
-            idx: 0,
-            remaining: total_size,
-            delay: Some(delay),
-        }
-    }
-}
-
-impl PartStream for DelayStream {
-    fn poll_part(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        stream_cx: &StreamContext,
-    ) -> Poll<Option<std::io::Result<PartData>>> {
-        let part_size = stream_cx.part_size();
-        // Check if we need to wait for the delay
-        if let Some(delay) = &mut self.delay {
-            match delay.as_mut().poll(cx) {
-                Poll::Ready(_) => self.delay = None,
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-
-        if self.remaining == 0 {
-            // End of stream
-            Poll::Ready(None)
-        } else {
-            let part_data_size = std::cmp::min(part_size, self.remaining);
-            let data = "This is a test"
-                .bytes()
-                .cycle()
-                .take(part_data_size)
-                .collect::<Vec<u8>>();
-            let part = PartData::new((self.idx + 1) as u64, data);
-
-            // Update state
-            self.idx += 1;
-            self.remaining -= part_data_size;
-            // Schedule delay for NEXT part
-            self.delay = Some(Box::pin(tokio::time::sleep(Duration::from_secs(5))));
-            Poll::Ready(Some(Ok(part)))
-        }
-    }
-
-    fn size_hint(&self) -> SizeHint {
-        SizeHint::exact(self.remaining as u64)
-    }
-}
-
-// This test is intended to reproduce the error we seen in https://github.com/awslabs/aws-s3-transfer-manager-rs/issues/77
-// https://github.com/awslabs/aws-s3-transfer-manager-rs/actions/runs/13317812974/job/37196043327?pr=102 is the failed run
-// But it's not guaranteed to reproduce the error yet.
-// Also, it sometimes triggers S3 to response 400 and ClientUploadSpeedTooSlow
-// https://github.com/awslabs/aws-s3-transfer-manager-rs/actions/runs/13333953491/job/37244814880
-// ignore this test as default.
-#[ignore]
-#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
-async fn test_upload_with_long_running_stream() {
-    let _logs = show_test_logs();
-    let (tm, _) = test_tm().await;
-    let file_size = 10 * 1024 * 1024; // 10MB
-    let num_uploads = 10;
-    let (bucket_name, express_bucket_name) = get_bucket_names();
-    for bucket in [bucket_name.as_str(), express_bucket_name.as_str()] {
-        let object_keys: Vec<String> = (0..num_uploads)
-            .map(|i| generate_key(i.to_string().as_str()))
-            .collect();
-
-        let mut handles = vec![];
-        for key in object_keys {
-            let stream = DelayStream::new(file_size);
-
-            let upload = tm
-                .upload()
-                .bucket(bucket)
-                .key(key.as_str())
-                .body(InputStream::from_part_stream(stream));
-
-            handles.push(upload.initiate().unwrap());
-        }
-        for handle in handles {
-            handle.join().await.unwrap();
-        }
-    }
-}
-
 #[tokio::test]
 async fn test_empty_object_download() {
     let _logs = show_test_logs();
@@ -409,6 +310,75 @@ async fn test_object_download_range() {
         )
         .await
         .unwrap();
+    }
+}
+
+/// Pins what S3 answers a ranged HEAD with, and that a tail range delivers the tail.
+///
+/// A suffix (`bytes=-N`) or open-ended (`bytes=N-`) range is discovered by HeadObject,
+/// and S3 answers that 206: `Content-Length` is the range's length, so the offsets are
+/// only in `Content-Range`. A download that reads the length but not the offsets asks
+/// for the right number of bytes from the wrong place, which a length assertion cannot
+/// see -- so the bytes are compared against the same range read directly through the
+/// SDK. This is the behavior `s3-mock-server` imitates for HeadObject.
+#[tokio::test]
+async fn test_object_download_tail_ranges() {
+    let _logs = show_test_logs();
+    let (tm, s3) = test_tm().await;
+    let (bucket_name, _) = get_bucket_names();
+    let object_key = "pre-existing-10MB";
+
+    let head = s3
+        .head_object()
+        .bucket(&bucket_name)
+        .key(object_key)
+        .range("bytes=-500")
+        .send()
+        .await
+        .unwrap();
+    let content_range = head.content_range().expect("a 206 carries content-range");
+    let total: u64 = content_range
+        .rsplit('/')
+        .next()
+        .and_then(|t| t.parse().ok())
+        .expect("content-range names the object size");
+    assert_eq!(
+        Some(500),
+        head.content_length(),
+        "206 reports the range's length, not the object's"
+    );
+    assert_eq!(
+        format!("bytes {}-{}/{total}", total - 500, total - 1),
+        content_range,
+        "the offsets are only in content-range"
+    );
+
+    for range in ["bytes=-3000000", "bytes=7000000-"] {
+        let expected = s3
+            .get_object()
+            .bucket(&bucket_name)
+            .key(object_key)
+            .range(range)
+            .send()
+            .await
+            .unwrap()
+            .body
+            .collect()
+            .await
+            .unwrap()
+            .to_vec();
+
+        let mut handle = tm
+            .download()
+            .bucket(&bucket_name)
+            .key(object_key)
+            .range(range)
+            .initiate()
+            .unwrap();
+        let body = drain(&mut handle).await.unwrap();
+
+        assert_eq!(expected.len(), body.len(), "range {range}");
+        assert_eq!(expected, body, "range {range} delivered other bytes");
     }
 }
 
