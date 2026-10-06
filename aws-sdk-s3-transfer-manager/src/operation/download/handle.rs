@@ -339,18 +339,13 @@ pub struct ManagedDownloadHandle {
     inner: DownloadHandleInner,
     temp_path: Option<std::path::PathBuf>,
     dest_path: Option<std::path::PathBuf>,
-    // Whether to give the finished file the object's own modification time. Off unless asked, so no
-    // existing caller's files change timestamps; a setter rather than a constructor argument so the
-    // default is off by construction rather than by every caller passing false.
+    // Whether to stamp the finished file with the object modification time. The setter keeps the
+    // stamp off unless a caller asks for it.
     stamp_modified_time: bool,
 }
 
-// Set a file's time if that can be done, and carry on if it cannot.
-//
-// Deliberately returns nothing. The caller runs inside `finalize`, whose failure costs the downloaded
-// file, and a file keeping its write time costs one repeat on the next run instead. Making the
-// difference unrepresentable is worth more than a test, because no portable input makes the underlying
-// call fail — a filesystem that cannot hold a far-future time clamps it rather than refusing.
+// Try to stamp a file with the object modification time. A stamp failure logs and leaves the
+// download successful.
 fn stamp_best_effort(path: &std::path::Path, at: aws_smithy_types::DateTime) {
     if let Err(err) = set_modified_time(path, at) {
         tracing::debug!(
@@ -361,21 +356,16 @@ fn stamp_best_effort(path: &std::path::Path, at: aws_smithy_types::DateTime) {
     }
 }
 
-// Give a file the time an object was last modified. Separate so the one caller that wants it reads as
-// one line, and so the conversion lives next to the only thing that needs it.
-//
-// Blocking, and not through `tokio::fs`, which has no asynchronous call to offer here: that module
-// runs ordinary blocking operations on the blocking pool, so opening through it and writing through
-// `std` paid two thread hops to reach one `utimensat`. The one caller runs on a managed thread,
-// where this crate runs file work on the calling thread by design.
+// Set a file modification time from the object time. Download file work already runs on the managed
+// thread, so this uses `std::fs`.
 fn set_modified_time(
     path: &std::path::Path,
     at: aws_smithy_types::DateTime,
 ) -> std::io::Result<()> {
     let secs = at.secs();
     let nanos = at.subsec_nanos();
-    // `DateTime` counts from the epoch in both directions, where `SystemTime` arithmetic needs the
-    // direction chosen; a date before 1970 is representable and reaches here.
+    // `DateTime` can be before the epoch. Choose addition or subtraction before creating
+    // `SystemTime`.
     let when = if secs >= 0 {
         std::time::SystemTime::UNIX_EPOCH.checked_add(std::time::Duration::new(secs as u64, nanos))
     } else {
@@ -409,12 +399,7 @@ impl ManagedDownloadHandle {
         }
     }
 
-    /// Give the finished file the object's own modification time rather than the time it was written.
-    ///
-    /// Best effort by design: a caller that wants this wants it so a later comparison reads the file
-    /// as no newer than the object it came from, and a file that keeps its write time is read as
-    /// newer and fetched again. A wasted transfer next time is the right price for a stamp that could
-    /// not be applied, where failing the download would discard bytes that already arrived.
+    // Request the object modification time on the finished file.
     pub(crate) fn stamp_modified_time(mut self) -> Self {
         self.stamp_modified_time = true;
         self
@@ -454,9 +439,7 @@ impl ManagedDownloadHandle {
 
         match &result {
             Ok(output) => {
-                // The time comes from the object that arrived rather than from anything observed
-                // earlier, so a file replaced between a listing and this download is dated by what is
-                // now in it.
+                // Use metadata from this response. A listing read earlier can be stale.
                 let modified = output.object_meta.last_modified;
                 if let Err(e) = self.finalize(modified).await {
                     self.cleanup().await;
@@ -505,19 +488,13 @@ impl ManagedDownloadHandle {
 
     async fn finalize(&self, modified: Option<aws_smithy_types::DateTime>) -> std::io::Result<()> {
         if let (Some(temp), Some(dest)) = (&self.temp_path, &self.dest_path) {
-            // Before the rename, so what appears at the destination already carries the right time
-            // rather than carrying the wrong one for a moment.
-            //
-            // Returns nothing, which is the point: `join` turns an error from `finalize` into a
-            // failed download and then deletes the temporary file, so a stamp able to report upward
-            // could throw away bytes that already arrived. A function with no error to give cannot do
-            // that however it is called later.
+            // Stamp the temporary file before the rename. The destination then appears with the
+            // object time.
             if self.stamp_modified_time {
                 match modified {
                     Some(at) => stamp_best_effort(temp, at),
-                    // A caller asked for the object's time and the response carried none, so the
-                    // file keeps the time it was written and the next run sees a file newer than
-                    // the object. Saying so costs a line and tells that caller why.
+                    // The response has no object time. Keep the file write time and log the
+                    // condition.
                     None => tracing::debug!(
                         path = %temp.display(),
                         "the object carried no modification time, so the file keeps its own"
@@ -557,9 +534,6 @@ impl Drop for ManagedDownloadHandle {
 
 #[cfg(test)]
 mod tests {
-    // The error `stamp_best_effort` swallows is a real one, so the swallowing is a choice rather than
-    // an impossibility. `finalize` cannot propagate it because the wrapper has nothing to return, and
-    // that is enforced by the signature rather than by anyone remembering.
     #[tokio::test]
     async fn setting_a_time_on_a_missing_file_fails_and_is_swallowed() {
         let dir = tempfile::tempdir().expect("a temp dir");
@@ -570,7 +544,6 @@ mod tests {
             super::set_modified_time(&missing, at).is_err(),
             "setting a time on a file that does not exist should fail"
         );
-        // The wrapper returns `()`, so this compiles only because there is no error to handle.
         super::stamp_best_effort(&missing, at);
     }
 

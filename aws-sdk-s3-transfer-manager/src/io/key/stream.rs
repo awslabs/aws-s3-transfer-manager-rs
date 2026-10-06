@@ -142,15 +142,12 @@ impl StreamError {
         }
     }
 
-    // Whether this names something no setting could have transferred, rather than something that
-    // should have worked and did not. A name that is not valid UTF-8 is the clearest case: an object
-    // key is Unicode, so no key exists for such a name under any setting. An object missing a field
-    // a comparison needs is the opposite — the listing should have carried it.
+    // A warning names something no transfer setting can carry. A non-UTF-8 local name has no S3
+    // key. A malformed listing should have supplied its missing field.
     pub(crate) fn is_warning(&self) -> bool {
         match self {
             StreamError::Walk(err) => err.kind().is_warning(),
             StreamError::UnkeyableName(_) => true,
-            // A listing's own collation being wrong is something that should have worked.
             StreamError::OutOfOrder { .. } => false,
             StreamError::MalformedListing { .. } => false,
         }
@@ -244,28 +241,23 @@ pub(crate) enum KeysLost {
 }
 
 impl StreamError {
-    // Matched exhaustively rather than tested against one kind, so a kind added later has to be
-    // placed deliberately instead of defaulting to the answer that permits a delete.
-    // The category this failure would carry once converted. Taken from a borrow, so a site can
-    // name the kind before the value itself moves into the records a caller reads. Converting
-    // needs ownership only to recover a service failure's operation and request ids, never to
-    // choose the kind.
+    // Return the error category without consuming the failure. Outcome reporting reads the category
+    // before it moves the failure into the run record.
     //
-    // Matched exhaustively for the same reason as `keys_lost` below: a kind added later has to be
-    // placed deliberately instead of arriving under whatever a wildcard arm happened to say.
+    // The match names every variant. A new stream error needs its own category.
     pub(crate) fn category(&self) -> crate::error::ErrorKind {
         use crate::error::ErrorKind;
         match self {
             StreamError::Walk(err) => err.kind().category(),
             StreamError::UnkeyableName(_) => ErrorKind::InputInvalid,
-            // A listing that answered out of order is a listing that did not behave, which is
-            // where the malformed one below lands too.
+            // Both errors make the object undiscoverable.
             StreamError::MalformedListing { .. } | StreamError::OutOfOrder { .. } => {
                 ErrorKind::ObjectNotDiscoverable
             }
         }
     }
 
+    // Matched exhaustively so a new kind needs a deliberate `KeysLost` answer.
     pub(crate) fn keys_lost(&self) -> KeysLost {
         match self {
             StreamError::Walk(err) => match err.kind() {
@@ -2295,9 +2287,6 @@ mod tests {
 
     use crate::io::walk::{WalkError, WalkErrorKind};
 
-    // The three kinds of thing that can go wrong while producing keys, and which of them a caller
-    // could have done something about. A name that is not valid UTF-8 has no key under any setting; a
-    // listing that left out a field a comparison needs should have carried it.
     #[test]
     fn only_a_name_with_no_key_and_a_loop_are_warnings() {
         assert!(StreamError::UnkeyableName(std::path::PathBuf::from("bad")).is_warning());

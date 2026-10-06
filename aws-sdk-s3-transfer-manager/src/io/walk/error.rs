@@ -58,26 +58,10 @@ impl WalkErrorKind {
         )
     }
 
-    // Whether this is something no setting could have transferred, as opposed to something that
-    // should have worked and did not. A caller stopping at the first failure wants the difference:
-    // halting over a name that was never going to be sent stops everything else for nothing.
+    // Return the error category without consuming the failure. Event integration and outcome
+    // reporting read it before the failure moves into a run record.
     //
-    // Only a loop qualifies. A link pointing at nothing looks similar and is not — it should have
-    // been readable, and it is the target's absence rather than the link's shape that stopped it. A
-    // loop has no target to be absent, and following it does not terminate.
-    //
-    // Crate-private and matched exhaustively here for the same reason as `is_fatal`:
-    // `WalkErrorKind` is public and `#[non_exhaustive]`, so a caller's own version needs a wildcard
-    // arm, and a kind added later would read there as whatever that arm says. Here a new kind stops
-    // the build until someone decides.
-    // The error category a failure of this kind carries.
-    //
-    // Two callers want it and would otherwise each carry a copy: converting a walk failure into
-    // this crate's error, and naming a category from a borrow before the failure moves into a
-    // run's records. Two copies agreeing is a thing that holds until someone adds a kind, so the
-    // kind answers for itself.
-    //
-    // Matched exhaustively for the same reason as the two answers below.
+    // The match names every variant. A new walk error needs its own category.
     pub(crate) fn category(&self) -> crate::error::ErrorKind {
         use crate::error::ErrorKind;
         match self {
@@ -94,6 +78,8 @@ impl WalkErrorKind {
         }
     }
 
+    // Return true when no sync setting can transfer the item. A symlink cycle has no terminal target.
+    // A path that vanished after listing has no work left to transfer.
     pub(crate) fn is_warning(&self) -> bool {
         match self {
             WalkErrorKind::SymlinkCycle | WalkErrorKind::Vanished => true,
@@ -193,12 +179,8 @@ impl std::error::Error for WalkError {
 mod tests {
     use super::*;
 
-    // Every kind, because the two questions a kind answers are whether it ends the walk and whether
-    // anything could have been transferred, and a kind that drifts between them changes what a run
-    // reports without changing any code that reads it.
     #[test]
     fn each_kind_says_whether_it_ends_the_walk_and_whether_it_was_ever_transferable() {
-        // Ends the walk: nothing is left to carry on with.
         for kind in [
             WalkErrorKind::SourceUnreadable,
             WalkErrorKind::NotADirectory,
@@ -207,8 +189,6 @@ mod tests {
             assert!(kind.is_fatal(), "{kind:?} must end the walk");
             assert!(!kind.is_warning(), "{kind:?} is a failure, not a warning");
         }
-        // Costs one key or one directory, and should have worked. A link pointing at nothing belongs
-        // here: the target's absence stopped it, not the link's shape.
         for kind in [
             WalkErrorKind::Io,
             WalkErrorKind::PermissionDenied,
@@ -221,8 +201,6 @@ mod tests {
                 "{kind:?} should have worked, so it is a failure"
             );
         }
-        // A loop has no target to be absent and following it does not terminate, so no setting
-        // transfers it.
         assert!(!WalkErrorKind::SymlinkCycle.is_fatal());
         assert!(WalkErrorKind::SymlinkCycle.is_warning());
     }
