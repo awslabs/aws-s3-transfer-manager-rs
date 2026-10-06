@@ -756,6 +756,11 @@ impl MaintenanceWorker {
 
 /// Adds a diagnostic value without wrapping.
 fn saturating_add(counter: &AtomicU64, value: u64) {
+    // TODO(msrv): `fetch_update` is deprecated from Rust 1.99 in favour of `try_update`,
+    // which is stable from 1.95. Switch to `try_update` once the MSRV is 1.95 or later and the
+    // loom atomics this module uses under `cfg(s3_tm_loom)` provide it (loom 0.7 has only
+    // `fetch_update`).
+    #[allow(deprecated)]
     let _ = counter.fetch_update(
         DiagnosticOrdering::Relaxed,
         DiagnosticOrdering::Relaxed,
