@@ -5853,4 +5853,420 @@ mod tests {
             "a cancelled work item left the merge where no poll can reach it"
         );
     }
+
+    // ======================================================================
+    // Real-bucket runs. `#[ignore]`d, so the ordinary suite never reaches S3:
+    //
+    //   S3_TEST_BUCKET_NAME_RS=<bucket> AWS_REGION=<region> \
+    //   SSL_CERT_FILE=/etc/ssl/cert.pem \
+    //     cargo test -p aws-sdk-s3-transfer-manager --lib real_bucket \
+    //     -- --ignored --test-threads=1 --nocapture
+    //
+    // `SSL_CERT_FILE` is needed where rustls cannot read the platform's root
+    // certificates; without it the TLS provider panics before any request goes out.
+    //
+    // TODO(sync): Tests below demonstrate functional correctness of sync within `pub(crate)`,
+    // before a public API exists for a caller to start a run. `#[ignore]` keeps the tests off an
+    // ordinary run, and tests are planned to move to `examples/` for customer demonstration.
+    // ======================================================================
+
+    // Both named by the environment, so nothing here says which account it runs against. The
+    // region and credentials come from the environment too, through `load_defaults`.
+    const BUCKET_VAR: &str = "S3_TEST_BUCKET_NAME_RS";
+
+    fn named_bucket(var: &str) -> String {
+        std::env::var(var).unwrap_or_else(|_| {
+            panic!("set {var} to a bucket these tests may write to and delete from")
+        })
+    }
+
+    fn regular_bucket() -> String {
+        named_bucket(BUCKET_VAR)
+    }
+
+    async fn real_client() -> aws_sdk_s3::Client {
+        let sdk = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+        aws_sdk_s3::Client::new(&sdk)
+    }
+
+    // A prefix nothing else is using, so a run that deletes can reach only its own keys.
+    fn a_run_prefix(what: &str) -> String {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("a clock after the epoch")
+            .as_nanos();
+        format!("sync-e2e/{what}-{stamp}/")
+    }
+
+    // What the bucket holds under a prefix, relative to it, sorted.
+    async fn bucket_keys(c: &aws_sdk_s3::Client, prefix: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let mut req = c.list_objects_v2().bucket(regular_bucket()).prefix(prefix);
+            if let Some(t) = token {
+                req = req.continuation_token(t);
+            }
+            let page = req.send().await.expect("the listing answers");
+            for o in page.contents() {
+                if let Some(k) = o.key() {
+                    out.push(k.strip_prefix(prefix).unwrap_or(k).to_string());
+                }
+            }
+            token = page.next_continuation_token().map(str::to_string);
+            if token.is_none() {
+                break;
+            }
+        }
+        out.sort();
+        out
+    }
+
+    // Every file under a root, relative and sorted, with the separator written as `/` so a tree
+    // and a listing compare directly.
+    fn tree_files(root: &Path) -> Vec<String> {
+        fn walk(dir: &Path, base: &Path, out: &mut Vec<String>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, base, out);
+                } else {
+                    let rel = p.strip_prefix(base).expect("a path under the root");
+                    out.push(
+                        rel.to_string_lossy()
+                            .replace(std::path::MAIN_SEPARATOR, "/"),
+                    );
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(root, root, &mut out);
+        out.sort();
+        out
+    }
+
+    fn a_tree_with_contents(root: &Path, files: &[(&str, &str)]) {
+        for (rel, body) in files {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().expect("a parent")).expect("directories are made");
+            std::fs::write(&p, body).expect("the file is written");
+        }
+    }
+
+    // Removes only what this run put in the bucket.
+    async fn remove_prefix(c: &aws_sdk_s3::Client, prefix: &str) {
+        let keys = bucket_keys(c, prefix).await;
+        for chunk in keys.chunks(1000) {
+            let ids: Vec<_> = chunk
+                .iter()
+                .filter_map(|k| {
+                    aws_sdk_s3::types::ObjectIdentifier::builder()
+                        .key(format!("{prefix}{k}"))
+                        .build()
+                        .ok()
+                })
+                .collect();
+            if ids.is_empty() {
+                continue;
+            }
+            let del = aws_sdk_s3::types::Delete::builder()
+                .set_objects(Some(ids))
+                .build()
+                .expect("a delete request");
+            let _ = c
+                .delete_objects()
+                .bucket(regular_bucket())
+                .delete(del)
+                .send()
+                .await;
+        }
+    }
+
+    #[derive(Debug)]
+    struct RealRun {
+        moved: u64,
+        transfers: u64,
+        transferred: u64,
+        deleted: u64,
+        failures: u64,
+        skipped: u64,
+    }
+
+    fn counters<S: KeyStream, D: KeyStream>(t: &SyncTransfer<S, D>) -> RealRun {
+        let state = t.inner.state.lock();
+        RealRun {
+            moved: state.bytes_moved,
+            transfers: state.decided.transfers,
+            transferred: state.transferred,
+            deleted: state.deleted,
+            failures: state.transfer_failures.total() + state.failures.total(),
+            skipped: state.decided.skipped.total(),
+        }
+    }
+
+    async fn real_upload(
+        local: &Path,
+        prefix: &str,
+        c: aws_sdk_s3::Client,
+        delete_mode: DeleteMode,
+    ) -> RealRun {
+        let config = crate::Config::builder().client(c.clone()).build();
+        let handle = crate::client::Handle::test_handle_managed(config);
+        let (ctx, rx) = TransferContext::new(handle);
+        let walk = Walker::builder()
+            .build()
+            .uploading(
+                LocalAndBucket::builder()
+                    .local_root(local)
+                    .client(c.clone())
+                    .bucket(regular_bucket())
+                    .prefix(prefix)
+                    .build(),
+            )
+            .expect("an ordinary bucket builds");
+        let transfer = SyncTransfer::new(
+            ctx.clone(),
+            walk,
+            Mode::default().uploading(),
+            Arc::new(SpawnUpload::new(
+                ctx.handle.clone(),
+                regular_bucket(),
+                Some(prefix),
+            )),
+            Deleter::Bucket(DeleteFromBucket::new(c, regular_bucket(), Some(prefix))),
+            RunSettings {
+                max_children: 8,
+                delete_mode,
+                failure_policy: FailurePolicy::Continue,
+            },
+        );
+        ctx.handle
+            .scheduler
+            .enqueue_transfer(Box::new(transfer.clone()));
+        tokio::time::timeout(Duration::from_secs(300), rx)
+            .await
+            .expect("the upload did not finish inside five minutes")
+            .expect("the terminal signal was dropped");
+        counters(&transfer)
+    }
+
+    async fn real_download(
+        local: &Path,
+        prefix: &str,
+        c: aws_sdk_s3::Client,
+        delete_mode: DeleteMode,
+    ) -> RealRun {
+        let config = crate::Config::builder().client(c.clone()).build();
+        let handle = crate::client::Handle::test_handle_managed(config);
+        let (ctx, rx) = TransferContext::new(handle);
+        let walk = Walker::builder()
+            .build()
+            .downloading(
+                LocalAndBucket::builder()
+                    .local_root(local)
+                    .client(c)
+                    .bucket(regular_bucket())
+                    .prefix(prefix)
+                    .build(),
+            )
+            .expect("an ordinary bucket builds");
+        let transfer = SyncTransfer::new(
+            ctx.clone(),
+            walk,
+            Mode::default().downloading(),
+            Arc::new(SpawnDownload::new(
+                ctx.handle.clone(),
+                regular_bucket(),
+                Some(prefix),
+                local,
+            )),
+            Deleter::LocalTree(DeleteFromLocalTree::new(local)),
+            RunSettings {
+                max_children: 8,
+                delete_mode,
+                failure_policy: FailurePolicy::Continue,
+            },
+        );
+        ctx.handle
+            .scheduler
+            .enqueue_transfer(Box::new(transfer.clone()));
+        tokio::time::timeout(Duration::from_secs(300), rx)
+            .await
+            .expect("the download did not finish inside five minutes")
+            .expect("the terminal signal was dropped");
+        counters(&transfer)
+    }
+
+    const REAL_TREE: &[(&str, &str)] = &[
+        ("a.txt", "alpha"),
+        ("b.txt", "bravo"),
+        ("nested/c.txt", "charlie"),
+        ("nested/deep/d.txt", "delta"),
+        ("empty.txt", ""),
+    ];
+
+    fn real_tree_keys() -> Vec<String> {
+        let mut v: Vec<String> = REAL_TREE.iter().map(|(k, _)| k.to_string()).collect();
+        v.sort();
+        v
+    }
+
+    // An upload under a prefix puts every key beneath it and nowhere else. The walk reports keys
+    // relative to the run's root, so naming an object means putting the prefix back; a run that
+    // forgets writes to the bucket root.
+    #[ignore = "will be moved to examples"]
+    #[tokio::test]
+    async fn real_bucket_upload_puts_every_key_under_its_prefix() {
+        let c = real_client().await;
+        let prefix = a_run_prefix("up-prefix");
+        let dir = tempfile::tempdir().expect("a temp dir");
+        a_tree_with_contents(dir.path(), REAL_TREE);
+
+        let run = real_upload(dir.path(), &prefix, c.clone(), DeleteMode::Off).await;
+        println!("  upload: {run:?}");
+
+        assert_eq!(
+            bucket_keys(&c, &prefix).await,
+            real_tree_keys(),
+            "the bucket does not hold the tree under {prefix}"
+        );
+        assert_eq!(run.failures, 0, "a key failed");
+        let stray = bucket_keys(&c, "a.txt").await;
+        assert!(
+            stray.is_empty(),
+            "a key landed at the bucket root: {stray:?}"
+        );
+
+        remove_prefix(&c, &prefix).await;
+    }
+
+    // The mirror, in the direction nothing has exercised: the prefix comes off rather than going
+    // on. A run that forgets writes `root/<prefix>/a.txt` for `root/a.txt`.
+    #[ignore = "will be moved to examples"]
+    #[tokio::test]
+    async fn real_bucket_download_strips_the_prefix_from_every_key() {
+        let c = real_client().await;
+        let prefix = a_run_prefix("down-prefix");
+        let src = tempfile::tempdir().expect("a temp dir");
+        a_tree_with_contents(src.path(), REAL_TREE);
+        real_upload(src.path(), &prefix, c.clone(), DeleteMode::Off).await;
+
+        let dst = tempfile::tempdir().expect("a temp dir");
+        let run = real_download(dst.path(), &prefix, c.clone(), DeleteMode::Off).await;
+        println!("  download: {run:?}");
+
+        assert_eq!(
+            tree_files(dst.path()),
+            real_tree_keys(),
+            "the local tree does not mirror the keys under {prefix}"
+        );
+        assert_eq!(run.failures, 0, "a key failed");
+        assert!(
+            !dst.path().join("sync-e2e").exists(),
+            "the prefix reached the local tree as a directory"
+        );
+        for (rel, body) in REAL_TREE {
+            let got = std::fs::read_to_string(dst.path().join(rel)).expect("the file reads");
+            assert_eq!(&got, body, "{rel} arrived with the wrong contents");
+        }
+
+        remove_prefix(&c, &prefix).await;
+    }
+
+    // What every caller does: sync, change little, sync again. The comparison has to agree with S3
+    // about size and time well enough to leave an unchanged key alone. A run that disagrees
+    // re-sends everything on every pass, and no mocked test would show it, because the mocks
+    // answer with whatever time the test asked for.
+    #[ignore = "will be moved to examples"]
+    #[tokio::test]
+    async fn real_bucket_second_run_moves_nothing() {
+        let c = real_client().await;
+        let prefix = a_run_prefix("idempotent");
+        let dir = tempfile::tempdir().expect("a temp dir");
+        a_tree_with_contents(dir.path(), REAL_TREE);
+
+        let up1 = real_upload(dir.path(), &prefix, c.clone(), DeleteMode::Off).await;
+        println!("  upload 1: {up1:?}");
+        let up2 = real_upload(dir.path(), &prefix, c.clone(), DeleteMode::Off).await;
+        println!("  upload 2: {up2:?}");
+        assert_eq!(
+            up2.transfers,
+            0,
+            "the second upload re-sent {} of {} keys",
+            up2.transfers,
+            REAL_TREE.len()
+        );
+
+        // The same the other way, which is where the stamp earns its place: a downloaded file
+        // keeps the time its object had, so a later run reads it as current.
+        let dst = tempfile::tempdir().expect("a temp dir");
+        let down1 = real_download(dst.path(), &prefix, c.clone(), DeleteMode::Off).await;
+        println!("  download 1: {down1:?}");
+        let down2 = real_download(dst.path(), &prefix, c.clone(), DeleteMode::Off).await;
+        println!("  download 2: {down2:?}");
+        assert_eq!(
+            down2.transfers,
+            0,
+            "the second download re-fetched {} of {} keys",
+            down2.transfers,
+            REAL_TREE.len()
+        );
+
+        remove_prefix(&c, &prefix).await;
+    }
+
+    // One object past the multipart threshold, up and back.
+    //
+    // Every other run here moves bytes small enough for a single request, so the multipart path —
+    // the parts, the completion, and the stamp that attaches once the file is whole — has never
+    // executed against S3. The threshold is 16 MiB, so twenty crosses it with room to spare.
+    #[ignore = "will be moved to examples"]
+    #[tokio::test]
+    async fn real_bucket_moves_an_object_past_the_multipart_threshold() {
+        let c = real_client().await;
+        let prefix = a_run_prefix("multipart");
+        let src = tempfile::tempdir().expect("a temp dir");
+        // Not all one byte: a run that mixed up part order would still match a uniform file.
+        let body: Vec<u8> = (0..20 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(src.path().join("big.dat"), &body).expect("the file is written");
+
+        let up = real_upload(src.path(), &prefix, c.clone(), DeleteMode::Off).await;
+        println!("  upload: {up:?}");
+        assert_eq!(up.failures, 0, "the multipart upload failed");
+        assert_eq!(
+            up.moved,
+            body.len() as u64,
+            "the run moved {} bytes of {}",
+            up.moved,
+            body.len()
+        );
+
+        let dst = tempfile::tempdir().expect("a temp dir");
+        let down = real_download(dst.path(), &prefix, c.clone(), DeleteMode::Off).await;
+        println!("  download: {down:?}");
+        assert_eq!(down.failures, 0, "the multipart download failed");
+        let back = std::fs::read(dst.path().join("big.dat")).expect("the copy reads");
+        assert_eq!(
+            back.len(),
+            body.len(),
+            "the copy is {} bytes against {}",
+            back.len(),
+            body.len()
+        );
+        assert!(back == body, "the bytes came back in a different order");
+
+        // And a second run leaves it alone, which is the stamp working on a file big enough to
+        // have taken several parts.
+        let again = real_download(dst.path(), &prefix, c.clone(), DeleteMode::Off).await;
+        println!("  download 2: {again:?}");
+        assert_eq!(
+            again.transfers, 0,
+            "the second download fetched the object again"
+        );
+
+        remove_prefix(&c, &prefix).await;
+    }
 }
