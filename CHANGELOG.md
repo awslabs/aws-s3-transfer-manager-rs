@@ -8,10 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.4.0] - Unreleased
 
 ### Changed
-- The `dial9` feature depends on `dial9` 0.5 instead of `dial9-tokio-telemetry` 0.3.
+- The `dial9` feature depends on `dial9` 0.5 instead of `dial9-tokio-telemetry` 0.3, and compiles
+  without `--cfg tokio_unstable`. Per-task poll, spawn, and terminate events and per-worker queue
+  depth for the managed runtime are recorded only when built with the flag.
 - `config::Builder::telemetry_guard` and `ConfigLoader::telemetry_guard` are renamed to
   `dial9_handle` and take a `dial9::Dial9Handle`. The caller owns the `dial9::Recorder`: pass
-  `recorder.handle().clone()`, and call `Recorder::graceful_shutdown` after dropping the client.
+  `recorder.handle().clone()`, and call `Recorder::graceful_shutdown` after the client, its clones,
+  and its transfer handles are dropped.
 
 ## [0.3.0] - 2026-09-30
 

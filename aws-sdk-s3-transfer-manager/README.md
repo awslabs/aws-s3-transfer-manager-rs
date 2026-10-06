@@ -134,6 +134,8 @@ The `cp` example supports optional [dial9](https://github.com/dial9-rs/dial9) in
 RUSTFLAGS="--cfg tokio_unstable -C force-frame-pointers=yes" cargo build --features dial9 --example cp --release
 ```
 
+`--cfg tokio_unstable` enables per-task poll and spawn events for the worker runtimes. `-C force-frame-pointers=yes` is required for the stacks captured by `--cpu-profiling` (Linux only).
+
 Then run with `--trace-dir` to enable tracing:
 
 ```sh

@@ -599,12 +599,12 @@ jobs:
           RUSTFLAGS: -Dwarnings -Adeprecated
 
   dial9-build:
-    # Builds the `cp` example, the workspace's consumer of dial9 types, with
-    # every feature and `--cfg tokio_unstable`. dial9 0.5 compiles without
-    # the flag, and the `features` job covers that configuration. With the
-    # flag, dial9's Tokio instrumentation also compiles its task-poll hooks,
-    # task spawn and terminate tracking, and per-worker queue depth, which
-    # is the configuration the crate README documents for tracing. A
+    # Builds the library and the `cp` example with every feature and
+    # `--cfg tokio_unstable`. dial9 0.5 compiles without the flag; the
+    # `features` job checks the library with `dial9` in that configuration.
+    # With the flag, dial9's Tokio instrumentation also compiles its
+    # task-poll hooks, task spawn and terminate tracking, and per-worker
+    # queue depth, which the crate README's tracing build enables. A
     # dedicated job keeps `tokio_unstable` out of the rest of CI.
     name: dial9 build
     needs: basics
