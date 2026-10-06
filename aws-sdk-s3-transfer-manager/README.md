@@ -126,6 +126,24 @@ let handle = transfer_manager
 let response = handle.join().await?;
 ```
 
+## Building the `cp` example with dial9 runtime tracing
+
+The `cp` example supports optional [dial9-tokio-telemetry](https://github.com/dial9-rs/dial9-tokio-telemetry) instrumentation for tracing all internal worker runtimes. This is useful for diagnosing hangs, load imbalance, and poll latency issues.
+
+```sh
+RUSTFLAGS="--cfg tokio_unstable" cargo build --features dial9 --example cp --release
+```
+
+Then run with `--trace-dir` to enable tracing:
+
+```sh
+./target/release/examples/cp s3://bucket/key /tmp/download --trace-dir /tmp/traces
+```
+
+Trace files are written to the specified directory and can be viewed with the [dial9 viewer](https://github.com/dial9-rs/dial9-tokio-telemetry/tree/main/dial9-viewer). Each worker runtime appears as worker 0..N in the trace.
+
+The `S3FIO_TRACE_DIR` environment variable can also be used instead of `--trace-dir`.
+
 ## Getting Help
 
 * [GitHub discussions](https://github.com/awslabs/aws-s3-transfer-manager-rs/discussions) - For ideas, RFCs & general questions

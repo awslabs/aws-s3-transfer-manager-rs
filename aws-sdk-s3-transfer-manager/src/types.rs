@@ -3,12 +3,11 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use core::fmt;
-use std::{borrow::Cow, fs::Metadata, path::Path, sync::Arc};
-
 use crate::metrics::{unit::ByteUnit, Throughput};
+use crate::runtime::buffer_pool::BufferPool;
 
 /// The target part size for an upload or download request.
+#[non_exhaustive]
 #[derive(Debug, Clone, Default)]
 pub enum PartSize {
     /// Automatically configure an optimal target part size based on the execution environment.
@@ -20,6 +19,79 @@ pub enum PartSize {
     /// NOTE: This is a suggestion and will be used if possible but may be adjusted for an individual request
     /// as required by the underlying API.
     Target(u64),
+}
+
+/// Configured capacity for reservation-based pooled transfer data.
+///
+/// Requests that fit within the resolved capacity backpressure when capacity
+/// is unavailable. A single reservation larger than the resolved capacity is
+/// rejected. Unreserved acquisition and process or runtime overhead are
+/// outside this ceiling.
+#[non_exhaustive]
+#[derive(Debug, Clone, Default)]
+pub enum MemoryBudgetConfig {
+    /// Use up to one quarter of detected effective memory, capped at 32 GiB.
+    ///
+    /// Effective memory includes process or container limits where the platform
+    /// exposes them. The result is rounded down to complete carriers. If
+    /// detection is unavailable, the pool uses 2 GiB.
+    #[default]
+    Auto,
+    /// Use the given fraction of detected effective memory.
+    ///
+    /// The fraction must be finite and in `(0.0, 1.0]`. This policy requires
+    /// memory detection and does not apply the automatic 32 GiB cap.
+    Fraction(f64),
+    /// An explicit byte limit that bypasses memory detection.
+    ///
+    /// The resolved capacity never exceeds this value and may be smaller by
+    /// less than one platform allocation unit. Values too small to fund one
+    /// allocation unit are rejected. The resolved capacity is reported by
+    /// [`MemoryMetrics::configured_capacity_bytes`].
+    ///
+    /// Use the [`ByteUnit`] helpers, for example
+    /// `Limit(2 * ByteUnit::Gibibyte.as_bytes_usize())`.
+    ///
+    /// [`MemoryMetrics::configured_capacity_bytes`]:
+    ///     crate::metrics::MemoryMetrics::configured_capacity_bytes
+    Limit(usize),
+}
+
+/// Selects the payload-memory pool used by a transfer-manager client.
+#[non_exhaustive]
+#[derive(Debug, Clone, Default)]
+pub enum MemoryConfig {
+    /// Construct an automatically sized pool when the client is created.
+    #[default]
+    Auto,
+    /// Use an existing pool.
+    ///
+    /// Every client or component using a clone of this pool shares one
+    /// admission ceiling, prepared-storage cache, and metrics domain.
+    Explicit(BufferPool),
+}
+
+/// Selects the execution runtime the transfer manager runs on.
+#[non_exhaustive]
+#[derive(Debug, Clone, Default)]
+pub enum RuntimeMode {
+    /// Managed OS threads owned by the transfer manager (default, recommended).
+    ///
+    /// Spawns and owns its own worker threads; the performance path.
+    #[default]
+    Managed,
+    /// Run on the caller's tokio multi-threaded runtime instead of spawning
+    /// dedicated threads.
+    ///
+    /// An escape hatch for embedding the transfer manager where it must not
+    /// spawn its own OS threads. This is not a performance tuning knob —
+    /// `Managed` is faster by design; prefer it unless you specifically need
+    /// the transfer manager to run on your existing runtime.
+    ///
+    /// Requires a multi-threaded runtime: transfer workers run via
+    /// `tokio::spawn`, so on a current-thread runtime they serialize onto one
+    /// thread and throughput collapses.
+    MultiThreadTokio,
 }
 
 /// The concurrency mode the client should use for executing requests.
@@ -37,6 +109,23 @@ pub enum ConcurrencyMode {
 
     /// Explicit concurrency control
     Explicit(usize),
+}
+
+/// How far a download may prefetch ahead of the consumer.
+///
+/// Read-ahead is speculative issuance: parts fetched before the consumer has read
+/// up to them. This bounds that speculation. It does not gate in-order delivery or
+/// override the memory budget; those are separate bounds.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ReadAhead {
+    /// Read ahead as far as available memory allows.
+    #[default]
+    Auto,
+
+    /// Read ahead at most `n` parts beyond the consumer's position. `0` fetches only
+    /// the part the consumer is waiting on (no speculation). Still bounded by memory.
+    Parts(usize),
 }
 
 /// Throughput target(s)
@@ -79,6 +168,7 @@ impl TargetThroughput {
 /// Policy for how to handle a failed multipart upload
 ///
 /// Default is to abort the upload.
+#[non_exhaustive]
 #[derive(Debug, Clone, Default)]
 pub enum FailedMultipartUploadPolicy {
     /// Abort the upload on any individual part failure
@@ -112,10 +202,11 @@ impl AbortedUpload {
     }
 }
 
-/// Policy for how to handle a failure of any indiviudal object in a transfer
+/// Policy for how to handle a failure of any individual object in a transfer
 /// involving multiple objects.
 ///
 /// Default is to abort the transfer.
+#[non_exhaustive]
 #[derive(Debug, Clone, Default, PartialEq)]
 pub enum FailedTransferPolicy {
     /// Abort the transfer on any individual failure to upload or download an object
@@ -124,47 +215,6 @@ pub enum FailedTransferPolicy {
     /// Continue the transfer. Any failure will be logged and the details of all failed
     /// objects will be available in the output after the transfer completes.
     Continue,
-}
-
-/// A filter for downloading objects from S3
-#[derive(Clone)]
-pub struct DownloadFilter {
-    pub(crate) predicate: Arc<dyn Fn(&aws_sdk_s3::types::Object) -> bool + Send + Sync + 'static>,
-}
-
-impl fmt::Debug for DownloadFilter {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut formatter = f.debug_struct("DownloadFilter");
-        formatter.field("predicate", &"<closure>");
-        formatter.finish()
-    }
-}
-
-impl<F> From<F> for DownloadFilter
-where
-    F: Fn(&aws_sdk_s3::types::Object) -> bool + Send + Sync + 'static,
-{
-    fn from(value: F) -> Self {
-        DownloadFilter {
-            predicate: Arc::new(value),
-        }
-    }
-}
-
-impl Default for DownloadFilter {
-    fn default() -> Self {
-        Self {
-            predicate: Arc::new(all_objects_filter),
-        }
-    }
-}
-
-/// Filter that returns all non-folder objects. A folder is a 0-byte object created
-/// when a customer uses S3 console to create a folder, and it always ends with '/'.
-fn all_objects_filter(obj: &aws_sdk_s3::types::Object) -> bool {
-    let key = obj.key().unwrap_or("");
-    let is_folder = key.ends_with('/') && obj.size().is_some() && obj.size().unwrap() == 0;
-    !is_folder
 }
 
 /// Detailed information about a failed object download
@@ -190,124 +240,14 @@ impl FailedDownload {
     }
 }
 
-/// A filter for choosing which objects to upload to S3.
-#[derive(Clone)]
-pub struct UploadFilter {
-    pub(crate) predicate: Arc<dyn Fn(&UploadFilterItem<'_>) -> bool + Send + Sync + 'static>,
-}
-
-impl fmt::Debug for UploadFilter {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut formatter = f.debug_struct("UploadFilter");
-        formatter.field("predicate", &"<closure>");
-        formatter.finish()
-    }
-}
-
-impl<F> From<F> for UploadFilter
-where
-    F: Fn(&UploadFilterItem<'_>) -> bool + Send + Sync + 'static,
-{
-    fn from(value: F) -> Self {
-        UploadFilter {
-            predicate: Arc::new(value),
-        }
-    }
-}
-
-fn is_hidden_file_name(path: &Path) -> bool {
-    path.file_name()
-        .map(|name| name.to_string_lossy().starts_with('.'))
-        .unwrap_or(false)
-}
-
-// This default filter does not exclude hidden directories. For example, if an `UploadFilterItem` corresponds to the path
-//   path/to/.hidden/ignore-me.txt
-// the item will not be filtered out and will be uploaded to S3.
-// https://github.com/awslabs/aws-s3-transfer-manager-rs/pull/72#discussion_r1835109128
-impl Default for UploadFilter {
-    fn default() -> Self {
-        Self {
-            predicate: Arc::new(|item| {
-                item.metadata().is_file() && !is_hidden_file_name(item.path())
-            }),
-        }
-    }
-}
-
-/// An item passed to [`UploadFilter`] for evaluation
-#[non_exhaustive]
-#[derive(Debug)]
-pub struct UploadFilterItem<'a> {
-    pub(crate) path: Cow<'a, Path>,
-    pub(crate) metadata: Metadata,
-}
-
-impl<'a> UploadFilterItem<'a> {
-    pub(crate) fn builder() -> UploadFilterItemBuilder<'a> {
-        UploadFilterItemBuilder::default()
-    }
-
-    /// Full path to the file.
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    /// Metadata about the file located at `self.path`.
-    ///
-    /// Use this `Metadata` for queries `is_dir()` and `is_file()`. However, it cannot
-    /// be used to determine whether `self.path` is a symbolic link because the metadata
-    /// set in this struct is assumed to return true for either `is_dir()` or `is_file()`,
-    /// but not for `is_symlink()`.
-    pub fn metadata(&self) -> &Metadata {
-        &self.metadata
-    }
-}
-
-#[derive(Debug, Default)]
-pub(crate) struct UploadFilterItemBuilder<'a> {
-    pub(crate) path: Option<Cow<'a, Path>>,
-    pub(crate) metadata: Option<Metadata>,
-}
-
-impl<'a> UploadFilterItemBuilder<'a> {
-    // Set the full path for a path entry to be filtered.
-    //
-    // NOTE: A path is required.
-    pub(crate) fn path(mut self, path: impl Into<Cow<'a, Path>>) -> Self {
-        self.path = Some(path.into());
-        self
-    }
-
-    // Set the `Metadata` for `self.path`.
-    //
-    // This `Metadata` must be one of the following:
-    // - Obtained via `fs::metadata()`, which follows symbolic links.
-    // - Obtained via `fs::symlink_metadata()`, which is guaranteed to return true for either `is_dir()` or `is_file()`,
-    //   but not for `is_symlink()`.
-    //
-    // NOTE: A metadata is required.
-    pub(crate) fn metadata(mut self, metadata: Metadata) -> Self {
-        self.metadata = Some(metadata);
-        self
-    }
-
-    pub(crate) fn build(self) -> UploadFilterItem<'a> {
-        UploadFilterItem {
-            path: self.path.expect("required field `path` should be set"),
-            metadata: self
-                .metadata
-                .expect("required field `metadata` should be set"),
-        }
-    }
-}
-
 /// Detailed information about a failed upload
 #[non_exhaustive]
 #[derive(Debug)]
 pub struct FailedUpload {
     pub(crate) input: Option<crate::operation::upload::UploadInput>,
     pub(crate) error: crate::error::Error,
+    /// Local filesystem path of the source file that failed to upload.
+    pub(crate) source_path: Option<std::path::PathBuf>,
 }
 
 impl FailedUpload {
@@ -320,6 +260,52 @@ impl FailedUpload {
     pub fn error(&self) -> &crate::error::Error {
         &self.error
     }
+
+    /// Local filesystem path of the source file that failed to upload.
+    pub fn source_path(&self) -> Option<&std::path::Path> {
+        self.source_path.as_deref()
+    }
+}
+
+/// Status of a transfer operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TransferStatus {
+    /// Transfer is actively running.
+    Active,
+    /// Transfer completed successfully.
+    Completed,
+    /// Transfer failed with an error.
+    Failed,
+    /// Transfer was cancelled.
+    Cancelled,
+}
+
+impl TransferStatus {
+    /// Returns true if the transfer has reached a terminal state.
+    pub fn is_terminal(&self) -> bool {
+        !matches!(self, Self::Active)
+    }
+}
+
+/// Snapshot of transfer progress and IO metrics.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct TransferMetrics {
+    /// Bytes sent over network (upload payload).
+    pub network_tx: u64,
+    /// Bytes received from network (download payload).
+    pub network_rx: u64,
+    /// Bytes read from disk.
+    pub disk_read: u64,
+    /// Bytes written to disk.
+    pub disk_write: u64,
+    /// Expected total payload bytes, if known.
+    pub total_bytes: Option<u64>,
+    /// When the transfer was initiated.
+    pub started_at: std::time::Instant,
+    /// When the transfer reached a terminal state, if it has.
+    pub finished_at: Option<std::time::Instant>,
 }
 
 /// Type of the bucket for the transfer
@@ -336,6 +322,150 @@ impl BucketType {
             BucketType::Express
         } else {
             BucketType::Standard
+        }
+    }
+}
+
+/// Internal bucket representation carrying the name and resolved kind.
+#[derive(Debug, Clone)]
+pub(crate) struct Bucket {
+    name: String,
+    kind: BucketType,
+}
+
+impl Bucket {
+    pub(crate) fn new(name: String) -> Self {
+        let kind = BucketType::from_bucket_name(&name);
+        Self { name, kind }
+    }
+
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub(crate) fn kind(&self) -> BucketType {
+        self.kind
+    }
+}
+
+/// Object-integrity information for a completed download.
+///
+/// Carries the object's reported checksum values (as returned by S3) and the
+/// outcome of checksum validation over the delivered bytes. Validation is a
+/// completion-time fact, distinct from the discovery-time [`ObjectMetadata`].
+///
+/// A checksum mismatch is not represented here; it surfaces as an `Err` from the
+/// download's `join()`. On a successful `DownloadOutput`, [`ChecksumValidation`]
+/// distinguishes "validated" from "validation did not happen".
+///
+/// [`ObjectMetadata`]: crate::operation::download::ObjectMetadata
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct IntegrityChecks {
+    checksum_crc32: Option<String>,
+    checksum_crc32c: Option<String>,
+    checksum_crc64_nvme: Option<String>,
+    checksum_sha1: Option<String>,
+    checksum_sha256: Option<String>,
+    checksum_type: Option<aws_sdk_s3::types::ChecksumType>,
+    checksum_validation: ChecksumValidation,
+}
+
+impl IntegrityChecks {
+    /// The outcome of checksum validation over the delivered object bytes.
+    pub fn checksum_validation(&self) -> &ChecksumValidation {
+        &self.checksum_validation
+    }
+
+    /// The base64-encoded CRC-32 checksum reported by S3, if present.
+    pub fn checksum_crc32(&self) -> Option<&str> {
+        self.checksum_crc32.as_deref()
+    }
+
+    /// The base64-encoded CRC-32C checksum reported by S3, if present.
+    pub fn checksum_crc32c(&self) -> Option<&str> {
+        self.checksum_crc32c.as_deref()
+    }
+
+    /// The base64-encoded CRC-64/NVME checksum reported by S3, if present.
+    pub fn checksum_crc64_nvme(&self) -> Option<&str> {
+        self.checksum_crc64_nvme.as_deref()
+    }
+
+    /// The base64-encoded SHA-1 checksum reported by S3, if present.
+    pub fn checksum_sha1(&self) -> Option<&str> {
+        self.checksum_sha1.as_deref()
+    }
+
+    /// The base64-encoded SHA-256 checksum reported by S3, if present.
+    pub fn checksum_sha256(&self) -> Option<&str> {
+        self.checksum_sha256.as_deref()
+    }
+
+    /// The object's checksum type (full-object vs composite), if reported.
+    pub fn checksum_type(&self) -> Option<&aws_sdk_s3::types::ChecksumType> {
+        self.checksum_type.as_ref()
+    }
+}
+
+/// Whether the bytes delivered by a download were validated against a checksum.
+///
+/// `Validated` means the *entire* delivered object was covered by a checksum and
+/// matched. Anything short of whole-object coverage is `NotValidated` with a
+/// [`NotValidatedReason`]; there is no partial state.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChecksumValidation {
+    /// Every delivered byte was validated against a checksum and matched.
+    #[non_exhaustive]
+    Validated {
+        /// The algorithm used to validate.
+        algorithm: aws_sdk_s3::types::ChecksumAlgorithm,
+    },
+    /// No whole-object validation occurred. `reason` explains why.
+    #[non_exhaustive]
+    NotValidated {
+        /// Why validation did not cover the whole object.
+        reason: NotValidatedReason,
+    },
+}
+
+/// Why a download's bytes were not whole-object checksum-validated.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotValidatedReason {
+    /// Checksum validation was not enabled for the request (client
+    /// `ResponseChecksumValidation::WhenRequired` with no request override).
+    Disabled,
+    /// The object carries only a composite (`-N`) checksum, which cannot be
+    /// validated against delivered bytes.
+    CompositeChecksum,
+    /// Some delivered bytes were validated but not the whole object.
+    PartialCoverage,
+    /// No checksum covered the delivered bytes (object has no stored checksum,
+    /// or the requested range did not align to a stored part).
+    Unavailable,
+}
+
+impl IntegrityChecks {
+    /// Build from the object's reported checksum fields and a resolved verdict.
+    pub(crate) fn new(
+        checksum_crc32: Option<String>,
+        checksum_crc32c: Option<String>,
+        checksum_crc64_nvme: Option<String>,
+        checksum_sha1: Option<String>,
+        checksum_sha256: Option<String>,
+        checksum_type: Option<aws_sdk_s3::types::ChecksumType>,
+        checksum_validation: ChecksumValidation,
+    ) -> Self {
+        Self {
+            checksum_crc32,
+            checksum_crc32c,
+            checksum_crc64_nvme,
+            checksum_sha1,
+            checksum_sha256,
+            checksum_type,
+            checksum_validation,
         }
     }
 }

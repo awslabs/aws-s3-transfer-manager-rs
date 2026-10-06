@@ -3,13 +3,11 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use crate::http::header;
 use aws_sdk_s3::operation::get_object::GetObjectOutput;
 use aws_sdk_s3::operation::head_object::HeadObjectOutput;
 use aws_sdk_s3::operation::RequestId;
 use aws_sdk_s3::operation::RequestIdExt;
 use std::ops::RangeInclusive;
-use std::str::FromStr;
 
 /// Object metadata other than the body that can be set from either `GetObject` or `HeadObject`
 /// In the case of GetObject, some data will be duplicated as part of the first chunk.
@@ -111,8 +109,12 @@ pub struct ObjectMetadata {
 }
 
 impl ObjectMetadata {
-    /// <p>Size of the object in bytes.</p>
-    pub fn content_length(&self) -> u64 {
+    /// Total size of the S3 object in bytes.
+    ///
+    /// When a `Content-Range` header is present (e.g. `bytes 0-8388607/34359738368`),
+    /// returns the total object size from the range denominator, NOT the response
+    /// body length. Falls back to the `Content-Length` header when no range is present.
+    pub fn total_object_size(&self) -> u64 {
         match (self.content_length, self.content_range.as_ref()) {
             (_, Some(range)) => {
                 let total = range.split_once('/').map(|x| x.1).expect("content range total");
@@ -128,24 +130,14 @@ impl ObjectMetadata {
 
     /// <p>Parse the content-range header to the inclusive range..</p>
     pub(crate) fn range_from_content_range(&self) -> Option<RangeInclusive<u64>> {
-        match self.content_length().checked_sub(1) {
-            Some(object_end) => match self.content_range.as_ref() {
-                Some(range) => {
-                    let byte_range_str = range
-                        .strip_prefix("bytes ")
-                        .expect("content range bytes-unit recognized")
-                        .split_once("/")
-                        .map(|x| x.0)
-                        .expect("content range valid");
-                    match header::ByteRange::from_str(byte_range_str).expect("valid byte range") {
-                        header::ByteRange::Inclusive(start, end) => Some(start..=end),
-                        _ => unreachable!("Content-Range header invalid"),
-                    }
-                }
-                // When S3 doesn't provide a content-range header, we can infer the total size from the content-length header.
-                None => Some(0..=object_end),
-            },
-            None => None,
+        match self.content_range.as_deref() {
+            Some(range) => crate::http::header::parse_content_range(range),
+            // Without Content-Range, Content-Length describes the complete object.
+            None => self
+                .content_length
+                .and_then(|length| u64::try_from(length).ok())
+                .and_then(|length| length.checked_sub(1))
+                .map(|end| 0..=end),
         }
     }
 }
@@ -208,7 +200,13 @@ impl From<HeadObjectOutput> for ObjectMetadata {
             content_disposition: value.content_disposition,
             content_encoding: value.content_encoding,
             content_language: value.content_language,
-            content_range: None,
+            // A HEAD carrying a `Range` answers 206 with `Content-Range`, and its
+            // `Content-Length` is then the range's length, not the object's. Dropping
+            // the range leaves `total_object_size` reporting that length and
+            // `range_from_content_range` falling back to `0..=length-1`, which is the
+            // right count at the wrong offset -- so a suffix or open-ended range
+            // downloads the object's leading bytes instead of the ones asked for.
+            content_range: value.content_range,
             content_type: value.content_type,
             expires_string: value.expires_string,
             website_redirect_location: value.website_redirect_location,
@@ -295,14 +293,14 @@ mod tests {
             ..Default::default()
         };
 
-        assert_eq!(15, meta.content_length());
+        assert_eq!(15, meta.total_object_size());
 
         let meta = ObjectMetadata {
             content_range: Some("bytes 0-499/900".to_owned()),
             content_length: Some(500),
             ..Default::default()
         };
-        assert_eq!(900, meta.content_length());
+        assert_eq!(900, meta.total_object_size());
     }
 
     #[test]

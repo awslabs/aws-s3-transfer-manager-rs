@@ -3,68 +3,642 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use std::cmp;
-use std::cmp::Ordering;
-use std::collections::BinaryHeap;
-use tokio::sync::mpsc;
+use std::io::IoSlice;
 
-use crate::io::AggregatedBytes;
+use bytes::Buf;
+
+use crate::runtime::buffer_pool::{Reservation, SegmentedBytes};
+use crate::runtime::sync::sync::Arc;
 
 use super::chunk_meta::ChunkMetadata;
+use super::recv_buffer::{
+    DrainMode, FillOutcome, PagedRecvBuffer, RecvBufferConsumer, SegmentWrite, SlotHandle,
+};
+
+/// Segment size for the paged buffer. Re-exported from `recv_buffer` for test access.
+const SEG_SIZE: usize = super::recv_buffer::DEFAULT_SEG_SIZE;
+use super::transfer::DownloadTransfer;
+
+/// Wakeup signal wrapper. Under loom, tokio::sync::Notify is unavailable,
+/// but the Notify doesn't participate in safety invariants — it's just a
+/// hint to the consumer. A no-op stub is sufficient for loom tests.
+#[cfg(not(all(test, s3_tm_loom)))]
+use tokio::sync::Notify as WakeNotify;
+
+#[cfg(all(test, s3_tm_loom))]
+struct WakeNotify;
+
+#[cfg(all(test, s3_tm_loom))]
+impl WakeNotify {
+    fn new() -> Self {
+        Self
+    }
+    fn notify_one(&self) {}
+    async fn notified(&self) {}
+}
+
+/// Borrowed read position over one contiguous run being written to disk.
+///
+/// The claimed receive-buffer slots retain ownership until the write
+/// completes. This cursor presents their bytes without cloning owner metadata.
+struct DiskWriteCursor<'a> {
+    write: &'a SegmentWrite<ChunkOutput>,
+    payload_index: usize,
+    payload_offset: usize,
+    remaining: usize,
+}
+
+impl<'a> DiskWriteCursor<'a> {
+    /// Validates one claimed run and returns its object offset and read cursor.
+    fn new(write: &'a SegmentWrite<ChunkOutput>) -> std::io::Result<(u64, Self)> {
+        let mut object_offset = None;
+        let mut expected_offset = None;
+        let mut remaining = 0usize;
+
+        for slot in write.payloads() {
+            let chunk = slot.get().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "claimed disk-write run contains an unfilled slot",
+                )
+            })?;
+            let chunk_len = chunk.data.remaining();
+            if chunk_len == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "claimed disk-write run contains an empty payload",
+                ));
+            }
+            if let Some(expected) = expected_offset {
+                if chunk.offset != expected {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "claimed disk-write run has noncontiguous object offsets",
+                    ));
+                }
+            } else {
+                object_offset = Some(chunk.offset);
+            }
+
+            let chunk_len_u64 = u64::try_from(chunk_len).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "disk-write payload length exceeds object-offset representation",
+                )
+            })?;
+            expected_offset = Some(chunk.offset.checked_add(chunk_len_u64).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "disk-write object offset overflow",
+                )
+            })?);
+            remaining = remaining.checked_add(chunk_len).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "disk-write run length overflow",
+                )
+            })?;
+        }
+
+        let object_offset = object_offset.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "claimed disk-write run contains no payloads",
+            )
+        })?;
+        Ok((
+            object_offset,
+            Self {
+                write,
+                payload_index: 0,
+                payload_offset: 0,
+                remaining,
+            },
+        ))
+    }
+
+    fn current(&self) -> &SegmentedBytes {
+        self.write.payloads()[self.payload_index]
+            .get()
+            .map(|chunk| &chunk.data)
+            .expect("validated disk-write payload disappeared")
+    }
+}
+
+impl Buf for DiskWriteCursor<'_> {
+    fn remaining(&self) -> usize {
+        self.remaining
+    }
+
+    fn chunk(&self) -> &[u8] {
+        if self.remaining == 0 {
+            return &[];
+        }
+        self.current().chunk_from(self.payload_offset)
+    }
+
+    fn chunks_vectored<'a>(&'a self, dst: &mut [IoSlice<'a>]) -> usize {
+        let mut written = 0;
+        for (index, slot) in self.write.payloads()[self.payload_index..]
+            .iter()
+            .enumerate()
+        {
+            if written == dst.len() {
+                break;
+            }
+            let chunk = slot
+                .get()
+                .expect("validated disk-write payload disappeared");
+            let offset = if index == 0 { self.payload_offset } else { 0 };
+            written += chunk.data.chunks_vectored_from(offset, &mut dst[written..]);
+        }
+        written
+    }
+
+    fn advance(&mut self, mut count: usize) {
+        assert!(
+            count <= self.remaining,
+            "advanced beyond download write run"
+        );
+        self.remaining -= count;
+        while count != 0 {
+            let current_len = self.current().remaining();
+            let available = current_len
+                .checked_sub(self.payload_offset)
+                .expect("disk-write cursor exceeds its payload");
+            let advanced = count.min(available);
+            self.payload_offset += advanced;
+            count -= advanced;
+            if self.payload_offset == current_len {
+                self.payload_index += 1;
+                self.payload_offset = 0;
+            }
+        }
+    }
+}
+
+/// Positioned-write target for download-to-file. Abstracts the file so the drain
+/// orchestration (run coalescing, offset translation) can be exercised against an
+/// in-memory capture, and so an alternative write strategy (e.g. O_DIRECT/io_uring)
+/// can replace the file write without touching the buffer or the drain logic.
+///
+/// Positions passed to `write_all_at` are relative to the downloaded payload.
+/// `prepare` may reserve storage before writes begin, while `finalize` establishes
+/// the destination layout after every payload write succeeds. Implementations are
+/// shared across the issuer and the drain task, hence `Send + Sync`.
+trait SinkWrite: Send + Sync + std::fmt::Debug {
+    /// Write the entire buffer at `pos` bytes from the payload's destination start.
+    fn write_all_at(&self, buf: &mut DiskWriteCursor<'_>, pos: u64) -> std::io::Result<()>;
+
+    /// Prepare a target for an expected download of `expected_download_len` bytes.
+    fn prepare(&self, _expected_download_len: u64) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    /// Establish the target's successful layout for the complete payload.
+    fn finalize(&self, _expected_download_len: u64) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// File-backed [`SinkWrite`] using the current replace-from-zero policy.
+///
+/// Payload-relative positions map directly to file positions and successful
+/// finalization truncates the file to the payload length. A future append or
+/// write-at policy belongs here: it can translate the relative positions and
+/// final length without changing transfer scheduling or object-range arithmetic.
+struct FileSink {
+    file: std::fs::File,
+    /// Whether the transfer manager created this file (vs caller-provided). Only an
+    /// owned file is preallocated.
+    owns_file: bool,
+}
+
+impl std::fmt::Debug for FileSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileSink").finish_non_exhaustive()
+    }
+}
+
+/// Returns whether failure to reserve storage makes the download futile.
+///
+/// Unsupported preallocation remains best effort because the subsequent
+/// positioned writes may still succeed. Linux storage and quota exhaustion
+/// cannot recover without external intervention and should fail before the
+/// transfer spends network and memory resources on the object body.
+fn preallocation_failure_is_fatal(error: &std::io::Error) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        matches!(
+            error.raw_os_error(),
+            Some(libc::ENOSPC) | Some(libc::EDQUOT)
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = error;
+        false
+    }
+}
+
+impl SinkWrite for FileSink {
+    fn write_all_at(&self, buf: &mut DiskWriteCursor<'_>, pos: u64) -> std::io::Result<()> {
+        crate::io::fs::write_all_at(&self.file, buf, pos)
+    }
+
+    fn prepare(&self, expected_download_len: u64) -> std::io::Result<()> {
+        if self.owns_file {
+            if let Err(e) = crate::io::fs::preallocate(&self.file, expected_download_len) {
+                if preallocation_failure_is_fatal(&e) {
+                    return Err(e);
+                }
+                tracing::warn!(error = %e, "failed to preallocate file space");
+            }
+        }
+        Ok(())
+    }
+
+    fn finalize(&self, expected_download_len: u64) -> std::io::Result<()> {
+        self.file.set_len(expected_download_len)
+    }
+}
+
+/// Stream vs disk discrimination. Mutually exclusive per transfer.
+#[derive(Debug)]
+enum Mode {
+    Stream,
+    /// Positioned writes land at `chunk.offset - object_range_start` in the sink.
+    Disk {
+        sink: Box<dyn SinkWrite>,
+        /// Start of the resolved S3 byte range for this transfer.
+        object_range_start: std::sync::OnceLock<u64>,
+    },
+}
+
+/// Producer handle to the download body buffer. Held at `self.inner.writer`
+/// in the transfer. Clone shares all state via `Arc`.
+#[derive(Clone)]
+pub(crate) struct BodyWriter {
+    buffer: PagedRecvBuffer<ChunkOutput>,
+    notify: Arc<WakeNotify>,
+    mode: Arc<Mode>,
+}
+
+impl std::fmt::Debug for BodyWriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BodyWriter")
+            .field("mode", &self.mode)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A claimed slot in the body buffer, produced by [`BodyWriter::claim`].
+/// Consuming [`fill`](Self::fill) publishes the payload and notifies the
+/// consumer. Drop without fill still wakes the consumer and closes any
+/// attached reservation.
+pub(crate) struct BodySlot {
+    handle: Option<SlotHandle<ChunkOutput>>,
+    buffer: PagedRecvBuffer<ChunkOutput>,
+    notify: Arc<WakeNotify>,
+    /// Memory reservation held from claim through response collection. A
+    /// successful fill closes acquisition authority; the immutable payload then
+    /// owns every live carrier charge directly. `None` until
+    /// [`BodySlot::attach_reservation`], and on paths that do not reserve
+    /// (tests).
+    reservation: Option<Reservation>,
+}
+
+impl std::fmt::Debug for BodySlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BodySlot")
+            .field("seq", &self.handle.as_ref().map(|h| h.seq()))
+            .finish_non_exhaustive()
+    }
+}
+
+impl BodySlot {
+    /// The sequence number for this slot.
+    pub(crate) fn seq(&self) -> u64 {
+        self.handle.as_ref().expect("slot already consumed").seq()
+    }
+
+    /// Returns the reservation attached before this slot was dispatched.
+    ///
+    /// Response attempts borrow this authority while copying transport-owned
+    /// frames into pooled carriers. A failed attempt drops its carriers but
+    /// leaves the reservation on the slot for the next attempt.
+    pub(crate) fn reservation(&self) -> &Reservation {
+        self.reservation
+            .as_ref()
+            .expect("body slot dispatched without a memory reservation")
+    }
+
+    /// Attach the memory reservation backing this chunk. It remains open while
+    /// response attempts may acquire carriers and closes on successful fill.
+    pub(crate) fn attach_reservation(&mut self, reservation: Reservation) {
+        self.reservation = Some(reservation);
+    }
+
+    /// Publish a completed chunk into this slot. Wakes the stream consumer
+    /// and returns the fill outcome (whether a segment was sealed). Immutable
+    /// owners retain all acquired carriers, so no direct acquisition authority
+    /// is needed after this point.
+    pub(crate) fn fill(mut self, chunk: ChunkOutput) -> FillOutcome {
+        let handle = self.handle.take().expect("slot already consumed");
+        if let Some(reservation) = self.reservation.take() {
+            reservation.close_acquisition();
+        }
+        let outcome = self.buffer.fill(handle, chunk);
+        self.notify.notify_one();
+        outcome
+    }
+}
+
+impl Drop for BodySlot {
+    fn drop(&mut self) {
+        // If the handle is still present the slot was never filled. Notify to
+        // prevent the consumer from sleeping forever waiting on this sequence.
+        if self.handle.is_some() {
+            self.notify.notify_one();
+        }
+    }
+}
+
+impl BodyWriter {
+    pub(crate) fn has_sink(&self) -> bool {
+        matches!(&*self.mode, Mode::Disk { .. })
+    }
+
+    /// Claim the next slot. The read-ahead gate lives in poll_work (tracks
+    /// `issued` under the state lock) — this is the unconditional claim.
+    pub(crate) fn claim(&self) -> BodySlot {
+        let handle = self.buffer.claim();
+        BodySlot {
+            handle: Some(handle),
+            buffer: self.buffer.clone(),
+            notify: self.notify.clone(),
+            reservation: None,
+        }
+    }
+
+    /// Disk mode: drain every batch-ready run to disk. Called on the `DrainReady`
+    /// edge from execute tasks. A non-terminal drain claims only runs that reach the
+    /// drain batch, coalescing each into one positioned write. Stream mode: no-op.
+    ///
+    /// Returns the number of parts freed across the runs drained by this call.
+    /// The download layer releases that read-ahead occupancy under its state
+    /// lock.
+    pub(crate) fn drain(&self, mode: DrainMode) -> Result<u64, std::io::Error> {
+        let mut freed = 0u64;
+        if let Mode::Disk {
+            sink,
+            object_range_start,
+        } = &*self.mode
+        {
+            let Some(object_range_start) = object_range_start.get().copied() else {
+                // Cancellation can terminate a disk transfer before discovery
+                // establishes its range. A fill before preparation violates the
+                // transfer ordering and cannot be positioned safely.
+                if self.buffer.has_undrained_fills() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "disk payload arrived before destination preparation",
+                    ));
+                }
+                return Ok(0);
+            };
+            while let Some(sw) = self.buffer.take_drain_run(mode) {
+                write_run(sink.as_ref(), object_range_start, &sw)?;
+                freed = freed.saturating_add(sw.complete());
+            }
+        }
+        Ok(freed)
+    }
+
+    /// Flush every remaining filled run at a terminal transition, including a partial
+    /// final segment below the drain batch.
+    ///
+    /// Success, failure, and cancellation all use this operation to release resident
+    /// payload ownership. It does not establish the target's successful final shape.
+    pub(crate) fn terminal_drain(&self) -> Result<u64, std::io::Error> {
+        if !matches!(&*self.mode, Mode::Disk { .. }) {
+            return Ok(0);
+        }
+        let terminal_parts = self.drain(DrainMode::Eager)?;
+        tracing::debug!(
+            target: crate::telemetry::TARGET_TRANSFER,
+            terminal_parts,
+            "terminal drain complete; tail flushed to disk",
+        );
+        Ok(terminal_parts)
+    }
+
+    /// Flush terminal payloads and establish the successful disk target length.
+    pub(crate) fn finalize(&self, expected_download_len: u64) -> Result<u64, std::io::Error> {
+        let terminal_parts = self.terminal_drain()?;
+        if let Mode::Disk { sink, .. } = &*self.mode {
+            sink.finalize(expected_download_len)?;
+        }
+        Ok(terminal_parts)
+    }
+
+    /// Whether a forced eager drain would free at least one resident part right now:
+    /// the disk surface holds a contiguous filled run at some segment's claim cursor.
+    /// Stream mode returns false: its consumer drives release, so it never pins
+    /// carrier charges behind the drain batch. This gates memory-pressure relief.
+    pub(crate) fn has_drainable_resident(&self) -> bool {
+        matches!(&*self.mode, Mode::Disk { .. }) && self.buffer.has_drainable_prefix()
+    }
+
+    /// Flush the resident filled prefix to disk now, below the drain batch.
+    /// Memory-pressure relief is distinct from terminal `finalize`, but uses
+    /// the same eager take. Returns the parts freed so the caller releases their
+    /// read-ahead occupancy. Not terminal: the transfer keeps issuing after this.
+    pub(crate) fn flush_resident(&self) -> Result<u64, std::io::Error> {
+        self.drain(DrainMode::Eager)
+    }
+
+    /// Couple the drain batch to the read-ahead window: a window narrower than a
+    /// segment drains in smaller runs so the block surface never waits for a run it
+    /// cannot accumulate. Capped at the segment size (the coalescing target). Called
+    /// at construction and whenever the window changes.
+    pub(crate) fn sync_drain_batch(&self, window: u64) {
+        let batch = std::cmp::min(SEG_SIZE as u64, window.max(1)) as usize;
+        self.buffer.set_drain_batch(batch);
+    }
+
+    /// Wake the consumer (terminal transition).
+    pub(crate) fn notify_consumer(&self) {
+        self.notify.notify_one();
+    }
+
+    /// Fix the resolved object-range origin and prepare a disk target.
+    pub(crate) fn prepare(
+        &self,
+        object_range_start: u64,
+        expected_download_len: u64,
+    ) -> std::io::Result<()> {
+        if let Mode::Disk {
+            sink,
+            object_range_start: configured_start,
+        } = &*self.mode
+        {
+            assert!(
+                configured_start.set(object_range_start).is_ok(),
+                "disk destination prepared more than once"
+            );
+            sink.prepare(expected_download_len)?;
+        }
+        Ok(())
+    }
+}
+
+/// Write one claimed, contiguous payload run at its translated file position.
+///
+/// The cursor borrows payloads in place. `complete()` (called by the caller
+/// after this returns) frees their owners.
+fn write_run(
+    sink: &dyn SinkWrite,
+    object_range_start: u64,
+    sw: &SegmentWrite<ChunkOutput>,
+) -> std::io::Result<()> {
+    let (object_offset, mut cursor) = DiskWriteCursor::new(sw)?;
+    let file_pos = object_offset
+        .checked_sub(object_range_start)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "disk-write payload begins before the requested object range",
+            )
+        })?;
+    sink.write_all_at(&mut cursor, file_pos)
+}
+
+/// Consumer wrapper carrying the notify handle alongside the buffer consumer.
+/// Handed from constructors to `Body::new`.
+pub(crate) struct RecvBodyConsumer {
+    consumer: RecvBufferConsumer<ChunkOutput>,
+    notify: Arc<WakeNotify>,
+}
+
+impl std::fmt::Debug for RecvBodyConsumer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecvBodyConsumer").finish_non_exhaustive()
+    }
+}
+
+impl RecvBodyConsumer {
+    /// Try to take the next sequential chunk without waiting.
+    #[cfg(test)]
+    pub(crate) fn try_take_next(&mut self) -> Option<ChunkOutput> {
+        self.consumer.poll_next()
+    }
+}
+
+/// Create a matched producer/consumer pair for download body delivery (stream mode).
+///
+/// Issuance backpressure is owned by the per-transfer [`ReadAhead`] controller, not
+/// by a fixed buffer capacity — the buffer grows as needed.
+///
+/// [`ReadAhead`]: super::read_ahead::ReadAhead
+pub(crate) fn new_recv_body() -> (BodyWriter, RecvBodyConsumer) {
+    let (buffer, consumer) = PagedRecvBuffer::new_with_segment_size(SEG_SIZE);
+    let notify = Arc::new(WakeNotify::new());
+    let writer = BodyWriter {
+        buffer,
+        notify: notify.clone(),
+        mode: Arc::new(Mode::Stream),
+    };
+    let slot_consumer = RecvBodyConsumer { consumer, notify };
+    (writer, slot_consumer)
+}
+
+/// Create a producer/consumer pair writing to an arbitrary [`SinkWrite`] target.
+/// Positioned writes land at `chunk.offset - object_range_start` in the sink.
+///
+/// Issuance backpressure is owned by the per-transfer [`ReadAhead`] controller.
+///
+/// [`ReadAhead`]: super::read_ahead::ReadAhead
+fn new_recv_body_with_disk_mode(sink: Box<dyn SinkWrite>) -> (BodyWriter, RecvBodyConsumer) {
+    let (buffer, consumer) = PagedRecvBuffer::new_with_segment_size(SEG_SIZE);
+    let notify = Arc::new(WakeNotify::new());
+    let resolved_range_start = std::sync::OnceLock::new();
+    let writer = BodyWriter {
+        buffer,
+        notify: notify.clone(),
+        mode: Arc::new(Mode::Disk {
+            sink,
+            object_range_start: resolved_range_start,
+        }),
+    };
+    let slot_consumer = RecvBodyConsumer { consumer, notify };
+    (writer, slot_consumer)
+}
+
+/// Create a producer/consumer pair with a file sink for download-to-file.
+pub(crate) fn new_recv_body_with_sink(
+    file: std::fs::File,
+    owns_file: bool,
+) -> (BodyWriter, RecvBodyConsumer) {
+    new_recv_body_with_disk_mode(Box::new(FileSink { file, owns_file }))
+}
 
 /// Stream of [ChunkOutput] representing an Amazon S3 Object's contents and metadata.
 ///
 /// Wraps potentially multiple streams of binary data into a single coherent stream.
 /// The data on this stream is sequenced into the correct order.
-#[derive(Debug)]
 pub struct Body {
-    inner: UnorderedBody,
-    sequencer: Sequencer,
+    consumer: RecvBufferConsumer<ChunkOutput>,
+    notify: Arc<WakeNotify>,
+    transfer: DownloadTransfer,
 }
 
-type BodyChannel = mpsc::Receiver<Result<ChunkOutput, crate::error::Error>>;
+impl std::fmt::Debug for Body {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Body").finish_non_exhaustive()
+    }
+}
 
 /// Contains body and metadata for each GetObject call made. This will be delivered sequentially
 /// in-order.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 #[non_exhaustive]
 pub struct ChunkOutput {
     // TODO(aws-sdk-rust#1159, design) - consider PartialOrd for ChunkResponse and hiding `seq` as internal only detail
     // the seq number
     pub(crate) seq: u64,
-    /// The content associated with this particular ranged GetObject request.
-    pub data: AggregatedBytes,
+    /// Byte offset in the object where this chunk starts.
+    pub(crate) offset: u64,
+    /// The content associated with this ranged `GetObject` request.
+    pub data: SegmentedBytes,
     /// The metadata associated with this particular ranged GetObject request. This contains all the
     /// metadata returned by the S3 GetObject operation.
     pub metadata: ChunkMetadata,
 }
 
-// TODO: Do we want to expose something to yield multiple chunks in a single call, like
-// recv_many/collect, etc.? We can benchmark to see if we get a significant performance boost once
-// we have a better scheduler in place.
+impl std::fmt::Debug for ChunkOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChunkOutput")
+            .field("seq", &self.seq)
+            .field("offset", &self.offset)
+            .field("data_len", &self.data.remaining())
+            .field("metadata", &self.metadata)
+            .finish()
+    }
+}
+
 impl Body {
-    /// Create a new empty body
-    pub fn empty() -> Self {
-        Self::new_from_channel(None)
-    }
-
-    pub(crate) fn new(chunks: BodyChannel) -> Self {
-        Self::new_from_channel(Some(chunks))
-    }
-
-    fn new_from_channel(chunks: Option<BodyChannel>) -> Self {
+    pub(crate) fn new(consumer: RecvBodyConsumer, transfer: DownloadTransfer) -> Self {
         Self {
-            inner: UnorderedBody::new(chunks),
-            sequencer: Sequencer::new(),
+            consumer: consumer.consumer,
+            notify: consumer.notify,
+            transfer,
         }
     }
 
-    /// Convert this body into an unordered stream of chunks.
-    // TODO(aws-sdk-rust#1159) - revisit if we actually need/use unordered data stream.
-    // download_objects should utilize this so that it can write in parallel to files.
-    #[allow(dead_code)]
-    pub(crate) fn unordered(self) -> UnorderedBody {
-        self.inner
+    /// Close the body, signaling no more chunks will be consumed.
+    pub(crate) fn close(&mut self) {
+        // No-op: dropping the consumer is sufficient for cleanup.
     }
 
     /// Pull the next chunk of data off the stream.
@@ -72,206 +646,877 @@ impl Body {
     /// Returns [None] when there is no more data.
     /// Chunks returned from a [Body] are guaranteed to be sequenced
     /// in the right order.
+    ///
+    /// On failure, returns `Some(Err(...))` with the error kind from the actual failure.
+    /// Call `join()` on the handle to get the full error with source chain.
     pub async fn next(&mut self) -> Option<Result<ChunkOutput, crate::error::Error>> {
         loop {
-            if self.sequencer.is_ordered() {
-                break;
+            // Register interest BEFORE checking state (lost-wake safety).
+            let notified = self.notify.notified();
+            if let Some(chunk) = self.consumer.poll_next() {
+                // Delivery freed one part's payload. Release that read-ahead occupancy
+                // and wake the issuer under the state lock, so the release is ordered
+                // against the gate's park (see `release_stream_occupancy`).
+                self.transfer.release_stream_occupancy();
+                return Some(Ok(chunk));
             }
-
-            match self.inner.next().await {
-                None => break,
-                Some(Ok(chunk)) => self.sequencer.push(chunk),
-                Some(Err(err)) => {
-                    self.close();
-                    return Some(Err(err));
+            if !self.transfer.ctx().is_active() {
+                // Terminal: drain then report.
+                if let Some(chunk) = self.consumer.poll_next() {
+                    self.transfer.release_stream_occupancy();
+                    return Some(Ok(chunk));
                 }
+                return self.terminal_result();
             }
+            notified.await;
         }
+    }
 
-        let chunk = self.sequencer.pop();
-        if let Some(chunk) = chunk {
-            self.sequencer.advance();
-            Some(Ok(chunk))
+    fn terminal_result(&self) -> Option<Result<ChunkOutput, crate::error::Error>> {
+        if self.transfer.ctx().is_cancelled() {
+            Some(Err(crate::error::from_kind(
+                crate::error::ErrorKind::OperationCancelled,
+            )("download cancelled")))
+        } else if self.transfer.ctx().is_failed() {
+            let kind = self
+                .transfer
+                .ctx()
+                .error_kind()
+                .unwrap_or(crate::error::ErrorKind::ChildOperationFailed);
+            Some(Err(crate::error::from_kind(kind)("transfer failed")))
         } else {
-            None
-        }
-    }
-
-    /// Close the body, no more data will flow from it and all publishers will be notified.
-    pub(crate) fn close(&mut self) {
-        self.inner.close()
-    }
-}
-
-#[derive(Debug)]
-struct Sequencer {
-    /// next expected sequence
-    next_seq: u64,
-    chunks: BinaryHeap<cmp::Reverse<SequencedChunk>>,
-}
-
-impl Sequencer {
-    fn new() -> Self {
-        Self {
-            chunks: BinaryHeap::with_capacity(8),
-            next_seq: 0,
-        }
-    }
-
-    fn push(&mut self, chunk: ChunkOutput) {
-        self.chunks.push(cmp::Reverse(SequencedChunk(chunk)))
-    }
-
-    fn pop(&mut self) -> Option<ChunkOutput> {
-        self.chunks.pop().map(|c| c.0 .0)
-    }
-
-    fn is_ordered(&self) -> bool {
-        let next = self.peek();
-        if next.is_none() {
-            return false;
-        }
-
-        next.unwrap().seq == self.next_seq
-    }
-
-    fn peek(&self) -> Option<&ChunkOutput> {
-        self.chunks.peek().map(|c| &c.0 .0)
-    }
-
-    fn advance(&mut self) {
-        self.next_seq += 1
-    }
-}
-
-#[derive(Debug)]
-struct SequencedChunk(ChunkOutput);
-
-impl Ord for SequencedChunk {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.0.seq.cmp(&other.0.seq)
-    }
-}
-
-impl PartialOrd for SequencedChunk {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Eq for SequencedChunk {}
-impl PartialEq for SequencedChunk {
-    fn eq(&self, other: &Self) -> bool {
-        self.0.seq == other.0.seq
-    }
-}
-
-/// A body that returns chunks in whatever order they are received.
-#[derive(Debug)]
-pub(crate) struct UnorderedBody {
-    chunks: Option<mpsc::Receiver<Result<ChunkOutput, crate::error::Error>>>,
-}
-
-impl UnorderedBody {
-    fn new(chunks: Option<BodyChannel>) -> Self {
-        Self { chunks }
-    }
-
-    /// Pull the next chunk of data off the stream.
-    ///
-    /// Returns [None] when there is no more data.
-    /// Chunks returned from an [UnorderedBody] are not guaranteed to be sorted
-    /// in the right order. Consumers are expected to sort the data themselves
-    /// using the chunk sequence number (starting from zero).
-    pub(crate) async fn next(&mut self) -> Option<Result<ChunkOutput, crate::error::Error>> {
-        match self.chunks.as_mut() {
-            None => None,
-            Some(ch) => ch.recv().await,
-        }
-    }
-
-    /// Close the body
-    pub(crate) fn close(&mut self) {
-        if let Some(ch) = &mut self.chunks {
-            ch.close();
+            None // normal completion
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::memory::SegmentedBytes;
+    use crate::operation::download::transfer::DownloadTransfer;
     use crate::{error, operation::download::body::ChunkOutput};
-    use bytes::Bytes;
-    use bytes_utils::SegmentedBuf;
-    use tokio::sync::mpsc;
+    use bytes::{BufMut, Bytes};
+    use std::sync::Arc;
 
-    use super::{AggregatedBytes, Body, Sequencer};
+    use super::{new_recv_body, Body, BodyWriter};
 
-    fn chunk_resp(seq: u64, data: AggregatedBytes) -> ChunkOutput {
+    fn chunk_resp(seq: u64, data: SegmentedBytes) -> ChunkOutput {
         ChunkOutput {
             seq,
+            offset: 0,
             data,
             metadata: Default::default(),
         }
     }
 
-    #[test]
-    fn test_sequencer() {
-        let mut sequencer = Sequencer::new();
-        sequencer.push(chunk_resp(1, AggregatedBytes(SegmentedBuf::new())));
-        sequencer.push(chunk_resp(2, AggregatedBytes(SegmentedBuf::new())));
-        assert_eq!(sequencer.peek().unwrap().seq, 1);
-        sequencer.push(chunk_resp(0, AggregatedBytes(SegmentedBuf::new())));
-        assert_eq!(sequencer.pop().unwrap().seq, 0);
+    fn test_body() -> (Body, DownloadTransfer, BodyWriter) {
+        use crate::operation::download::DownloadInput;
+        use crate::transfer::TransferContext;
+        use crate::types::BucketType;
+
+        let s3_client = aws_sdk_s3::Client::from_conf(
+            aws_sdk_s3::Config::builder()
+                .with_test_defaults()
+                .region(aws_sdk_s3::config::Region::new("us-west-2"))
+                .build(),
+        );
+        let config = crate::Config::builder().client(s3_client).build();
+        let tm = crate::Client::new(config);
+        let input = DownloadInput::builder()
+            .bucket("test")
+            .key("test")
+            .build()
+            .unwrap();
+        let (ctx, _) = TransferContext::new(tm.handle.clone());
+        let (writer, consumer) = new_recv_body();
+        let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, writer.clone());
+        (Body::new(consumer, transfer.clone()), transfer, writer)
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_body_next() {
-        let (tx, rx) = mpsc::channel(2);
-        let mut body = Body::new(rx);
+        let (mut body, transfer, writer) = test_body();
+        let ctx_clone = transfer.clone();
         tokio::spawn(async move {
-            let seq = vec![2, 0, 1];
-            for i in seq {
-                let data = Bytes::from(format!("chunk {i}"));
-                let mut aggregated = SegmentedBuf::new();
-                aggregated.push(data);
-                let chunk = chunk_resp(i as u64, AggregatedBytes(aggregated));
-                tx.send(Ok(chunk)).await.unwrap();
-            }
+            // Claim 3 seqs, fill out of order
+            let s0 = writer.claim();
+            let s1 = writer.claim();
+            let s2 = writer.claim();
+
+            // Fill out of order: 2, 0, 1
+            let seq2 = s2.seq();
+            s2.fill(chunk_resp(
+                seq2,
+                SegmentedBytes::from(Bytes::from("chunk 2")),
+            ));
+
+            let seq0 = s0.seq();
+            s0.fill(chunk_resp(
+                seq0,
+                SegmentedBytes::from(Bytes::from("chunk 0")),
+            ));
+
+            let seq1 = s1.seq();
+            s1.fill(chunk_resp(
+                seq1,
+                SegmentedBytes::from(Bytes::from("chunk 1")),
+            ));
+
+            ctx_clone.ctx().set_completed();
         });
 
         let mut received = Vec::new();
         while let Some(chunk) = body.next().await {
             let chunk = chunk.expect("chunk ok");
-            let data = String::from_utf8(chunk.data.to_vec()).unwrap();
+            let data = String::from_utf8(chunk.data.into_contiguous().to_vec()).unwrap();
             received.push(data);
         }
 
+        // Delivered in order despite out-of-order fill
         let expected: Vec<String> = [0, 1, 2].iter().map(|i| format!("chunk {i}")).collect();
         assert_eq!(expected, received);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
-    async fn test_body_next_error() {
-        let (tx, rx) = mpsc::channel(2);
-        let mut body = Body::new(rx);
-        tokio::spawn(async move {
-            let data = Bytes::from("chunk 0".to_string());
-            let mut aggregated = SegmentedBuf::new();
-            aggregated.push(data);
-            let chunk = chunk_resp(0, AggregatedBytes(aggregated));
-            tx.send(Ok(chunk)).await.unwrap();
-            let err = error::Error::new(error::ErrorKind::InputInvalid, "test errors".to_string());
-            tx.send(Err(err)).await.unwrap();
+    async fn test_body_next_on_failed_transfer() {
+        let (mut body, transfer, writer) = test_body();
+
+        // Fill one chunk
+        let s0 = writer.claim();
+        let seq0 = s0.seq();
+        s0.fill(chunk_resp(
+            seq0,
+            SegmentedBytes::from(Bytes::from("chunk 0")),
+        ));
+
+        // Fail the transfer
+        transfer.ctx().set_failed(error::Error::new(
+            error::ErrorKind::ChildOperationFailed,
+            "simulated failure",
+        ));
+
+        // First call returns the buffered chunk
+        let chunk = body.next().await.unwrap().unwrap();
+        assert_eq!(chunk.seq, 0);
+
+        // Second call sees failed status, returns error
+        let err = body.next().await.unwrap().unwrap_err();
+        assert!(matches!(err.kind(), error::ErrorKind::ChildOperationFailed));
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_body_next_on_cancelled_transfer() {
+        let (mut body, transfer, _writer) = test_body();
+
+        // Cancel the transfer
+        transfer.ctx().set_cancelled();
+
+        // next() should return cancellation error
+        let err = body.next().await.unwrap().unwrap_err();
+        assert!(matches!(err.kind(), error::ErrorKind::OperationCancelled));
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_body_next_unblocks_on_cancel() {
+        let (mut body, transfer, _writer) = test_body();
+
+        // Sync point: consumer signals it's about to wait
+        let waiting = Arc::new(tokio::sync::Notify::new());
+        let waiting_clone = waiting.clone();
+
+        let cancel_transfer = transfer.clone();
+        let consumer = tokio::spawn(async move {
+            // Signal we're about to enter next() (which will park on notified)
+            waiting_clone.notify_one();
+            body.next().await
         });
 
-        let mut received = Vec::new();
-        while let Some(chunk) = body.next().await {
-            received.push(chunk);
+        // Wait until consumer is about to park
+        waiting.notified().await;
+        // Yield to let consumer actually reach notified().await
+        tokio::task::yield_now().await;
+
+        // Now cancel and wake
+        cancel_transfer.ctx().set_cancelled();
+        cancel_transfer.writer().notify_consumer();
+
+        let result = consumer.await.unwrap();
+        let err = result.unwrap().unwrap_err();
+        assert!(matches!(err.kind(), error::ErrorKind::OperationCancelled));
+    }
+
+    // --- Disk driver tests ---
+
+    use super::{
+        new_recv_body_with_disk_mode, new_recv_body_with_sink, BodyWriter as Writer,
+        DiskWriteCursor, DrainMode, RecvBodyConsumer, Reservation, SinkWrite,
+    };
+    use bytes::Buf as _;
+    use std::collections::BTreeMap;
+    use std::sync::Mutex as StdMutex;
+
+    fn chunk_at(seq: u64, offset: u64, data: &[u8]) -> ChunkOutput {
+        ChunkOutput {
+            seq,
+            offset,
+            data: SegmentedBytes::from(Bytes::copy_from_slice(data)),
+            metadata: Default::default(),
+        }
+    }
+
+    #[test]
+    fn disk_write_cursor_vectors_and_advances_across_chunk_boundaries() {
+        let (writer, _consumer, _sink) = new_recv_body_with_capture(0);
+        writer.claim().fill(chunk_at(0, 0, b"ab"));
+        writer.claim().fill(chunk_at(1, 2, b"cdef"));
+        let write = writer
+            .buffer
+            .take_drain_run(DrainMode::Eager)
+            .expect("two filled payloads");
+        {
+            let (object_offset, mut cursor) = DiskWriteCursor::new(&write).unwrap();
+
+            let mut slices = [std::io::IoSlice::new(&[]); 4];
+            let count = cursor.chunks_vectored(&mut slices);
+            assert_eq!(object_offset, 0);
+            assert_eq!(count, 2);
+            assert_eq!(slices[0].as_ref(), b"ab");
+            assert_eq!(slices[1].as_ref(), b"cdef");
+
+            cursor.advance(3);
+            assert_eq!(cursor.remaining(), 3);
+            assert_eq!(cursor.chunk(), b"def");
+        }
+        assert_eq!(write.complete(), 2);
+    }
+
+    /// In-memory [`SinkWrite`] that records every positioned write, for asserting the
+    /// drain orchestration (offset translation, run coalescing, ordering under
+    /// concurrency) without a real file. Reconstructs the destination by laying each
+    /// write down at its position, so overlapping or misordered writes surface as
+    /// wrong bytes.
+    #[derive(Debug, Default)]
+    struct CaptureSink {
+        // pos -> bytes written there (most recent wins, as a real file would).
+        writes: StdMutex<BTreeMap<u64, Vec<u8>>>,
+    }
+
+    impl CaptureSink {
+        /// Materialize the written bytes into a contiguous buffer, panicking on a gap
+        /// (an unwritten position below the high-water mark) so a missed write is loud.
+        fn assembled(&self) -> Vec<u8> {
+            let writes = self.writes.lock().unwrap();
+            let mut out = Vec::new();
+            for (&pos, bytes) in writes.iter() {
+                assert_eq!(pos as usize, out.len(), "gap or overlap at pos {pos}");
+                out.extend_from_slice(bytes);
+            }
+            out
         }
 
-        assert_eq!(2, received.len());
-        received.pop().unwrap().expect_err("error propagated");
-        received.pop().unwrap().expect("chunk 0 successful");
+        fn write_count(&self) -> usize {
+            self.writes.lock().unwrap().len()
+        }
+    }
+
+    impl SinkWrite for CaptureSink {
+        fn write_all_at(&self, buf: &mut DiskWriteCursor<'_>, pos: u64) -> std::io::Result<()> {
+            let mut bytes = vec![0u8; buf.remaining()];
+            buf.copy_to_slice(&mut bytes);
+            self.writes.lock().unwrap().insert(pos, bytes);
+            Ok(())
+        }
+    }
+
+    fn new_recv_body_with_capture(
+        object_range_start: u64,
+    ) -> (Writer, RecvBodyConsumer, Arc<CaptureSink>) {
+        let sink = Arc::new(CaptureSink::default());
+        // The Mode holds a Box<dyn SinkWrite>; share state via an Arc the test also
+        // holds. A thin forwarder lets the Box and the test handle point at one sink.
+        #[derive(Debug)]
+        struct Shared(Arc<CaptureSink>);
+        impl SinkWrite for Shared {
+            fn write_all_at(&self, buf: &mut DiskWriteCursor<'_>, pos: u64) -> std::io::Result<()> {
+                self.0.write_all_at(buf, pos)
+            }
+        }
+        let (writer, consumer) = new_recv_body_with_disk_mode(Box::new(Shared(sink.clone())));
+        writer.prepare(object_range_start, 0).unwrap();
+        (writer, consumer, sink)
+    }
+
+    fn new_test_recv_body_with_sink(
+        file: std::fs::File,
+        object_range_start: u64,
+    ) -> (Writer, RecvBodyConsumer) {
+        let (writer, consumer) = new_recv_body_with_sink(file, false);
+        writer.prepare(object_range_start, 0).unwrap();
+        (writer, consumer)
+    }
+
+    /// Cancellation can terminally drain a disk transfer before discovery has
+    /// resolved its object range. No payload exists at that point.
+    #[test]
+    fn disk_terminal_drain_before_prepare_is_empty() {
+        let file = tempfile::tempfile().unwrap();
+        let (writer, _consumer) = new_recv_body_with_sink(file, false);
+
+        assert_eq!(writer.terminal_drain().unwrap(), 0);
+    }
+
+    /// A filled payload before destination preparation has no safe file
+    /// position and must not be discarded as an empty cancellation.
+    #[test]
+    fn disk_terminal_drain_before_prepare_rejects_payload() {
+        let file = tempfile::tempfile().unwrap();
+        let (writer, _consumer) = new_recv_body_with_sink(file, false);
+        writer.claim().fill(chunk_at(0, 0, b"payload"));
+
+        let error = writer
+            .terminal_drain()
+            .expect_err("unpositioned payload must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    /// `has_drainable_resident` gates memory-pressure draining. It is true only on the
+    /// disk surface with a filled run at the cursor: stream mode returns false (the
+    /// consumer drives release there, so an eager drain would be a no-op that spins),
+    /// and a resident run only exists once a slot at the cursor is filled.
+    #[test]
+    fn has_drainable_resident_only_on_disk_with_a_filled_run() {
+        // Stream mode: even with a filled slot, never drainable-resident.
+        let (stream_writer, _consumer) = new_recv_body();
+        stream_writer.claim().fill(chunk_at(0, 0, b"streamed"));
+        assert!(
+            !stream_writer.has_drainable_resident(),
+            "stream mode has no drainable-resident run (consumer drives release)"
+        );
+
+        // Disk mode: empty → false; filled at the cursor → true.
+        let (disk_writer, _consumer, _sink) = new_recv_body_with_capture(0);
+        assert!(
+            !disk_writer.has_drainable_resident(),
+            "disk mode with nothing filled is not drainable-resident"
+        );
+        disk_writer.claim().fill(chunk_at(0, 0, b"resident"));
+        assert!(
+            disk_writer.has_drainable_resident(),
+            "disk mode with a filled run at the cursor is drainable-resident"
+        );
+    }
+
+    #[test]
+    fn disk_submits_one_contiguous_run_as_one_positioned_write() {
+        let (writer, _consumer, sink) = new_recv_body_with_capture(100);
+        writer.claim().fill(chunk_at(0, 100, b"ab"));
+        writer.claim().fill(chunk_at(1, 102, b"cdef"));
+
+        assert_eq!(writer.terminal_drain().unwrap(), 2);
+        assert_eq!(sink.write_count(), 1);
+        assert_eq!(sink.assembled(), b"abcdef");
+    }
+
+    #[test]
+    fn disk_rejects_gaps_and_overlaps_within_a_claimed_run() {
+        for second_offset in [1, 3] {
+            let (writer, _consumer, sink) = new_recv_body_with_capture(0);
+            writer.claim().fill(chunk_at(0, 0, b"ab"));
+            writer.claim().fill(chunk_at(1, second_offset, b"cd"));
+
+            let error = writer
+                .terminal_drain()
+                .expect_err("offsets are not contiguous");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+            assert_eq!(sink.write_count(), 0);
+        }
+    }
+
+    #[test]
+    fn disk_rejects_an_empty_claimed_payload() {
+        let (writer, _consumer, sink) = new_recv_body_with_capture(0);
+        writer.claim().fill(chunk_at(0, 0, b""));
+
+        let error = writer.terminal_drain().expect_err("disk payload is empty");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(sink.write_count(), 0);
+    }
+
+    #[test]
+    fn disk_writes_full_segment() {
+        use super::SEG_SIZE;
+        const CHUNK_LEN: usize = 4;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out");
+        let file = std::fs::File::create(&path).unwrap();
+        let (writer, _consumer) = new_test_recv_body_with_sink(file, 0);
+
+        let mut expected = Vec::with_capacity(SEG_SIZE * CHUNK_LEN);
+        for i in 0..SEG_SIZE as u64 {
+            let slot = writer.claim();
+            let data = [i as u8; CHUNK_LEN];
+            let offset = i * CHUNK_LEN as u64;
+            expected.extend_from_slice(&data);
+            slot.fill(chunk_at(i, offset, &data));
+        }
+
+        writer.drain(DrainMode::Batched).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), expected);
+    }
+
+    #[test]
+    fn disk_eof_partial_tail() {
+        use super::SEG_SIZE;
+        const CHUNK_LEN: usize = 2;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out");
+        let file = std::fs::File::create(&path).unwrap();
+        let (writer, _consumer) = new_test_recv_body_with_sink(file, 0);
+
+        let partial = SEG_SIZE / 2;
+        let mut expected = Vec::with_capacity(partial * CHUNK_LEN);
+        for i in 0..partial as u64 {
+            let slot = writer.claim();
+            let data = [i as u8; CHUNK_LEN];
+            let offset = i * CHUNK_LEN as u64;
+            expected.extend_from_slice(&data);
+            slot.fill(chunk_at(i, offset, &data));
+        }
+
+        writer.finalize(expected.len() as u64).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), expected);
+    }
+
+    #[test]
+    fn disk_finalize_removes_an_existing_file_tail() {
+        const ORIGINAL: &[u8] = b"old contents with a stale tail";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out");
+        std::fs::write(&path, ORIGINAL).unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let (writer, _consumer) = new_recv_body_with_sink(file, false);
+        writer.prepare(0, 3).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            ORIGINAL.len() as u64,
+            "preparing a caller-owned file must not resize it"
+        );
+
+        writer.claim().fill(chunk_at(0, 0, b"new"));
+        writer.terminal_drain().unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            ORIGINAL.len() as u64,
+            "terminal cleanup must not establish the successful length"
+        );
+
+        writer.finalize(3).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+    }
+
+    #[test]
+    fn disk_finalize_propagates_resize_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out");
+        std::fs::write(&path, b"existing").unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let (writer, _consumer) = new_recv_body_with_sink(file, false);
+        writer.prepare(0, 3).unwrap();
+        writer
+            .finalize(3)
+            .expect_err("a read-only caller file cannot be finalized");
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 8);
+    }
+
+    #[test]
+    fn disk_finalize_truncates_an_empty_download() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out");
+        std::fs::write(&path, b"existing").unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let (writer, _consumer) = new_recv_body_with_sink(file, false);
+        writer.prepare(0, 0).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 8);
+
+        writer.finalize(0).unwrap();
+        assert!(std::fs::read(&path).unwrap().is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_preallocation_fails_only_for_storage_exhaustion() {
+        assert!(super::preallocation_failure_is_fatal(
+            &std::io::Error::from_raw_os_error(libc::ENOSPC)
+        ));
+        assert!(super::preallocation_failure_is_fatal(
+            &std::io::Error::from_raw_os_error(libc::EDQUOT)
+        ));
+        assert!(!super::preallocation_failure_is_fatal(
+            &std::io::Error::from_raw_os_error(libc::EOPNOTSUPP)
+        ));
+    }
+
+    #[test]
+    fn disk_finalize_drains_full_and_tail() {
+        use super::SEG_SIZE;
+        const CHUNK_LEN: usize = 2;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out");
+        let file = std::fs::File::create(&path).unwrap();
+        let (writer, _consumer) = new_test_recv_body_with_sink(file, 0);
+
+        let total = SEG_SIZE + 2;
+        let mut expected = Vec::with_capacity(total * CHUNK_LEN);
+        for i in 0..total as u64 {
+            let slot = writer.claim();
+            let data = [i as u8; CHUNK_LEN];
+            let offset = i * CHUNK_LEN as u64;
+            expected.extend_from_slice(&data);
+            slot.fill(chunk_at(i, offset, &data));
+        }
+
+        writer.finalize(expected.len() as u64).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), expected);
+    }
+
+    #[test]
+    fn disk_offset_translation() {
+        use super::SEG_SIZE;
+        const CHUNK_LEN: usize = 2;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out");
+        let file = std::fs::File::create(&path).unwrap();
+        let (writer, _consumer) = new_test_recv_body_with_sink(file, 1000);
+
+        let n = SEG_SIZE;
+        let mut expected = Vec::with_capacity(n * CHUNK_LEN);
+        for i in 0..n as u64 {
+            let slot = writer.claim();
+            let data = [i as u8; CHUNK_LEN];
+            let offset = 1000 + i * CHUNK_LEN as u64;
+            expected.extend_from_slice(&data);
+            slot.fill(chunk_at(i, offset, &data));
+        }
+
+        writer.drain(DrainMode::Batched).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), expected);
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn disk_concurrent_fill() {
+        use super::SEG_SIZE;
+        const CHUNK_LEN: usize = 4;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out");
+        let file = std::fs::File::create(&path).unwrap();
+        let (writer, _consumer) = new_test_recv_body_with_sink(file, 0);
+
+        let n = SEG_SIZE;
+        let mut handles = Vec::new();
+        for _ in 0..n {
+            let slot = writer.claim();
+            handles.push(tokio::spawn(async move {
+                tokio::task::yield_now().await;
+                let seq = slot.seq();
+                let offset = seq * CHUNK_LEN as u64;
+                let data = [seq as u8; CHUNK_LEN];
+                slot.fill(chunk_at(seq, offset, &data));
+            }));
+        }
+
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        writer.finalize((n * CHUNK_LEN) as u64).unwrap();
+
+        let contents = std::fs::read(&path).unwrap();
+        for seq in 0..n as u64 {
+            let offset = seq as usize * CHUNK_LEN;
+            assert_eq!(
+                &contents[offset..offset + CHUNK_LEN],
+                &[seq as u8; CHUNK_LEN],
+                "mismatch at seq {seq}"
+            );
+        }
+    }
+
+    /// Draining runs on the disk path must report freed parts to release read-ahead
+    /// occupancy.
+    ///
+    /// The issuance gate bounds `issued - released`, where `released` is the sum of the
+    /// freed counts `drain` reports. On the disk path the consumer is `drain`, which
+    /// writes and frees runs. If draining does not report freed parts, a download larger
+    /// than the read-ahead window wedges: the gate latches shut at the window and never
+    /// reopens even though the buffer has drained to empty. This drives that path
+    /// directly — no network, no large object — and asserts every part is reported freed.
+    #[test]
+    fn disk_drain_releases_read_ahead_occupancy() {
+        use super::SEG_SIZE;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out");
+        let file = std::fs::File::create(&path).unwrap();
+        let (writer, _consumer) = new_test_recv_body_with_sink(file, 0);
+
+        // Fill two full segments, draining on the DrainReady edge after each fill — the
+        // disk path's steady-state loop. Bounded iteration, so a regression fails fast.
+        let total = (2 * SEG_SIZE) as u64;
+        let mut freed_total = 0u64;
+        for i in 0..total {
+            let slot = writer.claim();
+            let outcome = slot.fill(chunk_at(i, i, &[i as u8]));
+            // Drain on the batch edge, as execute_get_range does.
+            if outcome == super::FillOutcome::DrainReady {
+                freed_total += writer.drain(DrainMode::Batched).unwrap();
+            }
+        }
+        // A terminal drain flushes any sub-batch tail so the total accounts for every part.
+        freed_total += writer.terminal_drain().unwrap();
+
+        // Resident occupancy is `issued - released` = total - freed_total. Every part has
+        // been written to disk and its memory freed, so it must be 0 — otherwise the gate
+        // would still count drained parts against the window.
+        let occupancy = total - freed_total;
+        assert_eq!(
+            occupancy, 0,
+            "all {total} parts drained to disk, but the drains reported only \
+             {freed_total} freed; issuance cannot reopen past the window"
+        );
+    }
+
+    /// Concurrent, out-of-order fills across several segments must drain to the correct
+    /// positions: many parts are claimed in order, then filled and drained from many
+    /// threads in a shuffled order, each thread mirroring the execute path (fill, then
+    /// drain on the `DrainReady` edge). A non-zero `object_range_start` also exercises
+    /// offset translation. The capture sink reconstructs the object; any misordered or
+    /// misplaced positioned write surfaces as wrong bytes or a gap.
+    ///
+    /// This is the property the disk path depends on but that an in-order producer
+    /// never exercises: parts arrive and drain out of order, yet positioned writes (no
+    /// recomputed checksum) must still reassemble the object byte-for-byte.
+    #[test]
+    fn disk_concurrent_out_of_order_drain_reassembles() {
+        use super::SEG_SIZE;
+
+        // Several segments' worth, with a partial final segment, so the run includes
+        // full-segment drains, cross-segment coalescing, and a terminal partial tail.
+        let parts = 3 * SEG_SIZE + 5;
+        let part_len = 64usize;
+        let range_start = 4096u64; // non-zero base: exercises offset translation
+
+        // Deterministic per-part bytes, so the assembled object is checkable.
+        let part_bytes = |seq: usize| -> Vec<u8> {
+            (0..part_len)
+                .map(|b| (seq as u8).wrapping_add(b as u8))
+                .collect()
+        };
+        let mut expected = Vec::with_capacity(parts * part_len);
+        for seq in 0..parts {
+            expected.extend_from_slice(&part_bytes(seq));
+        }
+
+        let (writer, _consumer, sink) = new_recv_body_with_capture(range_start);
+
+        // Claim all slots up front (claim is serialized; seq assignment is in order).
+        let slots: Vec<_> = (0..parts).map(|_| writer.claim()).collect();
+
+        // A fixed shuffle of fill order (deterministic — no rng): odd indices first,
+        // then even, so later segments seal before earlier ones complete.
+        let mut order: Vec<usize> = (0..parts).filter(|i| i % 2 == 1).collect();
+        order.extend((0..parts).filter(|i| i % 2 == 0));
+
+        // Map seq -> slot, consumed as each thread fills.
+        let mut by_seq: std::collections::HashMap<usize, super::BodySlot> =
+            slots.into_iter().map(|s| (s.seq() as usize, s)).collect();
+
+        let writer = Arc::new(writer);
+        // Sum every drain's freed count across threads, the way the download layer
+        // accumulates `released` under its state lock.
+        let freed_total = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let n_threads = 4;
+        let chunks: Vec<Vec<usize>> = (0..n_threads)
+            .map(|t| order.iter().copied().skip(t).step_by(n_threads).collect())
+            .collect();
+
+        std::thread::scope(|scope| {
+            for thread_seqs in &chunks {
+                // Move this thread's slots in.
+                let mut my_slots = Vec::new();
+                for &seq in thread_seqs {
+                    my_slots.push((seq, by_seq.remove(&seq).expect("slot for seq")));
+                }
+                let writer = writer.clone();
+                let freed_total = freed_total.clone();
+                scope.spawn(move || {
+                    for (seq, slot) in my_slots {
+                        let offset = range_start + (seq as u64) * (part_len as u64);
+                        let outcome = slot.fill(chunk_at(seq as u64, offset, &part_bytes(seq)));
+                        // Mirror execute_get_range: drain on the batch edge.
+                        if outcome == super::FillOutcome::DrainReady {
+                            let freed = writer.drain(DrainMode::Batched).unwrap();
+                            freed_total.fetch_add(freed, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                });
+            }
+        });
+        assert!(by_seq.is_empty(), "every slot dispatched to a thread");
+
+        // Terminal drain flushes the partial final segment and any straggler runs.
+        freed_total.fetch_add(
+            writer.terminal_drain().unwrap(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+
+        // Every part written and freed.
+        assert_eq!(
+            freed_total.load(std::sync::atomic::Ordering::Relaxed),
+            parts as u64,
+            "all parts drained"
+        );
+        // The positioned writes reassemble the object exactly.
+        assert_eq!(
+            sink.assembled(),
+            expected,
+            "out-of-order concurrent drain must reassemble the object byte-for-byte"
+        );
+    }
+
+    // --- Admission and payload ownership tests ---
+    //
+    // Fill closes acquisition authority. The resulting charge follows immutable
+    // ownership: to final consumer drop on the stream surface, or through the
+    // positioned write on the disk surface.
+
+    use crate::memory::{BufferPool, MemoryBudgetConfig};
+
+    fn test_reservation_pool() -> (BufferPool, usize) {
+        let pool = BufferPool::from_capacity(
+            MemoryBudgetConfig::Limit(1024 * 1024),
+            None,
+            crate::config::MemoryDiagnosticsConfig::default(),
+        )
+        .expect("test pool");
+        let carrier_size = pool.carrier_size();
+        (pool, carrier_size)
+    }
+
+    fn pooled_data(pool: &BufferPool, reservation: &Reservation, data: &[u8]) -> SegmentedBytes {
+        let mut buffer = pool
+            .acquire(reservation, data.len())
+            .expect("reserved pooled buffer");
+        buffer.put_slice(data);
+        buffer.freeze()
+    }
+
+    #[test]
+    fn test_stream_fill_closes_reservation_while_payload_retains_charge() {
+        let (pool, chunk_bytes) = test_reservation_pool();
+        let (writer, mut consumer) = new_recv_body();
+
+        let reservation = pool
+            .try_reserve(chunk_bytes)
+            .unwrap()
+            .expect("has capacity");
+        let data = pooled_data(&pool, &reservation, b"hello");
+        let mut slot = writer.claim();
+        slot.attach_reservation(reservation);
+        assert_eq!(
+            pool.metrics().active_planned_demand_bytes(),
+            chunk_bytes as u64
+        );
+        slot.fill(chunk_resp(0, data));
+
+        let metrics = pool.metrics();
+        assert_eq!(metrics.active_planned_demand_bytes(), 0);
+        assert_eq!(metrics.charged_capacity_bytes(), chunk_bytes as u64);
+        assert_eq!(metrics.admission_used_bytes(), chunk_bytes as u64);
+
+        let chunk = consumer.try_take_next().expect("chunk delivered");
+        assert_eq!(chunk.data.clone().into_contiguous().as_ref(), b"hello");
+        assert_eq!(pool.metrics().charged_capacity_bytes(), chunk_bytes as u64);
+
+        drop(chunk);
+        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_eq!(pool.metrics().admission_used_bytes(), 0);
+    }
+
+    #[test]
+    fn test_stream_charge_holds_until_last_chunk_clone_drops() {
+        let (pool, chunk_bytes) = test_reservation_pool();
+        let (writer, mut consumer) = new_recv_body();
+
+        let reservation = pool
+            .try_reserve(chunk_bytes)
+            .unwrap()
+            .expect("has capacity");
+        let data = pooled_data(&pool, &reservation, b"shared");
+        let mut slot = writer.claim();
+        slot.attach_reservation(reservation);
+        slot.fill(chunk_resp(0, data));
+
+        let chunk = consumer.try_take_next().expect("chunk delivered");
+        let clone = chunk.clone();
+        assert_eq!(pool.metrics().active_planned_demand_bytes(), 0);
+        assert_eq!(
+            pool.metrics().charged_capacity_bytes(),
+            chunk_bytes as u64,
+            "one physical buffer, charged once"
+        );
+
+        drop(chunk);
+        assert_eq!(
+            pool.metrics().charged_capacity_bytes(),
+            chunk_bytes as u64,
+            "a surviving clone still holds the resident bytes"
+        );
+
+        drop(clone);
+        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_eq!(pool.metrics().admission_used_bytes(), 0);
+    }
+
+    #[test]
+    fn test_disk_payload_charge_returns_on_drain() {
+        let (pool, chunk_bytes) = test_reservation_pool();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out");
+        let file = std::fs::File::create(&path).unwrap();
+        let (writer, _consumer) = new_test_recv_body_with_sink(file, 0);
+
+        let reservation = pool
+            .try_reserve(chunk_bytes)
+            .unwrap()
+            .expect("has capacity");
+        let data = pooled_data(&pool, &reservation, b"flushed");
+        let mut slot = writer.claim();
+        slot.attach_reservation(reservation);
+        slot.fill(ChunkOutput {
+            seq: 0,
+            offset: 0,
+            data,
+            metadata: Default::default(),
+        });
+
+        assert_eq!(pool.metrics().active_planned_demand_bytes(), 0);
+        assert_eq!(pool.metrics().charged_capacity_bytes(), chunk_bytes as u64);
+
+        writer.terminal_drain().unwrap();
+        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_eq!(pool.metrics().admission_used_bytes(), 0);
+        assert_eq!(&std::fs::read(&path).unwrap()[..7], b"flushed");
     }
 }

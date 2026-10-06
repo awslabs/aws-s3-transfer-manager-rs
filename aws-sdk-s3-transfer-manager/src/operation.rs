@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use std::{fs::Metadata, path::Path, sync::Arc};
+use std::{fs::Metadata, path::Path};
 
 use crate::error;
 
@@ -22,34 +22,16 @@ pub mod upload_objects;
 // The default delimiter of the S3 object key
 pub(crate) const DEFAULT_DELIMITER: &str = "/";
 
-// Type aliases to channel ends to send/receive cancel notification
-pub(crate) type CancelNotificationSender = tokio::sync::watch::Sender<bool>;
-pub(crate) type CancelNotificationReceiver = tokio::sync::watch::Receiver<bool>;
-
-/// Container for maintaining context required to carry out a single operation/transfer.
+/// Conservative per-transfer backstop on concurrently-materialized child
+/// transfers (shared by upload_objects and download_objects).
 ///
-/// `State` is whatever additional operation specific state is required for the operation.
-#[derive(Debug)]
-pub(crate) struct TransferContext<State> {
-    handle: Arc<crate::client::Handle>,
-    state: Arc<State>,
-}
-
-impl<State> TransferContext<State> {
-    /// The S3 client to use for SDK operations
-    pub(crate) fn client(&self) -> &aws_sdk_s3::Client {
-        self.handle.config.client()
-    }
-}
-
-impl<State> Clone for TransferContext<State> {
-    fn clone(&self) -> Self {
-        Self {
-            handle: self.handle.clone(),
-            state: self.state.clone(),
-        }
-    }
-}
+/// The scheduler's hierarchical fair-share drives throughput and the walker
+/// provides natural rate-limiting, so this cap primarily bounds working-set
+/// memory. 512 covers the highest useful concurrency observed in practice
+/// (100 Gbps links sustain ~200-250 concurrent transfers; 600 Gbps multi-NIC
+/// configurations stay below 500). Callers that genuinely need more can
+/// override via `max_concurrent_downloads` / `max_concurrent_uploads`.
+pub(crate) const DEFAULT_MAX_CONCURRENT_CHILDREN: usize = 512;
 
 // Checks if the target path at `path`, with the provided `metadata`, represents a directory.
 //

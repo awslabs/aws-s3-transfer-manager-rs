@@ -789,6 +789,8 @@ async fn test_mpu_no_strategy() {
 //
 // PutObject Upload Tests
 //
+// TODO(redux): These tests require single PutObject path (below MPU threshold).
+// Currently the new scheduler always uses MPU. Re-enable when PutObject is implemented.
 
 #[tokio::test]
 async fn test_put_object_provided_full_object_crc32() {
@@ -897,6 +899,7 @@ async fn test_put_object_calculated_sha256_composite_if_multipart() {
     assert_eq!(output.checksum_type(), Some(&ChecksumType::FullObject));
     assert!(output.checksum_sha256().is_some());
 }
+
 #[tokio::test]
 async fn test_put_object_default_strategy() {
     // Test where user didn't set a strategy, but SDK is calculating checksums wherever possible (its default behavior).

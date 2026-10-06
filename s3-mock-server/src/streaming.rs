@@ -14,7 +14,7 @@ use std::collections::VecDeque;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-/// A stream that yields bytes from a Vec<Bytes> in memory.
+/// A stream that yields bytes from a `Vec<Bytes>` in memory.
 ///
 /// This is similar to s3s::stream::VecByteStream but adapted for our needs.
 /// It's useful for implementing streaming GetObject for in-memory storage.
@@ -180,11 +180,17 @@ mod tests {
         let integrity_checks = ObjectIntegrityChecks::new().with_md5();
         let test_data_clone = test_data.clone();
         let stream = Box::pin(futures::stream::once(async move { Ok(test_data_clone) }));
-        let request = crate::storage::StoreObjectRequest::new("test-key", stream, integrity_checks);
+        let request = crate::storage::StoreObjectRequest::new(
+            "test-bucket",
+            "test-key",
+            stream,
+            integrity_checks,
+        );
         storage.put_object(request).await.unwrap();
 
         // Get the object as a stream
         let request = crate::storage::GetObjectRequest {
+            bucket: "test-bucket",
             key: "test-key",
             range: None,
         };

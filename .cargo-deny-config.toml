@@ -10,6 +10,7 @@ allow = [
     # [possible values: any SPDX 3.11 short identifier (+ optional exception)].
     "Apache-2.0 WITH LLVM-exception",
     "Apache-2.0",
+    "BSD-2-Clause",
     "BSD-3-Clause",
     "ISC",
     "MIT",

@@ -5,7 +5,8 @@
 
 use std::fmt;
 
-use aws_sdk_s3::operation::get_object::builders::GetObjectInputBuilder;
+use aws_sdk_s3::operation::get_object::builders::GetObjectFluentBuilder;
+use aws_sdk_s3::operation::head_object::builders::HeadObjectFluentBuilder;
 use aws_smithy_types::error::operation::BuildError;
 
 /// Input type for downloading a single object
@@ -120,6 +121,10 @@ pub struct DownloadInput {
     pub expected_bucket_owner: Option<String>,
     /// <p>To retrieve the checksum, this mode must be enabled.</p>
     pub checksum_mode: Option<aws_sdk_s3::types::ChecksumMode>,
+    /// How far this download may prefetch ahead of the consumer. `None` uses the
+    /// client default from [`Config`](crate::config::Config); `Some` overrides it for
+    /// this request.
+    pub read_ahead: Option<crate::types::ReadAhead>,
 }
 impl DownloadInput {
     /// <p>The bucket name containing the object.</p>
@@ -271,6 +276,11 @@ impl DownloadInput {
     pub fn checksum_mode(&self) -> Option<&aws_sdk_s3::types::ChecksumMode> {
         self.checksum_mode.as_ref()
     }
+    /// How far this download may prefetch ahead of the consumer, if overridden for
+    /// this request. `None` uses the client default.
+    pub fn read_ahead(&self) -> Option<&crate::types::ReadAhead> {
+        self.read_ahead.as_ref()
+    }
 }
 
 impl fmt::Debug for DownloadInput {
@@ -300,12 +310,13 @@ impl fmt::Debug for DownloadInput {
         formatter.field("part_number", &self.part_number);
         formatter.field("expected_bucket_owner", &self.expected_bucket_owner);
         formatter.field("checksum_mode", &self.checksum_mode);
+        formatter.field("read_ahead", &self.read_ahead);
         formatter.finish()
     }
 }
 
 impl DownloadInput {
-    /// Creates a new builder-style object to manufacture [`DownloadInput`](crate::operation::download::DownloadInput).
+    /// Creates a new builder-style object to manufacture [`DownloadInput`].
     pub fn builder() -> DownloadInputBuilder {
         DownloadInputBuilder::default()
     }
@@ -336,6 +347,7 @@ pub struct DownloadInputBuilder {
     pub(crate) part_number: Option<i32>,
     pub(crate) expected_bucket_owner: Option<String>,
     pub(crate) checksum_mode: Option<aws_sdk_s3::types::ChecksumMode>,
+    pub(crate) read_ahead: Option<crate::types::ReadAhead>,
 }
 
 impl DownloadInputBuilder {
@@ -816,6 +828,22 @@ impl DownloadInputBuilder {
     pub fn get_checksum_mode(&self) -> &Option<aws_sdk_s3::types::ChecksumMode> {
         &self.checksum_mode
     }
+    /// Override how far this download prefetches ahead of the consumer, replacing the
+    /// client default for this request.
+    pub fn read_ahead(mut self, input: crate::types::ReadAhead) -> Self {
+        self.read_ahead = Option::Some(input);
+        self
+    }
+    /// Override how far this download prefetches ahead of the consumer, replacing the
+    /// client default for this request.
+    pub fn set_read_ahead(mut self, input: Option<crate::types::ReadAhead>) -> Self {
+        self.read_ahead = input;
+        self
+    }
+    /// The read-ahead override set on this builder, if any.
+    pub fn get_read_ahead(&self) -> &Option<crate::types::ReadAhead> {
+        &self.read_ahead
+    }
     /// Consumes the builder and constructs a [`DownloadInput`].
     pub fn build(self) -> Result<DownloadInput, ::aws_smithy_types::error::operation::BuildError> {
         if self.bucket.is_none() {
@@ -848,6 +876,7 @@ impl DownloadInputBuilder {
             part_number: self.part_number,
             expected_bucket_owner: self.expected_bucket_owner,
             checksum_mode: self.checksum_mode,
+            read_ahead: self.read_ahead,
         })
     }
 }
@@ -879,34 +908,73 @@ impl fmt::Debug for DownloadInputBuilder {
         formatter.field("part_number", &self.part_number);
         formatter.field("expected_bucket_owner", &self.expected_bucket_owner);
         formatter.field("checksum_mode", &self.checksum_mode);
+        formatter.field("read_ahead", &self.read_ahead);
         formatter.finish()
     }
 }
 
-impl From<DownloadInput> for GetObjectInputBuilder {
-    fn from(value: DownloadInput) -> Self {
-        GetObjectInputBuilder::default()
-            .set_bucket(value.bucket)
-            .set_if_match(value.if_match)
-            .set_if_modified_since(value.if_modified_since)
-            .set_if_none_match(value.if_none_match)
-            .set_if_unmodified_since(value.if_unmodified_since)
-            .set_key(value.key)
-            .set_range(value.range)
-            .set_response_cache_control(value.response_cache_control)
-            .set_response_content_disposition(value.response_content_disposition)
-            .set_response_content_encoding(value.response_content_encoding)
-            .set_response_content_language(value.response_content_language)
-            .set_response_content_type(value.response_content_type)
-            .set_response_expires(value.response_expires)
-            .set_version_id(value.version_id)
-            .set_sse_customer_algorithm(value.sse_customer_algorithm)
-            .set_sse_customer_key(value.sse_customer_key)
-            .set_sse_customer_key_md5(value.sse_customer_key_md5)
-            .set_request_payer(value.request_payer)
-            .set_expected_bucket_owner(value.expected_bucket_owner)
-            .set_checksum_mode(value.checksum_mode)
-    }
+/// Copies service request fields from a download request to `GetObject`.
+///
+/// Caller-selected part numbers and transfer-manager read-ahead policy are not
+/// forwarded. Request-specific fields may be overridden on the returned
+/// builder.
+pub(crate) fn copy_fields_to_get_object_request(
+    input: &DownloadInput,
+    builder: GetObjectFluentBuilder,
+) -> GetObjectFluentBuilder {
+    builder
+        .set_bucket(input.bucket.clone())
+        .set_if_match(input.if_match.clone())
+        .set_if_modified_since(input.if_modified_since)
+        .set_if_none_match(input.if_none_match.clone())
+        .set_if_unmodified_since(input.if_unmodified_since)
+        .set_key(input.key.clone())
+        .set_range(input.range.clone())
+        .set_response_cache_control(input.response_cache_control.clone())
+        .set_response_content_disposition(input.response_content_disposition.clone())
+        .set_response_content_encoding(input.response_content_encoding.clone())
+        .set_response_content_language(input.response_content_language.clone())
+        .set_response_content_type(input.response_content_type.clone())
+        .set_response_expires(input.response_expires)
+        .set_version_id(input.version_id.clone())
+        .set_sse_customer_algorithm(input.sse_customer_algorithm.clone())
+        .set_sse_customer_key(input.sse_customer_key.clone())
+        .set_sse_customer_key_md5(input.sse_customer_key_md5.clone())
+        .set_request_payer(input.request_payer.clone())
+        .set_expected_bucket_owner(input.expected_bucket_owner.clone())
+        .set_checksum_mode(input.checksum_mode.clone())
+}
+
+/// Copies fields supported by `HeadObject` from a download request.
+///
+/// The returned builder identifies, authorizes, and conditions the same object
+/// as a corresponding `GetObject` request. Caller-selected part numbers and
+/// transfer-manager read-ahead policy are not forwarded.
+pub(crate) fn copy_fields_to_head_object_request(
+    input: &DownloadInput,
+    builder: HeadObjectFluentBuilder,
+) -> HeadObjectFluentBuilder {
+    builder
+        .set_bucket(input.bucket.clone())
+        .set_if_match(input.if_match.clone())
+        .set_if_modified_since(input.if_modified_since)
+        .set_if_none_match(input.if_none_match.clone())
+        .set_if_unmodified_since(input.if_unmodified_since)
+        .set_key(input.key.clone())
+        .set_range(input.range.clone())
+        .set_response_cache_control(input.response_cache_control.clone())
+        .set_response_content_disposition(input.response_content_disposition.clone())
+        .set_response_content_encoding(input.response_content_encoding.clone())
+        .set_response_content_language(input.response_content_language.clone())
+        .set_response_content_type(input.response_content_type.clone())
+        .set_response_expires(input.response_expires)
+        .set_version_id(input.version_id.clone())
+        .set_sse_customer_algorithm(input.sse_customer_algorithm.clone())
+        .set_sse_customer_key(input.sse_customer_key.clone())
+        .set_sse_customer_key_md5(input.sse_customer_key_md5.clone())
+        .set_request_payer(input.request_payer.clone())
+        .set_expected_bucket_owner(input.expected_bucket_owner.clone())
+        .set_checksum_mode(input.checksum_mode.clone())
 }
 
 impl From<DownloadInput> for DownloadInputBuilder {
@@ -933,40 +1001,168 @@ impl From<DownloadInput> for DownloadInputBuilder {
             part_number: value.part_number,
             expected_bucket_owner: value.expected_bucket_owner,
             checksum_mode: value.checksum_mode,
+            read_ahead: value.read_ahead,
         }
     }
 }
 
-impl DownloadInputBuilder {
-    /// Create an operation fluent builder for the rust SDK S3 client from this transfer manager
-    /// download input and the given client
-    pub(crate) fn into_sdk_operation(
-        self,
-        client: &aws_sdk_s3::Client,
-    ) -> aws_sdk_s3::operation::get_object::builders::GetObjectFluentBuilder {
-        client
-            .get_object()
-            .set_bucket(self.bucket)
-            .set_if_match(self.if_match)
-            .set_if_modified_since(self.if_modified_since)
-            .set_if_none_match(self.if_none_match)
-            .set_if_unmodified_since(self.if_unmodified_since)
-            .set_key(self.key)
-            .set_range(self.range)
-            .set_response_cache_control(self.response_cache_control)
-            .set_response_content_disposition(self.response_content_disposition)
-            .set_response_content_encoding(self.response_content_encoding)
-            .set_response_content_language(self.response_content_language)
-            .set_response_content_type(self.response_content_type)
-            .set_response_expires(self.response_expires)
-            .set_version_id(self.version_id)
-            .set_sse_customer_algorithm(self.sse_customer_algorithm)
-            .set_sse_customer_key(self.sse_customer_key)
-            .set_sse_customer_key_md5(self.sse_customer_key_md5)
-            .set_request_payer(self.request_payer)
-            .set_expected_bucket_owner(self.expected_bucket_owner)
-            .set_checksum_mode(self.checksum_mode)
-    }
-}
+impl DownloadInputBuilder {}
 
 // TODO - implement TryFrom<GetObjectInput> and TryFrom<GetObjectInputBuilder> for DownloadInput and DownloadInputBuilder respectively (TryFrom due to checksums)
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        copy_fields_to_get_object_request, copy_fields_to_head_object_request, DownloadInput,
+    };
+    use aws_sdk_s3::types::{ChecksumMode, RequestPayer};
+    use aws_smithy_mocks::mock_client;
+    use aws_smithy_types::DateTime;
+
+    /// Classifies every download input field as forwarded or request-local.
+    ///
+    /// Exhaustive destructuring makes a new field a compile-time decision.
+    fn assert_all_input_fields_classified(input: &DownloadInput) {
+        let DownloadInput {
+            // Forwarded to both GetObject and HeadObject.
+            bucket: _,
+            if_match: _,
+            if_modified_since: _,
+            if_none_match: _,
+            if_unmodified_since: _,
+            key: _,
+            range: _,
+            response_cache_control: _,
+            response_content_disposition: _,
+            response_content_encoding: _,
+            response_content_language: _,
+            response_content_type: _,
+            response_expires: _,
+            version_id: _,
+            sse_customer_algorithm: _,
+            sse_customer_key: _,
+            sse_customer_key_md5: _,
+            request_payer: _,
+            // Caller-selected object parts are unsupported. Discovery sets
+            // partNumber directly on the request that requires it.
+            part_number: _,
+            // Forwarded to both GetObject and HeadObject.
+            expected_bucket_owner: _,
+            checksum_mode: _,
+            // Transfer-manager policy; never sent to S3.
+            read_ahead: _,
+        } = input;
+    }
+
+    /// Builds an input with every service request field populated.
+    fn request_with_all_forwarded_fields() -> DownloadInput {
+        let mut input = DownloadInput::builder()
+            .bucket("bucket")
+            .if_match("if-match")
+            .if_modified_since(DateTime::from_secs(1))
+            .if_none_match("if-none-match")
+            .if_unmodified_since(DateTime::from_secs(2))
+            .key("key")
+            .range("bytes=10-19")
+            .response_cache_control("no-cache")
+            .response_content_disposition("attachment")
+            .response_content_encoding("gzip")
+            .response_content_language("en-US")
+            .response_content_type("application/octet-stream")
+            .response_expires(DateTime::from_secs(3))
+            .version_id("version")
+            .sse_customer_algorithm("AES256")
+            .sse_customer_key("secret")
+            .sse_customer_key_md5("key-md5")
+            .request_payer(RequestPayer::Requester)
+            .expected_bucket_owner("owner")
+            .checksum_mode(ChecksumMode::Enabled)
+            .build()
+            .unwrap();
+        // The public transfer-manager builder does not expose `part_number`.
+        // Populate it directly to pin that request-local field is not forwarded.
+        input.part_number = Some(7);
+        input
+    }
+
+    macro_rules! assert_forwarded_fields {
+        ($input:expr, $request:expr) => {
+            assert_eq!($input.bucket(), $request.bucket());
+            assert_eq!($input.if_match(), $request.if_match());
+            assert_eq!($input.if_modified_since(), $request.if_modified_since());
+            assert_eq!($input.if_none_match(), $request.if_none_match());
+            assert_eq!($input.if_unmodified_since(), $request.if_unmodified_since());
+            assert_eq!($input.key(), $request.key());
+            assert_eq!($input.range(), $request.range());
+            assert_eq!(
+                $input.response_cache_control(),
+                $request.response_cache_control()
+            );
+            assert_eq!(
+                $input.response_content_disposition(),
+                $request.response_content_disposition()
+            );
+            assert_eq!(
+                $input.response_content_encoding(),
+                $request.response_content_encoding()
+            );
+            assert_eq!(
+                $input.response_content_language(),
+                $request.response_content_language()
+            );
+            assert_eq!(
+                $input.response_content_type(),
+                $request.response_content_type()
+            );
+            assert_eq!($input.response_expires(), $request.response_expires());
+            assert_eq!($input.version_id(), $request.version_id());
+            assert_eq!(
+                $input.sse_customer_algorithm(),
+                $request.sse_customer_algorithm()
+            );
+            assert_eq!($input.sse_customer_key(), $request.sse_customer_key());
+            assert_eq!(
+                $input.sse_customer_key_md5(),
+                $request.sse_customer_key_md5()
+            );
+            assert_eq!($input.request_payer(), $request.request_payer());
+            assert_eq!(
+                $input.expected_bucket_owner(),
+                $request.expected_bucket_owner()
+            );
+            assert_eq!($input.checksum_mode(), $request.checksum_mode());
+
+            // User-selected object parts are unsupported. GET discovery sets
+            // its own part number only on requests that require one.
+            assert_eq!(None, $request.part_number());
+        };
+    }
+
+    #[test]
+    fn test_all_fields_copied_to_get_object_request() {
+        let input = request_with_all_forwarded_fields();
+        assert_all_input_fields_classified(&input);
+        let client = mock_client!(aws_sdk_s3, []);
+        let request = copy_fields_to_get_object_request(&input, client.get_object())
+            .as_input()
+            .clone()
+            .build()
+            .unwrap();
+
+        assert_forwarded_fields!(input, request);
+    }
+
+    #[test]
+    fn test_all_fields_copied_to_head_object_request() {
+        let input = request_with_all_forwarded_fields();
+        assert_all_input_fields_classified(&input);
+        let client = mock_client!(aws_sdk_s3, []);
+        let request = copy_fields_to_head_object_request(&input, client.head_object())
+            .as_input()
+            .clone()
+            .build()
+            .unwrap();
+
+        assert_forwarded_fields!(input, request);
+    }
+}

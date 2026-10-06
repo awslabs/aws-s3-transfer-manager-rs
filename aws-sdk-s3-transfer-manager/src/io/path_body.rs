@@ -30,6 +30,7 @@ pub(super) struct PathBody {
 ///     let stream = InputStream::read_from()
 ///         .path("docs/some-large-file.csv")
 ///         // Specify the length of the file used (skips an additional call to retrieve the size)
+///         .length(123_456)
 ///         .build()
 ///         .expect("valid path");
 ///     stream

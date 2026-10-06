@@ -1,0 +1,789 @@
+/*
+ * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+//! Per-core managed thread runtime.
+//!
+//! Spawns one OS thread per core in the topology, each running a tokio
+//! current-thread runtime. Work arrives via `Handle::spawn` from the dispatch
+//! path. Shutdown cancels a shared token; each thread's `block_on` returns and
+//! the thread exits.
+
+use std::panic::AssertUnwindSafe;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, Weak};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+use aws_smithy_http_client::pool::{self, ConnectionPool, DriverSpawner, Partition, PartitionId};
+use aws_smithy_http_client::proxy::ProxyConfig;
+use aws_smithy_http_client::tls::{rustls_provider::CryptoMode, Provider};
+use aws_smithy_runtime_api::box_error::BoxError;
+use aws_smithy_runtime_api::client::connector_metadata::ConnectorMetadata;
+use aws_smithy_runtime_api::client::dns::{DnsFuture, ResolveDns};
+use aws_smithy_runtime_api::client::http::{
+    HttpClient, HttpConnectorSettings, SharedHttpClient, SharedHttpConnector,
+};
+use aws_smithy_runtime_api::client::runtime_components::{
+    RuntimeComponents as SmithyRuntimeComponents, RuntimeComponentsBuilder,
+};
+use aws_smithy_runtime_api::shared::IntoShared;
+use aws_smithy_types::config_bag::ConfigBag;
+use futures_util::FutureExt;
+use tokio_util::sync::CancellationToken;
+
+use super::topology::Cpu;
+use super::Topology;
+use super::{ExecutionRuntime, RuntimeComponents, RuntimeHttpOptions, ScheduledWork};
+use crate::runtime::sync::SubmissionGuard;
+use crate::scheduler::Scheduler;
+use crate::transfer::{TransferId, WorkOutcome};
+
+/// DNS resolver that shuffles returned IPs to distribute connections across
+/// S3 fleet addresses. Wraps any [`ResolveDns`] implementation.
+///
+/// hyper tries resolved IPs sequentially, so without shuffling all connections
+/// land on the first IP. Shuffling gives each connection a random starting IP,
+/// spreading load across all resolved addresses. The connection pool's
+/// transport has the same sequential behavior, so shuffling still applies.
+#[derive(Debug, Clone)]
+struct ShufflingDnsResolver<R> {
+    inner: R,
+}
+
+impl<R> ShufflingDnsResolver<R> {
+    fn new(inner: R) -> Self {
+        Self { inner }
+    }
+}
+
+impl<R: ResolveDns + 'static> ResolveDns for ShufflingDnsResolver<R> {
+    fn resolve_dns<'a>(&'a self, name: &'a str) -> DnsFuture<'a> {
+        DnsFuture::new(async move {
+            let mut ips = self.inner.resolve_dns(name).await?;
+            fastrand::shuffle(&mut ips);
+            Ok(ips)
+        })
+    }
+}
+
+std::thread_local! {
+    /// Identifies which managed thread the current OS thread corresponds to.
+    /// Set once during thread startup, read by [`ManagedHttpClient`] to select
+    /// the calling thread's pool partition.
+    static MANAGED_THREAD_CPU: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// One managed OS thread and its tokio current-thread handle.
+struct ThreadHandle {
+    id: Cpu,
+    runtime_handle: tokio::runtime::Handle,
+    join_handle: Mutex<Option<JoinHandle<()>>>,
+    in_flight: Arc<AtomicUsize>,
+}
+
+/// HTTP client that routes each operation to the calling managed thread's
+/// connection pool partition.
+///
+/// The SDK client holds a single [`HttpClient`], but the pool binds each
+/// [`pool::Client`] to one partition whose connections and protocol drivers
+/// live on one managed thread's runtime. Smithy requests an HTTP connector
+/// from the task executing the operation, so the thread-local
+/// [`MANAGED_THREAD_CPU`] identifies the partition that owns local reuse for
+/// that request.
+///
+/// Some operations are sent from outside the managed threads, for example
+/// [`UploadHandle::abort`](crate::operation::upload::UploadHandle::abort)
+/// runs on the caller's runtime. Those requests use a randomly selected
+/// partition: establishment and protocol drivers still run on that partition's
+/// thread, and the calling task only awaits the response.
+#[derive(Debug, Clone)]
+struct ManagedHttpClient {
+    /// One client per managed thread, indexed by thread (and partition) index.
+    clients: Arc<[pool::Client]>,
+}
+
+impl HttpClient for ManagedHttpClient {
+    fn validate_base_client_config(
+        &self,
+        runtime_components: &RuntimeComponentsBuilder,
+        cfg: &ConfigBag,
+    ) -> Result<(), BoxError> {
+        // Transport preflight builds and caches the TLS connectors (loading
+        // native trust roots) so that work happens here, when the S3 client is
+        // built, instead of on a managed thread's first connection. It needs no
+        // runtime context. Connectors are cached by interface binding, so
+        // visiting every partition covers each distinct interface; unbound
+        // partitions share one connector and repeat visits are cache hits.
+        self.clients
+            .iter()
+            .try_for_each(|client| client.validate_base_client_config(runtime_components, cfg))
+    }
+
+    fn http_connector(
+        &self,
+        settings: &HttpConnectorSettings,
+        components: &SmithyRuntimeComponents,
+    ) -> SharedHttpConnector {
+        let index = MANAGED_THREAD_CPU
+            .with(|c| c.get())
+            .unwrap_or_else(|| fastrand::usize(..self.clients.len()));
+        self.clients[index].http_connector(settings, components)
+    }
+
+    fn connector_metadata(&self) -> Option<ConnectorMetadata> {
+        self.clients.first()?.connector_metadata()
+    }
+}
+
+impl std::fmt::Debug for ThreadHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ThreadHandle")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Selects which managed thread should execute a work item.
+///
+/// Uses power-of-two-random-choices: pick two threads at random, return the
+/// least loaded. O(1) regardless of thread count, low contention on the
+/// atomics (only two loads instead of N). Same algorithm CRT uses for
+/// event loop selection (`get_next_loop`).
+struct DispatchRouter;
+
+impl DispatchRouter {
+    /// Select a thread to execute the given work.
+    fn select(&self, threads: &[ThreadHandle]) -> Cpu {
+        let len = threads.len();
+        debug_assert!(len > 0, "no threads available");
+        if len == 1 {
+            return threads[0].id;
+        }
+        let a = fastrand::usize(..len);
+        let mut b = fastrand::usize(..len - 1);
+        if b >= a {
+            b += 1;
+        }
+        let load_a = threads[a].in_flight.load(Ordering::Relaxed);
+        let load_b = threads[b].in_flight.load(Ordering::Relaxed);
+        if load_a <= load_b {
+            threads[a].id
+        } else {
+            threads[b].id
+        }
+    }
+}
+
+/// Result of executing a single work item.
+enum ExecuteResult {
+    Completed(WorkOutcome, Duration),
+    Panicked,
+}
+
+/// Execute a single work item, mirroring the `worker_loop` semantics from
+/// `tokio_mt` but for one-shot per-task spawning.
+async fn execute_work(work: &mut ScheduledWork, scheduler: &Scheduler) -> ExecuteResult {
+    scheduler.on_dispatch();
+    let tid = work.descriptor.id();
+    work.descriptor.work_started();
+
+    if work.descriptor.is_terminal() {
+        tracing::trace!(target: crate::telemetry::TARGET_EXECUTION, %tid, "skipped (terminal)");
+        return ExecuteResult::Completed(WorkOutcome::Cancelled, Duration::ZERO);
+    }
+
+    tracing::trace!(target: crate::telemetry::TARGET_EXECUTION, %tid, "executing");
+    let transfer = work.descriptor.transfer();
+    let started = Instant::now();
+
+    let token = work.descriptor.cancellation_token().clone();
+    let outcome = AssertUnwindSafe(async {
+        tokio::select! {
+            biased;
+            _ = token.cancelled() => WorkOutcome::Cancelled,
+            outcome = transfer.execute(&mut work.item) => outcome,
+        }
+    })
+    .catch_unwind()
+    .await;
+
+    match outcome {
+        Ok(outcome) => {
+            tracing::trace!(target: crate::telemetry::TARGET_EXECUTION, %tid, ?outcome, "completed");
+            ExecuteResult::Completed(outcome, started.elapsed())
+        }
+        Err(_panic) => {
+            tracing::error!(target: crate::telemetry::TARGET_EXECUTION, %tid, "panic in transfer execute");
+            ExecuteResult::Panicked
+        }
+    }
+}
+
+/// Execution runtime backed by per-core OS threads, each running a tokio
+/// current-thread runtime.
+pub(crate) struct ManagedThreadRuntime {
+    handle: Weak<crate::client::Handle>,
+    #[allow(dead_code)] // used for topology-aware routing when wired
+    topology: Topology,
+    #[allow(dead_code)] // used for core pinning when wired
+    pin_threads: bool,
+    threads: Vec<ThreadHandle>,
+    shutdown_token: CancellationToken,
+    router: DispatchRouter,
+    components: RuntimeComponents,
+}
+
+impl std::fmt::Debug for ManagedThreadRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ManagedThreadRuntime")
+            .field("threads", &self.threads.len())
+            .field("topology", &self.topology)
+            .finish()
+    }
+}
+
+impl ManagedThreadRuntime {
+    /// Create a [`ManagedThreadRuntimeBuilder`].
+    pub(crate) fn builder(handle: Weak<crate::client::Handle>) -> ManagedThreadRuntimeBuilder {
+        ManagedThreadRuntimeBuilder::new(handle)
+    }
+
+    /// Create a new managed thread runtime.
+    ///
+    /// Spawns one OS thread per core in the topology. Each thread creates its
+    /// own tokio current-thread runtime (the I/O driver binds to the creating
+    /// thread). Builds an HTTP client only when `http` is present.
+    fn new(
+        handle: Weak<crate::client::Handle>,
+        topology: Topology,
+        pin_threads: bool,
+        http: Option<RuntimeHttpOptions>,
+        #[cfg(feature = "dial9")] telemetry_guard: Option<
+            std::sync::Arc<dial9_tokio_telemetry::telemetry::TelemetryGuard>,
+        >,
+    ) -> Self {
+        let shutdown_token = CancellationToken::new();
+
+        // spawn and initialize concurrently
+        let pending: Vec<_> = topology
+            .thread_ids()
+            .map(|id| {
+                let shutdown = shutdown_token.clone();
+                let (tx, rx) = std::sync::mpsc::channel();
+                let cpu_index = id.0;
+
+                #[cfg(feature = "dial9")]
+                let telemetry_guard = telemetry_guard.clone();
+
+                let join_handle = std::thread::Builder::new()
+                    .name(format!("s3-tm-{}", id))
+                    .spawn(move || {
+                        let mut builder = tokio::runtime::Builder::new_current_thread();
+                        builder.enable_all().max_blocking_threads(1);
+
+                        #[cfg(feature = "dial9")]
+                        let rt = if let Some(ref guard) = telemetry_guard {
+                            let (rt, _handle) = guard
+                                .trace_runtime(format!("s3-tm-{}", cpu_index))
+                                .build(builder)
+                                .expect("failed to create traced tokio runtime");
+                            rt
+                        } else {
+                            builder
+                                .build()
+                                .expect("failed to create tokio current-thread runtime")
+                        };
+
+                        #[cfg(not(feature = "dial9"))]
+                        let rt = builder
+                            .build()
+                            .expect("failed to create tokio current-thread runtime");
+
+                        let _ = tx.send(rt.handle().clone());
+                        MANAGED_THREAD_CPU.set(Some(cpu_index));
+                        rt.block_on(shutdown.cancelled());
+                    })
+                    .expect("failed to spawn managed thread");
+
+                (id, rx, join_handle)
+            })
+            .collect();
+
+        let threads: Vec<_> = pending
+            .into_iter()
+            .map(|(id, rx, join_handle)| {
+                let runtime_handle = rx.recv().expect("managed thread failed to start");
+                ThreadHandle {
+                    id,
+                    runtime_handle,
+                    join_handle: Mutex::new(Some(join_handle)),
+                    in_flight: Arc::new(AtomicUsize::new(0)),
+                }
+            })
+            .collect();
+
+        let mut components = RuntimeComponents::default();
+        if let Some(http) = http {
+            components.set_http_client(build_http_client(&threads, &http));
+        }
+        components.set_direct_io(true);
+
+        Self {
+            handle,
+            topology,
+            pin_threads,
+            threads,
+            shutdown_token,
+            router: DispatchRouter,
+            components,
+        }
+    }
+}
+
+/// How long a pooled connection may sit idle before the pool closes it.
+///
+/// S3 closes idle connections server-side. Retiring them first avoids reusing a
+/// connection the server is closing, which fails before the request is accepted
+/// and costs a retry on a fresh connection.
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Build one connection pool with a partition per managed thread and return an
+/// HTTP client that dispatches each request through the calling thread's
+/// partition.
+///
+/// Each partition spawns connection establishment, protocol drivers, and idle
+/// maintenance on its thread's runtime, so a connection's I/O stays on the
+/// thread that opened it. Partition identity is the thread index, which is also
+/// the index [`ManagedHttpClient`] reads from [`MANAGED_THREAD_CPU`].
+///
+/// When network interfaces are configured, each partition binds its
+/// connections to the interface [`partition_interface`] assigns its thread.
+///
+/// Proxy selection follows the standard environment variables (`HTTP_PROXY`,
+/// `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`), matching the SDK's default HTTPS
+/// client.
+///
+/// # Panics
+///
+/// Panics if the pool rejects its configuration, for example an interface name
+/// containing a NUL byte.
+fn build_http_client(threads: &[ThreadHandle], options: &RuntimeHttpOptions) -> SharedHttpClient {
+    debug_assert!(
+        threads.iter().enumerate().all(|(i, th)| th.id.0 == i),
+        "thread ids must be dense indices"
+    );
+
+    #[cfg(target_os = "android")]
+    let dns_resolver = ShufflingDnsResolver::new(
+        // Hickory reads /etc/resolv.conf on Unix. Android routes libc
+        // resolution through netd and does not provide that file.
+        aws_smithy_runtime::client::dns::TokioDnsResolver::new(),
+    );
+    #[cfg(not(target_os = "android"))]
+    let dns_resolver = ShufflingDnsResolver::new(aws_smithy_dns::HickoryDnsResolver::default());
+
+    let partitions = threads.iter().map(|th| {
+        let partition = Partition::new(
+            PartitionId::from_index(th.id.0),
+            DriverSpawner::tokio(th.runtime_handle.clone()),
+        );
+        bind_interface(partition, th.id, &options.network_interfaces)
+    });
+    let pool = ConnectionPool::builder()
+        .dns_resolver(dns_resolver)
+        .idle_timeout(POOL_IDLE_TIMEOUT)
+        .max_connections_per_host(options.max_connections_per_host)
+        .proxy_config(ProxyConfig::from_env())
+        .partitions(partitions)
+        .tls_provider(Provider::Rustls(CryptoMode::AwsLc))
+        .build_https()
+        .expect("failed to build the managed runtime connection pool");
+    let clients = threads
+        .iter()
+        .map(|th| pool::Client::from_partition(&pool, PartitionId::from_index(th.id.0)))
+        .collect::<Result<Arc<[_]>, _>>()
+        .expect("every managed thread has a declared partition");
+    ManagedHttpClient { clients }.into_shared()
+}
+
+/// Bind `partition` to the interface [`partition_interface`] assigns `thread`.
+#[cfg(any(
+    target_os = "android",
+    target_os = "fuchsia",
+    target_os = "illumos",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "solaris",
+    target_os = "tvos",
+    target_os = "visionos",
+    target_os = "watchos",
+))]
+fn bind_interface(partition: Partition, thread: Cpu, interfaces: &[String]) -> Partition {
+    match partition_interface(thread, interfaces) {
+        Some(interface) => partition.interface(interface),
+        None => partition,
+    }
+}
+
+/// Interface binding is unavailable on this platform, and the public setters
+/// that populate `interfaces` are not compiled.
+#[cfg(not(any(
+    target_os = "android",
+    target_os = "fuchsia",
+    target_os = "illumos",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "solaris",
+    target_os = "tvos",
+    target_os = "visionos",
+    target_os = "watchos",
+)))]
+fn bind_interface(partition: Partition, _thread: Cpu, _interfaces: &[String]) -> Partition {
+    partition
+}
+
+/// The network interface a managed thread's partition binds to: interfaces are
+/// assigned to threads round-robin in configuration order. `None` when no
+/// interfaces are configured, leaving selection to OS routing.
+///
+/// Threads are not pinned to NUMA nodes, so assignment cannot follow NIC
+/// locality; round-robin spreads threads evenly across interfaces.
+#[cfg(any(
+    target_os = "android",
+    target_os = "fuchsia",
+    target_os = "illumos",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "solaris",
+    target_os = "tvos",
+    target_os = "visionos",
+    target_os = "watchos",
+))]
+fn partition_interface(thread: Cpu, interfaces: &[String]) -> Option<&str> {
+    if interfaces.is_empty() {
+        return None;
+    }
+    Some(&interfaces[thread.0 % interfaces.len()])
+}
+
+/// Builder for [`ManagedThreadRuntime`].
+pub(crate) struct ManagedThreadRuntimeBuilder {
+    handle: Weak<crate::client::Handle>,
+    topology: Option<Topology>,
+    pin_threads: bool,
+    http: Option<RuntimeHttpOptions>,
+    #[cfg(feature = "dial9")]
+    telemetry_guard: Option<std::sync::Arc<dial9_tokio_telemetry::telemetry::TelemetryGuard>>,
+}
+
+impl ManagedThreadRuntimeBuilder {
+    fn new(handle: Weak<crate::client::Handle>) -> Self {
+        Self {
+            handle,
+            topology: None,
+            pin_threads: false,
+            http: None,
+            #[cfg(feature = "dial9")]
+            telemetry_guard: None,
+        }
+    }
+
+    /// Set a dial9 telemetry guard for tracing per-thread runtimes.
+    #[cfg(feature = "dial9")]
+    pub(crate) fn telemetry_guard(
+        mut self,
+        guard: std::sync::Arc<dial9_tokio_telemetry::telemetry::TelemetryGuard>,
+    ) -> Self {
+        self.telemetry_guard = Some(guard);
+        self
+    }
+
+    /// Set the hardware topology. Defaults to `Topology::uniform(num_cpus)`
+    /// where `num_cpus` is detected at build time.
+    #[allow(dead_code)] // TODO: expose on public config
+    pub(crate) fn topology(mut self, topology: Topology) -> Self {
+        self.topology = Some(topology);
+        self
+    }
+
+    /// Provide an HTTP client for the S3 client, configured by `options`.
+    /// Default: `None`, which builds no HTTP client.
+    pub(crate) fn http(mut self, options: Option<RuntimeHttpOptions>) -> Self {
+        self.http = options;
+        self
+    }
+
+    /// Enable thread pinning to cores. Default: false.
+    #[allow(dead_code)]
+    pub(crate) fn pin_threads(mut self, pin: bool) -> Self {
+        self.pin_threads = pin;
+        self
+    }
+
+    /// Build the runtime, spawning managed threads.
+    pub(crate) fn build(self) -> ManagedThreadRuntime {
+        let topology = self.topology.unwrap_or_else(|| {
+            // TODO - use many_cpu's / Topologoy::detect()
+            Topology::uniform(
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(1),
+            )
+        });
+        ManagedThreadRuntime::new(
+            self.handle,
+            topology,
+            self.pin_threads,
+            self.http,
+            #[cfg(feature = "dial9")]
+            self.telemetry_guard,
+        )
+    }
+}
+
+impl ExecutionRuntime for ManagedThreadRuntime {
+    fn dispatch(&self, batch: &mut SubmissionGuard<'_, ScheduledWork>) {
+        for mut work in batch.drain() {
+            let thread_id = self.router.select(&self.threads);
+            let th = &self.threads[thread_id.0];
+            th.in_flight.fetch_add(1, Ordering::Relaxed);
+
+            let handle = self.handle.clone();
+            let in_flight = Arc::clone(&th.in_flight);
+            let tid = work.descriptor.id();
+
+            tracing::trace!(
+                target: crate::telemetry::TARGET_EXECUTION,
+                %tid,
+                thread = thread_id.0,
+                "dispatching to managed thread",
+            );
+
+            th.runtime_handle.spawn(async move {
+                let Some(h) = handle.upgrade() else {
+                    return;
+                };
+                tracing::trace!(
+                    target: crate::telemetry::TARGET_EXECUTION,
+                    %tid,
+                    "execute starting",
+                );
+                let result = execute_work(&mut work, &h.scheduler).await;
+                tracing::trace!(
+                    target: crate::telemetry::TARGET_EXECUTION,
+                    %tid,
+                    "execute finished, entering on_completion",
+                );
+                in_flight.fetch_sub(1, Ordering::Relaxed);
+                match result {
+                    ExecuteResult::Completed(outcome, elapsed) => {
+                        h.scheduler.on_completion(work, outcome, elapsed);
+                    }
+                    ExecuteResult::Panicked => {
+                        h.scheduler.on_panic(work);
+                    }
+                }
+                tracing::trace!(
+                    target: crate::telemetry::TARGET_EXECUTION,
+                    %tid,
+                    "on_completion returned",
+                );
+            });
+        }
+    }
+
+    fn shutdown(&self) {
+        // Signal all threads to exit. Join happens in Drop.
+        self.shutdown_token.cancel();
+    }
+
+    fn remove_pending_for_transfer(&self, _id: TransferId) -> usize {
+        // Work is spawned as tasks on thread runtimes and cannot be removed.
+        // The terminal check in the execute path handles cancelled transfers.
+        0
+    }
+
+    fn components(&self) -> &RuntimeComponents {
+        &self.components
+    }
+}
+
+impl Drop for ManagedThreadRuntime {
+    fn drop(&mut self) {
+        self.shutdown_token.cancel();
+        for th in &self.threads {
+            if let Some(jh) = th.join_handle.lock().unwrap().take() {
+                let _ = jh.join();
+            }
+        }
+    }
+}
+
+#[cfg(all(test, not(miri)))]
+mod tests {
+    use super::*;
+    use crate::runtime::Topology;
+
+    /// Create a [`ThreadHandle`] with a preset in-flight count for testing
+    /// router selection. No real work is spawned — only `id` and `in_flight`
+    /// are meaningful.
+    fn test_thread_handle(
+        id: Cpu,
+        in_flight_count: usize,
+    ) -> (ThreadHandle, tokio::runtime::Runtime) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let th = ThreadHandle {
+            id,
+            runtime_handle: rt.handle().clone(),
+            join_handle: Mutex::new(None),
+            in_flight: Arc::new(AtomicUsize::new(in_flight_count)),
+        };
+        (th, rt)
+    }
+
+    fn test_handle(num_cores: usize) -> (Arc<crate::client::Handle>, Arc<ManagedThreadRuntime>) {
+        let rt_holder: Arc<std::sync::OnceLock<Arc<ManagedThreadRuntime>>> =
+            Arc::new(std::sync::OnceLock::new());
+        let rt_holder2 = rt_holder.clone();
+        let handle = crate::client::Handle::new_for_test_with_runtime(
+            crate::Config::builder()
+                .client(aws_smithy_mocks::mock_client!(aws_sdk_s3, []))
+                .build(),
+            Arc::new(crate::scheduler::FixedConcurrency::new(num_cores)),
+            move |weak| {
+                let rt = Arc::new(
+                    ManagedThreadRuntime::builder(weak)
+                        .topology(Topology::uniform(num_cores))
+                        .build(),
+                );
+                rt_holder2.set(rt.clone()).ok();
+                rt
+            },
+        );
+        let rt = rt_holder.get().unwrap().clone();
+        (handle, rt)
+    }
+
+    #[cfg(any(
+        target_os = "android",
+        target_os = "fuchsia",
+        target_os = "illumos",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "solaris",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos",
+    ))]
+    #[test]
+    fn partition_interface_assigns_round_robin() {
+        let interfaces = ["ens5".to_string(), "ens6".to_string()];
+        let assigned: Vec<_> = (0..5)
+            .map(|i| partition_interface(Cpu(i), &interfaces))
+            .collect();
+        assert_eq!(
+            assigned,
+            [
+                Some("ens5"),
+                Some("ens6"),
+                Some("ens5"),
+                Some("ens6"),
+                Some("ens5")
+            ]
+        );
+    }
+
+    #[cfg(any(
+        target_os = "android",
+        target_os = "fuchsia",
+        target_os = "illumos",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "solaris",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos",
+    ))]
+    #[test]
+    fn partition_interface_unbound_without_interfaces() {
+        assert_eq!(partition_interface(Cpu(0), &[]), None);
+        assert_eq!(partition_interface(Cpu(3), &[]), None);
+    }
+
+    #[test]
+    fn threads_start_and_shutdown() {
+        let (handle, rt) = test_handle(4);
+        assert_eq!(rt.threads.len(), 4);
+        rt.shutdown();
+        drop(rt);
+        drop(handle);
+    }
+
+    #[test]
+    fn shutdown_is_idempotent() {
+        let (handle, rt) = test_handle(2);
+        rt.shutdown();
+        rt.shutdown();
+        drop(rt);
+        drop(handle);
+    }
+
+    #[test]
+    fn drop_without_shutdown() {
+        let (_handle, rt) = test_handle(3);
+        drop(rt);
+    }
+
+    #[test]
+    fn router_selects_least_loaded() {
+        let router = DispatchRouter;
+        let (h0, _r0) = test_thread_handle(Cpu(0), 5);
+        let (h1, _r1) = test_thread_handle(Cpu(1), 2);
+        let (h2, _r2) = test_thread_handle(Cpu(2), 8);
+        let (h3, _r3) = test_thread_handle(Cpu(3), 3);
+        let handles = vec![h0, h1, h2, h3];
+        // Power-of-two: picks 2 random threads, returns least loaded.
+        // Over many iterations, should never pick the most loaded (Cpu(2)=8)
+        // when a lighter option exists.
+        let mut selected = std::collections::HashMap::new();
+        for _ in 0..1000 {
+            let cpu = router.select(&handles);
+            *selected.entry(cpu).or_insert(0u32) += 1;
+        }
+        // Cpu(1) with load=2 should be selected most often
+        assert!(
+            selected.get(&Cpu(1)).copied().unwrap_or(0)
+                > selected.get(&Cpu(2)).copied().unwrap_or(0),
+            "least loaded thread should be selected more than most loaded: {selected:?}"
+        );
+    }
+
+    #[test]
+    fn router_single_thread() {
+        let router = DispatchRouter;
+        let (h0, _r0) = test_thread_handle(Cpu(0), 5);
+        let handles = vec![h0];
+        assert_eq!(router.select(&handles), Cpu(0));
+    }
+
+    #[test]
+    fn router_two_threads_prefers_lighter() {
+        let router = DispatchRouter;
+        let (h0, _r0) = test_thread_handle(Cpu(0), 10);
+        let (h1, _r1) = test_thread_handle(Cpu(1), 0);
+        let handles = vec![h0, h1];
+        // With only 2 threads, power-of-two always picks both, returns lighter
+        for _ in 0..100 {
+            assert_eq!(router.select(&handles), Cpu(1));
+        }
+    }
+}

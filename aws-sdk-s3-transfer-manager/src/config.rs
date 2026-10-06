@@ -7,23 +7,168 @@ use aws_runtime::user_agent::FrameworkMetadata;
 use std::cmp;
 
 use crate::metrics::unit::ByteUnit;
-use crate::types::{ConcurrencyMode, PartSize};
+use crate::types::{ConcurrencyMode, MemoryConfig, PartSize, ReadAhead, RuntimeMode};
+
+mod diagnostics;
+pub(crate) use diagnostics::{
+    DiagnosticsConfig, MemoryDiagnosticsConfig, TransferDiagnosticsConfig,
+};
 
 pub(crate) mod loader;
+pub(crate) mod user_agent;
 
 /// Minimum upload part size in bytes
 pub(crate) const MIN_MULTIPART_PART_SIZE_BYTES: u64 = 5 * ByteUnit::Mebibyte.as_bytes_u64();
 
 // FIXME - should target throughput be configurable for upload and download independently?
 
+/// S3 client configuration for the transfer manager.
+///
+/// Wraps an `aws_sdk_s3::config::Builder` with transfer-manager-specific
+/// options. The transfer manager builds the S3 client from this configuration,
+/// injecting runtime-optimized HTTP transport by default.
+///
+/// Converts from shared AWS configuration or an S3 config builder:
+///
+/// ```no_run
+/// # async fn example() {
+/// let sdk_config = aws_config::load_from_env().await;
+/// let config = aws_sdk_s3_transfer_manager::Config::builder()
+///     .s3_config(&sdk_config)
+///     .build();
+/// # }
+/// ```
+pub struct S3ClientConfig {
+    pub(crate) builder: aws_sdk_s3::config::Builder,
+    pub(crate) enable_runtime_http: bool,
+    pub(crate) network_interfaces: Vec<String>,
+}
+
+impl S3ClientConfig {
+    /// Create a new `S3ClientConfig` from an S3 config builder or from shared
+    /// AWS configuration (`&SdkConfig`).
+    pub fn new(builder: impl Into<aws_sdk_s3::config::Builder>) -> Self {
+        Self {
+            builder: builder.into(),
+            enable_runtime_http: true,
+            network_interfaces: Vec::new(),
+        }
+    }
+
+    /// Control whether the transfer manager manages HTTP transport.
+    ///
+    /// When `true` (default), the runtime injects an HTTP client optimized
+    /// for its execution model (e.g. per-thread connection pools on managed
+    /// threads). When `false`, the HTTP client already set on the builder
+    /// is used as-is.
+    pub fn enable_runtime_http(mut self, enable: bool) -> Self {
+        self.enable_runtime_http = enable;
+        self
+    }
+
+    /// Bind the runtime-provided HTTP transport's connections to these network
+    /// interfaces.
+    ///
+    /// Managed worker threads are assigned interfaces round-robin in the order
+    /// given, and each thread opens connections only through its interface, so
+    /// traffic spreads across NICs by thread. The binding is applied to each
+    /// socket before connect (`SO_BINDTODEVICE` on Linux). An interface that
+    /// does not exist or cannot be bound surfaces as a connection error when a
+    /// request is sent. A name containing a NUL byte cannot be passed to the OS
+    /// and panics when the client is constructed.
+    ///
+    /// Applies only to [`RuntimeMode::Managed`] with runtime HTTP enabled; it is
+    /// ignored when [`enable_runtime_http`](Self::enable_runtime_http) is
+    /// `false` or under [`RuntimeMode::MultiThreadTokio`]. Empty (the default)
+    /// leaves interface selection to OS routing.
+    ///
+    /// Available on platforms that support binding a socket to an interface
+    /// (Linux, Android, Apple platforms, illumos, Solaris, and Fuchsia).
+    #[cfg(any(
+        target_os = "android",
+        target_os = "fuchsia",
+        target_os = "illumos",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "solaris",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos",
+    ))]
+    #[cfg_attr(
+        docsrs,
+        doc(cfg(any(
+            target_os = "android",
+            target_os = "fuchsia",
+            target_os = "illumos",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "solaris",
+            target_os = "tvos",
+            target_os = "visionos",
+            target_os = "watchos",
+        )))
+    )]
+    pub fn network_interfaces<I, S>(mut self, interfaces: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.network_interfaces = interfaces.into_iter().map(Into::into).collect();
+        self
+    }
+}
+
+impl From<&aws_types::SdkConfig> for S3ClientConfig {
+    fn from(sdk_config: &aws_types::SdkConfig) -> Self {
+        Self::new(sdk_config)
+    }
+}
+
+impl From<aws_sdk_s3::config::Builder> for S3ClientConfig {
+    fn from(builder: aws_sdk_s3::config::Builder) -> Self {
+        Self::new(builder)
+    }
+}
+
+impl std::fmt::Debug for S3ClientConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S3ClientConfig")
+            .field("enable_runtime_http", &self.enable_runtime_http)
+            .field("network_interfaces", &self.network_interfaces)
+            .finish_non_exhaustive()
+    }
+}
+
+/// How the S3 client is provided to the transfer manager.
+#[derive(Debug)]
+pub(crate) enum S3ClientSource {
+    /// User provided a finished S3 client. Use as-is.
+    Provided(aws_sdk_s3::Client),
+    /// Build the S3 client from config, injecting runtime components.
+    FromConfig(Box<S3ClientConfig>),
+}
+
 /// Configuration for a [`Client`](crate::client::Client)
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Config {
     multipart_threshold: PartSize,
     target_part_size: PartSize,
     concurrency: ConcurrencyMode,
+    runtime_mode: RuntimeMode,
+    read_ahead: ReadAhead,
+    memory: MemoryConfig,
+    diagnostics: DiagnosticsConfig,
     framework_metadata: Option<FrameworkMetadata>,
-    client: aws_sdk_s3::client::Client,
+    s3_client_source: Option<S3ClientSource>,
+    /// Machine facts detected once by the async config loader, off the
+    /// `Client::new` hot path. `None` when the config was built directly
+    /// (bypassing the loader); consumers then fall back to cheap local detection.
+    machine_profile: Option<crate::runtime::platform::MachineProfile>,
+    #[cfg(feature = "dial9")]
+    pub(crate) telemetry_guard: Option<dial9_tokio_telemetry::telemetry::TelemetryGuard>,
 }
 
 impl Config {
@@ -49,26 +194,94 @@ impl Config {
         &self.concurrency
     }
 
+    /// Returns the execution runtime the client runs transfers on.
+    ///
+    /// See [`RuntimeMode`] for the tradeoff between managed threads and the
+    /// caller's runtime.
+    pub fn runtime_mode(&self) -> &RuntimeMode {
+        &self.runtime_mode
+    }
+
+    /// Returns the read-ahead mode used for downloads.
+    ///
+    /// This is the client default; a download may override it per request via
+    /// [`DownloadInput`](crate::operation::download::DownloadInput).
+    pub fn read_ahead(&self) -> &ReadAhead {
+        &self.read_ahead
+    }
+
+    /// Returns the payload-memory configuration.
+    pub fn memory(&self) -> &MemoryConfig {
+        &self.memory
+    }
+
+    /// Returns the diagnostic policy fixed when this configuration was built.
+    pub(crate) fn diagnostics(&self) -> DiagnosticsConfig {
+        self.diagnostics
+    }
+
+    /// Machine facts detected by the async config loader, if this config was
+    /// built through it. `None` when built directly.
+    pub(crate) fn machine_profile(&self) -> Option<&crate::runtime::platform::MachineProfile> {
+        self.machine_profile.as_ref()
+    }
+
     /// Returns the framework metadata setting when using transfer manager.
     #[doc(hidden)]
     pub fn framework_metadata(&self) -> Option<&FrameworkMetadata> {
         self.framework_metadata.as_ref()
     }
 
-    /// The Amazon S3 client instance that will be used to send requests to S3.
-    pub fn client(&self) -> &aws_sdk_s3::Client {
-        &self.client
+    /// HTTP options for the runtime-provided transport, or `None` when the
+    /// runtime's HTTP client would not be installed: a finished S3 client was
+    /// supplied, or runtime HTTP is disabled.
+    pub(crate) fn runtime_http(
+        &self,
+        max_connections_per_host: usize,
+    ) -> Option<crate::runtime::RuntimeHttpOptions> {
+        match self.s3_client_source.as_ref()? {
+            S3ClientSource::FromConfig(config) if config.enable_runtime_http => {
+                Some(crate::runtime::RuntimeHttpOptions {
+                    network_interfaces: config.network_interfaces.clone(),
+                    max_connections_per_host,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Consume the S3 client source, returning it.
+    pub(crate) fn take_s3_client_source(&mut self) -> S3ClientSource {
+        self.s3_client_source
+            .take()
+            .expect("s3 client source already taken")
+    }
+
+    /// Take the telemetry guard, if set.
+    #[cfg(feature = "dial9")]
+    pub(crate) fn take_telemetry_guard(
+        &mut self,
+    ) -> Option<dial9_tokio_telemetry::telemetry::TelemetryGuard> {
+        self.telemetry_guard.take()
     }
 }
 
 /// Fluent style builder for [Config]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub struct Builder {
     multipart_threshold_part_size: PartSize,
     target_part_size: PartSize,
     concurrency: ConcurrencyMode,
-    framework_metadata: Option<FrameworkMetadata>,
+    runtime_mode: RuntimeMode,
+    read_ahead: ReadAhead,
+    memory: MemoryConfig,
+    diagnostics: Option<DiagnosticsConfig>,
+    pub(crate) framework_metadata: Option<FrameworkMetadata>,
     client: Option<aws_sdk_s3::Client>,
+    s3_client_config: Option<S3ClientConfig>,
+    machine_profile: Option<crate::runtime::platform::MachineProfile>,
+    #[cfg(feature = "dial9")]
+    telemetry_guard: Option<dial9_tokio_telemetry::telemetry::TelemetryGuard>,
 }
 
 impl Builder {
@@ -89,7 +302,7 @@ impl Builder {
 
     /// The target size of each part when using a multipart upload to complete the request.
     ///
-    /// When a request's content length is les than [`multipart_threshold`],
+    /// When a request's content length is less than [`multipart_threshold`],
     /// this setting is ignored and a single [`PutObject`] request will be made instead.
     ///
     /// NOTE: The actual part size used may be larger than the configured part size if
@@ -135,6 +348,45 @@ impl Builder {
         self
     }
 
+    /// Set the execution runtime mode.
+    ///
+    /// Default is [`RuntimeMode::Managed`].
+    pub fn runtime_mode(mut self, mode: RuntimeMode) -> Self {
+        self.runtime_mode = mode;
+        self
+    }
+
+    /// Set how far downloads may prefetch ahead of the consumer.
+    ///
+    /// This is the client default for all downloads; a request may override it via
+    /// [`DownloadInput`](crate::operation::download::DownloadInput), or a running
+    /// transfer may adjust it via
+    /// [`DownloadIoCtl`](crate::operation::download::DownloadIoCtl).
+    /// Default is [ReadAhead::Auto].
+    pub fn read_ahead(mut self, mode: ReadAhead) -> Self {
+        self.read_ahead = mode;
+        self
+    }
+
+    /// Set the payload-memory configuration.
+    ///
+    /// Default is [`MemoryConfig::Auto`].
+    pub fn memory(mut self, memory: MemoryConfig) -> Self {
+        self.memory = memory;
+        self
+    }
+
+    /// Installs deterministic diagnostics for internal tests.
+    #[cfg(test)]
+    pub(crate) fn diagnostics_for_test(
+        mut self,
+        memory: MemoryDiagnosticsConfig,
+        transfer_detail_level: u64,
+    ) -> Self {
+        self.diagnostics = Some(DiagnosticsConfig::for_test(memory, transfer_detail_level));
+        self
+    }
+
     /// Sets the framework metadata for the transfer manager.
     ///
     /// This _optional_ name is used to identify the framework using transfer manager in the user agent that
@@ -146,22 +398,134 @@ impl Builder {
     }
 
     /// Set an explicit S3 client to use.
+    ///
+    /// Either this or [`s3_config`](Self::s3_config) must be set.
+    #[doc(hidden)]
     pub fn client(mut self, client: aws_sdk_s3::Client) -> Self {
-        // TODO - decide the approach here:
-        // - Convert the client to build to modify it based on other configs for transfer manager
-        // - Instead of taking the client, take sdk-config/s3-config/builder?
         self.client = Some(client);
+        self
+    }
+
+    /// Set the S3 client configuration.
+    ///
+    /// The transfer manager builds the S3 client from this configuration,
+    /// injecting runtime-optimized HTTP transport by default. Use
+    /// [`S3ClientConfig::enable_runtime_http`] to opt out.
+    ///
+    /// Either this or [`client`](Self::client) must be set.
+    pub fn s3_config(mut self, config: impl Into<S3ClientConfig>) -> Self {
+        self.s3_client_config = Some(config.into());
+        self
+    }
+
+    /// Set a dial9 telemetry guard for runtime tracing.
+    ///
+    /// When set, each managed worker runtime will be traced via dial9-tokio-telemetry.
+    #[cfg(feature = "dial9")]
+    pub fn telemetry_guard(
+        mut self,
+        guard: dial9_tokio_telemetry::telemetry::TelemetryGuard,
+    ) -> Self {
+        self.telemetry_guard = Some(guard);
+        self
+    }
+
+    /// Set the machine profile detected by the async config loader. Internal:
+    /// populated by [`ConfigLoader`](crate::config::loader::ConfigLoader), not a
+    /// public builder method.
+    pub(crate) fn machine_profile(
+        mut self,
+        profile: Option<crate::runtime::platform::MachineProfile>,
+    ) -> Self {
+        self.machine_profile = profile;
         self
     }
 
     /// Consumes the builder and constructs a [`Config`]
     pub fn build(self) -> Config {
+        let s3_client_source = match (self.client, self.s3_client_config) {
+            (Some(client), _) => S3ClientSource::Provided(client),
+            (None, Some(config)) => S3ClientSource::FromConfig(Box::new(config)),
+            (None, None) => panic!("either client() or s3_config() must be set"),
+        };
         Config {
             multipart_threshold: self.multipart_threshold_part_size,
             target_part_size: self.target_part_size,
             concurrency: self.concurrency,
+            runtime_mode: self.runtime_mode,
+            read_ahead: self.read_ahead,
+            memory: self.memory,
+            diagnostics: self.diagnostics.unwrap_or_else(DiagnosticsConfig::from_env),
             framework_metadata: self.framework_metadata,
-            client: self.client.expect("client set"),
+            s3_client_source: Some(s3_client_source),
+            machine_profile: self.machine_profile,
+            #[cfg(feature = "dial9")]
+            telemetry_guard: self.telemetry_guard,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn s3_config_builder() -> aws_sdk_s3::config::Builder {
+        aws_sdk_s3::config::Builder::new()
+    }
+
+    #[test]
+    fn s3_client_config_converts_from_sdk_config_and_builder() {
+        let sdk_config = aws_types::SdkConfig::builder().build();
+        let from_sdk = S3ClientConfig::from(&sdk_config);
+        assert!(from_sdk.enable_runtime_http);
+        assert!(from_sdk.network_interfaces.is_empty());
+
+        let from_builder: S3ClientConfig = s3_config_builder().into();
+        assert!(from_builder.enable_runtime_http);
+    }
+
+    #[cfg(any(
+        target_os = "android",
+        target_os = "fuchsia",
+        target_os = "illumos",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "solaris",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos",
+    ))]
+    #[test]
+    fn runtime_http_carries_network_interfaces() {
+        let config = Config::builder()
+            .s3_config(
+                S3ClientConfig::new(s3_config_builder()).network_interfaces(["ens5", "ens6"]),
+            )
+            .build();
+        let http = config.runtime_http(64).expect("runtime HTTP enabled");
+        assert_eq!(http.network_interfaces, ["ens5", "ens6"]);
+        assert_eq!(http.max_connections_per_host, 64);
+    }
+
+    #[test]
+    fn runtime_http_present_for_s3_config() {
+        let config = Config::builder().s3_config(s3_config_builder()).build();
+        assert!(config.runtime_http(64).is_some());
+    }
+
+    #[test]
+    fn runtime_http_absent_without_runtime_transport() {
+        let disabled = Config::builder()
+            .s3_config(S3ClientConfig::new(s3_config_builder()).enable_runtime_http(false))
+            .build();
+        assert!(disabled.runtime_http(64).is_none());
+
+        // A mock client: a real one would build the default HTTPS client, whose
+        // TLS initialization is foreign code that miri cannot run.
+        let provided = Config::builder()
+            .client(aws_smithy_mocks::mock_client!(aws_sdk_s3, []))
+            .build();
+        assert!(provided.runtime_http(64).is_none());
     }
 }

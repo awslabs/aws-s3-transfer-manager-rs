@@ -30,10 +30,8 @@ pub async fn write_body(
     mut dest: fs::File,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     while let Some(chunk) = body.next().await {
-        let chunk = chunk?.data;
-        for segment in chunk.into_segments() {
-            dest.write_all(segment.as_ref()).await?;
-        }
+        let mut chunk = chunk?.data;
+        dest.write_all_buf(&mut chunk).await?;
     }
     Ok(())
 }
@@ -53,7 +51,7 @@ async fn setup_test(
 
     let data = Bytes::from(vec![0u8; size]);
     mock_server
-        .add_object("test-key", data, None)
+        .add_object("test-bucket", "test-key", data, None)
         .await
         .unwrap();
 
@@ -100,7 +98,8 @@ fn download_throughput_benchmark(c: &mut Criterion) {
                                 .key("test-key")
                                 .initiate()
                                 .expect("successful transfer initiate");
-                            black_box(drain(&mut dl_handle).await.unwrap());
+                            drain(&mut dl_handle).await.unwrap();
+                            black_box(&dl_handle);
                         }
                         let elapsed = start.elapsed();
 

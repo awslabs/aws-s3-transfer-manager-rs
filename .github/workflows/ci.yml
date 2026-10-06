@@ -12,12 +12,14 @@ concurrency:
 env:
   RUSTFLAGS: -Dwarnings
   RUST_BACKTRACE: 1
+  # FIXME: Remove nightly `-Adeprecated` overrides when MSRV reaches 1.95 and
+  # Atomic*::fetch_update can be replaced by try_update.
   # Change to specific Rust release to pin
   rust_stable: stable
-  rust_nightly: nightly-2025-08-06
-  rust_clippy: '1.86'
+  rust_nightly: nightly-2026-09-10
+  rust_clippy: '1.94.1'
   # When updating this, also update relevant docs
-  rust_min: '1.86'
+  rust_min: '1.94.1'
   CI_ROLE_ARN: ${{ secrets.CI_ROLE_ARN }}
   AWS_REGION: us-west-2
 
@@ -28,15 +30,16 @@ defaults:
 
 permissions:
   contents: read
-  id-token: write # This is required for requesting the JWT
 
 jobs:
   # depends on all actions required for a "successful" CI run
   ci-required-checks:
     name: Required checks pass
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    if: ${{ always() && !cancelled() }}
     needs:
-      - test-hll
+      - check-transfer-manager
       - fmt
       - clippy
       - docs
@@ -44,43 +47,96 @@ jobs:
       - check-external-types
       - check-deny
       - sanitizers
+      - fuzz
       - features
+      - dial9-build
+      - miri
+      - loom
     steps:
-      - run: exit 0
+      - name: Verify required results
+        env:
+          NEEDS_JSON: ${{ toJson(needs) }}
+        run: |
+          if ! jq -e 'all(.[]; .result == "success")' <<<"$NEEDS_JSON"; then
+            echo "one or more required CI jobs did not succeed" >&2
+            jq 'to_entries | map({job: .key, result: .value.result}) | sort_by(.job)' \
+              <<<"$NEEDS_JSON" >&2
+            exit 1
+          fi
 
  # Basic actions that must pass before we kick off more expensive tests.
   basics:
     name: basic checks
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    if: ${{ always() && !cancelled() }}
     needs:
       - fmt
       - clippy
       - docs
       - minrust
     steps:
-      - run: exit 0
+      - name: Verify prerequisite results
+        env:
+          NEEDS_JSON: ${{ toJson(needs) }}
+        run: |
+          if ! jq -e 'all(.[]; .result == "success")' <<<"$NEEDS_JSON"; then
+            echo "one or more basic CI prerequisite jobs did not succeed" >&2
+            jq 'to_entries | map({job: .key, result: .value.result}) | sort_by(.job)' \
+              <<<"$NEEDS_JSON" >&2
+            exit 1
+          fi
 
-  test-hll:
-    name: Test S3 transfer manager HLL
+  check-transfer-manager:
+    name: Transfer Manager checks pass
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    if: ${{ always() && !cancelled() }}
+    needs:
+      - default-targets
+      - musl
+      - freebsd
+      - android
+      - e2e
+    steps:
+      - name: Verify platform results
+        env:
+          NEEDS_JSON: ${{ toJson(needs) }}
+        run: |
+          if ! jq -e 'all(.[]; .result == "success")' <<<"$NEEDS_JSON"; then
+            echo "one or more transfer-manager platform jobs did not succeed" >&2
+            jq 'to_entries | map({job: .key, result: .value.result}) | sort_by(.job)' \
+              <<<"$NEEDS_JSON" >&2
+            exit 1
+          fi
+
+  default-targets:
+    name: Default target (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
+      fail-fast: false
       matrix:
-        os:
-          - ubuntu-24.04
-          - windows-2022
-          - macos-14
+        include:
+          - name: Linux x86_64 GNU
+            os: ubuntu-24.04
+          - name: Linux arm64 GNU
+            os: ubuntu-24.04-arm
+          - name: Windows x86_64 MSVC
+            os: windows-2022
+          - name: macOS arm64
+            # Public repositories use the architecture-neutral image label for
+            # the standard macOS arm64 runner.
+            os: macos-15
+          - name: macOS x86_64
+            os: macos-15-intel
     needs: basics
     steps:
-      - uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ env.CI_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-
       - uses: actions/checkout@v4
-      - name: Install Rust ${{ env.rust_nightly }}
+      - name: Install Rust ${{ env.rust_stable }}
         uses: dtolnay/rust-toolchain@stable
         with:
-            toolchain: ${{ env.rust_stable }}
+          toolchain: ${{ env.rust_stable }}
       - name: Install cargo-nextest
         uses: taiki-e/install-action@v2
         with:
@@ -88,18 +144,172 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: test s3-transfer-manager HLL
+      - name: Run workspace tests
         run: |
-          cargo nextest run --workspace --all-features
-          cargo test --doc --workspace --all-features
+          nextest_args=()
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            # Several integration tests each create a local server and a
+            # concurrent transfer. Running those test processes in parallel can
+            # exhaust macOS socket buffers without increasing product coverage.
+            nextest_args+=(--test-threads 1)
+          fi
+          cargo nextest run --locked --workspace --no-fail-fast "${nextest_args[@]}"
+          cargo test --locked --doc --workspace --no-fail-fast
 
-      - name: test s3-transfer-manager e2e
+  e2e:
+    name: E2E (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write # Required to request the AWS credentials JWT.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-24.04
+          - name: Windows
+            os: windows-2022
+          - name: macOS
+            os: macos-15
+    needs: basics
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.CI_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Install Rust ${{ env.rust_stable }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.rust_stable }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Run real-S3 tests
         run: |
-          RUSTFLAGS="--cfg e2e_test" cargo test --all-features --test e2e_transfer_test
+          RUSTFLAGS="-Dwarnings --cfg e2e_test" cargo test --locked --test e2e_transfer_test
+          integration_test_args=()
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            # Mock integration tests start local servers and concurrent
+            # transfers. Serial execution avoids exhausting macOS socket
+            # buffers while preserving each test's internal concurrency.
+            integration_test_args+=(-- --test-threads 1)
+          fi
+          RUSTFLAGS="-Dwarnings --cfg e2e_test" \
+            cargo test --locked -p integration-tests "${integration_test_args[@]}"
+
+  musl:
+    name: musl (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    needs: basics
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: x86_64
+            os: ubuntu-24.04
+          - name: arm64
+            os: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run workspace tests on Alpine
+        run: |
+          docker run --rm \
+            --volume "$GITHUB_WORKSPACE:/workspace" \
+            --workdir /workspace \
+            --env RUSTFLAGS \
+            --env RUST_BACKTRACE \
+            --env CARGO_HOME=/tmp/cargo \
+            --env CARGO_TARGET_DIR=/tmp/target \
+            "rust:${rust_min}-alpine" \
+            sh -euxc '
+              apk add --no-cache build-base cmake git linux-headers ninja perl pkgconf
+              adduser -D -h /tmp/tmtest tmtest
+              mkdir -p /tmp/cargo /tmp/target
+              chown tmtest:tmtest /tmp/cargo /tmp/target
+              su tmtest -c "cargo test --locked --workspace --no-fail-fast"
+              su tmtest -c "cargo test --locked --doc --workspace --no-fail-fast"
+            '
+
+  android:
+    name: Android (${{ matrix.name }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    needs: basics
+    env:
+      ANDROID_API_LEVEL: 35
+      ANDROID_NDK_VERSION: 28.0.13004108
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: arm64 build
+            mode: build
+            abi: arm64-v8a
+            rust_target: aarch64-linux-android
+          - name: x86_64, 4 KiB
+            mode: emulator
+            abi: x86_64
+            rust_target: x86_64-linux-android
+            page_size: 4096
+            system_image_target: google_apis
+          - name: x86_64, 16 KiB
+            mode: emulator
+            abi: x86_64
+            rust_target: x86_64-linux-android
+            page_size: 16384
+            system_image_target: google_apis_ps16k
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          # The action's default still includes the retired `tools` package.
+          packages: platform-tools
+      - name: Install Android packages
+        run: |
+          packages=(
+            "ndk;${ANDROID_NDK_VERSION}"
+            "platforms;android-${ANDROID_API_LEVEL}"
+          )
+          if [[ "${{ matrix.mode }}" == "emulator" ]]; then
+            packages+=(
+              emulator
+              "system-images;android-${ANDROID_API_LEVEL};${{ matrix.system_image_target }};${{ matrix.abi }}"
+            )
+          fi
+          sdkmanager "${packages[@]}"
+          android_sdk_root=${ANDROID_HOME:-${ANDROID_SDK_ROOT:?}}
+          echo "ANDROID_HOME=${android_sdk_root}" >>"$GITHUB_ENV"
+          android_ndk_root="${android_sdk_root}/ndk/${ANDROID_NDK_VERSION}"
+          echo "ANDROID_NDK_HOME=${android_ndk_root}" >>"$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=${android_ndk_root}" >>"$GITHUB_ENV"
+      - name: Install Rust ${{ env.rust_stable }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.rust_stable }}
+          targets: ${{ matrix.rust_target }}
+      - name: Install cargo-ndk
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk@4.1.2
+      - uses: Swatinem/rust-cache@v2
+      - name: Build Android arm64 test binary
+        if: ${{ matrix.mode == 'build' }}
+        run: .github/scripts/run-android-tests.sh build "${{ matrix.abi }}"
+      - name: Run Android tests
+        if: ${{ matrix.mode == 'emulator' }}
+        run: >-
+          .github/scripts/run-android-tests.sh emulator
+          "${{ matrix.abi }}"
+          "${{ matrix.page_size }}"
+          "${{ matrix.system_image_target }}"
 
   fmt:
     name: fmt
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust ${{ env.rust_stable }}
@@ -116,10 +326,15 @@ jobs:
             printf "Please run \`cargo fmt\` to fix rustfmt errors.\nSee CONTRIBUTING.md for more details.\n" >&2
             exit 1
           fi
+          if ! cargo fmt --manifest-path fuzz/Cargo.toml -- --check; then
+            printf "Please run \`cargo fmt --manifest-path fuzz/Cargo.toml\` to fix fuzz-target formatting.\n" >&2
+            exit 1
+          fi
 
   clippy:
     name: clippy
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust ${{ env.rust_clippy }}
@@ -129,11 +344,12 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: "clippy --all"
-        run: cargo clippy --all --tests --all-features --no-deps
+        run: cargo clippy --all --tests --no-deps
 
   docs:
     name: docs
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust ${{ env.rust_nightly }}
@@ -141,16 +357,17 @@ jobs:
         with:
           toolchain: ${{ env.rust_nightly }}
       - uses: Swatinem/rust-cache@v2
-      - name: "doc --lib --all-features"
+      - name: "doc --lib"
         run: |
-          cargo doc --lib --no-deps --all-features --document-private-items
+          cargo doc --lib --no-deps --document-private-items
         env:
-          RUSTFLAGS: --cfg docsrs
-          RUSTDOCFLAGS: --cfg docsrs
+          RUSTFLAGS: -Dwarnings -Adeprecated
+          RUSTDOCFLAGS: -Dwarnings --cfg docsrs
 
   minrust:
     name: minrust
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust ${{ env.rust_min }}
@@ -158,15 +375,40 @@ jobs:
         with:
           toolchain: ${{ env.rust_min }}
       - uses: Swatinem/rust-cache@v2
-      - name: "check --workspace --all-features"
-        run: cargo check --workspace --all-features
+      - name: "check --workspace"
+        run: cargo check --workspace
         env:
           RUSTFLAGS: "" # remove -Dwarnings
+
+  freebsd:
+    name: FreeBSD 14.4
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    needs: basics
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run transfer-manager library tests
+        uses: vmactions/freebsd-vm@83b151f58c6047089f4c80eb5ba2039d158ce093 # v1.5.3
+        with:
+          release: '14.4'
+          envs: RUST_BACKTRACE RUSTFLAGS
+          usesh: true
+          copyback: false
+          prepare: |
+            pkg install -y cmake curl gmake ninja perl5 pkgconf
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o rustup.sh
+            sh rustup.sh -y --profile minimal --default-toolchain ${{ env.rust_stable }}
+          run: |
+            set -eux
+            . "$HOME/.cargo/env"
+            export CMAKE_GENERATOR=Ninja
+            cargo test --locked -p aws-sdk-s3-transfer-manager --lib
 
   check-external-types:
     name: check-external-types (${{ matrix.os }})
     needs: basics
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     strategy:
       matrix:
         os:
@@ -176,7 +418,8 @@ jobs:
         rust:
           # `check-external-types` requires a specific Rust nightly version. See
           # the README for details: https://github.com/awslabs/cargo-check-external-types
-          - nightly-2025-08-06
+          # v0.5.0 uses rustdoc-types 0.57 and was tested with this nightly.
+          - nightly-2026-03-20
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust ${{ matrix.rust }}
@@ -187,15 +430,16 @@ jobs:
       - name: Install cargo-check-external-types
         uses: taiki-e/cache-cargo-install-action@v2
         with:
-          tool: cargo-check-external-types@0.3.0
+          tool: cargo-check-external-types@0.5.0
       - name: check-external-types
-        run: cargo check-external-types --all-features --config external-types.toml
+        run: cargo check-external-types --config external-types.toml
         working-directory: aws-sdk-s3-transfer-manager
 
   check-deny:
     name: check deps with cargo-deny
     needs: basics
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust ${{ matrix.rust }}
@@ -208,13 +452,35 @@ jobs:
         with:
           tool: cargo-deny
       - name: cargo-deny
-        run: cargo deny --all-features check --hide-inclusion-graph --config .cargo-deny-config.toml licenses bans sources
+        # --config is a global flag: it must precede the `check` subcommand.
+        # Newer cargo-deny rejects it after `check` (unexpected argument).
+        run: cargo deny --all-features --config .cargo-deny-config.toml check --hide-inclusion-graph licenses bans sources
 
   sanitizers:
-    name: saniters
+    name: sanitizers (${{ matrix.sanitizer }})
     needs: basics
     runs-on: ubuntu-24.04
-    # TODO - add additional sanitizers like leak via matrix or other jobs
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ASAN: leak detection + use-after-free + heap/stack buffer overflow.
+          # The dedicated target instruments the standard library as well as
+          # this workspace. Frame pointers improve native stack unwinding; they
+          # do not change which accesses ASan diagnoses.
+          # `--test-threads 1` keeps leak attribution readable when something
+          # panics mid-test and leaves Arc cycles behind.
+          - sanitizer: address
+            target: x86_64-unknown-linux-gnuasan
+            cfg: s3_tm_asan
+            test_args: --test-threads 1 --nocapture
+          # TSan uses the pre-instrumented standard-library target so happens-
+          # before edges inside std synchronization remain visible.
+          - sanitizer: thread
+            target: x86_64-unknown-linux-gnutsan
+            cfg: s3_tm_tsan
+            test_args: --test-threads 1 --nocapture
     steps:
       - uses: actions/checkout@v4
       - name: Install llvm
@@ -224,13 +490,81 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ env.rust_nightly }}
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-      - name: asan
-        run: cargo test --workspace --all-features --target x86_64-unknown-linux-gnu --tests -- --test-threads 1 --nocapture
+      - name: ${{ matrix.sanitizer }}
+        run: cargo test --workspace --target ${{ matrix.target }} --tests -- ${{ matrix.test_args }}
         env:
-          RUSTFLAGS: -Z sanitizer=address
+          RUSTFLAGS: -Dwarnings -Adeprecated -C force-frame-pointers=yes --cfg ${{ matrix.cfg }}
+          # Detect leaked ownership and stack lifetime errors, stop at the
+          # first report, and reject invalid C-string operations.
+          ASAN_OPTIONS: detect_leaks=1:detect_stack_use_after_return=1:halt_on_error=1:strict_string_checks=1
+          # Retain additional access history for race reports and stop at the
+          # first race diagnostic. Managed-runtime lifecycle tests can leave a
+          # finished Tokio blocking worker for process teardown, so thread-leak
+          # reporting remains disabled until their drain-and-join teardown is
+          # deterministic. The suppression covers Tokio's kernel-mediated
+          # reactor registration; transfer-manager races remain unsuppressed.
+          # Deadlock detection is not enabled.
+          TSAN_OPTIONS: halt_on_error=1:history_size=7:report_thread_leaks=0:suppressions=${{ github.workspace }}/.github/tsan-suppressions.txt
           # Ignore `trybuild` errors as they are irrelevant and flaky on nightly
           TRYBUILD: overwrite
+
+  fuzz:
+    name: fuzz harnesses
+    needs: basics
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install llvm
+        run: sudo apt-get install -y llvm
+      - name: Install Rust ${{ env.rust_nightly }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.rust_nightly }}
+          components: clippy
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz@0.13.2
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Check locked fuzz target
+        run: cargo check --manifest-path fuzz/Cargo.toml --locked --all-targets
+        env:
+          RUSTFLAGS: -Dwarnings -Adeprecated --cfg s3_tm_fuzz
+      - name: Lint locked fuzz target
+        run: cargo clippy --manifest-path fuzz/Cargo.toml --locked --all-targets --no-deps
+        env:
+          RUSTFLAGS: -Dwarnings -Adeprecated --cfg s3_tm_fuzz
+      - name: Run optimized model and corpus replay
+        run: cargo nextest run --release -p aws-sdk-s3-transfer-manager --lib
+        env:
+          RUSTFLAGS: -Dwarnings -Adeprecated
+      - name: Build native fuzz targets
+        run: .github/scripts/run-fuzz-targets.sh build
+        env:
+          RUSTFLAGS: -Dwarnings -Adeprecated --cfg s3_tm_fuzz
+      - name: Run deterministic fuzz smoke tests
+        run: .github/scripts/run-fuzz-targets.sh smoke
+        env:
+          RUSTFLAGS: -Dwarnings -Adeprecated --cfg s3_tm_fuzz
+      - name: Check fuzz lock is unchanged
+        run: git diff --exit-code -- fuzz/Cargo.lock
+      - name: Upload fuzz crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: required-fuzz-${{ github.run_id }}
+          path: fuzz/artifacts
+          if-no-files-found: ignore
+          retention-days: 30
 
   # TODO - re-enable semver check once released
   # semver:
@@ -249,6 +583,7 @@ jobs:
     name: features
     needs: basics
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust ${{ env.rust_nightly }}
@@ -259,7 +594,93 @@ jobs:
         uses: taiki-e/install-action@cargo-hack
       - uses: Swatinem/rust-cache@v2
       - name: check --feature-powerset
-        run: cargo hack check --all --feature-powerset
+        # Exclude dial9: it requires RUSTFLAGS=--cfg tokio_unstable (see the
+        # dial9-build job for dedicated coverage).
+        run: cargo hack check --all --feature-powerset --exclude-features dial9
+        env:
+          RUSTFLAGS: -Dwarnings -Adeprecated
+
+  dial9-build:
+    # Verifies the optional `dial9` feature compiles. dial9-tokio-telemetry
+    # uses tokio's unstable runtime metrics + task-lifecycle hooks, gated
+    # behind `--cfg tokio_unstable`. The `cp` example is the sole consumer
+    # of dial9 types in the workspace; building it transitively compiles
+    # the lib with `cfg(feature = "dial9")` paths active, which is enough
+    # to prove the wiring. Keeping it a dedicated job avoids leaking
+    # `tokio_unstable` into the rest of CI.
+    name: dial9 build
+    needs: basics
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust ${{ env.rust_stable }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.rust_stable }}
+      - uses: Swatinem/rust-cache@v2
+      - name: build cp example with dial9
+        run: cargo build -p aws-sdk-s3-transfer-manager --example cp --all-features
+        env:
+          RUSTFLAGS: "-Dwarnings --cfg tokio_unstable"
+
+  miri:
+    name: miri
+    needs: basics
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust ${{ env.rust_nightly }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.rust_nightly }}
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+      # Run miri on all lib tests. Tests that need tokio's I/O driver
+      # (epoll/kqueue FFI) are marked #[cfg_attr(miri, ignore)], as are tests
+      # that construct a client handle: dropping it drops the ready set's
+      # crossbeam skiplist, whose inline tower array is rejected by Stacked
+      # Borrows.
+      # Mutex/Condvar fall back to std::sync under miri (parking_lot uses
+      # integer-to-pointer casts incompatible with strict provenance).
+      - name: miri
+        run: |
+          cargo miri test -p aws-sdk-s3-transfer-manager --lib
+        env:
+          MIRIFLAGS: -Zmiri-disable-isolation -Zmiri-strict-provenance
+          RUSTFLAGS: -Dwarnings -Adeprecated
+
+  loom:
+    name: loom
+    needs: basics
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust ${{ env.rust_stable }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.rust_stable }}
+      - uses: Swatinem/rust-cache@v2
+      - name: loom
+        run: |
+          test_list=$(RUSTFLAGS='-Dwarnings --cfg s3_tm_loom' \
+            cargo test -p aws-sdk-s3-transfer-manager --lib --release -- --list)
+          if ! grep -q 'loom_tests::.*: test' <<<"$test_list"; then
+            echo "no Loom tests were registered" >&2
+            exit 1
+          fi
+          RUSTFLAGS='-Dwarnings --cfg s3_tm_loom' cargo test -p aws-sdk-s3-transfer-manager \
+            --lib --release -- loom_tests --nocapture
+        env:
+          # Three preemption points catches three-way interleaving bugs that
+          # two-preemption exploration misses. Branch budget raised to absorb
+          # the larger state space; if a specific test exhausts it, we calibrate
+          # that test rather than dropping back globally.
+          LOOM_MAX_PREEMPTIONS: 3
+          LOOM_MAX_BRANCHES: 50000
+          RUST_BACKTRACE: 1
 
   # TODO - get cross check working
   # cross-check:
