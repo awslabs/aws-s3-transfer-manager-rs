@@ -13,6 +13,7 @@ use crate::io::key::stream::{KeyStream, StreamError};
 use crate::operation::sync::compare::{Compare, Decision, Verdict};
 use crate::operation::sync::walk::{Pairing, Progress, Walk};
 use crate::transfer::{IoRequest, PollWork, Transfer, TransferContext, WorkOutcome};
+use crate::types::FailedTransferPolicy;
 
 // Pairings per merge work item. A merge draws from either side, so a listing page cannot size the
 // batch. The bound limits how long one work item holds an executor slot.
@@ -109,24 +110,15 @@ pub(crate) enum DeleteMode {
     Off,
 }
 
-// What a run does when something fails. One policy covers every failure site.
-//
-// `Continue` is the default. A later run can finish work that a failed run left behind.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum FailurePolicy {
-    #[default]
-    Continue,
-    Abort,
-}
-
 // Settings chosen by the caller. The comparison, child factory, and deleter choose the direction.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct RunSettings {
     // How many children may be live at once. One slot is a share of what the whole client has, so
     // whoever starts a run sets it.
     pub(crate) max_children: usize,
     pub(crate) delete_mode: DeleteMode,
-    pub(crate) failure_policy: FailurePolicy,
+    // Sync continues after a failure unless the caller selects `Abort`.
+    pub(crate) failure_policy: FailedTransferPolicy,
 }
 
 impl Default for RunSettings {
@@ -134,7 +126,7 @@ impl Default for RunSettings {
         Self {
             max_children: crate::operation::DEFAULT_MAX_CONCURRENT_CHILDREN,
             delete_mode: DeleteMode::default(),
-            failure_policy: FailurePolicy::default(),
+            failure_policy: FailedTransferPolicy::Continue,
         }
     }
 }
@@ -1037,7 +1029,7 @@ where
     deleter: Deleter,
     // What to do when something fails. Read at every site a failure can arrive, so one answer
     // covers the run.
-    failure_policy: FailurePolicy,
+    failure_policy: FailedTransferPolicy,
     // How many children may be live at once. One slot is a share of what the whole client has, so
     // whoever starts a run sets it.
     max_children: usize,
@@ -1155,7 +1147,7 @@ where
     // Record the first aborting failure. The terminal path sets the transfer result after
     // outstanding work returns.
     fn stop_if_aborting(&self, state: &mut State<S, D>, why: impl Into<crate::error::Error>) {
-        if self.inner.failure_policy == FailurePolicy::Abort && state.stopped_by.is_none() {
+        if self.inner.failure_policy == FailedTransferPolicy::Abort && state.stopped_by.is_none() {
             state.stopped_by = Some(why.into());
         }
     }
@@ -1752,7 +1744,7 @@ mod tests {
                 RunSettings {
                     max_children: 2,
                     delete_mode: DeleteMode::On,
-                    failure_policy: FailurePolicy::Continue,
+                    failure_policy: FailedTransferPolicy::Continue,
                 },
             ),
             ctx,
@@ -2099,7 +2091,7 @@ mod tests {
             RunSettings {
                 max_children: 2,
                 delete_mode: DeleteMode::On,
-                failure_policy: FailurePolicy::Continue,
+                failure_policy: FailedTransferPolicy::Continue,
             },
         );
 
@@ -2294,7 +2286,7 @@ mod tests {
             RunSettings {
                 max_children: 4,
                 delete_mode,
-                failure_policy: FailurePolicy::Continue,
+                failure_policy: FailedTransferPolicy::Continue,
             },
         );
         (transfer, ctx, rx)
@@ -2672,7 +2664,7 @@ mod tests {
             RunSettings {
                 max_children: 4,
                 delete_mode: DeleteMode::Off,
-                failure_policy: FailurePolicy::Continue,
+                failure_policy: FailedTransferPolicy::Continue,
             },
         );
         run_managed(&transfer, &ctx, rx).await;
@@ -2740,7 +2732,7 @@ mod tests {
             &["gone-a.txt", "gone-b.txt"],
             deleter.clone(),
             DeleteMode::On,
-            FailurePolicy::Continue,
+            FailedTransferPolicy::Continue,
         );
 
         let mut buffered = 0;
@@ -2801,7 +2793,7 @@ mod tests {
             RunSettings {
                 max_children: 4,
                 delete_mode: DeleteMode::Off,
-                failure_policy: FailurePolicy::Abort,
+                failure_policy: FailedTransferPolicy::Abort,
             },
         );
 
@@ -2864,7 +2856,7 @@ mod tests {
             RunSettings {
                 max_children: 4,
                 delete_mode: DeleteMode::On,
-                failure_policy: FailurePolicy::Continue,
+                failure_policy: FailedTransferPolicy::Continue,
             },
         );
 
@@ -2913,7 +2905,7 @@ mod tests {
             &["gone-a.txt", "gone-b.txt"],
             deleter.clone(),
             DeleteMode::On,
-            FailurePolicy::Abort,
+            FailedTransferPolicy::Abort,
         );
 
         let mut held = None;
@@ -3098,7 +3090,7 @@ mod tests {
             &["gone-a.txt", "gone-b.txt"],
             deleter.clone(),
             DeleteMode::On,
-            FailurePolicy::Continue,
+            FailedTransferPolicy::Continue,
         );
 
         let mut held = None;
@@ -3139,7 +3131,7 @@ mod tests {
             &["gone-a.txt"],
             deleter.clone(),
             DeleteMode::On,
-            FailurePolicy::Abort,
+            FailedTransferPolicy::Abort,
         );
 
         drive(&transfer).await;
@@ -3157,11 +3149,11 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn a_source_root_nobody_can_list_fails_the_run() {
-        for policy in [FailurePolicy::Continue, FailurePolicy::Abort] {
+        for policy in [FailedTransferPolicy::Continue, FailedTransferPolicy::Abort] {
             let dir = tempfile::tempdir().expect("a temp dir");
             let absent = dir.path().join("not-there");
             let spawner = Arc::new(SpawnEnded::new(0, false));
-            let (transfer, ctx) = uploading_with_policy(&absent, spawner, 4, policy);
+            let (transfer, ctx) = uploading_with_policy(&absent, spawner, 4, policy.clone());
 
             while let PollWork::Ready { io: mut work, .. } = transfer.poll_work() {
                 transfer.execute(&mut work).await;
@@ -3218,7 +3210,7 @@ mod tests {
             &["gone-a.txt", "gone-b.txt", "gone-c.txt"],
             deleter.clone(),
             DeleteMode::On,
-            FailurePolicy::Continue,
+            FailedTransferPolicy::Continue,
         );
 
         let mut held = None;
@@ -3250,7 +3242,7 @@ mod tests {
         a_local_tree(dir.path(), &["a.txt", "b.txt", "c.txt"]);
         let spawner = Arc::new(SpawnEnded::holding_open_but_refusing_at(1));
         let (transfer, ctx) =
-            uploading_with_policy(dir.path(), spawner.clone(), 4, FailurePolicy::Abort);
+            uploading_with_policy(dir.path(), spawner.clone(), 4, FailedTransferPolicy::Abort);
 
         while let PollWork::Ready { io: mut work, .. } = transfer.poll_work() {
             let _ = transfer.execute(&mut work).await;
@@ -3324,7 +3316,7 @@ mod tests {
         a_local_tree(dir.path(), &["a.txt", "b.txt", "c.txt"]);
         let spawner = Arc::new(SpawnEnded::holding_open_but_refusing_at(1));
         let (transfer, ctx) =
-            uploading_with_policy(dir.path(), spawner.clone(), 4, FailurePolicy::Abort);
+            uploading_with_policy(dir.path(), spawner.clone(), 4, FailedTransferPolicy::Abort);
 
         while let PollWork::Ready { io: mut work, .. } = transfer.poll_work() {
             transfer.execute(&mut work).await;
@@ -3357,7 +3349,7 @@ mod tests {
             &["gone-a.txt", "gone-b.txt"],
             deleter.clone(),
             DeleteMode::On,
-            FailurePolicy::Continue,
+            FailedTransferPolicy::Continue,
         );
 
         let mut held = None;
@@ -3456,7 +3448,7 @@ mod tests {
         a_local_tree(dir.path(), &["a.txt", "b.txt"]);
         let spawner = Arc::new(SpawnEnded::holding_open_but_refusing_at(1));
         let (transfer, ctx) =
-            uploading_with_policy(dir.path(), spawner.clone(), 4, FailurePolicy::Abort);
+            uploading_with_policy(dir.path(), spawner.clone(), 4, FailedTransferPolicy::Abort);
 
         while let PollWork::Ready { io: mut work, .. } = transfer.poll_work() {
             let _ = transfer.execute(&mut work).await;
@@ -3514,7 +3506,7 @@ mod tests {
             RunSettings {
                 max_children: 4,
                 delete_mode: DeleteMode::On,
-                failure_policy: FailurePolicy::Abort,
+                failure_policy: FailedTransferPolicy::Abort,
             },
         );
 
@@ -3562,7 +3554,7 @@ mod tests {
             RunSettings {
                 max_children: 4,
                 delete_mode: DeleteMode::On,
-                failure_policy: FailurePolicy::Abort,
+                failure_policy: FailedTransferPolicy::Abort,
             },
         );
 
@@ -3583,7 +3575,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn a_loop_warns_under_either_policy() {
-        for policy in [FailurePolicy::Continue, FailurePolicy::Abort] {
+        for policy in [FailedTransferPolicy::Continue, FailedTransferPolicy::Abort] {
             let dir = tempfile::tempdir().expect("a temp dir");
             std::fs::write(dir.path().join("a.txt"), b"x").expect("a file");
             let inner = dir.path().join("down");
@@ -3614,7 +3606,7 @@ mod tests {
                 RunSettings {
                     max_children: 2,
                     delete_mode: DeleteMode::On,
-                    failure_policy: policy,
+                    failure_policy: policy.clone(),
                 },
             );
 
@@ -3654,7 +3646,7 @@ mod tests {
             &["gone-a.txt", "gone-b.txt"],
             deleter.clone(),
             DeleteMode::On,
-            FailurePolicy::Abort,
+            FailedTransferPolicy::Abort,
         );
 
         drive(&transfer).await;
@@ -3689,7 +3681,7 @@ mod tests {
             &["gone-a.txt", "gone-b.txt"],
             deleter.clone(),
             DeleteMode::On,
-            FailurePolicy::Continue,
+            FailedTransferPolicy::Continue,
         );
 
         drive(&transfer).await;
@@ -3742,7 +3734,7 @@ mod tests {
             RunSettings {
                 max_children: 2,
                 delete_mode: DeleteMode::On,
-                failure_policy: FailurePolicy::Abort,
+                failure_policy: FailedTransferPolicy::Abort,
             },
         );
 
@@ -3759,12 +3751,13 @@ mod tests {
     #[tokio::test]
     async fn a_child_that_failed_ends_an_aborting_run() {
         for (policy, expect_failed) in [
-            (FailurePolicy::Continue, false),
-            (FailurePolicy::Abort, true),
+            (FailedTransferPolicy::Continue, false),
+            (FailedTransferPolicy::Abort, true),
         ] {
             let dir = tempfile::tempdir().expect("a temp dir");
             a_local_tree(dir.path(), &["a.txt", "b.txt"]);
-            let (transfer, ctx) = with_spawner(dir.path(), SpawnEnded::new(0, true), policy);
+            let (transfer, ctx) =
+                with_spawner(dir.path(), SpawnEnded::new(0, true), policy.clone());
 
             drive(&transfer).await;
 
@@ -3788,7 +3781,7 @@ mod tests {
         let (transfer, ctx) = with_spawner(
             dir.path(),
             SpawnEnded::refusing_to_spawn(),
-            FailurePolicy::Abort,
+            FailedTransferPolicy::Abort,
         );
 
         drive(&transfer).await;
@@ -3805,12 +3798,13 @@ mod tests {
     #[tokio::test]
     async fn a_child_that_could_not_be_built_ends_an_aborting_run() {
         for (policy, expect_failed) in [
-            (FailurePolicy::Continue, false),
-            (FailurePolicy::Abort, true),
+            (FailedTransferPolicy::Continue, false),
+            (FailedTransferPolicy::Abort, true),
         ] {
             let dir = tempfile::tempdir().expect("a temp dir");
             a_local_tree(dir.path(), &["a.txt", "b.txt"]);
-            let (transfer, ctx) = with_spawner(dir.path(), SpawnEnded::refusing_to_spawn(), policy);
+            let (transfer, ctx) =
+                with_spawner(dir.path(), SpawnEnded::refusing_to_spawn(), policy.clone());
 
             drive(&transfer).await;
 
@@ -3840,7 +3834,10 @@ mod tests {
 
     #[test]
     fn the_defaults_are_continue_and_no_deleting() {
-        assert_eq!(FailurePolicy::default(), FailurePolicy::Continue);
+        assert_eq!(
+            RunSettings::default().failure_policy,
+            FailedTransferPolicy::Continue
+        );
         assert_eq!(DeleteMode::default(), DeleteMode::Off);
     }
 
@@ -3876,7 +3873,7 @@ mod tests {
             RunSettings {
                 max_children: 2,
                 delete_mode: DeleteMode::On,
-                failure_policy: FailurePolicy::Continue,
+                failure_policy: FailedTransferPolicy::Continue,
             },
         );
 
@@ -3960,7 +3957,7 @@ mod tests {
             RunSettings {
                 max_children: 2,
                 delete_mode: DeleteMode::On,
-                failure_policy: FailurePolicy::Continue,
+                failure_policy: FailedTransferPolicy::Continue,
             },
         );
 
@@ -4048,7 +4045,7 @@ mod tests {
             RunSettings {
                 max_children: 2,
                 delete_mode: DeleteMode::On,
-                failure_policy: FailurePolicy::Continue,
+                failure_policy: FailedTransferPolicy::Continue,
             },
         );
 
@@ -4142,14 +4139,14 @@ mod tests {
         spawner: Arc<SpawnEnded>,
         cap: usize,
     ) -> (SyncTransfer<FsWalk, S3Walk>, TransferContext) {
-        uploading_with_policy(local, spawner, cap, FailurePolicy::Continue)
+        uploading_with_policy(local, spawner, cap, FailedTransferPolicy::Continue)
     }
 
     fn uploading_with_policy(
         local: &Path,
         spawner: Arc<SpawnEnded>,
         cap: usize,
-        failure_policy: FailurePolicy,
+        failure_policy: FailedTransferPolicy,
     ) -> (SyncTransfer<FsWalk, S3Walk>, TransferContext) {
         let client = a_bucket_holding(&[]);
         let config = crate::Config::builder().client(client.clone()).build();
@@ -4213,7 +4210,7 @@ mod tests {
         a_local_tree(dir.path(), &["a.txt", "b.txt", "c.txt"]);
         let spawner = Arc::new(SpawnEnded::holding_open_but_refusing_at(1));
         let (transfer, _ctx) =
-            uploading_with_policy(dir.path(), spawner.clone(), 4, FailurePolicy::Abort);
+            uploading_with_policy(dir.path(), spawner.clone(), 4, FailedTransferPolicy::Abort);
 
         while let PollWork::Ready { io: mut work, .. } = transfer.poll_work() {
             transfer.execute(&mut work).await;
@@ -4389,7 +4386,7 @@ mod tests {
             RunSettings {
                 max_children: 4,
                 delete_mode: DeleteMode::On,
-                failure_policy: FailurePolicy::Continue,
+                failure_policy: FailedTransferPolicy::Continue,
             },
         );
 
@@ -4476,7 +4473,7 @@ mod tests {
             RunSettings {
                 max_children: 4,
                 delete_mode: DeleteMode::On,
-                failure_policy: FailurePolicy::Continue,
+                failure_policy: FailedTransferPolicy::Continue,
             },
         );
 
@@ -4508,7 +4505,7 @@ mod tests {
     fn with_spawner(
         local: &Path,
         spawner: SpawnEnded,
-        failure_policy: FailurePolicy,
+        failure_policy: FailedTransferPolicy,
     ) -> (SyncTransfer<FsWalk, S3Walk>, TransferContext) {
         let client = a_bucket_holding(&[]);
         let config = crate::Config::builder().client(client.clone()).build();
@@ -4544,7 +4541,7 @@ mod tests {
         bucket_keys: &[&str],
         deleter: Arc<RecordDeletes>,
         delete_mode: DeleteMode,
-        failure_policy: FailurePolicy,
+        failure_policy: FailedTransferPolicy,
     ) -> (SyncTransfer<FsWalk, S3Walk>, TransferContext) {
         let client = a_bucket_holding(bucket_keys);
         let config = crate::Config::builder().client(client.clone()).build();
@@ -4605,7 +4602,7 @@ mod tests {
             RunSettings {
                 max_children: 4,
                 delete_mode: DeleteMode::Off,
-                failure_policy: FailurePolicy::Continue,
+                failure_policy: FailedTransferPolicy::Continue,
             },
         );
         (transfer, ctx)
@@ -4640,7 +4637,7 @@ mod tests {
             RunSettings {
                 max_children: 4,
                 delete_mode,
-                failure_policy: FailurePolicy::Continue,
+                failure_policy: FailedTransferPolicy::Continue,
             },
         );
         (transfer, ctx)
@@ -5070,7 +5067,7 @@ mod tests {
             RunSettings {
                 max_children: 4,
                 delete_mode: DeleteMode::On,
-                failure_policy: FailurePolicy::Continue,
+                failure_policy: FailedTransferPolicy::Continue,
             },
         );
 
@@ -5138,7 +5135,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("a temp dir");
         a_local_tree(dir.path(), &["a.txt", "b.txt"]);
         let spawner = Arc::new(SpawnEnded::new(0, false));
-        let (transfer, ctx) = uploading_with_policy(dir.path(), spawner, 4, FailurePolicy::Abort);
+        let (transfer, ctx) =
+            uploading_with_policy(dir.path(), spawner, 4, FailedTransferPolicy::Abort);
 
         let mut work = match transfer.poll_work() {
             PollWork::Ready { io, .. } => io,
@@ -5374,7 +5372,7 @@ mod tests {
             RunSettings {
                 max_children: 8,
                 delete_mode,
-                failure_policy: FailurePolicy::Continue,
+                failure_policy: FailedTransferPolicy::Continue,
             },
         );
         ctx.handle
@@ -5421,7 +5419,7 @@ mod tests {
             RunSettings {
                 max_children: 8,
                 delete_mode,
-                failure_policy: FailurePolicy::Continue,
+                failure_policy: FailedTransferPolicy::Continue,
             },
         );
         ctx.handle
