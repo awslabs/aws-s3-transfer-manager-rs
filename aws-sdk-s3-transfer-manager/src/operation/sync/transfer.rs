@@ -1991,10 +1991,13 @@ mod tests {
     async fn an_archived_object_and_a_restoring_one_are_counted_apart() {
         use crate::io::key::stream::Obstruction;
 
-        for why in [Obstruction::Archived, Obstruction::BeingRestored] {
+        for comparison in [
+            &AlwaysObstructed(Obstruction::Archived),
+            &AlwaysObstructed(Obstruction::BeingRestored),
+        ] {
+            let why = comparison.0;
             let dir = tempfile::tempdir().expect("a temp dir");
             a_local_tree(dir.path(), &["a.txt"]);
-            let comparison: &'static AlwaysObstructed = Box::leak(Box::new(AlwaysObstructed(why)));
             let (transfer, _ctx) = uploading_comparing_with(dir.path(), comparison);
 
             while let PollWork::Ready { io: mut work, .. } = transfer.poll_work() {
@@ -2022,10 +2025,13 @@ mod tests {
     async fn a_key_whose_absence_went_unread_is_counted_apart_from_an_unchanged_one() {
         use crate::io::key::stream::KeysLost;
 
-        for lost in [KeysLost::OneKey, KeysLost::UnknownRange] {
+        for comparison in [
+            &AlwaysUnknown(KeysLost::OneKey),
+            &AlwaysUnknown(KeysLost::UnknownRange),
+        ] {
+            let lost = comparison.0;
             let dir = tempfile::tempdir().expect("a temp dir");
             a_local_tree(dir.path(), &["a.txt"]);
-            let comparison: &'static AlwaysUnknown = Box::leak(Box::new(AlwaysUnknown(lost)));
             let (transfer, _ctx) = uploading_comparing_with(dir.path(), comparison);
 
             while let PollWork::Ready { io: mut work, .. } = transfer.poll_work() {
