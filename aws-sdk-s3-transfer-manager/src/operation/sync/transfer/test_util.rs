@@ -14,6 +14,7 @@ use aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output;
 use aws_sdk_s3::types::Object;
 use aws_smithy_mocks::{mock, mock_client, RuleMode};
 
+use super::delete::*;
 use super::*;
 
 pub(super) fn a_bucket_holding(keys: &[&str]) -> aws_sdk_s3::Client {
