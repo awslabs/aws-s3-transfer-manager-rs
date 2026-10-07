@@ -53,6 +53,7 @@ impl DownloadFluentBuilder {
             input,
             path.into(),
             None,
+            &crate::operation::download::sink::FileSinkFactory,
         )
         .await
     }
@@ -79,7 +80,12 @@ impl DownloadFluentBuilder {
         file: std::fs::File,
     ) -> Result<ManagedDownloadHandle, crate::error::Error> {
         let input = self.inner.build()?;
-        crate::operation::download::Download::orchestrate_to_file(self.handle, input, file)
+        crate::operation::download::Download::orchestrate_to_file(
+            self.handle,
+            input,
+            file,
+            &crate::operation::download::sink::FileSinkFactory,
+        )
     }
 
     /// <p>The bucket name containing the object.</p>
