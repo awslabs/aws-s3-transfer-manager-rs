@@ -1746,47 +1746,60 @@ async fn test_unknown_length_exactly_max_parts_succeeds() {
         .expect("a stream of exactly the maximum part count must upload");
 }
 
-/// A part number S3 cannot use as a distinct position fails the upload before that part is sent.
+/// Returns the error a failed numbered-part upload reported, as a message.
+fn part_number_failure_message(error: &Error) -> String {
+    assert_eq!(ErrorKind::InputInvalid, *error.kind());
+    format!(
+        "{}",
+        aws_smithy_types::error::display::DisplayErrorContext(error)
+    )
+}
+
+/// A part number outside S3's range fails the upload before that part is sent.
 ///
-/// 0 and 10,001 are outside S3's range. 2^32 + 1 is too, and narrowing it to 32 bits would place
-/// the part at position 1. A repeated number would replace the earlier part.
+/// 0 and 10,001 are outside the range. 2^32 + 1 is too, and narrowing it to 32 bits would place
+/// the part at position 1.
 #[tokio::test]
-async fn test_part_numbers_outside_range_or_repeated_fail_before_upload_part() {
-    for (part_numbers, rejected) in [
-        (&[0][..], 0u64),
-        (&[10_001], 10_001),
-        (&[(1 << 32) + 1], (1 << 32) + 1),
-        (&[1, 1], 1),
-    ] {
-        let (result, record) = upload_numbered_parts(part_numbers).await;
+async fn test_part_numbers_outside_range_fail_before_upload_part() {
+    for rejected in [0u64, 10_001, (1 << 32) + 1] {
+        let (result, record) = upload_numbered_parts(&[rejected]).await;
 
         let error = result.expect_err("an unusable part number must fail the upload");
-        assert_eq!(
-            ErrorKind::InputInvalid,
-            *error.kind(),
-            "part numbers {part_numbers:?}"
-        );
-        let message = format!(
-            "{}",
-            aws_smithy_types::error::display::DisplayErrorContext(&error)
-        );
+        let message = part_number_failure_message(&error);
         assert!(
             message.contains(&format!("part number {rejected}")),
             "error must name the rejected part number, got: {message}"
         );
-
-        // Only a part claimed before the rejected one may have been sent.
-        let upload_parts = record.upload_parts.lock().unwrap().clone();
-        let valid_prefix = part_numbers.len() - 1;
         assert!(
-            upload_parts.len() <= valid_prefix,
-            "part numbers {part_numbers:?} sent {upload_parts:?}"
+            record.upload_parts.lock().unwrap().is_empty(),
+            "part number {rejected} must not be sent"
         );
         assert!(
             record.completions.lock().unwrap().is_empty(),
-            "part numbers {part_numbers:?} must not complete the upload"
+            "part number {rejected} must not complete the upload"
         );
     }
+}
+
+/// A part number used twice fails the upload before CompleteMultipartUpload.
+///
+/// Two parts at one position would describe an object neither produced. The repeat is found when
+/// the part list is assembled, so both parts reach UploadPart; what must not happen is completing
+/// the upload over that list.
+#[tokio::test]
+async fn test_repeated_part_numbers_fail_before_completing_the_upload() {
+    let (result, record) = upload_numbered_parts(&[1, 1]).await;
+
+    let error = result.expect_err("a repeated part number must fail the upload");
+    let message = part_number_failure_message(&error);
+    assert!(
+        message.contains("part number 1 more than once"),
+        "error must name the repeated part number, got: {message}"
+    );
+    assert!(
+        record.completions.lock().unwrap().is_empty(),
+        "a repeated part number must not complete the upload"
+    );
 }
 
 /// Part numbers within S3's range reach UploadPart and CompleteMultipartUpload unchanged, with each

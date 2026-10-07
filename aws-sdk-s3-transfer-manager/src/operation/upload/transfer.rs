@@ -44,8 +44,9 @@ use crate::error::{Error, ErrorKind};
 use crate::io::part_reader::{Builder as PartReaderBuilder, PartReadStart};
 use crate::io::{InputStream, PartData};
 use crate::operation::upload::context::{
-    apply_content_length, validate_size_hint, MultipartCompletion, PartPlan, PartReadWake,
-    PartTransferState, PendingPartRead, UploadPartWork, UploadState,
+    apply_content_length, validate_distinct_part_numbers, validate_part_number, validate_size_hint,
+    MultipartCompletion, PartPlan, PartReadWake, PartTransferState, PendingPartRead,
+    UploadPartWork, UploadState,
 };
 use crate::operation::upload::input::convert::{
     copy_fields_to_mpu_request, copy_fields_to_upload_part_request,
@@ -609,7 +610,7 @@ impl UploadTransfer {
                     ),
                 ));
             }
-            if let Err(error) = parts.claim_part_number(data.part_number) {
+            if let Err(error) = validate_part_number(data.part_number) {
                 drop(state);
                 return self.fail(crate::error::invalid_input(error));
             }
@@ -750,19 +751,8 @@ impl UploadTransfer {
         // CompleteMultipartUpload on another worker, and that operation may
         // signal `join()` before this work item otherwise unwinds.
         drop(sdk_body);
-        // CompleteMultipartUpload identifies each part by its ETag, so a response without one is
-        // a failed part. The check runs after the retry loop, so the part is not re-sent.
-        let result = result.and_then(|resp| {
-            if resp.e_tag().is_some_and(|e_tag| !e_tag.is_empty()) {
-                Ok(resp)
-            } else {
-                Err(crate::error::invalid_service_response(
-                    "UploadPart",
-                    &resp,
-                    format!("UploadPart returned no ETag for part {part_number}"),
-                ))
-            }
-        });
+        // Validate the response after the retry loop, so a rejected response is not re-sent.
+        let result = result.and_then(|resp| validate_upload_part_response(resp, part_number));
         let resp = match result {
             Ok(resp) => resp,
             Err(e) => {
@@ -1000,6 +990,11 @@ impl UploadTransfer {
             final_snapshot,
         } = parts.into_completion();
         completed_parts.sort_by_key(|p| p.part_number);
+        // Sorted, so a number used twice is adjacent. Checked here rather than per part: the
+        // assembled list is the first place a repeat is visible without tracking every number.
+        if let Err(error) = validate_distinct_part_numbers(&completed_parts) {
+            return self.fail(crate::error::invalid_input(error));
+        }
 
         let object_size = match plan.mpu_object_size(bytes_read) {
             Ok(object_size) => object_size,
@@ -1112,6 +1107,27 @@ fn snapshot_state(state: &UploadState) -> UploadStateSnapshot {
 ///
 /// The state replacement elects exactly one caller even when source EOF and a network completion
 /// race to retire the final work item.
+/// Checks that a successful `UploadPart` response carries what completing the upload needs.
+///
+/// `CompleteMultipartUpload` identifies each part by its ETag, so a response without one, or with
+/// an empty one, is a failed part: the completed list could not identify it, and the object would
+/// be stored without that evidence. aws-c-s3 treats it the same way
+/// (`AWS_ERROR_S3_MISSING_ETAG`). The error carries the operation name and the response's request
+/// ids, as an error from a failed request does.
+fn validate_upload_part_response(
+    resp: aws_sdk_s3::operation::upload_part::UploadPartOutput,
+    part_number: u64,
+) -> Result<aws_sdk_s3::operation::upload_part::UploadPartOutput, Error> {
+    if resp.e_tag().is_some_and(|e_tag| !e_tag.is_empty()) {
+        return Ok(resp);
+    }
+    Err(crate::error::invalid_service_response(
+        "UploadPart",
+        &resp,
+        format!("UploadPart returned no ETag for part {part_number}"),
+    ))
+}
+
 fn try_begin_completing(state: &mut UploadState) -> bool {
     let ready = matches!(
         state,

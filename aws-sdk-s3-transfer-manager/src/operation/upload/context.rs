@@ -130,28 +130,9 @@ impl PartPlan {
 /// A caller's size declarations contradict each other, or the stream contradicted them.
 #[derive(Debug)]
 pub(crate) enum SizeHintViolation {
-    InvalidBounds {
-        lower: u64,
-        upper: u64,
-    },
-    BelowLower {
-        actual: u64,
-        lower: u64,
-    },
-    AboveUpper {
-        actual: u64,
-        upper: u64,
-    },
-    /// The request's `content_length` is negative.
-    NegativeContentLength {
-        content_length: i64,
-    },
-    /// The request's `content_length` lies outside the body's own size bounds.
-    ContentLengthOutsideBounds {
-        content_length: u64,
-        lower: u64,
-        upper: Option<u64>,
-    },
+    InvalidBounds { lower: u64, upper: u64 },
+    BelowLower { actual: u64, lower: u64 },
+    AboveUpper { actual: u64, upper: u64 },
 }
 
 impl fmt::Display for SizeHintViolation {
@@ -160,39 +141,6 @@ impl fmt::Display for SizeHintViolation {
             Self::InvalidBounds { lower, upper } => write!(
                 formatter,
                 "upload stream lower size bound {lower} exceeds upper bound {upper}"
-            ),
-            Self::NegativeContentLength { content_length } => {
-                write!(
-                    formatter,
-                    "upload content_length {content_length} is negative"
-                )
-            }
-            Self::ContentLengthOutsideBounds {
-                content_length,
-                lower,
-                upper: Some(upper),
-            } if lower == upper => write!(
-                formatter,
-                "upload content_length {content_length} does not match the body's size of \
-                 {lower} bytes"
-            ),
-            Self::ContentLengthOutsideBounds {
-                content_length,
-                lower,
-                upper: Some(upper),
-            } => write!(
-                formatter,
-                "upload content_length {content_length} is outside the body's size bounds of \
-                 {lower} to {upper} bytes"
-            ),
-            Self::ContentLengthOutsideBounds {
-                content_length,
-                lower,
-                upper: None,
-            } => write!(
-                formatter,
-                "upload content_length {content_length} is below the body's lower size bound of \
-                 {lower} bytes"
             ),
             Self::BelowLower { actual, lower } => write!(
                 formatter,
@@ -210,37 +158,89 @@ impl fmt::Display for SizeHintViolation {
 
 impl std::error::Error for SizeHintViolation {}
 
+/// The request's declared `content_length` cannot be the body's exact size.
+#[derive(Debug)]
+pub(crate) enum ContentLengthViolation {
+    /// The declared length is negative.
+    Negative { content_length: i64 },
+    /// The declared length lies outside the body's own size bounds.
+    OutsideBounds {
+        content_length: u64,
+        lower: u64,
+        upper: Option<u64>,
+    },
+}
+
+impl fmt::Display for ContentLengthViolation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Negative { content_length } => write!(
+                formatter,
+                "upload content_length {content_length} is negative"
+            ),
+            Self::OutsideBounds {
+                content_length,
+                lower,
+                upper: Some(upper),
+            } if lower == upper => write!(
+                formatter,
+                "upload content_length {content_length} does not match the body's size of \
+                 {lower} bytes"
+            ),
+            Self::OutsideBounds {
+                content_length,
+                lower,
+                upper: Some(upper),
+            } => write!(
+                formatter,
+                "upload content_length {content_length} is outside the body's size bounds of \
+                 {lower} to {upper} bytes"
+            ),
+            Self::OutsideBounds {
+                content_length,
+                lower,
+                upper: None,
+            } => write!(
+                formatter,
+                "upload content_length {content_length} is below the body's lower size bound of \
+                 {lower} bytes"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ContentLengthViolation {}
+
 /// Largest part number S3 accepts. Part numbers run from 1 to this value.
 const MAX_PART_NUMBER: u64 = 10_000;
 
 /// A source part's number cannot identify a distinct position in the object.
 #[derive(Debug)]
 pub(crate) enum PartNumberViolation {
-    /// The number is 0; part numbers start at 1.
-    Zero,
-    /// The number is above [`MAX_PART_NUMBER`].
+    /// The number is outside `1..=`[`MAX_PART_NUMBER`].
     ///
-    /// Parts are claimed under the state lock after their reads return, which need not be the
-    /// order the stream yielded them. A stream that yields more than [`MAX_PART_NUMBER`] parts can
-    /// therefore have its part numbered `MAX_PART_NUMBER + 1` claimed before the part-count limit
-    /// trips, so the message names that limit and its remedy as well.
-    AboveMaximum { part_number: u64 },
-    /// The number was already used by an earlier part of the same upload.
+    /// The message names the part limit and its remedy, because this and the part-count limit
+    /// describe the same mistake and either can report it first: parts are claimed under the state
+    /// lock after their reads return, which need not be the order the stream yielded them, so a
+    /// stream of more than [`MAX_PART_NUMBER`] parts can have its part numbered
+    /// `MAX_PART_NUMBER + 1` claimed before the count trips.
+    OutsideRange { part_number: u64 },
+    /// Two completed parts carry the same number.
+    ///
+    /// Found when the part list is assembled for `CompleteMultipartUpload`, rather than as each
+    /// part is read: a per-upload set of claimed numbers would cost memory on every multipart
+    /// upload to catch what the assembled list already shows.
     Repeated { part_number: u64 },
 }
 
 impl fmt::Display for PartNumberViolation {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Zero => write!(
+            Self::OutsideRange { part_number } => write!(
                 formatter,
-                "upload stream produced part number 0; part numbers start at 1"
-            ),
-            Self::AboveMaximum { part_number } => write!(
-                formatter,
-                "upload stream produced part number {part_number}, above the maximum of \
-                 {MAX_PART_NUMBER} parts; number parts from 1 to {MAX_PART_NUMBER}, and combine \
-                 source data into fewer, larger parts if there are more"
+                "upload stream produced part number {part_number}, outside the range 1 to the \
+                 maximum of {MAX_PART_NUMBER} parts; number parts from 1 to {MAX_PART_NUMBER}, \
+                 and combine source data into fewer, larger parts if there are more"
             ),
             Self::Repeated { part_number } => write!(
                 formatter,
@@ -252,45 +252,35 @@ impl fmt::Display for PartNumberViolation {
 
 impl std::error::Error for PartNumberViolation {}
 
-/// Number of 64-bit words needed for one bit per valid part number.
-const PART_NUMBER_WORDS: usize = (MAX_PART_NUMBER as usize).div_ceil(u64::BITS as usize);
-
-/// The part numbers claimed so far in one multipart upload.
+/// Checks that `part_number` identifies a position S3 accepts.
 ///
-/// S3 uses a part's number both to identify the part and to place it in the object, so each number
-/// may be used once. One bit per valid number keeps each claim constant-time and the set's size
-/// fixed, in whatever order the numbers arrive.
-#[derive(Debug)]
-struct PartNumberSet {
-    words: Box<[u64; PART_NUMBER_WORDS]>,
+/// S3 uses a part's number both to identify the part and to place it in the object, so a number
+/// outside 1..=[`MAX_PART_NUMBER`] cannot be used. Numbers may arrive in any order and need not be
+/// consecutive. Repeats are caught by [`validate_distinct_part_numbers`] when the part list is
+/// assembled.
+pub(crate) fn validate_part_number(part_number: u64) -> Result<(), PartNumberViolation> {
+    if part_number == 0 || part_number > MAX_PART_NUMBER {
+        return Err(PartNumberViolation::OutsideRange { part_number });
+    }
+    Ok(())
 }
 
-impl PartNumberSet {
-    fn new() -> Self {
-        Self {
-            words: Box::new([0; PART_NUMBER_WORDS]),
+/// Checks that no two completed parts share a part number.
+///
+/// `parts` must already be sorted by part number, as `CompleteMultipartUpload` requires, so any
+/// repeat is adjacent. A repeated number would place two parts at one position in the object, and
+/// the completed list would describe an object neither part produced.
+pub(crate) fn validate_distinct_part_numbers(
+    parts: &[CompletedPart],
+) -> Result<(), PartNumberViolation> {
+    for pair in parts.windows(2) {
+        if pair[0].part_number() == pair[1].part_number() {
+            return Err(PartNumberViolation::Repeated {
+                part_number: pair[0].part_number().unwrap_or_default() as u64,
+            });
         }
     }
-
-    /// Records `part_number`, or rejects it if it is out of range or already recorded.
-    ///
-    /// A rejected number leaves the set unchanged.
-    fn claim(&mut self, part_number: u64) -> Result<(), PartNumberViolation> {
-        if part_number == 0 {
-            return Err(PartNumberViolation::Zero);
-        }
-        if part_number > MAX_PART_NUMBER {
-            return Err(PartNumberViolation::AboveMaximum { part_number });
-        }
-        let index = (part_number - 1) as usize;
-        let word = &mut self.words[index / u64::BITS as usize];
-        let bit = 1u64 << (index % u64::BITS as usize);
-        if *word & bit != 0 {
-            return Err(PartNumberViolation::Repeated { part_number });
-        }
-        *word |= bit;
-        Ok(())
-    }
+    Ok(())
 }
 
 /// Validates the bounds captured before source polling begins.
@@ -315,15 +305,15 @@ pub(crate) fn validate_size_hint(size_hint: SizeHint) -> Result<(), SizeHintViol
 pub(crate) fn apply_content_length(
     size_hint: SizeHint,
     content_length: Option<i64>,
-) -> Result<SizeHint, SizeHintViolation> {
+) -> Result<SizeHint, ContentLengthViolation> {
     let Some(content_length) = content_length else {
         return Ok(size_hint);
     };
     let declared = u64::try_from(content_length)
-        .map_err(|_| SizeHintViolation::NegativeContentLength { content_length })?;
+        .map_err(|_| ContentLengthViolation::Negative { content_length })?;
     let within_upper = size_hint.upper().is_none_or(|upper| declared <= upper);
     if declared < size_hint.lower() || !within_upper {
-        return Err(SizeHintViolation::ContentLengthOutsideBounds {
+        return Err(ContentLengthViolation::OutsideBounds {
             content_length: declared,
             lower: size_hint.lower(),
             upper: size_hint.upper(),
@@ -515,8 +505,6 @@ pub(crate) struct PartTransferState {
     completed_parts: Vec<CompletedPart>,
     /// Number of `PartData` values returned by source reads.
     parts_read: u64,
-    /// Part numbers of source parts accepted for upload.
-    part_numbers: PartNumberSet,
     /// Bytes returned by source reads before UploadPart submission.
     bytes_read: u64,
     /// Bytes accepted by completed UploadPart requests.
@@ -541,7 +529,6 @@ impl PartTransferState {
             pending_reads: PendingPartReads::default(),
             completed_parts: Vec::with_capacity(completed_parts_capacity),
             parts_read: 0,
-            part_numbers: PartNumberSet::new(),
             bytes_read: 0,
             bytes_uploaded: 0,
             observability,
@@ -616,17 +603,6 @@ impl PartTransferState {
             .expect("source byte count overflow");
         self.plan.validate_progress(self.bytes_read)?;
         Ok(self.parts_read)
-    }
-
-    /// Claims a source part's number before its UploadPart request starts.
-    ///
-    /// The number is the part's position in the object. It must be between 1 and 10,000 and not
-    /// already claimed in this upload; numbers may be claimed in any order.
-    pub(crate) fn claim_part_number(
-        &mut self,
-        part_number: u64,
-    ) -> Result<(), PartNumberViolation> {
-        self.part_numbers.claim(part_number)
     }
 
     /// Records end-of-stream and returns whether this call changed source state.
@@ -903,12 +879,12 @@ mod tests {
         for content_length in [4, 11] {
             assert!(matches!(
                 apply_content_length(bounded, Some(content_length)),
-                Err(SizeHintViolation::ContentLengthOutsideBounds { .. })
+                Err(ContentLengthViolation::OutsideBounds { .. })
             ));
         }
         assert!(matches!(
             apply_content_length(SizeHint::default(), Some(-1)),
-            Err(SizeHintViolation::NegativeContentLength { content_length: -1 })
+            Err(ContentLengthViolation::Negative { content_length: -1 })
         ));
         let largest = i64::MAX as u64;
         assert_eq!(
@@ -918,24 +894,29 @@ mod tests {
     }
 
     #[test]
-    fn part_numbers_are_claimed_once_within_range_in_any_order() {
-        let mut numbers = PartNumberSet::new();
+    fn part_numbers_within_s3_range_are_accepted_in_any_order() {
         for part_number in [MAX_PART_NUMBER, 65, 64, 1, 2] {
-            numbers.claim(part_number).unwrap();
+            validate_part_number(part_number).unwrap();
         }
-        for part_number in [MAX_PART_NUMBER, 65, 64, 1, 2] {
+        for part_number in [0, MAX_PART_NUMBER + 1, (1 << 32) + 1, u64::MAX] {
             assert!(matches!(
-                numbers.claim(part_number),
-                Err(PartNumberViolation::Repeated { part_number: n }) if n == part_number
+                validate_part_number(part_number),
+                Err(PartNumberViolation::OutsideRange { part_number: n }) if n == part_number
             ));
         }
-        assert!(matches!(numbers.claim(0), Err(PartNumberViolation::Zero)));
-        for part_number in [MAX_PART_NUMBER + 1, (1 << 32) + 1, u64::MAX] {
-            assert!(matches!(
-                numbers.claim(part_number),
-                Err(PartNumberViolation::AboveMaximum { part_number: n }) if n == part_number
-            ));
-        }
+    }
+
+    #[test]
+    fn repeated_part_numbers_are_found_in_the_assembled_part_list() {
+        let part = |n: i32| CompletedPart::builder().part_number(n).build();
+
+        validate_distinct_part_numbers(&[]).unwrap();
+        validate_distinct_part_numbers(&[part(1)]).unwrap();
+        validate_distinct_part_numbers(&[part(1), part(2), part(7)]).unwrap();
+        assert!(matches!(
+            validate_distinct_part_numbers(&[part(1), part(2), part(2), part(3)]),
+            Err(PartNumberViolation::Repeated { part_number: 2 })
+        ));
     }
 
     #[test]

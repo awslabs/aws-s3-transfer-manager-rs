@@ -31,8 +31,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fails with `ErrorKind::IOError`. A temporary path is now renamed or removed at most once, so a
   file another download has since created under that name is left alone.
 - A `PartStream` part number of 2^32 or more was narrowed to a different part number, and a
-  repeated part number was accepted. Part numbers outside 1–10,000, or repeated within an upload,
-  now fail the upload with `ErrorKind::InputInvalid` before the part is sent.
+  repeated part number was accepted. A part number outside 1–10,000 now fails the upload with
+  `ErrorKind::InputInvalid` before that part is sent, and a part number repeated within an upload
+  fails it before the upload is completed.
 - An upload built without a body stored an empty object. It now fails at `initiate()` with
   `ErrorKind::InputInvalid`. To upload an empty object, pass `InputStream::from_static(b"")`.
 - `content_length` on an upload was ignored. When set, it is now the exact body size: a value that
