@@ -614,15 +614,8 @@ impl TransferEventSink {
     /// and its own [`dropped`](TransferEventStream::dropped) count, so a consumer that stops
     /// draining loses its own events and nobody else's.
     ///
-    /// **Merging the same sink twice is a no-op, not a doubling.** Registering one sink at both
-    /// the client and the request level is the documented way to observe both, so a caller
-    /// reaches that composition by accident as easily as on purpose. Without the check below
-    /// each event would be sent twice down one channel, and a consumer deleting a source on
-    /// each terminal would delete it twice.
-    ///
-    /// This is how the spec's *"a list of progress listeners"* is expressed — as composition
-    /// rather than as a `Vec` on every builder, so the registration surface stays one method
-    /// per operation and a second `.events()` call adds a consumer rather than dropping one.
+    /// Merging the same sink twice is a no-op rather than a doubling, so registering one
+    /// sink at both the client and the request level delivers each event once.
     pub fn merge(self, other: TransferEventSink) -> TransferEventSink {
         let mut outlets: Vec<Outlet> = Vec::with_capacity(self.outlets.len() + other.outlets.len());
         for src in [&self.outlets, &other.outlets] {

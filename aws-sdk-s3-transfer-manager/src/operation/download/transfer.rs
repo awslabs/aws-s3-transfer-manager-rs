@@ -479,10 +479,10 @@ impl DownloadTransfer {
                     // like every data-carrying completion, because completing blocks on the
                     // writer flush and the rename.
                     //
-                    // Counted as in flight before the guard is released, so a re-poll before
-                    // `execute` runs takes the `ranges_in_flight > 0` arm above and parks
-                    // instead of dispatching a second completion.
-                    *ranges_in_flight += 1;
+                    // Claimed before the guard is released, so a re-poll before `execute`
+                    // runs lands in the `Finalizing` arm and parks instead of dispatching a
+                    // second completion.
+                    *state = DownloadState::Finalizing;
                     drop(state);
                     return PollWork::ready(IoRequest {
                         data: Some(Box::new(DownloadWork::Finalize)),
@@ -552,6 +552,12 @@ impl DownloadTransfer {
                         etag: etag.clone(),
                     })),
                 })
+            }
+            DownloadState::Finalizing => {
+                // The completion is dispatched and must retire before the transfer is
+                // done. Nothing here to re-dispatch, so park on the in-flight work.
+                let snapshot = self.snapshot(&state);
+                self.park(DownloadPendingReason::RangeCompletion, snapshot)
             }
             DownloadState::Terminal => PollWork::Done,
         }
@@ -1591,6 +1597,11 @@ fn snapshot_state(state: &DownloadState, read_ahead_window: u64) -> DownloadStat
             read_ahead_window,
             pending.is_some(),
         ),
+        // No ranges remain, so the range counters are reported as zero rather than as the
+        // one the old in-flight bump used to show for an object that had no ranges at all.
+        DownloadState::Finalizing => {
+            DownloadStateSnapshot::inactive(DownloadExecutionState::Transferring, read_ahead_window)
+        }
         DownloadState::Terminal => {
             DownloadStateSnapshot::inactive(DownloadExecutionState::Terminal, read_ahead_window)
         }
@@ -2651,8 +2662,8 @@ mod tests {
     /// A second poll before the completion executes must not dispatch a second one.
     ///
     /// The scheduler polls on four edges, not only on work completion -- a concurrency-target
-    /// change re-polls a transfer whose work is still in flight. Without counting the
-    /// dispatched completion as in-flight work, that re-poll takes the same no-ranges arm and
+    /// change re-polls a transfer whose work is still in flight. Without the
+    /// `DownloadState::Finalizing` latch, that re-poll takes the same no-ranges arm and
     /// emits `Finalize` again, so the writer is flushed twice and the rename runs twice:
     /// the second finds no temporary file and fails the transfer that had already succeeded.
     #[cfg_attr(miri, ignore)]
@@ -2679,7 +2690,7 @@ mod tests {
         ));
 
         // Re-polled while that completion is still in flight, as a concurrency-target change
-        // would. It must park on the in-flight count, not hand out a second completion.
+        // would. It must park in `Finalizing`, not hand out a second completion.
         assert!(
             matches!(transfer.poll_work(), PollWork::Pending),
             "a re-poll before the completion runs must park, not dispatch a second one"

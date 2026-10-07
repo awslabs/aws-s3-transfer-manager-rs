@@ -100,6 +100,13 @@ pub(crate) enum DownloadState {
         pending: Option<PendingClaim>,
     },
 
+    /// Terminal completion dispatched to `execute` and not yet retired.
+    ///
+    /// Reached only by an object that carried no ranges. No ranges remain, so there is
+    /// nothing to count -- this state *is* the latch that stops a re-poll dispatching a
+    /// second completion, which would flush the writer and run the rename twice.
+    Finalizing,
+
     /// Terminal state - transfer ended (success, failure, or cancelled)
     /// TransferContext status holds final result
     Terminal,
