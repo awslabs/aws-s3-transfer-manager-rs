@@ -115,10 +115,10 @@ pub struct UploadOutput {
     pub metrics: crate::types::TransferMetrics,
     /// <p>If present, indicates the Amazon Web Services KMS Encryption Context to use for object encryption. The value of this header is a Base64 encoded string of a UTF-8 encoded JSON, which contains the encryption context as key-value pairs. This value is stored as object metadata and automatically gets passed on to Amazon Web Services KMS for future <code>GetObject</code> operations on this object.</p>
     /// <p>For multipart uploads, retained from the initiation response after successful completion.</p>
-    pub sse_kms_encryption_context: Option<::std::string::String>,
+    pub sse_kms_encryption_context: ::std::option::Option<::std::string::String>,
     /// <p>If present, indicates the ID of the KMS key that was used for object encryption.</p>
     /// <p>For multipart uploads, the completion response replaces the initiation value, including when absent.</p>
-    pub sse_kms_key_id: Option<::std::string::String>,
+    pub sse_kms_key_id: ::std::option::Option<::std::string::String>,
 }
 impl UploadOutput {
     /// <p>If the bucket has a lifecycle rule configured with an action to abort incomplete multipart uploads and the prefix in the lifecycle rule matches the object name in the request, the response includes this header. The header indicates when the initiated multipart upload becomes eligible for an abort operation. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/dev/mpuoverview.html#mpu-abort-incomplete-mpu-lifecycle-config"> Aborting Incomplete Multipart Uploads Using a Bucket Lifecycle Configuration</a> in the <i>Amazon S3 User Guide</i>.</p>
@@ -322,7 +322,7 @@ impl ::std::fmt::Debug for UploadOutput {
         formatter.finish()
     }
 }
-impl UploadOutput {
+impl crate::model::UploadOutput {
     /// Snapshot of transfer metrics at completion.
     #[cfg(not(s3_tm_out_of_tree))]
     pub fn metrics(&self) -> &crate::types::TransferMetrics {
@@ -330,12 +330,12 @@ impl UploadOutput {
     }
     /// <p>If present, indicates the Amazon Web Services KMS Encryption Context to use for object encryption. The value of this header is a Base64 encoded string of a UTF-8 encoded JSON, which contains the encryption context as key-value pairs. This value is stored as object metadata and automatically gets passed on to Amazon Web Services KMS for future <code>GetObject</code> operations on this object.</p>
     /// <p>For multipart uploads, retained from the initiation response after successful completion.</p>
-    pub fn sse_kms_encryption_context(&self) -> Option<&str> {
+    pub fn sse_kms_encryption_context(&self) -> ::std::option::Option<&str> {
         self.sse_kms_encryption_context.as_deref()
     }
     /// <p>If present, indicates the ID of the KMS key that was used for object encryption.</p>
     /// <p>For multipart uploads, the completion response replaces the initiation value, including when absent.</p>
-    pub fn sse_kms_key_id(&self) -> Option<&str> {
+    pub fn sse_kms_key_id(&self) -> ::std::option::Option<&str> {
         self.sse_kms_key_id.as_deref()
     }
 }
@@ -378,9 +378,9 @@ pub struct UploadOutputBuilder {
     pub(crate) upload_id: ::std::option::Option<::std::string::String>,
     pub(crate) version_id: ::std::option::Option<::std::string::String>,
     #[cfg(not(s3_tm_out_of_tree))]
-    pub(crate) metrics: Option<crate::types::TransferMetrics>,
-    pub(crate) sse_kms_encryption_context: Option<::std::string::String>,
-    pub(crate) sse_kms_key_id: Option<::std::string::String>,
+    pub(crate) metrics: ::std::option::Option<crate::types::TransferMetrics>,
+    pub(crate) sse_kms_encryption_context: ::std::option::Option<::std::string::String>,
+    pub(crate) sse_kms_key_id: ::std::option::Option<::std::string::String>,
 }
 impl UploadOutputBuilder {
     /// <p>If the bucket has a lifecycle rule configured with an action to abort incomplete multipart uploads and the prefix in the lifecycle rule matches the object name in the request, the response includes this header. The header indicates when the initiated multipart upload becomes eligible for an abort operation. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/dev/mpuoverview.html#mpu-abort-incomplete-mpu-lifecycle-config"> Aborting Incomplete Multipart Uploads Using a Bucket Lifecycle Configuration</a> in the <i>Amazon S3 User Guide</i>.</p>
@@ -1012,54 +1012,69 @@ impl UploadOutputBuilder {
     #[cfg(not(s3_tm_out_of_tree))]
     #[allow(dead_code)]
     pub(crate) fn metrics(mut self, input: crate::types::TransferMetrics) -> Self {
-        self.metrics = Some(input);
+        self.metrics = ::std::option::Option::Some(input);
         self
     }
     /// Snapshot of transfer metrics at completion.
     #[cfg(not(s3_tm_out_of_tree))]
     #[allow(dead_code)]
-    pub(crate) fn set_metrics(mut self, input: Option<crate::types::TransferMetrics>) -> Self {
+    pub(crate) fn set_metrics(
+        mut self,
+        input: ::std::option::Option<crate::types::TransferMetrics>,
+    ) -> Self {
         self.metrics = input;
         self
     }
     /// Snapshot of transfer metrics at completion.
     #[cfg(not(s3_tm_out_of_tree))]
     #[allow(dead_code)]
-    pub(crate) fn get_metrics(&self) -> &Option<crate::types::TransferMetrics> {
+    pub(crate) fn get_metrics(&self) -> &::std::option::Option<crate::types::TransferMetrics> {
         &self.metrics
     }
     /// <p>If present, indicates the Amazon Web Services KMS Encryption Context to use for object encryption. The value of this header is a Base64 encoded string of a UTF-8 encoded JSON, which contains the encryption context as key-value pairs. This value is stored as object metadata and automatically gets passed on to Amazon Web Services KMS for future <code>GetObject</code> operations on this object.</p>
     /// <p>For multipart uploads, retained from the initiation response after successful completion.</p>
-    pub fn sse_kms_encryption_context(mut self, input: impl Into<String>) -> Self {
-        self.sse_kms_encryption_context = Some(input.into());
+    pub fn sse_kms_encryption_context(
+        mut self,
+        input: impl ::std::convert::Into<::std::string::String>,
+    ) -> Self {
+        self.sse_kms_encryption_context = ::std::option::Option::Some(input.into());
         self
     }
     /// <p>If present, indicates the Amazon Web Services KMS Encryption Context to use for object encryption. The value of this header is a Base64 encoded string of a UTF-8 encoded JSON, which contains the encryption context as key-value pairs. This value is stored as object metadata and automatically gets passed on to Amazon Web Services KMS for future <code>GetObject</code> operations on this object.</p>
     /// <p>For multipart uploads, retained from the initiation response after successful completion.</p>
-    pub fn set_sse_kms_encryption_context(mut self, input: Option<::std::string::String>) -> Self {
+    pub fn set_sse_kms_encryption_context(
+        mut self,
+        input: ::std::option::Option<::std::string::String>,
+    ) -> Self {
         self.sse_kms_encryption_context = input;
         self
     }
     /// <p>If present, indicates the Amazon Web Services KMS Encryption Context to use for object encryption. The value of this header is a Base64 encoded string of a UTF-8 encoded JSON, which contains the encryption context as key-value pairs. This value is stored as object metadata and automatically gets passed on to Amazon Web Services KMS for future <code>GetObject</code> operations on this object.</p>
     /// <p>For multipart uploads, retained from the initiation response after successful completion.</p>
-    pub fn get_sse_kms_encryption_context(&self) -> &Option<::std::string::String> {
+    pub fn get_sse_kms_encryption_context(&self) -> &::std::option::Option<::std::string::String> {
         &self.sse_kms_encryption_context
     }
     /// <p>If present, indicates the ID of the KMS key that was used for object encryption.</p>
     /// <p>For multipart uploads, the completion response replaces the initiation value, including when absent.</p>
-    pub fn sse_kms_key_id(mut self, input: impl Into<String>) -> Self {
-        self.sse_kms_key_id = Some(input.into());
+    pub fn sse_kms_key_id(
+        mut self,
+        input: impl ::std::convert::Into<::std::string::String>,
+    ) -> Self {
+        self.sse_kms_key_id = ::std::option::Option::Some(input.into());
         self
     }
     /// <p>If present, indicates the ID of the KMS key that was used for object encryption.</p>
     /// <p>For multipart uploads, the completion response replaces the initiation value, including when absent.</p>
-    pub fn set_sse_kms_key_id(mut self, input: Option<::std::string::String>) -> Self {
+    pub fn set_sse_kms_key_id(
+        mut self,
+        input: ::std::option::Option<::std::string::String>,
+    ) -> Self {
         self.sse_kms_key_id = input;
         self
     }
     /// <p>If present, indicates the ID of the KMS key that was used for object encryption.</p>
     /// <p>For multipart uploads, the completion response replaces the initiation value, including when absent.</p>
-    pub fn get_sse_kms_key_id(&self) -> &Option<::std::string::String> {
+    pub fn get_sse_kms_key_id(&self) -> &::std::option::Option<::std::string::String> {
         &self.sse_kms_key_id
     }
     /// Consumes the builder and constructs a [`UploadOutput`](crate::model::UploadOutput).

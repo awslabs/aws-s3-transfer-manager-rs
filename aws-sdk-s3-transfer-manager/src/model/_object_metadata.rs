@@ -2,7 +2,7 @@
 
 /// Object metadata from the discovery GET or HEAD response. Some values are also present on the first chunk. Optional fields remain absent when discovery does not return them. Reported checksums describe the stored object; they do not by themselves indicate that the downloaded bytes were checksum-validated.
 #[non_exhaustive]
-#[derive(::std::clone::Clone, ::std::cmp::PartialEq)]
+#[derive(::std::clone::Clone, ::std::cmp::PartialEq, ::std::default::Default)]
 pub struct ObjectMetadata {
     /// <p>Indicates that a range of bytes was specified in the request.</p>
     pub accept_ranges: ::std::option::Option<::std::string::String>,
@@ -132,13 +132,13 @@ pub struct ObjectMetadata {
     /// <p>The date and time at which the object is no longer cacheable.</p>
     pub expires_string: ::std::option::Option<::std::string::String>,
     /// <p>Size of the body in bytes.</p>
-    pub(crate) content_length: Option<i64>,
+    pub(crate) content_length: ::std::option::Option<i64>,
     /// <p>The portion of the object returned in the response.</p>
-    pub(crate) content_range: Option<::std::string::String>,
+    pub(crate) content_range: ::std::option::Option<::std::string::String>,
     /// S3 request ID.
-    _request_id: Option<::std::string::String>,
+    _request_id: ::std::option::Option<::std::string::String>,
     /// S3 extended request ID.
-    _extended_request_id: Option<::std::string::String>,
+    _extended_request_id: ::std::option::Option<::std::string::String>,
 }
 impl ObjectMetadata {
     /// <p>Indicates that a range of bytes was specified in the request.</p>
@@ -415,29 +415,24 @@ impl ::std::fmt::Debug for ObjectMetadata {
         formatter.finish()
     }
 }
-impl ObjectMetadata {
+impl crate::model::ObjectMetadata {
     /// <p>Size of the body in bytes.</p>
     #[allow(dead_code)]
-    pub(crate) fn content_length(&self) -> Option<i64> {
+    pub(crate) fn content_length(&self) -> ::std::option::Option<i64> {
         self.content_length
     }
     /// <p>The portion of the object returned in the response.</p>
     #[allow(dead_code)]
-    pub(crate) fn content_range(&self) -> Option<&str> {
+    pub(crate) fn content_range(&self) -> ::std::option::Option<&str> {
         self.content_range.as_deref()
     }
     /// S3 request ID.
-    pub fn request_id(&self) -> Option<&str> {
+    pub fn request_id(&self) -> ::std::option::Option<&str> {
         self._request_id.as_deref()
     }
     /// S3 extended request ID.
-    pub fn extended_request_id(&self) -> Option<&str> {
+    pub fn extended_request_id(&self) -> ::std::option::Option<&str> {
         self._extended_request_id.as_deref()
-    }
-}
-impl ::std::default::Default for ObjectMetadata {
-    fn default() -> Self {
-        Self::builder().build()
     }
 }
 impl ObjectMetadata {
@@ -495,10 +490,10 @@ pub struct ObjectMetadataBuilder {
     pub(crate) version_id: ::std::option::Option<::std::string::String>,
     pub(crate) website_redirect_location: ::std::option::Option<::std::string::String>,
     pub(crate) expires_string: ::std::option::Option<::std::string::String>,
-    pub(crate) content_length: Option<i64>,
-    pub(crate) content_range: Option<::std::string::String>,
-    pub(crate) _request_id: Option<::std::string::String>,
-    pub(crate) _extended_request_id: Option<::std::string::String>,
+    pub(crate) content_length: ::std::option::Option<i64>,
+    pub(crate) content_range: ::std::option::Option<::std::string::String>,
+    pub(crate) _request_id: ::std::option::Option<::std::string::String>,
+    pub(crate) _extended_request_id: ::std::option::Option<::std::string::String>,
 }
 impl ObjectMetadataBuilder {
     /// <p>Indicates that a range of bytes was specified in the request.</p>
@@ -1378,69 +1373,87 @@ impl ObjectMetadataBuilder {
     /// <p>Size of the body in bytes.</p>
     #[allow(dead_code)]
     pub(crate) fn content_length(mut self, input: i64) -> Self {
-        self.content_length = Some(input);
+        self.content_length = ::std::option::Option::Some(input);
         self
     }
     /// <p>Size of the body in bytes.</p>
     #[allow(dead_code)]
-    pub(crate) fn set_content_length(mut self, input: Option<i64>) -> Self {
+    pub(crate) fn set_content_length(mut self, input: ::std::option::Option<i64>) -> Self {
         self.content_length = input;
         self
     }
     /// <p>Size of the body in bytes.</p>
     #[allow(dead_code)]
-    pub(crate) fn get_content_length(&self) -> &Option<i64> {
+    pub(crate) fn get_content_length(&self) -> &::std::option::Option<i64> {
         &self.content_length
     }
     /// <p>The portion of the object returned in the response.</p>
     #[allow(dead_code)]
-    pub(crate) fn content_range(mut self, input: impl Into<String>) -> Self {
-        self.content_range = Some(input.into());
+    pub(crate) fn content_range(
+        mut self,
+        input: impl ::std::convert::Into<::std::string::String>,
+    ) -> Self {
+        self.content_range = ::std::option::Option::Some(input.into());
         self
     }
     /// <p>The portion of the object returned in the response.</p>
     #[allow(dead_code)]
-    pub(crate) fn set_content_range(mut self, input: Option<::std::string::String>) -> Self {
+    pub(crate) fn set_content_range(
+        mut self,
+        input: ::std::option::Option<::std::string::String>,
+    ) -> Self {
         self.content_range = input;
         self
     }
     /// <p>The portion of the object returned in the response.</p>
     #[allow(dead_code)]
-    pub(crate) fn get_content_range(&self) -> &Option<::std::string::String> {
+    pub(crate) fn get_content_range(&self) -> &::std::option::Option<::std::string::String> {
         &self.content_range
     }
     /// S3 request ID.
     #[allow(dead_code)]
-    pub(crate) fn request_id(mut self, input: impl Into<String>) -> Self {
-        self._request_id = Some(input.into());
+    pub(crate) fn request_id(
+        mut self,
+        input: impl ::std::convert::Into<::std::string::String>,
+    ) -> Self {
+        self._request_id = ::std::option::Option::Some(input.into());
         self
     }
     /// S3 request ID.
     #[allow(dead_code)]
-    pub(crate) fn set_request_id(mut self, input: Option<::std::string::String>) -> Self {
+    pub(crate) fn set_request_id(
+        mut self,
+        input: ::std::option::Option<::std::string::String>,
+    ) -> Self {
         self._request_id = input;
         self
     }
     /// S3 request ID.
     #[allow(dead_code)]
-    pub(crate) fn get_request_id(&self) -> &Option<::std::string::String> {
+    pub(crate) fn get_request_id(&self) -> &::std::option::Option<::std::string::String> {
         &self._request_id
     }
     /// S3 extended request ID.
     #[allow(dead_code)]
-    pub(crate) fn extended_request_id(mut self, input: impl Into<String>) -> Self {
-        self._extended_request_id = Some(input.into());
+    pub(crate) fn extended_request_id(
+        mut self,
+        input: impl ::std::convert::Into<::std::string::String>,
+    ) -> Self {
+        self._extended_request_id = ::std::option::Option::Some(input.into());
         self
     }
     /// S3 extended request ID.
     #[allow(dead_code)]
-    pub(crate) fn set_extended_request_id(mut self, input: Option<::std::string::String>) -> Self {
+    pub(crate) fn set_extended_request_id(
+        mut self,
+        input: ::std::option::Option<::std::string::String>,
+    ) -> Self {
         self._extended_request_id = input;
         self
     }
     /// S3 extended request ID.
     #[allow(dead_code)]
-    pub(crate) fn get_extended_request_id(&self) -> &Option<::std::string::String> {
+    pub(crate) fn get_extended_request_id(&self) -> &::std::option::Option<::std::string::String> {
         &self._extended_request_id
     }
     /// Consumes the builder and constructs a [`ObjectMetadata`](crate::model::ObjectMetadata).

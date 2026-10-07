@@ -168,18 +168,19 @@ pub struct UploadInput {
     pub body: crate::io::InputStream,
     /// Checksum calculation or precalculated checksum policy.
     #[cfg(not(s3_tm_out_of_tree))]
-    pub checksum_strategy: Option<crate::operation::upload::ChecksumStrategy>,
+    pub checksum_strategy: ::std::option::Option<crate::operation::upload::ChecksumStrategy>,
     /// How to handle a failed multipart upload.
     #[cfg(not(s3_tm_out_of_tree))]
-    pub failed_multipart_upload_policy: Option<crate::types::FailedMultipartUploadPolicy>,
+    pub failed_multipart_upload_policy:
+        ::std::option::Option<crate::types::FailedMultipartUploadPolicy>,
     /// <p>Specifies the KMS key ID (Key ID, Key ARN, or Key Alias) to use for object encryption. If the KMS key doesn't exist in the same account that's issuing the command, you must use the full Key ARN not the Key ID.</p>
     /// <p><b>General purpose buckets</b> - If you specify <code>x-amz-server-side-encryption</code> with <code>aws:kms</code> or <code>aws:kms:dsse</code>, this header specifies the ID (Key ID, Key ARN, or Key Alias) of the KMS key to use. If you specify <code>x-amz-server-side-encryption:aws:kms</code> or <code>x-amz-server-side-encryption:aws:kms:dsse</code>, but do not provide <code>x-amz-server-side-encryption-aws-kms-key-id</code>, Amazon S3 uses the Amazon Web Services managed key (<code>aws/s3</code>) to protect the data.</p>
     /// <p><b>Directory buckets</b> - To encrypt data using SSE-KMS, it's recommended to specify the <code>x-amz-server-side-encryption</code> header to <code>aws:kms</code>. Then, the <code>x-amz-server-side-encryption-aws-kms-key-id</code> header implicitly uses the bucket's default KMS customer managed key ID. If you want to explicitly set the <code> x-amz-server-side-encryption-aws-kms-key-id</code> header, it must match the bucket's default customer managed key (using key ID or ARN, not alias). Your SSE-KMS configuration can only support 1 <a href="https://docs.aws.amazon.com/kms/latest/developerguide/concepts.html#customer-cmk">customer managed key</a> per directory bucket's lifetime. The <a href="https://docs.aws.amazon.com/kms/latest/developerguide/concepts.html#aws-managed-cmk">Amazon Web Services managed key</a> (<code>aws/s3</code>) isn't supported. Incorrect key specification results in an HTTP <code>400 Bad Request</code> error.</p>
-    pub sse_kms_key_id: Option<::std::string::String>,
+    pub sse_kms_key_id: ::std::option::Option<::std::string::String>,
     /// <p>Specifies the Amazon Web Services KMS Encryption Context as an additional encryption context to use for object encryption. The value of this header is a Base64 encoded string of a UTF-8 encoded JSON, which contains the encryption context as key-value pairs. This value is stored as object metadata and automatically gets passed on to Amazon Web Services KMS for future <code>GetObject</code> operations on this object.</p>
     /// <p><b>General purpose buckets</b> - This value must be explicitly added during <code>CopyObject</code> operations if you want an additional encryption context for your object. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/UsingKMSEncryption.html#encryption-context">Encryption context</a> in the <i>Amazon S3 User Guide</i>.</p>
     /// <p><b>Directory buckets</b> - You can optionally provide an explicit encryption context value. The value must match the default encryption context - the bucket Amazon Resource Name (ARN). An additional encryption context value is not supported.</p>
-    pub sse_kms_encryption_context: Option<::std::string::String>,
+    pub sse_kms_encryption_context: ::std::option::Option<::std::string::String>,
 }
 impl UploadInput {
     /// <p>The canned ACL to apply to the object. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/dev/acl-overview.html#CannedACL">Canned ACL</a> in the <i>Amazon S3 User Guide</i>.</p>
@@ -469,7 +470,7 @@ impl ::std::fmt::Debug for UploadInput {
         formatter.finish()
     }
 }
-impl UploadInput {
+impl crate::model::UploadInput {
     /// <p>Object data.</p>
     #[cfg(not(s3_tm_out_of_tree))]
     pub fn body(&self) -> &crate::io::InputStream {
@@ -477,33 +478,35 @@ impl UploadInput {
     }
     /// Checksum calculation or precalculated checksum policy.
     #[cfg(not(s3_tm_out_of_tree))]
-    pub fn checksum_strategy(&self) -> Option<&crate::operation::upload::ChecksumStrategy> {
+    pub fn checksum_strategy(
+        &self,
+    ) -> ::std::option::Option<&crate::operation::upload::ChecksumStrategy> {
         self.checksum_strategy.as_ref()
     }
     /// How to handle a failed multipart upload.
     #[cfg(not(s3_tm_out_of_tree))]
     pub fn failed_multipart_upload_policy(
         &self,
-    ) -> Option<&crate::types::FailedMultipartUploadPolicy> {
+    ) -> ::std::option::Option<&crate::types::FailedMultipartUploadPolicy> {
         self.failed_multipart_upload_policy.as_ref()
     }
     /// <p>Specifies the KMS key ID (Key ID, Key ARN, or Key Alias) to use for object encryption. If the KMS key doesn't exist in the same account that's issuing the command, you must use the full Key ARN not the Key ID.</p>
     /// <p><b>General purpose buckets</b> - If you specify <code>x-amz-server-side-encryption</code> with <code>aws:kms</code> or <code>aws:kms:dsse</code>, this header specifies the ID (Key ID, Key ARN, or Key Alias) of the KMS key to use. If you specify <code>x-amz-server-side-encryption:aws:kms</code> or <code>x-amz-server-side-encryption:aws:kms:dsse</code>, but do not provide <code>x-amz-server-side-encryption-aws-kms-key-id</code>, Amazon S3 uses the Amazon Web Services managed key (<code>aws/s3</code>) to protect the data.</p>
     /// <p><b>Directory buckets</b> - To encrypt data using SSE-KMS, it's recommended to specify the <code>x-amz-server-side-encryption</code> header to <code>aws:kms</code>. Then, the <code>x-amz-server-side-encryption-aws-kms-key-id</code> header implicitly uses the bucket's default KMS customer managed key ID. If you want to explicitly set the <code> x-amz-server-side-encryption-aws-kms-key-id</code> header, it must match the bucket's default customer managed key (using key ID or ARN, not alias). Your SSE-KMS configuration can only support 1 <a href="https://docs.aws.amazon.com/kms/latest/developerguide/concepts.html#customer-cmk">customer managed key</a> per directory bucket's lifetime. The <a href="https://docs.aws.amazon.com/kms/latest/developerguide/concepts.html#aws-managed-cmk">Amazon Web Services managed key</a> (<code>aws/s3</code>) isn't supported. Incorrect key specification results in an HTTP <code>400 Bad Request</code> error.</p>
-    pub fn sse_kms_key_id(&self) -> Option<&str> {
+    pub fn sse_kms_key_id(&self) -> ::std::option::Option<&str> {
         self.sse_kms_key_id.as_deref()
     }
     /// <p>Specifies the Amazon Web Services KMS Encryption Context as an additional encryption context to use for object encryption. The value of this header is a Base64 encoded string of a UTF-8 encoded JSON, which contains the encryption context as key-value pairs. This value is stored as object metadata and automatically gets passed on to Amazon Web Services KMS for future <code>GetObject</code> operations on this object.</p>
     /// <p><b>General purpose buckets</b> - This value must be explicitly added during <code>CopyObject</code> operations if you want an additional encryption context for your object. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/UsingKMSEncryption.html#encryption-context">Encryption context</a> in the <i>Amazon S3 User Guide</i>.</p>
     /// <p><b>Directory buckets</b> - You can optionally provide an explicit encryption context value. The value must match the default encryption context - the bucket Amazon Resource Name (ARN). An additional encryption context value is not supported.</p>
-    pub fn sse_kms_encryption_context(&self) -> Option<&str> {
+    pub fn sse_kms_encryption_context(&self) -> ::std::option::Option<&str> {
         self.sse_kms_encryption_context.as_deref()
     }
     /// Takes the upload stream, leaving an empty stream in its place.
     #[cfg(not(s3_tm_out_of_tree))]
     #[allow(dead_code)]
     pub(crate) fn take_body(&mut self) -> crate::io::InputStream {
-        std::mem::take(&mut self.body)
+        ::std::mem::take(&mut self.body)
     }
 }
 impl UploadInput {
@@ -552,13 +555,14 @@ pub struct UploadInputBuilder {
         ::std::option::Option<crate::model::ObjectLockLegalHoldStatus>,
     pub(crate) expected_bucket_owner: ::std::option::Option<::std::string::String>,
     #[cfg(not(s3_tm_out_of_tree))]
-    pub(crate) body: Option<crate::io::InputStream>,
+    pub(crate) body: ::std::option::Option<crate::io::InputStream>,
     #[cfg(not(s3_tm_out_of_tree))]
-    pub(crate) checksum_strategy: Option<crate::operation::upload::ChecksumStrategy>,
+    pub(crate) checksum_strategy: ::std::option::Option<crate::operation::upload::ChecksumStrategy>,
     #[cfg(not(s3_tm_out_of_tree))]
-    pub(crate) failed_multipart_upload_policy: Option<crate::types::FailedMultipartUploadPolicy>,
-    pub(crate) sse_kms_key_id: Option<::std::string::String>,
-    pub(crate) sse_kms_encryption_context: Option<::std::string::String>,
+    pub(crate) failed_multipart_upload_policy:
+        ::std::option::Option<crate::types::FailedMultipartUploadPolicy>,
+    pub(crate) sse_kms_key_id: ::std::option::Option<::std::string::String>,
+    pub(crate) sse_kms_encryption_context: ::std::option::Option<::std::string::String>,
 }
 impl UploadInputBuilder {
     /// <p>The canned ACL to apply to the object. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/dev/acl-overview.html#CannedACL">Canned ACL</a> in the <i>Amazon S3 User Guide</i>.</p>
@@ -1412,38 +1416,40 @@ impl UploadInputBuilder {
     /// <p>Object data.</p>
     #[cfg(not(s3_tm_out_of_tree))]
     pub fn body(mut self, input: crate::io::InputStream) -> Self {
-        self.body = Some(input);
+        self.body = ::std::option::Option::Some(input);
         self
     }
     /// <p>Object data.</p>
     #[cfg(not(s3_tm_out_of_tree))]
-    pub fn set_body(mut self, input: Option<crate::io::InputStream>) -> Self {
+    pub fn set_body(mut self, input: ::std::option::Option<crate::io::InputStream>) -> Self {
         self.body = input;
         self
     }
     /// <p>Object data.</p>
     #[cfg(not(s3_tm_out_of_tree))]
-    pub fn get_body(&self) -> &Option<crate::io::InputStream> {
+    pub fn get_body(&self) -> &::std::option::Option<crate::io::InputStream> {
         &self.body
     }
     /// Checksum calculation or precalculated checksum policy.
     #[cfg(not(s3_tm_out_of_tree))]
     pub fn checksum_strategy(mut self, input: crate::operation::upload::ChecksumStrategy) -> Self {
-        self.checksum_strategy = Some(input);
+        self.checksum_strategy = ::std::option::Option::Some(input);
         self
     }
     /// Checksum calculation or precalculated checksum policy.
     #[cfg(not(s3_tm_out_of_tree))]
     pub fn set_checksum_strategy(
         mut self,
-        input: Option<crate::operation::upload::ChecksumStrategy>,
+        input: ::std::option::Option<crate::operation::upload::ChecksumStrategy>,
     ) -> Self {
         self.checksum_strategy = input;
         self
     }
     /// Checksum calculation or precalculated checksum policy.
     #[cfg(not(s3_tm_out_of_tree))]
-    pub fn get_checksum_strategy(&self) -> &Option<crate::operation::upload::ChecksumStrategy> {
+    pub fn get_checksum_strategy(
+        &self,
+    ) -> &::std::option::Option<crate::operation::upload::ChecksumStrategy> {
         &self.checksum_strategy
     }
     /// How to handle a failed multipart upload.
@@ -1452,14 +1458,14 @@ impl UploadInputBuilder {
         mut self,
         input: crate::types::FailedMultipartUploadPolicy,
     ) -> Self {
-        self.failed_multipart_upload_policy = Some(input);
+        self.failed_multipart_upload_policy = ::std::option::Option::Some(input);
         self
     }
     /// How to handle a failed multipart upload.
     #[cfg(not(s3_tm_out_of_tree))]
     pub fn set_failed_multipart_upload_policy(
         mut self,
-        input: Option<crate::types::FailedMultipartUploadPolicy>,
+        input: ::std::option::Option<crate::types::FailedMultipartUploadPolicy>,
     ) -> Self {
         self.failed_multipart_upload_policy = input;
         self
@@ -1468,47 +1474,59 @@ impl UploadInputBuilder {
     #[cfg(not(s3_tm_out_of_tree))]
     pub fn get_failed_multipart_upload_policy(
         &self,
-    ) -> &Option<crate::types::FailedMultipartUploadPolicy> {
+    ) -> &::std::option::Option<crate::types::FailedMultipartUploadPolicy> {
         &self.failed_multipart_upload_policy
     }
     /// <p>Specifies the KMS key ID (Key ID, Key ARN, or Key Alias) to use for object encryption. If the KMS key doesn't exist in the same account that's issuing the command, you must use the full Key ARN not the Key ID.</p>
     /// <p><b>General purpose buckets</b> - If you specify <code>x-amz-server-side-encryption</code> with <code>aws:kms</code> or <code>aws:kms:dsse</code>, this header specifies the ID (Key ID, Key ARN, or Key Alias) of the KMS key to use. If you specify <code>x-amz-server-side-encryption:aws:kms</code> or <code>x-amz-server-side-encryption:aws:kms:dsse</code>, but do not provide <code>x-amz-server-side-encryption-aws-kms-key-id</code>, Amazon S3 uses the Amazon Web Services managed key (<code>aws/s3</code>) to protect the data.</p>
     /// <p><b>Directory buckets</b> - To encrypt data using SSE-KMS, it's recommended to specify the <code>x-amz-server-side-encryption</code> header to <code>aws:kms</code>. Then, the <code>x-amz-server-side-encryption-aws-kms-key-id</code> header implicitly uses the bucket's default KMS customer managed key ID. If you want to explicitly set the <code> x-amz-server-side-encryption-aws-kms-key-id</code> header, it must match the bucket's default customer managed key (using key ID or ARN, not alias). Your SSE-KMS configuration can only support 1 <a href="https://docs.aws.amazon.com/kms/latest/developerguide/concepts.html#customer-cmk">customer managed key</a> per directory bucket's lifetime. The <a href="https://docs.aws.amazon.com/kms/latest/developerguide/concepts.html#aws-managed-cmk">Amazon Web Services managed key</a> (<code>aws/s3</code>) isn't supported. Incorrect key specification results in an HTTP <code>400 Bad Request</code> error.</p>
-    pub fn sse_kms_key_id(mut self, input: impl Into<String>) -> Self {
-        self.sse_kms_key_id = Some(input.into());
+    pub fn sse_kms_key_id(
+        mut self,
+        input: impl ::std::convert::Into<::std::string::String>,
+    ) -> Self {
+        self.sse_kms_key_id = ::std::option::Option::Some(input.into());
         self
     }
     /// <p>Specifies the KMS key ID (Key ID, Key ARN, or Key Alias) to use for object encryption. If the KMS key doesn't exist in the same account that's issuing the command, you must use the full Key ARN not the Key ID.</p>
     /// <p><b>General purpose buckets</b> - If you specify <code>x-amz-server-side-encryption</code> with <code>aws:kms</code> or <code>aws:kms:dsse</code>, this header specifies the ID (Key ID, Key ARN, or Key Alias) of the KMS key to use. If you specify <code>x-amz-server-side-encryption:aws:kms</code> or <code>x-amz-server-side-encryption:aws:kms:dsse</code>, but do not provide <code>x-amz-server-side-encryption-aws-kms-key-id</code>, Amazon S3 uses the Amazon Web Services managed key (<code>aws/s3</code>) to protect the data.</p>
     /// <p><b>Directory buckets</b> - To encrypt data using SSE-KMS, it's recommended to specify the <code>x-amz-server-side-encryption</code> header to <code>aws:kms</code>. Then, the <code>x-amz-server-side-encryption-aws-kms-key-id</code> header implicitly uses the bucket's default KMS customer managed key ID. If you want to explicitly set the <code> x-amz-server-side-encryption-aws-kms-key-id</code> header, it must match the bucket's default customer managed key (using key ID or ARN, not alias). Your SSE-KMS configuration can only support 1 <a href="https://docs.aws.amazon.com/kms/latest/developerguide/concepts.html#customer-cmk">customer managed key</a> per directory bucket's lifetime. The <a href="https://docs.aws.amazon.com/kms/latest/developerguide/concepts.html#aws-managed-cmk">Amazon Web Services managed key</a> (<code>aws/s3</code>) isn't supported. Incorrect key specification results in an HTTP <code>400 Bad Request</code> error.</p>
-    pub fn set_sse_kms_key_id(mut self, input: Option<::std::string::String>) -> Self {
+    pub fn set_sse_kms_key_id(
+        mut self,
+        input: ::std::option::Option<::std::string::String>,
+    ) -> Self {
         self.sse_kms_key_id = input;
         self
     }
     /// <p>Specifies the KMS key ID (Key ID, Key ARN, or Key Alias) to use for object encryption. If the KMS key doesn't exist in the same account that's issuing the command, you must use the full Key ARN not the Key ID.</p>
     /// <p><b>General purpose buckets</b> - If you specify <code>x-amz-server-side-encryption</code> with <code>aws:kms</code> or <code>aws:kms:dsse</code>, this header specifies the ID (Key ID, Key ARN, or Key Alias) of the KMS key to use. If you specify <code>x-amz-server-side-encryption:aws:kms</code> or <code>x-amz-server-side-encryption:aws:kms:dsse</code>, but do not provide <code>x-amz-server-side-encryption-aws-kms-key-id</code>, Amazon S3 uses the Amazon Web Services managed key (<code>aws/s3</code>) to protect the data.</p>
     /// <p><b>Directory buckets</b> - To encrypt data using SSE-KMS, it's recommended to specify the <code>x-amz-server-side-encryption</code> header to <code>aws:kms</code>. Then, the <code>x-amz-server-side-encryption-aws-kms-key-id</code> header implicitly uses the bucket's default KMS customer managed key ID. If you want to explicitly set the <code> x-amz-server-side-encryption-aws-kms-key-id</code> header, it must match the bucket's default customer managed key (using key ID or ARN, not alias). Your SSE-KMS configuration can only support 1 <a href="https://docs.aws.amazon.com/kms/latest/developerguide/concepts.html#customer-cmk">customer managed key</a> per directory bucket's lifetime. The <a href="https://docs.aws.amazon.com/kms/latest/developerguide/concepts.html#aws-managed-cmk">Amazon Web Services managed key</a> (<code>aws/s3</code>) isn't supported. Incorrect key specification results in an HTTP <code>400 Bad Request</code> error.</p>
-    pub fn get_sse_kms_key_id(&self) -> &Option<::std::string::String> {
+    pub fn get_sse_kms_key_id(&self) -> &::std::option::Option<::std::string::String> {
         &self.sse_kms_key_id
     }
     /// <p>Specifies the Amazon Web Services KMS Encryption Context as an additional encryption context to use for object encryption. The value of this header is a Base64 encoded string of a UTF-8 encoded JSON, which contains the encryption context as key-value pairs. This value is stored as object metadata and automatically gets passed on to Amazon Web Services KMS for future <code>GetObject</code> operations on this object.</p>
     /// <p><b>General purpose buckets</b> - This value must be explicitly added during <code>CopyObject</code> operations if you want an additional encryption context for your object. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/UsingKMSEncryption.html#encryption-context">Encryption context</a> in the <i>Amazon S3 User Guide</i>.</p>
     /// <p><b>Directory buckets</b> - You can optionally provide an explicit encryption context value. The value must match the default encryption context - the bucket Amazon Resource Name (ARN). An additional encryption context value is not supported.</p>
-    pub fn sse_kms_encryption_context(mut self, input: impl Into<String>) -> Self {
-        self.sse_kms_encryption_context = Some(input.into());
+    pub fn sse_kms_encryption_context(
+        mut self,
+        input: impl ::std::convert::Into<::std::string::String>,
+    ) -> Self {
+        self.sse_kms_encryption_context = ::std::option::Option::Some(input.into());
         self
     }
     /// <p>Specifies the Amazon Web Services KMS Encryption Context as an additional encryption context to use for object encryption. The value of this header is a Base64 encoded string of a UTF-8 encoded JSON, which contains the encryption context as key-value pairs. This value is stored as object metadata and automatically gets passed on to Amazon Web Services KMS for future <code>GetObject</code> operations on this object.</p>
     /// <p><b>General purpose buckets</b> - This value must be explicitly added during <code>CopyObject</code> operations if you want an additional encryption context for your object. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/UsingKMSEncryption.html#encryption-context">Encryption context</a> in the <i>Amazon S3 User Guide</i>.</p>
     /// <p><b>Directory buckets</b> - You can optionally provide an explicit encryption context value. The value must match the default encryption context - the bucket Amazon Resource Name (ARN). An additional encryption context value is not supported.</p>
-    pub fn set_sse_kms_encryption_context(mut self, input: Option<::std::string::String>) -> Self {
+    pub fn set_sse_kms_encryption_context(
+        mut self,
+        input: ::std::option::Option<::std::string::String>,
+    ) -> Self {
         self.sse_kms_encryption_context = input;
         self
     }
     /// <p>Specifies the Amazon Web Services KMS Encryption Context as an additional encryption context to use for object encryption. The value of this header is a Base64 encoded string of a UTF-8 encoded JSON, which contains the encryption context as key-value pairs. This value is stored as object metadata and automatically gets passed on to Amazon Web Services KMS for future <code>GetObject</code> operations on this object.</p>
     /// <p><b>General purpose buckets</b> - This value must be explicitly added during <code>CopyObject</code> operations if you want an additional encryption context for your object. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/UsingKMSEncryption.html#encryption-context">Encryption context</a> in the <i>Amazon S3 User Guide</i>.</p>
     /// <p><b>Directory buckets</b> - You can optionally provide an explicit encryption context value. The value must match the default encryption context - the bucket Amazon Resource Name (ARN). An additional encryption context value is not supported.</p>
-    pub fn get_sse_kms_encryption_context(&self) -> &Option<::std::string::String> {
+    pub fn get_sse_kms_encryption_context(&self) -> &::std::option::Option<::std::string::String> {
         &self.sse_kms_encryption_context
     }
     /// Consumes the builder and constructs a [`UploadInput`](crate::model::UploadInput).

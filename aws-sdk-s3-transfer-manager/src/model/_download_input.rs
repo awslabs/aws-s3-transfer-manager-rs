@@ -111,10 +111,10 @@ pub struct DownloadInput {
     pub checksum_mode: ::std::option::Option<crate::model::ChecksumMode>,
     /// How far this download may prefetch ahead of the consumer. `None` uses the client default from [`Config`](crate::config::Config); `Some` overrides it for this request.
     #[cfg(not(s3_tm_out_of_tree))]
-    pub read_ahead: Option<crate::types::ReadAhead>,
+    pub read_ahead: ::std::option::Option<crate::types::ReadAhead>,
     /// <p>Part number of the object being read. This is a positive integer between 1 and 10,000. Effectively performs a 'ranged' GET request for the part specified. Useful for downloading just a part of an object.</p>
     /// Caller-selected part downloads are not supported. Transfer discovery manages request part numbers.
-    pub part_number: Option<i32>,
+    pub part_number: ::std::option::Option<i32>,
 }
 impl DownloadInput {
     /// <p>The bucket name containing the object.</p>
@@ -295,20 +295,22 @@ impl ::std::fmt::Debug for DownloadInput {
         formatter.finish()
     }
 }
-impl DownloadInput {
+impl crate::model::DownloadInput {
     /// How far this download may prefetch ahead of the consumer. `None` uses the client default from [`Config`](crate::config::Config); `Some` overrides it for this request.
     #[cfg(not(s3_tm_out_of_tree))]
-    pub fn read_ahead(&self) -> Option<&crate::types::ReadAhead> {
+    pub fn read_ahead(&self) -> ::std::option::Option<&crate::types::ReadAhead> {
         self.read_ahead.as_ref()
     }
     /// <p>Part number of the object being read. This is a positive integer between 1 and 10,000. Effectively performs a 'ranged' GET request for the part specified. Useful for downloading just a part of an object.</p>
     /// Caller-selected part downloads are not supported. Transfer discovery manages request part numbers.
-    pub fn part_number(&self) -> Option<i32> {
+    pub fn part_number(&self) -> ::std::option::Option<i32> {
         self.part_number
     }
 }
-impl From<DownloadInput> for DownloadInputBuilder {
-    fn from(value: DownloadInput) -> Self {
+impl ::std::convert::From<crate::model::DownloadInput>
+    for crate::model::builders::DownloadInputBuilder
+{
+    fn from(value: crate::model::DownloadInput) -> Self {
         Self {
             bucket: value.bucket,
             if_match: value.if_match,
@@ -368,8 +370,8 @@ pub struct DownloadInputBuilder {
     pub(crate) expected_bucket_owner: ::std::option::Option<::std::string::String>,
     pub(crate) checksum_mode: ::std::option::Option<crate::model::ChecksumMode>,
     #[cfg(not(s3_tm_out_of_tree))]
-    pub(crate) read_ahead: Option<crate::types::ReadAhead>,
-    pub(crate) part_number: Option<i32>,
+    pub(crate) read_ahead: ::std::option::Option<crate::types::ReadAhead>,
+    pub(crate) part_number: ::std::option::Option<i32>,
 }
 impl DownloadInputBuilder {
     /// <p>The bucket name containing the object.</p>
@@ -929,38 +931,38 @@ impl DownloadInputBuilder {
     /// How far this download may prefetch ahead of the consumer. `None` uses the client default from [`Config`](crate::config::Config); `Some` overrides it for this request.
     #[cfg(not(s3_tm_out_of_tree))]
     pub fn read_ahead(mut self, input: crate::types::ReadAhead) -> Self {
-        self.read_ahead = Some(input);
+        self.read_ahead = ::std::option::Option::Some(input);
         self
     }
     /// How far this download may prefetch ahead of the consumer. `None` uses the client default from [`Config`](crate::config::Config); `Some` overrides it for this request.
     #[cfg(not(s3_tm_out_of_tree))]
-    pub fn set_read_ahead(mut self, input: Option<crate::types::ReadAhead>) -> Self {
+    pub fn set_read_ahead(mut self, input: ::std::option::Option<crate::types::ReadAhead>) -> Self {
         self.read_ahead = input;
         self
     }
     /// How far this download may prefetch ahead of the consumer. `None` uses the client default from [`Config`](crate::config::Config); `Some` overrides it for this request.
     #[cfg(not(s3_tm_out_of_tree))]
-    pub fn get_read_ahead(&self) -> &Option<crate::types::ReadAhead> {
+    pub fn get_read_ahead(&self) -> &::std::option::Option<crate::types::ReadAhead> {
         &self.read_ahead
     }
     /// <p>Part number of the object being read. This is a positive integer between 1 and 10,000. Effectively performs a 'ranged' GET request for the part specified. Useful for downloading just a part of an object.</p>
     /// Caller-selected part downloads are not supported. Transfer discovery manages request part numbers.
     #[allow(dead_code)]
     pub(crate) fn part_number(mut self, input: i32) -> Self {
-        self.part_number = Some(input);
+        self.part_number = ::std::option::Option::Some(input);
         self
     }
     /// <p>Part number of the object being read. This is a positive integer between 1 and 10,000. Effectively performs a 'ranged' GET request for the part specified. Useful for downloading just a part of an object.</p>
     /// Caller-selected part downloads are not supported. Transfer discovery manages request part numbers.
     #[allow(dead_code)]
-    pub(crate) fn set_part_number(mut self, input: Option<i32>) -> Self {
+    pub(crate) fn set_part_number(mut self, input: ::std::option::Option<i32>) -> Self {
         self.part_number = input;
         self
     }
     /// <p>Part number of the object being read. This is a positive integer between 1 and 10,000. Effectively performs a 'ranged' GET request for the part specified. Useful for downloading just a part of an object.</p>
     /// Caller-selected part downloads are not supported. Transfer discovery manages request part numbers.
     #[allow(dead_code)]
-    pub(crate) fn get_part_number(&self) -> &Option<i32> {
+    pub(crate) fn get_part_number(&self) -> &::std::option::Option<i32> {
         &self.part_number
     }
     /// Consumes the builder and constructs a [`DownloadInput`](crate::model::DownloadInput).

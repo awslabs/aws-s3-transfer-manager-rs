@@ -16,14 +16,15 @@ import software.amazon.smithy.rust.codegen.core.rustlang.asOptional
 import software.amazon.smithy.rust.codegen.core.rustlang.deprecatedShape
 import software.amazon.smithy.rust.codegen.core.rustlang.documentShape
 import software.amazon.smithy.rust.codegen.core.rustlang.docs
-import software.amazon.smithy.rust.codegen.core.rustlang.render
 import software.amazon.smithy.rust.codegen.core.rustlang.rust
 import software.amazon.smithy.rust.codegen.core.rustlang.rustBlock
 import software.amazon.smithy.rust.codegen.core.rustlang.stripOuter
 import software.amazon.smithy.rust.codegen.core.smithy.RustCrate
 import software.amazon.smithy.rust.codegen.core.smithy.RustSymbolProvider
+import software.amazon.smithy.rust.codegen.core.smithy.RuntimeType
 import software.amazon.smithy.rust.codegen.core.smithy.generators.getterName
 import software.amazon.smithy.rust.codegen.core.smithy.generators.setterName
+import software.amazon.smithy.rust.codegen.core.smithy.mapRustType
 import software.amazon.smithy.rust.codegen.core.smithy.rustType
 
 /** Delegates modeled field methods to value builders; execution remains in the TM wrapper. */
@@ -31,8 +32,14 @@ import software.amazon.smithy.rust.codegen.core.smithy.rustType
 // independently of its client/execution wrapper, so this renderer can use it directly.
 object FluentBuilderGenerator {
     fun render(crate: RustCrate, model: Model, symbols: RustSymbolProvider, policy: MemberPolicy) {
-        render(crate, model, symbols, policy, TmModelProjection.id("PutObjectRequest"), "upload", "Upload")
-        render(crate, model, symbols, policy, TmModelProjection.id("GetObjectRequest"), "download", "Download")
+        render(
+            crate, model, symbols, policy, TmModelProjection.id("PutObjectRequest"),
+            "upload", "Upload", TmRuntimeTypes.uploadFluentBuilder,
+        )
+        render(
+            crate, model, symbols, policy, TmModelProjection.id("GetObjectRequest"),
+            "download", "Download", TmRuntimeTypes.downloadFluentBuilder,
+        )
     }
 
     private fun render(
@@ -43,6 +50,7 @@ object FluentBuilderGenerator {
         input: ShapeId,
         operation: String,
         name: String,
+        fluentBuilder: RuntimeType,
     ) {
         val shape = model.expectShape(input, StructureShape::class.java)
         val module = RustModule.new(
@@ -51,7 +59,7 @@ object FluentBuilderGenerator {
             documentationOverride = "$name fluent field delegation.",
         )
         crate.withModule(module) {
-            rustBlock("impl crate::operation::$operation::builders::${name}FluentBuilder") {
+            rustBlock("impl #T", fluentBuilder) {
                 shape.members().forEach { member ->
                     format(symbols.toSymbol(member))
                     val name = symbols.toMemberName(member)
@@ -106,8 +114,11 @@ object FluentBuilderGenerator {
                         rust("self.inner = self.inner.$setter(${input.value}); self")
                     }
                     val getter = member.getterName()
+                    val getterSymbol = symbols.toSymbol(member).mapRustType {
+                        RustType.Reference(null, it.asOptional())
+                    }
                     docs()
-                    rustBlock("pub fn $getter(&self) -> &${outer.asOptional().render(true)}") {
+                    rustBlock("pub fn $getter(&self) -> #T", getterSymbol) {
                         rust("self.inner.$getter()")
                     }
                 }
@@ -116,19 +127,18 @@ object FluentBuilderGenerator {
                     fun docs() {
                         with(policy) { fieldDocs(field) }
                     }
-                    val string = field.coreType in setOf("String", "::std::string::String")
-                    val argument = if (string) "impl Into<String>" else field.coreType
-                    val value = if (string) "input.into()" else "input"
+                    format(field.coreSymbol)
+                    val input = field.argument
                     docs()
-                    rustBlock("pub fn $name(mut self, input: $argument) -> Self") {
-                        rust("self.inner = self.inner.$name($value); self")
+                    rustBlock("pub fn $name(mut self, ${input.argument}) -> Self") {
+                        rust("self.inner = self.inner.$name(${input.value}); self")
                     }
                     docs()
-                    rustBlock("pub fn set_$name(mut self, input: Option<${field.coreType}>) -> Self") {
+                    rustBlock("pub fn set_$name(mut self, input: #T) -> Self", field.builderSymbol) {
                         rust("self.inner = self.inner.set_$name(input); self")
                     }
                     docs()
-                    rustBlock("pub fn get_$name(&self) -> &Option<${field.coreType}>") {
+                    rustBlock("pub fn get_$name(&self) -> #T", field.builderGetterSymbol) {
                         rust("self.inner.get_$name()")
                     }
                 }

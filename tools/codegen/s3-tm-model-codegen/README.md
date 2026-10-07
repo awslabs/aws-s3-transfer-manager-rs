@@ -146,7 +146,10 @@ generators, and client-compatible infallible enum generator. Required
 input fields are checked at builder construction while retaining their optional
 field representation. Timestamps use `aws_smithy_types::DateTime`; enum strings,
 other defaults, sensitivity, and documentation follow the modeled traits.
-Structure and builder customizations share `MemberPolicy.kt`.
+Structure and builder customizations share `MemberPolicy.kt`, retaining typed
+symbols for fields, accessors, and builder methods. `TmRuntimeTypes.kt` defines
+references to handwritten TM types; optional and borrowed forms use smithy-rs's
+type helpers.
 
 TM-owned references use `#[cfg(not(s3_tm_out_of_tree))]` consistently for fields,
 methods, construction, validation, and Debug. The standalone crate's generated

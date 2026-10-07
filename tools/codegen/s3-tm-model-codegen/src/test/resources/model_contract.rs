@@ -135,6 +135,21 @@ fn metadata_has_maps_timestamps_and_no_response_body() {
 }
 
 #[test]
+fn metadata_defaults_have_no_service_values() {
+    let object = ObjectMetadata::default();
+    let chunk = ChunkMetadata::default();
+    assert_eq!(object, ObjectMetadata::builder().build());
+    assert_eq!(chunk, ChunkMetadata::builder().build());
+    assert_eq!(object.delete_marker(), None);
+    assert_eq!(object.bucket_key_enabled(), None);
+    assert_eq!(object.missing_meta(), None);
+    assert_eq!(object.request_id(), None);
+    assert_eq!(object.extended_request_id(), None);
+    assert_eq!(chunk.content_length(), None);
+    assert_eq!(chunk.request_id(), None);
+}
+
+#[test]
 fn upload_values_compile_without_tm_runtime_and_validate_required_members() {
     assert!(UploadInput::builder().build().is_err());
     assert!(UploadInput::builder().bucket("bucket").build().is_err());

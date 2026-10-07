@@ -114,7 +114,7 @@ class SdkV1Mapping(val projection: TmModelProjection.Result, val symbols: SdkV1S
         require(reviewIssues.isEmpty()) { "Upload mapping requires review:\n${reviewIssues.sorted().joinToString("\n")}" }
         values.forEach { shape -> valueMembers(shape).forEach { coverage[it.sdk.id.toString()] = "value: ${it.tm.id}" } }
         symbols.policy.fields.forEach { (shape, fields) ->
-            fields.filter { it.runtime != null }.forEach { coverage["$shape\$${it.name}"] = "TM-only: ${it.runtime!!.path}" }
+            fields.filter { it.runtime != null }.forEach { coverage["$shape\$${it.name}"] = "TM-only: ${it.runtime!!.type.path}" }
         }
         projection.excludedMembers.forEach { (member, reason) -> coverage.putIfAbsent(member.toString(), "excluded: $reason") }
     }

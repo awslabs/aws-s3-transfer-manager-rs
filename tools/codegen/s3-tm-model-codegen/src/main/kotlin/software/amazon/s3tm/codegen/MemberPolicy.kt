@@ -5,6 +5,7 @@
 package software.amazon.s3tm.codegen
 
 import software.amazon.s3tm.codegen.customizations.RequestIdExt
+import software.amazon.smithy.codegen.core.Symbol
 import software.amazon.smithy.model.Model
 import software.amazon.smithy.model.node.Node
 import software.amazon.smithy.model.node.ObjectNode
@@ -15,27 +16,36 @@ import software.amazon.smithy.model.traits.SensitiveTrait
 import software.amazon.smithy.rust.codegen.core.rustlang.RustType
 import software.amazon.smithy.rust.codegen.core.rustlang.RustWriter
 import software.amazon.smithy.rust.codegen.core.rustlang.Writable
+import software.amazon.smithy.rust.codegen.core.rustlang.asArgument
+import software.amazon.smithy.rust.codegen.core.rustlang.asDeref
+import software.amazon.smithy.rust.codegen.core.rustlang.asRef
 import software.amazon.smithy.rust.codegen.core.rustlang.documentShape
 import software.amazon.smithy.rust.codegen.core.rustlang.deprecatedShape
 import software.amazon.smithy.rust.codegen.core.rustlang.docs
+import software.amazon.smithy.rust.codegen.core.rustlang.isCopy
+import software.amazon.smithy.rust.codegen.core.rustlang.isDeref
 import software.amazon.smithy.rust.codegen.core.rustlang.render
 import software.amazon.smithy.rust.codegen.core.rustlang.rust
 import software.amazon.smithy.rust.codegen.core.rustlang.rustBlock
+import software.amazon.smithy.rust.codegen.core.rustlang.stripOuter
 import software.amazon.smithy.rust.codegen.core.rustlang.writable
 import software.amazon.smithy.rust.codegen.core.smithy.RustSymbolProvider
+import software.amazon.smithy.rust.codegen.core.smithy.RuntimeType
 import software.amazon.smithy.rust.codegen.core.smithy.generators.BuilderCustomization
 import software.amazon.smithy.rust.codegen.core.smithy.generators.BuilderSection
 import software.amazon.smithy.rust.codegen.core.smithy.generators.StructureCustomization
 import software.amazon.smithy.rust.codegen.core.smithy.generators.StructureSection
+import software.amazon.smithy.rust.codegen.core.smithy.makeOptional
+import software.amazon.smithy.rust.codegen.core.smithy.mapRustType
 import software.amazon.smithy.rust.codegen.core.smithy.rustType
 
 /** A single member policy supplies both structure and builder customizations. */
 class MemberPolicy(private val source: Model, private val sourceSymbols: RustSymbolProvider) {
-    data class RuntimeMapping(val path: String, val clone: Boolean, val partialEq: Boolean)
+    data class RuntimeMapping(val type: RuntimeType, val clone: Boolean, val partialEq: Boolean)
     enum class Construction { OPTIONAL, DEFAULT, REQUIRED }
     data class Field(
         val name: String,
-        val coreType: String,
+        val coreSymbol: Symbol,
         val construction: Construction = Construction.OPTIONAL,
         val runtime: RuntimeMapping? = null,
         val visibility: String = "pub",
@@ -45,27 +55,61 @@ class MemberPolicy(private val source: Model, private val sourceSymbols: RustSym
         val builderVisibility: String? = null,
         val debug: Boolean = true,
     ) {
-        val type: String get() = if (construction == Construction.OPTIONAL) "Option<$coreType>" else coreType
+        val valueSymbol: Symbol
+            get() = if (construction == Construction.OPTIONAL) coreSymbol.makeOptional() else coreSymbol
+        val builderSymbol: Symbol get() = coreSymbol.makeOptional()
+        val builderGetterSymbol: Symbol
+            get() = builderSymbol.mapRustType { RustType.Reference(null, it) }
+        val argument get() = coreSymbol.rustType().asArgument("input")
         val gated: Boolean get() = runtime != null
         val methodVisibility: String get() = builderVisibility ?: if (visibility == "pub") "pub" else "pub(crate)"
+
+        data class Accessor(val symbol: Symbol, val expression: String)
+
+        /** Follow StructureGenerator's borrowed/copy accessors, including flattened vectors. */
+        val valueAccessor: Accessor
+            get() {
+                val type = valueSymbol.rustType()
+                val flatten = type is RustType.Option && type.member is RustType.Vec
+                val returnType = when {
+                    flatten -> type.stripOuter<RustType.Option>().asDeref().asRef()
+                    type.isCopy() -> type
+                    type is RustType.Option && type.member.isDeref() -> type.asDeref()
+                    type.isDeref() -> type.asDeref().asRef()
+                    else -> type.asRef()
+                }
+                val value = when {
+                    type.isCopy() -> "self.$name"
+                    type is RustType.Option && type.member.isDeref() -> "self.$name.as_deref()"
+                    type is RustType.Option -> "self.$name.as_ref()"
+                    type.isDeref() -> "::std::ops::Deref::deref(&self.$name)"
+                    else -> "&self.$name"
+                }
+                return Accessor(
+                    valueSymbol.mapRustType { returnType },
+                    value + if (flatten) ".unwrap_or_default()" else "",
+                )
+            }
     }
 
-    private val inputStream = RuntimeMapping("crate::io::InputStream", clone = false, partialEq = false)
-    private val readAhead = RuntimeMapping("crate::types::ReadAhead", clone = true, partialEq = true)
-    private val checksum = RuntimeMapping("crate::operation::upload::ChecksumStrategy", clone = true, partialEq = false)
-    private val failedUpload = RuntimeMapping("crate::types::FailedMultipartUploadPolicy", clone = true, partialEq = false)
-    private val metrics = RuntimeMapping("crate::types::TransferMetrics", clone = true, partialEq = false)
+    private val inputStream = RuntimeMapping(TmRuntimeTypes.inputStream, clone = false, partialEq = false)
+    private val readAhead = RuntimeMapping(TmRuntimeTypes.readAhead, clone = true, partialEq = true)
+    private val checksum = RuntimeMapping(TmRuntimeTypes.checksumStrategy, clone = true, partialEq = false)
+    private val failedUpload = RuntimeMapping(TmRuntimeTypes.failedMultipartUploadPolicy, clone = true, partialEq = false)
+    private val metrics = RuntimeMapping(TmRuntimeTypes.transferMetrics, clone = true, partialEq = false)
 
     private fun runtime(name: String, mapping: RuntimeMapping, construction: Construction, documentation: String) =
-        Field(name, mapping.path, construction, mapping, documentation = documentation)
+        Field(name, mapping.type.toSymbol(), construction, mapping, documentation = documentation)
 
     private fun modeled(member: MemberShape, name: String, visibility: String = "pub"): Field {
         val symbol = sourceSymbols.toSymbol(member)
-        val core = symbol.rustType().let { if (it is RustType.Option) it.member else it }
         require(symbol.rustType() is RustType.Option) {
             "Custom modeled member ${member.id} changed nullability; review its construction policy"
         }
-        return Field(name, core.render(), visibility = visibility, sourceMember = member)
+        return Field(
+            name, symbol.mapRustType { it.stripOuter<RustType.Option>() },
+            visibility = visibility, sourceMember = member,
+        )
     }
 
     val fields: Map<ShapeId, List<Field>> = buildMap {
@@ -143,7 +187,7 @@ class MemberPolicy(private val source: Model, private val sourceSymbols: RustSym
         fields.toSortedMap().forEach { (shape, additions) ->
             additions.sortedBy { it.name }.forEach { field ->
                 val item = Node.objectNodeBuilder()
-                    .withMember("rustType", field.type)
+                    .withMember("rustType", field.valueSymbol.rustType().render())
                     .withMember("construction", field.construction.name.lowercase())
                     .withMember("visibility", field.visibility.ifEmpty { "private" })
                     .withMember("builderVisibility", field.methodVisibility)
@@ -184,7 +228,6 @@ class MemberPolicy(private val source: Model, private val sourceSymbols: RustSym
 
     internal fun RustWriter.fieldDocs(field: Field) {
         if (field.sourceMember != null) {
-            if (field.runtime == null) format(sourceSymbols.toSymbol(field.sourceMember))
             documentShape(field.sourceMember, source)
             deprecatedShape(field.sourceMember)
             if (field.runtime == null && field.documentation.isNotEmpty()) docs(field.documentation)
@@ -213,46 +256,35 @@ class MemberPolicy(private val source: Model, private val sourceSymbols: RustSym
                 is StructureSection.AdditionalFields -> additions.forEach { field ->
                     fieldDocs(field)
                     condition(field)
-                    rust("${field.visibility} ${field.name}: ${field.type},")
+                    rust("${field.visibility} ${field.name}: #T,", field.valueSymbol)
                 }
                 is StructureSection.AdditionalDebugFields -> additions.forEach { debug(it, section.formatterName, section.shape) }
                 is StructureSection.AdditionalTraitImpls -> if (additions.isNotEmpty()) {
-                    rustBlock("impl ${section.structName}") {
+                    rustBlock("impl #T", sourceSymbols.toSymbol(section.shape)) {
                         additions.forEach { field ->
                             fieldDocs(field)
                             condition(field)
-                            val optional = field.construction == Construction.OPTIONAL
-                            val copy = field.coreType in setOf("i64", "i32", "bool")
-                            val string = field.coreType in setOf("String", "::std::string::String")
-                            val returnType = when {
-                                optional && copy -> field.type
-                                optional && string -> "Option<&str>"
-                                optional -> "Option<&${field.coreType}>"
-                                else -> "&${field.coreType}"
-                            }
+                            val getter = field.valueAccessor
                             val visibility = if (field.visibility == "pub(crate)") "pub(crate)" else "pub"
                             if (visibility == "pub(crate)") rust("##[allow(dead_code)]")
-                            rustBlock("$visibility fn ${field.accessor}(&self) -> $returnType") {
-                                rust(when {
-                                    optional && copy -> "self.${field.name}"
-                                    optional && string -> "self.${field.name}.as_deref()"
-                                    optional -> "self.${field.name}.as_ref()"
-                                    else -> "&self.${field.name}"
-                                })
+                            rustBlock("$visibility fn ${field.accessor}(&self) -> #T", getter.symbol) {
+                                rust(getter.expression)
                             }
                         }
                         additions.filter { it.runtime == inputStream }.forEach { field ->
                             docs("Takes the upload stream, leaving an empty stream in its place.")
                             condition(field)
                             rust("##[allow(dead_code)]")
-                            rustBlock("pub(crate) fn take_${field.name}(&mut self) -> ${field.coreType}") {
-                                rust("std::mem::take(&mut self.${field.name})")
+                            rustBlock("pub(crate) fn take_${field.name}(&mut self) -> #T", field.coreSymbol) {
+                                rust("#T(&mut self.${field.name})", RuntimeType.std.resolve("mem::take"))
                             }
                         }
                     }
                     if (section.shape.id == TmModelProjection.id("GetObjectRequest")) {
-                        rustBlock("impl From<${section.structName}> for ${section.structName}Builder") {
-                            rustBlock("fn from(value: ${section.structName}) -> Self") {
+                        val value = sourceSymbols.toSymbol(section.shape)
+                        val builder = sourceSymbols.symbolForBuilder(section.shape)
+                        rustBlock("impl #T<#T> for #T", RuntimeType.From, value, builder) {
+                            rustBlock("fn from(value: #T) -> Self", value) {
                                 rust("Self {")
                                 section.shape.members().forEach {
                                     val name = sourceSymbols.toMemberName(it)
@@ -277,7 +309,7 @@ class MemberPolicy(private val source: Model, private val sourceSymbols: RustSym
             when (section) {
                 is BuilderSection.AdditionalFields -> additions.forEach { field ->
                     condition(field)
-                    rust("pub(crate) ${field.name}: Option<${field.coreType}>,")
+                    rust("pub(crate) ${field.name}: #T,", field.builderSymbol)
                 }
                 is BuilderSection.AdditionalDebugFields -> additions.forEach { debug(it, section.formatterName, section.shape) }
                 is BuilderSection.AdditionalFieldsInBuild -> additions.forEach { field ->
@@ -293,23 +325,22 @@ class MemberPolicy(private val source: Model, private val sourceSymbols: RustSym
                     val name = field.name.removePrefix("_")
                     fieldDocs(field)
                     condition(field)
-                    val string = field.coreType in setOf("String", "::std::string::String")
-                    val argument = if (string) "impl Into<String>" else field.coreType
-                    val value = if (string) "input.into()" else "input"
+                    format(field.coreSymbol)
+                    val input = field.argument
                     if (field.methodVisibility != "pub") rust("##[allow(dead_code)]")
-                    rustBlock("${field.methodVisibility} fn $name(mut self, input: $argument) -> Self") {
-                        rust("self.${field.name} = Some($value); self")
+                    rustBlock("${field.methodVisibility} fn $name(mut self, ${input.argument}) -> Self") {
+                        rust("self.${field.name} = #T(${input.value}); self", RuntimeType.Option.resolve("Some"))
                     }
                     fieldDocs(field)
                     condition(field)
                     if (field.methodVisibility != "pub") rust("##[allow(dead_code)]")
-                    rustBlock("${field.methodVisibility} fn set_$name(mut self, input: Option<${field.coreType}>) -> Self") {
+                    rustBlock("${field.methodVisibility} fn set_$name(mut self, input: #T) -> Self", field.builderSymbol) {
                         rust("self.${field.name} = input; self")
                     }
                     fieldDocs(field)
                     condition(field)
                     if (field.methodVisibility != "pub") rust("##[allow(dead_code)]")
-                    rustBlock("${field.methodVisibility} fn get_$name(&self) -> &Option<${field.coreType}>") {
+                    rustBlock("${field.methodVisibility} fn get_$name(&self) -> #T", field.builderGetterSymbol) {
                         rust("&self.${field.name}")
                     }
                 }

@@ -8,6 +8,7 @@ import java.nio.file.Files
 import java.nio.file.Path
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import software.amazon.s3tm.codegen.ModelGenerator
@@ -28,9 +29,13 @@ class DownloadMetadataTest {
         val generated = ModelGenerator.generate(TmModelProjection.project(source()), temporary, "1.6.3")
         for ((name, file) in listOf("ObjectMetadata" to "_object_metadata.rs", "ChunkMetadata" to "_chunk_metadata.rs")) {
             val rust = Files.readString(generated.baseDir.resolve("src/model/$file"))
-            assertTrue(rust.contains("impl ::std::default::Default for $name"))
-            assertTrue(rust.contains("Self::builder().build()"))
+            assertTrue(Regex("""#\[derive\([^\]]*::std::default::Default[^\]]*\)\]\s*pub struct $name""")
+                .containsMatchIn(rust))
+            assertFalse(rust.contains("impl ::std::default::Default for $name"))
         }
+        val owner = Files.readString(generated.baseDir.resolve("src/model/_owner.rs"))
+        assertFalse(Regex("""#\[derive\([^\]]*::std::default::Default[^\]]*\)\]\s*pub struct Owner""")
+            .containsMatchIn(owner))
     }
 
     @Test

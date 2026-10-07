@@ -158,6 +158,12 @@ structure HeadObjectOutput with [ResponseMetadata] {
 }
 @mixin
 structure ResponseMetadata {
+    @default(false)
+    DeleteMarker: Boolean
+    @default(false)
+    BucketKeyEnabled: Boolean
+    @default(0)
+    MissingMeta: Integer
     LastModified: Timestamp
     ContentLength: Long
     ETag: String

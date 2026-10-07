@@ -558,12 +558,12 @@ impl crate::operation::download::builders::DownloadFluentBuilder {
         self
     }
     /// How far this download may prefetch ahead of the consumer. `None` uses the client default from [`Config`](crate::config::Config); `Some` overrides it for this request.
-    pub fn set_read_ahead(mut self, input: Option<crate::types::ReadAhead>) -> Self {
+    pub fn set_read_ahead(mut self, input: ::std::option::Option<crate::types::ReadAhead>) -> Self {
         self.inner = self.inner.set_read_ahead(input);
         self
     }
     /// How far this download may prefetch ahead of the consumer. `None` uses the client default from [`Config`](crate::config::Config); `Some` overrides it for this request.
-    pub fn get_read_ahead(&self) -> &Option<crate::types::ReadAhead> {
+    pub fn get_read_ahead(&self) -> &::std::option::Option<crate::types::ReadAhead> {
         self.inner.get_read_ahead()
     }
 }

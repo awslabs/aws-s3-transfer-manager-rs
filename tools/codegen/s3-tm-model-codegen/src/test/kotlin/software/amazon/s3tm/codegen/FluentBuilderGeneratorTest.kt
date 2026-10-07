@@ -160,10 +160,6 @@ class FluentBuilderGeneratorTest {
             }
         }
         return source.substring(start, end)
-            .replace("::std::option::Option", "Option")
-            .replace("::std::string::String", "String")
-            .replace("::std::vec::Vec", "Vec")
-            .replace("::std::convert::Into", "Into")
             .replace(Regex("""\s+"""), "")
     }
 }

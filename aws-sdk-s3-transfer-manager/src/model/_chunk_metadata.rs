@@ -2,7 +2,7 @@
 
 /// Metadata from an individual GET response used to download a chunk. Optional fields remain absent when that response does not return them. Content length and range describe this response, which may cover only part of the object. Reported checksums do not by themselves indicate that the delivered bytes were checksum-validated.
 #[non_exhaustive]
-#[derive(::std::clone::Clone, ::std::cmp::PartialEq)]
+#[derive(::std::clone::Clone, ::std::cmp::PartialEq, ::std::default::Default)]
 pub struct ChunkMetadata {
     /// <p>Indicates that a range of bytes was specified in the request.</p>
     pub accept_ranges: ::std::option::Option<::std::string::String>,
@@ -131,9 +131,9 @@ pub struct ChunkMetadata {
     /// <p>The date and time at which the object is no longer cacheable.</p>
     pub expires_string: ::std::option::Option<::std::string::String>,
     /// S3 request ID.
-    _request_id: Option<::std::string::String>,
+    _request_id: ::std::option::Option<::std::string::String>,
     /// S3 extended request ID.
-    _extended_request_id: Option<::std::string::String>,
+    _extended_request_id: ::std::option::Option<::std::string::String>,
 }
 impl ChunkMetadata {
     /// <p>Indicates that a range of bytes was specified in the request.</p>
@@ -410,19 +410,14 @@ impl ::std::fmt::Debug for ChunkMetadata {
         formatter.finish()
     }
 }
-impl ChunkMetadata {
+impl crate::model::ChunkMetadata {
     /// S3 request ID.
-    pub fn request_id(&self) -> Option<&str> {
+    pub fn request_id(&self) -> ::std::option::Option<&str> {
         self._request_id.as_deref()
     }
     /// S3 extended request ID.
-    pub fn extended_request_id(&self) -> Option<&str> {
+    pub fn extended_request_id(&self) -> ::std::option::Option<&str> {
         self._extended_request_id.as_deref()
-    }
-}
-impl ::std::default::Default for ChunkMetadata {
-    fn default() -> Self {
-        Self::builder().build()
     }
 }
 impl ChunkMetadata {
@@ -481,8 +476,8 @@ pub struct ChunkMetadataBuilder {
     pub(crate) version_id: ::std::option::Option<::std::string::String>,
     pub(crate) website_redirect_location: ::std::option::Option<::std::string::String>,
     pub(crate) expires_string: ::std::option::Option<::std::string::String>,
-    pub(crate) _request_id: Option<::std::string::String>,
-    pub(crate) _extended_request_id: Option<::std::string::String>,
+    pub(crate) _request_id: ::std::option::Option<::std::string::String>,
+    pub(crate) _extended_request_id: ::std::option::Option<::std::string::String>,
 }
 impl ChunkMetadataBuilder {
     /// <p>Indicates that a range of bytes was specified in the request.</p>
@@ -1369,36 +1364,48 @@ impl ChunkMetadataBuilder {
     }
     /// S3 request ID.
     #[allow(dead_code)]
-    pub(crate) fn request_id(mut self, input: impl Into<String>) -> Self {
-        self._request_id = Some(input.into());
+    pub(crate) fn request_id(
+        mut self,
+        input: impl ::std::convert::Into<::std::string::String>,
+    ) -> Self {
+        self._request_id = ::std::option::Option::Some(input.into());
         self
     }
     /// S3 request ID.
     #[allow(dead_code)]
-    pub(crate) fn set_request_id(mut self, input: Option<::std::string::String>) -> Self {
+    pub(crate) fn set_request_id(
+        mut self,
+        input: ::std::option::Option<::std::string::String>,
+    ) -> Self {
         self._request_id = input;
         self
     }
     /// S3 request ID.
     #[allow(dead_code)]
-    pub(crate) fn get_request_id(&self) -> &Option<::std::string::String> {
+    pub(crate) fn get_request_id(&self) -> &::std::option::Option<::std::string::String> {
         &self._request_id
     }
     /// S3 extended request ID.
     #[allow(dead_code)]
-    pub(crate) fn extended_request_id(mut self, input: impl Into<String>) -> Self {
-        self._extended_request_id = Some(input.into());
+    pub(crate) fn extended_request_id(
+        mut self,
+        input: impl ::std::convert::Into<::std::string::String>,
+    ) -> Self {
+        self._extended_request_id = ::std::option::Option::Some(input.into());
         self
     }
     /// S3 extended request ID.
     #[allow(dead_code)]
-    pub(crate) fn set_extended_request_id(mut self, input: Option<::std::string::String>) -> Self {
+    pub(crate) fn set_extended_request_id(
+        mut self,
+        input: ::std::option::Option<::std::string::String>,
+    ) -> Self {
         self._extended_request_id = input;
         self
     }
     /// S3 extended request ID.
     #[allow(dead_code)]
-    pub(crate) fn get_extended_request_id(&self) -> &Option<::std::string::String> {
+    pub(crate) fn get_extended_request_id(&self) -> &::std::option::Option<::std::string::String> {
         &self._extended_request_id
     }
     /// Consumes the builder and constructs a [`ChunkMetadata`](crate::model::ChunkMetadata).

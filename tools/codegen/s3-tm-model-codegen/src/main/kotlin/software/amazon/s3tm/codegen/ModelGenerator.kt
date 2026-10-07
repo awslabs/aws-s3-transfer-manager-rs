@@ -125,7 +125,8 @@ object ModelGenerator {
                     if (mappings.any { !it.clone }) add(RuntimeType.Clone)
                     if (mappings.any { !it.partialEq }) add(RuntimeType.PartialEq)
                 }
-                return symbol.toBuilder().meta(symbol.expectRustMetadata().withoutDerives(*remove.toTypedArray())).build()
+                val metadata = symbol.expectRustMetadata().withoutDerives(*remove.toTypedArray())
+                return symbol.toBuilder().meta(DownloadMetadata.metadata(shape, metadata)).build()
             }
         }
         val manifest = FileManifest.create(output)
@@ -155,7 +156,7 @@ object ModelGenerator {
                 shape is StructureShape -> {
                     crate.inPrivateModuleWithReexport(privateModule, symbols.toSymbol(shape)) {
                         StructureGenerator(
-                            model, symbols, this, shape, listOf(policy.structureCustomization(), DownloadMetadata()), StructSettings(true),
+                            model, symbols, this, shape, listOf(policy.structureCustomization()), StructSettings(true),
                         ).render()
                         implBlock(symbols.toSymbol(shape)) {
                             BuilderGenerator.renderConvenienceMethod(this, symbols, shape)
