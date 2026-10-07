@@ -422,21 +422,15 @@ pub enum Outcome {
 
 /// One fact about one entry.
 ///
-/// `parent` says which operation an event belongs to. `None` means *this event is the
-/// operation you called* — so what that implies depends on which one you called, and reading
-/// it as "not a real entry" is wrong.
-///
-/// For [`upload`](crate::Client::upload) or [`download`](crate::Client::download), the single
-/// event with `parent: None` **is** the file. For
-/// [`upload_objects`](crate::Client::upload_objects) or
-/// [`download_objects`](crate::Client::download_objects), it is the root — its endpoints are
-/// the source directory and the key prefix, not a file and a key — and every child carries
+/// `parent: None` marks the operation the caller invoked. For
+/// [`upload`](crate::Client::upload) or [`download`](crate::Client::download) that event is
+/// the file itself; for [`upload_objects`](crate::Client::upload_objects) or
+/// [`download_objects`](crate::Client::download_objects) it is the directory, whose endpoints
+/// are a source directory and a key prefix, and every object under it carries
 /// `parent: Some(root_id)`.
 ///
-/// So a consumer acting per entry — deleting each source once its upload succeeds — skips the
-/// `parent: None` event **only for the directory operations**, where acting on it would act on
-/// the whole tree. Skipping it unconditionally is wrong: it drops every single-file transfer,
-/// whose sole event is the one with no parent.
+/// A consumer acting per file should therefore skip the `parent: None` event for the
+/// directory operations only — skipping it always drops every single-file transfer.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum TransferEvent {
@@ -557,24 +551,12 @@ pub const MAX_CAPACITY: usize = usize::MAX >> 3;
 
 /// Create a sink/stream pair. The caller owns the stream and drains it.
 ///
-/// # Capacity
+/// Delivery is bounded and lossy: a transfer never waits on the consumer, so a stream that
+/// is drained slowly — or not at all — misses events once `capacity` is full.
+/// [`TransferEventStream::dropped`] counts what was lost. Size `capacity` against how far
+/// behind the consumer may fall.
 ///
-/// Bounded and lossy: a caller that reads slowly misses events and the run does not
-/// slow down waiting. `capacity` is therefore a pure lossiness dial — nothing is
-/// reserved and no event is owed — so size it against how far behind the consumer
-/// may fall, not against the transfer manager's concurrency, and read
-/// [`TransferEventStream::dropped`] for what it cost.
-///
-/// A stream that is never drained is the same case: undrained slots are occupied
-/// slots, and every event after the first `capacity` of them is counted and
-/// discarded.
-///
-/// Capacities above [`MAX_CAPACITY`] are clamped to it rather than panicking. The
-/// underlying channel asserts a ceiling of `usize::MAX >> 3` on its permit count, and
-/// `NonZeroUsize` only excludes the floor -- so every value this signature accepts above
-/// that ceiling would abort the caller's process on a dial whose documented meaning is
-/// "how far behind the consumer may fall". Clamping loses nothing: no consumer falls
-/// `usize::MAX >> 3` events behind.
+/// Capacities above [`MAX_CAPACITY`] are clamped to it rather than panicking.
 pub fn channel(capacity: NonZeroUsize) -> (TransferEventSink, TransferEventStream) {
     let (tx, rx) = tokio::sync::mpsc::channel(capacity.get().min(MAX_CAPACITY));
     let dropped = Arc::new(AtomicU64::new(0));
@@ -619,9 +601,7 @@ struct Outlet {
 /// Registration endpoint. Cheap to clone; every clone feeds the same stream or streams.
 ///
 /// A sink carries one or more outlets. [`channel`] produces one; [`merge`](Self::merge)
-/// combines sinks so a single registration feeds several independent consumers — which is
-/// what lets a client-level sink and a request-level sink both receive every event instead
-/// of one silently replacing the other.
+/// combines sinks so a single registration feeds several independent consumers.
 #[derive(Debug, Clone)]
 pub struct TransferEventSink {
     outlets: Arc<[Outlet]>,

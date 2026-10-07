@@ -290,21 +290,14 @@ impl TransferStatus {
 
 /// Snapshot of transfer progress and IO metrics.
 ///
-/// The four byte counters are four views of the *same* payload, not four addends. A
-/// file-backed upload of an 8 MiB object records 8 MiB as `disk_read` and 8 MiB again as
-/// `network_tx`, so summing them reports 200% against [`total_bytes`](Self::total_bytes).
+/// The four byte counters are four views of the same payload, not four addends: a
+/// file-backed upload records its bytes as both `disk_read` and `network_tx`.
 ///
-/// To draw a bar, take the one counter that matches the direction:
-///
-/// | Direction | Numerator | Why not the other |
-/// |---|---|---|
-/// | Upload | `network_tx` | `disk_read` runs ahead of it — bytes are read into memory before they are sent, so a bar on `disk_read` reaches 100% while the last parts are still in flight |
-/// | Download | `network_rx` | `disk_write` lags it, and is 0 for a download whose body the caller reads itself instead of writing to a path |
-///
-/// A directory operation aggregates its children into the same four counters, so the same
-/// rule picks its numerator. `total_bytes` is the denominator for both; prefer
-/// [`TransferView::byte_total`] where you need to distinguish a total that is still
-/// growing from one that is final.
+/// Draw progress from the counter matching the direction — `network_tx` for an upload,
+/// `network_rx` for a download — against [`total_bytes`](Self::total_bytes). A directory
+/// operation aggregates its children into the same four counters, so the same rule applies.
+/// Prefer [`TransferView::byte_total`] where a still-growing total must be told from a final
+/// one.
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub struct TransferMetrics {
@@ -400,9 +393,8 @@ impl TransferView {
     /// Always [`Total::Unknown`] for a single-object transfer, which is one entry and
     /// is itself the thing being counted.
     ///
-    /// Sealed by the same enumeration-complete fact as [`byte_total`](Self::byte_total), so
-    /// the two denominators agree about whether listing finished and one cannot be `Final`
-    /// while the other is still `Provisional`.
+    /// Becomes `Final` with [`byte_total`](Self::byte_total), so one is never `Final` while
+    /// the other is still `Provisional`.
     pub fn entry_total(&self) -> Total {
         self.metrics.entry_total()
     }

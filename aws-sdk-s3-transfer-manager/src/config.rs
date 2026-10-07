@@ -402,22 +402,15 @@ impl Builder {
     /// Report [events](crate::events) from this client's `upload` and `download` operations
     /// to `sink`.
     ///
-    /// A sink set here is merged with any sink set on an individual request, so both
-    /// consumers see every event. Calling this twice adds a second consumer rather than
-    /// replacing the first.
+    /// Merged with any sink set on an individual request, so both see every event, and
+    /// calling this twice adds a second consumer rather than replacing the first. Each keeps
+    /// its own capacity and [`dropped`](crate::events::TransferEventStream::dropped) count.
     ///
-    /// Each consumer keeps its own capacity and its own
-    /// [`dropped`](crate::events::TransferEventStream::dropped) count, so a slow
-    /// client-level consumer cannot cost a request-level one any events.
-    ///
-    /// # The stream does not end with an operation
-    ///
-    /// A sink registered here is held by the client, so its stream stays open for as long as
-    /// the client does — more operations may still arrive on it. A drain loop written as
-    /// `while let Some(ev) = stream.next().await` therefore never returns, where the same loop
-    /// over a *request*-level stream ends when that operation does. Read a client-level stream
-    /// with [`try_next`](crate::events::TransferEventStream::try_next) and your own stopping
-    /// condition, or drop the client when you are finished with it.
+    /// The client holds this sink, so its stream stays open for the life of the client and
+    /// `while let Some(ev) = stream.next().await` never returns — unlike the same loop over a
+    /// request-level stream. Drain it with
+    /// [`try_next`](crate::events::TransferEventStream::try_next) and your own stopping
+    /// condition, or drop the client.
     pub fn events(mut self, sink: crate::events::TransferEventSink) -> Self {
         // `upload_objects` and `download_objects` do not report yet, so a client-level sink
         // registered before one of those runs stays open and receives nothing.
