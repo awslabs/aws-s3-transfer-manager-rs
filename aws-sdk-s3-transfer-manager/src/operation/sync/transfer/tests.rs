@@ -14,6 +14,7 @@ use crate::io::walk::{FsWalk, S3Walk};
 use crate::operation::sync::modes::Mode;
 use crate::operation::sync::walk::{LocalAndBucket, Walker};
 
+use super::child::*;
 use super::delete::*;
 use super::test_util::*;
 use super::*;
