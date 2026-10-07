@@ -1186,8 +1186,7 @@ impl Transfer for UploadTransfer {
     fn on_terminal(&self) {
         // Both effects are one-shot and both read the status: `report_terminal` claims
         // `claim_terminal_report`, and the event's outcome comes from `terminal_outcome()`.
-        // `UploadState::Done` is published one statement ahead of `set_completed` (:951),
-        // so a caller can arrive here while the status is still `Active`, and spending
+        // A caller can arrive here while the status is still `Active`, and spending
         // either one-shot on it cannot be taken back -- the report would render nothing
         // and the event would say `Cancelled` about an upload that succeeded.
         if self.inner.ctx.is_active() {

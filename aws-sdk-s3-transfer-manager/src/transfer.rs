@@ -168,11 +168,6 @@ pub(crate) struct TransferId {
 
 impl std::fmt::Display for TransferId {
     /// `parent/child`, or just the id for a root.
-    ///
-    /// Parent first, so a `tid` sorts and reads outside-in like a path, and the two numbers
-    /// are not transposable by eye. The separator is `/` and not `-` because `-` already
-    /// means a byte range throughout this crate (`bytes 1024-2047/4096`), so `7-3` reads as
-    /// a range, or as subtraction, rather than as a parent link.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.parent {
             Some(parent) => write!(f, "{}/{}", parent, self.id),
@@ -486,26 +481,20 @@ pub(crate) struct MetricsState {
     /// confirmed success.
     ///
     /// Exists because `network_rx` is recorded once per *part*, so a single-part transfer
-    /// moves 0 → done with nothing in between — and at the 5 MiB download default that is
-    /// most of a small-file workload, which is exactly where a per-file progress line is
-    /// read. This counter moves during the body read, so a consumer has a numerator that
-    /// advances inside a part.
+    /// moves 0 → done with nothing in between, and at the 5 MiB download default most
+    /// small-file transfers are single-part. This counter moves during the body read.
     ///
-    /// **Monotonic and never decremented, which is what makes it correct under
-    /// cancellation.** The alternative — add on read, subtract on confirm-or-fail — cannot
-    /// be made leak-free here: both body-read sites run inside a `retry::retry` closure with
-    /// hedging enabled, so the losing attempt's future is *dropped* mid-read and no release
-    /// path on it ever runs. Every dropped hedge would strand its partial bytes in the
-    /// counter, and the strand rolls up to the parent, so a directory transfer would report
-    /// phantom in-flight bytes that never clear.
+    /// Monotonic and never decremented. Add-on-read / subtract-on-confirm cannot be made
+    /// leak-free here: both body-read sites run inside a `retry::retry` closure with hedging
+    /// enabled, so a losing attempt's future is dropped mid-read and no release path on it
+    /// ever runs, stranding its partial bytes in the counter and in the parent's rollup.
     ///
-    /// The cost of that choice: a retried or hedged attempt's partial bytes are counted and
-    /// never removed, so this can exceed the payload actually received, and after a retry it
-    /// can exceed `total_bytes`. It is an optimistic numerator for smoothing, never an
-    /// accounting figure — `network_rx` remains the exact one.
+    /// The cost: a retried or hedged attempt's partial bytes are counted and never removed,
+    /// so this can exceed the payload actually received, and after a retry it can exceed
+    /// `total_bytes`. `network_rx` remains the exact counter.
     bytes_streamed: AtomicU64,
     /// Why this transfer produced no work on its most recent poll, as a
-    /// [`StallReason`](crate::types::StallReason) discriminant; 0 for "not stalled".
+    /// [`PendingReason`](crate::types::PendingReason) discriminant; 0 for "not parked".
     ///
     /// Not rolled up to the parent, unlike every byte counter here: a composite's own poll
     /// parks for its own reasons, and inheriting a child's reason would report a directory as
@@ -516,7 +505,7 @@ pub(crate) struct MetricsState {
     /// `Arc<MetricsState>` and carries nothing else, and because the wake flag's `pending` bit
     /// is consumed by a destructive swap — a reader that peeked at it would race the
     /// scheduler's wake.
-    stall: AtomicU8,
+    pending_reason: AtomicU8,
     /// Running sum of the payload sizes of the entries enumerated so far, for a
     /// composite; always 0 for a leaf, which learns its total in one piece.
     ///
@@ -548,6 +537,11 @@ pub(crate) struct MetricsState {
 }
 
 impl MetricsState {
+    /// Root of a rollup chain, rolling up into nothing.
+    pub(crate) fn new() -> Self {
+        Self::with_parent(None)
+    }
+
     /// Root of a rollup chain, or a link in one.
     ///
     /// `Arc` and not `Weak`: `MetricsState` holds only counters and timestamps, with no
@@ -564,7 +558,7 @@ impl MetricsState {
             disk_read: AtomicU64::new(0),
             disk_write: AtomicU64::new(0),
             bytes_streamed: AtomicU64::new(0),
-            stall: AtomicU8::new(0),
+            pending_reason: AtomicU8::new(0),
             discovered_bytes: AtomicU64::new(0),
             discovered_entries: AtomicU64::new(0),
             settled_entries: AtomicU64::new(0),
@@ -626,26 +620,26 @@ impl MetricsState {
     /// Written on every poll by the operation's `poll_work` — cleared at entry, set again if
     /// that poll parks — so the value describes the most recent poll and cannot go stale while
     /// the transfer is running.
-    pub(crate) fn set_stall(&self, reason: Option<crate::types::StallReason>) {
-        use crate::types::StallReason as R;
+    pub(crate) fn set_pending_reason(&self, reason: Option<crate::types::PendingReason>) {
+        use crate::types::PendingReason as R;
         let code = match reason {
             None => 0u8,
             Some(R::ReadAheadWindow {}) => 1,
             Some(R::MemoryBudget {}) => 2,
-            Some(R::PendingDiscovery {}) => 3,
-            Some(R::AwaitingCompletion {}) => 4,
+            Some(R::Discovery {}) => 3,
+            Some(R::WorkInFlight {}) => 4,
         };
-        self.stall.store(code, Ordering::Relaxed);
+        self.pending_reason.store(code, Ordering::Relaxed);
     }
 
     /// Why this transfer last produced no work, if it did not.
-    pub(crate) fn stall_reason(&self) -> Option<crate::types::StallReason> {
-        use crate::types::StallReason as R;
-        match self.stall.load(Ordering::Relaxed) {
+    pub(crate) fn pending_reason(&self) -> Option<crate::types::PendingReason> {
+        use crate::types::PendingReason as R;
+        match self.pending_reason.load(Ordering::Relaxed) {
             1 => Some(R::ReadAheadWindow {}),
             2 => Some(R::MemoryBudget {}),
-            3 => Some(R::PendingDiscovery {}),
-            4 => Some(R::AwaitingCompletion {}),
+            3 => Some(R::Discovery {}),
+            4 => Some(R::WorkInFlight {}),
             _ => None,
         }
     }
@@ -678,33 +672,33 @@ impl MetricsState {
     /// `MetricsState` and cannot contradict each other. A seal landing between the two
     /// loads can only make this reading conservative — a `Provisional` equal to the value
     /// that just became final — never an overstatement.
-    pub(crate) fn byte_total(&self) -> crate::types::ByteTotal {
-        use crate::types::ByteTotal;
+    pub(crate) fn byte_total(&self) -> crate::types::Total {
+        use crate::types::Total;
         if let Some(n) = self.total_bytes.get().copied() {
-            return ByteTotal::Final(n);
+            return Total::Final(n);
         }
         match self.discovered_bytes.load(Ordering::Relaxed) {
-            0 => ByteTotal::Unknown,
-            n => ByteTotal::Provisional(n),
+            0 => Total::Unknown,
+            n => Total::Provisional(n),
         }
     }
 
     /// This transfer's entry denominator. Same three states and same ordering rule as
     /// [`byte_total`](Self::byte_total), reading the pair sealed by the same call.
-    pub(crate) fn entry_total(&self) -> crate::types::EntryTotal {
-        use crate::types::EntryTotal;
+    pub(crate) fn entry_total(&self) -> crate::types::Total {
+        use crate::types::Total;
         if let Some(n) = self.total_entries.get().copied() {
-            return EntryTotal::Final(n);
+            return Total::Final(n);
         }
         match self.discovered_entries.load(Ordering::Relaxed) {
-            0 => EntryTotal::Unknown,
-            n => EntryTotal::Provisional(n),
+            0 => Total::Unknown,
+            n => Total::Provisional(n),
         }
     }
 
     /// Mark the transfer as finished. No-op if already set.
     ///
-    /// Clears the stall reason here rather than on each terminal path, because `poll_work`
+    /// Clears the pending reason here rather than on each terminal path, because `poll_work`
     /// is the only other place that clears it and it returns early on `!is_active()` -- so a
     /// transfer that parked and then went terminal would report the reason it last parked on
     /// for the rest of its life. A consumer polling the view would read
@@ -712,7 +706,7 @@ impl MetricsState {
     /// failed. Every winning terminal CAS reaches this, so one clear covers them all.
     pub(crate) fn set_finished(&self) {
         let _ = self.finished_at.set(std::time::Instant::now());
-        self.set_stall(None);
+        self.set_pending_reason(None);
     }
 
     /// Claims the single terminal tracing record for this transfer.
@@ -1011,7 +1005,7 @@ impl TransferContext {
     /// Create a new transfer context.
     /// Returns the context and a receiver for terminal state notification.
     pub(crate) fn new(handle: Arc<crate::client::Handle>) -> (Self, StateMachineTerminalReceiver) {
-        Self::new_inner(handle, next_transfer_id(), None)
+        Self::new_inner(handle, next_transfer_id(), Arc::new(MetricsState::new()))
     }
 
     /// Returns a context + receiver for a child transfer of `parent`, linked by id and by
@@ -1032,13 +1026,17 @@ impl TransferContext {
     ) -> (Self, StateMachineTerminalReceiver) {
         let mut id = next_transfer_id();
         id.parent = Some(parent.id.id);
-        Self::new_inner(handle, id, Some(parent.metrics.clone()))
+        Self::new_inner(
+            handle,
+            id,
+            Arc::new(MetricsState::with_parent(Some(parent.metrics.clone()))),
+        )
     }
 
     fn new_inner(
         handle: Arc<crate::client::Handle>,
         id: TransferId,
-        parent_metrics: Option<Arc<MetricsState>>,
+        metrics: Arc<MetricsState>,
     ) -> (Self, StateMachineTerminalReceiver) {
         let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
         let diagnostics = handle.config.diagnostics().transfer();
@@ -1047,7 +1045,7 @@ impl TransferContext {
             .then(|| Arc::new(TransferPendingState::new(diagnostics.events_enabled())));
         let ctx = Self {
             id,
-            metrics: Arc::new(MetricsState::with_parent(parent_metrics)),
+            metrics,
             handle,
             status: StateMachineStatus::new(),
             error: Arc::new(crate::runtime::sync::Mutex::new(None)),
@@ -1065,7 +1063,7 @@ impl TransferContext {
         id: TransferId,
         handle: Arc<crate::client::Handle>,
     ) -> (Self, StateMachineTerminalReceiver) {
-        Self::new_inner(handle, id, None)
+        Self::new_inner(handle, id, Arc::new(MetricsState::new()))
     }
 
     /// Record that `poll_work` is about to return `Pending`.
@@ -1279,26 +1277,21 @@ impl TransferContext {
 
     /// The event outcome this transfer's terminal state implies.
     ///
-    /// Derived here, from one read of the status and one of the error, rather than
-    /// written as a literal at each emit site. An emit site that names its own outcome
-    /// has to re-derive the mapping, and a site that guards on "not active" has already
-    /// lost the distinction it needs: `Failed` and `Cancelled` are both inactive, so a
-    /// literal `Cancelled` reports a transfer that broke as one the caller stopped —
-    /// and since a cancellation carries no cause, it reports nothing at all about why.
-    /// A consumer branching `Failed => retry or alert` against
-    /// `Cancelled => the user stopped it, do nothing` then takes the wrong arm on every
-    /// failure.
+    /// Derived here rather than written as a literal at each emit site, because `Failed`
+    /// and `Cancelled` are both inactive: a site that guards on "not active" and then
+    /// names its own outcome reports a transfer that broke as one the caller stopped, and
+    /// a consumer branching `Failed => retry` against `Cancelled => do nothing` takes the
+    /// wrong arm on every failure.
     ///
-    /// Taking no status or error argument is the point: no caller can pass a pair that
-    /// disagrees.
+    /// Takes the status and nothing else, so no caller can pass a status and an error that
+    /// disagree, and so reading the error does not take it from `join()` —
+    /// [`crate::events::Outcome::Failed`] carries no payload, and a consumer that needs
+    /// the error reads it from the handle.
     ///
-    /// Derived from the status alone, and deliberately: reading the error would take
-    /// it from `join()`, so [`crate::events::Outcome::Failed`] carries no payload and
-    /// a consumer that needs the error reads it from the handle.
-    ///
-    /// A still-`Active` transfer reports `Cancelled`. Every caller is on a terminal
-    /// path, so `Active` means the status transition lost its race to another terminal
-    /// site, and that site emits the outcome it set.
+    /// A still-`Active` transfer reports `Cancelled`, which is wrong for one that is about
+    /// to succeed. A published status is therefore a precondition, not something this
+    /// derives around: every caller guards on `!is_active()` first. The terminal report
+    /// and the `Ended` event are both one-shot, so a wrong outcome cannot be corrected.
     pub(crate) fn terminal_outcome(&self) -> crate::events::Outcome {
         match self.transfer_status() {
             crate::types::TransferStatus::Completed => crate::events::Outcome::Succeeded {},
@@ -1410,8 +1403,8 @@ impl TransferContext {
     }
 
     /// Record why this transfer produced no work on this poll, or clear it with `None`.
-    pub(crate) fn set_stall(&self, reason: Option<crate::types::StallReason>) {
-        self.metrics.set_stall(reason);
+    pub(crate) fn set_pending_reason(&self, reason: Option<crate::types::PendingReason>) {
+        self.metrics.set_pending_reason(reason);
     }
 
     /// Record one request in the transfer aggregate.
@@ -2049,7 +2042,7 @@ mod tests {
                 disk_write: 4 * n,
             };
 
-            let parent = Arc::new(MetricsState::with_parent(None));
+            let parent = Arc::new(MetricsState::new());
             let child_a = MetricsState::with_parent(Some(parent.clone()));
             let child_b = MetricsState::with_parent(Some(parent.clone()));
 
@@ -2074,7 +2067,7 @@ mod tests {
         #[cfg_attr(miri, ignore)]
         #[test]
         fn record_io_rolls_up_through_more_than_one_level() {
-            let root = Arc::new(MetricsState::with_parent(None));
+            let root = Arc::new(MetricsState::new());
             let mid = Arc::new(MetricsState::with_parent(Some(root.clone())));
             let leaf = MetricsState::with_parent(Some(mid.clone()));
 
@@ -2096,7 +2089,7 @@ mod tests {
         #[cfg_attr(miri, ignore)]
         #[test]
         fn rollup_does_not_propagate_total_bytes_or_finished_at() {
-            let parent = Arc::new(MetricsState::with_parent(None));
+            let parent = Arc::new(MetricsState::new());
             let child = MetricsState::with_parent(Some(parent.clone()));
 
             child.set_total_bytes(999);
@@ -2124,18 +2117,18 @@ mod tests {
         #[cfg_attr(miri, ignore)]
         #[test]
         fn discovered_bytes_do_not_roll_up() {
-            let parent = Arc::new(MetricsState::with_parent(None));
+            let parent = Arc::new(MetricsState::new());
             let child = MetricsState::with_parent(Some(parent.clone()));
 
             child.add_discovered(7, 1);
 
-            assert_eq!(crate::types::ByteTotal::Provisional(7), child.byte_total());
-            assert_eq!(crate::types::ByteTotal::Unknown, parent.byte_total());
+            assert_eq!(crate::types::Total::Provisional(7), child.byte_total());
+            assert_eq!(crate::types::Total::Unknown, parent.byte_total());
         }
 
         /// A leaf reports `Unknown` forever: it is one entry, not a set of them.
         ///
-        /// `EntryTotal::Provisional(1)` would be worse than `Unknown` here — it would invite
+        /// `Total::Provisional(1)` would be worse than `Unknown` here — it would invite
         /// a caller to draw a one-entry progress bar that is either 0% or 100%.
         #[cfg_attr(miri, ignore)]
         #[test]
@@ -2145,9 +2138,9 @@ mod tests {
             ctx.set_total_bytes(512);
 
             let view = ctx.view();
-            assert_eq!(crate::types::ByteTotal::Final(512), view.byte_total());
+            assert_eq!(crate::types::Total::Final(512), view.byte_total());
             assert_eq!(
-                crate::types::EntryTotal::Unknown,
+                crate::types::Total::Unknown,
                 view.entry_total(),
                 "a single-object transfer enumerates nothing"
             );
@@ -2176,7 +2169,7 @@ mod tests {
             drop(ctx);
 
             assert_eq!(11, view.metrics().network_tx);
-            assert_eq!(crate::types::ByteTotal::Final(11), view.byte_total());
+            assert_eq!(crate::types::Total::Final(11), view.byte_total());
         }
     }
 }

@@ -20,6 +20,11 @@ pub(crate) enum DownloadPendingReason {
     RangeCompletion,
 }
 
+/// Both views of a park are projected from this one enum, so a site names its reason
+/// once and the two cannot disagree. They are not interchangeable:
+/// [`PendingCause`] carries a direction-specific label for aggregate diagnostics and is
+/// finer than the reported reason -- `range_completion` and a `part_completion` on the
+/// upload side are both [`crate::types::PendingReason::WorkInFlight`] to a caller.
 impl From<DownloadPendingReason> for PendingCause {
     fn from(reason: DownloadPendingReason) -> Self {
         match reason {
@@ -33,19 +38,13 @@ impl From<DownloadPendingReason> for PendingCause {
     }
 }
 
-impl From<DownloadPendingReason> for crate::types::StallReason {
-    /// The public name for the same cause the aggregate diagnostics record.
-    ///
-    /// Derived rather than set alongside, so a park site names its cause once. Two
-    /// vocabularies set independently drift: a site that records one and forgets the
-    /// other leaves a consumer reading "no reason" on a transfer that is demonstrably
-    /// parked, and nothing fails to compile.
+impl From<DownloadPendingReason> for crate::types::PendingReason {
     fn from(reason: DownloadPendingReason) -> Self {
         match reason {
-            DownloadPendingReason::Discovery => Self::PendingDiscovery {},
+            DownloadPendingReason::Discovery => Self::Discovery {},
             DownloadPendingReason::ReadAhead => Self::ReadAheadWindow {},
             DownloadPendingReason::MemoryAdmission => Self::MemoryBudget {},
-            DownloadPendingReason::RangeCompletion => Self::AwaitingCompletion {},
+            DownloadPendingReason::RangeCompletion => Self::WorkInFlight {},
         }
     }
 }

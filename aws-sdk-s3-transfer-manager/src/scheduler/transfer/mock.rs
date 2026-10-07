@@ -1349,15 +1349,11 @@ impl MockStateMachine for FusedReadySpawnedMock {
 /// and publishing its terminal status: `poll_work` returns `Done` while
 /// `ctx.transfer_status()` is still `Active`, and the status lands afterwards.
 ///
-/// `DownloadTransfer` has exactly this shape — `decrement_in_flight` assigns
-/// `DownloadState::Terminal` under the state lock
-/// (`operation/download/transfer.rs:1282`) and `ctx.set_completed()` does not run
-/// until after `writer.finalize()` and the rename in `commit_destination`
-/// (`operation/download/transfer.rs:1313-1346`) — as does `UploadTransfer`, where
-/// `*state = UploadState::Done` precedes `set_completed()`
-/// (`operation/upload/transfer.rs:948-949`). `on_terminal` records the status it was
-/// handed, which is what the scheduler's Done arm (`scheduler/scheduler.rs:804`)
-/// feeds to `terminal_outcome()`.
+/// `DownloadTransfer` has exactly this shape: `decrement_in_flight` assigns
+/// `DownloadState::Terminal` under the state lock, and `ctx.set_completed()` does not run
+/// until after `writer.finalize()` and the rename in `commit_destination`. `on_terminal`
+/// records the status it was handed, which is what the scheduler's Done arm feeds to
+/// `terminal_outcome()`.
 pub(crate) struct DoneWhileActiveMock {
     ctx: TransferContext,
     /// What `on_terminal` observed, or `None` if it was never called.
@@ -1366,7 +1362,7 @@ pub(crate) struct DoneWhileActiveMock {
 
 /// The status `on_terminal` read, and the `Outcome` label `terminal_outcome()` derived
 /// from it — the exact value `DownloadTransfer::on_terminal` hands to
-/// `TransferLifecycle::finish` (`operation/download/transfer.rs:1475`).
+/// `TransferLifecycle::finish`.
 pub(crate) type ObservedTerminal =
     Arc<std::sync::Mutex<Option<(crate::types::TransferStatus, &'static str)>>>;
 
@@ -1398,8 +1394,7 @@ impl Transfer for DoneWhileActiveMock {
 
     fn poll_work(&self) -> PollWork {
         // No status transition here, exactly like the download's
-        // `DownloadState::Terminal => PollWork::Done` arm
-        // (`operation/download/transfer.rs:539`).
+        // `DownloadState::Terminal => PollWork::Done` arm.
         PollWork::Done
     }
 

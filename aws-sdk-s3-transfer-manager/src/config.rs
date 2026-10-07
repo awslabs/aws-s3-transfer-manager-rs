@@ -402,15 +402,9 @@ impl Builder {
     /// Report [events](crate::events) from this client's `upload` and `download` operations
     /// to `sink`.
     ///
-    /// `upload_objects` and `download_objects` do not report yet. A client-level sink
-    /// registered before one of those runs stays open and receives nothing, which reads like
-    /// a hang rather than an unwired operation -- so until they are wired, prefer a
-    /// request-level sink on the operations that do report.
-    ///
-    /// The client level of the SEP's *"a list of progress listeners on both client level
-    /// and request level"*. A sink set here is merged with any sink set on an individual
-    /// request, so both consumers see every event; and calling this twice adds a second
-    /// consumer rather than replacing the first.
+    /// A sink set here is merged with any sink set on an individual request, so both
+    /// consumers see every event. Calling this twice adds a second consumer rather than
+    /// replacing the first.
     ///
     /// Each consumer keeps its own capacity and its own
     /// [`dropped`](crate::events::TransferEventStream::dropped) count, so a slow
@@ -425,6 +419,8 @@ impl Builder {
     /// with [`try_next`](crate::events::TransferEventStream::try_next) and your own stopping
     /// condition, or drop the client when you are finished with it.
     pub fn events(mut self, sink: crate::events::TransferEventSink) -> Self {
+        // `upload_objects` and `download_objects` do not report yet, so a client-level sink
+        // registered before one of those runs stays open and receives nothing.
         self.events = Some(match self.events.take() {
             Some(existing) => existing.merge(sink),
             None => sink,

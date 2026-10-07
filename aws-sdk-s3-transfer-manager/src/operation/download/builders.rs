@@ -25,8 +25,8 @@ impl DownloadFluentBuilder {
 
     /// Report lifecycle events for this transfer to `sink`.
     ///
-    /// Registered on the builder rather than the handle because orchestration
-    /// dispatches work before the handle exists.
+    /// Merged with any sink set on the client, and calling this twice adds a second
+    /// consumer rather than replacing the first.
     pub fn events(mut self, sink: crate::events::TransferEventSink) -> Self {
         // Appends rather than replaces, so every registered consumer sees every event: the
         // SEP asks for "a list of progress listeners", and a replacing setter would make a
@@ -80,7 +80,7 @@ impl DownloadFluentBuilder {
                 crate::operation::download::EventRegistration {
                     sink,
                     destination: crate::events::Endpoint::Local {
-                        path: std::sync::Arc::from(path.as_path()),
+                        path: Some(std::sync::Arc::from(path.as_path())),
                     },
                 }
             });
@@ -116,16 +116,14 @@ impl DownloadFluentBuilder {
         file: std::fs::File,
     ) -> Result<ManagedDownloadHandle, crate::error::Error> {
         let input = self.inner.build()?;
-        // The destination is `Stream`, not `Local`: the caller opened the file and this
-        // method is never told its path, so naming one would put an address in the event
-        // that the transfer manager cannot know. `Unresolved` would be wrong the other way
-        // -- it means "could not be determined", where here there is a real sink the caller
-        // already holds.
+        // `Local { path: None }`: the caller opened the file and this method is never told
+        // its path, so naming one would put an address in the event that the transfer
+        // manager cannot know.
         let events =
             crate::events::resolve_sink(self.handle.config.events(), self.events).map(|sink| {
                 crate::operation::download::EventRegistration {
                     sink,
-                    destination: crate::events::Endpoint::Stream {},
+                    destination: crate::events::Endpoint::Local { path: None },
                 }
             });
         crate::operation::download::Download::orchestrate_to_file(self.handle, input, file, events)

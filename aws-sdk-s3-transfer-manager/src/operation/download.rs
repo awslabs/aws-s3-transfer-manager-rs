@@ -92,8 +92,7 @@ impl Download {
         events.map(|reg| {
             Arc::new(crate::events::TransferLifecycle::new(
                 reg.sink,
-                ctx.id.id,
-                None,
+                ctx.id,
                 crate::events::TransferRef::download(
                     crate::events::Endpoint::S3 {
                         bucket: Arc::from(input.bucket().unwrap_or_default()),

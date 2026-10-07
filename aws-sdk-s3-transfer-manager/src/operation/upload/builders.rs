@@ -28,9 +28,8 @@ impl UploadFluentBuilder {
 
     /// Report lifecycle events for this transfer to `sink`.
     ///
-    /// Registered on the builder rather than the handle because orchestration
-    /// dispatches work before the handle exists, so a handle-side registration
-    /// could miss the transfer's own start.
+    /// Merged with any sink set on the client, and calling this twice adds a second
+    /// consumer rather than replacing the first.
     pub fn events(mut self, sink: crate::events::TransferEventSink) -> Self {
         // Appends rather than replaces, so every registered consumer sees every event: the
         // SEP asks for "a list of progress listeners", and a replacing setter would make a

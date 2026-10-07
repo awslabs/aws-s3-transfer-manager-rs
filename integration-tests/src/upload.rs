@@ -33,7 +33,7 @@ async fn setup() -> MockTm {
 #[tokio::test]
 async fn test_upload_single_object_entry_points_all_report_events() {
     use aws_sdk_s3_transfer_manager::events::TransferEvent;
-    use aws_sdk_s3_transfer_manager::types::ByteTotal;
+    use aws_sdk_s3_transfer_manager::types::Total;
     use std::time::Duration;
 
     #[derive(Debug)]
@@ -104,7 +104,7 @@ async fn test_upload_single_object_entry_points_all_report_events() {
         assert_eq!(1, settled, "{variant:?}: and exactly one Ended");
         let view = view.unwrap_or_else(|| panic!("{variant:?}: a real transfer owes a view"));
         assert_eq!(
-            ByteTotal::Final(size as u64),
+            Total::Final(size as u64),
             view.byte_total(),
             "{variant:?}: a known-length body gives the leaf a final total up front"
         );
@@ -120,10 +120,9 @@ async fn test_upload_single_object_entry_points_all_report_events() {
 
 /// A successful empty-object upload must still be observable as having moved zero bytes.
 ///
-/// The SEP makes progress being reported *"at least once for a successful transfer"* a MUST,
-/// and it does not condition that on the count being non-zero. An empty object is a successful
-/// transfer: S3 accepts a zero-length PUT, and `aws s3 sync` of a tree containing an empty file
-/// must not report that file as never having been acted on.
+/// Progress must be reported at least once for a successful transfer, whatever the count. An
+/// empty object is a successful transfer: S3 accepts a zero-length PUT, and `aws s3 sync` of a
+/// tree containing an empty file must not report that file as never having been acted on.
 ///
 /// What this rules out: a 0-byte entry that a consumer cannot distinguish from one that never
 /// started. The evidence has to be readable rather than inferable — a bar drawn from
@@ -133,7 +132,7 @@ async fn test_upload_single_object_entry_points_all_report_events() {
 #[tokio::test]
 async fn test_upload_empty_object_is_observable_as_zero_bytes() {
     use aws_sdk_s3_transfer_manager::events::{Outcome, TransferEvent};
-    use aws_sdk_s3_transfer_manager::types::ByteTotal;
+    use aws_sdk_s3_transfer_manager::types::Total;
     use std::time::Duration;
 
     let m = setup().await;
@@ -192,7 +191,7 @@ async fn test_upload_empty_object_is_observable_as_zero_bytes() {
         "an empty body moves no payload bytes"
     );
     assert_eq!(
-        ByteTotal::Final(0),
+        Total::Final(0),
         view.byte_total(),
         "the reading must be *reported*, not merely absent -- `Final(0)` is what \
          distinguishes a transfer that moved nothing from one whose total is still unknown"
@@ -325,7 +324,7 @@ async fn test_upload_verify_data_integrity() {
 
 /// The drain loop `config.rs` documents for a *request*-level stream must terminate.
 ///
-/// `Config::Builder::events` (config.rs:413-420) contrasts the two registration levels: a
+/// `Config::Builder::events` contrasts the two registration levels: a
 /// client-level stream "stays open for as long as the client does", so
 /// `while let Some(ev) = stream.next().await` "never returns", "where the same loop over a
 /// *request*-level stream ends when that operation does". This pins that second clause, which
@@ -408,15 +407,14 @@ async fn test_request_level_event_stream_ends_with_the_operation() {
     );
     assert!(
         phase1.is_ok(),
-        "config.rs:417-418 says a request-level stream's `while let Some(ev) = \
+        "`Config::Builder::events` says a request-level stream's `while let Some(ev) = \
          stream.next().await` ends when the operation does. It does not: the upload reached a \
          successful terminal, {seen} events were delivered, and then the loop hung -- so a \
          caller rendering events in that loop never reaches the `join()` that the doc assumes \
          comes after it. Controls: after join() consumed the handle the same loop {}; after \
          drop(client) it {}. A request-level sink's Sender therefore outlives the operation, \
-         the handle and the client, which is what docs/design/transfer-events.md:363-365 says \
-         must not happen (\"a stored sink would hold a stream open past the operation that \
-         created it\").",
+         the handle and the client, which docs/design/transfer-events.md says must not happen \
+         (\"a stored sink would hold a stream open past the operation that created it\").",
         ended(&phase2),
         ended(&phase3)
     );

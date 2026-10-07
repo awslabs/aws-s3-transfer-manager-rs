@@ -795,20 +795,17 @@ impl Scheduler {
                             "poll_work.done",
                         );
                         claim.release();
-                        // Symmetric with the cancel (:404) and panic (:514) paths.
-                        // `on_terminal` is a defaulted trait method, so this is
-                        // additive for every operation that ignores it; the two that
-                        // implement it both want it on a normal completion as well.
-                        // Called before the descriptor is removed, so the transfer is
-                        // still reachable, and outside any state guard.
+                        // Symmetric with the cancel and panic paths. `on_terminal` is a
+                        // defaulted trait method, so this is additive for every operation
+                        // that ignores it. Called before the descriptor is removed, so the
+                        // transfer is still reachable, and outside any state guard.
                         //
                         // Conditional, because `Done` and a published status are two
                         // different facts. A transfer answers `Done` off its own terminal
-                        // state, and both operations claim that state before the status:
-                        // download's `decrement_in_flight` claims it under the state lock
-                        // and `set_completed` does not run until the tail flush and the
-                        // rename are done; upload's is one statement earlier
-                        // (`upload/transfer.rs:951`). `on_terminal` reads
+                        // state, and both operations claim that state before they publish
+                        // the status -- download's `decrement_in_flight` claims it under
+                        // the state lock, and `set_completed` does not run until the tail
+                        // flush and the rename are done. `on_terminal` reads
                         // `terminal_outcome()`, which maps a still-`Active` status to
                         // `Cancelled`, and claims the one-shot terminal report -- so
                         // running it inside that window would tell the consumer a
@@ -816,7 +813,7 @@ impl Scheduler {
                         // completion still owes. Both of those are one-shot, so neither
                         // can be corrected afterwards. Skipping loses nothing: every
                         // completion path emits and reports for itself, and the
-                        // cancel/panic paths set the status before they get here.
+                        // cancel/panic paths publish the status before they get here.
                         if desc.is_terminal() {
                             desc.transfer().on_terminal();
                         }

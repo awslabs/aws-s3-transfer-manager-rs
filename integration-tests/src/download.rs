@@ -343,7 +343,7 @@ async fn test_download_write_to_file() {
 #[tokio::test]
 async fn test_download_single_object_entry_points_all_report_events() {
     use aws_sdk_s3_transfer_manager::events::TransferEvent;
-    use aws_sdk_s3_transfer_manager::types::ByteTotal;
+    use aws_sdk_s3_transfer_manager::types::Total;
     use std::time::Duration;
 
     #[derive(Debug)]
@@ -452,7 +452,7 @@ async fn test_download_single_object_entry_points_all_report_events() {
             "{variant:?}: the view must report the bytes that moved"
         );
         assert_eq!(
-            ByteTotal::Final(size as u64),
+            Total::Final(size as u64),
             view.byte_total(),
             "{variant:?}: a single object's length is known, so its total is final"
         );
@@ -1167,17 +1167,17 @@ async fn test_upload_leaves_bytes_streamed_at_zero() {
     // reason reads `None` rather than a download reason that would name a window this
     // transfer does not have.
     assert!(
-        view.stall_reason().is_none(),
-        "an upload must report no stall reason, not a download's; got {:?}",
-        view.stall_reason()
+        view.pending_reason().is_none(),
+        "an upload must report no pending reason, not a download's; got {:?}",
+        view.pending_reason()
     );
 
     m.handle.shutdown().await.expect("shutdown");
 }
 
-/// A stalled download says *why* it is stalled.
+/// A parked download says *why* it is parked.
 ///
-/// This is Aaron's `StallReason` item. Byte counters cannot answer it: a bar sitting still
+/// This is Aaron's pending-reason item. Byte counters cannot answer it: a bar sitting still
 /// looks identical whether the consumer stopped reading, the memory budget is full, or the
 /// listing has not returned — and the first is the caller's own doing, which is the one case
 /// they can fix.
@@ -1187,9 +1187,9 @@ async fn test_upload_leaves_bytes_streamed_at_zero() {
 /// consumer polling the view then reads `ReadAheadWindow` rather than a still bar with no
 /// explanation.
 #[tokio::test]
-async fn test_download_stalled_on_read_ahead_reports_the_reason() {
+async fn test_download_parked_on_read_ahead_reports_the_reason() {
     use aws_sdk_s3_transfer_manager::events::TransferEvent;
-    use aws_sdk_s3_transfer_manager::types::StallReason;
+    use aws_sdk_s3_transfer_manager::types::PendingReason;
     use std::time::Duration;
 
     // The window must close *before* every range is issued, or the transfer parks on
@@ -1242,12 +1242,12 @@ async fn test_download_stalled_on_read_ahead_reports_the_reason() {
     let mut seen = None;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while tokio::time::Instant::now() < deadline {
-        if let Some(reason) = view.stall_reason() {
+        if let Some(reason) = view.pending_reason() {
             seen = Some(reason);
-            // `matches!` with `{ .. }`, not `==`: every `StallReason` variant is
+            // `matches!` with `{ .. }`, not `==`: every `PendingReason` variant is
             // `#[non_exhaustive]`, so an external crate cannot construct one to compare
             // against — it matches instead. This is the shape a real consumer writes.
-            if matches!(reason, StallReason::ReadAheadWindow { .. }) {
+            if matches!(reason, PendingReason::ReadAheadWindow { .. }) {
                 break;
             }
         }
@@ -1255,7 +1255,7 @@ async fn test_download_stalled_on_read_ahead_reports_the_reason() {
     }
 
     assert!(
-        matches!(seen, Some(StallReason::ReadAheadWindow { .. })),
+        matches!(seen, Some(PendingReason::ReadAheadWindow { .. })),
         "a download whose body is never read must report the read-ahead window as the reason \
          it stopped, not an unexplained still bar; got {seen:?}"
     );

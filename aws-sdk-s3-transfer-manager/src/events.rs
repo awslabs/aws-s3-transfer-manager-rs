@@ -20,27 +20,16 @@
 //! **Lifecycle is pushed; quantities are pulled.** No event carries a byte count or an
 //! object count. Each [`TransferEvent::Planned`] instead hands over a
 //! [`TransferView`](crate::types::TransferView) — a read-only handle you keep and read
-//! whenever you want to repaint. Nothing pushes a number at you.
+//! whenever you want to repaint.
 //!
-//! Both halves of that split are forced. Pushing counts would mean running caller code on
-//! the thread that records them, which holds a scheduler dispatch ticket and one of the
-//! fixed per-core threads, so it would stall every transfer in the client. And any total
-//! *summed from* a lossy stream is a lower bound that silently disagrees with the
-//! operation's own result, where a counter read off a view is the number the operation
-//! reports — which is why `entries_settled()` exists rather than leaving a consumer to tally
-//! `Ended` events itself.
+//! **At most one `Ended` arrives per `Planned`**, however the entry ended. Because delivery
+//! is lossy, a total summed from the stream is only a lower bound; read a counter off the
+//! view, such as [`TransferView::entries_settled`](crate::types::TransferView::entries_settled),
+//! for the number the operation itself reports.
 //!
-//! **Two invariants carry the transport.**
-//!
-//! *At most one `Ended` per `Planned`.* Announcing an entry takes an obligation;
-//! whichever of the four terminal sites claims it first wins the swap and the rest
-//! are no-ops. The status CAS answers a different question — who *transitioned* —
-//! and the two come apart, because the transitioner is often the scheduler, which
-//! holds no sink.
-//!
-//! *No emit blocks, awaits, or runs caller code.* Every emit is a value rather than
-//! a send, claimed under a state guard and published after it is released. Nothing is reserved and no event is owed: an emit that
-//! finds a full channel is dropped and counted by [`TransferEventStream::dropped`].
+//! **Emitting never blocks, awaits, or runs your code.** Your sink is not called back on a
+//! transfer's own thread, and an event that finds a full channel is dropped and counted by
+//! [`TransferEventStream::dropped`] rather than making a transfer wait on you.
 //!
 //! Printing one of the familiar per-entry lines takes one event and nothing else:
 //!
@@ -72,13 +61,16 @@
 //!         Decision::Delete { .. } => transfer.destination().to_string(),
 //!         _ => format!("{} to {}", transfer.source(), transfer.destination()),
 //!     };
-//!     Some(match event.outcome() {
-//!         None if dry_run => format!("(dryrun) {verb}: {location}"),
+//!     Some(match event {
+//!         TransferEvent::Planned(_) if dry_run => format!("(dryrun) {verb}: {location}"),
 //!         // Planned, and the attempt is still to come: the line prints at `Ended`.
-//!         None => return None,
-//!         Some(Outcome::Failed { .. }) => format!("{verb} failed: {location}"),
-//!         Some(Outcome::Cancelled { .. }) => return None,
-//!         Some(_) => format!("{verb}: {location}"),
+//!         TransferEvent::Planned(_) => return None,
+//!         TransferEvent::Ended(ended) => match ended.outcome() {
+//!             Outcome::Failed { .. } => format!("{verb} failed: {location}"),
+//!             Outcome::Cancelled { .. } => return None,
+//!             _ => format!("{verb}: {location}"),
+//!         },
+//!         _ => return None,
 //!     })
 //! }
 //! let _ = line;
@@ -90,7 +82,7 @@
 //!
 //! ```
 //! use aws_sdk_s3_transfer_manager::events::{TransferEvent, TransferEventStream, TryNextError};
-//! use aws_sdk_s3_transfer_manager::types::{ByteTotal, EntryTotal, TransferView};
+//! use aws_sdk_s3_transfer_manager::types::{Total, TransferView};
 //!
 //! /// Drain whatever has arrived, then draw. Called on the caller's own clock — every
 //! /// 100 ms, on a keypress, whenever suits — not once per event.
@@ -117,12 +109,12 @@
 //!     let done = view.metrics().network_rx;
 //!     let bytes = match view.byte_total() {
 //!         // A percentage is defined only against a final total.
-//!         ByteTotal::Final(total) if total > 0 => {
+//!         Total::Final(total) if total > 0 => {
 //!             format!("{:.1}%", (done as f64 / total as f64) * 100.0)
 //!         }
 //!         // Still enumerating: the denominator can grow, so a bar drawn on it would
 //!         // walk backwards. Show bytes instead.
-//!         ByteTotal::Provisional(total) => format!("{done} of {total}+ bytes"),
+//!         Total::Provisional(total) => format!("{done} of {total}+ bytes"),
 //!         _ => format!("{done} bytes"),
 //!     };
 //!
@@ -131,9 +123,9 @@
 //!     // where the byte bar above stops short by whatever never moved.
 //!     let settled = view.entries_settled();
 //!     let files = match view.entry_total() {
-//!         EntryTotal::Final(total) => format!("{} file(s) remaining", total - settled),
+//!         Total::Final(total) => format!("{} file(s) remaining", total - settled),
 //!         // `~` because enumeration can still raise the total.
-//!         EntryTotal::Provisional(total) => {
+//!         Total::Provisional(total) => {
 //!             format!("~{} file(s) remaining", total.saturating_sub(settled))
 //!         }
 //!         _ => format!("{settled} file(s) done"),
@@ -154,6 +146,7 @@ use std::sync::{Arc, Mutex};
 // `std::sync::Arc` — they appear in the public types, which must not change shape
 // under a test cfg.
 use crate::runtime::sync::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use crate::transfer::TransferId;
 
 /// Which way an entry's bytes move.
 ///
@@ -169,11 +162,6 @@ pub enum Direction {
     /// S3 to local filesystem.
     Download,
     /// S3 to S3.
-    ///
-    /// Hidden for the same reason as [`SkipReason`]: nothing constructs it —
-    /// [`TransferRef`] builds only uploads and downloads — so the name has not been
-    /// exercised by the layer that will populate it. It becomes visible with `CopyObject`.
-    #[doc(hidden)]
     Copy,
 }
 
@@ -197,7 +185,11 @@ pub enum Endpoint {
     Local {
         /// The path the operation used, never canonicalized, so a caller that
         /// passed a relative root reads its own `./a` back.
-        path: Arc<Path>,
+        ///
+        /// `None` when the operation was handed an already-open file rather than a
+        /// path, as by [`write_to_file`](crate::operation::download::builders::DownloadFluentBuilder::write_to_file):
+        /// the end is a local file, but this layer was never told which one.
+        path: Option<Arc<Path>>,
     },
     /// An end the caller owns: the body of a streaming download, or an in-memory
     /// or caller-supplied upload body.
@@ -216,14 +208,15 @@ pub enum Endpoint {
 }
 
 impl fmt::Display for Endpoint {
-    /// `s3://bucket/key`, the path (lossy for a non-UTF-8 name), `-` for a
-    /// caller-owned stream, or `(unresolved)`. This is the rendering the
-    /// `upload:` / `download:` / `copy:` / `delete:` lines use, so no consumer
-    /// writes a formatter of its own.
+    /// `s3://bucket/key`, the path (lossy for a non-UTF-8 name), `(local file)` for a
+    /// local file whose path is unknown, `-` for a caller-owned stream, or
+    /// `(unresolved)`. This is the rendering the `upload:` / `download:` / `copy:` /
+    /// `delete:` lines use, so no consumer writes a formatter of its own.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Endpoint::S3 { bucket, key } => write!(f, "s3://{bucket}/{key}"),
-            Endpoint::Local { path } => write!(f, "{}", path.display()),
+            Endpoint::Local { path: Some(path) } => write!(f, "{}", path.display()),
+            Endpoint::Local { path: None } => f.write_str("(local file)"),
             Endpoint::Stream {} => f.write_str("-"),
             Endpoint::Unresolved {} => f.write_str("(unresolved)"),
         }
@@ -295,11 +288,6 @@ impl TransferRef {
 /// reach a delete or a skip: those decisions have no field of this type. Braced
 /// throughout with a per-variant `#[non_exhaustive]`, because each has an obvious
 /// field to gain — the two sizes, the two times, what forced it.
-/// Hidden while the only producer of eleven of the twelve reasons lives outside this
-/// crate: comparison decides them, and this crate emits `Forced {}` alone. Hiding
-/// keeps every name renameable, and hidden→public is additive where the reverse is
-/// breaking. Usable by name regardless of the attribute.
-#[doc(hidden)]
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum TransferReason {
@@ -322,9 +310,6 @@ pub enum TransferReason {
 /// Carries no severity. The same reason is silent, a warning, a skip, or a hard
 /// failure depending on how the run was configured, so severity belongs to whoever
 /// holds the configuration and cannot be structural here.
-/// Hidden for the same reason as [`TransferReason`]: no in-crate producer, so no
-/// name here has been exercised by the layer that will populate it.
-#[doc(hidden)]
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum SkipReason {
@@ -395,17 +380,10 @@ pub enum Decision {
     /// Carries no reason because the reason is the action: present at the
     /// destination, absent at the source, delete mode on. Braced-but-empty so it
     /// can gain one compatibly if a second way to reach a delete appears.
-    ///
-    /// Hidden until `sync` produces it: nothing in the crate decides a delete today.
-    #[doc(hidden)]
     #[non_exhaustive]
     Delete {},
     /// Leave the entry alone. Nothing is attempted, so this decision is terminal on
     /// arrival and no [`TransferEvent::Ended`] follows it.
-    ///
-    /// Hidden until `sync` produces it, which is also why its [`SkipReason`] payload is
-    /// hidden — a visible variant carrying a hidden type is the inconsistency this removes.
-    #[doc(hidden)]
     #[non_exhaustive]
     Skip {
         /// Why nothing was done.
@@ -476,8 +454,7 @@ pub enum TransferEvent {
 /// opaque id that can grow a generation without breaking a caller's pattern.
 #[derive(Debug, Clone)]
 pub struct Planned {
-    id: u64,
-    parent: Option<u64>,
+    id: TransferId,
     transfer: TransferRef,
     decision: Decision,
     view: Option<crate::types::TransferView>,
@@ -486,13 +463,13 @@ pub struct Planned {
 impl Planned {
     /// Opaque entry id, unique within the client.
     pub fn id(&self) -> u64 {
-        self.id
+        self.id.id
     }
 
     /// The id of the directory operation this entry belongs to, or `None` when this
     /// event *is* that operation.
     pub fn parent(&self) -> Option<u64> {
-        self.parent
+        self.id.parent
     }
 
     /// The entry, and where its two ends are.
@@ -520,8 +497,7 @@ impl Planned {
 /// Private fields for the same reason as [`Planned`].
 #[derive(Debug, Clone)]
 pub struct Ended {
-    id: u64,
-    parent: Option<u64>,
+    id: TransferId,
     transfer: TransferRef,
     decision: Decision,
     outcome: Outcome,
@@ -530,13 +506,13 @@ pub struct Ended {
 impl Ended {
     /// Opaque entry id, matching the [`Planned`] this ends.
     pub fn id(&self) -> u64 {
-        self.id
+        self.id.id
     }
 
     /// The id of the directory operation this entry belongs to, or `None` when this
     /// event *is* that operation.
     pub fn parent(&self) -> Option<u64> {
-        self.parent
+        self.id.parent
     }
 
     /// The entry. Repeated so no consumer needs a side map.
@@ -570,14 +546,6 @@ impl TransferEvent {
         match self {
             TransferEvent::Planned(e) => e.decision(),
             TransferEvent::Ended(e) => e.decision(),
-        }
-    }
-
-    /// How the attempt ended, or `None` if this event is the plan itself.
-    pub fn outcome(&self) -> Option<&Outcome> {
-        match self {
-            TransferEvent::Planned(_) => None,
-            TransferEvent::Ended(e) => Some(e.outcome()),
         }
     }
 }
@@ -830,8 +798,7 @@ pub(crate) struct TransferLifecycle {
     /// [`TryNextError::Disconnected`], because "every sink is gone" never becomes true.
     /// So the release is explicit, at the one instant the transfer is known to be over.
     sink: Arc<Mutex<Option<TransferEventSink>>>,
-    id: u64,
-    parent: Option<u64>,
+    id: TransferId,
     transfer: TransferRef,
     /// The decision both of this entry's events report.
     ///
@@ -859,7 +826,6 @@ impl fmt::Debug for TransferLifecycle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TransferLifecycle")
             .field("id", &self.id)
-            .field("parent", &self.parent)
             .field("transfer", &self.transfer)
             .field("owes_finish", &self.owes_finish.load(Ordering::Relaxed))
             .finish()
@@ -881,15 +847,13 @@ fn lock_sink(
 impl TransferLifecycle {
     pub(crate) fn new(
         sink: TransferEventSink,
-        id: u64,
-        parent: Option<u64>,
+        id: TransferId,
         transfer: TransferRef,
         view: Option<crate::types::TransferView>,
     ) -> Self {
         Self {
             sink: Arc::new(Mutex::new(Some(sink))),
             id,
-            parent,
             transfer,
             decision: Decision::Transfer {
                 reason: TransferReason::Forced {},
@@ -919,7 +883,6 @@ impl TransferLifecycle {
         if let Some(sink) = &*lock_sink(&self.sink) {
             sink.emit(TransferEvent::Planned(Planned {
                 id: self.id,
-                parent: self.parent,
                 transfer: self.transfer.clone(),
                 decision: self.decision.clone(),
                 view: self.view.clone(),
@@ -941,7 +904,6 @@ impl TransferLifecycle {
             owes_finish: self.owes_finish.clone(),
             event: Some(TransferEvent::Ended(Ended {
                 id: self.id,
-                parent: self.parent,
                 transfer: self.transfer.clone(),
                 decision: self.decision.clone(),
                 outcome,
@@ -1029,7 +991,7 @@ mod tests {
 
     fn local(path: &str) -> Endpoint {
         Endpoint::Local {
-            path: Arc::from(std::path::Path::new(path)),
+            path: Some(Arc::from(std::path::Path::new(path))),
         }
     }
 
@@ -1037,10 +999,14 @@ mod tests {
         TransferRef::upload(local("./a.txt"), s3("bucket", "k/a.txt"))
     }
 
+    fn tid(id: u64, parent: Option<u64>) -> TransferId {
+        TransferId { id, parent }
+    }
+
     fn lifecycle() -> (TransferLifecycle, TransferEventStream) {
         let (sink, stream) = channel(NonZeroUsize::new(8).unwrap());
         (
-            TransferLifecycle::new(sink, 1, None, upload_ref(), None),
+            TransferLifecycle::new(sink, tid(1, None), upload_ref(), None),
             stream,
         )
     }
@@ -1071,19 +1037,20 @@ mod tests {
             Decision::Delete { .. } => transfer.destination().to_string(),
             _ => format!("{} to {}", transfer.source(), transfer.destination()),
         };
-        Some(match event.outcome() {
-            None if dry_run => format!("(dryrun) {verb}: {location}"),
-            None => return None,
-            Some(Outcome::Failed { .. }) => format!("{verb} failed: {location}"),
-            Some(Outcome::Cancelled { .. }) => return None,
-            Some(_) => format!("{verb}: {location}"),
+        Some(match event {
+            TransferEvent::Planned(_) if dry_run => format!("(dryrun) {verb}: {location}"),
+            TransferEvent::Planned(_) => return None,
+            TransferEvent::Ended(ended) => match ended.outcome() {
+                Outcome::Failed { .. } => format!("{verb} failed: {location}"),
+                Outcome::Cancelled { .. } => return None,
+                _ => format!("{verb}: {location}"),
+            },
         })
     }
 
     fn ended(transfer: TransferRef, decision: Decision, outcome: Outcome) -> TransferEvent {
         TransferEvent::Ended(Ended {
-            id: 1,
-            parent: Some(0),
+            id: tid(1, Some(0)),
             transfer,
             decision,
             outcome,
@@ -1150,8 +1117,7 @@ mod tests {
         // A dry run's only event is the decision, and whether the run is dry is the
         // caller's own fact, which is why nothing on the event says so.
         let planned = TransferEvent::Planned(Planned {
-            id: 1,
-            parent: Some(0),
+            id: tid(1, Some(0)),
             transfer: upload_ref(),
             decision: forced(),
             view: None,
@@ -1292,7 +1258,7 @@ mod tests {
         for expected_outcome in [false, true] {
             let ev = stream.try_next().expect("both events reached the channel");
             assert_eq!(
-                ev.outcome().is_some(),
+                matches!(ev, TransferEvent::Ended(_)),
                 expected_outcome,
                 "the decision arrives before the terminal: {ev:?}"
             );
@@ -1356,7 +1322,7 @@ mod tests {
         // reserved, so the loss is at the end rather than the beginning -- and it is
         // counted, which is the whole of what bounded delivery promises.
         let (sink, mut stream) = channel(NonZeroUsize::new(1).unwrap());
-        let lc = TransferLifecycle::new(sink, 7, None, upload_ref(), None);
+        let lc = TransferLifecycle::new(sink, tid(7, None), upload_ref(), None);
         lc.announce();
         lc.finish(Outcome::Succeeded {}).expect("owed").send();
 
@@ -1390,8 +1356,7 @@ mod tests {
         let (sink, mut stream) = channel(NonZeroUsize::new(1).unwrap());
         let ev = || {
             TransferEvent::Planned(Planned {
-                id: 1,
-                parent: None,
+                id: tid(1, None),
                 transfer: upload_ref(),
                 decision: Decision::Transfer {
                     reason: TransferReason::Forced {},
@@ -1438,8 +1403,7 @@ mod tests {
             resolve_sink(Some(&sink), Some(sink.clone())).expect("both levels registered");
 
         resolved.emit(TransferEvent::Ended(Ended {
-            id: 7,
-            parent: Some(1),
+            id: tid(7, Some(1)),
             transfer: TransferRef::download(Endpoint::Stream {}, Endpoint::Stream {}),
             decision: Decision::Transfer {
                 reason: TransferReason::Forced {},
@@ -1477,8 +1441,7 @@ mod tests {
         let merged = a.merge(b);
 
         merged.emit(TransferEvent::Ended(Ended {
-            id: 9,
-            parent: None,
+            id: tid(9, None),
             transfer: TransferRef::download(Endpoint::Stream {}, Endpoint::Stream {}),
             decision: Decision::Transfer {
                 reason: TransferReason::Forced {},

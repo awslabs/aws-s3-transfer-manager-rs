@@ -117,7 +117,7 @@ pub(crate) enum DownloadWork {
     /// and non-blocking: a slow destination (a network or FUSE mount) would otherwise block
     /// a dispatch thread once per empty file and starve every transfer sharing it. Carries
     /// no data for the same reason `DrainResident` does not.
-    FinalizeNoData,
+    Finalize,
 }
 
 /// Early return if transfer is terminal (failed/cancelled by another work item).
@@ -345,7 +345,7 @@ impl DownloadTransfer {
         // reason describes the most recent poll rather than the last one that happened to
         // park. Without the clear, a transfer that parked once would report that reason for
         // the rest of its life, including while moving bytes.
-        self.inner.ctx.set_stall(None);
+        self.inner.ctx.set_pending_reason(None);
 
         let mut state = self.inner.state.lock().unwrap();
 
@@ -360,7 +360,7 @@ impl DownloadTransfer {
             DownloadState::DiscoveryInFlight => {
                 self.inner
                     .ctx
-                    .set_stall(Some(crate::types::StallReason::from(
+                    .set_pending_reason(Some(crate::types::PendingReason::from(
                         DownloadPendingReason::Discovery,
                     )));
                 self.inner.ctx.set_pending(DownloadPendingReason::Discovery);
@@ -485,7 +485,7 @@ impl DownloadTransfer {
                     *ranges_in_flight += 1;
                     drop(state);
                     return PollWork::ready(IoRequest {
-                        data: Some(Box::new(DownloadWork::FinalizeNoData)),
+                        data: Some(Box::new(DownloadWork::Finalize)),
                     });
                 };
 
@@ -563,9 +563,9 @@ impl DownloadTransfer {
     /// own scheduler-backed task waker.
     ///
     /// The cause is named once and reaches both readers: the aggregate diagnostics and
-    /// the public [`StallReason`](crate::types::StallReason) a view reports.
+    /// the public [`PendingReason`](crate::types::PendingReason) a view reports.
     fn park(&self, reason: DownloadPendingReason, snapshot: DownloadStateSnapshot) -> PollWork {
-        self.inner.ctx.set_stall(Some(reason.into()));
+        self.inner.ctx.set_pending_reason(Some(reason.into()));
         self.inner.ctx.set_pending(reason);
         self.inner.observability.observe_state(snapshot);
         PollWork::Pending
@@ -601,7 +601,7 @@ impl DownloadTransfer {
             // contract. The public cause still has to be set, by the same derivation.
             self.inner
                 .ctx
-                .set_stall(Some(crate::types::StallReason::from(
+                .set_pending_reason(Some(crate::types::PendingReason::from(
                     DownloadPendingReason::MemoryAdmission,
                 )));
             self.inner
@@ -726,7 +726,7 @@ impl DownloadTransfer {
                 .await
             }
             DownloadWork::DrainResident => self.execute_drain_resident(),
-            DownloadWork::FinalizeNoData => self.execute_finalize_no_data(),
+            DownloadWork::Finalize => self.execute_finalize(),
         }
     }
 
@@ -746,7 +746,7 @@ impl DownloadTransfer {
     /// The blocking half of what `poll_work` used to do inline: `complete` flushes the
     /// writer and renames the temporary file into place, and this is the thread that may
     /// block on it.
-    fn execute_finalize_no_data(&self) -> WorkOutcome {
+    fn execute_finalize(&self) -> WorkOutcome {
         // The same guard `execute_get_range` opens with, and for a sharper reason here:
         // `complete` renames the temp over the destination, which replaces whatever the
         // caller already had there. Without this, a cancel landing between the dispatch and
@@ -2230,9 +2230,8 @@ mod tests {
     }
 
     /// A download wired to a live event stream, so a test can read the terminal the
-    /// scheduler's hooks emit. Mirrors `Download::orchestrate` (`download.rs:128-142`):
-    /// the lifecycle is built from the ctx and handed to `DownloadTransfer::new`, and
-    /// the caller announces.
+    /// scheduler's hooks emit. Mirrors `Download::orchestrate`: the lifecycle is built
+    /// from the ctx and handed to `DownloadTransfer::new`, and the caller announces.
     #[allow(clippy::type_complexity)]
     fn create_download_with_events(
         object_size: u64,
@@ -2269,15 +2268,14 @@ mod tests {
         let (sink, stream) = crate::events::channel(std::num::NonZeroUsize::new(8).unwrap());
         let lifecycle = Arc::new(crate::events::TransferLifecycle::new(
             sink,
-            ctx.id.id,
-            None,
+            ctx.id,
             crate::events::TransferRef::download(
                 crate::events::Endpoint::S3 {
                     bucket: Arc::from("test-bucket"),
                     key: Arc::from("test-key"),
                 },
                 crate::events::Endpoint::Local {
-                    path: Arc::from(std::path::Path::new("./test-key")),
+                    path: Some(Arc::from(std::path::Path::new("./test-key"))),
                 },
             ),
             Some(ctx.view()),
@@ -2313,18 +2311,15 @@ mod tests {
     /// scheduler's Done arm emits the wrong terminal and spends the one-shot obligation
     /// the right one needed.
     ///
-    /// `decrement_in_flight` claims `DownloadState::Terminal` under the state lock
-    /// (`download/transfer.rs:1282`), and `finalize_completion` does not reach
-    /// `ctx.set_completed()` until after `writer.finalize()` and the rename in
-    /// `commit_destination` (`download/transfer.rs:1313-1346`) — a disk-flush-wide
+    /// `decrement_in_flight` claims `DownloadState::Terminal` under the state lock, and
+    /// `finalize_completion` does not reach `ctx.set_completed()` until after
+    /// `writer.finalize()` and the rename in `commit_destination` — a disk-flush-wide
     /// window with the lock released. A scheduler poll landing in it is not skipped,
-    /// because `is_terminal()` is `!ctx.is_active()` (`scheduler/descriptor.rs:337`),
-    /// falls through `poll_work`'s own `!is_active()` early-out
-    /// (`download/transfer.rs:331`) to `DownloadState::Terminal => PollWork::Done`
-    /// (`download/transfer.rs:539`), and so reaches `on_terminal`
-    /// (`scheduler/scheduler.rs:804`). There `terminal_outcome()` maps a still-`Active`
-    /// status to `Cancelled` through its `_` arm (`transfer.rs:1274`), and the one-shot
-    /// `owes_finish` swap (`events.rs:900`) means the real terminal emits nothing.
+    /// because the descriptor's `is_terminal()` tests `!ctx.is_active()`, falls through
+    /// `poll_work`'s own `!is_active()` early-out to
+    /// `DownloadState::Terminal => PollWork::Done`, and so reaches `on_terminal`. There
+    /// `terminal_outcome()` maps a still-`Active` status to `Cancelled` through its `_`
+    /// arm, and the one-shot `owes_finish` swap means the real terminal emits nothing.
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn done_while_active_reports_the_outcome_finalize_sets() {
@@ -2357,9 +2352,8 @@ mod tests {
     /// Positive control for `done_while_active_reports_the_outcome_finalize_sets`: the
     /// same sequence with the status set *before* the terminal state, which is the order
     /// the 0-byte path already uses — `complete()` calls `ctx.set_completed()` before
-    /// `enter_terminal()`, both under one guard (`download/transfer.rs:1423-1424`).
-    /// Identical harness, so a failure here would mean the probe is wrong rather than
-    /// the ordering.
+    /// `enter_terminal()`, both under one guard. Identical harness, so a failure here
+    /// would mean the probe is wrong rather than the ordering.
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn done_after_set_completed_reports_succeeded() {
@@ -2492,14 +2486,14 @@ mod tests {
         let mut work = assert_ready(transfer.poll_work());
         assert!(matches!(
             work.data_mut::<DownloadWork>(),
-            DownloadWork::FinalizeNoData
+            DownloadWork::Finalize
         ));
         assert!(matches!(
             transfer.execute(&mut work).await,
             WorkOutcome::Success { .. }
         ));
         // And the transfer is terminal once it has run, so the next poll is `Done` -- a
-        // second `FinalizeNoData` here would mean a second flush and rename.
+        // second `Finalize` here would mean a second flush and rename.
         assert_done(transfer.poll_work());
 
         let summary = transfer
@@ -2523,7 +2517,7 @@ mod tests {
     /// `commit_destination` renames the temp over `dest`, and `std::fs::rename` replaces an
     /// existing file -- so for a caller re-downloading over a file they already have, the
     /// rename consumes their copy. Nothing can give it back afterwards, which is why the
-    /// rename must not run at all once the transfer is terminal. `execute_finalize_no_data`
+    /// rename must not run at all once the transfer is terminal. `execute_finalize`
     /// is dispatched by `poll_work` and run later, so a cancel arriving between the two needs
     /// no race to get here.
     #[cfg_attr(miri, ignore)]
@@ -2577,7 +2571,7 @@ mod tests {
         let mut work = assert_ready(transfer.poll_work());
         assert!(matches!(
             work.data_mut::<DownloadWork>(),
-            DownloadWork::FinalizeNoData
+            DownloadWork::Finalize
         ));
 
         // Cancelled after the dispatch, before the run.
@@ -2659,7 +2653,7 @@ mod tests {
     /// The scheduler polls on four edges, not only on work completion -- a concurrency-target
     /// change re-polls a transfer whose work is still in flight. Without counting the
     /// dispatched completion as in-flight work, that re-poll takes the same no-ranges arm and
-    /// emits `FinalizeNoData` again, so the writer is flushed twice and the rename runs twice:
+    /// emits `Finalize` again, so the writer is flushed twice and the rename runs twice:
     /// the second finds no temporary file and fails the transfer that had already succeeded.
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
@@ -2681,7 +2675,7 @@ mod tests {
         let mut work = assert_ready(transfer.poll_work());
         assert!(matches!(
             work.data_mut::<DownloadWork>(),
-            DownloadWork::FinalizeNoData
+            DownloadWork::Finalize
         ));
 
         // Re-polled while that completion is still in flight, as a concurrency-target change
@@ -2859,8 +2853,7 @@ mod tests {
         let (sink, mut stream) = crate::events::channel(std::num::NonZeroUsize::new(8).unwrap());
         let lifecycle = Arc::new(crate::events::TransferLifecycle::new(
             sink,
-            ctx.id.id,
-            None,
+            ctx.id,
             crate::events::TransferRef::download(
                 crate::events::Endpoint::S3 {
                     bucket: Arc::from("test-bucket"),
@@ -2905,9 +2898,8 @@ mod tests {
         assert_done(transfer.poll_work());
 
         // Drive the real scheduler over it, so the `PollWork::Done` arm added by this PR
-        // runs as written (scheduler.rs:804) rather than being imitated. `enqueue_transfer`
-        // calls `generate_work` on this thread, which pops, polls -- `Done` -- and runs
-        // the arm.
+        // runs as written rather than being imitated. `enqueue_transfer` calls
+        // `generate_work` on this thread, which pops, polls -- `Done` -- and runs the arm.
         handle
             .scheduler
             .enqueue_transfer(Box::new(transfer.clone()));
@@ -2922,7 +2914,7 @@ mod tests {
             transfer.ctx().transfer_status(),
             crate::types::TransferStatus::Completed
         );
-        // The `on_completion` removal path reaches the same hook (scheduler.rs:552).
+        // The `on_completion` removal path reaches the same hook.
         transfer.on_terminal();
 
         // What the consumer saw.

@@ -109,14 +109,13 @@ impl Upload {
         let lifecycle = events.map(|sink| {
             let source = match stream.source_path() {
                 Some(path) => crate::events::Endpoint::Local {
-                    path: Arc::from(path),
+                    path: Some(Arc::from(path)),
                 },
                 None => crate::events::Endpoint::Stream {},
             };
             Arc::new(crate::events::TransferLifecycle::new(
                 sink,
-                ctx.id.id,
-                None,
+                ctx.id,
                 crate::events::TransferRef::upload(
                     source,
                     crate::events::Endpoint::S3 {

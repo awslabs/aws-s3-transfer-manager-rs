@@ -378,33 +378,32 @@ impl TransferView {
     /// Why this transfer produced no work on its most recent poll, if it produced none.
     ///
     /// `None` means it produced work, so a reading of `None` is not a promise that bytes are
-    /// moving — only that the transfer was not parked when last asked. See [`StallReason`] for
-    /// which reasons are reported and which two a reader might expect and will not find.
-    pub fn stall_reason(&self) -> Option<StallReason> {
-        self.metrics.stall_reason()
+    /// moving — only that the transfer was not parked when last asked.
+    pub fn pending_reason(&self) -> Option<PendingReason> {
+        self.metrics.pending_reason()
     }
 
-    /// This transfer's byte denominator. See [`ByteTotal`].
+    /// This transfer's byte denominator. See [`Total`].
     ///
     /// For a single-object transfer this is `Final` as soon as the length is known, and
     /// `Unknown` for an unknown-length streaming upload. For a directory operation it
     /// climbs through `Provisional` while enumeration runs and becomes `Final` only if
     /// enumeration completed — a run cancelled mid-listing never seals, because nobody
     /// knows the total.
-    pub fn byte_total(&self) -> ByteTotal {
+    pub fn byte_total(&self) -> Total {
         self.metrics.byte_total()
     }
 
     /// This transfer's entry denominator: how many objects the directory operation will
-    /// act on. See [`EntryTotal`].
+    /// act on. See [`Total`].
     ///
-    /// Always [`EntryTotal::Unknown`] for a single-object transfer, which is one entry and
+    /// Always [`Total::Unknown`] for a single-object transfer, which is one entry and
     /// is itself the thing being counted.
     ///
     /// Sealed by the same enumeration-complete fact as [`byte_total`](Self::byte_total), so
     /// the two denominators agree about whether listing finished and one cannot be `Final`
     /// while the other is still `Provisional`.
-    pub fn entry_total(&self) -> EntryTotal {
+    pub fn entry_total(&self) -> Total {
         self.metrics.entry_total()
     }
 
@@ -432,22 +431,15 @@ impl TransferView {
 /// Answers *"why is nothing moving"*, which byte counters cannot: a bar sitting still looks
 /// identical whether the consumer has stopped reading, the memory budget is full, or the
 /// listing has not returned. Read it from
-/// [`TransferView::stall_reason`](TransferView::stall_reason); `None` means the transfer
+/// [`TransferView::pending_reason`](TransferView::pending_reason); `None` means the transfer
 /// produced work on its most recent poll.
 ///
-/// **Currently reported for downloads only.** An upload's park sites are not labelled, so a
-/// stalled upload reports `None` rather than a wrong reason.
-///
-/// Two reasons a reader might expect are deliberately absent. *Consumer backpressure* is not
-/// separate from [`ReadAheadWindow`](StallReason::ReadAheadWindow) here — the read-ahead gate
-/// closes precisely because the consumer has not drained, so they are one mechanism and
-/// splitting them would invite a caller to handle two cases that cannot be distinguished. And
-/// a *concurrency limit* never appears: when the client is at its concurrency target the
-/// scheduler does not poll the transfer at all, so the transfer has no opportunity to report a
-/// reason. That one is a client-wide fact, not a per-transfer one.
+/// Not every reason is a problem — [`PendingReason::WorkInFlight`] is the normal tail of a
+/// transfer. Reported for downloads; an upload's park sites are not labelled, so a parked
+/// upload reports `None` rather than a wrong reason.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum StallReason {
+pub enum PendingReason {
     /// The read-ahead window is full: prefetched data is waiting for the caller to read it.
     /// Issuance resumes when the consumer drains.
     #[non_exhaustive]
@@ -459,46 +451,29 @@ pub enum StallReason {
     /// The initial `GetObject`/`HeadObject` has not returned, so the transfer does not yet
     /// know what to fetch.
     #[non_exhaustive]
-    PendingDiscovery {},
-    /// Every range has been issued and the transfer is waiting for the last in-flight
-    /// requests to finish. Not a problem — the normal tail of a transfer.
+    Discovery {},
+    /// Every unit of work has been issued and the transfer is waiting for the last
+    /// in-flight requests to retire. The normal tail of a transfer.
     #[non_exhaustive]
-    AwaitingCompletion {},
+    WorkInFlight {},
 }
 
-/// A transfer's expected total payload bytes, and how much to trust it.
+/// A denominator a transfer is still discovering, and how much to trust it.
 ///
-/// A percentage is defined only for [`ByteTotal::Final`].
+/// The unit comes from the accessor, not from this type:
+/// [`byte_total`](TransferView::byte_total) returns payload bytes,
+/// [`entry_total`](TransferView::entry_total) returns entries. A percentage is defined
+/// only for [`Total::Final`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum ByteTotal {
-    /// No total is known, and none may ever be: an unknown-length streaming upload, or a
-    /// directory operation cancelled before enumeration finished. Render bytes, not a bar.
+pub enum Total {
+    /// No total is known, and none may ever be: an unknown-length streaming upload, a
+    /// single-object transfer asked for its entry count, or a directory operation
+    /// cancelled before enumeration finished. Render what is done, not a fraction.
     Unknown,
     /// A lower bound. Enumeration is still running, so this will only grow. Do not treat
-    /// it as final even when a later reading repeats it — only [`ByteTotal::Final`] says
+    /// it as final even when a later reading repeats it — only [`Total::Final`] says
     /// enumeration is over.
-    Provisional(u64),
-    /// Enumeration finished and this will not change again.
-    Final(u64),
-}
-
-/// How many entries a directory operation will act on, and how much to trust the number.
-///
-/// Deliberately a distinct type from [`ByteTotal`] despite the identical shape. The two are
-/// different units, and the bug that conflates them is visible and alarming: a bar drawing a
-/// *byte* numerator against an *entry* denominator renders a 10 MiB / 900 object transfer at
-/// 1,165,084%, which reads as data corruption rather than as a units mistake. Separate types
-/// make that unrepresentable instead of merely unlikely.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum EntryTotal {
-    /// No count is known. A single-object transfer, or a directory operation cancelled
-    /// before enumeration finished. Report entries done, not a fraction.
-    Unknown,
-    /// A lower bound: enumeration is still running, so this will only grow. Render it as
-    /// approximate — the AWS CLI prints `~4 file(s) remaining (calculating...)` in exactly
-    /// this state.
     Provisional(u64),
     /// Enumeration finished and this will not change again.
     Final(u64),
