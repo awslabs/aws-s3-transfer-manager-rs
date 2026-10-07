@@ -146,7 +146,7 @@ pub(crate) enum Deleter {
     Bucket(DeleteFromBucket),
     LocalTree(DeleteFromLocalTree),
     #[cfg(test)]
-    Recording(Arc<tests::RecordDeletes>),
+    Recording(Arc<test_util::RecordDeletes>),
 }
 
 impl Deleter {
@@ -1635,5 +1635,7 @@ const _: fn() = || {
     >();
 };
 
+#[cfg(test)]
+mod test_util;
 #[cfg(test)]
 mod tests;
