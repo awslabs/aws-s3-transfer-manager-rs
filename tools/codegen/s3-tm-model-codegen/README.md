@@ -107,7 +107,10 @@ The underlying entry point is `python3 tools/scripts/codegen`.
 aggregation. The roots include `Object`, `Owner`, `RestoreStatus`,
 `ChecksumAlgorithm`, `ChecksumType`, and `ObjectStorageClass`. `GetObjectRequest`
 keeps its Smithy identity and all modeled input members, and is named
-`DownloadInput` in Rust. `PutObjectRequest` is named `UploadInput`; TM controls
+`DownloadInput` in Rust. Caller-selected part downloads are unsupported: the
+existing `part_number` field/accessor is retained, its builder methods are
+internal, and fluent methods are omitted. Discovery controls SDK request part
+numbers. `PutObjectRequest` is named `UploadInput`; TM controls
 its body and checksum strategy, and excludes unsupported append offsets.
 `UploadOutput` combines PUT, create-multipart-upload, and complete-multipart-upload
 outputs. `ObjectMetadata` contains the union of GET/HEAD response members, and
@@ -134,6 +137,9 @@ construction and redaction policy, and intentional exclusions.
   object/chunk metadata. Their fields and builder setters are internal, while
   SDK-independent getters are public. Their empty source-member lists identify
   synthetic values; the policy report records the response header mappings.
+- `DownloadMetadata` preserves empty metadata defaults and service descriptions,
+  including target documentation. Metadata documentation distinguishes discovery
+  responses from individual chunk responses and describes GET/HEAD-only values.
 
 `ModelGenerator.kt` calls smithy-rs's symbol provider, structure/builder
 generators, and client-compatible infallible enum generator. Required
@@ -204,8 +210,8 @@ The feature selects interoperability, not the SDK backend dependency.
 `mapping.json` records source-member classifications and correspondence;
 it is not installed into TM.
 
-`model/_upload_fluent_builder.rs` contains generated field delegation for the
-handwritten upload fluent wrapper. The module is gated out of standalone
+`model/_upload_fluent_builder.rs` and `model/_download_fluent_builder.rs` contain
+generated field delegation for the handwritten fluent wrappers. Both are gated out of standalone
 compilation with `s3_tm_out_of_tree`. Value and fluent builders use smithy-rs
 getter conventions (`&Option<T>`); built-value string accessors borrow `&str`.
 Execution methods and request-specific checksum/body handling remain outside

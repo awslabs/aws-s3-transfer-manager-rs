@@ -10,10 +10,10 @@ use bytes::Buf;
 use crate::runtime::buffer_pool::{Reservation, SegmentedBytes};
 use crate::runtime::sync::sync::Arc;
 
-use super::chunk_meta::ChunkMetadata;
 use super::recv_buffer::{
     DrainMode, FillOutcome, PagedRecvBuffer, RecvBufferConsumer, SegmentWrite, SlotHandle,
 };
+use super::ChunkMetadata;
 
 /// Segment size for the paged buffer. Re-exported from `recv_buffer` for test access.
 const SEG_SIZE: usize = super::recv_buffer::DEFAULT_SEG_SIZE;

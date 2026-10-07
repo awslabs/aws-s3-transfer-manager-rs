@@ -88,16 +88,13 @@ fn download_builder_validates_required_fields_and_redacts_sensitive_values() {
     assert_eq!(input.inherited_option(), Some("from-mixin"));
     // Client input defaults may be left unset for the service to supply.
     assert_eq!(input.part_number(), None);
-    assert_eq!(
-        DownloadInput::builder()
-            .bucket("bucket")
-            .key("key")
-            .part_number(3)
-            .build()
-            .unwrap()
-            .part_number(),
-        Some(3)
-    );
+    let mut part_input = input.clone();
+    part_input.part_number = Some(3);
+    assert_eq!(part_input.part_number(), Some(3));
+    let part_input = s3_tm_model::model::builders::DownloadInputBuilder::from(part_input)
+        .build()
+        .unwrap();
+    assert_eq!(part_input.part_number(), Some(3));
     assert_eq!(input.sse_customer_key(), Some("secret-customer-key"));
     assert!(DownloadInput::builder()
         .bucket("bucket")

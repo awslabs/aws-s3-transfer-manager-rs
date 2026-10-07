@@ -5,9 +5,9 @@
 
 use crate::error::{self, ErrorKind};
 use crate::operation::download::body::{Body, RecvBodyConsumer};
-use crate::operation::download::object_meta::ObjectMetadata;
 use crate::operation::download::output::DownloadOutput;
 use crate::operation::download::transfer::DownloadTransfer;
+use crate::operation::download::ObjectMetadata;
 use crate::transfer::{StateMachineTerminalReceiver, TransferId};
 
 /// Shared core logic for download handles.
@@ -383,9 +383,7 @@ impl ManagedDownloadHandle {
     /// Object metadata.
     ///
     /// Waits for discovery to complete if metadata is not yet available.
-    pub async fn object_meta(
-        &self,
-    ) -> Result<&crate::operation::download::object_meta::ObjectMetadata, error::Error> {
+    pub async fn object_meta(&self) -> Result<&ObjectMetadata, error::Error> {
         self.inner.object_meta().await
     }
 

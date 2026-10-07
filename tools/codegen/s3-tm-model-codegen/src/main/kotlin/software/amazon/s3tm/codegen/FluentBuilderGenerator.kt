@@ -5,6 +5,7 @@
 package software.amazon.s3tm.codegen
 
 import software.amazon.smithy.model.Model
+import software.amazon.smithy.model.shapes.ShapeId
 import software.amazon.smithy.model.shapes.StructureShape
 import software.amazon.smithy.rust.codegen.core.rustlang.Attribute
 import software.amazon.smithy.rust.codegen.core.rustlang.RustModule
@@ -30,14 +31,27 @@ import software.amazon.smithy.rust.codegen.core.smithy.rustType
 // independently of its client/execution wrapper, so this renderer can use it directly.
 object FluentBuilderGenerator {
     fun render(crate: RustCrate, model: Model, symbols: RustSymbolProvider, policy: MemberPolicy) {
-        val shape = model.expectShape(TmModelProjection.id("PutObjectRequest"), StructureShape::class.java)
+        render(crate, model, symbols, policy, TmModelProjection.id("PutObjectRequest"), "upload", "Upload")
+        render(crate, model, symbols, policy, TmModelProjection.id("GetObjectRequest"), "download", "Download")
+    }
+
+    private fun render(
+        crate: RustCrate,
+        model: Model,
+        symbols: RustSymbolProvider,
+        policy: MemberPolicy,
+        input: ShapeId,
+        operation: String,
+        name: String,
+    ) {
+        val shape = model.expectShape(input, StructureShape::class.java)
         val module = RustModule.new(
-            "_upload_fluent_builder", Visibility.PRIVATE, parent = ModelGenerator.modelModule,
+            "_${operation}_fluent_builder", Visibility.PRIVATE, parent = ModelGenerator.modelModule,
             additionalAttributes = listOf(Attribute("cfg(not(s3_tm_out_of_tree))")),
-            documentationOverride = "Upload fluent field delegation.",
+            documentationOverride = "$name fluent field delegation.",
         )
         crate.withModule(module) {
-            rustBlock("impl crate::operation::upload::builders::UploadFluentBuilder") {
+            rustBlock("impl crate::operation::$operation::builders::${name}FluentBuilder") {
                 shape.members().forEach { member ->
                     format(symbols.toSymbol(member))
                     val name = symbols.toMemberName(member)

@@ -70,7 +70,18 @@ class MemberPolicy(private val source: Model, private val sourceSymbols: RustSym
 
     val fields: Map<ShapeId, List<Field>> = buildMap {
         put(TmModelProjection.id("GetObjectRequest"), listOf(
-            runtime("read_ahead", readAhead, Construction.OPTIONAL, "How far the download may prefetch."),
+            runtime("read_ahead", readAhead, Construction.OPTIONAL,
+                "How far this download may prefetch ahead of the consumer. `None` uses the " +
+                    "client default from [`Config`](crate::config::Config); `Some` overrides it for this request."),
+            // Discovery owns SDK part numbers; do not add a public setter for an unsupported transfer.
+            modeled(
+                source.expectShape(TmModelProjection.id("GetObjectRequest"), StructureShape::class.java)
+                    .getMember("PartNumber").orElseThrow(),
+                "part_number",
+            ).copy(
+                builderVisibility = "pub(crate)",
+                documentation = "Caller-selected part downloads are not supported. Transfer discovery manages request part numbers.",
+            ),
         ))
         val put = source.expectShape(TmModelProjection.id("PutObjectRequest"), StructureShape::class.java)
         val body = put.getMember("Body").orElseThrow()
@@ -176,6 +187,7 @@ class MemberPolicy(private val source: Model, private val sourceSymbols: RustSym
             if (field.runtime == null) format(sourceSymbols.toSymbol(field.sourceMember))
             documentShape(field.sourceMember, source)
             deprecatedShape(field.sourceMember)
+            if (field.runtime == null && field.documentation.isNotEmpty()) docs(field.documentation)
         } else {
             docs(field.documentation)
         }
@@ -235,6 +247,22 @@ class MemberPolicy(private val source: Model, private val sourceSymbols: RustSym
                             rust("##[allow(dead_code)]")
                             rustBlock("pub(crate) fn take_${field.name}(&mut self) -> ${field.coreType}") {
                                 rust("std::mem::take(&mut self.${field.name})")
+                            }
+                        }
+                    }
+                    if (section.shape.id == TmModelProjection.id("GetObjectRequest")) {
+                        rustBlock("impl From<${section.structName}> for ${section.structName}Builder") {
+                            rustBlock("fn from(value: ${section.structName}) -> Self") {
+                                rust("Self {")
+                                section.shape.members().forEach {
+                                    val name = sourceSymbols.toMemberName(it)
+                                    rust("$name: value.$name,")
+                                }
+                                additions.forEach { field ->
+                                    condition(field)
+                                    rust("${field.name}: value.${field.name},")
+                                }
+                                rust("}")
                             }
                         }
                     }

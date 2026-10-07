@@ -11,14 +11,16 @@ use std::str::FromStr;
 use std::{cmp, mem};
 use tracing::Instrument;
 
-use super::chunk_meta::ChunkMetadata;
-use super::input::{copy_fields_to_get_object_request, copy_fields_to_head_object_request};
-use super::object_meta::ObjectMetadata;
 use super::observability::{DownloadRequestKind, DownloadRequestMeasurement};
 use super::transfer::DownloadTransfer;
 use super::DownloadInput;
+use super::{ChunkMetadata, ObjectMetadata};
 use crate::error;
 use crate::http::header::{self, ByteRange};
+use crate::sdk_v1::{
+    copy_download_input_fields_to_get_object as copy_fields_to_get_object_request,
+    copy_download_input_fields_to_head_object as copy_fields_to_head_object_request,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 enum ObjectDiscoveryStrategy {
@@ -236,7 +238,7 @@ async fn discover_obj_with_head(
     .await;
     req_metrics.finish();
     let resp = result?;
-    let object_meta: ObjectMetadata = resp.into();
+    let object_meta = crate::sdk_v1::object_metadata_from_head_object(&resp);
     let remaining = validate_head_response_range(input, &object_meta)?;
     let object_range_start = *remaining.start();
 
@@ -450,8 +452,8 @@ fn first_chunk_response_handler(
 ) -> Result<ObjectDiscovery, error::Error> {
     let empty_stream = ByteStream::new(SdkBody::empty());
     let body = mem::replace(&mut resp.body, empty_stream);
-    let object_meta: ObjectMetadata = (&resp).into();
-    let chunk_meta: ChunkMetadata = resp.into();
+    let object_meta = crate::sdk_v1::object_metadata_from_get_object(&resp);
+    let chunk_meta = crate::sdk_v1::chunk_metadata_from_get_object(&resp);
     let chunk_content_len = chunk_meta
         .content_length
         .ok_or_else(|| error::discovery_failed("response missing content-length"))
@@ -536,7 +538,6 @@ mod tests {
         discover_obj, discover_obj_with_head, first_chunk_response_handler,
         validate_head_response_range, ObjectDiscoveryStrategy,
     };
-    use crate::operation::download::object_meta::ObjectMetadata;
     use crate::operation::download::transfer::DownloadTransfer;
     use crate::operation::download::DownloadInput;
     use crate::transfer::TransferContext;
@@ -840,11 +841,11 @@ mod tests {
                 .range(requested)
                 .build()
                 .unwrap();
-            let object_meta: ObjectMetadata = HeadObjectOutput::builder()
+            let response = HeadObjectOutput::builder()
                 .content_length(length)
                 .content_range(returned)
-                .build()
-                .into();
+                .build();
+            let object_meta = crate::sdk_v1::object_metadata_from_head_object(&response);
 
             let error = validate_head_response_range(&input, &object_meta)
                 .expect_err("response range must match the request");
@@ -864,11 +865,11 @@ mod tests {
             .range("bytes=-1000")
             .build()
             .unwrap();
-        let object_meta: ObjectMetadata = HeadObjectOutput::builder()
+        let response = HeadObjectOutput::builder()
             .content_length(500)
             .content_range("bytes 0-499/500")
-            .build()
-            .into();
+            .build();
+        let object_meta = crate::sdk_v1::object_metadata_from_head_object(&response);
 
         let response = validate_head_response_range(&input, &object_meta).unwrap();
 

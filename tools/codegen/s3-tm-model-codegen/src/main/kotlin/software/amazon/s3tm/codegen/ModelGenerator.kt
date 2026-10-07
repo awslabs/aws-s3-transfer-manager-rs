@@ -6,6 +6,7 @@
 
 package software.amazon.s3tm.codegen
 
+import software.amazon.s3tm.codegen.customizations.DownloadMetadata
 import java.nio.file.Files
 import java.nio.file.Path
 import software.amazon.smithy.build.FileManifest
@@ -154,7 +155,7 @@ object ModelGenerator {
                 shape is StructureShape -> {
                     crate.inPrivateModuleWithReexport(privateModule, symbols.toSymbol(shape)) {
                         StructureGenerator(
-                            model, symbols, this, shape, listOf(policy.structureCustomization()), StructSettings(true),
+                            model, symbols, this, shape, listOf(policy.structureCustomization(), DownloadMetadata()), StructSettings(true),
                         ).render()
                         implBlock(symbols.toSymbol(shape)) {
                             BuilderGenerator.renderConvenienceMethod(this, symbols, shape)

@@ -3,10 +3,21 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-mod input;
+//! Download a single S3 object using modeled request and response metadata.
+//!
+//! [`DownloadInput`](crate::operation::download::DownloadInput) and the metadata
+//! types are re-exported from [`crate::model`].
+//! Object metadata describes the discovery response (GET or HEAD), while each
+//! [`ChunkOutput`](crate::operation::download::ChunkOutput) carries metadata from
+//! its own GET response. Optional service
+//! values remain absent when the corresponding response does not include them.
+//! Reported checksum fields alone do not mean that the downloaded bytes were
+//! validated; use
+//! [`DownloadOutput::integrity_checks`](crate::operation::download::DownloadOutput::integrity_checks)
+//! for that result.
 
-/// Request type for downloading a single object from Amazon S3
-pub use input::{DownloadInput, DownloadInputBuilder};
+pub use crate::model::builders::DownloadInputBuilder;
+pub use crate::model::{ChunkMetadata, DownloadInput, ObjectMetadata};
 
 /// Operation builders
 pub mod builders;
@@ -38,13 +49,7 @@ pub use output::DownloadOutput;
 pub(crate) mod transfer;
 pub(crate) use transfer::DownloadTransfer;
 
-/// Provides metadata for each chunk during an object download.
-mod chunk_meta;
-pub use chunk_meta::ChunkMetadata;
-
-/// Provides metadata for a single S3 object during download.
 mod object_meta;
-pub use object_meta::ObjectMetadata;
 
 use crate::error;
 use crate::operation::download::body::new_recv_body;

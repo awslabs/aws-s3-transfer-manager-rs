@@ -23,7 +23,28 @@ pub mod types {
     #[derive(Debug, Clone)]
     pub struct TransferMetrics(pub u64);
 }
+pub mod config {
+    /// Client configuration.
+    pub struct Config;
+}
 pub mod operation {
+    pub mod download {
+        pub mod builders {
+            #[derive(Debug, Default)]
+            pub struct DownloadFluentBuilder {
+                pub(crate) inner: crate::model::builders::DownloadInputBuilder,
+            }
+
+            impl DownloadFluentBuilder {
+                pub fn build(
+                    self,
+                ) -> Result<crate::model::DownloadInput, aws_smithy_types::error::operation::BuildError>
+                {
+                    self.inner.build()
+                }
+            }
+        }
+    }
     pub mod upload {
         #[derive(Debug, Clone)]
         pub struct ChecksumStrategy;
@@ -49,6 +70,35 @@ pub mod operation {
 #[cfg(test)]
 mod tests {
     use super::{io::InputStream, model::*, operation::upload::ChecksumStrategy, types::*};
+
+    #[test]
+    fn download_fluent_delegation_preserves_conditions_and_read_ahead_override() {
+        use super::operation::download::builders::DownloadFluentBuilder;
+        let builder = DownloadFluentBuilder::default()
+            .bucket("bucket")
+            .key("key")
+            .if_modified_since(aws_smithy_types::DateTime::from_secs(123))
+            .inherited_option("added")
+            .read_ahead(ReadAhead::Parts(3));
+        assert_eq!(builder.get_bucket(), &Some("bucket".to_owned()));
+        assert_eq!(builder.get_inherited_option().as_deref(), Some("added"));
+        assert_eq!(builder.get_read_ahead(), &Some(ReadAhead::Parts(3)));
+        let input = builder.build().unwrap();
+        assert_eq!(input.read_ahead(), Some(&ReadAhead::Parts(3)));
+        assert_eq!(input.inherited_option(), Some("added"));
+        assert_eq!(input.if_modified_since(), Some(&aws_smithy_types::DateTime::from_secs(123)));
+        let input = DownloadFluentBuilder::default()
+            .bucket("bucket")
+            .key("key")
+            .set_read_ahead(None)
+            .set_inherited_option(None)
+            .set_if_modified_since(None)
+            .build()
+            .unwrap();
+        assert!(input.read_ahead().is_none());
+        assert!(input.inherited_option().is_none());
+        assert!(input.if_modified_since().is_none());
+    }
 
     #[test]
     fn fluent_delegation_covers_modeled_collections_additions_and_runtime_members() {
@@ -156,6 +206,11 @@ mod tests {
 
     #[test]
     fn object_lengths_and_request_identifiers_keep_their_internal_construction() {
+        let object_default = ObjectMetadata::default();
+        assert_eq!(object_default, ObjectMetadata::builder().build());
+        assert_eq!(object_default.content_length(), None);
+        assert_eq!(object_default.request_id(), None);
+        assert_eq!(ChunkMetadata::default(), ChunkMetadata::builder().build());
         let object = ObjectMetadata::builder()
             .content_length(42)
             .request_id("request")

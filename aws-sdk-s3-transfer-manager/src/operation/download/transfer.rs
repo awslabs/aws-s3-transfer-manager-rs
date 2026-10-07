@@ -14,21 +14,21 @@ use std::task::{Context, Poll};
 use bytes::BufMut;
 use futures_util::future::{select, Either};
 
-use super::input::copy_fields_to_get_object_request;
+use crate::sdk_v1::copy_download_input_fields_to_get_object as copy_fields_to_get_object_request;
 
 use crate::error::{self, ChunkRef, Error};
 use crate::operation::download::body::{BodySlot, BodyWriter, ChunkOutput};
-use crate::operation::download::chunk_meta::ChunkMetadata;
 use crate::operation::download::context::{DownloadPendingReason, DownloadState, PendingClaim};
 use crate::operation::download::discovery::{discover_obj, ObjectDiscovery};
-use crate::operation::download::object_meta::ObjectMetadata;
 use crate::operation::download::observability::{
     DownloadDestination, DownloadEvent, DownloadExecutionState, DownloadObservability,
     DownloadRequestKind, DownloadRequestMeasurement, DownloadStateSnapshot, DownloadTerminalReport,
 };
 use crate::operation::download::read_ahead::ReadAhead;
 use crate::operation::download::recv_buffer::{DrainMode, FillOutcome};
+use crate::operation::download::ChunkMetadata;
 use crate::operation::download::DownloadInput;
+use crate::operation::download::ObjectMetadata;
 use crate::runtime::buffer_pool::{
     AcquireError, BufferPool, Reservation, ReserveError, SegmentedBytes,
 };
@@ -1104,7 +1104,7 @@ impl DownloadTransfer {
                         })
                         .await?;
                     // Untimed: drain the body. Errors here are inner (retryable IO).
-                    let chunk_meta = ChunkMetadata::from(&resp);
+                    let chunk_meta = crate::sdk_v1::chunk_metadata_from_get_object(&resp);
                     let bytes = collect_response_body(
                         &ctx.handle.buffer_pool,
                         resp.body,
@@ -1629,7 +1629,7 @@ mod tests {
 
     use super::*;
     use crate::model::ChecksumType;
-    use crate::operation::download::chunk_meta::ChunkMetadata;
+    use crate::operation::download::ChunkMetadata;
     use crate::operation::download::DownloadInput;
     use crate::scheduler::test_util::{assert_done, assert_pending, assert_ready};
     use crate::transfer::TransferContext;

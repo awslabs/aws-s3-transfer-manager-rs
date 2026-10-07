@@ -79,6 +79,10 @@ mod _checksum_type;
 /// Enum parsing errors.
 mod _chunk_metadata;
 
+/// Download fluent field delegation.
+#[cfg(not(s3_tm_out_of_tree))]
+mod _download_fluent_builder;
+
 /// Enum parsing errors.
 mod _download_input;
 
