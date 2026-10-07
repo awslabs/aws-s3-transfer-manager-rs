@@ -255,9 +255,10 @@ impl std::error::Error for PartNumberViolation {}
 /// Checks that `part_number` identifies a position S3 accepts.
 ///
 /// S3 uses a part's number both to identify the part and to place it in the object, so a number
-/// outside 1..=[`MAX_PART_NUMBER`] cannot be used. Numbers may arrive in any order and need not be
-/// consecutive. Repeats are caught by [`validate_distinct_part_numbers`] when the part list is
-/// assembled.
+/// outside 1..=[`MAX_PART_NUMBER`] cannot be used. Numbers may arrive in any order. Repeats are
+/// caught by [`validate_distinct_part_numbers`] when the part list is assembled. Gaps are not
+/// checked here: S3 rejects them on completion where it requires consecutive numbers (directory
+/// buckets, and parts carrying CRC32, CRC32C, SHA-1 or SHA-256 checksums).
 pub(crate) fn validate_part_number(part_number: u64) -> Result<(), PartNumberViolation> {
     if part_number == 0 || part_number > MAX_PART_NUMBER {
         return Err(PartNumberViolation::OutsideRange { part_number });

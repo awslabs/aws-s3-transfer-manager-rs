@@ -313,10 +313,16 @@ impl PartData {
     ///
     /// `part_number` is the part's position in the object: S3 assembles the
     /// object in part-number order, whatever order the parts are produced in.
-    /// It must be between 1 and 10,000 and unique within the upload; numbers
-    /// need not be consecutive. A part that breaks this fails the upload with
+    /// It must be between 1 and 10,000 and unique within the upload. A number
+    /// outside that range fails the upload with
     /// [`ErrorKind::InputInvalid`](crate::error::ErrorKind::InputInvalid)
-    /// before it is sent.
+    /// before the part is sent; a repeated number fails it with the same kind
+    /// before the upload is completed.
+    ///
+    /// Number parts 1 to N without gaps. S3 requires part numbers to start at 1
+    /// and be consecutive in a directory bucket, and in a general purpose
+    /// bucket when parts carry a CRC32, CRC32C, SHA-1 or SHA-256 checksum; it
+    /// rejects other numbering when the upload is completed.
     pub fn new(part_number: u64, data: impl Into<Bytes>) -> Self {
         Self::from_segmented(part_number, SegmentedBytes::from(data.into()))
     }
@@ -328,10 +334,16 @@ impl PartData {
     ///
     /// `part_number` is the part's position in the object: S3 assembles the
     /// object in part-number order, whatever order the parts are produced in.
-    /// It must be between 1 and 10,000 and unique within the upload; numbers
-    /// need not be consecutive. A part that breaks this fails the upload with
+    /// It must be between 1 and 10,000 and unique within the upload. A number
+    /// outside that range fails the upload with
     /// [`ErrorKind::InputInvalid`](crate::error::ErrorKind::InputInvalid)
-    /// before it is sent.
+    /// before the part is sent; a repeated number fails it with the same kind
+    /// before the upload is completed.
+    ///
+    /// Number parts 1 to N without gaps. S3 requires part numbers to start at 1
+    /// and be consecutive in a directory bucket, and in a general purpose
+    /// bucket when parts carry a CRC32, CRC32C, SHA-1 or SHA-256 checksum; it
+    /// rejects other numbering when the upload is completed.
     pub fn from_segmented(part_number: u64, data: SegmentedBytes) -> Self {
         Self {
             part_number,
@@ -383,8 +395,9 @@ pub trait PartStream {
     /// be shorter. Returns [`Poll::Ready(None)`](std::task::Poll::Ready) at end-of-stream. The
     /// transfer manager does not poll the stream again after end-of-stream or an error.
     ///
-    /// Each part's number is its position in the object, between 1 and 10,000 and unique within
-    /// the upload. Parts may be returned in any order (see [`PartData::new`]).
+    /// Each part's number is its position in the object, between 1 and 10,000, unique within the
+    /// upload, and best numbered 1 to N without gaps. Parts may be returned in any order (see
+    /// [`PartData::new`]).
     ///
     /// Returns [`Poll::Pending`](std::task::Poll::Pending) when the next part is not ready. Before
     /// returning `Pending`, the implementation must arrange for `cx.waker()` to be notified when

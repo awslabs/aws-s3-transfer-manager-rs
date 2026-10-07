@@ -9,7 +9,7 @@ use std::task::ready;
 use std::{task::Poll, time::Duration};
 
 use aws_sdk_s3::operation::complete_multipart_upload::{
-    CompleteMultipartUploadError, CompleteMultipartUploadOutput,
+    CompleteMultipartUploadError, CompleteMultipartUploadInput, CompleteMultipartUploadOutput,
 };
 use aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput;
 use aws_sdk_s3::operation::put_object::{PutObjectError, PutObjectOutput};
@@ -294,94 +294,166 @@ impl PartStream for SegmentedPartStream {
     }
 }
 
-fn mock_s3_client_for_multipart_upload() -> aws_sdk_s3::Client {
-    let upload_id = "test-upload-id".to_owned();
-
-    let create_mpu = mock!(aws_sdk_s3::Client::create_multipart_upload).then_output({
-        let upload_id = upload_id.clone();
-        move || {
-            CreateMultipartUploadOutput::builder()
-                .upload_id(upload_id.clone())
-                .build()
-        }
-    });
-
-    let upload_part = mock!(aws_sdk_s3::Client::upload_part)
-        .match_requests({
-            let upload_id = upload_id.clone();
-            move |input| input.upload_id.as_ref() == Some(&upload_id)
-        })
-        .then_output(|| UploadPartOutput::builder().e_tag("test-etag").build());
-
-    let complete_mpu = mock!(aws_sdk_s3::Client::complete_multipart_upload)
-        .match_requests({
-            let upload_id = upload_id.clone();
-            move |r| r.upload_id.as_ref() == Some(&upload_id)
-        })
-        .then_output(|| CompleteMultipartUploadOutput::builder().build());
-
-    mock_client!(
-        aws_sdk_s3,
-        RuleMode::MatchAny,
-        &[create_mpu, upload_part, complete_mpu]
+/// Builds a transfer manager with default config that sends its S3 requests to `client`.
+fn tm_with(client: aws_sdk_s3::Client) -> aws_sdk_s3_transfer_manager::Client {
+    aws_sdk_s3_transfer_manager::Client::new(
+        aws_sdk_s3_transfer_manager::Config::builder()
+            .client(client)
+            .build(),
     )
 }
 
-/// Requests a recording multipart mock received, for asserting what reached the wire.
+/// The upload ID a [`MultipartMock`]'s CreateMultipartUpload returns.
+const MOCK_UPLOAD_ID: &str = "test-upload-id";
+
+/// The multipart requests a [`MultipartMock`]'s default rules answered, in arrival order.
+///
+/// A request answered by an override rule is not recorded; that rule's `num_calls` counts it.
 #[derive(Debug, Default)]
 struct MultipartRecord {
-    /// `(part number, content length)` of each UploadPart, in arrival order.
+    /// `(part number, content length)` of each UploadPart.
     upload_parts: Mutex<Vec<(i32, i64)>>,
-    /// The part numbers each CompleteMultipartUpload listed.
-    completions: Mutex<Vec<Vec<i32>>>,
+    /// Each CompleteMultipartUpload request, as received.
+    completions: Mutex<Vec<CompleteMultipartUploadInput>>,
 }
 
-/// Builds a client whose multipart operations succeed and are recorded in `record`.
-fn recording_multipart_client(record: &Arc<MultipartRecord>) -> aws_sdk_s3::Client {
-    let create_mpu = mock!(aws_sdk_s3::Client::create_multipart_upload).then_output(|| {
-        CreateMultipartUploadOutput::builder()
-            .upload_id("test-upload-id")
-            .build()
-    });
-    let upload_part = mock!(aws_sdk_s3::Client::upload_part).then_compute_output({
-        let record = Arc::clone(record);
-        move |req| {
-            let part_number = req.part_number().expect("UploadPart carries a part number");
-            let content_length = req
-                .content_length()
-                .expect("UploadPart carries a content length");
-            record
-                .upload_parts
-                .lock()
-                .unwrap()
-                .push((part_number, content_length));
-            UploadPartOutput::builder()
-                .e_tag(format!("etag-{part_number}"))
+impl MultipartRecord {
+    /// `(part number, content length)` of each recorded UploadPart.
+    fn upload_parts(&self) -> Vec<(i32, i64)> {
+        self.upload_parts.lock().unwrap().clone()
+    }
+
+    /// How many UploadPart requests were recorded.
+    fn upload_part_calls(&self) -> usize {
+        self.upload_parts.lock().unwrap().len()
+    }
+
+    /// Each recorded CompleteMultipartUpload request.
+    fn completions(&self) -> Vec<CompleteMultipartUploadInput> {
+        self.completions.lock().unwrap().clone()
+    }
+
+    /// How many CompleteMultipartUpload requests were recorded.
+    fn complete_calls(&self) -> usize {
+        self.completions.lock().unwrap().len()
+    }
+
+    /// The part numbers each recorded CompleteMultipartUpload listed, in the order it listed them.
+    fn completed_part_numbers(&self) -> Vec<Vec<i32>> {
+        self.completions()
+            .iter()
+            .map(|complete| {
+                complete
+                    .multipart_upload()
+                    .map(|upload| {
+                        upload
+                            .parts()
+                            .iter()
+                            .filter_map(|part| part.part_number())
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    /// The `MpuObjectSize` each recorded CompleteMultipartUpload carried.
+    fn mpu_object_sizes(&self) -> Vec<Option<i64>> {
+        self.completions()
+            .iter()
+            .map(CompleteMultipartUploadInput::mpu_object_size)
+            .collect()
+    }
+}
+
+/// A mock multipart service. CreateMultipartUpload, UploadPart and CompleteMultipartUpload succeed
+/// and are recorded in a [`MultipartRecord`], unless a test overrides one with its own rule.
+///
+/// CreateMultipartUpload returns [`MOCK_UPLOAD_ID`]. The default UploadPart and
+/// CompleteMultipartUpload rules match only requests carrying that upload ID, so a request carrying
+/// any other ID matches no rule and the mock panics. The default UploadPart answer carries the ETag
+/// `etag-{part number}`.
+struct MultipartMock {
+    record: Arc<MultipartRecord>,
+    /// Consulted in the order they were added, before the default rules.
+    overrides: Vec<Rule>,
+}
+
+impl MultipartMock {
+    /// A mock with no override rules and an empty record.
+    fn new() -> Self {
+        Self {
+            record: Arc::default(),
+            overrides: Vec::new(),
+        }
+    }
+
+    /// Answers the requests `rule` matches with `rule` instead of the default rules.
+    ///
+    /// `rule` applies to the operation its `mock!` names. The requests it answers are not recorded;
+    /// `rule.num_calls()` counts them.
+    fn with_override(mut self, rule: &Rule) -> Self {
+        self.overrides.push(rule.clone());
+        self
+    }
+
+    /// Builds a client that answers with the override rules, then the default rules.
+    ///
+    /// `RuleMode::MatchAny` answers a request with the first rule, in list order, that matches it,
+    /// which is what lets an override take precedence.
+    fn client(&self) -> aws_sdk_s3::Client {
+        let create_mpu = mock!(aws_sdk_s3::Client::create_multipart_upload).then_output(|| {
+            CreateMultipartUploadOutput::builder()
+                .upload_id(MOCK_UPLOAD_ID)
                 .build()
-        }
-    });
-    let complete_mpu = mock!(aws_sdk_s3::Client::complete_multipart_upload).then_compute_output({
-        let record = Arc::clone(record);
-        move |req| {
-            let listed = req
-                .multipart_upload()
-                .map(|upload| {
-                    upload
-                        .parts()
-                        .iter()
-                        .filter_map(|part| part.part_number())
-                        .collect()
-                })
-                .unwrap_or_default();
-            record.completions.lock().unwrap().push(listed);
-            CompleteMultipartUploadOutput::builder().build()
-        }
-    });
-    mock_client!(
-        aws_sdk_s3,
-        RuleMode::MatchAny,
-        &[create_mpu, upload_part, complete_mpu]
-    )
+        });
+        let upload_part = mock!(aws_sdk_s3::Client::upload_part)
+            .match_requests(|req| req.upload_id() == Some(MOCK_UPLOAD_ID))
+            .then_compute_output({
+                let record = Arc::clone(&self.record);
+                move |req| {
+                    let part_number = req.part_number().expect("UploadPart carries a part number");
+                    let content_length = req
+                        .content_length()
+                        .expect("UploadPart carries a content length");
+                    record
+                        .upload_parts
+                        .lock()
+                        .unwrap()
+                        .push((part_number, content_length));
+                    UploadPartOutput::builder()
+                        .e_tag(format!("etag-{part_number}"))
+                        .build()
+                }
+            });
+        let complete_mpu = mock!(aws_sdk_s3::Client::complete_multipart_upload)
+            .match_requests(|req| req.upload_id() == Some(MOCK_UPLOAD_ID))
+            .then_compute_output({
+                let record = Arc::clone(&self.record);
+                move |req| {
+                    record.completions.lock().unwrap().push(req.clone());
+                    CompleteMultipartUploadOutput::builder().build()
+                }
+            });
+
+        let rules: Vec<Rule> = self
+            .overrides
+            .iter()
+            .cloned()
+            .chain([create_mpu, upload_part, complete_mpu])
+            .collect();
+        mock_client!(aws_sdk_s3, RuleMode::MatchAny, &rules)
+    }
+
+    /// Builds a transfer manager with default config over [`Self::client`].
+    fn tm(&self) -> aws_sdk_s3_transfer_manager::Client {
+        tm_with(self.client())
+    }
+
+    /// The requests the default rules have answered so far.
+    fn record(&self) -> &MultipartRecord {
+        &self.record
+    }
 }
 
 /// A `PartStream` that yields one part per scripted part number, in script order, then
@@ -423,14 +495,11 @@ impl PartStream for NumberedPartStream {
     }
 }
 
-/// Uploads a `NumberedPartStream` for `part_numbers` and returns the outcome with the mock's record.
-async fn upload_numbered_parts(part_numbers: &[u64]) -> (Result<(), Error>, Arc<MultipartRecord>) {
-    let record = Arc::new(MultipartRecord::default());
-    let tm = aws_sdk_s3_transfer_manager::Client::new(
-        aws_sdk_s3_transfer_manager::Config::builder()
-            .client(recording_multipart_client(&record))
-            .build(),
-    );
+/// Uploads a `NumberedPartStream` for `part_numbers` and returns the outcome with the mock it ran
+/// against.
+async fn upload_numbered_parts(part_numbers: &[u64]) -> (Result<(), Error>, MultipartMock) {
+    let mock = MultipartMock::new();
+    let tm = mock.tm();
     let result = tm
         .upload()
         .bucket("test-bucket")
@@ -443,39 +512,14 @@ async fn upload_numbered_parts(part_numbers: &[u64]) -> (Result<(), Error>, Arc<
         .join()
         .await
         .map(|_| ());
-    (result, record)
+    (result, mock)
 }
 
 /// Runs one valid zero-byte multipart source and verifies that the transfer sends exactly one empty
 /// part before completing a zero-byte object.
 async fn assert_single_empty_multipart_upload(stream: InputStream) {
-    let upload_id = "test-upload-id".to_owned();
-
-    let create_mpu = mock!(aws_sdk_s3::Client::create_multipart_upload).then_output({
-        let upload_id = upload_id.clone();
-        move || {
-            CreateMultipartUploadOutput::builder()
-                .upload_id(upload_id.clone())
-                .build()
-        }
-    });
-    let upload_part = mock!(aws_sdk_s3::Client::upload_part)
-        .match_requests(|req| req.part_number() == Some(1) && req.content_length() == Some(0))
-        .then_output(|| UploadPartOutput::builder().e_tag("empty-etag").build());
-    let complete_mpu = mock!(aws_sdk_s3::Client::complete_multipart_upload)
-        .match_requests(|req| req.mpu_object_size() == Some(0))
-        .then_output(|| CompleteMultipartUploadOutput::builder().build());
-
-    let client = mock_client!(
-        aws_sdk_s3,
-        RuleMode::MatchAny,
-        &[&create_mpu, &upload_part, &complete_mpu]
-    );
-    let tm = aws_sdk_s3_transfer_manager::Client::new(
-        aws_sdk_s3_transfer_manager::Config::builder()
-            .client(client)
-            .build(),
-    );
+    let mock = MultipartMock::new();
+    let tm = mock.tm();
 
     tm.upload()
         .bucket("test-bucket")
@@ -488,40 +532,18 @@ async fn assert_single_empty_multipart_upload(stream: InputStream) {
         .expect("a valid empty stream must complete as a zero-byte object");
 
     assert_eq!(
-        upload_part.num_calls(),
-        1,
+        vec![(1, 0)],
+        mock.record().upload_parts(),
         "an empty multipart source must upload exactly one empty part"
     );
-    assert_eq!(complete_mpu.num_calls(), 1);
+    assert_eq!(vec![Some(0)], mock.record().mpu_object_sizes());
 }
 
 /// Runs one nonexact size declaration and verifies that CompleteMPU receives the validated bytes
 /// emitted by the source rather than either declared bound.
 async fn assert_ranged_mpu_object_size(size_hint: SizeHint, actual: usize) {
-    let upload_id = "test-upload-id".to_owned();
-    let create_mpu = mock!(aws_sdk_s3::Client::create_multipart_upload).then_output({
-        let upload_id = upload_id.clone();
-        move || {
-            CreateMultipartUploadOutput::builder()
-                .upload_id(upload_id.clone())
-                .build()
-        }
-    });
-    let upload_part = mock!(aws_sdk_s3::Client::upload_part)
-        .then_output(|| UploadPartOutput::builder().e_tag("test-etag").build());
-    let complete_mpu = mock!(aws_sdk_s3::Client::complete_multipart_upload)
-        .match_requests(move |req| req.mpu_object_size() == Some(actual as i64))
-        .then_output(|| CompleteMultipartUploadOutput::builder().build());
-    let client = mock_client!(
-        aws_sdk_s3,
-        RuleMode::MatchAny,
-        &[&create_mpu, &upload_part, &complete_mpu]
-    );
-    let tm = aws_sdk_s3_transfer_manager::Client::new(
-        aws_sdk_s3_transfer_manager::Config::builder()
-            .client(client)
-            .build(),
-    );
+    let mock = MultipartMock::new();
+    let tm = mock.tm();
 
     let (tx, rx) = mpsc::channel(1);
     let handle = tm
@@ -540,7 +562,7 @@ async fn assert_ranged_mpu_object_size(size_hint: SizeHint, actual: usize) {
         .join()
         .await
         .expect("source output within its declared bounds must upload");
-    assert_eq!(complete_mpu.num_calls(), 1);
+    assert_eq!(vec![Some(actual as i64)], mock.record().mpu_object_sizes());
 }
 
 #[tokio::test]
@@ -552,11 +574,7 @@ async fn test_custom_stream_uploads_segmented_part_data() {
         part: Some(PartData::from_segmented(1, data)),
         size,
     };
-    let client = mock_s3_client_for_multipart_upload();
-    let config = aws_sdk_s3_transfer_manager::Config::builder()
-        .client(client)
-        .build();
-    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+    let tm = MultipartMock::new().tm();
 
     let handle = tm
         .upload()
@@ -580,9 +598,8 @@ async fn test_custom_stream_resumes_after_part_buffer_admission() {
     let holder = pool.try_reserve(CAPACITY).unwrap().unwrap();
     let held = pool.acquire(&holder, CAPACITY).unwrap();
 
-    let client = mock_s3_client_for_multipart_upload();
     let config = aws_sdk_s3_transfer_manager::Config::builder()
-        .client(client)
+        .client(MultipartMock::new().client())
         .memory(MemoryConfig::Explicit(pool.clone()))
         .build();
     let tm = aws_sdk_s3_transfer_manager::Client::new(config);
@@ -619,11 +636,7 @@ async fn test_custom_stream_resumes_after_part_buffer_admission() {
 
 #[tokio::test]
 async fn test_source_wake_before_read_parking_is_retained() {
-    let client = mock_s3_client_for_multipart_upload();
-    let config = aws_sdk_s3_transfer_manager::Config::builder()
-        .client(client)
-        .build();
-    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+    let tm = MultipartMock::new().tm();
     let polls = Arc::new(AtomicUsize::new(0));
 
     let handle = tm
@@ -659,12 +672,7 @@ async fn test_source_wake_before_read_parking_is_retained() {
 #[tokio::test]
 async fn test_many_uploads_no_deadlock() {
     let (_guard, _rx) = capture_test_logs();
-    let client = mock_s3_client_for_multipart_upload();
-    let config = aws_sdk_s3_transfer_manager::Config::builder()
-        .client(client)
-        .build();
-
-    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+    let tm = MultipartMock::new().tm();
 
     let mut transfers = Vec::with_capacity(MANY_ASYNC_UPLOADS_CNT);
     for i in 0..MANY_ASYNC_UPLOADS_CNT {
@@ -719,12 +727,7 @@ async fn test_many_uploads_no_deadlock() {
 
 #[tokio::test]
 async fn test_large_upload_part_size_bump() {
-    let client = mock_s3_client_for_multipart_upload();
-    let config = aws_sdk_s3_transfer_manager::Config::builder()
-        .client(client)
-        .build();
-
-    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+    let tm = MultipartMock::new().tm();
 
     let (tx, rx) = mpsc::channel(1);
     let size_hint = 100 * ByteUnit::Gibibyte.as_bytes_u64();
@@ -755,41 +758,13 @@ async fn test_large_upload_part_size_bump() {
 /// size (a dropped or duplicated part). Required by SEP step 7.
 #[tokio::test]
 async fn test_complete_mpu_sends_mpu_object_size() {
-    let upload_id = "test-upload-id".to_owned();
     let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
     // Two full parts plus a partial one, so the total is not a part-size multiple
     // and a stale part-count-derived value would not match.
     let content_length = 2 * part_size + 1024;
 
-    let create_mpu = mock!(aws_sdk_s3::Client::create_multipart_upload).then_output({
-        let upload_id = upload_id.clone();
-        move || {
-            CreateMultipartUploadOutput::builder()
-                .upload_id(upload_id.clone())
-                .build()
-        }
-    });
-
-    let upload_part = mock!(aws_sdk_s3::Client::upload_part)
-        .then_output(|| UploadPartOutput::builder().e_tag("test-etag").build());
-
-    // Match only when MpuObjectSize equals the full content length. With the
-    // field absent (or wrong) no rule matches and the upload fails, so the
-    // assertion below is what pins the behavior.
-    let complete_mpu = mock!(aws_sdk_s3::Client::complete_multipart_upload)
-        .match_requests(move |req| req.mpu_object_size() == Some(content_length as i64))
-        .then_output(|| CompleteMultipartUploadOutput::builder().build());
-
-    let client = mock_client!(
-        aws_sdk_s3,
-        RuleMode::MatchAny,
-        &[create_mpu, upload_part, complete_mpu]
-    );
-
-    let config = aws_sdk_s3_transfer_manager::Config::builder()
-        .client(client)
-        .build();
-    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+    let mock = MultipartMock::new();
+    let tm = mock.tm();
 
     let (tx, rx) = mpsc::channel(3);
     let stream = TestStream::exact(rx, content_length as u64);
@@ -806,10 +781,12 @@ async fn test_complete_mpu_sends_mpu_object_size() {
     tx.send(Bytes::from(vec![0u8; part_size])).await.unwrap();
     tx.send(Bytes::from(vec![0u8; 1024])).await.unwrap();
     drop(tx);
-    handle
-        .join()
-        .await
-        .expect("upload should succeed: CompleteMPU must carry MpuObjectSize = content length");
+    handle.join().await.expect("upload should succeed");
+    assert_eq!(
+        vec![Some(content_length as i64)],
+        mock.record().mpu_object_sizes(),
+        "CompleteMPU must carry MpuObjectSize = content length"
+    );
 }
 
 // --- Unknown content length --------------------------------------------------
@@ -822,11 +799,7 @@ async fn test_complete_mpu_sends_mpu_object_size() {
 #[tokio::test]
 async fn test_unknown_length_multipart_upload() {
     let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
-    let client = mock_s3_client_for_multipart_upload();
-    let config = aws_sdk_s3_transfer_manager::Config::builder()
-        .client(client)
-        .build();
-    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+    let tm = MultipartMock::new().tm();
 
     let (tx, rx) = mpsc::channel(2);
     let handle = tm
@@ -899,34 +872,12 @@ async fn test_explicit_zero_byte_part_is_not_duplicated() {
 /// value must still be sent so S3 can reject a mismatched assembly.
 #[tokio::test]
 async fn test_unknown_length_mpu_object_size_is_running_sum() {
-    let upload_id = "test-upload-id".to_owned();
     let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
     // Deliberately not a part-size multiple, so a part-count-derived value wouldn't match.
     let total = 2 * part_size + 1024;
 
-    let create_mpu = mock!(aws_sdk_s3::Client::create_multipart_upload).then_output({
-        let upload_id = upload_id.clone();
-        move || {
-            CreateMultipartUploadOutput::builder()
-                .upload_id(upload_id.clone())
-                .build()
-        }
-    });
-    let upload_part = mock!(aws_sdk_s3::Client::upload_part)
-        .then_output(|| UploadPartOutput::builder().e_tag("test-etag").build());
-    let complete_mpu = mock!(aws_sdk_s3::Client::complete_multipart_upload)
-        .match_requests(move |req| req.mpu_object_size() == Some(total as i64))
-        .then_output(|| CompleteMultipartUploadOutput::builder().build());
-
-    let client = mock_client!(
-        aws_sdk_s3,
-        RuleMode::MatchAny,
-        &[create_mpu, upload_part, complete_mpu]
-    );
-    let config = aws_sdk_s3_transfer_manager::Config::builder()
-        .client(client)
-        .build();
-    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+    let mock = MultipartMock::new();
+    let tm = mock.tm();
 
     let (tx, rx) = mpsc::channel(2);
     let handle = tm
@@ -942,8 +893,11 @@ async fn test_unknown_length_mpu_object_size_is_running_sum() {
     tx.send(Bytes::from(vec![0u8; 1024])).await.unwrap();
     drop(tx);
 
-    handle.join().await.expect(
-        "CompleteMPU must carry MpuObjectSize equal to the summed bytes of an unknown-length stream",
+    handle.join().await.expect("upload should succeed");
+    assert_eq!(
+        vec![Some(total as i64)],
+        mock.record().mpu_object_sizes(),
+        "CompleteMPU must carry MpuObjectSize equal to the summed bytes of an unknown-length stream"
     );
 }
 
@@ -953,34 +907,12 @@ async fn test_unknown_length_mpu_object_size_is_running_sum() {
 /// `MpuObjectSize` must carry the validated bytes actually emitted, not the planning bound.
 #[tokio::test]
 async fn test_bounded_length_sends_validated_actual_size() {
-    let upload_id = "test-upload-id".to_owned();
     let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
     let upper = 2 * part_size;
     let actual = part_size + 1024;
 
-    let create_mpu = mock!(aws_sdk_s3::Client::create_multipart_upload).then_output({
-        let upload_id = upload_id.clone();
-        move || {
-            CreateMultipartUploadOutput::builder()
-                .upload_id(upload_id.clone())
-                .build()
-        }
-    });
-    let upload_part = mock!(aws_sdk_s3::Client::upload_part)
-        .then_output(|| UploadPartOutput::builder().e_tag("test-etag").build());
-    let complete_mpu = mock!(aws_sdk_s3::Client::complete_multipart_upload)
-        .match_requests(move |req| req.mpu_object_size() == Some(actual as i64))
-        .then_output(|| CompleteMultipartUploadOutput::builder().build());
-
-    let client = mock_client!(
-        aws_sdk_s3,
-        RuleMode::MatchAny,
-        &[create_mpu, upload_part, complete_mpu]
-    );
-    let config = aws_sdk_s3_transfer_manager::Config::builder()
-        .client(client)
-        .build();
-    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+    let mock = MultipartMock::new();
+    let tm = mock.tm();
 
     let (tx, rx) = mpsc::channel(1);
     let stream = TestStream::with_size_hint(rx, SizeHint::default().with_upper(Some(upper as u64)));
@@ -994,10 +926,12 @@ async fn test_bounded_length_sends_validated_actual_size() {
     tx.send(Bytes::from(vec![0u8; actual])).await.unwrap();
     drop(tx);
 
-    handle
-        .join()
-        .await
-        .expect("a bounded upload must send its validated actual size as MpuObjectSize");
+    handle.join().await.expect("upload should succeed");
+    assert_eq!(
+        vec![Some(actual as i64)],
+        mock.record().mpu_object_sizes(),
+        "a bounded upload must send its validated actual size as MpuObjectSize"
+    );
 }
 
 /// Lower-only and two-sided bounds constrain the source without becoming an exact object size.
@@ -1010,29 +944,8 @@ async fn test_ranged_hints_send_validated_actual_mpu_object_size() {
 /// An exact size hint is a contract, not only a planning input.
 #[tokio::test]
 async fn test_exact_length_rejects_early_end_of_stream() {
-    let upload_id = "test-upload-id".to_owned();
-    let create_mpu = mock!(aws_sdk_s3::Client::create_multipart_upload).then_output({
-        let upload_id = upload_id.clone();
-        move || {
-            CreateMultipartUploadOutput::builder()
-                .upload_id(upload_id.clone())
-                .build()
-        }
-    });
-    let upload_part = mock!(aws_sdk_s3::Client::upload_part)
-        .then_output(|| UploadPartOutput::builder().e_tag("test-etag").build());
-    let complete_mpu = mock!(aws_sdk_s3::Client::complete_multipart_upload)
-        .then_output(|| CompleteMultipartUploadOutput::builder().build());
-    let client = mock_client!(
-        aws_sdk_s3,
-        RuleMode::MatchAny,
-        &[&create_mpu, &upload_part, &complete_mpu]
-    );
-    let tm = aws_sdk_s3_transfer_manager::Client::new(
-        aws_sdk_s3_transfer_manager::Config::builder()
-            .client(client)
-            .build(),
-    );
+    let mock = MultipartMock::new();
+    let tm = mock.tm();
 
     let (tx, rx) = mpsc::channel(1);
     let handle = tm
@@ -1050,36 +963,15 @@ async fn test_exact_length_rejects_early_end_of_stream() {
         .await
         .expect_err("an exact stream ending below its size must fail");
     assert_eq!(*error.kind(), ErrorKind::InputInvalid);
-    assert_eq!(upload_part.num_calls(), 1);
-    assert_eq!(complete_mpu.num_calls(), 0);
+    assert_eq!(mock.record().upload_part_calls(), 1);
+    assert_eq!(mock.record().complete_calls(), 0);
 }
 
 /// The upper bound is enforced before an oversized part is sent to S3.
 #[tokio::test]
 async fn test_exact_length_rejects_overflow_before_upload_part() {
-    let upload_id = "test-upload-id".to_owned();
-    let create_mpu = mock!(aws_sdk_s3::Client::create_multipart_upload).then_output({
-        let upload_id = upload_id.clone();
-        move || {
-            CreateMultipartUploadOutput::builder()
-                .upload_id(upload_id.clone())
-                .build()
-        }
-    });
-    let upload_part = mock!(aws_sdk_s3::Client::upload_part)
-        .then_output(|| UploadPartOutput::builder().e_tag("test-etag").build());
-    let complete_mpu = mock!(aws_sdk_s3::Client::complete_multipart_upload)
-        .then_output(|| CompleteMultipartUploadOutput::builder().build());
-    let client = mock_client!(
-        aws_sdk_s3,
-        RuleMode::MatchAny,
-        &[&create_mpu, &upload_part, &complete_mpu]
-    );
-    let tm = aws_sdk_s3_transfer_manager::Client::new(
-        aws_sdk_s3_transfer_manager::Config::builder()
-            .client(client)
-            .build(),
-    );
+    let mock = MultipartMock::new();
+    let tm = mock.tm();
 
     let (tx, rx) = mpsc::channel(1);
     let handle = tm
@@ -1097,19 +989,14 @@ async fn test_exact_length_rejects_overflow_before_upload_part() {
         .await
         .expect_err("a stream exceeding its exact size must fail");
     assert_eq!(*error.kind(), ErrorKind::InputInvalid);
-    assert_eq!(upload_part.num_calls(), 0);
-    assert_eq!(complete_mpu.num_calls(), 0);
+    assert_eq!(mock.record().upload_part_calls(), 0);
+    assert_eq!(mock.record().complete_calls(), 0);
 }
 
 /// A bounded stream must satisfy its lower bound when EOF closes dispatch.
 #[tokio::test]
 async fn test_bounded_length_rejects_below_lower_bound() {
-    let client = mock_s3_client_for_multipart_upload();
-    let tm = aws_sdk_s3_transfer_manager::Client::new(
-        aws_sdk_s3_transfer_manager::Config::builder()
-            .client(client)
-            .build(),
-    );
+    let tm = MultipartMock::new().tm();
     let (tx, rx) = mpsc::channel(1);
     let hint = SizeHint::default().with_lower(5).with_upper(Some(10));
     let handle = tm
@@ -1136,11 +1023,7 @@ async fn test_bounded_length_rejects_below_lower_bound() {
 fn test_stream_rejects_lower_bound_above_upper_bound() {
     let (_tx, rx) = mpsc::channel(1);
     let hint = SizeHint::default().with_lower(11).with_upper(Some(10));
-    let tm = aws_sdk_s3_transfer_manager::Client::new(
-        aws_sdk_s3_transfer_manager::Config::builder()
-            .client(mock_client!(aws_sdk_s3, []))
-            .build(),
-    );
+    let tm = tm_with(mock_client!(aws_sdk_s3, []));
 
     let error = tm
         .upload()
@@ -1154,42 +1037,14 @@ fn test_stream_rejects_lower_bound_above_upper_bound() {
     assert_eq!(*error.kind(), ErrorKind::InputInvalid);
 }
 
-/// Outcome of [`upload_with_content_length`].
-struct DeclaredLengthUpload {
-    result: Result<(), Error>,
-    upload_part_calls: usize,
-    /// `MpuObjectSize` of each CompleteMultipartUpload sent.
-    completions: Vec<Option<i64>>,
-}
-
 /// Uploads `produced` bytes, as one part, from a stream with no size bounds, on a request that
-/// declares `content_length`.
-async fn upload_with_content_length(content_length: i64, produced: usize) -> DeclaredLengthUpload {
-    let create_mpu = mock!(aws_sdk_s3::Client::create_multipart_upload).then_output(|| {
-        CreateMultipartUploadOutput::builder()
-            .upload_id("test-upload-id")
-            .build()
-    });
-    let upload_part = mock!(aws_sdk_s3::Client::upload_part)
-        .then_output(|| UploadPartOutput::builder().e_tag("test-etag").build());
-    let completions = Arc::new(Mutex::new(Vec::new()));
-    let complete_mpu = mock!(aws_sdk_s3::Client::complete_multipart_upload).then_compute_output({
-        let completions = Arc::clone(&completions);
-        move |req| {
-            completions.lock().unwrap().push(req.mpu_object_size());
-            CompleteMultipartUploadOutput::builder().build()
-        }
-    });
-    let client = mock_client!(
-        aws_sdk_s3,
-        RuleMode::MatchAny,
-        &[&create_mpu, &upload_part, &complete_mpu]
-    );
-    let tm = aws_sdk_s3_transfer_manager::Client::new(
-        aws_sdk_s3_transfer_manager::Config::builder()
-            .client(client)
-            .build(),
-    );
+/// declares `content_length`. Returns the outcome with the mock it ran against.
+async fn upload_with_content_length(
+    content_length: i64,
+    produced: usize,
+) -> (Result<(), Error>, MultipartMock) {
+    let mock = MultipartMock::new();
+    let tm = mock.tm();
 
     let (tx, rx) = mpsc::channel(1);
     let handle = tm
@@ -1206,59 +1061,43 @@ async fn upload_with_content_length(content_length: i64, produced: usize) -> Dec
     tx.send(Bytes::from(vec![0u8; produced])).await.unwrap();
     drop(tx);
     let result = handle.join().await.map(|_| ());
-
-    let completions = completions.lock().unwrap().clone();
-    DeclaredLengthUpload {
-        result,
-        upload_part_calls: upload_part.num_calls(),
-        completions,
-    }
+    (result, mock)
 }
 
 /// A stream with no size bounds that ends short of the declared `content_length` fails before
 /// CompleteMultipartUpload, rather than storing the short object.
 #[tokio::test]
 async fn test_content_length_rejects_short_stream_before_completion() {
-    let upload = upload_with_content_length(10, 5).await;
-    let error = upload
-        .result
-        .expect_err("a stream ending below its content_length must fail");
+    let (result, mock) = upload_with_content_length(10, 5).await;
+    let error = result.expect_err("a stream ending below its content_length must fail");
     assert_eq!(ErrorKind::InputInvalid, *error.kind());
-    assert!(upload.completions.is_empty());
+    assert!(mock.record().completions().is_empty());
 }
 
 /// A stream with no size bounds that runs past the declared `content_length` fails before the part
 /// that exceeds it is sent.
 #[tokio::test]
 async fn test_content_length_rejects_long_stream_before_upload_part() {
-    let upload = upload_with_content_length(10, 11).await;
-    let error = upload
-        .result
-        .expect_err("a stream running past its content_length must fail");
+    let (result, mock) = upload_with_content_length(10, 11).await;
+    let error = result.expect_err("a stream running past its content_length must fail");
     assert_eq!(ErrorKind::InputInvalid, *error.kind());
-    assert_eq!(0, upload.upload_part_calls);
-    assert!(upload.completions.is_empty());
+    assert_eq!(0, mock.record().upload_part_calls());
+    assert!(mock.record().completions().is_empty());
 }
 
 /// A stream that produces exactly the declared `content_length` uploads, and CompleteMultipartUpload
 /// carries the declaration as `MpuObjectSize`.
 #[tokio::test]
 async fn test_content_length_matching_stream_uploads() {
-    let upload = upload_with_content_length(10, 10).await;
-    upload
-        .result
-        .expect("a stream producing exactly its content_length must upload");
-    assert_eq!(vec![Some(10)], upload.completions);
+    let (result, mock) = upload_with_content_length(10, 10).await;
+    result.expect("a stream producing exactly its content_length must upload");
+    assert_eq!(vec![Some(10)], mock.record().mpu_object_sizes());
 }
 
 /// A `content_length` that is negative or contradicts the body's own size fails at `initiate()`.
 #[tokio::test]
 async fn test_content_length_contradicting_body_fails_at_initiate() {
-    let tm = aws_sdk_s3_transfer_manager::Client::new(
-        aws_sdk_s3_transfer_manager::Config::builder()
-            .client(mock_client!(aws_sdk_s3, []))
-            .build(),
-    );
+    let tm = tm_with(mock_client!(aws_sdk_s3, []));
     let initiate = |content_length: i64, body: InputStream| {
         tm.upload()
             .bucket("test-bucket")
@@ -1293,38 +1132,10 @@ async fn test_content_length_contradicting_body_fails_at_initiate() {
 /// list part 1 twice — and whichever write S3 kept last could truncate the object.
 #[tokio::test]
 async fn test_unknown_length_with_data_never_sends_empty_part() {
-    let upload_id = "test-upload-id".to_owned();
     let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
 
-    let create_mpu = mock!(aws_sdk_s3::Client::create_multipart_upload).then_output({
-        let upload_id = upload_id.clone();
-        move || {
-            CreateMultipartUploadOutput::builder()
-                .upload_id(upload_id.clone())
-                .build()
-        }
-    });
-
-    // Split the part rules by body size so the empty one's call count is the assertion.
-    let empty_part = mock!(aws_sdk_s3::Client::upload_part)
-        .match_requests(|req| req.content_length() == Some(0))
-        .then_output(|| UploadPartOutput::builder().e_tag("empty-etag").build());
-    let data_part = mock!(aws_sdk_s3::Client::upload_part)
-        .match_requests(|req| req.content_length() != Some(0))
-        .then_output(|| UploadPartOutput::builder().e_tag("data-etag").build());
-
-    let complete_mpu = mock!(aws_sdk_s3::Client::complete_multipart_upload)
-        .then_output(|| CompleteMultipartUploadOutput::builder().build());
-
-    let client = mock_client!(
-        aws_sdk_s3,
-        RuleMode::MatchAny,
-        &[&create_mpu, &empty_part, &data_part, &complete_mpu]
-    );
-    let config = aws_sdk_s3_transfer_manager::Config::builder()
-        .client(client)
-        .build();
-    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+    let mock = MultipartMock::new();
+    let tm = mock.tm();
 
     let (tx, rx) = mpsc::channel(1);
     let handle = tm
@@ -1341,14 +1152,20 @@ async fn test_unknown_length_with_data_never_sends_empty_part() {
 
     handle.join().await.expect("upload should succeed");
 
+    // Split the recorded parts by body size so the empty ones' count is the assertion.
+    let (empty_parts, data_parts): (Vec<_>, Vec<_>) = mock
+        .record()
+        .upload_parts()
+        .into_iter()
+        .partition(|&(_, content_length)| content_length == 0);
     assert_eq!(
         1,
-        data_part.num_calls(),
+        data_parts.len(),
         "the single data part must be uploaded once"
     );
     assert_eq!(
         0,
-        empty_part.num_calls(),
+        empty_parts.len(),
         "a stream that yielded data must not also send an empty part 1"
     );
 }
@@ -1411,34 +1228,12 @@ impl PartStream for UnknownLengthChecksumStream {
 /// final part and the transfer decides "final" from end-of-stream rather than a count.
 #[tokio::test]
 async fn test_unknown_length_forwards_full_object_checksum() {
-    let upload_id = "test-upload-id".to_owned();
     let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
-    // Base64 of a CRC32 value; the mock only checks that it is forwarded verbatim.
+    // Base64 of a CRC32 value; the test only checks that it is forwarded verbatim.
     let expected_checksum = "AAAAAA==";
 
-    let create_mpu = mock!(aws_sdk_s3::Client::create_multipart_upload).then_output({
-        let upload_id = upload_id.clone();
-        move || {
-            CreateMultipartUploadOutput::builder()
-                .upload_id(upload_id.clone())
-                .build()
-        }
-    });
-    let upload_part = mock!(aws_sdk_s3::Client::upload_part)
-        .then_output(|| UploadPartOutput::builder().e_tag("test-etag").build());
-    let complete_mpu = mock!(aws_sdk_s3::Client::complete_multipart_upload)
-        .match_requests(move |req| req.checksum_crc32() == Some(expected_checksum))
-        .then_output(|| CompleteMultipartUploadOutput::builder().build());
-
-    let client = mock_client!(
-        aws_sdk_s3,
-        RuleMode::MatchAny,
-        &[create_mpu, upload_part, complete_mpu]
-    );
-    let config = aws_sdk_s3_transfer_manager::Config::builder()
-        .client(client)
-        .build();
-    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+    let mock = MultipartMock::new();
+    let tm = mock.tm();
 
     let (tx, rx) = mpsc::channel(1);
     let stream = UnknownLengthChecksumStream::new(rx, Some(expected_checksum.to_owned()));
@@ -1454,10 +1249,17 @@ async fn test_unknown_length_forwards_full_object_checksum() {
     tx.send(Bytes::from(vec![0u8; part_size])).await.unwrap();
     drop(tx);
 
-    handle
-        .join()
-        .await
-        .expect("a stream-supplied full-object checksum must be sent on CompleteMPU");
+    handle.join().await.expect("upload should succeed");
+    let completions = mock.record().completions();
+    let checksums: Vec<_> = completions
+        .iter()
+        .map(CompleteMultipartUploadInput::checksum_crc32)
+        .collect();
+    assert_eq!(
+        vec![Some(expected_checksum)],
+        checksums,
+        "a stream-supplied full-object checksum must be sent on CompleteMPU"
+    );
 }
 
 /// An unknown-length transfer cannot report a total while in flight, but its final
@@ -1472,11 +1274,7 @@ async fn test_unknown_length_reports_total_bytes_after_completion() {
     let tail = 512;
     let expected = (part_size + tail) as u64;
 
-    let client = mock_s3_client_for_multipart_upload();
-    let config = aws_sdk_s3_transfer_manager::Config::builder()
-        .client(client)
-        .build();
-    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+    let tm = MultipartMock::new().tm();
 
     let (tx, rx) = mpsc::channel(2);
     let handle = tm
@@ -1518,11 +1316,7 @@ async fn test_unknown_length_reports_total_bytes_after_completion() {
 /// complete a truncated object, which is the worst possible outcome for an upload.
 #[tokio::test]
 async fn test_unknown_length_reader_error_fails_transfer() {
-    let client = mock_s3_client_for_multipart_upload();
-    let config = aws_sdk_s3_transfer_manager::Config::builder()
-        .client(client)
-        .build();
-    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+    let tm = MultipartMock::new().tm();
 
     let handle = tm
         .upload()
@@ -1578,35 +1372,13 @@ impl PartStream for FailingUnknownLengthStream {
 /// mis-sized or truncated part list would show up as a wrong `MpuObjectSize`.
 #[tokio::test]
 async fn test_unknown_length_many_parts_grows_part_list() {
-    let upload_id = "test-upload-id".to_owned();
     // Smallest permitted part size keeps the test cheap; 40 parts crosses the 32 default.
     let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
     let num_parts = 40usize;
     let expected_total = (part_size * num_parts) as i64;
 
-    let create_mpu = mock!(aws_sdk_s3::Client::create_multipart_upload).then_output({
-        let upload_id = upload_id.clone();
-        move || {
-            CreateMultipartUploadOutput::builder()
-                .upload_id(upload_id.clone())
-                .build()
-        }
-    });
-    let upload_part = mock!(aws_sdk_s3::Client::upload_part)
-        .then_output(|| UploadPartOutput::builder().e_tag("test-etag").build());
-    let complete_mpu = mock!(aws_sdk_s3::Client::complete_multipart_upload)
-        .match_requests(move |req| req.mpu_object_size() == Some(expected_total))
-        .then_output(|| CompleteMultipartUploadOutput::builder().build());
-
-    let client = mock_client!(
-        aws_sdk_s3,
-        RuleMode::MatchAny,
-        &[&create_mpu, &upload_part, &complete_mpu]
-    );
-    let config = aws_sdk_s3_transfer_manager::Config::builder()
-        .client(client)
-        .build();
-    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+    let mock = MultipartMock::new();
+    let tm = mock.tm();
 
     let (tx, rx) = mpsc::channel(4);
     let handle = tm
@@ -1632,8 +1404,13 @@ async fn test_unknown_length_many_parts_grows_part_list() {
         .expect("an unknown-length stream must handle more parts than the default capacity");
 
     assert_eq!(
+        vec![Some(expected_total)],
+        mock.record().mpu_object_sizes(),
+        "MpuObjectSize must count every part"
+    );
+    assert_eq!(
         num_parts,
-        upload_part.num_calls(),
+        mock.record().upload_part_calls(),
         "every part must be uploaded exactly once"
     );
 }
@@ -1682,11 +1459,7 @@ impl PartStream for CountingUnknownLengthStream {
 async fn test_unknown_length_exceeding_part_limit_fails() {
     const MAX_PARTS: u64 = 10_000;
 
-    let client = mock_s3_client_for_multipart_upload();
-    let config = aws_sdk_s3_transfer_manager::Config::builder()
-        .client(client)
-        .build();
-    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+    let tm = MultipartMock::new().tm();
 
     let handle = tm
         .upload()
@@ -1723,11 +1496,7 @@ async fn test_unknown_length_exceeding_part_limit_fails() {
 async fn test_unknown_length_exactly_max_parts_succeeds() {
     const MAX_PARTS: u64 = 10_000;
 
-    let client = mock_s3_client_for_multipart_upload();
-    let config = aws_sdk_s3_transfer_manager::Config::builder()
-        .client(client)
-        .build();
-    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+    let tm = MultipartMock::new().tm();
 
     let handle = tm
         .upload()
@@ -1762,7 +1531,7 @@ fn part_number_failure_message(error: &Error) -> String {
 #[tokio::test]
 async fn test_part_numbers_outside_range_fail_before_upload_part() {
     for rejected in [0u64, 10_001, (1 << 32) + 1] {
-        let (result, record) = upload_numbered_parts(&[rejected]).await;
+        let (result, mock) = upload_numbered_parts(&[rejected]).await;
 
         let error = result.expect_err("an unusable part number must fail the upload");
         let message = part_number_failure_message(&error);
@@ -1771,11 +1540,11 @@ async fn test_part_numbers_outside_range_fail_before_upload_part() {
             "error must name the rejected part number, got: {message}"
         );
         assert!(
-            record.upload_parts.lock().unwrap().is_empty(),
+            mock.record().upload_parts().is_empty(),
             "part number {rejected} must not be sent"
         );
         assert!(
-            record.completions.lock().unwrap().is_empty(),
+            mock.record().completions().is_empty(),
             "part number {rejected} must not complete the upload"
         );
     }
@@ -1788,7 +1557,7 @@ async fn test_part_numbers_outside_range_fail_before_upload_part() {
 /// the upload over that list.
 #[tokio::test]
 async fn test_repeated_part_numbers_fail_before_completing_the_upload() {
-    let (result, record) = upload_numbered_parts(&[1, 1]).await;
+    let (result, mock) = upload_numbered_parts(&[1, 1]).await;
 
     let error = result.expect_err("a repeated part number must fail the upload");
     let message = part_number_failure_message(&error);
@@ -1797,7 +1566,7 @@ async fn test_repeated_part_numbers_fail_before_completing_the_upload() {
         "error must name the repeated part number, got: {message}"
     );
     assert!(
-        record.completions.lock().unwrap().is_empty(),
+        mock.record().completions().is_empty(),
         "a repeated part number must not complete the upload"
     );
 }
@@ -1807,7 +1576,7 @@ async fn test_repeated_part_numbers_fail_before_completing_the_upload() {
 #[tokio::test]
 async fn test_part_numbers_in_range_reach_the_wire_in_any_order() {
     for part_numbers in [&[1, 2, 3][..], &[2, 1]] {
-        let (result, record) = upload_numbered_parts(part_numbers).await;
+        let (result, mock) = upload_numbered_parts(part_numbers).await;
         result.expect("unique part numbers within range must upload");
 
         let mut expected: Vec<(i32, i64)> = part_numbers
@@ -1816,7 +1585,7 @@ async fn test_part_numbers_in_range_reach_the_wire_in_any_order() {
             .map(|(position, &part_number)| (part_number as i32, position as i64 + 1))
             .collect();
         expected.sort_unstable();
-        let mut upload_parts = record.upload_parts.lock().unwrap().clone();
+        let mut upload_parts = mock.record().upload_parts();
         upload_parts.sort_unstable();
         assert_eq!(expected, upload_parts, "part numbers {part_numbers:?}");
 
@@ -1824,7 +1593,7 @@ async fn test_part_numbers_in_range_reach_the_wire_in_any_order() {
         listed.sort_unstable();
         assert_eq!(
             vec![listed],
-            *record.completions.lock().unwrap(),
+            mock.record().completed_part_numbers(),
             "CompleteMultipartUpload must list every part in part-number order"
         );
     }
@@ -1836,37 +1605,8 @@ async fn test_part_numbers_in_range_reach_the_wire_in_any_order() {
 /// a size hint exists.
 #[tokio::test]
 async fn test_positive_lower_bound_never_synthesizes_empty_part() {
-    let upload_id = "test-upload-id".to_owned();
-
-    let create_mpu = mock!(aws_sdk_s3::Client::create_multipart_upload).then_output({
-        let upload_id = upload_id.clone();
-        move || {
-            CreateMultipartUploadOutput::builder()
-                .upload_id(upload_id.clone())
-                .build()
-        }
-    });
-
-    // Split the part rules by body size so the empty one's call count is the assertion.
-    let empty_part = mock!(aws_sdk_s3::Client::upload_part)
-        .match_requests(|req| req.content_length() == Some(0))
-        .then_output(|| UploadPartOutput::builder().e_tag("empty-etag").build());
-    let data_part = mock!(aws_sdk_s3::Client::upload_part)
-        .match_requests(|req| req.content_length() != Some(0))
-        .then_output(|| UploadPartOutput::builder().e_tag("data-etag").build());
-
-    let complete_mpu = mock!(aws_sdk_s3::Client::complete_multipart_upload)
-        .then_output(|| CompleteMultipartUploadOutput::builder().build());
-
-    let client = mock_client!(
-        aws_sdk_s3,
-        RuleMode::MatchAny,
-        &[&create_mpu, &empty_part, &data_part, &complete_mpu]
-    );
-    let config = aws_sdk_s3_transfer_manager::Config::builder()
-        .client(client)
-        .build();
-    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+    let mock = MultipartMock::new();
+    let tm = mock.tm();
 
     // Declare a positive exact size and then reach EOF without yielding a part.
     let (tx, rx) = mpsc::channel(1);
@@ -1888,13 +1628,19 @@ async fn test_positive_lower_bound_never_synthesizes_empty_part() {
         .expect_err("an empty stream below its declared lower bound must fail");
 
     assert_eq!(*error.kind(), ErrorKind::InputInvalid);
+    // Split the recorded parts by body size so the empty ones' count is the assertion.
+    let (empty_parts, data_parts): (Vec<_>, Vec<_>) = mock
+        .record()
+        .upload_parts()
+        .into_iter()
+        .partition(|&(_, content_length)| content_length == 0);
     assert_eq!(
         0,
-        empty_part.num_calls(),
+        empty_parts.len(),
         "a positive lower bound must prevent empty-part synthesis"
     );
-    assert_eq!(0, data_part.num_calls());
-    assert_eq!(0, complete_mpu.num_calls());
+    assert_eq!(0, data_parts.len());
+    assert_eq!(0, mock.record().complete_calls());
 }
 
 // --- UploadPart responses ----------------------------------------------------
@@ -1903,25 +1649,8 @@ async fn test_positive_lower_bound_never_synthesizes_empty_part() {
 /// without a usable ETag. Checks that the upload fails with a `ServiceError` reporting no ETag
 /// for part 2, without re-sending part 2 or completing, and returns the upload's error.
 async fn upload_failing_on_part_two(part_two: Rule) -> Error {
-    let other_parts = mock!(aws_sdk_s3::Client::upload_part)
-        .then_output(|| UploadPartOutput::builder().e_tag("test-etag").build());
-    let create_mpu = mock!(aws_sdk_s3::Client::create_multipart_upload).then_output(|| {
-        CreateMultipartUploadOutput::builder()
-            .upload_id("test-upload-id")
-            .build()
-    });
-    let complete_mpu = mock!(aws_sdk_s3::Client::complete_multipart_upload)
-        .then_output(|| CompleteMultipartUploadOutput::builder().build());
-    let client = mock_client!(
-        aws_sdk_s3,
-        RuleMode::MatchAny,
-        &[&create_mpu, &part_two, &other_parts, &complete_mpu]
-    );
-    let tm = aws_sdk_s3_transfer_manager::Client::new(
-        aws_sdk_s3_transfer_manager::Config::builder()
-            .client(client)
-            .build(),
-    );
+    let mock = MultipartMock::new().with_override(&part_two);
+    let tm = mock.tm();
 
     let error = tm
         .upload()
@@ -1946,7 +1675,7 @@ async fn upload_failing_on_part_two(part_two: Rule) -> Error {
         "error must name the operation and part, got: {message}"
     );
     assert_eq!(1, part_two.num_calls(), "part 2 must not be re-sent");
-    assert_eq!(0, complete_mpu.num_calls());
+    assert_eq!(0, mock.record().complete_calls());
     error
 }
 
@@ -2018,12 +1747,7 @@ async fn test_upload_part_without_e_tag_error_carries_request_ids() {
 async fn test_upload_without_body_fails_at_initiate() {
     let put_object = mock!(aws_sdk_s3::Client::put_object)
         .then_output(|| PutObjectOutput::builder().e_tag("test-etag").build());
-    let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&put_object]);
-    let tm = aws_sdk_s3_transfer_manager::Client::new(
-        aws_sdk_s3_transfer_manager::Config::builder()
-            .client(client)
-            .build(),
-    );
+    let tm = tm_with(mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&put_object]));
 
     let never_set = tm
         .upload()
@@ -2052,12 +1776,7 @@ async fn test_explicit_empty_body_uploads_empty_object() {
     let put_object = mock!(aws_sdk_s3::Client::put_object)
         .match_requests(|req| req.body().bytes() == Some(&b""[..]))
         .then_output(|| PutObjectOutput::builder().e_tag("test-etag").build());
-    let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&put_object]);
-    let tm = aws_sdk_s3_transfer_manager::Client::new(
-        aws_sdk_s3_transfer_manager::Config::builder()
-            .client(client)
-            .build(),
-    );
+    let tm = tm_with(mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&put_object]));
 
     tm.upload()
         .bucket("test-bucket")
@@ -2073,9 +1792,10 @@ async fn test_explicit_empty_body_uploads_empty_object() {
 
 // --- Conditional-write preconditions -----------------------------------------
 //
-// Assertion shape: use `match_requests` to fail the mock unless the request
-// carries the header we expect, so a missing/wrong precondition surfaces as a
-// join failure rather than a silent pass.
+// Assertion shape: check the header on the request the mock received, so a
+// missing/wrong precondition fails the test rather than silently passing. A
+// PutObject rule uses `match_requests`, which fails the join; the multipart path
+// reads the `MultipartRecord`.
 
 /// A single-PUT upload with `if_none_match("*")` must forward the header to
 /// `PutObject`. Satisfied case: the mock rule matches, upload succeeds.
@@ -2084,11 +1804,7 @@ async fn test_put_object_forwards_if_none_match() {
     let put_object = mock!(aws_sdk_s3::Client::put_object)
         .match_requests(|req| req.if_none_match() == Some("*"))
         .then_output(|| PutObjectOutput::builder().e_tag("test-etag").build());
-    let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[put_object]);
-    let config = aws_sdk_s3_transfer_manager::Config::builder()
-        .client(client)
-        .build();
-    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+    let tm = tm_with(mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[put_object]));
 
     tm.upload()
         .bucket("test-bucket")
@@ -2115,11 +1831,7 @@ async fn test_put_object_412_surfaces_precondition_failed_code() {
             SdkBody::from("<Error><Code>PreconditionFailed</Code></Error>"),
         )
     });
-    let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&put_object]);
-    let config = aws_sdk_s3_transfer_manager::Config::builder()
-        .client(client)
-        .build();
-    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+    let tm = tm_with(mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&put_object]));
 
     let err = tm
         .upload()
@@ -2164,36 +1876,12 @@ async fn test_put_object_412_surfaces_precondition_failed_code() {
 /// silently drop the header at build time).
 #[tokio::test]
 async fn test_complete_mpu_forwards_if_match() {
-    let upload_id = "test-upload-id".to_owned();
     let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
     let content_length = 2 * part_size;
-
-    let create_mpu = mock!(aws_sdk_s3::Client::create_multipart_upload).then_output({
-        let upload_id = upload_id.clone();
-        move || {
-            CreateMultipartUploadOutput::builder()
-                .upload_id(upload_id.clone())
-                .build()
-        }
-    });
-
-    let upload_part = mock!(aws_sdk_s3::Client::upload_part)
-        .then_output(|| UploadPartOutput::builder().e_tag("test-etag").build());
-
     let expected_etag = "\"expected-etag\"";
-    let complete_mpu = mock!(aws_sdk_s3::Client::complete_multipart_upload)
-        .match_requests(move |req| req.if_match() == Some(expected_etag))
-        .then_output(|| CompleteMultipartUploadOutput::builder().build());
 
-    let client = mock_client!(
-        aws_sdk_s3,
-        RuleMode::MatchAny,
-        &[create_mpu, upload_part, complete_mpu]
-    );
-    let config = aws_sdk_s3_transfer_manager::Config::builder()
-        .client(client)
-        .build();
-    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+    let mock = MultipartMock::new();
+    let tm = mock.tm();
 
     let (tx, rx) = mpsc::channel(2);
     let stream = TestStream::exact(rx, content_length as u64);
@@ -2209,10 +1897,17 @@ async fn test_complete_mpu_forwards_if_match() {
     tx.send(Bytes::from(vec![0u8; part_size])).await.unwrap();
     tx.send(Bytes::from(vec![0u8; part_size])).await.unwrap();
     drop(tx);
-    handle
-        .join()
-        .await
-        .expect("CompleteMultipartUpload must carry the caller's If-Match header");
+    handle.join().await.expect("upload should succeed");
+    let completions = mock.record().completions();
+    let if_match: Vec<_> = completions
+        .iter()
+        .map(CompleteMultipartUploadInput::if_match)
+        .collect();
+    assert_eq!(
+        vec![Some(expected_etag)],
+        if_match,
+        "CompleteMultipartUpload must carry the caller's If-Match header"
+    );
 }
 
 /// When S3 rejects `CompleteMultipartUpload` with 412, the multipart path must
@@ -2220,20 +1915,9 @@ async fn test_complete_mpu_forwards_if_match() {
 /// exercises the MPU code path (which fails at a different site than PutObject).
 #[tokio::test]
 async fn test_complete_mpu_412_surfaces_precondition_failed_code() {
-    let upload_id = "test-upload-id".to_owned();
     let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
     let content_length = 2 * part_size;
 
-    let create_mpu = mock!(aws_sdk_s3::Client::create_multipart_upload).then_output({
-        let upload_id = upload_id.clone();
-        move || {
-            CreateMultipartUploadOutput::builder()
-                .upload_id(upload_id.clone())
-                .build()
-        }
-    });
-    let upload_part = mock!(aws_sdk_s3::Client::upload_part)
-        .then_output(|| UploadPartOutput::builder().e_tag("test-etag").build());
     let complete_mpu =
         mock!(aws_sdk_s3::Client::complete_multipart_upload).then_http_response(|| {
             HttpResponse::new(
@@ -2241,16 +1925,7 @@ async fn test_complete_mpu_412_surfaces_precondition_failed_code() {
                 SdkBody::from("<Error><Code>PreconditionFailed</Code></Error>"),
             )
         });
-
-    let client = mock_client!(
-        aws_sdk_s3,
-        RuleMode::MatchAny,
-        &[create_mpu, upload_part, complete_mpu]
-    );
-    let config = aws_sdk_s3_transfer_manager::Config::builder()
-        .client(client)
-        .build();
-    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+    let tm = MultipartMock::new().with_override(&complete_mpu).tm();
 
     let (tx, rx) = mpsc::channel(2);
     let stream = TestStream::exact(rx, content_length as u64);

@@ -14,25 +14,29 @@ use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
 use aws_sdk_s3_transfer_manager::types::{PartSize, RuntimeMode};
 use tokio::sync::mpsc;
 
+use crate::assertions::assert_same_content;
 use crate::harness::{mock_tm, mock_tm_with, MockTm};
+use crate::test_data::{deterministic_data, deterministic_data_seeded};
 
 async fn setup() -> MockTm {
     mock_tm(RuntimeMode::Managed).await
 }
 
+/// A multipart upload of patterned data spanning several parts reports an ETag and an upload ID,
+/// and stores exactly the source bytes.
 #[tokio::test]
-async fn test_mpu_upload_small_file() {
+async fn test_mpu_upload_stores_source_bytes() {
     let m = setup().await;
 
-    let content = vec![0u8; 16 * ByteUnit::Mebibyte.as_bytes_usize()]; // 16MB = 2 parts at 8MB default
-    let expected_content = content.clone();
+    // 24 MiB = 3 parts at the default 8 MiB part size.
+    let content = deterministic_data(24 * ByteUnit::Mebibyte.as_bytes_usize());
 
     let upload_handle = m
         .client
         .upload()
         .bucket("test-bucket")
         .key("test-key")
-        .body(InputStream::from(content))
+        .body(InputStream::from(content.clone()))
         .initiate()
         .expect("initiate upload");
 
@@ -43,17 +47,8 @@ async fn test_mpu_upload_small_file() {
         "should have upload_id for MPU"
     );
 
-    let s3_client = m.handle.client().await;
-    let get_result = s3_client
-        .get_object()
-        .bucket("test-bucket")
-        .key("test-key")
-        .send()
-        .await
-        .expect("get object");
-
-    let body = get_result.body.collect().await.expect("collect body");
-    assert_eq!(body.to_vec(), expected_content);
+    let stored = m.stored_object("test-bucket", "test-key").await;
+    assert_same_content(&content, &stored);
 
     m.handle.shutdown().await.expect("shutdown");
 }
@@ -61,11 +56,13 @@ async fn test_mpu_upload_small_file() {
 async fn test_mpu_upload_concurrent(rt: RuntimeMode) {
     let m = mock_tm(rt).await;
 
-    let mut handles = Vec::new();
+    let mut uploads = Vec::new();
 
-    // Start multiple concurrent uploads
+    // Start multiple concurrent uploads, each with its own seeded data. Each object is exactly the
+    // default multipart threshold, so every upload is a two-part multipart upload and the
+    // threshold boundary itself is covered.
     for i in 0..5 {
-        let content = vec![i as u8; 8 * ByteUnit::Mebibyte.as_bytes_usize()];
+        let content = deterministic_data_seeded(16 * ByteUnit::Mebibyte.as_bytes_usize(), i);
         let key = format!("concurrent-key-{}", i);
 
         let upload_handle = m
@@ -73,22 +70,25 @@ async fn test_mpu_upload_concurrent(rt: RuntimeMode) {
             .upload()
             .bucket("test-bucket")
             .key(&key)
-            .body(InputStream::from(content))
+            .body(InputStream::from(content.clone()))
             .initiate()
             .expect("initiate upload");
 
-        handles.push((key, upload_handle));
+        uploads.push((key, content, upload_handle));
     }
 
-    // Wait for all uploads to complete
-    for (key, handle) in handles {
-        let result = handle.join().await;
+    // Wait for all uploads to complete, and check each stored its own data
+    for (key, content, handle) in uploads {
+        let output = handle
+            .join()
+            .await
+            .unwrap_or_else(|e| panic!("upload {key} should succeed: {e:?}"));
         assert!(
-            result.is_ok(),
-            "upload {} should succeed: {:?}",
-            key,
-            result
+            output.upload_id().is_some(),
+            "upload {key} at the multipart threshold must be a multipart upload"
         );
+        let stored = m.stored_object("test-bucket", &key).await;
+        assert_same_content(&content, &stored);
     }
 
     m.handle.shutdown().await.expect("shutdown");
@@ -102,46 +102,6 @@ async fn test_mpu_upload_concurrent_mock_gp() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_mpu_upload_concurrent_tokio_mt() {
     test_mpu_upload_concurrent(RuntimeMode::MultiThreadTokio).await;
-}
-
-#[tokio::test]
-async fn test_upload_verify_data_integrity() {
-    let m = setup().await;
-
-    // Create content with recognizable pattern
-    let content: Vec<u8> = (0..24 * ByteUnit::Mebibyte.as_bytes_usize()) // 24MB = 3 parts
-        .map(|i| (i % 256) as u8)
-        .collect();
-    let expected_content = content.clone();
-
-    let upload_handle = m
-        .client
-        .upload()
-        .bucket("test-bucket")
-        .key("integrity-test")
-        .body(InputStream::from(content))
-        .initiate()
-        .expect("initiate upload");
-
-    upload_handle.join().await.expect("upload complete");
-
-    let s3_client = m.handle.client().await;
-    let get_result = s3_client
-        .get_object()
-        .bucket("test-bucket")
-        .key("integrity-test")
-        .send()
-        .await
-        .expect("get object");
-
-    let body = get_result.body.collect().await.expect("collect body");
-    assert_eq!(
-        body.to_vec(),
-        expected_content,
-        "data integrity check failed"
-    );
-
-    m.handle.shutdown().await.expect("shutdown");
 }
 
 /// Part size for the part-order tests, set on the client so that every part but the last is
@@ -268,21 +228,7 @@ where
     let (result, ()) = tokio::join!(upload.join(), produce(tx));
     result.expect("parts arriving in any order must upload");
 
-    let stored = m
-        .handle
-        .client()
-        .await
-        .get_object()
-        .bucket("test-bucket")
-        .key("ordered-parts")
-        .send()
-        .await
-        .expect("get object")
-        .body
-        .collect()
-        .await
-        .expect("collect body")
-        .to_vec();
+    let stored = m.stored_object("test-bucket", "ordered-parts").await;
     assert_ordered_content(&expected, &stored);
 
     m.handle.shutdown().await.expect("shutdown");
