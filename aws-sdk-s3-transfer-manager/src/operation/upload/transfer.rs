@@ -948,8 +948,13 @@ impl UploadTransfer {
 
         *self.inner.result.lock().expect("lock poisoned") = Some(result);
 
-        *self.inner.state.lock().expect("lock poisoned") = UploadState::Done;
+        // Status before state, because `poll_work` answers `Done` off the state while every
+        // reporting path derives its outcome from the status. Published the other way round,
+        // a poll landing between the two lines saw a finished transfer that still read
+        // `Active`, and the terminal it published was `Cancelled` for an upload that had
+        // just succeeded.
         self.inner.ctx.set_completed();
+        *self.inner.state.lock().expect("lock poisoned") = UploadState::Done;
         self.report_terminal();
         // Emit before the joiner is released, not only from `on_terminal`: the scheduler
         // runs `on_terminal` after this, so a consumer that writes `join().await` and then
@@ -1056,8 +1061,9 @@ impl UploadTransfer {
             .expect("valid response");
 
         *self.inner.result.lock().expect("lock poisoned") = Some(result);
-        *self.inner.state.lock().expect("lock poisoned") = UploadState::Done;
+        // Status before state, for the reason given on the `PutObject` path above.
         self.inner.ctx.set_completed();
+        *self.inner.state.lock().expect("lock poisoned") = UploadState::Done;
         self.report_terminal();
         // Emit before the joiner is released, not only from `on_terminal`: the scheduler
         // runs `on_terminal` after this, so a consumer that writes `join().await` and then
@@ -1170,13 +1176,23 @@ impl Transfer for UploadTransfer {
         Box::pin(UploadTransfer::execute(self, work))
     }
 
-    /// The one terminal emit for a single-object upload.
+    /// Terminal reporting and the terminal event, for whichever removal path reaches it
+    /// first -- normal completion, cancellation, a worker panic, or completion-driven
+    /// removal. Reaching it more than once is harmless: each obligation is claimed by
+    /// exactly one caller, and the completion paths emit for themselves before releasing
+    /// the joiner, so a consumer that drains after `join()` still sees this `Ended`.
     ///
-    /// Every removal path routes through here -- normal completion, cancellation,
-    /// a worker panic, and completion-driven removal -- so no per-path emit is
-    /// needed. Reaching it more than once is harmless: the obligation is claimed
-    /// by exactly one caller.
+    /// Requires the status to be published already -- see the early return.
     fn on_terminal(&self) {
+        // Both effects are one-shot and both read the status: `report_terminal` claims
+        // `claim_terminal_report`, and the event's outcome comes from `terminal_outcome()`.
+        // `UploadState::Done` is published one statement ahead of `set_completed` (:951),
+        // so a caller can arrive here while the status is still `Active`, and spending
+        // either one-shot on it cannot be taken back -- the report would render nothing
+        // and the event would say `Cancelled` about an upload that succeeded.
+        if self.inner.ctx.is_active() {
+            return;
+        }
         self.report_terminal();
         let Some(lc) = &self.inner.lifecycle else {
             return;

@@ -322,3 +322,102 @@ async fn test_upload_verify_data_integrity() {
 
     m.handle.shutdown().await.expect("shutdown");
 }
+
+/// The drain loop `config.rs` documents for a *request*-level stream must terminate.
+///
+/// `Config::Builder::events` (config.rs:413-420) contrasts the two registration levels: a
+/// client-level stream "stays open for as long as the client does", so
+/// `while let Some(ev) = stream.next().await` "never returns", "where the same loop over a
+/// *request*-level stream ends when that operation does". This pins that second clause, which
+/// is the one a caller writes code against.
+///
+/// Phase 1 is that loop, verbatim, with the handle still held -- which is where a caller is
+/// when the loop is their render loop. They cannot have called `join()` yet: `join(self)`
+/// consumes the handle, and reaching it is what the loop is supposed to let them do.
+///
+/// Phases 2 and 3 are controls that say how far the sink's lifetime actually extends, so the
+/// failure cannot be read as "you should have joined first": phase 2 re-runs the loop after
+/// `join()` has consumed the handle, and phase 3 after the client is gone as well.
+#[tokio::test]
+async fn test_request_level_event_stream_ends_with_the_operation() {
+    use aws_sdk_s3_transfer_manager::events::{Outcome, TransferEvent};
+    use std::time::Duration;
+
+    // Two parts at the 8 MiB default, so this is a real MPU, as in the entry-point test above.
+    let size = 16 * ByteUnit::Mebibyte.as_bytes_usize();
+    let m = setup().await;
+
+    let (sink, mut stream) = aws_sdk_s3_transfer_manager::events::channel(
+        std::num::NonZeroUsize::new(64).expect("capacity > 0"),
+    );
+
+    let handle = m
+        .client
+        .upload()
+        .bucket("test-bucket")
+        .key("drain-loop-key")
+        .body(InputStream::from(vec![9u8; size]))
+        .events(sink)
+        .initiate()
+        .expect("initiate");
+
+    // Phase 1: the documented loop, with the handle still held.
+    let mut seen = 0usize;
+    let mut succeeded = false;
+    let phase1 = tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(ev) = stream.next().await {
+            seen += 1;
+            if let TransferEvent::Ended(e) = &ev {
+                if e.parent().is_none() && matches!(e.outcome(), Outcome::Succeeded { .. }) {
+                    succeeded = true;
+                }
+            }
+        }
+    })
+    .await;
+
+    // Phase 2 control: `join` takes the handle by value, so after this nothing the caller
+    // holds refers to the transfer.
+    handle.join().await.expect("join upload");
+    let phase2 = tokio::time::timeout(Duration::from_secs(3), async {
+        while stream.next().await.is_some() {}
+    })
+    .await;
+
+    // Phase 3 control: and the client is the owner of the scheduler and the runtime.
+    drop(m.client);
+    let phase3 = tokio::time::timeout(Duration::from_secs(3), async {
+        while stream.next().await.is_some() {}
+    })
+    .await;
+
+    m.handle.shutdown().await.expect("shutdown");
+
+    let ended = |r: &Result<(), tokio::time::error::Elapsed>| {
+        if r.is_ok() {
+            "ended"
+        } else {
+            "hung"
+        }
+    };
+
+    assert!(
+        succeeded,
+        "the upload itself must finish, or phase 1 proves nothing about the loop: \
+         saw {seen} events, terminal Succeeded = {succeeded}"
+    );
+    assert!(
+        phase1.is_ok(),
+        "config.rs:417-418 says a request-level stream's `while let Some(ev) = \
+         stream.next().await` ends when the operation does. It does not: the upload reached a \
+         successful terminal, {seen} events were delivered, and then the loop hung -- so a \
+         caller rendering events in that loop never reaches the `join()` that the doc assumes \
+         comes after it. Controls: after join() consumed the handle the same loop {}; after \
+         drop(client) it {}. A request-level sink's Sender therefore outlives the operation, \
+         the handle and the client, which is what docs/design/transfer-events.md:363-365 says \
+         must not happen (\"a stored sink would hold a stream open past the operation that \
+         created it\").",
+        ended(&phase2),
+        ended(&phase3)
+    );
+}

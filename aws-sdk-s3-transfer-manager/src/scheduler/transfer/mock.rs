@@ -1345,6 +1345,87 @@ impl MockStateMachine for FusedReadySpawnedMock {
     }
 }
 
+/// Models the window every real `Transfer` has between claiming its terminal state
+/// and publishing its terminal status: `poll_work` returns `Done` while
+/// `ctx.transfer_status()` is still `Active`, and the status lands afterwards.
+///
+/// `DownloadTransfer` has exactly this shape — `decrement_in_flight` assigns
+/// `DownloadState::Terminal` under the state lock
+/// (`operation/download/transfer.rs:1282`) and `ctx.set_completed()` does not run
+/// until after `writer.finalize()` and the rename in `commit_destination`
+/// (`operation/download/transfer.rs:1313-1346`) — as does `UploadTransfer`, where
+/// `*state = UploadState::Done` precedes `set_completed()`
+/// (`operation/upload/transfer.rs:948-949`). `on_terminal` records the status it was
+/// handed, which is what the scheduler's Done arm (`scheduler/scheduler.rs:804`)
+/// feeds to `terminal_outcome()`.
+pub(crate) struct DoneWhileActiveMock {
+    ctx: TransferContext,
+    /// What `on_terminal` observed, or `None` if it was never called.
+    observed: ObservedTerminal,
+}
+
+/// The status `on_terminal` read, and the `Outcome` label `terminal_outcome()` derived
+/// from it — the exact value `DownloadTransfer::on_terminal` hands to
+/// `TransferLifecycle::finish` (`operation/download/transfer.rs:1475`).
+pub(crate) type ObservedTerminal =
+    Arc<std::sync::Mutex<Option<(crate::types::TransferStatus, &'static str)>>>;
+
+impl std::fmt::Debug for DoneWhileActiveMock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DoneWhileActiveMock").finish()
+    }
+}
+
+impl DoneWhileActiveMock {
+    pub(crate) fn new(
+        id: TransferId,
+        handle: Arc<crate::client::Handle>,
+    ) -> (Self, ObservedTerminal) {
+        let (ctx, _rx) = TransferContext::with_id(id, handle);
+        let observed: ObservedTerminal = Arc::new(std::sync::Mutex::new(None));
+        let mock = Self {
+            ctx,
+            observed: observed.clone(),
+        };
+        (mock, observed)
+    }
+}
+
+impl Transfer for DoneWhileActiveMock {
+    fn ctx(&self) -> &TransferContext {
+        &self.ctx
+    }
+
+    fn poll_work(&self) -> PollWork {
+        // No status transition here, exactly like the download's
+        // `DownloadState::Terminal => PollWork::Done` arm
+        // (`operation/download/transfer.rs:539`).
+        PollWork::Done
+    }
+
+    fn on_terminal(&self) {
+        // `terminal_outcome()` is the real function the download feeds to
+        // `TransferLifecycle::finish`; the label is only so the test can compare it
+        // (`Outcome` is deliberately not `PartialEq`).
+        let outcome = match self.ctx.terminal_outcome() {
+            crate::events::Outcome::Succeeded {} => "Succeeded",
+            crate::events::Outcome::Failed {} => "Failed",
+            crate::events::Outcome::Cancelled {} => "Cancelled",
+        };
+        *self.observed.lock().unwrap() = Some((self.ctx.transfer_status(), outcome));
+        // What `finalize_completion` does once the disk flush and rename are done.
+        self.ctx.set_completed();
+        self.ctx.signal_terminal();
+    }
+
+    fn execute<'a>(
+        &'a self,
+        _work: &'a mut IoRequest,
+    ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
+        unreachable!("DoneWhileActiveMock never returns PollWork::Ready")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

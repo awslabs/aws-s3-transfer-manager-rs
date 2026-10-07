@@ -135,6 +135,12 @@ pub(crate) trait Transfer: Send + Sync + std::fmt::Debug {
     /// indefinitely.
     ///
     /// Must be short and non-blocking.
+    ///
+    /// **Not guaranteed on the `Done` path.** The scheduler calls this only once the
+    /// status is published, because the hook's work is status-derived and one-shot. An
+    /// implementation that answers [`PollWork::Done`] off its own state before setting a
+    /// terminal status will not see this hook for that poll, so it must do its terminal
+    /// work on the path that sets the status rather than relying on being called back.
     fn on_terminal(&self) {}
 }
 
@@ -422,6 +428,24 @@ impl StateMachineStatus {
     #[inline]
     pub(crate) fn is_cancelled(&self) -> bool {
         self.0.load(Ordering::Acquire) == STATUS_CANCELLED
+    }
+
+    /// The status as one value, from one load.
+    ///
+    /// The `is_*` predicates each load separately, so a caller that asks several of them in
+    /// sequence can be told about two different values and conclude a third that was never
+    /// set: two loads answering `Active` either side of a landing `set_cancelled` leave
+    /// "not cancelled, not failed, not active", which reads as completed. Anything deriving
+    /// a status, rather than testing one bit of it, must come through here.
+    #[inline]
+    pub(crate) fn status(&self) -> crate::types::TransferStatus {
+        use crate::types::TransferStatus;
+        match self.0.load(Ordering::Acquire) {
+            STATUS_COMPLETED => TransferStatus::Completed,
+            STATUS_FAILED => TransferStatus::Failed,
+            STATUS_CANCELLED => TransferStatus::Cancelled,
+            _ => TransferStatus::Active,
+        }
     }
 
     fn as_str(&self) -> &'static str {
@@ -1426,17 +1450,13 @@ impl TransferContext {
     }
 
     /// Get current transfer status as a public enum.
+    ///
+    /// One load, not one per arm: deriving this from several `is_*` calls let a cancelled
+    /// transfer read as `Completed`, which `terminal_outcome` maps to `Succeeded` — and a
+    /// consumer that deletes its source on success would then delete the source of a
+    /// transfer the caller cancelled.
     pub(crate) fn transfer_status(&self) -> crate::types::TransferStatus {
-        use crate::types::TransferStatus;
-        if self.status.is_cancelled() {
-            TransferStatus::Cancelled
-        } else if self.is_failed() {
-            TransferStatus::Failed
-        } else if !self.is_active() {
-            TransferStatus::Completed
-        } else {
-            TransferStatus::Active
-        }
+        self.status.status()
     }
 
     /// Claims the single terminal tracing record for this transfer.
@@ -2167,6 +2187,36 @@ mod loom_tests {
     use loom::sync::atomic::{AtomicBool, Ordering};
     use loom::sync::{Arc, Mutex};
     use loom::thread;
+
+    /// A derived status must be the status the transfer holds.
+    ///
+    /// Nothing here sets completed, so `Completed` can only come from reading the one
+    /// write-once atomic more than once: two loads answering `Active` either side of a
+    /// landing `set_cancelled` leave "not cancelled, not failed, not active", which the old
+    /// fallthrough called `Completed`. `terminal_outcome` maps that to `Succeeded`, and a
+    /// consumer that deletes its source on success would delete the source of a transfer the
+    /// caller cancelled.
+    #[test]
+    fn transfer_status_loom_never_reports_completed_for_a_cancelled_transfer() {
+        loom::model(|| {
+            let status = super::StateMachineStatus::new();
+
+            let writer = {
+                let status = status.clone();
+                thread::spawn(move || assert!(status.set_cancelled()))
+            };
+
+            let observed = status.status();
+
+            writer.join().unwrap();
+
+            assert_ne!(
+                crate::types::TransferStatus::Completed,
+                observed,
+                "nothing set Completed, and the derived status reads Completed"
+            );
+        });
+    }
 
     /// A status that reads `Failed` always has its error behind it.
     ///

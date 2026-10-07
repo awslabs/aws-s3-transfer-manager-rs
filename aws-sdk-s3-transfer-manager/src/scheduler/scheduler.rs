@@ -801,7 +801,25 @@ impl Scheduler {
                         // implement it both want it on a normal completion as well.
                         // Called before the descriptor is removed, so the transfer is
                         // still reachable, and outside any state guard.
-                        desc.transfer().on_terminal();
+                        //
+                        // Conditional, because `Done` and a published status are two
+                        // different facts. A transfer answers `Done` off its own terminal
+                        // state, and both operations claim that state before the status:
+                        // download's `decrement_in_flight` claims it under the state lock
+                        // and `set_completed` does not run until the tail flush and the
+                        // rename are done; upload's is one statement earlier
+                        // (`upload/transfer.rs:951`). `on_terminal` reads
+                        // `terminal_outcome()`, which maps a still-`Active` status to
+                        // `Cancelled`, and claims the one-shot terminal report -- so
+                        // running it inside that window would tell the consumer a
+                        // succeeding transfer was cancelled and spend the report the real
+                        // completion still owes. Both of those are one-shot, so neither
+                        // can be corrected afterwards. Skipping loses nothing: every
+                        // completion path emits and reports for itself, and the
+                        // cancel/panic paths set the status before they get here.
+                        if desc.is_terminal() {
+                            desc.transfer().on_terminal();
+                        }
                         let desc_id = desc.id();
                         let (_completed, orphans) = self.remove_transfer_atomic(desc_id);
                         // The parent's `_completed` descriptor is the same one
@@ -993,8 +1011,8 @@ mod tests {
     use crate::scheduler::descriptor::TransferDescriptor;
     use crate::scheduler::descriptor::{vruntime_delta_for_cost, IO_WORK_COST, SPAWN_WORK_COST};
     use crate::scheduler::transfer::mock::{
-        BuggyDoneMock, FixedWorkCount, FusedReadySpawnedMock, MockStateMachine,
-        TerminalWithoutSignalMock, WithDelay, WithExecute,
+        BuggyDoneMock, DoneWhileActiveMock, FixedWorkCount, FusedReadySpawnedMock,
+        MockStateMachine, TerminalWithoutSignalMock, WithDelay, WithExecute,
     };
     use crate::scheduler::MockTransfer;
     use crate::transfer::{
@@ -3603,6 +3621,50 @@ mod tests {
         })
         .await
         .expect("scheduler should reach idle; orphaned children would hang it");
+
+        handle.runtime.shutdown();
+    }
+
+    /// The Done arm must not run `on_terminal` while the status is still `Active`.
+    ///
+    /// Every real `Transfer` claims its terminal *state* before it publishes the terminal
+    /// *status*, and `poll_work` answers `Done` off that state: a download's
+    /// `decrement_in_flight` assigns `DownloadState::Terminal` under the state lock, and
+    /// `finalize_completion` does not reach `set_completed` until the tail flush and the
+    /// rename are done. A poll landing in that window is not skipped, because
+    /// `TransferDescriptor::is_terminal` tests `!ctx.is_active()`. Running the hook there
+    /// reads a status it was never given — `terminal_outcome` maps `Active` to
+    /// `Outcome::Cancelled` — and spends the one-shot terminal report on a transfer that
+    /// is about to succeed. Both are one-shot, so neither is correctable afterwards.
+    ///
+    /// Skipping costs nothing: every completion path emits and reports for itself, which
+    /// `done_after_set_completed_reports_succeeded` covers from the other side.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn done_arm_skips_on_terminal_while_the_status_is_active() {
+        let _logs = show_test_logs();
+        let handle = test_handle(2);
+        let scheduler = &handle.scheduler;
+
+        let id = TransferId {
+            id: 1,
+            parent: None,
+        };
+        let (mock, observed) = DoneWhileActiveMock::new(id, handle.clone());
+        scheduler.enqueue_transfer(Box::new(mock));
+
+        // `enqueue_transfer` runs `generate_work` on this thread, so the Done arm has
+        // already executed by here. The sleep only covers a dispatch that landed on
+        // another worker.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let seen = *observed.lock().unwrap();
+        assert!(
+            seen.is_none(),
+            "the Done arm ran on_terminal while the status was still Active, so a \
+             succeeding transfer publishes Ended {{ Cancelled }} and the real completion \
+             finds the terminal report already spent: {seen:?}"
+        );
 
         handle.runtime.shutdown();
     }

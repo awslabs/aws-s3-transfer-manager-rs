@@ -146,7 +146,7 @@
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 // The loom compat layer for the atomics, not `std::sync::atomic` directly: the
 // terminal obligation is a two-thread protocol (a claim races every other terminal
@@ -819,7 +819,17 @@ impl std::error::Error for TryNextError {}
 /// policy has an obligation and no status, and a transfer that was never announced
 /// has a status and no obligation.
 pub(crate) struct TransferLifecycle {
-    sink: TransferEventSink,
+    /// Released by whichever site discharges the terminal emit, which is why it is
+    /// shared and optional rather than owned outright.
+    ///
+    /// Nothing drops a lifecycle at the end of an operation: it hangs off the transfer's
+    /// inner, whose context holds a strong `Arc<Handle>`, so holding the sink by value
+    /// kept a request-level `Sender` -- and with it the scheduler, runtime, memory budget
+    /// and retry cache -- alive for the process. A consumer then has no way to drain to
+    /// completion: `next()` never returns `None` and `try_next` never answers
+    /// [`TryNextError::Disconnected`], because "every sink is gone" never becomes true.
+    /// So the release is explicit, at the one instant the transfer is known to be over.
+    sink: Arc<Mutex<Option<TransferEventSink>>>,
     id: u64,
     parent: Option<u64>,
     transfer: TransferRef,
@@ -856,6 +866,18 @@ impl fmt::Debug for TransferLifecycle {
     }
 }
 
+/// Lock the shared sink slot, tolerating poison.
+///
+/// A terminal path runs during a worker panic, so an unwind that poisoned this lock must
+/// not take the terminal event with it. The slot holds a usable sink or `None`, and an
+/// unwind cannot leave it in any third state, so the inner value is always safe to take.
+fn lock_sink(
+    slot: &Mutex<Option<TransferEventSink>>,
+) -> std::sync::MutexGuard<'_, Option<TransferEventSink>> {
+    slot.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 impl TransferLifecycle {
     pub(crate) fn new(
         sink: TransferEventSink,
@@ -865,7 +887,7 @@ impl TransferLifecycle {
         view: Option<crate::types::TransferView>,
     ) -> Self {
         Self {
-            sink,
+            sink: Arc::new(Mutex::new(Some(sink))),
             id,
             parent,
             transfer,
@@ -894,13 +916,15 @@ impl TransferLifecycle {
         if !matches!(self.decision, Decision::Skip { .. }) {
             self.owes_finish.store(true, Ordering::Release);
         }
-        self.sink.emit(TransferEvent::Planned(Planned {
-            id: self.id,
-            parent: self.parent,
-            transfer: self.transfer.clone(),
-            decision: self.decision.clone(),
-            view: self.view.clone(),
-        }));
+        if let Some(sink) = &*lock_sink(&self.sink) {
+            sink.emit(TransferEvent::Planned(Planned {
+                id: self.id,
+                parent: self.parent,
+                transfer: self.transfer.clone(),
+                decision: self.decision.clone(),
+                view: self.view.clone(),
+            }));
+        }
     }
 
     /// Claim the terminal obligation. Returns the emit as a value; sending is the
@@ -931,7 +955,9 @@ impl TransferLifecycle {
 /// Claiming and sending are separate so a site holding a state guard can claim
 /// under the guard and publish after releasing it.
 pub(crate) struct PendingEmit {
-    sink: TransferEventSink,
+    /// The lifecycle's own handle, not a copy of the sink: sending is also what releases
+    /// it, so both sides must see the same slot.
+    sink: Arc<Mutex<Option<TransferEventSink>>>,
     /// `None` once sent. Distinguishes a discharged emit from an abandoned one in
     /// [`Drop`].
     event: Option<TransferEvent>,
@@ -953,11 +979,22 @@ impl PendingEmit {
     /// A full channel drops the event and counts it. Nothing was reserved for it:
     /// the one consumer that needs every terminal reads it from `join()`, which is
     /// exact.
+    ///
+    /// Sending is also where the sink is released, in the same critical section. This is
+    /// the only point of no return: `finish` can be claimed and abandoned, and
+    /// [`Drop`](PendingEmit::drop) hands that obligation back, so releasing any earlier
+    /// would leave a re-armed obligation with nothing to emit through. After this the
+    /// consumer's stream reports `Disconnected` once drained, which is what lets a drain
+    /// loop end.
     pub(crate) fn send(mut self) {
         let Some(event) = self.event.take() else {
             return;
         };
-        self.sink.emit(event);
+        let mut slot = lock_sink(&self.sink);
+        if let Some(sink) = &*slot {
+            sink.emit(event);
+        }
+        *slot = None;
     }
 }
 
@@ -1335,8 +1372,9 @@ mod tests {
              slow down waiting for the consumer"
         );
         assert!(
-            matches!(stream.try_next(), Err(TryNextError::Empty)),
-            "a dropped event must not be delivered late"
+            matches!(stream.try_next(), Err(TryNextError::Disconnected)),
+            "a dropped event must not be delivered late -- and since `send` released the \
+             sink, the stream is closed rather than merely empty"
         );
     }
 
