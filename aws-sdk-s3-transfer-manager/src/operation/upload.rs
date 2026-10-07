@@ -19,7 +19,9 @@ mod transfer;
 pub use checksum_strategy::{ChecksumStrategy, ChecksumStrategyBuilder};
 pub(crate) use transfer::UploadTransfer;
 
+use crate::config::user_agent::OperationFeatures;
 use crate::error;
+use aws_runtime::sdk_feature::AwsSdkFeature;
 use crate::transfer::TransferContext;
 use crate::types::BucketType;
 pub use handle::UploadHandle;
@@ -90,7 +92,14 @@ impl Upload {
             None => TransferContext::new(handle.clone()),
         };
 
-        let transfer = UploadTransfer::try_new(ctx, bucket_type, input, stream)?;
+        let features = OperationFeatures::new(
+            parent_id
+                .map(|_| AwsSdkFeature::S3TransferUploadDirectory)
+                .into_iter()
+                .chain(stream.is_file_backed().then_some(AwsSdkFeature::S3FilePath)),
+        );
+        let transfer =
+            UploadTransfer::try_new(ctx.with_features(features), bucket_type, input, stream)?;
 
         handle
             .scheduler

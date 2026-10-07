@@ -186,7 +186,7 @@ async fn discover_obj_with_get_first_part(
             .config_override(
                 transfer
                     .ctx()
-                    .handle
+                    
                     .bucket_partition_override(input.bucket()),
             );
         async move {
@@ -219,7 +219,7 @@ async fn discover_obj_with_head(
                 .config_override(
                     transfer
                         .ctx()
-                        .handle
+                        
                         .bucket_partition_override(input.bucket()),
                 );
         async move {
@@ -380,7 +380,7 @@ async fn discover_obj_with_get(
             .config_override(
                 transfer
                     .ctx()
-                    .handle
+                    
                     .bucket_partition_override(input.bucket()),
             );
         async move {

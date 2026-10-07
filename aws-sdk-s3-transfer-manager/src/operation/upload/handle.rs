@@ -168,7 +168,7 @@ impl UploadHandle {
                     )
                     .customize()
                     .config_override(
-                        ctx.handle
+                        ctx
                             .bucket_partition_override(self.transfer.request().bucket()),
                     )
                     .send()

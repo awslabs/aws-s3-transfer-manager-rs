@@ -384,7 +384,7 @@ impl UploadTransfer {
             .config_override(
                 self.inner
                     .ctx
-                    .handle
+                    
                     .bucket_partition_override(self.inner.request.bucket()),
             )
             .send()
@@ -717,7 +717,7 @@ impl UploadTransfer {
                     .config_override(
                         self.inner
                             .ctx
-                            .handle
+                            
                             .upload_override(self.inner.request.bucket()),
                     )
                     .disable_payload_signing()
@@ -880,7 +880,7 @@ impl UploadTransfer {
                     .config_override(
                         self.inner
                             .ctx
-                            .handle
+                            
                             .upload_override(self.inner.request.bucket()),
                     )
                     .disable_payload_signing()
@@ -1014,7 +1014,7 @@ impl UploadTransfer {
             .config_override(
                 self.inner
                     .ctx
-                    .handle
+                    
                     .bucket_partition_override(self.inner.request.bucket()),
             )
             .send()
