@@ -9,24 +9,19 @@ use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use crate::io::key::stream::{KeyStream, StreamError};
+use crate::io::key::stream::KeyStream;
 use crate::operation::sync::compare::{Compare, Decision, Verdict};
-use crate::operation::sync::walk::{Pairing, Progress, Walk};
+use crate::operation::sync::walk::{Progress, Walk};
 use crate::transfer::{IoRequest, PollWork, Transfer, TransferContext, WorkOutcome};
 use crate::types::FailedTransferPolicy;
 
 use child::{ChildHandle, SpawnChild};
 use delete::Deleter;
+use state::{Decided, State};
 
 // Pairings per merge work item. A merge draws from either side, so a listing page cannot size the
 // batch. The bound limits how long one work item holds an executor slot.
 const MERGE_BATCH: usize = 64;
-
-// How many failures a run keeps. The walk reports failures per entry, so keeping every failure
-// would grow memory with the tree. The run keeps the first failures and counts the rest.
-//
-// The sample comes from the first failing subtree. It does not represent the whole run.
-const FAILURES_KEPT: usize = 64;
 
 // Where a key lands, or the key a destination refuses.
 //
@@ -112,298 +107,6 @@ impl<S: KeyStream, D: KeyStream> fmt::Debug for SyncWork<S, D> {
     }
 }
 
-// A transfer decision with its pairing. The key names the destination; the source entry supplies
-// bytes.
-type Qualified<S, D> = (Pairing<S, D>, Decision);
-
-// What the comparison decided by kind. Every pairing produces one decision.
-#[derive(Debug, Default)]
-struct Decided {
-    transfers: u64,
-    deletes: u64,
-    skipped: Skipped,
-    // Keys marked for removal. The count stays independent of delete mode, so callers can compare
-    // intended removals with completed and refused removals.
-    deletable: u64,
-    // Which obstruction produced a skip. An obstruction is an entry, not a walk failure.
-    obstructed: Obstructed,
-}
-
-// Every skip by reason. A single count cannot distinguish an unchanged key, a protected
-// destination, and an incomplete plan.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-struct Skipped {
-    unchanged: u64,
-    destination_exists: u64,
-    deferred: u64,
-    unread: u64,
-    obstructed: u64,
-    // A delete decision that the mode turned into a skip.
-    delete_not_allowed: u64,
-}
-
-impl Skipped {
-    // The match is exhaustive, so a reason added to the comparison has to find a home here. A
-    // wildcard arm could put that reason inside whichever count it happened to name.
-    fn record(&mut self, reason: crate::operation::sync::compare::SkipReason) {
-        use crate::operation::sync::compare::SkipReason;
-        match reason {
-            SkipReason::Unchanged => self.unchanged += 1,
-            SkipReason::DestinationExists => self.destination_exists += 1,
-            SkipReason::Deferred => self.deferred += 1,
-            SkipReason::Unknown => self.unread += 1,
-            SkipReason::Obstructed => self.obstructed += 1,
-        }
-    }
-
-    // A removal the run was not allowed to make. Named apart from `record` because no comparison
-    // reports it: the key arrives decided for removal and the mode turns it into a skip.
-    fn record_delete_not_allowed(&mut self) {
-        self.delete_not_allowed += 1;
-    }
-
-    fn total(&self) -> u64 {
-        let Self {
-            unchanged,
-            destination_exists,
-            deferred,
-            unread,
-            obstructed,
-            delete_not_allowed,
-        } = self;
-        unchanged + destination_exists + deferred + unread + obstructed + delete_not_allowed
-    }
-}
-
-impl std::ops::AddAssign for Skipped {
-    fn add_assign(&mut self, batch: Self) {
-        let Self {
-            unchanged,
-            destination_exists,
-            deferred,
-            unread,
-            obstructed,
-            delete_not_allowed,
-        } = batch;
-        self.unchanged += unchanged;
-        self.destination_exists += destination_exists;
-        self.deferred += deferred;
-        self.unread += unread;
-        self.obstructed += obstructed;
-        self.delete_not_allowed += delete_not_allowed;
-    }
-}
-
-// Why a name held no bytes to transfer. An archive can become readable after a restore. Each reason
-// needs its own count.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-struct Obstructed {
-    // A socket, device, named pipe, or excluded symlink.
-    nothing_to_read: u64,
-    // Bytes in an archive, with no restored copy to read.
-    archived: u64,
-    // A restore under way, so a later run finds the bytes there.
-    restoring: u64,
-}
-
-impl Obstructed {
-    // The match is exhaustive, so a kind added later needs a deliberate destination. A wildcard arm
-    // could put that kind inside whichever count it happened to name.
-    fn record(&mut self, why: crate::io::key::stream::Obstruction) {
-        use crate::io::key::stream::Obstruction;
-        match why {
-            Obstruction::NothingToRead => self.nothing_to_read += 1,
-            Obstruction::Archived => self.archived += 1,
-            Obstruction::BeingRestored => self.restoring += 1,
-        }
-    }
-
-    fn any(&self) -> bool {
-        self.nothing_to_read > 0 || self.archived > 0 || self.restoring > 0
-    }
-}
-
-impl std::ops::AddAssign for Obstructed {
-    fn add_assign(&mut self, batch: Self) {
-        let Self {
-            nothing_to_read,
-            archived,
-            restoring,
-        } = batch;
-        self.nothing_to_read += nothing_to_read;
-        self.archived += archived;
-        self.restoring += restoring;
-    }
-}
-
-impl std::ops::AddAssign for Decided {
-    fn add_assign(&mut self, batch: Self) {
-        let Self {
-            transfers,
-            deletes,
-            skipped,
-            deletable,
-            obstructed,
-        } = batch;
-        self.transfers += transfers;
-        self.deletes += deletes;
-        self.skipped += skipped;
-        self.deletable += deletable;
-        self.obstructed += obstructed;
-    }
-}
-
-// What went wrong: an exact count and a bounded sample. The sample caps memory; the count records
-// every failure.
-#[derive(Debug)]
-struct Reported<T> {
-    kept: Vec<T>,
-    total: u64,
-}
-
-impl<T> Default for Reported<T> {
-    fn default() -> Self {
-        Self {
-            kept: Vec::new(),
-            total: 0,
-        }
-    }
-}
-
-impl<T> Reported<T> {
-    fn record(&mut self, item: T) {
-        self.total += 1;
-        if self.kept.len() < FAILURES_KEPT {
-            self.kept.push(item);
-        }
-    }
-
-    fn total(&self) -> u64 {
-        self.total
-    }
-
-    fn any(&self) -> bool {
-        self.total > 0
-    }
-
-    fn sample(&self) -> &[T] {
-        &self.kept
-    }
-}
-
-// `Merge` keeps the walk, its work-item status, and the pairing count.
-// A merge work item takes the walk out of `State`, so `in_flight` records that interval.
-struct Merge<S: KeyStream, D: KeyStream> {
-    // `None` only while a work item holds the merge. `Walk::next` needs `&mut`, so the merge leaves
-    // the state lock while it runs.
-    walk: Option<Walk<S, D>>,
-    in_flight: bool,
-    paired: u64,
-}
-
-// `Transfers` keeps every child transfer from decision through reap.
-// A child moves from `waiting` to `running` to `reaping`; the counters and failures record the result.
-struct Transfers<S: KeyStream, D: KeyStream> {
-    waiting: VecDeque<Qualified<S::Source, D::Source>>,
-    running: std::collections::HashMap<crate::transfer::TransferId, ChildHandle>,
-    reaping: usize,
-    arrived: u64,
-    bytes: u64,
-    failures: Reported<String>,
-    outcomes_unknown: u64,
-}
-
-// `Deletes` keeps keys from a delete decision through the service response.
-// A batch moves from `waiting` to `in_flight`; `removed` and `refusals` record the response.
-struct Deletes {
-    waiting: Vec<String>,
-    in_flight: usize,
-    removed: u64,
-    refusals: Reported<String>,
-}
-
-// `State` combines merge, transfer, delete, and run-wide records.
-// The scheduler locks `State` while it chooses work or records completed work.
-struct State<S: KeyStream, D: KeyStream> {
-    merge: Merge<S, D>,
-    decided: Decided,
-    transfers: Transfers<S, D>,
-    deletes: Deletes,
-    failures: Reported<StreamError>,
-    warnings: Reported<StreamError>,
-    plan_incomplete: bool,
-    walk_plan_incomplete: bool,
-    stopped_by: Option<crate::error::Error>,
-}
-
-impl<S: KeyStream, D: KeyStream> State<S, D> {
-    fn mark_plan_incomplete(&mut self) {
-        self.plan_incomplete = true;
-    }
-
-    fn mark_walk_plan_incomplete(&mut self) {
-        self.walk_plan_incomplete = true;
-    }
-
-    fn discard_waiting_deletes(&mut self) {
-        if !self.deletes.waiting.is_empty() {
-            self.mark_plan_incomplete();
-            self.deletes.waiting.clear();
-        }
-    }
-
-    fn discard_waiting_transfers(&mut self) {
-        if !self.transfers.waiting.is_empty() {
-            self.mark_plan_incomplete();
-            self.transfers.waiting.clear();
-        }
-    }
-
-    fn abandon_delete_batch(&mut self, key_count: usize) {
-        if key_count > 0 {
-            self.mark_plan_incomplete();
-        }
-        self.deletes.in_flight = self.deletes.in_flight.saturating_sub(key_count);
-    }
-
-    fn work_outstanding(&self) -> bool {
-        self.merge.in_flight
-            || self.transfers.reaping > 0
-            || self.deletes.in_flight > 0
-            || !self.transfers.running.is_empty()
-    }
-
-    fn is_execution_complete(&self) -> bool {
-        !self.work_outstanding()
-            && self.transfers.waiting.is_empty()
-            && self.deletes.waiting.is_empty()
-            && self
-                .merge
-                .walk
-                .as_ref()
-                .is_some_and(|walk| walk.progress() != Progress::Pairing)
-    }
-
-    fn is_plan_complete(&self, transfer_active: bool) -> bool {
-        !self.plan_incomplete
-            && !self.walk_plan_incomplete
-            && (transfer_active || !self.work_outstanding())
-    }
-
-    fn has_failures(&self) -> bool {
-        self.failures.any() || self.transfers.failures.any() || self.deletes.refusals.any()
-    }
-
-    fn has_warnings(&self, transfer_active: bool) -> bool {
-        self.warnings.any()
-            || self.decided.obstructed.any()
-            || self.plan_incomplete
-            || self.walk_plan_incomplete
-            || self.transfers.outcomes_unknown > 0
-            || (!transfer_active && self.work_outstanding())
-    }
-}
-
 pub(crate) struct SyncTransfer<S: KeyStream, D: KeyStream>
 where
     S::Source: 'static,
@@ -483,34 +186,7 @@ where
                 max_children: settings.max_children.max(1),
                 delete_mode: settings.delete_mode,
                 failure_policy: settings.failure_policy,
-                state: Mutex::new(State {
-                    merge: Merge {
-                        walk: Some(walk),
-                        in_flight: false,
-                        paired: 0,
-                    },
-                    decided: Decided::default(),
-                    transfers: Transfers {
-                        waiting: VecDeque::new(),
-                        running: std::collections::HashMap::new(),
-                        reaping: 0,
-                        arrived: 0,
-                        bytes: 0,
-                        failures: Reported::default(),
-                        outcomes_unknown: 0,
-                    },
-                    deletes: Deletes {
-                        waiting: Vec::new(),
-                        in_flight: 0,
-                        removed: 0,
-                        refusals: Reported::default(),
-                    },
-                    failures: Reported::default(),
-                    warnings: Reported::default(),
-                    plan_incomplete: false,
-                    walk_plan_incomplete: false,
-                    stopped_by: None,
-                }),
+                state: Mutex::new(State::new(walk)),
             }),
         }
     }
@@ -563,14 +239,14 @@ where
     // Return true after cancellation or an aborting failure. The transfer stays active until
     // outstanding work returns.
     fn has_stopped(&self, state: &State<S, D>) -> bool {
-        !self.inner.ctx.is_active() || state.stopped_by.is_some()
+        !self.inner.ctx.is_active() || state.is_stopped()
     }
 
     // Record the first aborting failure. The terminal path sets the transfer result after
     // outstanding work returns.
     fn stop_if_aborting(&self, state: &mut State<S, D>, why: impl Into<crate::error::Error>) {
-        if self.inner.failure_policy == FailedTransferPolicy::Abort && state.stopped_by.is_none() {
-            state.stopped_by = Some(why.into());
+        if self.inner.failure_policy == FailedTransferPolicy::Abort {
+            state.stop(why.into());
         }
     }
 
@@ -594,9 +270,9 @@ where
             if state.work_outstanding() {
                 return None;
             }
-            // Set the terminal status after outstanding work returns. Every earlier phase reads
-            // `stopped_by` and starts no new work.
-            if let Some(why) = state.stopped_by.take() {
+            // Set the terminal status after outstanding work returns. Every earlier phase checks
+            // `has_stopped` and starts no new work.
+            if let Some(why) = state.take_stop() {
                 self.inner.ctx.set_failed(why);
             }
             // Drop pending deletes and transfers after a stop. Their absence decisions came from an
@@ -622,8 +298,7 @@ where
     // Start one waiting transfer when a child slot is free. The spawned child uses its own
     // scheduler slot.
     fn spawn_one(&self, state: &mut State<S, D>) -> bool {
-        // Count only live children. A child in a reap holds no network or disk concurrency.
-        if state.transfers.running.len() >= self.inner.max_children {
+        if !state.transfers.has_room(self.inner.max_children) {
             return false;
         }
 
@@ -635,7 +310,7 @@ where
             if self.has_stopped(state) {
                 return false;
             }
-            let Some((pairing, _)) = state.transfers.waiting.pop_front() else {
+            let Some((pairing, _)) = state.transfers.next_waiting() else {
                 break;
             };
             let Some(entry) = pairing.source().entry() else {
@@ -647,8 +322,7 @@ where
                 );
                 state
                     .transfers
-                    .failures
-                    .record(format!("{}: {why}", pairing.key()));
+                    .record_failure(format!("{}: {why}", pairing.key()));
                 self.stop_if_aborting(state, why);
                 continue;
             };
@@ -658,14 +332,13 @@ where
                 .spawn(pairing.key(), &entry.source, self.inner.ctx.id.id)
             {
                 Ok(child) => {
-                    state.transfers.running.insert(child.id(), child);
+                    state.transfers.start(child);
                     return true;
                 }
                 Err(err) => {
                     state
                         .transfers
-                        .failures
-                        .record(format!("{}: {err}", pairing.key()));
+                        .record_failure(format!("{}: {err}", pairing.key()));
                     self.stop_if_aborting(state, err);
                     continue;
                 }
@@ -677,7 +350,7 @@ where
     // Send a delete batch when it fills or the merge cannot add another key.
     fn dispatch_deletes(&self, state: &mut State<S, D>) -> Option<PollWork> {
         let size = self.inner.deleter.batch_size();
-        let merge_done = match state.merge.walk.as_ref().map(Walk::progress) {
+        let merge_done = match state.merge.progress() {
             // Both sides paired every key either of them holds, so nothing can grow a part batch.
             Some(Progress::Accounted) => true,
             // More pairings will come, and any of them could add to the batch. A merge away with a
@@ -690,16 +363,9 @@ where
                 return None;
             }
         };
-        let full = state.deletes.waiting.len() >= size;
-        // A part batch waits until nothing can grow it. Sending early would cost a request per
-        // handful of keys for no gain.
-        let last_call = merge_done && !state.merge.in_flight && !state.deletes.waiting.is_empty();
-        if !full && !last_call {
-            return None;
-        }
-        let take = state.deletes.waiting.len().min(size);
-        let keys: Vec<String> = state.deletes.waiting.drain(..take).collect();
-        state.deletes.in_flight += keys.len();
+        let keys = state
+            .deletes
+            .take_batch(size, merge_done && !state.merge.in_flight())?;
         Some(PollWork::ready(IoRequest {
             data: Some(Box::new(SyncWork::<S, D>::DeleteKeys { keys })),
         }))
@@ -707,27 +373,7 @@ where
 
     // Collect terminal children for a reap. `reaping` counts them after they leave `running`.
     fn dispatch_reap(&self, state: &mut State<S, D>) -> Option<PollWork> {
-        let finished: Vec<crate::transfer::TransferId> = state
-            .transfers
-            .running
-            .iter()
-            .filter(|(_, child)| child.is_finished())
-            .map(|(id, _)| *id)
-            .collect();
-        if finished.is_empty() {
-            return None;
-        }
-        let children: Vec<ChildHandle> = finished
-            .into_iter()
-            .map(|id| {
-                state
-                    .transfers
-                    .running
-                    .remove(&id)
-                    .expect("id came from this map")
-            })
-            .collect();
-        state.transfers.reaping += children.len();
+        let children = state.transfers.take_finished()?;
         Some(PollWork::ready(IoRequest {
             data: Some(Box::new(SyncWork::<S, D>::ReapChildren { children })),
         }))
@@ -736,21 +382,7 @@ where
     // Hand the merge to a work item. When no merge work remains, the poll chooses `Done` or
     // `Pending`.
     fn dispatch_merge(&self, state: &mut State<S, D>) -> Option<PollWork> {
-        if state.merge.in_flight {
-            return None;
-        }
-
-        let walk = match state.merge.walk.take() {
-            Some(walk) if walk.progress() == Progress::Pairing => walk,
-            // Exhausted. Put it back so the completion test can see it.
-            Some(walk) => {
-                state.merge.walk = Some(walk);
-                return None;
-            }
-            None => return None,
-        };
-
-        state.merge.in_flight = true;
+        let walk = state.merge.take_walk_to_advance()?;
         Some(PollWork::ready(IoRequest {
             data: Some(Box::new(SyncWork::AdvanceMerge {
                 walk: Some(Box::new(walk)),
@@ -817,12 +449,11 @@ where
             let why = crate::error::Error::new(first.kind.clone(), first.why.clone());
             self.stop_if_aborting(&mut state, why);
         }
-        state.deletes.in_flight -= sent;
-        state.deletes.removed += gone;
-
-        for refusal in refused {
-            state.deletes.refusals.record(refusal.why);
-        }
+        state.deletes.record_response(
+            sent,
+            gone,
+            refused.into_iter().map(|refusal| refusal.why).collect(),
+        );
         if self.check_terminal(&mut state).is_some() {
             drop(state);
             return WorkOutcome::Success { data: None };
@@ -856,14 +487,7 @@ where
         if let Some(why) = why {
             self.stop_if_aborting(&mut state, why);
         }
-        state.transfers.reaping -= count;
-        state.transfers.bytes += moved;
-        state.transfers.arrived += arrived;
-        // Record every child failure. The first failure controls `Abort`; callers still need every
-        // reason.
-        for reason in reasons {
-            state.transfers.failures.record(reason);
-        }
+        state.transfers.record_reap(count, arrived, moved, reasons);
         if self.check_terminal(&mut state).is_some() {
             drop(state);
             return WorkOutcome::Success { data: None };
@@ -878,8 +502,7 @@ where
         {
             let mut state = self.inner.state.lock();
             if self.has_stopped(&state) {
-                state.merge.walk = Some(walk);
-                state.merge.in_flight = false;
+                state.merge.return_walk(walk, 0);
                 // Return the merge before checking for completion. The returned merge can finish the run.
                 if self.check_terminal(&mut state).is_some() {
                     return WorkOutcome::Cancelled;
@@ -947,15 +570,13 @@ where
         if !walk.is_plan_complete() {
             state.mark_walk_plan_incomplete();
         }
-        state.merge.walk = Some(walk);
-        state.merge.in_flight = false;
-        state.merge.paired += paired;
-        state.decided += decided;
+        state.merge.return_walk(walk, paired);
+        state.add_decided(decided);
         if deferred {
             state.mark_plan_incomplete();
         }
-        state.transfers.waiting.append(&mut batch);
-        state.deletes.waiting.append(&mut pending_deletes);
+        state.transfers.queue(&mut batch);
+        state.deletes.queue(&mut pending_deletes);
         // Warnings continue the run. Failures enter the run record and can stop the run.
         //
         // Record every failure. A fatal failure stops the run under both policies.
@@ -963,7 +584,7 @@ where
         let mut nothing_left = None;
         for entry in failures {
             if entry.is_warning() {
-                state.warnings.record(entry);
+                state.record_walk_warning(entry);
                 continue;
             }
             // A fatal entry leaves no source stream to continue.
@@ -974,14 +595,12 @@ where
                 // Read the category and message before moving the failure into the run record.
                 failed = Some((entry.category(), entry.to_string()));
             }
-            state.failures.record(entry);
+            state.record_walk_failure(entry);
         }
         // The run record keeps every failure. The terminal result carries the first failure.
         // A fatal failure stops the run under both policies.
         if let Some((kind, why)) = nothing_left {
-            if state.stopped_by.is_none() {
-                state.stopped_by = Some(crate::error::Error::new(kind, why));
-            }
+            state.stop(crate::error::Error::new(kind, why));
         } else if let Some((kind, why)) = failed {
             self.stop_if_aborting(&mut state, crate::error::Error::new(kind, why));
         }
@@ -1018,19 +637,7 @@ where
         // child can wake the scheduler.
         let children = {
             let mut state = self.inner.state.lock();
-            if !state.transfers.running.is_empty() {
-                state.transfers.outcomes_unknown += state.transfers.running.len() as u64;
-                // Read bytes moved before dropping child handles. Dropping a handle cancels its
-                // child.
-                let moved: u64 = state
-                    .transfers
-                    .running
-                    .values()
-                    .map(ChildHandle::bytes_so_far)
-                    .sum();
-                state.transfers.bytes += moved;
-            }
-            std::mem::take(&mut state.transfers.running)
+            state.transfers.abandon_running()
         };
         drop(children);
     }
@@ -1059,6 +666,7 @@ const _: fn() = || {
 
 mod child;
 mod delete;
+mod state;
 #[cfg(test)]
 mod test_util;
 #[cfg(test)]

@@ -16,6 +16,7 @@ use crate::operation::sync::walk::{LocalAndBucket, Walker};
 
 use super::child::*;
 use super::delete::*;
+use super::state::*;
 use super::test_util::*;
 use super::*;
 
@@ -69,7 +70,7 @@ async fn drive(transfer: &SyncTransfer<FsWalk, S3Walk>) -> u64 {
                 PollWork::Spawned => {}
             }
         }
-        transfer.inner.state.lock().merge.paired
+        transfer.inner.state.lock().snapshot().paired
     };
     tokio::time::timeout(Duration::from_secs(20), run)
         .await
@@ -94,7 +95,7 @@ async fn an_archived_object_and_a_restoring_one_are_counted_apart() {
             transfer.execute(&mut work).await;
         }
 
-        let counts = transfer.inner.state.lock().decided.obstructed;
+        let counts = transfer.inner.state.lock().snapshot().decided.obstructed;
         let expected = match why {
             Obstruction::Archived => Obstructed {
                 archived: 1,
@@ -128,14 +129,14 @@ async fn a_key_whose_absence_went_unread_is_counted_apart_from_an_unchanged_one(
             transfer.execute(&mut work).await;
         }
 
-        let state = transfer.inner.state.lock();
+        let snapshot = transfer.inner.state.lock().snapshot();
         assert_eq!(
-            state.decided.skipped.total(),
+            snapshot.decided.skipped.total(),
             1,
             "the key was not skipped, so this proves nothing about the reason"
         );
         assert_eq!(
-            state.decided.skipped.unread, 1,
+            snapshot.decided.skipped.unread, 1,
             "a key the run could not compare, lost as {lost:?}, is counted as one it compared"
         );
     }
@@ -149,13 +150,13 @@ async fn every_pairing_yields_exactly_one_decision() {
     let (transfer, _ctx) = uploading(dir.path(), &["b.txt", "d.txt"]);
 
     let paired = drive(&transfer).await;
-    let state = transfer.inner.state.lock();
+    let snapshot = transfer.inner.state.lock().snapshot();
     assert_eq!(
-        state.decided.transfers + state.decided.deletes + state.decided.skipped.total(),
+        snapshot.decided.transfers + snapshot.decided.deletes + snapshot.decided.skipped.total(),
         paired,
         "the decisions do not account for every key that was paired"
     );
-    assert_eq!(state.decided.deletes, 1, "d.txt is on the bucket alone");
+    assert_eq!(snapshot.decided.deletes, 1, "d.txt is on the bucket alone");
 }
 
 #[cfg_attr(miri, ignore)]
@@ -193,15 +194,15 @@ async fn a_deferred_verdict_is_skipped_and_shortens_the_plan() {
 
     let paired = drive(&transfer).await;
     assert_eq!(paired, 2);
-    let state = transfer.inner.state.lock();
+    let snapshot = transfer.inner.state.lock().snapshot();
     assert_eq!(
-        state.decided.skipped.total(),
+        snapshot.decided.skipped.total(),
         2,
         "a deferred key was not skipped"
     );
-    assert_eq!(state.decided.transfers, 0);
+    assert_eq!(snapshot.decided.transfers, 0);
     assert!(
-        state.plan_incomplete,
+        snapshot.plan_incomplete,
         "the plan is short two keys and does not say so"
     );
 }
@@ -220,8 +221,7 @@ async fn the_plan_is_whole_only_when_neither_flag_is_set() {
     ] {
         {
             let mut state = transfer.inner.state.lock();
-            state.plan_incomplete = mine;
-            state.walk_plan_incomplete = walks;
+            state.set_plan_flags(mine, walks);
         }
         assert_eq!(
             transfer.is_plan_complete(),
@@ -244,7 +244,7 @@ async fn taking_the_merge_away_does_not_change_the_answer() {
         other => panic!("expected a work item, got {other:?}"),
     };
     assert!(
-        transfer.inner.state.lock().merge.walk.is_none(),
+        !transfer.inner.state.lock().snapshot().merge_present,
         "the merge is still in state, so nothing was taken away"
     );
     assert_eq!(
@@ -276,7 +276,7 @@ async fn every_key_either_side_holds_is_paired_once() {
     let (transfer, _ctx) = uploading(dir.path(), &["b.txt", "d.txt"]);
     assert_eq!(drive(&transfer).await, 4);
     assert!(
-        transfer.inner.state.lock().failures.sample().is_empty(),
+        transfer.inner.state.lock().snapshot().walk_failures_kept == 0,
         "a well-formed listing produced a failure"
     );
 }
@@ -452,7 +452,7 @@ async fn a_local_delete_removes_the_file_and_leaves_its_directory() {
         dir.path().join("keep").is_dir(),
         "the directory went with the file"
     );
-    assert_eq!(transfer.inner.state.lock().deletes.removed, 1);
+    assert_eq!(transfer.inner.state.lock().snapshot().removed, 1);
 }
 
 #[cfg_attr(miri, ignore)]
@@ -469,7 +469,7 @@ async fn an_object_whose_key_names_a_place_is_reported_not_written() {
         "a key naming a place was written as a file"
     );
     assert_eq!(
-        transfer.inner.state.lock().transfers.failures.total(),
+        transfer.inner.state.lock().snapshot().transfer_failures,
         1,
         "the key was not accounted for"
     );
@@ -769,7 +769,7 @@ async fn a_cancelled_run_that_dropped_work_does_not_report_clean() {
     let mut buffered = 0;
     while let PollWork::Ready { io: mut work, .. } = transfer.poll_work() {
         transfer.execute(&mut work).await;
-        buffered = transfer.inner.state.lock().deletes.waiting.len();
+        buffered = transfer.inner.state.lock().snapshot().deletes_waiting;
         if buffered > 0 {
             break;
         }
@@ -914,7 +914,7 @@ async fn a_run_still_holding_children_does_not_report_clean() {
         transfer.execute(&mut work).await;
     }
     let _ = spawn_until_something_else(&transfer);
-    let held = transfer.inner.state.lock().transfers.running.len();
+    let held = transfer.inner.state.lock().snapshot().children_running;
     assert!(held > 0, "no child is held, so this proves nothing");
 
     ctx.set_cancelled();
@@ -941,7 +941,7 @@ async fn an_aborting_run_does_not_send_a_batch_that_was_already_in_flight() {
 
     let mut held = None;
     while let PollWork::Ready { io: mut work, .. } = transfer.poll_work() {
-        if transfer.inner.state.lock().deletes.in_flight > 0 {
+        if transfer.inner.state.lock().snapshot().deletes_in_flight > 0 {
             held = Some(work);
             break;
         }
@@ -964,7 +964,7 @@ async fn an_aborting_run_does_not_send_a_batch_that_was_already_in_flight() {
         "the status already moved, so the window this test is about is not open"
     );
     assert!(
-        transfer.inner.state.lock().stopped_by.is_some(),
+        transfer.inner.state.lock().snapshot().stopped,
         "the run did not decide to stop, so this proves nothing"
     );
 
@@ -989,10 +989,10 @@ async fn bytes_a_dropped_child_moved_are_counted() {
         transfer.execute(&mut work).await;
     }
     let _ = spawn_until_something_else(&transfer);
-    let held = transfer.inner.state.lock().transfers.running.len();
+    let held = transfer.inner.state.lock().snapshot().children_running;
     assert!(held > 0, "no child is held, so this proves nothing");
     assert_eq!(
-        transfer.inner.state.lock().transfers.bytes,
+        transfer.inner.state.lock().snapshot().bytes,
         0,
         "a child was already accounted for, so this would count it twice"
     );
@@ -1001,7 +1001,7 @@ async fn bytes_a_dropped_child_moved_are_counted() {
     transfer.on_terminal();
 
     assert_eq!(
-        transfer.inner.state.lock().transfers.bytes,
+        transfer.inner.state.lock().snapshot().bytes,
         512 * held as u64,
         "a run forgot what its dropped children had moved"
     );
@@ -1019,18 +1019,18 @@ async fn children_dropped_on_notice_leave_their_outcome_unknown() {
         transfer.execute(&mut work).await;
     }
     let _ = spawn_until_something_else(&transfer);
-    let held = transfer.inner.state.lock().transfers.running.len();
+    let held = transfer.inner.state.lock().snapshot().children_running;
     assert!(held > 0, "no child is held, so this proves nothing");
 
     ctx.set_cancelled();
     transfer.on_terminal();
 
     assert!(
-        transfer.inner.state.lock().transfers.running.is_empty(),
+        transfer.inner.state.lock().snapshot().children_running == 0,
         "the notice left the children where the outstanding question could still see them"
     );
     assert_eq!(
-        transfer.inner.state.lock().transfers.outcomes_unknown,
+        transfer.inner.state.lock().snapshot().outcomes_unknown,
         held as u64,
         "a run forgot that it never learned how {held} transfer(s) went"
     );
@@ -1051,14 +1051,14 @@ async fn keys_qualified_and_never_started_leave_the_plan_short() {
 
     while let PollWork::Ready { io: mut work, .. } = transfer.poll_work() {
         transfer.execute(&mut work).await;
-        if !transfer.inner.state.lock().transfers.waiting.is_empty() {
+        if transfer.inner.state.lock().snapshot().transfers_waiting > 0 {
             break;
         }
     }
-    let queued = transfer.inner.state.lock().transfers.waiting.len();
+    let queued = transfer.inner.state.lock().snapshot().transfers_waiting;
     assert!(queued > 0, "no key is queued, so this proves nothing");
     assert!(
-        transfer.inner.state.lock().transfers.running.is_empty(),
+        transfer.inner.state.lock().snapshot().children_running == 0,
         "a child is alive, so the children path could set the flag instead"
     );
 
@@ -1086,12 +1086,12 @@ async fn a_reap_that_never_ran_leaves_the_plan_short() {
 
     let mut held = None;
     while let PollWork::Ready { io: work, .. } = transfer.poll_work() {
-        if transfer.inner.state.lock().transfers.reaping > 0 {
+        if transfer.inner.state.lock().snapshot().children_reaping > 0 {
             held = Some(work);
             break;
         }
     }
-    let outstanding = transfer.inner.state.lock().transfers.reaping;
+    let outstanding = transfer.inner.state.lock().snapshot().children_reaping;
     assert!(
         outstanding > 0,
         "no reap was dispatched, so this proves nothing"
@@ -1126,7 +1126,7 @@ async fn an_abandoned_batch_leaves_the_plan_short() {
 
     let mut held = None;
     while let PollWork::Ready { io: mut work, .. } = transfer.poll_work() {
-        if transfer.inner.state.lock().deletes.in_flight > 0 {
+        if transfer.inner.state.lock().snapshot().deletes_in_flight > 0 {
             held = Some(work);
             break;
         }
@@ -1134,7 +1134,7 @@ async fn an_abandoned_batch_leaves_the_plan_short() {
     }
     let mut batch = held.expect("no delete batch was dispatched, so this proves nothing");
     assert!(
-        transfer.inner.state.lock().deletes.waiting.is_empty(),
+        transfer.inner.state.lock().snapshot().deletes_waiting == 0,
         "the keys are still in the buffer, so the accounting sites would see them"
     );
 
@@ -1246,21 +1246,21 @@ async fn an_abandoned_batch_gives_back_every_slot_it_took() {
 
     let mut held = None;
     while let PollWork::Ready { io: mut work, .. } = transfer.poll_work() {
-        if transfer.inner.state.lock().deletes.in_flight > 0 {
+        if transfer.inner.state.lock().snapshot().deletes_in_flight > 0 {
             held = Some(work);
             break;
         }
         transfer.execute(&mut work).await;
     }
     let mut batch = held.expect("no delete batch was dispatched, so this proves nothing");
-    let took = transfer.inner.state.lock().deletes.in_flight;
+    let took = transfer.inner.state.lock().snapshot().deletes_in_flight;
     assert!(took > 1, "a batch of one slot cannot show the leak");
 
     ctx.set_cancelled();
     transfer.execute(&mut batch).await;
 
     assert_eq!(
-        transfer.inner.state.lock().deletes.in_flight,
+        transfer.inner.state.lock().snapshot().deletes_in_flight,
         0,
         "a batch of {took} keys gave back fewer slots than it took, so the run can never end"
     );
@@ -1281,30 +1281,30 @@ async fn a_stopped_run_reports_fewer_arrivals_than_it_decided() {
     let _ = transfer.poll_work();
     let _ = transfer.poll_work();
     assert!(
-        !transfer.inner.state.lock().transfers.waiting.is_empty(),
+        transfer.inner.state.lock().snapshot().transfers_waiting > 0,
         "nothing was left buffered, so this proves nothing about the counts"
     );
 
     spawner.release(&ctx);
     drive(&transfer).await;
 
-    let state = transfer.inner.state.lock();
+    let snapshot = transfer.inner.state.lock().snapshot();
     assert!(
-        state.transfers.waiting.is_empty(),
+        snapshot.transfers_waiting == 0,
         "the teardown left keys buffered"
     );
     assert_eq!(
-        state.decided.transfers, 3,
+        snapshot.decided.transfers, 3,
         "the run decided {} transfers for three keys",
-        state.decided.transfers
+        snapshot.decided.transfers
     );
     assert_eq!(
-        state.transfers.arrived, 1,
+        snapshot.arrived, 1,
         "one key arrived and the run reports {}",
-        state.transfers.arrived
+        snapshot.arrived
     );
     assert!(
-        state.plan_incomplete,
+        snapshot.plan_incomplete,
         "a run that abandoned a decided transfer called its plan whole"
     );
 }
@@ -1321,7 +1321,7 @@ async fn a_cancelled_run_starts_no_further_child() {
         let _ = transfer.execute(&mut work).await;
     }
     assert!(
-        !transfer.inner.state.lock().transfers.waiting.is_empty(),
+        transfer.inner.state.lock().snapshot().transfers_waiting > 0,
         "nothing is waiting, so no spawn would have been attempted either way"
     );
 
@@ -1356,7 +1356,7 @@ async fn an_aborting_run_does_not_start_the_keys_after_the_one_that_failed() {
     let _ = transfer.poll_work();
 
     assert!(
-        transfer.inner.state.lock().stopped_by.is_some(),
+        transfer.inner.state.lock().snapshot().stopped,
         "the run did not decide to stop, so the guard this test is about was never reached"
     );
     assert_eq!(
@@ -1385,7 +1385,7 @@ async fn a_cancelled_run_does_not_send_a_batch_already_handed_over() {
 
     let mut held = None;
     while let PollWork::Ready { io: mut work, .. } = transfer.poll_work() {
-        if transfer.inner.state.lock().deletes.in_flight > 0 {
+        if transfer.inner.state.lock().snapshot().deletes_in_flight > 0 {
             held = Some(work);
             break;
         }
@@ -1414,7 +1414,7 @@ async fn a_cancelled_run_does_not_start_the_keys_it_had_buffered() {
     while let PollWork::Ready { io: mut work, .. } = transfer.poll_work() {
         transfer.execute(&mut work).await;
     }
-    let buffered = transfer.inner.state.lock().transfers.waiting.len();
+    let buffered = transfer.inner.state.lock().snapshot().transfers_waiting;
     assert!(
         buffered > 0,
         "no key is waiting, so the guard this test is about holds nothing"
@@ -1447,7 +1447,7 @@ async fn a_cancelled_run_keeps_the_children_it_already_sent() {
         matches!(spawned, PollWork::Pending),
         "the run did not park with children live, so this proves nothing"
     );
-    let live = transfer.inner.state.lock().transfers.running.len();
+    let live = transfer.inner.state.lock().snapshot().children_running;
     assert!(live > 0, "no child is live, so there is nothing to keep");
 
     ctx.set_cancelled();
@@ -1488,7 +1488,7 @@ async fn cancelling_before_a_failure_still_reports_cancelled() {
     let _ = transfer.poll_work();
 
     assert!(
-        transfer.inner.state.lock().stopped_by.is_some(),
+        transfer.inner.state.lock().snapshot().stopped,
         "nothing failed, so the cancellation has no failure to beat"
     );
     assert!(
@@ -1645,14 +1645,14 @@ async fn a_loop_warns_under_either_policy() {
 
         let state = transfer.inner.state.lock();
         assert_eq!(
-            state.warnings.sample().len(),
+            state.snapshot().warnings_kept,
             1,
             "under {policy:?} the loop was not kept where a caller can read it"
         );
         assert!(
-            state.failures.sample().is_empty(),
+            state.walk_failure_sample().is_empty(),
             "a loop nothing could transfer was filed as a failure: {:?}",
-            state.failures
+            state.walk_failure_sample()
         );
         drop(state);
         assert_eq!(
@@ -1692,7 +1692,7 @@ async fn a_failure_ends_an_aborting_run_and_lets_its_batch_go() {
         "a refused delete ended an aborting run without recording it as failed"
     );
     assert!(
-        transfer.inner.state.lock().deletes.waiting.is_empty(),
+        transfer.inner.state.lock().snapshot().deletes_waiting == 0,
         "an ended run kept keys judged against a stream it stopped reading"
     );
     assert_eq!(
@@ -1792,7 +1792,7 @@ async fn a_child_that_failed_ends_an_aborting_run() {
         drive(&transfer).await;
 
         assert!(
-            transfer.inner.state.lock().transfers.failures.any(),
+            transfer.inner.state.lock().snapshot().transfer_failures > 0,
             "under {policy:?} the failed child was not counted"
         );
         assert_eq!(
@@ -1839,7 +1839,7 @@ async fn a_child_that_could_not_be_built_ends_an_aborting_run() {
         drive(&transfer).await;
 
         assert!(
-            transfer.inner.state.lock().transfers.failures.any(),
+            transfer.inner.state.lock().snapshot().transfer_failures > 0,
             "under {policy:?} the refused spawn was not counted"
         );
         assert_eq!(
@@ -1913,7 +1913,7 @@ async fn a_key_the_listing_described_badly_is_kept_as_a_failure() {
         "no key was described well enough to pair"
     );
     assert_eq!(
-        transfer.inner.state.lock().failures.sample().len(),
+        transfer.inner.state.lock().snapshot().walk_failures_kept,
         1,
         "the run ended without keeping what it could not account for"
     );
@@ -1946,7 +1946,10 @@ async fn a_tree_larger_than_one_batch_takes_several_work_items() {
             other => panic!("unexpected {other:?}"),
         }
     }
-    assert_eq!(transfer.inner.state.lock().merge.paired, keys.len() as u64);
+    assert_eq!(
+        transfer.inner.state.lock().snapshot().paired,
+        keys.len() as u64
+    );
     assert!(
         items > 1,
         "a tree of {} keys came back in one work item, so the batch bound did nothing",
@@ -2000,7 +2003,10 @@ async fn the_scheduler_gets_the_run_to_the_end_on_its_own() {
         .expect("the run parked: a work item finished without waking the transfer")
         .expect("the terminal signal was dropped");
 
-    assert_eq!(transfer.inner.state.lock().merge.paired, keys.len() as u64);
+    assert_eq!(
+        transfer.inner.state.lock().snapshot().paired,
+        keys.len() as u64
+    );
     assert!(
         keys.len() > MERGE_BATCH,
         "the tree fits in one work item, so the run never parked and the wake went untested"
@@ -2019,8 +2025,7 @@ async fn a_batch_still_out_holds_the_run_open() {
         .state
         .lock()
         .merge
-        .walk
-        .take()
+        .take_walk_to_advance()
         .expect("the merge");
     while walk.next().await.is_some() {}
     assert_eq!(
@@ -2030,8 +2035,7 @@ async fn a_batch_still_out_holds_the_run_open() {
     );
     {
         let mut state = transfer.inner.state.lock();
-        state.merge.walk = Some(walk);
-        state.merge.in_flight = true;
+        state.merge.hold_in_flight(walk);
     }
     assert!(ctx.is_active(), "the transfer ended before the assertion");
 
@@ -2040,7 +2044,7 @@ async fn a_batch_still_out_holds_the_run_open() {
         "a finished merge with a batch still out reported the run over"
     );
 
-    transfer.inner.state.lock().merge.in_flight = false;
+    transfer.inner.state.lock().merge.release();
     assert!(
         matches!(transfer.poll_work(), PollWork::Done),
         "with nothing outstanding the run is not over"
@@ -2120,14 +2124,14 @@ async fn a_run_where_everything_fails_keeps_a_bounded_sample() {
         "the fixture did not produce unreadable directories, so nothing was tested"
     );
 
-    let state = transfer.inner.state.lock();
+    let snapshot = transfer.inner.state.lock().snapshot();
     assert!(
-        state.failures.sample().len() <= FAILURES_KEPT,
+        snapshot.walk_failures_kept <= FAILURES_KEPT,
         "the run kept {} failures, so peak memory follows the tree",
-        state.failures.sample().len()
+        snapshot.walk_failures_kept
     );
     assert!(
-        state.failures.total() > state.failures.sample().len() as u64,
+        snapshot.walk_failures > snapshot.walk_failures_kept as u64,
         "the total did not outrun the sample, so the cap was never reached"
     );
 }
@@ -2151,16 +2155,16 @@ async fn a_run_reports_the_transfers_that_arrived() {
 
     drive(&transfer).await;
 
-    let state = transfer.inner.state.lock();
+    let snapshot = transfer.inner.state.lock().snapshot();
     assert_eq!(
-        state.decided.transfers, 2,
+        snapshot.decided.transfers, 2,
         "the run decided {} transfers for two keys",
-        state.decided.transfers
+        snapshot.decided.transfers
     );
     assert_eq!(
-        state.transfers.arrived, 0,
+        snapshot.arrived, 0,
         "both children ended badly and the run reports {} arrivals",
-        state.transfers.arrived
+        snapshot.arrived
     );
 }
 
@@ -2221,12 +2225,11 @@ async fn a_decision_still_waiting_holds_the_run_open() {
     }
     let parked = spawn_until_something_else(&transfer);
 
-    let state = transfer.inner.state.lock();
+    let snapshot = transfer.inner.state.lock().snapshot();
     assert!(
-        !state.transfers.waiting.is_empty(),
+        snapshot.transfers_waiting > 0,
         "nothing is waiting, so this proves nothing about the buffer"
     );
-    drop(state);
     assert!(
         matches!(parked, PollWork::Pending),
         "a decision still waiting for a slot did not hold the run open"
@@ -2250,15 +2253,16 @@ async fn a_decision_a_stopped_run_gives_back_keeps_the_decision_it_was_made_with
     let _ = transfer.poll_work();
 
     let state = transfer.inner.state.lock();
+    let snapshot = state.snapshot();
     assert!(
-        state.stopped_by.is_some(),
+        snapshot.stopped,
         "the run did not stop, so nothing was given back"
     );
     assert!(
-        !state.transfers.waiting.is_empty(),
+        snapshot.transfers_waiting > 0,
         "nothing was given back, so this proves nothing about the decision"
     );
-    for (pairing, decision) in state.transfers.waiting.iter() {
+    for (pairing, decision) in state.waiting_transfers() {
         assert!(
             matches!(decision, Decision::Transfer(_)),
             "the key {:?} was qualified for transfer and came back as {decision:?}",
@@ -2309,12 +2313,15 @@ async fn a_reap_still_out_holds_the_run_open() {
         other => panic!("expected a reap, got {other:?}"),
     };
     {
-        let state = transfer.inner.state.lock();
+        let snapshot = transfer.inner.state.lock().snapshot();
         assert!(
-            state.transfers.running.is_empty(),
+            snapshot.children_running == 0,
             "the child is still in the map"
         );
-        assert_eq!(state.transfers.reaping, 1, "the reap is not accounted for");
+        assert_eq!(
+            snapshot.children_reaping, 1,
+            "the reap is not accounted for"
+        );
     }
     assert!(
         matches!(transfer.poll_work(), PollWork::Pending),
@@ -2344,7 +2351,7 @@ async fn no_more_children_are_live_than_the_cap_allows() {
     let parked = loop {
         match transfer.poll_work() {
             PollWork::Spawned => {
-                let live = transfer.inner.state.lock().transfers.running.len();
+                let live = transfer.inner.state.lock().snapshot().children_running;
                 seen = seen.max(live);
                 assert!(
                     live <= cap,
@@ -2401,10 +2408,9 @@ async fn a_transfer_decided_on_an_absent_source_does_not_strand_the_rest() {
 
     let paired = drive(&transfer).await;
     assert_eq!(paired, 2);
-    let state = transfer.inner.state.lock();
+    let snapshot = transfer.inner.state.lock().snapshot();
     assert_eq!(
-        state.transfers.failures.total(),
-        1,
+        snapshot.transfer_failures, 1,
         "the key with no source was not accounted for"
     );
     assert_eq!(
@@ -2678,16 +2684,13 @@ async fn destination_only_keys_are_deleted_in_batches() {
         batches.iter().all(|b| b.len() <= 3),
         "a batch exceeded the limit: {batches:?}"
     );
-    let state = transfer.inner.state.lock();
+    let snapshot = transfer.inner.state.lock().snapshot();
+    assert_eq!(snapshot.removed, 7, "each key's outcome was not counted");
     assert_eq!(
-        state.deletes.removed, 7,
-        "each key's outcome was not counted"
-    );
-    assert_eq!(
-        state.decided.deletable, 7,
+        snapshot.decided.deletable, 7,
         "a run allowed to delete does not report what the comparison marked"
     );
-    assert_eq!(state.deletes.refusals.total(), 0);
+    assert_eq!(snapshot.refusals, 0);
 }
 
 #[cfg_attr(miri, ignore)]
@@ -2701,29 +2704,20 @@ async fn a_refused_delete_is_counted_against_its_own_key() {
 
     let state = transfer.inner.state.lock();
     assert_eq!(
-        state.deletes.refusals.total(),
+        state.snapshot().refusals,
         2,
         "a refusal was not attributed per key"
     );
     assert_eq!(
-        state.deletes.removed, 0,
+        state.snapshot().removed,
+        0,
         "a refused key was counted as removed"
     );
+    let refusals = state.delete_refusals();
     assert!(
-        state
-            .deletes
-            .refusals
-            .sample()
-            .iter()
-            .any(|why| why.starts_with("a.txt:"))
-            && state
-                .deletes
-                .refusals
-                .sample()
-                .iter()
-                .any(|why| why.starts_with("b.txt:")),
-        "the refusal did not reach the record naming its key: {:?}",
-        state.deletes.refusals
+        refusals.iter().any(|why| why.starts_with("a.txt:"))
+            && refusals.iter().any(|why| why.starts_with("b.txt:")),
+        "the refusal did not reach the record naming its key: {refusals:?}"
     );
 }
 
@@ -2747,19 +2741,19 @@ async fn a_run_not_asked_to_delete_leaves_the_key_and_still_counts_it() {
         "a run that was not asked to delete issued {} keys anyway",
         deleter.keys_sent()
     );
-    let state = transfer.inner.state.lock();
-    assert_eq!(state.deletes.removed, 0, "a key was reported as removed");
-    assert_eq!(state.decided.deletes, 0, "a delete was decided");
+    let snapshot = transfer.inner.state.lock().snapshot();
+    assert_eq!(snapshot.removed, 0, "a key was reported as removed");
+    assert_eq!(snapshot.decided.deletes, 0, "a delete was decided");
     assert_eq!(
-        state.decided.skipped.total(),
+        snapshot.decided.skipped.total(),
         2,
         "the two keys left alone were not accounted for"
     );
     assert_eq!(
-        state.decided.deletable, 2,
+        snapshot.decided.deletable, 2,
         "the run cannot say how many objects turning deletion on would remove"
     );
-    assert!(state.deletes.waiting.is_empty());
+    assert!(snapshot.deletes_waiting == 0);
 }
 
 #[cfg_attr(miri, ignore)]
@@ -2995,12 +2989,12 @@ async fn a_delete_still_out_holds_the_run_open() {
         );
         if is_delete {
             {
-                let state = transfer.inner.state.lock();
+                let snapshot = transfer.inner.state.lock().snapshot();
                 assert!(
-                    state.deletes.waiting.is_empty(),
+                    snapshot.deletes_waiting == 0,
                     "the keys did not leave the buffer when the batch was built"
                 );
-                assert_eq!(state.deletes.in_flight, 1);
+                assert_eq!(snapshot.deletes_in_flight, 1);
             }
             assert!(
                 matches!(transfer.poll_work(), PollWork::Pending),
@@ -3027,7 +3021,7 @@ async fn cancelling_lets_the_pending_batch_go() {
     };
     transfer.execute(&mut work).await;
     assert_eq!(
-        transfer.inner.state.lock().deletes.waiting.len(),
+        transfer.inner.state.lock().snapshot().deletes_waiting,
         2,
         "the keys were not waiting, so this proves nothing"
     );
@@ -3039,7 +3033,7 @@ async fn cancelling_lets_the_pending_batch_go() {
         0,
         "a cancelled run still issued deletes judged against an incomplete source"
     );
-    assert!(transfer.inner.state.lock().deletes.waiting.is_empty());
+    assert!(transfer.inner.state.lock().snapshot().deletes_waiting == 0);
 }
 
 #[cfg_attr(miri, ignore)]
@@ -3097,18 +3091,17 @@ async fn a_qualified_key_reaches_the_bucket() {
         "the bucket did not receive both keys"
     );
 
-    let state = transfer.inner.state.lock();
+    let snapshot = transfer.inner.state.lock().snapshot();
     assert_eq!(
-        state.decided.transfers, 2,
+        snapshot.decided.transfers, 2,
         "both keys should have been sent"
     );
     assert_eq!(
-        state.transfers.failures.total(),
-        0,
+        snapshot.transfer_failures, 0,
         "a child failed, so the upload path is not working"
     );
     assert!(
-        state.transfers.running.is_empty() && state.transfers.reaping == 0,
+        snapshot.children_running == 0 && snapshot.children_reaping == 0,
         "the run ended with children unaccounted for"
     );
 }
@@ -3168,13 +3161,13 @@ async fn an_aborting_run_hands_the_merge_back() {
         transfer.execute(&mut work).await,
         WorkOutcome::Cancelled
     ));
-    let state = transfer.inner.state.lock();
+    let snapshot = transfer.inner.state.lock().snapshot();
     assert!(
-        state.merge.walk.is_some() && !state.merge.in_flight,
+        snapshot.merge_present && !snapshot.merge_in_flight,
         "an aborting work item left the merge where no poll can reach it"
     );
     assert_eq!(
-        state.decided.transfers, 0,
+        snapshot.decided.transfers, 0,
         "an aborting run paired and qualified keys after deciding to stop"
     );
 }
@@ -3196,9 +3189,9 @@ async fn a_cancelled_run_hands_the_merge_back() {
         transfer.execute(&mut work).await,
         WorkOutcome::Cancelled
     ));
-    let state = transfer.inner.state.lock();
+    let snapshot = transfer.inner.state.lock().snapshot();
     assert!(
-        state.merge.walk.is_some() && !state.merge.in_flight,
+        snapshot.merge_present && !snapshot.merge_in_flight,
         "a cancelled work item left the merge where no poll can reach it"
     );
 }
@@ -3339,14 +3332,14 @@ mod real_bucket {
     }
 
     fn counters<S: KeyStream, D: KeyStream>(t: &SyncTransfer<S, D>) -> RealRun {
-        let state = t.inner.state.lock();
+        let snapshot = t.inner.state.lock().snapshot();
         RealRun {
-            moved: state.transfers.bytes,
-            transfers: state.decided.transfers,
-            transferred: state.transfers.arrived,
-            deleted: state.deletes.removed,
-            failures: state.transfers.failures.total() + state.failures.total(),
-            skipped: state.decided.skipped.total(),
+            moved: snapshot.bytes,
+            transfers: snapshot.decided.transfers,
+            transferred: snapshot.arrived,
+            deleted: snapshot.removed,
+            failures: snapshot.transfer_failures + snapshot.walk_failures,
+            skipped: snapshot.decided.skipped.total(),
         }
     }
 
