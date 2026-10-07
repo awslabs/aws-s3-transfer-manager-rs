@@ -5,6 +5,21 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [vNext] - Unreleased
+
+### Fixed
+- A download to disk (`write_to_path`, `write_to_file`, or `download_objects`) could report success,
+  and `write_to_path` could rename its file into place, while a write made early to relieve memory
+  pressure was still in progress. If that write then failed, the error was discarded and part of the
+  file held zeros or its previous contents. Downloads now complete only after those writes finish,
+  and a failed write fails the download with `ErrorKind::IOError`.
+- A download to disk now fails with `ErrorKind::IOError`, instead of resizing and publishing the
+  destination, if fewer bytes were written than the object holds.
+- `TransferMetrics::disk_write` counted bytes when they were received rather than when they were
+  written, so it could run ahead of the file during a download and count unwritten parts after a
+  failure. It now matches the bytes written to the destination, both during a download and after a
+  failure. The value on success is unchanged.
+
 ## [0.3.0] - 2026-09-30
 
 Uploads and downloads now share one bounded, reusable pool for payload memory, and the managed

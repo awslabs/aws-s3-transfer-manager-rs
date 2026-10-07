@@ -94,12 +94,18 @@ impl HttpConnector for IoFaultConnector {
                 }
                 FailCount::First(n) => {
                     // Atomically claim a failure slot: increment iff still below n.
-                    self.failed
+                    // TODO(msrv): `fetch_update` is deprecated from Rust 1.99 in favour of
+                    // `try_update`, which is stable from 1.95. Switch to `try_update` once the
+                    // MSRV is 1.95 or later.
+                    #[allow(deprecated)]
+                    let claimed = self
+                        .failed
                         .0
                         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
                             (c < n).then_some(c + 1)
                         })
-                        .is_ok()
+                        .is_ok();
+                    claimed
                 }
                 FailCount::EachPartOnce => {
                     // Fault only this part's FIRST dispatch; re-issues pass through.
