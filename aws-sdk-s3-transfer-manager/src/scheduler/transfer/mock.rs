@@ -1421,6 +1421,54 @@ impl Transfer for DoneWhileActiveMock {
     }
 }
 
+/// Polls `Done` with a published terminal status, and panics in `on_terminal`.
+///
+/// Stands in for a real hook panicking in any of the four things it now does -- taking
+/// the state lock, draining, reporting the summary, emitting the lifecycle event. A
+/// poisoned state lock from an earlier worker panic reaches the first of those.
+pub(crate) struct PanickingTerminalHookMock {
+    ctx: TransferContext,
+}
+
+impl std::fmt::Debug for PanickingTerminalHookMock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PanickingTerminalHookMock").finish()
+    }
+}
+
+impl PanickingTerminalHookMock {
+    pub(crate) fn new(id: TransferId, handle: Arc<crate::client::Handle>) -> Self {
+        let (ctx, _rx) = TransferContext::with_id(id, handle);
+        Self { ctx }
+    }
+}
+
+impl Transfer for PanickingTerminalHookMock {
+    fn ctx(&self) -> &TransferContext {
+        &self.ctx
+    }
+
+    fn poll_work(&self) -> PollWork {
+        // Terminal is published *in* the poll, not before it: a descriptor that is
+        // already terminal when the ready set pops it is skipped without being polled,
+        // so the Done arm is only reachable this way. It is also the real order --
+        // `finalize_completion` publishes the status, and a later poll answers `Done`.
+        self.ctx.set_completed();
+        PollWork::Done
+    }
+
+    fn on_terminal(&self) {
+        panic!("on_terminal panicked");
+    }
+
+    fn execute<'a>(
+        &'a self,
+        _work: &'a mut IoRequest,
+    ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
+        unreachable!("PanickingTerminalHookMock never returns PollWork::Ready")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

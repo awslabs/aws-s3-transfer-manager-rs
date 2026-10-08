@@ -549,7 +549,18 @@ impl Scheduler {
                 //
                 // Safe to reach from more than one path: the hook's work is
                 // guarded by a claim that exactly one caller can win.
-                completed.transfer().on_terminal();
+                //
+                // Contained like the cancel and panic paths, because the hook takes the
+                // state lock, drains, reports and emits -- four steps that can panic. An
+                // escaping panic would skip the `generate_work` below, so the slot this
+                // completion just freed would never produce replacement work.
+                if !run_on_terminal(&completed) {
+                    tracing::error!(
+                        target: telemetry::TARGET_SCHEDULING,
+                        tid = %completed.id(),
+                        "on_terminal panicked; transfer cleanup is incomplete",
+                    );
+                }
             }
         }
 
@@ -814,8 +825,19 @@ impl Scheduler {
                         // can be corrected afterwards. Skipping loses nothing: every
                         // completion path emits and reports for itself, and the
                         // cancel/panic paths publish the status before they get here.
-                        if desc.is_terminal() {
-                            desc.transfer().on_terminal();
+                        //
+                        // Contained for the same reason the cancel and panic paths are:
+                        // an escaping panic would skip `remove_transfer_atomic` below,
+                        // leaving the descriptor in the map with its children running,
+                        // and skip the `sub.submit()` that returns this dispatch slot.
+                        // It would also leave the scheduler through `enqueue_transfer`
+                        // on the caller's thread.
+                        if desc.is_terminal() && !run_on_terminal(&desc) {
+                            tracing::error!(
+                                target: telemetry::TARGET_SCHEDULING,
+                                tid = %desc.id(),
+                                "on_terminal panicked; transfer cleanup is incomplete",
+                            );
                         }
                         let desc_id = desc.id();
                         let (_completed, orphans) = self.remove_transfer_atomic(desc_id);
@@ -1009,7 +1031,8 @@ mod tests {
     use crate::scheduler::descriptor::{vruntime_delta_for_cost, IO_WORK_COST, SPAWN_WORK_COST};
     use crate::scheduler::transfer::mock::{
         BuggyDoneMock, DoneWhileActiveMock, FixedWorkCount, FusedReadySpawnedMock,
-        MockStateMachine, TerminalWithoutSignalMock, WithDelay, WithExecute,
+        MockStateMachine, PanickingTerminalHookMock, TerminalWithoutSignalMock, WithDelay,
+        WithExecute,
     };
     use crate::scheduler::MockTransfer;
     use crate::transfer::{
@@ -3661,6 +3684,42 @@ mod tests {
             "the Done arm ran on_terminal while the status was still Active, so a \
              succeeding transfer publishes Ended {{ Cancelled }} and the real completion \
              finds the terminal report already spent: {seen:?}"
+        );
+
+        handle.runtime.shutdown();
+    }
+
+    /// A panic in `on_terminal` must not escape the Done arm or skip its removal.
+    ///
+    /// The hook takes the state lock, drains, reports the summary and emits the
+    /// lifecycle event, so four steps can panic where cleanup used to sit. Called
+    /// bare, the unwind skips `remove_transfer_atomic` on the next line -- leaving the
+    /// descriptor in the map with any children still running -- skips the `sub.submit()`
+    /// that returns the dispatch slot, and leaves the scheduler through
+    /// `enqueue_transfer` on this thread.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn a_panicking_terminal_hook_is_contained_in_the_done_arm() {
+        let _logs = show_test_logs();
+        let handle = test_handle(2);
+        let scheduler = &handle.scheduler;
+
+        let id = TransferId {
+            id: 1,
+            parent: None,
+        };
+        let mock = PanickingTerminalHookMock::new(id, handle.clone());
+
+        // `enqueue_transfer` runs `generate_work` on this thread, so an escaping panic
+        // would unwind through this call rather than being reported as a failed
+        // assertion below.
+        scheduler.enqueue_transfer(Box::new(mock));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert!(
+            scheduler.0.transfers.read().unwrap().get(&id).is_none(),
+            "the hook panicked and took `remove_transfer_atomic` with it, so the \
+             descriptor is still in the map"
         );
 
         handle.runtime.shutdown();
