@@ -18,6 +18,12 @@ pub use body::{Body, ChunkOutput};
 /// In-order delivery buffer (out-of-order arrival → in-order stream).
 pub(crate) mod recv_buffer;
 
+/// Positioned-write targets for disk downloads.
+pub(crate) mod sink;
+
+#[cfg(test)]
+pub(crate) mod test_util;
+
 /// Read-ahead window — the occupancy bound on speculative issuance.
 pub(crate) mod read_ahead;
 
@@ -64,23 +70,6 @@ pub(crate) struct Download;
 pub(crate) struct EventRegistration {
     pub(crate) sink: crate::events::TransferEventSink,
     pub(crate) destination: crate::events::Endpoint,
-}
-
-/// The file a download writes into, and the two facts that only travel with it.
-///
-/// Grouped rather than passed as two parameters because neither is meaningful without
-/// the other: the file is the destination and `owns_file` says who closes it. Keeping
-/// them together is also what holds [`Download::orchestrate_with_sink`] inside clippy's
-/// argument limit now that the listing's `known_size` travels with it.
-///
-/// The object-range origin is not here: the writer learns it from discovery through
-/// `BodyWriter::prepare`, which is the only point at which a ranged download's origin is
-/// known.
-pub(crate) struct FileSink {
-    pub(crate) file: std::fs::File,
-    /// `true` when the transfer manager created the file and must clean it up (the
-    /// temp-file-then-rename path); `false` when the caller opened it and owns it.
-    pub(crate) owns_file: bool,
 }
 
 impl Download {
@@ -148,6 +137,9 @@ impl Download {
 
     /// Orchestrate a download that writes to a file path (temp file + rename).
     ///
+    /// The destination sink is created by `sinks` over the temp file, which the
+    /// transfer manager owns and may therefore preallocate.
+    ///
     /// When `parent` is `Some`, the transfer is linked as a child of the
     /// given composite transfer via [`TransferContext::new_child`](crate::transfer::TransferContext::new_child).
     #[cfg(any(unix, windows))]
@@ -157,6 +149,7 @@ impl Download {
         dest_path: std::path::PathBuf,
         parent: Option<&crate::transfer::TransferContext>,
         events: Option<EventRegistration>,
+        sinks: &dyn sink::SinkFactory,
     ) -> Result<ManagedDownloadHandle, error::Error> {
         // Generate temp file in the same directory as destination
         let unique_id = fastrand::u32(..);
@@ -176,10 +169,7 @@ impl Download {
         let inner = Self::orchestrate_with_sink(
             handle,
             input,
-            FileSink {
-                file,
-                owns_file: true,
-            },
+            sinks.create(file, true),
             parent,
             events,
             None,
@@ -192,20 +182,21 @@ impl Download {
     }
 
     /// Orchestrate a download that writes to a caller-provided file.
+    ///
+    /// The destination sink is created by `sinks` over `file`. The caller owns
+    /// `file`, so it is not preallocated.
     #[cfg(any(unix, windows))]
     pub(crate) fn orchestrate_to_file(
         handle: Arc<crate::client::Handle>,
         input: DownloadInput,
         file: std::fs::File,
         events: Option<EventRegistration>,
+        sinks: &dyn sink::SinkFactory,
     ) -> Result<ManagedDownloadHandle, error::Error> {
         let inner = Self::orchestrate_with_sink(
             handle,
             input,
-            FileSink {
-                file,
-                owns_file: false,
-            },
+            sinks.create(file, false),
             None,
             events,
             None,
@@ -215,17 +206,21 @@ impl Download {
         Ok(ManagedDownloadHandle::new_unmanaged(inner))
     }
 
-    /// Shared orchestration for file-sink downloads.
+    /// Shared orchestration for disk downloads: the transfer writes the object
+    /// through `sink`.
     ///
     /// `known_size` is the object's size when the caller already learned it — a composite
     /// has it from its listing. Seeding it here rather than waiting for discovery is what
     /// gives the entry a byte denominator it keeps even if its own `GetObject` never
     /// succeeds; see the note at the `set_total_bytes` call below.
+    ///
+    /// When `parent` is `Some`, the transfer is linked as a child of the
+    /// given composite transfer via [`TransferContext::new_child`](crate::transfer::TransferContext::new_child).
     #[cfg(any(unix, windows))]
     pub(crate) fn orchestrate_with_sink(
         handle: Arc<crate::client::Handle>,
         input: DownloadInput,
-        sink: FileSink,
+        sink: Box<dyn sink::SinkWrite>,
         parent: Option<&crate::transfer::TransferContext>,
         events: Option<EventRegistration>,
         known_size: Option<u64>,
@@ -240,7 +235,7 @@ impl Download {
         let bucket_type =
             BucketType::from_bucket_name(input.bucket().expect("bucket is available"));
 
-        let (writer, _consumer) = body::new_recv_body_with_sink(sink.file, sink.owns_file);
+        let (writer, _consumer) = body::new_recv_body_with_disk_mode(sink);
 
         let (ctx, completion_rx) = match parent {
             Some(parent) => TransferContext::new_child(handle.clone(), parent),

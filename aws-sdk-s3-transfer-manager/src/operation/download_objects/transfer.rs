@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use crate::error::{self, Error, ErrorKind};
 use crate::io::walk::S3Walk;
+use crate::operation::download::sink::{FileSinkFactory, SinkFactory};
 use crate::operation::download::{Download, DownloadInput, ManagedDownloadHandle};
 use crate::transfer::{
     IoRequest, PendingCause, PollWork, Transfer, TransferContext, TransferId, WorkOutcome,
@@ -566,10 +567,7 @@ impl DownloadObjectsTransfer {
         let inner = Download::orchestrate_with_sink(
             handle.clone(),
             input,
-            crate::operation::download::FileSink {
-                file,
-                owns_file: true,
-            },
+            FileSinkFactory.create(file, true),
             Some(&self.inner.ctx),
             // No events for a child here: the composite's own event wiring lands with
             // `download_objects`, which is where a child would be announced.

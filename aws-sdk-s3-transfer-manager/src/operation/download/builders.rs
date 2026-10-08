@@ -90,6 +90,7 @@ impl DownloadFluentBuilder {
             path,
             None,
             events,
+            &crate::operation::download::sink::FileSinkFactory,
         )
         .await
     }
@@ -126,7 +127,13 @@ impl DownloadFluentBuilder {
                     destination: crate::events::Endpoint::Local { path: None },
                 }
             });
-        crate::operation::download::Download::orchestrate_to_file(self.handle, input, file, events)
+        crate::operation::download::Download::orchestrate_to_file(
+            self.handle,
+            input,
+            file,
+            events,
+            &crate::operation::download::sink::FileSinkFactory,
+        )
     }
 
     /// <p>The bucket name containing the object.</p>
