@@ -51,7 +51,7 @@ Answer each question with evidence, a path and a symbol, not with an impression.
 - **Invariants.** Check each invariant that the change touches, using the [invariant index](../design/README.md#invariant-index) and the module documentation.
 - **Evidence.** Check the evidence against the [risk table](standards.md#risk-specific-evidence). Each test must establish the behavior it names.
 - **Documentation.** Check it against [standards.md](standards.md).
-- **Description.** Check the pull request description against [standards.md](standards.md#pull-request-descriptions). Each claim of coverage names the test that establishes it.
+- **Description.** Check the pull request description against [pull-requests.md](pull-requests.md). Each claim of coverage names the test that establishes it.
 
 ## Triage
 
@@ -61,7 +61,7 @@ Answer each question with evidence, a path and a symbol, not with an impression.
 | **Recommended** | Raised now and settled during or after any restructure. |
 | **Second pass** | The code will move, or the fix is cheap and independent. The reproduction is kept, and the finding is raised once the structure settles. |
 
-A proposed restructure leads the review. It gives the module tree, what moves where, and a landing order: move-only changes first, behavior changes last.
+When the structural pass concludes that the change needs restructuring, the proposal leads the review: the module tree, what moves where, and a landing order with move-only changes first and behavior changes last. Line-level findings on code that the proposal moves are held for the second pass.
 
 ## Comment format
 
@@ -72,4 +72,3 @@ Each comment stands on its own for an author who does not have the reviewer's co
 - the options, with a recommendation;
 - for a blocker, the reproduction or test in a collapsed `<details>` block.
 
-[review-examples.md](review-examples.md) applies these questions to real reviews.

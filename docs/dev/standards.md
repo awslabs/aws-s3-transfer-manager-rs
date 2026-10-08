@@ -1,6 +1,6 @@
 # Standards
 
-These standards apply to code, documentation, tests, and pull requests in this repository, whoever writes them. [reviewing.md](reviewing.md) applies them in review.
+These standards apply to code, documentation, and tests in this repository, whoever writes them. [pull-requests.md](pull-requests.md) covers pull request descriptions, and [reviewing.md](reviewing.md) applies both in review.
 
 ## Core standard
 
@@ -9,66 +9,6 @@ Write for the next maintainer or reviewer. Describe the current contract, behavi
 Use kernel-style technical prose: terse, precise, contract-first, and maintainer-focused.
 
 Shipped documentation and code comments must contain no editorialization or project state. Do not include opinions, development phases, ticket status, temporary implementation notes, or descriptions of future work. Record those in planning documents or the issue tracker.
-
-## Pull request descriptions
-
-A PR description explains the assembled result, not the sequence of commits or the development process.
-
-### Recommended structure
-
-1. **Summary**
-   - State what changes and why it matters.
-   - Include the PR’s position and dependencies when part of a series.
-   - Use a compact table when a series contains many PRs.
-
-2. **Design and behavior**
-   - Explain the important architecture and control flow.
-   - Organize around reviewer concerns rather than files or commits.
-   - Identify invariants, ownership boundaries, failure behavior, and compatibility implications.
-
-3. **Developer experience**
-   - Show normal configuration or usage where relevant.
-   - Prefer representative examples over advanced or internal use cases.
-   - Link to detailed configuration documentation rather than duplicating it.
-
-4. **Structure**
-   - Name the existing abstraction the change extends.
-   - Justify each new module, type, or trait by why no existing one fits.
-   - List what was moved or renamed.
-   - Identify changes to components other operations share. Such a change carries its own changelog entry, and is usually its own pull request.
-
-5. **Invariants**
-   - List each invariant from the [design documents](../design/README.md#invariant-index) or module documentation that the change touches, and how it is preserved.
-   - Write "none touched" only after checking.
-
-6. **Correctness and qualification**
-   - Explain what the tests establish, not merely which commands ran.
-   - Name the test or CI lane that establishes each claim. A requirement or behavior without one is partial, not covered.
-   - Separate unit, property, fuzz, concurrency, platform, integration, and real-service coverage where useful.
-   - Say which validation ran locally and which remains for CI.
-   - State known exclusions or deferred behavior explicitly.
-
-7. **Related work**
-   - Name open pull requests this change conflicts with or depends on, and how they reconcile.
-
-Large pull requests add a **Review order**: the order in which to read files or types, and what to check in each.
-
-The [pull request template](../../.github/pull_request_template.md) follows this structure.
-
-### PR prose rules
-
-- Lead with the user- or maintainer-visible outcome.
-- Describe the final design rather than its development history.
-- Avoid commit-by-commit walkthroughs.
-- Use specific section names. Prefer “Property tests and fuzzing” over vague headings such as “Independent validation.”
-- Give substantial concerns such as guard pages, unsafe boundaries, compatibility, or platform behavior their own sections.
-- Use diagrams only when they materially clarify ownership, sequence, state transitions, or data flow.
-- Keep each Markdown paragraph on one physical line. Do not insert hard line breaks within a paragraph.
-- Use GitHub-flavored Markdown with blank lines around headings, lists, tables, and code blocks.
-- Distinguish measured results, enforced regression barriers, and expected behavior.
-- Do not call behavior a “policy” unless it genuinely defines a policy boundary or configurable choice.
-- Avoid defensive or self-referential prose such as “this PR is not intended to.”
-- Avoid editorial language such as “simply,” “just,” “obviously,” “clearly,” or “worth noting.”
 
 ## Documentation comments
 
@@ -92,7 +32,7 @@ Do not document:
 - Current callers or module wiring.
 - Implementation narration.
 - Names and types without additional meaning.
-- Tickets, milestones, phases, or temporary project state.
+- Tickets, milestones, phases, or temporary project state. A regression test's issue reference is the exception; see [Tests](#tests).
 - Change history.
 - Future plans.
 - Editorial opinions.
@@ -132,7 +72,7 @@ Module and crate documentation describes:
 
 It is not a feature list, roadmap, benchmark report, or project-status document.
 
-The module documentation of a public module is user documentation. Maintainer conventions for public modules belong in [architecture.md](architecture.md).
+The module documentation of a public module is user documentation.
 
 ## Tests
 
@@ -145,6 +85,14 @@ A test comment should explain:
 - What regression would make the assertion fail.
 
 Avoid names that require unexplained implementation vocabulary. Derive boundary values from shared production constants where practical so tests cannot silently drift from the geometry they exercise.
+
+A test that pins a reported issue or a fix references the issue in a comment above it:
+
+```rust
+// ref: awslabs/aws-s3-transfer-manager-rs#123
+```
+
+When there is no public issue, reference the internal tracker id instead (`// ref: RUST-123`). Prefer a public issue, since outside contributors cannot resolve an internal id.
 
 A passing test must establish the named behavior. Do not discard operation results or allow unrelated failures to make an assertion pass vacuously.
 

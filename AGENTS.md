@@ -38,29 +38,26 @@ Documentation and comments state the contract: what an item does, its invariants
 
 ## Validation
 
-Before handing off a source change, run:
+Before handing off a source change:
 
 ```sh
 cargo fmt --check
-cargo fmt --manifest-path fuzz/Cargo.toml -- --check
-cargo clippy --all --tests --no-deps
-cargo nextest run --locked --workspace
-cargo test --locked --doc --workspace
-RUSTFLAGS="-Dwarnings -Adeprecated" RUSTDOCFLAGS="-Dwarnings --cfg docsrs" \
-  cargo +nightly doc --lib --no-deps --document-private-items
+cargo clippy --all --tests --no-deps -- -D warnings
+cargo test --locked --workspace
 ```
 
-CI denies warnings in each of these commands. Then add the lane for the surface you changed:
+Some changes need a check that CI runs as a separate job:
 
-| Surface | Command |
+| Change | Command |
 |---|---|
+| Documentation or doc comments | `RUSTDOCFLAGS="-Dwarnings --cfg docsrs" cargo +nightly doc --lib --no-deps --document-private-items` |
+| Anything under `fuzz/` | `cargo fmt --manifest-path fuzz/Cargo.toml -- --check`, then `RUSTFLAGS='--cfg s3_tm_fuzz' .github/scripts/run-fuzz-targets.sh smoke` |
 | Atomics, the wake protocol, `runtime/sync` | `LOOM_MAX_PREEMPTIONS=3 RUSTFLAGS='--cfg s3_tm_loom' cargo test -p aws-sdk-s3-transfer-manager --lib --release -- loom_tests` |
 | `unsafe` code, buffer ownership | `MIRIFLAGS='-Zmiri-disable-isolation -Zmiri-strict-provenance' cargo +nightly miri test -p aws-sdk-s3-transfer-manager --lib` |
 | Feature gates | `cargo hack check --all --feature-powerset` |
-| Fuzz targets, decoders | `RUSTFLAGS='--cfg s3_tm_fuzz' .github/scripts/run-fuzz-targets.sh smoke` |
 
-[.github/workflows/ci.yml](.github/workflows/ci.yml) is authoritative. In the pull request, state which lanes ran locally and which remain for CI.
+[.github/workflows/ci.yml](.github/workflows/ci.yml) defines the full matrix. A pull request states which of these checks ran locally.
 
 ## Pull requests
 
-Write the description to the structure in [docs/dev/standards.md](docs/dev/standards.md#pull-request-descriptions). It describes the assembled result, not the commit history.
+Write the description as [docs/dev/pull-requests.md](docs/dev/pull-requests.md) describes. It explains the assembled result, not the commit history.

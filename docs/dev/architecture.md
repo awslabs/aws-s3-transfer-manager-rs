@@ -19,7 +19,6 @@ A client operation builds a transfer and enqueues it with the scheduler. The sch
 - Synchronization primitives that Loom must model come from `runtime/sync`, not from `std` directly.
 - Every transfer carries a `TransferContext`. Code that needs a transfer's id, status, or byte counts reads them from the context and does not keep its own copy. A composite transfer records each child's metrics on its own context when it reaps the child.
 - A transfer is complete when its state machine reaches a terminal state. Finalization belongs to that transition, not to the caller's handle. Examples are renaming a download into place and waiting for destination writes.
-- `operation/` and `io/` are public modules, so their module documentation is user documentation. Maintainer conventions for those modules belong in this document.
 
 ## Conventions
 
