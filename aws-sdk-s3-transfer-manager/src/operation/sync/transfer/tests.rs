@@ -105,7 +105,9 @@ async fn an_archived_object_and_a_restoring_one_are_counted_apart() {
                 restoring: 1,
                 ..Obstructed::default()
             },
-            Obstruction::NothingToRead => unreachable!("not under test here"),
+            Obstruction::NothingToRead | Obstruction::UnfollowedLink => {
+                unreachable!("not under test here")
+            }
         };
         assert_eq!(counts, expected, "{why:?} was counted under another reason");
     }
@@ -3332,6 +3334,137 @@ async fn a_cancelled_run_hands_the_merge_back() {
     assert!(
         snapshot.merge_present && !snapshot.merge_in_flight,
         "a cancelled work item left the merge where no poll can reach it"
+    );
+}
+
+const B: &str = "amzn-s3-demo-bucket";
+
+// This mock bucket lists `keys` and records every key a `DeleteObjects` request names.
+fn listing_and_recording_deletes(
+    keys: &[&str],
+    size: i64,
+) -> (aws_sdk_s3::Client, Arc<Mutex<Vec<String>>>) {
+    let contents: Vec<Object> = keys
+        .iter()
+        .map(|k| {
+            Object::builder()
+                .key(*k)
+                .size(size)
+                .last_modified(aws_smithy_types::DateTime::from_secs(1_600_000_000))
+                .build()
+        })
+        .collect();
+    let list = mock!(aws_sdk_s3::Client::list_objects_v2).then_output(move || {
+        ListObjectsV2Output::builder()
+            .set_contents(Some(contents.clone()))
+            .build()
+    });
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let last = Arc::new(Mutex::new(Vec::<String>::new()));
+    let (rec, rec_last) = (seen.clone(), last.clone());
+    let delete = mock!(aws_sdk_s3::Client::delete_objects)
+        .match_requests(move |req| {
+            let batch: Vec<String> = req
+                .delete()
+                .map(|d| d.objects().iter().map(|o| o.key().to_string()).collect())
+                .unwrap_or_default();
+            rec.lock().extend(batch.iter().cloned());
+            *rec_last.lock() = batch;
+            true
+        })
+        .then_output(move || {
+            let deleted = last
+                .lock()
+                .iter()
+                .map(|k| aws_sdk_s3::types::DeletedObject::builder().key(k).build())
+                .collect();
+            aws_sdk_s3::operation::delete_objects::DeleteObjectsOutput::builder()
+                .set_deleted(Some(deleted))
+                .build()
+        });
+    let put = mock!(aws_sdk_s3::Client::put_object)
+        .then_output(|| aws_sdk_s3::operation::put_object::PutObjectOutput::builder().build());
+    (
+        mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&list, &delete, &put]),
+        seen,
+    )
+}
+
+// Start an upload run in delete mode under the default `Continue` policy.
+fn upload_run(
+    root: &Path,
+    client: aws_sdk_s3::Client,
+    walker: Walker,
+) -> (SyncTransfer<FsWalk, S3Walk>, TransferContext) {
+    let config = crate::Config::builder().client(client.clone()).build();
+    let handle = crate::client::Handle::test_handle_tokio(config);
+    let (ctx, _rx) = TransferContext::new(handle);
+    let walk = walker
+        .uploading(
+            LocalAndBucket::builder()
+                .local_root(root)
+                .client(client.clone())
+                .bucket(B)
+                .build(),
+        )
+        .expect("an ordinary bucket builds");
+    let transfer = SyncTransfer::new(
+        ctx.clone(),
+        walk,
+        Mode::default().uploading(),
+        Arc::new(SpawnEnded::new(0, false)),
+        Arc::new(DeleteFromBucket::new(client, B, None)),
+        RunSettings {
+            max_children: 2,
+            delete_mode: DeleteMode::On,
+            failure_policy: FailedTransferPolicy::Continue,
+        },
+    );
+    (transfer, ctx)
+}
+
+#[cfg(unix)]
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn a_dangling_directory_link_sends_no_delete_for_its_subtree() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path().canonicalize().expect("canonical root");
+    std::fs::write(root.join("a.txt"), b"x").expect("a.txt");
+    std::os::unix::fs::symlink(root.join("unmounted-volume"), root.join("photos"))
+        .expect("dangling symlink");
+    let (client, deleted) =
+        listing_and_recording_deletes(&["a.txt", "photos", "photos/2019/x.jpg", "photos/y.jpg"], 1);
+    let (t, _ctx) = upload_run(
+        &root,
+        client,
+        Walker::builder().follow_symlinks(true).build(),
+    );
+    drive(&t).await;
+    let sent = deleted.lock().clone();
+    assert!(
+        !sent
+            .iter()
+            .any(|k| k == "photos" || k.starts_with("photos/")),
+        "DeleteObjects was sent for objects at or under a dangling directory link: {sent:?}"
+    );
+}
+
+#[cfg(unix)]
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn default_settings_send_no_delete_for_objects_under_a_directory_link() {
+    let real = tempfile::tempdir().expect("real photos dir");
+    std::fs::write(real.path().join("y.jpg"), b"x").expect("y.jpg");
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path().canonicalize().expect("canonical root");
+    std::os::unix::fs::symlink(real.path(), root.join("photos")).expect("symlink");
+    let (client, deleted) = listing_and_recording_deletes(&["photos", "photos/y.jpg"], 1);
+    let (t, _ctx) = upload_run(&root, client, Walker::builder().build());
+    drive(&t).await;
+    let sent = deleted.lock().clone();
+    assert!(
+        sent.is_empty(),
+        "default settings deleted an object at or under a directory link: {sent:?}"
     );
 }
 

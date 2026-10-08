@@ -21,7 +21,8 @@ use std::sync::Arc;
 
 use crate::io::key::filter::KeyFilter;
 use crate::io::key::stream::{
-    key_under_root, local_predicate, s3_predicate, Entry, KeyStream, KeysLost, StreamError,
+    key_under_root, local_predicate, s3_predicate, Entry, KeyStream, KeysLost, Obstruction,
+    StreamError,
 };
 use crate::io::walk::{
     FsEntry, FsWalk, FsWalkContext, FsWalker, S3Walk, S3WalkContext, S3Walker, SortOrder,
@@ -523,9 +524,35 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
         }
     }
 
-    fn take_source_only(&mut self) -> Pairing<S::Source, D::Source> {
+    // Take the source's head entry. A source link the walk did not follow occupies its name and
+    // hides whatever sits under it, so the source holds back every key under that name. A
+    // destination key there then reads as unknown and not as absent.
+    //
+    // TODO(vnext): The transfer manager has no symlink policy for the local side of a download.
+    // `download_objects` writes through links. Sync writes through them too, until the transfer
+    // manager settles a download-side policy.
+    fn take_source(&mut self) -> Entry<S::Source> {
         let entry = self.src.take();
+        if entry.meta.obstruction == Some(Obstruction::UnfollowedLink) {
+            self.src.gap.add(Stretch {
+                under: Some(entry.key.clone()),
+            });
+        }
+        entry
+    }
+
+    // A key one side could not account for leaves a hole in the plan, whether a failure or an
+    // unfollowed link hid it.
+    fn note_unknown<T>(&mut self, side: &SideState<T>) {
+        if matches!(side, SideState::Unknown(_)) {
+            self.incomplete = true;
+        }
+    }
+
+    fn take_source_only(&mut self) -> Pairing<S::Source, D::Source> {
+        let entry = self.take_source();
         let destination = self.dst.missing(&entry.key);
+        self.note_unknown(&destination);
         Pairing {
             key: entry.key.clone(),
             source: SideState::Present(entry),
@@ -536,6 +563,7 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
     fn take_destination_only(&mut self) -> Pairing<S::Source, D::Source> {
         let entry = self.dst.take();
         let source = self.src.missing(&entry.key);
+        self.note_unknown(&source);
         Pairing {
             key: entry.key.clone(),
             source,
@@ -545,7 +573,7 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
 
     fn take_both(&mut self) -> Pairing<S::Source, D::Source> {
         // Neither side is missing here, so neither has anything to answer for.
-        let src = self.src.take();
+        let src = self.take_source();
         let dst = self.dst.take();
         Pairing {
             key: src.key.clone(),
@@ -1397,6 +1425,100 @@ mod tests {
             key: Some(key.to_string()),
             what: "size",
         }
+    }
+
+    fn obstructed(key: &str, why: Obstruction) -> Entry<()> {
+        let mut entry = entry(key);
+        entry.meta.obstruction = Some(why);
+        entry
+    }
+
+    // Pair every key and report whether the walk called its plan complete.
+    async fn pair_all(mut walk: Walk<Scripted, Scripted>) -> (Vec<(String, At, At)>, bool) {
+        let mut seen = Vec::new();
+        while let Some(next) = walk.next().await {
+            if let Ok(pairing) = next {
+                seen.push((
+                    pairing.key().to_string(),
+                    at(pairing.source()),
+                    at(pairing.destination()),
+                ));
+            }
+        }
+        (seen, walk.is_plan_complete())
+    }
+
+    #[tokio::test]
+    async fn a_source_link_the_walk_did_not_follow_holds_back_the_keys_under_it() {
+        let walk = Walk::new(
+            Scripted::from(vec![
+                Ok(entry("a.txt")),
+                Ok(obstructed("photos", Obstruction::UnfollowedLink)),
+            ]),
+            Scripted::of(&["photos", "photos/2019/x.jpg", "photos/y.jpg", "q.txt"]),
+        );
+        let (seen, complete) = pair_all(walk).await;
+        assert_eq!(
+            seen,
+            plan(&[
+                ("a.txt", At::Here, At::Gone),
+                ("photos", At::Here, At::Here),
+                ("photos/2019/x.jpg", At::UnknownRange, At::Here),
+                ("photos/y.jpg", At::UnknownRange, At::Here),
+                ("q.txt", At::Gone, At::Here),
+            ])
+        );
+        assert!(
+            !complete,
+            "a plan that skipped keys under a link called itself complete"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_source_link_with_nothing_under_it_leaves_the_plan_complete() {
+        let walk = Walk::new(
+            Scripted::from(vec![Ok(obstructed("photos", Obstruction::UnfollowedLink))]),
+            Scripted::of(&["photos", "q.txt"]),
+        );
+        let (_, complete) = pair_all(walk).await;
+        assert!(complete);
+    }
+
+    // A download writes through a destination link, as `download_objects` does, so a destination
+    // link holds nothing back.
+    #[tokio::test]
+    async fn a_destination_link_holds_nothing_back() {
+        let walk = Walk::new(
+            Scripted::of(&["photos/y.jpg"]),
+            Scripted::from(vec![Ok(obstructed("photos", Obstruction::UnfollowedLink))]),
+        );
+        let (seen, complete) = pair_all(walk).await;
+        assert_eq!(
+            seen,
+            plan(&[
+                ("photos", At::Gone, At::Here),
+                ("photos/y.jpg", At::Here, At::Gone),
+            ])
+        );
+        assert!(complete);
+    }
+
+    // A socket cannot hold a directory, so its name holds back no keys under it.
+    #[tokio::test]
+    async fn a_source_socket_holds_nothing_back() {
+        let walk = Walk::new(
+            Scripted::from(vec![Ok(obstructed("sock", Obstruction::NothingToRead))]),
+            Scripted::of(&["sock/x.txt"]),
+        );
+        let (seen, complete) = pair_all(walk).await;
+        assert_eq!(
+            seen,
+            plan(&[
+                ("sock", At::Here, At::Gone),
+                ("sock/x.txt", At::Gone, At::Here),
+            ])
+        );
+        assert!(complete);
     }
 
     async fn drain(mut walk: Walk<Scripted, Scripted>) -> Vec<(String, At, At)> {

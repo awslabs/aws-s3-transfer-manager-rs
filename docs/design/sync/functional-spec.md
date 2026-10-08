@@ -192,12 +192,17 @@ This is about one entry at a time. Failing to read an entire directory is a diff
 (FR-Enum-12).
 *`[ISSUE]` [#487](https://github.com/aws/aws-cli/issues/487) — "S3 sync will exit when a broken symlink are present" (sic) — and its mirror [#425](https://github.com/aws/aws-cli/issues/425), where a filesystem exception makes the CLI "exit silently, and with a non-error (0) exit status", stopping "prematurely … before all files had been sync'ed up". The requirement is skip-and-warn: not skip-and-stop, and not fail. `[CLI]` the two categories are `filegenerator.py` → `is_special_file` versus `is_readable`; a name the filesystem encoding cannot decode is skipped with a warning naming its raw bytes (`should_ignore_file_with_decoding_warnings` → `FileDecodingError`). That check is locale-dependent, which a UTF-8 validity test is not. `[TM]` directory upload disagrees across implementations, so an object at a lossily-derived key is something sync will meet: this crate's `upload_objects` and the Java v2 transfer manager both build the key with a lossy conversion, the Go transfer manager passes the raw filename bytes through because a Go string need not be valid UTF-8, and boto3 and the JavaScript SDK have no directory upload at all.*
 
-**FR-Enum-4** Following symlinks MUST be a setting, and MUST default to **not** following them. With
-following turned on, sync transfers what the link points at, filed under the link's own name rather than
-the target's, on every platform.
+**FR-Enum-4** Following symlinks MUST be a setting. Sync MUST handle symlinks the way the transfer
+manager's directory operation for the same direction handles them. An upload sync MUST match
+`upload_objects`, so the setting defaults to off. A download sync MUST match `download_objects`, and it
+writes local files the same way.
+
+With following off on an upload, a link occupies its own name. Sync leaves every destination key under
+that name alone. The plan reports that it did not account for those keys. With following on, sync
+transfers what the link points at and files it under the link's own name on every platform.
 
 So a link `current -> releases/v3/` transfers the files inside `releases/v3/` as `current/...`.
-*`[NEW]` — **reverses** what the CLI documents (`--follow-symlinks | --no-follow-symlinks`, "the default is to follow symlinks"). Defaulted this way because sync delegates to the transfer manager's directory operations, and defaulting differently from them would surprise anyone composing the two. `[ISSUE]` [#2550](https://github.com/aws/aws-cli/issues/2550) — on Windows, following symlinks uploads 0-byte objects instead of target contents.*
+*`[TM]` the transfer manager design sets `followSymbolicLinks` to `false` for a directory upload and names no symlink setting for a directory download. The CLI follows symlinks by default (`--follow-symlinks | --no-follow-symlinks`). Sync follows the transfer manager, so a caller who combines sync with the directory operations sees one behavior. `[ISSUE]` [#2550](https://github.com/aws/aws-cli/issues/2550) — on Windows, following symlinks uploads each linked file as a 0-byte object.*
 
 **FR-Enum-5** When a local file's modification time falls outside the range this platform can represent,
 sync MUST warn and treat the file as though it were last modified at the UNIX epoch — midnight, 1 January

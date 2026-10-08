@@ -947,8 +947,9 @@ impl FsWalk {
                     Ok(m) => m,
                     Err(e) => {
                         match e.kind() {
-                            // A link pointing at nothing has no subtree to lose, so it is one
-                            // entry, and an excluded entry stays silent.
+                            // A link pointing at nothing can still stand for a directory, such as
+                            // one on a volume that is not mounted. The key stream costs it as the
+                            // name and every key under it. An excluded entry stays silent.
                             std::io::ErrorKind::NotFound => {
                                 if !rejected {
                                     result.errors.push(WalkError::new(

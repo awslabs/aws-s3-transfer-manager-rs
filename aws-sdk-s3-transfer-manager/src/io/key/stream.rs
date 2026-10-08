@@ -64,9 +64,13 @@ pub(crate) struct EntryMeta {
 // destination lacks the key there is no item here to hang them on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Obstruction {
-    // A socket, a device, a named pipe, or a symlink the walk was told not to follow: the name is
-    // taken and holds nothing a transfer could read, and reading one may never finish.
+    // The item is a socket, a device, or a named pipe. It occupies its name and holds nothing a
+    // transfer could read, and reading one may never finish.
     NothingToRead,
+    // The item is a symlink the walk did not follow. It occupies its name, and the walk never
+    // looked at what it points to. The target can be a directory, so the keys under this name are
+    // unknown too.
+    UnfollowedLink,
     // An object whose bytes sit in an archive with no restored copy to read.
     Archived,
     // A restore is under way. The bytes arrive when it finishes, so a later run gets them.
@@ -80,7 +84,7 @@ impl Obstruction {
     // writing to a pipe nobody reads never returns.
     pub(crate) fn blocks_overwrite(&self) -> bool {
         match self {
-            Self::NothingToRead => true,
+            Self::NothingToRead | Self::UnfollowedLink => true,
             // Writing over an object never reads what is already there, so an upload to a key
             // holding an archived object goes ahead and replaces it.
             Self::Archived | Self::BeingRestored => false,
@@ -265,15 +269,14 @@ impl StreamError {
                 WalkErrorKind::SourceUnreadable
                 | WalkErrorKind::NotADirectory
                 | WalkErrorKind::Service => KeysLost::UnknownRange,
-                // A directory nobody could read, and a cycle that stopped a descent, both leave a
-                // subtree unenumerated. No single key stands for a subtree.
-                WalkErrorKind::DirectoryUnreadable | WalkErrorKind::SymlinkCycle => {
-                    KeysLost::UnknownRange
-                }
+                // A directory nobody could read, a cycle that stopped a descent, and a link whose
+                // target is gone all leave a subtree unenumerated. A missing target can be a
+                // directory on a volume that is not mounted. No single key stands for a subtree.
+                WalkErrorKind::DirectoryUnreadable
+                | WalkErrorKind::SymlinkCycle
+                | WalkErrorKind::BrokenSymlink => KeysLost::UnknownRange,
                 // One entry that should have been readable.
-                WalkErrorKind::Io
-                | WalkErrorKind::PermissionDenied
-                | WalkErrorKind::BrokenSymlink => KeysLost::OneKey,
+                WalkErrorKind::Io | WalkErrorKind::PermissionDenied => KeysLost::OneKey,
                 // Gone, which is an answer rather than the lack of one.
                 WalkErrorKind::Vanished => KeysLost::Nothing,
             },
@@ -454,8 +457,10 @@ impl KeyStream for FsWalk {
                         .and_then(|m| secs_since_epoch(m.modified())),
                     obstruction: match entry.file_type() {
                         FileType::Regular => None,
-                        // A special file, or a symlink left unresolved. The walk yields it so the
-                        // name counts as taken; nothing can be read from it.
+                        // The walk reports a link as a link only when it did not follow it.
+                        FileType::Symlink => Some(Obstruction::UnfollowedLink),
+                        // The entry is a special file. The walk yields it so its name stays
+                        // occupied. A transfer can read nothing from it.
                         _ => Some(Obstruction::NothingToRead),
                     },
                 };
@@ -1058,7 +1063,8 @@ mod tests {
                 KeysLost::UnknownRange,
             ),
             (walk_err(WalkErrorKind::Service), KeysLost::UnknownRange),
-            // A subtree went unenumerated, and no single key stands for a subtree.
+            // A subtree went unenumerated, and no single key stands for a subtree. A link whose
+            // target is gone can stand for a directory.
             (
                 walk_err(WalkErrorKind::DirectoryUnreadable),
                 KeysLost::UnknownRange,
@@ -1067,10 +1073,13 @@ mod tests {
                 walk_err(WalkErrorKind::SymlinkCycle),
                 KeysLost::UnknownRange,
             ),
+            (
+                walk_err(WalkErrorKind::BrokenSymlink),
+                KeysLost::UnknownRange,
+            ),
             // One entry that should have been readable.
             (walk_err(WalkErrorKind::Io), KeysLost::OneKey),
             (walk_err(WalkErrorKind::PermissionDenied), KeysLost::OneKey),
-            (walk_err(WalkErrorKind::BrokenSymlink), KeysLost::OneKey),
             // An entry that went away between being named and being read. Its key is not missing
             // from this side's account, it is genuinely not there, so absence stays readable on
             // either side of it.
@@ -2038,7 +2047,37 @@ mod tests {
     #[cfg(unix)]
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
-    async fn a_broken_symlink_costs_one_entry_not_the_view() {
+    async fn an_unfollowed_link_and_a_socket_carry_different_obstructions() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join("real")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("real"), dir.path().join("link")).unwrap();
+        let _socket = std::os::unix::net::UnixListener::bind(dir.path().join("sock")).unwrap();
+
+        let mut walk = FsWalker::builder()
+            .recursive(true)
+            .sort(SortOrder::WholeWalk)
+            .include_special_files(true)
+            .build()
+            .walk(FsWalkContext::builder().root(dir.path()).build());
+
+        let mut seen = Vec::new();
+        while let Some(next) = walk.next_entry().await {
+            let entry = next.expect("no failure");
+            seen.push((entry.key, entry.meta.obstruction));
+        }
+        assert_eq!(
+            seen,
+            vec![
+                ("link".to_string(), Some(Obstruction::UnfollowedLink)),
+                ("sock".to_string(), Some(Obstruction::NothingToRead)),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn a_broken_symlink_costs_the_keys_under_its_name() {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("a.txt"), "").unwrap();
         std::os::unix::fs::symlink(dir.path().join("gone"), dir.path().join("broken")).unwrap();
@@ -2062,7 +2101,7 @@ mod tests {
         assert_eq!(seen, vec!["a.txt"]);
         assert_eq!(errors.len(), 1);
         assert_eq!(walk_kind(&errors[0]), Some(WalkErrorKind::BrokenSymlink));
-        assert_eq!(errors[0].keys_lost(), KeysLost::OneKey);
+        assert_eq!(errors[0].keys_lost(), KeysLost::UnknownRange);
     }
 
     // A cycle stops a descent, so everything under it goes unenumerated. The side has to say so, or

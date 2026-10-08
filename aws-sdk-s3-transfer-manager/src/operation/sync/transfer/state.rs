@@ -123,7 +123,8 @@ impl Obstructed {
     pub(super) fn record(&mut self, why: crate::io::key::stream::Obstruction) {
         use crate::io::key::stream::Obstruction;
         match why {
-            Obstruction::NothingToRead => self.nothing_to_read += 1,
+            // An unfollowed link holds nothing to read here, like a special file.
+            Obstruction::NothingToRead | Obstruction::UnfollowedLink => self.nothing_to_read += 1,
             Obstruction::Archived => self.archived += 1,
             Obstruction::BeingRestored => self.restoring += 1,
         }
