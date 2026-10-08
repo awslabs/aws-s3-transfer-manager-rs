@@ -28,8 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   link there was followed and its target overwritten, and two downloads to one path that drew
   the same name shared one file. A temporary file is now created only if no entry with that name
   exists. On a collision another name is drawn, up to three attempts, after which the download
-  fails with `ErrorKind::IOError`. A temporary path is no longer removed after its successful
-  rename.
+  fails with `ErrorKind::IOError`. A temporary path is now renamed or removed at most once, so a
+  file another download has since created under that name is left alone.
 
 ## [0.3.0] - 2026-09-30
 
