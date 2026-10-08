@@ -6,7 +6,6 @@
 use std::fmt;
 use std::ops::RangeInclusive;
 
-use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::operation::abort_multipart_upload::AbortMultipartUploadError;
 use aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadError;
 use aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadError;
@@ -16,11 +15,13 @@ use aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Error;
 use aws_sdk_s3::operation::put_object::PutObjectError;
 use aws_sdk_s3::operation::upload_part::UploadPartError;
 use aws_sdk_s3::operation::RequestIdExt;
-use aws_sdk_s3::types::ChecksumAlgorithm;
-use aws_smithy_runtime_api::client::result::ConnectorError;
+use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
+use aws_smithy_runtime_api::client::result::{ConnectorError, SdkError};
+use aws_smithy_types::error::metadata::ProvideErrorMetadata;
 use aws_smithy_types::retry::ErrorKind as RetryErrorKind;
 use aws_types::request_id::RequestId;
 
+use crate::model::ChecksumAlgorithm;
 use crate::types::{FailedDownload, FailedUpload};
 
 /// A boxed error that is `Send` and `Sync`.
@@ -577,17 +578,16 @@ fn is_sdk_transient_transport<E, R>(e: &SdkError<E, R>) -> bool {
     false
 }
 
-/// Converts an `SdkError` into a [`ErrorKind::ServiceError`], capturing the
+/// Associates an SDK service error type with its originating S3 operation.
+trait SdkOperationError: ProvideErrorMetadata + std::error::Error + Send + Sync + 'static {
+    const OPERATION_NAME: &'static str;
+}
+
+/// Converts an `SdkError` into an [`ErrorKind::ServiceError`], capturing the
 /// operation name, service metadata, and whether it was a transient transport
 /// failure.
-fn service_error<E>(
-    operation: &'static str,
-    e: SdkError<E, aws_smithy_runtime_api::client::orchestrator::HttpResponse>,
-) -> Error
-where
-    E: ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
-{
-    let service = service_metadata(operation, &e);
+fn service_error<E: SdkOperationError>(e: SdkError<E, HttpResponse>) -> Error {
+    let service = service_metadata(E::OPERATION_NAME, &e);
     let transient_transport = is_sdk_transient_transport(&e);
     Error {
         kind: ErrorKind::ServiceError,
@@ -600,28 +600,28 @@ where
     }
 }
 
-macro_rules! from_sdk_error {
+impl<E: SdkOperationError> From<SdkError<E, HttpResponse>> for Error {
+    fn from(e: SdkError<E, HttpResponse>) -> Self {
+        service_error(e)
+    }
+}
+
+macro_rules! sdk_operation_error {
     ($err:ty, $op:literal) => {
-        impl From<SdkError<$err, aws_smithy_runtime_api::client::orchestrator::HttpResponse>>
-            for Error
-        {
-            fn from(
-                e: SdkError<$err, aws_smithy_runtime_api::client::orchestrator::HttpResponse>,
-            ) -> Self {
-                service_error($op, e)
-            }
+        impl SdkOperationError for $err {
+            const OPERATION_NAME: &'static str = $op;
         }
     };
 }
 
-from_sdk_error!(GetObjectError, "GetObject");
-from_sdk_error!(HeadObjectError, "HeadObject");
-from_sdk_error!(PutObjectError, "PutObject");
-from_sdk_error!(UploadPartError, "UploadPart");
-from_sdk_error!(CreateMultipartUploadError, "CreateMultipartUpload");
-from_sdk_error!(CompleteMultipartUploadError, "CompleteMultipartUpload");
-from_sdk_error!(AbortMultipartUploadError, "AbortMultipartUpload");
-from_sdk_error!(ListObjectsV2Error, "ListObjectsV2");
+sdk_operation_error!(GetObjectError, "GetObject");
+sdk_operation_error!(HeadObjectError, "HeadObject");
+sdk_operation_error!(PutObjectError, "PutObject");
+sdk_operation_error!(UploadPartError, "UploadPart");
+sdk_operation_error!(CreateMultipartUploadError, "CreateMultipartUpload");
+sdk_operation_error!(CompleteMultipartUploadError, "CompleteMultipartUpload");
+sdk_operation_error!(AbortMultipartUploadError, "AbortMultipartUpload");
+sdk_operation_error!(ListObjectsV2Error, "ListObjectsV2");
 
 impl From<crate::io::walk::WalkError> for Error {
     /// Maps a directory-walk failure to a transfer error, preserving the
@@ -638,10 +638,10 @@ impl From<crate::io::walk::WalkError> for Error {
             WalkErrorKind::Service => {
                 // The S3 walker's only service call is ListObjectsV2, so the
                 // boxed source downcasts to that SdkError.
-                match e.into_source().downcast::<SdkError<
-                    ListObjectsV2Error,
-                    aws_smithy_runtime_api::client::orchestrator::HttpResponse,
-                >>() {
+                match e
+                    .into_source()
+                    .downcast::<SdkError<ListObjectsV2Error, HttpResponse>>()
+                {
                     Ok(sdk) => Error::from(*sdk),
                     Err(src) => Error::new(ErrorKind::ObjectNotDiscoverable, src),
                 }
@@ -802,7 +802,6 @@ mod tests {
     // --- transient-transport classification -----------------------------------
 
     use aws_sdk_s3::operation::get_object::GetObjectError;
-    use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
 
     fn dispatch(conn: ConnectorError) -> SdkError<GetObjectError, HttpResponse> {
         SdkError::dispatch_failure(conn)
