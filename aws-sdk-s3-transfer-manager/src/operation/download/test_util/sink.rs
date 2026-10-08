@@ -271,15 +271,17 @@ impl Drop for Held {
 
 /// [`SinkFactory`] whose sinks consult a [`WriteScript`] before each write
 /// and the finalizing resize, then delegate to a [`FileSinkFactory`] sink.
+///
+/// `create` fails exactly when [`FileSinkFactory`]'s does, with its error.
 #[derive(Debug)]
 pub(crate) struct ScriptedSinkFactory(pub(crate) Arc<WriteScript>);
 
 impl SinkFactory for ScriptedSinkFactory {
-    fn create(&self, file: std::fs::File, owns_file: bool) -> Box<dyn SinkWrite> {
-        Box::new(ScriptedSink {
-            inner: FileSinkFactory.create(file, owns_file),
+    fn create(&self, file: std::fs::File, owns_file: bool) -> io::Result<Box<dyn SinkWrite>> {
+        Ok(Box::new(ScriptedSink {
+            inner: FileSinkFactory.create(file, owns_file)?,
             script: Arc::clone(&self.0),
-        })
+        }))
     }
 }
 
@@ -340,7 +342,9 @@ mod tests {
         file: std::fs::File,
         expected_len: u64,
     ) -> BodyWriter {
-        let sink = ScriptedSinkFactory(Arc::clone(script)).create(file, false);
+        let sink = ScriptedSinkFactory(Arc::clone(script))
+            .create(file, false)
+            .unwrap();
         let (writer, _consumer) = new_recv_body_with_disk_mode(sink);
         writer.prepare(0, expected_len).unwrap();
         writer

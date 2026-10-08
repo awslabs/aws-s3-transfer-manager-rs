@@ -120,7 +120,8 @@ macro_rules! bail_if_terminal {
         if !$self.inner.ctx.is_active() {
             // Bailing before any drain: no occupancy freed on this path. The transfer is
             // no longer active, so a completion this retirement claims is dropped rather
-            // than finalized.
+            // than finalized: the cancellation's terminal path owns the destination (see
+            // `CompletionClaim`).
             let _ = $self.decrement_in_flight(0);
             return WorkOutcome::Cancelled;
         }
@@ -1442,6 +1443,10 @@ impl DownloadTransfer {
     /// caller already had there, so removing the result afterwards deletes a file this
     /// transfer never created and leaves the path empty. A correct object the caller did not
     /// ask for is recoverable; their own data is not.
+    /// A failed rename leaves the temporary file for the handle to remove: its status is
+    /// not `Completed`, so `cleanup` or drop frees the name, and each takes or guards the
+    /// path so the name is removed once. Removing it here too would reopen that window --
+    /// another download may already own the name by the time the second remove runs.
     fn commit_destination(&self) -> std::io::Result<()> {
         match &self.inner.commit {
             Some(target) => std::fs::rename(&target.temp, &target.dest),
@@ -2674,7 +2679,7 @@ mod tests {
         let temp = dir.path().join("out.dat.s3tmp.deadbeef");
         // The commit renames `temp` into a directory that does not exist, so it must fail.
         let dest = dir.path().join("no-such-dir").join("out.dat");
-        let transfer = committing_transfer(dest, temp, part_size);
+        let transfer = committing_transfer(dest.clone(), temp.clone(), part_size);
 
         // Discovery delivers part 1; retiring the last range claims completion and commits.
         assert_discovery_succeeds(&transfer).await;
@@ -2688,6 +2693,16 @@ mod tests {
         assert_eq!(
             crate::types::TransferStatus::Failed,
             transfer.ctx().transfer_status()
+        );
+        assert!(
+            !dest.exists(),
+            "a failed rename must not create the destination"
+        );
+        // The temporary file is still the handle's to remove: the status is not
+        // `Completed`, so its `cleanup` or drop frees the name, exactly once.
+        assert!(
+            temp.exists(),
+            "the failed rename must leave the temp in place"
         );
     }
 

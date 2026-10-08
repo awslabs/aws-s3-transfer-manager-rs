@@ -184,7 +184,14 @@ impl DownloadState {
 /// Only [`DownloadState::try_claim_completion`] constructs it; `finalize_completion`
 /// consumes it. The private field keeps code outside this module from
 /// constructing one.
-#[must_use = "a claimed completion must be finalized after releasing the state lock"]
+///
+/// A claim taken while the transfer is active must be finalized. A claim taken
+/// after the transfer stopped being active is dropped instead, as
+/// `bail_if_terminal!` does: that can happen only between a cancellation's status
+/// change and its `on_terminal`, and the cancellation's terminal path already
+/// owns the destination. `fail` cannot open that window, because it changes the
+/// status and the state together under the state lock.
+#[must_use = "a completion claimed while active must be finalized after releasing the state lock"]
 #[derive(Debug)]
 pub(crate) struct CompletionClaim(());
 

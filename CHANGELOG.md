@@ -19,6 +19,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   written, so it could run ahead of the file during a download and count unwritten parts after a
   failure. It now matches the bytes written to the destination, both during a download and after a
   failure. The value on success is unchanged.
+- `write_to_file` accepted a file opened in append mode. On Linux and Android every write went to
+  the end of the file and the final resize cut the result, so `join` returned `Ok` over the wrong
+  bytes. An append-mode destination is now rejected with `ErrorKind::InputInvalid` on every
+  platform, before any request is sent, and the file is left unchanged.
+- `write_to_path` and `download_objects` opened their temporary file with a truncating create. A
+  file already at the temporary name was overwritten and published as the download, a symbolic
+  link there was followed and its target overwritten, and two downloads to one path that drew
+  the same name shared one file. A temporary file is now created only if no entry with that name
+  exists. On a collision another name is drawn, up to three attempts, after which the download
+  fails with `ErrorKind::IOError`. A temporary path is now renamed or removed at most once, so a
+  file another download has since created under that name is left alone.
 
 ## [0.3.0] - 2026-09-30
 

@@ -547,27 +547,32 @@ impl DownloadObjectsTransfer {
             .expect("bucket and key are set");
 
         // Create temp file synchronously (we're in poll_work, not async).
-        // orchestrate_to_path is async (tokio::fs); for child spawning we
-        // use std::fs + orchestrate_with_sink directly.
-        let unique_id = fastrand::u32(..);
-        let temp_name = format!(
-            "{}.s3tmp.{:08x}",
-            dest_path.file_name().unwrap_or_default().to_string_lossy(),
-            unique_id
-        );
-        let temp_path = dest_path.with_file_name(&temp_name);
-
-        let file = std::fs::File::create(&temp_path).map_err(|e| {
+        // orchestrate_to_path is async; for child spawning we use the
+        // synchronous helper + orchestrate_with_sink directly.
+        let (file, temp_path) =
+            crate::io::fs::create_first_new(crate::operation::download::temp_file_candidates(
+                &dest_path,
+                std::iter::repeat_with(|| fastrand::u32(..)),
+            ))
+            .map_err(|e| {
+                error::Error::new(
+                    ErrorKind::IOError,
+                    format!("failed to create temp file for key '{key}': {e}"),
+                )
+            })?;
+        let sink = FileSinkFactory.create(file, true).map_err(|e| {
+            // No handle owns the temp file yet, so remove it here.
+            let _ = std::fs::remove_file(&temp_path);
             error::Error::new(
                 ErrorKind::IOError,
-                format!("failed to create temp file for key '{key}': {e}"),
+                format!("failed to create destination sink for key '{key}': {e}"),
             )
         })?;
 
         let inner = Download::orchestrate_with_sink(
             handle.clone(),
             input,
-            FileSinkFactory.create(file, true),
+            sink,
             Some(&self.inner.ctx),
             // No events for a child here: the composite's own event wiring lands with
             // `download_objects`, which is where a child would be announced.
