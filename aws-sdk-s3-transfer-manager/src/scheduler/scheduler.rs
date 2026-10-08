@@ -106,7 +106,7 @@
 
 use super::CompletionSample;
 use crate::telemetry;
-use crate::transfer::{BoxTransfer, PollWork, TransferId, WorkOutcome};
+use crate::transfer::{BoxTransfer, PollWork, Transfer, TransferId, WorkOutcome};
 
 use crate::runtime::sync::{Submission, SubmissionQueue};
 use crate::runtime::ScheduledWork;
@@ -250,7 +250,17 @@ impl Scheduler {
                     drop(transfers);
                     let ctx = transfer.ctx();
                     ctx.set_cancelled();
-                    transfer.on_terminal();
+                    // Contained, because `signal_terminal` below is what resolves this
+                    // child's handle. An escaping panic skips it and the handle's
+                    // `join()` never returns -- and the panic leaves the scheduler on
+                    // whichever thread enqueued the child.
+                    if !run_terminal_hook(transfer.as_ref()) {
+                        tracing::error!(
+                            target: telemetry::TARGET_SCHEDULING,
+                            tid = %tid,
+                            "on_terminal panicked; transfer cleanup is incomplete",
+                        );
+                    }
                     ctx.signal_terminal();
                     return;
                 }
@@ -1016,11 +1026,17 @@ impl Scheduler {
 ///
 /// Returns `false` if `on_terminal` panicked; its cleanup may be partial. The
 /// panic is not re-raised, so the caller's remaining terminal steps always run.
+///
+/// Takes the transfer rather than a descriptor because one terminal path runs before a
+/// descriptor exists -- a child whose parent group is already gone is cancelled inside
+/// `enqueue_transfer`, and that path still owes its handle a terminal signal.
+fn run_terminal_hook(transfer: &dyn Transfer) -> bool {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| transfer.on_terminal())).is_ok()
+}
+
+/// [`run_terminal_hook`] for a transfer the scheduler already holds a descriptor for.
 fn run_on_terminal(desc: &TransferDescriptor) -> bool {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        desc.transfer().on_terminal()
-    }))
-    .is_ok()
+    run_terminal_hook(desc.transfer())
 }
 
 #[cfg(test)]
@@ -3720,6 +3736,47 @@ mod tests {
             scheduler.0.transfers.read().unwrap().get(&id).is_none(),
             "the hook panicked and took `remove_transfer_atomic` with it, so the \
              descriptor is still in the map"
+        );
+
+        handle.runtime.shutdown();
+    }
+
+    /// A panicking hook must not cost a child its terminal signal.
+    ///
+    /// A child enqueued after its parent's group is gone is cancelled inside
+    /// `enqueue_transfer`, before any descriptor exists, and the `signal_terminal` on the
+    /// line after the hook is the only thing that resolves its handle. An escaping panic
+    /// skips it, so `join()` never returns -- and the unwind leaves the scheduler on
+    /// whichever thread enqueued the child.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn a_panicking_terminal_hook_still_signals_an_orphaned_child() {
+        let _logs = show_test_logs();
+        let handle = test_handle(2);
+        let scheduler = &handle.scheduler;
+
+        // A parent group that was never registered, so `resolve_group_vruntime` misses
+        // and the child takes the cancel-on-enqueue path.
+        let child_id = TransferId {
+            id: 2,
+            parent: Some(999),
+        };
+        let (mock, mut completion_rx) =
+            PanickingTerminalHookMock::with_receiver(child_id, handle.clone());
+
+        scheduler.enqueue_transfer(Box::new(mock));
+
+        assert!(
+            completion_rx.try_recv().is_ok(),
+            "the hook panicked and took `signal_terminal` with it, so this child's \
+             handle would wait on join() forever"
+        );
+        assert_eq!(
+            crate::types::TransferStatus::Cancelled,
+            scheduler.0.transfers.read().unwrap().get(&child_id).map_or(
+                crate::types::TransferStatus::Cancelled,
+                |d| d.transfer().ctx().transfer_status()
+            ),
         );
 
         handle.runtime.shutdown();

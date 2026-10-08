@@ -1441,6 +1441,16 @@ impl PanickingTerminalHookMock {
         let (ctx, _rx) = TransferContext::with_id(id, handle);
         Self { ctx }
     }
+
+    /// Returns the mock plus its completion receiver, so a test can assert the handle
+    /// was resolved even though the hook panicked.
+    pub(crate) fn with_receiver(
+        id: TransferId,
+        handle: Arc<crate::client::Handle>,
+    ) -> (Self, StateMachineTerminalReceiver) {
+        let (ctx, completion_rx) = TransferContext::with_id(id, handle);
+        (Self { ctx }, completion_rx)
+    }
 }
 
 impl Transfer for PanickingTerminalHookMock {
