@@ -143,10 +143,8 @@ Do not manufacture red-first tests for documentation, formatting, renames, or be
 
 ### Validation records
 
-- Summarize commands and results in the PR when they provide useful review evidence.
-- Explain what each relevant test or gate establishes.
-- Let CI retain ordinary command logs.
+- CI runs the full matrix on every pull request, and every check is expected to pass. Do not record test counts, commands run, or local results that CI repeats.
+- Explain what each new or changed test establishes.
+- Record qualification that CI does not run, such as benchmarks, real-service runs, or manual platform runs, with its method and result.
 - Preserve artifacts for fuzz crashes, sanitizer failures, minimized reproducers, or benchmark results needed for review.
-- Do not require every local test log to be uploaded.
-- State which validation remains for CI or another environment.
 - Never imply that a platform, sanitizer, service, or toolchain check ran when it did not.

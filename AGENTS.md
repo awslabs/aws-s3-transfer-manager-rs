@@ -56,7 +56,7 @@ Some changes need a check that CI runs as a separate job:
 | `unsafe` code, buffer ownership | `MIRIFLAGS='-Zmiri-disable-isolation -Zmiri-strict-provenance' cargo +nightly miri test -p aws-sdk-s3-transfer-manager --lib` |
 | Feature gates | `cargo hack check --all --feature-powerset` |
 
-[.github/workflows/ci.yml](.github/workflows/ci.yml) defines the full matrix. A pull request states which of these checks ran locally.
+[.github/workflows/ci.yml](.github/workflows/ci.yml) defines the full matrix, which runs on every pull request.
 
 ## Pull requests
 
