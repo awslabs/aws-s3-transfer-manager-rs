@@ -818,6 +818,12 @@ fn lock_sink(
 }
 
 impl TransferLifecycle {
+    /// A clone of the sink, so a parent can build emitters for its children
+    /// without the caller also holding a sink.
+    pub(crate) fn child_sink(&self) -> TransferEventSink {
+        self.sink.clone()
+    }
+
     pub(crate) fn new(
         sink: TransferEventSink,
         id: TransferId,
