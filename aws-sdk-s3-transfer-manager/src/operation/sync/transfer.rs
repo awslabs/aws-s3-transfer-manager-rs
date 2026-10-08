@@ -17,7 +17,7 @@ use crate::transfer::{IoRequest, PollWork, Transfer, TransferContext, WorkOutcom
 use crate::types::FailedTransferPolicy;
 
 use child::{ChildHandle, SpawnChild};
-use delete::Deleter;
+use delete::DeleteKeys;
 use state::{Decided, State};
 
 // Pairings per merge work item. A merge draws from either side, so a listing page cannot size the
@@ -120,7 +120,7 @@ where
     spawner: Arc<dyn SpawnChild<S::Source>>,
     // How keys leave the destination. A third direction-specific thing, and the one that differs
     // most between a bucket and a local tree.
-    deleter: Deleter,
+    deleter: Arc<dyn DeleteKeys>,
     // What to do when something fails. Read at every site a failure can arrive, so one answer
     // covers the run.
     failure_policy: FailedTransferPolicy,
@@ -143,7 +143,7 @@ where
         walk: Walk<S, D>,
         comparison: &'static (dyn Compare<S::Source, D::Source> + Send + Sync),
         spawner: Arc<dyn SpawnChild<S::Source>>,
-        deleter: Deleter,
+        deleter: Arc<dyn DeleteKeys>,
         settings: RunSettings,
     ) -> Self {
         Self {

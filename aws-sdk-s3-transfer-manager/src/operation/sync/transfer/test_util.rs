@@ -142,6 +142,20 @@ impl RecordDeletes {
     }
 }
 
+impl DeleteKeys for RecordDeletes {
+    fn batch_size(&self) -> usize {
+        RecordDeletes::batch_size(self)
+    }
+
+    fn delete<'a>(
+        &'a self,
+        keys: Vec<String>,
+        _stopped: StopCheck<'a>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<KeyOutcome>> + Send + 'a>> {
+        Box::pin(RecordDeletes::delete(self, keys))
+    }
+}
+
 pub(super) struct SpawnEnded {
     moved: u64,
     fails: bool,

@@ -45,7 +45,7 @@ fn uploading(
             walk,
             Mode::default().uploading(),
             Arc::new(SpawnEnded::new(0, false)),
-            Deleter::Recording(Arc::new(RecordDeletes::new(DELETE_BATCH))),
+            Arc::new(RecordDeletes::new(DELETE_BATCH)),
             RunSettings {
                 max_children: 2,
                 delete_mode: DeleteMode::On,
@@ -184,7 +184,7 @@ async fn a_deferred_verdict_is_skipped_and_shortens_the_plan() {
         walk,
         &AlwaysDefers,
         Arc::new(SpawnEnded::new(0, false)),
-        Deleter::Recording(Arc::new(RecordDeletes::new(DELETE_BATCH))),
+        Arc::new(RecordDeletes::new(DELETE_BATCH)),
         RunSettings {
             max_children: 2,
             delete_mode: DeleteMode::On,
@@ -313,7 +313,7 @@ fn downloading_into(
             None,
             local,
         )),
-        Deleter::LocalTree(DeleteFromLocalTree::new(local)),
+        Arc::new(DeleteFromLocalTree::new(local)),
         RunSettings {
             max_children: 4,
             delete_mode,
@@ -691,7 +691,7 @@ async fn a_download_asks_for_the_key_under_its_prefix() {
             Some("backup/"),
             dir.path(),
         )),
-        Deleter::LocalTree(DeleteFromLocalTree::new(dir.path())),
+        Arc::new(DeleteFromLocalTree::new(dir.path())),
         RunSettings {
             max_children: 4,
             delete_mode: DeleteMode::Off,
@@ -820,7 +820,7 @@ async fn an_aborting_run_attaches_the_category_the_failure_had() {
         walk,
         Mode::default().uploading(),
         Arc::new(SpawnEnded::new(0, false)),
-        Deleter::Recording(Arc::new(RecordDeletes::new(DELETE_BATCH))),
+        Arc::new(RecordDeletes::new(DELETE_BATCH)),
         RunSettings {
             max_children: 4,
             delete_mode: DeleteMode::Off,
@@ -883,7 +883,7 @@ async fn a_listing_that_failed_does_not_release_the_part_batch() {
         walk,
         Mode::default().uploading(),
         Arc::new(SpawnEnded::new(0, false)),
-        Deleter::Recording(deleter.clone()),
+        deleter.clone(),
         RunSettings {
             max_children: 4,
             delete_mode: DeleteMode::On,
@@ -1533,7 +1533,7 @@ async fn an_aborting_run_answers_its_waiter_without_another_poll() {
         walk,
         Mode::default().uploading(),
         spawner.clone(),
-        Deleter::Recording(Arc::new(RecordDeletes::new(DELETE_BATCH))),
+        Arc::new(RecordDeletes::new(DELETE_BATCH)),
         RunSettings {
             max_children: 4,
             delete_mode: DeleteMode::On,
@@ -1581,7 +1581,7 @@ async fn an_aborting_run_does_not_send_the_deletes_it_buffered() {
         walk,
         Mode::default().uploading(),
         Arc::new(SpawnEnded::refusing_to_spawn()),
-        Deleter::Recording(deleter.clone()),
+        deleter.clone(),
         RunSettings {
             max_children: 4,
             delete_mode: DeleteMode::On,
@@ -1633,7 +1633,7 @@ async fn a_loop_warns_under_either_policy() {
             walk,
             Mode::default().uploading(),
             Arc::new(SpawnEnded::new(0, false)),
-            Deleter::Recording(Arc::new(RecordDeletes::new(DELETE_BATCH))),
+            Arc::new(RecordDeletes::new(DELETE_BATCH)),
             RunSettings {
                 max_children: 2,
                 delete_mode: DeleteMode::On,
@@ -1761,7 +1761,7 @@ async fn a_badly_described_key_ends_an_aborting_run() {
         walk,
         Mode::default().uploading(),
         Arc::new(SpawnEnded::new(0, false)),
-        Deleter::Recording(Arc::new(RecordDeletes::new(DELETE_BATCH))),
+        Arc::new(RecordDeletes::new(DELETE_BATCH)),
         RunSettings {
             max_children: 2,
             delete_mode: DeleteMode::On,
@@ -1899,7 +1899,7 @@ async fn a_key_the_listing_described_badly_is_kept_as_a_failure() {
         walk,
         Mode::default().uploading(),
         Arc::new(SpawnEnded::new(0, false)),
-        Deleter::Recording(Arc::new(RecordDeletes::new(DELETE_BATCH))),
+        Arc::new(RecordDeletes::new(DELETE_BATCH)),
         RunSettings {
             max_children: 2,
             delete_mode: DeleteMode::On,
@@ -1986,7 +1986,7 @@ async fn the_scheduler_gets_the_run_to_the_end_on_its_own() {
         walk,
         Mode::default().uploading(),
         Arc::new(SpawnEnded::new(0, false)),
-        Deleter::Recording(Arc::new(RecordDeletes::new(DELETE_BATCH))),
+        Arc::new(RecordDeletes::new(DELETE_BATCH)),
         RunSettings {
             max_children: 2,
             delete_mode: DeleteMode::On,
@@ -2075,7 +2075,7 @@ async fn the_item_that_drains_the_merge_answers_the_waiter() {
         walk,
         Mode::default().uploading(),
         Arc::new(SpawnEnded::new(0, false)),
-        Deleter::Recording(Arc::new(RecordDeletes::new(DELETE_BATCH))),
+        Arc::new(RecordDeletes::new(DELETE_BATCH)),
         RunSettings {
             max_children: 2,
             delete_mode: DeleteMode::On,
@@ -2201,7 +2201,7 @@ fn uploading_with_policy(
         walk,
         Mode::default().uploading(),
         spawner,
-        Deleter::Recording(Arc::new(RecordDeletes::new(DELETE_BATCH))),
+        Arc::new(RecordDeletes::new(DELETE_BATCH)),
         RunSettings {
             max_children: cap,
             delete_mode: DeleteMode::On,
@@ -2398,7 +2398,7 @@ async fn a_transfer_decided_on_an_absent_source_does_not_strand_the_rest() {
         walk,
         &AlwaysTransfers,
         spawner.clone(),
-        Deleter::Recording(Arc::new(RecordDeletes::new(DELETE_BATCH))),
+        Arc::new(RecordDeletes::new(DELETE_BATCH)),
         RunSettings {
             max_children: 4,
             delete_mode: DeleteMode::On,
@@ -2484,7 +2484,7 @@ async fn an_uploaded_key_is_named_under_the_runs_prefix() {
             "amzn-s3-demo-bucket",
             Some("data"),
         )),
-        Deleter::Recording(Arc::new(RecordDeletes::new(DELETE_BATCH))),
+        Arc::new(RecordDeletes::new(DELETE_BATCH)),
         RunSettings {
             max_children: 4,
             delete_mode: DeleteMode::On,
@@ -2541,7 +2541,7 @@ fn with_spawner(
         walk,
         Mode::default().uploading(),
         Arc::new(spawner),
-        Deleter::Recording(Arc::new(RecordDeletes::new(DELETE_BATCH))),
+        Arc::new(RecordDeletes::new(DELETE_BATCH)),
         RunSettings {
             max_children: 4,
             delete_mode: DeleteMode::On,
@@ -2577,7 +2577,7 @@ fn deleting_with_policy(
         walk,
         Mode::default().uploading(),
         Arc::new(SpawnEnded::new(0, false)),
-        Deleter::Recording(deleter),
+        deleter,
         RunSettings {
             max_children: 4,
             delete_mode,
@@ -2613,7 +2613,7 @@ where
         walk,
         comparison,
         Arc::new(SpawnEnded::new(0, false)),
-        Deleter::Recording(Arc::new(RecordDeletes::new(DELETE_BATCH))),
+        Arc::new(RecordDeletes::new(DELETE_BATCH)),
         RunSettings {
             max_children: 4,
             delete_mode: DeleteMode::Off,
@@ -2648,7 +2648,7 @@ fn deleting_with(
         walk,
         Mode::default().uploading(),
         Arc::new(SpawnEnded::new(0, false)),
-        Deleter::Recording(deleter),
+        deleter,
         RunSettings {
             max_children: 4,
             delete_mode,
@@ -2791,14 +2791,16 @@ async fn the_deleter_reports_each_key_from_the_response_it_got() {
         });
     let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&answered]);
 
-    let deleter = Deleter::Bucket(DeleteFromBucket::new(
+    let deleter: Arc<dyn DeleteKeys> = Arc::new(DeleteFromBucket::new(
         client,
         "amzn-s3-demo-bucket",
         Some("data"),
     ));
     let outcomes = deleter
         .delete(
-            ["gone.txt", "held.txt", "silent.txt", "terse.txt"],
+            ["gone.txt", "held.txt", "silent.txt", "terse.txt"]
+                .map(String::from)
+                .to_vec(),
             still_running(),
         )
         .await;
@@ -2883,10 +2885,14 @@ async fn a_key_refused_for_load_is_asked_about_again() {
         .build();
     let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&first]);
 
-    let deleter = Deleter::Bucket(DeleteFromBucket::new(client, "amzn-s3-demo-bucket", None));
+    let deleter: Arc<dyn DeleteKeys> =
+        Arc::new(DeleteFromBucket::new(client, "amzn-s3-demo-bucket", None));
     let started = tokio::time::Instant::now();
     let outcomes = deleter
-        .delete(["gone.txt", "busy.txt"], still_running())
+        .delete(
+            ["gone.txt", "busy.txt"].map(String::from).to_vec(),
+            still_running(),
+        )
         .await;
     let waited = started.elapsed();
 
@@ -2950,10 +2956,16 @@ async fn a_run_that_stops_while_a_key_waits_sends_no_further_attempt() {
                 .build()
         });
     let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&rule]);
-    let deleter = Deleter::Bucket(DeleteFromBucket::new(client, "amzn-s3-demo-bucket", None));
+    let deleter: Arc<dyn DeleteKeys> =
+        Arc::new(DeleteFromBucket::new(client, "amzn-s3-demo-bucket", None));
 
     let stopped = || true;
-    let outcomes = deleter.delete(["gone.txt", "busy.txt"], &stopped).await;
+    let outcomes = deleter
+        .delete(
+            ["gone.txt", "busy.txt"].map(String::from).to_vec(),
+            &stopped,
+        )
+        .await;
 
     let batches = asked.lock().clone();
     assert_eq!(
@@ -3066,7 +3078,7 @@ async fn a_qualified_key_reaches_the_bucket() {
         walk,
         Mode::default().uploading(),
         spawner,
-        Deleter::Recording(Arc::new(RecordDeletes::new(DELETE_BATCH))),
+        Arc::new(RecordDeletes::new(DELETE_BATCH)),
         RunSettings {
             max_children: 4,
             delete_mode: DeleteMode::On,
@@ -3372,7 +3384,7 @@ mod real_bucket {
                 regular_bucket(),
                 Some(prefix),
             )),
-            Deleter::Bucket(DeleteFromBucket::new(c, regular_bucket(), Some(prefix))),
+            Arc::new(DeleteFromBucket::new(c, regular_bucket(), Some(prefix))),
             RunSettings {
                 max_children: 8,
                 delete_mode,
@@ -3419,7 +3431,7 @@ mod real_bucket {
                 Some(prefix),
                 local,
             )),
-            Deleter::LocalTree(DeleteFromLocalTree::new(local)),
+            Arc::new(DeleteFromLocalTree::new(local)),
             RunSettings {
                 max_children: 8,
                 delete_mode,

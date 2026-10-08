@@ -8,8 +8,8 @@
 //! A bucket removes up to 1,000 keys in one `DeleteObjects` request. A local tree removes one file
 //! per key. Each destination reports one outcome per key, so the run knows which keys survived.
 
-#[cfg(test)]
-use std::sync::Arc;
+use std::future::Future;
+use std::pin::Pin;
 
 use super::local_path_for_key;
 
@@ -59,42 +59,24 @@ pub(super) type KeyOutcome = Result<String, Refusal>;
 // The destination asks again after that wait, so a stopped run starts no new attempt.
 pub(crate) type StopCheck<'a> = &'a (dyn Fn() -> bool + Send + Sync);
 
-// Where keys go when they leave the destination. A bucket removes up to 1,000 keys per request. A
-// local tree removes one file per request.
-pub(crate) enum Deleter {
-    Bucket(DeleteFromBucket),
-    LocalTree(DeleteFromLocalTree),
-    #[cfg(test)]
-    Recording(Arc<super::test_util::RecordDeletes>),
-}
-
-impl Deleter {
+// A destination that removes keys for a sync run.
+//
+// A bucket removes up to 1,000 keys in one `DeleteObjects` request. A local tree removes one file
+// per key. The run collects up to `batch_size` keys, sends them in one call, and reads one outcome
+// per key. An implementation that retries checks `stopped` before each retry, so a stopped run
+// starts no new attempt.
+pub(crate) trait DeleteKeys: Send + Sync {
     // How many keys a destination collects before sending. A destination with no batch request
     // returns one.
-    pub(crate) fn batch_size(&self) -> usize {
-        match self {
-            Deleter::Bucket(d) => d.batch_size(),
-            Deleter::LocalTree(d) => d.batch_size(),
-            #[cfg(test)]
-            Deleter::Recording(d) => d.batch_size(),
-        }
-    }
+    fn batch_size(&self) -> usize;
 
     // Remove keys and report one outcome per key. A batch result alone cannot name the keys that
     // survived.
-    pub(crate) async fn delete<K, I>(&self, keys: I, stopped: StopCheck<'_>) -> Vec<KeyOutcome>
-    where
-        K: Into<String>,
-        I: IntoIterator<Item = K>,
-    {
-        let keys: Vec<String> = keys.into_iter().map(Into::into).collect();
-        match self {
-            Deleter::Bucket(d) => d.delete(keys, stopped).await,
-            Deleter::LocalTree(d) => d.delete(keys).await,
-            #[cfg(test)]
-            Deleter::Recording(d) => d.delete(keys).await,
-        }
-    }
+    fn delete<'a>(
+        &'a self,
+        keys: Vec<String>,
+        stopped: StopCheck<'a>,
+    ) -> Pin<Box<dyn Future<Output = Vec<KeyOutcome>> + Send + 'a>>;
 }
 
 // Remove files from a local tree. Directories stay in place. Sync may not own a directory that
@@ -160,6 +142,20 @@ impl DeleteFromLocalTree {
             }
         }
         outcomes
+    }
+}
+
+impl DeleteKeys for DeleteFromLocalTree {
+    fn batch_size(&self) -> usize {
+        DeleteFromLocalTree::batch_size(self)
+    }
+
+    fn delete<'a>(
+        &'a self,
+        keys: Vec<String>,
+        _stopped: StopCheck<'a>,
+    ) -> Pin<Box<dyn Future<Output = Vec<KeyOutcome>> + Send + 'a>> {
+        Box::pin(DeleteFromLocalTree::delete(self, keys))
     }
 }
 
@@ -342,5 +338,19 @@ impl DeleteFromBucket {
                 outcome.unwrap_or_else(|| unnamed(at, "the response did not mention this key"))
             })
             .collect()
+    }
+}
+
+impl DeleteKeys for DeleteFromBucket {
+    fn batch_size(&self) -> usize {
+        DeleteFromBucket::batch_size(self)
+    }
+
+    fn delete<'a>(
+        &'a self,
+        keys: Vec<String>,
+        stopped: StopCheck<'a>,
+    ) -> Pin<Box<dyn Future<Output = Vec<KeyOutcome>> + Send + 'a>> {
+        Box::pin(DeleteFromBucket::delete(self, keys, stopped))
     }
 }
