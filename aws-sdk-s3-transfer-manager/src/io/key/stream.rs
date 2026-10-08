@@ -199,6 +199,18 @@ impl From<WalkError> for StreamError {
     }
 }
 
+// This conversion hands a walk failure to `Error::from(WalkError)`, and that conversion keeps the
+// service code and request id. Every other variant comes from the key stream itself, so its error
+// carries a kind and a message only.
+impl From<StreamError> for crate::error::Error {
+    fn from(err: StreamError) -> Self {
+        match err {
+            StreamError::Walk(walk) => walk.into(),
+            other => crate::error::Error::new(other.category(), other.to_string()),
+        }
+    }
+}
+
 // Errors pass through as the walkers report them; what they mean is the caller's
 // call, via `keys_lost`. A run may continue past an unreadable directory, but
 // not while also deleting keys it never saw.

@@ -13,6 +13,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use crate::io::key::stream::{KeyStream, StreamError};
 use crate::operation::sync::compare::Decision;
 use crate::operation::sync::walk::{Pairing, Progress, Walk};
+use crate::types::FailedTransferPolicy;
 
 use super::child::SyncChild;
 use super::delete::Namespace;
@@ -23,6 +24,41 @@ use crate::transfer::composite::{Children, Reaping, Reservation};
 //
 // The sample comes from the first failing subtree. It does not represent the whole run.
 pub(super) const FAILURES_KEPT: usize = 64;
+
+// `FailedSyncKey` records one key whose transfer or delete failed, with the error that failed it.
+// The error keeps the service code and request id, so a caller can branch on them.
+#[derive(Debug)]
+pub(crate) struct FailedSyncKey {
+    pub(crate) key: String,
+    pub(crate) error: crate::error::Error,
+}
+
+impl FailedSyncKey {
+    pub(crate) fn new(key: impl Into<String>, error: crate::error::Error) -> Self {
+        Self {
+            key: key.into(),
+            error,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn why(&self) -> String {
+        self.to_string()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn kind(&self) -> &crate::error::ErrorKind {
+        self.error.kind()
+    }
+}
+
+// The text names the key, then the whole error chain.
+impl std::fmt::Display for FailedSyncKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let error = aws_smithy_types::error::display::DisplayErrorContext(&self.error);
+        write!(f, "{}: {error}", self.key)
+    }
+}
 
 // A transfer decision with its pairing. The key names the destination; the source entry supplies
 // bytes.
@@ -191,6 +227,12 @@ impl<T> Sampled<T> {
         }
     }
 
+    // Count the failure that became the run's terminal error. `State::stopped_by` holds that
+    // failure, so the sample keeps no copy.
+    fn record_terminal(&mut self) {
+        self.total += 1;
+    }
+
     fn total(&self) -> u64 {
         self.total
     }
@@ -274,10 +316,11 @@ pub(super) struct Transfers<S: KeyStream, D: KeyStream> {
     // This map holds the transfers that wait for a removal on their path. Each entry's key is the
     // name the run is removing.
     held: Held<S::Source, D::Source>,
-    running: Children<SyncChild, ()>,
+    // Each running child carries the key it transfers, so a failure can name that key.
+    running: Children<SyncChild, String>,
     arrived: u64,
     bytes: u64,
-    failures: Sampled<String>,
+    failures: Sampled<FailedSyncKey>,
     outcomes_unknown: u64,
 }
 
@@ -317,10 +360,12 @@ impl<S: KeyStream, D: KeyStream> Transfers<S, D> {
     // write through it or fail on it. The run records each one as a failure.
     pub(super) fn fail_held(&mut self, blocker: &str) {
         for (pairing, _) in self.held.remove(blocker).unwrap_or_default() {
-            self.failures.record(format!(
-                "{}: `{blocker}` stands on its path, and the run could not remove it",
-                pairing.key()
-            ));
+            let error = crate::error::Error::new(
+                crate::error::ErrorKind::IOError,
+                format!("`{blocker}` stands on its path, and the run could not remove it"),
+            );
+            self.failures
+                .record(FailedSyncKey::new(pairing.key(), error));
         }
     }
 
@@ -329,43 +374,32 @@ impl<S: KeyStream, D: KeyStream> Transfers<S, D> {
     }
 
     // Record a child that started in a reserved slot. A later reap joins it.
-    pub(super) fn start(&mut self, slot: Reservation, child: SyncChild) {
-        self.running.insert(slot, child, ());
-    }
-
-    // Record a key that never became a child, with the reason.
-    pub(super) fn record_failure(&mut self, reason: String) {
-        self.failures.record(reason);
+    pub(super) fn start(&mut self, slot: Reservation, child: SyncChild, key: String) {
+        self.running.insert(slot, child, key);
     }
 
     // Move up to `MAX_REAP_PER_POLL` finished children out for a reap.
-    pub(super) fn take_finished(&mut self) -> Option<Reaping<SyncChild, ()>> {
+    pub(super) fn take_finished(&mut self) -> Option<Reaping<SyncChild, String>> {
         self.running.drain_terminal()
     }
 
-    // Record what a reap learned: how many children arrived, the bytes they moved, and why the
-    // others failed. This method releases the reap after it records the results, so the run stays
-    // busy until then.
+    // Record what a reap learned: how many children arrived and the bytes they moved. The caller
+    // records each failure through `State::fail_transfer`. This method releases the reap after it
+    // records the results, so the run stays busy until then.
     pub(super) fn record_reap(
         &mut self,
-        batch: Reaping<SyncChild, ()>,
+        batch: Reaping<SyncChild, String>,
         arrived: u64,
         bytes: u64,
-        reasons: Vec<String>,
     ) {
         self.bytes += bytes;
         self.arrived += arrived;
-        // Record every child failure. The first failure controls `Abort`; callers still need every
-        // reason.
-        for reason in reasons {
-            self.failures.record(reason);
-        }
         batch.release();
     }
 
     // Hand back every running child so the run can drop them. Their outcomes stay unknown. This
     // method reads their bytes first, because dropping a handle cancels its child.
-    pub(super) fn abandon_running(&mut self) -> Vec<(SyncChild, ())> {
+    pub(super) fn abandon_running(&mut self) -> Vec<(SyncChild, String)> {
         let live = self.running.live_len();
         if live > 0 {
             self.outcomes_unknown += live as u64;
@@ -383,12 +417,12 @@ impl<S: KeyStream, D: KeyStream> Transfers<S, D> {
 }
 
 // `Deletes` keeps keys from a delete decision through the service response.
-// A batch moves from `waiting` to `in_flight`; `removed` and `refusals` record the response.
+// A batch moves from `waiting` to `in_flight`. `removed` and `failures` record the response.
 pub(super) struct Deletes {
     waiting: Vec<String>,
     in_flight: usize,
     removed: u64,
-    refusals: Sampled<String>,
+    failures: Sampled<FailedSyncKey>,
     namespace: Namespace,
     // On a tree destination, this set holds every key the run queued or sent for removal that has
     // no answer yet. A transfer under such a key waits until that key's answer arrives.
@@ -441,14 +475,11 @@ impl Deletes {
         Some(keys)
     }
 
-    // Record one response: how many keys the request named, how many the destination removed, and
-    // why it refused the others.
-    pub(super) fn record_response(&mut self, sent: usize, removed: u64, refusals: Vec<String>) {
+    // Record how many keys one request named and how many of them the destination removed. The
+    // caller records each refused key through `State::fail_delete`.
+    pub(super) fn record_response(&mut self, sent: usize, removed: u64) {
         self.in_flight -= sent;
         self.removed += removed;
-        for refusal in refusals {
-            self.refusals.record(refusal);
-        }
     }
 }
 
@@ -488,7 +519,7 @@ impl<S: KeyStream, D: KeyStream> State<S, D> {
                 waiting: Vec::new(),
                 in_flight: 0,
                 removed: 0,
-                refusals: Sampled::default(),
+                failures: Sampled::default(),
                 namespace,
                 clearing: HashSet::new(),
             },
@@ -520,6 +551,38 @@ impl<S: KeyStream, D: KeyStream> State<S, D> {
     // Record a walk failure. The run keeps a bounded sample and counts every failure.
     pub(super) fn record_walk_failure(&mut self, failure: StreamError) {
         self.failures.record(failure);
+    }
+
+    // Stop the run on a walk failure. The failure becomes the terminal error, and the sample counts
+    // it. When the run has already stopped, the sample keeps the failure.
+    pub(super) fn stop_on_walk_failure(&mut self, failure: StreamError) {
+        if self.stopped_by.is_some() {
+            self.failures.record(failure);
+        } else {
+            self.failures.record_terminal();
+            self.stopped_by = Some(failure.into());
+        }
+    }
+
+    // Record a key whose transfer failed. Under `Abort`, the first failure stops the run.
+    pub(super) fn fail_transfer(&mut self, failure: FailedSyncKey, policy: &FailedTransferPolicy) {
+        keep_or_stop(
+            &mut self.transfers.failures,
+            &mut self.stopped_by,
+            failure,
+            policy,
+        );
+    }
+
+    // Record a key the destination refused to remove. Under `Abort`, the first failure stops the
+    // run.
+    pub(super) fn fail_delete(&mut self, failure: FailedSyncKey, policy: &FailedTransferPolicy) {
+        keep_or_stop(
+            &mut self.deletes.failures,
+            &mut self.stopped_by,
+            failure,
+            policy,
+        );
     }
 
     // Record a walk warning. A warning does not stop the run.
@@ -586,7 +649,7 @@ impl<S: KeyStream, D: KeyStream> State<S, D> {
     }
 
     pub(super) fn has_failures(&self) -> bool {
-        self.failures.any() || self.transfers.failures.any() || self.deletes.refusals.any()
+        self.failures.any() || self.transfers.failures.any() || self.deletes.failures.any()
     }
 
     pub(super) fn has_warnings(&self, transfer_active: bool) -> bool {
@@ -596,6 +659,22 @@ impl<S: KeyStream, D: KeyStream> State<S, D> {
             || self.walk_plan_incomplete
             || self.transfers.outcomes_unknown() > 0
             || (!transfer_active && self.work_outstanding())
+    }
+}
+
+// Under `Abort`, the first failure of the run becomes the terminal error, and `sample` only counts
+// it. Every later failure, and every failure under `Continue`, goes into `sample`.
+fn keep_or_stop(
+    sample: &mut Sampled<FailedSyncKey>,
+    stopped_by: &mut Option<crate::error::Error>,
+    failure: FailedSyncKey,
+    policy: &FailedTransferPolicy,
+) {
+    if *policy == FailedTransferPolicy::Abort && stopped_by.is_none() {
+        sample.record_terminal();
+        *stopped_by = Some(failure.error);
+    } else {
+        sample.record(failure);
     }
 }
 
@@ -619,7 +698,7 @@ pub(super) struct RunSnapshot {
     pub(super) deletes_waiting: usize,
     pub(super) deletes_in_flight: usize,
     pub(super) removed: u64,
-    pub(super) refusals: u64,
+    pub(super) delete_failures: u64,
     pub(super) walk_failures: u64,
     pub(super) walk_failures_kept: usize,
     pub(super) warnings_kept: usize,
@@ -648,7 +727,7 @@ impl<S: KeyStream, D: KeyStream> State<S, D> {
             deletes_waiting: self.deletes.waiting.len(),
             deletes_in_flight: self.deletes.in_flight,
             removed: self.deletes.removed,
-            refusals: self.deletes.refusals.total(),
+            delete_failures: self.deletes.failures.total(),
             walk_failures: self.failures.total(),
             walk_failures_kept: self.failures.sample().len(),
             warnings_kept: self.warnings.sample().len(),
@@ -662,12 +741,12 @@ impl<S: KeyStream, D: KeyStream> State<S, D> {
         self.failures.sample()
     }
 
-    pub(super) fn transfer_failure_sample(&self) -> &[String] {
+    pub(super) fn transfer_failure_sample(&self) -> &[FailedSyncKey] {
         self.transfers.failures.sample()
     }
 
-    pub(super) fn delete_refusals(&self) -> &[String] {
-        self.deletes.refusals.sample()
+    pub(super) fn delete_failure_sample(&self) -> &[FailedSyncKey] {
+        self.deletes.failures.sample()
     }
 
     pub(super) fn waiting_transfers(

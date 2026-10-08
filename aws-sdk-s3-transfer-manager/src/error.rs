@@ -160,7 +160,7 @@ impl ChunkRef {
 }
 
 /// Service-call detail read from the concrete `SdkError`.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ServiceMetadata {
     operation: &'static str,
     code: Option<String>,
@@ -221,6 +221,55 @@ impl Error {
                 }),
                 ..Default::default()
             })),
+        }
+    }
+
+    /// Creates an error for one item that a batch call refused inside a successful response.
+    /// `DeleteObjects` reports each refused key this way. The error carries the item's code and
+    /// message, and the request id of the batch response.
+    pub(crate) fn refused_in_batch(
+        operation: &'static str,
+        code: Option<&str>,
+        message: Option<&str>,
+        request_id: Option<&str>,
+    ) -> Error {
+        let text = match (code, message) {
+            (Some(code), Some(message)) => format!("{code}: {message}"),
+            (Some(code), None) => code.to_string(),
+            (None, Some(message)) => message.to_string(),
+            (None, None) => "no reason given".to_string(),
+        };
+        Error {
+            kind: ErrorKind::ServiceError,
+            source: text.into(),
+            extra: Some(Box::new(ErrorExtra {
+                service: Some(ServiceMetadata {
+                    operation,
+                    code: code.map(str::to_owned),
+                    message: message.map(str::to_owned),
+                    request_id: request_id.map(str::to_owned),
+                    extended_request_id: None,
+                }),
+                ..Default::default()
+            })),
+        }
+    }
+
+    /// Returns a copy of this error for a caller that reports one failure for many items. The
+    /// copy keeps the kind, the service metadata, and the full message text. The copy drops the
+    /// source chain and every other attachment. `Error` owns its source and its attachments
+    /// uniquely, so only one error can hold them.
+    pub(crate) fn copy_for_report(&self) -> Error {
+        let text = aws_smithy_types::error::display::DisplayErrorContext(self).to_string();
+        Error {
+            kind: self.kind.clone(),
+            source: text.into(),
+            extra: self.service().map(|service| {
+                Box::new(ErrorExtra {
+                    service: Some(service.clone()),
+                    ..Default::default()
+                })
+            }),
         }
     }
 

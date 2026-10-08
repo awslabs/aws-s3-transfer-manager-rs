@@ -577,7 +577,10 @@ async fn deleting_a_file_that_is_already_gone_is_not_a_failure() {
 
     let outcomes = deleter.delete(vec!["never-existed.txt".to_string()]).await;
 
-    assert_eq!(outcomes, vec![Ok("never-existed.txt".to_string())]);
+    assert!(
+        matches!(outcomes.as_slice(), [Ok(key)] if key == "never-existed.txt"),
+        "a file already gone was not reported as removed: {outcomes:?}"
+    );
 }
 
 #[cfg_attr(miri, ignore)]
@@ -971,13 +974,10 @@ async fn an_aborting_run_does_not_send_a_batch_that_was_already_in_flight() {
 
     {
         let mut state = transfer.inner.state.lock();
-        transfer.stop_if_aborting(
-            &mut state,
-            crate::error::Error::new(
-                crate::error::ErrorKind::IOError,
-                "a child failed while the batch was away",
-            ),
-        );
+        state.stop(crate::error::Error::new(
+            crate::error::ErrorKind::IOError,
+            "a child failed while the batch was away",
+        ));
     }
     assert!(
         ctx.is_active(),
@@ -1952,6 +1952,69 @@ async fn a_child_that_failed_ends_an_aborting_run() {
 
 #[cfg_attr(miri, ignore)]
 #[tokio::test]
+async fn a_failed_child_is_recorded_under_its_own_key() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    a_local_tree(dir.path(), &["a.txt", "b.txt"]);
+    let (transfer, _ctx) = with_spawner(
+        dir.path(),
+        SpawnEnded::new(0, true),
+        FailedTransferPolicy::Continue,
+    );
+
+    drive(&transfer).await;
+
+    let state = transfer.inner.state.lock();
+    let mut keys: Vec<&str> = state
+        .transfer_failure_sample()
+        .iter()
+        .map(|failure| failure.key.as_str())
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["a.txt", "b.txt"], "a child failure lost its key");
+    assert!(
+        state
+            .transfer_failure_sample()
+            .iter()
+            .all(|failure| *failure.kind() == crate::error::ErrorKind::IOError),
+        "a child failure lost its own error: {:?}",
+        state.transfer_failure_sample()
+    );
+}
+
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn the_failure_that_aborts_a_run_is_counted_once() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    a_local_tree(dir.path(), &["a.txt"]);
+    let (transfer, ctx) = with_spawner(
+        dir.path(),
+        SpawnEnded::new(0, true),
+        FailedTransferPolicy::Abort,
+    );
+
+    drive(&transfer).await;
+
+    let err = ctx.take_error().expect("an aborting run attached no error");
+    assert!(
+        aws_smithy_types::error::display::DisplayErrorContext(&err)
+            .to_string()
+            .contains("a child that ended badly"),
+        "the run error is not the child's own error: {err:?}"
+    );
+    let state = transfer.inner.state.lock();
+    assert_eq!(
+        state.snapshot().transfer_failures,
+        1,
+        "the failure that ended the run was not counted"
+    );
+    assert!(
+        state.transfer_failure_sample().is_empty(),
+        "the run error and the sample both hold the same failure"
+    );
+}
+
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
 async fn an_aborting_run_keeps_the_failure_the_site_had() {
     let dir = tempfile::tempdir().expect("a temp dir");
     a_local_tree(dir.path(), &["a.txt"]);
@@ -2837,7 +2900,7 @@ async fn destination_only_keys_are_deleted_in_batches() {
         snapshot.decided.deletable, 7,
         "a run allowed to delete does not report what the comparison marked"
     );
-    assert_eq!(snapshot.refusals, 0);
+    assert_eq!(snapshot.delete_failures, 0);
 }
 
 #[cfg_attr(miri, ignore)]
@@ -2851,7 +2914,7 @@ async fn a_refused_delete_is_counted_against_its_own_key() {
 
     let state = transfer.inner.state.lock();
     assert_eq!(
-        state.snapshot().refusals,
+        state.snapshot().delete_failures,
         2,
         "a refusal was not attributed per key"
     );
@@ -2860,11 +2923,11 @@ async fn a_refused_delete_is_counted_against_its_own_key() {
         0,
         "a refused key was counted as removed"
     );
-    let refusals = state.delete_refusals();
+    let failures = state.delete_failure_sample();
     assert!(
-        refusals.iter().any(|why| why.starts_with("a.txt:"))
-            && refusals.iter().any(|why| why.starts_with("b.txt:")),
-        "the refusal did not reach the record naming its key: {refusals:?}"
+        failures.iter().any(|failure| failure.key == "a.txt")
+            && failures.iter().any(|failure| failure.key == "b.txt"),
+        "the refusal did not reach the record naming its key: {failures:?}"
     );
 }
 
@@ -2901,6 +2964,42 @@ async fn a_run_not_asked_to_delete_leaves_the_key_and_still_counts_it() {
         "the run cannot say how many objects turning deletion on would remove"
     );
     assert!(snapshot.deletes_waiting == 0);
+}
+
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn a_refused_delete_request_gives_each_key_its_service_code() {
+    use aws_sdk_s3::operation::delete_objects::DeleteObjectsError;
+
+    let denied = mock!(aws_sdk_s3::Client::delete_objects).then_error(|| {
+        DeleteObjectsError::generic(
+            aws_sdk_s3::error::ErrorMetadata::builder()
+                .code("AccessDenied")
+                .message("denied")
+                .build(),
+        )
+    });
+    let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&denied]);
+    let deleter = DeleteFromBucket::new(client, "amzn-s3-demo-bucket", None);
+
+    let outcomes = DeleteKeys::delete(
+        &deleter,
+        ["a.txt", "b.txt"].map(String::from).to_vec(),
+        still_running(),
+    )
+    .await;
+
+    for (outcome, key) in outcomes.iter().zip(["a.txt", "b.txt"]) {
+        let failure = outcome
+            .as_ref()
+            .expect_err("a refused request removed a key");
+        assert_eq!(failure.key, key);
+        assert_eq!(
+            failure.error.code(),
+            Some("AccessDenied"),
+            "a key lost the code of the request that failed for it: {failure:?}"
+        );
+    }
 }
 
 #[cfg_attr(miri, ignore)]
@@ -2957,13 +3056,18 @@ async fn the_deleter_reports_each_key_from_the_response_it_got() {
         4,
         "the outcomes do not account for every key sent"
     );
-    assert_eq!(outcomes[0], Ok("gone.txt".to_string()));
+    assert!(matches!(&outcomes[0], Ok(key) if key == "gone.txt"));
     let held = outcomes[1]
         .as_ref()
         .expect_err("a refusal was read as success");
     assert!(
         held.why().starts_with("held.txt:") && held.why().contains("denied"),
         "a refusal did not name its key and reason: {held:?}"
+    );
+    assert_eq!(
+        (held.error.code(), held.error.operation_name()),
+        (Some("AccessDenied"), Some("DeleteObjects")),
+        "a refusal lost the service code S3 gave for its key"
     );
     let silent = outcomes[2]
         .as_ref()
@@ -3043,10 +3147,9 @@ async fn a_key_refused_for_load_is_asked_about_again() {
         .await;
     let waited = started.elapsed();
 
-    assert_eq!(
-        outcomes,
-        vec![Ok("gone.txt".to_string()), Ok("busy.txt".to_string())],
-        "a key refused for load was not asked about again"
+    assert!(
+        matches!(outcomes.as_slice(), [Ok(a), Ok(b)] if a == "gone.txt" && b == "busy.txt"),
+        "a key refused for load was not asked about again: {outcomes:?}"
     );
     let batches = asked.lock().clone();
     assert_eq!(
@@ -3120,9 +3223,8 @@ async fn a_run_that_stops_while_a_key_waits_sends_no_further_attempt() {
         1,
         "a stopped run asked again for a throttled key: {batches:?}"
     );
-    assert_eq!(
-        outcomes[0],
-        Ok("gone.txt".to_string()),
+    assert!(
+        matches!(&outcomes[0], Ok(key) if key == "gone.txt"),
         "the key the response removed was not reported as removed"
     );
     let busy = outcomes[1]
@@ -3306,10 +3408,10 @@ async fn an_aborting_run_hands_the_merge_back() {
 
     {
         let mut state = transfer.inner.state.lock();
-        transfer.stop_if_aborting(
-            &mut state,
-            crate::error::Error::new(crate::error::ErrorKind::IOError, "a child failed"),
-        );
+        state.stop(crate::error::Error::new(
+            crate::error::ErrorKind::IOError,
+            "a child failed",
+        ));
     }
     assert!(
         ctx.is_active(),
@@ -3618,7 +3720,7 @@ async fn downloads_behind_a_refused_removal_fail_without_writing() {
     assert!(
         reasons
             .iter()
-            .all(|why| why.contains("`a` stands on its path")),
+            .all(|failure| failure.why().contains("`a` stands on its path")),
         "a failure did not name the removal that blocked it: {reasons:?}"
     );
 }
@@ -3651,6 +3753,29 @@ async fn an_upload_never_waits_for_a_bucket_removal() {
         deleter.keys_sent(),
         1,
         "the bucket-only key was not removed"
+    );
+}
+
+#[tokio::test]
+async fn a_refused_listing_keeps_its_service_code_on_the_run_error() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    a_local_tree(dir.path(), &["a.txt"]);
+    let denied = mock!(aws_sdk_s3::Client::list_objects_v2).then_error(|| {
+        aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Error::generic(
+            aws_sdk_s3::error::ErrorMetadata::builder()
+                .code("AccessDenied")
+                .message("denied")
+                .build(),
+        )
+    });
+    let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&denied]);
+    let (t, ctx) = upload_run(dir.path(), client, Walker::builder().build());
+    drive(&t).await;
+    let err = ctx.take_error().expect("the run failed");
+    assert_eq!(
+        err.code(),
+        Some("AccessDenied"),
+        "the run error lost the service code"
     );
 }
 

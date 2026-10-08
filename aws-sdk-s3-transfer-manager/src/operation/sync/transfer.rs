@@ -9,7 +9,7 @@ use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use crate::io::key::stream::KeyStream;
+use crate::io::key::stream::{KeyStream, StreamError};
 use crate::operation::sync::compare::{Compare, Decision, Verdict};
 use crate::operation::sync::input::{DeleteMode, RunSettings};
 use crate::operation::sync::walk::{Progress, Walk};
@@ -20,7 +20,7 @@ use crate::operation::sync::walk::Pairing;
 use crate::transfer::composite::{Reaping, Reservation};
 use child::{SpawnChild, SyncChild};
 use delete::DeleteKeys;
-use state::{Decided, State};
+use state::{Decided, FailedSyncKey, State};
 
 // Pairings per merge work item. A merge draws from either side, so a listing page cannot size the
 // batch. The bound limits how long one work item holds an executor slot.
@@ -63,7 +63,7 @@ pub(crate) enum SyncWork<S: KeyStream, D: KeyStream> {
     // Terminal children waiting for a reap. `reap_in_flight` counts them after they leave
     // `children`.
     ReapChildren {
-        batch: Option<Reaping<SyncChild, ()>>,
+        batch: Option<Reaping<SyncChild, String>>,
     },
     // Keys waiting for deletion. `deletes_in_flight` counts them after a delete work item takes
     // them.
@@ -206,12 +206,12 @@ where
                 };
                 let mut state = self.inner.state.lock();
                 match spawned {
-                    Ok(child) => state.transfers.start(slot, child),
+                    Ok(child) => state
+                        .transfers
+                        .start(slot, child, pairing.key().to_string()),
                     Err(err) => {
-                        state
-                            .transfers
-                            .record_failure(format!("{}: {err}", pairing.key()));
-                        self.stop_if_aborting(&mut state, err);
+                        let failure = FailedSyncKey::new(pairing.key(), err);
+                        state.fail_transfer(failure, &self.inner.failure_policy);
                     }
                 }
                 // The claimed key already left the queue. Returning `Spawned` makes the scheduler
@@ -249,11 +249,6 @@ where
 
     // Record the first aborting failure. The terminal path sets the transfer result after
     // outstanding work returns.
-    fn stop_if_aborting(&self, state: &mut State<S, D>, why: impl Into<crate::error::Error>) {
-        if self.inner.failure_policy == FailedTransferPolicy::Abort {
-            state.stop(why.into());
-        }
-    }
 
     // Return the run outcome. Failures outrank warnings; warnings outrank a clean result.
     pub(crate) fn outcome(&self) -> RunOutcome {
@@ -408,33 +403,20 @@ where
         };
         let outcomes = self.inner.deleter.delete(keys, &stopped).await;
 
-        let mut gone = 0u64;
-        let mut refused = Vec::new();
-        for outcome in &outcomes {
-            match outcome {
-                Ok(_) => gone += 1,
-                Err(why) => refused.push(why.clone()),
-            }
-        }
-
         // S3 reports a per-key refusal inside a successful response. The run records the key and
-        // reason.
+        // the error.
         let mut state = self.inner.state.lock();
-        if let Some(first) = refused.first() {
-            let why = crate::error::Error::new(first.kind.clone(), first.why.clone());
-            self.stop_if_aborting(&mut state, why);
-        }
-        state.deletes.record_response(
-            sent,
-            gone,
-            refused.into_iter().map(|refusal| refusal.why).collect(),
-        );
+        let gone = outcomes.iter().filter(|outcome| outcome.is_ok()).count() as u64;
+        state.deletes.record_response(sent, gone);
         // A destination answers in request order. Each answer releases or fails the transfers held
         // behind its key.
-        for (key, outcome) in asked.iter().zip(&outcomes) {
+        for (key, outcome) in asked.iter().zip(outcomes) {
             match outcome {
                 Ok(_) => state.transfers.release(key),
-                Err(_) => state.transfers.fail_held(key),
+                Err(failure) => {
+                    state.fail_delete(failure, &self.inner.failure_policy);
+                    state.transfers.fail_held(key);
+                }
             }
         }
         state.deletes.settle(&asked);
@@ -447,30 +429,24 @@ where
         WorkOutcome::Success { data: None }
     }
 
-    async fn execute_reap(&self, mut batch: Reaping<SyncChild, ()>) -> WorkOutcome {
+    async fn execute_reap(&self, mut batch: Reaping<SyncChild, String>) -> WorkOutcome {
         let mut moved = 0u64;
         let mut arrived = 0u64;
-        let mut why = None;
-        let mut reasons = Vec::new();
-        for ((), result) in batch.join().await {
+        let mut failures = Vec::new();
+        for (key, result) in batch.join().await {
             match result {
                 Ok(bytes) => {
                     arrived += 1;
                     moved += bytes;
                 }
-                Err(err) => {
-                    reasons.push(err.to_string());
-                    if why.is_none() {
-                        why = Some(err);
-                    }
-                }
+                Err(err) => failures.push(FailedSyncKey::new(key, err)),
             }
         }
         let mut state = self.inner.state.lock();
-        if let Some(why) = why {
-            self.stop_if_aborting(&mut state, why);
+        for failure in failures {
+            state.fail_transfer(failure, &self.inner.failure_policy);
         }
-        state.transfers.record_reap(batch, arrived, moved, reasons);
+        state.transfers.record_reap(batch, arrived, moved);
         if self.check_terminal(&mut state).is_some() {
             drop(state);
             return WorkOutcome::Success { data: None };
@@ -561,31 +537,27 @@ where
         state.transfers.queue(&mut batch);
         state.deletes.queue(&mut pending_deletes);
         // Warnings continue the run. Failures enter the run record and can stop the run.
-        //
-        // Record every failure. A fatal failure stops the run under both policies.
-        let mut failed = None;
-        let mut nothing_left = None;
+        let mut failed = Vec::new();
         for entry in failures {
             if entry.is_warning() {
                 state.record_walk_warning(entry);
-                continue;
+            } else {
+                failed.push(entry);
             }
-            // A fatal entry leaves no source stream to continue.
-            if entry.is_fatal() && nothing_left.is_none() {
-                nothing_left = Some((entry.category(), entry.to_string()));
-            }
-            if failed.is_none() {
-                // Read the category and message before moving the failure into the run record.
-                failed = Some((entry.category(), entry.to_string()));
-            }
-            state.record_walk_failure(entry);
         }
-        // The run record keeps every failure. The terminal result carries the first failure.
-        // A fatal failure stops the run under both policies.
-        if let Some((kind, why)) = nothing_left {
-            state.stop(crate::error::Error::new(kind, why));
-        } else if let Some((kind, why)) = failed {
-            self.stop_if_aborting(&mut state, crate::error::Error::new(kind, why));
+        // A fatal failure ends the source stream, so the fatal failure stops the run under both
+        // policies. Otherwise, under `Abort`, the first failure stops the run. The failure that
+        // stops the run becomes the run's terminal error and keeps its service code.
+        let stops_at = failed.iter().position(StreamError::is_fatal).or_else(|| {
+            (self.inner.failure_policy == FailedTransferPolicy::Abort && !failed.is_empty())
+                .then_some(0)
+        });
+        for (at, entry) in failed.into_iter().enumerate() {
+            if Some(at) == stops_at {
+                state.stop_on_walk_failure(entry);
+            } else {
+                state.record_walk_failure(entry);
+            }
         }
 
         // The last merge work item can end the run. Signal the caller after the terminal check.

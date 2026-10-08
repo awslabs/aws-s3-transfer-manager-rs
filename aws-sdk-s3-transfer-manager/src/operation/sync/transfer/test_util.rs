@@ -139,10 +139,9 @@ impl RecordDeletes {
         keys.into_iter()
             .map(|key| {
                 if refuse {
-                    Err(Refusal::new(
-                        crate::error::ErrorKind::ServiceError,
-                        format!("{key}: refused"),
-                    ))
+                    let error =
+                        crate::error::Error::new(crate::error::ErrorKind::ServiceError, "refused");
+                    Err(FailedSyncKey::new(key, error))
                 } else {
                     Ok(key)
                 }

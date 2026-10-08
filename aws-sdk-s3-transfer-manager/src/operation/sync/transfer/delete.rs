@@ -12,6 +12,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use super::local_path_for_key;
+use super::state::FailedSyncKey;
 
 // How many keys go in one delete request. `DeleteObjects` takes no more. Batching makes a large
 // delete affordable: a thousand keys sent singly cost a thousand round trips and a thousand
@@ -24,36 +25,10 @@ pub(super) const DELETE_BATCH: usize = 1000;
 // every key. A per-key retry sends only keys S3 still refuses. A batch can see both failures.
 const DELETE_REFUSAL_ATTEMPTS: u32 = 3;
 
-// Why one key was not removed: the category a caller acts on and the message a caller reads. The
-// destination supplies the category because a bucket, a local tree, and an invalid key fail for
-// different reasons.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Refusal {
-    pub(super) kind: crate::error::ErrorKind,
-    pub(super) why: String,
-}
-
-impl Refusal {
-    pub(super) fn new(kind: crate::error::ErrorKind, why: impl Into<String>) -> Self {
-        Self {
-            kind,
-            why: why.into(),
-        }
-    }
-
-    #[cfg(test)]
-    pub(super) fn why(&self) -> &str {
-        &self.why
-    }
-
-    #[cfg(test)]
-    pub(super) fn kind(&self) -> &crate::error::ErrorKind {
-        &self.kind
-    }
-}
-
-// What became of one key: removed, or refused with a reason naming it.
-pub(super) type KeyOutcome = Result<String, Refusal>;
+// A `KeyOutcome` says what the destination did with one key. `Ok` holds a removed key. `Err` holds
+// a refused key with the error the destination gave. A bucket, a local tree, and an invalid key
+// each give their own error kind.
+pub(super) type KeyOutcome = Result<String, FailedSyncKey>;
 
 // The delete path asks before it sends a batch. A throttled key can wait before its next attempt.
 // The destination asks again after that wait, so a stopped run starts no new attempt.
@@ -135,10 +110,7 @@ impl DeleteFromLocalTree {
                 Ok(path) => path,
                 Err(err) => {
                     // Path derivation reports invalid input. Filesystem removal reports an input/output error.
-                    outcomes.push(Err(Refusal::new(
-                        err.kind().clone(),
-                        format!("{key}: {err}"),
-                    )));
+                    outcomes.push(Err(FailedSyncKey::new(key, err)));
                     continue;
                 }
             };
@@ -147,10 +119,7 @@ impl DeleteFromLocalTree {
                 // A missing file already has the delete result the run wanted. A second run reports
                 // the same outcome.
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => outcomes.push(Ok(key)),
-                Err(e) => outcomes.push(Err(Refusal::new(
-                    crate::error::ErrorKind::IOError,
-                    format!("{key}: {e}"),
-                ))),
+                Err(e) => outcomes.push(Err(FailedSyncKey::new(key, e.into()))),
             }
         }
         outcomes
@@ -216,18 +185,23 @@ impl DeleteFromBucket {
             at_object.insert(object.as_str(), at);
         }
 
+        let refused =
+            |at: usize, error: crate::error::Error| Err(FailedSyncKey::new(&keys[at], error));
+        // Sync fails a key itself in two cases. In the first case, the request builder rejects the
+        // request. In the second case, the response skips the key.
         let unnamed = |at: usize, why: &str| {
-            Err(Refusal::new(
-                crate::error::ErrorKind::ServiceError,
-                format!("{}: {why}", keys[at]),
-            ))
+            refused(
+                at,
+                crate::error::Error::new(crate::error::ErrorKind::ServiceError, why.to_string()),
+            )
         };
-        let mut settled: Vec<Option<KeyOutcome>> = vec![None; keys.len()];
+        let mut settled: Vec<Option<KeyOutcome>> = (0..keys.len()).map(|_| None).collect();
         // Keys that S3 still refuses. The next request contains only those keys.
         let mut outstanding: Vec<usize> = (0..keys.len()).collect();
         // The last refusal for each outstanding key. A stopped run returns that refusal to the
         // caller.
-        let mut refused_with: std::collections::HashMap<usize, String> = Default::default();
+        let mut refused_with: std::collections::HashMap<usize, crate::error::Error> =
+            Default::default();
 
         for attempt in 0..DELETE_REFUSAL_ATTEMPTS {
             if outstanding.is_empty() {
@@ -243,11 +217,14 @@ impl DeleteFromBucket {
                 // earned its retry.
                 if stopped() {
                     for &at in &outstanding {
-                        let why = refused_with
-                            .get(&at)
-                            .map(String::as_str)
-                            .unwrap_or("the run stopped before the service answered for this key");
-                        settled[at].get_or_insert_with(|| unnamed(at, why));
+                        let outcome = match refused_with.remove(&at) {
+                            Some(error) => refused(at, error),
+                            None => unnamed(
+                                at,
+                                "the run stopped before the service answered for this key",
+                            ),
+                        };
+                        settled[at].get_or_insert(outcome);
                     }
                     break;
                 }
@@ -305,6 +282,7 @@ impl DeleteFromBucket {
                 // The response lists deleted keys and refused keys separately. The run reads both
                 // lists.
                 Ok(output) => {
+                    let request_id = aws_sdk_s3::operation::RequestId::request_id(&output);
                     for deleted in output.deleted() {
                         if let Some(&at) = deleted.key().and_then(|k| at_object.get(k)) {
                             settled[at] = Some(Ok(keys[at].clone()));
@@ -317,29 +295,30 @@ impl DeleteFromBucket {
                         };
                         // Keep the service code and message. The code names the refusal; the
                         // message explains it.
-                        let why = match (error.code(), error.message()) {
-                            (Some(code), Some(message)) => format!("{code}: {message}"),
-                            (Some(code), None) => code.to_string(),
-                            (None, Some(message)) => message.to_string(),
-                            (None, None) => "no reason given".to_string(),
-                        };
+                        let why = crate::error::Error::refused_in_batch(
+                            "DeleteObjects",
+                            error.code(),
+                            error.message(),
+                            request_id,
+                        );
                         // Retry only the throttle codes used by the request retry policy. A
                         // terminal delete stays for the next run.
                         if !last_attempt && crate::retry::is_throttle_code(error.code()) {
                             refused_with.insert(at, why);
                             refused_again.push(at);
                         } else {
-                            settled[at] = Some(unnamed(at, &why));
+                            settled[at] = Some(refused(at, why));
                         }
                     }
                     outstanding = refused_again;
                 }
                 // The request exhausted its retries. The run returns that failure for every
                 // outstanding key.
+                // The request failed as a whole, so each key gets a copy of the request's error.
+                // The copy keeps the service code and request id.
                 Err(err) => {
-                    let why = err.to_string();
                     for &at in &outstanding {
-                        settled[at].get_or_insert_with(|| unnamed(at, &why));
+                        settled[at].get_or_insert_with(|| refused(at, err.copy_for_report()));
                     }
                     break;
                 }
