@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use crate::io::key::stream::KeyStream;
 use crate::operation::sync::compare::{Compare, Decision, Verdict};
+use crate::operation::sync::input::{DeleteMode, RunSettings};
 use crate::operation::sync::walk::{Progress, Walk};
 use crate::transfer::{IoRequest, PollWork, Transfer, TransferContext, WorkOutcome};
 use crate::types::FailedTransferPolicy;
@@ -40,38 +41,6 @@ fn local_path_for_key(
         ));
     }
     crate::io::key::local_key_path(root, key, None, None)
-}
-
-// Whether a run may remove destination keys. The named type shows a caller what `true` would
-// enable.
-//
-// Delete mode is off by default. A delete can remove data the caller never sent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum DeleteMode {
-    On,
-    #[default]
-    Off,
-}
-
-// Settings chosen by the caller. The comparison, child factory, and deleter choose the direction.
-#[derive(Debug, Clone)]
-pub(crate) struct RunSettings {
-    // How many children may be live at once. One slot is a share of what the whole client has, so
-    // whoever starts a run sets it.
-    pub(crate) max_children: usize,
-    pub(crate) delete_mode: DeleteMode,
-    // Sync continues after a failure unless the caller selects `Abort`.
-    pub(crate) failure_policy: FailedTransferPolicy,
-}
-
-impl Default for RunSettings {
-    fn default() -> Self {
-        Self {
-            max_children: crate::operation::DEFAULT_MAX_CONCURRENT_CHILDREN,
-            delete_mode: DeleteMode::default(),
-            failure_policy: FailedTransferPolicy::Continue,
-        }
-    }
 }
 
 // How a run turned out. A run can finish without failures and still leave keys unaccounted for.
