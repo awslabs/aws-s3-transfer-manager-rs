@@ -29,6 +29,12 @@ be lost.
                                       metrics()
 ```
 
+Implemented for `upload` and `download` in #197, and this revision is reconciled against that branch
+at `68590af` — every type signature and code path quoted below is read from that tree, not proposed.
+Where an earlier revision of this doc claimed something the implementation then contradicted, the
+departure is stated where the claim was. `upload_objects` and `download_objects` follow in #198 and
+#199.
+
 ## Requirements
 
 ### Report the identity and outcome of each entry
@@ -203,19 +209,11 @@ weaker failure than a stalled operation.
 
 #### Why no emit site can wait for a consumer
 
-Loss is not a property of the event type. It follows from where every emit in this layer happens:
-
-```text
-emit site                        holds a state guard   on a scheduler thread   may block
----------                        -------------------   ---------------------   ---------
-transfer terminal                yes                   yes                     no
-child announcement under a reap  yes                   yes                     no
-abandoned-entry sweep            yes                   yes                     no
-```
-
-Every one of them runs while an operation's state guard is held, on a thread the scheduler needs, so a
-blocking emit stops not only that transfer but every transfer in the client. Bounded and lossy is
-therefore the only delivery this layer can offer, rather than the cheaper of two options.
+Loss is not a property of the event type. It follows from where every emit in this layer happens —
+the transfer terminal, a child announcement under a reap, and the abandoned-entry sweep. All three run
+while an operation's state guard is held, on a thread the scheduler needs, so a blocking emit stops
+not only that transfer but every transfer in the client. Bounded and lossy is therefore the only
+delivery this layer can offer, rather than the cheaper of two options.
 
 A producer that holds no guard and occupies no scheduler thread has no such constraint. No producer in
 this layer is one.
@@ -285,16 +283,16 @@ pub enum TransferEvent {
 }
 
 impl Planned {
-    pub fn id(&self) -> TransferId;
-    pub fn parent(&self) -> Option<TransferId>;
+    pub fn id(&self) -> u64;
+    pub fn parent(&self) -> Option<u64>;
     pub fn transfer(&self) -> &TransferRef;
     pub fn decision(&self) -> &Decision;
     pub fn view(&self) -> Option<&TransferView>;
 }
 
 impl Ended {
-    pub fn id(&self) -> TransferId;
-    pub fn parent(&self) -> Option<TransferId>;
+    pub fn id(&self) -> u64;
+    pub fn parent(&self) -> Option<u64>;
     pub fn transfer(&self) -> &TransferRef;
     pub fn decision(&self) -> &Decision;
     pub fn outcome(&self) -> &Outcome;
@@ -303,15 +301,12 @@ impl Ended {
 
 A `#[non_exhaustive]` struct variant admits an added field and nothing further. A rename, a type
 change, and a removal each remain breaking, and every caller's pattern requires `..`. Accessors cost
-one method per field and leave the representation free after the first release, which is also what
-permits an opaque `TransferId` that can later carry a generation rather than a bare integer that
-cannot.
+one method per field and leave the representation free after the first release, which is what lets
+the id become opaque later without breaking a consumer.
 
-```text
-                       add a field   rename   change a type   remove   caller pattern
-non_exhaustive enum    yes           no       no              no       requires ..
-private struct         yes           yes      yes             yes      accessor call
-```
+As implemented, both variants hold the crate's `TransferId` — the id and its parent as one value, so
+the two cannot be set inconsistently — and project it through these two accessors, which return `u64`
+because `TransferId` is `pub(crate)`. Whether to publish it is the open question below.
 
 #### Why these names
 
@@ -338,22 +333,24 @@ impl TransferRef {
 
 ```text
 Endpoint
-├── S3 { bucket, key }        either end of a transfer, a copy, or a delete
-├── Local { path }            a file or a directory the caller named
-├── Stream                    a body the caller owns and drains
-└── Unresolved                no address this layer can know
+├── S3 { bucket, key }           either end of a transfer, a copy, or a delete
+├── Local { path: Option<_> }    a local file; None when no path was given
+├── Stream                       a body the caller owns and drains
+└── Unresolved                   no address this layer can know
 ```
 
 Naming both ends is what lets a consumer key its own state off the event rather than off a side map
 it maintains: the key a download read from is on the event's source, so a caller deleting each source
 as it commits never has to remember which id was which.
 
-`Unresolved` is not a placeholder for an unknown value. A download to a caller-supplied open file is
-never told that file's path, so naming one would report an address the transfer manager cannot know.
+`Local` carries an `Option<Arc<Path>>`, because a download to a caller-supplied open file is never
+told that file's path. An earlier revision routed that case to `Unresolved`, which reported it as
+having no identifiable destination at all; `Local { path: None }` instead says the end is a local file
+whose name this layer was not given. `Unresolved` remains for an end it genuinely cannot place.
 
-`Local` carries a path and a path is not required to be valid UTF-8, so a local name with no key it
-could take is still reported, at its own name. Escaping such a name for display belongs to whatever
-renders it; the bytes are the fact.
+A path is not required to be valid UTF-8, so a local name with no key it could take is still reported,
+at its own name. Escaping such a name for display belongs to whatever renders it; the bytes are the
+fact.
 
 `view()` returns `None` when the entry never became a transfer, which is a skip or an entry abandoned
 before it started. That is distinct from a live transfer at zero bytes.
@@ -362,14 +359,12 @@ before it started. That is distinct from a live transfer at zero bytes.
 
 A view reports why a transfer is producing no work. That cause already exists crate-privately, as the
 pending state the request-observability layer records (`DownloadPendingReason`,
-`operation/download/context.rs`, added by #188 and on `main` as of `6528c2a`). Its four causes —
-discovery, read-ahead, memory admission, range completion — are one-to-one with the four a consumer
-needs, so the public `StallReason` is a `From` conversion over the private enum and a park site names
-its cause once:
+`operation/download/context.rs`, added by #188). A park site therefore names its cause once, and both
+views are `From` projections of that one name:
 
 ```rust
 fn park(&self, reason: DownloadPendingReason, snapshot: DownloadStateSnapshot) -> PollWork {
-    self.inner.ctx.set_stall(Some(reason.into()));
+    self.inner.ctx.set_pending_reason(Some(reason.into()));
     self.inner.ctx.set_pending(reason);
     ...
 ```
@@ -377,11 +372,17 @@ fn park(&self, reason: DownloadPendingReason, snapshot: DownloadStateSnapshot) -
 What that rules out: two vocabularies set independently at each park site. A site that records the
 private cause and forgets the public one leaves a consumer reading "no reason" on a transfer that is
 demonstrably parked, and nothing fails to compile — the omission is invisible to review and to the
-type system both. Deriving one from the other makes the pairing unforgeable.
+type system both. Deriving both from one name makes the pairing unforgeable.
 
-Verified, not proposed: the conversion and the single-naming park site compile and pass the suite on a
-local merge of this work with `main` at `6528c2a`. That merge is not part of this design and is not
-proposed for review; it is where the claim was measured.
+**Two projections, not one.** An earlier revision claimed the private causes were one-to-one with the
+public ones, so the public enum could be the single source. A test showed otherwise: the private
+taxonomy is strictly finer. `range_completion`, `drain_completion`, and the upload side's
+`part_completion` are distinct causes in per-direction diagnostics but one
+`PendingReason::WorkInFlight` to a consumer, so deriving the private label from the public enum
+flattened `range_completion` into `work_in_flight`. `DownloadPendingReason` therefore projects twice —
+to `PendingCause` for diagnostics, to `types::PendingReason` for the event surface — and the public
+enum is deliberately the coarser. A consumer picks a message from four cases; an operator keeps the
+seven.
 
 `Outcome` is the terminal fact, one variant per terminal status:
 
@@ -389,18 +390,21 @@ proposed for review; it is where the claim was measured.
 #[non_exhaustive]
 pub enum Outcome {
     #[non_exhaustive] Succeeded {},
-    #[non_exhaustive] Failed { error: Error },
+    #[non_exhaustive] Failed {},
     #[non_exhaustive] Cancelled {},
 }
 ```
 
 `Cancelled` stays separate from `Failed` because one interrupt is one cancellation, not N per-entry
 failures; [Deriving an outcome](#deriving-an-outcome) covers what merging them costs a consumer.
-Whether `error` remains a public field is the open question below.
 
-The clone that section requires is not available today: `Error` is not `Clone` and its only reader
-empties the slot. The prerequisite is an `Arc` source inside `Error`, which is a change to the error
-layer and lands before the types.
+**`Failed` carries no error.** An earlier revision put the error on the variant and asked whether it
+should be a public field or an accessor. Neither shipped, because the prerequisite did not: `Error` is
+not `Clone` and its only reader empties the slot, so handing a copy to an observer takes it from
+`join()` — the one caller that must have it. The variant is braced and `#[non_exhaustive]`, so the
+payload is additive once a failed transfer's error can be read without consuming it, which needs an
+`Arc` source inside `Error`. Until then the `--only-show-errors` consumer this design is partly for
+learns *which* entry failed from the stream and must join to learn *why*.
 
 `TransferRef`, `Endpoint`, `Decision`, and `Outcome` are `#[non_exhaustive]`. The lifecycle, the
 sink's internals, and the emit machinery are crate-private.
@@ -503,12 +507,24 @@ join() -> rename -> dest
 ```
 
 The rename therefore moves into the transfer's own completion path, ahead of the status, alongside the
-final flush. Both completion paths perform it directly, including the one holding the state guard: that
-path already flushes the file under the same guard, and a rename is a cheaper metadata operation than
-the flush it follows. Deferring it to a work item would add a scheduling hop to buy nothing.
+final flush.
 
 Every reporting path reads a status and cannot join. A status that means "flushed" rather than
 "committed" therefore makes every one of them report a destination that does not exist.
+
+**One completion path, reached by a claim rather than by counting.** An earlier revision described two
+completion paths and a latch for the object carrying no ranges. Both are gone: #200 restructured the
+transition underneath this work and did it better. `try_claim_completion` yields a `CompletionClaim`
+only from the state that can still complete, and `finalize_completion` consumes one, so exactly-once
+is a property of the type rather than of a counter or a flag. For a zero-byte object, discovery is the
+last item to retire and its own `execute` claims and finalizes — no extra work item, no latch. The
+claim is taken under the state guard and released before `finalize_destination` flushes and
+`commit_destination` renames, so neither runs under it; the earlier revision had argued holding the
+guard was acceptable rather than avoidable.
+
+A failed rename leaves the temporary file for the handle: the status is not `Completed`, so `cleanup`
+or drop frees the name, each taking or guarding the path so it is freed once. Removing it at the rename
+site too would reopen the window #201 closed — another download may already own that name.
 
 ### Terminal sweeps
 
@@ -665,15 +681,19 @@ claiming the terminal.
 
 ## Open Questions
 
-**Whether `Outcome::Failed` carries its error in a public field or behind an accessor.** The
-extensibility argument says accessor: a variant that carries a payload should hold it in a private
-struct, so the payload can gain a field or change a type after 1.0. The consumer argument says
-field, and it is concrete — the `--only-show-errors` mode this design is partly for is written
-`Outcome::Failed { error, .. }`, which compiles only while the field is public, and an accessor
-makes the same filter two lines and a binding. `#[non_exhaustive]` on the variant already makes an
-added field non-breaking, so the accessor buys only the freedom to change `error`'s type, and that
-type is this crate's own. The two asks came from the same reviewer, one on the enum and one in a
-consumer sketch, so the resolution is theirs rather than derivable here.
+**Whether the id accessors return `u64` or a public `TransferId`.** Both variants hold a `TransferId`
+already, so this is only about what the accessors expose. `u64` shipped because the type is
+`pub(crate)`. Publishing it collapses `id()` and `parent()` into one value a consumer destructures, and
+it decides whether a generation added later is additive or breaking — `u64` makes that change breaking,
+and the surface freezes at 1.0. Against it: two integers are what a consumer logs and keys a map on,
+and a newtype makes both of those a field access. The ask came from a reviewer, so the resolution is
+theirs.
+
+**What `network_rx` counts on a download — bytes confirmed written, or bytes off the wire.** The two
+diverge on a retried range: wire bytes count the discarded attempt, confirmed bytes do not. A progress
+bar wants confirmed, a throughput read wants wire. The counter is read by both, and which one it means
+decides whether a separate `bytes_streamed` has to exist at all or is a second name for the same
+number. Not derivable here — it is what the field was intended to mean.
 
 **Channel capacity has no measured floor.** Capacity stands for how far a consumer may fall behind
 before it loses events — its render interval multiplied by the operation's entry rate — and the library
