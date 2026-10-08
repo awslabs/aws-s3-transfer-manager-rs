@@ -11,7 +11,7 @@
 //!
 //! # Scheduling Model
 //!
-//! Transfers are state machines that implement [`Transfer`](crate::transfer::Transfer). The scheduler polls
+//! Transfers are state machines that implement [`Transfer`]. The scheduler polls
 //! them via `poll_work()` when capacity is available, receiving work items or
 //! signals that the transfer is blocked (`Pending`) or finished (`Done`).
 //!
@@ -83,7 +83,7 @@
 //!
 //! # State Machine Contracts
 //!
-//! A [`Transfer`](crate::transfer::Transfer) implementation must uphold:
+//! A [`Transfer`] implementation must uphold:
 //! - **Failed lifecycle**: record the error and signal termination before returning
 //!   a failure outcome.
 //! - **Poll-time pending/wake obligation**: every `PollWork::Pending` must record
