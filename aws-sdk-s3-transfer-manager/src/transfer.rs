@@ -5,6 +5,9 @@
 
 //! Transfer types that define what a transfer is and what it produces.
 
+#[allow(dead_code)]
+pub(crate) mod composite;
+
 use crate::error;
 use crate::scheduler::concurrency::ErrorKind;
 use std::any::Any;
