@@ -98,7 +98,8 @@ macro_rules! bail_if_terminal {
         if !$self.inner.ctx.is_active() {
             // Bailing before any drain: no occupancy freed on this path. The transfer is
             // no longer active, so a completion this retirement claims is dropped rather
-            // than finalized.
+            // than finalized: the cancellation's terminal path owns the destination (see
+            // `CompletionClaim`).
             let _ = $self.decrement_in_flight(0);
             return WorkOutcome::Cancelled;
         }

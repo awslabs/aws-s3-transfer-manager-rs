@@ -57,6 +57,33 @@ use crate::operation::download::body::new_recv_body;
 use crate::types::BucketType;
 use std::sync::Arc;
 
+/// Most names tried for the temporary file of one path download.
+///
+/// Bounded so that creation fails, rather than retrying indefinitely, when the
+/// suffix source keeps naming entries that already exist.
+pub(crate) const TEMP_FILE_ATTEMPTS: usize = 3;
+
+/// Candidate paths for the temporary file a path download writes before
+/// renaming it to `dest`.
+///
+/// Each is `{dest file name}.s3tmp.{suffix}` in `dest`'s directory, with the
+/// suffix written as 8 lower-case hex digits, for the first
+/// [`TEMP_FILE_ATTEMPTS`] values of `suffixes`. The suffixes are drawn here, on
+/// the calling thread, so a source backed by thread-local state, such as
+/// `fastrand`'s global generator, draws from the caller's state even when the
+/// file is then created on the blocking pool.
+pub(crate) fn temp_file_candidates(
+    dest: &std::path::Path,
+    suffixes: impl IntoIterator<Item = u32>,
+) -> Vec<std::path::PathBuf> {
+    let file_name = dest.file_name().unwrap_or_default().to_string_lossy();
+    suffixes
+        .into_iter()
+        .take(TEMP_FILE_ATTEMPTS)
+        .map(|suffix| dest.with_file_name(format!("{file_name}.s3tmp.{suffix:08x}")))
+        .collect()
+}
+
 /// Operation struct for single object download
 #[derive(Clone, Default, Debug)]
 pub(crate) struct Download;
@@ -92,7 +119,10 @@ impl Download {
     /// Orchestrate a download that writes to a file path (temp file + rename).
     ///
     /// The destination sink is created by `sinks` over the temp file, which the
-    /// transfer manager owns and may therefore preallocate.
+    /// transfer manager owns and may therefore preallocate. A failure to create
+    /// the temp file or the sink is returned as
+    /// [`ErrorKind::IOError`](error::ErrorKind::IOError); a temp file whose sink
+    /// could not be created is removed.
     ///
     /// When `parent_id` is `Some`, the transfer is linked as a child of the
     /// given composite transfer via [`TransferContext::new_child`](crate::transfer::TransferContext::new_child).
@@ -105,21 +135,21 @@ impl Download {
         sinks: &dyn sink::SinkFactory,
     ) -> Result<ManagedDownloadHandle, error::Error> {
         // Generate temp file in the same directory as destination
-        let unique_id = fastrand::u32(..);
-        let temp_name = format!(
-            "{}.s3tmp.{:08x}",
-            dest_path.file_name().unwrap_or_default().to_string_lossy(),
-            unique_id
-        );
-        let temp_path = dest_path.with_file_name(temp_name);
-
-        let tokio_file = tokio::fs::File::create(&temp_path)
+        let candidates =
+            temp_file_candidates(&dest_path, std::iter::repeat_with(|| fastrand::u32(..)));
+        let (file, temp_path) = crate::io::fs::create_first_new_async(candidates)
             .await
             .map_err(|e| error::from_kind(error::ErrorKind::IOError)(e))?;
-        let file = tokio_file.into_std().await;
 
-        let inner =
-            Self::orchestrate_with_sink(handle, input, sinks.create(file, true), parent_id)?;
+        let sink = match sinks.create(file, true) {
+            Ok(sink) => sink,
+            Err(e) => {
+                // No handle owns the temp file yet, so remove it here.
+                let _ = tokio::fs::remove_file(&temp_path).await;
+                return Err(error::from_kind(error::ErrorKind::IOError)(e));
+            }
+        };
+        let inner = Self::orchestrate_with_sink(handle, input, sink, parent_id)?;
         Ok(ManagedDownloadHandle::new(inner, temp_path, dest_path))
     }
 
@@ -127,6 +157,12 @@ impl Download {
     ///
     /// The destination sink is created by `sinks` over `file`. The caller owns
     /// `file`, so it is not preallocated.
+    ///
+    /// Returns [`ErrorKind::InputInvalid`](error::ErrorKind::InputInvalid)
+    /// when `sinks` rejects `file` with [`std::io::ErrorKind::InvalidInput`],
+    /// and [`ErrorKind::IOError`](error::ErrorKind::IOError) for any other
+    /// failure to create the sink. Either happens before the transfer is
+    /// scheduled, so no request is sent and `file` is not written.
     #[cfg(any(unix, windows))]
     pub(crate) fn orchestrate_to_file(
         handle: Arc<crate::client::Handle>,
@@ -134,7 +170,14 @@ impl Download {
         file: std::fs::File,
         sinks: &dyn sink::SinkFactory,
     ) -> Result<ManagedDownloadHandle, error::Error> {
-        let inner = Self::orchestrate_with_sink(handle, input, sinks.create(file, false), None)?;
+        let sink = sinks.create(file, false).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::InvalidInput {
+                error::invalid_input(e)
+            } else {
+                error::from_kind(error::ErrorKind::IOError)(e)
+            }
+        })?;
+        let inner = Self::orchestrate_with_sink(handle, input, sink, None)?;
         // No temp/dest paths — caller manages the file lifecycle
         Ok(ManagedDownloadHandle::new_unmanaged(inner))
     }
@@ -176,5 +219,31 @@ impl Download {
             transfer,
             completion_rx: Some(completion_rx),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{temp_file_candidates, TEMP_FILE_ATTEMPTS};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn temp_file_candidates_name_files_beside_the_destination() {
+        let candidates = temp_file_candidates(Path::new("dir/out.dat"), [0xaa, 0xbb]);
+
+        assert_eq!(
+            candidates,
+            [
+                PathBuf::from("dir/out.dat.s3tmp.000000aa"),
+                PathBuf::from("dir/out.dat.s3tmp.000000bb"),
+            ]
+        );
+    }
+
+    #[test]
+    fn temp_file_candidates_stop_at_the_attempt_bound() {
+        let candidates = temp_file_candidates(Path::new("out.dat"), 0..100);
+
+        assert_eq!(candidates.len(), TEMP_FILE_ATTEMPTS);
     }
 }
