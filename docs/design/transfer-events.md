@@ -29,21 +29,15 @@ be lost.
                                       metrics()
 ```
 
-Implemented for `upload` and `download` in #197, and this revision is reconciled against that branch
-at `68590af` — every type signature and code path quoted below is read from that tree, not proposed.
-Where an earlier revision of this doc claimed something the implementation then contradicted, the
-departure is stated where the claim was. `upload_objects` and `download_objects` follow in #198 and
-#199.
-
 ## Requirements
 
 ### Report the identity and outcome of each entry
 
-`aws s3 sync` draws progress by overwriting one line with a carriage return, unreadable once the output
-is a log file, and its `--no-progress` flag then prints nothing at all. The standing request is a third
-mode that logs one line per object as it transfers — `aws/aws-cli#4190`, open since 2019. That consumer
-wants the name of each object and how it ended, which is what decides this layer pushes per-entry facts
-rather than only exposing counters to poll: neither a repainting bar nor a count names an object.
+Three consumers want the same fact and cannot get it from a counter. A caller that deletes each source
+object once its upload commits needs to know which object committed. A caller that retries a partial
+run needs to know which entries failed, not how many. A caller logging one line per object — the
+standing `aws/aws-cli#4190` request — needs each object's name and how it ended. A count names no
+object, so none of the three can be written against counters alone, however often they are polled.
 
 Each entry of an operation is announced once and, when its action is attempted, reported once more
 with a terminal outcome. A consumer keyed on identity acts on that report.
@@ -110,9 +104,9 @@ a permissions failure, and every failure becomes one failure.
 
 ### Keep reported quantities correct under delivery loss
 
-A consumer renders from quantities it reads, not from quantities delivered to it. A quantity assembled
-from delivered messages is permanently wrong once one message is lost, where a quantity re-read after
-a loss is correct on the next read.
+A quantity is read, not delivered. One assembled from delivered messages is permanently wrong once a
+message is lost; one re-read from the counters is correct on the next read, whatever was lost before
+it.
 
 Delivery loss is therefore confined to lifecycle. Losing a lifecycle event costs one notification to
 one consumer. No loss changes a reported quantity.
@@ -122,9 +116,9 @@ one consumer. No loss changes a reported quantity.
 Registering a sink does not change what an operation reports about itself. Two runs that differ only
 in whether an observer was present report one set of quantities.
 
-Otherwise the settled-entry count depends on who was watching, and it cannot reach the enumerated
-total on a run with no consumer, so a progress display shows outstanding work after the operation has
-ended.
+Otherwise the settled-entry count depends on who was watching, and on a run with no consumer it never
+reaches the enumerated total — so an unobserved operation reports outstanding entries forever after it
+has ended.
 
 ### Isolate observers from each other and from the operation
 
@@ -136,8 +130,9 @@ No consumer can stall a transfer, and no consumer's code runs on a thread a tran
 ### Report progress in entries and in bytes
 
 An operation reports a settled-entry count against an enumerated entry total, and transferred bytes
-against a byte total. Both totals distinguish "not known yet" from "known to be zero", because a
-listing that is still running and a prefix that is empty are different facts to a progress display.
+against a byte total. Both totals distinguish "not known yet" from "known to be zero": a listing still
+running and a prefix that is empty are different facts, and a consumer that cannot tell them apart
+either claims completion early or waits on work that does not exist.
 
 A total is provisional while listing continues and final at the listing-complete edge. A listing that
 never ran seals nothing rather than sealing zero, which would claim an arbitrarily large prefix was
@@ -183,23 +178,13 @@ Lifecycle
     └── borrow of the entry's MetricsState, carried on the announcement
 ```
 
-Lifecycle is pushed and quantities are pulled. An event carries identity, decision, and outcome. It
-carries no byte counts. The announcement hands over the view, and the consumer reads the view when it
-renders.
-
-```text
-                    pushed                              pulled
-                    ------                              ------
-what travels        identity, decision, outcome         nothing
-what is read        nothing                             every counter
-on a full channel   dropped, counted per consumer       not applicable
-after one loss      that notification is gone           next read is correct
-```
+Lifecycle is pushed and quantities are pulled. An event carries identity, decision, and outcome, and no
+byte counts; the announcement hands over the view, and the consumer reads it whenever it needs a number.
 
 The split is what makes lossy delivery admissible. A lost byte delta is a total that stays wrong for
-the remainder of a run; a lost lifecycle event costs one notification and is counted. Carrying both on
-one channel also places progress in competition with terminals for one capacity, so a burst of byte
-updates evicts the event a consumer most needs.
+the remainder of a run, where a lost lifecycle event costs one notification and is counted. Carrying
+both on one channel would also place progress in competition with terminals for one capacity, so a
+burst of byte updates evicts the event a consumer most needs.
 
 An unbounded channel is the alternative to bounded delivery and converts a slow consumer into
 unbounded memory inside the library, which an operation cannot refuse. Reserving a terminal slot per
@@ -238,18 +223,12 @@ dropped unsent restores the obligation.
                                                └──► Armed; the next path claims it
 ```
 
-The obligation is not derived from the transfer's status transition. An entry refused by a failure
-policy never receives a transfer context, so it holds an obligation and has no status to derive one
-from. A transfer that was never announced reaches a terminal holding no obligation, so a status-driven
-emit would report an ending for an entry no consumer had heard of. The status transition also names
-the thread that performed it, which is usually the scheduler, and the scheduler holds no sink.
-
-```text
-                                obligation    status
-entry refused by the policy     yes           none
-transfer never announced        no            terminal
-announced transfer              yes           terminal
-```
+The obligation is not derived from the transfer's status transition, because the two do not coincide in
+either direction. An entry refused by a failure policy never receives a transfer context, so it holds
+an obligation and has no status to derive one from. A transfer that was never announced reaches a
+terminal holding no obligation, so a status-driven emit would report an ending for an entry no consumer
+had heard of. The status transition also names the thread that performed it, which is usually the
+scheduler, and the scheduler holds no sink.
 
 #### Deriving an outcome
 
@@ -272,6 +251,21 @@ branch is unreachable, and an unreachable branch that constructs a plausible err
 by review in the way a missing match arm is.
 
 ### Public surface
+
+Four types carry an event's payload, and the split between the first two is the one worth stating
+plainly:
+
+```text
+TransferRef    what the entry is        two endpoints and a direction   fixed for the entry's life
+TransferView   how the entry is going   live counters, read on demand   changes under the reader
+Decision       what was chosen for it   transfer, delete, or skip       fixed at announcement
+Outcome        how it ended             succeeded, failed, cancelled    only on Ended
+```
+
+`TransferRef` is identity: a consumer keys its own state off it and it never changes.
+`TransferView` is a handle onto the same counters `metrics()` reads, so two reads of one view return
+different numbers. An event carries the ref by value and the view by handle for exactly that reason —
+the addresses are a fact about the entry, the counters are a fact about the moment they are read.
 
 `TransferEvent` has two variants. Each holds a private struct read through accessors:
 
@@ -304,22 +298,19 @@ change, and a removal each remain breaking, and every caller's pattern requires 
 one method per field and leave the representation free after the first release, which is what lets
 the id become opaque later without breaking a consumer.
 
-As implemented, both variants hold the crate's `TransferId` — the id and its parent as one value, so
-the two cannot be set inconsistently — and project it through these two accessors, which return `u64`
-because `TransferId` is `pub(crate)`. Whether to publish it is the open question below.
+`id()` and `parent()` are two accessors over one field. `TransferId` already pairs an id with its
+parent, and both variants store it, so the two can never be set inconsistently — the accessors only
+split it on the way out, because `TransferId` is `pub(crate)` and cannot appear in a return type.
+Whether to publish it and return it whole is the open question below.
 
 #### Why these names
 
 `Planned` names the decision taken for an entry, including a decision not to transfer it, so it covers
-an entry that is announced and never attempted. `Ended` names a terminal without asserting success.
-
-Three pairs are ruled out. `Decided` and `Settled` read as near-homophones aloud, which is what a
-reviewer raised. `Started` and `Finished` misdescribes an entry that is announced and never attempted,
-so the first name has to mean that an action was chosen rather than that it began. `Decision` and
-`Result` collides with `Decision`, which is a payload type on both variants. `Completed` asserts success
-and collides with `TransferStatus::Completed`, which under
-[Report a terminal only when its effect has committed](#report-a-terminal-only-when-its-effect-has-committed)
-is a different fact.
+an entry that is announced and never attempted. `Ended` names a terminal without asserting success. Two
+constraints are worth recording because they rule out the obvious alternatives: `Started`/`Finished`
+misdescribes an entry that is announced and never attempted, and `Completed` both asserts success and
+collides with `TransferStatus::Completed`, which here is a different fact. The pair is not settled —
+whether these read well is a question for the consumer code, not for this doc.
 
 `TransferRef` names both ends of an entry, each an `Endpoint`, and which way the bytes move:
 
@@ -343,24 +334,53 @@ Naming both ends is what lets a consumer key its own state off the event rather 
 it maintains: the key a download read from is on the event's source, so a caller deleting each source
 as it commits never has to remember which id was which.
 
-`Local` carries an `Option<Arc<Path>>`, because a download to a caller-supplied open file is never
-told that file's path. An earlier revision routed that case to `Unresolved`, which reported it as
-having no identifiable destination at all; `Local { path: None }` instead says the end is a local file
-whose name this layer was not given. `Unresolved` remains for an end it genuinely cannot place.
+`Local` carries an `Option<Arc<Path>>` because a download to a caller-supplied open file is handed a
+descriptor and not a path. `None` there still says the end is a local file whose name this layer was
+not given, which is more than `Unresolved` says; `Unresolved` is for an end that has no filesystem or
+S3 address at all.
+
+A path *can* be recovered from a descriptor — `F_GETPATH` on macOS, `/proc/self/fd` on Linux — so
+`None` is a choice rather than a limit. It is the right one because the recovered path is not reliably
+the one the caller meant: a file with several hard links resolves to whichever name the kernel hands
+back, a file unlinked after opening resolves to a deleted path or nothing, and the call is unavailable
+on some targets. Reporting a plausible wrong path is worse than reporting none, because a consumer
+deleting or renaming by that path acts on the wrong file. A caller who wants the path in the event has
+it already and can pass it with `write_to_path`.
 
 A path is not required to be valid UTF-8, so a local name with no key it could take is still reported,
-at its own name. Escaping such a name for display belongs to whatever renders it; the bytes are the
+at its own name. Escaping such a name for display belongs to whatever consumes it; the bytes are the
 fact.
+
+`Decision` is what the operation chose for the entry, carried on both variants so a consumer reading
+only terminals still knows what was attempted:
+
+```rust
+#[non_exhaustive]
+pub enum Decision {
+    #[non_exhaustive] Transfer { reason: TransferReason },
+    #[non_exhaustive] Delete {},
+    #[non_exhaustive] Skip { reason: SkipReason },
+}
+```
+
+`Transfer` and `Skip` carry why; `Delete` does not, because for a delete the reason is the action
+itself — present at the destination, absent at the source, delete mode on. It is braced so it can gain
+one if a second route to a delete appears. Only `Transfer` is produced by the four operations today;
+`Delete` and `Skip` exist because the entry vocabulary has to be settled before a producer needs them,
+not after.
 
 `view()` returns `None` when the entry never became a transfer, which is a skip or an entry abandoned
 before it started. That is distinct from a live transfer at zero bytes.
 
-#### The park cause is derived, not set twice
+#### The park reason is read, not delivered
 
-A view reports why a transfer is producing no work. That cause already exists crate-privately, as the
-pending state the request-observability layer records (`DownloadPendingReason`,
-`operation/download/context.rs`, added by #188). A park site therefore names its cause once, and both
-views are `From` projections of that one name:
+**It emits no event.** The reason lives on the view, as `pending_reason()`, and a reader sees it by
+reading the view it already holds. A park is not a lifecycle transition — a transfer parks and unparks
+many times per second — so delivering one would flood a consumer with events that say nothing has
+happened, and the state a reader cares about is the current one, not the sequence that reached it.
+`None` means the last poll produced work, which is not a promise that bytes are moving.
+
+A park site names its reason once, and both readers of it are `From` projections of that one name:
 
 ```rust
 fn park(&self, reason: DownloadPendingReason, snapshot: DownloadStateSnapshot) -> PollWork {
@@ -369,20 +389,20 @@ fn park(&self, reason: DownloadPendingReason, snapshot: DownloadStateSnapshot) -
     ...
 ```
 
-What that rules out: two vocabularies set independently at each park site. A site that records the
-private cause and forgets the public one leaves a consumer reading "no reason" on a transfer that is
-demonstrably parked, and nothing fails to compile — the omission is invisible to review and to the
-type system both. Deriving both from one name makes the pairing unforgeable.
+**Why this is not folded into `set_pending`.** The two calls do unrelated work. `set_pending` is the
+wake protocol: it arms the edge-triggered flag under the state mutex, and a mutator clears it with
+`try_wake`. `set_pending_reason` publishes a value a consumer loads from another thread with no lock
+held, so it has to be a plain atomic rather than anything the state mutex guards. Folding the publish
+into the wake call would put a reader's load behind the mutex that every poll and every completion
+takes, which is the one lock a reporting path must not need. They are called together because the
+reason is the same; they stay separate because one is a handshake and the other is a readable value.
 
-**Two projections, not one.** An earlier revision claimed the private causes were one-to-one with the
-public ones, so the public enum could be the single source. A test showed otherwise: the private
-taxonomy is strictly finer. `range_completion`, `drain_completion`, and the upload side's
-`part_completion` are distinct causes in per-direction diagnostics but one
-`PendingReason::WorkInFlight` to a consumer, so deriving the private label from the public enum
-flattened `range_completion` into `work_in_flight`. `DownloadPendingReason` therefore projects twice —
-to `PendingCause` for diagnostics, to `types::PendingReason` for the event surface — and the public
-enum is deliberately the coarser. A consumer picks a message from four cases; an operator keeps the
-seven.
+**Two projections, not one.** The private taxonomy is strictly finer than the public one, so neither
+can be derived from the other and both are derived from the park site's own name. `range_completion`,
+`drain_completion`, and the upload side's `part_completion` are distinct causes in per-direction
+diagnostics but one `PendingReason::WorkInFlight` to a consumer. Deriving the private label from the
+public enum therefore flattens three causes into one and loses the diagnostic, which is what a test
+asserts. A consumer picks a message from four cases; an operator keeps the finer set.
 
 `Outcome` is the terminal fact, one variant per terminal status:
 
@@ -398,13 +418,13 @@ pub enum Outcome {
 `Cancelled` stays separate from `Failed` because one interrupt is one cancellation, not N per-entry
 failures; [Deriving an outcome](#deriving-an-outcome) covers what merging them costs a consumer.
 
-**`Failed` carries no error.** An earlier revision put the error on the variant and asked whether it
-should be a public field or an accessor. Neither shipped, because the prerequisite did not: `Error` is
-not `Clone` and its only reader empties the slot, so handing a copy to an observer takes it from
-`join()` — the one caller that must have it. The variant is braced and `#[non_exhaustive]`, so the
-payload is additive once a failed transfer's error can be read without consuming it, which needs an
-`Arc` source inside `Error`. Until then the `--only-show-errors` consumer this design is partly for
-learns *which* entry failed from the stream and must join to learn *why*.
+**`Failed` carries no error.** `Error` is not `Clone` and its only reader empties the slot, so handing
+a copy to an observer takes it from `join()` — the one caller that must have it. The variant is braced
+and `#[non_exhaustive]`, so the error becomes an added field, breaking nobody, once a failed transfer's
+error can be read without consuming it. That needs an `Arc` source inside `Error`, which is a change to
+the error layer rather than to this surface. Until then a consumer learns *which* entry failed from the
+stream and joins to learn *why*, and a consumer filtering on error kind alone cannot be written against
+the stream at all.
 
 `TransferRef`, `Endpoint`, `Decision`, and `Outcome` are `#[non_exhaustive]`. The lifecycle, the
 sink's internals, and the emit machinery are crate-private.
@@ -458,7 +478,19 @@ caller. The ordering is internal either way; what a caller depends on is the doc
 ## Integration
 
 Each operation registers a lifecycle at orchestration and discharges it on every path that reaches a
-terminal.
+terminal. Four terms below come from the existing composite machinery rather than from this design, and
+the rest of this section is unreadable without them:
+
+```text
+pending-entry buffer   entries a directory operation has listed but not yet started
+claim                  taking an entry off that buffer to start it
+reap                   collecting children that have finished, in batches
+orphan                 a child still held by the operation when the operation ends
+```
+
+A single-object operation holds one lifecycle. A directory operation holds one for the root and one per
+claimed child, so every lifecycle it creates it must also discharge — including for entries it claimed
+and then abandoned, which is what [Terminal sweeps](#terminal-sweeps) is about.
 
 ### Single-object operations
 
@@ -512,19 +544,17 @@ final flush.
 Every reporting path reads a status and cannot join. A status that means "flushed" rather than
 "committed" therefore makes every one of them report a destination that does not exist.
 
-**One completion path, reached by a claim rather than by counting.** An earlier revision described two
-completion paths and a latch for the object carrying no ranges. Both are gone: #200 restructured the
-transition underneath this work and did it better. `try_claim_completion` yields a `CompletionClaim`
-only from the state that can still complete, and `finalize_completion` consumes one, so exactly-once
-is a property of the type rather than of a counter or a flag. For a zero-byte object, discovery is the
-last item to retire and its own `execute` claims and finalizes — no extra work item, no latch. The
-claim is taken under the state guard and released before `finalize_destination` flushes and
-`commit_destination` renames, so neither runs under it; the earlier revision had argued holding the
-guard was acceptable rather than avoidable.
+There is one completion path and it is reached by a claim, not by counting. `try_claim_completion`
+yields a `CompletionClaim` only from the state that can still complete, and `finalize_completion`
+consumes one, so completing exactly once is a property of the type rather than of a counter or a flag.
+Whichever work item retires last takes the claim; for an object with no ranges that is discovery
+itself, so no extra work item and no latch is needed for the empty case. The claim is taken under the
+state guard and released before the tail flush and the rename, so neither runs under that guard.
 
-A failed rename leaves the temporary file for the handle: the status is not `Completed`, so `cleanup`
-or drop frees the name, each taking or guarding the path so it is freed once. Removing it at the rename
-site too would reopen the window #201 closed — another download may already own that name.
+A failed rename leaves the temporary file to the handle, whose status is then not `Completed`, so its
+cleanup path frees the name — taking or guarding the path so it is freed once. Freeing it at the rename
+site as well would reopen that window, because another download may already own the name by the time a
+second remove runs.
 
 ### Terminal sweeps
 
@@ -539,14 +569,14 @@ claimed, not yet announced             the abandoned-entry sweep, because the
                                        claim captures the sink under the same guard
 ```
 
-Claiming captures the child sink in the same critical section that removes the entry from the buffer,
-which places the third case under the same guard as the first. The capture belongs inside the claim and
-not at its call site. The claim borrows the operation state mutably and cannot release the caller's
-guard, which makes removal and capture one critical section by construction rather than by two
-statements remaining in order.
+The third case is the one that needs arranging. Claiming captures the child's sink in the same critical
+section that removes the entry from the buffer, which puts it under the same guard as the first case.
+Putting the capture inside the claim rather than at its call site is what makes that structural: the
+claim borrows the operation state mutably and so cannot release the caller's guard, where two
+statements at a call site only stay together as long as nobody reorders them.
 
-Reaping removes entries from the child collection before their outcomes are claimed, and the claim
-follows an await:
+One ordering remains. Reaping removes a batch from the child collection before each child's outcome is
+claimed, and the claim follows an `await`:
 
 ```text
 reap batch removed from the child collection
@@ -554,15 +584,13 @@ reap batch removed from the child collection
     ├── child joined, outcome claimed            reported with its own outcome
     |
     └── child not yet joined, operation ends     absent from the collection, so a
-            |                                    sweep would read "never existed"
-            └── the outcome is captured at drain, so the sweep reads it
+                                                 sweep reads "never existed"
 ```
 
-A mid-reap entry is therefore tracked with the outcome it already reached, captured in the same step
-that drains it out of the child collection. Tracking the identity alone is not enough and is the
-tempting half-fix: once the entry leaves the collection its handle is gone, so there is no status left
-to read, and a sweep that recognises the identity still has nothing to report for it. Carrying the
-outcome is what lets the sweep separate an entry that is mid-reap from one that never existed.
+So a mid-reap entry is drained with the outcome it already reached, captured in the step that removes
+it. Carrying the identity alone is the tempting half-fix and does not work: once the entry leaves the
+collection its handle is gone, so a sweep that recognises the identity has no status left to read and
+still nothing to report.
 
 ### Counting
 
