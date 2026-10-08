@@ -9,6 +9,7 @@ use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
 use aws_sdk_s3_transfer_manager::types::{ConcurrencyMode, PartSize, RuntimeMode};
 
 use crate::harness::{mock_tm, mock_tm_with, MockTm};
+use crate::test_data::deterministic_data;
 
 async fn setup() -> MockTm {
     mock_tm(RuntimeMode::Managed).await
@@ -231,11 +232,6 @@ async fn test_download_concurrent_mock_gp() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_download_concurrent_tokio_mt() {
     test_download_concurrent(RuntimeMode::MultiThreadTokio).await;
-}
-
-/// Generate deterministic data using prime 251 to avoid alignment patterns.
-fn deterministic_data(size: usize) -> Vec<u8> {
-    (0..size).map(|i| (i % 251) as u8).collect()
 }
 
 /// Test download to file path with concurrent multi-part download (100 MB, 5 MB parts, 8 workers).

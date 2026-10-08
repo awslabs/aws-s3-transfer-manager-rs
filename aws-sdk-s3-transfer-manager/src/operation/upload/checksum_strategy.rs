@@ -45,8 +45,11 @@ impl ChecksumStrategy {
         }
     }
 
-    /// The transfer manager calculates a `CRC64NVME` full object checksum while uploading.
-    /// This is the default strategy.
+    /// Send `CRC64NVME` checksums that the transfer manager calculates while uploading, with the
+    /// [`ChecksumType::FullObject`] type for a multipart upload. This is the default strategy.
+    ///
+    /// The transfer manager does not calculate a full object checksum; for a multipart upload, S3
+    /// computes it from the parts' checksums. See [`ChecksumStrategy`] for what is sent, and when.
     pub fn with_calculated_crc64_nvme() -> Self {
         Self {
             algorithm: ChecksumAlgorithm::Crc64Nvme,
@@ -55,7 +58,11 @@ impl ChecksumStrategy {
         }
     }
 
-    /// The transfer manager calculates a `CRC32` full object checksum while uploading.
+    /// Send `CRC32` checksums that the transfer manager calculates while uploading, with the
+    /// [`ChecksumType::FullObject`] type for a multipart upload.
+    ///
+    /// The transfer manager does not calculate a full object checksum; for a multipart upload, S3
+    /// computes it from the parts' checksums. See [`ChecksumStrategy`] for what is sent, and when.
     pub fn with_calculated_crc32() -> Self {
         Self {
             algorithm: ChecksumAlgorithm::Crc32,
@@ -64,7 +71,11 @@ impl ChecksumStrategy {
         }
     }
 
-    /// The transfer manager calculates a `CRC32C` full object checksum while uploading.
+    /// Send `CRC32C` checksums that the transfer manager calculates while uploading, with the
+    /// [`ChecksumType::FullObject`] type for a multipart upload.
+    ///
+    /// The transfer manager does not calculate a full object checksum; for a multipart upload, S3
+    /// computes it from the parts' checksums. See [`ChecksumStrategy`] for what is sent, and when.
     pub fn with_calculated_crc32_c() -> Self {
         Self {
             algorithm: ChecksumAlgorithm::Crc32C,
@@ -141,11 +152,16 @@ impl ChecksumStrategy {
 
     /// The precalculated full object checksum value.
     ///
-    /// If specified, this value will be sent to S3 as the full object checksum value.
-    /// In the case of a multipart upload, the transfer manager still calculates
-    /// checksums for individual parts, but this value will always be sent as the full object checksum value.
+    /// If specified, this value is sent to S3 as the full object checksum, and S3 checks the
+    /// object against it: for a single-request upload, in place of the checksum the transfer
+    /// manager would calculate, or on `CompleteMultipartUpload`, alongside each part's own
+    /// checksum.
     ///
-    /// If not specified, the transfer manager will calculate the checksum value.
+    /// If not specified, the transfer manager does not calculate one, and a multipart upload sends
+    /// a full object value only if
+    /// [`PartStream::full_object_checksum`](crate::io::PartStream::full_object_checksum) returns
+    /// one; otherwise S3 computes the object's checksum from its parts. See [`ChecksumStrategy`]
+    /// for what is sent.
     ///
     /// You may not specify this when [type_if_multipart](`Self::type_if_multipart`) is [`ChecksumType::Composite`].
     pub fn full_object_checksum(&self) -> Option<&str> {
@@ -154,7 +170,7 @@ impl ChecksumStrategy {
 }
 
 impl Default for ChecksumStrategy {
-    /// The transfer manager calculates a `CRC64NVME` full object checksum while uploading.
+    /// Returns [`ChecksumStrategy::with_calculated_crc64_nvme`].
     fn default() -> Self {
         Self::with_calculated_crc64_nvme()
     }
@@ -186,11 +202,16 @@ impl ChecksumStrategyBuilder {
 
     /// The precalculated full object checksum value.
     ///
-    /// If specified, this value will be sent to S3 as the full object checksum value.
-    /// In the case of a multipart upload, the transfer manager still calculates
-    /// checksums for individual parts, but this value will always be sent as the full object checksum value.
+    /// If specified, this value is sent to S3 as the full object checksum, and S3 checks the
+    /// object against it: for a single-request upload, in place of the checksum the transfer
+    /// manager would calculate, or on `CompleteMultipartUpload`, alongside each part's own
+    /// checksum.
     ///
-    /// If not specified, the transfer manager will calculate the checksum value.
+    /// If not specified, the transfer manager does not calculate one, and a multipart upload sends
+    /// a full object value only if
+    /// [`PartStream::full_object_checksum`](crate::io::PartStream::full_object_checksum) returns
+    /// one; otherwise S3 computes the object's checksum from its parts. See [`ChecksumStrategy`]
+    /// for what is sent.
     ///
     /// You may not specify this when [type_if_multipart](`Self::type_if_multipart`) is [`ChecksumType::Composite`].
     pub fn full_object_checksum(mut self, input: impl Into<String>) -> Self {

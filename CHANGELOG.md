@@ -30,6 +30,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exists. On a collision another name is drawn, up to three attempts, after which the download
   fails with `ErrorKind::IOError`. A temporary path is now renamed or removed at most once, so a
   file another download has since created under that name is left alone.
+- A `PartStream` part number of 2^32 or more was narrowed to a different part number, and a
+  repeated part number was accepted. A part number outside 1–10,000 now fails the upload with
+  `ErrorKind::InputInvalid` before that part is sent, and a part number repeated within an upload
+  fails it before the upload is completed.
+- An upload built without a body stored an empty object. It now fails at `initiate()` with
+  `ErrorKind::InputInvalid`. To upload an empty object, pass `InputStream::from_static(b"")`.
+- `content_length` on an upload was ignored. When set, it is now the exact body size: a value that
+  is negative or contradicts the body's size fails at `initiate()`, and a body that produces a
+  different number of bytes fails the upload before `CompleteMultipartUpload` is sent.
+- An `UploadPart` response without an ETag was recorded as a completed part. It now fails the
+  upload with `ErrorKind::ServiceError`, which carries the operation name and the response's
+  request IDs, as errors from a failed request do.
+- `TokioIo` published pooled memory it never wrote when the reader replaced the `ReadBuf` it was
+  given. That read now fails with `io::ErrorKind::InvalidData`. `TokioIo` also read its source
+  again after end of file, uploading data that arrived later or blocking on a terminal. It now
+  stops at the first end of file.
+- The `ChecksumStrategy` documentation said the `with_calculated_*` strategies calculate a full
+  object checksum while uploading. The transfer manager calculates none: a multipart upload sends
+  per-part checksums and the checksum type, and S3 computes the full object checksum from the
+  parts. The documentation now says so.
 
 ## [0.3.0] - 2026-09-30
 

@@ -426,7 +426,7 @@ mod test {
             });
 
         let upload_part = mock!(aws_sdk_s3::Client::upload_part)
-            .then_output(|| UploadPartOutput::builder().build());
+            .then_output(|| UploadPartOutput::builder().e_tag("test-etag").build());
 
         let abort_mpu = mock!(aws_sdk_s3::Client::abort_multipart_upload)
             .then_output(|| AbortMultipartUploadOutput::builder().build());
