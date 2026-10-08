@@ -154,6 +154,7 @@ where
         deleter: Arc<dyn DeleteKeys>,
         settings: RunSettings,
     ) -> Self {
+        let namespace = deleter.namespace();
         Self {
             inner: Arc::new(Inner {
                 ctx,
@@ -162,7 +163,7 @@ where
                 deleter,
                 delete_mode: settings.delete_mode,
                 failure_policy: settings.failure_policy,
-                state: Mutex::new(State::new(walk, settings.max_children)),
+                state: Mutex::new(State::new(walk, settings.max_children, namespace)),
             }),
         }
     }
@@ -305,8 +306,16 @@ where
             return None;
         }
         let slot = state.transfers.try_reserve()?;
-        let (pairing, _) = state.transfers.next_waiting()?;
-        Some((slot, pairing))
+        // When the run is still removing a name on a transfer's path, it holds the transfer and
+        // gives the slot to the next one. The merge decides a name before every key under it, so
+        // the removal is already queued when the transfers under that name arrive here.
+        loop {
+            let (pairing, decision) = state.transfers.next_waiting()?;
+            match state.deletes.blocker_of(pairing.key()) {
+                Some(blocker) => state.transfers.hold(blocker, (pairing, decision)),
+                None => return Some((slot, pairing)),
+            }
+        }
     }
 
     // Send a delete batch when it fills or the merge cannot add another key.
@@ -379,6 +388,7 @@ where
             let mut state = self.inner.state.lock();
             if self.has_stopped(&state) {
                 // This work item owns the batch. Mark the plan incomplete before dropping it.
+                state.deletes.settle(&keys);
                 state.abandon_delete_batch(keys.len());
                 if self.check_terminal(&mut state).is_some() {
                     return WorkOutcome::Cancelled;
@@ -390,6 +400,7 @@ where
         }
 
         let sent = keys.len();
+        let asked = keys.clone();
         // Pass the stop check to the destination retry loop. The loop checks before each retry.
         let stopped = || {
             let state = self.inner.state.lock();
@@ -418,6 +429,15 @@ where
             gone,
             refused.into_iter().map(|refusal| refusal.why).collect(),
         );
+        // A destination answers in request order. Each answer releases or fails the transfers held
+        // behind its key.
+        for (key, outcome) in asked.iter().zip(&outcomes) {
+            match outcome {
+                Ok(_) => state.transfers.release(key),
+                Err(_) => state.transfers.fail_held(key),
+            }
+        }
+        state.deletes.settle(&asked);
         if self.check_terminal(&mut state).is_some() {
             drop(state);
             return WorkOutcome::Success { data: None };

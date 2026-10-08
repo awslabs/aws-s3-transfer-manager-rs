@@ -8,13 +8,14 @@
 //! `SyncTransfer` locks `State` to choose work and to record finished work. Each part of `State`
 //! changes its own fields through its methods. `transfer.rs` decides what to do next and calls them.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::io::key::stream::{KeyStream, StreamError};
 use crate::operation::sync::compare::Decision;
 use crate::operation::sync::walk::{Pairing, Progress, Walk};
 
 use super::child::SyncChild;
+use super::delete::Namespace;
 use crate::transfer::composite::{Children, Reaping, Reservation};
 
 // How many failures a run keeps. The walk reports failures per entry, so keeping every failure
@@ -265,8 +266,14 @@ impl<S: KeyStream, D: KeyStream> Merge<S, D> {
 // `Transfers` keeps every child transfer from decision through reap.
 // A child moves from `waiting` to `running`, then out to a reap. The counters and failures record
 // the result.
+// This alias names the held transfers, grouped by the name the run is removing.
+type Held<S, D> = HashMap<String, Vec<Qualified<S, D>>>;
+
 pub(super) struct Transfers<S: KeyStream, D: KeyStream> {
     waiting: VecDeque<Qualified<S::Source, D::Source>>,
+    // This map holds the transfers that wait for a removal on their path. Each entry's key is the
+    // name the run is removing.
+    held: Held<S::Source, D::Source>,
     running: Children<SyncChild, ()>,
     arrived: u64,
     bytes: u64,
@@ -289,6 +296,36 @@ impl<S: KeyStream, D: KeyStream> Transfers<S, D> {
     // Take the oldest waiting decision.
     pub(super) fn next_waiting(&mut self) -> Option<Qualified<S::Source, D::Source>> {
         self.waiting.pop_front()
+    }
+
+    // Hold a transfer until the deleter answers for `blocker`.
+    pub(super) fn hold(&mut self, blocker: String, decision: Qualified<S::Source, D::Source>) {
+        self.held.entry(blocker).or_default().push(decision);
+    }
+
+    // The deleter removed `blocker`. The transfers held behind it go back to the front of the
+    // queue, in the order the merge decided them.
+    pub(super) fn release(&mut self, blocker: &str) {
+        if let Some(decisions) = self.held.remove(blocker) {
+            for decision in decisions.into_iter().rev() {
+                self.waiting.push_front(decision);
+            }
+        }
+    }
+
+    // The deleter refused `blocker`. It still stands on each held transfer's path, so each would
+    // write through it or fail on it. The run records each one as a failure.
+    pub(super) fn fail_held(&mut self, blocker: &str) {
+        for (pairing, _) in self.held.remove(blocker).unwrap_or_default() {
+            self.failures.record(format!(
+                "{}: `{blocker}` stands on its path, and the run could not remove it",
+                pairing.key()
+            ));
+        }
+    }
+
+    pub(super) fn is_holding(&self) -> bool {
+        !self.held.is_empty()
     }
 
     // Record a child that started in a reserved slot. A later reap joins it.
@@ -352,12 +389,37 @@ pub(super) struct Deletes {
     in_flight: usize,
     removed: u64,
     refusals: Sampled<String>,
+    namespace: Namespace,
+    // On a tree destination, this set holds every key the run queued or sent for removal that has
+    // no answer yet. A transfer under such a key waits until that key's answer arrives.
+    clearing: HashSet<String>,
 }
 
 impl Deletes {
     // Queue the destination-only keys from one merge batch.
     pub(super) fn queue(&mut self, keys: &mut Vec<String>) {
+        if self.namespace == Namespace::Tree {
+            self.clearing.extend(keys.iter().cloned());
+        }
         self.waiting.append(keys);
+    }
+
+    // Return the name on this key's path that the run is still removing. On a tree destination,
+    // the key can land only after that name is gone.
+    pub(super) fn blocker_of(&self, key: &str) -> Option<String> {
+        key.bytes()
+            .enumerate()
+            .filter(|(_, byte)| *byte == b'/')
+            .map(|(at, _)| &key[..at])
+            .find(|name| self.clearing.contains(*name))
+            .map(str::to_string)
+    }
+
+    // Mark these keys answered. A transfer under one of them no longer waits.
+    pub(super) fn settle(&mut self, keys: &[String]) {
+        for key in keys {
+            self.clearing.remove(key);
+        }
     }
 
     // Take up to `size` keys for one delete request. A full batch goes out at once. A partial batch
@@ -405,7 +467,7 @@ pub(super) struct State<S: KeyStream, D: KeyStream> {
 }
 
 impl<S: KeyStream, D: KeyStream> State<S, D> {
-    pub(super) fn new(walk: Walk<S, D>, max_children: usize) -> Self {
+    pub(super) fn new(walk: Walk<S, D>, max_children: usize, namespace: Namespace) -> Self {
         State {
             merge: Merge {
                 walk: Some(walk),
@@ -415,6 +477,7 @@ impl<S: KeyStream, D: KeyStream> State<S, D> {
             decided: Decided::default(),
             transfers: Transfers {
                 waiting: VecDeque::new(),
+                held: HashMap::new(),
                 running: Children::new(max_children),
                 arrived: 0,
                 bytes: 0,
@@ -426,6 +489,8 @@ impl<S: KeyStream, D: KeyStream> State<S, D> {
                 in_flight: 0,
                 removed: 0,
                 refusals: Sampled::default(),
+                namespace,
+                clearing: HashSet::new(),
             },
             failures: Sampled::default(),
             warnings: Sampled::default(),
@@ -478,14 +543,16 @@ impl<S: KeyStream, D: KeyStream> State<S, D> {
     pub(super) fn discard_waiting_deletes(&mut self) {
         if !self.deletes.waiting.is_empty() {
             self.mark_plan_incomplete();
-            self.deletes.waiting.clear();
+            let dropped: Vec<String> = self.deletes.waiting.drain(..).collect();
+            self.deletes.settle(&dropped);
         }
     }
 
     pub(super) fn discard_waiting_transfers(&mut self) {
-        if !self.transfers.waiting.is_empty() {
+        if !self.transfers.waiting.is_empty() || self.transfers.is_holding() {
             self.mark_plan_incomplete();
             self.transfers.waiting.clear();
+            self.transfers.held.clear();
         }
     }
 
@@ -503,6 +570,7 @@ impl<S: KeyStream, D: KeyStream> State<S, D> {
     pub(super) fn is_execution_complete(&self) -> bool {
         !self.work_outstanding()
             && self.transfers.waiting.is_empty()
+            && !self.transfers.is_holding()
             && self.deletes.waiting.is_empty()
             && self
                 .merge
@@ -541,6 +609,7 @@ pub(super) struct RunSnapshot {
     pub(super) merge_in_flight: bool,
     pub(super) merge_present: bool,
     pub(super) transfers_waiting: usize,
+    pub(super) transfers_held: usize,
     pub(super) children_running: usize,
     pub(super) children_reaping: usize,
     pub(super) arrived: u64,
@@ -569,6 +638,7 @@ impl<S: KeyStream, D: KeyStream> State<S, D> {
             merge_in_flight: self.merge.in_flight,
             merge_present: self.merge.walk.is_some(),
             transfers_waiting: self.transfers.waiting.len(),
+            transfers_held: self.transfers.held.values().map(Vec::len).sum(),
             children_running: self.transfers.running.live_len(),
             children_reaping: self.transfers.running.reaping_len(),
             arrived: self.transfers.arrived,
@@ -590,6 +660,10 @@ impl<S: KeyStream, D: KeyStream> State<S, D> {
 
     pub(super) fn walk_failure_sample(&self) -> &[StreamError] {
         self.failures.sample()
+    }
+
+    pub(super) fn transfer_failure_sample(&self) -> &[String] {
+        self.transfers.failures.sample()
     }
 
     pub(super) fn delete_refusals(&self) -> &[String] {

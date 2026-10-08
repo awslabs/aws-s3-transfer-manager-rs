@@ -292,6 +292,24 @@ fn downloading_into(
     TransferContext,
     crate::transfer::StateMachineTerminalReceiver,
 ) {
+    downloading_into_with(
+        local,
+        client,
+        delete_mode,
+        Arc::new(DeleteFromLocalTree::new(local)),
+    )
+}
+
+fn downloading_into_with(
+    local: &Path,
+    client: aws_sdk_s3::Client,
+    delete_mode: DeleteMode,
+    deleter: Arc<dyn DeleteKeys>,
+) -> (
+    SyncTransfer<S3Walk, crate::operation::sync::walk::LocalDestination>,
+    TransferContext,
+    crate::transfer::StateMachineTerminalReceiver,
+) {
     let config = crate::Config::builder().client(client.clone()).build();
     let handle = crate::client::Handle::test_handle_managed(config);
     let (ctx, rx) = TransferContext::new(handle);
@@ -315,7 +333,7 @@ fn downloading_into(
             None,
             local,
         )),
-        Arc::new(DeleteFromLocalTree::new(local)),
+        deleter,
         RunSettings {
             max_children: 4,
             delete_mode,
@@ -3465,6 +3483,174 @@ async fn default_settings_send_no_delete_for_objects_under_a_directory_link() {
     assert!(
         sent.is_empty(),
         "default settings deleted an object at or under a directory link: {sent:?}"
+    );
+}
+
+#[cfg(unix)]
+async fn through_a_destination_link(delete_mode: DeleteMode) -> Vec<String> {
+    let outside = tempfile::tempdir().expect("outside");
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path().canonicalize().expect("canonical root");
+    std::os::unix::fs::symlink(outside.path(), root.join("photos")).expect("symlink");
+    let (client, _gets) = a_bucket_recording_gets(&["photos/a.jpg"], 1_600_000_000);
+    let (t, ctx, rx) = downloading_into(&root, client, delete_mode);
+    run_managed(&t, &ctx, rx).await;
+    std::fs::read_dir(outside.path())
+        .expect("outside reads")
+        .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+        .collect()
+}
+
+#[cfg(unix)]
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn a_download_writes_nothing_outside_the_root_through_a_link_it_deletes() {
+    let escaped = through_a_destination_link(DeleteMode::On).await;
+    assert!(
+        escaped.is_empty(),
+        "delete mode on: wrote outside the root: {escaped:?}"
+    );
+}
+
+#[cfg(unix)]
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn a_download_writes_through_a_destination_link_as_download_objects_does() {
+    let landed = through_a_destination_link(DeleteMode::Off).await;
+    assert_eq!(
+        landed,
+        ["a.jpg"],
+        "delete mode off: the file did not land where the link points"
+    );
+}
+
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn a_file_standing_where_a_directory_is_needed_does_not_fail_the_download() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path().canonicalize().expect("canonical root");
+    std::fs::write(root.join("a"), b"old").expect("a file named a");
+    let (client, _gets) = a_bucket_recording_gets(&["a/b"], 1_600_000_000);
+    let (t, ctx, rx) = downloading_into(&root, client, DeleteMode::On);
+    run_managed(&t, &ctx, rx).await;
+    assert!(
+        root.join("a/b").exists(),
+        "the run removed `a` but never wrote `a/b`"
+    );
+}
+
+#[cfg(unix)]
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn each_removal_on_a_path_runs_before_the_downloads_under_it() {
+    let outside_photos = tempfile::tempdir().expect("outside");
+    let outside_docs = tempfile::tempdir().expect("outside");
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path().canonicalize().expect("canonical root");
+    std::os::unix::fs::symlink(outside_photos.path(), root.join("photos")).expect("symlink");
+    std::os::unix::fs::symlink(outside_docs.path(), root.join("docs")).expect("symlink");
+    std::fs::write(root.join("a"), b"old").expect("a file named a");
+    let keys = [
+        "a/b",
+        "docs/x.txt",
+        "docs/y/z.txt",
+        "photos/1.jpg",
+        "photos/2.jpg",
+        "q.txt",
+    ];
+    let client = a_bucket_to_download(&keys, 1_600_000_000);
+    let (t, ctx, rx) = downloading_into(&root, client, DeleteMode::On);
+
+    run_managed(&t, &ctx, rx).await;
+
+    for key in keys {
+        let path = root.join(key);
+        assert_eq!(
+            std::fs::read(&path).unwrap_or_default(),
+            b"hello",
+            "{key} did not land inside the root"
+        );
+    }
+    for name in ["photos", "docs", "a"] {
+        let meta = std::fs::symlink_metadata(root.join(name)).expect("the name exists");
+        assert!(
+            meta.is_dir(),
+            "{name} is not a real directory after the run"
+        );
+    }
+    for outside in [&outside_photos, &outside_docs] {
+        let escaped: Vec<_> = std::fs::read_dir(outside.path()).expect("reads").collect();
+        assert!(escaped.is_empty(), "the run wrote outside the root");
+    }
+    let snapshot = t.inner.state.lock().snapshot();
+    assert_eq!(snapshot.transfer_failures, 0);
+    assert_eq!(snapshot.transfers_held, 0);
+}
+
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn downloads_behind_a_refused_removal_fail_without_writing() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path().canonicalize().expect("canonical root");
+    std::fs::write(root.join("a"), b"old").expect("a file named a");
+    let client = a_bucket_to_download(&["a/b", "a/c", "q.txt"], 1_600_000_000);
+    let deleter = Arc::new(RecordDeletes::refusing_in_a_tree(1));
+    let (t, ctx, rx) = downloading_into_with(&root, client, DeleteMode::On, deleter);
+
+    run_managed(&t, &ctx, rx).await;
+
+    assert_eq!(
+        std::fs::read(root.join("a")).expect("a is still a file"),
+        b"old"
+    );
+    assert!(
+        root.join("q.txt").exists(),
+        "an unblocked download did not run"
+    );
+    let state = t.inner.state.lock();
+    assert_eq!(
+        state.snapshot().transfer_failures,
+        2,
+        "each download behind the refused removal should fail"
+    );
+    assert_eq!(state.snapshot().transfers_held, 0);
+    let reasons = state.transfer_failure_sample();
+    assert!(
+        reasons
+            .iter()
+            .all(|why| why.contains("`a` stands on its path")),
+        "a failure did not name the removal that blocked it: {reasons:?}"
+    );
+}
+
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn an_upload_never_waits_for_a_bucket_removal() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    a_local_tree(dir.path(), &["a/b.txt"]);
+    let deleter = Arc::new(RecordDeletes::new(1));
+    let (transfer, _ctx) = deleting(dir.path(), &["a"], deleter.clone());
+
+    loop {
+        let next = transfer.poll_work();
+        // The test checks before the work item runs, while the deleter has not answered for `a`.
+        assert_eq!(
+            transfer.inner.state.lock().snapshot().transfers_held,
+            0,
+            "an upload waited for a bucket removal"
+        );
+        match next {
+            PollWork::Ready { io: mut work, .. } => {
+                transfer.execute(&mut work).await;
+            }
+            PollWork::Spawned => {}
+            _ => break,
+        }
+    }
+    assert_eq!(
+        deleter.keys_sent(),
+        1,
+        "the bucket-only key was not removed"
     );
 }
 

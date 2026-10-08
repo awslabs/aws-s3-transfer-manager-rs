@@ -91,6 +91,7 @@ pub(crate) struct RecordDeletes {
     batch: usize,
     sent: Mutex<Vec<Vec<String>>>,
     refuse: bool,
+    namespace: Namespace,
 }
 
 impl RecordDeletes {
@@ -99,14 +100,22 @@ impl RecordDeletes {
             batch,
             sent: Mutex::new(Vec::new()),
             refuse: false,
+            namespace: Namespace::Flat,
         }
     }
 
     pub(super) fn refusing(batch: usize) -> Self {
         Self {
-            batch,
-            sent: Mutex::new(Vec::new()),
             refuse: true,
+            ..Self::new(batch)
+        }
+    }
+
+    // This double refuses every key and stands in for a local tree.
+    pub(super) fn refusing_in_a_tree(batch: usize) -> Self {
+        Self {
+            namespace: Namespace::Tree,
+            ..Self::refusing(batch)
         }
     }
 
@@ -145,6 +154,10 @@ impl RecordDeletes {
 impl DeleteKeys for RecordDeletes {
     fn batch_size(&self) -> usize {
         RecordDeletes::batch_size(self)
+    }
+
+    fn namespace(&self) -> Namespace {
+        self.namespace
     }
 
     fn delete<'a>(

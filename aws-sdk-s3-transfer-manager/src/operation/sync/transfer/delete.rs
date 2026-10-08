@@ -70,6 +70,8 @@ pub(crate) trait DeleteKeys: Send + Sync {
     // returns one.
     fn batch_size(&self) -> usize;
 
+    fn namespace(&self) -> Namespace;
+
     // Remove keys and report one outcome per key. A batch result alone cannot name the keys that
     // survived.
     fn delete<'a>(
@@ -77,6 +79,16 @@ pub(crate) trait DeleteKeys: Send + Sync {
         keys: Vec<String>,
         stopped: StopCheck<'a>,
     ) -> Pin<Box<dyn Future<Output = Vec<KeyOutcome>> + Send + 'a>>;
+}
+
+// `Namespace` says how the keys of a destination relate to each other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Namespace {
+    // The destination is a bucket. Removing `a` leaves the key `a/b` untouched.
+    Flat,
+    // The destination is a local tree. The item `a` sits on the path to `a/b`, so `a/b` can land
+    // only after `a` is gone.
+    Tree,
 }
 
 // Remove files from a local tree. Directories stay in place. Sync may not own a directory that
@@ -148,6 +160,10 @@ impl DeleteFromLocalTree {
 impl DeleteKeys for DeleteFromLocalTree {
     fn batch_size(&self) -> usize {
         DeleteFromLocalTree::batch_size(self)
+    }
+
+    fn namespace(&self) -> Namespace {
+        Namespace::Tree
     }
 
     fn delete<'a>(
@@ -344,6 +360,10 @@ impl DeleteFromBucket {
 impl DeleteKeys for DeleteFromBucket {
     fn batch_size(&self) -> usize {
         DeleteFromBucket::batch_size(self)
+    }
+
+    fn namespace(&self) -> Namespace {
+        Namespace::Flat
     }
 
     fn delete<'a>(
