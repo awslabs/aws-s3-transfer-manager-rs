@@ -1073,41 +1073,162 @@ async fn keys_qualified_and_never_started_leave_the_plan_short() {
 
 #[cfg_attr(miri, ignore)]
 #[tokio::test]
-async fn a_reap_that_never_ran_leaves_the_plan_short() {
+async fn a_dropped_reap_leaves_its_outcomes_unknown() {
     let dir = tempfile::tempdir().expect("a temp dir");
     a_local_tree(dir.path(), &["a.txt", "b.txt"]);
     let spawner = Arc::new(SpawnEnded::new(0, true));
-    let (transfer, ctx) = uploading_with(dir.path(), spawner.clone(), 4);
+    let (transfer, _ctx) = uploading_with(dir.path(), spawner.clone(), 4);
+
+    while let PollWork::Ready { io: mut work, .. } = transfer.poll_work() {
+        transfer.execute(&mut work).await;
+    }
+    let PollWork::Ready { io: reap, .. } = spawn_until_something_else(&transfer) else {
+        panic!("the finished children were not handed to a reap");
+    };
+    let held = transfer.inner.state.lock().snapshot().children_reaping;
+    assert!(held > 0, "no reap was dispatched, so this proves nothing");
+    drop(reap);
+
+    let snapshot = transfer.inner.state.lock().snapshot();
+    assert_eq!(
+        snapshot.children_reaping, 0,
+        "a dropped reap kept its count, so the run would never finish"
+    );
+    assert_eq!(
+        snapshot.outcomes_unknown, held as u64,
+        "a dropped reap lost {held} child outcome(s) without counting them"
+    );
+    assert_ne!(
+        transfer.outcome(),
+        RunOutcome::Clean,
+        "a run that lost {held} child outcome(s) called itself clean"
+    );
+}
+
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn a_finished_child_frees_its_slot_before_its_reap() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    a_local_tree(dir.path(), &["a.txt", "b.txt"]);
+    let spawner = Arc::new(SpawnEnded::holding_children_open());
+    let (transfer, ctx) = uploading_with(dir.path(), spawner.clone(), 1);
+
+    while let PollWork::Ready { io: mut work, .. } = transfer.poll_work() {
+        transfer.execute(&mut work).await;
+    }
+    let _ = spawn_until_something_else(&transfer);
+    assert_eq!(
+        spawner.asked_count(),
+        1,
+        "a cap of one started two children"
+    );
+
+    spawner.release(&ctx);
+    assert!(
+        matches!(transfer.poll_work(), PollWork::Spawned),
+        "the next poll did not start the second child"
+    );
+    assert_eq!(
+        spawner.asked_count(),
+        2,
+        "the finished child kept its slot until its reap"
+    );
+    assert_eq!(transfer.inner.state.lock().snapshot().children_reaping, 0);
+}
+
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn a_reap_takes_at_most_one_batch() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let keys: Vec<String> = (0..100).map(|n| format!("k{n:03}.txt")).collect();
+    a_local_tree(
+        dir.path(),
+        &keys.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+    let spawner = Arc::new(SpawnEnded::new(0, false));
+    let (transfer, _ctx) = uploading_with(dir.path(), spawner.clone(), 100);
+
+    let reaped = loop {
+        match transfer.poll_work() {
+            PollWork::Ready { io: mut work, .. } => {
+                let reaping = transfer.inner.state.lock().snapshot().children_reaping;
+                if reaping > 0 {
+                    break reaping;
+                }
+                transfer.execute(&mut work).await;
+            }
+            PollWork::Spawned => {}
+            other => panic!("the run reached {other:?} before any reap"),
+        }
+    };
+    assert_eq!(
+        spawner.asked_count(),
+        100,
+        "not every child had finished first"
+    );
+    assert_eq!(
+        reaped,
+        crate::transfer::composite::MAX_REAP_PER_POLL,
+        "one reap took {reaped} of 100 finished children"
+    );
+}
+
+// This spawner records whether the run's state lock was free when it ran.
+struct SpawnProbingTheLock {
+    inner: SpawnEnded,
+    run: std::sync::OnceLock<std::sync::Weak<Inner<FsWalk, S3Walk>>>,
+    lock_was_free: std::sync::atomic::AtomicBool,
+}
+
+impl SpawnChild<crate::io::walk::FsEntry> for SpawnProbingTheLock {
+    fn spawn(
+        &self,
+        key: &str,
+        source: &crate::io::walk::FsEntry,
+        parent: u64,
+    ) -> Result<SyncChild, crate::error::Error> {
+        let free = self
+            .run
+            .get()
+            .and_then(std::sync::Weak::upgrade)
+            .is_some_and(|run| run.state.try_lock().is_some());
+        self.lock_was_free
+            .store(free, std::sync::atomic::Ordering::SeqCst);
+        self.inner.spawn(key, source, parent)
+    }
+}
+
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn a_child_starts_without_the_run_state_lock() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    a_local_tree(dir.path(), &["a.txt"]);
+    let spawner = Arc::new(SpawnProbingTheLock {
+        inner: SpawnEnded::new(0, false),
+        run: std::sync::OnceLock::new(),
+        lock_was_free: std::sync::atomic::AtomicBool::new(false),
+    });
+    let (transfer, _ctx) = uploading_with(dir.path(), spawner.clone(), 4);
+    spawner
+        .run
+        .set(Arc::downgrade(&transfer.inner))
+        .unwrap_or_else(|_| panic!("the probe was set twice"));
 
     while let PollWork::Ready { io: mut work, .. } = transfer.poll_work() {
         transfer.execute(&mut work).await;
     }
     let _ = spawn_until_something_else(&transfer);
 
-    let mut held = None;
-    while let PollWork::Ready { io: work, .. } = transfer.poll_work() {
-        if transfer.inner.state.lock().snapshot().children_reaping > 0 {
-            held = Some(work);
-            break;
-        }
-    }
-    let outstanding = transfer.inner.state.lock().snapshot().children_reaping;
-    assert!(
-        outstanding > 0,
-        "no reap was dispatched, so this proves nothing"
+    assert_eq!(
+        spawner.inner.asked_count(),
+        1,
+        "the run never spawned a child"
     );
-    drop(held);
-
-    ctx.set_cancelled();
-
     assert!(
-        !transfer.is_plan_complete(),
-        "a run that lost {outstanding} child record(s) reported a complete plan"
-    );
-    assert_ne!(
-        transfer.outcome(),
-        RunOutcome::Clean,
-        "a run that lost {outstanding} child record(s) called itself clean"
+        spawner
+            .lock_was_free
+            .load(std::sync::atomic::Ordering::SeqCst),
+        "the run held its state lock while it spawned a child"
     );
 }
 
@@ -1327,12 +1448,12 @@ async fn a_cancelled_run_starts_no_further_child() {
 
     let asked_before = spawner.asked_count();
     ctx.set_cancelled();
-    let spawned = {
+    let claimed = {
         let mut state = transfer.inner.state.lock();
-        transfer.spawn_one(&mut state)
+        transfer.claim_one(&mut state).is_some()
     };
 
-    assert!(!spawned, "a cancelled run enqueued another child");
+    assert!(!claimed, "a cancelled run claimed another child");
     assert_eq!(
         spawner.asked_count(),
         asked_before,
@@ -1589,8 +1710,14 @@ async fn an_aborting_run_does_not_send_the_deletes_it_buffered() {
         },
     );
 
-    while let PollWork::Ready { io: mut work, .. } = transfer.poll_work() {
-        transfer.execute(&mut work).await;
+    loop {
+        match transfer.poll_work() {
+            PollWork::Ready { io: mut work, .. } => {
+                transfer.execute(&mut work).await;
+            }
+            PollWork::Spawned => {}
+            _ => break,
+        }
     }
 
     assert!(ctx.is_failed(), "the refused spawn did not abort the run");
@@ -2170,7 +2297,7 @@ async fn a_run_reports_the_transfers_that_arrived() {
 
 fn uploading_with(
     local: &Path,
-    spawner: Arc<SpawnEnded>,
+    spawner: Arc<dyn SpawnChild<crate::io::walk::FsEntry>>,
     cap: usize,
 ) -> (SyncTransfer<FsWalk, S3Walk>, TransferContext) {
     uploading_with_policy(local, spawner, cap, FailedTransferPolicy::Continue)
@@ -2178,7 +2305,7 @@ fn uploading_with(
 
 fn uploading_with_policy(
     local: &Path,
-    spawner: Arc<SpawnEnded>,
+    spawner: Arc<dyn SpawnChild<crate::io::walk::FsEntry>>,
     cap: usize,
     failure_policy: FailedTransferPolicy,
 ) -> (SyncTransfer<FsWalk, S3Walk>, TransferContext) {

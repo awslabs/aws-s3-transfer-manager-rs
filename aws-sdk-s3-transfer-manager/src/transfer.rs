@@ -5,7 +5,6 @@
 
 //! Transfer types that define what a transfer is and what it produces.
 
-#[allow(dead_code)]
 pub(crate) mod composite;
 
 use crate::error;

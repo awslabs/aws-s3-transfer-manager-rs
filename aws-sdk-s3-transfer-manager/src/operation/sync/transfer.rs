@@ -16,6 +16,8 @@ use crate::operation::sync::walk::{Progress, Walk};
 use crate::transfer::{IoRequest, PollWork, Transfer, TransferContext, WorkOutcome};
 use crate::types::FailedTransferPolicy;
 
+use crate::operation::sync::walk::Pairing;
+use crate::transfer::composite::{Reaping, Reservation};
 use child::{SpawnChild, SyncChild};
 use delete::DeleteKeys;
 use state::{Decided, State};
@@ -55,26 +57,35 @@ pub(crate) enum RunOutcome {
 // The merge leaves `State` while a work item advances it. `Walk::next` needs `&mut`, and the state
 // lock cannot stay held across that wait.
 pub(crate) enum SyncWork<S: KeyStream, D: KeyStream> {
-    AdvanceMerge { walk: Option<Box<Walk<S, D>>> },
+    AdvanceMerge {
+        walk: Option<Box<Walk<S, D>>>,
+    },
     // Terminal children waiting for a reap. `reap_in_flight` counts them after they leave
     // `children`.
-    ReapChildren { children: Vec<SyncChild> },
+    ReapChildren {
+        batch: Option<Reaping<SyncChild, ()>>,
+    },
     // Keys waiting for deletion. `deletes_in_flight` counts them after a delete work item takes
     // them.
-    DeleteKeys { keys: Vec<String> },
+    DeleteKeys {
+        keys: Vec<String>,
+    },
 }
 
 impl<S: KeyStream, D: KeyStream> fmt::Debug for SyncWork<S, D> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             SyncWork::AdvanceMerge { .. } => f.write_str("AdvanceMerge"),
-            SyncWork::ReapChildren { children } => {
-                write!(f, "ReapChildren({})", children.len())
+            SyncWork::ReapChildren { batch } => {
+                write!(f, "ReapChildren({:?})", batch.as_ref().map(Reaping::len))
             }
             SyncWork::DeleteKeys { keys } => write!(f, "DeleteKeys({})", keys.len()),
         }
     }
 }
+
+// A claim holds the slot its child will run in and the pairing its decision came from.
+type Claim<S, D> = (Reservation, Pairing<S, D>);
 
 pub(crate) struct SyncTransfer<S: KeyStream, D: KeyStream>
 where
@@ -124,9 +135,6 @@ where
     // What to do when something fails. Read at every site a failure can arrive, so one answer
     // covers the run.
     failure_policy: FailedTransferPolicy,
-    // How many children may be live at once. One slot is a share of what the whole client has, so
-    // whoever starts a run sets it.
-    max_children: usize,
     // Allow sync to remove destination-only keys. Delete mode requires caller opt-in.
     delete_mode: DeleteMode,
 }
@@ -152,10 +160,9 @@ where
                 comparison,
                 spawner,
                 deleter,
-                max_children: settings.max_children.max(1),
                 delete_mode: settings.delete_mode,
                 failure_policy: settings.failure_policy,
-                state: Mutex::new(State::new(walk)),
+                state: Mutex::new(State::new(walk, settings.max_children)),
             }),
         }
     }
@@ -179,7 +186,35 @@ where
             if let Some(work) = self.dispatch_merge(&mut state) {
                 return work;
             }
-            if self.spawn_one(&mut state) {
+            if let Some((slot, pairing)) = self.claim_one(&mut state) {
+                // Spawn without the state lock. The reservation holds the slot until the child
+                // starts.
+                drop(state);
+                let spawned = match pairing.source().entry() {
+                    Some(entry) => {
+                        self.inner
+                            .spawner
+                            .spawn(pairing.key(), &entry.source, self.inner.ctx.id.id)
+                    }
+                    // A transfer needs a source entry. Record a comparison error when that entry is
+                    // absent.
+                    None => Err(crate::error::Error::new(
+                        crate::error::ErrorKind::RuntimeError,
+                        "a transfer was decided for a key with no source entry",
+                    )),
+                };
+                let mut state = self.inner.state.lock();
+                match spawned {
+                    Ok(child) => state.transfers.start(slot, child),
+                    Err(err) => {
+                        state
+                            .transfers
+                            .record_failure(format!("{}: {err}", pairing.key()));
+                        self.stop_if_aborting(&mut state, err);
+                    }
+                }
+                // The claimed key already left the queue. Returning `Spawned` makes the scheduler
+                // poll again, so a failed spawn does not strand the keys behind it.
                 return PollWork::Spawned;
             }
         }
@@ -264,56 +299,14 @@ where
         None
     }
 
-    // Start one waiting transfer when a child slot is free. The spawned child uses its own
-    // scheduler slot.
-    fn spawn_one(&self, state: &mut State<S, D>) -> bool {
-        if !state.transfers.has_room(self.inner.max_children) {
-            return false;
+    // Claim one waiting transfer and a slot for it. A stopped run claims nothing.
+    fn claim_one(&self, state: &mut State<S, D>) -> Option<Claim<S::Source, D::Source>> {
+        if self.has_stopped(state) {
+            return None;
         }
-
-        // Skip a decision that cannot create a child. Keep reading waiting decisions until one
-        // starts or the queue empties.
-        loop {
-            // A stopped run starts no new child. Check before removing the key from the waiting
-            // queue.
-            if self.has_stopped(state) {
-                return false;
-            }
-            let Some((pairing, _)) = state.transfers.next_waiting() else {
-                break;
-            };
-            let Some(entry) = pairing.source().entry() else {
-                // A transfer needs a source entry. Record a comparison error when that entry is
-                // absent.
-                let why = crate::error::Error::new(
-                    crate::error::ErrorKind::RuntimeError,
-                    "a transfer was decided for a key with no source entry",
-                );
-                state
-                    .transfers
-                    .record_failure(format!("{}: {why}", pairing.key()));
-                self.stop_if_aborting(state, why);
-                continue;
-            };
-            match self
-                .inner
-                .spawner
-                .spawn(pairing.key(), &entry.source, self.inner.ctx.id.id)
-            {
-                Ok(child) => {
-                    state.transfers.start(child);
-                    return true;
-                }
-                Err(err) => {
-                    state
-                        .transfers
-                        .record_failure(format!("{}: {err}", pairing.key()));
-                    self.stop_if_aborting(state, err);
-                    continue;
-                }
-            }
-        }
-        false
+        let slot = state.transfers.try_reserve()?;
+        let (pairing, _) = state.transfers.next_waiting()?;
+        Some((slot, pairing))
     }
 
     // Send a delete batch when it fills or the merge cannot add another key.
@@ -342,9 +335,11 @@ where
 
     // Collect terminal children for a reap. `reaping` counts them after they leave `running`.
     fn dispatch_reap(&self, state: &mut State<S, D>) -> Option<PollWork> {
-        let children = state.transfers.take_finished()?;
+        let batch = state.transfers.take_finished()?;
         Some(PollWork::ready(IoRequest {
-            data: Some(Box::new(SyncWork::<S, D>::ReapChildren { children })),
+            data: Some(Box::new(SyncWork::<S, D>::ReapChildren {
+                batch: Some(batch),
+            })),
         }))
     }
 
@@ -366,9 +361,9 @@ where
                 let walk = walk.take().expect("the merge was already taken");
                 self.execute_advance_merge(*walk).await
             }
-            SyncWork::ReapChildren { children } => {
-                let children = std::mem::take(children);
-                self.execute_reap(children).await
+            SyncWork::ReapChildren { batch } => {
+                let batch = batch.take().expect("the reap was already taken");
+                self.execute_reap(batch).await
             }
             SyncWork::DeleteKeys { keys } => {
                 let keys = std::mem::take(keys);
@@ -432,14 +427,13 @@ where
         WorkOutcome::Success { data: None }
     }
 
-    async fn execute_reap(&self, children: Vec<SyncChild>) -> WorkOutcome {
-        let count = children.len();
+    async fn execute_reap(&self, mut batch: Reaping<SyncChild, ()>) -> WorkOutcome {
         let mut moved = 0u64;
         let mut arrived = 0u64;
         let mut why = None;
         let mut reasons = Vec::new();
-        for child in children {
-            match child.join().await {
+        for ((), result) in batch.join().await {
+            match result {
                 Ok(bytes) => {
                     arrived += 1;
                     moved += bytes;
@@ -456,7 +450,7 @@ where
         if let Some(why) = why {
             self.stop_if_aborting(&mut state, why);
         }
-        state.transfers.record_reap(count, arrived, moved, reasons);
+        state.transfers.record_reap(batch, arrived, moved, reasons);
         if self.check_terminal(&mut state).is_some() {
             drop(state);
             return WorkOutcome::Success { data: None };

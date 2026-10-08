@@ -262,3 +262,19 @@ impl SpawnChild<aws_sdk_s3::types::Object> for SpawnDownload {
         })
     }
 }
+
+impl crate::transfer::composite::JoinChild for SyncChild {
+    type Output = u64;
+
+    fn id(&self) -> crate::transfer::TransferId {
+        SyncChild::id(self)
+    }
+
+    fn is_finished(&self) -> bool {
+        SyncChild::is_finished(self)
+    }
+
+    fn join(self) -> impl std::future::Future<Output = Result<u64, crate::error::Error>> + Send {
+        SyncChild::join(self)
+    }
+}

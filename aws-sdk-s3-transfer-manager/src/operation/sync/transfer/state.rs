@@ -15,6 +15,7 @@ use crate::operation::sync::compare::Decision;
 use crate::operation::sync::walk::{Pairing, Progress, Walk};
 
 use super::child::SyncChild;
+use crate::transfer::composite::{Children, Reaping, Reservation};
 
 // How many failures a run keeps. The walk reports failures per entry, so keeping every failure
 // would grow memory with the tree. The run keeps the first failures and counts the rest.
@@ -261,11 +262,11 @@ impl<S: KeyStream, D: KeyStream> Merge<S, D> {
 }
 
 // `Transfers` keeps every child transfer from decision through reap.
-// A child moves from `waiting` to `running` to `reaping`; the counters and failures record the result.
+// A child moves from `waiting` to `running`, then out to a reap. The counters and failures record
+// the result.
 pub(super) struct Transfers<S: KeyStream, D: KeyStream> {
     waiting: VecDeque<Qualified<S::Source, D::Source>>,
-    running: std::collections::HashMap<crate::transfer::TransferId, SyncChild>,
-    reaping: usize,
+    running: Children<SyncChild, ()>,
     arrived: u64,
     bytes: u64,
     failures: Sampled<String>,
@@ -278,10 +279,10 @@ impl<S: KeyStream, D: KeyStream> Transfers<S, D> {
         self.waiting.append(batch);
     }
 
-    // Return true while fewer than `max` children run. A child in a reap holds no network or disk
-    // concurrency, so it does not count.
-    pub(super) fn has_room(&self, max: usize) -> bool {
-        self.running.len() < max
+    // Reserve a slot for one child, or return `None` at capacity. A finished child that waits for
+    // its reap holds no network or disk concurrency, so it does not count.
+    pub(super) fn try_reserve(&self) -> Option<Reservation> {
+        self.running.try_reserve()
     }
 
     // Take the oldest waiting decision.
@@ -289,9 +290,9 @@ impl<S: KeyStream, D: KeyStream> Transfers<S, D> {
         self.waiting.pop_front()
     }
 
-    // Record a child that started. A later reap joins it.
-    pub(super) fn start(&mut self, child: SyncChild) {
-        self.running.insert(child.id(), child);
+    // Record a child that started in a reserved slot. A later reap joins it.
+    pub(super) fn start(&mut self, slot: Reservation, child: SyncChild) {
+        self.running.insert(slot, child, ());
     }
 
     // Record a key that never became a child, with the reason.
@@ -299,36 +300,21 @@ impl<S: KeyStream, D: KeyStream> Transfers<S, D> {
         self.failures.record(reason);
     }
 
-    // Move finished children out of `running` for a reap. `reaping` counts them until the reap
-    // reports back.
-    pub(super) fn take_finished(&mut self) -> Option<Vec<SyncChild>> {
-        let finished: Vec<crate::transfer::TransferId> = self
-            .running
-            .iter()
-            .filter(|(_, child)| child.is_finished())
-            .map(|(id, _)| *id)
-            .collect();
-        if finished.is_empty() {
-            return None;
-        }
-        let children: Vec<SyncChild> = finished
-            .into_iter()
-            .map(|id| self.running.remove(&id).expect("id came from this map"))
-            .collect();
-        self.reaping += children.len();
-        Some(children)
+    // Move up to `MAX_REAP_PER_POLL` finished children out for a reap.
+    pub(super) fn take_finished(&mut self) -> Option<Reaping<SyncChild, ()>> {
+        self.running.drain_terminal()
     }
 
-    // Record what a reap learned: how many children it joined, how many arrived, the bytes they
-    // moved, and why the others failed.
+    // Record what a reap learned: how many children arrived, the bytes they moved, and why the
+    // others failed. This method releases the reap after it records the results, so the run stays
+    // busy until then.
     pub(super) fn record_reap(
         &mut self,
-        joined: usize,
+        batch: Reaping<SyncChild, ()>,
         arrived: u64,
         bytes: u64,
         reasons: Vec<String>,
     ) {
-        self.reaping -= joined;
         self.bytes += bytes;
         self.arrived += arrived;
         // Record every child failure. The first failure controls `Abort`; callers still need every
@@ -336,19 +322,25 @@ impl<S: KeyStream, D: KeyStream> Transfers<S, D> {
         for reason in reasons {
             self.failures.record(reason);
         }
+        batch.release();
     }
 
     // Hand back every running child so the run can drop them. Their outcomes stay unknown. This
     // method reads their bytes first, because dropping a handle cancels its child.
-    pub(super) fn abandon_running(
-        &mut self,
-    ) -> std::collections::HashMap<crate::transfer::TransferId, SyncChild> {
-        if !self.running.is_empty() {
-            self.outcomes_unknown += self.running.len() as u64;
-            let moved: u64 = self.running.values().map(SyncChild::bytes_so_far).sum();
+    pub(super) fn abandon_running(&mut self) -> Vec<(SyncChild, ())> {
+        let live = self.running.live_len();
+        if live > 0 {
+            self.outcomes_unknown += live as u64;
+            let moved: u64 = self.running.live().map(SyncChild::bytes_so_far).sum();
             self.bytes += moved;
         }
-        std::mem::take(&mut self.running)
+        self.running.abandon()
+    }
+
+    // Count the children whose outcome the run never learned: the ones `abandon_running` dropped
+    // and the ones a dropped reap took with it.
+    pub(super) fn outcomes_unknown(&self) -> u64 {
+        self.outcomes_unknown + self.running.lost()
     }
 }
 
@@ -412,7 +404,7 @@ pub(super) struct State<S: KeyStream, D: KeyStream> {
 }
 
 impl<S: KeyStream, D: KeyStream> State<S, D> {
-    pub(super) fn new(walk: Walk<S, D>) -> Self {
+    pub(super) fn new(walk: Walk<S, D>, max_children: usize) -> Self {
         State {
             merge: Merge {
                 walk: Some(walk),
@@ -422,8 +414,7 @@ impl<S: KeyStream, D: KeyStream> State<S, D> {
             decided: Decided::default(),
             transfers: Transfers {
                 waiting: VecDeque::new(),
-                running: std::collections::HashMap::new(),
-                reaping: 0,
+                running: Children::new(max_children),
                 arrived: 0,
                 bytes: 0,
                 failures: Sampled::default(),
@@ -505,10 +496,7 @@ impl<S: KeyStream, D: KeyStream> State<S, D> {
     }
 
     pub(super) fn work_outstanding(&self) -> bool {
-        self.merge.in_flight
-            || self.transfers.reaping > 0
-            || self.deletes.in_flight > 0
-            || !self.transfers.running.is_empty()
+        self.merge.in_flight || self.deletes.in_flight > 0 || !self.transfers.running.is_idle()
     }
 
     pub(super) fn is_execution_complete(&self) -> bool {
@@ -537,7 +525,7 @@ impl<S: KeyStream, D: KeyStream> State<S, D> {
             || self.decided.obstructed.any()
             || self.plan_incomplete
             || self.walk_plan_incomplete
-            || self.transfers.outcomes_unknown > 0
+            || self.transfers.outcomes_unknown() > 0
             || (!transfer_active && self.work_outstanding())
     }
 }
@@ -580,12 +568,12 @@ impl<S: KeyStream, D: KeyStream> State<S, D> {
             merge_in_flight: self.merge.in_flight,
             merge_present: self.merge.walk.is_some(),
             transfers_waiting: self.transfers.waiting.len(),
-            children_running: self.transfers.running.len(),
-            children_reaping: self.transfers.reaping,
+            children_running: self.transfers.running.live_len(),
+            children_reaping: self.transfers.running.reaping_len(),
             arrived: self.transfers.arrived,
             bytes: self.transfers.bytes,
             transfer_failures: self.transfers.failures.total(),
-            outcomes_unknown: self.transfers.outcomes_unknown,
+            outcomes_unknown: self.transfers.outcomes_unknown(),
             deletes_waiting: self.deletes.waiting.len(),
             deletes_in_flight: self.deletes.in_flight,
             removed: self.deletes.removed,

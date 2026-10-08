@@ -144,6 +144,7 @@ impl<H: JoinChild, M: Send + 'static> Children<H, M> {
         self.live.len()
     }
 
+    #[cfg(test)]
     pub(crate) fn reaping_len(&self) -> usize {
         self.counts.reaping.load(Ordering::Acquire)
     }
