@@ -6,12 +6,12 @@ Review in two passes. The first pass settles structure. The second checks correc
 
 ## Pass 1: structure
 
-Answer each question with evidence, a path and a symbol, not with an impression. The questions apply to every added or moved module, type, and trait, and to every file over about 1,500 lines.
+Answer each question with evidence, a path and a symbol, not with an impression. The questions apply to every added or moved module, type, and trait, and to every file with more than about 1,500 lines of production code. Count test lines separately. Defects caused by not reusing existing machinery are Pass 1 findings.
 
 ### Reuse
 
 1. **Does existing code already do most of this?** Search for the concept, not only the name. Count the existing copies. A second copy needs a justification; a third copy means the shared part is extracted.
-2. **How do the existing copies differ?** Before extracting a shared part, compare the copies side by side. Compare both their data structures and their behavior on each terminal path: completion, failure, cancellation, and abort. An extraction that unifies divergent behavior is a behavior change, and is stated and tested as one.
+2. **How do the existing copies differ?** Before extracting a shared part, compare the copies side by side. Compare both their data structures and their behavior on each terminal path: completion, failure, cancellation, and abort. An extraction that unifies divergent behavior is a behavior change, and is stated and tested as one. The reviewer lists each divergence; which behavior survives is a blocker question for the maintainers.
 3. **Does the new code re-carry data the framework already provides?** Ids, status, and metrics belong to `TransferContext`. A type that keeps its own copy duplicates them and can diverge from them.
 4. **Could an existing mechanism be called from a different place instead?** Prefer moving a call site over adding a parallel field, counter, or code path.
 
@@ -19,12 +19,12 @@ Answer each question with evidence, a path and a symbol, not with an impression.
 
 5. **Which module owns this concept?** Shared code goes in the lowest module that owns its concept, with dependencies pointing down, as [architecture.md](architecture.md) describes.
 6. **Does the component that defines completion own each finalization step?** Finalization belongs to the state machine's terminal transition, not to a handle.
-7. **Does the work run where the runtime model expects?** Check blocking calls, the thread that runs file I/O, and the cost of each `poll_work` call against the scheduler's contracts.
+7. **Does the work run where the runtime model expects?** Check blocking calls, the thread that runs file I/O, and the cost of each `poll_work` call against [scheduler.md](../design/scheduler.md#bounded-per-call-cost).
 
 ### Shape
 
 8. **Does the module layout match its siblings?** Compare the new module's files with a sibling's. The operation layout and the `test_util` convention are in [architecture.md](architecture.md#conventions).
-9. **Does a large file mix concerns?** Name the concerns and the seams between them.
+9. **Does a large file mix concerns?** Name the concerns and the seams between them. A large inline test module is a test-support question (Q8), not a production split.
 10. **Is the code split too finely?** One file per type scatters a concept. Match the granularity of sibling modules.
 11. **Does the API keep its policy inside the type?** A caller that passes a limit or threshold into every call is computing arithmetic that the type should own.
 12. **Is a variant-specific or speculative accessor hoisted into a shared surface?**
