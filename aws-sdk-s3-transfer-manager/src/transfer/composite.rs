@@ -21,9 +21,18 @@
 //! Each parent decides where its children come from, what a failure means, and what it records
 //! about each child.
 //!
+//! A parent that stops early calls `Children::drain_all` and then `Reaping::cancel`. Each child
+//! then cancels through its own handle and settles before the parent reads its result.
+//!
 //! TODO(vnext): `upload_objects` and `download_objects` keep their own copy of this
 //! bookkeeping. They log a warning with the parent's id when a token drops unconsumed, so moving
 //! them here needs the parent's id in `Children`.
+//!
+//! TODO(vnext): `upload_objects` and `download_objects` cancel their children through
+//! `scheduler.cancel_transfer` on the parent. That call skips each child handle's `abort`, so a
+//! child upload leaves its multipart upload incomplete. When a test drops a sync child's handle in
+//! place of calling `abort`, the child leaves the same incomplete upload in a real bucket.
+//! `Reaping::cancel` gives each child its own `abort`.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -47,6 +56,10 @@ pub(crate) trait JoinChild: Send + 'static {
     fn is_finished(&self) -> bool;
 
     fn join(self) -> impl Future<Output = Result<Self::Output, Error>> + Send;
+
+    /// Cancel the child and wait until it settles. A child that already finished returns its own
+    /// result.
+    fn cancel(self) -> impl Future<Output = Result<Self::Output, Error>> + Send;
 }
 
 #[derive(Debug)]
@@ -119,6 +132,23 @@ impl<H: JoinChild, M: Send + 'static> Children<H, M> {
             .into_iter()
             .filter_map(|id| self.live.remove(&id))
             .collect();
+        let count = children.len();
+        self.counts.reaping.fetch_add(count, Ordering::AcqRel);
+        Some(Reaping {
+            children: Some(children),
+            counts: self.counts.clone(),
+            count,
+            released: false,
+        })
+    }
+
+    /// Move every live child out for a cancel, including each finished child. The batch holds the
+    /// parent busy the same way a reap does.
+    pub(crate) fn drain_all(&mut self) -> Option<Reaping<H, M>> {
+        if self.live.is_empty() {
+            return None;
+        }
+        let children: Vec<(H, M)> = self.live.drain().map(|(_, child)| child).collect();
         let count = children.len();
         self.counts.reaping.fetch_add(count, Ordering::AcqRel);
         Some(Reaping {
@@ -210,6 +240,16 @@ impl<H: JoinChild, M> Reaping<H, M> {
         futures_util::future::join_all(joins).await
     }
 
+    /// Cancel every child concurrently and wait until each one settles. The count stays held until
+    /// `release`.
+    pub(crate) async fn cancel(&mut self) -> Vec<(M, Result<H::Output, Error>)> {
+        let children = self.children.take().expect("a batch settles once");
+        let cancels = children
+            .into_iter()
+            .map(|(handle, record)| async move { (record, handle.cancel().await) });
+        futures_util::future::join_all(cancels).await
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.count
     }
@@ -261,6 +301,16 @@ mod tests {
 
         async fn join(self) -> Result<u64, Error> {
             Ok(self.id)
+        }
+
+        async fn cancel(self) -> Result<u64, Error> {
+            if self.is_finished() {
+                return self.join().await;
+            }
+            Err(Error::new(
+                crate::error::ErrorKind::OperationCancelled,
+                "cancelled",
+            ))
         }
     }
 
@@ -361,6 +411,28 @@ mod tests {
         assert_eq!(children.lost(), 3);
     }
 
+    #[tokio::test]
+    async fn a_cancel_takes_every_child_and_keeps_a_finished_result() {
+        let mut children = with_children(4, &[true, false]);
+        let mut batch = children.drain_all().expect("a batch");
+        assert_eq!(children.live_len(), 0, "a running child stayed behind");
+        assert!(
+            !children.is_idle(),
+            "a batch out for a cancel left the parent idle"
+        );
+        let mut results: Vec<(u64, Option<u64>)> = batch
+            .cancel()
+            .await
+            .into_iter()
+            .map(|(record, result)| (record, result.ok()))
+            .collect();
+        results.sort();
+        assert_eq!(results, [(0, Some(0)), (1, None)]);
+        batch.release();
+        assert!(children.is_idle());
+        assert_eq!(children.lost(), 0);
+    }
+
     #[test]
     fn abandoning_hands_back_every_live_child() {
         let mut children = with_children(4, &[false, true]);
@@ -392,6 +464,10 @@ mod loom_tests {
         }
 
         async fn join(self) -> Result<(), Error> {
+            Ok(())
+        }
+
+        async fn cancel(self) -> Result<(), Error> {
             Ok(())
         }
     }

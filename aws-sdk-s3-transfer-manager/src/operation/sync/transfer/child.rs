@@ -39,6 +39,7 @@ pub(super) enum ChildInner {
         ended: Arc<std::sync::atomic::AtomicBool>,
         moved: u64,
         failed: bool,
+        cancelled: Arc<std::sync::atomic::AtomicUsize>,
     },
 }
 
@@ -93,6 +94,29 @@ impl SyncChild {
                 }
             }
         }
+    }
+
+    // Cancel the child and wait until it settles. A finished child keeps its own result, so the run
+    // joins it. A running child aborts through its handle. An upload aborts its multipart upload,
+    // and a download deletes its temporary file.
+    pub(crate) async fn cancel(self) -> Result<u64, crate::error::Error> {
+        if self.is_finished() {
+            return self.join().await;
+        }
+        match self.inner {
+            ChildInner::Upload(handle) => {
+                handle.abort().await?;
+            }
+            ChildInner::Download(handle) => handle.abort().await,
+            #[cfg(test)]
+            ChildInner::Controlled { cancelled, .. } => {
+                cancelled.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        Err(crate::error::Error::new(
+            crate::error::ErrorKind::OperationCancelled,
+            "the run stopped and cancelled this child",
+        ))
     }
 }
 
@@ -276,5 +300,9 @@ impl crate::transfer::composite::JoinChild for SyncChild {
 
     fn join(self) -> impl std::future::Future<Output = Result<u64, crate::error::Error>> + Send {
         SyncChild::join(self)
+    }
+
+    fn cancel(self) -> impl std::future::Future<Output = Result<u64, crate::error::Error>> + Send {
+        SyncChild::cancel(self)
     }
 }

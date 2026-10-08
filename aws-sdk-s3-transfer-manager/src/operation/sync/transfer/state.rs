@@ -321,6 +321,8 @@ pub(super) struct Transfers<S: KeyStream, D: KeyStream> {
     arrived: u64,
     bytes: u64,
     failures: Sampled<FailedSyncKey>,
+    // This counter holds the children a stopped run cancelled before they finished.
+    cancelled: u64,
     outcomes_unknown: u64,
 }
 
@@ -381,6 +383,17 @@ impl<S: KeyStream, D: KeyStream> Transfers<S, D> {
     // Move up to `MAX_REAP_PER_POLL` finished children out for a reap.
     pub(super) fn take_finished(&mut self) -> Option<Reaping<SyncChild, String>> {
         self.running.drain_terminal()
+    }
+
+    // Move every live child out for a cancel. A stopped run calls this method, and each child then
+    // settles before the run fails.
+    pub(super) fn take_all_to_cancel(&mut self) -> Option<Reaping<SyncChild, String>> {
+        self.running.drain_all()
+    }
+
+    // Count the children a cancel stopped before they finished.
+    pub(super) fn record_cancelled(&mut self, cancelled: u64) {
+        self.cancelled += cancelled;
     }
 
     // Record what a reap learned: how many children arrived and the bytes they moved. The caller
@@ -513,6 +526,7 @@ impl<S: KeyStream, D: KeyStream> State<S, D> {
                 arrived: 0,
                 bytes: 0,
                 failures: Sampled::default(),
+                cancelled: 0,
                 outcomes_unknown: 0,
             },
             deletes: Deletes {
@@ -694,6 +708,7 @@ pub(super) struct RunSnapshot {
     pub(super) arrived: u64,
     pub(super) bytes: u64,
     pub(super) transfer_failures: u64,
+    pub(super) cancelled: u64,
     pub(super) outcomes_unknown: u64,
     pub(super) deletes_waiting: usize,
     pub(super) deletes_in_flight: usize,
@@ -723,6 +738,7 @@ impl<S: KeyStream, D: KeyStream> State<S, D> {
             arrived: self.transfers.arrived,
             bytes: self.transfers.bytes,
             transfer_failures: self.transfers.failures.total(),
+            cancelled: self.transfers.cancelled,
             outcomes_unknown: self.transfers.outcomes_unknown(),
             deletes_waiting: self.deletes.waiting.len(),
             deletes_in_flight: self.deletes.in_flight,

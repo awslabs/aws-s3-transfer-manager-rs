@@ -175,6 +175,7 @@ pub(super) struct SpawnEnded {
     refuse_at: Option<usize>,
     asked: std::sync::atomic::AtomicUsize,
     ended: Arc<std::sync::atomic::AtomicBool>,
+    cancelled: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl SpawnEnded {
@@ -186,6 +187,7 @@ impl SpawnEnded {
             refuse_at: None,
             asked: std::sync::atomic::AtomicUsize::new(0),
             ended: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            cancelled: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -217,6 +219,10 @@ impl SpawnEnded {
             .ended
             .store(false, std::sync::atomic::Ordering::SeqCst);
         spawner
+    }
+
+    pub(super) fn cancelled_count(&self) -> usize {
+        self.cancelled.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub(super) fn asked_count(&self) -> usize {
@@ -252,6 +258,7 @@ impl SpawnChild<crate::io::walk::FsEntry> for SpawnEnded {
                 ended: self.ended.clone(),
                 moved: self.moved,
                 failed: self.fails,
+                cancelled: self.cancelled.clone(),
             },
         })
     }

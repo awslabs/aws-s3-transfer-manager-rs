@@ -651,12 +651,16 @@ first failed entry throws away progress that the next run has to repeat.
 
 **FR-Fail-3** What each policy obliges:
 
-- **Continue** — the run carries on past the failed entry. Every failure MUST be recorded and readable in
-  the result, and the run MUST report completed-with-failures (FR-Fail-5). A failure that only reached a log
-  has been lost.
-- **Abort** — sync MUST stop starting new work promptly, and MUST report which entries completed before it
-  stopped.
-*`[NEW]` — the two policies are the same pair the transfer manager's other directory operations expose, so a caller can compose them without learning a second model.*
+- **Continue** — the run carries on past the failed entry. The run MUST count every failure. The
+  result MUST group the failures by cause (FR-Fail-4). Each failure MUST reach the caller as an
+  event while the run is going (FR-Obs-1). The run MUST report completed-with-failures
+  (FR-Fail-5). The caller loses a failure that only reached a log.
+- **Abort** — sync MUST stop starting new work promptly. Sync MUST cancel every running transfer.
+  Sync MUST wait until each transfer settles, and sync then fails the run. The run's error MUST be
+  the error of the failure that stopped the run. The result MUST report the entries that completed
+  before the run stopped. Sync waits for the response to a delete request it already sent, because
+  S3 may have acted on that request.
+*`[NEW]` — the two policies are the same pair the transfer manager's other directory operations expose, so a caller can compose them without learning a second model. `[CLI]` s3transfer `manager.py` → `TransferManager.__exit__` → `_shutdown` cancels every in-flight transfer. Then `_shutdown` waits for each one, so a fatal error ends the run promptly and leaves no transfer running. `[TM]` `upload_objects` and `download_objects` fail the run at once with `ChildOperationFailed`, and the handle's `join` cancels the children. Sync cancels the children itself, so the run's error stays the failure's own error and keeps its service code. `[DERIVED]` — FR-Fail-4 bounds the result by the number of causes. The result therefore holds counts and groups, and the caller reads each failure from its event.*
 
 **FR-Fail-4** The result MUST report how many entries and bytes were transferred, deleted, skipped as
 unchanged, skipped with a warning, and skipped as unknown (FR-Fail-7). None of it MUST grow with the number

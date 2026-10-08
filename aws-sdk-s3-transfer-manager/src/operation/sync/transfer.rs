@@ -65,6 +65,11 @@ pub(crate) enum SyncWork<S: KeyStream, D: KeyStream> {
     ReapChildren {
         batch: Option<Reaping<SyncChild, String>>,
     },
+    // This variant carries every live child of a stopped run. The work item cancels each child and
+    // waits until it settles.
+    CancelChildren {
+        batch: Option<Reaping<SyncChild, String>>,
+    },
     // Keys waiting for deletion. `deletes_in_flight` counts them after a delete work item takes
     // them.
     DeleteKeys {
@@ -78,6 +83,9 @@ impl<S: KeyStream, D: KeyStream> fmt::Debug for SyncWork<S, D> {
             SyncWork::AdvanceMerge { .. } => f.write_str("AdvanceMerge"),
             SyncWork::ReapChildren { batch } => {
                 write!(f, "ReapChildren({:?})", batch.as_ref().map(Reaping::len))
+            }
+            SyncWork::CancelChildren { batch } => {
+                write!(f, "CancelChildren({:?})", batch.as_ref().map(Reaping::len))
             }
             SyncWork::DeleteKeys { keys } => write!(f, "DeleteKeys({})", keys.len()),
         }
@@ -226,6 +234,12 @@ where
             }
         }
 
+        // A stopped run cancels its live children before it fails. Each child settles first, so the
+        // run reports every child's outcome.
+        if let Some(work) = self.dispatch_cancel(&mut state) {
+            return work;
+        }
+
         // Reap terminal children after cancellation. The run still needs each child outcome.
         if let Some(work) = self.dispatch_reap(&mut state) {
             return work;
@@ -246,9 +260,6 @@ where
     fn has_stopped(&self, state: &State<S, D>) -> bool {
         !self.inner.ctx.is_active() || state.is_stopped()
     }
-
-    // Record the first aborting failure. The terminal path sets the transfer result after
-    // outstanding work returns.
 
     // Return the run outcome. Failures outrank warnings; warnings outrank a clean result.
     pub(crate) fn outcome(&self) -> RunOutcome {
@@ -347,6 +358,20 @@ where
         }))
     }
 
+    // Hand every live child of a stopped run to a cancel. A run that its caller cancelled skips
+    // this step, because the scheduler already cancelled the run's children.
+    fn dispatch_cancel(&self, state: &mut State<S, D>) -> Option<PollWork> {
+        if !state.is_stopped() || !self.inner.ctx.is_active() {
+            return None;
+        }
+        let batch = state.transfers.take_all_to_cancel()?;
+        Some(PollWork::ready(IoRequest {
+            data: Some(Box::new(SyncWork::<S, D>::CancelChildren {
+                batch: Some(batch),
+            })),
+        }))
+    }
+
     // Hand the merge to a work item. When no merge work remains, the poll chooses `Done` or
     // `Pending`.
     fn dispatch_merge(&self, state: &mut State<S, D>) -> Option<PollWork> {
@@ -368,6 +393,10 @@ where
             SyncWork::ReapChildren { batch } => {
                 let batch = batch.take().expect("the reap was already taken");
                 self.execute_reap(batch).await
+            }
+            SyncWork::CancelChildren { batch } => {
+                let batch = batch.take().expect("the cancel was already taken");
+                self.execute_cancel(batch).await
             }
             SyncWork::DeleteKeys { keys } => {
                 let keys = std::mem::take(keys);
@@ -446,6 +475,40 @@ where
         for failure in failures {
             state.fail_transfer(failure, &self.inner.failure_policy);
         }
+        state.transfers.record_reap(batch, arrived, moved);
+        if self.check_terminal(&mut state).is_some() {
+            drop(state);
+            return WorkOutcome::Success { data: None };
+        }
+        drop(state);
+        self.inner.ctx.try_wake();
+        WorkOutcome::Success { data: None }
+    }
+
+    // A finished child keeps its own result. A child the cancel stopped counts as cancelled. A
+    // child that failed on its own counts as a failure.
+    async fn execute_cancel(&self, mut batch: Reaping<SyncChild, String>) -> WorkOutcome {
+        let mut moved = 0u64;
+        let mut arrived = 0u64;
+        let mut cancelled = 0u64;
+        let mut failures = Vec::new();
+        for (key, result) in batch.cancel().await {
+            match result {
+                Ok(bytes) => {
+                    arrived += 1;
+                    moved += bytes;
+                }
+                Err(err) if *err.kind() == crate::error::ErrorKind::OperationCancelled => {
+                    cancelled += 1;
+                }
+                Err(err) => failures.push(FailedSyncKey::new(key, err)),
+            }
+        }
+        let mut state = self.inner.state.lock();
+        for failure in failures {
+            state.fail_transfer(failure, &self.inner.failure_policy);
+        }
+        state.transfers.record_cancelled(cancelled);
         state.transfers.record_reap(batch, arrived, moved);
         if self.check_terminal(&mut state).is_some() {
             drop(state);

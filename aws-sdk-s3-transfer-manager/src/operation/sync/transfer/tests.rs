@@ -1420,14 +1420,13 @@ async fn a_stopped_run_reports_fewer_arrivals_than_it_decided() {
         let _ = transfer.execute(&mut work).await;
     }
     let _ = transfer.poll_work();
-    let _ = transfer.poll_work();
     assert!(
         transfer.inner.state.lock().snapshot().transfers_waiting > 0,
         "nothing was left buffered, so this proves nothing about the counts"
     );
 
-    spawner.release(&ctx);
     drive(&transfer).await;
+    assert!(ctx.is_failed(), "the aborting run did not fail");
 
     let snapshot = transfer.inner.state.lock().snapshot();
     assert!(
@@ -1440,9 +1439,13 @@ async fn a_stopped_run_reports_fewer_arrivals_than_it_decided() {
         snapshot.decided.transfers
     );
     assert_eq!(
-        snapshot.arrived, 1,
-        "one key arrived and the run reports {}",
-        snapshot.arrived
+        (
+            snapshot.arrived,
+            snapshot.cancelled,
+            spawner.cancelled_count()
+        ),
+        (0, 1, 1),
+        "the run did not cancel the child it held open"
     );
     assert!(
         snapshot.plan_incomplete,
@@ -1948,6 +1951,90 @@ async fn a_child_that_failed_ends_an_aborting_run() {
             "under {policy:?} the run's status does not match the policy"
         );
     }
+}
+
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn an_aborting_run_cancels_its_running_children_and_waits_for_them() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    a_local_tree(dir.path(), &["a.txt", "b.txt"]);
+    // The child for `a.txt` stays open. The spawn for `b.txt` fails, and the failure aborts the
+    // run.
+    let spawner = Arc::new(SpawnEnded::holding_open_but_refusing_at(1));
+    let (transfer, ctx) =
+        uploading_with_policy(dir.path(), spawner.clone(), 4, FailedTransferPolicy::Abort);
+
+    drive(&transfer).await;
+
+    assert_eq!(
+        spawner.cancelled_count(),
+        1,
+        "the run left its open child running"
+    );
+    let snapshot = transfer.inner.state.lock().snapshot();
+    assert_eq!(
+        (
+            snapshot.cancelled,
+            snapshot.children_running,
+            snapshot.children_reaping
+        ),
+        (1, 0, 0),
+        "the run failed before its cancelled child settled"
+    );
+    let err = ctx.take_error().expect("an aborting run attached no error");
+    assert_eq!(
+        *err.kind(),
+        crate::error::ErrorKind::ObjectNotDiscoverable,
+        "the run error is not the failure that stopped the run"
+    );
+}
+
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn a_continuing_run_lets_its_children_finish() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    a_local_tree(dir.path(), &["a.txt", "b.txt", "c.txt"]);
+    let spawner = Arc::new(SpawnEnded::holding_open_but_refusing_at(1));
+    let (transfer, ctx) = uploading_with_policy(
+        dir.path(),
+        spawner.clone(),
+        4,
+        FailedTransferPolicy::Continue,
+    );
+
+    loop {
+        match transfer.poll_work() {
+            PollWork::Ready { io: mut work, .. } => {
+                transfer.execute(&mut work).await;
+            }
+            PollWork::Spawned => {}
+            _ => break,
+        }
+    }
+    assert_eq!(
+        transfer.inner.state.lock().snapshot().children_running,
+        2,
+        "the run started the two children it could build"
+    );
+    assert_eq!(
+        spawner.cancelled_count(),
+        0,
+        "a failure cancelled a child under Continue"
+    );
+
+    spawner.release(&ctx);
+    drive(&transfer).await;
+
+    let snapshot = transfer.inner.state.lock().snapshot();
+    assert_eq!(
+        (
+            snapshot.arrived,
+            snapshot.cancelled,
+            snapshot.transfer_failures
+        ),
+        (2, 0, 1),
+        "a continuing run did not let both open children arrive"
+    );
 }
 
 #[cfg_attr(miri, ignore)]
@@ -2458,9 +2545,9 @@ async fn a_decision_a_stopped_run_gives_back_keeps_the_decision_it_was_made_with
     while let PollWork::Ready { io: mut work, .. } = transfer.poll_work() {
         transfer.execute(&mut work).await;
     }
-    let _ = transfer.poll_work();
-    let _ = transfer.poll_work();
-    let _ = transfer.poll_work();
+    // The test keeps each returned work item, so the cancel batch stays out and the run stays
+    // stopped while the test reads it.
+    let _held: Vec<PollWork> = (0..3).map(|_| transfer.poll_work()).collect();
 
     let state = transfer.inner.state.lock();
     let snapshot = state.snapshot();
@@ -4165,6 +4252,119 @@ mod real_bucket {
         assert_eq!(
             again.transfers, 0,
             "the second download fetched the object again"
+        );
+
+        remove_prefix(&c, &prefix).await;
+    }
+
+    // This spawner builds real upload children and refuses to build one for `refused`.
+    struct SpawnUploadRefusing {
+        upload: SpawnUpload,
+        refused: &'static str,
+    }
+
+    impl SpawnChild<crate::io::walk::FsEntry> for SpawnUploadRefusing {
+        fn spawn(
+            &self,
+            key: &str,
+            source: &crate::io::walk::FsEntry,
+            parent: u64,
+        ) -> Result<SyncChild, crate::error::Error> {
+            if key == self.refused {
+                return Err(crate::error::Error::new(
+                    crate::error::ErrorKind::IOError,
+                    "the test refuses this key",
+                ));
+            }
+            self.upload.spawn(key, source, parent)
+        }
+    }
+
+    async fn incomplete_uploads(c: &aws_sdk_s3::Client, prefix: &str) -> Vec<String> {
+        let page = c
+            .list_multipart_uploads()
+            .bucket(regular_bucket())
+            .prefix(prefix)
+            .send()
+            .await
+            .expect("the multipart listing answers");
+        page.uploads()
+            .iter()
+            .filter_map(|u| u.key().map(str::to_string))
+            .collect()
+    }
+
+    #[ignore = "will be moved to examples"]
+    #[tokio::test]
+    async fn real_bucket_abort_leaves_no_incomplete_multipart_upload() {
+        let c = real_client().await;
+        let prefix = a_run_prefix("abort-multipart");
+        let src = tempfile::tempdir().expect("a temp dir");
+        // The large file sorts first, so its upload starts before the refused key fails the run.
+        std::fs::write(src.path().join("a.dat"), vec![7u8; 64 * 1024 * 1024])
+            .expect("the file is written");
+        std::fs::write(src.path().join("z.txt"), "refused").expect("the file is written");
+
+        let config = crate::Config::builder().client(c.clone()).build();
+        let handle = crate::client::Handle::test_handle_managed(config);
+        let (ctx, rx) = TransferContext::new(handle);
+        let walk = Walker::builder()
+            .build()
+            .uploading(
+                LocalAndBucket::builder()
+                    .local_root(src.path())
+                    .client(c.clone())
+                    .bucket(regular_bucket())
+                    .prefix(&prefix)
+                    .build(),
+            )
+            .expect("an ordinary bucket builds");
+        let transfer = SyncTransfer::new(
+            ctx.clone(),
+            walk,
+            Mode::default().uploading(),
+            Arc::new(SpawnUploadRefusing {
+                upload: SpawnUpload::new(ctx.handle.clone(), regular_bucket(), Some(&prefix)),
+                refused: "z.txt",
+            }),
+            Arc::new(DeleteFromBucket::new(
+                c.clone(),
+                regular_bucket(),
+                Some(&prefix),
+            )),
+            RunSettings {
+                max_children: 8,
+                delete_mode: DeleteMode::Off,
+                failure_policy: FailedTransferPolicy::Abort,
+            },
+        );
+        ctx.handle
+            .scheduler
+            .enqueue_transfer(Box::new(transfer.clone()));
+        tokio::time::timeout(Duration::from_secs(300), rx)
+            .await
+            .expect("the aborting run did not finish inside five minutes")
+            .expect("the terminal signal was dropped");
+
+        let snapshot = transfer.inner.state.lock().snapshot();
+        println!(
+            "  abort: cancelled={} arrived={}",
+            snapshot.cancelled, snapshot.arrived
+        );
+        assert!(ctx.is_failed(), "the aborting run did not fail");
+        assert_eq!(
+            snapshot.cancelled, 1,
+            "the large upload finished first, so this run proves nothing about the cancel"
+        );
+        assert_eq!(
+            incomplete_uploads(&c, &prefix).await,
+            Vec::<String>::new(),
+            "the cancelled child left its multipart upload incomplete"
+        );
+        assert_eq!(
+            bucket_keys(&c, &prefix).await,
+            Vec::<String>::new(),
+            "the cancelled child left an object behind"
         );
 
         remove_prefix(&c, &prefix).await;
