@@ -9,7 +9,6 @@
 //! discovers objects, the parent spawns child downloads (via
 //! [`Download::orchestrate_with_sink`]), and reaps them as they complete.
 
-use aws_sdk_s3::types::Object;
 use parking_lot::Mutex;
 use path_clean::PathClean;
 use std::borrow::Cow;
@@ -21,6 +20,7 @@ use std::sync::Arc;
 
 use crate::error::{self, Error, ErrorKind};
 use crate::io::walk::S3Walk;
+use crate::model::Object;
 use crate::operation::download::{Download, DownloadInput, ManagedDownloadHandle};
 use crate::transfer::{
     IoRequest, PendingCause, PollWork, Transfer, TransferContext, TransferId, WorkOutcome,
@@ -2302,9 +2302,12 @@ mod tests {
             );
             let mut state = transfer.inner.state.lock();
             for i in 0..WALK_LOW_WATER {
-                state
-                    .pending_entries
-                    .push_back(Object::builder().key(format!("k{i}")).size(1).build());
+                state.pending_entries.push_back(
+                    crate::model::Object::builder()
+                        .key(format!("k{i}"))
+                        .size(1)
+                        .build(),
+                );
             }
             assert!(
                 transfer.dispatch_walk(&mut state).is_none(),

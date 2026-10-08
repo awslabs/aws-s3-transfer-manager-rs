@@ -6,9 +6,8 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use aws_sdk_s3::types::Object;
-
 use super::error::{WalkError, WalkErrorKind};
+use crate::model::Object;
 use crate::types::BucketType;
 
 type FilterFn = Arc<dyn Fn(&Object) -> bool + Send + Sync>;
@@ -205,7 +204,9 @@ impl S3WalkerBuilder {
 
     /// Set a filter predicate applied to each discovered object.
     ///
-    /// Returning `false` drops the object silently.
+    /// The predicate receives a [`crate::model::Object`] containing the
+    /// metadata returned by `ListObjectsV2`. Returning `false` drops the
+    /// object silently.
     #[must_use]
     pub fn filter(mut self, f: impl Fn(&Object) -> bool + Send + Sync + 'static) -> Self {
         self.filter = Some(Arc::new(f));
@@ -327,7 +328,8 @@ impl S3WalkContextBuilder {
 /// A running S3 walk, yielding objects from a bucket listing.
 ///
 /// Created by [`S3Walker::walk`]. The walk pages through the bucket,
-/// buffering objects and yielding them via [`next`](Self::next).
+/// buffering [`crate::model::Object`] values and yielding them via
+/// [`next`](Self::next).
 pub struct S3Walk {
     config: S3Walker,
     client: aws_sdk_s3::Client,
@@ -353,7 +355,7 @@ impl std::fmt::Debug for S3Walk {
 }
 
 impl S3Walk {
-    /// Return the next object from the walk.
+    /// Return the next [`crate::model::Object`] from the walk.
     ///
     /// Returns:
     /// - `Some(Ok(object))` for an object that passed the filter.
@@ -484,7 +486,12 @@ impl S3Walk {
             .await
             .map_err(|e| WalkError::new(None, WalkErrorKind::Service, Box::new(e)))?;
 
-        let mut objects: Vec<Object> = output.contents.unwrap_or_default();
+        let mut objects: Vec<Object> = output
+            .contents
+            .unwrap_or_default()
+            .into_iter()
+            .map(|object| crate::sdk_v1::object_from_sdk(&object))
+            .collect();
         if let Some(ref filter) = self.config.filter {
             objects.retain(|obj| filter(obj));
         }
@@ -592,13 +599,14 @@ mod tests {
         let client = mock_client!(aws_sdk_s3, RuleMode::Sequential, &[&rule]);
 
         let mut walk = walker()
-            .filter(|obj| !obj.key().unwrap_or("").ends_with('/'))
+            .filter(|obj: &crate::model::Object| !obj.key().unwrap_or("").ends_with('/'))
             .build()
             .walk(s3ctx(client, "test-bucket"));
 
         let mut keys = Vec::new();
         while let Some(result) = walk.next().await {
-            keys.push(result.unwrap().key.unwrap());
+            let object: crate::model::Object = result.unwrap();
+            keys.push(object.key.unwrap());
         }
         assert_eq!(keys, vec!["file.txt", "other.txt"]);
     }
