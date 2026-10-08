@@ -79,7 +79,9 @@ pub enum ErrorKind {
     /// as a response missing required metadata.
     ObjectNotDiscoverable,
 
-    /// A request to S3 failed. The originating operation, service error code,
+    /// A request to S3 failed, or S3 answered with a response the transfer
+    /// cannot use, such as an UploadPart response without an ETag. The
+    /// originating operation, service error code (when S3 reported one),
     /// message, and request ids are available via the accessors on [`Error`]
     /// ([`Error::operation_name`], [`Error::code`], [`Error::request_id`]).
     ///
@@ -158,7 +160,8 @@ impl ChunkRef {
     }
 }
 
-/// Service-call detail read from the concrete `SdkError`.
+/// Service-call detail, read from the concrete `SdkError` of a failed request, or from the output
+/// of a successful response the transfer cannot use.
 #[derive(Debug)]
 struct ServiceMetadata {
     operation: &'static str,
@@ -595,6 +598,37 @@ where
         extra: Some(Box::new(ErrorExtra {
             service: Some(service),
             transient_transport,
+            ..Default::default()
+        })),
+    }
+}
+
+/// Converts a successful S3 response that the transfer cannot use, such as one missing a field
+/// the transfer requires, into an [`ErrorKind::ServiceError`].
+///
+/// The error carries the same service metadata as one converted from a failed request:
+/// `operation`, `message`, and the request ids read from `output`. `code` is `None` because S3
+/// reported no error. `message` is also the error's source, so it appears in the error chain.
+pub(crate) fn invalid_service_response<O>(
+    operation: &'static str,
+    output: &O,
+    message: impl Into<String>,
+) -> Error
+where
+    O: RequestId + RequestIdExt,
+{
+    let message = message.into();
+    Error {
+        kind: ErrorKind::ServiceError,
+        source: message.clone().into(),
+        extra: Some(Box::new(ErrorExtra {
+            service: Some(ServiceMetadata {
+                operation,
+                code: None,
+                message: Some(message),
+                request_id: output.request_id().map(str::to_owned),
+                extended_request_id: output.extended_request_id().map(str::to_owned),
+            }),
             ..Default::default()
         })),
     }

@@ -310,6 +310,19 @@ impl PartData {
     ///
     /// The data is retained without copying and uses the SDK's native
     /// contiguous request-body path.
+    ///
+    /// `part_number` is the part's position in the object: S3 assembles the
+    /// object in part-number order, whatever order the parts are produced in.
+    /// It must be between 1 and 10,000 and unique within the upload. A number
+    /// outside that range fails the upload with
+    /// [`ErrorKind::InputInvalid`](crate::error::ErrorKind::InputInvalid)
+    /// before the part is sent; a repeated number fails it with the same kind
+    /// before the upload is completed.
+    ///
+    /// Number parts 1 to N without gaps. S3 requires part numbers to start at 1
+    /// and be consecutive in a directory bucket, and in a general purpose
+    /// bucket when parts carry a CRC32, CRC32C, SHA-1 or SHA-256 checksum; it
+    /// rejects other numbering when the upload is completed.
     pub fn new(part_number: u64, data: impl Into<Bytes>) -> Self {
         Self::from_segmented(part_number, SegmentedBytes::from(data.into()))
     }
@@ -318,11 +331,20 @@ impl PartData {
     ///
     /// The transfer manager retains the payload's immutable owners through
     /// request retries without gathering its presentation segments.
+    ///
+    /// `part_number` is the part's position in the object: S3 assembles the
+    /// object in part-number order, whatever order the parts are produced in.
+    /// It must be between 1 and 10,000 and unique within the upload. A number
+    /// outside that range fails the upload with
+    /// [`ErrorKind::InputInvalid`](crate::error::ErrorKind::InputInvalid)
+    /// before the part is sent; a repeated number fails it with the same kind
+    /// before the upload is completed.
+    ///
+    /// Number parts 1 to N without gaps. S3 requires part numbers to start at 1
+    /// and be consecutive in a directory bucket, and in a general purpose
+    /// bucket when parts carry a CRC32, CRC32C, SHA-1 or SHA-256 checksum; it
+    /// rejects other numbering when the upload is completed.
     pub fn from_segmented(part_number: u64, data: SegmentedBytes) -> Self {
-        debug_assert!(
-            part_number > 0,
-            "part numbers are 1-indexed and must be greater than zero"
-        );
         Self {
             part_number,
             data,
@@ -335,9 +357,12 @@ impl PartData {
     /// (base64 encoding of the big-endian checksum value for this part's data
     /// using the algorithm specified in the [ChecksumStrategy](crate::operation::upload::ChecksumStrategy)).
     ///
-    /// If you don't set this, the Transfer Manager will calculate one
-    /// automatically, unless you've explicitly disabled checksum calculation
-    /// (see [ChecksumStrategy](crate::operation::upload::ChecksumStrategy)).
+    /// The value is sent with the part only if the upload has a checksum
+    /// strategy, either set on the upload or applied by default; otherwise it is
+    /// ignored. If you don't set it, the SDK calculates the part's checksum as it
+    /// sends the part, when the S3 client's `request_checksum_calculation` is
+    /// `WhenSupported` (the default). See
+    /// [ChecksumStrategy](crate::operation::upload::ChecksumStrategy).
     pub fn with_checksum(mut self, checksum: impl Into<String>) -> Self {
         self.checksum = Some(checksum.into());
         self
@@ -369,6 +394,10 @@ pub trait PartStream {
     /// Parts should contain [`StreamContext::part_size`] bytes except for the final part, which may
     /// be shorter. Returns [`Poll::Ready(None)`](std::task::Poll::Ready) at end-of-stream. The
     /// transfer manager does not poll the stream again after end-of-stream or an error.
+    ///
+    /// Each part's number is its position in the object, between 1 and 10,000, unique within the
+    /// upload, and best numbered 1 to N without gaps. Parts may be returned in any order (see
+    /// [`PartData::new`]).
     ///
     /// Returns [`Poll::Pending`](std::task::Poll::Pending) when the next part is not ready. Before
     /// returning `Pending`, the implementation must arrange for `cx.waker()` to be notified when
@@ -407,6 +436,8 @@ pub trait PartStream {
     ///
     /// Return the base64 encoding of the big-endian checksum value of the full object's data,
     /// using the algorithm specified in the [ChecksumStrategy](crate::operation::upload::ChecksumStrategy)).
+    /// The value must cover the object's bytes in part-number order, which is the order S3
+    /// assembles them in, not necessarily the order the parts were returned.
     fn full_object_checksum(&self) -> Option<String> {
         None
     }
