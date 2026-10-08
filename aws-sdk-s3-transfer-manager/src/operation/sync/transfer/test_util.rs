@@ -223,7 +223,7 @@ impl SpawnChild<crate::io::walk::FsEntry> for SpawnEnded {
         _key: &str,
         _source: &crate::io::walk::FsEntry,
         _parent: u64,
-    ) -> Result<ChildHandle, crate::error::Error> {
+    ) -> Result<SyncChild, crate::error::Error> {
         let n = self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if self.refuses || self.refuse_at == Some(n) {
             return Err(crate::error::Error::new(
@@ -231,7 +231,7 @@ impl SpawnChild<crate::io::walk::FsEntry> for SpawnEnded {
                 "the child could not be built",
             ));
         }
-        Ok(ChildHandle {
+        Ok(SyncChild {
             id: crate::transfer::TransferId {
                 id: 900_000 + n as u64,
                 parent: None,

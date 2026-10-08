@@ -16,7 +16,7 @@ use crate::operation::sync::walk::{Progress, Walk};
 use crate::transfer::{IoRequest, PollWork, Transfer, TransferContext, WorkOutcome};
 use crate::types::FailedTransferPolicy;
 
-use child::{ChildHandle, SpawnChild};
+use child::{SpawnChild, SyncChild};
 use delete::DeleteKeys;
 use state::{Decided, State};
 
@@ -58,7 +58,7 @@ pub(crate) enum SyncWork<S: KeyStream, D: KeyStream> {
     AdvanceMerge { walk: Option<Box<Walk<S, D>>> },
     // Terminal children waiting for a reap. `reap_in_flight` counts them after they leave
     // `children`.
-    ReapChildren { children: Vec<ChildHandle> },
+    ReapChildren { children: Vec<SyncChild> },
     // Keys waiting for deletion. `deletes_in_flight` counts them after a delete work item takes
     // them.
     DeleteKeys { keys: Vec<String> },
@@ -432,7 +432,7 @@ where
         WorkOutcome::Success { data: None }
     }
 
-    async fn execute_reap(&self, children: Vec<ChildHandle>) -> WorkOutcome {
+    async fn execute_reap(&self, children: Vec<SyncChild>) -> WorkOutcome {
         let count = children.len();
         let mut moved = 0u64;
         let mut arrived = 0u64;

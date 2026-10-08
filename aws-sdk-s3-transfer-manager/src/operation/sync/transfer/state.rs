@@ -14,7 +14,7 @@ use crate::io::key::stream::{KeyStream, StreamError};
 use crate::operation::sync::compare::Decision;
 use crate::operation::sync::walk::{Pairing, Progress, Walk};
 
-use super::child::ChildHandle;
+use super::child::SyncChild;
 
 // How many failures a run keeps. The walk reports failures per entry, so keeping every failure
 // would grow memory with the tree. The run keeps the first failures and counts the rest.
@@ -264,7 +264,7 @@ impl<S: KeyStream, D: KeyStream> Merge<S, D> {
 // A child moves from `waiting` to `running` to `reaping`; the counters and failures record the result.
 pub(super) struct Transfers<S: KeyStream, D: KeyStream> {
     waiting: VecDeque<Qualified<S::Source, D::Source>>,
-    running: std::collections::HashMap<crate::transfer::TransferId, ChildHandle>,
+    running: std::collections::HashMap<crate::transfer::TransferId, SyncChild>,
     reaping: usize,
     arrived: u64,
     bytes: u64,
@@ -290,7 +290,7 @@ impl<S: KeyStream, D: KeyStream> Transfers<S, D> {
     }
 
     // Record a child that started. A later reap joins it.
-    pub(super) fn start(&mut self, child: ChildHandle) {
+    pub(super) fn start(&mut self, child: SyncChild) {
         self.running.insert(child.id(), child);
     }
 
@@ -301,7 +301,7 @@ impl<S: KeyStream, D: KeyStream> Transfers<S, D> {
 
     // Move finished children out of `running` for a reap. `reaping` counts them until the reap
     // reports back.
-    pub(super) fn take_finished(&mut self) -> Option<Vec<ChildHandle>> {
+    pub(super) fn take_finished(&mut self) -> Option<Vec<SyncChild>> {
         let finished: Vec<crate::transfer::TransferId> = self
             .running
             .iter()
@@ -311,7 +311,7 @@ impl<S: KeyStream, D: KeyStream> Transfers<S, D> {
         if finished.is_empty() {
             return None;
         }
-        let children: Vec<ChildHandle> = finished
+        let children: Vec<SyncChild> = finished
             .into_iter()
             .map(|id| self.running.remove(&id).expect("id came from this map"))
             .collect();
@@ -342,10 +342,10 @@ impl<S: KeyStream, D: KeyStream> Transfers<S, D> {
     // method reads their bytes first, because dropping a handle cancels its child.
     pub(super) fn abandon_running(
         &mut self,
-    ) -> std::collections::HashMap<crate::transfer::TransferId, ChildHandle> {
+    ) -> std::collections::HashMap<crate::transfer::TransferId, SyncChild> {
         if !self.running.is_empty() {
             self.outcomes_unknown += self.running.len() as u64;
-            let moved: u64 = self.running.values().map(ChildHandle::bytes_so_far).sum();
+            let moved: u64 = self.running.values().map(SyncChild::bytes_so_far).sum();
             self.bytes += moved;
         }
         std::mem::take(&mut self.running)

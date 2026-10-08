@@ -6,7 +6,7 @@
 //! This module builds the child transfers a sync run starts.
 //!
 //! An upload child sends one local file to the bucket. A download child writes one object to a
-//! temporary file and renames the file after the bytes arrive. The run holds a `ChildHandle` for
+//! temporary file and renames the file after the bytes arrive. The run holds a `SyncChild` for
 //! each child and asks it whether the child finished and how many bytes it moved.
 
 use parking_lot::Mutex;
@@ -20,12 +20,11 @@ use super::local_path_for_key;
 pub(crate) trait SpawnChild<S>: Send + Sync {
     // Enqueue a child for this key and hand back a way to ask after it. The key is the relative
     // one both sides agree on; turning it into an address is this implementation's business.
-    fn spawn(&self, key: &str, source: &S, parent: u64)
-        -> Result<ChildHandle, crate::error::Error>;
+    fn spawn(&self, key: &str, source: &S, parent: u64) -> Result<SyncChild, crate::error::Error>;
 }
 
 // Sync asks a child whether it finished and how many bytes it moved.
-pub(crate) struct ChildHandle {
+pub(crate) struct SyncChild {
     pub(super) id: crate::transfer::TransferId,
     pub(super) inner: ChildInner,
 }
@@ -43,13 +42,13 @@ pub(super) enum ChildInner {
     },
 }
 
-impl fmt::Debug for ChildHandle {
+impl fmt::Debug for SyncChild {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ChildHandle").field("id", &self.id).finish()
+        f.debug_struct("SyncChild").field("id", &self.id).finish()
     }
 }
 
-impl ChildHandle {
+impl SyncChild {
     pub(crate) fn id(&self) -> crate::transfer::TransferId {
         self.id
     }
@@ -130,7 +129,7 @@ impl SpawnChild<crate::io::walk::FsEntry> for SpawnUpload {
         key: &str,
         source: &crate::io::walk::FsEntry,
         parent: u64,
-    ) -> Result<ChildHandle, crate::error::Error> {
+    ) -> Result<SyncChild, crate::error::Error> {
         // Hand the builder the metadata the walk already read. Without it the builder stats the
         // path again: a blocking syscall inside a poll, once per key, for a size the comparison has
         // already decided from. A second read can also disagree with the first.
@@ -150,7 +149,7 @@ impl SpawnChild<crate::io::walk::FsEntry> for SpawnUpload {
             input,
             parent,
         )?;
-        Ok(ChildHandle {
+        Ok(SyncChild {
             id: handle.id(),
             inner: ChildInner::Upload(handle),
         })
@@ -208,7 +207,7 @@ impl SpawnChild<aws_sdk_s3::types::Object> for SpawnDownload {
         key: &str,
         _source: &aws_sdk_s3::types::Object,
         parent: u64,
-    ) -> Result<ChildHandle, crate::error::Error> {
+    ) -> Result<SyncChild, crate::error::Error> {
         let dest_path = self.file_path(key)?;
         if let Some(parent_dir) = dest_path.parent() {
             // A missing destination means every key is absent. The download creates directories as
@@ -257,7 +256,7 @@ impl SpawnChild<aws_sdk_s3::types::Object> for SpawnDownload {
         let handle =
             crate::operation::download::ManagedDownloadHandle::new(inner, temp_path, dest_path)
                 .stamp_modified_time();
-        Ok(ChildHandle {
+        Ok(SyncChild {
             id: handle.transfer_id(),
             inner: ChildInner::Download(handle),
         })
