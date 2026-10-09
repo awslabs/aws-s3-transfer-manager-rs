@@ -540,10 +540,12 @@ otherwise a run against a requester-pays bucket fails at the first listing, befo
 considered.
 *`[CLI]` `utils.py` → `RequestParamsMapper._set_request_payer_param`, `map_list_objects_v2_params`; `subcommands.py` → `_map_request_payer_params` applies it to both `HeadObject` and `ListObjectsV2` request parameters for both generators. `[DOC]` `--request-payer`.*
 
-**FR-Exec-12** Transfers MAY happen in any order, but within a single run a delete and a transfer for the
-same relative key MUST NOT overlap. Otherwise the outcome depends on which finishes last, and the same run
-could leave the key either present or absent.
-*`[DERIVED]` from `comparator.py` → `Comparator.call`: each `compare_key` resolves to exactly one branch (`equal`, `less_than`, `greater_than`), so a key can never be both transferred and deleted in the same run.*
+**FR-Exec-12** Transfers MAY happen in any order. Within a single run, a delete and a transfer MUST NOT
+overlap when they touch the same place. On a bucket, the same place means the same relative key. On a
+local tree, it also means a name on a transfer's path. A download of `photos/a.jpg` waits for the removal
+of the file or link `photos`. Otherwise the outcome depends on the order the work finishes in. The same
+run could leave a key either present or absent, or write outside the root.
+*`[DERIVED]` from `comparator.py` → `Comparator.call`: each `compare_key` resolves to exactly one branch (`equal`, `less_than`, `greater_than`), so a key can never be both transferred and deleted in the same run. `[NEW]` — the path rule covers what a local tree adds. A download writes `photos/a.jpg` through whatever stands at `photos`. When the removal of `photos` lands after the download starts, the file lands outside the root, or the run ends with neither key.*
 
 **FR-Exec-13** A destination file MUST NOT be truncated or removed until its replacement has been
 retrieved: a failed download MUST leave previous local content intact.

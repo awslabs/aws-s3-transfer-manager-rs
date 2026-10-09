@@ -77,9 +77,8 @@ does not poll its parent. Every dispatched work item signals the parent after it
 changes state or finishes. A merge advance, a reap, and a delete batch each do
 this. A missing signal leaves the run pending with work it cannot observe.
 
-`upload_objects` and `download_objects` follow the same rule. They signal after
-they publish work while their walks continue. Sync needs that behavior for both
-walks: a merge can produce keys, signal the parent, and keep comparing.
+The merge follows the same rule while both walks continue. A merge can produce
+keys, signal the parent, and keep comparing.
 
 **D2. Sync implements `Transfer`. `poll_work` selects work. `execute` waits.**
 The `Transfer` trait is the scheduler's contract with an operation. It has four
@@ -117,7 +116,27 @@ The loop uses source and destination as roles. The caller supplies two
 direction-specific parts: the child factory and the comparison rule. Upload and
 download differ there. One loop keeps their completion condition the same.
 
-**D3. A run ends after every scheduled item returns.** Reaping moves a
+**D3. One composite module keeps the child bookkeeping.**
+`transfer/composite.rs` holds the bookkeeping every composite transfer needs. A
+child slot moves from reserved, to live, to reaping, to released, and a token
+owns each step outside the parent's state lock:
+
+| step | token | if the token drops early |
+| --- | --- | --- |
+| reserved | `Reservation` | It gives the slot back. |
+| reaping | `Reaping` | It counts its children as lost. |
+
+A work item that the scheduler purges, or that panics, still gives its slots
+back. The parent reads `Children::lost` and reports each lost child's outcome as
+unknown.
+
+A child handle implements `JoinChild`. The parent asks the handle whether the
+child finished, joins it for its result, or cancels it and waits until it
+settles (D5). `SyncChild` is sync's handle for an upload or a download. It
+reports the two facts a reap needs: whether the child succeeded, and how many
+bytes it moved. The reap then treats every child the same way.
+
+**D4. A run ends after every scheduled item returns.** Reaping moves a
 finished child from the child list into a work item. The merge can exhaust both
 walks. The reap can empty the child list while it still holds a child's result.
 The run stays open until the reap returns.
@@ -130,7 +149,7 @@ Stopping and finishing are separate facts. Stopping blocks new work. Finishing
 says every scheduled item returned. The scheduler never polls a finished run, so
 the run marks itself finished last.
 
-**D4. One failure policy governs execution failures. `Continue` is the
+**D5. One failure policy governs execution failures. `Continue` is the
 default.** **FR-Fail-9** names five sites:
 
 1. The walk cannot read a listed entry.
@@ -140,8 +159,15 @@ default.** **FR-Fail-9** names five sites:
 5. A destination refuses a delete.
 
 `Continue` records a failure and lets the run carry on. A later run can finish
-work that the failed run left behind. `Abort` records the failure and stops new
-work.
+work that the failed run left behind.
+
+`Abort` stops new work, and then it cancels every running child through the
+child handle's `abort()`. An upload child aborts its multipart upload, and a
+download child deletes its temporary file. The run waits until every child
+settles, and then it fails with the error of the failure that stopped it
+(**FR-Fail-3**). The run counts a cancelled child apart from a failed one, and a
+child that finished first keeps its own result. A delete batch already in flight
+waits for its response, because S3 may have acted on it.
 
 An unreadable root ends its walk. `Walk::next` then returns `None`, so no stream
 remains to continue. **FR-Fail-6** requires that result for a bad root.
@@ -155,7 +181,7 @@ model before execution can do that.
 A per-key delete refusal reaches the run as a named outcome. The same policy
 then decides whether the run continues or stops (**FR-Exec-6**).
 
-**D5. A delete batch holds at most 1,000 keys and reports every key.**
+**D6. A delete batch holds at most 1,000 keys and reports every key.**
 `DeleteObjects` accepts 1,000 keys in one request. A batch of 1,000 saves 999
 round trips and 999 scheduler dispatches. S3 can remove some keys and refuse
 others in the same request, so the run records an outcome for every key
@@ -182,15 +208,14 @@ still leaves the object absent.
 A delete batch uses one scheduler request slot and one round trip. It needs no
 separate cost class.
 
-**D6. Sync records every key outcome. Per-entry transfer events and private
-diagnostics carry outcomes to callers.** D3 already tracks work that started, work that
+**D7. Sync records every key outcome. Per-entry transfer events and private
+diagnostics carry outcomes to callers.** D4 already tracks work that started, work that
 returned, and work still outstanding. **FR-Exec-6** needs one outcome
 record for each key.
 
-A fatal walk error shows why the record belongs to sync. `upload_objects`
-returns the walk error and drops the successes that came before it. Sync keeps
-each completed key in its own record, so a later run result does not erase an
-earlier success.
+The record belongs to sync, because a fatal walk error can end the run partway.
+Sync keeps each completed key in its own record, so the successes before the
+failure stay recorded.
 
 The transfer event design needs three settlement rules:
 
@@ -207,7 +232,14 @@ composite sends itself. A pending run waits on one of two sides. A million-key
 run uses counters and a bounded failure sample. Sync counts the remaining
 failures.
 
-**D7. Requirements attach at three execution boundaries.**
+A failure record names one key and keeps that key's own error. A transfer
+failure keeps the child's error. A delete refusal keeps the destination's error,
+with the S3 code and request id, so a caller can branch on the code. A walk
+failure keeps the walk's own error type. Under `Abort`, the failure that stopped
+the run becomes the run's error, and the sample counts that failure without
+keeping a second copy.
+
+**D8. Requirements attach at three execution boundaries.**
 
 1. **Child creation.** User metadata, ACLs, encryption settings, storage class,
    content type, and the other object properties attach where an entry becomes a
@@ -216,13 +248,15 @@ failures.
 2. **The local tree.** The download spawner creates the directories it needs
    (**FR-Exec-3**). Pruning empty directories (**FR-Exec-4**) needs a record of
    which directories ended empty. That record exists only after every delete in
-   the subtree returns.
+   the subtree returns. Every local site maps a key to a path through one rule.
+   The rule refuses a key unless its cleaned path still spells the key. The key
+   `a//b` cleans to `a/b`, and `a/b` is the file of a different key.
 3. **Sync-owned requests.** **FR-Exec-20** retries listing and deleting after
    throttling or transient transport failure. Child requests use the retry logic
-   in their SDK client. A per-key delete refusal follows D5 because S3 returned
+   in their SDK client. A per-key delete refusal follows D6 because S3 returned
    it inside a successful batch response.
 
-**D8. The download stamps the temporary file before it renames the file.**
+**D9. The download stamps the temporary file before it renames the file.**
 `ExactTimestamps` compares the object's time with the file's time. A downloaded
 file needs the object's time or the next run sends it again.
 
@@ -238,24 +272,52 @@ A filesystem can clamp a far-future timestamp. The download still completes. An
 exact-timestamp run can download the file again because the stored time differs
 from the object time.
 
-**D9. One child wrapper hides upload and download handles.** An upload join
-returns an `UploadOutput`. A download join returns a `DownloadOutput`. Execution
-asks both handles two questions: did the child succeed, and how many bytes did
-it move.
-
-`TransferMetrics` carries moved bytes on both outputs. The wrapper exposes the
-two common facts. Reap code then treats every child the same way.
-
-The wrapper maps the two output types once. The reap path does not need a match
-for upload and download at every call site.
-
 **D10. Cancellation stops new work and still answers the caller.** A cancelled
 run starts no new children and drops its pending delete batch. The terminal path
 still answers the caller after outstanding scheduled work returns.
 
-The scheduler decides whether a child stops that already started. **FR-Exec-23**
-limits execution to three actions: stop spawning, drop the pending delete batch,
-and answer the caller.
+When the caller cancels, the scheduler cancels the run's children with it.
+Execution then takes three actions (**FR-Exec-23**): it stops spawning, drops
+the pending delete batch, and answers the caller. An aborting run differs,
+because the run itself decides to stop. It cancels its own children through
+`abort()` (D5).
+
+**D11. The merge pauses at three watermarks.** The merge decides keys as fast as
+the two sides list them, and children and deletes finish far more slowly. An
+unpaused merge queues a decision for nearly every key, so the run's memory grows
+with the tree.
+
+The merge pauses while any of three conditions holds:
+
+1. 1,024 transfers wait to start, counting the downloads that D12 holds.
+2. A full delete batch waits to go out. `poll_work` offers merge work before
+   deletes, so the pause lets the batch go first.
+3. Two full delete batches are in flight.
+
+A child finishing or a delete answer makes the run poll again, and the merge
+resumes.
+
+Only a full batch pauses the merge. On a bucket, a partial batch goes out after
+the merge finishes (D6), so a pause for a partial batch would deadlock the run.
+A local tree removes one key per request, so its batch is always full, and the
+downloads that D12 holds drain while the merge pauses.
+
+**D12. On a local tree, a removal on a download's path runs before the
+download.** **FR-Exec-12** keeps a delete and a transfer that touch the same
+place apart. On a local tree, a name on a download's path is the same place. A
+download of `photos/a.jpg` needs `photos` to be a directory. In delete mode,
+when `photos` is a file or a link that the source lacks, the run removes it. A
+download that started before the removal would fail on the file or write through
+the link.
+
+So the run holds a download while any name on its path waits for removal. The
+merge decides `photos` before `photos/a.jpg`, so the removal is always queued
+first. When the tree removes the name, the held downloads return to the front of
+the queue. When the tree refuses, each held download fails, and its record names
+the item in the way.
+
+A bucket destination skips the hold, because removing the key `a` leaves the key
+`a/b` in place.
 
 ## 3. How the pieces fit
 
@@ -269,7 +331,8 @@ waiting, and the run stays open until every scheduled item returns.
 
 The comparison returns three decisions:
 
-1. `Transfer` creates one child transfer and returns `Spawned`.
+1. `Transfer` creates one child transfer and returns `Spawned`. On a local tree,
+   D12 can hold the transfer first.
 2. `Delete` adds one key to the pending batch. The batch returns `Ready` when
    it fills or the merge ends.
 3. `Skip` records one skipped key and creates no new work.
@@ -296,8 +359,8 @@ child or a download child and gives it the parent's transfer id. A child termina
 then signals the parent, and cancellation reaches the child through the parent.
 
 The scheduler owns a child after execution enqueues it. The child has its own
-scheduling record and uses its own scheduler slot. Execution keeps the D9
-wrapper for the child's result and bytes moved.
+scheduling record and uses its own scheduler slot. Execution keeps the child in
+the D3 bookkeeping, and the child's handle reports its result and bytes moved.
 
 Each operation owns its work shapes. An upload child can send one object or run
 a multipart upload. A download child can discover the object, fetch a range, or
@@ -314,7 +377,7 @@ needs deletion. The child cap is two. The table shows states a four-key run can 
 | `c.txt` compares equal. | Record a skip. | No scheduled work starts. |
 | `d.txt` is destination-only. | Add `d.txt` to the batch. | The batch holds `d.txt`. |
 | Both children reach a terminal status. | Dispatch their reap. | The reap holds both results. |
-| The reap holds both results. | Return `Pending`. | D3 keeps the run open. |
+| The reap holds both results. | Return `Pending`. | D4 keeps the run open. |
 | The merge ends; the batch is ready. | Dispatch `d.txt` delete. | The delete is outstanding. |
 | The reap and delete work return. | Report `Done`. | No scheduled work remains. |
 
