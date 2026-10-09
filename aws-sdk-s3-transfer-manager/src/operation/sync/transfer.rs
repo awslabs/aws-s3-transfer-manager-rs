@@ -274,6 +274,11 @@ where
             // incomplete.
             state.discard_waiting_deletes();
             state.discard_waiting_transfers();
+            // A merge that stopped before it reached every key left the unreached keys undecided,
+            // so the plan is partial even when both queues are empty.
+            if state.merge.progress() != Some(Progress::Accounted) {
+                state.mark_plan_incomplete();
+            }
             // The run recorded the terminal outcome. Signal the caller.
             self.inner.ctx.signal_terminal();
             return Some(PollWork::Done);

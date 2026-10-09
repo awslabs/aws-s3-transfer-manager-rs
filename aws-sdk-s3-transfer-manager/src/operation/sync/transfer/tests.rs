@@ -1993,6 +1993,60 @@ async fn a_child_that_failed_ends_an_aborting_run() {
 
 #[cfg_attr(miri, ignore)]
 #[tokio::test]
+async fn a_run_that_stops_before_its_merge_finishes_reports_a_partial_plan() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let names: Vec<String> = (0..MERGE_BATCH * 2)
+        .map(|i| format!("{i:04}.txt"))
+        .collect();
+    a_local_tree(
+        dir.path(),
+        &names.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+    // Every child of the first batch stays open, and the last spawn of that batch fails. The run
+    // then stops with nothing waiting, while the test still holds the second merge batch.
+    let spawner = Arc::new(SpawnEnded::holding_open_but_refusing_at(MERGE_BATCH - 1));
+    let (transfer, ctx) = uploading_with_policy(
+        dir.path(),
+        spawner,
+        MERGE_BATCH,
+        FailedTransferPolicy::Abort,
+    );
+
+    let mut first = match transfer.poll_work() {
+        PollWork::Ready { io, .. } => io,
+        other => panic!("expected the first merge batch, got {other:?}"),
+    };
+    transfer.execute(&mut first).await;
+    let mut second = match transfer.poll_work() {
+        PollWork::Ready { io, .. } => io,
+        other => panic!("expected the second merge batch, got {other:?}"),
+    };
+    loop {
+        match transfer.poll_work() {
+            PollWork::Ready { io: mut work, .. } => {
+                transfer.execute(&mut work).await;
+            }
+            PollWork::Spawned => {}
+            _ => break,
+        }
+    }
+    let snapshot = transfer.inner.state.lock().snapshot();
+    assert!(
+        snapshot.stopped && snapshot.transfers_waiting == 0 && snapshot.deletes_waiting == 0,
+        "the run must stop with nothing waiting, or this proves nothing: {snapshot:?}"
+    );
+    transfer.execute(&mut second).await;
+    drive(&transfer).await;
+
+    assert!(ctx.is_failed(), "the aborting run did not fail");
+    assert!(
+        !transfer.is_plan_complete(),
+        "a run that stopped before its merge reached every key reported a whole plan"
+    );
+}
+
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
 async fn an_aborting_run_cancels_its_running_children_and_waits_for_them() {
     let dir = tempfile::tempdir().expect("a temp dir");
     a_local_tree(dir.path(), &["a.txt", "b.txt"]);
