@@ -233,6 +233,11 @@ impl SpawnChild<aws_sdk_s3::types::Object> for SpawnDownload {
         }
 
         // The temporary name keeps concurrent downloads from writing the same half-finished file.
+        //
+        // TODO(vnext): `poll_work` creates this file for every key, and the `Transfer` contract
+        // forbids a blocking call in `poll_work`. `download_objects` creates its temporary file the
+        // same way. A shared child constructor that creates the file in the child's own work item
+        // would fix both.
         let temp_path = dest_path.with_file_name(format!(
             "{}.s3tmp.{:08x}",
             dest_path.file_name().unwrap_or_default().to_string_lossy(),
