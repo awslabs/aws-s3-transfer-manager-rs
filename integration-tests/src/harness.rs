@@ -123,7 +123,7 @@ pub(crate) async fn mock_tm_with_s3_config(
 /// credentials, region, and path-style addressing. The transfer manager builds
 /// the client from it and installs the runtime's HTTP transport.
 async fn mock_s3_config(handle: &s3_mock_server::ServerHandle) -> S3ClientConfig {
-    S3ClientConfig::new(handle.client().await.config().to_builder())
+    S3ClientConfig::new(&handle.shared_config().await)
 }
 
 // ---------------------------------------------------------------------------
@@ -192,21 +192,21 @@ impl Target {
     pub(crate) async fn connect_mock_when_required(self) -> TmTestClient {
         self.connect_mock_configured(None, |b| {
             b.response_checksum_validation(
-                aws_sdk_s3::config::ResponseChecksumValidation::WhenRequired,
+                aws_smithy_types::checksum_config::ResponseChecksumValidation::WhenRequired,
             )
         })
         .await
     }
 
     /// Mock-only escape hatch: connect with an arbitrary override applied to the
-    /// mock S3 client's config builder, for tests that need a non-default client
+    /// mock shared-config builder, for tests that need a non-default client
     /// (checksum validation, stalled-stream protection, timeouts, ...). Applies
-    /// `configure` to the mock client's config, which the transfer manager then
+    /// `configure` to the shared config, which the transfer manager then
     /// builds its S3 client from.
     pub(crate) async fn connect_mock_configured(
         self,
         part_size: Option<aws_sdk_s3_transfer_manager::types::PartSize>,
-        configure: impl FnOnce(aws_sdk_s3::config::Builder) -> aws_sdk_s3::config::Builder,
+        configure: impl FnOnce(aws_types::sdk_config::Builder) -> aws_types::sdk_config::Builder,
     ) -> TmTestClient {
         assert_eq!(self.backend, Backend::Mock, "mock-only helper");
         TmTestClient::connect_mock_with(part_size, Some(configure)).await
@@ -252,18 +252,20 @@ impl TmTestClient {
     async fn connect_mock(part_size: Option<aws_sdk_s3_transfer_manager::types::PartSize>) -> Self {
         Self::connect_mock_with(
             part_size,
-            None::<fn(aws_sdk_s3::config::Builder) -> aws_sdk_s3::config::Builder>,
+            None::<fn(aws_types::sdk_config::Builder) -> aws_types::sdk_config::Builder>,
         )
         .await
     }
 
     /// Connect to the mock, optionally pinning a part size and applying an
-    /// override to the S3 client's config builder. With no override the mock
+    /// override to the shared-config builder. With no override the mock
     /// client uses SDK defaults (`ResponseChecksumValidation::WhenSupported`,
     /// stalled-stream protection enabled).
     async fn connect_mock_with(
         part_size: Option<aws_sdk_s3_transfer_manager::types::PartSize>,
-        configure: Option<impl FnOnce(aws_sdk_s3::config::Builder) -> aws_sdk_s3::config::Builder>,
+        configure: Option<
+            impl FnOnce(aws_types::sdk_config::Builder) -> aws_types::sdk_config::Builder,
+        >,
     ) -> Self {
         init_test_logs();
         let server = S3MockServer::builder()
@@ -271,19 +273,19 @@ impl TmTestClient {
             .build()
             .expect("build mock server");
         let handle = server.start().await.expect("start mock server");
-        let mut s3_client = handle.client().await;
+        let mut shared_config = handle.shared_config().await;
         if let Some(configure) = configure {
-            let conf = configure(s3_client.config().to_builder()).build();
-            s3_client = aws_sdk_s3::Client::from_conf(conf);
+            shared_config = configure(shared_config.into_builder()).build();
         }
-        s3_client
+        handle
+            .client()
+            .await
             .create_bucket()
             .bucket("test-bucket")
             .send()
             .await
             .ok();
-        let mut builder = aws_sdk_s3_transfer_manager::Config::builder()
-            .s3_config(S3ClientConfig::new(s3_client.config().to_builder()));
+        let mut builder = aws_sdk_s3_transfer_manager::Config::builder().s3_config(&shared_config);
         if let Some(ps) = part_size {
             builder = builder.part_size(ps);
         }

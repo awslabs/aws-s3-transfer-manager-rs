@@ -2032,7 +2032,7 @@ mod tests {
         detail: u64,
     ) -> DownloadTransfer {
         let config = crate::Config::builder()
-            .client(client)
+            .sdk_client(client)
             .part_size(crate::types::PartSize::Target(part_size))
             .diagnostics_for_test(crate::config::MemoryDiagnosticsConfig::default(), detail)
             .build();
@@ -2294,7 +2294,7 @@ mod tests {
         let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[head_obj, get_obj]);
 
         let config = crate::Config::builder()
-            .client(client)
+            .sdk_client(client)
             .part_size(crate::types::PartSize::Target(8 * MB))
             .build();
 
@@ -2604,7 +2604,7 @@ mod tests {
         // No explicit part size: discovery issues the Auto-sized ranged GET,
         // then realigns to the stored part size via partNumber=1.
         let config = crate::Config::builder()
-            .client(client)
+            .sdk_client(client)
             .diagnostics_for_test(crate::config::MemoryDiagnosticsConfig::default(), 1)
             .build();
         let handle = crate::client::Handle::test_handle_tokio(config);
@@ -2686,7 +2686,7 @@ mod tests {
         let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get_obj]);
 
         let mut config = crate::Config::builder()
-            .client(client)
+            .sdk_client(client)
             .part_size(crate::types::PartSize::Target(part_size));
         if let Some(capacity_bytes) = capacity_bytes {
             let pool = crate::memory::BufferPool::builder()
@@ -3069,7 +3069,7 @@ mod tests {
             .build()
             .expect("test pool");
         let config = crate::Config::builder()
-            .client(client)
+            .sdk_client(client)
             .part_size(crate::types::PartSize::Target(part_size))
             .memory(crate::types::MemoryConfig::Explicit(pool.clone()))
             .diagnostics_for_test(crate::config::MemoryDiagnosticsConfig::default(), 1)
@@ -3253,7 +3253,7 @@ mod tests {
             .build()
             .expect("test pool");
         let config = crate::Config::builder()
-            .client(mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get_obj]))
+            .sdk_client(mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get_obj]))
             .part_size(crate::types::PartSize::Target(part_size))
             .memory(crate::types::MemoryConfig::Explicit(pool.clone()))
             .build();
@@ -3335,7 +3335,7 @@ mod tests {
             .build()
             .expect("test pool");
         let config = crate::Config::builder()
-            .client(mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get_obj]))
+            .sdk_client(mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get_obj]))
             .part_size(crate::types::PartSize::Target(part_size))
             .memory(crate::types::MemoryConfig::Explicit(pool.clone()))
             .build();
@@ -3404,7 +3404,7 @@ mod tests {
                     .build()
             });
             let config = crate::Config::builder()
-                .client(mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get_obj]))
+                .sdk_client(mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get_obj]))
                 .part_size(crate::types::PartSize::Target(8 * MB))
                 .read_ahead(client_mode)
                 .build();

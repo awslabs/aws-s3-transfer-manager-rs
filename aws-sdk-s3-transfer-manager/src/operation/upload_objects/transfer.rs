@@ -1401,7 +1401,7 @@ mod tests {
         UploadObjectsTransfer,
         crate::transfer::StateMachineTerminalReceiver,
     ) {
-        let config = crate::Config::builder().client(s3_client).build();
+        let config = crate::Config::builder().sdk_client(s3_client).build();
         let handle = crate::client::Handle::test_handle_tokio(config);
 
         let input = super::super::UploadObjectsInputBuilder::default()
@@ -1525,7 +1525,7 @@ mod tests {
             .then_output(|| PutObjectOutput::builder().e_tag("test-etag").build());
         let s3_client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[put]);
 
-        let config = crate::Config::builder().client(s3_client).build();
+        let config = crate::Config::builder().sdk_client(s3_client).build();
         let handle = crate::client::Handle::test_handle_tokio(config);
 
         let input = super::super::UploadObjectsInputBuilder::default()
@@ -2202,7 +2202,9 @@ mod tests {
             fs::write(dir.path().join(format!("f{i:02}.txt")), "abc").unwrap();
         }
 
-        let config = crate::Config::builder().client(mock_s3_success()).build();
+        let config = crate::Config::builder()
+            .sdk_client(mock_s3_success())
+            .build();
         let handle = crate::client::Handle::test_handle_tokio(config);
 
         let input = super::super::UploadObjectsInputBuilder::default()
@@ -2281,7 +2283,9 @@ mod tests {
         fs::write(dir.path().join("bad-file.txt"), "fail").unwrap();
         fs::write(dir.path().join("good.txt"), "ok").unwrap();
 
-        let config = crate::Config::builder().client(mock_s3_success()).build();
+        let config = crate::Config::builder()
+            .sdk_client(mock_s3_success())
+            .build();
         let handle = crate::client::Handle::test_handle_tokio(config);
 
         let input = super::super::UploadObjectsInputBuilder::default()
@@ -2331,7 +2335,9 @@ mod tests {
         fs::write(dir.path().join("bad-file.txt"), "fail").unwrap();
         fs::write(dir.path().join("good.txt"), "ok").unwrap();
 
-        let config = crate::Config::builder().client(mock_s3_success()).build();
+        let config = crate::Config::builder()
+            .sdk_client(mock_s3_success())
+            .build();
         let handle = crate::client::Handle::test_handle_tokio(config);
 
         let input = super::super::UploadObjectsInputBuilder::default()

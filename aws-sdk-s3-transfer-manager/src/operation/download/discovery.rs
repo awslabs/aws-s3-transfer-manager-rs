@@ -568,7 +568,7 @@ mod tests {
         target_part_size: u64,
     ) -> Arc<crate::client::Handle> {
         let tm_config = crate::Config::builder()
-            .client(client)
+            .sdk_client(client)
             .set_target_part_size(PartSize::Target(target_part_size))
             .build();
         let tm = crate::Client::new(tm_config);
@@ -578,7 +578,7 @@ mod tests {
     // Handle with an Auto part size (download Auto = 5 MiB), so the multipart
     // alignment branch (gated on `!user_set_part_size`) can be exercised.
     fn test_handle_auto(client: aws_sdk_s3::Client) -> Arc<crate::client::Handle> {
-        let tm_config = crate::Config::builder().client(client).build();
+        let tm_config = crate::Config::builder().sdk_client(client).build();
         let tm = crate::Client::new(tm_config);
         tm.handle.clone()
     }

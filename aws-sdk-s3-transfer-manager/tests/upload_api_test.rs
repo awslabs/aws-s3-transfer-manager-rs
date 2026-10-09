@@ -3,24 +3,33 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+mod common;
+
+#[cfg(feature = "sdk-v1")]
 use std::{
     pin::Pin,
     task::{Context, Poll},
 };
 
+#[cfg(feature = "sdk-v1")]
 use aws_sdk_s3::operation::{
     complete_multipart_upload::CompleteMultipartUploadOutput,
     create_multipart_upload::CreateMultipartUploadOutput, put_object::PutObjectOutput,
     upload_part::UploadPartOutput,
 };
+#[cfg(feature = "sdk-v1")]
+use aws_sdk_s3_transfer_manager::io::{PartData, PartStream, SizeHint, StreamContext};
 use aws_sdk_s3_transfer_manager::{
-    io::{InputStream, PartData, PartStream, SizeHint, StreamContext},
+    io::InputStream,
     model,
     operation::upload::{self, ChecksumStrategy},
     Client, Config,
 };
+#[cfg(feature = "sdk-v1")]
 use aws_smithy_mocks::{mock, mock_client, RuleMode};
+#[cfg(feature = "sdk-v1")]
 use aws_smithy_types::DateTime;
+#[cfg(feature = "sdk-v1")]
 use bytes::Bytes;
 
 #[test]
@@ -43,8 +52,13 @@ fn operation_exports_are_the_canonical_modeled_types_and_builders() {
 
 #[test]
 fn fluent_fields_use_upstream_getters_and_preserve_collection_and_sensitive_semantics() {
-    let sdk = mock_client!(aws_sdk_s3, []);
-    let tm = Client::new(Config::builder().client(sdk).build());
+    let tm = Client::new(
+        Config::builder()
+            .s3_config(common::s3_config(
+                aws_smithy_mocks::create_mock_http_client(),
+            ))
+            .build(),
+    );
     let builder = tm
         .upload()
         .bucket("bucket")
@@ -74,6 +88,7 @@ fn fluent_fields_use_upstream_getters_and_preserve_collection_and_sensitive_sema
     assert!(tm.upload().bucket("bucket").initiate().is_err());
 }
 
+#[cfg(feature = "sdk-v1")]
 #[cfg_attr(miri, ignore)]
 #[tokio::test]
 async fn fluent_and_modeled_builder_initiation_return_canonical_metadata_and_transfer_snapshot() {
@@ -95,7 +110,13 @@ async fn fluent_and_modeled_builder_initiation_return_canonical_metadata_and_tra
                     .build()
             });
         let sdk = mock_client!(aws_sdk_s3, RuleMode::Sequential, &[&put]);
-        let tm = Client::new(Config::builder().client(sdk).build());
+        let tm = Client::new(
+            Config::builder()
+                .s3_config(test_common::s3_config_with_test_http(
+                    sdk.config().to_builder(),
+                ))
+                .build(),
+        );
         let handle = if fluent {
             tm.upload()
                 .bucket("bucket")
@@ -124,8 +145,10 @@ async fn fluent_and_modeled_builder_initiation_return_canonical_metadata_and_tra
 }
 
 #[derive(Debug)]
+#[cfg(feature = "sdk-v1")]
 struct SinglePart(Option<Bytes>);
 
+#[cfg(feature = "sdk-v1")]
 impl PartStream for SinglePart {
     fn poll_part(
         mut self: Pin<&mut Self>,
@@ -140,6 +163,7 @@ impl PartStream for SinglePart {
     }
 }
 
+#[cfg(feature = "sdk-v1")]
 #[cfg_attr(miri, ignore)]
 #[tokio::test]
 async fn multipart_runtime_merges_response_metadata_without_synthesizing_absent_values() {
@@ -183,7 +207,13 @@ async fn multipart_runtime_merges_response_metadata_without_synthesizing_absent_
             RuleMode::Sequential,
             &[&create, &part, &complete]
         );
-        let tm = Client::new(Config::builder().client(sdk).build());
+        let tm = Client::new(
+            Config::builder()
+                .s3_config(test_common::s3_config_with_test_http(
+                    sdk.config().to_builder(),
+                ))
+                .build(),
+        );
         let output: upload::UploadOutput = tm
             .upload()
             .bucket("request-bucket")

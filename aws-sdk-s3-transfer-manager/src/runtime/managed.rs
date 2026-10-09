@@ -654,7 +654,7 @@ mod tests {
         let rt_holder2 = rt_holder.clone();
         let handle = crate::client::Handle::new_for_test_with_runtime(
             crate::Config::builder()
-                .client(aws_smithy_mocks::mock_client!(aws_sdk_s3, []))
+                .sdk_client(aws_smithy_mocks::mock_client!(aws_sdk_s3, []))
                 .build(),
             Arc::new(crate::scheduler::FixedConcurrency::new(num_cores)),
             move |weak| {

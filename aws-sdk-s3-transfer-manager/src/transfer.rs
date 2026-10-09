@@ -1289,14 +1289,14 @@ mod tests {
 
         fn test_handle() -> Arc<crate::client::Handle> {
             let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
-            let config = crate::Config::builder().client(s3_client).build();
+            let config = crate::Config::builder().sdk_client(s3_client).build();
             crate::client::Handle::new_for_test(config, 4)
         }
 
         fn test_handle_with_diagnostics(detail: u64) -> Arc<crate::client::Handle> {
             let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
             let config = crate::Config::builder()
-                .client(s3_client)
+                .sdk_client(s3_client)
                 .diagnostics_for_test(crate::config::MemoryDiagnosticsConfig::default(), detail)
                 .build();
             crate::client::Handle::new_for_test(config, 4)

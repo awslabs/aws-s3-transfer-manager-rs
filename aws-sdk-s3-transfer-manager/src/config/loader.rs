@@ -140,9 +140,7 @@ impl ConfigLoader {
         // construction stays free of blocking DMI reads and network IMDS calls.
         let profile = detect_machine_profile().await;
 
-        let sdk_client_builder = aws_sdk_s3::config::Builder::from(&shared_config);
-
-        let mut s3_config = S3ClientConfig::new(sdk_client_builder);
+        let mut s3_config = S3ClientConfig::new(&shared_config);
         s3_config.network_interfaces = self.network_interfaces;
         let builder = self
             .builder
@@ -348,7 +346,7 @@ mod tests {
             .build();
 
         let capture_request_config = crate::Config::builder()
-            .client(aws_sdk_s3::Client::from_conf(sdk_s3_config))
+            .sdk_client(aws_sdk_s3::Client::from_conf(sdk_s3_config))
             .part_size(PartSize::Target(8))
             .build();
 

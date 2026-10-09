@@ -44,8 +44,24 @@ smallvec = "1"
 
 [features]
 dial9 = ["dep:dial9-tokio-telemetry"]
-# Conversions between modeled values and AWS SDK for Rust S3 v1 types.
+# Interoperability with AWS SDK for Rust S3 v1 types and client configuration.
 sdk-v1 = []
+
+[[test]]
+name = "upload_test"
+required-features = ["sdk-v1"]
+
+[[test]]
+name = "upload_objects_test"
+required-features = ["sdk-v1"]
+
+[[test]]
+name = "upload_checksum_test"
+required-features = ["sdk-v1"]
+
+[[test]]
+name = "download_objects_test"
+required-features = ["sdk-v1"]
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.189"

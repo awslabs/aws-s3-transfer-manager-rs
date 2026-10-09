@@ -179,7 +179,7 @@ mod test {
             .runtime_mode(runtime_mode)
             .set_multipart_threshold(PartSize::Target(10))
             .set_target_part_size(PartSize::Target(5 * ByteUnit::Mebibyte.as_bytes_u64()))
-            .client(client)
+            .sdk_client(client)
             .build();
         let tm = crate::Client::new(tm_config);
         let handle = UploadInput::builder()
@@ -311,7 +311,7 @@ mod test {
             .runtime_mode(runtime_mode)
             .set_multipart_threshold(PartSize::Target(10))
             .set_target_part_size(PartSize::Target(5 * ByteUnit::Mebibyte.as_bytes_u64()))
-            .client(client)
+            .sdk_client(client)
             .build();
         let tm = crate::Client::new(tm_config);
         let handle = UploadInput::builder()
@@ -419,7 +419,7 @@ mod test {
             .concurrency(ConcurrencyMode::Explicit(1))
             .set_multipart_threshold(PartSize::Target(10))
             .set_target_part_size(PartSize::Target(5 * ByteUnit::Mebibyte.as_bytes_u64()))
-            .client(client)
+            .sdk_client(client)
             .build();
 
         let tm = crate::Client::new(tm_config);
@@ -532,7 +532,7 @@ mod retry_tests {
             .concurrency(ConcurrencyMode::Explicit(1))
             .set_multipart_threshold(PartSize::Target(10))
             .set_target_part_size(PartSize::Target(5 * ByteUnit::Mebibyte.as_bytes_u64()))
-            .client(s3_client)
+            .sdk_client(s3_client)
             .build();
 
         let tm = crate::Client::new(tm_config);

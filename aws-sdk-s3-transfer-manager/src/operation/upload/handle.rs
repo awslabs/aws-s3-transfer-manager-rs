@@ -251,7 +251,7 @@ mod tests {
     async fn test_join_returns_cancelled_error_when_transfer_cancelled() {
         let handle = crate::client::Handle::test_handle_tokio(
             crate::Config::builder()
-                .client(aws_smithy_mocks::mock_client!(
+                .sdk_client(aws_smithy_mocks::mock_client!(
                     aws_sdk_s3,
                     aws_smithy_mocks::RuleMode::MatchAny,
                     &[]

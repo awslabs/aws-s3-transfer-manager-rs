@@ -3,15 +3,19 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+mod common;
+
+#[cfg(feature = "sdk-v1")]
 use aws_sdk_s3::operation::{get_object::GetObjectOutput, head_object::HeadObjectOutput};
-use aws_sdk_s3_transfer_manager::{
-    model,
-    operation::download,
-    types::{ChecksumValidation, NotValidatedReason, ReadAhead},
-    Client, Config,
-};
+#[cfg(feature = "sdk-v1")]
+use aws_sdk_s3_transfer_manager::types::{ChecksumValidation, NotValidatedReason};
+use aws_sdk_s3_transfer_manager::{model, operation::download, types::ReadAhead, Client, Config};
+#[cfg(feature = "sdk-v1")]
 use aws_smithy_mocks::{mock, mock_client, RuleMode};
-use aws_smithy_types::{byte_stream::ByteStream, DateTime};
+#[cfg(feature = "sdk-v1")]
+use aws_smithy_types::byte_stream::ByteStream;
+use aws_smithy_types::DateTime;
+#[cfg(feature = "sdk-v1")]
 use bytes::Buf;
 
 #[test]
@@ -50,7 +54,9 @@ fn operation_exports_are_canonical_and_preserve_construction_and_empty_metadata(
 fn fluent_fields_use_upstream_getters_and_preserve_conditions_read_ahead_and_redaction() {
     let tm = Client::new(
         Config::builder()
-            .client(mock_client!(aws_sdk_s3, []))
+            .s3_config(common::s3_config(
+                aws_smithy_mocks::create_mock_http_client(),
+            ))
             .build(),
     );
     let since = DateTime::from_secs(123);
@@ -83,6 +89,7 @@ fn fluent_fields_use_upstream_getters_and_preserve_conditions_read_ahead_and_red
     assert!(tm.download().bucket("bucket").initiate().is_err());
 }
 
+#[cfg(feature = "sdk-v1")]
 #[cfg_attr(miri, ignore)]
 #[tokio::test]
 async fn fluent_and_modeled_initiation_return_canonical_object_and_chunk_metadata() {
@@ -115,7 +122,13 @@ async fn fluent_and_modeled_initiation_return_canonical_object_and_chunk_metadat
                     .build()
             });
         let sdk = mock_client!(aws_sdk_s3, RuleMode::Sequential, &[&get]);
-        let tm = Client::new(Config::builder().client(sdk).build());
+        let tm = Client::new(
+            Config::builder()
+                .s3_config(test_common::s3_config_with_test_http(
+                    sdk.config().to_builder(),
+                ))
+                .build(),
+        );
         let mut handle = if fluent {
             tm.download()
                 .bucket("bucket")
@@ -174,6 +187,7 @@ async fn fluent_and_modeled_initiation_return_canonical_object_and_chunk_metadat
 }
 
 #[cfg(any(unix, windows))]
+#[cfg(feature = "sdk-v1")]
 #[cfg_attr(miri, ignore)]
 #[tokio::test]
 async fn managed_suffix_download_preserves_head_discovery_metadata_and_absolute_range() {
@@ -209,7 +223,13 @@ async fn managed_suffix_download_preserves_head_discovery_metadata_and_absolute_
                 .build()
         });
     let sdk = mock_client!(aws_sdk_s3, RuleMode::Sequential, &[&head, &get]);
-    let tm = Client::new(Config::builder().client(sdk).build());
+    let tm = Client::new(
+        Config::builder()
+            .s3_config(test_common::s3_config_with_test_http(
+                sdk.config().to_builder(),
+            ))
+            .build(),
+    );
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("download");
     let handle = tm

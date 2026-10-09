@@ -24,11 +24,11 @@ pub(crate) const MIN_MULTIPART_PART_SIZE_BYTES: u64 = 5 * ByteUnit::Mebibyte.as_
 
 /// S3 client configuration for the transfer manager.
 ///
-/// Wraps an `aws_sdk_s3::config::Builder` with transfer-manager-specific
-/// options. The transfer manager builds the S3 client from this configuration,
+/// The transfer manager builds its S3 client from shared AWS configuration,
 /// injecting runtime-optimized HTTP transport by default.
 ///
-/// Converts from shared AWS configuration or an S3 config builder:
+/// With the `sdk-v1` feature, this also converts from
+/// `aws_sdk_s3::config::Builder` for S3-specific configuration.
 ///
 /// ```no_run
 /// # async fn example() {
@@ -45,11 +45,16 @@ pub struct S3ClientConfig {
 }
 
 impl S3ClientConfig {
-    /// Create a new `S3ClientConfig` from an S3 config builder or from shared
-    /// AWS configuration (`&SdkConfig`).
-    pub fn new(builder: impl Into<aws_sdk_s3::config::Builder>) -> Self {
+    /// Create S3 client configuration from shared AWS configuration.
+    ///
+    /// With `sdk-v1` enabled, an `aws_sdk_s3::config::Builder` is also accepted.
+    pub fn new(config: impl Into<Self>) -> Self {
+        config.into()
+    }
+
+    pub(crate) fn from_sdk_builder(builder: aws_sdk_s3::config::Builder) -> Self {
         Self {
-            builder: builder.into(),
+            builder,
             enable_runtime_http: true,
             network_interfaces: Vec::new(),
         }
@@ -59,7 +64,7 @@ impl S3ClientConfig {
     ///
     /// When `true` (default), the runtime injects an HTTP client optimized
     /// for its execution model (e.g. per-thread connection pools on managed
-    /// threads). When `false`, the HTTP client already set on the builder
+    /// threads). When `false`, the HTTP client already set on the configuration
     /// is used as-is.
     pub fn enable_runtime_http(mut self, enable: bool) -> Self {
         self.enable_runtime_http = enable;
@@ -123,13 +128,14 @@ impl S3ClientConfig {
 
 impl From<&aws_types::SdkConfig> for S3ClientConfig {
     fn from(sdk_config: &aws_types::SdkConfig) -> Self {
-        Self::new(sdk_config)
+        Self::from_sdk_builder(aws_sdk_s3::config::Builder::from(sdk_config))
     }
 }
 
+#[cfg(feature = "sdk-v1")]
 impl From<aws_sdk_s3::config::Builder> for S3ClientConfig {
     fn from(builder: aws_sdk_s3::config::Builder) -> Self {
-        Self::new(builder)
+        Self::from_sdk_builder(builder)
     }
 }
 
@@ -397,11 +403,9 @@ impl Builder {
         self
     }
 
-    /// Set an explicit S3 client to use.
-    ///
-    /// Either this or [`s3_config`](Self::s3_config) must be set.
-    #[doc(hidden)]
-    pub fn client(mut self, client: aws_sdk_s3::Client) -> Self {
+    /// Inject a finished SDK client for library unit fixtures.
+    #[cfg(test)]
+    pub(crate) fn sdk_client(mut self, client: aws_sdk_s3::Client) -> Self {
         self.client = Some(client);
         self
     }
@@ -412,7 +416,7 @@ impl Builder {
     /// injecting runtime-optimized HTTP transport by default. Use
     /// [`S3ClientConfig::enable_runtime_http`] to opt out.
     ///
-    /// Either this or [`client`](Self::client) must be set.
+    /// This configuration is required.
     pub fn s3_config(mut self, config: impl Into<S3ClientConfig>) -> Self {
         self.s3_client_config = Some(config.into());
         self
@@ -446,7 +450,7 @@ impl Builder {
         let s3_client_source = match (self.client, self.s3_client_config) {
             (Some(client), _) => S3ClientSource::Provided(client),
             (None, Some(config)) => S3ClientSource::FromConfig(Box::new(config)),
-            (None, None) => panic!("either client() or s3_config() must be set"),
+            (None, None) => panic!("s3_config() must be set"),
         };
         Config {
             multipart_threshold: self.multipart_threshold_part_size,
@@ -480,7 +484,10 @@ mod tests {
         assert!(from_sdk.enable_runtime_http);
         assert!(from_sdk.network_interfaces.is_empty());
 
-        let from_builder: S3ClientConfig = s3_config_builder().into();
+        #[cfg(feature = "sdk-v1")]
+        let from_builder = S3ClientConfig::new(s3_config_builder());
+        #[cfg(not(feature = "sdk-v1"))]
+        let from_builder = S3ClientConfig::from_sdk_builder(s3_config_builder());
         assert!(from_builder.enable_runtime_http);
     }
 
@@ -500,7 +507,8 @@ mod tests {
     fn runtime_http_carries_network_interfaces() {
         let config = Config::builder()
             .s3_config(
-                S3ClientConfig::new(s3_config_builder()).network_interfaces(["ens5", "ens6"]),
+                S3ClientConfig::from_sdk_builder(s3_config_builder())
+                    .network_interfaces(["ens5", "ens6"]),
             )
             .build();
         let http = config.runtime_http(64).expect("runtime HTTP enabled");
@@ -510,21 +518,25 @@ mod tests {
 
     #[test]
     fn runtime_http_present_for_s3_config() {
-        let config = Config::builder().s3_config(s3_config_builder()).build();
+        let config = Config::builder()
+            .s3_config(S3ClientConfig::from_sdk_builder(s3_config_builder()))
+            .build();
         assert!(config.runtime_http(64).is_some());
     }
 
     #[test]
     fn runtime_http_absent_without_runtime_transport() {
         let disabled = Config::builder()
-            .s3_config(S3ClientConfig::new(s3_config_builder()).enable_runtime_http(false))
+            .s3_config(
+                S3ClientConfig::from_sdk_builder(s3_config_builder()).enable_runtime_http(false),
+            )
             .build();
         assert!(disabled.runtime_http(64).is_none());
 
         // A mock client: a real one would build the default HTTPS client, whose
         // TLS initialization is foreign code that miri cannot run.
         let provided = Config::builder()
-            .client(aws_smithy_mocks::mock_client!(aws_sdk_s3, []))
+            .sdk_client(aws_smithy_mocks::mock_client!(aws_sdk_s3, []))
             .build();
         assert!(provided.runtime_http(64).is_none());
     }

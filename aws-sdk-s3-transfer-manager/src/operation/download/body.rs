@@ -720,7 +720,7 @@ mod tests {
                 .region(aws_sdk_s3::config::Region::new("us-west-2"))
                 .build(),
         );
-        let config = crate::Config::builder().client(s3_client).build();
+        let config = crate::Config::builder().sdk_client(s3_client).build();
         let tm = crate::Client::new(config);
         let input = DownloadInput::builder()
             .bucket("test")

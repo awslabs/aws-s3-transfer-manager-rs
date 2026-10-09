@@ -592,7 +592,9 @@ async fn run_test(config: TestConfig) -> UploadOutput {
     };
 
     let tm_config = aws_sdk_s3_transfer_manager::Config::builder()
-        .client(s3_client)
+        .s3_config(test_common::s3_config_with_test_http(
+            s3_client.config().to_builder(),
+        ))
         .part_size(PartSize::Target(PART_SIZE as u64))
         .multipart_threshold(PartSize::Target(PART_SIZE as u64))
         .concurrency(ConcurrencyMode::Explicit(1)) // guarantee parts sent in order

@@ -1171,7 +1171,7 @@ mod tests {
     ) -> UploadTransfer {
         let handle = crate::client::Handle::test_handle_tokio(
             crate::Config::builder()
-                .client(s3_client)
+                .sdk_client(s3_client)
                 .diagnostics_for_test(crate::config::MemoryDiagnosticsConfig::default(), detail)
                 .build(),
         );
@@ -2067,7 +2067,7 @@ mod tests {
         tmp.flush().unwrap();
 
         let handle = crate::client::Handle::test_handle_tokio(
-            crate::Config::builder().client(s3_client).build(),
+            crate::Config::builder().sdk_client(s3_client).build(),
         );
         let input = UploadInput::builder()
             .bucket("test-bucket")

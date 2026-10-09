@@ -200,8 +200,8 @@ jobs:
             # exhaust macOS socket buffers without increasing product coverage.
             nextest_args+=(--test-threads 1)
           fi
-          cargo nextest run --locked --workspace --no-fail-fast "${nextest_args[@]}"
-          cargo test --locked --doc --workspace --no-fail-fast
+          cargo nextest run --locked --workspace --features sdk-v1 --no-fail-fast "${nextest_args[@]}"
+          cargo test --locked --doc --workspace --features sdk-v1 --no-fail-fast
 
   e2e:
     name: E2E (${{ matrix.name }})
@@ -275,8 +275,8 @@ jobs:
               adduser -D -h /tmp/tmtest tmtest
               mkdir -p /tmp/cargo /tmp/target
               chown tmtest:tmtest /tmp/cargo /tmp/target
-              su tmtest -c "cargo test --locked --workspace --no-fail-fast"
-              su tmtest -c "cargo test --locked --doc --workspace --no-fail-fast"
+              su tmtest -c "cargo test --locked --workspace --features sdk-v1 --no-fail-fast"
+              su tmtest -c "cargo test --locked --doc --workspace --features sdk-v1 --no-fail-fast"
             '
 
   android:
@@ -479,7 +479,9 @@ jobs:
         with:
           tool: cargo-check-external-types@0.5.0
       - name: check-external-types
-        run: cargo check-external-types --config external-types.toml
+        # Otherwise the checker forwards workspace-resolved features, including
+        # sdk-v1 enabled by the integration-tests package.
+        run: cargo check-external-types --no-default-features --features '' --config external-types.toml
         working-directory: aws-sdk-s3-transfer-manager
 
   check-deny:
@@ -540,7 +542,7 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
       - name: ${{ matrix.sanitizer }}
-        run: cargo test --workspace --target ${{ matrix.target }} --tests -- ${{ matrix.test_args }}
+        run: cargo test --workspace --features sdk-v1 --target ${{ matrix.target }} --tests -- ${{ matrix.test_args }}
         env:
           RUSTFLAGS: -Dwarnings -Adeprecated -C force-frame-pointers=yes --cfg ${{ matrix.cfg }}
           # Detect leaked ownership and stack lifetime errors, stop at the

@@ -354,7 +354,9 @@ async fn assert_single_empty_multipart_upload(stream: InputStream) {
     );
     let tm = aws_sdk_s3_transfer_manager::Client::new(
         aws_sdk_s3_transfer_manager::Config::builder()
-            .client(client)
+            .s3_config(test_common::s3_config_with_test_http(
+                client.config().to_builder(),
+            ))
             .build(),
     );
 
@@ -400,7 +402,9 @@ async fn assert_ranged_mpu_object_size(size_hint: SizeHint, actual: usize) {
     );
     let tm = aws_sdk_s3_transfer_manager::Client::new(
         aws_sdk_s3_transfer_manager::Config::builder()
-            .client(client)
+            .s3_config(test_common::s3_config_with_test_http(
+                client.config().to_builder(),
+            ))
             .build(),
     );
 
@@ -435,7 +439,9 @@ async fn test_custom_stream_uploads_segmented_part_data() {
     };
     let client = mock_s3_client_for_multipart_upload();
     let config = aws_sdk_s3_transfer_manager::Config::builder()
-        .client(client)
+        .s3_config(test_common::s3_config_with_test_http(
+            client.config().to_builder(),
+        ))
         .build();
     let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
@@ -463,7 +469,9 @@ async fn test_custom_stream_resumes_after_part_buffer_admission() {
 
     let client = mock_s3_client_for_multipart_upload();
     let config = aws_sdk_s3_transfer_manager::Config::builder()
-        .client(client)
+        .s3_config(test_common::s3_config_with_test_http(
+            client.config().to_builder(),
+        ))
         .memory(MemoryConfig::Explicit(pool.clone()))
         .build();
     let tm = aws_sdk_s3_transfer_manager::Client::new(config);
@@ -502,7 +510,9 @@ async fn test_custom_stream_resumes_after_part_buffer_admission() {
 async fn test_source_wake_before_read_parking_is_retained() {
     let client = mock_s3_client_for_multipart_upload();
     let config = aws_sdk_s3_transfer_manager::Config::builder()
-        .client(client)
+        .s3_config(test_common::s3_config_with_test_http(
+            client.config().to_builder(),
+        ))
         .build();
     let tm = aws_sdk_s3_transfer_manager::Client::new(config);
     let polls = Arc::new(AtomicUsize::new(0));
@@ -542,7 +552,9 @@ async fn test_many_uploads_no_deadlock() {
     let (_guard, _rx) = capture_test_logs();
     let client = mock_s3_client_for_multipart_upload();
     let config = aws_sdk_s3_transfer_manager::Config::builder()
-        .client(client)
+        .s3_config(test_common::s3_config_with_test_http(
+            client.config().to_builder(),
+        ))
         .build();
 
     let tm = aws_sdk_s3_transfer_manager::Client::new(config);
@@ -602,7 +614,9 @@ async fn test_many_uploads_no_deadlock() {
 async fn test_large_upload_part_size_bump() {
     let client = mock_s3_client_for_multipart_upload();
     let config = aws_sdk_s3_transfer_manager::Config::builder()
-        .client(client)
+        .s3_config(test_common::s3_config_with_test_http(
+            client.config().to_builder(),
+        ))
         .build();
 
     let tm = aws_sdk_s3_transfer_manager::Client::new(config);
@@ -668,7 +682,9 @@ async fn test_complete_mpu_sends_mpu_object_size() {
     );
 
     let config = aws_sdk_s3_transfer_manager::Config::builder()
-        .client(client)
+        .s3_config(test_common::s3_config_with_test_http(
+            client.config().to_builder(),
+        ))
         .build();
     let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
@@ -705,7 +721,9 @@ async fn test_unknown_length_multipart_upload() {
     let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
     let client = mock_s3_client_for_multipart_upload();
     let config = aws_sdk_s3_transfer_manager::Config::builder()
-        .client(client)
+        .s3_config(test_common::s3_config_with_test_http(
+            client.config().to_builder(),
+        ))
         .build();
     let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
@@ -805,7 +823,9 @@ async fn test_unknown_length_mpu_object_size_is_running_sum() {
         &[create_mpu, upload_part, complete_mpu]
     );
     let config = aws_sdk_s3_transfer_manager::Config::builder()
-        .client(client)
+        .s3_config(test_common::s3_config_with_test_http(
+            client.config().to_builder(),
+        ))
         .build();
     let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
@@ -859,7 +879,9 @@ async fn test_bounded_length_sends_validated_actual_size() {
         &[create_mpu, upload_part, complete_mpu]
     );
     let config = aws_sdk_s3_transfer_manager::Config::builder()
-        .client(client)
+        .s3_config(test_common::s3_config_with_test_http(
+            client.config().to_builder(),
+        ))
         .build();
     let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
@@ -911,7 +933,9 @@ async fn test_exact_length_rejects_early_end_of_stream() {
     );
     let tm = aws_sdk_s3_transfer_manager::Client::new(
         aws_sdk_s3_transfer_manager::Config::builder()
-            .client(client)
+            .s3_config(test_common::s3_config_with_test_http(
+                client.config().to_builder(),
+            ))
             .build(),
     );
 
@@ -958,7 +982,9 @@ async fn test_exact_length_rejects_overflow_before_upload_part() {
     );
     let tm = aws_sdk_s3_transfer_manager::Client::new(
         aws_sdk_s3_transfer_manager::Config::builder()
-            .client(client)
+            .s3_config(test_common::s3_config_with_test_http(
+                client.config().to_builder(),
+            ))
             .build(),
     );
 
@@ -988,7 +1014,9 @@ async fn test_bounded_length_rejects_below_lower_bound() {
     let client = mock_s3_client_for_multipart_upload();
     let tm = aws_sdk_s3_transfer_manager::Client::new(
         aws_sdk_s3_transfer_manager::Config::builder()
-            .client(client)
+            .s3_config(test_common::s3_config_with_test_http(
+                client.config().to_builder(),
+            ))
             .build(),
     );
     let (tx, rx) = mpsc::channel(1);
@@ -1019,7 +1047,9 @@ fn test_stream_rejects_lower_bound_above_upper_bound() {
     let hint = SizeHint::default().with_lower(11).with_upper(Some(10));
     let tm = aws_sdk_s3_transfer_manager::Client::new(
         aws_sdk_s3_transfer_manager::Config::builder()
-            .client(mock_client!(aws_sdk_s3, []))
+            .s3_config(test_common::s3_config_with_test_http(
+                mock_client!(aws_sdk_s3, []).config().to_builder(),
+            ))
             .build(),
     );
 
@@ -1074,7 +1104,9 @@ async fn test_unknown_length_with_data_never_sends_empty_part() {
         &[&create_mpu, &empty_part, &data_part, &complete_mpu]
     );
     let config = aws_sdk_s3_transfer_manager::Config::builder()
-        .client(client)
+        .s3_config(test_common::s3_config_with_test_http(
+            client.config().to_builder(),
+        ))
         .build();
     let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
@@ -1188,7 +1220,9 @@ async fn test_unknown_length_forwards_full_object_checksum() {
         &[create_mpu, upload_part, complete_mpu]
     );
     let config = aws_sdk_s3_transfer_manager::Config::builder()
-        .client(client)
+        .s3_config(test_common::s3_config_with_test_http(
+            client.config().to_builder(),
+        ))
         .build();
     let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
@@ -1226,7 +1260,9 @@ async fn test_unknown_length_reports_total_bytes_after_completion() {
 
     let client = mock_s3_client_for_multipart_upload();
     let config = aws_sdk_s3_transfer_manager::Config::builder()
-        .client(client)
+        .s3_config(test_common::s3_config_with_test_http(
+            client.config().to_builder(),
+        ))
         .build();
     let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
@@ -1272,7 +1308,9 @@ async fn test_unknown_length_reports_total_bytes_after_completion() {
 async fn test_unknown_length_reader_error_fails_transfer() {
     let client = mock_s3_client_for_multipart_upload();
     let config = aws_sdk_s3_transfer_manager::Config::builder()
-        .client(client)
+        .s3_config(test_common::s3_config_with_test_http(
+            client.config().to_builder(),
+        ))
         .build();
     let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
@@ -1356,7 +1394,9 @@ async fn test_unknown_length_many_parts_grows_part_list() {
         &[&create_mpu, &upload_part, &complete_mpu]
     );
     let config = aws_sdk_s3_transfer_manager::Config::builder()
-        .client(client)
+        .s3_config(test_common::s3_config_with_test_http(
+            client.config().to_builder(),
+        ))
         .build();
     let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
@@ -1436,7 +1476,9 @@ async fn test_unknown_length_exceeding_part_limit_fails() {
 
     let client = mock_s3_client_for_multipart_upload();
     let config = aws_sdk_s3_transfer_manager::Config::builder()
-        .client(client)
+        .s3_config(test_common::s3_config_with_test_http(
+            client.config().to_builder(),
+        ))
         .build();
     let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
@@ -1477,7 +1519,9 @@ async fn test_unknown_length_exactly_max_parts_succeeds() {
 
     let client = mock_s3_client_for_multipart_upload();
     let config = aws_sdk_s3_transfer_manager::Config::builder()
-        .client(client)
+        .s3_config(test_common::s3_config_with_test_http(
+            client.config().to_builder(),
+        ))
         .build();
     let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
@@ -1532,7 +1576,9 @@ async fn test_positive_lower_bound_never_synthesizes_empty_part() {
         &[&create_mpu, &empty_part, &data_part, &complete_mpu]
     );
     let config = aws_sdk_s3_transfer_manager::Config::builder()
-        .client(client)
+        .s3_config(test_common::s3_config_with_test_http(
+            client.config().to_builder(),
+        ))
         .build();
     let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
@@ -1580,7 +1626,9 @@ async fn test_put_object_forwards_if_none_match() {
         .then_output(|| PutObjectOutput::builder().e_tag("test-etag").build());
     let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[put_object]);
     let config = aws_sdk_s3_transfer_manager::Config::builder()
-        .client(client)
+        .s3_config(test_common::s3_config_with_test_http(
+            client.config().to_builder(),
+        ))
         .build();
     let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
@@ -1611,7 +1659,9 @@ async fn test_put_object_412_surfaces_precondition_failed_code() {
     });
     let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&put_object]);
     let config = aws_sdk_s3_transfer_manager::Config::builder()
-        .client(client)
+        .s3_config(test_common::s3_config_with_test_http(
+            client.config().to_builder(),
+        ))
         .build();
     let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
@@ -1685,7 +1735,9 @@ async fn test_complete_mpu_forwards_if_match() {
         &[create_mpu, upload_part, complete_mpu]
     );
     let config = aws_sdk_s3_transfer_manager::Config::builder()
-        .client(client)
+        .s3_config(test_common::s3_config_with_test_http(
+            client.config().to_builder(),
+        ))
         .build();
     let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
@@ -1742,7 +1794,9 @@ async fn test_complete_mpu_412_surfaces_precondition_failed_code() {
         &[create_mpu, upload_part, complete_mpu]
     );
     let config = aws_sdk_s3_transfer_manager::Config::builder()
-        .client(client)
+        .s3_config(test_common::s3_config_with_test_http(
+            client.config().to_builder(),
+        ))
         .build();
     let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 

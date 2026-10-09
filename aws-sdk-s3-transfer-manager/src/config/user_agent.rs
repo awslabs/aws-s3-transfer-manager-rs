@@ -151,8 +151,8 @@ mod tests {
 
         // The capture-request client is the transport under test, so the runtime must
         // not substitute its own.
-        let s3_config =
-            crate::config::S3ClientConfig::new(tweak(builder)).enable_runtime_http(false);
+        let s3_config = crate::config::S3ClientConfig::from_sdk_builder(tweak(builder))
+            .enable_runtime_http(false);
 
         let tm = crate::Client::new(
             crate::Config::builder()
@@ -283,7 +283,7 @@ mod tests {
         let tm = crate::Client::new(
             crate::Config::builder()
                 .runtime_mode(RuntimeMode::MultiThreadTokio)
-                .client(client)
+                .sdk_client(client)
                 .build(),
         );
         let mut handle = tm.download().bucket("foo").key("bar").initiate().unwrap();
@@ -407,7 +407,7 @@ mod tests {
         let first = crate::Client::new(
             crate::Config::builder()
                 .runtime_mode(RuntimeMode::MultiThreadTokio)
-                .client(provided_client(http_client))
+                .sdk_client(provided_client(http_client))
                 .build(),
         );
         // The clone a child transfer would be handed.
