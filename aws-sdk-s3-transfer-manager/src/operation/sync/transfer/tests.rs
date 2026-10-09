@@ -1037,6 +1037,48 @@ async fn an_aborting_run_does_not_send_a_batch_that_was_already_in_flight() {
     );
 }
 
+// A destination asks the run's stop check before each retry. A run that stops while a batch is in
+// flight answers `true`, so the destination stops retrying.
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn a_delete_batch_learns_that_the_run_stopped_while_in_flight() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let (deleter, pause) = RecordDeletes::pausing(DELETE_BATCH);
+    let deleter = Arc::new(deleter);
+    let (transfer, _ctx) = deleting_with_policy(
+        dir.path(),
+        &["gone.txt"],
+        deleter.clone(),
+        DeleteMode::On,
+        FailedTransferPolicy::Abort,
+    );
+
+    let mut held = None;
+    while let PollWork::Ready { io: mut work, .. } = transfer.poll_work() {
+        if transfer.inner.state.lock().snapshot().deletes_in_flight > 0 {
+            held = Some(work);
+            break;
+        }
+        transfer.execute(&mut work).await;
+    }
+    let mut batch = held.expect("no delete batch was dispatched, so this proves nothing");
+
+    let stop_while_in_flight = async {
+        transfer.inner.state.lock().stop(crate::error::Error::new(
+            crate::error::ErrorKind::IOError,
+            "a child failed while the batch was in flight",
+        ));
+        pause.notify_one();
+    };
+    tokio::join!(transfer.execute(&mut batch), stop_while_in_flight);
+
+    assert_eq!(
+        deleter.stops_seen(),
+        [true],
+        "the destination did not learn that the run stopped"
+    );
+}
+
 #[cfg_attr(miri, ignore)]
 #[tokio::test]
 async fn bytes_a_dropped_child_moved_are_counted() {

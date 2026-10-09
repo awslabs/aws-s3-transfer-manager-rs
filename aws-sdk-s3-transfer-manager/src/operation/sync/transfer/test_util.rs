@@ -92,6 +92,11 @@ pub(crate) struct RecordDeletes {
     sent: Mutex<Vec<Vec<String>>>,
     refuse: bool,
     namespace: Namespace,
+    // This list holds each answer the run's stop check gave the double, one per batch.
+    stops_seen: Mutex<Vec<bool>>,
+    // When set, the double waits here before it asks the stop check, so a test can stop the run
+    // while a batch is in flight.
+    pause: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl RecordDeletes {
@@ -101,7 +106,19 @@ impl RecordDeletes {
             sent: Mutex::new(Vec::new()),
             refuse: false,
             namespace: Namespace::Flat,
+            stops_seen: Mutex::new(Vec::new()),
+            pause: None,
         }
+    }
+
+    // The test releases the returned `Notify` to let the paused batch go on.
+    pub(super) fn pausing(batch: usize) -> (Self, Arc<tokio::sync::Notify>) {
+        let pause = Arc::new(tokio::sync::Notify::new());
+        let deleter = Self {
+            pause: Some(pause.clone()),
+            ..Self::new(batch)
+        };
+        (deleter, pause)
     }
 
     pub(super) fn refusing(batch: usize) -> Self {
@@ -126,6 +143,10 @@ impl RecordDeletes {
     pub(super) fn keys_sent(&self) -> usize {
         self.sent.lock().iter().map(Vec::len).sum()
     }
+
+    pub(super) fn stops_seen(&self) -> Vec<bool> {
+        self.stops_seen.lock().clone()
+    }
 }
 
 impl RecordDeletes {
@@ -133,7 +154,17 @@ impl RecordDeletes {
         self.batch
     }
 
-    pub(crate) async fn delete(&self, keys: Vec<String>) -> Vec<KeyOutcome> {
+    pub(crate) async fn delete(
+        &self,
+        keys: Vec<String>,
+        stopped: StopCheck<'_>,
+    ) -> Vec<KeyOutcome> {
+        if let Some(pause) = &self.pause {
+            pause.notified().await;
+        }
+        // A real destination asks before each retry. The double asks once, so a test sees what the
+        // run answered.
+        self.stops_seen.lock().push(stopped());
         self.sent.lock().push(keys.clone());
         let refuse = self.refuse;
         keys.into_iter()
@@ -162,9 +193,9 @@ impl DeleteKeys for RecordDeletes {
     fn delete<'a>(
         &'a self,
         keys: Vec<String>,
-        _stopped: StopCheck<'a>,
+        stopped: StopCheck<'a>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<KeyOutcome>> + Send + 'a>> {
-        Box::pin(RecordDeletes::delete(self, keys))
+        Box::pin(RecordDeletes::delete(self, keys, stopped))
     }
 }
 
