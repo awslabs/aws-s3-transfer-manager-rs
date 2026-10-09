@@ -378,6 +378,11 @@ impl<S: KeyStream, D: KeyStream> Transfers<S, D> {
         !self.held.is_empty()
     }
 
+    // Count the transfers that wait to start, including the ones held behind a removal.
+    pub(super) fn waiting_len(&self) -> usize {
+        self.waiting.len() + self.held.values().map(Vec::len).sum::<usize>()
+    }
+
     // Record a child that started in a reserved slot. A later reap joins it.
     pub(super) fn start(&mut self, slot: Reservation, child: SyncChild, key: String) {
         self.running.insert(slot, child, key);
@@ -463,6 +468,17 @@ impl Deletes {
             .map(|(at, _)| &key[..at])
             .find(|name| self.clearing.contains(*name))
             .map(str::to_string)
+    }
+
+    // Count the keys the run sent for removal that still wait for an answer.
+    pub(super) fn in_flight(&self) -> usize {
+        self.in_flight
+    }
+
+    // Return whether a full batch of `size` keys waits to go out. A full batch goes out at once,
+    // and a partial one waits for the merge to finish.
+    pub(super) fn has_full_batch(&self, size: usize) -> bool {
+        self.waiting.len() >= size
     }
 
     // Mark these keys answered. A transfer under one of them no longer waits.

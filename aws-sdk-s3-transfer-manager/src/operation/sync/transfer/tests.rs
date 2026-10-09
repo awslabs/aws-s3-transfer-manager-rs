@@ -1079,6 +1079,168 @@ async fn a_delete_batch_learns_that_the_run_stopped_while_in_flight() {
     );
 }
 
+// The merge decides far faster than the children send. With every child busy, the merge stops
+// once the queue holds `MERGE_LOW_WATER` transfers, and it resumes as children finish.
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn a_run_with_every_child_busy_stops_deciding_once_its_queue_is_full() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let names: Vec<String> = (0..3000).map(|i| format!("{i:04}.txt")).collect();
+    a_local_tree(
+        dir.path(),
+        &names.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+    let spawner = Arc::new(SpawnEnded::holding_children_open());
+    let (transfer, ctx) = uploading_with_policy(
+        dir.path(),
+        spawner.clone(),
+        4,
+        FailedTransferPolicy::Continue,
+    );
+
+    loop {
+        match transfer.poll_work() {
+            PollWork::Ready { io: mut work, .. } => {
+                transfer.execute(&mut work).await;
+            }
+            PollWork::Spawned => {}
+            _ => break,
+        }
+    }
+    let snapshot = transfer.inner.state.lock().snapshot();
+    assert!(
+        snapshot.paired < 3000,
+        "the merge decided every key while its children were all busy"
+    );
+    assert!(
+        snapshot.transfers_waiting <= MERGE_LOW_WATER + MERGE_BATCH,
+        "{} transfers waited for 4 children",
+        snapshot.transfers_waiting
+    );
+
+    spawner.release(&ctx);
+    drive(&transfer).await;
+    assert_eq!(transfer.inner.state.lock().snapshot().arrived, 3000);
+}
+
+// A bucket answers a delete batch slowly while the merge keeps deciding. The merge stops once
+// `DELETES_IN_FLIGHT_LOW_WATER` keys are in flight.
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn a_run_stops_deciding_while_two_delete_batches_are_in_flight() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let names: Vec<String> = (0..5000).map(|i| format!("{i:04}.txt")).collect();
+    let (deleter, pause) = RecordDeletes::pausing(DELETE_BATCH);
+    let deleter = Arc::new(deleter);
+    let (transfer, _ctx) = deleting_with_policy(
+        dir.path(),
+        &names.iter().map(String::as_str).collect::<Vec<_>>(),
+        deleter.clone(),
+        DeleteMode::On,
+        FailedTransferPolicy::Continue,
+    );
+
+    let mut in_flight = Vec::new();
+    loop {
+        let before = transfer.inner.state.lock().snapshot().deletes_in_flight;
+        match transfer.poll_work() {
+            PollWork::Ready { io: mut work, .. } => {
+                if transfer.inner.state.lock().snapshot().deletes_in_flight > before {
+                    in_flight.push(work);
+                } else {
+                    transfer.execute(&mut work).await;
+                }
+            }
+            PollWork::Spawned => {}
+            _ => break,
+        }
+    }
+    let snapshot = transfer.inner.state.lock().snapshot();
+    assert!(
+        snapshot.paired < 5000,
+        "the merge decided every key while its delete batches went unanswered"
+    );
+    assert!(
+        snapshot.deletes_in_flight <= DELETES_IN_FLIGHT_LOW_WATER,
+        "{} delete keys were in flight",
+        snapshot.deletes_in_flight
+    );
+
+    for mut work in in_flight {
+        pause.notify_one();
+        transfer.execute(&mut work).await;
+    }
+    let finish = async {
+        loop {
+            match transfer.poll_work() {
+                PollWork::Ready { io: mut work, .. } => {
+                    pause.notify_one();
+                    transfer.execute(&mut work).await;
+                }
+                PollWork::Done => break,
+                PollWork::Spawned => {}
+                PollWork::Pending => panic!("the run parked with nothing left to wake it"),
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(20), finish)
+        .await
+        .expect("the run did not finish");
+    assert_eq!(
+        deleter.keys_sent(),
+        5000,
+        "the run did not remove every key"
+    );
+}
+
+// A bucket takes up to `DELETE_BATCH` keys per request, so the last partial batch goes out only
+// after the merge finishes. A merge that paused for waiting deletes would hang.
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn a_partial_delete_batch_still_goes_out_while_the_merge_can_pause() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let names: Vec<String> = (0..2500).map(|i| format!("{i:04}.txt")).collect();
+    let deleter = Arc::new(RecordDeletes::new(DELETE_BATCH));
+    let (transfer, _ctx) = deleting_with_policy(
+        dir.path(),
+        &names.iter().map(String::as_str).collect::<Vec<_>>(),
+        deleter.clone(),
+        DeleteMode::On,
+        FailedTransferPolicy::Continue,
+    );
+
+    drive(&transfer).await;
+
+    let sizes: Vec<usize> = deleter.batches().iter().map(Vec::len).collect();
+    assert_eq!(
+        sizes,
+        [1000, 1000, 500],
+        "the run did not send its last partial batch"
+    );
+}
+
+// Every download here waits behind the removal of the file `a`. A local tree removes one file per
+// request, so that removal goes out at once, and the held downloads drain while the merge pauses.
+#[cfg(unix)]
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn downloads_held_behind_a_removal_drain_while_the_merge_pauses() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path().canonicalize().expect("canonical root");
+    std::fs::write(root.join("a"), "a file in the way").expect("the file is written");
+    let keys: Vec<String> = (0..2000).map(|i| format!("a/{i:04}")).collect();
+    let (client, _gets) =
+        a_bucket_recording_gets(&keys.iter().map(String::as_str).collect::<Vec<_>>(), 1);
+
+    let (t, ctx, rx) = downloading_into(&root, client, DeleteMode::On);
+    run_managed(&t, &ctx, rx).await;
+
+    let landed = std::fs::read_dir(root.join("a"))
+        .expect("`a` is a directory after the run")
+        .count();
+    assert_eq!(landed, 2000, "the run did not land every held download");
+}
+
 #[cfg_attr(miri, ignore)]
 #[tokio::test]
 async fn bytes_a_dropped_child_moved_are_counted() {

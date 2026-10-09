@@ -26,6 +26,14 @@ use state::{Decided, FailedSyncKey, State};
 // batch. The bound limits how long one work item holds an executor slot.
 const MERGE_BATCH: usize = 64;
 
+// The merge pauses while this many transfers wait to start, counting the downloads held behind a
+// removal. `upload_objects` pauses its walk at the same size, and `download_objects` pauses its
+// walk at 1,000.
+const MERGE_LOW_WATER: usize = 1024;
+
+// The merge also pauses while this many delete keys are in flight. That is two full batches.
+const DELETES_IN_FLIGHT_LOW_WATER: usize = 2 * delete::DELETE_BATCH;
+
 // How a run turned out. A run can finish without failures and still leave keys unaccounted for.
 // `Warned` reports that case.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -361,6 +369,22 @@ where
     // Hand the merge to a work item. When no merge work remains, the poll chooses `Done` or
     // `Pending`.
     fn dispatch_merge(&self, state: &mut State<S, D>) -> Option<PollWork> {
+        // The merge decides faster than children and deletes finish, so it pauses at
+        // `MERGE_LOW_WATER` waiting transfers or `DELETES_IN_FLIGHT_LOW_WATER` delete keys in
+        // flight. A child finishing or a delete answer makes the run poll again, and the merge
+        // resumes.
+        //
+        // `poll_work` hands out merge work before deletes, so a full delete batch pauses the merge
+        // and goes out first. A partial batch on a bucket goes out only after the merge finishes,
+        // so only a full batch pauses the merge.
+        if state.transfers.waiting_len() >= MERGE_LOW_WATER
+            || state
+                .deletes
+                .has_full_batch(self.inner.deleter.batch_size())
+            || state.deletes.in_flight() >= DELETES_IN_FLIGHT_LOW_WATER
+        {
+            return None;
+        }
         let walk = state.merge.take_walk_to_advance()?;
         Some(PollWork::ready(IoRequest {
             data: Some(Box::new(SyncWork::AdvanceMerge {
