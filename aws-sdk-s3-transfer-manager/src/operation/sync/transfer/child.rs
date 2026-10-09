@@ -13,8 +13,6 @@ use parking_lot::Mutex;
 use std::fmt;
 use std::sync::Arc;
 
-use super::local_path_for_key;
-
 // Build a child from a source entry. Each direction supplies the client, bucket, and roots the
 // child needs.
 pub(crate) trait SpawnChild<S>: Send + Sync {
@@ -120,12 +118,10 @@ impl SyncChild {
     }
 }
 
-// Send a local file to a bucket. Upload and download use different client calls and destination paths.
+// `SpawnUpload` starts a child that sends one local file to a bucket.
 pub(crate) struct SpawnUpload {
     handle: Arc<crate::client::Handle>,
-    bucket: String,
-    // The bucket prefix for uploads. Upload requests add the prefix to relative keys.
-    root: String,
+    root: crate::io::key::BucketRoot,
 }
 
 impl SpawnUpload {
@@ -136,14 +132,8 @@ impl SpawnUpload {
     ) -> Self {
         Self {
             handle,
-            bucket: bucket.into(),
-            root: crate::io::key::stream::root_prefix(prefix).into_owned(),
+            root: crate::io::key::BucketRoot::new(bucket, prefix),
         }
-    }
-
-    // The object a relative key names under this run's root.
-    pub(crate) fn object_key(&self, key: &str) -> String {
-        format!("{}{}", self.root, key)
     }
 }
 
@@ -163,8 +153,8 @@ impl SpawnChild<crate::io::walk::FsEntry> for SpawnUpload {
         }
         let stream = body.build()?;
         let input = crate::operation::upload::UploadInput::builder()
-            .bucket(self.bucket.clone())
-            .key(self.object_key(key))
+            .bucket(self.root.bucket())
+            .key(self.root.object_key(key))
             .body(stream)
             .build()
             .expect("bucket, key and body are all set");
@@ -180,17 +170,14 @@ impl SpawnChild<crate::io::walk::FsEntry> for SpawnUpload {
     }
 }
 
-// Spawn a download child. The local-tree deleter uses the destination name; this type uses the
-// child name.
+// `SpawnDownload` starts a child that writes one object into the local tree.
 pub(crate) struct SpawnDownload {
     handle: Arc<crate::client::Handle>,
-    bucket: String,
-    // The bucket prefix for downloads. Download requests add the prefix to relative keys.
-    root: String,
-    // The local root for downloaded keys.
+    root: crate::io::key::BucketRoot,
+    // Each downloaded key lands below this directory.
     local_root: std::path::PathBuf,
-    // Directories created for earlier keys. The cache avoids repeating `create_dir_all` for every
-    // key.
+    // This cache holds the directories the run created for earlier keys, so the run calls
+    // `create_dir_all` once per directory.
     //
     // TODO(sync): Directory creation runs in `poll_work`. Measure one key per deep directory before
     // moving that work to a scheduled item.
@@ -206,22 +193,16 @@ impl SpawnDownload {
     ) -> Self {
         Self {
             handle,
-            bucket: bucket.into(),
-            root: crate::io::key::stream::root_prefix(prefix).into_owned(),
+            root: crate::io::key::BucketRoot::new(bucket, prefix),
             local_root: local_root.into(),
             created_dirs: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
-    // The object a relative key names under this run's root.
-    pub(crate) fn object_key(&self, key: &str) -> String {
-        format!("{}{}", self.root, key)
-    }
-
-    // An S3 key can resolve above the destination root. This path uses the directory download path
-    // check.
+    // Return the file a key names below the local root. An S3 key can resolve above the root, or
+    // onto the file of a different key, and this function refuses both.
     pub(crate) fn file_path(&self, key: &str) -> Result<std::path::PathBuf, crate::error::Error> {
-        local_path_for_key(&self.local_root, key)
+        crate::io::key::local_path_strict(&self.local_root, key)
     }
 }
 
@@ -265,8 +246,8 @@ impl SpawnChild<aws_sdk_s3::types::Object> for SpawnDownload {
         })?;
 
         let input = crate::operation::download::DownloadInput::builder()
-            .bucket(&self.bucket)
-            .key(self.object_key(key))
+            .bucket(self.root.bucket())
+            .key(self.root.object_key(key))
             .build()
             .expect("bucket and key are set");
         let inner = crate::operation::download::Download::orchestrate_with_sink(

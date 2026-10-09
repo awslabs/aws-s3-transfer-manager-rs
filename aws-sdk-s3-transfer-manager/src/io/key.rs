@@ -23,8 +23,35 @@ use path_clean::PathClean;
 
 use crate::error;
 
-// Default S3 key delimiter.
+// S3 uses this delimiter when a caller sets none.
 pub(crate) const DEFAULT_DELIMITER: &str = "/";
+
+// `BucketRoot` names the place in a bucket that holds a sync run's keys. The run's keys are
+// relative to that place, so each request puts the root back on before it names an object. A
+// request that sent a relative key would reach for an object at the bucket's top level.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BucketRoot {
+    bucket: String,
+    root: String,
+}
+
+impl BucketRoot {
+    pub(crate) fn new(bucket: impl Into<String>, prefix: Option<&str>) -> Self {
+        Self {
+            bucket: bucket.into(),
+            root: stream::root_prefix(prefix).into_owned(),
+        }
+    }
+
+    pub(crate) fn bucket(&self) -> &str {
+        &self.bucket
+    }
+
+    // Return the object that a relative key names under this root.
+    pub(crate) fn object_key(&self, key: &str) -> String {
+        format!("{}{}", self.root, key)
+    }
+}
 
 // Derive the S3 object key for a file at `relative_filename` inside the walk root.
 //
@@ -140,6 +167,33 @@ pub(crate) fn local_key_path(
     Ok(local_path)
 }
 
+// Return the file a relative key names below `root`, or refuse the key. The path must stay below
+// the root, and it must still spell the key after path cleaning. Cleaning turns `a//b` and
+// `a/./b` into `a/b`, so either key would act on the file of the key `a/b`. A key ending in the
+// delimiter, such as `photos/2019/`, names a directory. Its path names the file of the key
+// `photos/2019`.
+//
+// Sync uses this function. `download_objects` keeps `local_key_path`.
+pub(crate) fn local_path_strict(root: &Path, key: &str) -> Result<PathBuf, error::Error> {
+    if key.ends_with(DEFAULT_DELIMITER) {
+        return Err(error::Error::new(
+            error::ErrorKind::InputInvalid,
+            format!("the key '{key}' names a place rather than a file"),
+        ));
+    }
+    let path = local_key_path(root, key, None, None)?;
+    let spelled = below_root(root, &path)
+        .and_then(Path::to_str)
+        .is_some_and(|rest| rest == key.replace(DEFAULT_DELIMITER, MAIN_SEPARATOR_STR));
+    if !spelled {
+        return Err(error::Error::new(
+            error::ErrorKind::InputInvalid,
+            format!("the key '{key}' names the file of a different key"),
+        ));
+    }
+    Ok(path)
+}
+
 // Return the part of `path` below `root`. The root itself and paths outside the root return `None`.
 //
 // `local_key_path` already cleans the derived path. Callers pass the root as written, so this
@@ -246,6 +300,20 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_bucket_root_puts_its_place_back_on_each_key() {
+        assert_eq!(BucketRoot::new("b", None).object_key("a.txt"), "a.txt");
+        assert_eq!(
+            BucketRoot::new("b", Some("data")).object_key("a.txt"),
+            "data/a.txt"
+        );
+        assert_eq!(
+            BucketRoot::new("b", Some("data/")).object_key("a.txt"),
+            "data/a.txt"
+        );
+        assert_eq!(BucketRoot::new("b", Some("data")).bucket(), "b");
+    }
 
     #[test]
     fn a_key_naming_a_place_still_derives_a_path() {

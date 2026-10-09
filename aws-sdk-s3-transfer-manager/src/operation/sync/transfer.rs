@@ -26,25 +26,6 @@ use state::{Decided, FailedSyncKey, State};
 // batch. The bound limits how long one work item holds an executor slot.
 const MERGE_BATCH: usize = 64;
 
-// Where a key lands, or the key a destination refuses.
-//
-// A key ending in the delimiter names a directory. Path derivation removes the trailing delimiter,
-// so `photos/2019/` becomes a file named `2019`. Both local sync paths refuse that key.
-//
-// Directory download keeps its existing behavior. Sync owns the rejection for sync runs.
-fn local_path_for_key(
-    root: &std::path::Path,
-    key: &str,
-) -> Result<std::path::PathBuf, crate::error::Error> {
-    if key.ends_with('/') {
-        return Err(crate::error::Error::new(
-            crate::error::ErrorKind::InputInvalid,
-            format!("the key '{key}' names a place rather than a file"),
-        ));
-    }
-    crate::io::key::local_key_path(root, key, None, None)
-}
-
 // How a run turned out. A run can finish without failures and still leave keys unaccounted for.
 // `Warned` reports that case.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -736,16 +736,54 @@ async fn a_download_asks_for_the_key_under_its_prefix() {
 }
 
 #[test]
+fn neither_local_site_acts_on_a_key_whose_path_names_another_key() {
+    let root = Path::new("/tmp/root");
+    for key in ["a//b", "a/./b", "a/../b", "./a"] {
+        assert!(
+            crate::io::key::local_path_strict(root, key).is_err(),
+            "a local site accepted {key:?}, whose path names a different key's file"
+        );
+    }
+}
+
+// The bucket's `a//b` and the local `a/b` are different keys, so a download run in delete mode
+// removes `a/b`. Path cleaning turns `a//b` into `a/b`, so a download of `a//b` would write the
+// file the same run removes.
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn a_download_refuses_a_key_whose_path_names_another_key() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path().canonicalize().expect("canonical root");
+    a_local_tree(&root, &["a/b"]);
+    let (client, gets) = a_bucket_recording_gets(&["a//b"], 1_600_000_000);
+
+    let (t, ctx, rx) = downloading_into(&root, client, DeleteMode::On);
+    run_managed(&t, &ctx, rx).await;
+
+    assert!(
+        gets.lock().is_empty(),
+        "the run downloaded `a//b` onto `a/b`"
+    );
+    let state = t.inner.state.lock();
+    let refused: Vec<&str> = state
+        .transfer_failure_sample()
+        .iter()
+        .map(|failure| failure.key.as_str())
+        .collect();
+    assert_eq!(refused, ["a//b"], "the run did not refuse `a//b`");
+}
+
+#[test]
 fn neither_local_site_acts_on_a_key_naming_a_place() {
     let root = Path::new("/tmp/root");
     for key in ["photos/2019/", "a/"] {
         assert!(
-            local_path_for_key(root, key).is_err(),
+            crate::io::key::local_path_strict(root, key).is_err(),
             "a local site would have acted on {key:?}"
         );
     }
     assert_eq!(
-        local_path_for_key(root, "photos/2019").expect("a file"),
+        crate::io::key::local_path_strict(root, "photos/2019").expect("a file"),
         Path::new("/tmp/root/photos/2019")
     );
 }

@@ -11,7 +11,6 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use super::local_path_for_key;
 use super::state::FailedSyncKey;
 
 // How many keys go in one delete request. `DeleteObjects` takes no more. Batching makes a large
@@ -78,25 +77,10 @@ impl DeleteFromLocalTree {
         Self { root: root.into() }
     }
 
-    // Return the file a relative key names below the root. Reject paths outside the root and paths
-    // that path cleaning changed.
-    //
-    // A local walk already produces cleaned paths. An S3 key can collapse onto another path after
-    // cleaning. The check stops a future S3-to-local delete from removing the wrong file.
+    // Return the file a relative key names below the root. A download names its files the same
+    // way, so the run removes a file only where a download of the same key would write it.
     pub(crate) fn file_path(&self, key: &str) -> Result<std::path::PathBuf, crate::error::Error> {
-        let path = local_path_for_key(&self.root, key)?;
-        // Containment and local deletion use the same remainder. The deletion path also requires
-        // that the remainder still spells the original key.
-        let named = crate::io::key::below_root(&self.root, &path)
-            .and_then(std::path::Path::to_str)
-            .is_some_and(|rest| rest == key.replace('/', std::path::MAIN_SEPARATOR_STR));
-        if !named {
-            return Err(crate::error::Error::new(
-                crate::error::ErrorKind::InputInvalid,
-                format!("the key '{key}' does not name the file this run would remove"),
-            ));
-        }
-        Ok(path)
+        crate::io::key::local_path_strict(&self.root, key)
     }
 
     fn batch_size(&self) -> usize {
@@ -148,10 +132,7 @@ impl DeleteKeys for DeleteFromLocalTree {
 // failure. A child gets retry behavior from its SDK client.
 pub(crate) struct DeleteFromBucket {
     client: aws_sdk_s3::Client,
-    bucket: String,
-    // As in `SpawnUpload`: keys arrive relative to the run's root, so the root goes back on before
-    // naming an object. Deleting a relative key would reach for something at the bucket root.
-    root: String,
+    root: crate::io::key::BucketRoot,
 }
 
 impl DeleteFromBucket {
@@ -162,14 +143,8 @@ impl DeleteFromBucket {
     ) -> Self {
         Self {
             client,
-            bucket: bucket.into(),
-            root: crate::io::key::stream::root_prefix(prefix).into_owned(),
+            root: crate::io::key::BucketRoot::new(bucket, prefix),
         }
-    }
-
-    // The object a relative key names under this run's root.
-    pub(crate) fn object_key(&self, key: &str) -> String {
-        format!("{}{}", self.root, key)
     }
 
     fn batch_size(&self) -> usize {
@@ -177,9 +152,9 @@ impl DeleteFromBucket {
     }
 
     async fn delete(&self, keys: Vec<String>, stopped: StopCheck<'_>) -> Vec<KeyOutcome> {
-        // The object each relative key names, in the same order. The run matches a response entry
-        // to the key it answers, and not to whatever sits at the same offset.
-        let addressed: Vec<String> = keys.iter().map(|k| self.object_key(k)).collect();
+        // `addressed` holds the object each relative key names, in the same order. The run matches
+        // a response entry to the key it answers, and not to whatever sits at the same offset.
+        let addressed: Vec<String> = keys.iter().map(|k| self.root.object_key(k)).collect();
         let mut at_object = std::collections::HashMap::with_capacity(addressed.len());
         for (at, object) in addressed.iter().enumerate() {
             at_object.insert(object.as_str(), at);
@@ -265,7 +240,7 @@ impl DeleteFromBucket {
                 async move {
                     self.client
                         .delete_objects()
-                        .bucket(&self.bucket)
+                        .bucket(self.root.bucket())
                         .delete(delete)
                         .send()
                         .await
