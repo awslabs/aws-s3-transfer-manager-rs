@@ -77,11 +77,21 @@ impl UploadFluentBuilder {
         self.inner.get_acl()
     }
     /// <p>Object data.</p>
+    ///
+    /// Required: [`initiate`](Self::initiate) fails with
+    /// [`ErrorKind::InputInvalid`](crate::error::ErrorKind::InputInvalid) if no body is set. To
+    /// upload an empty object, pass an empty body such as
+    /// [`InputStream::from_static(b"")`](crate::io::InputStream::from_static).
     pub fn body(mut self, input: crate::io::InputStream) -> Self {
         self.inner = self.inner.body(input);
         self
     }
     /// <p>Object data.</p>
+    ///
+    /// Required: [`initiate`](Self::initiate) fails with
+    /// [`ErrorKind::InputInvalid`](crate::error::ErrorKind::InputInvalid) if no body is set,
+    /// including after `set_body(None)`. To upload an empty object, pass an empty body such as
+    /// [`InputStream::from_static(b"")`](crate::io::InputStream::from_static).
     pub fn set_body(mut self, input: Option<crate::io::InputStream>) -> Self {
         self.inner = self.inner.set_body(input);
         self
@@ -178,17 +188,35 @@ impl UploadFluentBuilder {
     pub fn get_content_language(&self) -> Option<&str> {
         self.inner.get_content_language()
     }
-    /// <p>Size of the body in bytes. This parameter is useful when the size of the body cannot be determined automatically. For more information, see <a href="https://www.rfc-editor.org/rfc/rfc9110.html#name-content-length">https://www.rfc-editor.org/rfc/rfc9110.html#name-content-length</a>.</p>
+    /// The exact size of the body in bytes.
+    ///
+    /// When set, the body must produce exactly this many bytes, and a mismatch fails the upload.
+    /// A negative value, or one outside the body's [size hint](crate::io::InputStream::size_hint),
+    /// fails when the upload is initiated. A [`PartStream`](crate::io::PartStream) body that runs
+    /// past the value fails before the part that exceeds it is sent, and one that ends short of
+    /// it fails before CompleteMultipartUpload is sent.
     pub fn content_length(mut self, input: i64) -> Self {
         self.inner = self.inner.content_length(input);
         self
     }
-    /// <p>Size of the body in bytes. This parameter is useful when the size of the body cannot be determined automatically. For more information, see <a href="https://www.rfc-editor.org/rfc/rfc9110.html#name-content-length">https://www.rfc-editor.org/rfc/rfc9110.html#name-content-length</a>.</p>
+    /// The exact size of the body in bytes.
+    ///
+    /// When set, the body must produce exactly this many bytes, and a mismatch fails the upload.
+    /// A negative value, or one outside the body's [size hint](crate::io::InputStream::size_hint),
+    /// fails when the upload is initiated. A [`PartStream`](crate::io::PartStream) body that runs
+    /// past the value fails before the part that exceeds it is sent, and one that ends short of
+    /// it fails before CompleteMultipartUpload is sent.
     pub fn set_content_length(mut self, input: Option<i64>) -> Self {
         self.inner = self.inner.set_content_length(input);
         self
     }
-    /// <p>Size of the body in bytes. This parameter is useful when the size of the body cannot be determined automatically. For more information, see <a href="https://www.rfc-editor.org/rfc/rfc9110.html#name-content-length">https://www.rfc-editor.org/rfc/rfc9110.html#name-content-length</a>.</p>
+    /// The exact size of the body in bytes.
+    ///
+    /// When set, the body must produce exactly this many bytes, and a mismatch fails the upload.
+    /// A negative value, or one outside the body's [size hint](crate::io::InputStream::size_hint),
+    /// fails when the upload is initiated. A [`PartStream`](crate::io::PartStream) body that runs
+    /// past the value fails before the part that exceeds it is sent, and one that ends short of
+    /// it fails before CompleteMultipartUpload is sent.
     pub fn get_content_length(&self) -> &Option<i64> {
         self.inner.get_content_length()
     }

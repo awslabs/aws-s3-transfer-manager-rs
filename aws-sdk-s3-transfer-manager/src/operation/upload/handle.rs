@@ -252,12 +252,13 @@ mod tests {
                 ))
                 .build(),
         );
-        let input = UploadInput::builder()
+        let mut input = UploadInput::builder()
             .bucket("test-bucket")
             .key("test-key")
+            .body(InputStream::from(Vec::<u8>::new()))
             .build()
             .unwrap();
-        let stream = InputStream::from(Vec::<u8>::new());
+        let stream = input.take_body();
         let (ctx, completion_rx) = TransferContext::new(handle);
         let transfer =
             UploadTransfer::try_new(ctx.clone(), BucketType::Standard, input, stream).unwrap();

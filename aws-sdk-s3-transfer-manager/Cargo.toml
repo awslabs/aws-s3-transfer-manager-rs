@@ -1,6 +1,6 @@
 [package]
 name = "aws-sdk-s3-transfer-manager"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 authors = ["AWS Rust SDK Team <aws-sdk-rust@amazon.com>", "Aaron Todd <todaaron@amazon.com>"]
 license = "Apache-2.0"
@@ -52,9 +52,9 @@ nix = { version = "0.31", features = ["uio", "fs", "resource"] }
 [target.'cfg(target_os = "android")'.dependencies]
 aws-smithy-runtime = { workspace = true, features = ["client", "rt-tokio"] }
 
-# Virtual memory and total physical RAM.
+# Virtual memory, total physical RAM, and a file handle's granted access.
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_System_Memory", "Win32_System_SystemInformation"] }
+windows-sys = { version = "0.59", features = ["Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Memory", "Win32_System_SystemInformation"] }
 
 [dev-dependencies]
 aws-sdk-s3 = { workspace = true, features = ["behavior-version-latest", "test-util"] }
