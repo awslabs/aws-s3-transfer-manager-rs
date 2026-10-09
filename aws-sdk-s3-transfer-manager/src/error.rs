@@ -10,6 +10,7 @@ use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::operation::abort_multipart_upload::AbortMultipartUploadError;
 use aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadError;
 use aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadError;
+use aws_sdk_s3::operation::delete_objects::DeleteObjectsError;
 use aws_sdk_s3::operation::get_object::GetObjectError;
 use aws_sdk_s3::operation::head_object::HeadObjectError;
 use aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Error;
@@ -159,7 +160,7 @@ impl ChunkRef {
 }
 
 /// Service-call detail read from the concrete `SdkError`.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ServiceMetadata {
     operation: &'static str,
     code: Option<String>,
@@ -220,6 +221,55 @@ impl Error {
                 }),
                 ..Default::default()
             })),
+        }
+    }
+
+    /// Creates an error for one item that a batch call refused inside a successful response.
+    /// `DeleteObjects` reports each refused key this way. The error carries the item's code and
+    /// message, and the request id of the batch response.
+    pub(crate) fn refused_in_batch(
+        operation: &'static str,
+        code: Option<&str>,
+        message: Option<&str>,
+        request_id: Option<&str>,
+    ) -> Error {
+        let text = match (code, message) {
+            (Some(code), Some(message)) => format!("{code}: {message}"),
+            (Some(code), None) => code.to_string(),
+            (None, Some(message)) => message.to_string(),
+            (None, None) => "no reason given".to_string(),
+        };
+        Error {
+            kind: ErrorKind::ServiceError,
+            source: text.into(),
+            extra: Some(Box::new(ErrorExtra {
+                service: Some(ServiceMetadata {
+                    operation,
+                    code: code.map(str::to_owned),
+                    message: message.map(str::to_owned),
+                    request_id: request_id.map(str::to_owned),
+                    extended_request_id: None,
+                }),
+                ..Default::default()
+            })),
+        }
+    }
+
+    /// Returns a copy of this error for a caller that reports one failure for many items. The
+    /// copy keeps the kind, the service metadata, and the full message text. The copy drops the
+    /// source chain and every other attachment. `Error` owns its source and its attachments
+    /// uniquely, so only one error can hold them.
+    pub(crate) fn copy_for_report(&self) -> Error {
+        let text = aws_smithy_types::error::display::DisplayErrorContext(self).to_string();
+        Error {
+            kind: self.kind.clone(),
+            source: text.into(),
+            extra: self.service().map(|service| {
+                Box::new(ErrorExtra {
+                    service: Some(service.clone()),
+                    ..Default::default()
+                })
+            }),
         }
     }
 
@@ -622,20 +672,19 @@ from_sdk_error!(CreateMultipartUploadError, "CreateMultipartUpload");
 from_sdk_error!(CompleteMultipartUploadError, "CompleteMultipartUpload");
 from_sdk_error!(AbortMultipartUploadError, "AbortMultipartUpload");
 from_sdk_error!(ListObjectsV2Error, "ListObjectsV2");
+from_sdk_error!(DeleteObjectsError, "DeleteObjects");
 
 impl From<crate::io::walk::WalkError> for Error {
     /// Maps a directory-walk failure to a transfer error, preserving the
     /// `WalkError` as the source so its classification and path remain reachable
     /// via [`std::error::Error::source`].
     ///
-    /// A `ListObjectsV2` service failure is recovered to a full
-    /// [`ErrorKind::ServiceError`] (with operation, code, and request ids); an
-    /// unreadable or non-directory source root is [`ErrorKind::InputInvalid`];
-    /// per-entry filesystem failures and unreadable subdirectories are
-    /// [`ErrorKind::IOError`].
+    /// The kind names its own category, so the mapping lives with the kind and not here. A
+    /// `ListObjectsV2` service failure takes the one extra step: recovering its operation, code
+    /// and request ids needs the error by value, which naming a category does not.
     ///
-    /// A subdirectory that turns out not to be a directory between being listed and being read is
-    /// one of the latter. It used to be [`ErrorKind::InputInvalid`] and end the walk, because the
+    /// A subdirectory that turns out not to be a directory between being listed and being read
+    /// reads as a filesystem failure. It used to be invalid input and end the walk, because the
     /// kind came from the error itself rather than from where it happened; a walk that has already
     /// produced entries has no reason to stop over one name, so it now costs the keys beneath that
     /// directory instead of the run.
@@ -647,25 +696,28 @@ impl From<crate::io::walk::WalkError> for Error {
         use crate::io::walk::WalkErrorKind;
         match e.kind() {
             WalkErrorKind::Service => {
-                // The S3 walker's only service call is ListObjectsV2, so the
-                // boxed source downcasts to that SdkError.
-                match e.into_source().downcast::<SdkError<
+                // The S3 walker's only service call is ListObjectsV2, so an unretried send's boxed
+                // source downcasts to that SdkError.
+                let source = e.into_source();
+                match source.downcast::<SdkError<
                     ListObjectsV2Error,
                     aws_smithy_runtime_api::client::orchestrator::HttpResponse,
                 >>() {
                     Ok(sdk) => Error::from(*sdk),
-                    Err(src) => Error::new(ErrorKind::ObjectNotDiscoverable, src),
+                    // A retried send arrives already converted, because the classifier that decides
+                    // whether to send again reads the service code, and only the conversion carries
+                    // it. Taking that error as it is keeps the operation, code and request ids that
+                    // the fallback below would drop.
+                    Err(source) => match source.downcast::<Error>() {
+                        Ok(converted) => *converted,
+                        Err(source) => Error::new(ErrorKind::ObjectNotDiscoverable, source),
+                    },
                 }
             }
-            WalkErrorKind::SourceUnreadable | WalkErrorKind::NotADirectory => {
-                Error::new(ErrorKind::InputInvalid, e)
-            }
-            WalkErrorKind::Io
-            | WalkErrorKind::Vanished
-            | WalkErrorKind::PermissionDenied
-            | WalkErrorKind::DirectoryUnreadable
-            | WalkErrorKind::BrokenSymlink
-            | WalkErrorKind::SymlinkCycle => Error::new(ErrorKind::IOError, e),
+            // Every other kind takes the category the kind itself names. The service arm above is
+            // separate because recovering its metadata needs the error by value, where naming a
+            // category needs only the kind.
+            other => Error::new(other.category(), e),
         }
     }
 }

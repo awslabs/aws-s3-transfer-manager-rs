@@ -192,12 +192,18 @@ This is about one entry at a time. Failing to read an entire directory is a diff
 (FR-Enum-12).
 *`[ISSUE]` [#487](https://github.com/aws/aws-cli/issues/487) — "S3 sync will exit when a broken symlink are present" (sic) — and its mirror [#425](https://github.com/aws/aws-cli/issues/425), where a filesystem exception makes the CLI "exit silently, and with a non-error (0) exit status", stopping "prematurely … before all files had been sync'ed up". The requirement is skip-and-warn: not skip-and-stop, and not fail. `[CLI]` the two categories are `filegenerator.py` → `is_special_file` versus `is_readable`; a name the filesystem encoding cannot decode is skipped with a warning naming its raw bytes (`should_ignore_file_with_decoding_warnings` → `FileDecodingError`). That check is locale-dependent, which a UTF-8 validity test is not. `[TM]` directory upload disagrees across implementations, so an object at a lossily-derived key is something sync will meet: this crate's `upload_objects` and the Java v2 transfer manager both build the key with a lossy conversion, the Go transfer manager passes the raw filename bytes through because a Go string need not be valid UTF-8, and boto3 and the JavaScript SDK have no directory upload at all.*
 
-**FR-Enum-4** Following symlinks MUST be a setting, and MUST default to **not** following them. With
-following turned on, sync transfers what the link points at, filed under the link's own name rather than
-the target's, on every platform.
+**FR-Enum-4** Following symlinks MUST be a setting. Sync MUST handle symlinks the way the transfer
+manager's directory operation for the same direction handles them. An upload sync MUST match
+`upload_objects`, so the setting defaults to off. A download sync MUST match `download_objects`, and it
+writes local files the same way. A link on a directory above a file carries the write to the link's
+target. The download replaces a link that stands at the file's own name.
+
+With following off on an upload, a link occupies its own name. Sync leaves every destination key under
+that name alone. The plan reports that it did not account for those keys. With following on, sync
+transfers what the link points at and files it under the link's own name on every platform.
 
 So a link `current -> releases/v3/` transfers the files inside `releases/v3/` as `current/...`.
-*`[NEW]` — **reverses** what the CLI documents (`--follow-symlinks | --no-follow-symlinks`, "the default is to follow symlinks"). Defaulted this way because sync delegates to the transfer manager's directory operations, and defaulting differently from them would surprise anyone composing the two. `[ISSUE]` [#2550](https://github.com/aws/aws-cli/issues/2550) — on Windows, following symlinks uploads 0-byte objects instead of target contents.*
+*`[TM]` the transfer manager design sets `followSymbolicLinks` to `false` for a directory upload and names no symlink setting for a directory download. The CLI follows symlinks by default (`--follow-symlinks | --no-follow-symlinks`). Sync follows the transfer manager, so a caller who combines sync with the directory operations sees one behavior. `[ISSUE]` [#2550](https://github.com/aws/aws-cli/issues/2550) — on Windows, following symlinks uploads each linked file as a 0-byte object.*
 
 **FR-Enum-5** When a local file's modification time falls outside the range this platform can represent,
 sync MUST warn and treat the file as though it were last modified at the UNIX epoch — midnight, 1 January
@@ -534,10 +540,12 @@ otherwise a run against a requester-pays bucket fails at the first listing, befo
 considered.
 *`[CLI]` `utils.py` → `RequestParamsMapper._set_request_payer_param`, `map_list_objects_v2_params`; `subcommands.py` → `_map_request_payer_params` applies it to both `HeadObject` and `ListObjectsV2` request parameters for both generators. `[DOC]` `--request-payer`.*
 
-**FR-Exec-12** Transfers MAY happen in any order, but within a single run a delete and a transfer for the
-same relative key MUST NOT overlap. Otherwise the outcome depends on which finishes last, and the same run
-could leave the key either present or absent.
-*`[DERIVED]` from `comparator.py` → `Comparator.call`: each `compare_key` resolves to exactly one branch (`equal`, `less_than`, `greater_than`), so a key can never be both transferred and deleted in the same run.*
+**FR-Exec-12** Transfers MAY happen in any order. Within a single run, a delete and a transfer MUST NOT
+overlap when they touch the same place. On a bucket, the same place means the same relative key. On a
+local tree, it also means a name on a transfer's path. A download of `photos/a.jpg` waits for the removal
+of the file or link `photos`. Otherwise the outcome depends on the order the work finishes in. The same
+run could leave a key either present or absent, or write outside the root.
+*`[DERIVED]` from `comparator.py` → `Comparator.call`: each `compare_key` resolves to exactly one branch (`equal`, `less_than`, `greater_than`), so a key can never be both transferred and deleted in the same run. `[NEW]` — the path rule covers what a local tree adds. A download writes `photos/a.jpg` through whatever stands at `photos`. When the removal of `photos` lands after the download starts, the file lands outside the root, or the run ends with neither key.*
 
 **FR-Exec-13** A destination file MUST NOT be truncated or removed until its replacement has been
 retrieved: a failed download MUST leave previous local content intact.
@@ -646,12 +654,16 @@ first failed entry throws away progress that the next run has to repeat.
 
 **FR-Fail-3** What each policy obliges:
 
-- **Continue** — the run carries on past the failed entry. Every failure MUST be recorded and readable in
-  the result, and the run MUST report completed-with-failures (FR-Fail-5). A failure that only reached a log
-  has been lost.
-- **Abort** — sync MUST stop starting new work promptly, and MUST report which entries completed before it
-  stopped.
-*`[NEW]` — the two policies are the same pair the transfer manager's other directory operations expose, so a caller can compose them without learning a second model.*
+- **Continue** — the run carries on past the failed entry. The run MUST count every failure. The
+  result MUST group the failures by cause (FR-Fail-4). Each failure MUST reach the caller as an
+  event while the run is going (FR-Obs-1). The run MUST report completed-with-failures
+  (FR-Fail-5). The caller loses a failure that only reached a log.
+- **Abort** — sync MUST stop starting new work promptly. Sync MUST cancel every running transfer.
+  Sync MUST wait until each transfer settles, and sync then fails the run. The run's error MUST be
+  the error of the failure that stopped the run. The result MUST report the entries that completed
+  before the run stopped. Sync waits for the response to a delete request it already sent, because
+  S3 may have acted on that request.
+*`[NEW]` — the two policies are the same pair the transfer manager's other directory operations expose, so a caller can compose them without learning a second model. `[CLI]` s3transfer `manager.py` → `TransferManager.__exit__` → `_shutdown` cancels every in-flight transfer. Then `_shutdown` waits for each one, so a fatal error ends the run promptly and leaves no transfer running. `[TM]` `upload_objects` and `download_objects` fail the run at once with `ChildOperationFailed`, and the handle's `join` cancels the children. Sync cancels the children itself, so the run's error stays the failure's own error and keeps its service code. `[DERIVED]` — FR-Fail-4 bounds the result by the number of causes. The result therefore holds counts and groups, and the caller reads each failure from its event.*
 
 **FR-Fail-4** The result MUST report how many entries and bytes were transferred, deleted, skipped as
 unchanged, skipped with a warning, and skipped as unknown (FR-Fail-7). None of it MUST grow with the number

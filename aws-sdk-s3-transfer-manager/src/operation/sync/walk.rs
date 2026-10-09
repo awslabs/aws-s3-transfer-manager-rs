@@ -21,7 +21,8 @@ use std::sync::Arc;
 
 use crate::io::key::filter::KeyFilter;
 use crate::io::key::stream::{
-    key_under_root, local_predicate, s3_predicate, Entry, KeyStream, KeysLost, StreamError,
+    key_under_root, local_predicate, s3_predicate, Entry, KeyStream, KeysLost, Obstruction,
+    StreamError,
 };
 use crate::io::walk::{
     FsEntry, FsWalk, FsWalkContext, FsWalker, S3Walk, S3WalkContext, S3Walker, SortOrder,
@@ -238,6 +239,13 @@ impl<K: KeyStream> Side<K> {
         matches!(self.head, Head::Finished)
     }
 
+    // Return whether the head entry carries `obstruction`.
+    fn head_is(&self, obstruction: Obstruction) -> bool {
+        self.head
+            .entry()
+            .is_some_and(|entry| entry.meta.obstruction == Some(obstruction))
+    }
+
     // Take the entry at the head, releasing every stretch the merge has now passed.
     //
     // A key inside a stretch, or one sorting before it, releases nothing: the failure was heard
@@ -411,6 +419,17 @@ fn at_or_under(key: &str, name: &str) -> bool {
 }
 
 // Two key-ordered streams merged into one pairing per key.
+// `Progress` tells callers whether the merge can infer absence from key position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Progress {
+    // The merge has not finished. It may produce more pairings.
+    Pairing,
+    // Both streams finished. Every produced key has a pairing.
+    Accounted,
+    // A terminal failure stopped the merge. Later keys cannot read absence from position.
+    Stopped,
+}
+
 pub(crate) struct Walk<S: KeyStream, D: KeyStream> {
     src: Side<S>,
     dst: Side<D>,
@@ -448,19 +467,40 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
         if self.ended_by_failure {
             return None;
         }
-        if let Some(err) = self.src.fill().await {
-            self.incomplete = true;
-            if self.src.is_done() {
-                self.ended_by_failure = true;
+        loop {
+            // A failure that lost no key, such as a file that vanished, leaves the plan whole.
+            if let Some(err) = self.src.fill().await {
+                if err.keys_lost() != KeysLost::Nothing {
+                    self.incomplete = true;
+                }
+                if self.src.is_done() {
+                    self.ended_by_failure = true;
+                }
+                return Some(Err(err));
             }
-            return Some(Err(err));
-        }
-        if let Some(err) = self.dst.fill().await {
-            self.incomplete = true;
-            if self.dst.is_done() {
-                self.ended_by_failure = true;
+            if let Some(err) = self.dst.fill().await {
+                if err.keys_lost() != KeysLost::Nothing {
+                    self.incomplete = true;
+                }
+                if self.dst.is_done() {
+                    self.ended_by_failure = true;
+                }
+                return Some(Err(err));
             }
-            return Some(Err(err));
+            // The filter excluded this link's own name, so the name makes no pairing. A source link
+            // still hides the keys under its name, so the source holds those keys back.
+            if self.src.head_is(Obstruction::ExcludedLink) {
+                let link = self.src.take();
+                self.src.gap.add(Stretch {
+                    under: Some(link.key),
+                });
+                continue;
+            }
+            if self.dst.head_is(Obstruction::ExcludedLink) {
+                self.dst.take();
+                continue;
+            }
+            break;
         }
 
         match (&self.src.head, &self.dst.head) {
@@ -501,17 +541,47 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
         !self.incomplete
     }
 
-    // Whether anything further will be paired.
+    // Report whether the merge can continue pairing, accounted for every key, or stopped.
+    pub(crate) fn progress(&self) -> Progress {
+        if self.ended_by_failure {
+            Progress::Stopped
+        } else if self.src.is_finished() && self.dst.is_finished() {
+            Progress::Accounted
+        } else {
+            Progress::Pairing
+        }
+    }
+
+    // Take the source's head entry. A source link the walk did not follow occupies its name and
+    // hides whatever sits under it, so the source holds back every key under that name. A
+    // destination key there then reads as unknown and not as absent.
     //
-    // A walk that has not been advanced answers `false`, since neither side has said yet
-    // whether it holds anything. That matches what the two walkers underneath do.
-    pub(crate) fn is_done(&self) -> bool {
-        self.ended_by_failure || (self.src.is_finished() && self.dst.is_finished())
+    // TODO(vnext): The transfer manager has no symlink policy for the local side of a download.
+    // `download_objects` writes through a link on a directory above a file, and it replaces a link
+    // at the file's own name. Sync does both, until the transfer manager settles a download-side
+    // policy.
+    fn take_source(&mut self) -> Entry<S::Source> {
+        let entry = self.src.take();
+        if entry.meta.obstruction == Some(Obstruction::UnfollowedLink) {
+            self.src.gap.add(Stretch {
+                under: Some(entry.key.clone()),
+            });
+        }
+        entry
+    }
+
+    // A key one side could not account for leaves a hole in the plan, whether a failure or an
+    // unfollowed link hid it.
+    fn note_unknown<T>(&mut self, side: &SideState<T>) {
+        if matches!(side, SideState::Unknown(_)) {
+            self.incomplete = true;
+        }
     }
 
     fn take_source_only(&mut self) -> Pairing<S::Source, D::Source> {
-        let entry = self.src.take();
+        let entry = self.take_source();
         let destination = self.dst.missing(&entry.key);
+        self.note_unknown(&destination);
         Pairing {
             key: entry.key.clone(),
             source: SideState::Present(entry),
@@ -522,6 +592,7 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
     fn take_destination_only(&mut self) -> Pairing<S::Source, D::Source> {
         let entry = self.dst.take();
         let source = self.src.missing(&entry.key);
+        self.note_unknown(&source);
         Pairing {
             key: entry.key.clone(),
             source,
@@ -531,7 +602,7 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
 
     fn take_both(&mut self) -> Pairing<S::Source, D::Source> {
         // Neither side is missing here, so neither has anything to answer for.
-        let src = self.src.take();
+        let src = self.take_source();
         let dst = self.dst.take();
         Pairing {
             key: src.key.clone(),
@@ -761,6 +832,7 @@ fn cost_of(err: &StreamError, root: Option<&Path>) -> Cost {
 // Only an absent root is swallowed. A root that exists and is not a directory still ends the run,
 // because nothing can be written into it either, and a root that could not be read is a permission
 // problem the caller has to hear about.
+#[derive(Debug)]
 pub(crate) struct LocalDestination {
     walk: FsWalk,
     absent: bool,
@@ -1047,8 +1119,9 @@ mod tests {
                 at(pairing.destination()),
             ));
         }
-        assert!(
-            walk.is_done(),
+        assert_eq!(
+            walk.progress(),
+            Progress::Accounted,
             "the merge ends only when both sides are done"
         );
         plan
@@ -1381,6 +1454,135 @@ mod tests {
             key: Some(key.to_string()),
             what: "size",
         }
+    }
+
+    fn obstructed(key: &str, why: Obstruction) -> Entry<()> {
+        let mut entry = entry(key);
+        entry.meta.obstruction = Some(why);
+        entry
+    }
+
+    // Pair every key and report whether the walk called its plan complete.
+    async fn pair_all(mut walk: Walk<Scripted, Scripted>) -> (Vec<(String, At, At)>, bool) {
+        let mut seen = Vec::new();
+        while let Some(next) = walk.next().await {
+            if let Ok(pairing) = next {
+                seen.push((
+                    pairing.key().to_string(),
+                    at(pairing.source()),
+                    at(pairing.destination()),
+                ));
+            }
+        }
+        (seen, walk.is_plan_complete())
+    }
+
+    #[tokio::test]
+    async fn a_source_link_the_walk_did_not_follow_holds_back_the_keys_under_it() {
+        let walk = Walk::new(
+            Scripted::from(vec![
+                Ok(entry("a.txt")),
+                Ok(obstructed("photos", Obstruction::UnfollowedLink)),
+            ]),
+            Scripted::of(&["photos", "photos/2019/x.jpg", "photos/y.jpg", "q.txt"]),
+        );
+        let (seen, complete) = pair_all(walk).await;
+        assert_eq!(
+            seen,
+            plan(&[
+                ("a.txt", At::Here, At::Gone),
+                ("photos", At::Here, At::Here),
+                ("photos/2019/x.jpg", At::UnknownRange, At::Here),
+                ("photos/y.jpg", At::UnknownRange, At::Here),
+                ("q.txt", At::Gone, At::Here),
+            ])
+        );
+        assert!(
+            !complete,
+            "a plan that skipped keys under a link called itself complete"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_excluded_source_link_holds_back_the_keys_under_it_and_makes_no_pairing() {
+        let walk = Walk::new(
+            Scripted::from(vec![
+                Ok(entry("a.txt")),
+                Ok(obstructed("photos", Obstruction::ExcludedLink)),
+            ]),
+            Scripted::of(&["photos/y.jpg", "q.txt"]),
+        );
+        let (seen, complete) = pair_all(walk).await;
+        assert_eq!(
+            seen,
+            plan(&[
+                ("a.txt", At::Here, At::Gone),
+                ("photos/y.jpg", At::UnknownRange, At::Here),
+                ("q.txt", At::Gone, At::Here),
+            ])
+        );
+        assert!(
+            !complete,
+            "a plan that skipped keys under an excluded link called itself complete"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_excluded_destination_link_makes_no_pairing() {
+        let walk = Walk::new(
+            Scripted::of(&["photos/y.jpg"]),
+            Scripted::from(vec![Ok(obstructed("photos", Obstruction::ExcludedLink))]),
+        );
+        let (seen, complete) = pair_all(walk).await;
+        assert_eq!(seen, plan(&[("photos/y.jpg", At::Here, At::Gone)]));
+        assert!(complete);
+    }
+
+    #[tokio::test]
+    async fn a_source_link_with_nothing_under_it_leaves_the_plan_complete() {
+        let walk = Walk::new(
+            Scripted::from(vec![Ok(obstructed("photos", Obstruction::UnfollowedLink))]),
+            Scripted::of(&["photos", "q.txt"]),
+        );
+        let (_, complete) = pair_all(walk).await;
+        assert!(complete);
+    }
+
+    // A download writes through a destination link, as `download_objects` does, so a destination
+    // link holds nothing back.
+    #[tokio::test]
+    async fn a_destination_link_holds_nothing_back() {
+        let walk = Walk::new(
+            Scripted::of(&["photos/y.jpg"]),
+            Scripted::from(vec![Ok(obstructed("photos", Obstruction::UnfollowedLink))]),
+        );
+        let (seen, complete) = pair_all(walk).await;
+        assert_eq!(
+            seen,
+            plan(&[
+                ("photos", At::Gone, At::Here),
+                ("photos/y.jpg", At::Here, At::Gone),
+            ])
+        );
+        assert!(complete);
+    }
+
+    // A socket cannot hold a directory, so its name holds back no keys under it.
+    #[tokio::test]
+    async fn a_source_socket_holds_nothing_back() {
+        let walk = Walk::new(
+            Scripted::from(vec![Ok(obstructed("sock", Obstruction::NothingToRead))]),
+            Scripted::of(&["sock/x.txt"]),
+        );
+        let (seen, complete) = pair_all(walk).await;
+        assert_eq!(
+            seen,
+            plan(&[
+                ("sock", At::Here, At::Gone),
+                ("sock/x.txt", At::Gone, At::Here),
+            ])
+        );
+        assert!(complete);
     }
 
     async fn drain(mut walk: Walk<Scripted, Scripted>) -> Vec<(String, At, At)> {
@@ -1928,7 +2130,7 @@ mod tests {
             Scripted::of(&["a.txt", "b.txt", "c.txt"]),
         );
         while walk.next().await.is_some() {}
-        assert!(walk.is_done());
+        assert_eq!(walk.progress(), Progress::Stopped);
         assert!(!walk.is_plan_complete());
     }
 
@@ -1937,6 +2139,30 @@ mod tests {
         let mut walk = Walk::new(Scripted::of(&["a.txt"]), Scripted::of(&["a.txt"]));
         while walk.next().await.is_some() {}
         assert!(walk.is_plan_complete());
+    }
+
+    #[tokio::test]
+    async fn a_file_that_went_away_leaves_the_plan_whole() {
+        // A file that vanished mid-walk is an answer: the file is gone. The walk lost no key, so
+        // an active tree keeps a whole plan.
+        let gone = StreamError::Walk(WalkError::new(
+            Some(PathBuf::from("/root/b.txt")),
+            WalkErrorKind::Vanished,
+            Box::from("not there any more"),
+        ));
+        let mut walk = Walk::new(
+            Scripted::from(vec![Ok(entry("a.txt")), Err(gone), Ok(entry("c.txt"))]),
+            Scripted::of(&["a.txt", "c.txt"]),
+        );
+        let mut errors = 0;
+        while let Some(next) = walk.next().await {
+            errors += usize::from(next.is_err());
+        }
+        assert_eq!(errors, 1, "the walk did not report the vanished file");
+        assert!(
+            walk.is_plan_complete(),
+            "a file that went away marked the plan incomplete"
+        );
     }
 
     #[tokio::test]
@@ -1964,7 +2190,7 @@ mod tests {
             walk.next().await.is_none(),
             "a side that has stopped cannot say a key is absent, so nothing more is paired"
         );
-        assert!(walk.is_done());
+        assert_eq!(walk.progress(), Progress::Stopped);
     }
 
     #[tokio::test]
@@ -1979,7 +2205,7 @@ mod tests {
             walk.next().await.is_none(),
             "nothing may be written to or removed from a side nobody could read"
         );
-        assert!(walk.is_done());
+        assert_eq!(walk.progress(), Progress::Stopped);
     }
 
     #[tokio::test]
@@ -2446,8 +2672,9 @@ mod tests {
                     .build(),
             )
             .expect("an ordinary bucket builds");
-        assert!(
-            !walk.is_done(),
+        assert_eq!(
+            walk.progress(),
+            Progress::Pairing,
             "a walk that has read nothing has not finished"
         );
         // Without this the local side cannot turn a failure's path into a key, and one

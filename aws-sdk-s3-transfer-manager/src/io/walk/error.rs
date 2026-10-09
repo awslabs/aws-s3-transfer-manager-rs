@@ -57,6 +57,41 @@ impl WalkErrorKind {
             WalkErrorKind::SourceUnreadable | WalkErrorKind::NotADirectory | WalkErrorKind::Service
         )
     }
+
+    // Return the error category without consuming the failure. Event integration and outcome
+    // reporting read it before the failure moves into a run record.
+    //
+    // The match names every variant. A new walk error needs its own category.
+    pub(crate) fn category(&self) -> crate::error::ErrorKind {
+        use crate::error::ErrorKind;
+        match self {
+            WalkErrorKind::Service => ErrorKind::ServiceError,
+            WalkErrorKind::SourceUnreadable | WalkErrorKind::NotADirectory => {
+                ErrorKind::InputInvalid
+            }
+            WalkErrorKind::Io
+            | WalkErrorKind::Vanished
+            | WalkErrorKind::PermissionDenied
+            | WalkErrorKind::DirectoryUnreadable
+            | WalkErrorKind::SymlinkCycle
+            | WalkErrorKind::BrokenSymlink => ErrorKind::IOError,
+        }
+    }
+
+    // Return true when no sync setting can transfer the item. A symlink cycle has no terminal target.
+    // A path that vanished after listing has no work left to transfer.
+    pub(crate) fn is_warning(&self) -> bool {
+        match self {
+            WalkErrorKind::SymlinkCycle | WalkErrorKind::Vanished => true,
+            WalkErrorKind::SourceUnreadable
+            | WalkErrorKind::NotADirectory
+            | WalkErrorKind::Service
+            | WalkErrorKind::Io
+            | WalkErrorKind::PermissionDenied
+            | WalkErrorKind::DirectoryUnreadable
+            | WalkErrorKind::BrokenSymlink => false,
+        }
+    }
 }
 
 /// An error encountered during a directory walk.
@@ -143,6 +178,32 @@ impl std::error::Error for WalkError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_kind_says_whether_it_ends_the_walk_and_whether_it_was_ever_transferable() {
+        for kind in [
+            WalkErrorKind::SourceUnreadable,
+            WalkErrorKind::NotADirectory,
+            WalkErrorKind::Service,
+        ] {
+            assert!(kind.is_fatal(), "{kind:?} must end the walk");
+            assert!(!kind.is_warning(), "{kind:?} is a failure, not a warning");
+        }
+        for kind in [
+            WalkErrorKind::Io,
+            WalkErrorKind::PermissionDenied,
+            WalkErrorKind::DirectoryUnreadable,
+            WalkErrorKind::BrokenSymlink,
+        ] {
+            assert!(!kind.is_fatal(), "{kind:?} must not end the walk");
+            assert!(
+                !kind.is_warning(),
+                "{kind:?} should have worked, so it is a failure"
+            );
+        }
+        assert!(!WalkErrorKind::SymlinkCycle.is_fatal());
+        assert!(WalkErrorKind::SymlinkCycle.is_warning());
+    }
 
     #[test]
     fn test_classify_io_permission_denied() {

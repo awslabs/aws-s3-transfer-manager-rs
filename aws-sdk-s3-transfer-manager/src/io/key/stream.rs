@@ -23,7 +23,7 @@ use crate::io::FileType;
 use super::filter::KeyFilter;
 use super::{derive_object_key, DEFAULT_DELIMITER};
 use crate::io::walk::{
-    exclude_s3_folder_markers, FsEntry, FsWalk, S3Walk, WalkError, WalkErrorKind,
+    exclude_s3_folder_markers, FsEntry, FsWalk, PathFiltered, S3Walk, WalkError, WalkErrorKind,
 };
 
 // Metadata of an `Entry`, read off the item the walker produced and kept to what a comparison
@@ -64,9 +64,17 @@ pub(crate) struct EntryMeta {
 // destination lacks the key there is no item here to hang them on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Obstruction {
-    // A socket, a device, a named pipe, or a symlink the walk was told not to follow: the name is
-    // taken and holds nothing a transfer could read, and reading one may never finish.
+    // The item is a socket, a device, or a named pipe. It occupies its name and holds nothing a
+    // transfer could read, and reading one may never finish.
     NothingToRead,
+    // The item is a symlink the walk did not follow. It occupies its name, and the walk never
+    // looked at what it points to. The target can be a directory, so the keys under this name are
+    // unknown too.
+    UnfollowedLink,
+    // The item is a link whose own name the filter excluded. The filter hides the name. The link
+    // still hides the keys under the name, so the merge drops this entry and holds back those
+    // keys.
+    ExcludedLink,
     // An object whose bytes sit in an archive with no restored copy to read.
     Archived,
     // A restore is under way. The bytes arrive when it finishes, so a later run gets them.
@@ -81,6 +89,11 @@ impl Obstruction {
     pub(crate) fn blocks_overwrite(&self) -> bool {
         match self {
             Self::NothingToRead => true,
+            // The merge drops an excluded link before any comparison reads this answer.
+            Self::ExcludedLink => true,
+            // A download renames its file onto the destination name, and the rename replaces a
+            // link at that name. `download_objects` replaces the link the same way.
+            Self::UnfollowedLink => false,
             // Writing over an object never reads what is already there, so an upload to a key
             // holding an archived object goes ahead and replaces it.
             Self::Archived | Self::BeingRestored => false,
@@ -141,6 +154,17 @@ impl StreamError {
             StreamError::OutOfOrder { .. } => false,
         }
     }
+
+    // A warning names something no transfer setting can carry. A non-UTF-8 local name has no S3
+    // key. A malformed listing should have supplied its missing field.
+    pub(crate) fn is_warning(&self) -> bool {
+        match self {
+            StreamError::Walk(err) => err.kind().is_warning(),
+            StreamError::UnkeyableName(_) => true,
+            StreamError::OutOfOrder { .. } => false,
+            StreamError::MalformedListing { .. } => false,
+        }
+    }
 }
 
 impl std::fmt::Display for StreamError {
@@ -181,6 +205,18 @@ impl std::error::Error for StreamError {
 impl From<WalkError> for StreamError {
     fn from(err: WalkError) -> Self {
         StreamError::Walk(err)
+    }
+}
+
+// This conversion hands a walk failure to `Error::from(WalkError)`, and that conversion keeps the
+// service code and request id. Every other variant comes from the key stream itself, so its error
+// carries a kind and a message only.
+impl From<StreamError> for crate::error::Error {
+    fn from(err: StreamError) -> Self {
+        match err {
+            StreamError::Walk(walk) => walk.into(),
+            other => crate::error::Error::new(other.category(), other.to_string()),
+        }
     }
 }
 
@@ -230,8 +266,23 @@ pub(crate) enum KeysLost {
 }
 
 impl StreamError {
-    // Matched exhaustively rather than tested against one kind, so a kind added later has to be
-    // placed deliberately instead of defaulting to the answer that permits a delete.
+    // Return the error category without consuming the failure. Outcome reporting reads the category
+    // before it moves the failure into the run record.
+    //
+    // The match names every variant. A new stream error needs its own category.
+    pub(crate) fn category(&self) -> crate::error::ErrorKind {
+        use crate::error::ErrorKind;
+        match self {
+            StreamError::Walk(err) => err.kind().category(),
+            StreamError::UnkeyableName(_) => ErrorKind::InputInvalid,
+            // Both errors make the object undiscoverable.
+            StreamError::MalformedListing { .. } | StreamError::OutOfOrder { .. } => {
+                ErrorKind::ObjectNotDiscoverable
+            }
+        }
+    }
+
+    // Matched exhaustively so a new kind needs a deliberate `KeysLost` answer.
     pub(crate) fn keys_lost(&self) -> KeysLost {
         match self {
             StreamError::Walk(err) => match err.kind() {
@@ -239,15 +290,14 @@ impl StreamError {
                 WalkErrorKind::SourceUnreadable
                 | WalkErrorKind::NotADirectory
                 | WalkErrorKind::Service => KeysLost::UnknownRange,
-                // A directory nobody could read, and a cycle that stopped a descent, both leave a
-                // subtree unenumerated. No single key stands for a subtree.
-                WalkErrorKind::DirectoryUnreadable | WalkErrorKind::SymlinkCycle => {
-                    KeysLost::UnknownRange
-                }
+                // A directory nobody could read, a cycle that stopped a descent, and a link whose
+                // target is gone all leave a subtree unenumerated. A missing target can be a
+                // directory on a volume that is not mounted. No single key stands for a subtree.
+                WalkErrorKind::DirectoryUnreadable
+                | WalkErrorKind::SymlinkCycle
+                | WalkErrorKind::BrokenSymlink => KeysLost::UnknownRange,
                 // One entry that should have been readable.
-                WalkErrorKind::Io
-                | WalkErrorKind::PermissionDenied
-                | WalkErrorKind::BrokenSymlink => KeysLost::OneKey,
+                WalkErrorKind::Io | WalkErrorKind::PermissionDenied => KeysLost::OneKey,
                 // Gone, which is an answer rather than the lack of one.
                 WalkErrorKind::Vanished => KeysLost::Nothing,
             },
@@ -426,11 +476,16 @@ impl KeyStream for FsWalk {
                     last_modified_secs: entry
                         .metadata()
                         .and_then(|m| secs_since_epoch(m.modified())),
-                    obstruction: match entry.file_type() {
-                        FileType::Regular => None,
-                        // A special file, or a symlink left unresolved. The walk yields it so the
-                        // name counts as taken; nothing can be read from it.
-                        _ => Some(Obstruction::NothingToRead),
+                    obstruction: match (entry.path_filtered(), entry.file_type()) {
+                        (PathFiltered::Excluded, _) => Some(Obstruction::ExcludedLink),
+                        (PathFiltered::Kept, FileType::Regular) => None,
+                        // The walk reports a link as a link when it left the link unfollowed.
+                        (PathFiltered::Kept, FileType::Symlink) => {
+                            Some(Obstruction::UnfollowedLink)
+                        }
+                        // The entry is a special file. The walk yields it so its name stays
+                        // occupied, and a comparison skips it.
+                        (PathFiltered::Kept, _) => Some(Obstruction::NothingToRead),
                     },
                 };
                 Some(Ok(Entry {
@@ -1032,7 +1087,8 @@ mod tests {
                 KeysLost::UnknownRange,
             ),
             (walk_err(WalkErrorKind::Service), KeysLost::UnknownRange),
-            // A subtree went unenumerated, and no single key stands for a subtree.
+            // A subtree went unenumerated, and no single key stands for a subtree. A link whose
+            // target is gone can stand for a directory.
             (
                 walk_err(WalkErrorKind::DirectoryUnreadable),
                 KeysLost::UnknownRange,
@@ -1041,10 +1097,13 @@ mod tests {
                 walk_err(WalkErrorKind::SymlinkCycle),
                 KeysLost::UnknownRange,
             ),
+            (
+                walk_err(WalkErrorKind::BrokenSymlink),
+                KeysLost::UnknownRange,
+            ),
             // One entry that should have been readable.
             (walk_err(WalkErrorKind::Io), KeysLost::OneKey),
             (walk_err(WalkErrorKind::PermissionDenied), KeysLost::OneKey),
-            (walk_err(WalkErrorKind::BrokenSymlink), KeysLost::OneKey),
             // An entry that went away between being named and being read. Its key is not missing
             // from this side's account, it is genuinely not there, so absence stays readable on
             // either side of it.
@@ -1592,6 +1651,11 @@ mod tests {
     }
 
     #[test]
+    fn a_link_at_a_destination_name_allows_an_overwrite() {
+        assert!(!Obstruction::UnfollowedLink.blocks_overwrite());
+    }
+
+    #[test]
     fn an_archive_stops_a_read_and_allows_an_overwrite() {
         // Writing over an object never reads what is already there, so an upload to a key holding
         // an archived object replaces it. Answering both roles alike would refuse that upload for
@@ -2012,7 +2076,37 @@ mod tests {
     #[cfg(unix)]
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
-    async fn a_broken_symlink_costs_one_entry_not_the_view() {
+    async fn an_unfollowed_link_and_a_socket_carry_different_obstructions() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join("real")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("real"), dir.path().join("link")).unwrap();
+        let _socket = std::os::unix::net::UnixListener::bind(dir.path().join("sock")).unwrap();
+
+        let mut walk = FsWalker::builder()
+            .recursive(true)
+            .sort(SortOrder::WholeWalk)
+            .include_special_files(true)
+            .build()
+            .walk(FsWalkContext::builder().root(dir.path()).build());
+
+        let mut seen = Vec::new();
+        while let Some(next) = walk.next_entry().await {
+            let entry = next.expect("no failure");
+            seen.push((entry.key, entry.meta.obstruction));
+        }
+        assert_eq!(
+            seen,
+            vec![
+                ("link".to_string(), Some(Obstruction::UnfollowedLink)),
+                ("sock".to_string(), Some(Obstruction::NothingToRead)),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn a_broken_symlink_costs_the_keys_under_its_name() {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("a.txt"), "").unwrap();
         std::os::unix::fs::symlink(dir.path().join("gone"), dir.path().join("broken")).unwrap();
@@ -2036,7 +2130,7 @@ mod tests {
         assert_eq!(seen, vec!["a.txt"]);
         assert_eq!(errors.len(), 1);
         assert_eq!(walk_kind(&errors[0]), Some(WalkErrorKind::BrokenSymlink));
-        assert_eq!(errors[0].keys_lost(), KeysLost::OneKey);
+        assert_eq!(errors[0].keys_lost(), KeysLost::UnknownRange);
     }
 
     // A cycle stops a descent, so everything under it goes unenumerated. The side has to say so, or
@@ -2257,5 +2351,29 @@ mod tests {
             secs_since_epoch(Ok(largest)),
             Some(i64::try_from(lo).unwrap())
         );
+    }
+
+    use crate::io::walk::{WalkError, WalkErrorKind};
+
+    #[test]
+    fn only_a_name_with_no_key_and_a_loop_are_warnings() {
+        assert!(StreamError::UnkeyableName(std::path::PathBuf::from("bad")).is_warning());
+        assert!(!StreamError::MalformedListing {
+            key: Some("k".to_string()),
+            what: "last_modified",
+        }
+        .is_warning());
+        assert!(StreamError::Walk(WalkError::new(
+            None,
+            WalkErrorKind::SymlinkCycle,
+            Box::from("loop"),
+        ))
+        .is_warning());
+        assert!(!StreamError::Walk(WalkError::new(
+            None,
+            WalkErrorKind::BrokenSymlink,
+            Box::from("dangling"),
+        ))
+        .is_warning());
     }
 }

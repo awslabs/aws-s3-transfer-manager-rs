@@ -95,6 +95,9 @@ macro_rules! picker {
     ($picker:ident, $source:ty, $destination:ty, $doc:literal) => {
         impl Mode {
             #[doc = $doc]
+            // `Send + Sync` because a comparison is held by a transfer, and the scheduler requires
+            // a transfer to be both. Every mode here is a unit struct, so this states what they
+            // already are.
             pub(crate) fn $picker(
                 &self,
             ) -> &'static (dyn Compare<$source, $destination> + Send + Sync) {

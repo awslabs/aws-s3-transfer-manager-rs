@@ -134,6 +134,15 @@ fn cmp_key_form(a: &Child, b: &Child) -> Ordering {
     }
 }
 
+// `PathFiltered` records what the path filter did to an entry's own name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PathFiltered {
+    Kept,
+    // The walk yields an excluded entry for a link only. A consumer that reads absence from the
+    // stream then learns that the link hides the keys under its name.
+    Excluded,
+}
+
 /// One thing a filesystem walk found.
 ///
 /// Carries the absolute path, the path relative to the walk root, what the filesystem said is
@@ -150,6 +159,7 @@ pub struct FsEntry {
     // link points at. False for a path reached directly, and for a link left alone — which
     // `file_type` reports as `Symlink`.
     followed_symlink: bool,
+    path_filtered: PathFiltered,
     // The walk root, shared by every entry it produces. `relative_path` is a suffix of
     // `path`, so storing it separately would put a second copy of the whole path in
     // memory for every entry held — and a key-ordered walk holds the unconsumed
@@ -159,6 +169,10 @@ pub struct FsEntry {
 }
 
 impl FsEntry {
+    pub(crate) fn path_filtered(&self) -> PathFiltered {
+        self.path_filtered
+    }
+
     /// Absolute path to the file on the local filesystem.
     pub fn path(&self) -> &Path {
         &self.path
@@ -547,6 +561,9 @@ impl FsWalkerBuilder {
     // Directories are not offered to it: skipping one would skip everything beneath,
     // and a rule written for a file's key says nothing about the keys under a folder
     // of a similar name.
+    //
+    // The filter judges each name on its own, so a link it rejects can still hide keys under its
+    // name. The walk yields such a link marked `PathFiltered::Excluded`, with no metadata.
     pub(crate) fn path_filter(mut self, f: impl Fn(&Path) -> bool + Send + Sync + 'static) -> Self {
         self.path_filter = Some(Arc::new(f));
         self
@@ -930,9 +947,11 @@ impl FsWalk {
 
             if file_type.is_symlink() {
                 if !self.config.follow_symlinks {
-                    if !rejected && self.config.include_special_files {
-                        // Nothing here describes what the link points at, because the walk did
-                        // not look. The metadata is the link's own, which is what `lstat` gave.
+                    if rejected {
+                        self.push_excluded_link(&mut result.children, path);
+                    } else if self.config.include_special_files {
+                        // The walk left the link unread, so the entry describes the link itself.
+                        // The metadata is the link's own, from `lstat`.
                         self.push_entry(
                             &mut result.children,
                             path,
@@ -947,10 +966,14 @@ impl FsWalk {
                     Ok(m) => m,
                     Err(e) => {
                         match e.kind() {
-                            // A link pointing at nothing has no subtree to lose, so it is one
-                            // entry, and an excluded entry stays silent.
+                            // A dangling link can still stand for a directory, such as one on an
+                            // unmounted volume. The key stream costs the link as its name and every
+                            // key under it. The walk yields an excluded link marked, in place of a
+                            // failure.
                             std::io::ErrorKind::NotFound => {
-                                if !rejected {
+                                if rejected {
+                                    self.push_excluded_link(&mut result.children, path);
+                                } else {
                                     result.errors.push(WalkError::new(
                                         Some(path),
                                         WalkErrorKind::BrokenSymlink,
@@ -1139,12 +1162,27 @@ impl FsWalk {
             path,
             file_type,
             followed_symlink,
+            path_filtered: PathFiltered::Kept,
             root: Arc::clone(&self.root),
             metadata,
         };
         if self.config.filter.as_ref().is_none_or(|f| f(&entry)) {
             children.push(Child::File(entry));
         }
+    }
+
+    // Yield a link whose own name the path filter excluded. The entry skips the entry filter,
+    // because the consumer drops the link before it acts on any entry. The walk skips the
+    // metadata read, so a rejected name still costs zero `stat` calls.
+    fn push_excluded_link(&self, children: &mut Vec<Child>, path: PathBuf) {
+        children.push(Child::File(FsEntry {
+            path,
+            file_type: FileType::Symlink,
+            followed_symlink: false,
+            path_filtered: PathFiltered::Excluded,
+            root: Arc::clone(&self.root),
+            metadata: None,
+        }));
     }
 
     // Whether the path filter rejects this entry. `push_file` is where rejection is
@@ -1398,6 +1436,51 @@ mod tests {
                 (PathBuf::from("real.txt"), FileType::Regular),
             ]
         );
+    }
+
+    #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn a_link_the_path_filter_excludes_arrives_marked() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join("real")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("real"), dir.path().join("photos")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("gone"), dir.path().join("dangling")).unwrap();
+        let excluding = |p: &Path| p != Path::new("photos") && p != Path::new("dangling");
+
+        for follow in [false, true] {
+            let marked = walker()
+                .follow_symlinks(follow)
+                .include_special_files(true)
+                .path_filter(excluding)
+                .build()
+                .walk(ctx(dir.path()));
+            let (entries, errors) = collect_entries(marked).await;
+            assert!(
+                errors.is_empty(),
+                "an excluded link reported a failure: {errors:?}"
+            );
+            assert!(
+                entries.iter().all(|e| e.metadata().is_none()),
+                "the walk read metadata for a name its path filter rejected"
+            );
+            let mut seen: Vec<_> = entries
+                .iter()
+                .map(|e| (norm(e.relative_path()), e.path_filtered()))
+                .collect();
+            seen.sort_by(|a, b| a.0.cmp(&b.0));
+            // With following on, the walk descends into the link to a real directory, so only the
+            // dangling link stands as a link. With following off, both links stand as links.
+            let expected: Vec<(String, PathFiltered)> = if follow {
+                vec![("dangling".to_string(), PathFiltered::Excluded)]
+            } else {
+                vec![
+                    ("dangling".to_string(), PathFiltered::Excluded),
+                    ("photos".to_string(), PathFiltered::Excluded),
+                ]
+            };
+            assert_eq!(seen, expected, "follow_symlinks({follow})");
+        }
     }
 
     #[cfg(unix)]
