@@ -3767,6 +3767,44 @@ async fn default_settings_send_no_delete_for_objects_under_a_directory_link() {
     );
 }
 
+// `download_objects` renames its temporary file onto the destination name. The rename replaces a
+// link at that name and leaves the link's target alone. Sync does the same.
+#[cfg(unix)]
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn a_download_replaces_a_link_at_its_own_name_as_download_objects_does() {
+    let outside = tempfile::tempdir().expect("outside");
+    let target = outside.path().join("target.jpg");
+    std::fs::write(&target, "original").expect("the target is written");
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path().canonicalize().expect("canonical root");
+    std::os::unix::fs::symlink(&target, root.join("a.jpg")).expect("symlink");
+    let (client, gets) = a_bucket_recording_gets(&["a.jpg"], 1_600_000_000);
+
+    let (t, ctx, rx) = downloading_into(&root, client, DeleteMode::Off);
+    run_managed(&t, &ctx, rx).await;
+
+    assert_eq!(
+        *gets.lock(),
+        ["a.jpg"],
+        "the run skipped the key a link stood on"
+    );
+    let landed = std::fs::symlink_metadata(root.join("a.jpg")).expect("the name exists");
+    assert!(
+        landed.is_file(),
+        "the link still stands where the download should land"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("a.jpg")).expect("the file reads"),
+        "hello"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&target).expect("the target reads"),
+        "original",
+        "the download wrote through the link into its target"
+    );
+}
+
 #[cfg(unix)]
 async fn through_a_destination_link(delete_mode: DeleteMode) -> Vec<String> {
     let outside = tempfile::tempdir().expect("outside");

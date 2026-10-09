@@ -529,8 +529,9 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
     // destination key there then reads as unknown and not as absent.
     //
     // TODO(vnext): The transfer manager has no symlink policy for the local side of a download.
-    // `download_objects` writes through links. Sync writes through them too, until the transfer
-    // manager settles a download-side policy.
+    // `download_objects` writes through a link on a directory above a file, and it replaces a link
+    // at the file's own name. Sync does both, until the transfer manager settles a download-side
+    // policy.
     fn take_source(&mut self) -> Entry<S::Source> {
         let entry = self.src.take();
         if entry.meta.obstruction == Some(Obstruction::UnfollowedLink) {

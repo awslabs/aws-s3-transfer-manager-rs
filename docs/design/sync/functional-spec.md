@@ -195,7 +195,8 @@ This is about one entry at a time. Failing to read an entire directory is a diff
 **FR-Enum-4** Following symlinks MUST be a setting. Sync MUST handle symlinks the way the transfer
 manager's directory operation for the same direction handles them. An upload sync MUST match
 `upload_objects`, so the setting defaults to off. A download sync MUST match `download_objects`, and it
-writes local files the same way.
+writes local files the same way. A link on a directory above a file carries the write to the link's
+target. The download replaces a link that stands at the file's own name.
 
 With following off on an upload, a link occupies its own name. Sync leaves every destination key under
 that name alone. The plan reports that it did not account for those keys. With following on, sync

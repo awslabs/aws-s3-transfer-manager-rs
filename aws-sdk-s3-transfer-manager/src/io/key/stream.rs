@@ -84,7 +84,10 @@ impl Obstruction {
     // writing to a pipe nobody reads never returns.
     pub(crate) fn blocks_overwrite(&self) -> bool {
         match self {
-            Self::NothingToRead | Self::UnfollowedLink => true,
+            Self::NothingToRead => true,
+            // A download renames its file onto the destination name, and the rename replaces a
+            // link at that name. `download_objects` replaces the link the same way.
+            Self::UnfollowedLink => false,
             // Writing over an object never reads what is already there, so an upload to a key
             // holding an archived object goes ahead and replaces it.
             Self::Archived | Self::BeingRestored => false,
@@ -1636,6 +1639,11 @@ mod tests {
     #[test]
     fn a_name_holding_nothing_stops_a_read_and_an_overwrite() {
         assert!(Obstruction::NothingToRead.blocks_overwrite());
+    }
+
+    #[test]
+    fn a_link_at_a_destination_name_allows_an_overwrite() {
+        assert!(!Obstruction::UnfollowedLink.blocks_overwrite());
     }
 
     #[test]
