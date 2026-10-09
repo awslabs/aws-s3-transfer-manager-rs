@@ -1428,6 +1428,7 @@ impl Transfer for DoneWhileActiveMock {
 /// poisoned state lock from an earlier worker panic reaches the first of those.
 pub(crate) struct PanickingTerminalHookMock {
     ctx: TransferContext,
+    calls: Arc<AtomicUsize>,
 }
 
 impl std::fmt::Debug for PanickingTerminalHookMock {
@@ -1437,19 +1438,36 @@ impl std::fmt::Debug for PanickingTerminalHookMock {
 }
 
 impl PanickingTerminalHookMock {
-    pub(crate) fn new(id: TransferId, handle: Arc<crate::client::Handle>) -> Self {
+    /// `calls` counts hook entries. A test needs it because the cleanup around the hook
+    /// runs whether or not the hook was reached, so asserting on cleanup alone passes
+    /// against a call site that skips the hook entirely.
+    pub(crate) fn new(
+        id: TransferId,
+        handle: Arc<crate::client::Handle>,
+        calls: Arc<AtomicUsize>,
+    ) -> Self {
         let (ctx, _rx) = TransferContext::with_id(id, handle);
-        Self { ctx }
+        Self { ctx, calls }
     }
 
     /// Returns the mock plus its completion receiver, so a test can assert the handle
-    /// was resolved even though the hook panicked.
+    /// was resolved even though the hook panicked, and a clone of its context: the
+    /// orphan path returns before inserting a descriptor, so the context is the only
+    /// place the status can be read from.
     pub(crate) fn with_receiver(
         id: TransferId,
         handle: Arc<crate::client::Handle>,
-    ) -> (Self, StateMachineTerminalReceiver) {
+        calls: Arc<AtomicUsize>,
+    ) -> (Self, StateMachineTerminalReceiver, TransferContext) {
         let (ctx, completion_rx) = TransferContext::with_id(id, handle);
-        (Self { ctx }, completion_rx)
+        (
+            Self {
+                ctx: ctx.clone(),
+                calls,
+            },
+            completion_rx,
+            ctx,
+        )
     }
 }
 
@@ -1468,6 +1486,8 @@ impl Transfer for PanickingTerminalHookMock {
     }
 
     fn on_terminal(&self) {
+        // Bump before the panic, so the count records the entry the unwind interrupts.
+        self.calls.fetch_add(1, Ordering::SeqCst);
         panic!("on_terminal panicked");
     }
 

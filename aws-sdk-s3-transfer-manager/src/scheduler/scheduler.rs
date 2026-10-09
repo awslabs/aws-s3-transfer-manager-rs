@@ -3724,7 +3724,8 @@ mod tests {
             id: 1,
             parent: None,
         };
-        let mock = PanickingTerminalHookMock::new(id, handle.clone());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mock = PanickingTerminalHookMock::new(id, handle.clone(), calls.clone());
 
         // `enqueue_transfer` runs `generate_work` on this thread, so an escaping panic
         // would unwind through this call rather than being reported as a failed
@@ -3732,6 +3733,14 @@ mod tests {
         scheduler.enqueue_transfer(Box::new(mock));
         tokio::time::sleep(Duration::from_millis(50)).await;
 
+        // The removal below runs whether or not the hook was reached, so on its own it
+        // also passes against a Done arm that skips the hook entirely.
+        assert_eq!(
+            1,
+            calls.load(Ordering::SeqCst),
+            "the Done arm never called `on_terminal`, so nothing here exercises the \
+             containment"
+        );
         assert!(
             scheduler.0.transfers.read().unwrap().get(&id).is_none(),
             "the hook panicked and took `remove_transfer_atomic` with it, so the \
@@ -3761,22 +3770,29 @@ mod tests {
             id: 2,
             parent: Some(999),
         };
-        let (mock, mut completion_rx) =
-            PanickingTerminalHookMock::with_receiver(child_id, handle.clone());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (mock, mut completion_rx, child_ctx) =
+            PanickingTerminalHookMock::with_receiver(child_id, handle.clone(), calls.clone());
 
         scheduler.enqueue_transfer(Box::new(mock));
 
+        assert_eq!(
+            1,
+            calls.load(Ordering::SeqCst),
+            "the orphan path never called `on_terminal`, so nothing here exercises the \
+             containment"
+        );
         assert!(
             completion_rx.try_recv().is_ok(),
             "the hook panicked and took `signal_terminal` with it, so this child's \
              handle would wait on join() forever"
         );
+        // Read the status off the context, not the map: this path returns before
+        // `transfers.insert`, so a map lookup is always `None` and any default it falls
+        // back to is the expected value.
         assert_eq!(
             crate::types::TransferStatus::Cancelled,
-            scheduler.0.transfers.read().unwrap().get(&child_id).map_or(
-                crate::types::TransferStatus::Cancelled,
-                |d| d.transfer().ctx().transfer_status()
-            ),
+            child_ctx.transfer_status(),
         );
 
         handle.runtime.shutdown();
