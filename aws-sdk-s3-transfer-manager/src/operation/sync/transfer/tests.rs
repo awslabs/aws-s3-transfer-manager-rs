@@ -3929,9 +3929,9 @@ async fn an_upload_never_waits_for_a_bucket_removal() {
         }
     }
     assert_eq!(
-        deleter.keys_sent(),
-        1,
-        "the bucket-only key was not removed"
+        deleter.batches(),
+        vec![vec!["a".to_string()]],
+        "the run named the wrong key for removal"
     );
 }
 
