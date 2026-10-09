@@ -344,45 +344,16 @@ pub struct ManagedDownloadHandle {
     stamp_modified_time: bool,
 }
 
-// Try to stamp a file with the object modification time. A stamp failure logs and leaves the
-// download successful.
+// Try to give a file the object's modification time. When the stamp fails, this function logs the
+// failure, and the download still succeeds.
 fn stamp_best_effort(path: &std::path::Path, at: aws_smithy_types::DateTime) {
-    if let Err(err) = set_modified_time(path, at) {
+    if let Err(err) = crate::io::fs::set_modified_time(path, at) {
         tracing::debug!(
             path = %path.display(),
             error = %err,
             "could not give the file the object's time; it keeps the time it was written"
         );
     }
-}
-
-// Set a file modification time from the object time. Download file work already runs on the managed
-// thread, so this uses `std::fs`.
-fn set_modified_time(
-    path: &std::path::Path,
-    at: aws_smithy_types::DateTime,
-) -> std::io::Result<()> {
-    let secs = at.secs();
-    let nanos = at.subsec_nanos();
-    // `DateTime` can be before the epoch. Choose addition or subtraction before creating
-    // `SystemTime`.
-    let when = if secs >= 0 {
-        std::time::SystemTime::UNIX_EPOCH.checked_add(std::time::Duration::new(secs as u64, nanos))
-    } else {
-        std::time::SystemTime::UNIX_EPOCH
-            .checked_sub(std::time::Duration::new(secs.unsigned_abs(), 0))
-            .and_then(|t| t.checked_add(std::time::Duration::new(0, nanos)))
-    };
-    let Some(when) = when else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "the object's time is outside what this platform can represent",
-        ));
-    };
-    std::fs::File::options()
-        .write(true)
-        .open(path)?
-        .set_times(std::fs::FileTimes::new().set_modified(when))
 }
 
 impl ManagedDownloadHandle {
@@ -541,7 +512,7 @@ mod tests {
         let at = aws_smithy_types::DateTime::from_secs(1_600_000_000);
 
         assert!(
-            super::set_modified_time(&missing, at).is_err(),
+            crate::io::fs::set_modified_time(&missing, at).is_err(),
             "setting a time on a file that does not exist should fail"
         );
         super::stamp_best_effort(&missing, at);
