@@ -160,9 +160,12 @@ impl Obstructed {
     pub(super) fn record(&mut self, why: crate::io::key::stream::Obstruction) {
         use crate::io::key::stream::Obstruction;
         match why {
-            // An unfollowed link holds nothing to read here, like a special file.
+            // An unfollowed link counts with the special files. Both occupy a name, and a transfer
+            // reads only regular files.
             Obstruction::NothingToRead | Obstruction::UnfollowedLink => self.nothing_to_read += 1,
             Obstruction::Archived => self.archived += 1,
+            // The merge drops an excluded link before any decision reaches this count.
+            Obstruction::ExcludedLink => {}
             Obstruction::BeingRestored => self.restoring += 1,
         }
     }

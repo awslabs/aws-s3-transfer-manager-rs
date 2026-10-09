@@ -239,6 +239,13 @@ impl<K: KeyStream> Side<K> {
         matches!(self.head, Head::Finished)
     }
 
+    // Return whether the head entry carries `obstruction`.
+    fn head_is(&self, obstruction: Obstruction) -> bool {
+        self.head
+            .entry()
+            .is_some_and(|entry| entry.meta.obstruction == Some(obstruction))
+    }
+
     // Take the entry at the head, releasing every stretch the merge has now passed.
     //
     // A key inside a stretch, or one sorting before it, releases nothing: the failure was heard
@@ -460,24 +467,40 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
         if self.ended_by_failure {
             return None;
         }
-        // A failure that lost no key, such as a file that vanished, leaves the plan whole.
-        if let Some(err) = self.src.fill().await {
-            if err.keys_lost() != KeysLost::Nothing {
-                self.incomplete = true;
+        loop {
+            // A failure that lost no key, such as a file that vanished, leaves the plan whole.
+            if let Some(err) = self.src.fill().await {
+                if err.keys_lost() != KeysLost::Nothing {
+                    self.incomplete = true;
+                }
+                if self.src.is_done() {
+                    self.ended_by_failure = true;
+                }
+                return Some(Err(err));
             }
-            if self.src.is_done() {
-                self.ended_by_failure = true;
+            if let Some(err) = self.dst.fill().await {
+                if err.keys_lost() != KeysLost::Nothing {
+                    self.incomplete = true;
+                }
+                if self.dst.is_done() {
+                    self.ended_by_failure = true;
+                }
+                return Some(Err(err));
             }
-            return Some(Err(err));
-        }
-        if let Some(err) = self.dst.fill().await {
-            if err.keys_lost() != KeysLost::Nothing {
-                self.incomplete = true;
+            // The filter excluded this link's own name, so the name makes no pairing. A source link
+            // still hides the keys under its name, so the source holds those keys back.
+            if self.src.head_is(Obstruction::ExcludedLink) {
+                let link = self.src.take();
+                self.src.gap.add(Stretch {
+                    under: Some(link.key),
+                });
+                continue;
             }
-            if self.dst.is_done() {
-                self.ended_by_failure = true;
+            if self.dst.head_is(Obstruction::ExcludedLink) {
+                self.dst.take();
+                continue;
             }
-            return Some(Err(err));
+            break;
         }
 
         match (&self.src.head, &self.dst.head) {
@@ -1478,6 +1501,41 @@ mod tests {
             !complete,
             "a plan that skipped keys under a link called itself complete"
         );
+    }
+
+    #[tokio::test]
+    async fn an_excluded_source_link_holds_back_the_keys_under_it_and_makes_no_pairing() {
+        let walk = Walk::new(
+            Scripted::from(vec![
+                Ok(entry("a.txt")),
+                Ok(obstructed("photos", Obstruction::ExcludedLink)),
+            ]),
+            Scripted::of(&["photos/y.jpg", "q.txt"]),
+        );
+        let (seen, complete) = pair_all(walk).await;
+        assert_eq!(
+            seen,
+            plan(&[
+                ("a.txt", At::Here, At::Gone),
+                ("photos/y.jpg", At::UnknownRange, At::Here),
+                ("q.txt", At::Gone, At::Here),
+            ])
+        );
+        assert!(
+            !complete,
+            "a plan that skipped keys under an excluded link called itself complete"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_excluded_destination_link_makes_no_pairing() {
+        let walk = Walk::new(
+            Scripted::of(&["photos/y.jpg"]),
+            Scripted::from(vec![Ok(obstructed("photos", Obstruction::ExcludedLink))]),
+        );
+        let (seen, complete) = pair_all(walk).await;
+        assert_eq!(seen, plan(&[("photos/y.jpg", At::Here, At::Gone)]));
+        assert!(complete);
     }
 
     #[tokio::test]

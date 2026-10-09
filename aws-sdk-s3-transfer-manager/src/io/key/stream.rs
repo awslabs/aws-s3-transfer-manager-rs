@@ -23,7 +23,7 @@ use crate::io::FileType;
 use super::filter::KeyFilter;
 use super::{derive_object_key, DEFAULT_DELIMITER};
 use crate::io::walk::{
-    exclude_s3_folder_markers, FsEntry, FsWalk, S3Walk, WalkError, WalkErrorKind,
+    exclude_s3_folder_markers, FsEntry, FsWalk, PathFiltered, S3Walk, WalkError, WalkErrorKind,
 };
 
 // Metadata of an `Entry`, read off the item the walker produced and kept to what a comparison
@@ -71,6 +71,10 @@ pub(crate) enum Obstruction {
     // looked at what it points to. The target can be a directory, so the keys under this name are
     // unknown too.
     UnfollowedLink,
+    // The item is a link whose own name the filter excluded. The filter hides the name. The link
+    // still hides the keys under the name, so the merge drops this entry and holds back those
+    // keys.
+    ExcludedLink,
     // An object whose bytes sit in an archive with no restored copy to read.
     Archived,
     // A restore is under way. The bytes arrive when it finishes, so a later run gets them.
@@ -85,6 +89,8 @@ impl Obstruction {
     pub(crate) fn blocks_overwrite(&self) -> bool {
         match self {
             Self::NothingToRead => true,
+            // The merge drops an excluded link before any comparison reads this answer.
+            Self::ExcludedLink => true,
             // A download renames its file onto the destination name, and the rename replaces a
             // link at that name. `download_objects` replaces the link the same way.
             Self::UnfollowedLink => false,
@@ -470,13 +476,16 @@ impl KeyStream for FsWalk {
                     last_modified_secs: entry
                         .metadata()
                         .and_then(|m| secs_since_epoch(m.modified())),
-                    obstruction: match entry.file_type() {
-                        FileType::Regular => None,
-                        // The walk reports a link as a link only when it did not follow it.
-                        FileType::Symlink => Some(Obstruction::UnfollowedLink),
+                    obstruction: match (entry.path_filtered(), entry.file_type()) {
+                        (PathFiltered::Excluded, _) => Some(Obstruction::ExcludedLink),
+                        (PathFiltered::Kept, FileType::Regular) => None,
+                        // The walk reports a link as a link when it left the link unfollowed.
+                        (PathFiltered::Kept, FileType::Symlink) => {
+                            Some(Obstruction::UnfollowedLink)
+                        }
                         // The entry is a special file. The walk yields it so its name stays
-                        // occupied. A transfer can read nothing from it.
-                        _ => Some(Obstruction::NothingToRead),
+                        // occupied, and a comparison skips it.
+                        (PathFiltered::Kept, _) => Some(Obstruction::NothingToRead),
                     },
                 };
                 Some(Ok(Entry {

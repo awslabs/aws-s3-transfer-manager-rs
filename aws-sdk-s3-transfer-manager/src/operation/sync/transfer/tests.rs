@@ -105,7 +105,9 @@ async fn an_archived_object_and_a_restoring_one_are_counted_apart() {
                 restoring: 1,
                 ..Obstructed::default()
             },
-            Obstruction::NothingToRead | Obstruction::UnfollowedLink => {
+            Obstruction::NothingToRead
+            | Obstruction::UnfollowedLink
+            | Obstruction::ExcludedLink => {
                 unreachable!("not under test here")
             }
         };
@@ -3764,6 +3766,65 @@ async fn default_settings_send_no_delete_for_objects_under_a_directory_link() {
     assert!(
         sent.is_empty(),
         "default settings deleted an object at or under a directory link: {sent:?}"
+    );
+}
+
+// A rule on a name matches only that name. `exclude("photos")` hides the link `photos` and the
+// object `photos`, and it leaves `photos/y.jpg` in the listing.
+#[cfg(unix)]
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn an_excluded_directory_link_still_holds_back_the_objects_under_its_name() {
+    use crate::io::key::filter::{KeyFilter, Rule};
+
+    let real = tempfile::tempdir().expect("real photos dir");
+    std::fs::write(real.path().join("y.jpg"), b"x").expect("y.jpg");
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path().canonicalize().expect("canonical root");
+    std::os::unix::fs::symlink(real.path(), root.join("photos")).expect("symlink");
+    let (client, deleted) = listing_and_recording_deletes(&["photos/y.jpg"], 1);
+    let walker = Walker::builder()
+        .filter(Arc::new(KeyFilter::new(vec![Rule::exclude("photos")])))
+        .build();
+    let (t, _ctx) = upload_run(&root, client, walker);
+    drive(&t).await;
+    let sent = deleted.lock().clone();
+    assert!(
+        sent.is_empty(),
+        "the run deleted an object under an excluded link: {sent:?}"
+    );
+    assert!(
+        !t.is_plan_complete(),
+        "a run that held back keys under a link reported a whole plan"
+    );
+}
+
+#[cfg(unix)]
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn an_excluded_dangling_link_still_holds_back_the_objects_under_its_name() {
+    use crate::io::key::filter::{KeyFilter, Rule};
+
+    let gone = tempfile::tempdir().expect("a target to remove");
+    let target = gone.path().join("unmounted");
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path().canonicalize().expect("canonical root");
+    std::os::unix::fs::symlink(&target, root.join("photos")).expect("symlink");
+    let (client, deleted) = listing_and_recording_deletes(&["photos/y.jpg"], 1);
+    let walker = Walker::builder()
+        .follow_symlinks(true)
+        .filter(Arc::new(KeyFilter::new(vec![Rule::exclude("photos")])))
+        .build();
+    let (t, _ctx) = upload_run(&root, client, walker);
+    drive(&t).await;
+    let sent = deleted.lock().clone();
+    assert!(
+        sent.is_empty(),
+        "the run deleted an object under an excluded dangling link: {sent:?}"
+    );
+    assert!(
+        !t.is_plan_complete(),
+        "a run that held back keys under a link reported a whole plan"
     );
 }
 
