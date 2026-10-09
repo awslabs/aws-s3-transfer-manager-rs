@@ -460,15 +460,20 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
         if self.ended_by_failure {
             return None;
         }
+        // A failure that lost no key, such as a file that vanished, leaves the plan whole.
         if let Some(err) = self.src.fill().await {
-            self.incomplete = true;
+            if err.keys_lost() != KeysLost::Nothing {
+                self.incomplete = true;
+            }
             if self.src.is_done() {
                 self.ended_by_failure = true;
             }
             return Some(Err(err));
         }
         if let Some(err) = self.dst.fill().await {
-            self.incomplete = true;
+            if err.keys_lost() != KeysLost::Nothing {
+                self.incomplete = true;
+            }
             if self.dst.is_done() {
                 self.ended_by_failure = true;
             }
@@ -2076,6 +2081,30 @@ mod tests {
         let mut walk = Walk::new(Scripted::of(&["a.txt"]), Scripted::of(&["a.txt"]));
         while walk.next().await.is_some() {}
         assert!(walk.is_plan_complete());
+    }
+
+    #[tokio::test]
+    async fn a_file_that_went_away_leaves_the_plan_whole() {
+        // A file that vanished mid-walk is an answer: the file is gone. The walk lost no key, so
+        // an active tree keeps a whole plan.
+        let gone = StreamError::Walk(WalkError::new(
+            Some(PathBuf::from("/root/b.txt")),
+            WalkErrorKind::Vanished,
+            Box::from("not there any more"),
+        ));
+        let mut walk = Walk::new(
+            Scripted::from(vec![Ok(entry("a.txt")), Err(gone), Ok(entry("c.txt"))]),
+            Scripted::of(&["a.txt", "c.txt"]),
+        );
+        let mut errors = 0;
+        while let Some(next) = walk.next().await {
+            errors += usize::from(next.is_err());
+        }
+        assert_eq!(errors, 1, "the walk did not report the vanished file");
+        assert!(
+            walk.is_plan_complete(),
+            "a file that went away marked the plan incomplete"
+        );
     }
 
     #[tokio::test]
