@@ -594,20 +594,18 @@ jobs:
         uses: taiki-e/install-action@cargo-hack
       - uses: Swatinem/rust-cache@v2
       - name: check --feature-powerset
-        # Exclude dial9: it requires RUSTFLAGS=--cfg tokio_unstable (see the
-        # dial9-build job for dedicated coverage).
-        run: cargo hack check --all --feature-powerset --exclude-features dial9
+        run: cargo hack check --all --feature-powerset
         env:
           RUSTFLAGS: -Dwarnings -Adeprecated
 
   dial9-build:
-    # Verifies the optional `dial9` feature compiles. dial9-tokio-telemetry
-    # uses tokio's unstable runtime metrics + task-lifecycle hooks, gated
-    # behind `--cfg tokio_unstable`. The `cp` example is the sole consumer
-    # of dial9 types in the workspace; building it transitively compiles
-    # the lib with `cfg(feature = "dial9")` paths active, which is enough
-    # to prove the wiring. Keeping it a dedicated job avoids leaking
-    # `tokio_unstable` into the rest of CI.
+    # Builds the library and the `cp` example with every feature and
+    # `--cfg tokio_unstable`. dial9 0.5 compiles without the flag; the
+    # `features` job checks the library with `dial9` in that configuration.
+    # With the flag, dial9's Tokio instrumentation also compiles its
+    # task-poll hooks, task spawn and terminate tracking, and per-worker
+    # queue depth, which the crate README's tracing build enables. A
+    # dedicated job keeps `tokio_unstable` out of the rest of CI.
     name: dial9 build
     needs: basics
     runs-on: ubuntu-24.04

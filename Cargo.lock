@@ -274,7 +274,7 @@ dependencies = [
  "console-subscriber",
  "crossbeam-skiplist",
  "crossbeam-utils",
- "dial9-tokio-telemetry",
+ "dial9",
  "fastrand",
  "futures-test",
  "futures-util",
@@ -810,12 +810,6 @@ name = "bit-vec"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e764a1d40d510daf35e07be9eb06e75770908c27d411ee6c92109c9840eaaf7"
-
-[[package]]
-name = "bitflags"
-version = "1.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bef38d45163c2f1dde094a7dfd33ccf595c92905c8f8f4fdc18d06fb1037718a"
 
 [[package]]
 name = "bitflags"
@@ -1397,37 +1391,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
 
 [[package]]
-name = "defmt"
-version = "1.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e2953bfe4f93bbd20cc71198842756f77d161884c99ebbabc41d80231ded88d1"
-dependencies = [
- "bitflags 1.3.2",
- "defmt-macros",
-]
-
-[[package]]
-name = "defmt-macros"
-version = "1.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bad9c72e7ca2137e0dc3813245a0d282fd6daad32fd800af018306a9169b5fe8"
-dependencies = [
- "defmt-parser",
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
-name = "defmt-parser"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "10d60334b3b2e7c9d91ef8150abfb6fa4c1c39ebbcf4a81c2e346aad939fee3e"
-dependencies = [
- "thiserror",
-]
-
-[[package]]
 name = "der"
 version = "0.7.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1456,10 +1419,50 @@ dependencies = [
 ]
 
 [[package]]
-name = "dial9-macro"
-version = "0.3.7"
+name = "dial9"
+version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a7e31f073f2e14e5a9d338c543a0601aeaf7c43fc428cd59ce417230d0db37d"
+checksum = "b35f95885a2167602b457c77caf898670c02eb0aaba72bef76ac5b0faef86e14"
+dependencies = [
+ "bon",
+ "dial9-core",
+ "dial9-macro",
+ "dial9-metrique",
+ "dial9-perf-self-profile",
+ "dial9-tokio-telemetry",
+ "dial9-trace-format",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "dial9-core"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "82f826078c782919cf9a4fb0b2b6755dab24d6c908b5181469b23cf6eb8f6fff"
+dependencies = [
+ "ahash",
+ "arc-swap",
+ "bon",
+ "bytes",
+ "crossbeam-queue",
+ "dial9-trace-format",
+ "flate2",
+ "futures-util",
+ "libc",
+ "metrique",
+ "metrique-timesource",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "ulid",
+]
+
+[[package]]
+name = "dial9-macro"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4177b8f8bf95d8e3769c1aad596f5d6fb231953a45c4c3d2a5946fe8e4ec327b"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1467,40 +1470,53 @@ dependencies = [
 ]
 
 [[package]]
-name = "dial9-perf-self-profile"
-version = "0.4.3"
+name = "dial9-metrique"
+version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b4c50586825778e15e38653b36c3fc448a6594368a347e862863463f2dc57e1f"
+checksum = "9c59e35e7b38ce255d3dc6310b48c3ea54307c42a0589eda44ea91ba24eadf67"
+dependencies = [
+ "dial9-core",
+ "dial9-trace-format",
+ "metrique",
+ "metrique-writer",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "dial9-perf-self-profile"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c429b209bc07612b2e60267e8bca80cd2b249f498e9a0b83f7caf514d5f5388"
 dependencies = [
  "blazesym",
+ "bytes",
  "crossbeam-utils",
+ "dial9-core",
  "dial9-trace-format",
  "libc",
  "perf-event-data",
  "perf-event-open-sys2",
+ "tokio",
  "tracing",
 ]
 
 [[package]]
 name = "dial9-tokio-telemetry"
-version = "0.3.15"
+version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9b511dfd54f5191f7eb86856fe19d8e3c8f71673bd256e1bfa1c8128fbbc0cdb"
+checksum = "aee46c0a97dd88ba151f9688c79de60c41cd7efc6855e6eb369af06326cba8f3"
 dependencies = [
- "arc-swap",
  "bon",
  "bytes",
- "crossbeam-queue",
- "dial9-macro",
+ "dial9-core",
  "dial9-perf-self-profile",
  "dial9-trace-format",
  "flate2",
  "futures-util",
  "hostname",
  "libc",
- "metrique",
  "metrique-timesource",
- "metrique-writer",
  "pin-project-lite",
  "serde",
  "serde_json",
@@ -1512,20 +1528,23 @@ dependencies = [
 
 [[package]]
 name = "dial9-trace-format"
-version = "0.4.1"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b3636d6ec60d94840cc414dcd6a95c77b3ba0a7b86d43fd035b89662eeb5cfa7"
+checksum = "258116805212db80e607656c81d2bf9830e66d5747e6ed6a29d17eeb2e673ff2"
 dependencies = [
+ "ahash",
  "dial9-trace-format-derive",
  "serde",
+ "typeid",
 ]
 
 [[package]]
 name = "dial9-trace-format-derive"
-version = "0.4.1"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fff7c2855b73d0de34bc31d6dc7afbf0f6ce230a668403ac2b57b21d1ffe3928"
+checksum = "23b6700840c894de4a66d698850647560a1ae889183d419211877d049a063aad"
 dependencies = [
+ "proc-macro-crate",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -2268,7 +2287,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tokio",
  "tower-service",
  "tracing",
@@ -2478,60 +2497,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "jiff"
-version = "0.2.37"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ab1baf72f08796de0260609515130699b890ac25f30e610ad894bc5856cafdb"
-dependencies = [
- "defmt",
- "jiff-core",
- "jiff-static",
- "jiff-tzdb-platform",
- "log",
- "portable-atomic",
- "portable-atomic-util",
- "serde_core",
- "windows-link",
-]
-
-[[package]]
-name = "jiff-core"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5e52fe76043ccecc9005d2305ebaadf7d7fc0cc89ca6baa10a94d6bc68c7128c"
-dependencies = [
- "defmt",
- "log",
-]
-
-[[package]]
-name = "jiff-static"
-version = "0.2.37"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "378268a1116ad67ae6228701118ac9f491d78fda38a40a1f1a9e1348de6f7212"
-dependencies = [
- "jiff-core",
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
-name = "jiff-tzdb"
-version = "0.1.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "142bd39932ad231f10513df9ab62661fead8719872150b7ad02a2df79f4e141e"
-
-[[package]]
-name = "jiff-tzdb-platform"
-version = "0.1.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "875a5a69ac2bab1a891711cf5eccbec1ce0341ea805560dcd90b7a2e925132e8"
-dependencies = [
- "jiff-tzdb",
-]
-
-[[package]]
 name = "jobserver"
 version = "0.1.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2708,7 +2673,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2b55bfa39e6f5e44a37a59a794915ce36d04371471cf62ae365cd9703f58a5e0"
 dependencies = [
  "itoa",
- "jiff",
  "metrique-core",
  "metrique-macro",
  "metrique-service-metrics",
@@ -2717,7 +2681,6 @@ dependencies = [
  "metrique-writer-core",
  "metrique-writer-macro",
  "ryu",
- "serde_json",
  "tokio",
 ]
 
@@ -2872,7 +2835,7 @@ version = "0.31.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf20d2fde8ff38632c426f1165ed7436270b44f199fc55284c38276f9db47c3d"
 dependencies = [
- "bitflags 2.13.2",
+ "bitflags",
  "cfg-if",
  "cfg_aliases",
  "libc",
@@ -3056,7 +3019,7 @@ version = "0.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "575828d9d7d205188048eb1508560607a03d21eafdbba47b8cade1736c1c28e1"
 dependencies = [
- "bitflags 2.13.2",
+ "bitflags",
  "c-enum",
  "perf-event-open-sys2",
 ]
@@ -3154,15 +3117,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "05c8b63e8d9609db387f0324918f81d68fe27748f084ef092fb35954d0539a85"
 
 [[package]]
-name = "portable-atomic-util"
-version = "0.2.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "10ab3eb7f3becc3a1cbc4f2c6f20267996cfc1a6467a873763411b136a122715"
-dependencies = [
- "portable-atomic",
-]
-
-[[package]]
 name = "potential_utf"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3216,6 +3170,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "proc-macro-crate"
+version = "3.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e67ba7e9b2b56446f1d419b1d807906278ffa1a658a8a5d8a39dcb1f5a78614f"
+dependencies = [
+ "toml_edit",
+]
+
+[[package]]
 name = "proc-macro2"
 version = "1.0.107"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3232,7 +3195,7 @@ checksum = "4b45fcc2344c680f5025fe57779faef368840d0bd1f42f216291f0dc4ace4744"
 dependencies = [
  "bit-set",
  "bit-vec",
- "bitflags 2.13.2",
+ "bitflags",
  "num-traits",
  "rand",
  "rand_chacha",
@@ -3260,7 +3223,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -3408,7 +3371,7 @@ version = "11.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "498cd0dc59d73224351ee52a95fee0f1a617a2eae0e7d9d720cc622c73a54186"
 dependencies = [
- "bitflags 2.13.2",
+ "bitflags",
 ]
 
 [[package]]
@@ -3437,7 +3400,7 @@ version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed2bf2547551a7053d6fdfafda3f938979645c44812fbfcda098faae3f1a362d"
 dependencies = [
- "bitflags 2.13.2",
+ "bitflags",
 ]
 
 [[package]]
@@ -3535,7 +3498,7 @@ version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
 dependencies = [
- "bitflags 2.13.2",
+ "bitflags",
  "errno",
  "libc",
  "linux-raw-sys",
@@ -3780,7 +3743,7 @@ version = "3.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b7f4bc775c73d9a02cde8bf7b2ec4c9d12743edf609006c7facc23998404cd1d"
 dependencies = [
- "bitflags 2.13.2",
+ "bitflags",
  "core-foundation",
  "core-foundation-sys",
  "libc",
@@ -4287,6 +4250,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "toml_datetime"
+version = "1.1.1+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3165f65f62e28e0115a00b2ebdd37eb6f3b641855f9d636d3cd4103767159ad7"
+dependencies = [
+ "serde_core",
+]
+
+[[package]]
+name = "toml_edit"
+version = "0.25.13+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6975367e4d2ef766d86af01ffad14b622fecc8d4357a998fbc4deb6e9bacaf9b"
+dependencies = [
+ "indexmap",
+ "toml_datetime",
+ "toml_parser",
+ "winnow",
+]
+
+[[package]]
+name = "toml_parser"
+version = "1.1.3+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d38ac1cf9b95face32296c0a3ede1fdc270627c9d9c02a7274dd6d960dc4d56"
+dependencies = [
+ "winnow",
+]
+
+[[package]]
 name = "tonic"
 version = "0.14.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4461,10 +4454,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
+name = "typeid"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bc7d623258602320d5c55d1bc22793b57daff0ec7efc270ea7d55ce1d5f5471c"
+
+[[package]]
 name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
+
+[[package]]
+name = "ulid"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "470dbf6591da1b39d43c14523b2b469c86879a53e8b758c8e090a470fe7b1fbe"
+dependencies = [
+ "rand",
+ "web-time",
+]
 
 [[package]]
 name = "unarray"
@@ -4636,6 +4645,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "web-time"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
+dependencies = [
+ "js-sys",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "widestring"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4797,6 +4816,15 @@ name = "windows_x86_64_msvc"
 version = "0.52.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
+
+[[package]]
+name = "winnow"
+version = "1.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
+dependencies = [
+ "memchr",
+]
 
 [[package]]
 name = "wit-bindgen"

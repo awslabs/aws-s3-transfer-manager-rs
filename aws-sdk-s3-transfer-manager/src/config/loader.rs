@@ -119,13 +119,13 @@ impl ConfigLoader {
         self
     }
 
-    /// Set a dial9 telemetry guard for runtime tracing.
+    /// Set a dial9 handle for runtime tracing.
+    ///
+    /// See [`Builder::dial9_handle`](crate::config::Builder::dial9_handle)
+    /// for recorder ownership and shutdown ordering.
     #[cfg(feature = "dial9")]
-    pub fn telemetry_guard(
-        mut self,
-        guard: dial9_tokio_telemetry::telemetry::TelemetryGuard,
-    ) -> Self {
-        self.builder = self.builder.telemetry_guard(guard);
+    pub fn dial9_handle(mut self, handle: dial9::Dial9Handle) -> Self {
+        self.builder = self.builder.dial9_handle(handle);
         self
     }
 
