@@ -1,0 +1,14 @@
+[package]
+name = "aws-ort-topology"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.94.1"
+authors = ["AWS Rust SDK Team <aws-sdk-rust@amazon.com>", "Aaron Todd <todaaron@amazon.com>"]
+license = "Apache-2.0"
+repository = "https://github.com/awslabs/aws-s3-transfer-manager-rs"
+description = "Hardware topology and placement primitives for AWS ORT."
+readme = "README.md"
+categories = ["hardware-support", "concurrency"]
+keywords = ["aws", "ort", "topology", "numa"]
+
+[dependencies]

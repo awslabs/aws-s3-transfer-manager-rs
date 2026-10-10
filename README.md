@@ -12,6 +12,12 @@ It is meant for early access and feedback purposes at this time. We'd love to he
 See the AWS SDK and Tools [maintenance policy](https://docs.aws.amazon.com/sdkref/latest/guide/maint-policy.html#version-life-cycle)
 descriptions for more information.
 
+## AWS ORT components
+
+The [AWS ORT crates](crates/README.md) share this repository and separate
+hardware topology, managed execution, and HTTP transport into independently
+versioned packages.
+
 ## Development
 
 **Run all tests**

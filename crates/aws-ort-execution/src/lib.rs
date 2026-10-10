@@ -1,0 +1,16 @@
+/*
+ * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#![warn(
+    missing_debug_implementations,
+    missing_docs,
+    rustdoc::missing_crate_level_docs,
+    unreachable_pub,
+    rust_2018_idioms
+)]
+#![doc = include_str!("../README.md")]
+
+/// Hardware topology and placement primitives.
+pub use aws_ort_topology as topology;

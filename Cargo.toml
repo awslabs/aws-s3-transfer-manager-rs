@@ -3,6 +3,11 @@ resolver = "2"
 members = [
     "aws-sdk-s3-transfer-manager",
 
+    # AWS ORT
+    "crates/aws-ort-topology",
+    "crates/aws-ort-execution",
+    "crates/aws-ort-http",
+
     # internal
     "s3-mock-server",
     "benches",
