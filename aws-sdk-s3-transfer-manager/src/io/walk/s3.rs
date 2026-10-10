@@ -49,7 +49,7 @@ pub(crate) struct ListPageResult {
 /// Configuration for walking an S3 bucket by listing objects under a prefix.
 ///
 /// Describes what to list and how (prefix, delimiter, filter, pagination).
-/// The S3 client and bucket name are supplied separately via
+/// The transfer manager client and bucket name are supplied separately via
 /// [`S3WalkContext`] when starting a walk.
 ///
 /// Use [`S3Walker::builder`] to construct an instance.

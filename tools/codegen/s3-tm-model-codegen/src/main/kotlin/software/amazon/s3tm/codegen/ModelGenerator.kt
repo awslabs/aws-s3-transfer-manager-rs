@@ -7,6 +7,7 @@
 package software.amazon.s3tm.codegen
 
 import software.amazon.s3tm.codegen.customizations.DownloadMetadata
+import software.amazon.s3tm.codegen.customizations.EnumDocumentation
 import java.nio.file.Files
 import java.nio.file.Path
 import software.amazon.smithy.build.FileManifest
@@ -26,7 +27,6 @@ import software.amazon.smithy.model.traits.EnumTrait
 import software.amazon.smithy.rust.codegen.client.smithy.ClientRustSettings
 import software.amazon.smithy.rust.codegen.client.smithy.RustClientCodegenPlugin
 import software.amazon.smithy.rust.codegen.client.smithy.customize.CombinedClientCodegenDecorator
-import software.amazon.smithy.rust.codegen.client.smithy.generators.InfallibleEnumType
 import software.amazon.smithy.rust.codegen.core.rustlang.RustModule
 import software.amazon.smithy.rust.codegen.core.rustlang.RustWriter
 import software.amazon.smithy.rust.codegen.core.rustlang.Visibility
@@ -168,7 +168,7 @@ object ModelGenerator {
                 }
                 enum != null ->
                     crate.inPrivateModuleWithReexport(privateModule, symbols.toSymbol(shape)) {
-                        EnumGenerator(model, symbols, enum, InfallibleEnumType(unknownModule), emptyList()).render(this)
+                        EnumGenerator(model, symbols, enum, EnumDocumentation(unknownModule), emptyList()).render(this)
                     }
                 shape.isUnionShape || shape.isIntEnumShape ->
                     error("Unsupported value shape ${shape.id}: requires an explicit TM projection")

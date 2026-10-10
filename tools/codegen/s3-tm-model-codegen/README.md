@@ -128,6 +128,8 @@ construction and redaction policy, and intentional exclusions.
 
 `customizations/` contains S3-specific value policies:
 
+- `EnumDocumentation` describes forward-compatible matching for TM-owned enums;
+  parsing, unknown values, and trait implementations use smithy-rs unchanged.
 - `S3Expires` uses `DateTime` for upload expiration and preserves raw response
   strings as `expires_string`, without changing their shared upstream target.
 - `S3Optionality` removes boolean/numeric defaults to preserve absence. Required

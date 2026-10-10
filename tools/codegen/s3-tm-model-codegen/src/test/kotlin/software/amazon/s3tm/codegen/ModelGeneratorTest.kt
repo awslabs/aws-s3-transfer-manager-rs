@@ -9,6 +9,7 @@ package software.amazon.s3tm.codegen
 import java.nio.file.Files
 import java.nio.file.Path
 import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
@@ -42,6 +43,11 @@ class ModelGeneratorTest {
             val rust = Files.readString(generated.baseDir.resolve("src/model/$file"))
             assertTrue(rust.contains("pub enum $name"))
             assertTrue(rust.contains("Unknown("))
+            assertTrue(rust.contains("future version of this crate"))
+            assertTrue(rust.contains("other if other.as_str() == \"NewFeature\""))
+            assertTrue(rust.contains("///     other if other.as_str()"))
+            assertFalse(rust.contains("version of SDK"))
+            assertFalse(rust.contains("upgrade SDK"))
         }
         assertTrue(Files.readString(generated.baseDir.resolve("src/model/_owner.rs")).contains("crate::model::LegacyState"))
         val module = Files.readString(generated.baseDir.resolve("src/model.rs"))

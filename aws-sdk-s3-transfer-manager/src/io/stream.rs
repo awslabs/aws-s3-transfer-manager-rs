@@ -308,8 +308,8 @@ impl std::fmt::Debug for PartData {
 impl PartData {
     /// Creates a part from contiguous immutable data.
     ///
-    /// The data is retained without copying and uses the SDK's native
-    /// contiguous request-body path.
+    /// The data is retained without copying and sent as a contiguous request
+    /// body.
     pub fn new(part_number: u64, data: impl Into<Bytes>) -> Self {
         Self::from_segmented(part_number, SegmentedBytes::from(data.into()))
     }
