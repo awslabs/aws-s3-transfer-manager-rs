@@ -53,6 +53,7 @@ impl DownloadFluentBuilder {
             input,
             path.into(),
             None,
+            &crate::operation::download::sink::FileSinkFactory,
         )
         .await
     }
@@ -64,6 +65,12 @@ impl DownloadFluentBuilder {
     /// offsets starting from 0 and resizes it to the exact downloaded length,
     /// removing any previous tail. The file cursor is ignored. Append and
     /// nonzero destination offsets are not supported by this operation.
+    ///
+    /// A file that is open in append mode when this method is called, such as
+    /// one opened with [`OpenOptions::append`](std::fs::OpenOptions::append),
+    /// is rejected with
+    /// [`ErrorKind::InputInvalid`](crate::error::ErrorKind::InputInvalid) on
+    /// every platform. No request is sent, and the file is not modified.
     ///
     /// On failure or cancellation, the file may contain a noncontiguous mixture
     /// of downloaded and previous data, and positioned writes may have extended
@@ -79,7 +86,12 @@ impl DownloadFluentBuilder {
         file: std::fs::File,
     ) -> Result<ManagedDownloadHandle, crate::error::Error> {
         let input = self.inner.build()?;
-        crate::operation::download::Download::orchestrate_to_file(self.handle, input, file)
+        crate::operation::download::Download::orchestrate_to_file(
+            self.handle,
+            input,
+            file,
+            &crate::operation::download::sink::FileSinkFactory,
+        )
     }
 
     /// <p>The bucket name containing the object.</p>
