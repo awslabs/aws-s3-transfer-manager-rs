@@ -151,7 +151,7 @@ pub(crate) fn disk_transfer(
     let file = std::fs::File::create(dir.path().join("out")).unwrap();
     let (writer, consumer) = new_recv_body_with_disk_mode(sinks.create(file, false).unwrap());
     let (ctx, _completion_rx) = TransferContext::new(handle);
-    let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, writer);
+    let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, writer, None, None);
     (transfer, consumer, dir)
 }
 

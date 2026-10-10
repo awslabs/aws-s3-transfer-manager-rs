@@ -75,6 +75,28 @@ struct DownloadTransferInner {
     expected_download_len: std::sync::OnceLock<u64>,
     /// Notified when discovery completes (success or failure)
     discovery_notify: tokio::sync::Notify,
+    /// Lifecycle emitter, `None` unless a caller registered a sink.
+    lifecycle: Option<Arc<crate::events::TransferLifecycle>>,
+    /// Where the downloaded bytes are committed, for a managed path download.
+    ///
+    /// `None` for a caller-supplied file or a streamed body: those have no commit
+    /// step of their own, so their terminal status already means what it says the
+    /// moment the tail is flushed.
+    commit: Option<CommitTarget>,
+}
+
+/// The rename that makes a managed path download's bytes reachable at the
+/// destination the caller named.
+///
+/// This lives on the transfer rather than on the handle because every path that
+/// reports the transfer reads its status and cannot join it. A rename performed in
+/// `join()` is reachable only by the one caller who joins, so every other reader —
+/// a metrics snapshot, an event consumer, the orphan drain — sees `Completed` for a
+/// destination that does not exist yet.
+#[derive(Debug, Clone)]
+pub(crate) struct CommitTarget {
+    pub(crate) temp: std::path::PathBuf,
+    pub(crate) dest: std::path::PathBuf,
 }
 
 /// Download-specific work data.
@@ -112,6 +134,8 @@ impl DownloadTransfer {
         bucket_type: BucketType,
         input: DownloadInput,
         writer: BodyWriter,
+        lifecycle: Option<Arc<crate::events::TransferLifecycle>>,
+        commit: Option<CommitTarget>,
     ) -> Self {
         // Resolve the read-ahead knob (per-request override, else client default)
         // to a window in parts before `ctx` and `input` are moved into the struct.
@@ -140,6 +164,8 @@ impl DownloadTransfer {
             integrity_checks: std::sync::OnceLock::new(),
             expected_download_len: std::sync::OnceLock::new(),
             discovery_notify: tokio::sync::Notify::new(),
+            lifecycle,
+            commit,
         });
         Self { inner }
     }
@@ -316,6 +342,11 @@ impl DownloadTransfer {
             tracing::debug!("not active, returning Done");
             return PollWork::Done;
         }
+        // Cleared at entry and set again by whichever park site this poll reaches, so the
+        // reason describes the most recent poll rather than the last one that happened to
+        // park. Without the clear, a transfer that parked once would report that reason for
+        // the rest of its life, including while moving bytes.
+        self.inner.ctx.set_pending_reason(None);
 
         let mut state = self.inner.state.lock().unwrap();
 
@@ -328,6 +359,11 @@ impl DownloadTransfer {
                 })
             }
             DownloadState::DiscoveryInFlight => {
+                self.inner
+                    .ctx
+                    .set_pending_reason(Some(crate::types::PendingReason::from(
+                        DownloadPendingReason::Discovery,
+                    )));
                 self.inner.ctx.set_pending(DownloadPendingReason::Discovery);
                 self.inner
                     .observability
@@ -536,7 +572,11 @@ impl DownloadTransfer {
     /// waker re-readies it: the consumer freeing occupancy, or a GET
     /// completion decrementing the in-flight count. Memory reservations use their
     /// own scheduler-backed task waker.
+    ///
+    /// The cause is named once and reaches both readers: the aggregate diagnostics and
+    /// the public [`PendingReason`](crate::types::PendingReason) a view reports.
     fn park(&self, reason: DownloadPendingReason, snapshot: DownloadStateSnapshot) -> PollWork {
+        self.inner.ctx.set_pending_reason(Some(reason.into()));
         self.inner.ctx.set_pending(reason);
         self.inner.observability.observe_state(snapshot);
         PollWork::Pending
@@ -578,6 +618,14 @@ impl DownloadTransfer {
                 data: Some(Box::new(DownloadWork::DrainResident)),
             })
         } else {
+            // Not routed through `park`: the reservation future has already registered
+            // its own waker, so this path arms the pending state without park's wake
+            // contract. The public cause still has to be set, by the same derivation.
+            self.inner
+                .ctx
+                .set_pending_reason(Some(crate::types::PendingReason::from(
+                    DownloadPendingReason::MemoryAdmission,
+                )));
             self.inner
                 .ctx
                 .set_pending(DownloadPendingReason::MemoryAdmission);
@@ -1049,6 +1097,7 @@ impl DownloadTransfer {
                     reservation,
                     expected_len,
                     || ctx.is_active(),
+                    |n| ctx.record_bytes_streamed(n),
                 )
                 .await
                 .map_err(crate::retry::GuardError::Inner)
@@ -1193,6 +1242,7 @@ impl DownloadTransfer {
                         reservation,
                         expected_len,
                         || ctx.is_active(),
+                        |n| ctx.record_bytes_streamed(n),
                     )
                     .await
                     .map_err(crate::retry::GuardError::Inner)?;
@@ -1346,6 +1396,12 @@ impl DownloadTransfer {
             let guard = self.inner.state.lock().unwrap();
             return self.fail(guard, error::Error::new(error::ErrorKind::IOError, e));
         }
+        // Commit before the status, not after: `join()` is the only caller that could
+        // rename afterwards, and no reporting path can call it.
+        if let Err(e) = self.commit_destination() {
+            let guard = self.inner.state.lock().unwrap();
+            return self.fail(guard, error::Error::new(error::ErrorKind::IOError, e));
+        }
         let state_snapshot = {
             let state = self.inner.state.lock().expect("lock poisoned");
             self.snapshot(&state)
@@ -1357,11 +1413,45 @@ impl DownloadTransfer {
                 state_snapshot,
             );
         }
+        // A lost CAS is left alone deliberately -- see `commit_destination`.
         self.inner.ctx.set_completed();
         self.inner.writer.notify_consumer();
         self.report_terminal(state_snapshot);
+        // Emit before the joiner is released, not only from `on_terminal`: the scheduler
+        // runs `on_terminal` after this, so a consumer that writes `join().await` and then
+        // drains once would miss this operation's own `Ended`. `finish` is exactly-once, so
+        // whichever of the two paths runs first emits and the other is a no-op.
+        if let Some(lc) = &self.inner.lifecycle {
+            if let Some(emit) = lc.finish(self.inner.ctx.terminal_outcome()) {
+                emit.send();
+            }
+        }
         self.inner.ctx.signal_terminal();
         WorkOutcome::Success { data: None }
+    }
+
+    /// Make the downloaded bytes reachable at the destination the caller named.
+    ///
+    /// Runs immediately before the completed status on every path that sets it, so no
+    /// reporting path can observe `Completed` for a destination that does not exist. A
+    /// no-op when the caller owns the file, and a lost CAS is not undone.
+    ///
+    /// The rename must precede the status, because every reporting path reads the status
+    /// without joining and would otherwise name a destination that does not exist yet. So a
+    /// `set_cancelled` landing in between leaves the finished object at the destination under
+    /// a `Cancelled` status, and that is the accepted cost: the rename replaces whatever the
+    /// caller already had there, so removing the result afterwards deletes a file this
+    /// transfer never created and leaves the path empty. A correct object the caller did not
+    /// ask for is recoverable; their own data is not.
+    /// A failed rename leaves the temporary file for the handle to remove: its status is
+    /// not `Completed`, so `cleanup` or drop frees the name, and each takes or guards the
+    /// path so the name is removed once. Removing it here too would reopen that window --
+    /// another download may already own the name by the time the second remove runs.
+    fn commit_destination(&self) -> std::io::Result<()> {
+        match &self.inner.commit {
+            Some(target) => std::fs::rename(&target.temp, &target.dest),
+            None => Ok(()),
+        }
     }
 
     /// Transition to terminal failed state. Requires holding the work lock.
@@ -1410,6 +1500,15 @@ impl DownloadTransfer {
         self.run_terminal_drain();
         self.inner.writer.notify_consumer();
         self.report_terminal(snapshot);
+        // Emit before the joiner is released, not only from `on_terminal`: the scheduler
+        // runs `on_terminal` after this, so a consumer that writes `join().await` and then
+        // drains once would miss this operation's own `Ended`. `finish` is exactly-once, so
+        // whichever of the two paths runs first emits and the other is a no-op.
+        if let Some(lc) = &self.inner.lifecycle {
+            if let Some(emit) = lc.finish(self.inner.ctx.terminal_outcome()) {
+                emit.send();
+            }
+        }
         self.inner.ctx.signal_terminal();
         WorkOutcome::Failed { classification }
     }
@@ -1468,6 +1567,19 @@ impl Transfer for DownloadTransfer {
     }
 
     fn on_terminal(&self) {
+        // Both of this hook's effects are one-shot and both read the status: the terminal
+        // report claims `claim_terminal_report`, and the event derives its outcome from
+        // `terminal_outcome()`. A published status is therefore a precondition, not an
+        // assumption -- `decrement_in_flight` claims the state that makes `poll_work`
+        // answer `Done` before `set_completed` runs, so a caller can arrive here with the
+        // status still `Active`, and spending either one-shot on it is unrecoverable: the
+        // report would render nothing and the event would say `Cancelled` about a transfer
+        // that is about to succeed. Enforced here rather than at the four call sites
+        // because the claim, not the call, is what cannot be taken back. The real
+        // completion runs both for itself afterwards.
+        if self.inner.ctx.is_active() {
+            return;
+        }
         // Release a memory-blocked claim if one is held. External cancellation
         // does not run `fail` or claim completion, so it must explicitly extract
         // the claim and cancel its reservation future after releasing state.
@@ -1488,6 +1600,13 @@ impl Transfer for DownloadTransfer {
         self.run_terminal_drain();
         self.inner.writer.notify_consumer();
         self.report_terminal(snapshot);
+
+        // The terminal event, from the same hook every removal path reaches.
+        if let Some(lc) = &self.inner.lifecycle {
+            if let Some(emit) = lc.finish(self.inner.ctx.terminal_outcome()) {
+                emit.send();
+            }
+        }
     }
 }
 
@@ -1581,6 +1700,7 @@ async fn collect_response_body(
     reservation: &Reservation,
     expected_len: usize,
     is_active: impl Fn() -> bool,
+    on_bytes: impl Fn(u64),
 ) -> Result<SegmentedBytes, Error> {
     if expected_len == 0 {
         return Err(response_length_error(0, 0));
@@ -1607,6 +1727,11 @@ async fn collect_response_body(
             debug_assert!(pooled.remaining_mut() >= data.len());
             pooled.put_slice(&data);
             bytes_received += data.len();
+            // Per chunk, not per part: the only counter that moves inside a part, and the
+            // one that lets a single-part transfer show progress between 0 and done. This
+            // is the single body path for both the ranged and the discovery read, so one
+            // hook covers both.
+            on_bytes(data.len() as u64);
         }
 
         if !is_active() {
@@ -1886,6 +2011,7 @@ mod tests {
             reservation,
             expected_len,
             is_active,
+            |_| {},
         ));
         let mut context = Context::from_waker(Waker::noop());
         match future.as_mut().poll(&mut context) {
@@ -2160,7 +2286,148 @@ mod tests {
         let (writer, _consumer) = crate::operation::download::body::new_recv_body();
         let (ctx, _completion_rx) = TransferContext::new(handle);
 
-        DownloadTransfer::new(ctx, BucketType::Standard, input, writer)
+        DownloadTransfer::new(ctx, BucketType::Standard, input, writer, None, None)
+    }
+
+    /// A download wired to a live event stream, so a test can read the terminal the
+    /// scheduler's hooks emit. Mirrors `Download::orchestrate`: the lifecycle is built
+    /// from the ctx and handed to `DownloadTransfer::new`, and the caller announces.
+    #[allow(clippy::type_complexity)]
+    fn create_download_with_events(
+        object_size: u64,
+        part_size: u64,
+    ) -> (
+        DownloadTransfer,
+        Arc<crate::events::TransferLifecycle>,
+        crate::events::TransferEventStream,
+    ) {
+        let chunk = vec![0u8; part_size as usize];
+        let get_obj = mock!(aws_sdk_s3::Client::get_object).then_output(move || {
+            GetObjectOutput::builder()
+                .content_length(part_size as i64)
+                .content_range(format!("bytes 0-{}/{}", part_size - 1, object_size))
+                .e_tag("test-etag")
+                .body(ByteStream::from(chunk.clone()))
+                .build()
+        });
+        let config = crate::Config::builder()
+            .client(mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get_obj]))
+            .part_size(crate::types::PartSize::Target(part_size))
+            .build();
+        let handle = crate::client::Handle::test_handle_tokio(config);
+
+        let input = DownloadInput::builder()
+            .bucket("test-bucket")
+            .key("test-key")
+            .build()
+            .unwrap();
+
+        let (writer, _consumer) = crate::operation::download::body::new_recv_body();
+        let (ctx, _completion_rx) = TransferContext::new(handle);
+
+        let (sink, stream) = crate::events::channel(std::num::NonZeroUsize::new(8).unwrap());
+        let lifecycle = Arc::new(crate::events::TransferLifecycle::new(
+            sink,
+            ctx.id,
+            crate::events::TransferRef::download(
+                crate::events::Endpoint::S3 {
+                    bucket: Arc::from("test-bucket"),
+                    key: Arc::from("test-key"),
+                },
+                crate::events::Endpoint::Local {
+                    path: Some(Arc::from(std::path::Path::new("./test-key"))),
+                },
+            ),
+            Some(ctx.view()),
+        ));
+        let transfer = DownloadTransfer::new(
+            ctx,
+            BucketType::Standard,
+            input,
+            writer,
+            Some(lifecycle.clone()),
+            None,
+        );
+        (transfer, lifecycle, stream)
+    }
+
+    /// Every `Ended` outcome the stream holds, as a label, so the sequence is
+    /// assertable (`Outcome` is deliberately not `PartialEq`).
+    fn drain_terminals(stream: &mut crate::events::TransferEventStream) -> Vec<&'static str> {
+        let mut terminals = Vec::new();
+        while let Ok(event) = stream.try_next() {
+            if let crate::events::TransferEvent::Ended(ended) = event {
+                terminals.push(match ended.outcome() {
+                    crate::events::Outcome::Succeeded {} => "Succeeded",
+                    crate::events::Outcome::Failed {} => "Failed",
+                    crate::events::Outcome::Cancelled {} => "Cancelled",
+                });
+            }
+        }
+        terminals
+    }
+
+    /// `PollWork::Done` is reachable while the context status is still `Active`, so the
+    /// scheduler's Done arm emits the wrong terminal and spends the one-shot obligation
+    /// the right one needed.
+    ///
+    /// `decrement_in_flight` claims `DownloadState::Terminal` under the state lock, and
+    /// `finalize_completion` does not reach `ctx.set_completed()` until after
+    /// `writer.finalize()` and the rename in `commit_destination` — a disk-flush-wide
+    /// window with the lock released. A scheduler poll landing in it is not skipped,
+    /// because the descriptor's `is_terminal()` tests `!ctx.is_active()`, falls through
+    /// `poll_work`'s own `!is_active()` early-out to
+    /// `DownloadState::Terminal => PollWork::Done`, and so reaches `on_terminal`. There
+    /// `terminal_outcome()` maps a still-`Active` status to `Cancelled` through its `_`
+    /// arm, and the one-shot `owes_finish` swap means the real terminal emits nothing.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn done_while_active_reports_the_outcome_finalize_sets() {
+        let (transfer, lifecycle, mut stream) = create_download_with_events(24 * MB, 8 * MB);
+        lifecycle.announce();
+        assert_discovery_succeeds(&transfer).await;
+
+        // Exactly what the last range's completion does under the state lock.
+        drop(transfer.inner.state.lock().unwrap().enter_terminal());
+        assert!(
+            transfer.ctx().is_active(),
+            "the finalize window: Terminal claimed, status not set yet"
+        );
+        assert_done(transfer.poll_work());
+
+        // The scheduler's Done arm, reached in that window.
+        transfer.on_terminal();
+
+        // `finalize_completion` then gets to the status and runs its own terminal path.
+        transfer.ctx().set_completed();
+        transfer.on_terminal();
+
+        assert_eq!(
+            drain_terminals(&mut stream),
+            vec!["Succeeded"],
+            "a download join() returns Ok for must report one Succeeded terminal"
+        );
+    }
+
+    /// Positive control for `done_while_active_reports_the_outcome_finalize_sets`: the
+    /// same sequence with the status set *before* the terminal state, which is the order
+    /// the 0-byte path already uses — `complete()` calls `ctx.set_completed()` before
+    /// `enter_terminal()`, both under one guard. Identical harness, so a failure here
+    /// would mean the probe is wrong rather than the ordering.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn done_after_set_completed_reports_succeeded() {
+        let (transfer, lifecycle, mut stream) = create_download_with_events(24 * MB, 8 * MB);
+        lifecycle.announce();
+        assert_discovery_succeeds(&transfer).await;
+
+        transfer.ctx().set_completed();
+        drop(transfer.inner.state.lock().unwrap().enter_terminal());
+        assert_done(transfer.poll_work());
+        transfer.on_terminal();
+        transfer.on_terminal();
+
+        assert_eq!(drain_terminals(&mut stream), vec!["Succeeded"]);
     }
 
     // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
@@ -2258,6 +2525,8 @@ mod tests {
         let client = mock_client!(aws_sdk_s3, &[&ranged, &part]);
         let transfer = create_download_with_client_and_detail(client, part_size, 1);
 
+        // No ranges, so discovery is the last item to retire: its own `execute` claims
+        // completion and finalizes, and the next poll is `Done`.
         assert_discovery_succeeds(&transfer).await;
         assert_done(transfer.poll_work());
 
@@ -2320,6 +2589,123 @@ mod tests {
         assert_done(transfer.poll_work());
     }
 
+    /// Build a two-part managed download whose temp file commits to `dest`.
+    ///
+    /// Two parts, so discovery delivers the first and `poll_work` hands out the last range
+    /// as a separate item. That gap is the only window in which a cancel can land before
+    /// the completion claim, and the claim is what reaches `commit_destination`.
+    fn committing_transfer(
+        dest: std::path::PathBuf,
+        temp: std::path::PathBuf,
+        part_size: u64,
+    ) -> DownloadTransfer {
+        let object_size = 2 * part_size;
+        let chunk = vec![0u8; part_size as usize];
+        let get_obj = mock!(aws_sdk_s3::Client::get_object).then_output(move || {
+            GetObjectOutput::builder()
+                .content_length(part_size as i64)
+                .content_range(format!("bytes 0-{}/{}", part_size - 1, object_size))
+                .e_tag("test-etag")
+                .body(ByteStream::from(chunk.clone()))
+                .build()
+        });
+        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get_obj]);
+        let config = crate::Config::builder()
+            .client(client)
+            .part_size(crate::types::PartSize::Target(part_size))
+            .build();
+        let handle = crate::client::Handle::test_handle_tokio(config);
+        let input = DownloadInput::builder()
+            .bucket("test-bucket")
+            .key("test-key")
+            .build()
+            .unwrap();
+        let file = std::fs::File::create(&temp).unwrap();
+        let (writer, _consumer) =
+            crate::operation::download::body::new_recv_body_with_sink(file, true);
+        let (ctx, _completion_rx) = TransferContext::new(handle);
+        DownloadTransfer::new(
+            ctx,
+            BucketType::Standard,
+            input,
+            writer,
+            None,
+            Some(CommitTarget { temp, dest }),
+        )
+    }
+
+    /// A cancelled download must leave a destination it did not create alone.
+    ///
+    /// `commit_destination` renames the temp over `dest`, and `std::fs::rename` replaces an
+    /// existing file -- so for a caller re-downloading over a file they already have, the
+    /// rename consumes their copy. Nothing can give it back afterwards, which is why the
+    /// rename must not run at all once the transfer is terminal. The cancel lands after
+    /// `poll_work` hands out the work and before `execute` claims completion.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn a_cancelled_download_leaves_a_pre_existing_destination_alone() {
+        let part_size = 8 * MB;
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out.dat");
+        let temp = dir.path().join("out.dat.s3tmp.deadbeef");
+        std::fs::write(&dest, b"the caller's own data").unwrap();
+        let transfer = committing_transfer(dest.clone(), temp, part_size);
+
+        // Discovery delivers part 1 and leaves the last range to issue.
+        assert_discovery_succeeds(&transfer).await;
+        // The last range: retiring it is what claims completion and commits.
+        let mut last = assert_ready(transfer.poll_work());
+        // Cancelled after the dispatch, before the run.
+        assert!(transfer.ctx().set_cancelled());
+        let _ = execute(&transfer, &mut last).await;
+
+        assert_eq!(
+            b"the caller's own data".as_slice(),
+            std::fs::read(&dest).unwrap_or_default().as_slice(),
+            "a cancelled download replaced a file it never created"
+        );
+    }
+
+    /// A failed commit must not reach the scheduler as a success.
+    ///
+    /// `finalize_completion` builds a `WorkOutcome::Failed` through `fail` when the flush or
+    /// the rename errors. Reporting `Success` regardless made
+    /// `Scheduler::on_completion` record a clean completion for a transfer that had failed.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn a_failed_commit_reports_failed_not_success() {
+        let part_size = 8 * MB;
+        let dir = tempfile::tempdir().unwrap();
+        let temp = dir.path().join("out.dat.s3tmp.deadbeef");
+        // The commit renames `temp` into a directory that does not exist, so it must fail.
+        let dest = dir.path().join("no-such-dir").join("out.dat");
+        let transfer = committing_transfer(dest.clone(), temp.clone(), part_size);
+
+        // Discovery delivers part 1; retiring the last range claims completion and commits.
+        assert_discovery_succeeds(&transfer).await;
+        let mut last = assert_ready(transfer.poll_work());
+        let outcome = execute(&transfer, &mut last).await;
+
+        assert!(
+            matches!(outcome, WorkOutcome::Failed { .. }),
+            "a commit that could not rename reported {outcome:?} to the scheduler"
+        );
+        assert_eq!(
+            crate::types::TransferStatus::Failed,
+            transfer.ctx().transfer_status()
+        );
+        assert!(
+            !dest.exists(),
+            "a failed rename must not create the destination"
+        );
+        // The temporary file is still the handle's to remove: the status is not
+        // `Completed`, so its `cleanup` or drop frees the name, exactly once.
+        assert!(
+            temp.exists(),
+            "the failed rename must leave the temp in place"
+        );
+    }
+
     /// The terminal hook completes cleanup and reports a summary when a worker
     /// panicked while holding the state lock.
     #[cfg_attr(miri, ignore)]
@@ -2359,6 +2745,70 @@ mod tests {
         );
     }
 
+    /// `decrement_in_flight` claims `DownloadState::Terminal` under the state lock
+    /// while the ctx status is still `Active` (`set_completed` only runs later, in
+    /// `finalize_completion`). A scheduler thread that pops the descriptor inside
+    /// that window sees `poll_work() == Done` and runs the terminal hook. The
+    /// one-shot terminal report must survive that premature hook: the completion
+    /// that follows is the one that has an outcome to report.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn premature_terminal_hook_does_not_burn_the_completion_report() {
+        let transfer = create_download_with_detail(24 * MB, 8 * MB, 1);
+        assert_discovery_succeeds(&transfer).await;
+
+        // The terminal claim `decrement_in_flight` takes on the last range: nothing left
+        // to issue and nothing in flight. Shaped directly so the test need not drive every
+        // range, then claimed through the production path.
+        let claim = {
+            let mut state = transfer.inner.state.lock().unwrap();
+            if let DownloadState::Transferring {
+                remaining,
+                ranges_in_flight,
+                drains_in_flight,
+                pending,
+                ..
+            } = &mut *state
+            {
+                *remaining = None;
+                *ranges_in_flight = 0;
+                *drains_in_flight = 0;
+                *pending = None;
+            }
+            state
+                .try_claim_completion()
+                .expect("the shaped state must be claimable")
+        };
+        assert_eq!(
+            transfer.ctx().transfer_status(),
+            crate::types::TransferStatus::Active,
+            "the completion is not published until finalize_completion"
+        );
+
+        // Scheduler thread: pops the still-Active descriptor, polls Done, runs the hook.
+        assert_done(transfer.poll_work());
+        transfer.on_terminal();
+
+        // Execute thread: the real completion finalizes, publishes, and reports.
+        let outcome = transfer.finalize_completion(claim);
+        assert!(
+            matches!(outcome, WorkOutcome::Success { .. }),
+            "completion failed: {outcome:?}"
+        );
+        assert_eq!(
+            transfer.ctx().transfer_status(),
+            crate::types::TransferStatus::Completed
+        );
+
+        let summary = transfer
+            .test_terminal_summary()
+            .expect("a completed download must still emit its terminal summary");
+        assert_eq!(
+            summary.outcome,
+            crate::operation::download::observability::DownloadTerminalOutcome::Completed
+        );
+    }
+
     /// External cancellation must close pending diagnostics and report one
     /// terminal summary through the scheduler-owned terminal hook.
     #[cfg_attr(miri, ignore)]
@@ -2390,6 +2840,134 @@ mod tests {
         assert_eq!(
             summary.last_active_snapshot.state,
             DownloadExecutionState::DiscoveryInFlight
+        );
+    }
+
+    /// The scheduler's `Done` arm must not report a download that succeeds as cancelled.
+    ///
+    /// `decrement_in_flight` claims the terminal transition on the *state machine* while
+    /// the status is still `Active`: `set_completed` does not run until
+    /// `finalize_completion` has flushed the tail and committed the destination. A poll
+    /// landing in that window returns `Done` (the state is `Terminal`) while
+    /// `desc.is_terminal()` -- `!ctx.is_active()` -- is still false, so nothing in
+    /// `generate_work` skips it. The `Done` arm then calls `on_terminal()`, which emits
+    /// `terminal_outcome()`, and that maps `Active` through `_ => Cancelled`.
+    /// `owes_finish` is a one-shot swap, so the wrong outcome is the only `Ended` the
+    /// consumer ever sees for a download that goes on to complete.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn done_poll_in_finalize_window_must_not_report_cancelled() {
+        let part_size = 8 * MB;
+        let object_size = 2 * part_size;
+        let chunk = vec![0u8; part_size as usize];
+        let get_obj = mock!(aws_sdk_s3::Client::get_object).then_output(move || {
+            GetObjectOutput::builder()
+                .content_length(part_size as i64)
+                .content_range(format!("bytes 0-{}/{}", part_size - 1, object_size))
+                .e_tag("test-etag")
+                .body(ByteStream::from(chunk.clone()))
+                .build()
+        });
+        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get_obj]);
+        let config = crate::Config::builder()
+            .client(client)
+            .part_size(crate::types::PartSize::Target(part_size))
+            .build();
+        let handle = crate::client::Handle::test_handle_tokio(config);
+        let input = DownloadInput::builder()
+            .bucket("test-bucket")
+            .key("test-key")
+            .build()
+            .unwrap();
+        let (writer, _consumer) = crate::operation::download::body::new_recv_body();
+        let (ctx, _completion_rx) = TransferContext::new(handle.clone());
+
+        // The sink/lifecycle wiring `Download::orchestrate` builds for a request that
+        // registered an event consumer.
+        let (sink, mut stream) = crate::events::channel(std::num::NonZeroUsize::new(8).unwrap());
+        let lifecycle = Arc::new(crate::events::TransferLifecycle::new(
+            sink,
+            ctx.id,
+            crate::events::TransferRef::download(
+                crate::events::Endpoint::S3 {
+                    bucket: Arc::from("test-bucket"),
+                    key: Arc::from("test-key"),
+                },
+                crate::events::Endpoint::Stream {},
+            ),
+            Some(ctx.view()),
+        ));
+        let transfer = DownloadTransfer::new(
+            ctx,
+            BucketType::Standard,
+            input,
+            writer,
+            Some(lifecycle.clone()),
+            None,
+        );
+        lifecycle.announce();
+
+        // Discovery delivers part 1 and leaves part 2 to issue.
+        assert_discovery_succeeds(&transfer).await;
+        // Issue the last range: `remaining` becomes None and one range is in flight.
+        let _last = assert_ready(transfer.poll_work());
+
+        // That range's data finishes. `decrement_in_flight` claims the terminal
+        // transition under the state lock and returns `true`, so `execute` will run
+        // `finalize_completion` next. Production code, not a poked enum: the status is
+        // deliberately untouched here, per this function's own comment.
+        let claim = transfer
+            .decrement_in_flight(0)
+            .expect("the last in-flight range must claim the terminal transition");
+        assert_eq!(
+            transfer.ctx().transfer_status(),
+            crate::types::TransferStatus::Active,
+            "set_completed runs in finalize_completion, after the tail flush and rename",
+        );
+
+        // The window. A sibling range's `try_wake`, or a descriptor the ready set still
+        // holds after a `no_capacity` break, lands the scheduler here: nothing in
+        // `generate_work` skips the descriptor, and the poll returns `Done`.
+        assert_done(transfer.poll_work());
+
+        // Drive the real scheduler over it, so the `PollWork::Done` arm added by this PR
+        // runs as written rather than being imitated. `enqueue_transfer` calls
+        // `generate_work` on this thread, which pops, polls -- `Done` -- and runs the arm.
+        handle
+            .scheduler
+            .enqueue_transfer(Box::new(transfer.clone()));
+
+        // The real completion now finishes: tail flush, commit, `set_completed`.
+        let outcome = transfer.finalize_completion(claim);
+        assert!(
+            matches!(outcome, WorkOutcome::Success { .. }),
+            "expected Success, got {outcome:?}"
+        );
+        assert_eq!(
+            transfer.ctx().transfer_status(),
+            crate::types::TransferStatus::Completed
+        );
+        // The `on_completion` removal path reaches the same hook.
+        transfer.on_terminal();
+
+        // What the consumer saw.
+        let mut events = Vec::new();
+        while let Ok(event) = stream.try_next() {
+            events.push(event);
+        }
+        assert_eq!(stream.dropped(), 0, "no event was lost to capacity");
+        let ended: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                crate::events::TransferEvent::Ended(ended) => Some(ended),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ended.len(), 1, "exactly one terminal event: {events:?}");
+        assert!(
+            matches!(ended[0].outcome(), crate::events::Outcome::Succeeded {}),
+            "a download whose status reads Completed reported {:?} to its consumer",
+            ended[0].outcome(),
         );
     }
 
@@ -2449,7 +3027,7 @@ mod tests {
 
         let (writer, _consumer) = crate::operation::download::body::new_recv_body();
         let (ctx, _completion_rx) = TransferContext::new(handle);
-        let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, writer);
+        let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, writer, None, None);
 
         assert_discovery_succeeds(&transfer).await;
 
@@ -2756,7 +3334,7 @@ mod tests {
             .unwrap();
         let (writer, _consumer) = crate::operation::download::body::new_recv_body();
         let (ctx, _completion_rx) = TransferContext::new(handle);
-        let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, writer);
+        let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, writer, None, None);
 
         assert_discovery_succeeds(&transfer).await;
         let mut range = assert_ready(transfer.poll_work());
@@ -2847,7 +3425,7 @@ mod tests {
 
         let (writer, consumer) = crate::operation::download::body::new_recv_body();
         let (ctx, _completion_rx) = TransferContext::new(handle);
-        let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, writer);
+        let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, writer, None, None);
         (transfer, consumer)
     }
 
@@ -3230,7 +3808,7 @@ mod tests {
         let (writer, _consumer) =
             crate::operation::download::body::new_recv_body_with_sink(file, false);
         let (ctx, _completion_rx) = TransferContext::new(handle);
-        let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, writer);
+        let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, writer, None, None);
 
         assert_eq!(pool.metrics().active_planned_demand_bytes(), 0);
 
@@ -3271,6 +3849,94 @@ mod tests {
             written.len(),
             part_size as usize,
             "all bytes should be flushed to disk"
+        );
+    }
+
+    /// A managed path download must have committed its destination by the time any
+    /// reader can observe `Completed`.
+    ///
+    /// The assertion deliberately never joins. `join()` is reachable by exactly one
+    /// caller, so a rename performed there leaves every other reader -- a metrics
+    /// snapshot, an event consumer, the composite's orphan drain -- reading
+    /// `Completed` for a path that does not exist. Reading the status is the only thing
+    /// a reporting path can do, so the status is what the destination has to be ready
+    /// for.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_destination_exists_when_status_reads_completed() {
+        let part_size = 8 * MB;
+        let object_size = part_size;
+
+        let chunk = vec![0u8; part_size as usize];
+        let get_obj = mock!(aws_sdk_s3::Client::get_object).then_output(move || {
+            GetObjectOutput::builder()
+                .content_length(part_size as i64)
+                .content_range(format!("bytes 0-{}/{}", part_size - 1, object_size))
+                .e_tag("test-etag")
+                .body(ByteStream::from(chunk.clone()))
+                .build()
+        });
+        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get_obj]);
+
+        let config = crate::Config::builder()
+            .client(client)
+            .part_size(crate::types::PartSize::Target(part_size))
+            .build();
+        let handle = crate::client::Handle::test_handle_tokio(config);
+
+        let input = DownloadInput::builder()
+            .bucket("test-bucket")
+            .key("test-key")
+            .build()
+            .unwrap();
+
+        // The same temp/dest split `orchestrate_to_path` sets up.
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out.dat");
+        let temp = dir.path().join("out.dat.s3tmp.deadbeef");
+        let file = std::fs::File::create(&temp).unwrap();
+        let (writer, _consumer) =
+            crate::operation::download::body::new_recv_body_with_sink(file, true);
+        let (ctx, _completion_rx) = TransferContext::new(handle);
+        let transfer = DownloadTransfer::new(
+            ctx,
+            BucketType::Standard,
+            input,
+            writer,
+            None,
+            Some(CommitTarget {
+                temp: temp.clone(),
+                dest: dest.clone(),
+            }),
+        );
+
+        // Single chunk: discovery fetches the whole object and the terminal completion
+        // runs inside this one execute.
+        let mut work = assert_ready(transfer.poll_work());
+        let outcome = execute(&transfer, &mut work).await;
+        assert!(
+            matches!(outcome, WorkOutcome::Success { .. }),
+            "expected Success, got {outcome:?}"
+        );
+
+        // No join() anywhere above. This is what every reporting path sees.
+        assert_eq!(
+            transfer.ctx().transfer_status(),
+            crate::types::TransferStatus::Completed,
+            "the terminal execute must have set the completed status"
+        );
+        assert!(
+            dest.exists(),
+            "status reads Completed but the destination does not exist"
+        );
+        assert!(
+            !temp.exists(),
+            "the temp file must have been renamed away, not copied"
+        );
+        assert_eq!(
+            std::fs::read(&dest).unwrap().len(),
+            part_size as usize,
+            "the committed destination must hold every byte"
         );
     }
 
@@ -3726,6 +4392,7 @@ mod tests {
             input,
             dest.clone(),
             None,
+            None,
             &ScriptedSinkFactory(Arc::clone(&script)),
         )
         .await
@@ -4144,7 +4811,7 @@ mod tests {
                 .unwrap();
             let (writer, _consumer) = crate::operation::download::body::new_recv_body();
             let (ctx, _rx) = TransferContext::new(handle);
-            DownloadTransfer::new(ctx, BucketType::Standard, input, writer)
+            DownloadTransfer::new(ctx, BucketType::Standard, input, writer, None, None)
         };
 
         // No request override: the client default resolves.

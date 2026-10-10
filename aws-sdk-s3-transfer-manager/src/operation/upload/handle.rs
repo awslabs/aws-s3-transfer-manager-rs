@@ -261,7 +261,8 @@ mod tests {
         let stream = input.take_body();
         let (ctx, completion_rx) = TransferContext::new(handle);
         let transfer =
-            UploadTransfer::try_new(ctx.clone(), BucketType::Standard, input, stream).unwrap();
+            UploadTransfer::try_new(ctx.clone(), BucketType::Standard, input, stream, None)
+                .unwrap();
 
         // Drive to Cancelled terminal state.
         ctx.set_cancelled();

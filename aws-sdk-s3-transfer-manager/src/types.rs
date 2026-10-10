@@ -289,6 +289,15 @@ impl TransferStatus {
 }
 
 /// Snapshot of transfer progress and IO metrics.
+///
+/// The four byte counters are four views of the same payload, not four addends: a
+/// file-backed upload records its bytes as both `disk_read` and `network_tx`.
+///
+/// Draw progress from the counter matching the direction — `network_tx` for an upload,
+/// `network_rx` for a download — against [`total_bytes`](Self::total_bytes). A directory
+/// operation aggregates its children into the same four counters, so the same rule applies.
+/// Prefer [`TransferView::byte_total`] where a still-growing total must be told from a final
+/// one.
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub struct TransferMetrics {
@@ -300,12 +309,166 @@ pub struct TransferMetrics {
     pub disk_read: u64,
     /// Bytes written to disk.
     pub disk_write: u64,
+    /// Download payload bytes read off a socket, counted per chunk as they arrive rather
+    /// than per part at confirmed success.
+    ///
+    /// Use this when you need a numerator that moves *inside* a part: `network_rx` advances
+    /// once per part, so a single-part transfer shows nothing between 0 and done, and at the
+    /// 5 MiB download default most small-file transfers are single-part.
+    ///
+    /// **An optimistic estimate, not an accounting figure.** Monotonic, but a retried or
+    /// hedged attempt's partial bytes are counted and never removed, so this can exceed
+    /// `network_rx` permanently and can exceed `total_bytes`. Clamp it when rendering, and
+    /// use `network_rx` for any total that has to be right. Always 0 for an upload.
+    pub bytes_streamed: u64,
     /// Expected total payload bytes, if known.
     pub total_bytes: Option<u64>,
     /// When the transfer was initiated.
     pub started_at: std::time::Instant,
     /// When the transfer reached a terminal state, if it has.
     pub finished_at: Option<std::time::Instant>,
+}
+
+/// Detached, read-only view of one transfer's live byte counters.
+///
+/// Handed out on [`TransferEvent::Planned`](crate::events::TransferEvent::Planned). Owns
+/// nothing the caller can act with and borrows nothing, so it outlives the `join(self)`
+/// that consumes the operation handle. Read it whenever you repaint; nothing pushes.
+///
+/// Drop it once that entry's
+/// [`TransferEvent::Ended`](crate::events::TransferEvent::Ended) arrives — it keeps
+/// one small allocation alive until then, so retaining every view of a million-object
+/// directory transfer retains a million of them.
+#[derive(Debug, Clone)]
+pub struct TransferView {
+    metrics: std::sync::Arc<crate::transfer::MetricsState>,
+}
+
+impl TransferView {
+    pub(crate) fn new(metrics: std::sync::Arc<crate::transfer::MetricsState>) -> Self {
+        Self { metrics }
+    }
+
+    /// Point-in-time reading of this transfer's counters.
+    ///
+    /// Every counter is an **absolute cumulative total for this transfer, never a
+    /// delta**: a rate is the caller's own difference between two readings. Each is
+    /// monotonically non-decreasing, so a later reading never returns less than an
+    /// earlier one.
+    ///
+    /// Which counter is the numerator depends on the direction — see
+    /// [`TransferMetrics`]. Summing all four double-counts: a file-backed upload records
+    /// the same payload as both `network_tx` and `disk_read`.
+    ///
+    /// [`TransferMetrics::finished_at`] is set on the transfer's terminal transition,
+    /// which happens while in-flight work may still be draining, so a counter can still
+    /// grow after it is `Some`. For exact final numbers use the operation's own `join()`
+    /// result.
+    pub fn metrics(&self) -> TransferMetrics {
+        self.metrics.snapshot()
+    }
+
+    /// Why this transfer produced no work on its most recent poll, if it produced none.
+    ///
+    /// `None` means it produced work, so a reading of `None` is not a promise that bytes are
+    /// moving — only that the transfer was not parked when last asked.
+    pub fn pending_reason(&self) -> Option<PendingReason> {
+        self.metrics.pending_reason()
+    }
+
+    /// This transfer's byte denominator. See [`Total`].
+    ///
+    /// For a single-object transfer this is `Final` as soon as the length is known, and
+    /// `Unknown` for an unknown-length streaming upload. For a directory operation it
+    /// climbs through `Provisional` while enumeration runs and becomes `Final` only if
+    /// enumeration completed — a run cancelled mid-listing never seals, because nobody
+    /// knows the total.
+    pub fn byte_total(&self) -> Total {
+        self.metrics.byte_total()
+    }
+
+    /// This transfer's entry denominator: how many objects the directory operation will
+    /// act on. See [`Total`].
+    ///
+    /// Always [`Total::Unknown`] for a single-object transfer, which is one entry and
+    /// is itself the thing being counted.
+    ///
+    /// Becomes `Final` with [`byte_total`](Self::byte_total), so one is never `Final` while
+    /// the other is still `Provisional`.
+    pub fn entry_total(&self) -> Total {
+        self.metrics.entry_total()
+    }
+
+    /// Entries that have reached a terminal state, however they ended.
+    ///
+    /// Counts successes, failures, cancellations and entries abandoned before they
+    /// started — "no longer pending", not "succeeded". This is the numerator for a
+    /// `N of M objects` or `M - N remaining` display, where
+    /// [`entry_total`](Self::entry_total) is `M`: a caller that counted only successes
+    /// would show work remaining forever on a run with failures.
+    ///
+    /// Incremented at the same instant the entry's
+    /// [`TransferEvent::Ended`](crate::events::TransferEvent::Ended) is claimed, so
+    /// this is exactly what a consumer would tally from the stream if no event were ever
+    /// dropped — and unlike that tally, it stays exact when events are.
+    ///
+    /// 0 for a single-object transfer.
+    pub fn entries_settled(&self) -> u64 {
+        self.metrics.entries_settled()
+    }
+}
+
+/// Why a transfer is producing no work right now.
+///
+/// Answers *"why is nothing moving"*, which byte counters cannot: a bar sitting still looks
+/// identical whether the consumer has stopped reading, the memory budget is full, or the
+/// listing has not returned. Read it from
+/// [`TransferView::pending_reason`](TransferView::pending_reason); `None` means the transfer
+/// produced work on its most recent poll.
+///
+/// Not every reason is a problem — [`PendingReason::WorkInFlight`] is the normal tail of a
+/// transfer. Reported for downloads; an upload's park sites are not labelled, so a parked
+/// upload reports `None` rather than a wrong reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PendingReason {
+    /// The read-ahead window is full: prefetched data is waiting for the caller to read it.
+    /// Issuance resumes when the consumer drains.
+    #[non_exhaustive]
+    ReadAheadWindow {},
+    /// The client's memory budget has no room for another part. Resumes when an in-flight
+    /// part completes and releases its reservation.
+    #[non_exhaustive]
+    MemoryBudget {},
+    /// The initial `GetObject`/`HeadObject` has not returned, so the transfer does not yet
+    /// know what to fetch.
+    #[non_exhaustive]
+    Discovery {},
+    /// Every unit of work has been issued and the transfer is waiting for the last
+    /// in-flight requests to retire. The normal tail of a transfer.
+    #[non_exhaustive]
+    WorkInFlight {},
+}
+
+/// A denominator a transfer is still discovering, and how much to trust it.
+///
+/// The unit comes from the accessor, not from this type:
+/// [`byte_total`](TransferView::byte_total) returns payload bytes,
+/// [`entry_total`](TransferView::entry_total) returns entries. A percentage is defined
+/// only for [`Total::Final`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Total {
+    /// No total is known, and none may ever be: an unknown-length streaming upload, a
+    /// single-object transfer asked for its entry count, or a directory operation
+    /// cancelled before enumeration finished. Render what is done, not a fraction.
+    Unknown,
+    /// A lower bound. Enumeration is still running, so this will only grow. Do not treat
+    /// it as final even when a later reading repeats it — only [`Total::Final`] says
+    /// enumeration is over.
+    Provisional(u64),
+    /// Enumeration finished and this will not change again.
+    Final(u64),
 }
 
 /// Type of the bucket for the transfer

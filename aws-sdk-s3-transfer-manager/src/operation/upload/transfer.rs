@@ -113,6 +113,11 @@ struct UploadTransferInner {
     bucket_type: BucketType,
     /// Stored result for handle to retrieve
     result: Mutex<Option<UploadOutput>>,
+    /// Lifecycle emitter, `None` unless a caller registered a sink.
+    ///
+    /// A single-object upload has no children, so one emitter is the whole story:
+    /// announced by `orchestrate`, discharged by `on_terminal`.
+    lifecycle: Option<Arc<crate::events::TransferLifecycle>>,
 }
 
 impl UploadTransfer {
@@ -121,6 +126,7 @@ impl UploadTransfer {
         bucket_type: BucketType,
         request: UploadInput,
         stream: InputStream,
+        lifecycle: Option<Arc<crate::events::TransferLifecycle>>,
     ) -> Result<Self, Error> {
         let size_hint = stream.size_hint();
         validate_size_hint(size_hint).map_err(crate::error::invalid_input)?;
@@ -148,6 +154,7 @@ impl UploadTransfer {
             request: Arc::new(request),
             bucket_type,
             result: Mutex::new(None),
+            lifecycle,
         });
 
         Ok(Self { inner })
@@ -929,13 +936,6 @@ impl UploadTransfer {
             }
         };
 
-        let result = UploadOutputBuilder::from(resp)
-            .metrics(self.inner.ctx.metrics())
-            .build()
-            .expect("valid response");
-
-        *self.inner.result.lock().expect("lock poisoned") = Some(result);
-
         // A successful response means the SDK fully read the body and
         // the bytes made it to the wire. For file-backed sources, the
         // body implementations above have therefore read `content_length`
@@ -943,6 +943,9 @@ impl UploadTransfer {
         // per-chunk inside the body) so that there is a single semantic
         // anchor — "recorded when the SDK confirms success" — consistent
         // with how `network_tx` is attributed.
+        //
+        // Recorded before the output is built, because the output carries a snapshot
+        // of these counters and a caller has no other view of them.
         let disk_read = if is_file_backed { content_length } else { 0 };
         self.inner.ctx.record_io(&crate::metrics::IoSample {
             network_tx: content_length,
@@ -950,9 +953,30 @@ impl UploadTransfer {
             ..Default::default()
         });
 
-        *self.inner.state.lock().expect("lock poisoned") = UploadState::Done;
+        let result = UploadOutputBuilder::from(resp)
+            .metrics(self.inner.ctx.metrics())
+            .build()
+            .expect("valid response");
+
+        *self.inner.result.lock().expect("lock poisoned") = Some(result);
+
+        // Status before state, because `poll_work` answers `Done` off the state while every
+        // reporting path derives its outcome from the status. Published the other way round,
+        // a poll landing between the two lines saw a finished transfer that still read
+        // `Active`, and the terminal it published was `Cancelled` for an upload that had
+        // just succeeded.
         self.inner.ctx.set_completed();
+        *self.inner.state.lock().expect("lock poisoned") = UploadState::Done;
         self.report_terminal();
+        // Emit before the joiner is released, not only from `on_terminal`: the scheduler
+        // runs `on_terminal` after this, so a consumer that writes `join().await` and then
+        // drains once would miss this operation's own `Ended`. `finish` is exactly-once, so
+        // whichever of the two paths runs first emits and the other is a no-op.
+        if let Some(lc) = &self.inner.lifecycle {
+            if let Some(emit) = lc.finish(self.inner.ctx.terminal_outcome()) {
+                emit.send();
+            }
+        }
         self.inner.ctx.signal_terminal();
 
         WorkOutcome::Success { data: None }
@@ -1054,9 +1078,19 @@ impl UploadTransfer {
             .expect("valid response");
 
         *self.inner.result.lock().expect("lock poisoned") = Some(result);
-        *self.inner.state.lock().expect("lock poisoned") = UploadState::Done;
+        // Status before state, for the reason given on the `PutObject` path above.
         self.inner.ctx.set_completed();
+        *self.inner.state.lock().expect("lock poisoned") = UploadState::Done;
         self.report_terminal();
+        // Emit before the joiner is released, not only from `on_terminal`: the scheduler
+        // runs `on_terminal` after this, so a consumer that writes `join().await` and then
+        // drains once would miss this operation's own `Ended`. `finish` is exactly-once, so
+        // whichever of the two paths runs first emits and the other is a no-op.
+        if let Some(lc) = &self.inner.lifecycle {
+            if let Some(emit) = lc.finish(self.inner.ctx.terminal_outcome()) {
+                emit.send();
+            }
+        }
         self.inner.ctx.signal_terminal();
 
         WorkOutcome::Success { data: None }
@@ -1071,6 +1105,15 @@ impl UploadTransfer {
         let classification = crate::scheduler::classify_error(&error);
         self.inner.ctx.set_failed(error);
         self.report_terminal();
+        // Emit before the joiner is released, not only from `on_terminal`: the scheduler
+        // runs `on_terminal` after this, so a consumer that writes `join().await` and then
+        // drains once would miss this operation's own `Ended`. `finish` is exactly-once, so
+        // whichever of the two paths runs first emits and the other is a no-op.
+        if let Some(lc) = &self.inner.lifecycle {
+            if let Some(emit) = lc.finish(self.inner.ctx.terminal_outcome()) {
+                emit.send();
+            }
+        }
         self.inner.ctx.signal_terminal();
         WorkOutcome::Failed { classification }
     }
@@ -1171,8 +1214,29 @@ impl Transfer for UploadTransfer {
         Box::pin(UploadTransfer::execute(self, work))
     }
 
+    /// Terminal reporting and the terminal event, for whichever removal path reaches it
+    /// first -- normal completion, cancellation, a worker panic, or completion-driven
+    /// removal. Reaching it more than once is harmless: each obligation is claimed by
+    /// exactly one caller, and the completion paths emit for themselves before releasing
+    /// the joiner, so a consumer that drains after `join()` still sees this `Ended`.
+    ///
+    /// Requires the status to be published already -- see the early return.
     fn on_terminal(&self) {
+        // Both effects are one-shot and both read the status: `report_terminal` claims
+        // `claim_terminal_report`, and the event's outcome comes from `terminal_outcome()`.
+        // A caller can arrive here while the status is still `Active`, and spending
+        // either one-shot on it cannot be taken back -- the report would render nothing
+        // and the event would say `Cancelled` about an upload that succeeded.
+        if self.inner.ctx.is_active() {
+            return;
+        }
         self.report_terminal();
+        let Some(lc) = &self.inner.lifecycle else {
+            return;
+        };
+        if let Some(emit) = lc.finish(self.inner.ctx.terminal_outcome()) {
+            emit.send();
+        }
     }
 }
 
@@ -1221,7 +1285,7 @@ mod tests {
         let stream = input.take_body();
 
         let (ctx, _completion_rx) = TransferContext::new(handle);
-        UploadTransfer::try_new(ctx, BucketType::Standard, input, stream).unwrap()
+        UploadTransfer::try_new(ctx, BucketType::Standard, input, stream, None).unwrap()
     }
 
     fn mock_s3_client_for_mpu() -> aws_sdk_s3::Client {
@@ -2115,7 +2179,8 @@ mod tests {
             .unwrap();
         let stream = input.take_body();
         let (ctx, _completion_rx) = TransferContext::new(handle);
-        let transfer = UploadTransfer::try_new(ctx, BucketType::Standard, input, stream).unwrap();
+        let transfer =
+            UploadTransfer::try_new(ctx, BucketType::Standard, input, stream, None).unwrap();
 
         let mut work = assert_ready(transfer.poll_work());
         assert!(matches!(
@@ -2135,6 +2200,26 @@ mod tests {
             payload.len() as u64,
             metrics.disk_read,
             "disk_read should equal the file size for a file-backed PutObject"
+        );
+
+        // `UploadOutput` is the only view a caller of `upload()` gets, and it used to be
+        // built before the sample above was recorded -- so both counters read 0 in the
+        // output while `ctx().metrics()` read the real numbers, and the two views of one
+        // transfer disagreed.
+        let out = transfer
+            .take_result()
+            .expect("a successful PutObject leaves a result");
+        assert_eq!(
+            payload.len() as u64,
+            out.metrics.network_tx,
+            "the output a caller reads reports {} bytes sent",
+            out.metrics.network_tx
+        );
+        assert_eq!(
+            payload.len() as u64,
+            out.metrics.disk_read,
+            "the output a caller reads reports {} bytes read from disk",
+            out.metrics.disk_read
         );
     }
 

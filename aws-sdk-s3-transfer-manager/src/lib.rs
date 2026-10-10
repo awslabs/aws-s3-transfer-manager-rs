@@ -129,6 +129,8 @@
 /// Error types emitted by `aws-sdk-s3-transfer-manager`
 pub mod error;
 
+pub mod events;
+
 /// Common types used by `aws-sdk-s3-transfer-manager`
 pub mod types;
 

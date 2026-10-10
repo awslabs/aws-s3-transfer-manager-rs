@@ -23,6 +23,11 @@ pub(crate) enum DownloadPendingReason {
     DrainCompletion,
 }
 
+/// Both views of a park are projected from this one enum, so a site names its reason
+/// once and the two cannot disagree. They are not interchangeable:
+/// [`PendingCause`] carries a direction-specific label for aggregate diagnostics and is
+/// finer than the reported reason -- `range_completion` and a `part_completion` on the
+/// upload side are both [`crate::types::PendingReason::WorkInFlight`] to a caller.
 impl From<DownloadPendingReason> for PendingCause {
     fn from(reason: DownloadPendingReason) -> Self {
         match reason {
@@ -33,6 +38,18 @@ impl From<DownloadPendingReason> for PendingCause {
             }
             DownloadPendingReason::RangeCompletion => Self::in_flight_work("range_completion"),
             DownloadPendingReason::DrainCompletion => Self::in_flight_work("drain_completion"),
+        }
+    }
+}
+
+impl From<DownloadPendingReason> for crate::types::PendingReason {
+    fn from(reason: DownloadPendingReason) -> Self {
+        match reason {
+            DownloadPendingReason::Discovery => Self::Discovery {},
+            DownloadPendingReason::ReadAhead => Self::ReadAheadWindow {},
+            DownloadPendingReason::MemoryAdmission => Self::MemoryBudget {},
+            DownloadPendingReason::RangeCompletion => Self::WorkInFlight {},
+            DownloadPendingReason::DrainCompletion => Self::WorkInFlight {},
         }
     }
 }
