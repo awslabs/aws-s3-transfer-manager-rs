@@ -1,12 +1,12 @@
 [package]
 name = "aws-ort-execution"
 version = "0.1.0"
-edition = "2021"
-rust-version = "1.94.1"
-authors = ["AWS Rust SDK Team <aws-sdk-rust@amazon.com>", "Aaron Todd <todaaron@amazon.com>"]
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
 license = "Apache-2.0"
 repository = "https://github.com/awslabs/aws-s3-transfer-manager-rs"
-description = "Managed execution and worker placement for AWS ORT."
+description = "Managed async execution with worker placement."
 readme = "README.md"
 categories = ["asynchronous", "concurrency"]
 keywords = ["aws", "ort", "runtime", "execution"]

@@ -2,9 +2,9 @@
 name = "aws-sdk-s3-transfer-manager"
 version = "0.3.1"
 edition = "2021"
-authors = ["AWS Rust SDK Team <aws-sdk-rust@amazon.com>", "Aaron Todd <todaaron@amazon.com>"]
+authors.workspace = true
 license = "Apache-2.0"
-rust-version = "1.94.1"
+rust-version.workspace = true
 repository = "https://github.com/awslabs/aws-s3-transfer-manager-rs"
 description = """
 A high performance Amazon S3 transfer manager for Rust.

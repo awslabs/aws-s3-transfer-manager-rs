@@ -1,6 +1,6 @@
-# AWS ORT HTTP
+# aws-ort-http
 
-Managed HTTP transport for AWS ORT (Oxidized Runtime).
+HTTP transport with connection pooling and managed execution.
 
 The HTTP component combines connection pooling with managed execution placement.
 Its boundary covers transport, request and response bodies, and ecosystem adapter

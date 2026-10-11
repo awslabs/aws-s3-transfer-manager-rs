@@ -1,6 +1,6 @@
-# AWS ORT Execution
+# aws-ort-execution
 
-Managed execution and worker placement for AWS ORT (Oxidized Runtime).
+Managed async execution with worker placement.
 
 The execution component owns workers and provides access to their execution
 partitions. Hardware discovery and placement resources belong to
