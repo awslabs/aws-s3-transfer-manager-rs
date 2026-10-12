@@ -2594,22 +2594,20 @@ mod tests {
     /// Two parts, so discovery delivers the first and `poll_work` hands out the last range
     /// as a separate item. That gap is the only window in which a cancel can land before
     /// the completion claim, and the claim is what reaches `commit_destination`.
+    ///
+    /// The client must answer each range with the bytes that range asked for. A mock
+    /// returning one fixed `content_range` fails `validate_content_range` on the second
+    /// range, so the transfer ends in `Failed` before any completion is claimed and
+    /// `commit_destination` is never reached -- which is how both tests below passed
+    /// without executing the code they name.
     fn committing_transfer(
         dest: std::path::PathBuf,
         temp: std::path::PathBuf,
         part_size: u64,
     ) -> DownloadTransfer {
-        let object_size = 2 * part_size;
-        let chunk = vec![0u8; part_size as usize];
-        let get_obj = mock!(aws_sdk_s3::Client::get_object).then_output(move || {
-            GetObjectOutput::builder()
-                .content_length(part_size as i64)
-                .content_range(format!("bytes 0-{}/{}", part_size - 1, object_size))
-                .e_tag("test-etag")
-                .body(ByteStream::from(chunk.clone()))
-                .build()
-        });
-        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get_obj]);
+        use crate::operation::download::test_util::fixtures::{object_bytes, object_client};
+
+        let client = object_client(object_bytes(2 * part_size as usize));
         let config = crate::Config::builder()
             .client(client)
             .part_size(crate::types::PartSize::Target(part_size))
@@ -2634,13 +2632,23 @@ mod tests {
         )
     }
 
-    /// A cancelled download must leave a destination it did not create alone.
+    /// A cancel landing before completion is claimed leaves a pre-existing destination
+    /// alone.
     ///
-    /// `commit_destination` renames the temp over `dest`, and `std::fs::rename` replaces an
-    /// existing file -- so for a caller re-downloading over a file they already have, the
-    /// rename consumes their copy. Nothing can give it back afterwards, which is why the
-    /// rename must not run at all once the transfer is terminal. The cancel lands after
-    /// `poll_work` hands out the work and before `execute` claims completion.
+    /// Scope stated precisely, because the stronger reading is false. This covers the
+    /// window before the claim: the range read fails under cancellation, no completion is
+    /// claimed, and `commit_destination` never runs. It does **not** show that the rename
+    /// never runs once the transfer is terminal -- a `set_cancelled` landing inside
+    /// `finalize_destination`, after the claim, does commit over the caller's file, which
+    /// `commit_destination` documents as the accepted cost of ordering the rename before
+    /// the status. Reaching that window needs a seam in `finalize_completion` that does
+    /// not exist, so it is deliberately unexercised.
+    ///
+    /// Not injection-verified, and that is recorded rather than papered over: several
+    /// independent things stop the rename on this path, so no single-line removal turns
+    /// this red. What is asserted is the observable property a customer would notice --
+    /// their bytes still at `dest`, and the temp not renamed away. Asserting the status
+    /// here would be circular, because the test is what sets it.
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn a_cancelled_download_leaves_a_pre_existing_destination_alone() {
@@ -2649,20 +2657,28 @@ mod tests {
         let dest = dir.path().join("out.dat");
         let temp = dir.path().join("out.dat.s3tmp.deadbeef");
         std::fs::write(&dest, b"the caller's own data").unwrap();
-        let transfer = committing_transfer(dest.clone(), temp, part_size);
+        let transfer = committing_transfer(dest.clone(), temp.clone(), part_size);
 
         // Discovery delivers part 1 and leaves the last range to issue.
         assert_discovery_succeeds(&transfer).await;
-        // The last range: retiring it is what claims completion and commits.
+        // The last range: retiring it is what would claim completion and commit.
         let mut last = assert_ready(transfer.poll_work());
         // Cancelled after the dispatch, before the run.
         assert!(transfer.ctx().set_cancelled());
-        let _ = execute(&transfer, &mut last).await;
+        let outcome = execute(&transfer, &mut last).await;
 
+        assert!(
+            !matches!(outcome, WorkOutcome::Success { .. }),
+            "a cancelled work item reported {outcome:?}"
+        );
         assert_eq!(
             b"the caller's own data".as_slice(),
             std::fs::read(&dest).unwrap_or_default().as_slice(),
             "a cancelled download replaced a file it never created"
+        );
+        assert!(
+            temp.exists(),
+            "the temp was renamed away, so the commit ran on a cancelled transfer"
         );
     }
 
