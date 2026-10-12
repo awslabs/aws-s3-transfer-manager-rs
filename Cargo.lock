@@ -192,6 +192,8 @@ name = "aws-ort-execution"
 version = "0.1.0"
 dependencies = [
  "aws-ort-topology",
+ "dial9",
+ "tokio",
 ]
 
 [[package]]
