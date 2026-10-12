@@ -68,7 +68,7 @@ pub async fn drain(handle: &mut DownloadHandle) -> Result<Bytes, Error> {
     let mut error: Option<Error> = None;
     while let Some(chunk) = body.next().await {
         match chunk {
-            Ok(chunk) => data.put(chunk.data.into_bytes()),
+            Ok(chunk) => data.put(chunk.data.into_contiguous()),
             Err(err) => {
                 error.get_or_insert(err);
                 break;

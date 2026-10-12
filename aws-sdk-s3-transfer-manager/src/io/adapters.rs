@@ -4,21 +4,28 @@
  */
 
 use crate::io::stream::StreamContext;
-use crate::io::Buffer;
+use crate::io::PartBuffer;
 use crate::io::PartStream;
 use crate::io::SizeHint;
 
 use crate::io::PartData;
 
-use std::mem;
 use std::task::Poll;
 
-use bytes::Bytes;
 use pin_project_lite::pin_project;
 
 pin_project! {
     /// A wrapper that implements [`PartStream`] trait for an inner type
     /// that implements Tokio's IO traits.
+    ///
+    /// The adapter acquires one part-sized envelope from the transfer manager's
+    /// shared memory pool. Partial bytes and their reservation remain live
+    /// across `Poll::Pending`; a completed part is published without copying.
+    ///
+    /// The inner reader must fill the [`ReadBuf`](tokio::io::ReadBuf) it is
+    /// given. A read that fills a different buffer fails the upload. The first
+    /// read that returns no data ends the stream, and the reader is not polled
+    /// after it.
     ///
     /// # Examples
     ///
@@ -36,27 +43,11 @@ pin_project! {
         #[pin]
         inner: T,
         size_hint: SizeHint,
-        buf: BufState,
+        buffer: Option<PartBuffer>,
         next_part: u64,
-    }
-}
-
-#[derive(Debug)]
-enum BufState {
-    /// No buffer acquired
-    Unset,
-    /// Buffer acquired and possibly partially filled
-    Acquired(Buffer),
-}
-
-impl BufState {
-    /// Take the current buffer if already set or acquire a new one
-    fn take_or_acquire(&mut self, stream_cx: &StreamContext) -> Buffer {
-        let current = mem::replace(self, BufState::Unset);
-        match current {
-            BufState::Unset => stream_cx.new_buffer(stream_cx.part_size()),
-            BufState::Acquired(buffer) => buffer,
-        }
+        // Set by the first zero-byte read. The reader is not polled again after it, so data a
+        // source produces after end-of-file is never uploaded.
+        eof: bool,
     }
 }
 
@@ -66,8 +57,9 @@ impl<T> TokioIo<T> {
         Self {
             inner,
             size_hint,
-            buf: BufState::Unset,
+            buffer: None,
             next_part: 1,
+            eof: false,
         }
     }
 
@@ -93,47 +85,83 @@ where
     ) -> std::task::Poll<Option<std::io::Result<PartData>>> {
         use bytes::BufMut;
         let mut this = self.project();
-        let mut inner_buf = this.buf.take_or_acquire(stream_cx);
+        if *this.eof {
+            return Poll::Ready(None);
+        }
+        let part_buffer = this.buffer.get_or_insert_with(|| stream_cx.part_buffer());
+        match part_buffer.poll_acquire(cx, stream_cx.part_size()) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(error)) => {
+                *this.buffer = None;
+                return Poll::Ready(Some(Err(error)));
+            }
+        }
 
         loop {
+            let part_buffer = this
+                .buffer
+                .as_mut()
+                .expect("part buffer disappeared while reading");
             // SAFETY: `ReadBuf` and `poll_read` promise not to set any uninitialized bytes into `dst`.
-            let dst = unsafe { inner_buf.chunk_mut().as_uninit_slice_mut() };
+            let dst = unsafe { part_buffer.chunk_mut().as_uninit_slice_mut() };
             let mut buf = tokio::io::ReadBuf::uninit(dst);
+            let lent_ptr = buf.filled().as_ptr();
 
             match this.inner.as_mut().poll_read(cx, &mut buf) {
                 Poll::Ready(result) => match result {
                     Ok(_) => {
                         let n = buf.filled().len();
-                        if n > 0 {
-                            // SAFETY: we just read that many bytes into the uninitialized part of the buffer
+                        // A reader can only fill the `ReadBuf` it was lent, which holds at most
+                        // `dst`, so comparing the filled pointer is enough. A reader that assigns
+                        // another `ReadBuf` to `*buf` reports bytes that were never written to
+                        // `dst`; advancing by them would publish pooled memory. tokio's `read_buf`
+                        // makes the same check.
+                        if buf.filled().as_ptr() != lent_ptr {
+                            *this.buffer = None;
+                            return Poll::Ready(Some(Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "TokioIo reader replaced the ReadBuf it was given",
+                            ))));
+                        }
+                        if n == 0 {
+                            *this.eof = true;
+                        } else {
+                            // SAFETY: the filled region is the first `n` bytes of `dst`.
+                            // `ReadBuf::uninit` marked none of `dst` initialized, and `ReadBuf`
+                            // only marks initialized bytes as filled, so this read wrote them.
                             unsafe {
-                                inner_buf.advance_mut(n);
+                                part_buffer.advance_mut(n);
                             }
                         }
 
                         // full part available or EOF with partial data already buffered
-                        if inner_buf.len() == stream_cx.part_size()
-                            || (n == 0 && !inner_buf.is_empty())
+                        if part_buffer.len() == stream_cx.part_size()
+                            || (n == 0 && !part_buffer.is_empty())
                         {
-                            let data: Bytes = inner_buf.into();
+                            let data = this
+                                .buffer
+                                .take()
+                                .expect("completed part lost its buffer")
+                                .freeze();
                             let part_number = *this.next_part;
                             *this.next_part += 1;
-                            // We don't know whether this is the last part data, since determining that
-                            // would require an additional `poll_read`.
-                            let part = PartData::new(part_number, data);
+                            // Parts are not marked last: for a full part, that would need another
+                            // `poll_read`.
+                            let part = PartData::from_segmented(part_number, data);
                             return Poll::Ready(Some(Ok(part)));
                         } else if n == 0 {
                             // EOF
+                            *this.buffer = None;
                             return Poll::Ready(None);
                         }
                     }
-                    Err(err) => return Poll::Ready(Some(Err(err))),
+                    Err(err) => {
+                        *this.buffer = None;
+                        return Poll::Ready(Some(Err(err)));
+                    }
                 },
-                Poll::Pending => {
-                    // store already acquired, possibly partially filled buffer for next poll
-                    *this.buf = BufState::Acquired(inner_buf);
-                    return Poll::Pending;
-                }
+                Poll::Pending => return Poll::Pending,
             }
         }
     }
@@ -150,11 +178,33 @@ mod tests {
     use crate::io::PartData;
     use crate::io::PartStream;
     use crate::io::SizeHint;
+    use crate::memory::BufferPool;
+    use crate::types::MemoryBudgetConfig;
     use futures_test::task::new_count_waker;
-    use std::pin::pin;
-    use std::task::Context;
+    use std::pin::{pin, Pin};
+    use std::task::{Context, Poll};
+    use tokio::io::ReadBuf;
     use tokio_test::io::Builder;
     use tokio_test::{assert_pending, assert_ready};
+
+    fn test_stream_cx(part_size: usize) -> (StreamContext, BufferPool) {
+        let buffer_pool = BufferPool::builder()
+            .memory_budget(MemoryBudgetConfig::Limit(1024 * 1024))
+            .build()
+            .unwrap();
+        (
+            StreamContext::new(
+                part_size,
+                buffer_pool.clone(),
+                false,
+                std::sync::Arc::new(crate::transfer::MetricsState::new()),
+                std::sync::Arc::new(crate::telemetry::Telemetry::new(
+                    std::time::Duration::from_secs(1),
+                )),
+            ),
+            buffer_pool,
+        )
+    }
 
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
@@ -165,16 +215,13 @@ mod tests {
 
         let (waker, awoken_cnt) = new_count_waker();
         let mut task_cx = Context::from_waker(&waker);
-        let stream_cx = StreamContext::new(
-            part_size,
-            false,
-            std::sync::Arc::new(crate::transfer::MetricsState::new()),
-            std::sync::Arc::new(crate::telemetry::Telemetry::new(
-                std::time::Duration::from_secs(1),
-            )),
-        );
+        let (stream_cx, pool) = test_stream_cx(part_size);
 
         assert_pending!(io.as_mut().poll_part(&mut task_cx, &stream_cx));
+        assert_eq!(
+            pool.metrics().charged_capacity_bytes(),
+            pool.carrier_size() as u64
+        );
         handle.read(b"hello");
         assert_eq!(awoken_cnt.get(), 1);
 
@@ -183,6 +230,12 @@ mod tests {
             .unwrap();
         let expected = PartData::new(1, "hello");
         assert_eq!(expected, result);
+        assert_eq!(
+            pool.metrics().charged_capacity_bytes(),
+            pool.carrier_size() as u64
+        );
+        drop(result);
+        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
 
         assert_pending!(io.as_mut().poll_part(&mut task_cx, &stream_cx));
         handle.read(b"world");
@@ -193,10 +246,12 @@ mod tests {
             .unwrap();
         let expected = PartData::new(2, "world");
         assert_eq!(expected, result);
+        drop(result);
 
         drop(handle);
         let result = assert_ready!(io.as_mut().poll_part(&mut task_cx, &stream_cx));
         assert!(result.is_none());
+        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
     }
 
     #[cfg_attr(miri, ignore)]
@@ -208,18 +263,15 @@ mod tests {
 
         let (waker, awoken_cnt) = new_count_waker();
         let mut task_cx = Context::from_waker(&waker);
-        let stream_cx = StreamContext::new(
-            part_size,
-            false,
-            std::sync::Arc::new(crate::transfer::MetricsState::new()),
-            std::sync::Arc::new(crate::telemetry::Telemetry::new(
-                std::time::Duration::from_secs(1),
-            )),
-        );
+        let (stream_cx, pool) = test_stream_cx(part_size);
 
         // partial read
         handle.read(b"hello");
         assert_pending!(io.as_mut().poll_part(&mut task_cx, &stream_cx));
+        assert_eq!(
+            pool.metrics().charged_capacity_bytes(),
+            pool.carrier_size() as u64
+        );
 
         handle.read(b"world"); // full part available
         handle.read(b"second"); // last part less than part size
@@ -232,6 +284,7 @@ mod tests {
             .unwrap();
         let expected = PartData::new(1, "helloworld");
         assert_eq!(expected, result);
+        drop(result);
 
         // should hit EOF and get the last part less than configured part size
         let result = assert_ready!(io.as_mut().poll_part(&mut task_cx, &stream_cx))
@@ -239,9 +292,134 @@ mod tests {
             .unwrap();
         let expected = PartData::new(2, "second");
         assert_eq!(expected, result);
+        drop(result);
 
         // one final poll to actual get done signal
         let result = assert_ready!(io.as_mut().poll_part(&mut task_cx, &stream_cx));
         assert!(result.is_none());
+        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+    }
+
+    /// A reader that, on its first read, replaces the `ReadBuf` it was given with one over a
+    /// buffer of its own and marks `claim` bytes filled there. Later reads report end-of-file.
+    ///
+    /// A reader written in safe code can do the same with `Box::leak`. This one frees its buffer
+    /// when it is dropped, so the tests leak nothing.
+    struct ReplacingReader {
+        claim: usize,
+        /// The replacement buffer, once the first read has swapped it in. `Drop` frees it.
+        replacement: Option<std::ptr::NonNull<[u8]>>,
+    }
+
+    impl tokio::io::AsyncRead for ReplacingReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if self.replacement.is_none() {
+                let raw = Box::into_raw(vec![b'B'; self.claim].into_boxed_slice());
+                self.replacement = std::ptr::NonNull::new(raw);
+                // SAFETY: `raw` is a live allocation that nothing else references. It stays
+                // valid until `Drop`, and the reader outlives the `ReadBuf` this read assigns,
+                // which `poll_part` drops before it returns.
+                *buf = ReadBuf::new(unsafe { &mut *raw });
+                buf.set_filled(self.claim);
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl Drop for ReplacingReader {
+        fn drop(&mut self) {
+            if let Some(raw) = self.replacement {
+                // SAFETY: `raw` came from `Box::into_raw` in `poll_read`, and the `ReadBuf` that
+                // borrowed it is gone.
+                drop(unsafe { Box::from_raw(raw.as_ptr()) });
+            }
+        }
+    }
+
+    /// A reader that replaces the `ReadBuf` it was given fails the read with `InvalidData` and
+    /// returns the part's pooled storage, whether its claim fits the lent slice or runs past it.
+    #[test]
+    fn test_tokio_adapter_rejects_replaced_read_buf() {
+        let carrier_size = test_stream_cx(1).1.carrier_size();
+        let cases = [
+            // The claim fits the lent slice.
+            (10, 3),
+            // The adapter lends one carrier at a time, so a part spanning several carriers
+            // leaves room in the part for a claim larger than the lent slice.
+            (4 * carrier_size, 2 * carrier_size),
+        ];
+        for (part_size, claim) in cases {
+            let case = format!("part size {part_size}, claim {claim}");
+            let (stream_cx, pool) = test_stream_cx(part_size);
+            let reader = ReplacingReader {
+                claim,
+                replacement: None,
+            };
+            let mut io = pin!(TokioIo::new(reader, SizeHint::default()));
+            let (waker, _) = new_count_waker();
+            let mut task_cx = Context::from_waker(&waker);
+
+            let result = assert_ready!(io.as_mut().poll_part(&mut task_cx, &stream_cx));
+            let Some(Err(error)) = result else {
+                panic!("{case}: a replaced buffer must fail the read, got {result:?}");
+            };
+            assert_eq!(std::io::ErrorKind::InvalidData, error.kind(), "{case}");
+            assert_eq!(pool.metrics().charged_capacity_bytes(), 0, "{case}");
+        }
+    }
+
+    /// A reader that plays back a script of reads, where `Some(bytes)` returns those bytes and
+    /// `None` reports end-of-file, and counts how often it is polled.
+    struct ScriptedReader {
+        script: std::collections::VecDeque<Option<&'static [u8]>>,
+        polls: usize,
+    }
+
+    impl tokio::io::AsyncRead for ScriptedReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            self.polls += 1;
+            if let Some(Some(bytes)) = self.script.pop_front() {
+                buf.put_slice(bytes);
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// The adapter stops at the reader's first end-of-file, as tokio-util's `ReaderStream` does,
+    /// so data the source produces afterwards is not uploaded.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn test_tokio_adapter_stops_at_first_end_of_file() {
+        let (stream_cx, pool) = test_stream_cx(10);
+        let reader = ScriptedReader {
+            script: [Some(&b"abc"[..]), None, Some(&b"def"[..]), None].into(),
+            polls: 0,
+        };
+        let mut io = pin!(TokioIo::new(reader, SizeHint::default()));
+        let (waker, _) = new_count_waker();
+        let mut task_cx = Context::from_waker(&waker);
+
+        let part = assert_ready!(io.as_mut().poll_part(&mut task_cx, &stream_cx))
+            .unwrap()
+            .unwrap();
+        assert_eq!(PartData::new(1, "abc"), part);
+        drop(part);
+
+        let result = assert_ready!(io.as_mut().poll_part(&mut task_cx, &stream_cx));
+        assert!(result.is_none(), "expected end-of-stream, got {result:?}");
+        assert_eq!(
+            2,
+            io.inner().polls,
+            "the reader must not be read after end-of-file"
+        );
+        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
     }
 }

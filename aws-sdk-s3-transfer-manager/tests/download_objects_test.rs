@@ -624,3 +624,133 @@ async fn test_drop_download_objects_handle() {
     .await
     .expect("test_drop_download_objects_handle timed out");
 }
+
+/// Whether any `.s3tmp` file exists directly under `dir`.
+fn temp_file_exists(dir: &Path) -> bool {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .any(|e| e.file_name().to_string_lossy().contains(".s3tmp"))
+}
+
+/// Records, when dropped, whether a child temp file still exists.
+#[derive(Debug)]
+struct TempFileProbe {
+    dir: std::path::PathBuf,
+    temp_existed_at_drop: Arc<std::sync::Mutex<Option<bool>>>,
+}
+
+impl Drop for TempFileProbe {
+    fn drop(&mut self) {
+        *self.temp_existed_at_drop.lock().unwrap() = Some(temp_file_exists(&self.dir));
+    }
+}
+
+/// Connector that lists a single key and keeps every GetObject in flight until
+/// its future is dropped.
+///
+/// Each GetObject adds a permit to `get_started` when it begins. Dropping a
+/// GetObject future records whether a temp file under `dest` existed at that
+/// moment.
+#[derive(Debug)]
+struct ParkedGetConnector {
+    dest: std::path::PathBuf,
+    get_started: Arc<tokio::sync::Semaphore>,
+    temp_existed_at_drop: Arc<std::sync::Mutex<Option<bool>>>,
+}
+
+const LIST_ONE_KEY_RESPONSE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+    <Name>test-bucket</Name>
+    <KeyCount>1</KeyCount>
+    <MaxKeys>1000</MaxKeys>
+    <IsTruncated>false</IsTruncated>
+    <Contents>
+        <Key>key1</Key>
+        <Size>1024</Size>
+    </Contents>
+</ListBucketResult>"#;
+
+impl aws_smithy_runtime_api::client::http::HttpConnector for ParkedGetConnector {
+    fn call(
+        &self,
+        request: aws_smithy_runtime_api::client::orchestrator::HttpRequest,
+    ) -> aws_smithy_runtime_api::client::http::HttpConnectorFuture {
+        use aws_smithy_runtime_api::client::http::HttpConnectorFuture;
+        use aws_smithy_runtime_api::client::result::ConnectorError;
+
+        assert_eq!("GET", request.method());
+        if request.uri().contains("list-type=2") {
+            return HttpConnectorFuture::ready(Ok(HttpResponse::new(
+                StatusCode::try_from(200).unwrap(),
+                aws_smithy_types::body::SdkBody::from(LIST_ONE_KEY_RESPONSE),
+            )));
+        }
+
+        let get_started = self.get_started.clone();
+        let probe = TempFileProbe {
+            dir: self.dest.clone(),
+            temp_existed_at_drop: self.temp_existed_at_drop.clone(),
+        };
+        HttpConnectorFuture::new(async move {
+            let _probe = probe;
+            get_started.add_permits(1);
+            std::future::pending::<Result<HttpResponse, ConnectorError>>().await
+        })
+    }
+}
+
+/// Aborting `download_objects` while a child GetObject is executing must stop
+/// that request before the child's temp file is removed.
+#[tokio::test]
+async fn test_abort_stops_child_get_before_temp_file_cleanup() {
+    use aws_smithy_runtime_api::client::http::{http_client_fn, SharedHttpConnector};
+    use std::time::Duration;
+
+    let dest = tempfile::tempdir().unwrap();
+    let get_started = Arc::new(tokio::sync::Semaphore::new(0));
+    let temp_existed_at_drop = Arc::new(std::sync::Mutex::new(None));
+    let connector = SharedHttpConnector::new(ParkedGetConnector {
+        dest: dest.path().to_path_buf(),
+        get_started: get_started.clone(),
+        temp_existed_at_drop: temp_existed_at_drop.clone(),
+    });
+    let client = aws_sdk_s3::Client::from_conf(
+        aws_sdk_s3::config::Config::builder()
+            .http_client(http_client_fn(move |_, _| connector.clone()))
+            .region(aws_sdk_s3::config::Region::from_static("us-west-2"))
+            .with_test_defaults()
+            .build(),
+    );
+    let config = aws_sdk_s3_transfer_manager::Config::builder()
+        .client(client)
+        .build();
+    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+
+    let handle = tm
+        .download_objects()
+        .bucket("test-bucket")
+        .destination(dest.path())
+        .initiate()
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(5), get_started.acquire())
+        .await
+        .expect("child GetObject did not start")
+        .expect("start semaphore closed")
+        .forget();
+    assert!(
+        temp_file_exists(dest.path()),
+        "child temp file must exist while its GetObject is executing"
+    );
+
+    tokio::time::timeout(Duration::from_secs(1), handle.abort())
+        .await
+        .expect("abort hung while a child GetObject was executing");
+
+    assert_eq!(
+        Some(true),
+        *temp_existed_at_drop.lock().unwrap(),
+        "child GetObject must be dropped before its temp file is removed"
+    );
+}

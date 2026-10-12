@@ -240,7 +240,11 @@ where
 
         // Mark the transfer pending before returning. A work item signal wakes only a pending
         // transfer.
-        self.inner.ctx.set_pending();
+        self.inner
+            .ctx
+            .set_pending(crate::transfer::PendingCause::in_flight_work(
+                "sync_work_completion",
+            ));
         PollWork::Pending
     }
 

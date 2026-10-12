@@ -30,10 +30,8 @@ pub async fn write_body(
     mut dest: fs::File,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     while let Some(chunk) = body.next().await {
-        let chunk = chunk?.data;
-        for segment in chunk.into_segments() {
-            dest.write_all(segment.as_ref()).await?;
-        }
+        let mut chunk = chunk?.data;
+        dest.write_all_buf(&mut chunk).await?;
     }
     Ok(())
 }

@@ -188,7 +188,7 @@ async fn worker_loop(pool: Arc<WorkerPool>, handle: Weak<crate::client::Handle>)
         let transfer = work.descriptor.transfer();
         let started = Instant::now();
 
-        let token = transfer.ctx().cancellation_token().clone();
+        let token = work.descriptor.cancellation_token().clone();
         let outcome = AssertUnwindSafe(async {
             tokio::select! {
                 biased;

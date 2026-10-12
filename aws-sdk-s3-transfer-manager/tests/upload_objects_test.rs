@@ -65,7 +65,7 @@ fn mock_s3_client_for_multipart_upload(bucket_name: String) -> Client {
                 input.upload_id.as_ref() == Some(&upload_id) && input.bucket() == Some(&bucket_name)
             }
         })
-        .then_output(|| UploadPartOutput::builder().build());
+        .then_output(|| UploadPartOutput::builder().e_tag("test-etag").build());
 
     let complete_mpu = mock!(aws_sdk_s3::Client::complete_multipart_upload)
         .match_requests({
@@ -1669,7 +1669,7 @@ async fn test_upload_objects_children_send_mpu_object_size() {
         });
 
         let upload_part = mock!(aws_sdk_s3::Client::upload_part)
-            .then_output(|| UploadPartOutput::builder().build());
+            .then_output(|| UploadPartOutput::builder().e_tag("test-etag").build());
 
         // Match CompleteMPU only when MpuObjectSize is one of the known file
         // sizes. The mock is size-set-aware rather than per-key because

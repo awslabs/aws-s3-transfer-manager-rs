@@ -12,6 +12,7 @@ use crate::runtime::sync::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use crate::runtime::sync::sync::Arc;
 
 use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 
 use crate::transfer::{BoxTransfer, Transfer, TransferId};
 
@@ -168,6 +169,10 @@ struct Inner {
     transfer: BoxTransfer,
     idle_notify: Notify,
     claim_state: ClaimState,
+    /// Cancels this transfer's executing work. Fired by
+    /// `Scheduler::cancel_descriptor`; the execution runtimes race each
+    /// `execute` future against it.
+    cancellation_token: CancellationToken,
 }
 
 impl std::fmt::Debug for TransferDescriptor {
@@ -199,6 +204,7 @@ impl TransferDescriptor {
             transfer,
             idle_notify: Notify::new(),
             claim_state: ClaimState::new(),
+            cancellation_token: CancellationToken::new(),
         }))
     }
 
@@ -212,18 +218,42 @@ impl TransferDescriptor {
         self.0.claim_state.release_claim()
     }
 
-    /// Mark that a wake has been requested.
-    pub(super) fn mark_wake_requested(&self) {
-        self.0.claim_state.mark_wake_requested()
+    /// Records a scheduler wake request.
+    ///
+    /// The claim-state flag preserves scheduler liveness. Pending accounting
+    /// records the wake immediately when the transfer has already published its
+    /// cause.
+    pub(super) fn record_wake_request(&self) {
+        self.0.claim_state.mark_wake_requested();
+        self.transfer().ctx().record_wake();
     }
 
-    /// Atomically clear and return the wake-requested flag.
-    pub(super) fn take_wake_requested(&self) -> bool {
-        self.0.claim_state.take_wake_requested()
+    /// Discards a wake request retained before the scheduler starts a new poll.
+    pub(super) fn clear_wake_request(&self) {
+        self.0.claim_state.take_wake_requested();
+    }
+
+    /// Reconciles a wake retained while `poll_work` was executing.
+    ///
+    /// A registered future may wake before the state machine publishes its
+    /// pending cause. In that ordering, the initial observation is a no-op and
+    /// this release-and-recheck path records the wake after `poll_work`
+    /// returns `Pending`.
+    pub(super) fn reconcile_pending_wake(&self) -> bool {
+        if !self.0.claim_state.take_wake_requested() {
+            return false;
+        }
+        self.transfer().ctx().record_wake();
+        true
     }
 
     pub(crate) fn transfer(&self) -> &dyn Transfer {
         self.0.transfer.as_ref()
+    }
+
+    /// Token that cancels this transfer's executing work.
+    pub(crate) fn cancellation_token(&self) -> &CancellationToken {
+        &self.0.cancellation_token
     }
 
     pub(crate) fn id(&self) -> TransferId {

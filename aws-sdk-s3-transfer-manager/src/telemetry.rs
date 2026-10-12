@@ -8,10 +8,11 @@
 //! These targets allow filtering logs by concern rather than module path:
 //!
 //! ```text
-//! RUST_LOG=aws_sdk_s3_transfer_manager::concurrency=debug   # adaptive algorithm decisions
-//! RUST_LOG=aws_sdk_s3_transfer_manager::scheduling=debug    # scheduler + memory-budget capacity
+//! RUST_LOG=aws_sdk_s3_transfer_manager::concurrency=debug   # concurrency resolution and control
+//! RUST_LOG=aws_sdk_s3_transfer_manager::scheduling=debug    # scheduler + memory-budget admission
 //! RUST_LOG=aws_sdk_s3_transfer_manager::execution=trace     # per-work-item execute/complete
 //! RUST_LOG=aws_sdk_s3_transfer_manager::transfer=debug      # transfer lifecycle events
+//! RUST_LOG=aws_sdk_s3_transfer_manager::memory=debug        # buffer-pool admission + storage
 //! ```
 
 use crate::metrics::latency::LatencyTracker;
@@ -19,12 +20,14 @@ use crate::metrics::IOCounters;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Adaptive concurrency controller: phase transitions, target changes, probe results.
+/// Concurrency resolution and control: selected targets, transitions, and probe results.
 pub(crate) const TARGET_CONCURRENCY: &str = "aws_sdk_s3_transfer_manager::concurrency";
 
-/// Scheduler capacity decisions, worker pool growth, and memory-budget admission
-/// (reserve/grant/release flow, and saturation edges where a reserve parks).
+/// Scheduler capacity decisions, worker pool growth, and memory-budget admission.
 pub(crate) const TARGET_SCHEDULING: &str = "aws_sdk_s3_transfer_manager::scheduling";
+
+/// Buffer-pool admission, physical storage, reclamation, and fatal errors.
+pub(crate) const TARGET_MEMORY: &str = "aws_sdk_s3_transfer_manager::memory";
 
 /// Per-work-item execution: dispatch, complete, skip, panic.
 pub(crate) const TARGET_EXECUTION: &str = "aws_sdk_s3_transfer_manager::execution";
