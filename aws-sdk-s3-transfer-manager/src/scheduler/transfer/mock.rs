@@ -1345,6 +1345,160 @@ impl MockStateMachine for FusedReadySpawnedMock {
     }
 }
 
+/// Models the window every real `Transfer` has between claiming its terminal state
+/// and publishing its terminal status: `poll_work` returns `Done` while
+/// `ctx.transfer_status()` is still `Active`, and the status lands afterwards.
+///
+/// `DownloadTransfer` has exactly this shape: `decrement_in_flight` assigns
+/// `DownloadState::Terminal` under the state lock, and `ctx.set_completed()` does not run
+/// until after `writer.finalize()` and the rename in `commit_destination`. `on_terminal`
+/// records the status it was handed, which is what the scheduler's Done arm feeds to
+/// `terminal_outcome()`.
+pub(crate) struct DoneWhileActiveMock {
+    ctx: TransferContext,
+    /// What `on_terminal` observed, or `None` if it was never called.
+    observed: ObservedTerminal,
+}
+
+/// The status `on_terminal` read, and the `Outcome` label `terminal_outcome()` derived
+/// from it — the exact value `DownloadTransfer::on_terminal` hands to
+/// `TransferLifecycle::finish`.
+pub(crate) type ObservedTerminal =
+    Arc<std::sync::Mutex<Option<(crate::types::TransferStatus, &'static str)>>>;
+
+impl std::fmt::Debug for DoneWhileActiveMock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DoneWhileActiveMock").finish()
+    }
+}
+
+impl DoneWhileActiveMock {
+    pub(crate) fn new(
+        id: TransferId,
+        handle: Arc<crate::client::Handle>,
+    ) -> (Self, ObservedTerminal) {
+        let (ctx, _rx) = TransferContext::with_id(id, handle);
+        let observed: ObservedTerminal = Arc::new(std::sync::Mutex::new(None));
+        let mock = Self {
+            ctx,
+            observed: observed.clone(),
+        };
+        (mock, observed)
+    }
+}
+
+impl Transfer for DoneWhileActiveMock {
+    fn ctx(&self) -> &TransferContext {
+        &self.ctx
+    }
+
+    fn poll_work(&self) -> PollWork {
+        // No status transition here, exactly like the download's
+        // `DownloadState::Terminal => PollWork::Done` arm.
+        PollWork::Done
+    }
+
+    fn on_terminal(&self) {
+        // `terminal_outcome()` is the real function the download feeds to
+        // `TransferLifecycle::finish`; the label is only so the test can compare it
+        // (`Outcome` is deliberately not `PartialEq`).
+        let outcome = match self.ctx.terminal_outcome() {
+            crate::events::Outcome::Succeeded {} => "Succeeded",
+            crate::events::Outcome::Failed {} => "Failed",
+            crate::events::Outcome::Cancelled {} => "Cancelled",
+        };
+        *self.observed.lock().unwrap() = Some((self.ctx.transfer_status(), outcome));
+        // What `finalize_completion` does once the disk flush and rename are done.
+        self.ctx.set_completed();
+        self.ctx.signal_terminal();
+    }
+
+    fn execute<'a>(
+        &'a self,
+        _work: &'a mut IoRequest,
+    ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
+        unreachable!("DoneWhileActiveMock never returns PollWork::Ready")
+    }
+}
+
+/// Polls `Done` with a published terminal status, and panics in `on_terminal`.
+///
+/// Stands in for a real hook panicking in any of the four things it now does -- taking
+/// the state lock, draining, reporting the summary, emitting the lifecycle event. A
+/// poisoned state lock from an earlier worker panic reaches the first of those.
+pub(crate) struct PanickingTerminalHookMock {
+    ctx: TransferContext,
+    calls: Arc<AtomicUsize>,
+}
+
+impl std::fmt::Debug for PanickingTerminalHookMock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PanickingTerminalHookMock").finish()
+    }
+}
+
+impl PanickingTerminalHookMock {
+    /// `calls` counts hook entries. A test needs it because the cleanup around the hook
+    /// runs whether or not the hook was reached, so asserting on cleanup alone passes
+    /// against a call site that skips the hook entirely.
+    pub(crate) fn new(
+        id: TransferId,
+        handle: Arc<crate::client::Handle>,
+        calls: Arc<AtomicUsize>,
+    ) -> Self {
+        let (ctx, _rx) = TransferContext::with_id(id, handle);
+        Self { ctx, calls }
+    }
+
+    /// Returns the mock plus its completion receiver, so a test can assert the handle
+    /// was resolved even though the hook panicked, and a clone of its context: the
+    /// orphan path returns before inserting a descriptor, so the context is the only
+    /// place the status can be read from.
+    pub(crate) fn with_receiver(
+        id: TransferId,
+        handle: Arc<crate::client::Handle>,
+        calls: Arc<AtomicUsize>,
+    ) -> (Self, StateMachineTerminalReceiver, TransferContext) {
+        let (ctx, completion_rx) = TransferContext::with_id(id, handle);
+        (
+            Self {
+                ctx: ctx.clone(),
+                calls,
+            },
+            completion_rx,
+            ctx,
+        )
+    }
+}
+
+impl Transfer for PanickingTerminalHookMock {
+    fn ctx(&self) -> &TransferContext {
+        &self.ctx
+    }
+
+    fn poll_work(&self) -> PollWork {
+        // Terminal is published *in* the poll, not before it: a descriptor that is
+        // already terminal when the ready set pops it is skipped without being polled,
+        // so the Done arm is only reachable this way. It is also the real order --
+        // `finalize_completion` publishes the status, and a later poll answers `Done`.
+        self.ctx.set_completed();
+        PollWork::Done
+    }
+
+    fn on_terminal(&self) {
+        // Bump before the panic, so the count records the entry the unwind interrupts.
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        panic!("on_terminal panicked");
+    }
+
+    fn execute<'a>(
+        &'a self,
+        _work: &'a mut IoRequest,
+    ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
+        unreachable!("PanickingTerminalHookMock never returns PollWork::Ready")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -162,6 +162,8 @@ pub struct Config {
     memory: MemoryConfig,
     diagnostics: DiagnosticsConfig,
     framework_metadata: Option<FrameworkMetadata>,
+    /// Client-level event sink, applied to every operation this client runs.
+    events: Option<crate::events::TransferEventSink>,
     s3_client_source: Option<S3ClientSource>,
     /// Machine facts detected once by the async config loader, off the
     /// `Client::new` hot path. `None` when the config was built directly
@@ -232,6 +234,15 @@ impl Config {
         self.framework_metadata.as_ref()
     }
 
+    /// The client-level event sink, if one was configured.
+    ///
+    /// Every operation this client runs reports to it, in addition to any sink set on
+    /// the request itself — the two are merged rather than one overriding the other, so
+    /// a client-wide observer cannot be switched off by a per-request registration.
+    pub fn events(&self) -> Option<&crate::events::TransferEventSink> {
+        self.events.as_ref()
+    }
+
     /// HTTP options for the runtime-provided transport, or `None` when the
     /// runtime's HTTP client would not be installed: a finished S3 client was
     /// supplied, or runtime HTTP is disabled.
@@ -275,6 +286,7 @@ pub struct Builder {
     memory: MemoryConfig,
     diagnostics: Option<DiagnosticsConfig>,
     pub(crate) framework_metadata: Option<FrameworkMetadata>,
+    pub(crate) events: Option<crate::events::TransferEventSink>,
     client: Option<aws_sdk_s3::Client>,
     s3_client_config: Option<S3ClientConfig>,
     machine_profile: Option<crate::runtime::platform::MachineProfile>,
@@ -385,6 +397,28 @@ impl Builder {
         self
     }
 
+    /// Report [events](crate::events) from this client's `upload` and `download` operations
+    /// to `sink`.
+    ///
+    /// Merged with any sink set on an individual request, so both see every event, and
+    /// calling this twice adds a second consumer rather than replacing the first. Each keeps
+    /// its own capacity and [`dropped`](crate::events::TransferEventStream::dropped) count.
+    ///
+    /// The client holds this sink, so its stream stays open for the life of the client and
+    /// `while let Some(ev) = stream.next().await` never returns — unlike the same loop over a
+    /// request-level stream. Drain it with
+    /// [`try_next`](crate::events::TransferEventStream::try_next) and your own stopping
+    /// condition, or drop the client.
+    pub fn events(mut self, sink: crate::events::TransferEventSink) -> Self {
+        // `upload_objects` and `download_objects` do not report yet, so a client-level sink
+        // registered before one of those runs stays open and receives nothing.
+        self.events = Some(match self.events.take() {
+            Some(existing) => existing.merge(sink),
+            None => sink,
+        });
+        self
+    }
+
     /// Sets the framework metadata for the transfer manager.
     ///
     /// This _optional_ name is used to identify the framework using transfer manager in the user agent that
@@ -457,6 +491,7 @@ impl Builder {
             memory: self.memory,
             diagnostics: self.diagnostics.unwrap_or_else(DiagnosticsConfig::from_env),
             framework_metadata: self.framework_metadata,
+            events: self.events,
             s3_client_source: Some(s3_client_source),
             machine_profile: self.machine_profile,
             #[cfg(feature = "dial9")]

@@ -510,6 +510,7 @@ mod tests {
             input,
             dest.clone(),
             None,
+            None,
             &ScriptedSinkFactory(Arc::clone(&script)),
         )
         .await
