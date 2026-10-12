@@ -1738,7 +1738,9 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    // The adb shell test domain cannot bind a filesystem Unix socket in the
+    // deployed test directory. Other Unix legs retain the special-file check.
+    #[cfg(all(unix, not(target_os = "android")))]
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_walk_skips_special_files() {

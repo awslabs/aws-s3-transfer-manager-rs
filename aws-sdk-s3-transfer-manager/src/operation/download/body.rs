@@ -3,16 +3,19 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+use std::io::IoSlice;
+
 use bytes::Buf;
 
-use crate::io::AggregatedBytes;
-use crate::runtime::memory::Reservation;
+use crate::runtime::buffer_pool::{Reservation, SegmentedBytes};
+use crate::runtime::sync::sync::atomic::{AtomicU64, Ordering};
 use crate::runtime::sync::sync::Arc;
 
 use super::chunk_meta::ChunkMetadata;
 use super::recv_buffer::{
     DrainMode, FillOutcome, PagedRecvBuffer, RecvBufferConsumer, SegmentWrite, SlotHandle,
 };
+use super::sink::SinkWrite;
 
 /// Segment size for the paged buffer. Re-exported from `recv_buffer` for test access.
 const SEG_SIZE: usize = super::recv_buffer::DEFAULT_SEG_SIZE;
@@ -36,53 +39,141 @@ impl WakeNotify {
     async fn notified(&self) {}
 }
 
-/// Positioned-write target for download-to-file. Abstracts the file so the drain
-/// orchestration (run coalescing, offset translation) can be exercised against an
-/// in-memory capture, and so an alternative write strategy (e.g. O_DIRECT/io_uring)
-/// can replace the file write without touching the buffer or the drain logic.
+/// Borrowed read position over one contiguous run being written to disk.
 ///
-/// `write_all_at` writes the whole buffer at an absolute file position; `preallocate`
-/// is a best-effort size hint. Implementations are shared across the issuer and the
-/// drain task, hence `Send + Sync`.
-pub(crate) trait SinkWrite: Send + Sync + std::fmt::Debug {
-    /// Write the entire buffer at `pos` bytes into the target.
-    fn write_all_at(
-        &self,
-        buf: &mut bytes_utils::SegmentedBuf<bytes::Bytes>,
-        pos: u64,
-    ) -> std::io::Result<()>;
-
-    /// Best-effort preallocation of `len` bytes. Default no-op.
-    fn preallocate(&self, _len: u64) {}
+/// The claimed receive-buffer slots retain ownership until the write
+/// completes. This cursor presents their bytes without cloning owner metadata.
+pub(crate) struct DiskWriteCursor<'a> {
+    write: &'a SegmentWrite<ChunkOutput>,
+    payload_index: usize,
+    payload_offset: usize,
+    remaining: usize,
 }
 
-/// File-backed [`SinkWrite`]: positioned writes via `pwritev`.
-struct FileSink {
-    file: std::fs::File,
-    /// Whether the transfer manager created this file (vs caller-provided). Only an
-    /// owned file is preallocated.
-    owns_file: bool,
-}
+impl<'a> DiskWriteCursor<'a> {
+    /// Validates one claimed run and returns its object offset and read cursor.
+    fn new(write: &'a SegmentWrite<ChunkOutput>) -> std::io::Result<(u64, Self)> {
+        let mut object_offset = None;
+        let mut expected_offset = None;
+        let mut remaining = 0usize;
 
-impl std::fmt::Debug for FileSink {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FileSink").finish_non_exhaustive()
+        for slot in write.payloads() {
+            let chunk = slot.get().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "claimed disk-write run contains an unfilled slot",
+                )
+            })?;
+            let chunk_len = chunk.data.remaining();
+            if chunk_len == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "claimed disk-write run contains an empty payload",
+                ));
+            }
+            if let Some(expected) = expected_offset {
+                if chunk.offset != expected {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "claimed disk-write run has noncontiguous object offsets",
+                    ));
+                }
+            } else {
+                object_offset = Some(chunk.offset);
+            }
+
+            let chunk_len_u64 = u64::try_from(chunk_len).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "disk-write payload length exceeds object-offset representation",
+                )
+            })?;
+            expected_offset = Some(chunk.offset.checked_add(chunk_len_u64).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "disk-write object offset overflow",
+                )
+            })?);
+            remaining = remaining.checked_add(chunk_len).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "disk-write run length overflow",
+                )
+            })?;
+        }
+
+        let object_offset = object_offset.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "claimed disk-write run contains no payloads",
+            )
+        })?;
+        Ok((
+            object_offset,
+            Self {
+                write,
+                payload_index: 0,
+                payload_offset: 0,
+                remaining,
+            },
+        ))
+    }
+
+    fn current(&self) -> &SegmentedBytes {
+        self.write.payloads()[self.payload_index]
+            .get()
+            .map(|chunk| &chunk.data)
+            .expect("validated disk-write payload disappeared")
     }
 }
 
-impl SinkWrite for FileSink {
-    fn write_all_at(
-        &self,
-        buf: &mut bytes_utils::SegmentedBuf<bytes::Bytes>,
-        pos: u64,
-    ) -> std::io::Result<()> {
-        crate::io::fs::write_all_at(&self.file, buf, pos)
+impl Buf for DiskWriteCursor<'_> {
+    fn remaining(&self) -> usize {
+        self.remaining
     }
 
-    fn preallocate(&self, len: u64) {
-        if self.owns_file {
-            if let Err(e) = crate::io::fs::preallocate(&self.file, len) {
-                tracing::warn!(error = %e, "failed to preallocate file space");
+    fn chunk(&self) -> &[u8] {
+        if self.remaining == 0 {
+            return &[];
+        }
+        self.current().chunk_from(self.payload_offset)
+    }
+
+    fn chunks_vectored<'a>(&'a self, dst: &mut [IoSlice<'a>]) -> usize {
+        let mut written = 0;
+        for (index, slot) in self.write.payloads()[self.payload_index..]
+            .iter()
+            .enumerate()
+        {
+            if written == dst.len() {
+                break;
+            }
+            let chunk = slot
+                .get()
+                .expect("validated disk-write payload disappeared");
+            let offset = if index == 0 { self.payload_offset } else { 0 };
+            written += chunk.data.chunks_vectored_from(offset, &mut dst[written..]);
+        }
+        written
+    }
+
+    fn advance(&mut self, mut count: usize) {
+        assert!(
+            count <= self.remaining,
+            "advanced beyond download write run"
+        );
+        self.remaining -= count;
+        while count != 0 {
+            let current_len = self.current().remaining();
+            let available = current_len
+                .checked_sub(self.payload_offset)
+                .expect("disk-write cursor exceeds its payload");
+            let advanced = count.min(available);
+            self.payload_offset += advanced;
+            count -= advanced;
+            if self.payload_offset == current_len {
+                self.payload_index += 1;
+                self.payload_offset = 0;
             }
         }
     }
@@ -95,9 +186,33 @@ enum Mode {
     /// Positioned writes land at `chunk.offset - object_range_start` in the sink.
     Disk {
         sink: Box<dyn SinkWrite>,
-        /// Start of the S3 byte range for this transfer.
-        object_range_start: u64,
+        /// Start of the resolved S3 byte range for this transfer.
+        object_range_start: std::sync::OnceLock<u64>,
+        /// Bytes the sink has accepted across every drain. Only completed run
+        /// writes are counted, so this never exceeds what reached the sink.
+        written: AtomicU64,
     },
+}
+
+/// Destination work done by one drain call.
+///
+/// A run is counted only after the sink accepted all of it. A drain that fails
+/// returns what it did before the failure in its [`DrainError`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Drained {
+    /// Parts whose payloads were written and freed: the read-ahead occupancy
+    /// the caller releases.
+    pub(crate) parts: u64,
+    /// Bytes the sink accepted.
+    pub(crate) bytes: u64,
+}
+
+/// A drain that failed after writing `drained`: the runs the sink accepted before
+/// the failing one, or, from `finalize`, the tail its terminal drain wrote.
+#[derive(Debug)]
+pub(crate) struct DrainError {
+    pub(crate) drained: Drained,
+    pub(crate) source: std::io::Error,
 }
 
 /// Producer handle to the download body buffer. Held at `self.inner.writer`
@@ -119,17 +234,17 @@ impl std::fmt::Debug for BodyWriter {
 
 /// A claimed slot in the body buffer, produced by [`BodyWriter::claim`].
 /// Consuming [`fill`](Self::fill) publishes the payload and notifies the
-/// consumer. Drop without fill still wakes the consumer (lost-wake safety).
+/// consumer. Drop without fill still wakes the consumer and closes any
+/// attached reservation.
 pub(crate) struct BodySlot {
     handle: Option<SlotHandle<ChunkOutput>>,
     buffer: PagedRecvBuffer<ChunkOutput>,
     notify: Arc<WakeNotify>,
-    /// Memory-budget reservation held from claim, moved into the chunk at
-    /// [`fill`](Self::fill). The reservation then rides the `ChunkOutput` through
-    /// the buffer and drops with it: on the stream surface when the consumer drops
-    /// the delivered chunk (its true residency), on the disk surface when the drain
-    /// frees the payload after copy-out. `None` until [`attach_reservation`], and on
-    /// paths that do not reserve (tests).
+    /// Memory reservation held from claim through response collection. A
+    /// successful fill closes acquisition authority; the immutable payload then
+    /// owns every live carrier charge directly. `None` until
+    /// [`BodySlot::attach_reservation`], and on paths that do not reserve
+    /// (tests).
     reservation: Option<Reservation>,
 }
 
@@ -147,20 +262,32 @@ impl BodySlot {
         self.handle.as_ref().expect("slot already consumed").seq()
     }
 
-    /// Attach the memory-budget reservation backing this chunk. Held on the slot
-    /// from claim until [`fill`](Self::fill) moves it into the `ChunkOutput`, so it
-    /// drops with the chunk's bytes rather than at the buffer boundary.
+    /// Returns the reservation attached before this slot was dispatched.
+    ///
+    /// Response attempts borrow this authority while copying transport-owned
+    /// frames into pooled carriers. A failed attempt drops its carriers but
+    /// leaves the reservation on the slot for the next attempt.
+    pub(crate) fn reservation(&self) -> &Reservation {
+        self.reservation
+            .as_ref()
+            .expect("body slot dispatched without a memory reservation")
+    }
+
+    /// Attach the memory reservation backing this chunk. It remains open while
+    /// response attempts may acquire carriers and closes on successful fill.
     pub(crate) fn attach_reservation(&mut self, reservation: Reservation) {
         self.reservation = Some(reservation);
     }
 
     /// Publish a completed chunk into this slot. Wakes the stream consumer
-    /// and returns the fill outcome (whether a segment was sealed). The slot's
-    /// reservation moves into the chunk so it rides through the buffer and drops
-    /// with the delivered bytes.
-    pub(crate) fn fill(mut self, mut chunk: ChunkOutput) -> FillOutcome {
+    /// and returns the fill outcome (whether a segment was sealed). Immutable
+    /// owners retain all acquired carriers, so no direct acquisition authority
+    /// is needed after this point.
+    pub(crate) fn fill(mut self, chunk: ChunkOutput) -> FillOutcome {
         let handle = self.handle.take().expect("slot already consumed");
-        chunk.reservation = self.reservation.take().map(Arc::new);
+        if let Some(reservation) = self.reservation.take() {
+            reservation.close_acquisition();
+        }
         let outcome = self.buffer.fill(handle, chunk);
         self.notify.notify_one();
         outcome
@@ -182,6 +309,19 @@ impl BodyWriter {
         matches!(&*self.mode, Mode::Disk { .. })
     }
 
+    /// Bytes the destination sink has accepted across every drain, including
+    /// drains that went on to fail. Stream mode: 0.
+    ///
+    /// Counts only runs the sink fully accepted, so it never exceeds what
+    /// reached the sink.
+    #[cfg(test)]
+    pub(crate) fn written(&self) -> u64 {
+        match &*self.mode {
+            Mode::Disk { written, .. } => written.load(Ordering::Acquire),
+            Mode::Stream => 0,
+        }
+    }
+
     /// Claim the next slot. The read-ahead gate lives in poll_work (tracks
     /// `issued` under the state lock) — this is the unconditional claim.
     pub(crate) fn claim(&self) -> BodySlot {
@@ -198,54 +338,114 @@ impl BodyWriter {
     /// edge from execute tasks. A non-terminal drain claims only runs that reach the
     /// drain batch, coalescing each into one positioned write. Stream mode: no-op.
     ///
-    /// Returns the number of parts freed across the runs drained by this call — the
-    /// read-ahead occupancy the caller releases. The buffer does not track a running
-    /// total; the download layer accounts for the freed count under its state lock.
-    pub(crate) fn drain(&self, mode: DrainMode) -> Result<u64, std::io::Error> {
-        let mut freed = 0u64;
+    /// Returns the parts freed and the bytes written across the runs drained by
+    /// this call. The download layer releases that read-ahead occupancy under
+    /// its state lock.
+    ///
+    /// A run that fails to write ends the drain with a [`DrainError`] carrying
+    /// the runs written before it. A filled payload before
+    /// [`prepare`](Self::prepare) fails the drain with nothing drained.
+    pub(crate) fn drain(&self, mode: DrainMode) -> Result<Drained, DrainError> {
+        let mut drained = Drained::default();
         if let Mode::Disk {
             sink,
             object_range_start,
+            written,
         } = &*self.mode
         {
+            let Some(object_range_start) = object_range_start.get().copied() else {
+                // Cancellation can terminate a disk transfer before discovery
+                // establishes its range. A fill before preparation violates the
+                // transfer ordering and cannot be positioned safely.
+                if self.buffer.has_undrained_fills() {
+                    return Err(DrainError {
+                        drained: Drained::default(),
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "disk payload arrived before destination preparation",
+                        ),
+                    });
+                }
+                return Ok(drained);
+            };
             while let Some(sw) = self.buffer.take_drain_run(mode) {
-                write_run(sink.as_ref(), *object_range_start, &sw)?;
-                freed += sw.complete();
+                let bytes = match write_run(sink.as_ref(), object_range_start, &sw) {
+                    Ok(bytes) => bytes,
+                    Err(source) => return Err(DrainError { drained, source }),
+                };
+                written.fetch_add(bytes, Ordering::Release);
+                drained.bytes = drained.bytes.saturating_add(bytes);
+                drained.parts = drained.parts.saturating_add(sw.complete());
             }
         }
-        Ok(freed)
+        Ok(drained)
     }
 
-    /// Terminal drain: flush every remaining filled run, including a partial final
-    /// segment below the drain batch. Called once from `complete()` / `on_terminal()`.
-    /// Returns the parts freed by this terminal pass (the tail left resident below the
-    /// drain batch) so the caller can release the last of the read-ahead occupancy.
-    pub(crate) fn finalize(&self) -> Result<u64, std::io::Error> {
+    /// Flush every remaining filled run at a terminal transition, including a partial
+    /// final segment below the drain batch.
+    ///
+    /// Success, failure, and cancellation all use this operation to release resident
+    /// payload ownership. It does not establish the target's successful final shape.
+    /// Fails as [`drain`](Self::drain) does.
+    pub(crate) fn terminal_drain(&self) -> Result<Drained, DrainError> {
         if !matches!(&*self.mode, Mode::Disk { .. }) {
-            return Ok(0);
+            return Ok(Drained::default());
         }
-        let terminal_parts = self.drain(DrainMode::Eager)?;
+        let drained = self.drain(DrainMode::Eager)?;
         tracing::debug!(
             target: crate::telemetry::TARGET_TRANSFER,
-            terminal_parts,
+            terminal_parts = drained.parts,
+            terminal_bytes = drained.bytes,
             "terminal drain complete; tail flushed to disk",
         );
-        Ok(terminal_parts)
+        Ok(drained)
+    }
+
+    /// Flush terminal payloads and establish the successful disk target length.
+    ///
+    /// Returns what the terminal drain wrote. A failed terminal drain returns its
+    /// [`DrainError`]. Fails with
+    /// [`UnexpectedEof`](std::io::ErrorKind::UnexpectedEof), before the target
+    /// is resized, if the sink has not accepted exactly `expected_download_len`
+    /// bytes across every drain. A run claimed by a drain that has not finished
+    /// writing is invisible to the terminal drain, so without this check its
+    /// region would be published holding zeros or the file's previous bytes.
+    /// That error, and a failed resize, carry what the terminal drain wrote.
+    pub(crate) fn finalize(&self, expected_download_len: u64) -> Result<Drained, DrainError> {
+        let drained = self.terminal_drain()?;
+        if let Mode::Disk { sink, written, .. } = &*self.mode {
+            let written = written.load(Ordering::Acquire);
+            if written != expected_download_len {
+                return Err(DrainError {
+                    drained,
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "destination accepted {written} of {expected_download_len} expected bytes"
+                        ),
+                    ),
+                });
+            }
+            sink.finalize(expected_download_len)
+                .map_err(|source| DrainError { drained, source })?;
+        }
+        Ok(drained)
     }
 
     /// Whether a forced eager drain would free at least one resident part right now:
     /// the disk surface holds a contiguous filled run at some segment's claim cursor.
-    /// Stream mode returns false — its consumer drives release, so it never pins budget
-    /// behind the drain batch. Gates budget-pressure relief (`drain_or_park`).
+    /// Stream mode returns false: its consumer drives release, so it never pins
+    /// carrier charges behind the drain batch. This gates memory-pressure relief.
     pub(crate) fn has_drainable_resident(&self) -> bool {
         matches!(&*self.mode, Mode::Disk { .. }) && self.buffer.has_drainable_prefix()
     }
 
-    /// Flush the resident filled prefix to disk now, below the drain batch — budget
-    /// backpressure relief, distinct in intent from the terminal `finalize` but using
-    /// the same eager take. Returns the parts freed so the caller releases their
-    /// read-ahead occupancy. Not terminal: the transfer keeps issuing after this.
-    pub(crate) fn flush_resident(&self) -> Result<u64, std::io::Error> {
+    /// Flush the resident filled prefix to disk now, below the drain batch.
+    /// Memory-pressure relief is distinct from terminal `finalize`, but uses
+    /// the same eager take. Returns the parts freed, so the caller releases their
+    /// read-ahead occupancy, and the bytes written. Not terminal: the transfer
+    /// keeps issuing after this. Fails as [`drain`](Self::drain) does.
+    pub(crate) fn flush_resident(&self) -> Result<Drained, DrainError> {
         self.drain(DrainMode::Eager)
     }
 
@@ -263,68 +463,50 @@ impl BodyWriter {
         self.notify.notify_one();
     }
 
-    /// Best-effort pre-allocation of disk space.
-    pub(crate) fn preallocate(&self, len: u64) {
-        if let Mode::Disk { sink, .. } = &*self.mode {
-            sink.preallocate(len);
+    /// Fix the resolved object-range origin and prepare a disk target.
+    pub(crate) fn prepare(
+        &self,
+        object_range_start: u64,
+        expected_download_len: u64,
+    ) -> std::io::Result<()> {
+        if let Mode::Disk {
+            sink,
+            object_range_start: configured_start,
+            ..
+        } = &*self.mode
+        {
+            assert!(
+                configured_start.set(object_range_start).is_ok(),
+                "disk destination prepared more than once"
+            );
+            sink.prepare(expected_download_len)?;
         }
+        Ok(())
     }
 }
 
-/// Gather a claimed run's filled payloads and write them to the sink at the correct
-/// positions, coalescing offset-contiguous payloads into one positioned write. A
-/// payload at object offset `o` lands at sink position `o - object_range_start`. Reads
-/// payloads in place via `Slot::get()`; `complete()` (called by the caller after this
-/// returns) frees them.
+/// Write one claimed, contiguous payload run at its translated file position,
+/// returning the run's length in bytes.
+///
+/// The cursor borrows payloads in place. `complete()` (called by the caller
+/// after this returns) frees their owners.
 fn write_run(
     sink: &dyn SinkWrite,
     object_range_start: u64,
     sw: &SegmentWrite<ChunkOutput>,
-) -> std::io::Result<()> {
-    let mut run_start_file_pos: Option<u64> = None;
-    let mut run_end: u64 = 0;
-    let mut combined = bytes_utils::SegmentedBuf::<bytes::Bytes>::new();
-
-    for slot in sw.payloads() {
-        let Some(chunk) = slot.get() else {
-            // Unfilled slot in a partial tail segment — flush accumulated run
-            // and reset.
-            if let Some(pos) = run_start_file_pos.take() {
-                sink.write_all_at(&mut combined, pos)?;
-                combined = bytes_utils::SegmentedBuf::new();
-            }
-            continue;
-        };
-
-        let file_pos = chunk.offset - object_range_start;
-        let chunk_len = chunk.data.remaining() as u64;
-
-        if let Some(start) = run_start_file_pos {
-            if file_pos != run_end {
-                // Gap: flush the accumulated run and start a new one.
-                sink.write_all_at(&mut combined, start)?;
-                combined = bytes_utils::SegmentedBuf::new();
-                run_start_file_pos = Some(file_pos);
-                run_end = file_pos + chunk_len;
-            } else {
-                run_end += chunk_len;
-            }
-        } else {
-            run_start_file_pos = Some(file_pos);
-            run_end = file_pos + chunk_len;
-        }
-
-        // Clone Bytes segments (refcount bump, zero data copy).
-        for seg in chunk.data.clone().into_segments() {
-            combined.push(seg);
-        }
-    }
-
-    // Flush any remaining accumulated run.
-    if let Some(pos) = run_start_file_pos {
-        sink.write_all_at(&mut combined, pos)?;
-    }
-    Ok(())
+) -> std::io::Result<u64> {
+    let (object_offset, mut cursor) = DiskWriteCursor::new(sw)?;
+    let len = cursor.remaining() as u64;
+    let file_pos = object_offset
+        .checked_sub(object_range_start)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "disk-write payload begins before the requested object range",
+            )
+        })?;
+    sink.write_all_at(&mut cursor, file_pos)?;
+    Ok(len)
 }
 
 /// Consumer wrapper carrying the notify handle alongside the buffer consumer.
@@ -372,31 +554,33 @@ pub(crate) fn new_recv_body() -> (BodyWriter, RecvBodyConsumer) {
 /// Issuance backpressure is owned by the per-transfer [`ReadAhead`] controller.
 ///
 /// [`ReadAhead`]: super::read_ahead::ReadAhead
-fn new_recv_body_with_disk_mode(
+pub(crate) fn new_recv_body_with_disk_mode(
     sink: Box<dyn SinkWrite>,
-    object_range_start: u64,
 ) -> (BodyWriter, RecvBodyConsumer) {
     let (buffer, consumer) = PagedRecvBuffer::new_with_segment_size(SEG_SIZE);
     let notify = Arc::new(WakeNotify::new());
+    let resolved_range_start = std::sync::OnceLock::new();
     let writer = BodyWriter {
         buffer,
         notify: notify.clone(),
         mode: Arc::new(Mode::Disk {
             sink,
-            object_range_start,
+            object_range_start: resolved_range_start,
+            written: AtomicU64::new(0),
         }),
     };
     let slot_consumer = RecvBodyConsumer { consumer, notify };
     (writer, slot_consumer)
 }
 
-/// Create a producer/consumer pair with a file sink for download-to-file.
+/// Create a producer/consumer pair writing directly to `file` through a
+/// [`FileSink`](super::sink::FileSink).
+#[cfg(test)]
 pub(crate) fn new_recv_body_with_sink(
     file: std::fs::File,
-    object_range_start: u64,
     owns_file: bool,
 ) -> (BodyWriter, RecvBodyConsumer) {
-    new_recv_body_with_disk_mode(Box::new(FileSink { file, owns_file }), object_range_start)
+    new_recv_body_with_disk_mode(Box::new(super::sink::FileSink::new(file, owns_file)))
 }
 
 /// Stream of [ChunkOutput] representing an Amazon S3 Object's contents and metadata.
@@ -425,17 +609,11 @@ pub struct ChunkOutput {
     pub(crate) seq: u64,
     /// Byte offset in the object where this chunk starts.
     pub(crate) offset: u64,
-    /// The content associated with this particular ranged GetObject request.
-    pub data: AggregatedBytes,
+    /// The content associated with this ranged `GetObject` request.
+    pub data: SegmentedBytes,
     /// The metadata associated with this particular ranged GetObject request. This contains all the
     /// metadata returned by the S3 GetObject operation.
     pub metadata: ChunkMetadata,
-    /// Memory-budget reservation accounting for this chunk's bytes. Rides the chunk
-    /// from fill through delivery; the budget is charged until the last clone of the
-    /// delivered chunk drops (`AggregatedBytes` clones share the same backing bytes,
-    /// so an `Arc` reservation matches that residency exactly). `None` on paths that
-    /// do not reserve against the budget.
-    pub(crate) reservation: Option<Arc<Reservation>>,
 }
 
 impl std::fmt::Debug for ChunkOutput {
@@ -514,21 +692,20 @@ impl Body {
 
 #[cfg(test)]
 mod tests {
+    use crate::memory::SegmentedBytes;
     use crate::operation::download::transfer::DownloadTransfer;
     use crate::{error, operation::download::body::ChunkOutput};
-    use bytes::Bytes;
-    use bytes_utils::SegmentedBuf;
+    use bytes::{BufMut, Bytes};
     use std::sync::Arc;
 
-    use super::{new_recv_body, AggregatedBytes, Body, BodyWriter};
+    use super::{new_recv_body, Body, BodyWriter};
 
-    fn chunk_resp(seq: u64, data: AggregatedBytes) -> ChunkOutput {
+    fn chunk_resp(seq: u64, data: SegmentedBytes) -> ChunkOutput {
         ChunkOutput {
             seq,
             offset: 0,
             data,
             metadata: Default::default(),
-            reservation: None,
         }
     }
 
@@ -568,20 +745,23 @@ mod tests {
             let s2 = writer.claim();
 
             // Fill out of order: 2, 0, 1
-            let mut seg2 = SegmentedBuf::new();
-            seg2.push(Bytes::from("chunk 2"));
             let seq2 = s2.seq();
-            s2.fill(chunk_resp(seq2, AggregatedBytes(seg2)));
+            s2.fill(chunk_resp(
+                seq2,
+                SegmentedBytes::from(Bytes::from("chunk 2")),
+            ));
 
-            let mut seg0 = SegmentedBuf::new();
-            seg0.push(Bytes::from("chunk 0"));
             let seq0 = s0.seq();
-            s0.fill(chunk_resp(seq0, AggregatedBytes(seg0)));
+            s0.fill(chunk_resp(
+                seq0,
+                SegmentedBytes::from(Bytes::from("chunk 0")),
+            ));
 
-            let mut seg1 = SegmentedBuf::new();
-            seg1.push(Bytes::from("chunk 1"));
             let seq1 = s1.seq();
-            s1.fill(chunk_resp(seq1, AggregatedBytes(seg1)));
+            s1.fill(chunk_resp(
+                seq1,
+                SegmentedBytes::from(Bytes::from("chunk 1")),
+            ));
 
             ctx_clone.ctx().set_completed();
         });
@@ -589,7 +769,7 @@ mod tests {
         let mut received = Vec::new();
         while let Some(chunk) = body.next().await {
             let chunk = chunk.expect("chunk ok");
-            let data = String::from_utf8(chunk.data.to_vec()).unwrap();
+            let data = String::from_utf8(chunk.data.into_contiguous().to_vec()).unwrap();
             received.push(data);
         }
 
@@ -605,10 +785,11 @@ mod tests {
 
         // Fill one chunk
         let s0 = writer.claim();
-        let mut seg = SegmentedBuf::new();
-        seg.push(Bytes::from("chunk 0"));
         let seq0 = s0.seq();
-        s0.fill(chunk_resp(seq0, AggregatedBytes(seg)));
+        s0.fill(chunk_resp(
+            seq0,
+            SegmentedBytes::from(Bytes::from("chunk 0")),
+        ));
 
         // Fail the transfer
         transfer.ctx().set_failed(error::Error::new(
@@ -671,23 +852,50 @@ mod tests {
     // --- Disk driver tests ---
 
     use super::{
-        new_recv_body_with_disk_mode, new_recv_body_with_sink, BodyWriter as Writer, DrainMode,
-        RecvBodyConsumer, SinkWrite,
+        new_recv_body_with_disk_mode, new_recv_body_with_sink, BodyWriter as Writer,
+        DiskWriteCursor, DrainMode, Drained, RecvBodyConsumer, Reservation,
+    };
+    use crate::operation::download::sink::{SinkFactory, SinkWrite};
+    use crate::operation::download::test_util::sink::{
+        Action, Match, Op, ScriptedSinkFactory, WriteScript,
     };
     use bytes::Buf as _;
     use std::collections::BTreeMap;
     use std::sync::Mutex as StdMutex;
 
     fn chunk_at(seq: u64, offset: u64, data: &[u8]) -> ChunkOutput {
-        let mut seg = SegmentedBuf::new();
-        seg.push(Bytes::copy_from_slice(data));
         ChunkOutput {
             seq,
             offset,
-            data: AggregatedBytes(seg),
+            data: SegmentedBytes::from(Bytes::copy_from_slice(data)),
             metadata: Default::default(),
-            reservation: None,
         }
+    }
+
+    #[test]
+    fn disk_write_cursor_vectors_and_advances_across_chunk_boundaries() {
+        let (writer, _consumer, _sink) = new_recv_body_with_capture(0);
+        writer.claim().fill(chunk_at(0, 0, b"ab"));
+        writer.claim().fill(chunk_at(1, 2, b"cdef"));
+        let write = writer
+            .buffer
+            .take_drain_run(DrainMode::Eager)
+            .expect("two filled payloads");
+        {
+            let (object_offset, mut cursor) = DiskWriteCursor::new(&write).unwrap();
+
+            let mut slices = [std::io::IoSlice::new(&[]); 4];
+            let count = cursor.chunks_vectored(&mut slices);
+            assert_eq!(object_offset, 0);
+            assert_eq!(count, 2);
+            assert_eq!(slices[0].as_ref(), b"ab");
+            assert_eq!(slices[1].as_ref(), b"cdef");
+
+            cursor.advance(3);
+            assert_eq!(cursor.remaining(), 3);
+            assert_eq!(cursor.chunk(), b"def");
+        }
+        assert_eq!(write.complete(), 2);
     }
 
     /// In-memory [`SinkWrite`] that records every positioned write, for asserting the
@@ -713,14 +921,14 @@ mod tests {
             }
             out
         }
+
+        fn write_count(&self) -> usize {
+            self.writes.lock().unwrap().len()
+        }
     }
 
     impl SinkWrite for CaptureSink {
-        fn write_all_at(
-            &self,
-            buf: &mut bytes_utils::SegmentedBuf<bytes::Bytes>,
-            pos: u64,
-        ) -> std::io::Result<()> {
+        fn write_all_at(&self, buf: &mut DiskWriteCursor<'_>, pos: u64) -> std::io::Result<()> {
             let mut bytes = vec![0u8; buf.remaining()];
             buf.copy_to_slice(&mut bytes);
             self.writes.lock().unwrap().insert(pos, bytes);
@@ -737,20 +945,50 @@ mod tests {
         #[derive(Debug)]
         struct Shared(Arc<CaptureSink>);
         impl SinkWrite for Shared {
-            fn write_all_at(
-                &self,
-                buf: &mut bytes_utils::SegmentedBuf<bytes::Bytes>,
-                pos: u64,
-            ) -> std::io::Result<()> {
+            fn write_all_at(&self, buf: &mut DiskWriteCursor<'_>, pos: u64) -> std::io::Result<()> {
                 self.0.write_all_at(buf, pos)
             }
         }
-        let (writer, consumer) =
-            new_recv_body_with_disk_mode(Box::new(Shared(sink.clone())), object_range_start);
+        let (writer, consumer) = new_recv_body_with_disk_mode(Box::new(Shared(sink.clone())));
+        writer.prepare(object_range_start, 0).unwrap();
         (writer, consumer, sink)
     }
 
-    /// `has_drainable_resident` gates budget-relief draining. It is true only on the
+    fn new_test_recv_body_with_sink(
+        file: std::fs::File,
+        object_range_start: u64,
+    ) -> (Writer, RecvBodyConsumer) {
+        let (writer, consumer) = new_recv_body_with_sink(file, false);
+        writer.prepare(object_range_start, 0).unwrap();
+        (writer, consumer)
+    }
+
+    /// Cancellation can terminally drain a disk transfer before discovery has
+    /// resolved its object range. No payload exists at that point.
+    #[test]
+    fn disk_terminal_drain_before_prepare_is_empty() {
+        let file = tempfile::tempfile().unwrap();
+        let (writer, _consumer) = new_recv_body_with_sink(file, false);
+
+        assert_eq!(writer.terminal_drain().unwrap(), Drained::default());
+    }
+
+    /// A filled payload before destination preparation has no safe file
+    /// position and must not be discarded as an empty cancellation.
+    #[test]
+    fn disk_terminal_drain_before_prepare_rejects_payload() {
+        let file = tempfile::tempfile().unwrap();
+        let (writer, _consumer) = new_recv_body_with_sink(file, false);
+        writer.claim().fill(chunk_at(0, 0, b"payload"));
+
+        let error = writer
+            .terminal_drain()
+            .expect_err("unpositioned payload must fail");
+        assert_eq!(error.source.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(error.drained, Drained::default());
+    }
+
+    /// `has_drainable_resident` gates memory-pressure draining. It is true only on the
     /// disk surface with a filled run at the cursor: stream mode returns false (the
     /// consumer drives release there, so an eager drain would be a no-op that spins),
     /// and a resident run only exists once a slot at the cursor is filled.
@@ -778,137 +1016,321 @@ mod tests {
     }
 
     #[test]
+    fn disk_submits_one_contiguous_run_as_one_positioned_write() {
+        let (writer, _consumer, sink) = new_recv_body_with_capture(100);
+        writer.claim().fill(chunk_at(0, 100, b"ab"));
+        writer.claim().fill(chunk_at(1, 102, b"cdef"));
+
+        assert_eq!(
+            writer.terminal_drain().unwrap(),
+            Drained { parts: 2, bytes: 6 }
+        );
+        assert_eq!(sink.write_count(), 1);
+        assert_eq!(sink.assembled(), b"abcdef");
+    }
+
+    #[test]
+    fn disk_rejects_gaps_and_overlaps_within_a_claimed_run() {
+        for second_offset in [1, 3] {
+            let (writer, _consumer, sink) = new_recv_body_with_capture(0);
+            writer.claim().fill(chunk_at(0, 0, b"ab"));
+            writer.claim().fill(chunk_at(1, second_offset, b"cd"));
+
+            let error = writer
+                .terminal_drain()
+                .expect_err("offsets are not contiguous");
+            assert_eq!(error.source.kind(), std::io::ErrorKind::InvalidData);
+            assert_eq!(sink.write_count(), 0);
+        }
+    }
+
+    #[test]
+    fn disk_rejects_an_empty_claimed_payload() {
+        let (writer, _consumer, sink) = new_recv_body_with_capture(0);
+        writer.claim().fill(chunk_at(0, 0, b""));
+
+        let error = writer.terminal_drain().expect_err("disk payload is empty");
+        assert_eq!(error.source.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(sink.write_count(), 0);
+    }
+
+    #[test]
     fn disk_writes_full_segment() {
         use super::SEG_SIZE;
+        const CHUNK_LEN: usize = 4;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("out");
         let file = std::fs::File::create(&path).unwrap();
-        let (writer, _consumer) = new_recv_body_with_sink(file, 0, false);
+        let (writer, _consumer) = new_test_recv_body_with_sink(file, 0);
 
-        // Fill a full segment's worth of slots
+        let mut expected = Vec::with_capacity(SEG_SIZE * CHUNK_LEN);
         for i in 0..SEG_SIZE as u64 {
             let slot = writer.claim();
-            let offset = i * 100;
-            let data = format!("d{i}xx");
-            slot.fill(chunk_at(i, offset, data.as_bytes()));
+            let data = [i as u8; CHUNK_LEN];
+            let offset = i * CHUNK_LEN as u64;
+            expected.extend_from_slice(&data);
+            slot.fill(chunk_at(i, offset, &data));
         }
 
-        // The last fill sealed the segment; drain it.
         writer.drain(DrainMode::Batched).unwrap();
-
-        let contents = std::fs::read(&path).unwrap();
-        for i in 0..SEG_SIZE as u64 {
-            let offset = (i * 100) as usize;
-            let expected = format!("d{i}xx");
-            assert_eq!(
-                &contents[offset..offset + expected.len()],
-                expected.as_bytes(),
-                "mismatch at seq {i}"
-            );
-        }
+        assert_eq!(std::fs::read(&path).unwrap(), expected);
     }
 
     #[test]
     fn disk_eof_partial_tail() {
         use super::SEG_SIZE;
+        const CHUNK_LEN: usize = 2;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("out");
         let file = std::fs::File::create(&path).unwrap();
-        let (writer, _consumer) = new_recv_body_with_sink(file, 0, false);
+        let (writer, _consumer) = new_test_recv_body_with_sink(file, 0);
 
-        // Fill fewer than a segment's worth (partial)
         let partial = SEG_SIZE / 2;
+        let mut expected = Vec::with_capacity(partial * CHUNK_LEN);
         for i in 0..partial as u64 {
             let slot = writer.claim();
-            let offset = i * 100;
-            let data = format!("p{i}");
-            slot.fill(chunk_at(i, offset, data.as_bytes()));
+            let data = [i as u8; CHUNK_LEN];
+            let offset = i * CHUNK_LEN as u64;
+            expected.extend_from_slice(&data);
+            slot.fill(chunk_at(i, offset, &data));
         }
 
-        // finalize drains the partial tail
-        writer.finalize().unwrap();
+        writer.finalize(expected.len() as u64).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), expected);
+    }
 
+    #[test]
+    fn disk_finalize_removes_an_existing_file_tail() {
+        const ORIGINAL: &[u8] = b"old contents with a stale tail";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out");
+        std::fs::write(&path, ORIGINAL).unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let (writer, _consumer) = new_recv_body_with_sink(file, false);
+        writer.prepare(0, 3).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            ORIGINAL.len() as u64,
+            "preparing a caller-owned file must not resize it"
+        );
+
+        writer.claim().fill(chunk_at(0, 0, b"new"));
+        writer.terminal_drain().unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            ORIGINAL.len() as u64,
+            "terminal cleanup must not establish the successful length"
+        );
+
+        writer.finalize(3).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+    }
+
+    /// A disk body writer over the existing file at `path`, opened for reading
+    /// and writing, whose destination operations go through `script`.
+    fn scripted_writer_over(
+        path: &std::path::Path,
+        script: &Arc<WriteScript>,
+    ) -> (Writer, RecvBodyConsumer) {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        new_recv_body_with_disk_mode(
+            ScriptedSinkFactory(Arc::clone(script))
+                .create(file, false)
+                .unwrap(),
+        )
+    }
+
+    /// A drain that fails part-way returns the runs it wrote before the failing
+    /// one. An eager drain takes the head run of each of three receive-buffer
+    /// segments, and the destination rejects the third.
+    #[test]
+    fn failed_drain_returns_the_runs_written_before_it() {
+        use super::SEG_SIZE;
+        const RUN_LEN: u64 = 4;
+        let script = Arc::new(WriteScript::default()).on(
+            Match::NthWrite(3),
+            Action::Fail(std::io::ErrorKind::StorageFull),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out");
+        std::fs::File::create(&path).unwrap();
+        let (writer, _consumer) = scripted_writer_over(&path, &script);
+        writer.prepare(0, 3 * RUN_LEN).unwrap();
+
+        // Fill only the first slot of each segment, so the drain takes three
+        // separate runs, in order.
+        let seg = SEG_SIZE as u64;
+        for seq in 0..=2 * seg {
+            let slot = writer.claim();
+            if seq % seg == 0 {
+                let run = seq / seg;
+                slot.fill(chunk_at(
+                    seq,
+                    run * RUN_LEN,
+                    &[run as u8 + 1; RUN_LEN as usize],
+                ));
+            }
+        }
+
+        let error = writer
+            .drain(DrainMode::Eager)
+            .expect_err("the third write is scripted to fail");
+        assert_eq!(error.source.kind(), std::io::ErrorKind::StorageFull);
+        assert_eq!(error.drained, Drained { parts: 2, bytes: 8 });
+        assert_eq!(writer.written(), 8);
+    }
+
+    /// A resize that fails after every byte was written fails finalization
+    /// with the resize's error and leaves the destination's length in place.
+    #[test]
+    fn disk_finalize_propagates_resize_failure() {
+        let script = Arc::new(WriteScript::default()).on(
+            Match::Finalize,
+            Action::Fail(std::io::ErrorKind::PermissionDenied),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out");
+        std::fs::write(&path, b"existing").unwrap();
+        let (writer, _consumer) = scripted_writer_over(&path, &script);
+        writer.prepare(0, 3).unwrap();
+        writer.claim().fill(chunk_at(0, 0, b"new"));
+        writer.drain(DrainMode::Eager).unwrap();
+        assert_eq!(writer.written(), 3, "the whole object was written");
+
+        let error = writer
+            .finalize(3)
+            .expect_err("the resize is scripted to fail");
+        assert_eq!(error.source.kind(), std::io::ErrorKind::PermissionDenied);
         let contents = std::fs::read(&path).unwrap();
-        for i in 0..partial as u64 {
-            let offset = (i * 100) as usize;
-            let expected = format!("p{i}");
-            assert_eq!(
-                &contents[offset..offset + expected.len()],
-                expected.as_bytes(),
-                "mismatch at seq {i}"
+        assert_eq!(contents.len(), 8, "a failed resize keeps the length");
+        assert_eq!(&contents[..3], b"new");
+    }
+
+    /// A run claimed by a drain that has not finished writing it leaves the
+    /// destination short. Finalization must fail before the resize that would
+    /// publish the hole, leaving the caller's previous bytes and length in
+    /// place.
+    #[test]
+    fn disk_finalize_rejects_a_short_destination_without_resizing() {
+        const ORIGINAL: &[u8] = b"previous contents";
+        const HOLD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+        let script = Arc::new(WriteScript::default()).on(Match::NthWrite(1), Action::Hold);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out");
+        std::fs::write(&path, ORIGINAL).unwrap();
+        let (writer, _consumer) = scripted_writer_over(&path, &script);
+        writer.prepare(0, 4).unwrap();
+        writer.claim().fill(chunk_at(0, 0, b"ab"));
+
+        std::thread::scope(|scope| {
+            let drain = scope.spawn(|| writer.drain(DrainMode::Eager));
+            let held = script.wait_held(HOLD_TIMEOUT);
+            assert_eq!(held.op(), Op::Write { pos: 0, len: 2 });
+
+            writer.claim().fill(chunk_at(1, 2, b"cd"));
+            let error = writer
+                .finalize(4)
+                .expect_err("two of four bytes reached the destination");
+            assert_eq!(error.source.kind(), std::io::ErrorKind::UnexpectedEof);
+            assert!(
+                error.source.to_string().contains("2 of 4"),
+                "the error names both byte counts: {}",
+                error.source
             );
-        }
+            let contents = std::fs::read(&path).unwrap();
+            assert_eq!(
+                contents.len(),
+                ORIGINAL.len(),
+                "a short destination must not be resized"
+            );
+            assert_eq!(&contents[..4], b"prcd");
+
+            held.release();
+            drain.join().unwrap().unwrap();
+        });
+    }
+
+    #[test]
+    fn disk_finalize_truncates_an_empty_download() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out");
+        std::fs::write(&path, b"existing").unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let (writer, _consumer) = new_recv_body_with_sink(file, false);
+        writer.prepare(0, 0).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 8);
+
+        writer.finalize(0).unwrap();
+        assert!(std::fs::read(&path).unwrap().is_empty());
     }
 
     #[test]
     fn disk_finalize_drains_full_and_tail() {
         use super::SEG_SIZE;
+        const CHUNK_LEN: usize = 2;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("out");
         let file = std::fs::File::create(&path).unwrap();
-        let (writer, _consumer) = new_recv_body_with_sink(file, 0, false);
+        let (writer, _consumer) = new_test_recv_body_with_sink(file, 0);
 
-        // Fill SEG_SIZE + 2 parts
         let total = SEG_SIZE + 2;
+        let mut expected = Vec::with_capacity(total * CHUNK_LEN);
         for i in 0..total as u64 {
             let slot = writer.claim();
-            let offset = i * 50;
-            let data = format!("x{i}");
-            slot.fill(chunk_at(i, offset, data.as_bytes()));
+            let data = [i as u8; CHUNK_LEN];
+            let offset = i * CHUNK_LEN as u64;
+            expected.extend_from_slice(&data);
+            slot.fill(chunk_at(i, offset, &data));
         }
 
-        writer.finalize().unwrap();
-
-        let contents = std::fs::read(&path).unwrap();
-        for i in 0..total as u64 {
-            let offset = (i * 50) as usize;
-            let expected = format!("x{i}");
-            assert_eq!(
-                &contents[offset..offset + expected.len()],
-                expected.as_bytes(),
-                "mismatch at seq {i}"
-            );
-        }
+        writer.finalize(expected.len() as u64).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), expected);
     }
 
     #[test]
     fn disk_offset_translation() {
         use super::SEG_SIZE;
+        const CHUNK_LEN: usize = 2;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("out");
         let file = std::fs::File::create(&path).unwrap();
-        let (writer, _consumer) = new_recv_body_with_sink(file, 1000, false);
+        let (writer, _consumer) = new_test_recv_body_with_sink(file, 1000);
 
         let n = SEG_SIZE;
+        let mut expected = Vec::with_capacity(n * CHUNK_LEN);
         for i in 0..n as u64 {
             let slot = writer.claim();
-            let offset = 1000 + i * 100;
-            let data = format!("r{i}");
-            slot.fill(chunk_at(i, offset, data.as_bytes()));
+            let data = [i as u8; CHUNK_LEN];
+            let offset = 1000 + i * CHUNK_LEN as u64;
+            expected.extend_from_slice(&data);
+            slot.fill(chunk_at(i, offset, &data));
         }
 
         writer.drain(DrainMode::Batched).unwrap();
-
-        let contents = std::fs::read(&path).unwrap();
-        for i in 0..n as u64 {
-            let file_pos = (i * 100) as usize;
-            let expected = format!("r{i}");
-            assert_eq!(
-                &contents[file_pos..file_pos + expected.len()],
-                expected.as_bytes(),
-                "mismatch at seq {i}"
-            );
-        }
+        assert_eq!(std::fs::read(&path).unwrap(), expected);
     }
 
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn disk_concurrent_fill() {
         use super::SEG_SIZE;
+        const CHUNK_LEN: usize = 4;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("out");
         let file = std::fs::File::create(&path).unwrap();
-        let (writer, _consumer) = new_recv_body_with_sink(file, 0, false);
+        let (writer, _consumer) = new_test_recv_body_with_sink(file, 0);
 
         let n = SEG_SIZE;
         let mut handles = Vec::new();
@@ -917,9 +1339,9 @@ mod tests {
             handles.push(tokio::spawn(async move {
                 tokio::task::yield_now().await;
                 let seq = slot.seq();
-                let offset = seq * 100;
-                let data = format!("d{seq}");
-                slot.fill(chunk_at(seq, offset, data.as_bytes()));
+                let offset = seq * CHUNK_LEN as u64;
+                let data = [seq as u8; CHUNK_LEN];
+                slot.fill(chunk_at(seq, offset, &data));
             }));
         }
 
@@ -927,15 +1349,14 @@ mod tests {
             h.await.unwrap();
         }
 
-        writer.finalize().unwrap();
+        writer.finalize((n * CHUNK_LEN) as u64).unwrap();
 
         let contents = std::fs::read(&path).unwrap();
         for seq in 0..n as u64 {
-            let offset = (seq * 100) as usize;
-            let expected = format!("d{seq}");
+            let offset = seq as usize * CHUNK_LEN;
             assert_eq!(
-                &contents[offset..offset + expected.len()],
-                expected.as_bytes(),
+                &contents[offset..offset + CHUNK_LEN],
+                &[seq as u8; CHUNK_LEN],
                 "mismatch at seq {seq}"
             );
         }
@@ -956,7 +1377,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("out");
         let file = std::fs::File::create(&path).unwrap();
-        let (writer, _consumer) = new_recv_body_with_sink(file, 0, false);
+        let (writer, _consumer) = new_test_recv_body_with_sink(file, 0);
 
         // Fill two full segments, draining on the DrainReady edge after each fill — the
         // disk path's steady-state loop. Bounded iteration, so a regression fails fast.
@@ -964,14 +1385,14 @@ mod tests {
         let mut freed_total = 0u64;
         for i in 0..total {
             let slot = writer.claim();
-            let outcome = slot.fill(chunk_at(i, i * 100, format!("d{i}").as_bytes()));
+            let outcome = slot.fill(chunk_at(i, i, &[i as u8]));
             // Drain on the batch edge, as execute_get_range does.
             if outcome == super::FillOutcome::DrainReady {
-                freed_total += writer.drain(DrainMode::Batched).unwrap();
+                freed_total += writer.drain(DrainMode::Batched).unwrap().parts;
             }
         }
         // A terminal drain flushes any sub-batch tail so the total accounts for every part.
-        freed_total += writer.finalize().unwrap();
+        freed_total += writer.terminal_drain().unwrap().parts;
 
         // Resident occupancy is `issued - released` = total - freed_total. Every part has
         // been written to disk and its memory freed, so it must be 0 — otherwise the gate
@@ -1053,7 +1474,7 @@ mod tests {
                         let outcome = slot.fill(chunk_at(seq as u64, offset, &part_bytes(seq)));
                         // Mirror execute_get_range: drain on the batch edge.
                         if outcome == super::FillOutcome::DrainReady {
-                            let freed = writer.drain(DrainMode::Batched).unwrap();
+                            let freed = writer.drain(DrainMode::Batched).unwrap().parts;
                             freed_total.fetch_add(freed, std::sync::atomic::Ordering::Relaxed);
                         }
                     }
@@ -1064,7 +1485,7 @@ mod tests {
 
         // Terminal drain flushes the partial final segment and any straggler runs.
         freed_total.fetch_add(
-            writer.finalize().unwrap(),
+            writer.terminal_drain().unwrap().parts,
             std::sync::atomic::Ordering::Relaxed,
         );
 
@@ -1082,120 +1503,128 @@ mod tests {
         );
     }
 
-    // --- Reservation lease-lifetime tests ---
+    // --- Admission and payload ownership tests ---
     //
-    // The budget caps TOTAL memory the transfer manager holds, not buffer residency
-    // (the read-ahead window already bounds that). So a reservation must live for as
-    // long as the bytes it accounts for are resident: on the stream surface the bytes
-    // escape to the consumer in the delivered `ChunkOutput` and stay resident until
-    // the consumer drops it, so the reservation must ride the chunk and release on
-    // consumer-drop — NOT at the buffer boundary. On the disk surface the drain copies
-    // the bytes out and frees them, so the reservation releases at drain.
+    // Fill closes acquisition authority. The resulting charge follows immutable
+    // ownership: to final consumer drop on the stream surface, or through the
+    // positioned write on the disk surface.
 
-    use crate::runtime::memory::MemoryBudget;
+    use crate::memory::{BufferPool, MemoryBudgetConfig};
 
-    #[test]
-    fn stream_reservation_rides_chunk_and_releases_on_consumer_drop() {
-        let chunk_bytes = 1024;
-        let budget = MemoryBudget::new(chunk_bytes * 4, chunk_bytes);
-        let (writer, mut consumer) = new_recv_body();
+    fn test_reservation_pool() -> (BufferPool, usize) {
+        let pool = BufferPool::from_capacity(
+            MemoryBudgetConfig::Limit(1024 * 1024),
+            None,
+            crate::config::MemoryDiagnosticsConfig::default(),
+        )
+        .expect("test pool");
+        let carrier_size = pool.carrier_size();
+        (pool, carrier_size)
+    }
 
-        // Claim, reserve, fill — the producer path. One chunk charged.
-        let mut slot = writer.claim();
-        slot.attach_reservation(budget.try_reserve(chunk_bytes).expect("has capacity"));
-        assert_eq!(budget.in_use_chunks(), 1);
-        slot.fill(chunk_resp(0, {
-            let mut seg = SegmentedBuf::new();
-            seg.push(Bytes::from("hello"));
-            AggregatedBytes(seg)
-        }));
-
-        // Still charged while the chunk sits in the buffer.
-        assert_eq!(budget.in_use_chunks(), 1);
-
-        // Deliver to the consumer. The chunk (and its reservation) leaves the buffer as
-        // an owned value — the bytes are now resident in the consumer's hands, so the
-        // budget must STILL be charged. Releasing here would be the lease-lifetime bug.
-        let chunk = consumer.try_take_next().expect("chunk delivered");
-        assert_eq!(chunk.data.clone().to_vec(), b"hello");
-        assert_eq!(
-            budget.in_use_chunks(),
-            1,
-            "reservation must survive delivery: the bytes are resident in the consumer"
-        );
-
-        // Consumer drops the chunk: the bytes are freed, so the reservation releases.
-        drop(chunk);
-        assert_eq!(
-            budget.in_use_chunks(),
-            0,
-            "reservation must release when the consumer drops the delivered chunk"
-        );
+    fn pooled_data(pool: &BufferPool, reservation: &Reservation, data: &[u8]) -> SegmentedBytes {
+        let mut buffer = pool
+            .acquire(reservation, data.len())
+            .expect("reserved pooled buffer");
+        buffer.put_slice(data);
+        buffer.freeze()
     }
 
     #[test]
-    fn stream_reservation_holds_until_last_chunk_clone_drops() {
-        // `ChunkOutput` is Clone and its `AggregatedBytes` clone shares the same backing
-        // `Bytes` (a refcount bump, no copy), so the bytes stay resident until the last
-        // clone drops. The `Arc<Reservation>` matches that: the budget stays charged
-        // until the final clone is gone, never double-charged for the shared buffer.
-        let chunk_bytes = 1024;
-        let budget = MemoryBudget::new(chunk_bytes * 4, chunk_bytes);
+    fn test_stream_fill_closes_reservation_while_payload_retains_charge() {
+        let (pool, chunk_bytes) = test_reservation_pool();
         let (writer, mut consumer) = new_recv_body();
 
+        let reservation = pool
+            .try_reserve(chunk_bytes)
+            .unwrap()
+            .expect("has capacity");
+        let data = pooled_data(&pool, &reservation, b"hello");
         let mut slot = writer.claim();
-        slot.attach_reservation(budget.try_reserve(chunk_bytes).expect("has capacity"));
-        slot.fill(chunk_resp(0, {
-            let mut seg = SegmentedBuf::new();
-            seg.push(Bytes::from("shared"));
-            AggregatedBytes(seg)
-        }));
+        slot.attach_reservation(reservation);
+        assert_eq!(
+            pool.metrics().active_planned_demand_bytes(),
+            chunk_bytes as u64
+        );
+        slot.fill(chunk_resp(0, data));
+
+        let metrics = pool.metrics();
+        assert_eq!(metrics.active_planned_demand_bytes(), 0);
+        assert_eq!(metrics.charged_capacity_bytes(), chunk_bytes as u64);
+        assert_eq!(metrics.admission_used_bytes(), chunk_bytes as u64);
+
+        let chunk = consumer.try_take_next().expect("chunk delivered");
+        assert_eq!(chunk.data.clone().into_contiguous().as_ref(), b"hello");
+        assert_eq!(pool.metrics().charged_capacity_bytes(), chunk_bytes as u64);
+
+        drop(chunk);
+        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_eq!(pool.metrics().admission_used_bytes(), 0);
+    }
+
+    #[test]
+    fn test_stream_charge_holds_until_last_chunk_clone_drops() {
+        let (pool, chunk_bytes) = test_reservation_pool();
+        let (writer, mut consumer) = new_recv_body();
+
+        let reservation = pool
+            .try_reserve(chunk_bytes)
+            .unwrap()
+            .expect("has capacity");
+        let data = pooled_data(&pool, &reservation, b"shared");
+        let mut slot = writer.claim();
+        slot.attach_reservation(reservation);
+        slot.fill(chunk_resp(0, data));
 
         let chunk = consumer.try_take_next().expect("chunk delivered");
         let clone = chunk.clone();
+        assert_eq!(pool.metrics().active_planned_demand_bytes(), 0);
         assert_eq!(
-            budget.in_use_chunks(),
-            1,
+            pool.metrics().charged_capacity_bytes(),
+            chunk_bytes as u64,
             "one physical buffer, charged once"
         );
 
-        // Dropping one clone does not release: the other still holds the bytes.
         drop(chunk);
         assert_eq!(
-            budget.in_use_chunks(),
-            1,
+            pool.metrics().charged_capacity_bytes(),
+            chunk_bytes as u64,
             "a surviving clone still holds the resident bytes"
         );
 
-        // The last clone drops: now the bytes are gone and the reservation releases.
         drop(clone);
-        assert_eq!(budget.in_use_chunks(), 0, "released on last clone drop");
+        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_eq!(pool.metrics().admission_used_bytes(), 0);
     }
 
     #[test]
-    fn disk_reservation_releases_on_drain() {
-        let chunk_bytes = 1024;
-        let budget = MemoryBudget::new(chunk_bytes * 4, chunk_bytes);
+    fn test_disk_payload_charge_returns_on_drain() {
+        let (pool, chunk_bytes) = test_reservation_pool();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("out");
         let file = std::fs::File::create(&path).unwrap();
-        let (writer, _consumer) = new_recv_body_with_sink(file, 0, false);
+        let (writer, _consumer) = new_test_recv_body_with_sink(file, 0);
 
+        let reservation = pool
+            .try_reserve(chunk_bytes)
+            .unwrap()
+            .expect("has capacity");
+        let data = pooled_data(&pool, &reservation, b"flushed");
         let mut slot = writer.claim();
-        slot.attach_reservation(budget.try_reserve(chunk_bytes).expect("has capacity"));
-        slot.fill(chunk_at(0, 0, b"flushed"));
+        slot.attach_reservation(reservation);
+        slot.fill(ChunkOutput {
+            seq: 0,
+            offset: 0,
+            data,
+            metadata: Default::default(),
+        });
 
-        // Charged while resident in the buffer, before the drain copies it out.
-        assert_eq!(budget.in_use_chunks(), 1);
+        assert_eq!(pool.metrics().active_planned_demand_bytes(), 0);
+        assert_eq!(pool.metrics().charged_capacity_bytes(), chunk_bytes as u64);
 
-        // The drain writes the bytes to the sink and frees the buffer payload; the disk
-        // surface owns nothing after copy-out, so the reservation releases here.
-        writer.finalize().unwrap();
-        assert_eq!(
-            budget.in_use_chunks(),
-            0,
-            "disk drain copies out and frees the bytes; the reservation releases at drain"
-        );
+        writer.terminal_drain().unwrap();
+        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_eq!(pool.metrics().admission_used_bytes(), 0);
         assert_eq!(&std::fs::read(&path).unwrap()[..7], b"flushed");
     }
 }

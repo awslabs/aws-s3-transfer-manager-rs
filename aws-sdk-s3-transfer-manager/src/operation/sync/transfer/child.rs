@@ -238,15 +238,28 @@ impl SpawnChild<aws_sdk_s3::types::Object> for SpawnDownload {
         // forbids a blocking call in `poll_work`. `download_objects` creates its temporary file the
         // same way. A shared child constructor that creates the file in the child's own work item
         // would fix both.
-        let temp_path = dest_path.with_file_name(format!(
-            "{}.s3tmp.{:08x}",
-            dest_path.file_name().unwrap_or_default().to_string_lossy(),
-            fastrand::u32(..)
-        ));
-        let file = std::fs::File::create(&temp_path).map_err(|e| {
+        let (file, temp_path) =
+            crate::io::fs::create_first_new(crate::operation::download::temp_file_candidates(
+                &dest_path,
+                std::iter::repeat_with(|| fastrand::u32(..)),
+            ))
+            .map_err(|e| {
+                crate::error::Error::new(
+                    crate::error::ErrorKind::IOError,
+                    format!("could not open a temporary file for '{key}': {e}"),
+                )
+            })?;
+        let sink = crate::operation::download::sink::SinkFactory::create(
+            &crate::operation::download::sink::FileSinkFactory,
+            file,
+            true,
+        )
+        .map_err(|e| {
+            // No handle owns the temporary file yet, so this function removes it.
+            let _ = std::fs::remove_file(&temp_path);
             crate::error::Error::new(
                 crate::error::ErrorKind::IOError,
-                format!("could not open a temporary file for '{key}': {e}"),
+                format!("could not open a destination for '{key}': {e}"),
             )
         })?;
 
@@ -258,9 +271,7 @@ impl SpawnChild<aws_sdk_s3::types::Object> for SpawnDownload {
         let inner = crate::operation::download::Download::orchestrate_with_sink(
             self.handle.clone(),
             input,
-            file,
-            0,
-            true,
+            sink,
             Some(parent),
         )?;
         let handle =

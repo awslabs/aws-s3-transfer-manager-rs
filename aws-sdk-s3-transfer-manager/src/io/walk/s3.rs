@@ -531,19 +531,21 @@ impl S3Walk {
         // Retried on throttling and transient transport failure. A service error here is fatal to the
         // walk, so one dropped page costs every key after it — and a caller that consumed those keys
         // as absent would be reading a hole as an answer.
-        let output = crate::retry::retry(crate::retry::classify_discovery_retry, |_| {
-            let req = req.clone();
-            async move {
-                // `Error::from` rather than wrapping by kind: only the conversion carries the
-                // service metadata across, and the classifier reads the service code to tell a
-                // throttle from a refusal.
-                req.send()
-                    .await
-                    .map_err(|e| crate::retry::GuardError::Inner(crate::error::Error::from(e)))
-            }
-        })
-        .await
-        .map_err(|e| WalkError::new(None, WalkErrorKind::Service, Box::new(e)))?;
+        let mut metrics = crate::metrics::RequestMetrics::default();
+        let output =
+            crate::retry::retry(&mut metrics, crate::retry::classify_discovery_retry, |_| {
+                let req = req.clone();
+                async move {
+                    // `Error::from` rather than wrapping by kind: only the conversion carries the
+                    // service metadata across, and the classifier reads the service code to tell a
+                    // throttle from a refusal.
+                    req.send()
+                        .await
+                        .map_err(|e| crate::retry::GuardError::Inner(crate::error::Error::from(e)))
+                }
+            })
+            .await
+            .map_err(|e| WalkError::new(None, WalkErrorKind::Service, Box::new(e)))?;
 
         let mut objects: Vec<Object> = output.contents.unwrap_or_default();
         if let Some(ref filter) = self.config.filter {

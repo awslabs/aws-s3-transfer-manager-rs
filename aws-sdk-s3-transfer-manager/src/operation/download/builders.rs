@@ -35,7 +35,13 @@ impl DownloadFluentBuilder {
     ///
     /// Data is written to a temporary file in the same directory, then
     /// atomically renamed to the destination on success. The temporary file
-    /// is deleted on failure, cancellation, or drop.
+    /// is deleted on failure, cancellation, or drop. The destination has the
+    /// exact downloaded length.
+    ///
+    /// Successful completion means every byte was accepted by the operating
+    /// system and the temporary file was renamed. It does not call `sync_data`,
+    /// `sync_all`, or synchronize the parent directory, and therefore does not
+    /// promise persistence across a system crash or power loss.
     #[cfg(any(unix, windows))]
     pub async fn write_to_path(
         self,
@@ -47,6 +53,7 @@ impl DownloadFluentBuilder {
             input,
             path.into(),
             None,
+            &crate::operation::download::sink::FileSinkFactory,
         )
         .await
     }
@@ -55,14 +62,36 @@ impl DownloadFluentBuilder {
     ///
     /// The caller is responsible for the file lifecycle (creation, cleanup).
     /// The transfer manager writes to the file using positioned writes at
-    /// offsets starting from 0.
+    /// offsets starting from 0 and resizes it to the exact downloaded length,
+    /// removing any previous tail. The file cursor is ignored. Append and
+    /// nonzero destination offsets are not supported by this operation.
+    ///
+    /// A file that is open in append mode when this method is called, such as
+    /// one opened with [`OpenOptions::append`](std::fs::OpenOptions::append),
+    /// is rejected with
+    /// [`ErrorKind::InputInvalid`](crate::error::ErrorKind::InputInvalid) on
+    /// every platform. No request is sent, and the file is not modified.
+    ///
+    /// On failure or cancellation, the file may contain a noncontiguous mixture
+    /// of downloaded and previous data, and positioned writes may have extended
+    /// it. Treat its contents as invalid unless [`ManagedDownloadHandle::join`]
+    /// succeeds.
+    ///
+    /// Successful completion does not synchronize file data or metadata. Call
+    /// the appropriate synchronization method on another handle when crash
+    /// persistence is required.
     #[cfg(any(unix, windows))]
     pub fn write_to_file(
         self,
         file: std::fs::File,
     ) -> Result<ManagedDownloadHandle, crate::error::Error> {
         let input = self.inner.build()?;
-        crate::operation::download::Download::orchestrate_to_file(self.handle, input, file)
+        crate::operation::download::Download::orchestrate_to_file(
+            self.handle,
+            input,
+            file,
+            &crate::operation::download::sink::FileSinkFactory,
+        )
     }
 
     /// <p>The bucket name containing the object.</p>

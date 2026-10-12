@@ -231,6 +231,7 @@ pub(crate) fn copy_fields_to_abort_mpu_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::io::InputStream;
     use crate::operation::upload::ChecksumStrategy;
     use aws_sdk_s3::operation::put_object::PutObjectOutput;
     use aws_sdk_s3::operation::upload_part::UploadPartOutput;
@@ -246,6 +247,7 @@ mod tests {
     fn upload_request_for_tests() -> UploadInput {
         UploadInput::builder()
             .acl(ObjectCannedAcl::PublicRead)
+            .body(InputStream::from_static(b"test body"))
             .bucket("test-bucket")
             .bucket_key_enabled(true)
             .cache_control("max-age=3600")
@@ -456,7 +458,7 @@ mod tests {
                     true
                 }
             })
-            .then_output(|| UploadPartOutput::builder().build());
+            .then_output(|| UploadPartOutput::builder().e_tag("test-etag").build());
 
         let client = mock_client!(aws_sdk_s3, RuleMode::Sequential, &[&upload_part_mock]);
         let upload_part_builder = client.upload_part().upload_id("test-id").part_number(1);

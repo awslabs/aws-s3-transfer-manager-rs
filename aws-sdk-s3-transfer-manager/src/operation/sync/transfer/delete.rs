@@ -235,23 +235,25 @@ impl DeleteFromBucket {
                 }
             };
 
-            let sent = crate::retry::retry(crate::retry::classify_discovery_retry, |_| {
-                let delete = delete.clone();
-                async move {
-                    self.client
-                        .delete_objects()
-                        .bucket(self.root.bucket())
-                        .delete(delete)
-                        .send()
-                        .await
-                        // `Error::from` keeps the service metadata. The retry classifier reads that
-                        // metadata.
-                        .map_err(|err| {
-                            crate::retry::GuardError::Inner(crate::error::Error::from(err))
-                        })
-                }
-            })
-            .await;
+            let mut metrics = crate::metrics::RequestMetrics::default();
+            let sent =
+                crate::retry::retry(&mut metrics, crate::retry::classify_discovery_retry, |_| {
+                    let delete = delete.clone();
+                    async move {
+                        self.client
+                            .delete_objects()
+                            .bucket(self.root.bucket())
+                            .delete(delete)
+                            .send()
+                            .await
+                            // `Error::from` keeps the service metadata. The retry classifier
+                            // reads that metadata.
+                            .map_err(|err| {
+                                crate::retry::GuardError::Inner(crate::error::Error::from(err))
+                            })
+                    }
+                })
+                .await;
 
             match sent {
                 // The response lists deleted keys and refused keys separately. The run reads both

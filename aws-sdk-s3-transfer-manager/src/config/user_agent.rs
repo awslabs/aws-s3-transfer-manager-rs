@@ -112,7 +112,7 @@ mod tests {
     use aws_sdk_s3::config::{
         AppName, Credentials, Intercept, IntoShared, SharedCredentialsProvider,
     };
-    use aws_smithy_runtime::client::http::test_util::capture_request;
+    use aws_smithy_http_client::test_util::capture_request;
     use std::borrow::Cow;
 
     fn test_credentials() -> SharedCredentialsProvider {

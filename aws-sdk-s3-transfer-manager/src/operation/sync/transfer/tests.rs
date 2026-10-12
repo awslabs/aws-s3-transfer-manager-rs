@@ -4262,6 +4262,375 @@ async fn a_refused_listing_keeps_its_service_code_on_the_run_error() {
 }
 
 // ======================================================================
+// Pooled memory. A sync run moves its bytes through its children, and each child takes its memory
+// from the client's buffer pool. The tests below check that the pool gets every byte back.
+
+fn a_pool() -> crate::runtime::buffer_pool::BufferPool {
+    crate::runtime::buffer_pool::BufferPool::builder()
+        .memory_budget(crate::types::MemoryBudgetConfig::Limit(64 * 1024 * 1024))
+        .build()
+        .expect("a pool builds")
+}
+
+fn assert_pool_is_empty(pool: &crate::runtime::buffer_pool::BufferPool, after: &str) {
+    let metrics = pool.metrics();
+    assert!(
+        metrics.prepared_capacity_bytes() > 0,
+        "{after}, the pool shows the run never used it, so this proves nothing"
+    );
+    assert_eq!(
+        (
+            metrics.charged_capacity_bytes(),
+            metrics.active_planned_demand_bytes(),
+            metrics.queued_reservations(),
+        ),
+        (0, 0, 0),
+        "{after}, the pool still holds memory for the run"
+    );
+}
+
+// This body sends its first bytes and then waits forever, so the download child that reads it
+// stays in flight and keeps its pooled buffer.
+struct StallAfterFirstBytes {
+    sent: bool,
+}
+
+impl http_body_1x::Body for StallAfterFirstBytes {
+    type Data = bytes::Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body_1x::Frame<Self::Data>, Self::Error>>> {
+        if self.sent {
+            return std::task::Poll::Pending;
+        }
+        self.sent = true;
+        std::task::Poll::Ready(Some(Ok(http_body_1x::Frame::data(
+            bytes::Bytes::from_static(b"he"),
+        ))))
+    }
+}
+
+// This body sends its first bytes and then fails, after the download child holds its pooled buffer.
+struct FailAfterFirstBytes {
+    sent: bool,
+}
+
+impl http_body_1x::Body for FailAfterFirstBytes {
+    type Data = bytes::Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body_1x::Frame<Self::Data>, Self::Error>>> {
+        if self.sent {
+            return std::task::Poll::Ready(Some(Err(std::io::Error::other("the body broke"))));
+        }
+        self.sent = true;
+        std::task::Poll::Ready(Some(Ok(http_body_1x::Frame::data(
+            bytes::Bytes::from_static(b"he"),
+        ))))
+    }
+}
+
+// The bucket lists `stalls` and `fails`. The download of `stalls` stays in flight, and the
+// download of `fails` gets a service error.
+fn a_bucket_with_a_stalled_and_a_failed_object() -> aws_sdk_s3::Client {
+    let contents: Vec<Object> = ["fails", "stalls"]
+        .iter()
+        .map(|k| {
+            Object::builder()
+                .key(*k)
+                .size(5)
+                .last_modified(aws_smithy_types::DateTime::from_secs(1_600_000_000))
+                .build()
+        })
+        .collect();
+    let list = mock!(aws_sdk_s3::Client::list_objects_v2).then_output(move || {
+        ListObjectsV2Output::builder()
+            .set_contents(Some(contents.clone()))
+            .build()
+    });
+    let stalled = mock!(aws_sdk_s3::Client::get_object)
+        .match_requests(|req| req.key() == Some("stalls"))
+        .then_output(|| {
+            aws_sdk_s3::operation::get_object::GetObjectOutput::builder()
+                .content_length(5)
+                .last_modified(aws_smithy_types::DateTime::from_secs(1_600_000_000))
+                .body(aws_sdk_s3::primitives::ByteStream::from_body_1_x(
+                    StallAfterFirstBytes { sent: false },
+                ))
+                .build()
+        });
+    let failed = mock!(aws_sdk_s3::Client::get_object)
+        .match_requests(|req| req.key() == Some("fails"))
+        .then_error(|| {
+            aws_sdk_s3::operation::get_object::GetObjectError::generic(
+                aws_sdk_s3::error::ErrorMetadata::builder()
+                    .code("InternalError")
+                    .build(),
+            )
+        });
+    mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&list, &stalled, &failed])
+}
+
+fn downloading_from_a_pool(
+    local: &Path,
+    client: aws_sdk_s3::Client,
+    pool: &crate::runtime::buffer_pool::BufferPool,
+    failure_policy: FailedTransferPolicy,
+) -> (
+    SyncTransfer<S3Walk, crate::operation::sync::walk::LocalDestination>,
+    TransferContext,
+    crate::transfer::StateMachineTerminalReceiver,
+) {
+    let config = crate::Config::builder()
+        .client(client.clone())
+        .memory(crate::types::MemoryConfig::Explicit(pool.clone()))
+        .build();
+    let handle = crate::client::Handle::test_handle_managed(config);
+    let (ctx, rx) = TransferContext::new(handle);
+    let walk = Walker::builder()
+        .build()
+        .downloading(
+            LocalAndBucket::builder()
+                .local_root(local)
+                .client(client)
+                .bucket("amzn-s3-demo-bucket")
+                .build(),
+        )
+        .expect("an ordinary bucket builds");
+    let transfer = SyncTransfer::new(
+        ctx.clone(),
+        walk,
+        Mode::default().downloading(),
+        Arc::new(SpawnDownload::new(
+            ctx.handle.clone(),
+            "amzn-s3-demo-bucket",
+            None,
+            local,
+        )),
+        Arc::new(DeleteFromLocalTree::new(local)),
+        RunSettings {
+            max_children: 4,
+            delete_mode: DeleteMode::Off,
+            failure_policy,
+        },
+    );
+    (transfer, ctx, rx)
+}
+
+async fn until_the_pool_charges_memory(pool: &crate::runtime::buffer_pool::BufferPool) {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while pool.metrics().charged_capacity_bytes() == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the stalled download never took memory from the pool");
+}
+
+// A multipart upload reads each part into a pooled buffer before it sends the part. A single
+// `PutObject` fills its pooled body only as the request sends it, and a mock reads no body.
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn an_upload_run_returns_its_pooled_memory() {
+    const PART: u64 = 5 * 1024 * 1024;
+    let dir = tempfile::tempdir().expect("a temp dir");
+    std::fs::write(
+        dir.path().join("big.dat"),
+        vec![7u8; (PART + 1024) as usize],
+    )
+    .expect("the file is written");
+    let list = mock!(aws_sdk_s3::Client::list_objects_v2)
+        .then_output(|| ListObjectsV2Output::builder().build());
+    let create = mock!(aws_sdk_s3::Client::create_multipart_upload).then_output(|| {
+        aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput::builder()
+            .upload_id("upload-1")
+            .build()
+    });
+    let part = mock!(aws_sdk_s3::Client::upload_part).then_output(|| {
+        aws_sdk_s3::operation::upload_part::UploadPartOutput::builder()
+            .e_tag("etag")
+            .build()
+    });
+    let complete = mock!(aws_sdk_s3::Client::complete_multipart_upload).then_output(|| {
+        aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput::builder()
+            .build()
+    });
+    let client = mock_client!(
+        aws_sdk_s3,
+        RuleMode::MatchAny,
+        &[&list, &create, &part, &complete]
+    );
+    let pool = a_pool();
+    let config = crate::Config::builder()
+        .client(client.clone())
+        .memory(crate::types::MemoryConfig::Explicit(pool.clone()))
+        .multipart_threshold(crate::types::PartSize::Target(PART))
+        .part_size(crate::types::PartSize::Target(PART))
+        .build();
+    let handle = crate::client::Handle::test_handle_managed(config);
+    let (ctx, rx) = TransferContext::new(handle);
+    let walk = Walker::builder()
+        .build()
+        .uploading(
+            LocalAndBucket::builder()
+                .local_root(dir.path())
+                .client(client)
+                .bucket("amzn-s3-demo-bucket")
+                .build(),
+        )
+        .expect("an ordinary bucket builds");
+    let transfer = SyncTransfer::new(
+        ctx.clone(),
+        walk,
+        Mode::default().uploading(),
+        Arc::new(SpawnUpload::new(
+            ctx.handle.clone(),
+            "amzn-s3-demo-bucket",
+            None,
+        )),
+        Arc::new(RecordDeletes::new(DELETE_BATCH)),
+        RunSettings {
+            max_children: 4,
+            delete_mode: DeleteMode::Off,
+            failure_policy: FailedTransferPolicy::Continue,
+        },
+    );
+    ctx.handle
+        .scheduler
+        .enqueue_transfer(Box::new(transfer.clone()));
+    tokio::time::timeout(Duration::from_secs(20), rx)
+        .await
+        .expect("the run did not finish")
+        .expect("the terminal signal was dropped");
+
+    assert_eq!(
+        transfer.inner.state.lock().snapshot().arrived,
+        1,
+        "the multipart upload did not arrive"
+    );
+    assert_pool_is_empty(&pool, "after a clean upload");
+}
+
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn a_download_run_returns_its_pooled_memory() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path().canonicalize().expect("canonical root");
+    let (client, gets) = a_bucket_recording_gets(&["a.jpg", "b.jpg", "c/d.jpg"], 1_600_000_000);
+    let pool = a_pool();
+
+    let (t, ctx, rx) =
+        downloading_from_a_pool(&root, client, &pool, FailedTransferPolicy::Continue);
+    run_managed(&t, &ctx, rx).await;
+
+    assert_eq!(
+        gets.lock().len(),
+        3,
+        "the run did not download every object"
+    );
+    assert_pool_is_empty(&pool, "after a clean download");
+}
+
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn a_failed_download_returns_its_pooled_memory() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path().canonicalize().expect("canonical root");
+    let list = mock!(aws_sdk_s3::Client::list_objects_v2).then_output(|| {
+        ListObjectsV2Output::builder()
+            .set_contents(Some(vec![Object::builder()
+                .key("a.jpg")
+                .size(5)
+                .last_modified(aws_smithy_types::DateTime::from_secs(1_600_000_000))
+                .build()]))
+            .build()
+    });
+    let broken = mock!(aws_sdk_s3::Client::get_object).then_output(|| {
+        aws_sdk_s3::operation::get_object::GetObjectOutput::builder()
+            .content_length(5)
+            .last_modified(aws_smithy_types::DateTime::from_secs(1_600_000_000))
+            .body(aws_sdk_s3::primitives::ByteStream::from_body_1_x(
+                FailAfterFirstBytes { sent: false },
+            ))
+            .build()
+    });
+    let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&list, &broken]);
+    let pool = a_pool();
+
+    let (t, ctx, rx) =
+        downloading_from_a_pool(&root, client, &pool, FailedTransferPolicy::Continue);
+    run_managed(&t, &ctx, rx).await;
+
+    assert_eq!(
+        t.inner.state.lock().snapshot().transfer_failures,
+        1,
+        "the download did not fail"
+    );
+    assert_pool_is_empty(&pool, "after a failed download");
+}
+
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn an_aborting_run_returns_the_memory_of_the_children_it_cancels() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path().canonicalize().expect("canonical root");
+    let pool = a_pool();
+    let (t, ctx, rx) = downloading_from_a_pool(
+        &root,
+        a_bucket_with_a_stalled_and_a_failed_object(),
+        &pool,
+        FailedTransferPolicy::Abort,
+    );
+
+    run_managed(&t, &ctx, rx).await;
+
+    assert!(ctx.is_failed(), "the aborting run did not fail");
+    assert_eq!(
+        t.inner.state.lock().snapshot().cancelled,
+        1,
+        "the stalled download finished, so this run proves nothing about the cancel"
+    );
+    assert_pool_is_empty(&pool, "after an aborting run cancelled its children");
+}
+
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn a_run_the_caller_cancels_returns_its_pooled_memory() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path().canonicalize().expect("canonical root");
+    let pool = a_pool();
+    let (t, ctx, _rx) = downloading_from_a_pool(
+        &root,
+        a_bucket_with_a_stalled_and_a_failed_object(),
+        &pool,
+        FailedTransferPolicy::Continue,
+    );
+    ctx.handle.scheduler.enqueue_transfer(Box::new(t.clone()));
+    until_the_pool_charges_memory(&pool).await;
+
+    ctx.handle
+        .scheduler
+        .cancel_transfer(ctx.id)
+        .wait_for_idle()
+        .await;
+
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while pool.metrics().charged_capacity_bytes() > 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the cancelled run kept its pooled memory");
+    assert_pool_is_empty(&pool, "after the caller cancelled the run");
+}
+
+// ======================================================================
 // Real-bucket runs. `#[ignore]`d, so the ordinary suite never reaches S3:
 //
 //   S3_TEST_BUCKET_NAME_RS=<bucket> AWS_REGION=<region> \
