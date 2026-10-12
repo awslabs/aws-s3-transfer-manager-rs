@@ -1,7 +1,12 @@
 # aws-ort-http
 
-HTTP transport with connection pooling and managed execution.
+HTTP connection pooling with explicit managed execution placement.
 
-The HTTP component combines connection pooling with managed execution placement.
-Its boundary covers transport, request and response bodies, and ecosystem adapter
-views, independently of AWS service clients and transfer scheduling.
+The client module combines the native Smithy connection pool with a managed
+runtime. Transport settings stay on the native pool builder, and callers obtain
+its existing clients for explicitly chosen execution partitions. These clients
+can be installed in AWS SDK configurations using Smithy's shared conversion.
+
+Client construction requires the `client` feature. For HTTPS, enable a TLS provider
+on `aws-smithy-http-client` and select it on the supplied native builder. Runtime
+ownership and shutdown remain with the application.

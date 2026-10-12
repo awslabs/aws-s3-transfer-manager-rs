@@ -1,1 +1,4 @@
-allowed_external_types = []
+allowed_external_types = [
+    "aws_ort_execution::*",
+    "aws_smithy_http_client::*",
+]

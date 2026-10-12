@@ -56,7 +56,9 @@ impl RuntimePartitionId {
 
     /// Returns this partition's zero-based index within its runtime.
     ///
-    /// The index follows the supplied topology's placement ordering.
+    /// The index is the partition's position in its runtime's partition slice,
+    /// which follows the supplied topology's placement ordering. Processor
+    /// identifiers do not determine these indices.
     pub fn index(self) -> usize {
         self.index
     }

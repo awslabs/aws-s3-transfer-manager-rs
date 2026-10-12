@@ -11,3 +11,7 @@
     rust_2018_idioms
 )]
 #![doc = include_str!("../README.md")]
+
+/// Connection-pool construction and clients with managed execution placement.
+#[cfg(feature = "client")]
+pub mod client;

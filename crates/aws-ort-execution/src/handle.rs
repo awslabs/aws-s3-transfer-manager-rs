@@ -36,6 +36,9 @@ impl ManagedRuntimeHandle {
     }
 
     /// Returns the nonempty execution partition collection in topology placement order.
+    ///
+    /// Indices are dense: the partition at position `i` has index `i`, and all
+    /// partitions belong to this runtime. The collection is fixed at construction.
     pub fn partitions(&self) -> &[RuntimePartition] {
         &self.state.partitions
     }

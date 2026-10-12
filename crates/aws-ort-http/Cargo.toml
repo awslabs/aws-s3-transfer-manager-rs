@@ -12,4 +12,18 @@ categories = ["asynchronous", "network-programming"]
 keywords = ["aws", "ort", "http", "https"]
 
 [dependencies]
-aws-ort-execution = { version = "0.1.0", path = "../aws-ort-execution" }
+aws-ort-execution = { version = "0.1.0", path = "../aws-ort-execution", optional = true }
+aws-smithy-http-client = { workspace = true, default-features = false, features = ["default-client", "rt-tokio"], optional = true }
+
+[dev-dependencies]
+aws-smithy-async = { workspace = true, features = ["rt-tokio"] }
+aws-smithy-http-client = { workspace = true, features = ["wire-mock", "rustls-ring"] }
+aws-smithy-runtime-api = { workspace = true, features = ["client", "http-1x", "test-util"] }
+aws-smithy-types = { workspace = true, features = ["http-body-1-x"] }
+dial9 = { version = "0.5.3", default-features = false, features = ["tokio"] }
+http-body-util = "0.1"
+tokio = { version = "1.53.1", default-features = false, features = ["rt", "net", "time", "sync", "macros"] }
+
+[features]
+client = ["dep:aws-ort-execution", "dep:aws-smithy-http-client"]
+dial9 = ["client", "aws-ort-execution/dial9"]
