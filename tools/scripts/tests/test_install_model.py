@@ -97,10 +97,13 @@ class InstallModelTest(unittest.TestCase):
         self.assertEqual(0, status)
         for action in ("Added:", "Changed:", "Removed:"):
             self.assertIn(action, output)
+        self.assertIn("Dry run: installed source differs.", output)
         self.assertEqual(original, install_model.inventory(self.target))
 
     def test_check_missing_different_extra_and_matching_source_is_nonmutating(self):
-        self.assertEqual(1, self.invoke("--check")[0])
+        status, output = self.invoke("--check")
+        self.assertEqual(1, status)
+        self.assertIn("Check: installed source differs.", output)
         self.assertFalse(self.target.exists())
         original = {"mod.rs": HEADER + b"old\n", "stale.rs": HEADER}
         self.write_tree(self.target, original)
@@ -108,7 +111,9 @@ class InstallModelTest(unittest.TestCase):
         self.assertEqual(original, install_model.inventory(self.target))
         (self.target / "stale.rs").unlink()
         (self.target / "mod.rs").write_bytes(self.candidate["mod.rs"])
-        self.assertEqual(0, self.invoke("--check")[0])
+        status, output = self.invoke("--check")
+        self.assertEqual(0, status)
+        self.assertIn("Installed generated source unchanged.", output)
 
     def test_clean_stale_files_are_removed_only_inside_generated_subtree(self):
         self.write_tree(self.target, {"mod.rs": HEADER + b"old\n", "stale.rs": HEADER})
@@ -128,7 +133,9 @@ class InstallModelTest(unittest.TestCase):
         self.assertEqual(1, status)
         self.assertIn("--overwrite", output)
         self.assertEqual(original, install_model.inventory(self.target))
-        self.assertEqual(0, self.invoke("--dry-run")[0])
+        status, output = self.invoke("--dry-run")
+        self.assertEqual(0, status)
+        self.assertIn("Dry run: installed source differs.", output)
         self.assertEqual(0, self.invoke("--overwrite")[0])
         self.assertEqual(self.candidate, install_model.inventory(self.target))
 

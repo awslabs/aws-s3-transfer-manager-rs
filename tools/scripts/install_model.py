@@ -250,10 +250,10 @@ def main(argv=None) -> int:
                 print("Installed generated source unchanged.")
                 return 0
             if options.check:
-                print("Check: installed source unchanged.")
+                print("Check: installed source differs.")
                 return 1
             if options.dry_run:
-                print("Dry run: installed source unchanged.")
+                print("Dry run: installed source differs.")
                 return 0
             publish(REPOSITORY_ROOT, candidates, options.overwrite)
             for _, target, _, new in candidates:
