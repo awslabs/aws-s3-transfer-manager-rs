@@ -19,6 +19,7 @@ Read the subsystem's module documentation (`//!`), then its design document from
 - Memory and buffers: [memory.md](docs/design/memory.md).
 - Download delivery: [paged-recv-buffer.md](docs/design/paged-recv-buffer.md).
 - Retry and hedging: [retry.md](docs/design/retry.md) and [hedging.md](docs/design/hedging.md).
+- Upload: [upload.md](docs/design/upload.md).
 
 ## Before adding code
 

@@ -9,6 +9,7 @@ Each design document states a subsystem's requirements, architecture, and correc
 | [paged-recv-buffer.md](paged-recv-buffer.md) | Download reassembly, the occupancy gate, and read-ahead | `operation/download/recv_buffer.rs`, `operation/download/read_ahead.rs` |
 | [retry.md](retry.md) | The outer retry loop, failure classification, and throttle recovery | `retry.rs` |
 | [hedging.md](hedging.md) | Speculative re-issue, the adaptive deadline, and the hedge budget | `retry.rs` |
+| [upload.md](upload.md) | Single-object upload: path selection, source partitioning, the multipart state machine, and request mapping | `operation/upload.rs`, `operation/upload/`, `io/part_reader.rs` |
 
 Code paths are relative to `aws-sdk-s3-transfer-manager/src/`.
 
@@ -58,3 +59,12 @@ This index locates each invariant. The linked section is authoritative.
 - [A timeout never ratchets the deadline tighter](hedging.md#a-timeout-never-ratchets-the-deadline-tighter)
 - [A uniformly slow link is never hedged](hedging.md#a-uniformly-slow-link-is-never-hedged)
 - [Hedging concurrency safety](hedging.md#concurrency-safety)
+
+### Upload
+
+- [Part accounting balances exactly once](upload.md#part-accounting-balances-exactly-once)
+- [Completion is elected once](upload.md#completion-is-elected-once)
+- [The stored object matches the source's declaration](upload.md#the-stored-object-matches-the-sources-declaration)
+- [A retry re-sends identical bytes](upload.md#a-retry-re-sends-identical-bytes)
+- [A parked part read is never lost or recreated](upload.md#a-parked-part-read-is-never-lost-or-recreated)
+- [An open multipart upload is always reachable](upload.md#an-open-multipart-upload-is-always-reachable)
