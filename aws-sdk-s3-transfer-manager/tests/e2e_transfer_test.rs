@@ -416,7 +416,7 @@ async fn test_objects_transfer() {
     let (bucket_name, _) = get_bucket_names();
 
     // SSE-C objects require the key to download, skipping it.
-    fn sse_c_filter(obj: &aws_sdk_s3::types::Object) -> bool {
+    fn sse_c_filter(obj: &aws_sdk_s3_transfer_manager::model::Object) -> bool {
         let key = obj.key().unwrap_or("");
         let is_sse_c = key.ends_with("aes256-c");
         !is_sse_c

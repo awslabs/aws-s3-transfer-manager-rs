@@ -48,9 +48,6 @@ use crate::operation::upload::context::{
     MultipartCompletion, PartPlan, PartReadWake, PartTransferState, PendingPartRead,
     UploadPartWork, UploadState,
 };
-use crate::operation::upload::input::convert::{
-    copy_fields_to_mpu_request, copy_fields_to_upload_part_request,
-};
 #[cfg(test)]
 use crate::operation::upload::observability::UploadTerminalOutcome;
 use crate::operation::upload::observability::{
@@ -58,6 +55,9 @@ use crate::operation::upload::observability::{
     UploadPartTiming, UploadRequestKind, UploadStateSnapshot, UploadTerminalReport,
 };
 use crate::operation::upload::part_body;
+use crate::operation::upload::request::{
+    copy_fields_to_mpu_request, copy_fields_to_upload_part_request,
+};
 use crate::operation::upload::{UploadInput, UploadOutput, UploadOutputBuilder};
 use crate::transfer::{IoRequest, PendingCause, PollWork, Transfer, TransferContext, WorkOutcome};
 use crate::types::BucketType;
@@ -402,7 +402,7 @@ impl UploadTransfer {
         };
 
         let upload_id = resp.upload_id().expect("upload_id present").to_string();
-        let response_builder = UploadOutputBuilder::from(resp);
+        let response_builder = crate::sdk_v1::upload_output_from_create_multipart_upload(&resp);
 
         let (stream, size_hint) = {
             let mut state = self.inner.state.lock().expect("lock poisoned");
@@ -832,7 +832,7 @@ impl UploadTransfer {
     }
 
     async fn execute_put_object(&self, stream: InputStream) -> WorkOutcome {
-        use crate::operation::upload::input::convert::copy_fields_to_put_object_request;
+        use crate::operation::upload::request::copy_fields_to_put_object_request;
 
         let content_length = stream
             .size_hint()
@@ -929,7 +929,7 @@ impl UploadTransfer {
             }
         };
 
-        let result = UploadOutputBuilder::from(resp)
+        let result = crate::sdk_v1::upload_output_from_put_object(&resp)
             .metrics(self.inner.ctx.metrics())
             .build()
             .expect("valid response");
@@ -1015,7 +1015,7 @@ impl UploadTransfer {
                     .build(),
             );
 
-        let complete_req = super::input::convert::copy_fields_to_complete_mpu_request(
+        let complete_req = super::request::copy_fields_to_complete_mpu_request(
             &self.inner.request,
             base_req,
             || async { part_reader.full_object_checksum().await },
@@ -1047,11 +1047,13 @@ impl UploadTransfer {
             completion_timer.elapsed(),
         );
 
-        let result = response_builder
-            .update_from_complete_mpu(&resp)
-            .metrics(self.inner.ctx.metrics())
-            .build()
-            .expect("valid response");
+        let result = crate::sdk_v1::update_upload_output_from_complete_multipart_upload(
+            response_builder,
+            &resp,
+        )
+        .metrics(self.inner.ctx.metrics())
+        .build()
+        .expect("valid response");
 
         *self.inner.result.lock().expect("lock poisoned") = Some(result);
         *self.inner.state.lock().expect("lock poisoned") = UploadState::Done;
@@ -1207,7 +1209,7 @@ mod tests {
     ) -> UploadTransfer {
         let handle = crate::client::Handle::test_handle_tokio(
             crate::Config::builder()
-                .client(s3_client)
+                .sdk_client(s3_client)
                 .diagnostics_for_test(crate::config::MemoryDiagnosticsConfig::default(), detail)
                 .build(),
         );
@@ -2105,7 +2107,7 @@ mod tests {
         tmp.flush().unwrap();
 
         let handle = crate::client::Handle::test_handle_tokio(
-            crate::Config::builder().client(s3_client).build(),
+            crate::Config::builder().sdk_client(s3_client).build(),
         );
         let mut input = UploadInput::builder()
             .bucket("test-bucket")

@@ -2408,6 +2408,8 @@ dependencies = [
  "aws-smithy-checksums",
  "aws-smithy-http-client",
  "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-types",
  "bytes",
  "s3-mock-server",
  "tempfile",

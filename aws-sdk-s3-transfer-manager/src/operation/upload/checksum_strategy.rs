@@ -1,4 +1,4 @@
-use aws_sdk_s3::types::{ChecksumAlgorithm, ChecksumType};
+use crate::model::{ChecksumAlgorithm, ChecksumType};
 use aws_smithy_types::error::operation::BuildError;
 
 #[doc = std::include_str!("checksum_strategy.md")]

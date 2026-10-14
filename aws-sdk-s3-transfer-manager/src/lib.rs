@@ -22,6 +22,18 @@
 //!
 //! [service API]: https://docs.aws.amazon.com/AmazonS3/latest/API/API_Operations_Amazon_Simple_Storage_Service.html
 //!
+//! # Modeled types and configuration
+//!
+//! S3 request values, response metadata, and enums are defined in [`model`].
+//! Operation modules re-export their corresponding modeled types and builders.
+//! Configure a client from shared [`aws_types::SdkConfig`] using
+//! [`S3ClientConfig`], or load configuration with [`from_env`].
+//!
+//! The `sdk-v1` feature enables conversions between modeled values and AWS SDK
+//! for Rust S3 v1 types, conversion from an S3 configuration builder, and
+//! [`S3WalkContextBuilder`](crate::io::walk::S3WalkContextBuilder) construction
+//! from an SDK client.
+//!
 //! # Examples
 //!
 //! Load the default configuration:
@@ -132,6 +144,10 @@ pub mod error;
 /// Common types used by `aws-sdk-s3-transfer-manager`
 pub mod types;
 
+/// Modeled S3 values and builders.
+pub mod model;
+pub(crate) mod sdk_v1;
+
 /// Types and helpers for I/O
 pub mod io;
 
@@ -209,3 +225,6 @@ pub use self::transfer::SchedulingCtl;
 pub fn from_env() -> ConfigLoader {
     ConfigLoader::default()
 }
+
+#[cfg(test)]
+mod tests;

@@ -6,12 +6,31 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use aws_sdk_s3::types::Object;
-
 use super::error::{WalkError, WalkErrorKind};
+use crate::model::Object;
 use crate::types::BucketType;
 
 type FilterFn = Arc<dyn Fn(&Object) -> bool + Send + Sync>;
+
+/// Service client backing a listing, including the runtime ownership it needs.
+#[derive(Debug)]
+enum S3WalkServiceClient {
+    /// Standalone walks retain the transfer manager and its managed runtime.
+    TransferManager(crate::Client),
+    /// SDK client without a TM owner. Internal transfers use this to avoid a
+    /// cycle through the scheduler; SDK interoperability callers own any
+    /// custom transport's runtime separately.
+    Provided(aws_sdk_s3::Client),
+}
+
+impl S3WalkServiceClient {
+    fn sdk_client(&self) -> &aws_sdk_s3::Client {
+        match self {
+            Self::TransferManager(client) => &client.handle.s3_client,
+            Self::Provided(client) => client,
+        }
+    }
+}
 
 /// Result of listing a single page of S3 objects.
 ///
@@ -30,7 +49,7 @@ pub(crate) struct ListPageResult {
 /// Configuration for walking an S3 bucket by listing objects under a prefix.
 ///
 /// Describes what to list and how (prefix, delimiter, filter, pagination).
-/// The S3 client and bucket name are supplied separately via
+/// The transfer manager client and bucket name are supplied separately via
 /// [`S3WalkContext`] when starting a walk.
 ///
 /// Use [`S3Walker::builder`] to construct an instance.
@@ -55,7 +74,7 @@ pub struct S3Walker {
     prefix: Option<String>,
     delimiter: Option<String>,
     expected_bucket_owner: Option<String>,
-    request_payer: Option<aws_sdk_s3::types::RequestPayer>,
+    request_payer: Option<crate::model::RequestPayer>,
     filter: Option<FilterFn>,
     start_after: Option<String>,
     continuation_token: Option<String>,
@@ -150,7 +169,7 @@ pub struct S3WalkerBuilder {
     prefix: Option<String>,
     delimiter: Option<String>,
     expected_bucket_owner: Option<String>,
-    request_payer: Option<aws_sdk_s3::types::RequestPayer>,
+    request_payer: Option<crate::model::RequestPayer>,
     filter: Option<FilterFn>,
     start_after: Option<String>,
     continuation_token: Option<String>,
@@ -198,14 +217,16 @@ impl S3WalkerBuilder {
 
     /// Set the request-payer preference for Requester-Pays buckets.
     #[must_use]
-    pub fn request_payer(mut self, payer: aws_sdk_s3::types::RequestPayer) -> Self {
+    pub fn request_payer(mut self, payer: crate::model::RequestPayer) -> Self {
         self.request_payer = Some(payer);
         self
     }
 
     /// Set a filter predicate applied to each discovered object.
     ///
-    /// Returning `false` drops the object silently.
+    /// The predicate receives a [`crate::model::Object`] containing the
+    /// metadata returned by `ListObjectsV2`. Returning `false` drops the
+    /// object silently.
     #[must_use]
     pub fn filter(mut self, f: impl Fn(&Object) -> bool + Send + Sync + 'static) -> Self {
         self.filter = Some(Arc::new(f));
@@ -258,9 +279,9 @@ impl S3WalkerBuilder {
     }
 }
 
-/// The S3 client and bucket for an S3 walk.
+/// The transfer manager client and bucket for an S3 walk.
 pub struct S3WalkContext {
-    client: aws_sdk_s3::Client,
+    client: S3WalkServiceClient,
     bucket: crate::types::Bucket,
 }
 
@@ -286,17 +307,35 @@ impl S3WalkContext {
 /// Builder for [`S3WalkContext`].
 #[derive(Debug, Default)]
 pub struct S3WalkContextBuilder {
-    client: Option<aws_sdk_s3::Client>,
+    client: Option<S3WalkServiceClient>,
     bucket: Option<String>,
 }
 
 impl S3WalkContextBuilder {
-    /// Set the S3 client to use for listing.
+    /// Set the transfer manager client to use for listing.
     ///
-    /// This field is required.
+    /// This field is required. The context and resulting walk retain a clone
+    /// of the client, keeping its runtime alive until the walk is dropped.
     #[must_use]
-    pub fn client(mut self, client: aws_sdk_s3::Client) -> Self {
-        self.client = Some(client);
+    pub fn client(mut self, client: &crate::Client) -> Self {
+        self.client = Some(S3WalkServiceClient::TransferManager(client.clone()));
+        self
+    }
+
+    /// Set an AWS SDK for Rust S3 v1 client to use for listing.
+    ///
+    /// Unlike [`client`](Self::client), this does not retain a transfer manager
+    /// runtime. The caller must keep any custom HTTP transport's runtime alive.
+    #[cfg(feature = "sdk-v1")]
+    #[must_use]
+    pub fn sdk_v1_client(self, client: aws_sdk_s3::Client) -> Self {
+        self.sdk_client(client)
+    }
+
+    // Directory transfers already belong to a TM handle. Retaining that handle
+    // here would form a cycle through the scheduler and transfer.
+    pub(crate) fn sdk_client(mut self, client: aws_sdk_s3::Client) -> Self {
+        self.client = Some(S3WalkServiceClient::Provided(client));
         self
     }
 
@@ -327,10 +366,11 @@ impl S3WalkContextBuilder {
 /// A running S3 walk, yielding objects from a bucket listing.
 ///
 /// Created by [`S3Walker::walk`]. The walk pages through the bucket,
-/// buffering objects and yielding them via [`next`](Self::next).
+/// buffering [`crate::model::Object`] values and yielding them via
+/// [`next`](Self::next).
 pub struct S3Walk {
     config: S3Walker,
-    client: aws_sdk_s3::Client,
+    client: S3WalkServiceClient,
     bucket: crate::types::Bucket,
     pending_prefixes: VecDeque<String>,
     ready_objects: VecDeque<Object>,
@@ -353,7 +393,7 @@ impl std::fmt::Debug for S3Walk {
 }
 
 impl S3Walk {
-    /// Return the next object from the walk.
+    /// Return the next [`crate::model::Object`] from the walk.
     ///
     /// Returns:
     /// - `Some(Ok(object))` for an object that passed the filter.
@@ -437,6 +477,7 @@ impl S3Walk {
     ) -> Result<ListPageResult, WalkError> {
         let mut req = self
             .client
+            .sdk_client()
             .list_objects_v2()
             .bucket(self.bucket.name())
             .prefix(prefix);
@@ -473,7 +514,7 @@ impl S3Walk {
             req = req.expected_bucket_owner(owner);
         }
         if let Some(payer) = &self.config.request_payer {
-            req = req.request_payer(payer.clone());
+            req = req.request_payer(crate::sdk_v1::request_payer_to_sdk(payer));
         }
         if let Some(page_size) = self.config.page_size {
             req = req.max_keys(page_size);
@@ -484,7 +525,12 @@ impl S3Walk {
             .await
             .map_err(|e| WalkError::new(None, WalkErrorKind::Service, Box::new(e)))?;
 
-        let mut objects: Vec<Object> = output.contents.unwrap_or_default();
+        let mut objects: Vec<Object> = output
+            .contents
+            .unwrap_or_default()
+            .into_iter()
+            .map(|object| crate::sdk_v1::object_from_sdk(&object))
+            .collect();
         if let Some(ref filter) = self.config.filter {
             objects.retain(|obj| filter(obj));
         }
@@ -516,10 +562,72 @@ mod tests {
     }
 
     fn s3ctx(client: aws_sdk_s3::Client, bucket: impl Into<String>) -> S3WalkContext {
-        S3WalkContext::builder()
-            .client(client)
-            .bucket(bucket)
-            .build()
+        let builder = S3WalkContext::builder();
+        #[cfg(feature = "sdk-v1")]
+        let builder = builder.sdk_v1_client(client);
+        #[cfg(not(feature = "sdk-v1"))]
+        let builder = builder.sdk_client(client);
+        builder.bucket(bucket).build()
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn standalone_walk_retains_transfer_manager_until_dropped() {
+        let list = mock!(aws_sdk_s3::Client::list_objects_v2).then_output(|| {
+            ListObjectsV2Output::builder()
+                .contents(Object::builder().key("object").build())
+                .build()
+        });
+        let sdk = mock_client!(aws_sdk_s3, RuleMode::Sequential, &[&list]);
+        let tm = crate::Client::new(crate::Config::builder().sdk_client(sdk).build());
+        let handle = Arc::downgrade(&tm.handle);
+        let context = S3WalkContext::builder()
+            .client(&tm)
+            .bucket("bucket")
+            .build();
+        drop(tm);
+        assert!(handle.upgrade().is_some());
+
+        let mut walk = S3Walker::default().walk(context);
+        assert_eq!(walk.next().await.unwrap().unwrap().key(), Some("object"));
+        assert!(walk.next().await.is_none());
+        assert!(handle.upgrade().is_some());
+        drop(walk);
+        assert!(handle.upgrade().is_none());
+        assert_eq!(list.num_calls(), 1);
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn shared_config_loopback_endpoint_uses_path_style_without_sdk_settings() {
+        use aws_sdk_s3::config::{Credentials, SharedCredentialsProvider};
+        use aws_smithy_http_client::test_util::capture_request;
+
+        let (http_client, captured) = capture_request(None);
+        let shared = aws_types::SdkConfig::builder()
+            .behavior_version(aws_config::BehaviorVersion::latest())
+            .region(aws_config::Region::new("us-east-1"))
+            .credentials_provider(SharedCredentialsProvider::new(Credentials::for_tests()))
+            .endpoint_url("http://127.0.0.1:12345")
+            .http_client(http_client)
+            .build();
+        let tm = crate::Client::new(
+            crate::Config::builder()
+                .s3_config(crate::config::S3ClientConfig::new(&shared).enable_runtime_http(false))
+                .build(),
+        );
+        let context = S3WalkContext::builder()
+            .client(&tm)
+            .bucket("bucket")
+            .build();
+        let mut walk = S3Walker::default().walk(context);
+        // The capture client returns an error response; only addressing is under test.
+        assert!(walk.next().await.unwrap().is_err());
+        let request = captured.expect_request();
+        assert_eq!(
+            request.uri().to_string(),
+            "http://127.0.0.1:12345/bucket/?list-type=2&prefix="
+        );
     }
 
     #[cfg_attr(miri, ignore)]
@@ -592,13 +700,14 @@ mod tests {
         let client = mock_client!(aws_sdk_s3, RuleMode::Sequential, &[&rule]);
 
         let mut walk = walker()
-            .filter(|obj| !obj.key().unwrap_or("").ends_with('/'))
+            .filter(|obj: &crate::model::Object| !obj.key().unwrap_or("").ends_with('/'))
             .build()
             .walk(s3ctx(client, "test-bucket"));
 
         let mut keys = Vec::new();
         while let Some(result) = walk.next().await {
-            keys.push(result.unwrap().key.unwrap());
+            let object: crate::model::Object = result.unwrap();
+            keys.push(object.key.unwrap());
         }
         assert_eq!(keys, vec!["file.txt", "other.txt"]);
     }
@@ -940,7 +1049,7 @@ mod tests {
         let client = mock_client!(aws_sdk_s3, RuleMode::Sequential, &[&rule]);
 
         let mut walk = walker()
-            .request_payer(aws_sdk_s3::types::RequestPayer::Requester)
+            .request_payer(crate::model::RequestPayer::Requester)
             .build()
             .walk(s3ctx(client, "test-bucket"));
 
