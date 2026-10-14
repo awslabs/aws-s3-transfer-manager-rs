@@ -21,6 +21,15 @@ fn modeled_inputs_use_real_tm_runtime_types_and_validate_required_fields() {
     let _: UploadInputBuilder = UploadInput::builder();
     assert!(DownloadInput::builder().build().is_err());
     assert!(UploadInput::builder().bucket("bucket").build().is_err());
+    let missing_body = UploadInput::builder()
+        .bucket("bucket")
+        .key("key")
+        .build()
+        .expect_err("a body is required");
+    assert!(
+        missing_body.to_string().contains("body"),
+        "error should name the missing field: {missing_body}"
+    );
     let download = DownloadInput::builder()
         .bucket("bucket")
         .key("key")
@@ -49,7 +58,12 @@ fn expiration_types_preserve_upload_timestamps_and_raw_response_strings() {
     let time = DateTime::from_secs(123);
     let builder = UploadInput::builder().expires(time);
     assert_eq!(builder.get_expires(), &Some(time));
-    let upload = builder.bucket("bucket").key("key").build().unwrap();
+    let upload = builder
+        .bucket("bucket")
+        .key("key")
+        .body(InputStream::from_static(b""))
+        .build()
+        .unwrap();
     let expires: Option<&DateTime> = upload.expires();
     assert_eq!(expires, Some(&time));
     let download = DownloadInput::builder()
@@ -117,7 +131,12 @@ fn metadata_identifiers_are_accessible_without_sdk_traits() {
 fn sensitive_input_and_builder_debug_redacts_real_modeled_members() {
     let builder = UploadInput::builder().sse_kms_key_id("secret");
     assert!(!format!("{builder:?}").contains("secret"));
-    let input = builder.bucket("bucket").key("key").build().unwrap();
+    let input = builder
+        .bucket("bucket")
+        .key("key")
+        .body(InputStream::from_static(b""))
+        .build()
+        .unwrap();
     assert!(!format!("{input:?}").contains("secret"));
     let input = DownloadInput::builder()
         .bucket("bucket")
@@ -140,6 +159,7 @@ fn existing_operation_input_paths_remain_available() {
         aws_sdk_s3_transfer_manager::operation::upload::UploadInput::builder()
             .bucket("bucket")
             .key("key")
+            .body(InputStream::from_static(b""))
             .build()
             .unwrap();
 }

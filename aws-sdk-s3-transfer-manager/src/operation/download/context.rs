@@ -18,6 +18,9 @@ pub(crate) enum DownloadPendingReason {
     MemoryAdmission,
     /// Every range was issued and in-flight range work must retire.
     RangeCompletion,
+    /// Every range retired, and in-flight drains (memory-relief writes) must
+    /// finish before the destination can be finalized.
+    DrainCompletion,
 }
 
 impl From<DownloadPendingReason> for PendingCause {
@@ -29,6 +32,7 @@ impl From<DownloadPendingReason> for PendingCause {
                 Self::new(PendingCategory::Memory, "memory_admission")
             }
             DownloadPendingReason::RangeCompletion => Self::in_flight_work("range_completion"),
+            DownloadPendingReason::DrainCompletion => Self::in_flight_work("drain_completion"),
         }
     }
 }
@@ -52,6 +56,19 @@ impl std::fmt::Debug for PendingClaim {
 }
 
 /// Mutable state for tracking download work progress
+///
+/// # Completion
+///
+/// Every work item `poll_work` issues is counted when it is issued and
+/// uncounted when it retires: a range in `ranges_in_flight`, a memory-relief
+/// item in `drains_in_flight`, and discovery by the `DiscoveryInFlight` state,
+/// its body, if any, then counted in `ranges_in_flight` like a range. The item
+/// that uncounts the last one with nothing left to issue (discovery itself,
+/// for an object with no ranges) claims completion with
+/// [`try_claim_completion`](Self::try_claim_completion) under the state lock
+/// and finalizes the destination after releasing it. `poll_work` issues work
+/// and parks; it never completes a transfer. Failure can be claimed from any
+/// path, through the transfer's `fail`.
 #[derive(Debug)]
 pub(crate) enum DownloadState {
     /// Waiting to start discovery
@@ -66,6 +83,12 @@ pub(crate) enum DownloadState {
         remaining: Option<std::ops::RangeInclusive<u64>>,
         /// Number of ranges currently in flight
         ranges_in_flight: usize,
+        /// Memory-relief items in flight: counted when `poll_work` issues one
+        /// and uncounted when it retires, after writing every run it claimed.
+        /// A claimed run is invisible to the terminal drain, so the transfer
+        /// completes only when this is zero. At most one is in flight, since
+        /// one item drains every drainable run.
+        drains_in_flight: u32,
         /// ETag for consistency (shared across all range requests)
         etag: Option<std::sync::Arc<str>>,
         /// Per-chunk size used to slice `remaining`. Normally the configured
@@ -109,7 +132,51 @@ impl DownloadState {
         *self = DownloadState::Terminal;
         pending
     }
+
+    /// Claims successful completion when nothing is left to issue and no work is in
+    /// flight, and enters `Terminal`.
+    ///
+    /// Returns `Some` at most once per transfer: from `Transferring` with no range
+    /// remaining, no range or memory-relief item in flight, and no pending claim,
+    /// after which the state is `Terminal`. Any other state returns `None` and is
+    /// left unchanged. The caller holds the state lock across the check and the
+    /// transition, and finalizes the destination only after releasing it.
+    ///
+    /// `remaining: None` implies `pending: None`: a claim waits in `pending` only
+    /// while its range is still in `remaining`, because `poll_work` commits a range
+    /// only once its slot is ready. The pattern matches `pending: None` to state the
+    /// full condition, so entering `Terminal` here never returns a claim to cancel.
+    pub(crate) fn try_claim_completion(&mut self) -> Option<CompletionClaim> {
+        let DownloadState::Transferring {
+            remaining: None,
+            ranges_in_flight: 0,
+            drains_in_flight: 0,
+            pending: None,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        let _no_claim = self.enter_terminal();
+        Some(CompletionClaim(()))
+    }
 }
+
+/// Proof that this caller claimed successful completion under the state lock.
+///
+/// Only [`DownloadState::try_claim_completion`] constructs it; `finalize_completion`
+/// consumes it. The private field keeps code outside this module from
+/// constructing one.
+///
+/// A claim taken while the transfer is active must be finalized. A claim taken
+/// after the transfer stopped being active is dropped instead, as
+/// `bail_if_terminal!` does: that can happen only between a cancellation's status
+/// change and its `on_terminal`, and the cancellation's terminal path already
+/// owns the destination. `fail` cannot open that window, because it changes the
+/// status and the state together under the state lock.
+#[must_use = "a completion claimed while active must be finalized after releasing the state lock"]
+#[derive(Debug)]
+pub(crate) struct CompletionClaim(());
 
 /// Read-ahead occupancy accounting: the numerator of the issuance gate.
 ///
@@ -190,8 +257,70 @@ impl OccupancyGate {
 
 #[cfg(test)]
 mod tests {
-    use super::{DownloadPendingReason, OccupancyGate};
+    use super::{DownloadPendingReason, DownloadState, OccupancyGate};
     use crate::transfer::PendingCategory;
+
+    /// A `Transferring` state with the given work outstanding and no pending claim.
+    fn transferring(
+        remaining: Option<std::ops::RangeInclusive<u64>>,
+        ranges_in_flight: usize,
+        drains_in_flight: u32,
+    ) -> DownloadState {
+        DownloadState::Transferring {
+            remaining,
+            ranges_in_flight,
+            drains_in_flight,
+            etag: None,
+            part_size: 8,
+            gate: OccupancyGate::default(),
+            pending: None,
+        }
+    }
+
+    /// Completion is not claimed while a range remains to issue, a range or a
+    /// drain is in flight, or the transfer is not transferring, and the state is
+    /// left as it was.
+    #[test]
+    fn completion_is_not_claimed_with_work_outstanding() {
+        let outstanding = [
+            ("a range remaining", transferring(Some(0..=7), 0, 0)),
+            ("a range in flight", transferring(None, 1, 0)),
+            ("a drain in flight", transferring(None, 0, 1)),
+        ];
+        for (what, mut state) in outstanding {
+            assert!(
+                state.try_claim_completion().is_none(),
+                "completion claimed with {what}"
+            );
+            assert!(
+                matches!(state, DownloadState::Transferring { .. }),
+                "state changed with {what}: {state:?}"
+            );
+        }
+
+        for mut state in [
+            DownloadState::PendingDiscovery,
+            DownloadState::DiscoveryInFlight,
+            DownloadState::Terminal,
+        ] {
+            let before = format!("{state:?}");
+            assert!(
+                state.try_claim_completion().is_none(),
+                "claimed from {before}"
+            );
+            assert_eq!(format!("{state:?}"), before);
+        }
+    }
+
+    /// With nothing remaining and nothing in flight, completion is claimed once,
+    /// and the claim leaves the state `Terminal`.
+    #[test]
+    fn completion_is_claimed_exactly_once() {
+        let mut state = transferring(None, 0, 0);
+        assert!(state.try_claim_completion().is_some());
+        assert!(matches!(state, DownloadState::Terminal));
+        assert!(state.try_claim_completion().is_none(), "claimed twice");
+    }
 
     #[test]
     fn gate_closes_at_window() {
@@ -251,6 +380,11 @@ mod tests {
                 DownloadPendingReason::RangeCompletion,
                 PendingCategory::InFlightWork,
                 "range_completion",
+            ),
+            (
+                DownloadPendingReason::DrainCompletion,
+                PendingCategory::InFlightWork,
+                "drain_completion",
             ),
         ];
 

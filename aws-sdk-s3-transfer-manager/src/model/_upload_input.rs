@@ -29,8 +29,6 @@ pub struct UploadInput {
     pub content_encoding: ::std::option::Option<::std::string::String>,
     /// <p>The language the content is in.</p>
     pub content_language: ::std::option::Option<::std::string::String>,
-    /// <p>Size of the body in bytes. This parameter is useful when the size of the body cannot be determined automatically. For more information, see <a href="https://www.rfc-editor.org/rfc/rfc9110.html#name-content-length">https://www.rfc-editor.org/rfc/rfc9110.html#name-content-length</a>.</p>
-    pub content_length: ::std::option::Option<i64>,
     /// <p>The Base64 encoded 128-bit <code>MD5</code> digest of the message (without the headers) according to RFC 1864. This header can be used as a message integrity check to verify that the data is the same data that was originally sent. Although it is optional, we recommend using the Content-MD5 mechanism as an end-to-end integrity check. For more information about REST request authentication, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/dev/RESTAuthentication.html">REST Authentication</a>.</p><note>
     /// <p>The <code>Content-MD5</code> or <code>x-amz-sdk-checksum-algorithm</code> header is required for any request to upload an object with a retention period configured using Amazon S3 Object Lock. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lock-managing.html#object-lock-put-object">Uploading objects to an Object Lock enabled bucket </a> in the <i>Amazon S3 User Guide</i>.</p>
     /// </note> <note>
@@ -164,6 +162,7 @@ pub struct UploadInput {
     /// <p>The account ID of the expected bucket owner. If the account ID that you provide does not match the actual owner of the bucket, the request fails with the HTTP status code <code>403 Forbidden</code> (access denied).</p>
     pub expected_bucket_owner: ::std::option::Option<::std::string::String>,
     /// <p>Object data.</p>
+    /// Required: building an upload without a body fails. To upload an empty object, pass an empty body such as [`InputStream::from_static(b"")`](crate::io::InputStream::from_static).
     #[cfg(not(s3_tm_out_of_tree))]
     pub body: crate::io::InputStream,
     /// Checksum calculation or precalculated checksum policy.
@@ -173,6 +172,9 @@ pub struct UploadInput {
     #[cfg(not(s3_tm_out_of_tree))]
     pub failed_multipart_upload_policy:
         ::std::option::Option<crate::types::FailedMultipartUploadPolicy>,
+    /// <p>Size of the body in bytes. This parameter is useful when the size of the body cannot be determined automatically. For more information, see <a href="https://www.rfc-editor.org/rfc/rfc9110.html#name-content-length">https://www.rfc-editor.org/rfc/rfc9110.html#name-content-length</a>.</p>
+    /// A transfer treats this as the exact size of the body. When set, the body must produce exactly this many bytes, and a mismatch fails the upload. A negative value, or one outside the body's [size hint](crate::io::InputStream::size_hint), fails when the upload is initiated. A [`PartStream`](crate::io::PartStream) body that runs past the value fails before the part that exceeds it is sent, and one that ends short of it fails before CompleteMultipartUpload is sent.
+    pub content_length: ::std::option::Option<i64>,
     /// <p>Specifies the KMS key ID (Key ID, Key ARN, or Key Alias) to use for object encryption. If the KMS key doesn't exist in the same account that's issuing the command, you must use the full Key ARN not the Key ID.</p>
     /// <p><b>General purpose buckets</b> - If you specify <code>x-amz-server-side-encryption</code> with <code>aws:kms</code> or <code>aws:kms:dsse</code>, this header specifies the ID (Key ID, Key ARN, or Key Alias) of the KMS key to use. If you specify <code>x-amz-server-side-encryption:aws:kms</code> or <code>x-amz-server-side-encryption:aws:kms:dsse</code>, but do not provide <code>x-amz-server-side-encryption-aws-kms-key-id</code>, Amazon S3 uses the Amazon Web Services managed key (<code>aws/s3</code>) to protect the data.</p>
     /// <p><b>Directory buckets</b> - To encrypt data using SSE-KMS, it's recommended to specify the <code>x-amz-server-side-encryption</code> header to <code>aws:kms</code>. Then, the <code>x-amz-server-side-encryption-aws-kms-key-id</code> header implicitly uses the bucket's default KMS customer managed key ID. If you want to explicitly set the <code> x-amz-server-side-encryption-aws-kms-key-id</code> header, it must match the bucket's default customer managed key (using key ID or ARN, not alias). Your SSE-KMS configuration can only support 1 <a href="https://docs.aws.amazon.com/kms/latest/developerguide/concepts.html#customer-cmk">customer managed key</a> per directory bucket's lifetime. The <a href="https://docs.aws.amazon.com/kms/latest/developerguide/concepts.html#aws-managed-cmk">Amazon Web Services managed key</a> (<code>aws/s3</code>) isn't supported. Incorrect key specification results in an HTTP <code>400 Bad Request</code> error.</p>
@@ -220,10 +222,6 @@ impl UploadInput {
     /// <p>The language the content is in.</p>
     pub fn content_language(&self) -> ::std::option::Option<&str> {
         self.content_language.as_deref()
-    }
-    /// <p>Size of the body in bytes. This parameter is useful when the size of the body cannot be determined automatically. For more information, see <a href="https://www.rfc-editor.org/rfc/rfc9110.html#name-content-length">https://www.rfc-editor.org/rfc/rfc9110.html#name-content-length</a>.</p>
-    pub fn content_length(&self) -> ::std::option::Option<i64> {
-        self.content_length
     }
     /// <p>The Base64 encoded 128-bit <code>MD5</code> digest of the message (without the headers) according to RFC 1864. This header can be used as a message integrity check to verify that the data is the same data that was originally sent. Although it is optional, we recommend using the Content-MD5 mechanism as an end-to-end integrity check. For more information about REST request authentication, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/dev/RESTAuthentication.html">REST Authentication</a>.</p><note>
     /// <p>The <code>Content-MD5</code> or <code>x-amz-sdk-checksum-algorithm</code> header is required for any request to upload an object with a retention period configured using Amazon S3 Object Lock. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lock-managing.html#object-lock-put-object">Uploading objects to an Object Lock enabled bucket </a> in the <i>Amazon S3 User Guide</i>.</p>
@@ -422,7 +420,6 @@ impl ::std::fmt::Debug for UploadInput {
         formatter.field("content_disposition", &self.content_disposition);
         formatter.field("content_encoding", &self.content_encoding);
         formatter.field("content_language", &self.content_language);
-        formatter.field("content_length", &self.content_length);
         formatter.field("content_md5", &self.content_md5);
         formatter.field("content_type", &self.content_type);
         formatter.field("expires", &self.expires);
@@ -462,6 +459,7 @@ impl ::std::fmt::Debug for UploadInput {
             "failed_multipart_upload_policy",
             &self.failed_multipart_upload_policy,
         );
+        formatter.field("content_length", &self.content_length);
         formatter.field("sse_kms_key_id", &"*** Sensitive Data Redacted ***");
         formatter.field(
             "sse_kms_encryption_context",
@@ -472,6 +470,7 @@ impl ::std::fmt::Debug for UploadInput {
 }
 impl crate::model::UploadInput {
     /// <p>Object data.</p>
+    /// Required: building an upload without a body fails. To upload an empty object, pass an empty body such as [`InputStream::from_static(b"")`](crate::io::InputStream::from_static).
     #[cfg(not(s3_tm_out_of_tree))]
     pub fn body(&self) -> &crate::io::InputStream {
         &self.body
@@ -489,6 +488,11 @@ impl crate::model::UploadInput {
         &self,
     ) -> ::std::option::Option<&crate::types::FailedMultipartUploadPolicy> {
         self.failed_multipart_upload_policy.as_ref()
+    }
+    /// <p>Size of the body in bytes. This parameter is useful when the size of the body cannot be determined automatically. For more information, see <a href="https://www.rfc-editor.org/rfc/rfc9110.html#name-content-length">https://www.rfc-editor.org/rfc/rfc9110.html#name-content-length</a>.</p>
+    /// A transfer treats this as the exact size of the body. When set, the body must produce exactly this many bytes, and a mismatch fails the upload. A negative value, or one outside the body's [size hint](crate::io::InputStream::size_hint), fails when the upload is initiated. A [`PartStream`](crate::io::PartStream) body that runs past the value fails before the part that exceeds it is sent, and one that ends short of it fails before CompleteMultipartUpload is sent.
+    pub fn content_length(&self) -> ::std::option::Option<i64> {
+        self.content_length
     }
     /// <p>Specifies the KMS key ID (Key ID, Key ARN, or Key Alias) to use for object encryption. If the KMS key doesn't exist in the same account that's issuing the command, you must use the full Key ARN not the Key ID.</p>
     /// <p><b>General purpose buckets</b> - If you specify <code>x-amz-server-side-encryption</code> with <code>aws:kms</code> or <code>aws:kms:dsse</code>, this header specifies the ID (Key ID, Key ARN, or Key Alias) of the KMS key to use. If you specify <code>x-amz-server-side-encryption:aws:kms</code> or <code>x-amz-server-side-encryption:aws:kms:dsse</code>, but do not provide <code>x-amz-server-side-encryption-aws-kms-key-id</code>, Amazon S3 uses the Amazon Web Services managed key (<code>aws/s3</code>) to protect the data.</p>
@@ -526,7 +530,6 @@ pub struct UploadInputBuilder {
     pub(crate) content_disposition: ::std::option::Option<::std::string::String>,
     pub(crate) content_encoding: ::std::option::Option<::std::string::String>,
     pub(crate) content_language: ::std::option::Option<::std::string::String>,
-    pub(crate) content_length: ::std::option::Option<i64>,
     pub(crate) content_md5: ::std::option::Option<::std::string::String>,
     pub(crate) content_type: ::std::option::Option<::std::string::String>,
     pub(crate) expires: ::std::option::Option<::aws_smithy_types::DateTime>,
@@ -561,6 +564,7 @@ pub struct UploadInputBuilder {
     #[cfg(not(s3_tm_out_of_tree))]
     pub(crate) failed_multipart_upload_policy:
         ::std::option::Option<crate::types::FailedMultipartUploadPolicy>,
+    pub(crate) content_length: ::std::option::Option<i64>,
     pub(crate) sse_kms_key_id: ::std::option::Option<::std::string::String>,
     pub(crate) sse_kms_encryption_context: ::std::option::Option<::std::string::String>,
 }
@@ -715,20 +719,6 @@ impl UploadInputBuilder {
     /// <p>The language the content is in.</p>
     pub fn get_content_language(&self) -> &::std::option::Option<::std::string::String> {
         &self.content_language
-    }
-    /// <p>Size of the body in bytes. This parameter is useful when the size of the body cannot be determined automatically. For more information, see <a href="https://www.rfc-editor.org/rfc/rfc9110.html#name-content-length">https://www.rfc-editor.org/rfc/rfc9110.html#name-content-length</a>.</p>
-    pub fn content_length(mut self, input: i64) -> Self {
-        self.content_length = ::std::option::Option::Some(input);
-        self
-    }
-    /// <p>Size of the body in bytes. This parameter is useful when the size of the body cannot be determined automatically. For more information, see <a href="https://www.rfc-editor.org/rfc/rfc9110.html#name-content-length">https://www.rfc-editor.org/rfc/rfc9110.html#name-content-length</a>.</p>
-    pub fn set_content_length(mut self, input: ::std::option::Option<i64>) -> Self {
-        self.content_length = input;
-        self
-    }
-    /// <p>Size of the body in bytes. This parameter is useful when the size of the body cannot be determined automatically. For more information, see <a href="https://www.rfc-editor.org/rfc/rfc9110.html#name-content-length">https://www.rfc-editor.org/rfc/rfc9110.html#name-content-length</a>.</p>
-    pub fn get_content_length(&self) -> &::std::option::Option<i64> {
-        &self.content_length
     }
     /// <p>The Base64 encoded 128-bit <code>MD5</code> digest of the message (without the headers) according to RFC 1864. This header can be used as a message integrity check to verify that the data is the same data that was originally sent. Although it is optional, we recommend using the Content-MD5 mechanism as an end-to-end integrity check. For more information about REST request authentication, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/dev/RESTAuthentication.html">REST Authentication</a>.</p><note>
     /// <p>The <code>Content-MD5</code> or <code>x-amz-sdk-checksum-algorithm</code> header is required for any request to upload an object with a retention period configured using Amazon S3 Object Lock. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lock-managing.html#object-lock-put-object">Uploading objects to an Object Lock enabled bucket </a> in the <i>Amazon S3 User Guide</i>.</p>
@@ -1414,18 +1404,21 @@ impl UploadInputBuilder {
         &self.expected_bucket_owner
     }
     /// <p>Object data.</p>
+    /// Required: building an upload without a body fails. To upload an empty object, pass an empty body such as [`InputStream::from_static(b"")`](crate::io::InputStream::from_static).
     #[cfg(not(s3_tm_out_of_tree))]
     pub fn body(mut self, input: crate::io::InputStream) -> Self {
         self.body = ::std::option::Option::Some(input);
         self
     }
     /// <p>Object data.</p>
+    /// Required: building an upload without a body fails. To upload an empty object, pass an empty body such as [`InputStream::from_static(b"")`](crate::io::InputStream::from_static).
     #[cfg(not(s3_tm_out_of_tree))]
     pub fn set_body(mut self, input: ::std::option::Option<crate::io::InputStream>) -> Self {
         self.body = input;
         self
     }
     /// <p>Object data.</p>
+    /// Required: building an upload without a body fails. To upload an empty object, pass an empty body such as [`InputStream::from_static(b"")`](crate::io::InputStream::from_static).
     #[cfg(not(s3_tm_out_of_tree))]
     pub fn get_body(&self) -> &::std::option::Option<crate::io::InputStream> {
         &self.body
@@ -1476,6 +1469,23 @@ impl UploadInputBuilder {
         &self,
     ) -> &::std::option::Option<crate::types::FailedMultipartUploadPolicy> {
         &self.failed_multipart_upload_policy
+    }
+    /// <p>Size of the body in bytes. This parameter is useful when the size of the body cannot be determined automatically. For more information, see <a href="https://www.rfc-editor.org/rfc/rfc9110.html#name-content-length">https://www.rfc-editor.org/rfc/rfc9110.html#name-content-length</a>.</p>
+    /// A transfer treats this as the exact size of the body. When set, the body must produce exactly this many bytes, and a mismatch fails the upload. A negative value, or one outside the body's [size hint](crate::io::InputStream::size_hint), fails when the upload is initiated. A [`PartStream`](crate::io::PartStream) body that runs past the value fails before the part that exceeds it is sent, and one that ends short of it fails before CompleteMultipartUpload is sent.
+    pub fn content_length(mut self, input: i64) -> Self {
+        self.content_length = ::std::option::Option::Some(input);
+        self
+    }
+    /// <p>Size of the body in bytes. This parameter is useful when the size of the body cannot be determined automatically. For more information, see <a href="https://www.rfc-editor.org/rfc/rfc9110.html#name-content-length">https://www.rfc-editor.org/rfc/rfc9110.html#name-content-length</a>.</p>
+    /// A transfer treats this as the exact size of the body. When set, the body must produce exactly this many bytes, and a mismatch fails the upload. A negative value, or one outside the body's [size hint](crate::io::InputStream::size_hint), fails when the upload is initiated. A [`PartStream`](crate::io::PartStream) body that runs past the value fails before the part that exceeds it is sent, and one that ends short of it fails before CompleteMultipartUpload is sent.
+    pub fn set_content_length(mut self, input: ::std::option::Option<i64>) -> Self {
+        self.content_length = input;
+        self
+    }
+    /// <p>Size of the body in bytes. This parameter is useful when the size of the body cannot be determined automatically. For more information, see <a href="https://www.rfc-editor.org/rfc/rfc9110.html#name-content-length">https://www.rfc-editor.org/rfc/rfc9110.html#name-content-length</a>.</p>
+    /// A transfer treats this as the exact size of the body. When set, the body must produce exactly this many bytes, and a mismatch fails the upload. A negative value, or one outside the body's [size hint](crate::io::InputStream::size_hint), fails when the upload is initiated. A [`PartStream`](crate::io::PartStream) body that runs past the value fails before the part that exceeds it is sent, and one that ends short of it fails before CompleteMultipartUpload is sent.
+    pub fn get_content_length(&self) -> &::std::option::Option<i64> {
+        &self.content_length
     }
     /// <p>Specifies the KMS key ID (Key ID, Key ARN, or Key Alias) to use for object encryption. If the KMS key doesn't exist in the same account that's issuing the command, you must use the full Key ARN not the Key ID.</p>
     /// <p><b>General purpose buckets</b> - If you specify <code>x-amz-server-side-encryption</code> with <code>aws:kms</code> or <code>aws:kms:dsse</code>, this header specifies the ID (Key ID, Key ARN, or Key Alias) of the KMS key to use. If you specify <code>x-amz-server-side-encryption:aws:kms</code> or <code>x-amz-server-side-encryption:aws:kms:dsse</code>, but do not provide <code>x-amz-server-side-encryption-aws-kms-key-id</code>, Amazon S3 uses the Amazon Web Services managed key (<code>aws/s3</code>) to protect the data.</p>
@@ -1543,7 +1553,6 @@ impl UploadInputBuilder {
             content_disposition: self.content_disposition,
             content_encoding: self.content_encoding,
             content_language: self.content_language,
-            content_length: self.content_length,
             content_md5: self.content_md5,
             content_type: self.content_type,
             expires: self.expires,
@@ -1569,11 +1578,12 @@ impl UploadInputBuilder {
             object_lock_legal_hold_status: self.object_lock_legal_hold_status,
             expected_bucket_owner: self.expected_bucket_owner,
             #[cfg(not(s3_tm_out_of_tree))]
-            body: self.body.unwrap_or_default(),
+            body: self.body.expect("body must be set"),
             #[cfg(not(s3_tm_out_of_tree))]
             checksum_strategy: self.checksum_strategy,
             #[cfg(not(s3_tm_out_of_tree))]
             failed_multipart_upload_policy: self.failed_multipart_upload_policy,
+            content_length: self.content_length,
             sse_kms_key_id: self.sse_kms_key_id,
             sse_kms_encryption_context: self.sse_kms_encryption_context,
         })
@@ -1588,7 +1598,6 @@ impl ::std::fmt::Debug for UploadInputBuilder {
         formatter.field("content_disposition", &self.content_disposition);
         formatter.field("content_encoding", &self.content_encoding);
         formatter.field("content_language", &self.content_language);
-        formatter.field("content_length", &self.content_length);
         formatter.field("content_md5", &self.content_md5);
         formatter.field("content_type", &self.content_type);
         formatter.field("expires", &self.expires);
@@ -1628,6 +1637,7 @@ impl ::std::fmt::Debug for UploadInputBuilder {
             "failed_multipart_upload_policy",
             &self.failed_multipart_upload_policy,
         );
+        formatter.field("content_length", &self.content_length);
         formatter.field("sse_kms_key_id", &"*** Sensitive Data Redacted ***");
         formatter.field(
             "sse_kms_encryption_context",
@@ -1658,6 +1668,15 @@ impl UploadInputBuilder {
             return Err(
                 ::aws_smithy_types::error::operation::BuildError::missing_field(
                     "key",
+                    "A required field was not set",
+                ),
+            );
+        }
+        #[cfg(not(s3_tm_out_of_tree))]
+        if self.body.is_none() {
+            return Err(
+                ::aws_smithy_types::error::operation::BuildError::missing_field(
+                    "body",
                     "A required field was not set",
                 ),
             );

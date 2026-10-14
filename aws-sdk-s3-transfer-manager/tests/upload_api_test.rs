@@ -35,7 +35,10 @@ use bytes::Bytes;
 #[test]
 fn operation_exports_are_the_canonical_modeled_types_and_builders() {
     let builder: upload::UploadInputBuilder = model::UploadInput::builder();
-    let builder: model::builders::UploadInputBuilder = builder.bucket("bucket").key("key");
+    let builder: model::builders::UploadInputBuilder = builder
+        .bucket("bucket")
+        .key("key")
+        .body(InputStream::from_static(b""));
     assert_eq!(builder.get_bucket(), &Some("bucket".to_owned()));
     let input: upload::UploadInput = builder.build().unwrap();
     let input: model::UploadInput = input;

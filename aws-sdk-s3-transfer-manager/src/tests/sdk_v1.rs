@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+use crate::io::InputStream;
 use crate::{model, sdk_v1::*};
 use aws_smithy_types::DateTime;
 
@@ -10,6 +11,7 @@ fn upload() -> model::UploadInput {
     model::UploadInput::builder()
         .bucket("bucket")
         .key("key")
+        .body(InputStream::from_static(b""))
         .request_payer(model::RequestPayer::Requester)
         .expected_bucket_owner("owner")
         .sse_customer_algorithm("AES256")
@@ -450,6 +452,7 @@ fn upload_ordinary_fields_preserve_wire_values_and_tm_spellings() {
     let input = model::UploadInput::builder()
         .bucket("bucket")
         .key("key")
+        .body(InputStream::from_static(b""))
         .acl(model::ObjectCannedAcl::from("FUTURE_ACL"))
         .cache_control("no-cache")
         .content_disposition("attachment")
@@ -559,11 +562,13 @@ fn upload_field_copy_distinguishes_absent_values_from_explicit_empty_and_false()
     let absent = model::UploadInput::builder()
         .bucket("bucket")
         .key("key")
+        .body(InputStream::from_static(b""))
         .build()
         .unwrap();
     let empty = model::UploadInput::builder()
         .bucket("bucket")
         .key("key")
+        .body(InputStream::from_static(b""))
         .bucket_key_enabled(false)
         .set_metadata(Some(Default::default()))
         .tagging("")

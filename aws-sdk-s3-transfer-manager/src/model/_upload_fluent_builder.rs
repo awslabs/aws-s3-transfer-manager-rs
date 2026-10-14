@@ -150,20 +150,6 @@ impl crate::operation::upload::builders::UploadFluentBuilder {
     pub fn get_content_language(&self) -> &::std::option::Option<::std::string::String> {
         self.inner.get_content_language()
     }
-    /// <p>Size of the body in bytes. This parameter is useful when the size of the body cannot be determined automatically. For more information, see <a href="https://www.rfc-editor.org/rfc/rfc9110.html#name-content-length">https://www.rfc-editor.org/rfc/rfc9110.html#name-content-length</a>.</p>
-    pub fn content_length(mut self, input: i64) -> Self {
-        self.inner = self.inner.content_length(input);
-        self
-    }
-    /// <p>Size of the body in bytes. This parameter is useful when the size of the body cannot be determined automatically. For more information, see <a href="https://www.rfc-editor.org/rfc/rfc9110.html#name-content-length">https://www.rfc-editor.org/rfc/rfc9110.html#name-content-length</a>.</p>
-    pub fn set_content_length(mut self, input: ::std::option::Option<i64>) -> Self {
-        self.inner = self.inner.set_content_length(input);
-        self
-    }
-    /// <p>Size of the body in bytes. This parameter is useful when the size of the body cannot be determined automatically. For more information, see <a href="https://www.rfc-editor.org/rfc/rfc9110.html#name-content-length">https://www.rfc-editor.org/rfc/rfc9110.html#name-content-length</a>.</p>
-    pub fn get_content_length(&self) -> &::std::option::Option<i64> {
-        self.inner.get_content_length()
-    }
     /// <p>The Base64 encoded 128-bit <code>MD5</code> digest of the message (without the headers) according to RFC 1864. This header can be used as a message integrity check to verify that the data is the same data that was originally sent. Although it is optional, we recommend using the Content-MD5 mechanism as an end-to-end integrity check. For more information about REST request authentication, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/dev/RESTAuthentication.html">REST Authentication</a>.</p><note>
     /// <p>The <code>Content-MD5</code> or <code>x-amz-sdk-checksum-algorithm</code> header is required for any request to upload an object with a retention period configured using Amazon S3 Object Lock. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lock-managing.html#object-lock-put-object">Uploading objects to an Object Lock enabled bucket </a> in the <i>Amazon S3 User Guide</i>.</p>
     /// </note> <note>
@@ -846,16 +832,19 @@ impl crate::operation::upload::builders::UploadFluentBuilder {
         self.inner.get_expected_bucket_owner()
     }
     /// <p>Object data.</p>
+    /// Required: building an upload without a body fails. To upload an empty object, pass an empty body such as [`InputStream::from_static(b"")`](crate::io::InputStream::from_static).
     pub fn body(mut self, input: crate::io::InputStream) -> Self {
         self.inner = self.inner.body(input);
         self
     }
     /// <p>Object data.</p>
+    /// Required: building an upload without a body fails. To upload an empty object, pass an empty body such as [`InputStream::from_static(b"")`](crate::io::InputStream::from_static).
     pub fn set_body(mut self, input: ::std::option::Option<crate::io::InputStream>) -> Self {
         self.inner = self.inner.set_body(input);
         self
     }
     /// <p>Object data.</p>
+    /// Required: building an upload without a body fails. To upload an empty object, pass an empty body such as [`InputStream::from_static(b"")`](crate::io::InputStream::from_static).
     pub fn get_body(&self) -> &::std::option::Option<crate::io::InputStream> {
         self.inner.get_body()
     }
@@ -899,6 +888,23 @@ impl crate::operation::upload::builders::UploadFluentBuilder {
         &self,
     ) -> &::std::option::Option<crate::types::FailedMultipartUploadPolicy> {
         self.inner.get_failed_multipart_upload_policy()
+    }
+    /// <p>Size of the body in bytes. This parameter is useful when the size of the body cannot be determined automatically. For more information, see <a href="https://www.rfc-editor.org/rfc/rfc9110.html#name-content-length">https://www.rfc-editor.org/rfc/rfc9110.html#name-content-length</a>.</p>
+    /// A transfer treats this as the exact size of the body. When set, the body must produce exactly this many bytes, and a mismatch fails the upload. A negative value, or one outside the body's [size hint](crate::io::InputStream::size_hint), fails when the upload is initiated. A [`PartStream`](crate::io::PartStream) body that runs past the value fails before the part that exceeds it is sent, and one that ends short of it fails before CompleteMultipartUpload is sent.
+    pub fn content_length(mut self, input: i64) -> Self {
+        self.inner = self.inner.content_length(input);
+        self
+    }
+    /// <p>Size of the body in bytes. This parameter is useful when the size of the body cannot be determined automatically. For more information, see <a href="https://www.rfc-editor.org/rfc/rfc9110.html#name-content-length">https://www.rfc-editor.org/rfc/rfc9110.html#name-content-length</a>.</p>
+    /// A transfer treats this as the exact size of the body. When set, the body must produce exactly this many bytes, and a mismatch fails the upload. A negative value, or one outside the body's [size hint](crate::io::InputStream::size_hint), fails when the upload is initiated. A [`PartStream`](crate::io::PartStream) body that runs past the value fails before the part that exceeds it is sent, and one that ends short of it fails before CompleteMultipartUpload is sent.
+    pub fn set_content_length(mut self, input: ::std::option::Option<i64>) -> Self {
+        self.inner = self.inner.set_content_length(input);
+        self
+    }
+    /// <p>Size of the body in bytes. This parameter is useful when the size of the body cannot be determined automatically. For more information, see <a href="https://www.rfc-editor.org/rfc/rfc9110.html#name-content-length">https://www.rfc-editor.org/rfc/rfc9110.html#name-content-length</a>.</p>
+    /// A transfer treats this as the exact size of the body. When set, the body must produce exactly this many bytes, and a mismatch fails the upload. A negative value, or one outside the body's [size hint](crate::io::InputStream::size_hint), fails when the upload is initiated. A [`PartStream`](crate::io::PartStream) body that runs past the value fails before the part that exceeds it is sent, and one that ends short of it fails before CompleteMultipartUpload is sent.
+    pub fn get_content_length(&self) -> &::std::option::Option<i64> {
+        self.inner.get_content_length()
     }
     /// <p>Specifies the KMS key ID (Key ID, Key ARN, or Key Alias) to use for object encryption. If the KMS key doesn't exist in the same account that's issuing the command, you must use the full Key ARN not the Key ID.</p>
     /// <p><b>General purpose buckets</b> - If you specify <code>x-amz-server-side-encryption</code> with <code>aws:kms</code> or <code>aws:kms:dsse</code>, this header specifies the ID (Key ID, Key ARN, or Key Alias) of the KMS key to use. If you specify <code>x-amz-server-side-encryption:aws:kms</code> or <code>x-amz-server-side-encryption:aws:kms:dsse</code>, but do not provide <code>x-amz-server-side-encryption-aws-kms-key-id</code>, Amazon S3 uses the Amazon Web Services managed key (<code>aws/s3</code>) to protect the data.</p>

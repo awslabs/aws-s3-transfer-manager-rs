@@ -76,6 +76,22 @@ pub(crate) struct MockTm {
     pub(crate) client: TmClient,
 }
 
+impl MockTm {
+    /// Returns the bytes the mock server stores for `bucket`/`key`, read from its storage rather
+    /// than through a GetObject request.
+    ///
+    /// Panics if no object is stored there or storage cannot be read.
+    pub(crate) async fn stored_object(&self, bucket: &str, key: &str) -> Vec<u8> {
+        self.server
+            .get_object(bucket, key)
+            .await
+            .expect("read object from mock storage")
+            .unwrap_or_else(|| panic!("no object stored at {bucket}/{key}"))
+            .body
+            .to_vec()
+    }
+}
+
 /// Build a mock TM on the given runtime with default config.
 pub(crate) async fn mock_tm(runtime: RuntimeMode) -> MockTm {
     mock_tm_with(runtime, |b| b).await

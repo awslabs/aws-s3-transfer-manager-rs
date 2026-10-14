@@ -127,7 +127,7 @@ mod tests {
         assert_eq!(input.body().0, vec![1, 2, 3]);
         assert_eq!(input.additional_upload(), Some("added"));
         assert_eq!(input.additional_labels(), &["first", "second"]);
-        let input = UploadFluentBuilder::default()
+        let builder = UploadFluentBuilder::default()
             .bucket("bucket")
             .key("key")
             .set_metadata(None)
@@ -135,9 +135,9 @@ mod tests {
             .set_additional_labels(None)
             .set_body(None)
             .set_checksum_strategy(None)
-            .set_failed_multipart_upload_policy(None)
-            .build()
-            .unwrap();
+            .set_failed_multipart_upload_policy(None);
+        assert!(builder.get_body().is_none());
+        let input = builder.body(InputStream(Vec::new())).build().unwrap();
         assert!(input.metadata().is_none());
         assert!(input.additional_upload().is_none());
         assert!(input.additional_labels().is_empty());
@@ -183,14 +183,7 @@ mod tests {
         assert!(builder.get_body().is_none());
         assert!(builder.get_checksum_strategy().is_none());
         assert!(builder.get_failed_multipart_upload_policy().is_none());
-        assert!(builder
-            .bucket("bucket")
-            .key("key")
-            .build()
-            .unwrap()
-            .body()
-            .0
-            .is_empty());
+        assert!(builder.bucket("bucket").key("key").build().is_err());
     }
 
     #[test]

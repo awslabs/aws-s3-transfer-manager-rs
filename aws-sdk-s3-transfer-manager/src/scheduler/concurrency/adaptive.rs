@@ -489,6 +489,9 @@ impl ConcurrencyController for AdaptiveConcurrencyController {
     }
 
     fn on_completion(&self, sample: Option<&CompletionSample>) {
+        // TODO(msrv): `fetch_update` is deprecated from Rust 1.99 in favour of `try_update`,
+        // which is stable from 1.95. Switch to `try_update` once the MSRV is 1.95 or later.
+        #[allow(deprecated)]
         let _ = self
             .in_flight
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {

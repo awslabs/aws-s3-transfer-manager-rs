@@ -977,6 +977,9 @@ fn saturating_add(counter: &AtomicU64, value: u64) {
     if value == 0 {
         return;
     }
+    // TODO(msrv): `fetch_update` is deprecated from Rust 1.99 in favour of `try_update`,
+    // which is stable from 1.95. Switch to `try_update` once the MSRV is 1.95 or later.
+    #[allow(deprecated)]
     let _ = counter.fetch_update(
         DiagnosticOrdering::Relaxed,
         DiagnosticOrdering::Relaxed,

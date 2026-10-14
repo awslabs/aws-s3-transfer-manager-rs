@@ -130,9 +130,22 @@ class MemberPolicy(private val source: Model, private val sourceSymbols: RustSym
         val put = source.expectShape(TmModelProjection.id("PutObjectRequest"), StructureShape::class.java)
         val body = put.getMember("Body").orElseThrow()
         put(put.id, listOf(
-            runtime("body", inputStream, Construction.DEFAULT, "Object data.").copy(sourceMember = body),
+            runtime("body", inputStream, Construction.REQUIRED,
+                "Required: building an upload without a body fails. To upload an empty object, pass an " +
+                    "empty body such as [`InputStream::from_static(b\"\")`]"
+                    + "(crate::io::InputStream::from_static).").copy(sourceMember = body),
             runtime("checksum_strategy", checksum, Construction.OPTIONAL, "Checksum calculation or precalculated checksum policy."),
             runtime("failed_multipart_upload_policy", failedUpload, Construction.OPTIONAL, "How to handle a failed multipart upload."),
+            // S3 documents ContentLength as a hint; a transfer holds the body to it exactly.
+            modeled(put.getMember("ContentLength").orElseThrow(), "content_length").copy(
+                documentation =
+                    "A transfer treats this as the exact size of the body. When set, the body must produce " +
+                        "exactly this many bytes, and a mismatch fails the upload. A negative value, or one " +
+                        "outside the body's [size hint](crate::io::InputStream::size_hint), fails when the " +
+                        "upload is initiated. A [`PartStream`](crate::io::PartStream) body that runs past the " +
+                        "value fails before the part that exceeds it is sent, and one that ends short of it " +
+                        "fails before CompleteMultipartUpload is sent.",
+            ),
         ) + put.members().mapNotNull {
             when (it.memberName) {
                 "SSEKMSKeyId" -> modeled(it, "sse_kms_key_id")
@@ -230,7 +243,7 @@ class MemberPolicy(private val source: Model, private val sourceSymbols: RustSym
         if (field.sourceMember != null) {
             documentShape(field.sourceMember, source)
             deprecatedShape(field.sourceMember)
-            if (field.runtime == null && field.documentation.isNotEmpty()) docs(field.documentation)
+            if (field.documentation.isNotEmpty()) docs(field.documentation)
         } else {
             docs(field.documentation)
         }
