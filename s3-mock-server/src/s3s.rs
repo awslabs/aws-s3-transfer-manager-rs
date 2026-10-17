@@ -370,6 +370,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         let key = &input.key;
         tracing::trace!(%bucket, %key, "GetObject");
         check_bucket(&self.storage, bucket).await?;
+        check_part_number_request(input.part_number, input.range.is_some())?;
 
         // Get metadata first to validate range
         let metadata = match self.storage.head_object(bucket, key).await? {
@@ -392,25 +393,12 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             })
             .transpose()?;
 
-        // A partNumber GET returns exactly that stored part's bytes. Translate it
-        // to the part's byte range; the range path below then returns the part's
-        // data, Content-Range, and per-part checksum. parts_count is set on the
-        // response so callers learn the stored part count.
-        // For a non-multipart (single-PUT) object there are no stored parts:
-        // partNumber=1 returns the whole object, any higher number errors.
+        // A partNumber GET returns exactly that part's bytes: the range path below then
+        // returns the part's data and Content-Range, and `apply_part_checksums` reports its
+        // checksum. parts_count is set on the response so callers learn the stored part count.
         let parts_count = metadata.parts_count();
-        if let Some(pn) = input.part_number {
-            if parts_count == 0 {
-                if pn != 1 {
-                    return Err(Error::InvalidPartNumber.into());
-                }
-                // pn == 1, single-PUT: leave range as-is (whole object).
-            } else {
-                match metadata.part_range(pn) {
-                    Some(r) => range = Some(r),
-                    None => return Err(Error::InvalidPartNumber.into()),
-                }
-            }
+        if let Some(part_number) = input.part_number {
+            range = part_number_range(&metadata, part_number)?;
         }
 
         // Get object stream with validated range
@@ -424,10 +412,16 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             None => return Err(Error::NoSuchKey.into()),
         };
 
-        let (stream, stream_metadata) = (response.stream, response.metadata);
+        let (stream, mut stream_metadata) = (response.stream, response.metadata);
         // The object can be replaced between the lookup above and this read: the condition must
         // also hold for the object whose data is returned.
         check_if_match(input.if_match.as_ref(), &stream_metadata)?;
+        if let Some(part_number) = input.part_number {
+            stream_metadata.apply_part_checksums(part_number);
+        }
+        if omits_part_checksums(&metadata, input.part_number, range.as_ref()) {
+            stream_metadata.clear_checksums();
+        }
 
         let mut output = s3s::dto::GetObjectOutput::default();
 
@@ -468,7 +462,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         output.checksum_crc64nvme = stream_metadata.crc64nvme;
 
         // A partNumber GET reports the object's stored part count.
-        if input.part_number.is_some() && parts_count > 1 {
+        if input.part_number.is_some() && parts_count > 0 {
             output.parts_count = Some(parts_count as i32);
         }
 
@@ -514,6 +508,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         let key = &input.key;
         tracing::trace!(%bucket, %key, "HeadObject");
         check_bucket(&self.storage, bucket).await?;
+        check_part_number_request(input.part_number, input.range.is_some())?;
 
         // Get object metadata from storage
         let mut metadata = match self.storage.head_object(bucket, key).await? {
@@ -526,7 +521,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         // length and `Content-Range` names the offsets, which is the only thing that
         // tells a caller WHERE a suffix or open-ended range landed. Checksums follow
         // the same rule as a ranged GET.
-        let range = input
+        let mut range = input
             .range
             .as_ref()
             .map(|range_dto| {
@@ -535,12 +530,23 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
                     .map_err(|_| Error::InvalidRange)
             })
             .transpose()?;
+        // A partNumber HEAD describes the part that a partNumber GET returns.
+        let parts_count = metadata.parts_count();
+        if let Some(part_number) = input.part_number {
+            range = part_number_range(&metadata, part_number)?;
+        }
         let content_range = range
             .as_ref()
             .map(|r| content_range_header(r, metadata.content_length));
         let checksum_type = stored_checksum_type(&metadata);
-        if let Some(r) = range.as_ref() {
-            metadata.apply_range_checksums(r.start, r.end);
+        let omit_checksums = omits_part_checksums(&metadata, input.part_number, range.as_ref());
+        match (input.part_number, range.as_ref()) {
+            (Some(part_number), _) => metadata.apply_part_checksums(part_number),
+            (None, Some(r)) => metadata.apply_range_checksums(r.start, r.end),
+            (None, None) => {}
+        }
+        if omit_checksums {
+            metadata.clear_checksums();
         }
 
         // Build response
@@ -573,6 +579,9 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         output.content_disposition = metadata.content_disposition.map(|s| s.parse().unwrap());
         output.content_language = metadata.content_language.map(|s| s.parse().unwrap());
         output.restore = metadata.restore_status.map(restore_header);
+        if input.part_number.is_some() && parts_count > 0 {
+            output.parts_count = Some(parts_count as i32);
+        }
         // As in S3, checksums are returned only in checksum mode.
         if !checksum_mode_enabled(input.checksum_mode.as_ref()) {
             output.checksum_crc32 = None;
@@ -1257,6 +1266,54 @@ fn list_entry(obj: crate::storage::ObjectInfo, include_restore_status: bool) -> 
         key: Some(obj.key),
         ..Default::default()
     }
+}
+
+/// Fail a GetObject or HeadObject whose `partNumber` S3 rejects before looking up the object:
+/// with a `Range` (400 InvalidRequest), or outside 1 to 10,000 (400 InvalidArgument).
+fn check_part_number_request(part_number: Option<i32>, has_range: bool) -> crate::Result<()> {
+    match part_number {
+        Some(_) if has_range => Err(Error::InvalidRequest(
+            "Cannot specify both Range header and partNumber query parameter",
+        )),
+        Some(part_number) if !(1..=10_000).contains(&part_number) => Err(Error::InvalidArgument(
+            "Part number must be an integer between 1 and 10000, inclusive",
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// The byte range of part `part_number` of an object, for a partNumber GetObject or HeadObject.
+/// S3 treats an object uploaded in one request as a single part, so partNumber=1 selects the
+/// whole object as a range, except for an empty object, which has no range. A part number the
+/// object does not have fails with 416 InvalidPartNumber.
+fn part_number_range(
+    metadata: &ObjectMetadata,
+    part_number: i32,
+) -> crate::Result<Option<std::ops::Range<u64>>> {
+    if metadata.parts_count() == 0 && part_number == 1 {
+        Ok((metadata.content_length > 0).then_some(0..metadata.content_length))
+    } else {
+        metadata
+            .part_range(part_number)
+            .map(Some)
+            .ok_or(Error::InvalidPartNumber)
+    }
+}
+
+/// Whether a GetObject or HeadObject of part of `metadata`'s object (a `part_number`, or a
+/// `range` other than the whole object) returns no checksum: S3 returns none for the parts of a
+/// multipart object with a full-object checksum.
+fn omits_part_checksums(
+    metadata: &ObjectMetadata,
+    part_number: Option<i32>,
+    range: Option<&std::ops::Range<u64>>,
+) -> bool {
+    let partial = part_number.is_some()
+        || range.is_some_and(|range| range.start != 0 || range.end != metadata.content_length);
+    partial
+        && !metadata.parts.is_empty()
+        && stored_checksum_type(metadata)
+            .is_some_and(|t| t.as_str() == s3s::dto::ChecksumType::FULL_OBJECT)
 }
 
 /// Fail a request whose digest headers are malformed before its body is read, as S3 does: a

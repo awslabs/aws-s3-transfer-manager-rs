@@ -749,8 +749,12 @@ async fn tampered_many_part_file_cleans_up(target: Target) {
     let dest = dir.path().join("dest.bin");
     let _ = write_pattern_file(&src, many_part_len());
 
-    t.put_from_path("obj", &src, ChecksumStrategy::with_calculated_crc32())
-        .await;
+    t.put_from_path(
+        "obj",
+        &src,
+        ChecksumStrategy::with_calculated_crc32_composite_if_multipart(),
+    )
+    .await;
 
     let mock = t.mock().expect("tamper faults require the mock backend");
     // Skip the first 8 chunks so several parts flush to the temp before the
@@ -866,8 +870,12 @@ async fn tampered_multipart_errors(target: Target) {
     // a per-part checksum the SDK validates, so a tampered checksum fails.
     let t = target.connect_with(Some(ALIGNED_PART_SIZE)).await;
     let data = multipart_data();
-    t.put("obj", data, ChecksumStrategy::with_calculated_crc32())
-        .await;
+    t.put(
+        "obj",
+        data,
+        ChecksumStrategy::with_calculated_crc32_composite_if_multipart(),
+    )
+    .await;
 
     let mock = t.mock().expect("tamper faults require the mock backend");
     // Fail every chunk for a deterministic transfer outcome.
@@ -942,8 +950,12 @@ async fn multipart_aligned_round_trips_real_express() {
 async fn multipart_default_tamper_caught(target: Target) {
     let t = target.connect().await; // default (Auto) part size -> auto-aligned
     let data = multipart_data();
-    t.put("obj", data, ChecksumStrategy::with_calculated_crc32())
-        .await;
+    t.put(
+        "obj",
+        data,
+        ChecksumStrategy::with_calculated_crc32_composite_if_multipart(),
+    )
+    .await;
 
     let mock = t.mock().expect("requires the mock backend");
     mock.insert_fault(

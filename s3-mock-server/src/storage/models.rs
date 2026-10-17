@@ -183,6 +183,24 @@ impl ObjectMetadata {
         self.clear_checksums();
     }
 
+    /// Resolve the checksum headers for a partNumber GET or HEAD: a multipart object reports the
+    /// checksum of part `part_number`, even when that part is the whole object. An object
+    /// uploaded in one request keeps its checksum, as its single part.
+    pub(crate) fn apply_part_checksums(&mut self, part_number: i32) {
+        let part = usize::try_from(part_number)
+            .ok()
+            .and_then(|n| n.checked_sub(1))
+            .and_then(|index| self.parts.get(index))
+            .cloned();
+        if let Some(part) = part {
+            self.crc32 = part.crc32;
+            self.crc32c = part.crc32c;
+            self.crc64nvme = part.crc64nvme;
+            self.sha1 = part.sha1;
+            self.sha256 = part.sha256;
+        }
+    }
+
     /// Byte range `[start, end)` of the 1-based `part_number` for a completed
     /// multipart object, from the stored part boundaries. `None` if the object
     /// has no parts (single-PUT) or the part number is out of range. Matches S3's

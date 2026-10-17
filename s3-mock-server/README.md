@@ -160,6 +160,12 @@ GetObject and HeadObject omit `x-amz-storage-class` for `STANDARD` objects; List
 - Objects report their checksum type, on reads, writes and listings:
   COMPOSITE for a multipart object whose checksum combines its parts' checksums, FULL_OBJECT
   otherwise.
+- A GetObject or HeadObject with `partNumber` returns or describes that part, with its
+  `Content-Range`; an object uploaded in one request is a single part. A HeadObject with a `Range`
+  describes the range. HeadObject is always answered 200, where S3 answers 206 for a part or a
+  range.
+- A GetObject or HeadObject of part of a multipart object with a full-object checksum, by
+  `partNumber` or by a range, returns no checksum, as S3 general purpose buckets do.
 
 ### Listing
 

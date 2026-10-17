@@ -3,8 +3,11 @@
 
 //! Integration tests for S3 checksum compliance
 
+mod common;
+
 use aws_sdk_s3::types::{ChecksumAlgorithm, ChecksumMode, CompletedMultipartUpload, CompletedPart};
 use bytes::Bytes;
+use common::{assert_failure, failure};
 use s3_mock_server::S3MockServer;
 use uuid::Uuid;
 
@@ -1115,15 +1118,43 @@ async fn run_part_number_get_fidelity(storage_type: StorageType) -> Result<()> {
     let body = r.body.collect().await?.to_vec();
     assert_eq!(body, part3, "tail part bytes");
 
-    // Out-of-range part number → error (not a panic, not wrong data).
-    let err = s3
-        .get_object()
+    // A partNumber HEAD describes the part, as the GET returns it.
+    let r = s3
+        .head_object()
         .bucket(&bucket)
         .key(key)
-        .part_number(99)
+        .part_number(1)
+        .checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled)
         .send()
-        .await;
-    assert!(err.is_err(), "out-of-range partNumber must error");
+        .await?;
+    assert_eq!(r.checksum_crc32(), Some(c1.as_str()), "HEAD part1 checksum");
+    assert_eq!(r.parts_count(), Some(3), "HEAD parts_count");
+    assert_eq!(
+        r.content_length(),
+        Some(part1.len() as i64),
+        "HEAD part1 length"
+    );
+    assert_eq!(
+        r.content_range(),
+        Some(format!("bytes 0-{}/{}", part1.len() - 1, total).as_str()),
+    );
+
+    // A part number the object does not have fails with 416 InvalidPartNumber, as in S3.
+    for part_number in [4, 99] {
+        let err = s3
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .part_number(part_number)
+            .send()
+            .await
+            .expect_err("out-of-range partNumber must fail");
+        assert_eq!(err.raw_response().map(|r| r.status().as_u16()), Some(416));
+        assert_eq!(
+            aws_sdk_s3::error::ProvideErrorMetadata::code(&err),
+            Some("InvalidPartNumber")
+        );
+    }
 
     handle.shutdown().await?;
     Ok(())
@@ -2256,4 +2287,301 @@ async fn test_digest_header_validation_in_memory() -> Result<()> {
 #[tokio::test]
 async fn test_digest_header_validation_filesystem() -> Result<()> {
     run_digest_header_validation(StorageType::Filesystem).await
+}
+
+/// S3 treats an object uploaded in one request as a single part: partNumber=1 on GetObject and
+/// HeadObject returns the whole object with its Content-Range (none for an empty object), and
+/// partNumber=2 fails with 416 InvalidPartNumber. Part numbers outside 1 to 10,000 fail with 400
+/// InvalidArgument, and partNumber with a Range with 400 InvalidRequest. A HEAD with a Range
+/// reports the range, as the GET.
+#[tokio::test]
+async fn test_part_number_and_ranged_head_of_single_part_object() -> Result<()> {
+    let (server, bucket) = create_server(StorageType::InMemory).await?;
+    let handle = server.start().await?;
+    let s3 = handle.client().await;
+    s3.put_object()
+        .bucket(&bucket)
+        .key("single")
+        .body(Bytes::from_static(b"0123456789").into())
+        .send()
+        .await?;
+    s3.put_object()
+        .bucket(&bucket)
+        .key("empty")
+        .body(Bytes::new().into())
+        .send()
+        .await?;
+
+    let get = s3
+        .get_object()
+        .bucket(&bucket)
+        .key("single")
+        .part_number(1)
+        .send()
+        .await?;
+    assert_eq!(get.content_range(), Some("bytes 0-9/10"));
+    assert_eq!(get.parts_count(), None);
+    let head = s3
+        .head_object()
+        .bucket(&bucket)
+        .key("single")
+        .part_number(1)
+        .send()
+        .await?;
+    assert_eq!(head.content_range(), Some("bytes 0-9/10"));
+    assert_eq!(head.content_length(), Some(10));
+
+    for (range, content_range) in [
+        ("bytes=2-5", "bytes 2-5/10"),
+        ("bytes=-3", "bytes 7-9/10"),
+        ("bytes=7-", "bytes 7-9/10"),
+    ] {
+        let head = s3
+            .head_object()
+            .bucket(&bucket)
+            .key("single")
+            .range(range)
+            .send()
+            .await?;
+        assert_eq!(head.content_range(), Some(content_range), "{range}");
+    }
+    let head = s3
+        .head_object()
+        .bucket(&bucket)
+        .key("single")
+        .send()
+        .await?;
+    assert_eq!(head.content_range(), None);
+
+    let get = s3
+        .get_object()
+        .bucket(&bucket)
+        .key("empty")
+        .part_number(1)
+        .send()
+        .await?;
+    assert_eq!(get.content_range(), None);
+
+    let fail = failure(
+        s3.get_object()
+            .bucket(&bucket)
+            .key("single")
+            .part_number(2)
+            .send()
+            .await,
+    );
+    assert_failure(&fail, 416, "InvalidPartNumber");
+
+    // Part numbers outside 1 to 10,000, and partNumber with a Range, are invalid requests.
+    for part_number in [0, 10_001] {
+        let fail = failure(
+            s3.get_object()
+                .bucket(&bucket)
+                .key("single")
+                .part_number(part_number)
+                .send()
+                .await,
+        );
+        assert_failure(&fail, 400, "InvalidArgument");
+    }
+    // HEAD errors have no body, so the SDK only sees a 400.
+    let fail = failure(
+        s3.head_object()
+            .bucket(&bucket)
+            .key("single")
+            .part_number(1)
+            .range("bytes=0-1")
+            .send()
+            .await,
+    );
+    assert_eq!(fail.status, 400);
+    let fail = failure(
+        s3.get_object()
+            .bucket(&bucket)
+            .key("single")
+            .part_number(1)
+            .range("bytes=0-1")
+            .send()
+            .await,
+    );
+    assert_failure(&fail, 400, "InvalidRequest");
+    handle.shutdown().await?;
+    Ok(())
+}
+
+/// A partNumber request on a multipart object of one part reports the part count and the part's
+/// checksum, although the part is the whole object; without partNumber the object's composite
+/// checksum is reported, without a part count, as S3 does.
+#[tokio::test]
+async fn test_part_number_of_one_part_multipart_object() -> Result<()> {
+    use aws_sdk_s3::types::{ChecksumMode, ChecksumType};
+    let (server, bucket) = create_server(StorageType::InMemory).await?;
+    let handle = server.start().await?;
+    let s3 = handle.client().await;
+    let upload_id = s3
+        .create_multipart_upload()
+        .bucket(&bucket)
+        .key("one")
+        .checksum_algorithm(ChecksumAlgorithm::Crc32)
+        .send()
+        .await?
+        .upload_id
+        .unwrap();
+    let part = s3
+        .upload_part()
+        .bucket(&bucket)
+        .key("one")
+        .upload_id(&upload_id)
+        .part_number(1)
+        .checksum_algorithm(ChecksumAlgorithm::Crc32)
+        .body(Bytes::from_static(b"only part").into())
+        .send()
+        .await?;
+    let part_checksum = part.checksum_crc32.clone().unwrap();
+    s3.complete_multipart_upload()
+        .bucket(&bucket)
+        .key("one")
+        .upload_id(&upload_id)
+        .multipart_upload(
+            CompletedMultipartUpload::builder()
+                .parts(
+                    CompletedPart::builder()
+                        .part_number(1)
+                        .e_tag(part.e_tag.unwrap())
+                        .checksum_crc32(&part_checksum)
+                        .build(),
+                )
+                .build(),
+        )
+        .send()
+        .await?;
+
+    let head = s3
+        .head_object()
+        .bucket(&bucket)
+        .key("one")
+        .part_number(1)
+        .checksum_mode(ChecksumMode::Enabled)
+        .send()
+        .await?;
+    assert_eq!(head.parts_count(), Some(1));
+    assert_eq!(head.checksum_crc32(), Some(part_checksum.as_str()));
+    assert_eq!(head.checksum_type(), Some(&ChecksumType::Composite));
+    let get = s3
+        .get_object()
+        .bucket(&bucket)
+        .key("one")
+        .part_number(1)
+        .checksum_mode(ChecksumMode::Enabled)
+        .send()
+        .await?;
+    assert_eq!(get.parts_count(), Some(1));
+    assert_eq!(get.checksum_crc32(), Some(part_checksum.as_str()));
+
+    let head = s3
+        .head_object()
+        .bucket(&bucket)
+        .key("one")
+        .checksum_mode(ChecksumMode::Enabled)
+        .send()
+        .await?;
+    assert_eq!(head.parts_count(), None);
+    assert!(head.checksum_crc32().unwrap().ends_with("-1"));
+    handle.shutdown().await?;
+    Ok(())
+}
+
+/// A range or partNumber read of part of a multipart object with a full-object checksum returns
+/// no checksum, as S3 general purpose buckets do; a read of the whole object returns the object's
+/// checksum.
+#[tokio::test]
+async fn test_part_checksums_of_full_object_multipart_object() -> Result<()> {
+    use aws_sdk_s3::types::ChecksumType;
+    let (server, bucket) = create_server(StorageType::InMemory).await?;
+    let handle = server.start().await?;
+    let s3 = handle.client().await;
+    let parts: [&'static [u8]; 2] = [b"first part", b"second"];
+    let upload_id = s3
+        .create_multipart_upload()
+        .bucket(&bucket)
+        .key("mpu")
+        .checksum_algorithm(ChecksumAlgorithm::Crc64Nvme)
+        .checksum_type(ChecksumType::FullObject)
+        .send()
+        .await?
+        .upload_id
+        .unwrap();
+    let mut completed = Vec::new();
+    for (i, part) in parts.iter().enumerate() {
+        let out = s3
+            .upload_part()
+            .bucket(&bucket)
+            .key("mpu")
+            .upload_id(&upload_id)
+            .part_number(i as i32 + 1)
+            .checksum_algorithm(ChecksumAlgorithm::Crc64Nvme)
+            .body(Bytes::from_static(part).into())
+            .send()
+            .await?;
+        completed.push(
+            CompletedPart::builder()
+                .part_number(i as i32 + 1)
+                .e_tag(out.e_tag.unwrap())
+                .set_checksum_crc64_nvme(out.checksum_crc64_nvme)
+                .build(),
+        );
+    }
+    s3.complete_multipart_upload()
+        .bucket(&bucket)
+        .key("mpu")
+        .upload_id(&upload_id)
+        .multipart_upload(
+            CompletedMultipartUpload::builder()
+                .set_parts(Some(completed))
+                .build(),
+        )
+        .send()
+        .await?;
+
+    let range = s3
+        .get_object()
+        .bucket(&bucket)
+        .key("mpu")
+        .range(format!("bytes=0-{}", parts[0].len() - 1))
+        .checksum_mode(ChecksumMode::Enabled)
+        .send()
+        .await?;
+    assert_eq!(range.checksum_crc64_nvme, None);
+    assert_eq!(range.checksum_type, None);
+    let get = s3
+        .get_object()
+        .bucket(&bucket)
+        .key("mpu")
+        .part_number(1)
+        .checksum_mode(ChecksumMode::Enabled)
+        .send()
+        .await?;
+    assert_eq!(get.checksum_crc64_nvme, None);
+    let head = s3
+        .head_object()
+        .bucket(&bucket)
+        .key("mpu")
+        .part_number(1)
+        .checksum_mode(ChecksumMode::Enabled)
+        .send()
+        .await?;
+    assert_eq!(head.checksum_crc64_nvme, None);
+    assert_eq!(head.checksum_type, None);
+
+    let whole = s3
+        .get_object()
+        .bucket(&bucket)
+        .key("mpu")
+        .checksum_mode(ChecksumMode::Enabled)
+        .send()
+        .await?;
+    assert!(whole.checksum_crc64_nvme.is_some());
+    assert_eq!(whole.checksum_type, Some(ChecksumType::FullObject));
+    handle.shutdown().await?;
+    Ok(())
 }
