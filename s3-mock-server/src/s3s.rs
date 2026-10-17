@@ -608,6 +608,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         }
 
         let client_checksums = crate::types::ClientChecksums::from(&input);
+        validate_digest_headers(&client_checksums)?;
         let integrity_checks = crate::types::ObjectIntegrityChecks::from(&client_checksums);
 
         // Create storage request with configured checksums
@@ -786,6 +787,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         check_bucket(&self.storage, &input.bucket).await?;
 
         let client_checksums = crate::types::ClientChecksums::from(&input);
+        validate_digest_headers(&client_checksums)?;
         let mut integrity_checks = crate::types::ObjectIntegrityChecks::from(&client_checksums);
 
         // Read the part content and calculate checksums.
@@ -1257,6 +1259,60 @@ fn list_entry(obj: crate::storage::ObjectInfo, include_restore_status: bool) -> 
     }
 }
 
+/// Fail a request whose digest headers are malformed before its body is read, as S3 does: a
+/// checksum that is not the base64 encoding of a digest of its algorithm's size fails with 400
+/// InvalidRequest, and a malformed `Content-MD5` with 400 InvalidDigest.
+fn validate_digest_headers(checksums: &crate::types::ClientChecksums) -> crate::Result<()> {
+    let decoded_len = |value: &str| {
+        base64::engine::general_purpose::STANDARD
+            .decode(value)
+            .ok()
+            .map(|digest| digest.len())
+    };
+    for (checksum, len, message) in [
+        (
+            &checksums.crc32,
+            4,
+            "Value for x-amz-checksum-crc32 header is invalid.",
+        ),
+        (
+            &checksums.crc32c,
+            4,
+            "Value for x-amz-checksum-crc32c header is invalid.",
+        ),
+        (
+            &checksums.crc64nvme,
+            8,
+            "Value for x-amz-checksum-crc64nvme header is invalid.",
+        ),
+        (
+            &checksums.sha1,
+            20,
+            "Value for x-amz-checksum-sha1 header is invalid.",
+        ),
+        (
+            &checksums.sha256,
+            32,
+            "Value for x-amz-checksum-sha256 header is invalid.",
+        ),
+    ] {
+        if checksum
+            .as_deref()
+            .is_some_and(|value| decoded_len(value) != Some(len))
+        {
+            return Err(Error::InvalidRequest(message));
+        }
+    }
+    if checksums
+        .md5
+        .as_deref()
+        .is_some_and(|value| decoded_len(value) != Some(16))
+    {
+        return Err(Error::InvalidDigest);
+    }
+    Ok(())
+}
+
 /// The checksum type of a stored object: COMPOSITE when its checksum combines part checksums,
 /// which S3 writes with a `-<part count>` suffix, FULL_OBJECT otherwise, and `None` when it has
 /// no checksum.
@@ -1563,12 +1619,16 @@ mod tests {
                     Ok::<_, std::io::Error>(bytes::Bytes::from(&content[..]))
                 }),
             )))
-            .checksum_crc32(Some("wrong-checksum".to_string()))
+            // Well-formed, but the CRC32 of other data.
+            .checksum_crc32(Some("AAAAAA==".to_string()))
             .build()
             .unwrap();
 
-        let result_wrong = inner.put_object(s3_request(input_wrong)).await;
-        assert!(result_wrong.is_err());
+        let error = inner
+            .put_object(s3_request(input_wrong))
+            .await
+            .expect_err("wrong checksum must fail");
+        assert_eq!(error.code(), &s3s::S3ErrorCode::BadDigest);
     }
 
     /// A PutObject with an empty key, which only a POST Object request can send, fails with
@@ -1684,12 +1744,16 @@ mod tests {
                     Ok::<_, std::io::Error>(bytes::Bytes::from(&content[..]))
                 }),
             )))
-            .checksum_crc32(Some("wrong-checksum".to_string()))
+            // Well-formed, but the CRC32 of other data.
+            .checksum_crc32(Some("AAAAAA==".to_string()))
             .build()
             .unwrap();
 
-        let result_wrong = inner.upload_part(s3_request(input_wrong)).await;
-        assert!(result_wrong.is_err());
+        let error = inner
+            .upload_part(s3_request(input_wrong))
+            .await
+            .expect_err("wrong checksum must fail");
+        assert_eq!(error.code(), &s3s::S3ErrorCode::BadDigest);
     }
 
     #[tokio::test]

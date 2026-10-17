@@ -1080,6 +1080,7 @@ mod tests {
             sha1: None,
             sha256: None,
             crc64nvme: None,
+            md5: None,
         };
 
         let result = storage

@@ -17,6 +17,9 @@ pub struct ClientChecksums {
     pub sha1: Option<String>,
     pub sha256: Option<String>,
     pub crc64nvme: Option<String>,
+    /// `Content-MD5`, base64-encoded. Validated like the checksums, but not a checksum
+    /// algorithm: [`Self::has_any`] ignores it.
+    pub md5: Option<String>,
 }
 
 impl ClientChecksums {
@@ -37,6 +40,7 @@ impl From<&s3s::dto::PutObjectInput> for ClientChecksums {
             sha1: input.checksum_sha1.clone(),
             sha256: input.checksum_sha256.clone(),
             crc64nvme: input.checksum_crc64nvme.clone(),
+            md5: input.content_md5.clone(),
         }
     }
 }
@@ -49,6 +53,7 @@ impl From<&s3s::dto::UploadPartInput> for ClientChecksums {
             sha1: input.checksum_sha1.clone(),
             sha256: input.checksum_sha256.clone(),
             crc64nvme: input.checksum_crc64nvme.clone(),
+            md5: input.content_md5.clone(),
         }
     }
 }
@@ -61,6 +66,7 @@ impl From<&s3s::dto::CompleteMultipartUploadInput> for ClientChecksums {
             sha1: input.checksum_sha1.clone(),
             sha256: input.checksum_sha256.clone(),
             crc64nvme: input.checksum_crc64nvme.clone(),
+            md5: None,
         }
     }
 }
@@ -222,32 +228,33 @@ impl ObjectIntegrity {
         }
     }
 
-    /// Validate against client-provided checksums. On a mismatch, returns the algorithm of the
-    /// first checksum that does not match.
+    /// Validate against client-provided checksums and `Content-MD5`. On a mismatch, returns the
+    /// algorithm of the first value that does not match, MD5 for `Content-MD5`. `Content-MD5` is
+    /// checked only when the MD5 of the data was computed.
     pub fn validate(&self, client: &ClientChecksums) -> Result<(), ChecksumAlgorithm> {
-        if let Some(expected) = &client.crc32 {
-            if self.crc32.as_ref() != Some(expected) {
-                return Err(ChecksumAlgorithm::Crc32);
+        for (expected, actual, algorithm) in [
+            (&client.crc32, &self.crc32, ChecksumAlgorithm::Crc32),
+            (&client.crc32c, &self.crc32c, ChecksumAlgorithm::Crc32c),
+            (&client.sha1, &self.sha1, ChecksumAlgorithm::Sha1),
+            (&client.sha256, &self.sha256, ChecksumAlgorithm::Sha256),
+            (
+                &client.crc64nvme,
+                &self.crc64nvme,
+                ChecksumAlgorithm::Crc64Nvme,
+            ),
+        ] {
+            if expected.is_some() && actual != expected {
+                return Err(algorithm);
             }
         }
-        if let Some(expected) = &client.crc32c {
-            if self.crc32c.as_ref() != Some(expected) {
-                return Err(ChecksumAlgorithm::Crc32c);
-            }
-        }
-        if let Some(expected) = &client.sha1 {
-            if self.sha1.as_ref() != Some(expected) {
-                return Err(ChecksumAlgorithm::Sha1);
-            }
-        }
-        if let Some(expected) = &client.sha256 {
-            if self.sha256.as_ref() != Some(expected) {
-                return Err(ChecksumAlgorithm::Sha256);
-            }
-        }
-        if let Some(expected) = &client.crc64nvme {
-            if self.crc64nvme.as_ref() != Some(expected) {
-                return Err(ChecksumAlgorithm::Crc64Nvme);
+        if let (Some(expected), Some(md5)) = (&client.md5, &self.md5_hash) {
+            let expected =
+                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, expected)
+                    .map(hex::encode)
+                    .unwrap_or_default();
+            if md5.trim_matches('"') != expected {
+                #[allow(deprecated)]
+                return Err(ChecksumAlgorithm::Md5);
             }
         }
         Ok(())

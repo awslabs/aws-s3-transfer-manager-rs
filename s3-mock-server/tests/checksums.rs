@@ -179,7 +179,8 @@ async fn run_put_object_incorrect_checksum(
 
     let key = "test-single-part-bad.txt";
     let content = b"Hello, S3 checksum world!";
-    let wrong_checksum = "wrong-checksum-value";
+    // Well-formed, but the checksum of other data: a malformed value fails with InvalidRequest.
+    let wrong_checksum = &calculate_checksum(b"other data", algorithm.clone());
 
     let mut put_request = s3
         .put_object()
@@ -196,12 +197,14 @@ async fn run_put_object_incorrect_checksum(
         _ => panic!("Unsupported algorithm: {:?}", algorithm),
     };
 
-    let result = put_request.send().await;
-
-    // Should fail with BadDigest error
-    assert!(result.is_err());
-    let error_msg = format!("{:?}", result.unwrap_err());
-    assert!(error_msg.contains("BadDigest") || error_msg.contains("checksum"));
+    let err = put_request
+        .send()
+        .await
+        .expect_err("wrong checksum must fail");
+    assert_eq!(
+        aws_sdk_s3::error::ProvideErrorMetadata::code(&err),
+        Some("BadDigest")
+    );
 
     handle.shutdown().await?;
     Ok(())
@@ -700,7 +703,8 @@ async fn run_upload_part_incorrect_checksum(
 
     let key = "test-multipart-bad-part.txt";
     let part_data = b"Test part with wrong checksum";
-    let wrong_checksum = "wrong-checksum-value";
+    // Well-formed, but the checksum of other data: a malformed value fails with InvalidRequest.
+    let wrong_checksum = &calculate_checksum(b"other data", algorithm.clone());
 
     // Create multipart upload
     let create_response = s3
@@ -730,12 +734,14 @@ async fn run_upload_part_incorrect_checksum(
         _ => panic!("Unsupported algorithm: {:?}", algorithm),
     };
 
-    let result = part_request.send().await;
-
-    // Should fail with BadDigest error
-    assert!(result.is_err());
-    let error_msg = format!("{:?}", result.unwrap_err());
-    assert!(error_msg.contains("BadDigest") || error_msg.contains("checksum"));
+    let err = part_request
+        .send()
+        .await
+        .expect_err("wrong checksum must fail");
+    assert_eq!(
+        aws_sdk_s3::error::ProvideErrorMetadata::code(&err),
+        Some("BadDigest")
+    );
 
     handle.shutdown().await?;
     Ok(())
@@ -2091,4 +2097,163 @@ async fn test_checksum_type_reporting() -> Result<()> {
 
     handle.shutdown().await?;
     Ok(())
+}
+
+/// Digest headers are checked as S3 checks them. A checksum that is not the base64 encoding of
+/// a digest of its algorithm's size fails PutObject and UploadPart with 400 InvalidRequest
+/// before the body is read; a malformed Content-MD5 fails with 400 InvalidDigest, and one that
+/// does not match the body with 400 BadDigest. A body that does not match a checksum fails with
+/// BadDigest and S3's message. No failed PutObject stores anything.
+async fn run_digest_header_validation(storage_type: StorageType) -> Result<()> {
+    use aws_sdk_s3::error::ProvideErrorMetadata;
+    use base64::Engine;
+    let (server, bucket) = create_server(storage_type).await?;
+    let handle = server.start().await?;
+    let s3 = handle.client().await;
+    let body = || Bytes::from_static(b"body").into();
+    let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+
+    type Customize = fn(
+        aws_sdk_s3::operation::put_object::builders::PutObjectFluentBuilder,
+        String,
+    ) -> aws_sdk_s3::operation::put_object::builders::PutObjectFluentBuilder;
+    let cases: [(&str, Customize, usize); 5] = [
+        ("crc32", |r, v| r.checksum_crc32(v), 4),
+        ("crc32c", |r, v| r.checksum_crc32_c(v), 4),
+        ("crc64nvme", |r, v| r.checksum_crc64_nvme(v), 8),
+        ("sha1", |r, v| r.checksum_sha1(v), 20),
+        ("sha256", |r, v| r.checksum_sha256(v), 32),
+    ];
+    for (name, customize, len) in cases {
+        for value in [b64(&vec![0; len - 1]), "not base64!".to_owned()] {
+            let request = s3.put_object().bucket(&bucket).key(name).body(body());
+            let error = customize(request, value)
+                .send()
+                .await
+                .expect_err("malformed checksum");
+            assert_eq!(error.code(), Some("InvalidRequest"), "{name}: {error:?}");
+            assert_eq!(
+                error.message(),
+                Some(format!("Value for x-amz-checksum-{name} header is invalid.").as_str()),
+            );
+        }
+    }
+
+    // The request fails before its body is read: a stalled body read does not delay it.
+    server.insert_fault(
+        &bucket,
+        "stalled",
+        s3_mock_server::FaultType::StallRequestRead { after_bytes: 0 },
+        0,
+        s3_mock_server::Occurrence::Always,
+    );
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        s3.put_object()
+            .bucket(&bucket)
+            .key("stalled")
+            .checksum_crc32(b64(&[0; 3]))
+            .body(body())
+            .send(),
+    )
+    .await
+    .expect("the request is answered without reading the body")
+    .expect_err("malformed checksum");
+    assert_eq!(error.code(), Some("InvalidRequest"));
+
+    let error = s3
+        .put_object()
+        .bucket(&bucket)
+        .key("crc32")
+        .checksum_crc32(calculate_checksum(b"other", ChecksumAlgorithm::Crc32))
+        .body(body())
+        .send()
+        .await
+        .expect_err("mismatching checksum");
+    assert_eq!(error.code(), Some("BadDigest"));
+    assert_eq!(
+        error.message(),
+        Some("The CRC32 you specified did not match the calculated checksum.")
+    );
+
+    let error = s3
+        .put_object()
+        .bucket(&bucket)
+        .key("md5")
+        .content_md5(b64(b"short"))
+        .body(body())
+        .send()
+        .await
+        .expect_err("malformed Content-MD5");
+    assert_eq!(error.code(), Some("InvalidDigest"));
+    let error = s3
+        .put_object()
+        .bucket(&bucket)
+        .key("md5")
+        .content_md5(b64(&md5::compute(b"other").0))
+        .body(body())
+        .send()
+        .await
+        .expect_err("mismatching Content-MD5");
+    assert_eq!(error.code(), Some("BadDigest"));
+    assert_eq!(
+        error.message(),
+        Some("The Content-MD5 you specified did not match what we received.")
+    );
+    let listing = s3.list_objects_v2().bucket(&bucket).send().await?;
+    assert_eq!(listing.key_count(), Some(0));
+
+    s3.put_object()
+        .bucket(&bucket)
+        .key("md5")
+        .content_md5(b64(&md5::compute(b"body").0))
+        .body(body())
+        .send()
+        .await?;
+
+    let upload_id = s3
+        .create_multipart_upload()
+        .bucket(&bucket)
+        .key("mpu")
+        .send()
+        .await?
+        .upload_id
+        .unwrap();
+    let error = s3
+        .upload_part()
+        .bucket(&bucket)
+        .key("mpu")
+        .upload_id(&upload_id)
+        .part_number(1)
+        .checksum_crc32(b64(&[0; 3]))
+        .body(body())
+        .send()
+        .await
+        .expect_err("malformed part checksum");
+    assert_eq!(error.code(), Some("InvalidRequest"));
+    let error = s3
+        .upload_part()
+        .bucket(&bucket)
+        .key("mpu")
+        .upload_id(&upload_id)
+        .part_number(1)
+        .content_md5(b64(&md5::compute(b"other").0))
+        .body(body())
+        .send()
+        .await
+        .expect_err("mismatching part Content-MD5");
+    assert_eq!(error.code(), Some("BadDigest"));
+
+    handle.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_digest_header_validation_in_memory() -> Result<()> {
+    run_digest_header_validation(StorageType::InMemory).await
+}
+
+#[tokio::test]
+async fn test_digest_header_validation_filesystem() -> Result<()> {
+    run_digest_header_validation(StorageType::Filesystem).await
 }

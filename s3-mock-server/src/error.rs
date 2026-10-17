@@ -54,14 +54,18 @@ pub enum Error {
         bucket_type: BucketType,
     },
 
-    /// A checksum the request sent does not match the data.
+    /// A checksum or `Content-MD5` the request sent does not match the data.
     #[error("{} checksum mismatch", .algorithm.as_str())]
     BadDigest {
-        /// The algorithm of the checksum.
+        /// The algorithm of the checksum, MD5 for `Content-MD5`.
         algorithm: ChecksumAlgorithm,
         /// Whether the checksum is the object checksum of a CompleteMultipartUpload.
         completion: bool,
     },
+
+    /// A `Content-MD5` header is not the base64 encoding of an MD5 digest.
+    #[error("invalid digest")]
+    InvalidDigest,
 
     /// The range specified is invalid
     #[error("invalid range")]
@@ -209,13 +213,31 @@ impl From<Error> for s3s::S3Error {
                 )
                 .into(),
             ),
+            #[allow(deprecated)]
+            Error::BadDigest {
+                algorithm: ChecksumAlgorithm::Md5,
+                completion: false,
+            } => (
+                S3ErrorCode::BadDigest,
+                StatusCode::BAD_REQUEST,
+                "The Content-MD5 you specified did not match what we received.".into(),
+            ),
             Error::BadDigest {
                 algorithm,
                 completion: false,
             } => (
                 S3ErrorCode::BadDigest,
                 StatusCode::BAD_REQUEST,
-                format!("checksum_{} mismatch", algorithm.as_str()).into(),
+                format!(
+                    "The {} you specified did not match the calculated checksum.",
+                    algorithm.as_str().to_ascii_uppercase()
+                )
+                .into(),
+            ),
+            Error::InvalidDigest => (
+                S3ErrorCode::InvalidDigest,
+                StatusCode::BAD_REQUEST,
+                "The Content-MD5 you specified was invalid.".into(),
             ),
             Error::InvalidRange => (
                 S3ErrorCode::InvalidRange,
