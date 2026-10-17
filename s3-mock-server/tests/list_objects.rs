@@ -249,10 +249,15 @@ async fn test_list_object_attributes() -> Result {
             )
         })
         .collect();
-    assert_eq!(listed["crc32c"], (vec![ChecksumAlgorithm::Crc32C], None));
+    // An object without a storage class is listed as STANDARD, as S3 lists it.
+    let standard = Some(aws_sdk_s3::types::ObjectStorageClass::Standard);
+    assert_eq!(
+        listed["crc32c"],
+        (vec![ChecksumAlgorithm::Crc32C], standard.clone())
+    );
     assert_eq!(
         listed["default"],
-        (vec![ChecksumAlgorithm::Crc64Nvme], None)
+        (vec![ChecksumAlgorithm::Crc64Nvme], standard)
     );
     assert_eq!(
         listed["restored"].1,

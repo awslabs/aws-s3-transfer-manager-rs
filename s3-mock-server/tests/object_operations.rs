@@ -195,3 +195,25 @@ async fn test_restore_object_in_progress() -> Result {
     f.shutdown().await;
     Ok(())
 }
+
+/// GetObject and HeadObject omit the storage class of a STANDARD object, also when STANDARD was
+/// requested explicitly, and report any other class, as S3 does.
+#[tokio::test]
+async fn test_storage_class_reporting() -> Result {
+    let f = Fixture::new().await;
+    f.put("default", "x").await;
+    put_in_class(&f, "standard", "x", StorageClass::Standard).await;
+    put_in_class(&f, "ia", "x", StorageClass::StandardIa).await;
+    for (key, expected) in [
+        ("default", None),
+        ("standard", None),
+        ("ia", Some(StorageClass::StandardIa)),
+    ] {
+        let head = f.s3.head_object().bucket(&f.bucket).key(key).send().await?;
+        assert_eq!(head.storage_class, expected, "{key}");
+        let get = f.s3.get_object().bucket(&f.bucket).key(key).send().await?;
+        assert_eq!(get.storage_class, expected, "{key}");
+    }
+    f.shutdown().await;
+    Ok(())
+}

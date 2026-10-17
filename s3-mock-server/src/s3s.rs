@@ -484,7 +484,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         }
 
         // Return stored HTTP headers
-        output.storage_class = stream_metadata.storage_class.map(|s| s.parse().unwrap());
+        output.storage_class = storage_class_header(stream_metadata.storage_class);
         output.cache_control = stream_metadata.cache_control.map(|s| s.parse().unwrap());
         output.content_encoding = stream_metadata.content_encoding.map(|s| s.parse().unwrap());
         output.content_disposition = stream_metadata
@@ -565,7 +565,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         output.checksum_crc64nvme = metadata.crc64nvme;
 
         // Return stored HTTP headers
-        output.storage_class = metadata.storage_class.map(|s| s.parse().unwrap());
+        output.storage_class = storage_class_header(metadata.storage_class);
         output.cache_control = metadata.cache_control.map(|s| s.parse().unwrap());
         output.content_encoding = metadata.content_encoding.map(|s| s.parse().unwrap());
         output.content_disposition = metadata.content_disposition.map(|s| s.parse().unwrap());
@@ -1215,7 +1215,7 @@ fn list_entry(obj: crate::storage::ObjectInfo, include_restore_status: bool) -> 
         size: Some(obj.metadata.content_length as i64),
         e_tag: Some(etag_from_quoted(&obj.metadata.etag)),
         last_modified: Some(Timestamp::from(obj.metadata.last_modified)),
-        storage_class: obj.metadata.storage_class.clone().map(Into::into),
+        storage_class: Some(listed_storage_class(&obj.metadata.storage_class).into()),
         checksum_algorithm: (!algorithms.is_empty()).then(|| {
             algorithms
                 .iter()
@@ -1239,6 +1239,22 @@ fn list_entry(obj: crate::storage::ObjectInfo, include_restore_status: bool) -> 
         key: Some(obj.key),
         ..Default::default()
     }
+}
+
+/// The `x-amz-storage-class` header of a GetObject or HeadObject response: S3 omits it for
+/// `STANDARD` objects, also when `STANDARD` was requested explicitly.
+fn storage_class_header(storage_class: Option<String>) -> Option<s3s::dto::StorageClass> {
+    storage_class
+        .filter(|class| class != s3s::dto::StorageClass::STANDARD)
+        .map(s3s::dto::StorageClass::from)
+}
+
+/// The storage class of an object in ListObjectsV2 entries, which S3 always reports: `STANDARD`
+/// when none was set.
+fn listed_storage_class(storage_class: &Option<String>) -> String {
+    storage_class
+        .clone()
+        .unwrap_or_else(|| s3s::dto::StorageClass::STANDARD.to_owned())
 }
 
 /// The `x-amz-restore` header for a restore status.

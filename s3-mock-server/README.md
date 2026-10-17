@@ -143,6 +143,11 @@ async fn test_filesystem_storage() -> Result<(), Box<dyn std::error::Error>> {
   including a restore in progress, which a further RestoreObject fails with 409.
 - A RestoreObject without `Days` restores the object for 1 day.
 
+### Storage Classes
+
+GetObject and HeadObject omit `x-amz-storage-class` for `STANDARD` objects; ListObjectsV2 reports
+`STANDARD` for objects stored without a storage class, as S3 general purpose buckets do.
+
 ### Listing
 
 ListObjectsV2 pages hold at most `max-keys` entries, counting each common prefix once, and never
