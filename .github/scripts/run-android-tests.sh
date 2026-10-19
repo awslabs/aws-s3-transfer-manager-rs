@@ -84,6 +84,15 @@ case "$abi" in
         ;;
 esac
 
+# Maximum seconds any single adb invocation may run.
+adb_timeout_seconds=${ADB_TIMEOUT_SECONDS:-60}
+
+# Run an adb command under a hard timeout so a hung device cannot stall the
+# script. Returns the command's own status, or 124 if the timeout fired.
+adb_bounded() {
+    timeout --signal=KILL "$adb_timeout_seconds" adb "$@"
+}
+
 run_android_tests() {
     local deps_directory
     local target_directory
@@ -208,10 +217,20 @@ case "$mode" in
                 tail -200 "$emulator_log" >&2 || true
             fi
             if [[ -n "${android_cert_bundle:-}" ]]; then
-                adb -s "$emulator_serial" shell rm -f "$android_cert_bundle" >/dev/null 2>&1 || true
+                adb_bounded -s "$emulator_serial" shell rm -f "$android_cert_bundle" >/dev/null 2>&1 || true
             fi
-            adb -s "$emulator_serial" emu kill >/dev/null 2>&1 || true
+            adb_bounded -s "$emulator_serial" emu kill >/dev/null 2>&1 || true
             kill "$emulator_pid" >/dev/null 2>&1 || true
+            # Give the emulator a grace period to exit on its own, then SIGKILL it. 
+            local grace_deadline=$((SECONDS + 600))
+            while kill -0 "$emulator_pid" 2>/dev/null; do
+                if (( SECONDS >= grace_deadline )); then
+                    echo "Android emulator did not exit within 60 seconds; sending SIGKILL" >&2
+                    kill -KILL "$emulator_pid" >/dev/null 2>&1 || true
+                    break
+                fi
+                sleep 1
+            done
             wait "$emulator_pid" 2>/dev/null || true
             exit "$status"
         }
@@ -228,7 +247,7 @@ case "$mode" in
                 echo "Android emulator did not register with adb within 600 seconds" >&2
                 exit 1
             fi
-            adb_state=$(adb -s "$emulator_serial" get-state 2>/dev/null || true)
+            adb_state=$(adb_bounded -s "$emulator_serial" get-state 2>/dev/null || true)
             if [[ "$adb_state" == "device" ]]; then
                 break
             fi
@@ -246,7 +265,7 @@ case "$mode" in
                 exit 1
             fi
             boot_completed=$(
-                adb -s "$emulator_serial" shell getprop sys.boot_completed 2>/dev/null || true
+                adb_bounded -s "$emulator_serial" shell getprop sys.boot_completed 2>/dev/null || true
             )
             boot_completed=${boot_completed//$'\r'/}
             if [[ "$boot_completed" == "1" ]]; then
@@ -255,7 +274,7 @@ case "$mode" in
             sleep 2
         done
 
-        actual_page_size=$(adb -s "$emulator_serial" shell getconf PAGE_SIZE | tr -d '\r')
+        actual_page_size=$(adb_bounded -s "$emulator_serial" shell getconf PAGE_SIZE | tr -d '\r')
         if [[ "$actual_page_size" != "$expected_page_size" ]]; then
             echo "Android page size mismatch: expected $expected_page_size, got $actual_page_size" >&2
             exit 1
@@ -266,7 +285,7 @@ case "$mode" in
             /apex/com.android.conscrypt/cacerts \
             /system/etc/security/cacerts
         do
-            if adb -s "$emulator_serial" shell test -d "$cert_dir"; then
+            if adb_bounded -s "$emulator_serial" shell test -d "$cert_dir"; then
                 android_cert_sources+=" $cert_dir/*"
             fi
         done
@@ -280,10 +299,10 @@ case "$mode" in
         # usable from the deployed test process, so materialize an accessible
         # bundle in the adb shell domain and fail closed if it contains no roots.
         android_cert_bundle=/data/local/tmp/s3-tm-ca-certificates.pem
-        adb -s "$emulator_serial" shell \
+        adb_bounded -s "$emulator_serial" shell \
             "cat$android_cert_sources > $android_cert_bundle"
         android_cert_count=$(
-            adb -s "$emulator_serial" shell \
+            adb_bounded -s "$emulator_serial" shell \
                 "grep -c 'BEGIN CERTIFICATE' $android_cert_bundle || true" |
                 tr -d '\r'
         )

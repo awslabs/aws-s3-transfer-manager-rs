@@ -240,6 +240,10 @@ jobs:
     env:
       ANDROID_API_LEVEL: 35
       ANDROID_NDK_VERSION: 28.0.13004108
+      # Hard cap on each individual adb call in the Android test scripts, so a
+      # wedged adb or unresponsive emulator cannot stall a step. Used by both
+      # run-android-tests.sh and android-test-runner.sh.
+      ADB_TIMEOUT_SECONDS: 120
     strategy:
       fail-fast: false
       matrix:
