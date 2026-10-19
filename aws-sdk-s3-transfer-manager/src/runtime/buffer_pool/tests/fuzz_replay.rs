@@ -78,8 +78,7 @@ fn assert_replay_at_supported_carrier_sizes(
 
     let runtime_page_size = page_size().expect("runtime page size").get();
     for carrier_size in [4 * 1024, 16 * 1024, 64 * 1024] {
-        if carrier_size != runtime_page_size
-            && carrier_size >= runtime_page_size
+        if carrier_size > runtime_page_size
             && carrier_size.is_multiple_of(runtime_page_size)
         {
             assert_milestones(name, run_with_carrier_size(input, carrier_size));
