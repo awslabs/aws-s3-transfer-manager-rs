@@ -4,10 +4,10 @@
  */
 
 use crate::metrics::unit::ByteUnit;
-use crate::runtime::ManagedThreadRuntime;
+use crate::runtime::ManagedExecution;
 use crate::scheduler::{ConcurrencyController, FixedConcurrency, Scheduler};
 use crate::telemetry::Telemetry;
-use crate::types::{ConcurrencyMode, MemoryConfig, PartSize, RuntimeMode};
+use crate::types::{ConcurrencyMode, MemoryConfig, PartSize};
 use crate::Config;
 use std::sync::Arc;
 use std::time::Duration;
@@ -176,7 +176,7 @@ impl Handle {
         Self::new_for_test(config, 128)
     }
 
-    /// Test handle with real managed threads (4 OS threads).
+    /// Test handle with up to four managed threads from detected topology.
     ///
     /// Use for: end-to-end dispatch/wake correctness, verifying behavior
     /// under real thread scheduling. Catches bugs like missing `set_pending`
@@ -189,13 +189,7 @@ impl Handle {
         Self::new_for_test_with_runtime(
             config,
             Arc::new(crate::scheduler::FixedConcurrency::new(128)),
-            |weak| {
-                Arc::new(
-                    crate::runtime::ManagedThreadRuntime::builder(weak)
-                        .topology(crate::runtime::Topology::uniform(4))
-                        .build(),
-                )
-            },
+            |weak| Arc::new(crate::runtime::ManagedExecution::for_test(weak, 4)),
         )
     }
 
@@ -229,7 +223,7 @@ impl Handle {
             let s3_client = match config.take_s3_client_source() {
                 crate::config::S3ClientSource::Provided(client) => client,
                 crate::config::S3ClientSource::FromConfig(s3_config) => {
-                    aws_sdk_s3::Client::from_conf(s3_config.builder.build())
+                    aws_sdk_s3::Client::from_conf(s3_config.config)
                 }
             };
             Self {
@@ -296,32 +290,34 @@ impl Client {
         // this transfer manager constructs.
         let connection_cap = crate::runtime::platform::ConnectionCap::detect();
         let runtime_http = config.runtime_http(connection_cap.max_per_host);
-        if runtime_http.is_some() && matches!(config.runtime_mode(), RuntimeMode::Managed) {
+        if runtime_http.is_some() {
             log_connection_cap(&connection_cap, controller.target());
         }
+        let managed = match config.runtime_config().managed_config() {
+            Some(managed) => {
+                let owner = managed
+                    .build(
+                        #[cfg(feature = "dial9")]
+                        dial9_handle,
+                    )
+                    .expect("failed to construct transfer manager execution");
+                let components = crate::runtime::prepare_components(&owner, runtime_http)
+                    .expect("failed to construct transfer manager HTTP transport");
+                Some((owner, components))
+            }
+            None => None,
+        };
         let handle = Arc::new_cyclic(|weak_handle| {
             let scheduler = Scheduler::new(weak_handle.clone());
-            let runtime: Arc<dyn ExecutionRuntime> = match config.runtime_mode() {
-                RuntimeMode::Managed => {
-                    #[allow(unused_mut)]
-                    let mut builder =
-                        ManagedThreadRuntime::builder(weak_handle.clone()).http(runtime_http);
-                    #[cfg(feature = "dial9")]
-                    if let Some(handle) = dial9_handle {
-                        builder = builder.dial9_handle(handle);
-                    }
-                    Arc::new(builder.build())
-                }
-                RuntimeMode::MultiThreadTokio => {
-                    if runtime_http.is_some_and(|http| !http.network_interfaces.is_empty()) {
-                        tracing::warn!(
-                            "network interfaces are ignored under RuntimeMode::MultiThreadTokio"
-                        );
-                    }
-                    Arc::new(crate::runtime::TokioMultiThreadRuntime::new(
-                        weak_handle.clone(),
-                    ))
-                }
+            let runtime: Arc<dyn ExecutionRuntime> = match managed {
+                Some((owner, components)) => Arc::new(ManagedExecution::new(
+                    weak_handle.clone(),
+                    owner,
+                    components,
+                )),
+                None => Arc::new(crate::runtime::TokioMultiThreadRuntime::new(
+                    weak_handle.clone(),
+                )),
             };
 
             let s3_client = match config.take_s3_client_source() {
@@ -332,11 +328,9 @@ impl Client {
                     )
                 }
                 crate::config::S3ClientSource::FromConfig(s3_config) => {
-                    let mut builder = s3_config.builder;
-                    if s3_config.enable_runtime_http {
-                        if let Some(http_client) = runtime.components().http_client() {
-                            builder = builder.http_client(http_client.clone());
-                        }
+                    let mut builder = s3_config.config.to_builder();
+                    if let Some(http_client) = runtime.components().http_client() {
+                        builder = builder.http_client(http_client.clone());
                     }
                     crate::config::user_agent::install(
                         &mut builder,
@@ -609,6 +603,7 @@ fn resolve_concurrency_target(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::RuntimeConfig;
     use aws_smithy_runtime_api::client::http::SharedHttpClient;
 
     fn test_config() -> crate::Config {
@@ -620,6 +615,196 @@ mod tests {
         client.handle.runtime.components().http_client()
     }
 
+    /// A configured transport that polls file bodies on the caller's runtime,
+    /// retries the first PUT, and lets the test hold an active transfer.
+    #[derive(Debug)]
+    struct CallerHttp {
+        caller: tokio::runtime::Handle,
+        started: Arc<tokio::sync::Semaphore>,
+        release: Arc<tokio::sync::Semaphore>,
+        bodies: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    }
+
+    impl aws_smithy_runtime_api::client::http::HttpConnector for CallerHttp {
+        fn call(
+            &self,
+            request: aws_smithy_runtime_api::client::orchestrator::HttpRequest,
+        ) -> aws_smithy_runtime_api::client::http::HttpConnectorFuture {
+            use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
+            use aws_smithy_types::body::SdkBody;
+            use http_body_1x::Body;
+            use std::pin::Pin;
+
+            assert_eq!(request.method(), "PUT");
+            let started = self.started.clone();
+            let release = self.release.clone();
+            let bodies = self.bodies.clone();
+            let task = self.caller.spawn(async move {
+                let first = bodies.lock().unwrap().is_empty();
+                if first {
+                    started.add_permits(1);
+                    release.acquire().await.unwrap().forget();
+                }
+                let mut body = request.into_body();
+                let mut bytes = Vec::new();
+                while let Some(frame) =
+                    futures_util::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await
+                {
+                    if let Ok(data) = frame.unwrap().into_data() {
+                        bytes.extend_from_slice(&data);
+                    }
+                }
+                bodies.lock().unwrap().push(bytes);
+                HttpResponse::try_from(
+                    ::http::Response::builder()
+                        .status(if first { 500 } else { 200 })
+                        .header("etag", "\"test-etag\"")
+                        .body(SdkBody::empty())
+                        .unwrap(),
+                )
+                .unwrap()
+            });
+            aws_smithy_runtime_api::client::http::HttpConnectorFuture::new(async move {
+                Ok(task.await.unwrap())
+            })
+        }
+    }
+
+    // Real SDK requests, body replay, and owner retention are exercised together:
+    // the configured HTTP implementation polls outside managed execution.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn configured_sdk_http_uploads_files_and_retains_active_execution() {
+        use aws_sdk_s3::config::{Credentials, Region, SharedCredentialsProvider};
+        use aws_smithy_runtime_api::client::http::{http_client_fn, SharedHttpConnector};
+        use std::io::Write;
+
+        let caller = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        let payload = vec![0x5a; 128 * 1024];
+        file.write_all(&payload).unwrap();
+        let mut checksum = aws_smithy_checksums::ChecksumAlgorithm::Crc32.into_impl();
+        checksum.update(&payload);
+        let checksum = checksum.header_value().to_str().unwrap().to_owned();
+
+        for (runtime, managed) in [
+            (RuntimeConfig::default(), true),
+            (RuntimeConfig::multi_thread_tokio(), false),
+        ] {
+            caller.block_on(async {
+                let started = Arc::new(tokio::sync::Semaphore::new(0));
+                let release = Arc::new(tokio::sync::Semaphore::new(0));
+                let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+                let connector = SharedHttpConnector::new(CallerHttp {
+                    caller: caller.handle().clone(),
+                    started: started.clone(),
+                    release: release.clone(),
+                    bodies: bodies.clone(),
+                });
+                let sdk = aws_types::SdkConfig::builder()
+                    .http_client(http_client_fn(move |_, _| connector.clone()))
+                    .region(Region::new("us-west-2"))
+                    .credentials_provider(SharedCredentialsProvider::new(Credentials::new(
+                        "test", "test", None, None, "test",
+                    )))
+                    .behavior_version(aws_config::BehaviorVersion::latest())
+                    .build();
+                let client = Client::new(
+                    crate::Config::builder()
+                        .s3_config(&sdk)
+                        .runtime_config(runtime)
+                        .build(),
+                );
+                let components = client.handle.runtime.components();
+                assert!(
+                    components.http_client().is_none(),
+                    "unused managed HTTP must not be built"
+                );
+                assert_eq!(components.direct_io(), managed);
+                assert!(
+                    !components.direct_body_io(),
+                    "configured HTTP controls its polling thread"
+                );
+
+                let weak = Arc::downgrade(&client.handle);
+                let upload = client
+                    .upload()
+                    .bucket("test-bucket")
+                    .key("file")
+                    .checksum_strategy(crate::operation::upload::ChecksumStrategy::with_crc32(
+                        &checksum,
+                    ))
+                    .body(crate::io::InputStream::from_path(file.path()).unwrap())
+                    .initiate()
+                    .unwrap();
+                tokio::time::timeout(Duration::from_secs(5), started.acquire())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .forget();
+                drop(client);
+                assert!(
+                    weak.upgrade().is_some(),
+                    "active transfer retains execution owner"
+                );
+                release.add_permits(1);
+                let output = tokio::time::timeout(Duration::from_secs(10), upload.join())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    output.upload_id().is_none(),
+                    "exercise single-PUT file body"
+                );
+                {
+                    let captured = bodies.lock().unwrap();
+                    assert_eq!(captured.len(), 2, "SDK retries the first PUT");
+                    assert!(
+                        captured.iter().all(|body| body == &payload),
+                        "both attempts replay the file"
+                    );
+                }
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    // SkipMap retires scheduler descriptors through its global
+                    // epoch collector. Advance collection before checking final
+                    // owner destruction; retirement need not reclaim immediately.
+                    let retired = crossbeam_skiplist::SkipMap::new();
+                    while weak.upgrade().is_some() {
+                        for index in 0..256 {
+                            retired.insert(index, ());
+                            retired.remove(&index);
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("finished transfer retains execution (managed={managed})")
+                });
+            });
+        }
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn shared_tokio_without_configured_http_uses_sdk_defaults() {
+        let mut s3 = mock_s3_config().config.to_builder();
+        s3.set_http_client(None);
+        let client = Client::new(
+            crate::Config::builder()
+                .s3_config(s3)
+                .runtime_config(RuntimeConfig::multi_thread_tokio())
+                .build(),
+        );
+        let components = client.handle.runtime.components();
+        assert!(components.http_client().is_none());
+        assert!(!components.direct_io());
+        assert!(!components.direct_body_io());
+    }
+
     fn mock_s3_config() -> crate::config::S3ClientConfig {
         let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
         crate::config::S3ClientConfig::new(s3_client.config().to_builder())
@@ -629,8 +814,12 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn managed_runtime_builds_http_for_s3_config() {
-        let client = Client::new(crate::Config::builder().s3_config(mock_s3_config()).build());
+        let mut builder = mock_s3_config().config.to_builder();
+        builder.set_http_client(None);
+        let client = Client::new(crate::Config::builder().s3_config(builder).build());
         assert!(runtime_http_client(&client).is_some());
+        assert!(client.handle.runtime.components().direct_io());
+        assert!(client.handle.runtime.components().direct_body_io());
     }
 
     // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
@@ -644,10 +833,8 @@ mod tests {
     // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
     #[cfg_attr(miri, ignore)]
     #[test]
-    fn managed_runtime_skips_http_when_runtime_http_disabled() {
-        let config = crate::Config::builder()
-            .s3_config(mock_s3_config().enable_runtime_http(false))
-            .build();
+    fn managed_runtime_preserves_configured_http() {
+        let config = crate::Config::builder().s3_config(mock_s3_config()).build();
         let client = Client::new(config);
         assert!(runtime_http_client(&client).is_none());
     }
@@ -911,19 +1098,19 @@ mod tests {
     // --- runtime mode selection ---
 
     #[test]
-    fn config_default_runtime_mode_is_managed() {
+    fn config_default_runtime_is_managed() {
         let config = config_with(ConcurrencyMode::Auto, None);
-        assert!(matches!(config.runtime_mode(), RuntimeMode::Managed));
+        assert!(config.runtime_config().managed_config().is_some());
     }
 
     // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
     #[cfg_attr(miri, ignore)]
     #[test]
-    fn client_new_with_managed_runtime_mode() {
+    fn client_new_with_managed_runtime() {
         let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
         let config = crate::Config::builder()
             .client(s3_client)
-            .runtime_mode(RuntimeMode::Managed)
+            .runtime_config(RuntimeConfig::default())
             .build();
         let _client = Client::new(config);
     }
@@ -931,11 +1118,11 @@ mod tests {
     // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
     #[cfg_attr(miri, ignore)]
     #[tokio::test(flavor = "multi_thread")]
-    async fn client_new_with_multi_thread_tokio_runtime_mode() {
+    async fn client_new_with_multi_thread_tokio_runtime() {
         let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
         let config = crate::Config::builder()
             .client(s3_client)
-            .runtime_mode(RuntimeMode::MultiThreadTokio)
+            .runtime_config(RuntimeConfig::multi_thread_tokio())
             .build();
         let _client = Client::new(config);
     }

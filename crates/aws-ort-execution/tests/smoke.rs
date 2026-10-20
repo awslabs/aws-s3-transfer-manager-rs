@@ -647,3 +647,35 @@ mod tracing {
         assert!(error.source().unwrap().to_string().contains("shut down"));
     }
 }
+
+#[test]
+fn each_partition_limits_blocking_execution_to_one_thread() {
+    let runtime = runtime();
+    let awaiting = caller();
+    for partition in runtime.handle().partitions() {
+        let (started_tx, started) = mpsc::channel();
+        let (release_tx, release) = mpsc::channel::<()>();
+        let (queued_tx, queued) = mpsc::channel();
+        let (second_tx, second) = mpsc::channel();
+        let task = partition.spawn(async move {
+            let first = tokio::task::spawn_blocking(move || {
+                started_tx.send(thread::current().id()).unwrap();
+                let _ = release.recv();
+            });
+            let next = tokio::task::spawn_blocking(move || {
+                second_tx.send(thread::current().id()).unwrap();
+            });
+            queued_tx.send(()).unwrap();
+            first.await.unwrap();
+            next.await.unwrap();
+        });
+        let first_thread = started.recv_timeout(TIMEOUT).unwrap();
+        queued.recv_timeout(TIMEOUT).unwrap();
+        let early = second.recv_timeout(Duration::from_millis(50));
+        // Always release the first task, including on failure.
+        drop(release_tx);
+        assert!(matches!(early, Err(mpsc::RecvTimeoutError::Timeout)));
+        assert_eq!(second.recv_timeout(TIMEOUT).unwrap(), first_thread);
+        awaiting.block_on(task).unwrap();
+    }
+}

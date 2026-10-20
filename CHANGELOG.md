@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.4.0] - Unreleased
 
 ### Changed
+- `RuntimeConfig` and opaque `Managed` replace `RuntimeMode`; builders and loaders use
+  `runtime_config`. Managed execution uses reusable runtime components while the transfer
+  manager retains runtime ownership and scheduling.
+- An HTTP client configured on the SDK or S3 configuration is preserved under either execution
+  mode. Managed execution supplies its transport only when HTTP is absent. The
+  `S3ClientConfig::enable_runtime_http` switch is removed; configure HTTP through the SDK/S3
+  configuration instead. File bodies using configured HTTP offload filesystem reads because
+  the transport controls their polling threads.
 - The `dial9` feature depends on `dial9` 0.5 instead of `dial9-tokio-telemetry` 0.3, and compiles
   without `--cfg tokio_unstable`. Per-task poll, spawn, and terminate events and per-worker queue
   depth for the managed runtime are recorded only when built with the flag.

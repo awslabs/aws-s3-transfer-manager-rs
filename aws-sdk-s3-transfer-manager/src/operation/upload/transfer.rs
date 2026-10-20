@@ -840,7 +840,7 @@ impl UploadTransfer {
             .expect("content length must be known for PutObject");
 
         let is_file_backed = stream.is_file_backed();
-        let direct_io = self.inner.ctx.handle.runtime.components().direct_io();
+        let direct_io = self.inner.ctx.handle.runtime.components().direct_body_io();
 
         // Hand the request body off to the SDK as a retryable `SdkBody`:
         // in-memory sources ride `SdkBody::from(Bytes)`'s built-in rebuild path;

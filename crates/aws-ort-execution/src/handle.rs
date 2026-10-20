@@ -53,6 +53,31 @@ impl ManagedRuntimeHandle {
         if current.runtime_id() != self.id() {
             return None;
         }
-        self.state.partitions.get(current.index())
+        Some(
+            self.state
+                .partitions
+                .get(current.index())
+                .expect("current partition index must belong to this runtime"),
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ManagedRuntime, RuntimePartitionId};
+
+    #[test]
+    #[should_panic(expected = "current partition index must belong to this runtime")]
+    fn same_runtime_invalid_partition_is_a_contract_violation() {
+        let owner = ManagedRuntime::builder()
+            .topology(Topology::detect().unwrap().with_max_placements(1))
+            .pin_threads(false)
+            .build()
+            .unwrap();
+        let execution = owner.handle();
+        let _current =
+            identity::CurrentPartition::enter(RuntimePartitionId::new(execution.id(), 1));
+        execution.current_partition();
     }
 }

@@ -13,6 +13,7 @@ categories = ["asynchronous", "concurrency"]
 keywords = ["AWS", "Amazon", "S3", "high-performance", "transfer-manager"]
 
 [dependencies]
+aws-ort-execution = { workspace = true }
 aws-config = { workspace = true, features = ["behavior-version-latest"] }
 aws-sdk-s3 = { workspace = true, features = ["behavior-version-latest"] }
 aws-smithy-runtime-api = { workspace = true }
@@ -43,7 +44,7 @@ arc-swap = "1.9.2"
 smallvec = "1"
 
 [features]
-dial9 = ["dep:dial9"]
+dial9 = ["dep:dial9", "aws-ort-execution/dial9"]
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.189"

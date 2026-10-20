@@ -21,6 +21,7 @@ edition = "2024"
 authors = ["AWS Rust SDK Team <aws-sdk-rust@amazon.com>"]
 
 [workspace.dependencies]
+aws-ort-execution = { version = "0.1.0", path = "crates/aws-ort-execution" }
 aws-config = { path = "../smithy-rs.ort/aws/sdk/build/aws-sdk/sdk/aws-config" }
 aws-runtime = { path = "../smithy-rs.ort/aws/sdk/build/aws-sdk/sdk/aws-runtime" }
 aws-sdk-s3 = { path = "../smithy-rs.ort/aws/sdk/build/aws-sdk/sdk/s3" }

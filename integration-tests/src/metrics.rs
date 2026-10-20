@@ -9,13 +9,14 @@ use std::time::Duration;
 
 use aws_sdk_s3_transfer_manager::io::InputStream;
 use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
-use aws_sdk_s3_transfer_manager::types::{RuntimeMode, TransferStatus};
+use aws_sdk_s3_transfer_manager::types::TransferStatus;
+use aws_sdk_s3_transfer_manager::RuntimeConfig;
 use tokio::time::timeout;
 
 use crate::harness::{mock_tm, MockTm};
 
 async fn setup() -> MockTm {
-    mock_tm(RuntimeMode::Managed).await
+    mock_tm(RuntimeConfig::default()).await
 }
 
 /// Poll handle status until terminal, with timeout.
@@ -137,7 +138,7 @@ async fn test_download_metrics_and_status() {
 }
 
 #[cfg(any(unix, windows))]
-async fn test_download_to_file_metrics(rt: RuntimeMode) {
+async fn test_download_to_file_metrics(rt: RuntimeConfig) {
     let m = mock_tm(rt).await;
 
     let size = 25 * ByteUnit::Mebibyte.as_bytes_usize();
@@ -174,13 +175,13 @@ async fn test_download_to_file_metrics(rt: RuntimeMode) {
 #[cfg(any(unix, windows))]
 #[tokio::test]
 async fn test_download_to_file_metrics_mock_gp() {
-    test_download_to_file_metrics(RuntimeMode::Managed).await;
+    test_download_to_file_metrics(RuntimeConfig::default()).await;
 }
 
 #[cfg(any(unix, windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_download_to_file_metrics_tokio_mt() {
-    test_download_to_file_metrics(RuntimeMode::MultiThreadTokio).await;
+    test_download_to_file_metrics(RuntimeConfig::multi_thread_tokio()).await;
 }
 
 #[tokio::test]

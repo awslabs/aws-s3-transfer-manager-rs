@@ -102,6 +102,7 @@ fn initialize(
     let mut builder = tokio::runtime::Builder::new_current_thread();
     builder
         .enable_all()
+        .max_blocking_threads(1)
         .on_thread_start(move || identity::mark_runtime_thread(id));
     #[cfg(feature = "dial9")]
     let runtime = match &config.dial9_handle {

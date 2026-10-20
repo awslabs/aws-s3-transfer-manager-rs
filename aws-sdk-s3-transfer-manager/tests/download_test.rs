@@ -4,10 +4,11 @@
  */
 
 use aws_config::Region;
+use aws_sdk_s3_transfer_manager::RuntimeConfig;
 use aws_sdk_s3_transfer_manager::{
     error::{BoxError, ErrorKind},
     metrics::unit::ByteUnit,
-    types::{ConcurrencyMode, PartSize, RuntimeMode, TransferStatus},
+    types::{ConcurrencyMode, PartSize, TransferStatus},
 };
 use aws_smithy_runtime_api::client::http::{
     http_client_fn, HttpConnector, HttpConnectorFuture, SharedHttpConnector,
@@ -291,7 +292,7 @@ impl HttpConnector for ParkAfterDiscoveryConnector {
 /// without waiting for those requests to complete on their own.
 ///
 /// The body is never consumed.
-async fn abort_download_with_executing_gets(runtime_mode: RuntimeMode) {
+async fn abort_download_with_executing_gets(runtime_config: RuntimeConfig) {
     let total = 25 * ByteUnit::Mebibyte.as_bytes_usize();
     let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
     let requests = Arc::new(AtomicUsize::new(0));
@@ -312,7 +313,7 @@ async fn abort_download_with_executing_gets(runtime_mode: RuntimeMode) {
         .client(s3_client)
         .part_size(PartSize::Target(part_size as u64))
         .concurrency(ConcurrencyMode::Explicit(2))
-        .runtime_mode(runtime_mode)
+        .runtime_config(runtime_config)
         .build();
     let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
@@ -342,12 +343,12 @@ async fn abort_download_with_executing_gets(runtime_mode: RuntimeMode) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_abort_download_on_tokio_runtime() {
-    abort_download_with_executing_gets(RuntimeMode::MultiThreadTokio).await;
+    abort_download_with_executing_gets(RuntimeConfig::multi_thread_tokio()).await;
 }
 
 #[tokio::test]
 async fn test_abort_download_on_managed_runtime() {
-    abort_download_with_executing_gets(RuntimeMode::Managed).await;
+    abort_download_with_executing_gets(RuntimeConfig::default()).await;
 }
 
 pin_project! {

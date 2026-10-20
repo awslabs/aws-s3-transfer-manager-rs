@@ -278,6 +278,7 @@ version = "0.3.1"
 dependencies = [
  "arc-swap",
  "aws-config",
+ "aws-ort-execution",
  "aws-runtime",
  "aws-sdk-s3",
  "aws-smithy-checksums",

@@ -3681,12 +3681,14 @@ mod tests {
     /// relief item, and the final range gets the second slot only once
     /// discovery has retired. The held write's thread is then the only loaded
     /// one, and routing, which picks the less loaded of two threads, picks
-    /// another.
+    /// another. With one detected partition, the final range instead waits
+    /// for the held write to be released.
     async fn write_to_path_with_held_relief_write(
         release_err: Option<std::io::ErrorKind>,
+        max_partitions: usize,
     ) -> HeldReliefDownload {
         use crate::operation::download::test_util::fixtures::{
-            managed_test_handle, object_bytes, object_client,
+            managed_test_handle_with_max_partitions, object_bytes, object_client,
         };
         use crate::operation::download::test_util::sink::{
             Action, Match, Op, ScriptedSinkFactory, WriteScript,
@@ -3712,7 +3714,8 @@ mod tests {
             .part_size(crate::types::PartSize::Target(part_size as u64))
             .memory(crate::types::MemoryConfig::Explicit(pool))
             .build();
-        let handle = managed_test_handle(config, 2);
+        let (handle, partition_count) =
+            managed_test_handle_with_max_partitions(config, 2, max_partitions);
         let input = DownloadInput::builder()
             .bucket("test-bucket")
             .key("test-key")
@@ -3746,13 +3749,18 @@ mod tests {
         );
 
         drop(blocker);
-        tokio::time::timeout(TIMEOUT, async {
-            while download.metrics().network_rx < 2 * part_size as u64 {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        })
-        .await
-        .expect("the final range is received while the relief write is held");
+        if partition_count > 1 {
+            tokio::time::timeout(TIMEOUT, async {
+                while download.metrics().network_rx < 2 * part_size as u64 {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("the final range is received while the relief write is held");
+        }
+        // On one partition, the held synchronous write also holds the only
+        // managed thread. Join must still wait and publication must still wait;
+        // the final range can run after that write is released.
 
         let join = tokio::spawn(download.join());
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -3786,7 +3794,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn write_to_path_join_waits_for_a_held_relief_write() {
-        let download = write_to_path_with_held_relief_write(None).await;
+        let download = write_to_path_with_held_relief_write(None, 4).await;
         download.result.expect("the download succeeds");
         assert_eq!(std::fs::read(&download.dest).unwrap(), &download.object[..]);
     }
@@ -3797,7 +3805,7 @@ mod tests {
     #[tokio::test]
     async fn write_to_path_fails_without_publishing_when_a_relief_write_fails() {
         let download =
-            write_to_path_with_held_relief_write(Some(std::io::ErrorKind::StorageFull)).await;
+            write_to_path_with_held_relief_write(Some(std::io::ErrorKind::StorageFull), 4).await;
         let error = download.result.expect_err("the relief write failed");
         assert_eq!(error.kind(), &crate::error::ErrorKind::IOError);
         assert!(
@@ -3809,6 +3817,27 @@ mod tests {
             0,
             "the temporary file must be removed"
         );
+    }
+
+    /// Holding the only managed partition must not publish early, and an I/O
+    /// failure must still leave neither a destination nor a temporary file.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn held_relief_write_on_one_partition_preserves_completion_and_cleanup() {
+        let download = write_to_path_with_held_relief_write(None, 1).await;
+        download
+            .result
+            .expect("download succeeds after the write is released");
+        assert_eq!(std::fs::read(&download.dest).unwrap(), &download.object[..]);
+
+        let download =
+            write_to_path_with_held_relief_write(Some(std::io::ErrorKind::StorageFull), 1).await;
+        assert_eq!(
+            download.result.unwrap_err().kind(),
+            &crate::error::ErrorKind::IOError
+        );
+        assert!(!download.dest.exists());
+        assert_eq!(std::fs::read_dir(download.dir.path()).unwrap().count(), 0);
     }
 
     /// A failure after the transfer completed panics in debug builds. The case

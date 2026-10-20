@@ -32,7 +32,8 @@
 //! Enabling the feature alone does not attach a recorder. Shut down the runtime
 //! before shutting down the recorder so managed-thread events can flush.
 //!
-//! Tokio blocking-pool threads are outside the execution partition collection.
+//! Each partition currently permits one Tokio blocking-pool thread. These
+//! helper threads are outside the execution partition collection.
 //! Thread binding does not establish a memory allocation policy.
 //!
 //! ```rust
