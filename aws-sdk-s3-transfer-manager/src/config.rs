@@ -187,6 +187,10 @@ impl Config {
         &self.runtime_config
     }
 
+    pub(crate) fn managed_config_mut(&mut self) -> Option<&mut Managed> {
+        self.runtime_config.managed_config_mut()
+    }
+
     /// Returns the read-ahead mode used for downloads.
     ///
     /// This is the client default; a download may override it per request via

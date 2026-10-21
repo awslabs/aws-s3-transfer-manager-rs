@@ -431,9 +431,8 @@ jobs:
         uses: taiki-e/cache-cargo-install-action@v2
         with:
           tool: cargo-check-external-types@0.5.0
-      - name: check-external-types
-        run: cargo check-external-types --config external-types.toml
-        working-directory: aws-sdk-s3-transfer-manager
+      - name: check ordinary, experimental, and adapter APIs
+        run: python3 tools/check-tm-public-api.py
 
   check-deny:
     name: check deps with cargo-deny

@@ -1,0 +1,14 @@
+# The experimental hook exposes only the concrete runtime owner.
+allowed_external_types = [
+    "aws_ort_execution::runtime::ManagedRuntime",
+    "aws_sdk_s3::*",
+    "aws_smithy_runtime_api::*",
+    "aws_smithy_types::*",
+    "aws_types::request_id::RequestId",
+    "aws_types::sdk_config::SdkConfig",
+    "bytes::buf::buf_impl::Buf",
+    "bytes::buf::buf_mut::BufMut",
+    "bytes::bytes::Bytes",
+    "tokio::io::async_read::AsyncRead",
+    "tokio::runtime::task::error::JoinError",
+]

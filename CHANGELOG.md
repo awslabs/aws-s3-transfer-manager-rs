@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.4.0] - Unreleased
 
+### Added
+- Experimental managed-runtime adoption through the non-default `__exp_ort` feature,
+  used by the new `aws-sdk-s3-transfer-manager-ort` adapter. The adapter transfers runtime
+  ownership into opaque TM configuration and provides a Smithy HTTP view over existing
+  managed pool clients. Configure adopted-runtime tracing on its execution builder.
+
 ### Changed
 - `RuntimeConfig` and opaque `Managed` replace `RuntimeMode`; builders and loaders use
   `runtime_config`. Managed execution uses reusable runtime components while the transfer

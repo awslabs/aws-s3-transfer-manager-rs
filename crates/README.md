@@ -9,6 +9,7 @@ share a repository with S3 Transfer Manager and have their own versions.
 | [`aws-ort-topology`](aws-ort-topology/) | Hardware discovery and placement resources | None |
 | [`aws-ort-execution`](aws-ort-execution/) | Worker ownership and execution partitions | `aws-ort-topology` |
 | [`aws-ort-http`](aws-ort-http/) | Connection pooling, HTTP transport, and adapter views | `aws-ort-execution` |
+| [`aws-sdk-s3-transfer-manager-ort`](aws-sdk-s3-transfer-manager-ort/) | Experimental TM runtime adoption and Smithy HTTP composition | TM, `aws-ort-execution`, `aws-ort-http` |
 
 `aws-ort-execution` re-exports the topology crate as `topology`. The component
 dependency chain points from HTTP to execution to topology. Transfer scheduling,

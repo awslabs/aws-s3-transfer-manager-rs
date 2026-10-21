@@ -293,7 +293,7 @@ impl Client {
         if runtime_http.is_some() {
             log_connection_cap(&connection_cap, controller.target());
         }
-        let managed = match config.runtime_config().managed_config() {
+        let managed = match config.managed_config_mut() {
             Some(managed) => {
                 let owner = managed
                     .build(
@@ -623,6 +623,8 @@ mod tests {
         started: Arc<tokio::sync::Semaphore>,
         release: Arc<tokio::sync::Semaphore>,
         bodies: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+        execution: Option<aws_ort_execution::ManagedRuntimeHandle>,
+        dispatches: Arc<std::sync::Mutex<Vec<aws_ort_execution::RuntimePartitionId>>>,
     }
 
     impl aws_smithy_runtime_api::client::http::HttpConnector for CallerHttp {
@@ -636,6 +638,12 @@ mod tests {
             use std::pin::Pin;
 
             assert_eq!(request.method(), "PUT");
+            if let Some(execution) = &self.execution {
+                let partition = execution
+                    .current_partition()
+                    .expect("transfer must execute on the adopted runtime");
+                self.dispatches.lock().unwrap().push(partition.id());
+            }
             let started = self.started.clone();
             let release = self.release.clone();
             let bodies = self.bodies.clone();
@@ -690,19 +698,57 @@ mod tests {
         checksum.update(&payload);
         let checksum = checksum.header_value().to_str().unwrap().to_owned();
 
-        for (runtime, managed) in [
-            (RuntimeConfig::default(), true),
-            (RuntimeConfig::multi_thread_tokio(), false),
-        ] {
+        let adopted: Option<(
+            RuntimeConfig,
+            bool,
+            Option<aws_ort_execution::ManagedRuntimeHandle>,
+        )> = {
+            #[cfg(feature = "__exp_ort")]
+            {
+                let owner = aws_ort_execution::ManagedRuntime::builder()
+                    .topology(
+                        aws_ort_execution::topology::Topology::detect()
+                            .unwrap()
+                            .with_max_placements(1),
+                    )
+                    .thread_name_prefix("adopted-upload")
+                    .pin_threads(false)
+                    .build()
+                    .unwrap();
+                let execution = owner.handle();
+                Some((
+                    RuntimeConfig::managed(crate::unstable::managed(owner)),
+                    true,
+                    Some(execution),
+                ))
+            }
+            #[cfg(not(feature = "__exp_ort"))]
+            {
+                None
+            }
+        };
+        for (runtime, managed, adopted) in [
+            (RuntimeConfig::default(), true, None),
+            (RuntimeConfig::multi_thread_tokio(), false, None),
+        ]
+        .into_iter()
+        .chain(adopted)
+        {
             caller.block_on(async {
                 let started = Arc::new(tokio::sync::Semaphore::new(0));
                 let release = Arc::new(tokio::sync::Semaphore::new(0));
                 let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+                let dispatches = Arc::new(std::sync::Mutex::new(Vec::new()));
+                let owner_watch = adopted
+                    .as_ref()
+                    .map(|execution| execution.partitions()[0].spawn(std::future::pending::<()>()));
                 let connector = SharedHttpConnector::new(CallerHttp {
                     caller: caller.handle().clone(),
                     started: started.clone(),
                     release: release.clone(),
                     bodies: bodies.clone(),
+                    execution: adopted.clone(),
+                    dispatches: dispatches.clone(),
                 });
                 let sdk = aws_types::SdkConfig::builder()
                     .http_client(http_client_fn(move |_, _| connector.clone()))
@@ -767,6 +813,11 @@ mod tests {
                         "both attempts replay the file"
                     );
                 }
+                if let Some(execution) = &adopted {
+                    let observed = dispatches.lock().unwrap();
+                    assert_eq!(observed.len(), 2);
+                    assert!(observed.iter().all(|id| id.runtime_id() == execution.id()));
+                }
                 tokio::time::timeout(Duration::from_secs(5), async {
                     // SkipMap retires scheduler descriptors through its global
                     // epoch collector. Advance collection before checking final
@@ -784,8 +835,141 @@ mod tests {
                 .unwrap_or_else(|_| {
                     panic!("finished transfer retains execution (managed={managed})")
                 });
+                if let Some(watch) = owner_watch {
+                    let error = tokio::time::timeout(Duration::from_secs(5), watch)
+                        .await
+                        .unwrap()
+                        .unwrap_err();
+                    assert!(
+                        error.is_cancelled(),
+                        "retained handles must not retain ownership"
+                    );
+                }
             });
         }
+    }
+
+    #[cfg(all(feature = "__exp_ort", not(miri)))]
+    #[tokio::test]
+    async fn adopted_runtime_without_configured_http_uses_the_managed_preset() {
+        let owner = aws_ort_execution::ManagedRuntime::builder()
+            .topology(
+                aws_ort_execution::topology::Topology::detect()
+                    .unwrap()
+                    .with_max_placements(1),
+            )
+            .pin_threads(false)
+            .build()
+            .unwrap();
+        let execution = owner.handle();
+        let watch = execution.partitions()[0].spawn(std::future::pending::<()>());
+        let mut s3 = mock_s3_config().config.to_builder();
+        s3.set_http_client(None);
+        let client = Client::new(
+            crate::Config::builder()
+                .s3_config(s3)
+                .runtime_config(RuntimeConfig::managed(crate::unstable::managed(owner)))
+                .build(),
+        );
+        assert!(client
+            .handle
+            .config
+            .runtime_config()
+            .managed_config()
+            .is_some());
+        let components = client.handle.runtime.components();
+        assert!(components.http_client().is_some());
+        assert!(components.direct_io());
+        assert!(components.direct_body_io());
+        assert_eq!(
+            execution.partitions()[0].spawn(async { 42 }).await.unwrap(),
+            42,
+        );
+        drop(client);
+        assert!(tokio::time::timeout(Duration::from_secs(5), watch)
+            .await
+            .unwrap()
+            .unwrap_err()
+            .is_cancelled());
+    }
+
+    #[cfg(all(
+        feature = "__exp_ort",
+        not(miri),
+        any(
+            target_os = "android",
+            target_os = "fuchsia",
+            target_os = "illumos",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "solaris",
+            target_os = "tvos",
+            target_os = "visionos",
+            target_os = "watchos",
+        )
+    ))]
+    #[tokio::test]
+    async fn transport_construction_failure_drops_the_adopted_owner() {
+        let owner = aws_ort_execution::ManagedRuntime::builder()
+            .topology(
+                aws_ort_execution::topology::Topology::detect()
+                    .unwrap()
+                    .with_max_placements(1),
+            )
+            .pin_threads(false)
+            .build()
+            .unwrap();
+        let execution = owner.handle();
+        let watch = execution.partitions()[0].spawn(std::future::pending::<()>());
+        let mut s3 = mock_s3_config().config.to_builder();
+        s3.set_http_client(None);
+        let config = crate::Config::builder()
+            .s3_config(
+                crate::config::S3ClientConfig::new(s3).network_interfaces(["bad\0interface"]),
+            )
+            .runtime_config(RuntimeConfig::managed(crate::unstable::managed(owner)))
+            .build();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Client::new(config)));
+        assert!(result.is_err());
+        assert!(tokio::time::timeout(Duration::from_secs(5), watch)
+            .await
+            .unwrap()
+            .unwrap_err()
+            .is_cancelled());
+    }
+
+    #[cfg(all(feature = "__exp_ort", feature = "dial9", not(miri)))]
+    #[tokio::test]
+    async fn adopted_runtime_rejects_tm_recorder_and_releases_ownership() {
+        let owner = aws_ort_execution::ManagedRuntime::builder()
+            .topology(
+                aws_ort_execution::topology::Topology::detect()
+                    .unwrap()
+                    .with_max_placements(1),
+            )
+            .pin_threads(false)
+            .build()
+            .unwrap();
+        let execution = owner.handle();
+        let watch = execution.partitions()[0].spawn(std::future::pending::<()>());
+        let config = crate::Config::builder()
+            .s3_config(mock_s3_config())
+            .runtime_config(RuntimeConfig::managed(crate::unstable::managed(owner)))
+            .dial9_handle(dial9::Dial9Handle::disabled())
+            .build();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Client::new(config)));
+        let panic = match result {
+            Err(panic) => panic,
+            Ok(_) => panic!("conflicting recorder must fail client construction"),
+        };
+        let message = panic.downcast_ref::<String>().unwrap();
+        assert!(message.contains("configure Dial9 on the runtime builder before adoption"));
+        assert!(tokio::time::timeout(Duration::from_secs(5), watch)
+            .await
+            .unwrap()
+            .unwrap_err()
+            .is_cancelled());
     }
 
     #[cfg_attr(miri, ignore)]

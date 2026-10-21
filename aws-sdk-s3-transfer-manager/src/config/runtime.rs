@@ -52,6 +52,13 @@ impl RuntimeConfig {
             Kind::MultiThreadTokio => None,
         }
     }
+
+    pub(crate) fn managed_config_mut(&mut self) -> Option<&mut Managed> {
+        match &mut self.kind {
+            Kind::Managed(managed) => Some(managed),
+            Kind::MultiThreadTokio => None,
+        }
+    }
 }
 
 impl Default for RuntimeConfig {
@@ -69,22 +76,133 @@ impl Default for RuntimeConfig {
 #[non_exhaustive]
 #[derive(Debug, Default)]
 pub struct Managed {
-    _private: (),
+    source: Source,
+}
+
+#[derive(Debug, Default)]
+enum Source {
+    #[default]
+    Automatic,
+    #[cfg(feature = "__exp_ort")]
+    Ort(Option<aws_ort_execution::ManagedRuntime>),
 }
 
 impl Managed {
+    #[cfg(feature = "__exp_ort")]
+    pub(crate) fn from_runtime(runtime: aws_ort_execution::ManagedRuntime) -> Self {
+        Self {
+            source: Source::Ort(Some(runtime)),
+        }
+    }
+
     pub(crate) fn build(
-        &self,
+        &mut self,
         #[cfg(feature = "dial9")] recorder: Option<dial9::Dial9Handle>,
-    ) -> Result<aws_ort_execution::ManagedRuntime, aws_ort_execution::BuildError> {
-        let builder = aws_ort_execution::ManagedRuntime::builder()
-            .thread_name_prefix("s3-tm")
-            .pin_threads(false);
-        #[cfg(feature = "dial9")]
-        let builder = match recorder {
-            Some(recorder) => builder.dial9_handle(recorder),
-            None => builder,
-        };
-        builder.build()
+    ) -> Result<aws_ort_execution::ManagedRuntime, aws_smithy_runtime_api::box_error::BoxError>
+    {
+        match &mut self.source {
+            Source::Automatic => {
+                let builder = aws_ort_execution::ManagedRuntime::builder()
+                    .thread_name_prefix("s3-tm")
+                    .pin_threads(false);
+                #[cfg(feature = "dial9")]
+                let builder = match recorder {
+                    Some(recorder) => builder.dial9_handle(recorder),
+                    None => builder,
+                };
+                builder.build().map_err(Into::into)
+            }
+            #[cfg(feature = "__exp_ort")]
+            Source::Ort(owner) => {
+                #[cfg(feature = "dial9")]
+                if recorder.is_some() {
+                    return Err("configure Dial9 on the runtime builder before adoption; \
+                         a transfer-manager dial9_handle cannot instrument an adopted runtime"
+                        .into());
+                }
+                // Config retains its managed selection after execution takes
+                // ownership. A second take must not construct another runtime.
+                Ok(owner.take().expect("adopted managed runtime already taken"))
+            }
+        }
+    }
+}
+
+#[cfg(all(test, feature = "__exp_ort", not(miri)))]
+mod tests {
+    use super::*;
+    use aws_ort_execution::{topology::Topology, ManagedRuntime};
+
+    #[test]
+    fn adoption_preserves_identity_topology_and_names_and_takes_owner_once() {
+        let runtime = ManagedRuntime::builder()
+            .topology(Topology::detect().unwrap().with_max_placements(1))
+            .thread_name_prefix("external")
+            .pin_threads(false)
+            .build()
+            .unwrap();
+        let before = runtime.handle();
+        let mut managed = Managed::from_runtime(runtime);
+        let runtime = managed
+            .build(
+                #[cfg(feature = "dial9")]
+                None,
+            )
+            .unwrap();
+        let after = runtime.handle();
+        assert_eq!(before.id(), after.id());
+        assert_eq!(
+            before.topology().placements(),
+            after.topology().placements()
+        );
+        let caller = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let partition = after.partitions()[0].clone();
+        let expected = partition.id();
+        let observed = after.clone();
+        caller
+            .block_on(partition.spawn(async move {
+                assert_eq!(observed.current_partition().unwrap().id(), expected);
+                assert!(std::thread::current()
+                    .name()
+                    .unwrap()
+                    .starts_with("external-"));
+            }))
+            .unwrap();
+        let repeated = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            managed.build(
+                #[cfg(feature = "dial9")]
+                None,
+            )
+        }));
+        assert!(
+            repeated.is_err(),
+            "a consumed owner must not become automatic execution"
+        );
+        caller.block_on(runtime.shutdown()).unwrap();
+    }
+
+    #[cfg(feature = "dial9")]
+    #[test]
+    fn separate_recorder_is_rejected_without_consuming_the_owner() {
+        let runtime = ManagedRuntime::builder()
+            .topology(Topology::detect().unwrap().with_max_placements(1))
+            .pin_threads(false)
+            .dial9_handle(dial9::Dial9Handle::disabled())
+            .build()
+            .unwrap();
+        let id = runtime.handle().id();
+        let mut managed = Managed::from_runtime(runtime);
+        let error = managed
+            .build(Some(dial9::Dial9Handle::disabled()))
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("configure Dial9 on the runtime builder before adoption"));
+        let runtime = managed.build(None).unwrap();
+        assert_eq!(runtime.handle().id(), id);
+        drop(runtime);
     }
 }

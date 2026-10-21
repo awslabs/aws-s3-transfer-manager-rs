@@ -328,6 +328,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-s3-transfer-manager-ort"
+version = "0.1.0"
+dependencies = [
+ "aws-credential-types",
+ "aws-ort-execution",
+ "aws-ort-http",
+ "aws-sdk-s3-transfer-manager",
+ "aws-smithy-checksums",
+ "aws-smithy-http-client",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-types",
+ "crossbeam-skiplist",
+ "fastrand",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "aws-sdk-sso"
 version = "0.0.0-local"
 dependencies = [

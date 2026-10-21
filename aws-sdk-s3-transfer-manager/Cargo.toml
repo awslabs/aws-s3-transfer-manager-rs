@@ -44,6 +44,8 @@ arc-swap = "1.9.2"
 smallvec = "1"
 
 [features]
+# Version-coupled adoption hook used by the experimental execution adapter.
+__exp_ort = []
 dial9 = ["dep:dial9", "aws-ort-execution/dial9"]
 
 [target.'cfg(unix)'.dependencies]

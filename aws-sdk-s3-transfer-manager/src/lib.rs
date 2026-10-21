@@ -144,6 +144,10 @@ pub mod operation;
 /// Transfer manager configuration
 pub mod config;
 
+/// Experimental integrations with version-coupled managed execution.
+#[cfg(feature = "__exp_ort")]
+pub mod unstable;
+
 /// Payload-memory configuration and shared pooled storage.
 ///
 /// Transfer-manager clients construct a pool automatically by default.

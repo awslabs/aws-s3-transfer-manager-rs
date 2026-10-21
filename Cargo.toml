@@ -7,6 +7,7 @@ members = [
     "crates/aws-ort-topology",
     "crates/aws-ort-execution",
     "crates/aws-ort-http",
+    "crates/aws-sdk-s3-transfer-manager-ort",
 
     # internal
     "s3-mock-server",
@@ -21,8 +22,11 @@ edition = "2024"
 authors = ["AWS Rust SDK Team <aws-sdk-rust@amazon.com>"]
 
 [workspace.dependencies]
+aws-sdk-s3-transfer-manager = { version = "=0.3.1", path = "aws-sdk-s3-transfer-manager" }
+aws-ort-http = { version = "0.1.0", path = "crates/aws-ort-http" }
 aws-ort-execution = { version = "0.1.0", path = "crates/aws-ort-execution" }
 aws-config = { path = "../smithy-rs.ort/aws/sdk/build/aws-sdk/sdk/aws-config" }
+aws-credential-types = { path = "../smithy-rs.ort/aws/sdk/build/aws-sdk/sdk/aws-credential-types" }
 aws-runtime = { path = "../smithy-rs.ort/aws/sdk/build/aws-sdk/sdk/aws-runtime" }
 aws-sdk-s3 = { path = "../smithy-rs.ort/aws/sdk/build/aws-sdk/sdk/s3" }
 aws-smithy-async = { path = "../smithy-rs.ort/aws/sdk/build/aws-sdk/sdk/aws-smithy-async" }
