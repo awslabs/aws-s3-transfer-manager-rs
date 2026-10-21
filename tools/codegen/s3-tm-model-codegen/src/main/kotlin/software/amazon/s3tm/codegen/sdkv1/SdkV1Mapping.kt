@@ -6,6 +6,7 @@
 
 package software.amazon.s3tm.codegen.sdkv1
 
+import java.util.SortedSet
 import software.amazon.s3tm.codegen.TmModelProjection
 import software.amazon.s3tm.codegen.UploadRequestPolicy
 import software.amazon.smithy.model.neighbor.Walker
@@ -28,8 +29,14 @@ class SdkV1Mapping(val projection: TmModelProjection.Result, val symbols: SdkV1S
     val enums = shapes.filter(::isEnum)
     private val operationRoots = projection.roots.drop(TmModelProjection.nestedRoots.size).toSet()
     val values = shapes.filterIsInstance<StructureShape>().filter { it.id !in operationRoots }
-    private val coverage = sortedMapOf<String, String>()
+    private val coverage = sortedMapOf<String, SortedSet<String>>()
     private val reviewIssues = mutableListOf<String>()
+
+    // A GET response member reaches both ObjectMetadata and ChunkMetadata, so one source
+    // member can have two destinations.
+    private fun classify(member: String, classification: String) {
+        coverage.getOrPut(member) { sortedSetOf() }.add(classification)
+    }
 
     fun valueMembers(shape: StructureShape): List<Member> = shape.members().map { member ->
         val source = projection.memberSources[member.id]?.singleOrNull()
@@ -52,11 +59,11 @@ class SdkV1Mapping(val projection: TmModelProjection.Result, val symbols: SdkV1S
             }
             when (route) {
                 is UploadRequestPolicy.Route.Controlled -> {
-                    coverage[member.id.toString()] = "controlled: ${route.reason}"
+                    classify(member.id.toString(), "controlled: ${route.reason}")
                     null
                 }
                 is UploadRequestPolicy.Route.Omit -> {
-                    coverage[member.id.toString()] = "omitted: ${route.reason}"
+                    classify(member.id.toString(), "omitted: ${route.reason}")
                     null
                 }
                 is UploadRequestPolicy.Route.ReviewRequired -> {
@@ -69,7 +76,7 @@ class SdkV1Mapping(val projection: TmModelProjection.Result, val symbols: SdkV1S
                     require(tmMember.target == member.target || member.memberName == "Expires") {
                         "Request target differs: ${member.id} -> ${tmMember.id}"
                     }
-                    coverage[member.id.toString()] = "forwarded: ${tmMember.id}"
+                    classify(member.id.toString(), "forwarded: ${tmMember.id}")
                     Member(tmMember, member)
                 }
             }
@@ -91,13 +98,13 @@ class SdkV1Mapping(val projection: TmModelProjection.Result, val symbols: SdkV1S
         val output = projection.model.expectShape(TmModelProjection.tmId(tmOutput), StructureShape::class.java)
         val members = sdkOutput.members().mapNotNull { member ->
             if (member.memberName == "Body") {
-                coverage[member.id.toString()] = "TM-controlled: response stream"
+                classify(member.id.toString(), "TM-controlled: response stream")
                 null
             } else {
                 val tmMember = output.members().singleOrNull {
                     projection.memberSources[it.id].orEmpty().contains(member.id)
                 } ?: error("${member.id} has no $tmOutput member correspondence")
-                coverage[member.id.toString()] = "forwarded: ${tmMember.id}"
+                classify(member.id.toString(), "forwarded: ${tmMember.id}")
                 Member(tmMember, member)
             }
         }
@@ -112,17 +119,19 @@ class SdkV1Mapping(val projection: TmModelProjection.Result, val symbols: SdkV1S
 
     init {
         require(reviewIssues.isEmpty()) { "Upload mapping requires review:\n${reviewIssues.sorted().joinToString("\n")}" }
-        values.forEach { shape -> valueMembers(shape).forEach { coverage[it.sdk.id.toString()] = "value: ${it.tm.id}" } }
+        values.forEach { shape -> valueMembers(shape).forEach { classify(it.sdk.id.toString(), "value: ${it.tm.id}") } }
         symbols.policy.fields.forEach { (shape, fields) ->
-            fields.filter { it.runtime != null }.forEach { coverage["$shape\$${it.name}"] = "TM-only: ${it.runtime!!.type.path}" }
+            fields.filter { it.runtime != null }.forEach { classify("$shape\$${it.name}", "TM-only: ${it.runtime!!.type.path}") }
         }
-        projection.excludedMembers.forEach { (member, reason) -> coverage.putIfAbsent(member.toString(), "excluded: $reason") }
+        projection.excludedMembers.forEach { (member, reason) ->
+            if (member.toString() !in coverage) classify(member.toString(), "excluded: $reason")
+        }
     }
 
     fun report(): String = Node.prettyPrintJson(Node.objectNodeBuilder()
         .withMember("schemaVersion", 1)
         .withMember("members", Node.objectNodeBuilder().also { builder ->
-            coverage.forEach { (member, classification) -> builder.withMember(member, classification) }
+            coverage.forEach { (member, classifications) -> builder.withMember(member, Node.fromStrings(classifications)) }
         }.build()).build()) + "\n"
 
     companion object {

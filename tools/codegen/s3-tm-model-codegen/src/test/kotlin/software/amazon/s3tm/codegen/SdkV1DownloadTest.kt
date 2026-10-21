@@ -15,6 +15,7 @@ import software.amazon.s3tm.codegen.sdkv1.SdkV1Generator
 import software.amazon.s3tm.codegen.sdkv1.SdkV1Mapping
 import software.amazon.s3tm.codegen.sdkv1.SdkV1Symbols
 import software.amazon.smithy.model.Model
+import software.amazon.smithy.model.node.Node
 import software.amazon.smithy.model.shapes.ShapeId
 import software.amazon.smithy.model.shapes.StructureShape
 
@@ -96,6 +97,25 @@ class SdkV1DownloadTest {
             assertFalse(body.contains(".body("))
             assertFalse(body.contains(".set_body("))
         }
+    }
+
+    @Test
+    fun `mapping report keeps every destination of a GET member that reaches both metadata values`() {
+        val (mapping, _) = generate()
+        val reported = Node.parse(mapping.report()).expectObjectNode().expectObjectMember("members")
+        val forwarded = mapping.responses.filter { it.operation.id.name == "GetObject" }
+            .flatMap { it.members }.groupBy({ it.sdk.id.toString() }, { "forwarded: ${it.tm.id}" })
+        assertEquals(
+            setOf("forwarded: s3.tm#ObjectMetadata\$ETag", "forwarded: s3.tm#ChunkMetadata\$ETag"),
+            forwarded.getValue("com.amazonaws.s3#GetObjectOutput\$ETag").toSet(),
+        )
+        forwarded.forEach { (member, destinations) ->
+            assertEquals(destinations.sorted(),
+                reported.expectArrayMember(member).elements.map { it.expectStringNode().value }, member)
+        }
+        assertEquals(listOf("TM-controlled: response stream"),
+            reported.expectArrayMember("com.amazonaws.s3#GetObjectOutput\$Body").elements
+                .map { it.expectStringNode().value })
     }
 
     @Test

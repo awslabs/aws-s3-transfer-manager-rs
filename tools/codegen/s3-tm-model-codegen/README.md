@@ -255,6 +255,7 @@ Reports support maintenance without being installed:
 - `member-policy.json`: custom names/visibility, runtime types, construction,
   redaction, exclusions, and synthetic request-ID header mappings.
 - `sdk_v1/mapping.json`: source-member classifications and conversion mappings.
+  A GET response member lists both metadata destinations.
 - `provenance.json`: input, projection configuration, projected model, and
   generator-source digests.
 - `dependencies.json`: generated dependencies and Smithy/smithy-rs versions.
