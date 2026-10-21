@@ -4,22 +4,22 @@
  */
 #![cfg(feature = "sdk-v1")]
 
-use aws_sdk_s3_transfer_manager::model;
+use aws_sdk_s3_transfer_manager::types;
 use aws_smithy_types::DateTime;
 
 macro_rules! enum_roundtrip {
     ($name:ident) => {
-        for name in model::$name::values()
+        for name in types::$name::values()
             .iter()
             .copied()
             .chain(["FUTURE_VALUE"])
         {
-            let tm = model::$name::from(name);
+            let tm = types::$name::from(name);
             let sdk = aws_sdk_s3::types::$name::from(&tm);
             assert_eq!(sdk.as_str(), name);
-            assert_eq!(model::$name::from(&sdk), tm);
+            assert_eq!(types::$name::from(&sdk), tm);
             let sdk: aws_sdk_s3::types::$name = tm.clone().into();
-            let roundtrip: model::$name = sdk.into();
+            let roundtrip: types::$name = sdk.into();
             assert_eq!(roundtrip, tm);
         }
     };
@@ -44,14 +44,14 @@ fn owned_and_borrowed_enum_conversions_preserve_known_and_unknown_values() {
 #[test]
 fn owned_and_borrowed_nested_values_preserve_storage_not_getter_defaults() {
     let time = DateTime::from_secs(42);
-    let object = model::Object::builder()
+    let object = types::Object::builder()
         .key("key")
         .size(0)
         .last_modified(time)
         .set_checksum_algorithm(Some(Vec::new()))
-        .owner(model::Owner::builder().id("owner").build())
+        .owner(types::Owner::builder().id("owner").build())
         .restore_status(
-            model::RestoreStatus::builder()
+            types::RestoreStatus::builder()
                 .is_restore_in_progress(false)
                 .restore_expiry_date(time)
                 .build(),
@@ -60,7 +60,7 @@ fn owned_and_borrowed_nested_values_preserve_storage_not_getter_defaults() {
     let borrowed = aws_sdk_s3::types::Object::from(&object);
     let owned = aws_sdk_s3::types::Object::from(object.clone());
     for sdk in [borrowed, owned] {
-        let tm = model::Object::from(&sdk);
+        let tm = types::Object::from(&sdk);
         assert_eq!(tm.last_modified(), Some(&time));
         assert_eq!(tm.size(), Some(0));
         assert_eq!(tm.checksum_algorithm, Some(Vec::new()));
@@ -69,9 +69,9 @@ fn owned_and_borrowed_nested_values_preserve_storage_not_getter_defaults() {
             Some(false)
         );
         assert_eq!(tm.owner().unwrap().id(), Some("owner"));
-        assert_eq!(model::Object::from(sdk).key(), Some("key"));
+        assert_eq!(types::Object::from(sdk).key(), Some("key"));
     }
-    let absent = model::Object::from(aws_sdk_s3::types::Object::builder().build());
+    let absent = types::Object::from(aws_sdk_s3::types::Object::builder().build());
     assert_eq!(absent.checksum_algorithm, None);
     assert_eq!(absent.size(), None);
     assert_eq!(absent.restore_status(), None);
@@ -87,8 +87,8 @@ fn put_response_conversion_preserves_values_without_claiming_a_complete_transfer
         .server_side_encryption(aws_sdk_s3::types::ServerSideEncryption::from("FUTURE"))
         .ssekms_key_id("key")
         .build();
-    let borrowed = model::builders::UploadOutputBuilder::from(&sdk);
-    let owned = model::builders::UploadOutputBuilder::from(sdk);
+    let borrowed = types::builders::UploadOutputBuilder::from(&sdk);
+    let owned = types::builders::UploadOutputBuilder::from(sdk);
     for builder in [borrowed, owned] {
         assert_eq!(builder.get_e_tag().as_deref(), Some("etag"));
         assert_eq!(builder.get_size(), &Some(0));
@@ -117,8 +117,8 @@ fn multipart_response_conversion_preserves_create_members_during_completion() {
             .ssekms_encryption_context("context")
             .bucket_key_enabled(true)
             .build();
-    let borrowed = model::builders::UploadOutputBuilder::from(&create);
-    let owned = model::builders::UploadOutputBuilder::from(create);
+    let borrowed = types::builders::UploadOutputBuilder::from(&create);
+    let owned = types::builders::UploadOutputBuilder::from(create);
     let complete =
         aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput::builder()
             .location("location")
@@ -153,8 +153,8 @@ fn completion_response_can_populate_a_builder_without_create_response_state() {
             .location("location")
             .checksum_md5("checksum")
             .build();
-    let borrowed = model::builders::UploadOutputBuilder::from(&sdk);
-    let owned = model::builders::UploadOutputBuilder::from(sdk);
+    let borrowed = types::builders::UploadOutputBuilder::from(&sdk);
+    let owned = types::builders::UploadOutputBuilder::from(sdk);
     for builder in [borrowed, owned] {
         assert_eq!(builder.get_bucket().as_deref(), Some("bucket"));
         assert_eq!(builder.get_key().as_deref(), Some("key"));
@@ -182,15 +182,15 @@ fn borrowed_get_metadata_preserves_the_body_and_owned_conversion_preserves_value
         .storage_class(aws_sdk_s3::types::StorageClass::from("FUTURE_STORAGE"))
         .ssekms_key_id("kms-key")
         .build();
-    let object = model::ObjectMetadata::from(&sdk);
-    let chunk = model::ChunkMetadata::from(&sdk);
+    let object = types::ObjectMetadata::from(&sdk);
+    let chunk = types::ChunkMetadata::from(&sdk);
     assert_eq!(sdk.body.bytes(), Some(&b"payload"[..]));
     assert_eq!(chunk.content_length(), Some(7));
     assert_eq!(chunk.content_range(), Some("bytes 0-6/42"));
     assert_eq!(chunk.expires_string(), Some("invalid HTTP date"));
     assert_eq!(chunk.checksum_md5(), Some("md5"));
     assert_eq!(chunk.checksum_sha512(), Some("sha512"));
-    let owned = model::ObjectMetadata::from(sdk);
+    let owned = types::ObjectMetadata::from(sdk);
     assert_eq!(object, owned);
     assert_eq!(owned.delete_marker(), Some(false));
     assert_eq!(owned.bucket_key_enabled(), Some(false));
@@ -208,8 +208,8 @@ fn owned_get_chunk_metadata_and_head_metadata_support_the_same_value_conversions
         .last_modified(DateTime::from_secs(123))
         .checksum_xxhash128("checksum")
         .build();
-    let borrowed = model::ChunkMetadata::from(&get);
-    let owned = model::ChunkMetadata::from(get);
+    let borrowed = types::ChunkMetadata::from(&get);
+    let owned = types::ChunkMetadata::from(get);
     assert_eq!(borrowed, owned);
     assert_eq!(owned.last_modified(), Some(&DateTime::from_secs(123)));
     assert_eq!(owned.checksum_xxhash128(), Some("checksum"));
@@ -220,8 +220,8 @@ fn owned_get_chunk_metadata_and_head_metadata_support_the_same_value_conversions
         .missing_meta(0)
         .checksum_xxhash128("head-checksum")
         .build();
-    let borrowed = model::ObjectMetadata::from(&head);
-    let owned = model::ObjectMetadata::from(head);
+    let borrowed = types::ObjectMetadata::from(&head);
+    let owned = types::ObjectMetadata::from(head);
     assert_eq!(borrowed, owned);
     assert_eq!(owned.archive_status().unwrap().as_str(), "FUTURE_ARCHIVE");
     assert_eq!(owned.expires_string(), Some("not a date"));
@@ -238,8 +238,8 @@ fn sdk_request_identifier_traits_agree_with_inherent_metadata_getters() {
         assert_eq!(metadata.request_id(), None);
         assert_eq!(metadata.extended_request_id(), None);
     }
-    let object = model::ObjectMetadata::builder().build();
-    let chunk = model::ChunkMetadata::builder().build();
+    let object = types::ObjectMetadata::builder().build();
+    let chunk = types::ChunkMetadata::builder().build();
     check(&object);
     check(&chunk);
     assert_eq!(

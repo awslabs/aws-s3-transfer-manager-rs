@@ -24,8 +24,9 @@
 //!
 //! # Modeled types and configuration
 //!
-//! S3 request values, response metadata, and enums are defined in [`model`].
-//! Operation modules re-export their corresponding modeled types and builders.
+//! S3 request values, response metadata, and enums live in [`types`], and
+//! their builders in [`types::builders`]. Operation modules re-export the
+//! modeled types and builders they use.
 //! Configure a client from shared [`aws_types::SdkConfig`] using
 //! [`S3ClientConfig`], or load configuration with [`from_env`].
 //!
@@ -145,7 +146,7 @@ pub mod error;
 pub mod types;
 
 /// Modeled S3 values and builders.
-pub mod model;
+pub(crate) mod model;
 pub(crate) mod sdk_v1;
 
 /// Types and helpers for I/O

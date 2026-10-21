@@ -9,7 +9,11 @@ mod common;
 use aws_sdk_s3::operation::{get_object::GetObjectOutput, head_object::HeadObjectOutput};
 #[cfg(feature = "sdk-v1")]
 use aws_sdk_s3_transfer_manager::types::{ChecksumValidation, NotValidatedReason};
-use aws_sdk_s3_transfer_manager::{model, operation::download, types::ReadAhead, Client, Config};
+use aws_sdk_s3_transfer_manager::{
+    operation::download,
+    types::{self, ReadAhead},
+    Client, Config,
+};
 #[cfg(feature = "sdk-v1")]
 use aws_smithy_mocks::{mock, mock_client, RuleMode};
 #[cfg(feature = "sdk-v1")]
@@ -20,27 +24,27 @@ use bytes::Buf;
 
 #[test]
 fn operation_exports_are_canonical_and_preserve_construction_and_empty_metadata() {
-    let builder: download::DownloadInputBuilder = model::DownloadInput::builder();
-    let builder: model::builders::DownloadInputBuilder = builder
+    let builder: download::DownloadInputBuilder = types::DownloadInput::builder();
+    let builder: types::builders::DownloadInputBuilder = builder
         .bucket("bucket")
         .key("key")
         .read_ahead(ReadAhead::Parts(3));
     assert_eq!(builder.get_bucket(), &Some("bucket".to_owned()));
     let input: download::DownloadInput = builder.build().unwrap();
-    let input: model::DownloadInput = input;
+    let input: types::DownloadInput = input;
     let builder: download::DownloadInputBuilder = input.clone().into();
     assert_eq!(input, builder.build().unwrap());
     assert_eq!(input.part_number(), None);
     assert_eq!(input.read_ahead(), Some(&ReadAhead::Parts(3)));
-    assert!(model::DownloadInput::builder().key("key").build().is_err());
-    assert!(model::DownloadInput::builder()
+    assert!(types::DownloadInput::builder().key("key").build().is_err());
+    assert!(types::DownloadInput::builder()
         .bucket("bucket")
         .build()
         .is_err());
-    let object: download::ObjectMetadata = model::ObjectMetadata::default();
-    let chunk: download::ChunkMetadata = model::ChunkMetadata::default();
-    assert_eq!(object, model::ObjectMetadata::builder().build());
-    assert_eq!(chunk, model::ChunkMetadata::builder().build());
+    let object: download::ObjectMetadata = types::ObjectMetadata::default();
+    let chunk: download::ChunkMetadata = types::ChunkMetadata::default();
+    assert_eq!(object, types::ObjectMetadata::builder().build());
+    assert_eq!(chunk, types::ChunkMetadata::builder().build());
     assert_eq!(object.delete_marker(), None);
     assert_eq!(object.missing_meta(), None);
     assert_eq!(object.bucket_key_enabled(), None);
@@ -68,7 +72,7 @@ fn fluent_fields_use_upstream_getters_and_preserve_conditions_read_ahead_and_red
         .range("bytes=1-3")
         .response_content_type("application/octet-stream")
         .sse_customer_key("sensitive-download-key-sentinel")
-        .checksum_mode(model::ChecksumMode::Enabled)
+        .checksum_mode(types::ChecksumMode::Enabled)
         .read_ahead(ReadAhead::Parts(3));
     assert_eq!(builder.get_bucket(), &Some("bucket".to_owned()));
     assert_eq!(builder.get_key().as_deref(), Some("key"));
@@ -139,7 +143,7 @@ async fn fluent_and_modeled_initiation_return_canonical_object_and_chunk_metadat
                 .initiate()
                 .unwrap()
         } else {
-            model::DownloadInput::builder()
+            types::DownloadInput::builder()
                 .bucket("bucket")
                 .key("key")
                 .version_id("version")
@@ -148,7 +152,7 @@ async fn fluent_and_modeled_initiation_return_canonical_object_and_chunk_metadat
                 .initiate_with(&tm)
                 .unwrap()
         };
-        let metadata: &model::ObjectMetadata = handle.object_meta().await.unwrap();
+        let metadata: &types::ObjectMetadata = handle.object_meta().await.unwrap();
         assert_eq!(metadata.total_object_size(), 7);
         assert_eq!(metadata.e_tag(), Some("etag"));
         assert_eq!(metadata.delete_marker(), Some(false));
@@ -161,10 +165,10 @@ async fn fluent_and_modeled_initiation_return_canonical_object_and_chunk_metadat
         assert_eq!(metadata.expires_string(), Some("unparsed-service-date"));
         assert_eq!(
             metadata.request_charged(),
-            Some(&model::RequestCharged::Requester)
+            Some(&types::RequestCharged::Requester)
         );
         let mut chunk = handle.body_mut().next().await.unwrap().unwrap();
-        let metadata: &model::ChunkMetadata = &chunk.metadata;
+        let metadata: &types::ChunkMetadata = &chunk.metadata;
         assert_eq!(metadata.content_length(), Some(7));
         assert_eq!(metadata.checksum_sha512(), Some("server-sha512"));
         assert_eq!(metadata.checksum_md5(), Some("server-md5"));
@@ -178,7 +182,7 @@ async fn fluent_and_modeled_initiation_return_canonical_object_and_chunk_metadat
             output.integrity_checks().checksum_validation(),
             ChecksumValidation::NotValidated { .. }
         ));
-        let metadata: model::ObjectMetadata = output.object_meta;
+        let metadata: types::ObjectMetadata = output.object_meta;
         assert_eq!(metadata.total_object_size(), 7);
         assert_eq!(metadata.checksum_sha512(), Some("server-sha512"));
         assert_eq!(output.metrics.total_bytes, Some(7));
@@ -242,11 +246,11 @@ async fn managed_suffix_download_preserves_head_discovery_metadata_and_absolute_
         .write_to_path(&path)
         .await
         .unwrap();
-    let metadata: &model::ObjectMetadata = handle.object_meta().await.unwrap();
+    let metadata: &types::ObjectMetadata = handle.object_meta().await.unwrap();
     assert_eq!(metadata.total_object_size(), 7);
     assert_eq!(
         metadata.archive_status(),
-        Some(&model::ArchiveStatus::ArchiveAccess)
+        Some(&types::ArchiveStatus::ArchiveAccess)
     );
     assert_eq!(metadata.checksum_sha512(), Some("head-sha512"));
     let output = handle.join().await.unwrap();

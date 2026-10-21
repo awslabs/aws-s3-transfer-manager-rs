@@ -18,7 +18,7 @@ fn enums_preserve_known_and_unknown_wire_values() {
         "FUTURE_CHECKSUM".parse::<ChecksumAlgorithm>().unwrap(),
         future
     );
-    let _: s3_tm_model::model::error::UnknownVariantError =
+    let _: s3_tm_model::model::UnknownVariantError =
         ChecksumAlgorithm::try_parse("FUTURE_CHECKSUM").unwrap_err();
     assert_eq!(ChecksumType::from("FULL_OBJECT").as_str(), "FULL_OBJECT");
     assert_eq!(ObjectStorageClass::from("GLACIER").as_str(), "GLACIER");

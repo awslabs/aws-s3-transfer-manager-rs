@@ -141,5 +141,7 @@ pub mod builders;
 /// Enum parsing errors.
 pub(crate) mod sealed_enum_unknown;
 
+pub use crate::model::error::UnknownVariantError;
+
 /// Enum parsing errors.
-pub mod error;
+pub(crate) mod error;

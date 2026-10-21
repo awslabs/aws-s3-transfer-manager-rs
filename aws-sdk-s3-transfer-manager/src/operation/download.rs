@@ -6,7 +6,7 @@
 //! Download a single S3 object using modeled request and response metadata.
 //!
 //! [`DownloadInput`](crate::operation::download::DownloadInput) and the metadata
-//! types are re-exported from [`crate::model`].
+//! types are re-exported from [`crate::types`].
 //! Object metadata describes the discovery response (GET or HEAD), while each
 //! [`ChunkOutput`](crate::operation::download::ChunkOutput) carries metadata from
 //! its own GET response. Optional service

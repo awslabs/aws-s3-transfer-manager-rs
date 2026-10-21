@@ -21,9 +21,8 @@ use aws_sdk_s3::operation::{
 use aws_sdk_s3_transfer_manager::io::{PartData, PartStream, SizeHint, StreamContext};
 use aws_sdk_s3_transfer_manager::{
     io::InputStream,
-    model,
     operation::upload::{self, ChecksumStrategy},
-    Client, Config,
+    types, Client, Config,
 };
 #[cfg(feature = "sdk-v1")]
 use aws_smithy_mocks::{mock, mock_client, RuleMode};
@@ -34,23 +33,23 @@ use bytes::Bytes;
 
 #[test]
 fn operation_exports_are_the_canonical_modeled_types_and_builders() {
-    let builder: upload::UploadInputBuilder = model::UploadInput::builder();
-    let builder: model::builders::UploadInputBuilder = builder
+    let builder: upload::UploadInputBuilder = types::UploadInput::builder();
+    let builder: types::builders::UploadInputBuilder = builder
         .bucket("bucket")
         .key("key")
         .body(InputStream::from_static(b""));
     assert_eq!(builder.get_bucket(), &Some("bucket".to_owned()));
     let input: upload::UploadInput = builder.build().unwrap();
-    let input: model::UploadInput = input;
+    let input: types::UploadInput = input;
     assert_eq!(input.bucket(), Some("bucket"));
     assert_eq!(input.body().size_hint().upper(), Some(0));
-    let builder: upload::UploadOutputBuilder = model::UploadOutput::builder();
-    let builder: model::builders::UploadOutputBuilder = builder;
+    let builder: upload::UploadOutputBuilder = types::UploadOutput::builder();
+    let builder: types::builders::UploadOutputBuilder = builder;
     assert!(builder.build().is_err());
-    fn canonical_output(value: upload::UploadOutput) -> model::UploadOutput {
+    fn canonical_output(value: upload::UploadOutput) -> types::UploadOutput {
         value
     }
-    let _: fn(upload::UploadOutput) -> model::UploadOutput = canonical_output;
+    let _: fn(upload::UploadOutput) -> types::UploadOutput = canonical_output;
 }
 
 #[test]
@@ -128,14 +127,14 @@ async fn fluent_and_modeled_builder_initiation_return_canonical_metadata_and_tra
                 .initiate()
                 .unwrap()
         } else {
-            model::UploadInput::builder()
+            types::UploadInput::builder()
                 .bucket("bucket")
                 .key("key")
                 .body(InputStream::from_static(b"payload"))
                 .initiate_with(&tm)
                 .unwrap()
         };
-        let output: model::UploadOutput = handle.join().await.unwrap();
+        let output: types::UploadOutput = handle.join().await.unwrap();
         assert_eq!(output.e_tag(), Some("etag"));
         assert_eq!(output.bucket_key_enabled(), Some(false));
         assert_eq!(output.checksum_sha512(), Some("server-sha512"));
@@ -233,7 +232,7 @@ async fn multipart_runtime_merges_response_metadata_without_synthesizing_absent_
         assert_eq!(output.abort_rule_id(), Some("lifecycle-rule"));
         assert_eq!(
             output.checksum_algorithm(),
-            Some(&model::ChecksumAlgorithm::Sha256)
+            Some(&types::ChecksumAlgorithm::Sha256)
         );
         assert_eq!(output.upload_id(), Some("upload"));
         assert_eq!(

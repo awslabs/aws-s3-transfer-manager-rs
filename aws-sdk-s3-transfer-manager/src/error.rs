@@ -24,6 +24,8 @@ use aws_types::request_id::RequestId;
 use crate::model::ChecksumAlgorithm;
 use crate::types::{FailedDownload, FailedUpload};
 
+pub use crate::model::UnknownVariantError;
+
 /// A boxed error that is `Send` and `Sync`.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 

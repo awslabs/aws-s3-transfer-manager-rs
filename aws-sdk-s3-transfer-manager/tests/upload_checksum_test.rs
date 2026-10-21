@@ -13,9 +13,8 @@ use aws_sdk_s3::operation::{
 use aws_sdk_s3_transfer_manager::{
     io::{InputStream, PartData, PartStream, SizeHint},
     metrics::unit::ByteUnit,
-    model::{ChecksumAlgorithm, ChecksumType},
     operation::upload::{ChecksumStrategy, UploadOutput},
-    types::{ConcurrencyMode, PartSize},
+    types::{ChecksumAlgorithm, ChecksumType, ConcurrencyMode, PartSize},
 };
 use aws_smithy_mocks::{mock, mock_client, Rule, RuleMode};
 use bytes::Bytes;

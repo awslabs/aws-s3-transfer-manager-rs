@@ -5,13 +5,12 @@
 
 use aws_sdk_s3_transfer_manager::{
     io::InputStream,
-    model::{
-        builders::{DownloadInputBuilder, UploadInputBuilder},
-        ChecksumAlgorithm, ChunkMetadata, DownloadInput, Object, ObjectMetadata, Owner,
-        RestoreStatus, UploadInput,
-    },
     operation::upload::ChecksumStrategy,
-    types::{FailedMultipartUploadPolicy, ReadAhead},
+    types::{
+        builders::{DownloadInputBuilder, UploadInputBuilder},
+        ChecksumAlgorithm, ChunkMetadata, DownloadInput, FailedMultipartUploadPolicy, Object,
+        ObjectMetadata, Owner, ReadAhead, RestoreStatus, UploadInput,
+    },
 };
 use aws_smithy_types::DateTime;
 

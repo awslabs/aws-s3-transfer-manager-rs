@@ -6,6 +6,14 @@
 use crate::metrics::{unit::ByteUnit, Throughput};
 use crate::runtime::buffer_pool::BufferPool;
 
+pub use crate::model::builders;
+pub use crate::model::{
+    ArchiveStatus, ChecksumAlgorithm, ChecksumMode, ChecksumType, ChunkMetadata, DownloadInput,
+    Object, ObjectCannedAcl, ObjectLockLegalHoldStatus, ObjectLockMode, ObjectMetadata,
+    ObjectStorageClass, Owner, ReplicationStatus, RequestCharged, RequestPayer, RestoreStatus,
+    ServerSideEncryption, StorageClass, UploadInput, UploadOutput,
+};
+
 /// The target part size for an upload or download request.
 #[non_exhaustive]
 #[derive(Debug, Clone, Default)]
