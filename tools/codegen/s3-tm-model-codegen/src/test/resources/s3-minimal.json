@@ -1,0 +1,15 @@
+{
+  "smithy": "2.0",
+  "shapes": {
+    "com.amazonaws.s3#AmazonS3": {
+      "type": "service",
+      "version": "2006-03-01",
+      "operations": [
+        {"target": "com.amazonaws.s3#GetObject"}
+      ]
+    },
+    "com.amazonaws.s3#GetObject": {
+      "type": "operation"
+    }
+  }
+}

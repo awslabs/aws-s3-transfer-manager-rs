@@ -9,7 +9,6 @@
 //! discovers objects, the parent spawns child downloads (via
 //! [`Download::orchestrate_with_sink`]), and reaps them as they complete.
 
-use aws_sdk_s3::types::Object;
 use parking_lot::Mutex;
 use path_clean::PathClean;
 use std::borrow::Cow;
@@ -21,6 +20,7 @@ use std::sync::Arc;
 
 use crate::error::{self, Error, ErrorKind};
 use crate::io::walk::S3Walk;
+use crate::model::Object;
 use crate::operation::download::sink::{FileSinkFactory, SinkFactory};
 use crate::operation::download::{Download, DownloadInput, ManagedDownloadHandle};
 use crate::transfer::{
@@ -1064,12 +1064,14 @@ mod tests {
         DownloadObjectsTransfer,
         crate::transfer::StateMachineTerminalReceiver,
     ) {
-        let config = crate::Config::builder().client(s3_client.clone()).build();
+        let config = crate::Config::builder()
+            .sdk_client(s3_client.clone())
+            .build();
         let handle = crate::client::Handle::test_handle_tokio(config);
 
         let walk = S3Walker::builder().build().walk(
             S3WalkContext::builder()
-                .client(s3_client)
+                .sdk_client(s3_client)
                 .bucket("test-bucket")
                 .build(),
         );
@@ -1117,7 +1119,7 @@ mod tests {
     ) {
         let walk = S3Walker::builder().build().walk(
             S3WalkContext::builder()
-                .client(s3_client)
+                .sdk_client(s3_client)
                 .bucket("test-bucket")
                 .build(),
         );
@@ -1468,12 +1470,12 @@ mod tests {
         });
         let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[list, get]);
 
-        let config = crate::Config::builder().client(client.clone()).build();
+        let config = crate::Config::builder().sdk_client(client.clone()).build();
         let handle = crate::client::Handle::test_handle_tokio(config);
 
         let walk = S3Walker::builder().prefix("backup/2023/").build().walk(
             S3WalkContext::builder()
-                .client(client)
+                .sdk_client(client)
                 .bucket("test-bucket")
                 .build(),
         );
@@ -1615,7 +1617,9 @@ mod tests {
     #[tokio::test]
     async fn test_happy_path_managed_runtime() {
         let dir = tempdir().unwrap();
-        let config = crate::Config::builder().client(mock_s3_success()).build();
+        let config = crate::Config::builder()
+            .sdk_client(mock_s3_success())
+            .build();
         let handle = crate::client::Handle::test_handle_managed(config);
 
         let (transfer, completion_rx) = setup_enqueued(
@@ -1663,7 +1667,9 @@ mod tests {
         });
         let s3_client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[list, get]);
 
-        let config = crate::Config::builder().client(s3_client.clone()).build();
+        let config = crate::Config::builder()
+            .sdk_client(s3_client.clone())
+            .build();
         let handle = crate::client::Handle::test_handle_managed(config);
 
         let (transfer, completion_rx) = setup_enqueued(
@@ -1739,7 +1745,9 @@ mod tests {
         });
         let s3_client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[list, get]);
 
-        let config = crate::Config::builder().client(s3_client.clone()).build();
+        let config = crate::Config::builder()
+            .sdk_client(s3_client.clone())
+            .build();
         let handle = crate::client::Handle::test_handle_managed(config);
 
         let (transfer, completion_rx) =
@@ -1789,7 +1797,9 @@ mod tests {
         });
         let s3_client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[list, get]);
 
-        let config = crate::Config::builder().client(s3_client.clone()).build();
+        let config = crate::Config::builder()
+            .sdk_client(s3_client.clone())
+            .build();
         let handle = crate::client::Handle::test_handle_managed(config);
 
         let (transfer, completion_rx) = setup_enqueued(
@@ -1819,7 +1829,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let s3_client = mock_s3_list_failure();
 
-        let config = crate::Config::builder().client(s3_client.clone()).build();
+        let config = crate::Config::builder()
+            .sdk_client(s3_client.clone())
+            .build();
         let handle = crate::client::Handle::test_handle_managed(config);
 
         let (transfer, completion_rx) = setup_enqueued(
@@ -2064,7 +2076,7 @@ mod tests {
         });
         let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[list, get]);
 
-        let config = crate::Config::builder().client(client.clone()).build();
+        let config = crate::Config::builder().sdk_client(client.clone()).build();
         let handle = crate::client::Handle::test_handle_managed(config);
 
         let (transfer, completion_rx) =
@@ -2114,12 +2126,12 @@ mod tests {
         });
         let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[list, get]);
 
-        let config = crate::Config::builder().client(client.clone()).build();
+        let config = crate::Config::builder().sdk_client(client.clone()).build();
         let handle = crate::client::Handle::test_handle_tokio(config);
 
         let walk = S3Walker::builder().build().walk(
             S3WalkContext::builder()
-                .client(client)
+                .sdk_client(client)
                 .bucket("test-bucket")
                 .build(),
         );
@@ -2307,9 +2319,12 @@ mod tests {
             );
             let mut state = transfer.inner.state.lock();
             for i in 0..WALK_LOW_WATER {
-                state
-                    .pending_entries
-                    .push_back(Object::builder().key(format!("k{i}")).size(1).build());
+                state.pending_entries.push_back(
+                    crate::model::Object::builder()
+                        .key(format!("k{i}"))
+                        .size(1)
+                        .build(),
+                );
             }
             assert!(
                 transfer.dispatch_walk(&mut state).is_none(),
