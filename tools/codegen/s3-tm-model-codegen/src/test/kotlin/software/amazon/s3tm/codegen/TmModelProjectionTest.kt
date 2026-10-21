@@ -165,7 +165,10 @@ class TmModelProjectionTest {
         val output = projection.model.expectShape(TmModelProjection.tmId("UploadOutput"), StructureShape::class.java)
         val originals = listOf("PutObjectOutput", "CreateMultipartUploadOutput", "CompleteMultipartUploadOutput")
             .map { original.expectShape(TmModelProjection.id(it), StructureShape::class.java) }
-        assertEquals(originals.flatMap { it.allMembers.keys }.toSet(), output.allMembers.keys)
+        assertEquals(
+            originals.flatMap { it.allMembers.keys }.toSet() + setOf("RequestId", "ExtendedRequestId"),
+            output.allMembers.keys,
+        )
         assertEquals(
             listOf(
                 TmModelProjection.id("PutObjectOutput").withMember("ETag"),

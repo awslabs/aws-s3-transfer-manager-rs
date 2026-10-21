@@ -112,6 +112,11 @@ class MemberPolicy(private val source: Model, private val sourceSymbols: RustSym
         )
     }
 
+    private fun requestIds(shape: StructureShape): List<Field> = RequestIdExt.identifiers.map {
+        modeled(shape.getMember(it.member).orElseThrow(), "_${it.accessor}", "")
+            .copy(accessor = it.accessor)
+    }
+
     val fields: Map<ShapeId, List<Field>> = buildMap {
         put(TmModelProjection.id("GetObjectRequest"), listOf(
             runtime("read_ahead", readAhead, Construction.OPTIONAL,
@@ -163,7 +168,7 @@ class MemberPolicy(private val source: Model, private val sourceSymbols: RustSym
                 "SSEKMSEncryptionContext" -> modeled(it, "sse_kms_encryption_context")
                 else -> null
             }
-        })
+        } + requestIds(output))
         for (name in listOf("ObjectMetadata", "ChunkMetadata")) {
             val shape = source.expectShape(TmModelProjection.tmId(name), StructureShape::class.java)
             put(shape.id, shape.members().mapNotNull {
@@ -172,10 +177,7 @@ class MemberPolicy(private val source: Model, private val sourceSymbols: RustSym
                         modeled(it, sourceSymbols.toMemberName(it), "pub(crate)")
                     else -> null
                 }
-            } + RequestIdExt.identifiers.map {
-                modeled(shape.getMember(it.member).orElseThrow(), "_${it.accessor}", "")
-                    .copy(accessor = it.accessor)
-            })
+            } + requestIds(shape))
         }
     }
 

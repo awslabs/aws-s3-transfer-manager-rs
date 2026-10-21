@@ -94,6 +94,24 @@ class SdkV1UploadTest {
     }
 
     @Test
+    fun `upload conversions carry each response's request identifiers into the result builder`() {
+        val (_, output) = generate()
+        val rust = Files.readString(output.resolve("convert.rs"))
+        for (module in listOf("put_object", "create_multipart_upload", "complete_multipart_upload")) {
+            val update = rust.substringAfter("fn update_upload_output_from_$module(")
+                .substringBefore("\npub(crate) fn ")
+            assertTrue(update.contains(".set_request_id(output.request_id().map(str::to_owned))"), module)
+            assertTrue(update.contains(".set_extended_request_id(output.extended_request_id().map(str::to_owned))"), module)
+            assertFalse(update.contains(".build()"), module)
+        }
+        val compact = Files.readString(output.resolve("compat.rs")).replace(Regex("""\s+"""), "")
+        for ((trait, accessor) in listOf("RequestId" to "request_id", "RequestIdExt" to "extended_request_id")) {
+            assertTrue(compact.contains("impl::aws_sdk_s3::operation::$trait" + "forcrate::model::UploadOutput{"), trait)
+            assertTrue(compact.contains("crate::model::UploadOutput::$accessor(self)"), accessor)
+        }
+    }
+
+    @Test
     fun `additive upload response members enter values and conversion generation together`() {
         val original = source()
         val output = original.expectShape(TmModelProjection.id("PutObjectOutput"), StructureShape::class.java)

@@ -175,11 +175,10 @@ class SdkV1Generator(private val mapping: SdkV1Mapping) {
                 }
                 appendLine("        .set_${symbols.tmField(member.tm).removePrefix("_")}(${field(member, "output", false, setter = true)})")
             }
-            if (!upload) {
-                appendLine("        .set_request_id(output.request_id().map(str::to_owned))")
-                appendLine("        .set_extended_request_id(output.extended_request_id().map(str::to_owned))")
-                appendLine("        .build()")
-            }
+            appendLine("        .set_request_id(output.request_id().map(str::to_owned))")
+            appendLine("        .set_extended_request_id(output.extended_request_id().map(str::to_owned))")
+            // An upload conversion returns the builder, so a caller can merge the completion response.
+            if (!upload) appendLine("        .build()")
             appendLine("}")
         }
     }

@@ -236,5 +236,21 @@ mod tests {
                 .expires_string(),
             Some("invalid date")
         );
+        let upload = UploadOutput::builder()
+            .metrics(TransferMetrics(7))
+            .request_id("upload")
+            .extended_request_id("extended upload")
+            .build()
+            .unwrap();
+        assert_eq!(upload.request_id(), Some("upload"));
+        assert_eq!(upload.extended_request_id(), Some("extended upload"));
+        assert_eq!(
+            UploadOutput::builder()
+                .metrics(TransferMetrics(7))
+                .build()
+                .unwrap()
+                .request_id(),
+            None
+        );
     }
 }

@@ -18,7 +18,7 @@ object RequestIdExt {
         Identifier("RequestId", "request_id", "x-amz-request-id", "S3 request ID."),
         Identifier("ExtendedRequestId", "extended_request_id", "x-amz-id-2", "S3 extended request ID."),
     )
-    val containers = listOf("ObjectMetadata", "ChunkMetadata").map(TmModelProjection::tmId)
+    val containers = listOf("ObjectMetadata", "ChunkMetadata", "UploadOutput").map(TmModelProjection::tmId)
 
     fun transform(projection: TmModelProjection.Result): TmModelProjection.Result {
         val builder = projection.model.toBuilder()

@@ -79,6 +79,22 @@ class UploadOutputDocumentationTest {
     }
 
     @Test
+    fun `synthetic request identifiers report the final request and claim no response origin`() {
+        val projection = TmModelProjection.project(source())
+        val shape = projection.model.expectShape(TmModelProjection.tmId("UploadOutput"), StructureShape::class.java)
+        for (identifier in RequestIdExt.identifiers) {
+            assertTrue(shape.getMember(identifier.member).isPresent, "${shape.id} lacks ${identifier.member}")
+            val member = shape.getMember(identifier.member).orElseThrow()
+            assertEquals(emptyList<ShapeId>(), projection.memberSources.getValue(member.id))
+            val docs = member.expectTrait(DocumentationTrait::class.java).value
+            assertTrue(docs.startsWith(identifier.documentation), identifier.member)
+            assertTrue(docs.contains("Identifies the final request"), identifier.member)
+            assertFalse(docs.contains("single-request uploads"), identifier.member)
+            assertFalse(docs.contains("For multipart uploads"), identifier.member)
+        }
+    }
+
+    @Test
     fun `target documentation is inherited and member documentation takes precedence`() {
         val original = source()
         val target = StringShape.builder().id(TmModelProjection.id("RequestCharged"))

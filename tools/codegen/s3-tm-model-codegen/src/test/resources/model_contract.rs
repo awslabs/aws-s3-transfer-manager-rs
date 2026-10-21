@@ -173,6 +173,8 @@ fn upload_values_compile_without_tm_runtime_and_validate_required_members() {
     assert_eq!(output.upload_id(), Some("upload"));
     assert_eq!(output.location(), Some("location"));
     assert_eq!(output.e_tag(), Some("tag"));
+    assert_eq!(output.request_id(), None);
+    assert_eq!(output.extended_request_id(), None);
 }
 
 #[test]

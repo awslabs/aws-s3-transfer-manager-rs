@@ -41,6 +41,7 @@ object UploadOutputDocumentation {
                 else -> upstream
             }
             val presence = when {
+                responses.isEmpty() -> ""
                 "PutObject" !in responses -> "Not returned for single-request uploads."
                 responses == listOf("PutObject") -> "Only returned for single-request uploads."
                 else -> ""
@@ -66,6 +67,9 @@ object UploadOutputDocumentation {
                 "RequestCharged" ->
                     "Reports the final request's charge status, " +
                         "not aggregate charges for initiation and part requests."
+                "RequestId", "ExtendedRequestId" ->
+                    "Identifies the final request. A multipart upload reports its " +
+                        "CompleteMultipartUpload request, and the initiation and part requests are not reported."
                 else -> ""
             }
             val transferDocs = listOf(presence, lifecycle, meaning).filter { it.isNotBlank() }

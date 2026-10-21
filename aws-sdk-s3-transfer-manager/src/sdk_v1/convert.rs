@@ -684,6 +684,8 @@ pub(crate) fn update_upload_output_from_put_object(
                 .as_ref()
                 .map(request_charged_from_sdk),
         )
+        .set_request_id(output.request_id().map(str::to_owned))
+        .set_extended_request_id(output.extended_request_id().map(str::to_owned))
 }
 pub(crate) fn upload_output_from_create_multipart_upload(
     output: &::aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput,
@@ -724,6 +726,8 @@ pub(crate) fn update_upload_output_from_create_multipart_upload(
                 .map(checksum_algorithm_from_sdk),
         )
         .set_checksum_type(output.checksum_type.as_ref().map(checksum_type_from_sdk))
+        .set_request_id(output.request_id().map(str::to_owned))
+        .set_extended_request_id(output.extended_request_id().map(str::to_owned))
 }
 pub(crate) fn upload_output_from_complete_multipart_upload(
     output: &::aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput,
@@ -769,4 +773,6 @@ pub(crate) fn update_upload_output_from_complete_multipart_upload(
                 .as_ref()
                 .map(request_charged_from_sdk),
         )
+        .set_request_id(output.request_id().map(str::to_owned))
+        .set_extended_request_id(output.extended_request_id().map(str::to_owned))
 }

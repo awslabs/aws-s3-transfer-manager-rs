@@ -119,6 +119,12 @@ pub struct UploadOutput {
     /// <p>If present, indicates the ID of the KMS key that was used for object encryption.</p>
     /// <p>For multipart uploads, the completion response replaces the initiation value, including when absent.</p>
     pub sse_kms_key_id: ::std::option::Option<::std::string::String>,
+    /// S3 request ID.
+    /// <p>Identifies the final request. A multipart upload reports its CompleteMultipartUpload request, and the initiation and part requests are not reported.</p>
+    _request_id: ::std::option::Option<::std::string::String>,
+    /// S3 extended request ID.
+    /// <p>Identifies the final request. A multipart upload reports its CompleteMultipartUpload request, and the initiation and part requests are not reported.</p>
+    _extended_request_id: ::std::option::Option<::std::string::String>,
 }
 impl UploadOutput {
     /// <p>If the bucket has a lifecycle rule configured with an action to abort incomplete multipart uploads and the prefix in the lifecycle rule matches the object name in the request, the response includes this header. The header indicates when the initiated multipart upload becomes eligible for an abort operation. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/dev/mpuoverview.html#mpu-abort-incomplete-mpu-lifecycle-config"> Aborting Incomplete Multipart Uploads Using a Bucket Lifecycle Configuration</a> in the <i>Amazon S3 User Guide</i>.</p>
@@ -319,6 +325,8 @@ impl ::std::fmt::Debug for UploadOutput {
             &"*** Sensitive Data Redacted ***",
         );
         formatter.field("sse_kms_key_id", &"*** Sensitive Data Redacted ***");
+        formatter.field("_request_id", &self._request_id);
+        formatter.field("_extended_request_id", &self._extended_request_id);
         formatter.finish()
     }
 }
@@ -337,6 +345,16 @@ impl crate::model::UploadOutput {
     /// <p>For multipart uploads, the completion response replaces the initiation value, including when absent.</p>
     pub fn sse_kms_key_id(&self) -> ::std::option::Option<&str> {
         self.sse_kms_key_id.as_deref()
+    }
+    /// S3 request ID.
+    /// <p>Identifies the final request. A multipart upload reports its CompleteMultipartUpload request, and the initiation and part requests are not reported.</p>
+    pub fn request_id(&self) -> ::std::option::Option<&str> {
+        self._request_id.as_deref()
+    }
+    /// S3 extended request ID.
+    /// <p>Identifies the final request. A multipart upload reports its CompleteMultipartUpload request, and the initiation and part requests are not reported.</p>
+    pub fn extended_request_id(&self) -> ::std::option::Option<&str> {
+        self._extended_request_id.as_deref()
     }
 }
 impl UploadOutput {
@@ -381,6 +399,8 @@ pub struct UploadOutputBuilder {
     pub(crate) metrics: ::std::option::Option<crate::types::TransferMetrics>,
     pub(crate) sse_kms_encryption_context: ::std::option::Option<::std::string::String>,
     pub(crate) sse_kms_key_id: ::std::option::Option<::std::string::String>,
+    pub(crate) _request_id: ::std::option::Option<::std::string::String>,
+    pub(crate) _extended_request_id: ::std::option::Option<::std::string::String>,
 }
 impl UploadOutputBuilder {
     /// <p>If the bucket has a lifecycle rule configured with an action to abort incomplete multipart uploads and the prefix in the lifecycle rule matches the object name in the request, the response includes this header. The header indicates when the initiated multipart upload becomes eligible for an abort operation. For more information, see <a href="https://docs.aws.amazon.com/AmazonS3/latest/dev/mpuoverview.html#mpu-abort-incomplete-mpu-lifecycle-config"> Aborting Incomplete Multipart Uploads Using a Bucket Lifecycle Configuration</a> in the <i>Amazon S3 User Guide</i>.</p>
@@ -1077,6 +1097,58 @@ impl UploadOutputBuilder {
     pub fn get_sse_kms_key_id(&self) -> &::std::option::Option<::std::string::String> {
         &self.sse_kms_key_id
     }
+    /// S3 request ID.
+    /// <p>Identifies the final request. A multipart upload reports its CompleteMultipartUpload request, and the initiation and part requests are not reported.</p>
+    #[allow(dead_code)]
+    pub(crate) fn request_id(
+        mut self,
+        input: impl ::std::convert::Into<::std::string::String>,
+    ) -> Self {
+        self._request_id = ::std::option::Option::Some(input.into());
+        self
+    }
+    /// S3 request ID.
+    /// <p>Identifies the final request. A multipart upload reports its CompleteMultipartUpload request, and the initiation and part requests are not reported.</p>
+    #[allow(dead_code)]
+    pub(crate) fn set_request_id(
+        mut self,
+        input: ::std::option::Option<::std::string::String>,
+    ) -> Self {
+        self._request_id = input;
+        self
+    }
+    /// S3 request ID.
+    /// <p>Identifies the final request. A multipart upload reports its CompleteMultipartUpload request, and the initiation and part requests are not reported.</p>
+    #[allow(dead_code)]
+    pub(crate) fn get_request_id(&self) -> &::std::option::Option<::std::string::String> {
+        &self._request_id
+    }
+    /// S3 extended request ID.
+    /// <p>Identifies the final request. A multipart upload reports its CompleteMultipartUpload request, and the initiation and part requests are not reported.</p>
+    #[allow(dead_code)]
+    pub(crate) fn extended_request_id(
+        mut self,
+        input: impl ::std::convert::Into<::std::string::String>,
+    ) -> Self {
+        self._extended_request_id = ::std::option::Option::Some(input.into());
+        self
+    }
+    /// S3 extended request ID.
+    /// <p>Identifies the final request. A multipart upload reports its CompleteMultipartUpload request, and the initiation and part requests are not reported.</p>
+    #[allow(dead_code)]
+    pub(crate) fn set_extended_request_id(
+        mut self,
+        input: ::std::option::Option<::std::string::String>,
+    ) -> Self {
+        self._extended_request_id = input;
+        self
+    }
+    /// S3 extended request ID.
+    /// <p>Identifies the final request. A multipart upload reports its CompleteMultipartUpload request, and the initiation and part requests are not reported.</p>
+    #[allow(dead_code)]
+    pub(crate) fn get_extended_request_id(&self) -> &::std::option::Option<::std::string::String> {
+        &self._extended_request_id
+    }
     /// Consumes the builder and constructs a [`UploadOutput`](crate::model::UploadOutput).
     fn build_unchecked(self) -> crate::model::UploadOutput {
         crate::model::UploadOutput {
@@ -1111,6 +1183,8 @@ impl UploadOutputBuilder {
             metrics: self.metrics.expect("metrics must be set"),
             sse_kms_encryption_context: self.sse_kms_encryption_context,
             sse_kms_key_id: self.sse_kms_key_id,
+            _request_id: self._request_id,
+            _extended_request_id: self._extended_request_id,
         }
     }
 }
@@ -1149,6 +1223,8 @@ impl ::std::fmt::Debug for UploadOutputBuilder {
             &"*** Sensitive Data Redacted ***",
         );
         formatter.field("sse_kms_key_id", &"*** Sensitive Data Redacted ***");
+        formatter.field("_request_id", &self._request_id);
+        formatter.field("_extended_request_id", &self._extended_request_id);
         formatter.finish()
     }
 }

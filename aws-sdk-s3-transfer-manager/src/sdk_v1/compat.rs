@@ -440,3 +440,13 @@ impl ::aws_sdk_s3::operation::RequestIdExt for crate::model::ChunkMetadata {
         crate::model::ChunkMetadata::extended_request_id(self)
     }
 }
+impl ::aws_sdk_s3::operation::RequestId for crate::model::UploadOutput {
+    fn request_id(&self) -> Option<&str> {
+        crate::model::UploadOutput::request_id(self)
+    }
+}
+impl ::aws_sdk_s3::operation::RequestIdExt for crate::model::UploadOutput {
+    fn extended_request_id(&self) -> Option<&str> {
+        crate::model::UploadOutput::extended_request_id(self)
+    }
+}
