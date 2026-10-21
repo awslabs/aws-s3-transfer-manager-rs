@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Audit ordinary TM, experimental adoption, and the execution adapter separately."""
+"""Audit ordinary TM, experimental adoption, and TM extensions separately."""
 
 import os
 from pathlib import Path
@@ -11,7 +11,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 TM = "aws-sdk-s3-transfer-manager"
-ADAPTER = "crates/aws-sdk-s3-transfer-manager-ort"
+ADAPTER = "crates/aws-sdk-s3-transfer-manager-ext"
 
 
 def check(package, config, *features):
@@ -30,7 +30,7 @@ def check_ordinary():
     # The adapter enables the experimental feature in workspace resolution.
     # An identical-source workspace without that member keeps the ordinary
     # allowlist strict; --no-default-features alone does not undo unification.
-    packages = [TM, "crates/aws-ort-execution", "crates/aws-ort-topology"]
+    packages = [TM, "crates/aws-smithy-execution", "crates/aws-smithy-topology"]
     with tempfile.TemporaryDirectory(prefix="tm-public-api-") as directory:
         snapshot = Path(directory)
         for package in packages:
@@ -64,7 +64,7 @@ def main():
         ROOT / TM,
         "external-types-experimental.toml",
         "--features",
-        "__exp_ort",
+        "__unstable_ext",
     )
     check(ROOT / ADAPTER, "external-types.toml")
 

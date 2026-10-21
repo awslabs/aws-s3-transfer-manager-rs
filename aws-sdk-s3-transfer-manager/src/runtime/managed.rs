@@ -7,7 +7,7 @@
 
 mod http;
 
-use aws_ort_execution::{ManagedRuntime, ManagedRuntimeHandle, RuntimePartition};
+use aws_smithy_execution::{ManagedRuntime, ManagedRuntimeHandle, RuntimePartition};
 use aws_smithy_http_client::pool::{self, ConnectionPool, DriverSpawner, Partition, PartitionId};
 use aws_smithy_http_client::proxy::ProxyConfig;
 use aws_smithy_http_client::tls::{rustls_provider::CryptoMode, Provider};
@@ -327,7 +327,7 @@ impl ManagedExecution {
 
     #[cfg(test)]
     pub(crate) fn for_test(handle: Weak<crate::client::Handle>, max_partitions: usize) -> Self {
-        let topology = aws_ort_execution::topology::Topology::detect()
+        let topology = aws_smithy_execution::topology::Topology::detect()
             .unwrap()
             .with_max_placements(max_partitions);
         let owner = ManagedRuntime::builder()

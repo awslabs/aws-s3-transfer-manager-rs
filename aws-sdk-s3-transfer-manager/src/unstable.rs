@@ -5,7 +5,7 @@
 
 //! Version-coupled integrations with managed execution.
 //!
-//! Available with the non-default `__exp_ort` feature. This module's contract
+//! Available with the non-default `__unstable_ext` feature. This module's contract
 //! is experimental and may change independently of the ordinary TM API. Use
 //! an adapter release constrained to the supported TM and execution versions.
 
@@ -23,6 +23,6 @@
 /// The transfer manager continues to preserve HTTP configured through the
 /// SDK or S3 configuration. With no configured HTTP it builds its default
 /// transport against the adopted runtime's partitions.
-pub fn managed(runtime: aws_ort_execution::ManagedRuntime) -> crate::Managed {
+pub fn managed(runtime: aws_smithy_execution::ManagedRuntime) -> crate::Managed {
     crate::Managed::from_runtime(runtime)
 }

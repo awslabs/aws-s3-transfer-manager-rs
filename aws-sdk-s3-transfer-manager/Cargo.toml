@@ -13,7 +13,7 @@ categories = ["asynchronous", "concurrency"]
 keywords = ["AWS", "Amazon", "S3", "high-performance", "transfer-manager"]
 
 [dependencies]
-aws-ort-execution = { workspace = true }
+aws-smithy-execution = { workspace = true }
 aws-config = { workspace = true, features = ["behavior-version-latest"] }
 aws-sdk-s3 = { workspace = true, features = ["behavior-version-latest"] }
 aws-smithy-runtime-api = { workspace = true }
@@ -44,9 +44,9 @@ arc-swap = "1.9.2"
 smallvec = "1"
 
 [features]
-# Version-coupled adoption hook used by the experimental execution adapter.
-__exp_ort = []
-dial9 = ["dep:dial9", "aws-ort-execution/dial9"]
+# Version-coupled adoption hook used by the unstable extension crate.
+__unstable_ext = []
+dial9 = ["dep:dial9", "aws-smithy-execution/dial9"]
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.189"

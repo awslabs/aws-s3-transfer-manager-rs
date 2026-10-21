@@ -145,7 +145,7 @@ pub mod operation;
 pub mod config;
 
 /// Experimental integrations with version-coupled managed execution.
-#[cfg(feature = "__exp_ort")]
+#[cfg(feature = "__unstable_ext")]
 pub mod unstable;
 
 /// Payload-memory configuration and shared pooled storage.

@@ -115,21 +115,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "aws-ort-execution"
-version = "0.1.0"
-dependencies = [
- "aws-ort-topology",
- "tokio",
-]
-
-[[package]]
-name = "aws-ort-topology"
-version = "0.1.0"
-dependencies = [
- "many_cpus",
-]
-
-[[package]]
 name = "aws-runtime"
 version = "1.10.1"
 dependencies = [
@@ -201,11 +186,11 @@ version = "0.3.1"
 dependencies = [
  "arc-swap",
  "aws-config",
- "aws-ort-execution",
  "aws-runtime",
  "aws-sdk-s3",
  "aws-smithy-checksums",
  "aws-smithy-dns",
+ "aws-smithy-execution",
  "aws-smithy-http-client",
  "aws-smithy-runtime",
  "aws-smithy-runtime-api",
@@ -375,6 +360,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-smithy-execution"
+version = "0.1.0"
+dependencies = [
+ "aws-smithy-topology",
+ "tokio",
+]
+
+[[package]]
 name = "aws-smithy-http"
 version = "0.64.2"
 dependencies = [
@@ -501,6 +494,13 @@ dependencies = [
  "aws-smithy-runtime-api",
  "aws-smithy-types",
  "http 1.5.0",
+]
+
+[[package]]
+name = "aws-smithy-topology"
+version = "0.1.0"
+dependencies = [
+ "many_cpus",
 ]
 
 [[package]]

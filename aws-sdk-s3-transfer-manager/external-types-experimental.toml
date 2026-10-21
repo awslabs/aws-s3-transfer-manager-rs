@@ -1,6 +1,6 @@
 # The experimental hook exposes only the concrete runtime owner.
 allowed_external_types = [
-    "aws_ort_execution::runtime::ManagedRuntime",
+    "aws_smithy_execution::runtime::ManagedRuntime",
     "aws_sdk_s3::*",
     "aws_smithy_runtime_api::*",
     "aws_smithy_types::*",

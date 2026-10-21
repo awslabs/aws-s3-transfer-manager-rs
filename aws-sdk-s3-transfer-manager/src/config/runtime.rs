@@ -83,26 +83,26 @@ pub struct Managed {
 enum Source {
     #[default]
     Automatic,
-    #[cfg(feature = "__exp_ort")]
-    Ort(Option<aws_ort_execution::ManagedRuntime>),
+    #[cfg(feature = "__unstable_ext")]
+    Adopted(Option<aws_smithy_execution::ManagedRuntime>),
 }
 
 impl Managed {
-    #[cfg(feature = "__exp_ort")]
-    pub(crate) fn from_runtime(runtime: aws_ort_execution::ManagedRuntime) -> Self {
+    #[cfg(feature = "__unstable_ext")]
+    pub(crate) fn from_runtime(runtime: aws_smithy_execution::ManagedRuntime) -> Self {
         Self {
-            source: Source::Ort(Some(runtime)),
+            source: Source::Adopted(Some(runtime)),
         }
     }
 
     pub(crate) fn build(
         &mut self,
         #[cfg(feature = "dial9")] recorder: Option<dial9::Dial9Handle>,
-    ) -> Result<aws_ort_execution::ManagedRuntime, aws_smithy_runtime_api::box_error::BoxError>
+    ) -> Result<aws_smithy_execution::ManagedRuntime, aws_smithy_runtime_api::box_error::BoxError>
     {
         match &mut self.source {
             Source::Automatic => {
-                let builder = aws_ort_execution::ManagedRuntime::builder()
+                let builder = aws_smithy_execution::ManagedRuntime::builder()
                     .thread_name_prefix("s3-tm")
                     .pin_threads(false);
                 #[cfg(feature = "dial9")]
@@ -112,8 +112,8 @@ impl Managed {
                 };
                 builder.build().map_err(Into::into)
             }
-            #[cfg(feature = "__exp_ort")]
-            Source::Ort(owner) => {
+            #[cfg(feature = "__unstable_ext")]
+            Source::Adopted(owner) => {
                 #[cfg(feature = "dial9")]
                 if recorder.is_some() {
                     return Err("configure Dial9 on the runtime builder before adoption; \
@@ -128,10 +128,10 @@ impl Managed {
     }
 }
 
-#[cfg(all(test, feature = "__exp_ort", not(miri)))]
+#[cfg(all(test, feature = "__unstable_ext", not(miri)))]
 mod tests {
     use super::*;
-    use aws_ort_execution::{topology::Topology, ManagedRuntime};
+    use aws_smithy_execution::{topology::Topology, ManagedRuntime};
 
     #[test]
     fn adoption_preserves_identity_topology_and_names_and_takes_owner_once() {

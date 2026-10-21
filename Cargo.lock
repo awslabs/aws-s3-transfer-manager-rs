@@ -184,37 +184,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "aws-ort-execution"
-version = "0.1.0"
-dependencies = [
- "aws-ort-topology",
- "dial9",
- "tokio",
-]
-
-[[package]]
-name = "aws-ort-http"
-version = "0.1.0"
-dependencies = [
- "aws-ort-execution",
- "aws-smithy-async",
- "aws-smithy-http-client",
- "aws-smithy-runtime-api",
- "aws-smithy-types",
- "dial9",
- "http-body-util",
- "tokio",
-]
-
-[[package]]
-name = "aws-ort-topology"
-version = "0.1.0"
-dependencies = [
- "many_cpus",
- "tempfile",
-]
-
-[[package]]
 name = "aws-runtime"
 version = "1.10.1"
 dependencies = [
@@ -278,11 +247,11 @@ version = "0.3.1"
 dependencies = [
  "arc-swap",
  "aws-config",
- "aws-ort-execution",
  "aws-runtime",
  "aws-sdk-s3",
  "aws-smithy-checksums",
  "aws-smithy-dns",
+ "aws-smithy-execution",
  "aws-smithy-http-client",
  "aws-smithy-mocks",
  "aws-smithy-runtime",
@@ -328,15 +297,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "aws-sdk-s3-transfer-manager-ort"
+name = "aws-sdk-s3-transfer-manager-ext"
 version = "0.1.0"
 dependencies = [
  "aws-credential-types",
- "aws-ort-execution",
- "aws-ort-http",
  "aws-sdk-s3-transfer-manager",
  "aws-smithy-checksums",
+ "aws-smithy-execution",
  "aws-smithy-http-client",
+ "aws-smithy-managed-http",
  "aws-smithy-runtime-api",
  "aws-smithy-types",
  "aws-types",
@@ -488,6 +457,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-smithy-execution"
+version = "0.1.0"
+dependencies = [
+ "aws-smithy-topology",
+ "dial9",
+ "tokio",
+]
+
+[[package]]
 name = "aws-smithy-http"
 version = "0.64.2"
 dependencies = [
@@ -550,6 +528,20 @@ dependencies = [
  "aws-smithy-runtime-api",
  "aws-smithy-schema",
  "aws-smithy-types",
+]
+
+[[package]]
+name = "aws-smithy-managed-http"
+version = "0.1.0"
+dependencies = [
+ "aws-smithy-async",
+ "aws-smithy-execution",
+ "aws-smithy-http-client",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "dial9",
+ "http-body-util",
+ "tokio",
 ]
 
 [[package]]
@@ -651,6 +643,14 @@ dependencies = [
  "aws-smithy-runtime-api",
  "aws-smithy-types",
  "http 1.5.0",
+]
+
+[[package]]
+name = "aws-smithy-topology"
+version = "0.1.0"
+dependencies = [
+ "many_cpus",
+ "tempfile",
 ]
 
 [[package]]

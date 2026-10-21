@@ -1,0 +1,19 @@
+[package]
+name = "aws-smithy-topology"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license = "Apache-2.0"
+repository = "https://github.com/awslabs/aws-s3-transfer-manager-rs"
+description = "Hardware topology and placement primitives for the AWS SDK and smithy-rs ecosystem."
+readme = "README.md"
+categories = ["hardware-support", "concurrency"]
+keywords = ["aws", "smithy", "topology", "numa"]
+
+[dependencies]
+many_cpus = { version = "=2.4.16", default-features = false }
+
+[dev-dependencies]
+many_cpus = { version = "=2.4.16", default-features = false, features = ["test-util"] }
+tempfile = "3.27.0"

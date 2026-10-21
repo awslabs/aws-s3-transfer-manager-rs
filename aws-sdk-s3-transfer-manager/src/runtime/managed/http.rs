@@ -5,7 +5,7 @@
 
 //! HTTP connector routing over one native pool.
 
-use aws_ort_execution::ManagedRuntimeHandle;
+use aws_smithy_execution::ManagedRuntimeHandle;
 use aws_smithy_http_client::pool;
 use aws_smithy_runtime_api::{
     box_error::BoxError,
@@ -85,7 +85,7 @@ impl ManagedHttpClient {
 #[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
-    use aws_ort_execution::{topology::Topology, ManagedRuntime};
+    use aws_smithy_execution::{topology::Topology, ManagedRuntime};
     use aws_smithy_http_client::pool::{ConnectionPool, DriverSpawner, Partition, PartitionId};
     use aws_smithy_http_client::test_util::wire::connection::{
         ConnectionTestHarness, EndpointPlan, Http1Response, Http1Script,

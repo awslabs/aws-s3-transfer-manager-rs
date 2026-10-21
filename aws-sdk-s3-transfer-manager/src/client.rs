@@ -623,8 +623,8 @@ mod tests {
         started: Arc<tokio::sync::Semaphore>,
         release: Arc<tokio::sync::Semaphore>,
         bodies: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
-        execution: Option<aws_ort_execution::ManagedRuntimeHandle>,
-        dispatches: Arc<std::sync::Mutex<Vec<aws_ort_execution::RuntimePartitionId>>>,
+        execution: Option<aws_smithy_execution::ManagedRuntimeHandle>,
+        dispatches: Arc<std::sync::Mutex<Vec<aws_smithy_execution::RuntimePartitionId>>>,
     }
 
     impl aws_smithy_runtime_api::client::http::HttpConnector for CallerHttp {
@@ -701,13 +701,13 @@ mod tests {
         let adopted: Option<(
             RuntimeConfig,
             bool,
-            Option<aws_ort_execution::ManagedRuntimeHandle>,
+            Option<aws_smithy_execution::ManagedRuntimeHandle>,
         )> = {
-            #[cfg(feature = "__exp_ort")]
+            #[cfg(feature = "__unstable_ext")]
             {
-                let owner = aws_ort_execution::ManagedRuntime::builder()
+                let owner = aws_smithy_execution::ManagedRuntime::builder()
                     .topology(
-                        aws_ort_execution::topology::Topology::detect()
+                        aws_smithy_execution::topology::Topology::detect()
                             .unwrap()
                             .with_max_placements(1),
                     )
@@ -722,7 +722,7 @@ mod tests {
                     Some(execution),
                 ))
             }
-            #[cfg(not(feature = "__exp_ort"))]
+            #[cfg(not(feature = "__unstable_ext"))]
             {
                 None
             }
@@ -849,12 +849,12 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "__exp_ort", not(miri)))]
+    #[cfg(all(feature = "__unstable_ext", not(miri)))]
     #[tokio::test]
     async fn adopted_runtime_without_configured_http_uses_the_managed_preset() {
-        let owner = aws_ort_execution::ManagedRuntime::builder()
+        let owner = aws_smithy_execution::ManagedRuntime::builder()
             .topology(
-                aws_ort_execution::topology::Topology::detect()
+                aws_smithy_execution::topology::Topology::detect()
                     .unwrap()
                     .with_max_placements(1),
             )
@@ -894,7 +894,7 @@ mod tests {
     }
 
     #[cfg(all(
-        feature = "__exp_ort",
+        feature = "__unstable_ext",
         not(miri),
         any(
             target_os = "android",
@@ -911,9 +911,9 @@ mod tests {
     ))]
     #[tokio::test]
     async fn transport_construction_failure_drops_the_adopted_owner() {
-        let owner = aws_ort_execution::ManagedRuntime::builder()
+        let owner = aws_smithy_execution::ManagedRuntime::builder()
             .topology(
-                aws_ort_execution::topology::Topology::detect()
+                aws_smithy_execution::topology::Topology::detect()
                     .unwrap()
                     .with_max_placements(1),
             )
@@ -939,12 +939,12 @@ mod tests {
             .is_cancelled());
     }
 
-    #[cfg(all(feature = "__exp_ort", feature = "dial9", not(miri)))]
+    #[cfg(all(feature = "__unstable_ext", feature = "dial9", not(miri)))]
     #[tokio::test]
     async fn adopted_runtime_rejects_tm_recorder_and_releases_ownership() {
-        let owner = aws_ort_execution::ManagedRuntime::builder()
+        let owner = aws_smithy_execution::ManagedRuntime::builder()
             .topology(
-                aws_ort_execution::topology::Topology::detect()
+                aws_smithy_execution::topology::Topology::detect()
                     .unwrap()
                     .with_max_placements(1),
             )

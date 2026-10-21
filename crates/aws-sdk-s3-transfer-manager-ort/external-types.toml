@@ -1,6 +1,0 @@
-allowed_external_types = [
-    "aws_sdk_s3_transfer_manager::*",
-    "aws_ort_execution::*",
-    "aws_ort_http::*",
-    "aws_smithy_runtime_api::client::http::SharedHttpClient",
-]
