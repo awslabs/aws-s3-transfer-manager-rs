@@ -74,10 +74,10 @@ impl ServerHandle {
         }
     }
 
-    /// Create an S3 client configured to use this mock server.
-    pub async fn client(&self) -> Client {
+    /// Load shared AWS configuration for this mock server.
+    pub async fn shared_config(&self) -> aws_config::SdkConfig {
         let endpoint_url = format!("http://127.0.0.1:{}", self.address.port());
-        let shared_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        aws_config::defaults(aws_config::BehaviorVersion::latest())
             .credentials_provider(Credentials::new(
                 TEST_ACCESS_KEY,
                 TEST_SECRET_KEY,
@@ -88,8 +88,12 @@ impl ServerHandle {
             .region(Region::new("us-east-1"))
             .endpoint_url(endpoint_url)
             .load()
-            .await;
+            .await
+    }
 
+    /// Create an S3 client configured to use this mock server.
+    pub async fn client(&self) -> Client {
+        let shared_config = self.shared_config().await;
         let config = aws_sdk_s3::config::Builder::from(&shared_config)
             // TODO - we could override the http client with a custom ResolveDns impl to avoid path style
             .force_path_style(true)

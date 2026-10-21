@@ -96,7 +96,11 @@ async fn test_successful_multiple_objects_upload_via_put_object() {
 
         let bucket_name = "test-bucket";
         let config = aws_sdk_s3_transfer_manager::Config::builder()
-            .client(mock_s3_client_for_put_object(bucket_name.to_owned()))
+            .s3_config(test_common::s3_config_with_test_http(
+                mock_s3_client_for_put_object(bucket_name.to_owned())
+                    .config()
+                    .to_builder(),
+            ))
             .build();
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
@@ -134,7 +138,11 @@ async fn test_successful_multiple_objects_upload_via_multipart_upload() {
 
         let bucket_name = "test-bucket";
         let config = aws_sdk_s3_transfer_manager::Config::builder()
-            .client(mock_s3_client_for_multipart_upload(bucket_name.to_owned()))
+            .s3_config(test_common::s3_config_with_test_http(
+                mock_s3_client_for_multipart_upload(bucket_name.to_owned())
+                    .config()
+                    .to_builder(),
+            ))
             .multipart_threshold(PartSize::Target(5))
             .build();
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);
@@ -189,7 +197,11 @@ async fn test_successful_multiple_objects_upload_with_symlinks() {
 
         let bucket_name = "test-bucket";
         let config = aws_sdk_s3_transfer_manager::Config::builder()
-            .client(mock_s3_client_for_put_object(bucket_name.to_owned()))
+            .s3_config(test_common::s3_config_with_test_http(
+                mock_s3_client_for_put_object(bucket_name.to_owned())
+                    .config()
+                    .to_builder(),
+            ))
             .build();
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
@@ -246,7 +258,11 @@ async fn test_source_dir_is_symlink() {
 
         let bucket_name = "test-bucket";
         let config = aws_sdk_s3_transfer_manager::Config::builder()
-            .client(mock_s3_client_for_put_object(bucket_name.to_owned()))
+            .s3_config(test_common::s3_config_with_test_http(
+                mock_s3_client_for_put_object(bucket_name.to_owned())
+                    .config()
+                    .to_builder(),
+            ))
             .build();
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
@@ -306,7 +322,11 @@ async fn test_failed_upload_policy_continue() {
 
         let bucket_name = "test-bucket";
         let config = aws_sdk_s3_transfer_manager::Config::builder()
-            .client(mock_s3_client_for_put_object(bucket_name.to_owned()))
+            .s3_config(test_common::s3_config_with_test_http(
+                mock_s3_client_for_put_object(bucket_name.to_owned())
+                    .config()
+                    .to_builder(),
+            ))
             .build();
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
@@ -343,7 +363,9 @@ async fn test_server_error_should_be_recorded_as_such_in_failed_transfers() {
             });
         let s3_client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[put_object]);
         let config = aws_sdk_s3_transfer_manager::Config::builder()
-            .client(s3_client)
+            .s3_config(test_common::s3_config_with_test_http(
+                s3_client.config().to_builder(),
+            ))
             .build();
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
@@ -375,7 +397,11 @@ async fn test_source_dir_not_valid() {
 
         let bucket_name = "test-bucket";
         let config = aws_sdk_s3_transfer_manager::Config::builder()
-            .client(mock_s3_client_for_put_object(bucket_name.to_owned()))
+            .s3_config(test_common::s3_config_with_test_http(
+                mock_s3_client_for_put_object(bucket_name.to_owned())
+                    .config()
+                    .to_builder(),
+            ))
             .build();
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
@@ -410,7 +436,11 @@ async fn test_error_when_custom_delimiter_appears_in_filename() {
 
         let bucket_name = "test-bucket";
         let config = aws_sdk_s3_transfer_manager::Config::builder()
-            .client(mock_s3_client_for_put_object(bucket_name.to_owned()))
+            .s3_config(test_common::s3_config_with_test_http(
+                mock_s3_client_for_put_object(bucket_name.to_owned())
+                    .config()
+                    .to_builder(),
+            ))
             .build();
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
@@ -462,7 +492,9 @@ async fn test_abort_on_handle_should_terminate_tasks_gracefully() {
 
         let s3_client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[put_object]);
         let config = aws_sdk_s3_transfer_manager::Config::builder()
-            .client(s3_client)
+            .s3_config(test_common::s3_config_with_test_http(
+                s3_client.config().to_builder(),
+            ))
             .build();
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
@@ -511,7 +543,9 @@ async fn test_failed_child_operation_should_cause_ongoing_requests_to_be_cancell
 
         let s3_client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[put_object]);
         let config = aws_sdk_s3_transfer_manager::Config::builder()
-            .client(s3_client)
+            .s3_config(test_common::s3_config_with_test_http(
+                s3_client.config().to_builder(),
+            ))
             .build();
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
@@ -558,7 +592,9 @@ async fn test_drop_upload_objects_handle() {
             });
         let s3_client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[put_object]);
         let config = aws_sdk_s3_transfer_manager::Config::builder()
-            .client(s3_client)
+            .s3_config(test_common::s3_config_with_test_http(
+                s3_client.config().to_builder(),
+            ))
             .build();
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
@@ -608,7 +644,11 @@ async fn test_metrics_correctness_on_success() {
 
         let bucket_name = "test-bucket";
         let config = aws_sdk_s3_transfer_manager::Config::builder()
-            .client(mock_s3_client_for_put_object(bucket_name.to_owned()))
+            .s3_config(test_common::s3_config_with_test_http(
+                mock_s3_client_for_put_object(bucket_name.to_owned())
+                    .config()
+                    .to_builder(),
+            ))
             .build();
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
@@ -658,7 +698,11 @@ async fn test_max_concurrent_uploads_one_serial_execution() {
 
         let bucket_name = "test-bucket";
         let config = aws_sdk_s3_transfer_manager::Config::builder()
-            .client(mock_s3_client_for_put_object(bucket_name.to_owned()))
+            .s3_config(test_common::s3_config_with_test_http(
+                mock_s3_client_for_put_object(bucket_name.to_owned())
+                    .config()
+                    .to_builder(),
+            ))
             .build();
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
@@ -701,7 +745,11 @@ async fn test_deep_tree_subtree_claiming() {
 
         let bucket_name = "test-bucket";
         let config = aws_sdk_s3_transfer_manager::Config::builder()
-            .client(mock_s3_client_for_put_object(bucket_name.to_owned()))
+            .s3_config(test_common::s3_config_with_test_http(
+                mock_s3_client_for_put_object(bucket_name.to_owned())
+                    .config()
+                    .to_builder(),
+            ))
             .build();
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
@@ -743,7 +791,11 @@ async fn test_walker_filter_restricts_uploads() {
 
         let bucket_name = "test-bucket";
         let config = aws_sdk_s3_transfer_manager::Config::builder()
-            .client(mock_s3_client_for_put_object(bucket_name.to_owned()))
+            .s3_config(test_common::s3_config_with_test_http(
+                mock_s3_client_for_put_object(bucket_name.to_owned())
+                    .config()
+                    .to_builder(),
+            ))
             .build();
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
@@ -785,7 +837,11 @@ async fn test_empty_source_directory() {
 
         let bucket_name = "test-bucket";
         let config = aws_sdk_s3_transfer_manager::Config::builder()
-            .client(mock_s3_client_for_put_object(bucket_name.to_owned()))
+            .s3_config(test_common::s3_config_with_test_http(
+                mock_s3_client_for_put_object(bucket_name.to_owned())
+                    .config()
+                    .to_builder(),
+            ))
             .build();
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
@@ -846,7 +902,9 @@ async fn test_interleaved_success_failure_continue() {
 
         let s3_client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[fail_match, succeed_match]);
         let config = aws_sdk_s3_transfer_manager::Config::builder()
-            .client(s3_client)
+            .s3_config(test_common::s3_config_with_test_http(
+                s3_client.config().to_builder(),
+            ))
             .build();
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
@@ -896,7 +954,11 @@ async fn test_drop_during_walk_in_progress() {
 
         let bucket_name = "test-bucket";
         let config = aws_sdk_s3_transfer_manager::Config::builder()
-            .client(mock_s3_client_for_put_object(bucket_name.to_owned()))
+            .s3_config(test_common::s3_config_with_test_http(
+                mock_s3_client_for_put_object(bucket_name.to_owned())
+                    .config()
+                    .to_builder(),
+            ))
             .build();
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
@@ -939,7 +1001,11 @@ async fn test_multipart_metrics_aggregate_across_children() {
 
         let bucket_name = "test-bucket";
         let config = aws_sdk_s3_transfer_manager::Config::builder()
-            .client(mock_s3_client_for_multipart_upload(bucket_name.to_owned()))
+            .s3_config(test_common::s3_config_with_test_http(
+                mock_s3_client_for_multipart_upload(bucket_name.to_owned())
+                    .config()
+                    .to_builder(),
+            ))
             .multipart_threshold(PartSize::Target(5))
             .build();
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);
@@ -976,7 +1042,11 @@ async fn test_status_transitions_to_terminal() {
 
         let bucket_name = "test-bucket";
         let config = aws_sdk_s3_transfer_manager::Config::builder()
-            .client(mock_s3_client_for_put_object(bucket_name.to_owned()))
+            .s3_config(test_common::s3_config_with_test_http(
+                mock_s3_client_for_put_object(bucket_name.to_owned())
+                    .config()
+                    .to_builder(),
+            ))
             .build();
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
@@ -1016,7 +1086,11 @@ async fn test_hidden_files_uploaded_by_default() {
 
         let bucket_name = "test-bucket";
         let config = aws_sdk_s3_transfer_manager::Config::builder()
-            .client(mock_s3_client_for_put_object(bucket_name.to_owned()))
+            .s3_config(test_common::s3_config_with_test_http(
+                mock_s3_client_for_put_object(bucket_name.to_owned())
+                    .config()
+                    .to_builder(),
+            ))
             .build();
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
@@ -1059,7 +1133,11 @@ async fn test_multiple_iterations_on_same_client_do_not_hang() {
 
         let bucket_name = "test-bucket";
         let config = aws_sdk_s3_transfer_manager::Config::builder()
-            .client(mock_s3_client_for_put_object(bucket_name.to_owned()))
+            .s3_config(test_common::s3_config_with_test_http(
+                mock_s3_client_for_put_object(bucket_name.to_owned())
+                    .config()
+                    .to_builder(),
+            ))
             .build();
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
@@ -1121,7 +1199,11 @@ async fn test_concurrent_child_completion_terminates_cleanly() {
 
         let bucket_name = "test-bucket";
         let config = aws_sdk_s3_transfer_manager::Config::builder()
-            .client(mock_s3_client_for_put_object(bucket_name.to_owned()))
+            .s3_config(test_common::s3_config_with_test_http(
+                mock_s3_client_for_put_object(bucket_name.to_owned())
+                    .config()
+                    .to_builder(),
+            ))
             .build();
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
@@ -1171,7 +1253,9 @@ async fn test_continue_policy_records_all_failures_under_concurrent_orchestratio
 
         let s3 = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&put_object]);
         let config = aws_sdk_s3_transfer_manager::Config::builder()
-            .client(s3)
+            .s3_config(test_common::s3_config_with_test_http(
+                s3.config().to_builder(),
+            ))
             .build();
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
@@ -1234,7 +1318,7 @@ async fn test_max_concurrent_uploads_respected_during_concurrent_orchestration()
 
         let s3 = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&put_object]);
         let config = aws_sdk_s3_transfer_manager::Config::builder()
-            .client(s3)
+            .s3_config(test_common::s3_config_with_test_http(s3.config().to_builder()))
             .build();
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
@@ -1291,10 +1375,14 @@ async fn test_abort_policy_terminates_cleanly_during_concurrent_orchestration() 
 
         let bucket_name = "test-bucket";
         let config = aws_sdk_s3_transfer_manager::Config::builder()
-            .client(mock_s3_client_for_put_object_succeeds_then_fails(
-                bucket_name.to_owned(),
-                SUCCESS_COUNT,
-                LATENCY,
+            .s3_config(test_common::s3_config_with_test_http(
+                mock_s3_client_for_put_object_succeeds_then_fails(
+                    bucket_name.to_owned(),
+                    SUCCESS_COUNT,
+                    LATENCY,
+                )
+                .config()
+                .to_builder(),
             ))
             .build();
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);
@@ -1358,9 +1446,10 @@ async fn test_drop_during_active_uploads_cancels_without_hang() {
 
         let bucket_name = "test-bucket";
         let config = aws_sdk_s3_transfer_manager::Config::builder()
-            .client(mock_s3_client_for_put_object_with_latency(
-                bucket_name.to_owned(),
-                LATENCY,
+            .s3_config(test_common::s3_config_with_test_http(
+                mock_s3_client_for_put_object_with_latency(bucket_name.to_owned(), LATENCY)
+                    .config()
+                    .to_builder(),
             ))
             .build();
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);
@@ -1428,7 +1517,11 @@ async fn test_stress_multi_iter_reproduce_ec2_hang() {
 
         let bucket_name = "test-bucket";
         let config = aws_sdk_s3_transfer_manager::Config::builder()
-            .client(mock_s3_client_for_put_object(bucket_name.to_owned()))
+            .s3_config(test_common::s3_config_with_test_http(
+                mock_s3_client_for_put_object(bucket_name.to_owned())
+                    .config()
+                    .to_builder(),
+            ))
             .build();
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
@@ -1596,10 +1689,10 @@ async fn test_stress_parent_lock_contention() {
 
         let bucket_name = "test-bucket";
         let config = aws_sdk_s3_transfer_manager::Config::builder()
-            .client(mock_s3_client_for_put_object_with_latency(
+            .s3_config(test_common::s3_config_with_test_http(mock_s3_client_for_put_object_with_latency(
                 bucket_name.to_owned(),
                 PUT_LATENCY,
-            ))
+            ).config().to_builder()))
             .build();
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
@@ -1693,7 +1786,7 @@ async fn test_upload_objects_children_send_mpu_object_size() {
         );
 
         let config = aws_sdk_s3_transfer_manager::Config::builder()
-            .client(client)
+            .s3_config(test_common::s3_config_with_test_http(client.config().to_builder()))
             .multipart_threshold(PartSize::Target(5))
             .build();
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);

@@ -14,23 +14,23 @@ use std::task::{Context, Poll};
 use bytes::BufMut;
 use futures_util::future::{select, Either};
 
-use super::input::copy_fields_to_get_object_request;
+use crate::sdk_v1::copy_download_input_fields_to_get_object as copy_fields_to_get_object_request;
 
 use crate::error::{self, ChunkRef, Error};
 use crate::operation::download::body::{BodySlot, BodyWriter, ChunkOutput, DrainError, Drained};
-use crate::operation::download::chunk_meta::ChunkMetadata;
 use crate::operation::download::context::{
     CompletionClaim, DownloadPendingReason, DownloadState, PendingClaim,
 };
 use crate::operation::download::discovery::{discover_obj, ObjectDiscovery};
-use crate::operation::download::object_meta::ObjectMetadata;
 use crate::operation::download::observability::{
     DownloadDestination, DownloadEvent, DownloadExecutionState, DownloadObservability,
     DownloadRequestKind, DownloadRequestMeasurement, DownloadStateSnapshot, DownloadTerminalReport,
 };
 use crate::operation::download::read_ahead::ReadAhead;
 use crate::operation::download::recv_buffer::{DrainMode, FillOutcome};
+use crate::operation::download::ChunkMetadata;
 use crate::operation::download::DownloadInput;
+use crate::operation::download::ObjectMetadata;
 use crate::runtime::buffer_pool::{
     AcquireError, BufferPool, Reservation, ReserveError, SegmentedBytes,
 };
@@ -312,7 +312,7 @@ impl DownloadTransfer {
     /// default, and unknown values enable it).
     fn validation_enabled(&self, input: &DownloadInput) -> bool {
         match input.checksum_mode {
-            Some(aws_sdk_s3::types::ChecksumMode::Enabled) => true,
+            Some(crate::model::ChecksumMode::Enabled) => true,
             _ => !matches!(
                 self.ctx()
                     .s3_client()
@@ -1235,7 +1235,7 @@ impl DownloadTransfer {
                         })
                         .await?;
                     // Untimed: drain the body. Errors here are inner (retryable IO).
-                    let chunk_meta = ChunkMetadata::from(&resp);
+                    let chunk_meta = crate::sdk_v1::chunk_metadata_from_get_object(&resp);
                     let bytes = collect_response_body(
                         &ctx.handle.buffer_pool,
                         resp.body,
@@ -1859,7 +1859,7 @@ mod tests {
     use http_body_1x::{Body as HttpBody, Frame, SizeHint};
 
     use super::*;
-    use crate::operation::download::chunk_meta::ChunkMetadata;
+    use crate::model::{ChecksumType, ChunkMetadata};
     use crate::operation::download::sink::FileSinkFactory;
     use crate::operation::download::test_util::fixtures::{
         assert_discovery_succeeds, disk_test_handle, disk_transfer, execute, finalize_started,
@@ -1873,7 +1873,6 @@ mod tests {
     use aws_sdk_s3::operation::get_object::GetObjectError;
     use aws_sdk_s3::operation::get_object::GetObjectOutput;
     use aws_sdk_s3::primitives::ByteStream;
-    use aws_sdk_s3::types::ChecksumType;
     use aws_smithy_mocks::{mock, mock_client, RuleMode};
     use aws_smithy_types::error::metadata::ErrorMetadata;
 
@@ -2270,7 +2269,7 @@ mod tests {
         detail: u64,
     ) -> DownloadTransfer {
         let config = crate::Config::builder()
-            .client(client)
+            .sdk_client(client)
             .part_size(crate::types::PartSize::Target(part_size))
             .diagnostics_for_test(crate::config::MemoryDiagnosticsConfig::default(), detail)
             .build();
@@ -2311,7 +2310,7 @@ mod tests {
                 .build()
         });
         let config = crate::Config::builder()
-            .client(mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get_obj]))
+            .sdk_client(mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get_obj]))
             .part_size(crate::types::PartSize::Target(part_size))
             .build();
         let handle = crate::client::Handle::test_handle_tokio(config);
@@ -2609,7 +2608,7 @@ mod tests {
 
         let client = object_client(object_bytes(2 * part_size as usize));
         let config = crate::Config::builder()
-            .client(client)
+            .sdk_client(client)
             .part_size(crate::types::PartSize::Target(part_size))
             .build();
         let handle = crate::client::Handle::test_handle_tokio(config);
@@ -2886,7 +2885,7 @@ mod tests {
         });
         let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get_obj]);
         let config = crate::Config::builder()
-            .client(client)
+            .sdk_client(client)
             .part_size(crate::types::PartSize::Target(part_size))
             .build();
         let handle = crate::client::Handle::test_handle_tokio(config);
@@ -3028,7 +3027,7 @@ mod tests {
         let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[head_obj, get_obj]);
 
         let config = crate::Config::builder()
-            .client(client)
+            .sdk_client(client)
             .part_size(crate::types::PartSize::Target(8 * MB))
             .build();
 
@@ -3338,7 +3337,7 @@ mod tests {
         // No explicit part size: discovery issues the Auto-sized ranged GET,
         // then realigns to the stored part size via partNumber=1.
         let config = crate::Config::builder()
-            .client(client)
+            .sdk_client(client)
             .diagnostics_for_test(crate::config::MemoryDiagnosticsConfig::default(), 1)
             .build();
         let handle = crate::client::Handle::test_handle_tokio(config);
@@ -3420,7 +3419,7 @@ mod tests {
         let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get_obj]);
 
         let mut config = crate::Config::builder()
-            .client(client)
+            .sdk_client(client)
             .part_size(crate::types::PartSize::Target(part_size));
         if let Some(capacity_bytes) = capacity_bytes {
             let pool = crate::memory::BufferPool::builder()
@@ -3803,7 +3802,7 @@ mod tests {
             .build()
             .expect("test pool");
         let config = crate::Config::builder()
-            .client(client)
+            .sdk_client(client)
             .part_size(crate::types::PartSize::Target(part_size))
             .memory(crate::types::MemoryConfig::Explicit(pool.clone()))
             .diagnostics_for_test(crate::config::MemoryDiagnosticsConfig::default(), 1)
@@ -3895,7 +3894,7 @@ mod tests {
         let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get_obj]);
 
         let config = crate::Config::builder()
-            .client(client)
+            .sdk_client(client)
             .part_size(crate::types::PartSize::Target(part_size))
             .build();
         let handle = crate::client::Handle::test_handle_tokio(config);
@@ -4390,7 +4389,7 @@ mod tests {
             .expect("the budget fits the blocker");
         let script = Arc::new(WriteScript::default()).on(Match::NthWrite(1), Action::Hold);
         let config = crate::Config::builder()
-            .client(object_client(Arc::clone(&object)))
+            .sdk_client(object_client(Arc::clone(&object)))
             .part_size(crate::types::PartSize::Target(part_size as u64))
             .memory(crate::types::MemoryConfig::Explicit(pool))
             .build();
@@ -4663,7 +4662,7 @@ mod tests {
             .build()
             .expect("test pool");
         let config = crate::Config::builder()
-            .client(mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get_obj]))
+            .sdk_client(mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get_obj]))
             .part_size(crate::types::PartSize::Target(part_size))
             .memory(crate::types::MemoryConfig::Explicit(pool.clone()))
             .build();
@@ -4745,7 +4744,7 @@ mod tests {
             .build()
             .expect("test pool");
         let config = crate::Config::builder()
-            .client(mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get_obj]))
+            .sdk_client(mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get_obj]))
             .part_size(crate::types::PartSize::Target(part_size))
             .memory(crate::types::MemoryConfig::Explicit(pool.clone()))
             .build();
@@ -4814,7 +4813,7 @@ mod tests {
                     .build()
             });
             let config = crate::Config::builder()
-                .client(mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get_obj]))
+                .sdk_client(mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get_obj]))
                 .part_size(crate::types::PartSize::Target(8 * MB))
                 .read_ahead(client_mode)
                 .build();

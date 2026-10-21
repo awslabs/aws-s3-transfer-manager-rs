@@ -280,7 +280,7 @@ impl Client {
         // 2. Build Handle with Arc::new_cyclic so scheduler and runtime
         //    can hold Weak<Handle> without creating a reference cycle.
         #[cfg(feature = "dial9")]
-        let telemetry_guard = config.take_telemetry_guard().map(std::sync::Arc::new);
+        let dial9_handle = config.take_dial9_handle();
 
         let memory_diagnostics = config.diagnostics().memory();
         let buffer_pool = match config.memory() {
@@ -307,8 +307,8 @@ impl Client {
                     let mut builder =
                         ManagedThreadRuntime::builder(weak_handle.clone()).http(runtime_http);
                     #[cfg(feature = "dial9")]
-                    if let Some(guard) = telemetry_guard {
-                        builder = builder.telemetry_guard(guard);
+                    if let Some(handle) = dial9_handle {
+                        builder = builder.dial9_handle(handle);
                     }
                     Arc::new(builder.build())
                 }
@@ -613,7 +613,7 @@ mod tests {
 
     fn test_config() -> crate::Config {
         let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
-        crate::Config::builder().client(s3_client).build()
+        crate::Config::builder().sdk_client(s3_client).build()
     }
 
     fn runtime_http_client(client: &Client) -> Option<&SharedHttpClient> {
@@ -622,7 +622,7 @@ mod tests {
 
     fn mock_s3_config() -> crate::config::S3ClientConfig {
         let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
-        crate::config::S3ClientConfig::new(s3_client.config().to_builder())
+        crate::config::S3ClientConfig::from_sdk_builder(s3_client.config().to_builder())
     }
 
     // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
@@ -684,7 +684,7 @@ mod tests {
         let carrier_size = pool.carrier_size();
         let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
         let config = crate::Config::builder()
-            .client(s3_client)
+            .sdk_client(s3_client)
             .memory(MemoryConfig::Explicit(pool.clone()))
             .build();
 
@@ -710,7 +710,7 @@ mod tests {
     fn test_client_automatic_pool_starts_unprepared() {
         let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
         let config = crate::Config::builder()
-            .client(s3_client)
+            .sdk_client(s3_client)
             .machine_profile(Some(crate::runtime::platform::MachineProfile {
                 instance_type: None,
                 vcpus: 4,
@@ -738,7 +738,7 @@ mod tests {
         .unwrap();
         let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
         let config = crate::Config::builder()
-            .client(s3_client)
+            .sdk_client(s3_client)
             .memory(MemoryConfig::Explicit(pool.clone()))
             .build();
 
@@ -802,7 +802,7 @@ mod tests {
     fn config_with(mode: ConcurrencyMode, profile: Option<MachineProfile>) -> crate::Config {
         let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
         crate::config::Config::builder()
-            .client(s3_client)
+            .sdk_client(s3_client)
             .concurrency(mode)
             .machine_profile(profile)
             .build()
@@ -922,7 +922,7 @@ mod tests {
     fn client_new_with_managed_runtime_mode() {
         let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
         let config = crate::Config::builder()
-            .client(s3_client)
+            .sdk_client(s3_client)
             .runtime_mode(RuntimeMode::Managed)
             .build();
         let _client = Client::new(config);
@@ -934,7 +934,7 @@ mod tests {
     async fn client_new_with_multi_thread_tokio_runtime_mode() {
         let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
         let config = crate::Config::builder()
-            .client(s3_client)
+            .sdk_client(s3_client)
             .runtime_mode(RuntimeMode::MultiThreadTokio)
             .build();
         let _client = Client::new(config);

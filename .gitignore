@@ -30,6 +30,9 @@ build/
 **/bin/main/
 **/bin/test/
 
+# Kotlin codegen compiler cache
+/tools/codegen/**/.kotlin/
+
 # Ignore Gradle GUI config
 gradle-app.setting
 
@@ -64,3 +67,4 @@ fuzz/corpus/
 
 # python
 __pycache__
+/tools/scripts/**/*.py[cod]

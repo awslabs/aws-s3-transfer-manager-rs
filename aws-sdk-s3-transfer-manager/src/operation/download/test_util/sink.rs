@@ -493,7 +493,7 @@ mod tests {
         let object = object_bytes(5 * MIB + 1024);
         let script = Arc::new(WriteScript::default());
         let config = crate::Config::builder()
-            .client(object_client(Arc::clone(&object)))
+            .sdk_client(object_client(Arc::clone(&object)))
             .part_size(crate::types::PartSize::Target(5 * MIB as u64))
             .build();
         let handle = managed_test_handle(config, 128);
