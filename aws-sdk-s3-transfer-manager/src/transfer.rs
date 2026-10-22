@@ -954,7 +954,6 @@ impl TransferContext {
     ) -> Self {
         self.lifecycle = Some(Arc::new(crate::events::TransferLifecycle::new(
             sink,
-            self.id,
             transfer,
             Some(self.view()),
         )));
@@ -1197,7 +1196,7 @@ impl TransferContext {
     /// is registered, and makes the matching `Finished` owed.
     pub(crate) fn announce(&self) {
         if let Some(lifecycle) = &self.lifecycle {
-            lifecycle.announce();
+            lifecycle.announce(self.id);
         }
     }
 
@@ -1211,7 +1210,7 @@ impl TransferContext {
         if let Some(emit) = self
             .lifecycle
             .as_ref()
-            .and_then(|lifecycle| lifecycle.finish(self.terminal_outcome()))
+            .and_then(|lifecycle| lifecycle.finish(self.id, self.terminal_outcome()))
         {
             emit.send();
         }

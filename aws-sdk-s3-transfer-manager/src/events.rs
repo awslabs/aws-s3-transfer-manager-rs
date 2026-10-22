@@ -458,7 +458,6 @@ pub(crate) struct TransferLifecycle {
     /// Taken at that send rather than when the lifecycle drops: the lifecycle lives as long
     /// as any clone of the transfer's context, and a stream cannot end while its sink is held.
     route: Arc<Mutex<Option<Route>>>,
-    id: TransferId,
     transfer: TransferRef,
     /// The view the `Started` carries.
     view: Option<crate::types::TransferView>,
@@ -471,7 +470,6 @@ pub(crate) struct TransferLifecycle {
 impl fmt::Debug for TransferLifecycle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TransferLifecycle")
-            .field("id", &self.id)
             .field("transfer", &self.transfer)
             .field("owes_finish", &self.owes_finish.load(Ordering::Relaxed))
             .finish()
@@ -501,7 +499,6 @@ fn lock_route(slot: &Mutex<Option<Route>>) -> std::sync::MutexGuard<'_, Option<R
 impl TransferLifecycle {
     pub(crate) fn new(
         sink: TransferEventSink,
-        id: TransferId,
         transfer: TransferRef,
         view: Option<crate::types::TransferView>,
     ) -> Self {
@@ -510,14 +507,14 @@ impl TransferLifecycle {
                 sink,
                 finish: Vec::new(),
             }))),
-            id,
             transfer,
             view,
             owes_finish: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    /// Emits [`TransferEvent::Started`] and takes on the obligation to emit the `Finished`.
+    /// Emits [`TransferEvent::Started`] for the transfer `id` and takes on the obligation to
+    /// emit its `Finished`.
     ///
     /// Each outlet with room for both events receives the `Started` and holds a slot for the
     /// `Finished`. Each outlet without that room receives neither and counts both as dropped,
@@ -525,7 +522,7 @@ impl TransferLifecycle {
     ///
     /// The obligation is taken even where no outlet had room, because discharging it is what
     /// releases the sink.
-    pub(crate) fn announce(&self) {
+    pub(crate) fn announce(&self, id: TransferId) {
         let mut slot = lock_route(&self.route);
         // Under the lock, so a terminal claimed from here on sends only after the slots it
         // sends through are reserved and the `Started` is queued ahead of it.
@@ -538,17 +535,17 @@ impl TransferLifecycle {
         deliver(
             start,
             TransferEvent::Started(Started {
-                id: self.id,
+                id,
                 transfer: self.transfer.clone(),
                 view: self.view.clone(),
             }),
         );
     }
 
-    /// Claims the `Finished`, or returns `None` when none is owed: before
-    /// [`announce`](Self::announce), while another claim is outstanding, or once it has been
-    /// sent.
-    pub(crate) fn finish(&self, outcome: Outcome) -> Option<PendingEmit> {
+    /// Claims the `Finished` for the transfer `id`, the id [`announce`](Self::announce) was
+    /// given, or returns `None` when none is owed: before `announce`, while another claim is
+    /// outstanding, or once it has been sent.
+    pub(crate) fn finish(&self, id: TransferId, outcome: Outcome) -> Option<PendingEmit> {
         if !self.owes_finish.swap(false, Ordering::AcqRel) {
             return None;
         }
@@ -556,7 +553,7 @@ impl TransferLifecycle {
             route: self.route.clone(),
             owes_finish: self.owes_finish.clone(),
             event: Some(TransferEvent::Finished(Finished {
-                id: self.id,
+                id,
                 transfer: self.transfer.clone(),
                 outcome,
             })),
@@ -640,18 +637,21 @@ mod tests {
         TransferId { id, parent }
     }
 
+    /// The transfer a [`lifecycle`] reports on.
+    const ID: TransferId = TransferId {
+        id: 1,
+        parent: None,
+    };
+
     fn lifecycle() -> (TransferLifecycle, TransferEventStream) {
         let (sink, stream) = channel(NonZeroUsize::new(8).unwrap());
-        (
-            TransferLifecycle::new(sink, tid(1, None), upload_ref(), None),
-            stream,
-        )
+        (TransferLifecycle::new(sink, upload_ref(), None), stream)
     }
 
     /// A lifecycle on `sink` for transfer `id`, already announced.
     fn announced(sink: &TransferEventSink, id: u64) -> TransferLifecycle {
-        let lc = TransferLifecycle::new(sink.clone(), tid(id, None), upload_ref(), None);
-        lc.announce();
+        let lc = TransferLifecycle::new(sink.clone(), upload_ref(), None);
+        lc.announce(tid(id, None));
         lc
     }
 
@@ -721,7 +721,7 @@ mod tests {
         assert_eq!(
             line(&finished(upload_ref(), failed())).as_deref(),
             Some("upload failed: ./a.txt to s3://bucket/k/a.txt"),
-            "a failure must name its entry from the same event"
+            "a failure must name its transfer from the same event"
         );
 
         let started = TransferEvent::Started(Started {
@@ -737,10 +737,10 @@ mod tests {
     }
 
     #[test]
-    fn both_events_carry_the_entry_and_its_id() {
+    fn both_events_carry_the_transfer_and_its_id() {
         let (lc, mut stream) = lifecycle();
-        lc.announce();
-        lc.finish(Outcome::Succeeded {}).expect("owed").send();
+        lc.announce(ID);
+        lc.finish(ID, Outcome::Succeeded {}).expect("owed").send();
 
         for expected_outcome in [false, true] {
             let ev = stream.try_recv().expect("both events reached the channel");
@@ -754,15 +754,14 @@ mod tests {
                 TransferEvent::Finished(finished) => finished.id(),
             };
             assert_eq!(
-                tid(1, None),
-                id,
+                ID, id,
                 "the terminal must carry the start's id, or a consumer of several transfers \
                  cannot tell which one ended: {ev:?}"
             );
             assert_eq!(
                 ev.transfer().destination().to_string(),
                 "s3://bucket/k/a.txt",
-                "both events must name the entry: {ev:?}"
+                "both events must name the transfer: {ev:?}"
             );
         }
     }
@@ -770,16 +769,16 @@ mod tests {
     #[test]
     fn finish_is_claimed_once() {
         let (lc, _stream) = lifecycle();
-        lc.announce();
+        lc.announce(ID);
         // Held: dropping the claim would hand the obligation back, which the next test covers.
-        let first = lc.finish(failed()).expect("first claim wins");
+        let first = lc.finish(ID, failed()).expect("first claim wins");
         assert!(
-            lc.finish(failed()).is_none(),
+            lc.finish(ID, failed()).is_none(),
             "a terminal path reached twice must not emit twice"
         );
         first.send();
         assert!(
-            lc.finish(failed()).is_none(),
+            lc.finish(ID, failed()).is_none(),
             "sending discharges the obligation for good"
         );
     }
@@ -787,10 +786,10 @@ mod tests {
     #[test]
     fn a_claim_dropped_unsent_hands_the_obligation_back() {
         let (lc, mut stream) = lifecycle();
-        lc.announce();
+        lc.announce(ID);
         // A site that claims and then returns early without publishing.
-        drop(lc.finish(failed()));
-        lc.finish(failed())
+        drop(lc.finish(ID, failed()));
+        lc.finish(ID, failed())
             .expect(
                 "an abandoned claim must re-arm: otherwise the obligation is consumed \
                  by a value that never reached the channel, and the `Finished` is lost \
@@ -798,7 +797,7 @@ mod tests {
             )
             .send();
         assert_eq!(
-            vec![("Started", tid(1, None)), ("Finished", tid(1, None))],
+            vec![("Started", ID), ("Finished", ID)],
             drain_ids(&mut stream),
             "the abandoned claim must leave the slot `announce` held for the `Finished`, \
              so the re-armed claim still has room to send through"
@@ -809,8 +808,8 @@ mod tests {
     fn finish_without_announce_emits_nothing() {
         let (lc, _stream) = lifecycle();
         assert!(
-            lc.finish(Outcome::Cancelled {}).is_none(),
-            "nothing is owed for an entry that was never announced"
+            lc.finish(ID, Outcome::Cancelled {}).is_none(),
+            "nothing is owed for a transfer that was never announced"
         );
     }
 
@@ -823,9 +822,11 @@ mod tests {
     #[test]
     fn a_capacity_of_one_still_delivers_a_whole_transfer() {
         let (sink, mut stream) = channel(NonZeroUsize::new(1).unwrap());
-        let lc = TransferLifecycle::new(sink, tid(7, None), upload_ref(), None);
-        lc.announce();
-        lc.finish(Outcome::Succeeded {}).expect("owed").send();
+        let lc = TransferLifecycle::new(sink, upload_ref(), None);
+        lc.announce(tid(7, None));
+        lc.finish(tid(7, None), Outcome::Succeeded {})
+            .expect("owed")
+            .send();
 
         assert_eq!(
             vec![("Started", tid(7, None)), ("Finished", tid(7, None))],
@@ -915,8 +916,10 @@ mod tests {
              third has room for both of its events"
         );
 
-        for lc in [&first, &third] {
-            lc.finish(Outcome::Succeeded {}).expect("owed").send();
+        for (lc, id) in [(&first, 1), (&third, 3)] {
+            lc.finish(tid(id, None), Outcome::Succeeded {})
+                .expect("owed")
+                .send();
         }
         assert_eq!(
             vec![
@@ -928,7 +931,10 @@ mod tests {
             "each transfer with room delivers its `Finished` through the slot it held"
         );
 
-        second.finish(Outcome::Succeeded {}).expect("owed").send();
+        second
+            .finish(tid(2, None), Outcome::Succeeded {})
+            .expect("owed")
+            .send();
         assert_eq!(
             Vec::<(&str, TransferId)>::new(),
             drain_ids(&mut stream),
@@ -950,7 +956,7 @@ mod tests {
         let abandoned = announced(&sink, 1);
         // A claim dropped unsent re-arms, so the lifecycle still owes its `Finished` when it
         // goes.
-        drop(abandoned.finish(failed()));
+        drop(abandoned.finish(tid(1, None), failed()));
         drop(abandoned);
         assert_eq!(
             vec![("Started", tid(1, None))],
@@ -966,7 +972,9 @@ mod tests {
             "the abandoned slot must go back to the channel, so the next transfer has room \
              for both of its events"
         );
-        next.finish(Outcome::Succeeded {}).expect("owed").send();
+        next.finish(tid(2, None), Outcome::Succeeded {})
+            .expect("owed")
+            .send();
         assert_eq!(
             vec![("Started", tid(2, None)), ("Finished", tid(2, None))],
             drain_ids(&mut stream),
@@ -989,12 +997,13 @@ mod tests {
 
         let lc = TransferLifecycle::new(
             registered,
-            tid(7, Some(1)),
             TransferRef::download(Endpoint::Stream {}, Endpoint::Stream {}),
             None,
         );
-        lc.announce();
-        lc.finish(Outcome::Succeeded {}).expect("owed").send();
+        lc.announce(tid(7, Some(1)));
+        lc.finish(tid(7, Some(1)), Outcome::Succeeded {})
+            .expect("owed")
+            .send();
 
         let mut settled = 0;
         while let Some(ev) = stream.recv().await {
@@ -1021,12 +1030,13 @@ mod tests {
 
         let lc = TransferLifecycle::new(
             a.merge(b),
-            tid(9, None),
             TransferRef::download(Endpoint::Stream {}, Endpoint::Stream {}),
             None,
         );
-        lc.announce();
-        lc.finish(Outcome::Succeeded {}).expect("owed").send();
+        lc.announce(tid(9, None));
+        lc.finish(tid(9, None), Outcome::Succeeded {})
+            .expect("owed")
+            .send();
 
         let both = vec![("Started", tid(9, None)), ("Finished", tid(9, None))];
         assert_eq!(both, drain_ids(&mut sa), "the first consumer receives");
@@ -1047,7 +1057,9 @@ mod tests {
         let _holder = announced(&a, 1);
 
         let lc = announced(&a.merge(b), 2);
-        lc.finish(Outcome::Succeeded {}).expect("owed").send();
+        lc.finish(tid(2, None), Outcome::Succeeded {})
+            .expect("owed")
+            .send();
 
         assert_eq!(
             vec![("Started", tid(2, None)), ("Finished", tid(2, None))],
@@ -1077,7 +1089,9 @@ mod tests {
         drop(sa);
 
         let lc = announced(&a.clone().merge(b), 1);
-        lc.finish(Outcome::Succeeded {}).expect("owed").send();
+        lc.finish(tid(1, None), Outcome::Succeeded {})
+            .expect("owed")
+            .send();
 
         assert_eq!(
             vec![("Started", tid(1, None)), ("Finished", tid(1, None))],
