@@ -739,6 +739,8 @@ pub(crate) struct TransferContext {
     pending_state: Option<Arc<TransferPendingState>>,
     /// Per-transfer metrics backing store
     pub(crate) metrics: Arc<MetricsState>,
+    /// Emitter of this transfer's events, `None` unless a caller registered a sink.
+    lifecycle: Option<Arc<crate::events::TransferLifecycle>>,
 }
 
 /// In-progress measurement for one logical transfer-manager request.
@@ -1013,8 +1015,27 @@ impl TransferContext {
             wake_flag: Arc::new(wake_flag::WakeFlag::new()),
             pending_cause: Arc::new(PendingCauseSlot::new()),
             pending_state,
+            lifecycle: None,
         };
         (ctx, completion_rx)
+    }
+
+    /// Reports this transfer's events to `sink`, describing the transfer as `transfer`.
+    ///
+    /// Only the returned context and its later clones emit, so attach the sink before the
+    /// context is cloned.
+    pub(crate) fn with_events(
+        mut self,
+        sink: crate::events::TransferEventSink,
+        transfer: crate::events::TransferRef,
+    ) -> Self {
+        self.lifecycle = Some(Arc::new(crate::events::TransferLifecycle::new(
+            sink,
+            self.id,
+            transfer,
+            Some(self.view()),
+        )));
+        self
     }
 
     /// Create a new transfer context with a specific ID (for testing).
@@ -1243,28 +1264,40 @@ impl TransferContext {
         }
     }
 
-    /// The event outcome this transfer's terminal state implies.
+    /// The event outcome this transfer's terminal status implies.
     ///
-    /// Derived here rather than written as a literal at each emit site, because `Failed`
-    /// and `Cancelled` are both inactive: a site that guards on "not active" and then
-    /// names its own outcome reports a transfer that broke as one the caller stopped, and
-    /// a consumer branching `Failed => retry` against `Cancelled => do nothing` takes the
-    /// wrong arm on every failure.
-    ///
-    /// Takes the status and nothing else, so no caller can pass a status and an error that
-    /// disagree, and so reading the error does not take it from `join()` —
-    /// [`crate::events::Outcome::Failed`] carries no payload, and a consumer that needs
-    /// the error reads it from the handle.
-    ///
-    /// A still-`Active` transfer reports `Cancelled`, which is wrong for one that is about
-    /// to succeed. A published status is therefore a precondition, not something this
-    /// derives around: every caller guards on `!is_active()` first. The terminal report
-    /// and the `Finished` event are both one-shot, so a wrong outcome cannot be corrected.
+    /// Reads the status alone, so it never takes the error from `join()`. Requires a
+    /// terminal status: a still-`Active` transfer maps to `Cancelled`.
     pub(crate) fn terminal_outcome(&self) -> crate::events::Outcome {
         match self.transfer_status() {
             crate::types::TransferStatus::Completed => crate::events::Outcome::Succeeded {},
             crate::types::TransferStatus::Failed => crate::events::Outcome::Failed {},
             _ => crate::events::Outcome::Cancelled {},
+        }
+    }
+
+    /// Emits [`TransferEvent::Started`](crate::events::TransferEvent::Started) if a sink
+    /// is registered, and makes the matching `Finished` owed.
+    pub(crate) fn announce(&self) {
+        if let Some(lifecycle) = &self.lifecycle {
+            lifecycle.announce();
+        }
+    }
+
+    /// Emits [`TransferEvent::Finished`](crate::events::TransferEvent::Finished) with the
+    /// outcome the terminal status implies, if a sink is registered.
+    ///
+    /// Any terminal path may call this, any number of times: the first call after
+    /// [`Self::announce`] emits and every other call does nothing. Requires a terminal
+    /// status. A call made before [`Self::signal_terminal`] sends the event before any
+    /// joiner wakes.
+    pub(crate) fn emit_finished(&self) {
+        if let Some(emit) = self
+            .lifecycle
+            .as_ref()
+            .and_then(|lifecycle| lifecycle.finish(self.terminal_outcome()))
+        {
+            emit.send();
         }
     }
 

@@ -113,11 +113,6 @@ struct UploadTransferInner {
     bucket_type: BucketType,
     /// Stored result for handle to retrieve
     result: Mutex<Option<UploadOutput>>,
-    /// Lifecycle emitter, `None` unless a caller registered a sink.
-    ///
-    /// A single-object upload has no children, so one emitter is the whole story:
-    /// announced by `orchestrate`, discharged by `on_terminal`.
-    lifecycle: Option<Arc<crate::events::TransferLifecycle>>,
 }
 
 impl UploadTransfer {
@@ -126,7 +121,6 @@ impl UploadTransfer {
         bucket_type: BucketType,
         request: UploadInput,
         stream: InputStream,
-        lifecycle: Option<Arc<crate::events::TransferLifecycle>>,
     ) -> Result<Self, Error> {
         let size_hint = stream.size_hint();
         validate_size_hint(size_hint).map_err(crate::error::invalid_input)?;
@@ -154,7 +148,6 @@ impl UploadTransfer {
             request: Arc::new(request),
             bucket_type,
             result: Mutex::new(None),
-            lifecycle,
         });
 
         Ok(Self { inner })
@@ -968,15 +961,7 @@ impl UploadTransfer {
         self.inner.ctx.set_completed();
         *self.inner.state.lock().expect("lock poisoned") = UploadState::Done;
         self.report_terminal();
-        // Emit before the joiner is released, not only from `on_terminal`: the scheduler
-        // runs `on_terminal` after this, so a consumer that writes `join().await` and then
-        // drains once would miss this operation's own `Finished`. `finish` is exactly-once, so
-        // whichever of the two paths runs first emits and the other is a no-op.
-        if let Some(lc) = &self.inner.lifecycle {
-            if let Some(emit) = lc.finish(self.inner.ctx.terminal_outcome()) {
-                emit.send();
-            }
-        }
+        self.inner.ctx.emit_finished();
         self.inner.ctx.signal_terminal();
 
         WorkOutcome::Success { data: None }
@@ -1084,15 +1069,7 @@ impl UploadTransfer {
         self.inner.ctx.set_completed();
         *self.inner.state.lock().expect("lock poisoned") = UploadState::Done;
         self.report_terminal();
-        // Emit before the joiner is released, not only from `on_terminal`: the scheduler
-        // runs `on_terminal` after this, so a consumer that writes `join().await` and then
-        // drains once would miss this operation's own `Finished`. `finish` is exactly-once, so
-        // whichever of the two paths runs first emits and the other is a no-op.
-        if let Some(lc) = &self.inner.lifecycle {
-            if let Some(emit) = lc.finish(self.inner.ctx.terminal_outcome()) {
-                emit.send();
-            }
-        }
+        self.inner.ctx.emit_finished();
         self.inner.ctx.signal_terminal();
 
         WorkOutcome::Success { data: None }
@@ -1107,15 +1084,7 @@ impl UploadTransfer {
         let classification = crate::scheduler::classify_error(&error);
         self.inner.ctx.set_failed(error);
         self.report_terminal();
-        // Emit before the joiner is released, not only from `on_terminal`: the scheduler
-        // runs `on_terminal` after this, so a consumer that writes `join().await` and then
-        // drains once would miss this operation's own `Finished`. `finish` is exactly-once, so
-        // whichever of the two paths runs first emits and the other is a no-op.
-        if let Some(lc) = &self.inner.lifecycle {
-            if let Some(emit) = lc.finish(self.inner.ctx.terminal_outcome()) {
-                emit.send();
-            }
-        }
+        self.inner.ctx.emit_finished();
         self.inner.ctx.signal_terminal();
         WorkOutcome::Failed { classification }
     }
@@ -1216,29 +1185,10 @@ impl Transfer for UploadTransfer {
         Box::pin(UploadTransfer::execute(self, work))
     }
 
-    /// Terminal reporting and the terminal event, for whichever removal path reaches it
-    /// first -- normal completion, cancellation, a worker panic, or completion-driven
-    /// removal. Reaching it more than once is harmless: each obligation is claimed by
-    /// exactly one caller, and the completion paths emit for themselves before releasing
-    /// the joiner, so a consumer that drains after `join()` still sees this `Finished`.
-    ///
-    /// Requires the status to be published already -- see the early return.
+    /// Reports the terminal summary and emits `Finished`, each at most once per transfer.
     fn on_terminal(&self) {
-        // Both effects are one-shot and both read the status: `report_terminal` claims
-        // `claim_terminal_report`, and the event's outcome comes from `terminal_outcome()`.
-        // A caller can arrive here while the status is still `Active`, and spending
-        // either one-shot on it cannot be taken back -- the report would render nothing
-        // and the event would say `Cancelled` about an upload that succeeded.
-        if self.inner.ctx.is_active() {
-            return;
-        }
         self.report_terminal();
-        let Some(lc) = &self.inner.lifecycle else {
-            return;
-        };
-        if let Some(emit) = lc.finish(self.inner.ctx.terminal_outcome()) {
-            emit.send();
-        }
+        self.inner.ctx.emit_finished();
     }
 }
 
@@ -1287,7 +1237,7 @@ mod tests {
         let stream = input.take_body();
 
         let (ctx, _completion_rx) = TransferContext::new(handle);
-        UploadTransfer::try_new(ctx, BucketType::Standard, input, stream, None).unwrap()
+        UploadTransfer::try_new(ctx, BucketType::Standard, input, stream).unwrap()
     }
 
     fn mock_s3_client_for_mpu() -> aws_sdk_s3::Client {
@@ -2215,8 +2165,7 @@ mod tests {
             .unwrap();
         let stream = input.take_body();
         let (ctx, _completion_rx) = TransferContext::new(handle);
-        let transfer =
-            UploadTransfer::try_new(ctx, BucketType::Standard, input, stream, None).unwrap();
+        let transfer = UploadTransfer::try_new(ctx, BucketType::Standard, input, stream).unwrap();
 
         let mut work = assert_ready(transfer.poll_work());
         assert!(matches!(

@@ -96,6 +96,120 @@ pub(crate) fn object_client_failing_at(
     })
 }
 
+/// The response an [`object_client_holding`] client holds back until
+/// [`release`](Self::release).
+#[derive(Debug, Clone)]
+pub(crate) struct HeldRange {
+    arrived: Arc<tokio::sync::Semaphore>,
+    released: Arc<tokio::sync::Semaphore>,
+}
+
+impl HeldRange {
+    /// Waits until the held request has been sent.
+    pub(crate) async fn arrived(&self) {
+        self.arrived
+            .acquire()
+            .await
+            .expect("the semaphore is never closed")
+            .forget();
+    }
+
+    /// Answers the held request.
+    pub(crate) fn release(&self) {
+        self.released.add_permits(1);
+    }
+}
+
+/// An S3 client serving `object` by range that answers the range starting at
+/// `failing_start` with a server error, and answers the range starting at
+/// `held_start` only after [`HeldRange::release`]. SDK retries are disabled.
+///
+/// Panics on a request without an inclusive byte range.
+pub(crate) fn object_client_holding(
+    object: Arc<[u8]>,
+    failing_start: u64,
+    held_start: u64,
+) -> (aws_sdk_s3::Client, HeldRange) {
+    use aws_smithy_runtime_api::client::http::{
+        http_client_fn, HttpConnector, HttpConnectorFuture, SharedHttpConnector,
+    };
+    use aws_smithy_runtime_api::client::orchestrator::{HttpRequest, HttpResponse};
+    use aws_smithy_types::body::SdkBody;
+
+    use crate::http::header::{ByteRange, Range};
+
+    #[derive(Debug)]
+    struct Connector {
+        object: Arc<[u8]>,
+        failing_start: u64,
+        held_start: u64,
+        held: HeldRange,
+    }
+
+    impl HttpConnector for Connector {
+        fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
+            let (start, end) = match request
+                .headers()
+                .get("range")
+                .and_then(|r| r.parse::<Range>().ok())
+            {
+                Some(Range(ByteRange::Inclusive(start, end))) => {
+                    (start, end.min(self.object.len() as u64 - 1))
+                }
+                other => panic!("unexpected range request {other:?}"),
+            };
+            if start == self.failing_start {
+                return HttpConnectorFuture::ready(Ok(HttpResponse::new(
+                    500.try_into().unwrap(),
+                    SdkBody::from("internal error"),
+                )));
+            }
+            let body = self.object[start as usize..=end as usize].to_vec();
+            let mut response = HttpResponse::new(206.try_into().unwrap(), SdkBody::from(body));
+            let headers = response.headers_mut();
+            headers.insert("Content-Length", (end - start + 1).to_string());
+            headers.insert(
+                "Content-Range",
+                format!("bytes {start}-{end}/{}", self.object.len()),
+            );
+            headers.insert("ETag", "\"test-etag\"");
+            if start != self.held_start {
+                return HttpConnectorFuture::ready(Ok(response));
+            }
+            let held = self.held.clone();
+            HttpConnectorFuture::new(async move {
+                held.arrived.add_permits(1);
+                held.released
+                    .acquire()
+                    .await
+                    .expect("the semaphore is never closed")
+                    .forget();
+                Ok(response)
+            })
+        }
+    }
+
+    let held = HeldRange {
+        arrived: Arc::new(tokio::sync::Semaphore::new(0)),
+        released: Arc::new(tokio::sync::Semaphore::new(0)),
+    };
+    let connector = SharedHttpConnector::new(Connector {
+        object,
+        failing_start,
+        held_start,
+        held: held.clone(),
+    });
+    let client = aws_sdk_s3::Client::from_conf(
+        aws_sdk_s3::config::Config::builder()
+            .http_client(http_client_fn(move |_, _| connector.clone()))
+            .region(aws_sdk_s3::config::Region::from_static("us-west-2"))
+            .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
+            .with_test_defaults()
+            .build(),
+    );
+    (client, held)
+}
+
 /// A test handle on the ambient tokio runtime whose S3 client is `client`,
 /// slicing downloads into `part_size` ranges.
 pub(crate) fn disk_test_handle(
@@ -149,9 +263,9 @@ pub(crate) fn disk_transfer(
         .unwrap();
     let dir = tempfile::tempdir().unwrap();
     let file = std::fs::File::create(dir.path().join("out")).unwrap();
-    let (writer, consumer) = new_recv_body_with_disk_mode(sinks.create(file, false).unwrap());
+    let (writer, consumer) = new_recv_body_with_disk_mode(sinks.create(file, false).unwrap(), None);
     let (ctx, _completion_rx) = TransferContext::new(handle);
-    let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, writer, None, None);
+    let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, writer);
     (transfer, consumer, dir)
 }
 

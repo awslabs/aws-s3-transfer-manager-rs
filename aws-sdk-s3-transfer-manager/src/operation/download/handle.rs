@@ -107,21 +107,22 @@ impl DownloadHandleInner {
         ))
     }
 
-    /// Core abort logic: cancel transfer, notify consumer, and wait for idle.
+    /// Core abort logic: cancel the transfer, notify the consumer, and wait for the
+    /// transfer's executing work to stop.
     pub(crate) async fn abort(&self) {
         let ctx = self.transfer.ctx();
-        let id = self.transfer.id();
 
+        // Cancelled through the scheduler before the status is set. A status set first
+        // lets a completing work item remove the transfer and run its terminal hook, and
+        // the wait below would then return before that hook finishes.
+        let cancellation = ctx.handle.scheduler.cancel_transfer(self.transfer.id());
+        // Still needed when the scheduler had already removed the transfer: a finalizing
+        // download that sees the status removes its temporary file instead of renaming it
+        // into place.
         ctx.set_cancelled();
         self.transfer.writer().notify_consumer();
 
-        // Cancel transfer (purges queued work, interrupts executing work) and
-        // wait for executing work to stop.
-        ctx.handle
-            .scheduler
-            .cancel_transfer(id)
-            .wait_for_idle()
-            .await;
+        cancellation.wait_for_idle().await;
     }
 
     /// Get scheduling controls for this transfer.
@@ -338,10 +339,10 @@ impl Drop for DownloadHandle {
 /// this handle does not expose a body — the transfer manager writes data
 /// directly to disk.
 ///
-/// Data is written to a temporary file (`{dest}.s3tmp.{id}`) during the transfer,
-/// and renamed to the destination path by the transfer itself, so the rename
-/// precedes the completed status rather than waiting for a join. On failure,
-/// cancellation, or drop, the temporary file is deleted.
+/// Data is written to a temporary file (`{dest}.s3tmp.{id}`) beside the
+/// destination and renamed into place before [`status`](Self::status) reports
+/// `Completed`. On failure, cancellation, or drop, the temporary file is removed
+/// once the transfer's in-flight requests stop.
 ///
 /// Success means the operating system accepted every byte and, for a managed
 /// path, completed the rename. The transfer manager does not call `sync_data`,
@@ -350,29 +351,11 @@ impl Drop for DownloadHandle {
 #[derive(Debug)]
 pub struct ManagedDownloadHandle {
     inner: DownloadHandleInner,
-    /// The temporary file this handle still owns, for a download to a path.
-    ///
-    /// Whatever removes the file takes the path first: [`cleanup`](Self::cleanup)
-    /// for a failed `join` and for `abort`, otherwise drop. Each name is therefore
-    /// removed once, even if the caller stops awaiting `join` partway. After that
-    /// the name is free, and another download may have created its own file there.
-    /// A successful transfer renamed it already, in `commit_destination`.
-    temp_path: Option<std::path::PathBuf>,
 }
 
 impl ManagedDownloadHandle {
-    pub(crate) fn new(inner: DownloadHandleInner, temp_path: std::path::PathBuf) -> Self {
-        Self {
-            inner,
-            temp_path: Some(temp_path),
-        }
-    }
-
-    pub(crate) fn new_unmanaged(inner: DownloadHandleInner) -> Self {
-        Self {
-            inner,
-            temp_path: None,
-        }
+    pub(crate) fn new(inner: DownloadHandleInner) -> Self {
+        Self { inner }
     }
 
     /// The transfer ID for this child download.
@@ -389,27 +372,23 @@ impl ManagedDownloadHandle {
 
     /// Wait for the download to complete.
     ///
-    /// The rename to the destination path already happened, before the transfer set
-    /// its completed status, so a successful join has nothing left to commit. On
-    /// failure or cancellation this deletes the temporary file. Neither path adds a
-    /// filesystem durability barrier.
+    /// On success, the object is at the destination path. On failure, returns the
+    /// transfer's error, and on cancellation an
+    /// [`OperationCancelled`](crate::error::ErrorKind::OperationCancelled) error; the
+    /// temporary file is removed once the transfer's in-flight requests stop, which can
+    /// be after this returns. No outcome adds a filesystem durability barrier.
     pub async fn join(
         mut self,
     ) -> Result<crate::operation::download::output::DownloadOutput, error::Error> {
-        let result = self.inner.join().await;
-        if result.is_err() {
-            self.cleanup().await;
-        }
-        result
+        self.inner.join().await
     }
 
     /// Abort the download and cancel any in-progress work.
     ///
-    /// Deletes the temporary file. When this method returns, all work for
-    /// this transfer has been cancelled or completed.
-    pub async fn abort(mut self) {
+    /// When this method returns, all work for this transfer has been cancelled or
+    /// completed.
+    pub async fn abort(self) {
         self.inner.abort().await;
-        self.cleanup().await;
     }
 
     /// Get scheduling controls for this transfer.
@@ -435,25 +414,10 @@ impl ManagedDownloadHandle {
         self.inner.transfer.ctx().metrics()
     }
 
-    // The rename lives on the transfer, in `commit_destination`, because every path
-    // that reports the transfer reads its status and cannot join it. A rename that
-    // fails removes the temporary file there, so this handle never holds a name the
-    // transfer has already dealt with.
-    //
     // TODO(vnext): consider an opt-in download durability policy. Managed path
     // downloads would sync file data before rename and the parent directory after
     // rename where supported. The latency and cross-platform semantics make this a
     // client/API policy rather than the default.
-
-    /// Removes the temporary file, if this handle still owns one.
-    ///
-    /// Takes the temporary path before removing it, so drop doesn't remove
-    /// that name again.
-    async fn cleanup(&mut self) {
-        if let Some(temp) = self.temp_path.take() {
-            let _ = tokio::fs::remove_file(&temp).await;
-        }
-    }
 }
 
 impl Drop for ManagedDownloadHandle {
@@ -465,14 +429,6 @@ impl Drop for ManagedDownloadHandle {
             ctx.handle
                 .scheduler
                 .cancel_transfer(self.inner.transfer.id());
-        }
-        // Only a transfer that did not commit still owns a temporary file. A completed
-        // download renamed it away in `commit_destination`, and unlinking unconditionally
-        // here is what let a reported-as-succeeded download lose its bytes.
-        if ctx.transfer_status() != crate::types::TransferStatus::Completed {
-            if let Some(temp) = &self.temp_path {
-                let _ = std::fs::remove_file(temp);
-            }
         }
     }
 }
@@ -498,12 +454,9 @@ mod tests {
         is_sync::<ManagedDownloadHandle>();
     }
 
-    /// Build a `DownloadHandleInner` already at a terminal state, chosen by `terminal`.
-    ///
-    /// The status is first-write-wins, so it is set here rather than by the caller.
-    fn make_terminal_download_inner(
-        terminal: impl FnOnce(&TransferContext),
-    ) -> (DownloadHandleInner, RecvBodyConsumer) {
+    /// Build a `DownloadHandleInner` whose `TransferContext` is already at
+    /// a `Cancelled` terminal state.
+    fn make_cancelled_download_inner() -> (DownloadHandleInner, RecvBodyConsumer) {
         let handle = crate::client::Handle::test_handle_tokio(
             crate::Config::builder()
                 .sdk_client(aws_smithy_mocks::mock_client!(
@@ -520,10 +473,9 @@ mod tests {
             .unwrap();
         let (writer, consumer) = new_recv_body();
         let (ctx, completion_rx) = TransferContext::new(handle);
-        let transfer =
-            DownloadTransfer::new(ctx.clone(), BucketType::Standard, input, writer, None, None);
+        let transfer = DownloadTransfer::new(ctx.clone(), BucketType::Standard, input, writer);
 
-        terminal(&ctx);
+        ctx.set_cancelled();
         ctx.signal_terminal();
 
         let inner = DownloadHandleInner {
@@ -531,16 +483,6 @@ mod tests {
             completion_rx: Some(completion_rx),
         };
         (inner, consumer)
-    }
-
-    /// Build a `DownloadHandleInner` whose `TransferContext` is already at
-    /// a `Cancelled` terminal state. Callers assemble either a
-    /// `DownloadHandle` or `ManagedDownloadHandle` around it to test the
-    /// post-cancel `join()` contract.
-    fn make_cancelled_download_inner() -> (DownloadHandleInner, RecvBodyConsumer) {
-        make_terminal_download_inner(|ctx| {
-            ctx.set_cancelled();
-        })
     }
 
     /// Regression: if the transfer reaches a `Cancelled` terminal state
@@ -560,89 +502,4 @@ mod tests {
             .expect_err("join on cancelled transfer must return Err");
         assert_eq!(err.kind(), &ErrorKind::OperationCancelled);
     }
-
-    /// Regression: `ManagedDownloadHandle::join()` on a cancelled transfer
-    /// must return `Err(OperationCancelled)` and delete the temp file.
-    #[cfg_attr(miri, ignore)]
-    #[tokio::test]
-    async fn test_managed_download_join_returns_cancelled_and_cleans_up() {
-        let dir = tempfile::tempdir().unwrap();
-        let dest = dir.path().join("out.dat");
-        let temp = dir.path().join("out.dat.s3tmp.abcdefgh");
-        std::fs::write(&temp, b"partial").unwrap();
-
-        let (inner, _consumer) = make_cancelled_download_inner();
-        let managed = ManagedDownloadHandle::new(inner, temp.clone());
-
-        let err = managed
-            .join()
-            .await
-            .expect_err("join on cancelled transfer must return Err");
-        assert_eq!(err.kind(), &ErrorKind::OperationCancelled);
-        assert!(
-            !temp.exists(),
-            "temp file must be cleaned up on cancellation"
-        );
-        assert!(
-            !dest.exists(),
-            "dest file must not be created on cancellation"
-        );
-    }
-
-    /// Once the transfer has renamed the temporary file, dropping the handle must not
-    /// remove a file another download has since created under the same temporary name.
-    ///
-    /// The rename happens on the transfer, in `commit_destination`, so the handle still
-    /// holds the temporary path when the download completes. `Completed` is what tells
-    /// drop the name is no longer its to remove.
-    #[cfg_attr(miri, ignore)]
-    #[tokio::test]
-    async fn test_managed_download_drop_after_rename_keeps_file_at_temp_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let temp = dir.path().join("out.dat.s3tmp.0000abcd");
-
-        // The transfer committed and published its completed status, as
-        // `finalize_completion` does.
-        let (inner, _consumer) = make_terminal_download_inner(|ctx| {
-            ctx.set_completed();
-        });
-        let managed = ManagedDownloadHandle::new(inner, temp.clone());
-
-        // Another download now owns that name.
-        std::fs::write(&temp, b"another download").unwrap();
-        drop(managed);
-
-        assert_eq!(
-            std::fs::read(&temp).unwrap(),
-            b"another download",
-            "drop removed a temp name the completed transfer had already renamed away"
-        );
-    }
-
-    /// Once `cleanup` has removed the temporary file, dropping the handle must
-    /// not remove a file another download has since created under the same
-    /// temporary name. `join` and `abort` consume the handle right after
-    /// `cleanup`, so this drives `cleanup` and the drop directly.
-    #[cfg_attr(miri, ignore)]
-    #[tokio::test]
-    async fn test_managed_download_drop_after_cleanup_keeps_file_at_temp_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let dest = dir.path().join("out.dat");
-        let temp = dir.path().join("out.dat.s3tmp.0000abcd");
-        std::fs::write(&temp, b"partial").unwrap();
-
-        let (inner, _consumer) = make_cancelled_download_inner();
-        let mut managed = ManagedDownloadHandle::new(inner, temp.clone());
-        managed.cleanup().await;
-        assert!(!temp.exists(), "cleanup must remove the temp file");
-
-        std::fs::write(&temp, b"another download").unwrap();
-        drop(managed);
-
-        assert_eq!(std::fs::read(&temp).unwrap(), b"another download");
-        assert!(!dest.exists(), "cleanup must not create the destination");
-    }
-
-    // A rename that fails is covered at the transfer level, where the rename lives:
-    // `a_failed_commit_reports_failed_not_success` in `download::transfer::tests`.
 }

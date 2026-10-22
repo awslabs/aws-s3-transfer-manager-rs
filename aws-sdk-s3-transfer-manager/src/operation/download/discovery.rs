@@ -590,7 +590,7 @@ mod tests {
         use crate::operation::download::body;
         let (writer, _consumer) = body::new_recv_body();
         let (ctx, _completion_rx) = TransferContext::new(handle);
-        DownloadTransfer::new(ctx, BucketType::Standard, input.clone(), writer, None, None)
+        DownloadTransfer::new(ctx, BucketType::Standard, input.clone(), writer)
     }
 
     #[test]

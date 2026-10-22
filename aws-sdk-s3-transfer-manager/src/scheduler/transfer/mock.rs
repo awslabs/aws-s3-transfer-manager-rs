@@ -1345,24 +1345,18 @@ impl MockStateMachine for FusedReadySpawnedMock {
     }
 }
 
-/// Models the window every real `Transfer` has between claiming its terminal state
-/// and publishing its terminal status: `poll_work` returns `Done` while
-/// `ctx.transfer_status()` is still `Active`, and the status lands afterwards.
+/// Polls `Done` while its status is still `Active`, as a transfer does between claiming
+/// its terminal state and publishing its terminal status.
 ///
-/// `DownloadTransfer` has exactly this shape: `decrement_in_flight` assigns
-/// `DownloadState::Terminal` under the state lock, and `ctx.set_completed()` does not run
-/// until after `writer.finalize()` and the rename in `commit_destination`. `on_terminal`
-/// records the status it was handed, which is what the scheduler's Done arm feeds to
-/// `terminal_outcome()`.
+/// `on_terminal` records what it observes, then publishes `Completed`.
 pub(crate) struct DoneWhileActiveMock {
     ctx: TransferContext,
     /// What `on_terminal` observed, or `None` if it was never called.
     observed: ObservedTerminal,
 }
 
-/// The status `on_terminal` read, and the `Outcome` label `terminal_outcome()` derived
-/// from it — the exact value `DownloadTransfer::on_terminal` hands to
-/// `TransferLifecycle::finish`.
+/// The status `on_terminal` observed, and a label for the outcome
+/// [`TransferContext::terminal_outcome`] derives from it.
 pub(crate) type ObservedTerminal =
     Arc<std::sync::Mutex<Option<(crate::types::TransferStatus, &'static str)>>>;
 
@@ -1399,16 +1393,14 @@ impl Transfer for DoneWhileActiveMock {
     }
 
     fn on_terminal(&self) {
-        // `terminal_outcome()` is the real function the download feeds to
-        // `TransferLifecycle::finish`; the label is only so the test can compare it
-        // (`Outcome` is deliberately not `PartialEq`).
+        // A label, because `Outcome` is not `PartialEq`.
         let outcome = match self.ctx.terminal_outcome() {
             crate::events::Outcome::Succeeded {} => "Succeeded",
             crate::events::Outcome::Failed {} => "Failed",
             crate::events::Outcome::Cancelled {} => "Cancelled",
         };
         *self.observed.lock().unwrap() = Some((self.ctx.transfer_status(), outcome));
-        // What `finalize_completion` does once the disk flush and rename are done.
+        // The status lands after the `Done` poll.
         self.ctx.set_completed();
         self.ctx.signal_terminal();
     }

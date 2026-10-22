@@ -24,6 +24,7 @@ pub mod builders;
 
 /// Abstractions for responses and consuming data streams.
 mod body;
+pub(crate) use body::CommitTarget;
 pub use body::{Body, ChunkOutput};
 
 /// In-order delivery buffer (out-of-order arrival → in-order stream).
@@ -104,28 +105,28 @@ pub(crate) struct EventRegistration {
     pub(crate) destination: crate::events::Endpoint,
 }
 
-impl Download {
-    fn lifecycle_for(
-        ctx: &crate::transfer::TransferContext,
+impl EventRegistration {
+    /// Returns `ctx` with this registration's sink attached, describing the transfer as a
+    /// download of `input`'s object to this registration's destination.
+    fn attach(
+        self,
+        ctx: crate::transfer::TransferContext,
         input: &DownloadInput,
-        events: Option<EventRegistration>,
-    ) -> Option<Arc<crate::events::TransferLifecycle>> {
-        events.map(|reg| {
-            Arc::new(crate::events::TransferLifecycle::new(
-                reg.sink,
-                ctx.id,
-                crate::events::TransferRef::download(
-                    crate::events::Endpoint::S3 {
-                        bucket: Arc::from(input.bucket().unwrap_or_default()),
-                        key: Arc::from(input.key().unwrap_or_default()),
-                    },
-                    reg.destination,
-                ),
-                Some(ctx.view()),
-            ))
-        })
+    ) -> crate::transfer::TransferContext {
+        ctx.with_events(
+            self.sink,
+            crate::events::TransferRef::download(
+                crate::events::Endpoint::S3 {
+                    bucket: Arc::from(input.bucket().unwrap_or_default()),
+                    key: Arc::from(input.key().unwrap_or_default()),
+                },
+                self.destination,
+            ),
+        )
     }
+}
 
+impl Download {
     /// Execute a single `Download` transfer operation
     pub(crate) fn orchestrate(
         handle: Arc<crate::client::Handle>,
@@ -145,21 +146,13 @@ impl Download {
         let (writer, consumer) = new_recv_body();
 
         let (ctx, completion_rx) = TransferContext::new(handle.clone());
+        let ctx = match events {
+            Some(events) => events.attach(ctx, &input),
+            None => ctx,
+        };
 
-        // A streaming download has no local path: the caller owns the body, so there is
-        // no destination of its own to commit to.
-        let lifecycle = Self::lifecycle_for(&ctx, &input, events);
-        let transfer = DownloadTransfer::new(
-            ctx.clone(),
-            bucket_type,
-            input,
-            writer,
-            lifecycle.clone(),
-            None,
-        );
-        if let Some(lc) = &lifecycle {
-            lc.announce();
-        }
+        let transfer = DownloadTransfer::new(ctx, bucket_type, input, writer);
+        transfer.ctx().announce();
         handle
             .scheduler
             .enqueue_transfer(Box::new(transfer.clone()));
@@ -196,7 +189,7 @@ impl Download {
         let sink = match sinks.create(file, true) {
             Ok(sink) => sink,
             Err(e) => {
-                // No handle owns the temp file yet, so remove it here.
+                // No transfer owns the temp file yet, so remove it here.
                 let _ = tokio::fs::remove_file(&temp_path).await;
                 return Err(error::from_kind(error::ErrorKind::IOError)(e));
             }
@@ -209,12 +202,12 @@ impl Download {
             parent,
             events,
             None,
-            Some(transfer::CommitTarget {
-                temp: temp_path.clone(),
+            Some(CommitTarget {
+                temp: temp_path,
                 dest: dest_path,
             }),
         )?;
-        Ok(ManagedDownloadHandle::new(inner, temp_path))
+        Ok(ManagedDownloadHandle::new(inner))
     }
 
     /// Orchestrate a download that writes to a caller-provided file.
@@ -244,7 +237,7 @@ impl Download {
         })?;
         let inner = Self::orchestrate_with_sink(handle, input, sink, None, events, None, None)?;
         // No temp path and nothing to commit — caller manages the file lifecycle
-        Ok(ManagedDownloadHandle::new_unmanaged(inner))
+        Ok(ManagedDownloadHandle::new(inner))
     }
 
     /// Shared orchestration for disk downloads: the transfer writes the object
@@ -265,7 +258,7 @@ impl Download {
         parent: Option<&crate::transfer::TransferContext>,
         events: Option<EventRegistration>,
         known_size: Option<u64>,
-        commit: Option<transfer::CommitTarget>,
+        commit: Option<CommitTarget>,
     ) -> Result<DownloadHandleInner, error::Error> {
         use crate::transfer::TransferContext;
 
@@ -276,11 +269,15 @@ impl Download {
         let bucket_type =
             BucketType::from_bucket_name(input.bucket().expect("bucket is available"));
 
-        let (writer, _consumer) = body::new_recv_body_with_disk_mode(sink);
+        let (writer, _consumer) = body::new_recv_body_with_disk_mode(sink, commit);
 
         let (ctx, completion_rx) = match parent {
             Some(parent) => TransferContext::new_child(handle.clone(), parent),
             None => TransferContext::new(handle.clone()),
+        };
+        let ctx = match events {
+            Some(events) => events.attach(ctx, &input),
+            None => ctx,
         };
 
         // Before `enqueue_transfer`, so the value is in place by the time the transfer can be
@@ -299,18 +296,8 @@ impl Download {
             ctx.set_expected_bytes(size);
         }
 
-        let lifecycle = Self::lifecycle_for(&ctx, &input, events);
-        let transfer = DownloadTransfer::new(
-            ctx.clone(),
-            bucket_type,
-            input,
-            writer,
-            lifecycle.clone(),
-            commit,
-        );
-        if let Some(lc) = &lifecycle {
-            lc.announce();
-        }
+        let transfer = DownloadTransfer::new(ctx, bucket_type, input, writer);
+        transfer.ctx().announce();
         handle
             .scheduler
             .enqueue_transfer(Box::new(transfer.clone()));

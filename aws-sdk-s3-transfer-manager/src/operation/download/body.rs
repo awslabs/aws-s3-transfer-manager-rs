@@ -179,6 +179,58 @@ impl Buf for DiskWriteCursor<'_> {
     }
 }
 
+/// A disk download's temporary file and the destination it is renamed to.
+#[derive(Debug)]
+pub(crate) struct CommitTarget {
+    pub(crate) temp: std::path::PathBuf,
+    pub(crate) dest: std::path::PathBuf,
+}
+
+/// Reference-counted [`CommitTarget`]: dropping the last reference removes the
+/// temporary file unless [`BodyWriter::finalize`] already renamed or removed it.
+#[derive(Debug)]
+pub(crate) struct TempFile {
+    /// Taken when the file is renamed or removed, so that happens at most once.
+    target: std::sync::Mutex<Option<CommitTarget>>,
+}
+
+impl TempFile {
+    /// Renames the temporary file to its destination if `is_active` returns true,
+    /// and removes it otherwise. Does nothing once the file has been renamed or
+    /// removed.
+    ///
+    /// A failed rename leaves the file for the last reference's drop to remove.
+    fn commit(&self, is_active: impl FnOnce() -> bool) -> std::io::Result<()> {
+        let mut target = self
+            .target
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(paths) = target.as_ref() else {
+            return Ok(());
+        };
+        if is_active() {
+            std::fs::rename(&paths.temp, &paths.dest)?;
+        } else {
+            let _ = std::fs::remove_file(&paths.temp);
+        }
+        *target = None;
+        Ok(())
+    }
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let target = self
+            .target
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(target) = target {
+            let _ = std::fs::remove_file(&target.temp);
+        }
+    }
+}
+
 /// Stream vs disk discrimination. Mutually exclusive per transfer.
 #[derive(Debug)]
 enum Mode {
@@ -191,6 +243,9 @@ enum Mode {
         /// Bytes the sink has accepted across every drain. Only completed run
         /// writes are counted, so this never exceeds what reached the sink.
         written: AtomicU64,
+        /// The transfer's reference to its temporary file, until
+        /// [`BodyWriter::release_temp_file`] drops it.
+        temp_file: std::sync::Mutex<Option<std::sync::Arc<TempFile>>>,
     },
 }
 
@@ -309,6 +364,37 @@ impl BodyWriter {
         matches!(&*self.mode, Mode::Disk { .. })
     }
 
+    /// A reference to the temporary file. Holding it defers the removal that dropping
+    /// the last reference performs.
+    ///
+    /// `None` without a [`CommitTarget`], or once
+    /// [`release_temp_file`](Self::release_temp_file) has run.
+    pub(crate) fn temp_file(&self) -> Option<std::sync::Arc<TempFile>> {
+        match &*self.mode {
+            Mode::Disk { temp_file, .. } => temp_file
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+            Mode::Stream => None,
+        }
+    }
+
+    /// Drops the transfer's reference to the temporary file.
+    ///
+    /// The file is removed when the last reference drops, unless
+    /// [`finalize`](Self::finalize) renamed or removed it. Later calls do nothing.
+    pub(crate) fn release_temp_file(&self) {
+        if let Mode::Disk { temp_file, .. } = &*self.mode {
+            let released = temp_file
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            // Dropped after the lock is released: dropping the last reference
+            // removes the file.
+            drop(released);
+        }
+    }
+
     /// Bytes the destination sink has accepted across every drain, including
     /// drains that went on to fail. Stream mode: 0.
     ///
@@ -351,6 +437,7 @@ impl BodyWriter {
             sink,
             object_range_start,
             written,
+            ..
         } = &*self.mode
         {
             let Some(object_range_start) = object_range_start.get().copied() else {
@@ -401,7 +488,8 @@ impl BodyWriter {
         Ok(drained)
     }
 
-    /// Flush terminal payloads and establish the successful disk target length.
+    /// Flush terminal payloads, establish the successful disk target length, and
+    /// rename or remove the temporary file when the writer has a [`CommitTarget`].
     ///
     /// Returns what the terminal drain wrote. A failed terminal drain returns its
     /// [`DrainError`]. Fails with
@@ -410,8 +498,19 @@ impl BodyWriter {
     /// bytes across every drain. A run claimed by a drain that has not finished
     /// writing is invisible to the terminal drain, so without this check its
     /// region would be published holding zeros or the file's previous bytes.
-    /// That error, and a failed resize, carry what the terminal drain wrote.
-    pub(crate) fn finalize(&self, expected_download_len: u64) -> Result<Drained, DrainError> {
+    /// That error, a failed resize, and a failed rename carry what the terminal
+    /// drain wrote.
+    ///
+    /// The temporary file is renamed or removed only after the resize succeeds:
+    /// renamed to its destination if `is_active` returns true, and removed otherwise.
+    /// A failed rename, or a call after [`release_temp_file`](Self::release_temp_file),
+    /// leaves the file for the last reference's drop to remove. The rename is not
+    /// atomic with `is_active`.
+    pub(crate) fn finalize(
+        &self,
+        expected_download_len: u64,
+        is_active: impl FnOnce() -> bool,
+    ) -> Result<Drained, DrainError> {
         let drained = self.terminal_drain()?;
         if let Mode::Disk { sink, written, .. } = &*self.mode {
             let written = written.load(Ordering::Acquire);
@@ -428,6 +527,11 @@ impl BodyWriter {
             }
             sink.finalize(expected_download_len)
                 .map_err(|source| DrainError { drained, source })?;
+            if let Some(temp_file) = self.temp_file() {
+                temp_file
+                    .commit(is_active)
+                    .map_err(|source| DrainError { drained, source })?;
+            }
         }
         Ok(drained)
     }
@@ -549,13 +653,17 @@ pub(crate) fn new_recv_body() -> (BodyWriter, RecvBodyConsumer) {
 }
 
 /// Create a producer/consumer pair writing to an arbitrary [`SinkWrite`] target.
-/// Positioned writes land at `chunk.offset - object_range_start` in the sink.
+/// Positioned writes land at `chunk.offset - object_range_start` in the sink. With a
+/// `commit` target, [`finalize`](BodyWriter::finalize) renames its temporary file to
+/// its destination, and a file it does not rename is removed once every
+/// [`TempFile`] reference has dropped.
 ///
 /// Issuance backpressure is owned by the per-transfer [`ReadAhead`] controller.
 ///
 /// [`ReadAhead`]: super::read_ahead::ReadAhead
 pub(crate) fn new_recv_body_with_disk_mode(
     sink: Box<dyn SinkWrite>,
+    commit: Option<CommitTarget>,
 ) -> (BodyWriter, RecvBodyConsumer) {
     let (buffer, consumer) = PagedRecvBuffer::new_with_segment_size(SEG_SIZE);
     let notify = Arc::new(WakeNotify::new());
@@ -567,6 +675,11 @@ pub(crate) fn new_recv_body_with_disk_mode(
             sink,
             object_range_start: resolved_range_start,
             written: AtomicU64::new(0),
+            temp_file: std::sync::Mutex::new(commit.map(|target| {
+                std::sync::Arc::new(TempFile {
+                    target: std::sync::Mutex::new(Some(target)),
+                })
+            })),
         }),
     };
     let slot_consumer = RecvBodyConsumer { consumer, notify };
@@ -580,7 +693,7 @@ pub(crate) fn new_recv_body_with_sink(
     file: std::fs::File,
     owns_file: bool,
 ) -> (BodyWriter, RecvBodyConsumer) {
-    new_recv_body_with_disk_mode(Box::new(super::sink::FileSink::new(file, owns_file)))
+    new_recv_body_with_disk_mode(Box::new(super::sink::FileSink::new(file, owns_file)), None)
 }
 
 /// Stream of [ChunkOutput] representing an Amazon S3 Object's contents and metadata.
@@ -729,8 +842,7 @@ mod tests {
             .unwrap();
         let (ctx, _) = TransferContext::new(tm.handle.clone());
         let (writer, consumer) = new_recv_body();
-        let transfer =
-            DownloadTransfer::new(ctx, BucketType::Standard, input, writer.clone(), None, None);
+        let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, writer.clone());
         (Body::new(consumer, transfer.clone()), transfer, writer)
     }
 
@@ -853,10 +965,10 @@ mod tests {
     // --- Disk driver tests ---
 
     use super::{
-        new_recv_body_with_disk_mode, new_recv_body_with_sink, BodyWriter as Writer,
+        new_recv_body_with_disk_mode, new_recv_body_with_sink, BodyWriter as Writer, CommitTarget,
         DiskWriteCursor, DrainMode, Drained, RecvBodyConsumer, Reservation,
     };
-    use crate::operation::download::sink::{SinkFactory, SinkWrite};
+    use crate::operation::download::sink::{FileSinkFactory, SinkFactory, SinkWrite};
     use crate::operation::download::test_util::sink::{
         Action, Match, Op, ScriptedSinkFactory, WriteScript,
     };
@@ -950,7 +1062,7 @@ mod tests {
                 self.0.write_all_at(buf, pos)
             }
         }
-        let (writer, consumer) = new_recv_body_with_disk_mode(Box::new(Shared(sink.clone())));
+        let (writer, consumer) = new_recv_body_with_disk_mode(Box::new(Shared(sink.clone())), None);
         writer.prepare(object_range_start, 0).unwrap();
         (writer, consumer, sink)
     }
@@ -1096,7 +1208,7 @@ mod tests {
             slot.fill(chunk_at(i, offset, &data));
         }
 
-        writer.finalize(expected.len() as u64).unwrap();
+        writer.finalize(expected.len() as u64, || true).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), expected);
     }
 
@@ -1127,7 +1239,7 @@ mod tests {
             "terminal cleanup must not establish the successful length"
         );
 
-        writer.finalize(3).unwrap();
+        writer.finalize(3, || true).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"new");
     }
 
@@ -1146,6 +1258,7 @@ mod tests {
             ScriptedSinkFactory(Arc::clone(script))
                 .create(file, false)
                 .unwrap(),
+            None,
         )
     }
 
@@ -1207,12 +1320,93 @@ mod tests {
         assert_eq!(writer.written(), 3, "the whole object was written");
 
         let error = writer
-            .finalize(3)
+            .finalize(3, || true)
             .expect_err("the resize is scripted to fail");
         assert_eq!(error.source.kind(), std::io::ErrorKind::PermissionDenied);
         let contents = std::fs::read(&path).unwrap();
         assert_eq!(contents.len(), 8, "a failed resize keeps the length");
         assert_eq!(&contents[..3], b"new");
+    }
+
+    // ref: awslabs/aws-s3-transfer-manager-rs#197
+    /// A resize that fails leaves the commit target unrenamed. If the rename ran first,
+    /// the destination would hold a file whose length was never established, in place
+    /// of what the caller had there.
+    #[test]
+    fn finalize_renames_only_after_the_resize_succeeds() {
+        let script = Arc::new(WriteScript::default()).on(
+            Match::Finalize,
+            Action::Fail(std::io::ErrorKind::PermissionDenied),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let temp = dir.path().join("out.s3tmp");
+        let dest = dir.path().join("out");
+        std::fs::write(&dest, b"previous").unwrap();
+        let file = std::fs::File::create(&temp).unwrap();
+        let (writer, _consumer) = new_recv_body_with_disk_mode(
+            ScriptedSinkFactory(Arc::clone(&script))
+                .create(file, false)
+                .unwrap(),
+            Some(CommitTarget {
+                temp: temp.clone(),
+                dest: dest.clone(),
+            }),
+        );
+        writer.prepare(0, 3).unwrap();
+        writer.claim().fill(chunk_at(0, 0, b"new"));
+
+        let error = writer
+            .finalize(3, || true)
+            .expect_err("the resize is scripted to fail");
+        assert_eq!(error.source.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            b"previous",
+            "a failed resize renamed the target over the destination"
+        );
+        assert_eq!(std::fs::read(&temp).unwrap(), b"new");
+    }
+
+    // ref: awslabs/aws-s3-transfer-manager-rs#197
+    /// Once `finalize` has renamed or removed the temporary file, dropping the writer
+    /// leaves alone a file another download has since created under that name.
+    ///
+    /// The last reference's drop removes the temporary file only if `finalize` has not
+    /// already acted on it. A rename or a removal that left its target in place would
+    /// have that drop remove the other download's file.
+    #[test]
+    fn finalize_frees_the_temporary_name_for_good() {
+        for active in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let temp = dir.path().join("out.s3tmp");
+            let dest = dir.path().join("out");
+            let file = std::fs::File::create(&temp).unwrap();
+            let (writer, _consumer) = new_recv_body_with_disk_mode(
+                FileSinkFactory.create(file, true).unwrap(),
+                Some(CommitTarget {
+                    temp: temp.clone(),
+                    dest: dest.clone(),
+                }),
+            );
+            writer.prepare(0, 3).unwrap();
+            writer.claim().fill(chunk_at(0, 0, b"new"));
+            writer.finalize(3, || active).unwrap();
+            assert_eq!(
+                std::fs::read(&dest).ok().as_deref(),
+                active.then_some(b"new".as_slice()),
+                "active: {active}"
+            );
+            assert!(!temp.exists(), "active: {active}");
+
+            std::fs::write(&temp, b"another download").unwrap();
+            drop(writer);
+
+            assert_eq!(
+                std::fs::read(&temp).ok().as_deref(),
+                Some(b"another download".as_slice()),
+                "active: {active}: dropping the writer removed a name its finalize had freed"
+            );
+        }
     }
 
     /// A run claimed by a drain that has not finished writing it leaves the
@@ -1238,7 +1432,7 @@ mod tests {
 
             writer.claim().fill(chunk_at(1, 2, b"cd"));
             let error = writer
-                .finalize(4)
+                .finalize(4, || true)
                 .expect_err("two of four bytes reached the destination");
             assert_eq!(error.source.kind(), std::io::ErrorKind::UnexpectedEof);
             assert!(
@@ -1273,7 +1467,7 @@ mod tests {
         writer.prepare(0, 0).unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 8);
 
-        writer.finalize(0).unwrap();
+        writer.finalize(0, || true).unwrap();
         assert!(std::fs::read(&path).unwrap().is_empty());
     }
 
@@ -1296,7 +1490,7 @@ mod tests {
             slot.fill(chunk_at(i, offset, &data));
         }
 
-        writer.finalize(expected.len() as u64).unwrap();
+        writer.finalize(expected.len() as u64, || true).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), expected);
     }
 
@@ -1350,7 +1544,7 @@ mod tests {
             h.await.unwrap();
         }
 
-        writer.finalize((n * CHUNK_LEN) as u64).unwrap();
+        writer.finalize((n * CHUNK_LEN) as u64, || true).unwrap();
 
         let contents = std::fs::read(&path).unwrap();
         for seq in 0..n as u64 {

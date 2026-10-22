@@ -3741,20 +3741,13 @@ mod tests {
         handle.runtime.shutdown();
     }
 
-    /// The Done arm must not run `on_terminal` while the status is still `Active`.
+    // ref: awslabs/aws-s3-transfer-manager-rs#197
+    /// The Done arm does not run `on_terminal` while the status is still `Active`.
     ///
-    /// Every real `Transfer` claims its terminal *state* before it publishes the terminal
-    /// *status*, and `poll_work` answers `Done` off that state: a download's
-    /// `decrement_in_flight` assigns `DownloadState::Terminal` under the state lock, and
-    /// `finalize_completion` does not reach `set_completed` until the tail flush and the
-    /// rename are done. A poll landing in that window is not skipped, because
-    /// `TransferDescriptor::is_terminal` tests `!ctx.is_active()`. Running the hook there
-    /// reads a status it was never given — `terminal_outcome` maps `Active` to
-    /// `Outcome::Cancelled` — and spends the one-shot terminal report on a transfer that
-    /// is about to succeed. Both are one-shot, so neither is correctable afterwards.
-    ///
-    /// Skipping costs nothing: every completion path emits and reports for itself, which
-    /// `done_after_set_completed_reports_succeeded` covers from the other side.
+    /// The mock answers `Done` before it publishes a terminal status, as a transfer does
+    /// between claiming its terminal state and publishing that status. If the Done arm ran
+    /// the hook there, the hook would observe `Active`, and its one-shot summary and
+    /// `Finished` event would describe a transfer that has not finished.
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn done_arm_skips_on_terminal_while_the_status_is_active() {
@@ -3768,11 +3761,13 @@ mod tests {
         };
         let (mock, observed) = DoneWhileActiveMock::new(id, handle.clone());
         scheduler.enqueue_transfer(Box::new(mock));
-
-        // `enqueue_transfer` runs `generate_work` on this thread, so the Done arm has
-        // already executed by here. The sleep only covers a dispatch that landed on
-        // another worker.
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // `enqueue_transfer` runs `generate_work` on this thread, and only the Done arm
+        // removes this transfer.
+        assert_eq!(
+            0,
+            scheduler.transfer_count(),
+            "the scheduler never polled the mock to Done"
+        );
 
         let seen = *observed.lock().unwrap();
         assert!(
@@ -3782,6 +3777,97 @@ mod tests {
              finds the terminal report already spent: {seen:?}"
         );
 
+        handle.runtime.shutdown();
+    }
+
+    /// Transfer that hands out one work item and then parks, recording the status its
+    /// `on_terminal` observes.
+    #[derive(Debug)]
+    struct OneItemThenParkTransfer {
+        ctx: TransferContext,
+        polls: Arc<AtomicUsize>,
+        /// The status `on_terminal` observed, or `None` if it never ran.
+        terminal_status: Arc<std::sync::Mutex<Option<crate::types::TransferStatus>>>,
+    }
+
+    impl Transfer for OneItemThenParkTransfer {
+        fn ctx(&self) -> &TransferContext {
+            &self.ctx
+        }
+
+        fn poll_work(&self) -> PollWork {
+            if self.polls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return PollWork::ready(IoRequest { data: None });
+            }
+            self.ctx.set_pending(PendingCause::other("test"));
+            PollWork::Pending
+        }
+
+        fn execute<'a>(
+            &'a self,
+            _work: &'a mut IoRequest,
+        ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
+            Box::pin(async { WorkOutcome::Success { data: None } })
+        }
+
+        fn on_terminal(&self) {
+            *self.terminal_status.lock().unwrap() = Some(self.ctx.transfer_status());
+        }
+    }
+
+    // ref: awslabs/aws-s3-transfer-manager-rs#197
+    /// A work item that completes while its transfer is still active neither removes the
+    /// transfer nor runs `on_terminal`.
+    ///
+    /// The transfer hands out one item and then parks, so the item's completion leaves it
+    /// idle and `Active`. At concurrency 1 the scheduler does not poll it again until that
+    /// completion, so the second poll comes from the completion's own `generate_work`,
+    /// after its removal check. If that check removed every idle transfer, the completion
+    /// would run `on_terminal` on an `Active` transfer, release its handle, and leave
+    /// nothing to poll it again.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn completion_keeps_an_idle_transfer_that_is_still_active() {
+        let _logs = show_test_logs();
+        let handle = test_handle(1);
+        let scheduler = &handle.scheduler;
+        let id = TransferId {
+            id: 40_010,
+            parent: None,
+        };
+        let (ctx, mut completion_rx) = TransferContext::with_id(id, handle.clone());
+        let polls = Arc::new(AtomicUsize::new(0));
+        let terminal_status = Arc::new(std::sync::Mutex::new(None));
+        scheduler.enqueue_transfer(Box::new(OneItemThenParkTransfer {
+            ctx,
+            polls: Arc::clone(&polls),
+            terminal_status: Arc::clone(&terminal_status),
+        }));
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while polls.load(Ordering::SeqCst) < 2 && terminal_status.lock().unwrap().is_none() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the work item's completion never reached the scheduler");
+
+        assert_eq!(
+            None,
+            *terminal_status.lock().unwrap(),
+            "the completion ran on_terminal on a transfer that is still active"
+        );
+        assert!(
+            scheduler.0.transfers.read().unwrap().contains_key(&id),
+            "the completion removed a transfer that is still active"
+        );
+        assert_eq!(
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty),
+            completion_rx.try_recv(),
+            "the completion released the handle of a transfer that is still active"
+        );
+
+        drop(scheduler.cancel_transfer(id));
         handle.runtime.shutdown();
     }
 

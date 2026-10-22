@@ -110,39 +110,36 @@ impl Upload {
             Some(parent) => TransferContext::new_child(handle.clone(), parent),
             None => TransferContext::new(handle.clone()),
         };
-
-        // Announced before `enqueue_transfer`, which can drive the transfer fully
-        // terminal before this function returns.
-        //
         // The source is the body the caller supplied: a path when the body reads
         // from a file, and a stream otherwise. Naming a path for an in-memory body
         // would report a file the transfer manager never opened.
-        let lifecycle = events.map(|sink| {
-            let source = match stream.source_path() {
-                Some(path) => crate::events::Endpoint::Local {
-                    path: Some(Arc::from(path)),
-                },
-                None => crate::events::Endpoint::Stream {},
-            };
-            Arc::new(crate::events::TransferLifecycle::new(
-                sink,
-                ctx.id,
-                crate::events::TransferRef::upload(
-                    source,
-                    crate::events::Endpoint::S3 {
-                        bucket: Arc::from(input.bucket().unwrap_or_default()),
-                        key: Arc::from(input.key().unwrap_or_default()),
+        let ctx = match events {
+            Some(sink) => {
+                let source = match stream.source_path() {
+                    Some(path) => crate::events::Endpoint::Local {
+                        path: Some(Arc::from(path)),
                     },
-                ),
-                Some(ctx.view()),
-            ))
-        });
+                    None => crate::events::Endpoint::Stream {},
+                };
+                ctx.with_events(
+                    sink,
+                    crate::events::TransferRef::upload(
+                        source,
+                        crate::events::Endpoint::S3 {
+                            bucket: Arc::from(input.bucket().unwrap_or_default()),
+                            key: Arc::from(input.key().unwrap_or_default()),
+                        },
+                    ),
+                )
+            }
+            None => ctx,
+        };
 
-        let transfer = UploadTransfer::try_new(ctx, bucket_type, input, stream, lifecycle.clone())?;
+        let transfer = UploadTransfer::try_new(ctx, bucket_type, input, stream)?;
 
-        if let Some(lc) = &lifecycle {
-            lc.announce();
-        }
+        // Announced before `enqueue_transfer`, which can drive the transfer fully
+        // terminal before this function returns.
+        transfer.ctx().announce();
 
         handle
             .scheduler

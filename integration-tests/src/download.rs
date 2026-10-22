@@ -333,7 +333,7 @@ async fn test_download_write_to_file() {
 #[cfg(any(unix, windows))]
 #[tokio::test]
 async fn test_download_single_object_entry_points_all_report_events() {
-    use aws_sdk_s3_transfer_manager::events::TransferEvent;
+    use aws_sdk_s3_transfer_manager::events::{Outcome, TransferEvent};
     use aws_sdk_s3_transfer_manager::types::Total;
     use std::time::Duration;
 
@@ -366,8 +366,7 @@ async fn test_download_single_object_entry_points_all_report_events() {
             .key("ev-key")
             .events(sink);
 
-        // Each arm drives the transfer to completion and drops its handle, which is what
-        // releases the sink and ends the stream.
+        // Each arm drives the transfer to completion.
         match variant {
             Sink::Path => {
                 let h = req
@@ -388,39 +387,50 @@ async fn test_download_single_object_entry_points_all_report_events() {
             }
         }
 
-        // A single-object transfer's `Finished` is emitted from `on_terminal`, which the
-        // scheduler runs *after* `join()` has returned — `signal_terminal` wakes the joiner
-        // first. So a consumer-facing fact: `join()` returning does not mean the terminal
-        // event has been delivered. Polled with a deadline rather than awaiting stream
-        // termination, and rather than draining once (which passes or fails on the rename's
-        // wall-clock — the `write_to_path` arm of this test did exactly that before the
-        // deadline was added).
-        let mut started = 0usize;
-        let mut settled = 0usize;
+        // The transfer emits `Finished` before `join()` returns, and sending it releases the
+        // sink, so the stream ends once drained. Draining to the end rather than to the first
+        // `Finished` is what lets a second `Finished` fail the count below.
+        let mut started = Vec::new();
+        let mut finished = Vec::new();
         let mut view = None;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        while settled == 0 && tokio::time::Instant::now() < deadline {
-            match stream.try_recv() {
-                Ok(TransferEvent::Started(p)) if p.id().parent().is_none() => {
-                    started += 1;
-                    view = p.view().cloned();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(event) = stream.recv().await {
+                match event {
+                    TransferEvent::Started(p) => {
+                        started.push(p.id());
+                        view = p.view().cloned();
+                    }
+                    TransferEvent::Finished(e) => {
+                        finished.push((e.id(), matches!(e.outcome(), Outcome::Succeeded { .. })))
+                    }
+                    _ => {}
                 }
-                Ok(TransferEvent::Finished(e)) if e.id().parent().is_none() => settled += 1,
-                Ok(_) => continue,
-                // Empty: the terminal has not been emitted yet. Disconnected: every sink is
-                // gone, so nothing more is coming and the loop should stop.
-                Err(aws_sdk_s3_transfer_manager::events::TryRecvError::Empty) => {
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-                Err(_) => break,
             }
-        }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!("{variant:?}: the stream did not end, so the sink outlived the transfer")
+        });
 
         assert_eq!(
-            1, started,
+            1,
+            started.len(),
             "{variant:?}: a registered sink must receive exactly one Started"
         );
-        assert_eq!(1, settled, "{variant:?}: and exactly one Finished");
+        assert_eq!(
+            started,
+            finished.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            "{variant:?}: and exactly one Finished, for the same id"
+        );
+        assert!(
+            finished.iter().all(|(_, succeeded)| *succeeded),
+            "{variant:?}: a download that joined Ok reported a Finished that did not succeed"
+        );
+        assert_eq!(
+            None,
+            started[0].parent(),
+            "{variant:?}: a single-object download is its own root"
+        );
         let view = view.unwrap_or_else(|| panic!("{variant:?}: a real transfer owes a view"));
         assert_eq!(
             size as u64,

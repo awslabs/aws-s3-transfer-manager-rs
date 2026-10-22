@@ -561,7 +561,7 @@ impl DownloadObjectsTransfer {
                 )
             })?;
         let sink = FileSinkFactory.create(file, true).map_err(|e| {
-            // No handle owns the temp file yet, so remove it here.
+            // No transfer owns the temp file yet, so remove it here.
             let _ = std::fs::remove_file(&temp_path);
             error::Error::new(
                 ErrorKind::IOError,
@@ -581,12 +581,12 @@ impl DownloadObjectsTransfer {
             // The child renames its own temp file before it reports Completed, so a
             // path that reads the status without joining does not see a destination
             // the rename has not created.
-            Some(crate::operation::download::transfer::CommitTarget {
-                temp: temp_path.clone(),
+            Some(crate::operation::download::CommitTarget {
+                temp: temp_path,
                 dest: dest_path,
             }),
         )?;
-        Ok(ManagedDownloadHandle::new(inner, temp_path))
+        Ok(ManagedDownloadHandle::new(inner))
     }
 
     /// Merge results of child spawning back into state. Inserts each child into

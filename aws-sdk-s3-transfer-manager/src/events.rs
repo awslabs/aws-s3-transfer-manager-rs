@@ -563,16 +563,11 @@ impl std::error::Error for TryRecvError {}
 /// policy has an obligation and no status, and a transfer that was never announced
 /// has a status and no obligation.
 pub(crate) struct TransferLifecycle {
-    /// Released by whichever site discharges the terminal emit, which is why it is
-    /// shared and optional rather than owned outright.
+    /// The sink, shared with each claimed emit and released by the one that sends.
     ///
-    /// Nothing drops a lifecycle at the end of an operation: it hangs off the transfer's
-    /// inner, whose context holds a strong `Arc<Handle>`, so holding the sink by value
-    /// kept a request-level `Sender` -- and with it the scheduler, runtime, memory budget
-    /// and retry cache -- alive for the process. A consumer then has no way to drain to
-    /// completion: `recv()` never returns `None` and `try_recv` never answers
-    /// [`TryRecvError::Disconnected`], because "every sink is gone" never becomes true.
-    /// So the release is explicit, at the one instant the transfer is known to be over.
+    /// Released at that send rather than when the lifecycle drops: the lifecycle lives as
+    /// long as any clone of its transfer's context, and a consumer's stream reports
+    /// [`TryRecvError::Disconnected`] only once every sink is gone.
     sink: Arc<Mutex<Option<TransferEventSink>>>,
     id: TransferId,
     transfer: TransferRef,

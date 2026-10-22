@@ -23,11 +23,11 @@ async fn setup() -> MockTm {
 }
 
 /// An upload with a registered sink reports exactly one `Started` carrying a view and exactly
-/// one `Finished`, and the view reports the payload on `network_tx`, the upload numerator,
-/// against a `Final` total the leaf knows from its own size hint before a byte moves.
+/// one `Finished` that succeeded, and the view reports the payload on `network_tx`, the upload
+/// numerator, against a `Final` total the leaf knows from its own size hint before a byte moves.
 #[tokio::test]
 async fn test_upload_reports_events() {
-    use aws_sdk_s3_transfer_manager::events::TransferEvent;
+    use aws_sdk_s3_transfer_manager::events::{Outcome, TransferEvent};
     use aws_sdk_s3_transfer_manager::types::Total;
     use std::time::Duration;
 
@@ -51,33 +51,48 @@ async fn test_upload_reports_events() {
 
     handle.join().await.expect("join upload");
 
-    // `Finished` comes from `on_terminal`, which the scheduler runs after `join()` has
-    // already returned, so this polls to a deadline rather than awaiting stream
-    // termination — the handle is gone but the crate's sink clone is released later.
-    let mut started = 0usize;
-    let mut settled = 0usize;
+    // The transfer emits `Finished` before `join()` returns, and sending it releases the
+    // sink, so the stream ends once drained. Draining to the end rather than to the first
+    // `Finished` is what lets a second `Finished` fail the count below.
+    let mut started = Vec::new();
+    let mut finished = Vec::new();
     let mut view = None;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while settled == 0 && tokio::time::Instant::now() < deadline {
-        match stream.try_recv() {
-            Ok(TransferEvent::Started(p)) if p.id().parent().is_none() => {
-                started += 1;
-                view = p.view().cloned();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(event) = stream.recv().await {
+            match event {
+                TransferEvent::Started(p) => {
+                    started.push(p.id());
+                    view = p.view().cloned();
+                }
+                TransferEvent::Finished(e) => {
+                    finished.push((e.id(), matches!(e.outcome(), Outcome::Succeeded { .. })))
+                }
+                _ => {}
             }
-            Ok(TransferEvent::Finished(e)) if e.id().parent().is_none() => settled += 1,
-            Ok(_) => continue,
-            Err(aws_sdk_s3_transfer_manager::events::TryRecvError::Empty) => {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-            Err(_) => break,
         }
-    }
+    })
+    .await
+    .expect("the stream did not end, so the sink outlived the transfer");
 
     assert_eq!(
-        1, started,
+        1,
+        started.len(),
         "a registered sink must receive exactly one Started"
     );
-    assert_eq!(1, settled, "and exactly one Finished");
+    assert_eq!(
+        started,
+        finished.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        "and exactly one Finished, for the same id"
+    );
+    assert!(
+        finished.iter().all(|(_, succeeded)| *succeeded),
+        "an upload that joined Ok reported a Finished that did not succeed"
+    );
+    assert_eq!(
+        None,
+        started[0].parent(),
+        "a single-object upload is its own root"
+    );
     let view = view.expect("a real transfer owes a view");
     assert_eq!(
         Total::Final(size as u64),
@@ -128,31 +143,29 @@ async fn test_upload_empty_object_is_observable_as_zero_bytes() {
 
     handle.join().await.expect("join upload");
 
-    // `Finished` is emitted from `on_terminal`, which the scheduler runs after `join()` has
-    // returned, so drain to a deadline rather than waiting for the stream to end.
+    // The transfer emits `Finished` before `join()` returns, and sending it releases the
+    // sink, so the stream ends once drained.
     let mut view = None;
-    let mut settled = None;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        match stream.try_recv() {
-            Ok(TransferEvent::Started(p)) => view = p.view().cloned(),
-            Ok(TransferEvent::Finished(e)) => {
-                settled = Some(e.outcome().clone());
-                break;
+    let mut outcomes = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(event) = stream.recv().await {
+            match event {
+                TransferEvent::Started(p) => view = p.view().cloned(),
+                TransferEvent::Finished(e) => outcomes.push(e.outcome().clone()),
+                _ => {}
             }
-            Ok(_) => continue,
-            Err(aws_sdk_s3_transfer_manager::events::TryRecvError::Empty) => {
-                if tokio::time::Instant::now() >= deadline {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-            Err(_) => break,
         }
-    }
+    })
+    .await
+    .expect("the stream did not end, so the sink outlived the transfer");
     m.handle.shutdown().await.expect("shutdown");
 
-    let outcome = settled.expect("a zero-length PUT succeeds, so a terminal must arrive");
+    assert_eq!(
+        1,
+        outcomes.len(),
+        "a zero-length PUT succeeds, so exactly one terminal must arrive: {outcomes:?}"
+    );
+    let outcome = outcomes.remove(0);
     assert!(
         matches!(outcome, Outcome::Succeeded { .. }),
         "a zero-length PUT succeeds; got {outcome:?}"
