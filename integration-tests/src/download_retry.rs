@@ -639,10 +639,9 @@ async fn requests_carry_per_bucket_retry_partition() {
     };
     let tm = TmClient::new(
         aws_sdk_s3_transfer_manager::Config::builder()
-            .s3_config(
-                aws_sdk_s3_transfer_manager::config::S3ClientConfig::new(s3.config().to_builder())
-                    .enable_runtime_http(false),
-            )
+            .s3_config(aws_sdk_s3_transfer_manager::config::S3ClientConfig::new(
+                s3.config().to_builder(),
+            ))
             .part_size(PART_SIZE)
             .build(),
     );

@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use aws_sdk_s3_transfer_manager::io::walk::FsWalker;
 use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
-use aws_sdk_s3_transfer_manager::types::RuntimeMode;
+use aws_sdk_s3_transfer_manager::RuntimeConfig;
 use s3_mock_server::S3MockServer;
 use tempfile::TempDir;
 use tokio::time::timeout;
@@ -28,14 +28,14 @@ use crate::harness::{mock_tm, mock_tm_with, MockTm};
 const TEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 async fn setup() -> MockTm {
-    mock_tm(RuntimeMode::Managed).await
+    mock_tm(RuntimeConfig::default()).await
 }
 
 /// Setup with an explicit concurrency limit, bounding the sustained offered load
 /// an installed throttle sees (so a throttled object's re-issues are not drowned
 /// out by peers retrying into the same limit).
 async fn setup_with_concurrency(concurrency: usize) -> MockTm {
-    mock_tm_with(RuntimeMode::Managed, |b| {
+    mock_tm_with(RuntimeConfig::default(), |b| {
         b.concurrency(aws_sdk_s3_transfer_manager::types::ConcurrencyMode::Explicit(concurrency))
     })
     .await
@@ -76,7 +76,7 @@ async fn fetch_object_bytes(server: &S3MockServer, bucket: &str, key: &str) -> V
 /// s3fio benchmarks. The smithy interceptor mocks cannot reproduce this
 /// because they short-circuit above hyper; a real HTTP server exposes
 /// connection-pool and request-pipeline behavior.
-async fn test_upload_objects_many_small_files(rt: RuntimeMode) {
+async fn test_upload_objects_many_small_files(rt: RuntimeConfig) {
     timeout(TEST_TIMEOUT, async {
         let m = mock_tm(rt).await;
 
@@ -115,12 +115,12 @@ async fn test_upload_objects_many_small_files(rt: RuntimeMode) {
 
 #[tokio::test]
 async fn test_upload_objects_many_small_files_mock_gp() {
-    test_upload_objects_many_small_files(RuntimeMode::Managed).await;
+    test_upload_objects_many_small_files(RuntimeConfig::default()).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_upload_objects_many_small_files_tokio_mt() {
-    test_upload_objects_many_small_files(RuntimeMode::MultiThreadTokio).await;
+    test_upload_objects_many_small_files(RuntimeConfig::multi_thread_tokio()).await;
 }
 
 /// Flat single-directory recursive upload through the real HTTP mock
@@ -219,7 +219,7 @@ async fn test_upload_objects_nested_tree() {
 /// Files above the multipart threshold drive each child through the MPU
 /// path. Verifies that the plural state machine + child MPU uploads
 /// behave correctly against a real HTTP server.
-async fn test_upload_objects_multipart_children(rt: RuntimeMode) {
+async fn test_upload_objects_multipart_children(rt: RuntimeConfig) {
     timeout(TEST_TIMEOUT, async {
         let m = mock_tm(rt).await;
 
@@ -256,12 +256,12 @@ async fn test_upload_objects_multipart_children(rt: RuntimeMode) {
 
 #[tokio::test]
 async fn test_upload_objects_multipart_children_mock_gp() {
-    test_upload_objects_multipart_children(RuntimeMode::Managed).await;
+    test_upload_objects_multipart_children(RuntimeConfig::default()).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_upload_objects_multipart_children_tokio_mt() {
-    test_upload_objects_multipart_children(RuntimeMode::MultiThreadTokio).await;
+    test_upload_objects_multipart_children(RuntimeConfig::multi_thread_tokio()).await;
 }
 
 /// Walker filter applied end-to-end: only matching files should land in

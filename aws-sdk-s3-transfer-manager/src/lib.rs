@@ -161,6 +161,10 @@ pub mod operation;
 /// Transfer manager configuration
 pub mod config;
 
+/// Experimental integrations with version-coupled managed execution.
+#[cfg(feature = "__unstable_ext")]
+pub mod unstable;
+
 /// Payload-memory configuration and shared pooled storage.
 ///
 /// Transfer-manager clients construct a pool automatically by default.
@@ -218,8 +222,8 @@ pub(crate) mod retry;
 
 pub use self::client::Client;
 use self::config::loader::ConfigLoader;
-pub use self::config::Config;
 pub use self::config::S3ClientConfig;
+pub use self::config::{Config, Managed, RuntimeConfig};
 pub use self::transfer::SchedulingCtl;
 
 /// Create a config loader

@@ -59,10 +59,9 @@ async fn setup_test(
     let shared_config = handle.shared_config().await;
 
     let tm_config = aws_sdk_s3_transfer_manager::Config::builder()
-        .s3_config(
-            aws_sdk_s3_transfer_manager::config::S3ClientConfig::new(&shared_config)
-                .enable_runtime_http(false),
-        )
+        .s3_config(aws_sdk_s3_transfer_manager::config::S3ClientConfig::new(
+            &shared_config,
+        ))
         .build();
     let tm = aws_sdk_s3_transfer_manager::Client::new(tm_config);
 

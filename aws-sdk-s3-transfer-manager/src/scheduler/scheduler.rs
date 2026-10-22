@@ -1383,29 +1383,15 @@ mod tests {
         assert_eq!(controller.samples.load(Ordering::Relaxed), 0);
     }
 
-    // TODO(vnext): tests built on this helper are gated out under asan
-    // (`#[cfg_attr(s3_tm_asan, ignore)]`). Each managed worker thread builds its
-    // own current-thread tokio runtime; that runtime's driver is reclaimed only
-    // when `ManagedThreadRuntime::drop` joins the threads, which requires the
-    // `Handle` Arc to reach zero. A test that returns with work still in flight
-    // leaves a strong `Handle` on a worker (via `handle.upgrade()` in dispatch),
-    // so drop/join never runs and the per-thread runtimes leak at process exit.
-    // The fix is a deterministic drain-and-join teardown for these tests (and a
-    // check that a real consumer running asan does not hit the same at shutdown);
-    // until then they are asan-gated rather than leaking the sanitizer run.
+    // ASan teardown still needs explicit thread completion: owner drop requests
+    // shutdown and detaches, so completion may outlive the last client reference.
     fn test_handle_managed(concurrency: usize) -> Arc<Handle> {
         let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
         let config = crate::Config::builder().sdk_client(s3_client).build();
         Handle::new_for_test_with_runtime(
             config,
             Arc::new(crate::scheduler::FixedConcurrency::new(concurrency)),
-            |weak| {
-                Arc::new(
-                    crate::runtime::ManagedThreadRuntime::builder(weak)
-                        .topology(crate::runtime::Topology::uniform(4))
-                        .build(),
-                )
-            },
+            |weak| Arc::new(crate::runtime::ManagedExecution::for_test(weak, 4)),
         )
     }
 
@@ -1880,11 +1866,9 @@ mod tests {
                         Arc::new(crate::runtime::TokioMultiThreadRuntime::new(weak))
                             as Arc<dyn crate::runtime::ExecutionRuntime>
                     }
-                    TestRuntime::Managed { threads } => Arc::new(
-                        crate::runtime::ManagedThreadRuntime::builder(weak)
-                            .topology(crate::runtime::Topology::uniform(threads))
-                            .build(),
-                    ),
+                    TestRuntime::Managed { threads } => {
+                        Arc::new(crate::runtime::ManagedExecution::for_test(weak, threads))
+                    }
                 },
             );
         (handle, controller)
