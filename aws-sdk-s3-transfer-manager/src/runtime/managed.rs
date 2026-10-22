@@ -384,7 +384,8 @@ fn build_http_client(threads: &[ThreadHandle], options: &RuntimeHttpOptions) -> 
         aws_smithy_runtime::client::dns::TokioDnsResolver::new(),
     );
     #[cfg(not(target_os = "android"))]
-    let dns_resolver = ShufflingDnsResolver::new(aws_smithy_dns::HickoryDnsResolver::default());
+    let dns_resolver = //ShufflingDnsResolver::new(aws_smithy_dns::HickoryDnsResolver::default());
+        crate::dns::new_sra_caching_resolver(crate::dns::CachingResolverConfigBuilder::new().build());
 
     let partitions = threads.iter().map(|th| {
         let partition = Partition::new(

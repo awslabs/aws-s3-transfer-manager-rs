@@ -20,6 +20,7 @@ aws-runtime = { workspace = true }
 aws-smithy-types = { workspace = true }
 aws-smithy-checksums = { workspace = true }
 aws-types = { workspace = true }
+aws-smithy-runtime = { workspace = true, features = ["client"] }
 bytes = "1"
 bytes-utils = "0.1.4"
 futures-util = "0.3.31"
@@ -59,7 +60,7 @@ windows-sys = { version = "0.59", features = ["Wdk_Storage_FileSystem", "Win32_F
 [dev-dependencies]
 aws-sdk-s3 = { workspace = true, features = ["behavior-version-latest", "test-util"] }
 aws-smithy-mocks = { workspace = true }
-aws-smithy-runtime = { workspace = true, features = ["client", "test-util"] }
+aws-smithy-runtime = { workspace = true, features = ["test-util"] }
 aws-smithy-http-client = { workspace = true, features = ["test-util", "wire-mock", "rustls-aws-lc"] }
 clap = { version = "4.5.7", default-features = false, features = ["derive", "std", "help"] }
 console-subscriber = "0.5.0"
