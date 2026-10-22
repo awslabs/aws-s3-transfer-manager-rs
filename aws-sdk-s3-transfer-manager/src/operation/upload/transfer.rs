@@ -44,11 +44,9 @@ use crate::error::{Error, ErrorKind};
 use crate::io::part_reader::{Builder as PartReaderBuilder, PartReadStart};
 use crate::io::{InputStream, PartData};
 use crate::operation::upload::context::{
-    validate_size_hint, MultipartCompletion, PartPlan, PartReadWake, PartTransferState,
-    PendingPartRead, UploadPartWork, UploadState,
-};
-use crate::operation::upload::input::convert::{
-    copy_fields_to_mpu_request, copy_fields_to_upload_part_request,
+    apply_content_length, validate_distinct_part_numbers, validate_part_number, validate_size_hint,
+    MultipartCompletion, PartPlan, PartReadWake, PartTransferState, PendingPartRead,
+    UploadPartWork, UploadState,
 };
 #[cfg(test)]
 use crate::operation::upload::observability::UploadTerminalOutcome;
@@ -57,6 +55,9 @@ use crate::operation::upload::observability::{
     UploadPartTiming, UploadRequestKind, UploadStateSnapshot, UploadTerminalReport,
 };
 use crate::operation::upload::part_body;
+use crate::operation::upload::request::{
+    copy_fields_to_mpu_request, copy_fields_to_upload_part_request,
+};
 use crate::operation::upload::{UploadInput, UploadOutput, UploadOutputBuilder};
 use crate::transfer::{IoRequest, PendingCause, PollWork, Transfer, TransferContext, WorkOutcome};
 use crate::types::BucketType;
@@ -123,6 +124,10 @@ impl UploadTransfer {
     ) -> Result<Self, Error> {
         let size_hint = stream.size_hint();
         validate_size_hint(size_hint).map_err(crate::error::invalid_input)?;
+        // A declared content length replaces the body's bounds, so the size checks while reading
+        // and at completion hold the body to exactly that many bytes.
+        let size_hint = apply_content_length(size_hint, request.content_length())
+            .map_err(crate::error::invalid_input)?;
         let observability =
             UploadObservability::new(ctx.handle.config.diagnostics().transfer(), size_hint);
 
@@ -397,7 +402,7 @@ impl UploadTransfer {
         };
 
         let upload_id = resp.upload_id().expect("upload_id present").to_string();
-        let response_builder = UploadOutputBuilder::from(resp);
+        let response_builder = crate::sdk_v1::upload_output_from_create_multipart_upload(&resp);
 
         let (stream, size_hint) = {
             let mut state = self.inner.state.lock().expect("lock poisoned");
@@ -605,6 +610,10 @@ impl UploadTransfer {
                     ),
                 ));
             }
+            if let Err(error) = validate_part_number(data.part_number) {
+                drop(state);
+                return self.fail(crate::error::invalid_input(error));
+            }
         }
 
         // A custom source that was blocked is available again. Refill the work withheld while the
@@ -665,7 +674,8 @@ impl UploadTransfer {
             }
         };
 
-        let part_num_i32 = part_number as i32;
+        let part_num_i32 = i32::try_from(part_number)
+            .expect("part numbers are checked against 1..=10,000 before UploadPart");
         self.inner.observability.observe_part_started(
             self.inner.ctx.id,
             part_number,
@@ -741,6 +751,8 @@ impl UploadTransfer {
         // CompleteMultipartUpload on another worker, and that operation may
         // signal `join()` before this work item otherwise unwinds.
         drop(sdk_body);
+        // Validate the response after the retry loop, so a rejected response is not re-sent.
+        let result = result.and_then(|resp| validate_upload_part_response(resp, part_number));
         let resp = match result {
             Ok(resp) => resp,
             Err(e) => {
@@ -820,7 +832,7 @@ impl UploadTransfer {
     }
 
     async fn execute_put_object(&self, stream: InputStream) -> WorkOutcome {
-        use crate::operation::upload::input::convert::copy_fields_to_put_object_request;
+        use crate::operation::upload::request::copy_fields_to_put_object_request;
 
         let content_length = stream
             .size_hint()
@@ -917,7 +929,7 @@ impl UploadTransfer {
             }
         };
 
-        let result = UploadOutputBuilder::from(resp)
+        let result = crate::sdk_v1::upload_output_from_put_object(&resp)
             .metrics(self.inner.ctx.metrics())
             .build()
             .expect("valid response");
@@ -978,6 +990,11 @@ impl UploadTransfer {
             final_snapshot,
         } = parts.into_completion();
         completed_parts.sort_by_key(|p| p.part_number);
+        // Sorted, so a number used twice is adjacent. Checked here rather than per part: the
+        // assembled list is the first place a repeat is visible without tracking every number.
+        if let Err(error) = validate_distinct_part_numbers(&completed_parts) {
+            return self.fail(crate::error::invalid_input(error));
+        }
 
         let object_size = match plan.mpu_object_size(bytes_read) {
             Ok(object_size) => object_size,
@@ -998,7 +1015,7 @@ impl UploadTransfer {
                     .build(),
             );
 
-        let complete_req = super::input::convert::copy_fields_to_complete_mpu_request(
+        let complete_req = super::request::copy_fields_to_complete_mpu_request(
             &self.inner.request,
             base_req,
             || async { part_reader.full_object_checksum().await },
@@ -1030,11 +1047,13 @@ impl UploadTransfer {
             completion_timer.elapsed(),
         );
 
-        let result = response_builder
-            .update_from_complete_mpu(&resp)
-            .metrics(self.inner.ctx.metrics())
-            .build()
-            .expect("valid response");
+        let result = crate::sdk_v1::update_upload_output_from_complete_multipart_upload(
+            response_builder,
+            &resp,
+        )
+        .metrics(self.inner.ctx.metrics())
+        .build()
+        .expect("valid response");
 
         *self.inner.result.lock().expect("lock poisoned") = Some(result);
         *self.inner.state.lock().expect("lock poisoned") = UploadState::Done;
@@ -1090,6 +1109,27 @@ fn snapshot_state(state: &UploadState) -> UploadStateSnapshot {
 ///
 /// The state replacement elects exactly one caller even when source EOF and a network completion
 /// race to retire the final work item.
+/// Checks that a successful `UploadPart` response carries what completing the upload needs.
+///
+/// `CompleteMultipartUpload` identifies each part by its ETag, so a response without one, or with
+/// an empty one, is a failed part: the completed list could not identify it, and the object would
+/// be stored without that evidence. aws-c-s3 treats it the same way
+/// (`AWS_ERROR_S3_MISSING_ETAG`). The error carries the operation name and the response's request
+/// ids, as an error from a failed request does.
+fn validate_upload_part_response(
+    resp: aws_sdk_s3::operation::upload_part::UploadPartOutput,
+    part_number: u64,
+) -> Result<aws_sdk_s3::operation::upload_part::UploadPartOutput, Error> {
+    if resp.e_tag().is_some_and(|e_tag| !e_tag.is_empty()) {
+        return Ok(resp);
+    }
+    Err(crate::error::invalid_service_response(
+        "UploadPart",
+        &resp,
+        format!("UploadPart returned no ETag for part {part_number}"),
+    ))
+}
+
 fn try_begin_completing(state: &mut UploadState) -> bool {
     let ready = matches!(
         state,
@@ -1169,16 +1209,18 @@ mod tests {
     ) -> UploadTransfer {
         let handle = crate::client::Handle::test_handle_tokio(
             crate::Config::builder()
-                .client(s3_client)
+                .sdk_client(s3_client)
                 .diagnostics_for_test(crate::config::MemoryDiagnosticsConfig::default(), detail)
                 .build(),
         );
 
-        let input = UploadInput::builder()
+        let mut input = UploadInput::builder()
             .bucket("test-bucket")
             .key("test-key")
+            .body(stream)
             .build()
             .unwrap();
+        let stream = input.take_body();
 
         let (ctx, _completion_rx) = TransferContext::new(handle);
         UploadTransfer::try_new(ctx, BucketType::Standard, input, stream).unwrap()
@@ -2065,14 +2107,15 @@ mod tests {
         tmp.flush().unwrap();
 
         let handle = crate::client::Handle::test_handle_tokio(
-            crate::Config::builder().client(s3_client).build(),
+            crate::Config::builder().sdk_client(s3_client).build(),
         );
-        let input = UploadInput::builder()
+        let mut input = UploadInput::builder()
             .bucket("test-bucket")
             .key("test-key")
+            .body(InputStream::from_path(tmp.path()).unwrap())
             .build()
             .unwrap();
-        let stream = InputStream::from_path(tmp.path()).unwrap();
+        let stream = input.take_body();
         let (ctx, _completion_rx) = TransferContext::new(handle);
         let transfer = UploadTransfer::try_new(ctx, BucketType::Standard, input, stream).unwrap();
 

@@ -103,7 +103,7 @@ pub(crate) fn disk_test_handle(
     part_size: u64,
 ) -> Arc<crate::client::Handle> {
     let config = crate::Config::builder()
-        .client(client)
+        .sdk_client(client)
         .part_size(crate::types::PartSize::Target(part_size))
         .build();
     crate::client::Handle::test_handle_tokio(config)
@@ -149,7 +149,7 @@ pub(crate) fn disk_transfer(
         .unwrap();
     let dir = tempfile::tempdir().unwrap();
     let file = std::fs::File::create(dir.path().join("out")).unwrap();
-    let (writer, consumer) = new_recv_body_with_disk_mode(sinks.create(file, false));
+    let (writer, consumer) = new_recv_body_with_disk_mode(sinks.create(file, false).unwrap());
     let (ctx, _completion_rx) = TransferContext::new(handle);
     let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, writer);
     (transfer, consumer, dir)
@@ -214,7 +214,7 @@ pub(crate) async fn relief_scenario(script: &Arc<WriteScript>) -> ReliefScenario
         .unwrap()
         .expect("the budget fits the blocker");
     let config = crate::Config::builder()
-        .client(object_client(Arc::clone(&object)))
+        .sdk_client(object_client(Arc::clone(&object)))
         .part_size(crate::types::PartSize::Target(part_size))
         .memory(crate::types::MemoryConfig::Explicit(pool))
         .build();

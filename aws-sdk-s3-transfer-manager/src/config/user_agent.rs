@@ -236,8 +236,8 @@ mod tests {
 
         // The capture-request client is the transport under test, so the runtime must
         // not substitute its own.
-        let s3_config =
-            crate::config::S3ClientConfig::new(tweak(builder)).enable_runtime_http(false);
+        let s3_config = crate::config::S3ClientConfig::from_sdk_builder(tweak(builder))
+            .enable_runtime_http(false);
 
         let tm = crate::Client::new(
             crate::Config::builder()
@@ -368,7 +368,8 @@ mod tests {
         let tm = crate::Client::new(
             crate::Config::builder()
                 .runtime_mode(RuntimeMode::MultiThreadTokio)
-                .client(client)
+                .part_size(PartSize::Target(8 << 20))
+                .sdk_client(client)
                 .build(),
         );
         let mut handle = tm.download().bucket("foo").key("bar").initiate().unwrap();
@@ -396,10 +397,12 @@ mod tests {
             .split_whitespace()
             .find_map(|section| section.strip_prefix("m/"))
             .expect("user agent carries a metrics section");
-        assert!(
-            metrics.split(',').any(|id| id == "G"),
-            "S3Transfer metric missing from {metrics:?} in {ua:?}"
-        );
+        for id in ["G", "AX"] {
+            assert!(
+                metrics.split(',').any(|m| m == id),
+                "{id} missing from {metrics:?} in {ua:?}"
+            );
+        }
     }
 
     /// Rebuilding a caller's client must not cost them anything they configured on it, so this
@@ -492,7 +495,7 @@ mod tests {
         let first = crate::Client::new(
             crate::Config::builder()
                 .runtime_mode(RuntimeMode::MultiThreadTokio)
-                .client(provided_client(http_client))
+                .sdk_client(provided_client(http_client))
                 .build(),
         );
         // The clone a child transfer would be handed.
@@ -630,100 +633,41 @@ mod tests {
         ids.iter().any(|i| i == id)
     }
 
-    #[cfg_attr(miri, ignore)]
-    #[tokio::test]
-    async fn defaults_carry_no_configuration_metrics() {
-        let ids = download_ids(|b| b).await;
-        assert!(has(&ids, "G"), "{ids:?}");
-        for id in ["AX", "AY", "AZ", "Aa", "Ab", "9", "+"] {
-            assert!(!has(&ids, id), "{id} present in {ids:?}");
-        }
+    /// The attribution ids a transfer manager's requests carry for its configuration, and for
+    /// the operation that issued them.
+    async fn attribution_ids(
+        tweak: impl FnOnce(crate::config::Builder) -> crate::config::Builder,
+    ) -> Vec<String> {
+        let mut ids = download_ids(tweak).await;
+        ids.retain(|id| ["AX", "AY", "AZ", "Aa", "Ab", "9", "+"].contains(&id.as_str()));
+        ids
     }
 
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
-    async fn explicit_part_size_emits_custom_part_size() {
-        let ids = download_ids(|b| b.part_size(PartSize::Target(8 * 1024 * 1024))).await;
-        assert!(has(&ids, "AX"), "{ids:?}");
-        assert!(!has(&ids, "AY") && !has(&ids, "AZ"), "{ids:?}");
-    }
-
-    #[cfg_attr(miri, ignore)]
-    #[tokio::test]
-    async fn explicit_concurrency_emits_custom_throughput() {
-        let ids = download_ids(|b| b.concurrency(ConcurrencyMode::Explicit(4))).await;
-        assert!(has(&ids, "AY"), "{ids:?}");
-        assert!(!has(&ids, "AX") && !has(&ids, "AZ"), "{ids:?}");
-    }
-
-    #[cfg_attr(miri, ignore)]
-    #[tokio::test]
-    async fn explicit_memory_emits_custom_memory_limit() {
+    async fn configuration_metrics_follow_the_configuration() {
+        type Tweak = Box<dyn FnOnce(crate::config::Builder) -> crate::config::Builder>;
         let pool = crate::runtime::buffer_pool::BufferPool::from_capacity(
             crate::types::MemoryBudgetConfig::Limit(256 * 1024 * 1024),
             None,
             Default::default(),
         )
         .unwrap();
-        let ids = download_ids(|b| b.memory(MemoryConfig::Explicit(pool))).await;
-        assert!(has(&ids, "AZ"), "{ids:?}");
-        assert!(!has(&ids, "AX") && !has(&ids, "AY"), "{ids:?}");
-    }
-
-    #[cfg_attr(miri, ignore)]
-    #[tokio::test]
-    async fn detected_ec2_emits_on_ec2() {
-        let ids = download_ids(|b| {
-            b.machine_profile(Some(crate::runtime::platform::MachineProfile {
-                instance_type: Some("m6i.large".to_owned()),
-                vcpus: 2,
-                ram_bytes: None,
-            }))
-        })
-        .await;
-        assert!(has(&ids, "Aa"), "{ids:?}");
-    }
-
-    #[cfg_attr(miri, ignore)]
-    #[tokio::test]
-    async fn path_download_emits_file_path_and_stream_does_not() {
-        let (http_client, seen) = recording_client();
-        let tm = tm_over(http_client, |b| b);
-        let dir = tempfile::tempdir().unwrap();
-        let handle = tm
-            .download()
-            .bucket("foo")
-            .key("bar")
-            .write_to_path(dir.path().join("out"))
-            .await
-            .unwrap();
-        let _ = handle.join().await;
-        let mut stream = tm.download().bucket("foo").key("bar").initiate().unwrap();
-        let _ = stream.body_mut().next().await;
-
-        let seen = seen.lock().unwrap();
-        assert!(has(&seen[0].1, "Ab"), "{seen:?}");
-        assert!(!has(&seen[0].1, "+"), "{seen:?}");
-        let last = &seen.last().unwrap().1;
-        assert!(!has(last, "Ab"), "{seen:?}");
-    }
-
-    #[cfg_attr(miri, ignore)]
-    #[tokio::test]
-    async fn path_upload_emits_file_path_and_bytes_do_not() {
-        let (http_client, seen) = recording_client();
-        let tm = tm_over(http_client, |b| b);
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("in");
-        std::fs::write(&file, b"x").unwrap();
-        let from_path = crate::io::InputStream::from_path(&file).unwrap();
-        let _ = tm.upload().bucket("foo").key("k").body(from_path).initiate().unwrap().join().await;
-        let _ = tm.upload().bucket("foo").key("k").body(crate::io::InputStream::from(bytes::Bytes::from_static(b"x"))).initiate().unwrap().join().await;
-
-        let seen = seen.lock().unwrap();
-        assert!(has(&seen[0].1, "Ab"), "{seen:?}");
-        assert!(!has(&seen[0].1, "9"), "{seen:?}");
-        assert!(!has(&seen.last().unwrap().1, "Ab"), "{seen:?}");
+        let ec2 = crate::runtime::platform::MachineProfile {
+            instance_type: Some("m6i.large".to_owned()),
+            vcpus: 2,
+            ram_bytes: None,
+        };
+        let cases: Vec<(&str, Tweak, &[&str])> = vec![
+            ("defaults", Box::new(|b| b), &[]),
+            ("part size", Box::new(|b| b.part_size(PartSize::Target(8 << 20))), &["AX"]),
+            ("concurrency", Box::new(|b| b.concurrency(ConcurrencyMode::Explicit(4))), &["AY"]),
+            ("memory", Box::new(|b| b.memory(MemoryConfig::Explicit(pool))), &["AZ"]),
+            ("ec2", Box::new(|b| b.machine_profile(Some(ec2))), &["Aa"]),
+        ];
+        for (name, tweak, expected) in cases {
+            assert_eq!(expected, attribution_ids(tweak).await, "{name}");
+        }
     }
 
     #[cfg_attr(miri, ignore)]
@@ -741,12 +685,18 @@ mod tests {
             .unwrap()
             .join()
             .await;
+        let children = seen.lock().unwrap().len();
+        let body = crate::io::InputStream::from(bytes::Bytes::from_static(b"x"));
+        let _ = tm.upload().bucket("foo").key("k").body(body).initiate().unwrap().join().await;
 
         let seen = seen.lock().unwrap();
-        assert!(!seen.is_empty());
-        for (uri, ids) in seen.iter() {
+        assert!(children > 0);
+        for (uri, ids) in &seen[..children] {
             assert!(has(ids, "9") && has(ids, "Ab") && !has(ids, "+"), "{uri}: {ids:?}");
         }
+        // The markers belong to the operation: a later plain upload from the same client has none.
+        let ids = &seen[children].1;
+        assert!(has(ids, "G") && !has(ids, "9") && !has(ids, "Ab"), "{ids:?}");
     }
 
     #[cfg_attr(miri, ignore)]
@@ -763,10 +713,14 @@ mod tests {
             .unwrap()
             .join()
             .await;
+        let children = seen.lock().unwrap().len();
+        let mut stream = tm.download().bucket("foo").key("bar").initiate().unwrap();
+        let _ = stream.body_mut().next().await;
 
         let seen = seen.lock().unwrap();
-        let (listings, objects): (Vec<_>, Vec<_>) =
-            seen.iter().partition(|(uri, _)| uri.contains("list-type=2"));
+        let (listings, objects): (Vec<_>, Vec<_>) = seen[..children]
+            .iter()
+            .partition(|(uri, _)| uri.contains("list-type=2"));
         assert!(!listings.is_empty() && !objects.is_empty(), "{seen:?}");
         for (uri, ids) in listings {
             assert!(has(ids, "+") && !has(ids, "Ab") && !has(ids, "9"), "{uri}: {ids:?}");
@@ -774,30 +728,8 @@ mod tests {
         for (uri, ids) in objects {
             assert!(has(ids, "+") && has(ids, "Ab") && !has(ids, "9"), "{uri}: {ids:?}");
         }
-    }
-
-    /// The directory markers belong to the operation, not to the shared client.
-    #[cfg_attr(miri, ignore)]
-    #[tokio::test]
-    async fn directory_markers_do_not_outlive_their_operation() {
-        let (http_client, seen) = recording_client();
-        let tm = tm_over(http_client, |b| b);
-        let dir = tempfile::tempdir().unwrap();
-        let _ = tm
-            .download_objects()
-            .bucket("foo")
-            .destination(dir.path())
-            .initiate()
-            .unwrap()
-            .join()
-            .await;
-        let before = seen.lock().unwrap().len();
-        let mut stream = tm.download().bucket("foo").key("bar").initiate().unwrap();
-        let _ = stream.body_mut().next().await;
-
-        let seen = seen.lock().unwrap();
-        let ids = &seen[before].1;
-        assert!(has(ids, "G"), "{ids:?}");
-        assert!(!has(ids, "+") && !has(ids, "9") && !has(ids, "Ab"), "{ids:?}");
+        // The markers belong to the operation: a later plain download from the same client has none.
+        let ids = &seen[children].1;
+        assert!(has(ids, "G") && !has(ids, "+") && !has(ids, "Ab"), "{ids:?}");
     }
 }

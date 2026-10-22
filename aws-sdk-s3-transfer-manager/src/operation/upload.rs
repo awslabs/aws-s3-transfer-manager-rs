@@ -3,11 +3,20 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+//! Single-object uploads using either a single PUT or multipart upload.
+//!
+//! Construct an upload through the client's fluent builder or
+//! [`UploadInput::builder`](crate::model::UploadInput::builder).
+//! Wait for [`UploadHandle::join`](crate::operation::upload::UploadHandle::join) to obtain
+//! [`UploadOutput`](crate::model::UploadOutput), which combines service response metadata with
+//! transfer metrics. Optional response fields depend on the selected path
+//! and the values returned by S3; see [`UploadOutput`](crate::model::UploadOutput)
+//! for their provenance.
+
 /// Operation builders
 pub mod builders;
 mod checksum_strategy;
-mod input;
-mod output;
+mod request;
 
 mod context;
 pub(crate) mod file_body;
@@ -21,14 +30,16 @@ pub(crate) use transfer::UploadTransfer;
 
 use crate::config::user_agent::OperationFeatures;
 use crate::error;
+pub use crate::model::builders::UploadInputBuilder;
+pub use crate::model::builders::UploadOutputBuilder;
+/// Request type for uploads to Amazon S3
+pub use crate::model::UploadInput;
+/// Response type for uploads to Amazon S3
+pub use crate::model::UploadOutput;
 use aws_runtime::sdk_feature::AwsSdkFeature;
 use crate::transfer::TransferContext;
 use crate::types::BucketType;
 pub use handle::UploadHandle;
-/// Request type for uploads to Amazon S3
-pub use input::{UploadInput, UploadInputBuilder};
-/// Response type for uploads to Amazon S3
-pub use output::{UploadOutput, UploadOutputBuilder};
 
 use std::sync::Arc;
 
@@ -177,7 +188,7 @@ mod test {
             .runtime_mode(runtime_mode)
             .set_multipart_threshold(PartSize::Target(10))
             .set_target_part_size(PartSize::Target(5 * ByteUnit::Mebibyte.as_bytes_u64()))
-            .client(client)
+            .sdk_client(client)
             .build();
         let tm = crate::Client::new(tm_config);
         let handle = UploadInput::builder()
@@ -309,7 +320,7 @@ mod test {
             .runtime_mode(runtime_mode)
             .set_multipart_threshold(PartSize::Target(10))
             .set_target_part_size(PartSize::Target(5 * ByteUnit::Mebibyte.as_bytes_u64()))
-            .client(client)
+            .sdk_client(client)
             .build();
         let tm = crate::Client::new(tm_config);
         let handle = UploadInput::builder()
@@ -394,7 +405,7 @@ mod test {
             });
 
         let upload_part = mock!(aws_sdk_s3::Client::upload_part)
-            .then_output(|| UploadPartOutput::builder().build());
+            .then_output(|| UploadPartOutput::builder().e_tag("test-etag").build());
 
         let abort_mpu = mock!(aws_sdk_s3::Client::abort_multipart_upload)
             .then_output(|| AbortMultipartUploadOutput::builder().build());
@@ -417,7 +428,7 @@ mod test {
             .concurrency(ConcurrencyMode::Explicit(1))
             .set_multipart_threshold(PartSize::Target(10))
             .set_target_part_size(PartSize::Target(5 * ByteUnit::Mebibyte.as_bytes_u64()))
-            .client(client)
+            .sdk_client(client)
             .build();
 
         let tm = crate::Client::new(tm_config);
@@ -530,7 +541,7 @@ mod retry_tests {
             .concurrency(ConcurrencyMode::Explicit(1))
             .set_multipart_threshold(PartSize::Target(10))
             .set_target_part_size(PartSize::Target(5 * ByteUnit::Mebibyte.as_bytes_u64()))
-            .client(s3_client)
+            .sdk_client(s3_client)
             .build();
 
         let tm = crate::Client::new(tm_config);

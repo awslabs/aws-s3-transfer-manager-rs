@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use aws_config::Region;
+mod common;
 use aws_sdk_s3_transfer_manager::{
     error::{BoxError, ErrorKind},
     metrics::unit::ByteUnit,
@@ -105,16 +105,8 @@ fn test_tm(
     http_client: StaticReplayClient,
     part_size: usize,
 ) -> aws_sdk_s3_transfer_manager::Client {
-    let s3_client = aws_sdk_s3::Client::from_conf(
-        aws_sdk_s3::config::Config::builder()
-            .http_client(http_client)
-            .region(Region::from_static("us-west-2"))
-            .with_test_defaults()
-            .build(),
-    );
-
     let config = aws_sdk_s3_transfer_manager::Config::builder()
-        .client(s3_client)
+        .s3_config(common::s3_config(http_client))
         .part_size(PartSize::Target(part_size as u64))
         .concurrency(ConcurrencyMode::Explicit(1))
         .build();
@@ -301,15 +293,10 @@ async fn abort_download_with_executing_gets(runtime_mode: RuntimeMode) {
         requests: requests.clone(),
         parked_started: parked_started.clone(),
     });
-    let s3_client = aws_sdk_s3::Client::from_conf(
-        aws_sdk_s3::config::Config::builder()
-            .http_client(http_client_fn(move |_, _| connector.clone()))
-            .region(Region::from_static("us-west-2"))
-            .with_test_defaults()
-            .build(),
-    );
     let config = aws_sdk_s3_transfer_manager::Config::builder()
-        .client(s3_client)
+        .s3_config(common::s3_config(http_client_fn(move |_, _| {
+            connector.clone()
+        })))
         .part_size(PartSize::Target(part_size as u64))
         .concurrency(ConcurrencyMode::Explicit(2))
         .runtime_mode(runtime_mode)
@@ -711,6 +698,42 @@ async fn test_download_write_to_path() {
     assert!(tmp_files.is_empty(), "leftover temp files: {:?}", tmp_files);
 }
 
+/// A file already at the temporary name `write_to_path` draws is left
+/// untouched, and the download writes through another name. Seeding
+/// `fastrand` on the polling thread, which draws the name, makes the first
+/// name predictable.
+#[cfg(any(unix, windows))]
+#[tokio::test(flavor = "current_thread")]
+async fn test_download_write_to_path_leaves_existing_temp_file() {
+    const SEED: u64 = 0x5eed_0042;
+    let data = rand_data(10 * ByteUnit::Mebibyte.as_bytes_usize());
+    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let (tm, _http_client) = simple_test_tm(&data, part_size);
+
+    let dir = tempfile::tempdir().unwrap();
+    let dest_path = dir.path().join("output.dat");
+    let first_suffix = fastrand::Rng::with_seed(SEED).u32(..);
+    let sentinel_path = dir
+        .path()
+        .join(format!("output.dat.s3tmp.{first_suffix:08x}"));
+    std::fs::write(&sentinel_path, b"SENTINEL").unwrap();
+
+    let download = tm.download().bucket("test-bucket").key("test-object");
+    fastrand::seed(SEED);
+    let handle = download.write_to_path(&dest_path).await.unwrap();
+    handle.join().await.unwrap();
+
+    assert_eq!(std::fs::read(&sentinel_path).unwrap(), b"SENTINEL");
+    assert_eq!(std::fs::read(&dest_path).unwrap(), data.as_ref());
+    let tmp_files: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|path| path.to_string_lossy().contains(".s3tmp"))
+        .collect();
+    assert_eq!(tmp_files, vec![sentinel_path]);
+}
+
 /// Test that aborting a download-to-file cleans up both temp and dest files.
 #[cfg(any(unix, windows))]
 #[tokio::test]
@@ -806,6 +829,37 @@ async fn test_download_write_to_path_error_cleans_up() {
         .filter(|e| e.path().to_string_lossy().contains(".s3tmp"))
         .collect();
     assert!(tmp_files.is_empty(), "leftover temp files: {:?}", tmp_files);
+}
+
+/// `write_to_file` rejects a destination opened in append mode before sending
+/// any request, and leaves the file's contents as they were.
+#[cfg(any(unix, windows))]
+#[tokio::test]
+async fn test_download_write_to_file_rejects_append_mode() {
+    let data = rand_data(10 * ByteUnit::Mebibyte.as_bytes_usize());
+    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let (tm, http_client) = simple_test_tm(&data, part_size);
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("output.dat");
+    let header = rand_data(4096);
+    std::fs::write(&path, &header).unwrap();
+    let file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap();
+
+    let error = tm
+        .download()
+        .bucket("test-bucket")
+        .key("test-object")
+        .write_to_file(file)
+        .expect_err("an append-mode destination must be rejected");
+
+    assert_eq!(error.kind(), &ErrorKind::InputInvalid);
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), header.len() as u64);
+    assert_eq!(std::fs::read(&path).unwrap(), header.as_ref());
+    assert_eq!(http_client.actual_requests().count(), 0);
 }
 
 /// Download requests carry `x-amz-checksum-mode: ENABLED` by default. The SDK's
@@ -904,18 +958,17 @@ async fn test_integrity_checks_disabled_when_validation_when_required() {
     let data = Bytes::from_static(HELLO);
     let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
     let http_client = single_part_connector(&data, Some(HELLO_CRC32));
-    let s3_client = aws_sdk_s3::Client::from_conf(
-        aws_sdk_s3::config::Config::builder()
-            .http_client(http_client)
-            .region(Region::from_static("us-west-2"))
-            .response_checksum_validation(
-                aws_sdk_s3::config::ResponseChecksumValidation::WhenRequired,
-            )
-            .with_test_defaults()
-            .build(),
-    );
+    let shared = common::shared_config(http_client)
+        .into_builder()
+        .response_checksum_validation(
+            aws_smithy_types::checksum_config::ResponseChecksumValidation::WhenRequired,
+        )
+        .build();
     let config = aws_sdk_s3_transfer_manager::Config::builder()
-        .client(s3_client)
+        .s3_config(
+            aws_sdk_s3_transfer_manager::config::S3ClientConfig::new(&shared)
+                .enable_runtime_http(false),
+        )
         .part_size(PartSize::Target(part_size as u64))
         .concurrency(ConcurrencyMode::Explicit(1))
         .build();
@@ -953,7 +1006,7 @@ async fn test_integrity_checks_enabled_not_falsely_validated() {
         .download()
         .bucket("test-bucket")
         .key("test-object")
-        .checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled)
+        .checksum_mode(aws_sdk_s3_transfer_manager::types::ChecksumMode::Enabled)
         .initiate()
         .unwrap();
     let _ = drain(&mut handle).await.unwrap();

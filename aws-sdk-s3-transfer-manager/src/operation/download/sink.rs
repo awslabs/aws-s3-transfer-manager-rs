@@ -116,7 +116,12 @@ pub(crate) trait SinkFactory: Send + Sync + std::fmt::Debug {
     /// Builds the sink a disk download writes through, over an already-open
     /// destination `file`. `owns_file` is true when the transfer manager
     /// created the file, which permits preallocating it.
-    fn create(&self, file: std::fs::File, owns_file: bool) -> Box<dyn SinkWrite>;
+    ///
+    /// Fails, without writing to `file`, when `file` cannot serve as this
+    /// factory's destination or its handle cannot be inspected. An
+    /// [`InvalidInput`](std::io::ErrorKind::InvalidInput) error means the
+    /// caller supplied a destination the sink does not support.
+    fn create(&self, file: std::fs::File, owns_file: bool) -> std::io::Result<Box<dyn SinkWrite>>;
 }
 
 /// [`SinkFactory`] whose sinks write directly to the destination file.
@@ -124,13 +129,45 @@ pub(crate) trait SinkFactory: Send + Sync + std::fmt::Debug {
 pub(crate) struct FileSinkFactory;
 
 impl SinkFactory for FileSinkFactory {
-    fn create(&self, file: std::fs::File, owns_file: bool) -> Box<dyn SinkWrite> {
-        Box::new(FileSink::new(file, owns_file))
+    /// Returns [`InvalidInput`](std::io::ErrorKind::InvalidInput) when
+    /// `file`'s handle is in append mode
+    /// ([`is_append_only`](crate::io::fs::is_append_only)), since positioned
+    /// writes through it would not land at their offsets. An error reading the
+    /// handle's mode is returned as is.
+    fn create(&self, file: std::fs::File, owns_file: bool) -> std::io::Result<Box<dyn SinkWrite>> {
+        if crate::io::fs::is_append_only(&file)? {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "destination file is open in append mode, which downloads to a file do not support",
+            ));
+        }
+        Ok(Box::new(FileSink::new(file, owns_file)))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    /// A destination opened in append mode is rejected before a sink is
+    /// built, and its contents are left as they were.
+    #[cfg(any(unix, windows))]
+    #[cfg_attr(miri, ignore)] // the Miri build does not inspect the handle
+    #[test]
+    fn file_sink_factory_rejects_append_mode() {
+        use super::{FileSinkFactory, SinkFactory};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.bin");
+        std::fs::write(&path, b"header").unwrap();
+        let file = std::fs::File::options().append(true).open(&path).unwrap();
+
+        let error = FileSinkFactory
+            .create(file, false)
+            .expect_err("an append-mode destination must be rejected");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(std::fs::read(&path).unwrap(), b"header");
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_preallocation_fails_only_for_storage_exhaustion() {
