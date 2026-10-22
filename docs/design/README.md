@@ -9,7 +9,7 @@ Each design document states a subsystem's requirements, architecture, and correc
 | [paged-recv-buffer.md](paged-recv-buffer.md) | Download reassembly, the occupancy gate, and read-ahead | `operation/download/recv_buffer.rs`, `operation/download/read_ahead.rs` |
 | [retry.md](retry.md) | The outer retry loop, failure classification, and throttle recovery | `retry.rs` |
 | [hedging.md](hedging.md) | Speculative re-issue, the adaptive deadline, and the hedge budget | `retry.rs` |
-| [upload.md](upload.md) | Single-object upload: path selection, source partitioning, the multipart state machine, and request mapping | `operation/upload.rs`, `operation/upload/`, `io/part_reader.rs` |
+| [upload.md](upload.md) | Single-object upload: path selection, source partitioning, the multipart state machine, request mapping, and append mode | `operation/upload.rs`, `operation/upload/`, `io/part_reader.rs` |
 
 Code paths are relative to `aws-sdk-s3-transfer-manager/src/`.
 
@@ -68,3 +68,6 @@ This index locates each invariant. The linked section is authoritative.
 - [A retry re-sends identical bytes](upload.md#a-retry-re-sends-identical-bytes)
 - [A parked part read is never lost or recreated](upload.md#a-parked-part-read-is-never-lost-or-recreated)
 - [An open multipart upload is always reachable](upload.md#an-open-multipart-upload-is-always-reachable)
+- [One append in flight](upload.md#one-append-in-flight)
+- [Each append is conditioned on the state the previous one produced](upload.md#each-append-is-conditioned-on-the-state-the-previous-one-produced)
+- [A re-send is never unconditional](upload.md#a-re-send-is-never-unconditional)

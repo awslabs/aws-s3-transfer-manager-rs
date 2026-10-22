@@ -5,16 +5,19 @@ stream that produces parts over time. S3 offers a single `PutObject` or a multip
 sends up to 10,000 parts independently and assembles them on completion; the right one depends on
 the source type, the object's size, and whether the size is known before reading. The upload is a
 state machine that picks the path, partitions the source into parts, keeps every part's bytes alive
-through retries, and reports the committed object to the caller.
+through retries, and reports the committed object to the caller. An S3 Express One Zone directory
+bucket adds append mode: a serial chain of `PutObject` requests, each adding bytes to the end of one
+object.
 
-It has four parts: **path selection** (decided once from the source type and its size bounds),
+It has five parts: **path selection** (decided once from the source type and its size bounds),
 **source partitioning** (a part reader over memory, a file, or a custom stream, with a part size
 that fits S3's part limit), the **multipart state machine** (lazily generated part work, balanced
-accounting, one elected completion), and the **request mapping** (how the caller's input becomes
+accounting, one elected completion), the **request mapping** (how the caller's input becomes
 `PutObject`, `CreateMultipartUpload`, `UploadPart`, `CompleteMultipartUpload`, and
-`AbortMultipartUpload` requests). Memory staging is specified in the
-[memory design](./memory.md#upload-staging-and-retry), the retry loop in the
-[retry design](./retry.md).
+`AbortMultipartUpload` requests), and [**append mode**](#append) (a serial chain of
+offset-conditioned `PutObject` requests that grows one object). Memory staging is specified in the
+[memory design](./memory.md#upload-staging-and-retry), the retry loop in the [retry
+design](./retry.md).
 
 ---
 
@@ -100,7 +103,8 @@ narrows the size hint to exactly that length.
 
 ### Choosing the path
 
-The decision is made once, on the first poll, from the size hint and the source type:
+The decision is made once, on the first poll, from the size hint and the source type. An upload with
+`append` set skips it and always appends (see [Append](#append)):
 
 ```rust
 let use_mpu = match size_hint.upper() {
@@ -115,6 +119,7 @@ let use_mpu = match size_hint.upper() {
 | File | exact | `PutObject` below the threshold, multipart at or above |
 | `PartStream` (including `TokioIo`) | any | multipart |
 | any | no upper bound | multipart |
+| any, with `append` set | any | serial appends; never multipart |
 
 The threshold is `Config::multipart_threshold`, 16 MiB under `PartSize::Auto`. A custom stream
 always uses multipart.
@@ -313,7 +318,7 @@ The `convert` module copies the input onto each request with one setter per fiel
 
 | Request | Carries |
 |---|---|
-| `PutObject` | every object field, `If-Match` / `If-None-Match`, checksum |
+| `PutObject` | every object field, `If-Match` / `If-None-Match`, checksum; in append mode, the write offset and `If-Match` from the append state |
 | `CreateMultipartUpload` | every object field except `Content-MD5` and `If-Match` / `If-None-Match`, checksum algorithm and type |
 | `UploadPart` | SSE-C, request payer, expected bucket owner, part checksum |
 | `CompleteMultipartUpload` | `If-Match` / `If-None-Match`, SSE-C, request payer, expected bucket owner, `MpuObjectSize`, checksum type and full-object value |
@@ -348,8 +353,143 @@ already have created the object. `abort()` on an upload that already completed r
 ### Bucket type
 
 `BucketType` (`Standard` or `Express`, from the `--x-s3` name suffix) is computed and stored on the
-transfer; upload does not read it. S3 enforces the rules specific to directory buckets, such as
-consecutive part numbers, when the upload completes.
+transfer; upload reads it only to [gate append mode](#gating). S3 enforces the rules specific to
+directory buckets, such as consecutive part numbers, when the upload completes.
+
+---
+
+## Append
+
+Append mode sends a serial chain of `PutObject` requests with a write offset to one object in an S3
+Express One Zone directory bucket. Each request carries the size and ETag the previous response
+returned.
+
+### API
+
+```rust
+client.upload()
+    .bucket("logs--usw2-az1--x-s3")
+    .key("app.log")
+    .body(InputStream::from(chunk))
+    .append(AppendPosition::End)          // or ::Start, or ::After(prev.append_state())
+    .initiate()?
+    .join().await?;                       // UploadOutput { size, e_tag, append_state(), .. }
+```
+
+`UploadInput` gains `append: Option<AppendPosition>`:
+
+| `AppendPosition` | Meaning | Requests before the first append |
+|---|---|---|
+| `Start` | Create the object, or append to an empty one at offset 0 | none |
+| `End` | Append to the object as it is; if the object does not exist yet, it behaves as `Start` | `HeadObject` with `ChecksumMode=ENABLED` |
+| `After(AppendState)` | Continue from a previous upload's output | none |
+
+`AppendState` is opaque: size, ETag, and checksum algorithm. `UploadOutput::append_state()` returns
+it on success and the error carries it on failure. `UploadOutput::size` carries
+`PutObjectOutput::size`; in append mode its ETag, size, and checksum fields are those of the last
+append's response.
+
+`build()` rejects, with `InputInvalid`, `append` combined with `if_match`, `if_none_match`, or a
+`full_object_checksum` value.
+
+### Gating
+
+A bucket whose name lacks the `--x-s3` suffix is `BucketType::Standard` and fails `initiate()` with
+`AppendError::NotAppendable` before any request. A 501 `NotImplemented` response maps to the same
+error.
+
+### State machine and scheduling
+
+Append mode replaces the path decision with its own branch of the [state machine](#state-machine):
+
+```text
+PendingInit ─► Discovering (End only: HeadObject)
+                    │
+                    ▼
+               Appending ◄──────────────┐  read one chunk; source Pending → Yielded + park_read
+                    │ chunk ready       │
+                    ▼                   │
+              AppendInFlight ───────────┘  response: next offset = size, next If-Match = ETag
+                    │ source exhausted
+                    ▼
+                  Done
+```
+
+- `AppendInFlight` returns `PollWork::Pending` with `set_pending`; the append's completion writes
+  the next `AppendState` under the state lock, then calls `try_wake`, as `PutObjectInFlight` does.
+- Each append costs one IO unit in CFS. An upload waiting on its source or its in-flight append
+  leaves the ready set and rejoins at the root floor when woken ([fair
+  scheduling](./scheduler.md#fair-scheduling)). N append-mode uploads hold at most N execution slots
+  under the global concurrency target; priority is `handle.scheduling().set_priority`.
+- A blocked custom source parks as in [blocked part reads](#blocked-part-reads).
+- Appends do not hedge.
+- A download of an object being appended pins the ETag, so an append during the read fails the read.
+
+### Chunking and memory
+
+| Source | One append carries | Memory |
+|---|---|---|
+| `Bytes` | `min(remaining, 5 GiB)`, a zero-copy slice | caller-owned, outside pool accounting |
+| File | `min(remaining, 5 GiB)`, a file body over that range | 1 MiB pooled chunks, as for `PutObject` |
+| `PartStream` | one `PartData` | what the stream acquires, bounded by the part size |
+
+File bodies take an offset and length, so the range body is `DirectFileBody` / `OffloadedFileBody`.
+A `PartStream` part is held, immutable, until its append completes, and the next is not read until
+then, so an upload holds at most one part. Part numbers are ignored. If the response's `size` is not
+`offset + len`, the upload fails with `IntegrityError`.
+
+### Checksum
+
+The algorithm is, in order: the one in `AppendState`; the one `HeadObject` reports (`End`); the
+caller's `ChecksumStrategy`; else CRC64NVME. A strategy naming a different algorithm from the
+discovered one fails with `InputInvalid` before any append. Each append sets `checksum_algorithm`,
+so the SDK calculates a checksum over that append's body; a `PartData::with_checksum` value is sent
+as that append's checksum.
+
+### Retry and reconcile
+
+- The append send disables the SDK's inner retry through its per-request config override, the
+  mechanism `upload_override` uses. The outer [retry loop](./retry.md) is the only retrier.
+- The classifier is `classify_upload_part_retry`: transient transport failures and throttles retry.
+  Each reconciles before the re-send.
+- **Reconcile** is a `HeadObject`. `size == offset` with the ETag unchanged: re-send under the same
+  condition. `size == offset + len`: a ranged `GetObject` of `[offset, offset + len)` compared with
+  the part held for retry; equal means committed, so adopt the new ETag and continue. Not equal, or
+  any other size, is `AppendError::OffsetMismatch`.
+
+### Part ceiling
+
+`TooManyParts` maps to `AppendError::PartLimitReached`, carrying the last committed `AppendState`.
+The upload does not count parts.
+
+### Append errors
+
+`ErrorKind::AppendError(AppendError)`, shaped like `ErrorKind::IntegrityError`.
+
+| `AppendError` | From | Carries |
+|---|---|---|
+| `NotAppendable` | `BucketType::Standard`; 501 `NotImplemented` | none |
+| `OffsetMismatch` | 400 `InvalidWriteOffset`; 412 `PreconditionFailed`; 409 `ConditionalRequestConflict`; 404 `NoSuchKey` on `After`; a failed reconcile | expected offset; observed size if known |
+| `PartLimitReached` | 400 `TooManyParts` | none |
+
+Every `AppendError`, and any failure after at least one append committed, carries the last committed
+`AppendState`. A failure leaves the committed prefix in place. `abort()` stops further appends.
+
+### Open Decisions
+
+**Concurrent writers to one key.** A second writer fails with `OffsetMismatch`. Either that is the
+only mechanism, or append-mode uploads to one bucket and key within a client are also serialized.
+
+**An append in flight at cancel, or with no response.** Either the outcome is reported as unknown
+with the last committed `AppendState`, and the caller reconciles with `End`; or `abort()` waits for
+the in-flight append, and a response-wait timeout bounds the wait.
+
+**Many small appends.** Each append spends one of 10,000 parts. Either the limit is only surfaced,
+or small writes within a flush window are coalesced into one append up to the part size, or appends
+below a minimum size are rejected.
+
+**Fields S3 rejects on append.** Either `build()` rejects a field set in append mode that S3 rejects
+on an existing object, or every field is forwarded and the S3 error is surfaced.
 
 ---
 
@@ -431,3 +571,28 @@ is in the transfer state.
 only on `Done`, after `CompleteMultipartUpload` succeeded. Two uploads never reach the state, and no
 `abort()` can reach them: one created by a `CreateMultipartUpload` dropped mid-flight, and one whose
 part-reader build failed after `CreateMultipartUpload` succeeded.
+
+### One append in flight
+
+**Invariant.** An append-mode upload never dispatches an append while another of its appends is in
+flight.
+
+**Mechanism.** `AppendInFlight` returns `PollWork::Pending` until the append's completion writes the
+next `AppendState` under the state lock and calls `try_wake`.
+
+### Each append is conditioned on the state the previous one produced
+
+**Invariant.** The write offset and `If-Match` of append *n + 1* are the size and ETag from append
+*n*'s response, or from a reconcile that proved append *n* committed.
+
+**Mechanism.** Only an append's successful completion and a reconcile that matched the held bytes
+write `AppendState`; the next append's request is built from it.
+
+### A re-send is never unconditional
+
+**Invariant.** A retried append carries the same write offset and `If-Match` as the attempt it
+repeats, and is sent only after a reconcile found the append not committed.
+
+**Mechanism.** The request builder reads the offset and ETag from the `AppendState` captured before
+the first attempt, and the SDK's inner retry is disabled for append sends, so every re-send passes
+through the outer loop's reconcile.
