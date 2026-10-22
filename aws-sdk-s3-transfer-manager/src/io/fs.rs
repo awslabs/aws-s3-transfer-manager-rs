@@ -11,10 +11,15 @@
 //! preserves segmented buffers for vectored I/O where the platform supports
 //! it. Preallocation prepares an output file for later writes but does not
 //! flush data or provide a durability boundary.
+//!
+//! [`is_append_only`] reports whether a handle's positioned writes would land
+//! at their offsets, and [`create_first_new`] creates the first of several
+//! candidate paths that does not exist yet, without opening any existing entry.
 
 use bytes::{Buf, BufMut};
 use std::fs::File;
 use std::io;
+use std::path::PathBuf;
 
 use crate::io::PartBuffer;
 
@@ -189,6 +194,66 @@ pub(crate) fn preallocate(file: &File, len: u64) -> io::Result<()> {
     sys::preallocate(file, len)
 }
 
+/// Reports whether `file`'s handle is in append mode, so that positioned
+/// writes through it would not land at their offsets.
+///
+/// - On Unix, true when the open file description has `O_APPEND` set. Linux
+///   and Android append every positioned write to such a file regardless of
+///   its offset.
+/// - On Windows, true when the handle was granted `FILE_APPEND_DATA` without
+///   `FILE_WRITE_DATA`, as [`OpenOptions::append`](std::fs::OpenOptions::append)
+///   opens it. Every write through such a handle goes to the end of the file
+///   regardless of its offset.
+/// - Under Miri, and on targets that are neither Unix nor Windows, the handle
+///   is not inspected and the result is `Ok(false)`.
+///
+/// The result describes the handle at the time of the call. An error means
+/// the handle's mode could not be read.
+pub(crate) fn is_append_only(file: &File) -> io::Result<bool> {
+    sys::is_append_only(file)
+}
+
+/// Creates the first of `candidates` that does not exist yet and opens it for
+/// writing.
+///
+/// Each candidate is opened with
+/// [`create_new`](std::fs::OpenOptions::create_new), so it succeeds only if no
+/// entry, including a dangling symbolic link, exists at that path. An existing
+/// entry is never opened, truncated, or followed; the next candidate is tried
+/// instead. The caller bounds the attempts by the candidates it passes.
+///
+/// Returns the open file and its path. Returns
+/// [`io::ErrorKind::AlreadyExists`] when every candidate named an existing
+/// entry, or there were none. Any other error from opening a candidate is
+/// returned at once.
+pub(crate) fn create_first_new(
+    candidates: impl IntoIterator<Item = PathBuf>,
+) -> io::Result<(File, PathBuf)> {
+    let mut tried = 0;
+    for path in candidates {
+        tried += 1;
+        match File::options().write(true).create_new(true).open(&path) {
+            Ok(file) => return Ok((file, path)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!("every candidate path already exists ({tried} tried)"),
+    ))
+}
+
+/// Runs [`create_first_new`] on the blocking thread pool.
+///
+/// Returns its result, or an error if the blocking task panics or is
+/// cancelled.
+pub(crate) async fn create_first_new_async(
+    candidates: Vec<PathBuf>,
+) -> io::Result<(File, PathBuf)> {
+    tokio::task::spawn_blocking(move || create_first_new(candidates)).await?
+}
+
 #[cfg(all(unix, not(miri)))]
 mod sys {
     //! Native Unix positioned I/O.
@@ -238,6 +303,14 @@ mod sys {
     pub(super) fn preallocate(file: &File, len: u64) -> io::Result<()> {
         file.set_len(len)
     }
+
+    /// Reports whether the descriptor's status flags include `O_APPEND`.
+    pub(super) fn is_append_only(file: &File) -> io::Result<bool> {
+        use nix::fcntl::{fcntl, FcntlArg, OFlag};
+
+        let flags = fcntl(file.as_fd(), FcntlArg::F_GETFL).map_err(io::Error::from)?;
+        Ok(OFlag::from_bits_truncate(flags).contains(OFlag::O_APPEND))
+    }
 }
 
 #[cfg(all(unix, miri))]
@@ -266,6 +339,11 @@ mod sys {
 
     pub(super) fn preallocate(file: &File, len: u64) -> io::Result<()> {
         file.set_len(len)
+    }
+
+    /// Does not inspect the handle: always `Ok(false)`.
+    pub(super) fn is_append_only(_file: &File) -> io::Result<bool> {
+        Ok(false)
     }
 }
 
@@ -298,6 +376,59 @@ mod sys {
         // posix_fallocate guarantees ENOSPC at preallocate time.
         file.set_len(len)
     }
+
+    /// Reports whether `file`'s handle was granted `FILE_APPEND_DATA` without
+    /// `FILE_WRITE_DATA`.
+    ///
+    /// Windows has no `O_APPEND` flag: append mode is a property of the
+    /// access a handle was granted. std's `OpenOptions::append` requests
+    /// `FILE_GENERIC_WRITE & !FILE_WRITE_DATA`, which keeps
+    /// `FILE_APPEND_DATA`. Every write through a handle that has
+    /// `FILE_APPEND_DATA` but not `FILE_WRITE_DATA` goes to the end of the
+    /// file, whatever offset it names, and resizing the file through such a
+    /// handle fails with access denied. A handle that has `FILE_WRITE_DATA`
+    /// writes at the offsets it names, whether or not it also has
+    /// `FILE_APPEND_DATA`.
+    ///
+    /// The granted access is read with `NtQueryInformationFile` for
+    /// `FileAccessInformation`. A query that does not return
+    /// `STATUS_SUCCESS` is reported as the equivalent Win32 error.
+    pub(super) fn is_append_only(file: &File) -> io::Result<bool> {
+        use std::mem::MaybeUninit;
+        use std::os::windows::io::AsRawHandle;
+
+        use windows_sys::Wdk::Storage::FileSystem::{
+            FileAccessInformation, NtQueryInformationFile, FILE_ACCESS_INFORMATION,
+        };
+        use windows_sys::Win32::Foundation::{RtlNtStatusToDosError, STATUS_SUCCESS};
+        use windows_sys::Win32::Storage::FileSystem::{FILE_APPEND_DATA, FILE_WRITE_DATA};
+        use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+
+        let mut io_status = MaybeUninit::<IO_STATUS_BLOCK>::uninit();
+        let mut info = FILE_ACCESS_INFORMATION { AccessFlags: 0 };
+        // SAFETY: the handle comes from `file`, which is borrowed for the
+        // whole call, so it stays open and valid. `io_status` is writable
+        // storage for one IO_STATUS_BLOCK. `info` is a local
+        // FILE_ACCESS_INFORMATION, so it is properly sized and aligned for
+        // the FileAccessInformation class, and the length passed is its size.
+        let status = unsafe {
+            NtQueryInformationFile(
+                file.as_raw_handle(),
+                io_status.as_mut_ptr(),
+                std::ptr::from_mut(&mut info).cast(),
+                std::mem::size_of::<FILE_ACCESS_INFORMATION>() as u32,
+                FileAccessInformation,
+            )
+        };
+        if status != STATUS_SUCCESS {
+            // SAFETY: RtlNtStatusToDosError only maps its argument to a
+            // Win32 error code.
+            let code = unsafe { RtlNtStatusToDosError(status) };
+            return Err(io::Error::from_raw_os_error(code as i32));
+        }
+        let access = info.AccessFlags;
+        Ok((access & FILE_APPEND_DATA) != 0 && (access & FILE_WRITE_DATA) == 0)
+    }
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -325,12 +456,18 @@ mod sys {
     pub(super) fn preallocate(_file: &File, _len: u64) -> io::Result<()> {
         Ok(())
     }
+
+    /// Does not inspect the handle: always `Ok(false)`.
+    pub(super) fn is_append_only(_file: &File) -> io::Result<bool> {
+        Ok(false)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::IoSlice;
+    use std::path::Path;
     use std::task::{Context, Waker};
 
     use bytes::Bytes;
@@ -489,6 +626,60 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert_eq!(input.as_ref(), b"x");
         assert_eq!(tmp.as_file().metadata().unwrap().len(), 0);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[cfg_attr(miri, ignore)] // the Miri build does not inspect the handle
+    #[test]
+    fn is_append_only_detects_append_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.bin");
+
+        let append = File::options()
+            .append(true)
+            .create(true)
+            .open(&path)
+            .unwrap();
+        assert!(is_append_only(&append).unwrap());
+        // `append(true)` already implies write access, so std ignores
+        // `write(true)` beside it. The pair is checked because callers write
+        // it, and must still be reported as append mode.
+        let mut write_append = File::options();
+        write_append.write(true);
+        let write_append = write_append.append(true).open(&path).unwrap();
+        assert!(is_append_only(&write_append).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[cfg_attr(miri, ignore)] // the Miri build does not inspect the handle
+    #[test]
+    fn is_append_only_detects_append_flag_set_after_open() {
+        use nix::fcntl::{fcntl, FcntlArg, OFlag};
+        use std::os::unix::io::AsFd;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = File::create(dir.path().join("out.bin")).unwrap();
+        assert!(!is_append_only(&file).unwrap());
+
+        let flags = OFlag::from_bits_truncate(fcntl(file.as_fd(), FcntlArg::F_GETFL).unwrap());
+        fcntl(file.as_fd(), FcntlArg::F_SETFL(flags | OFlag::O_APPEND)).unwrap();
+
+        assert!(is_append_only(&file).unwrap());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[cfg_attr(miri, ignore)] // the Miri build does not inspect the handle
+    #[test]
+    fn is_append_only_is_false_for_positional_handles() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.bin");
+
+        let created = File::create(&path).unwrap();
+        assert!(!is_append_only(&created).unwrap());
+        let read_write = File::options().read(true).write(true).open(&path).unwrap();
+        assert!(!is_append_only(&read_write).unwrap());
+        let read_only = File::open(&path).unwrap();
+        assert!(!is_append_only(&read_only).unwrap());
     }
 
     #[test]
@@ -674,5 +865,67 @@ mod tests {
 
         let meta = std::fs::metadata(&path).unwrap();
         assert_eq!(meta.len(), len);
+    }
+
+    /// Writes through the returned handle and checks the bytes land at the
+    /// returned path, so the handle is known to refer to that file.
+    fn assert_handle_writes_path(mut file: std::fs::File, path: &Path) {
+        std::io::Write::write_all(&mut file, b"object").unwrap();
+        drop(file);
+        assert_eq!(std::fs::read(path).unwrap(), b"object");
+    }
+
+    #[test]
+    fn create_first_new_leaves_existing_file_and_uses_next_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("taken");
+        std::fs::write(&existing, b"CUSTOMER").unwrap();
+        let free = dir.path().join("free");
+
+        let (file, path) =
+            create_first_new([existing.clone(), existing.clone(), free.clone()]).unwrap();
+
+        assert_eq!(path, free);
+        assert_handle_writes_path(file, &path);
+        assert_eq!(std::fs::read(&existing).unwrap(), b"CUSTOMER");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_first_new_does_not_follow_symlink_at_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("victim.txt");
+        std::fs::write(&target, b"VICTIM").unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let free = dir.path().join("free");
+
+        let (file, path) = create_first_new([link.clone(), free.clone()]).unwrap();
+
+        assert_eq!(path, free);
+        assert_handle_writes_path(file, &path);
+        assert_eq!(std::fs::read(&target).unwrap(), b"VICTIM");
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+    }
+
+    #[test]
+    fn create_first_new_fails_when_every_candidate_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let taken: Vec<PathBuf> = (0u8..3)
+            .map(|i| {
+                let path = dir.path().join(format!("taken-{i}"));
+                std::fs::write(&path, [i]).unwrap();
+                path
+            })
+            .collect();
+
+        let error = create_first_new(taken.clone()).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert!(error.to_string().contains("(3 tried)"), "{error}");
+        for (i, path) in taken.iter().enumerate() {
+            assert_eq!(std::fs::read(path).unwrap(), [i as u8]);
+        }
     }
 }

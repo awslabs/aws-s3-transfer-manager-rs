@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use super::object_meta::ObjectMetadata;
+use super::ObjectMetadata;
 use crate::types::IntegrityChecks;
 
 /// Output from a completed download operation.
@@ -12,7 +12,11 @@ use crate::types::IntegrityChecks;
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct DownloadOutput {
-    /// Object metadata from the download
+    /// Object metadata from the discovery GET or HEAD response.
+    ///
+    /// Service checksum values describe the stored object; use
+    /// [`integrity_checks`](Self::integrity_checks) to determine whether the
+    /// delivered bytes were validated.
     pub object_meta: ObjectMetadata,
     /// Snapshot of transfer metrics at completion.
     pub metrics: crate::types::TransferMetrics,

@@ -11,11 +11,11 @@ use crate::runtime::buffer_pool::{Reservation, SegmentedBytes};
 use crate::runtime::sync::sync::atomic::{AtomicU64, Ordering};
 use crate::runtime::sync::sync::Arc;
 
-use super::chunk_meta::ChunkMetadata;
 use super::recv_buffer::{
     DrainMode, FillOutcome, PagedRecvBuffer, RecvBufferConsumer, SegmentWrite, SlotHandle,
 };
 use super::sink::SinkWrite;
+use super::ChunkMetadata;
 
 /// Segment size for the paged buffer. Re-exported from `recv_buffer` for test access.
 const SEG_SIZE: usize = super::recv_buffer::DEFAULT_SEG_SIZE;
@@ -720,7 +720,7 @@ mod tests {
                 .region(aws_sdk_s3::config::Region::new("us-west-2"))
                 .build(),
         );
-        let config = crate::Config::builder().client(s3_client).build();
+        let config = crate::Config::builder().sdk_client(s3_client).build();
         let tm = crate::Client::new(config);
         let input = DownloadInput::builder()
             .bucket("test")
@@ -1141,7 +1141,11 @@ mod tests {
             .write(true)
             .open(path)
             .unwrap();
-        new_recv_body_with_disk_mode(ScriptedSinkFactory(Arc::clone(script)).create(file, false))
+        new_recv_body_with_disk_mode(
+            ScriptedSinkFactory(Arc::clone(script))
+                .create(file, false)
+                .unwrap(),
+        )
     }
 
     /// A drain that fails part-way returns the runs it wrote before the failing

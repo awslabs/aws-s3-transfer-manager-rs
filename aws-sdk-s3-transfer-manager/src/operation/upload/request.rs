@@ -4,52 +4,20 @@
  */
 
 use super::UploadInput;
+use crate::model::{ChecksumAlgorithm, ChecksumType};
 use aws_sdk_s3::operation::{
-    abort_multipart_upload::builders::AbortMultipartUploadFluentBuilder,
     complete_multipart_upload::builders::CompleteMultipartUploadFluentBuilder,
     create_multipart_upload::builders::CreateMultipartUploadFluentBuilder,
     put_object::builders::PutObjectFluentBuilder, upload_part::builders::UploadPartFluentBuilder,
 };
-use aws_sdk_s3::types::{ChecksumAlgorithm, ChecksumType};
 
-/// Copy fields from UploadInput to `PutObjectFluentBuilder`
+/// Assemble ordinary modeled fields and the upload checksum policy.
 pub(crate) fn copy_fields_to_put_object_request(
     upload_input: &UploadInput,
     put_object_builder: PutObjectFluentBuilder,
 ) -> PutObjectFluentBuilder {
-    let mut put_object_builder = put_object_builder
-        .set_acl(upload_input.acl.clone())
-        .set_bucket(upload_input.bucket.clone())
-        .set_bucket_key_enabled(upload_input.bucket_key_enabled)
-        .set_cache_control(upload_input.cache_control.clone())
-        .set_content_disposition(upload_input.content_disposition.clone())
-        .set_content_encoding(upload_input.content_encoding.clone())
-        .set_content_language(upload_input.content_language.clone())
-        .set_content_md5(upload_input.content_md5.clone())
-        .set_content_type(upload_input.content_type.clone())
-        .set_expected_bucket_owner(upload_input.expected_bucket_owner.clone())
-        .set_expires(upload_input.expires)
-        .set_grant_full_control(upload_input.grant_full_control.clone())
-        .set_grant_read(upload_input.grant_read.clone())
-        .set_grant_read_acp(upload_input.grant_read_acp.clone())
-        .set_grant_write_acp(upload_input.grant_write_acp.clone())
-        .set_if_match(upload_input.if_match.clone())
-        .set_if_none_match(upload_input.if_none_match.clone())
-        .set_key(upload_input.key.clone())
-        .set_metadata(upload_input.metadata.clone())
-        .set_object_lock_legal_hold_status(upload_input.object_lock_legal_hold_status.clone())
-        .set_object_lock_mode(upload_input.object_lock_mode.clone())
-        .set_object_lock_retain_until_date(upload_input.object_lock_retain_until_date)
-        .set_request_payer(upload_input.request_payer.clone())
-        .set_server_side_encryption(upload_input.server_side_encryption.clone())
-        .set_sse_customer_algorithm(upload_input.sse_customer_algorithm.clone())
-        .set_sse_customer_key(upload_input.sse_customer_key.clone())
-        .set_sse_customer_key_md5(upload_input.sse_customer_key_md5.clone())
-        .set_ssekms_encryption_context(upload_input.sse_kms_encryption_context.clone())
-        .set_ssekms_key_id(upload_input.sse_kms_key_id.clone())
-        .set_storage_class(upload_input.storage_class.clone())
-        .set_tagging(upload_input.tagging.clone())
-        .set_website_redirect_location(upload_input.website_redirect_location.clone());
+    let mut put_object_builder =
+        crate::sdk_v1::copy_upload_input_fields_to_put_object(upload_input, put_object_builder);
 
     if let Some(checksum_strategy) = &upload_input.checksum_strategy {
         if let Some(value) = checksum_strategy.full_object_checksum() {
@@ -64,8 +32,9 @@ pub(crate) fn copy_fields_to_put_object_request(
             }
         } else {
             // Set checksum algorithm, which tells SDK to calculate and add checksum value
-            put_object_builder =
-                put_object_builder.checksum_algorithm(checksum_strategy.algorithm().clone())
+            put_object_builder = put_object_builder.checksum_algorithm(
+                crate::sdk_v1::checksum_algorithm_to_sdk(checksum_strategy.algorithm()),
+            )
         }
     }
 
@@ -77,41 +46,19 @@ pub(crate) fn copy_fields_to_mpu_request(
     upload_input: &UploadInput,
     mpu_builder: CreateMultipartUploadFluentBuilder,
 ) -> CreateMultipartUploadFluentBuilder {
-    let mut mpu_builder = mpu_builder
-        .set_acl(upload_input.acl.clone())
-        .set_bucket(upload_input.bucket.clone())
-        .set_bucket_key_enabled(upload_input.bucket_key_enabled)
-        .set_cache_control(upload_input.cache_control.clone())
-        .set_content_disposition(upload_input.content_disposition.clone())
-        .set_content_encoding(upload_input.content_encoding.clone())
-        .set_content_language(upload_input.content_language.clone())
-        .set_content_type(upload_input.content_type.clone())
-        .set_expected_bucket_owner(upload_input.expected_bucket_owner.clone())
-        .set_expires(upload_input.expires)
-        .set_grant_full_control(upload_input.grant_full_control.clone())
-        .set_grant_read(upload_input.grant_read.clone())
-        .set_grant_read_acp(upload_input.grant_read_acp.clone())
-        .set_grant_write_acp(upload_input.grant_write_acp.clone())
-        .set_key(upload_input.key.clone())
-        .set_metadata(upload_input.metadata.clone())
-        .set_object_lock_legal_hold_status(upload_input.object_lock_legal_hold_status.clone())
-        .set_object_lock_mode(upload_input.object_lock_mode.clone())
-        .set_object_lock_retain_until_date(upload_input.object_lock_retain_until_date)
-        .set_request_payer(upload_input.request_payer.clone())
-        .set_server_side_encryption(upload_input.server_side_encryption.clone())
-        .set_sse_customer_algorithm(upload_input.sse_customer_algorithm.clone())
-        .set_sse_customer_key(upload_input.sse_customer_key.clone())
-        .set_sse_customer_key_md5(upload_input.sse_customer_key_md5.clone())
-        .set_ssekms_encryption_context(upload_input.sse_kms_encryption_context.clone())
-        .set_ssekms_key_id(upload_input.sse_kms_key_id.clone())
-        .set_storage_class(upload_input.storage_class.clone())
-        .set_tagging(upload_input.tagging.clone())
-        .set_website_redirect_location(upload_input.website_redirect_location.clone());
+    let mut mpu_builder = crate::sdk_v1::copy_upload_input_fields_to_create_multipart_upload(
+        upload_input,
+        mpu_builder,
+    );
 
     if let Some(checksum_strategy) = &upload_input.checksum_strategy {
         mpu_builder = mpu_builder
-            .checksum_algorithm(checksum_strategy.algorithm().clone())
-            .checksum_type(checksum_strategy.type_if_multipart().clone());
+            .checksum_algorithm(crate::sdk_v1::checksum_algorithm_to_sdk(
+                checksum_strategy.algorithm(),
+            ))
+            .checksum_type(crate::sdk_v1::checksum_type_to_sdk(
+                checksum_strategy.type_if_multipart(),
+            ));
     }
 
     mpu_builder
@@ -125,14 +72,8 @@ pub(crate) fn copy_fields_to_upload_part_request(
     upload_part_builder: UploadPartFluentBuilder,
     checksum_value: Option<&String>,
 ) -> UploadPartFluentBuilder {
-    let mut upload_part_builder = upload_part_builder
-        .set_bucket(upload_input.bucket.clone())
-        .set_expected_bucket_owner(upload_input.expected_bucket_owner.clone())
-        .set_key(upload_input.key.clone())
-        .set_request_payer(upload_input.request_payer.clone())
-        .set_sse_customer_algorithm(upload_input.sse_customer_algorithm.clone())
-        .set_sse_customer_key(upload_input.sse_customer_key.clone())
-        .set_sse_customer_key_md5(upload_input.sse_customer_key_md5.clone());
+    let mut upload_part_builder =
+        crate::sdk_v1::copy_upload_input_fields_to_upload_part(upload_input, upload_part_builder);
 
     if let Some(checksum_strategy) = &upload_input.checksum_strategy {
         // If user passed checksum value via PartStream, add it to request
@@ -149,8 +90,9 @@ pub(crate) fn copy_fields_to_upload_part_request(
             };
         } else {
             // Otherwise, set checksum algorithm, which tells SDK to calculate and add checksum value
-            upload_part_builder =
-                upload_part_builder.checksum_algorithm(checksum_strategy.algorithm().clone());
+            upload_part_builder = upload_part_builder.checksum_algorithm(
+                crate::sdk_v1::checksum_algorithm_to_sdk(checksum_strategy.algorithm()),
+            );
         }
     } else {
         // Warn if user is passing a checksum value, but the upload isn't doing checksums.
@@ -176,20 +118,16 @@ where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = Option<String>>,
 {
-    let mut complete_mpu_builder = complete_mpu_builder
-        .set_bucket(upload_input.bucket.clone())
-        .set_if_match(upload_input.if_match.clone())
-        .set_if_none_match(upload_input.if_none_match.clone())
-        .set_key(upload_input.key.clone())
-        .set_request_payer(upload_input.request_payer.clone())
-        .set_expected_bucket_owner(upload_input.expected_bucket_owner.clone())
-        .set_sse_customer_algorithm(upload_input.sse_customer_algorithm.clone())
-        .set_sse_customer_key(upload_input.sse_customer_key.clone())
-        .set_sse_customer_key_md5(upload_input.sse_customer_key_md5.clone());
+    let mut complete_mpu_builder =
+        crate::sdk_v1::copy_upload_input_fields_to_complete_multipart_upload(
+            upload_input,
+            complete_mpu_builder,
+        );
 
     if let Some(checksum_strategy) = &upload_input.checksum_strategy {
-        complete_mpu_builder =
-            complete_mpu_builder.checksum_type(checksum_strategy.type_if_multipart().clone());
+        complete_mpu_builder = complete_mpu_builder.checksum_type(
+            crate::sdk_v1::checksum_type_to_sdk(checksum_strategy.type_if_multipart()),
+        );
 
         // check for user-provided full-object checksum...
         if checksum_strategy.type_if_multipart() == &ChecksumType::FullObject {
@@ -216,28 +154,17 @@ where
     complete_mpu_builder
 }
 
-// Copy fields from UploadInput to `AbortMultipartUploadFluentBuilder`
-pub(crate) fn copy_fields_to_abort_mpu_request(
-    upload_input: &UploadInput,
-    abort_mpu_builder: AbortMultipartUploadFluentBuilder,
-) -> AbortMultipartUploadFluentBuilder {
-    abort_mpu_builder
-        .set_bucket(upload_input.bucket.clone())
-        .set_key(upload_input.key.clone())
-        .set_request_payer(upload_input.request_payer.clone())
-        .set_expected_bucket_owner(upload_input.expected_bucket_owner.clone())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::operation::upload::ChecksumStrategy;
-    use aws_sdk_s3::operation::put_object::PutObjectOutput;
-    use aws_sdk_s3::operation::upload_part::UploadPartOutput;
-    use aws_sdk_s3::types::{
+    use crate::io::InputStream;
+    use crate::model::{
         ObjectCannedAcl, ObjectLockLegalHoldStatus, ObjectLockMode, RequestPayer,
         ServerSideEncryption, StorageClass,
     };
+    use crate::operation::upload::ChecksumStrategy;
+    use aws_sdk_s3::operation::put_object::PutObjectOutput;
+    use aws_sdk_s3::operation::upload_part::UploadPartOutput;
     use aws_sdk_s3::{Client, Config};
     use aws_smithy_mocks::{mock, mock_client, RuleMode};
     use aws_smithy_types::DateTime;
@@ -246,6 +173,7 @@ mod tests {
     fn upload_request_for_tests() -> UploadInput {
         UploadInput::builder()
             .acl(ObjectCannedAcl::PublicRead)
+            .body(InputStream::from_static(b"test body"))
             .bucket("test-bucket")
             .bucket_key_enabled(true)
             .cache_control("max-age=3600")
@@ -308,7 +236,10 @@ mod tests {
                     assert_eq!(upload_req.if_match(), put_object_req.if_match());
                     assert_eq!(upload_req.if_none_match(), put_object_req.if_none_match());
                     assert_eq!(upload_req.key(), put_object_req.key());
-                    assert_eq!(upload_req.request_payer(), put_object_req.request_payer());
+                    assert_eq!(
+                        upload_req.request_payer().map(|v| v.as_str()),
+                        put_object_req.request_payer().map(|v| v.as_str())
+                    );
                     assert_eq!(
                         upload_req.sse_customer_algorithm(),
                         put_object_req.sse_customer_algorithm()
@@ -349,7 +280,10 @@ mod tests {
         let mpu_builder = copy_fields_to_mpu_request(&upload_req, client.create_multipart_upload());
         let mpu_req = mpu_builder.as_input().clone().build().unwrap();
 
-        assert_eq!(upload_req.acl(), mpu_req.acl());
+        assert_eq!(
+            upload_req.acl().map(|v| v.as_str()),
+            mpu_req.acl().map(|v| v.as_str())
+        );
         assert_eq!(upload_req.bucket(), mpu_req.bucket());
         assert_eq!(
             upload_req.bucket_key_enabled(),
@@ -357,8 +291,10 @@ mod tests {
         );
         assert_eq!(upload_req.cache_control(), mpu_req.cache_control());
         assert_eq!(
-            upload_req.checksum_strategy().map(|c| c.algorithm()),
-            mpu_req.checksum_algorithm()
+            upload_req
+                .checksum_strategy()
+                .map(|c| c.algorithm().as_str()),
+            mpu_req.checksum_algorithm().map(|v| v.as_str())
         );
         assert_eq!(
             upload_req.content_disposition(),
@@ -382,15 +318,23 @@ mod tests {
         assert_eq!(upload_req.key(), mpu_req.key());
         assert_eq!(upload_req.metadata(), mpu_req.metadata());
         assert_eq!(
-            upload_req.object_lock_legal_hold_status(),
-            mpu_req.object_lock_legal_hold_status()
+            upload_req
+                .object_lock_legal_hold_status()
+                .map(|v| v.as_str()),
+            mpu_req.object_lock_legal_hold_status().map(|v| v.as_str())
         );
-        assert_eq!(upload_req.object_lock_mode(), mpu_req.object_lock_mode());
+        assert_eq!(
+            upload_req.object_lock_mode().map(|v| v.as_str()),
+            mpu_req.object_lock_mode().map(|v| v.as_str())
+        );
         assert_eq!(
             upload_req.object_lock_retain_until_date(),
             mpu_req.object_lock_retain_until_date()
         );
-        assert_eq!(upload_req.request_payer(), mpu_req.request_payer());
+        assert_eq!(
+            upload_req.request_payer().map(|v| v.as_str()),
+            mpu_req.request_payer().map(|v| v.as_str())
+        );
         assert_eq!(
             upload_req.sse_customer_algorithm(),
             mpu_req.sse_customer_algorithm()
@@ -406,10 +350,13 @@ mod tests {
         );
         assert_eq!(upload_req.sse_kms_key_id(), mpu_req.ssekms_key_id());
         assert_eq!(
-            upload_req.server_side_encryption(),
-            mpu_req.server_side_encryption()
+            upload_req.server_side_encryption().map(|v| v.as_str()),
+            mpu_req.server_side_encryption().map(|v| v.as_str())
         );
-        assert_eq!(upload_req.storage_class(), mpu_req.storage_class());
+        assert_eq!(
+            upload_req.storage_class().map(|v| v.as_str()),
+            mpu_req.storage_class().map(|v| v.as_str())
+        );
         assert_eq!(upload_req.tagging(), mpu_req.tagging());
         assert_eq!(
             upload_req.website_redirect_location(),
@@ -440,7 +387,10 @@ mod tests {
                         upload_part_req.expected_bucket_owner()
                     );
                     assert_eq!(upload_req.key(), upload_part_req.key());
-                    assert_eq!(upload_req.request_payer(), upload_part_req.request_payer());
+                    assert_eq!(
+                        upload_req.request_payer().map(|v| v.as_str()),
+                        upload_part_req.request_payer().map(|v| v.as_str())
+                    );
                     assert_eq!(
                         upload_req.sse_customer_algorithm(),
                         upload_part_req.sse_customer_algorithm()
@@ -456,7 +406,7 @@ mod tests {
                     true
                 }
             })
-            .then_output(|| UploadPartOutput::builder().build());
+            .then_output(|| UploadPartOutput::builder().e_tag("test-etag").build());
 
         let client = mock_client!(aws_sdk_s3, RuleMode::Sequential, &[&upload_part_mock]);
         let upload_part_builder = client.upload_part().upload_id("test-id").part_number(1);
@@ -494,7 +444,10 @@ mod tests {
         assert_eq!(upload_req.if_match(), complete_mpu_req.if_match());
         assert_eq!(upload_req.if_none_match(), complete_mpu_req.if_none_match());
         assert_eq!(upload_req.key(), complete_mpu_req.key());
-        assert_eq!(upload_req.request_payer(), complete_mpu_req.request_payer());
+        assert_eq!(
+            upload_req.request_payer().map(|v| v.as_str()),
+            complete_mpu_req.request_payer().map(|v| v.as_str())
+        );
         assert_eq!(
             upload_req.sse_customer_algorithm(),
             complete_mpu_req.sse_customer_algorithm()
@@ -510,13 +463,15 @@ mod tests {
     }
 
     #[test]
-    fn test_copy_fields_to_abort_mpu_request() {
+    fn test_copy_fields_to_abort_multipart_upload() {
         let client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
 
         let upload_req = upload_request_for_tests();
 
-        let abort_mpu_builder =
-            copy_fields_to_abort_mpu_request(&upload_req, client.abort_multipart_upload());
+        let abort_mpu_builder = crate::sdk_v1::copy_upload_input_fields_to_abort_multipart_upload(
+            &upload_req,
+            client.abort_multipart_upload(),
+        );
         let abort_mpu_req = abort_mpu_builder.as_input().clone().build().unwrap();
 
         assert_eq!(upload_req.bucket(), abort_mpu_req.bucket());
@@ -525,6 +480,9 @@ mod tests {
             abort_mpu_req.expected_bucket_owner()
         );
         assert_eq!(upload_req.key(), abort_mpu_req.key());
-        assert_eq!(upload_req.request_payer(), abort_mpu_req.request_payer());
+        assert_eq!(
+            upload_req.request_payer().map(|v| v.as_str()),
+            abort_mpu_req.request_payer().map(|v| v.as_str())
+        );
     }
 }

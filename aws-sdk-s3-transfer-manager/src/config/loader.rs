@@ -119,13 +119,13 @@ impl ConfigLoader {
         self
     }
 
-    /// Set a dial9 telemetry guard for runtime tracing.
+    /// Set a dial9 handle for runtime tracing.
+    ///
+    /// See [`Builder::dial9_handle`](crate::config::Builder::dial9_handle)
+    /// for recorder ownership and shutdown ordering.
     #[cfg(feature = "dial9")]
-    pub fn telemetry_guard(
-        mut self,
-        guard: dial9_tokio_telemetry::telemetry::TelemetryGuard,
-    ) -> Self {
-        self.builder = self.builder.telemetry_guard(guard);
+    pub fn dial9_handle(mut self, handle: dial9::Dial9Handle) -> Self {
+        self.builder = self.builder.dial9_handle(handle);
         self
     }
 
@@ -140,9 +140,7 @@ impl ConfigLoader {
         // construction stays free of blocking DMI reads and network IMDS calls.
         let profile = detect_machine_profile().await;
 
-        let sdk_client_builder = aws_sdk_s3::config::Builder::from(&shared_config);
-
-        let mut s3_config = S3ClientConfig::new(sdk_client_builder);
+        let mut s3_config = S3ClientConfig::new(&shared_config);
         s3_config.network_interfaces = self.network_interfaces;
         let builder = self
             .builder
@@ -348,7 +346,7 @@ mod tests {
             .build();
 
         let capture_request_config = crate::Config::builder()
-            .client(aws_sdk_s3::Client::from_conf(sdk_s3_config))
+            .sdk_client(aws_sdk_s3::Client::from_conf(sdk_s3_config))
             .part_size(PartSize::Target(8))
             .build();
 

@@ -70,7 +70,7 @@ impl DownloadObjects {
         let features = OperationFeatures::new([AwsSdkFeature::S3TransferDownloadDirectory]);
         let s3_client = features.apply_to_client(&handle.s3_client);
         let walk_ctx = S3WalkContext::builder()
-            .client(s3_client)
+            .sdk_client(s3_client)
             .bucket(&bucket)
             .build();
         let walk = walker.walk(walk_ctx);
