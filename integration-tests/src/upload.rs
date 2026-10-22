@@ -11,7 +11,8 @@ use std::task::{Context, Poll};
 
 use aws_sdk_s3_transfer_manager::io::{InputStream, PartData, PartStream, SizeHint, StreamContext};
 use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
-use aws_sdk_s3_transfer_manager::types::{PartSize, RuntimeMode};
+use aws_sdk_s3_transfer_manager::types::PartSize;
+use aws_sdk_s3_transfer_manager::RuntimeConfig;
 use tokio::sync::mpsc;
 
 use crate::assertions::assert_same_content;
@@ -19,7 +20,7 @@ use crate::harness::{mock_tm, mock_tm_with, MockTm};
 use crate::test_data::{deterministic_data, deterministic_data_seeded};
 
 async fn setup() -> MockTm {
-    mock_tm(RuntimeMode::Managed).await
+    mock_tm(RuntimeConfig::default()).await
 }
 
 /// A multipart upload of patterned data spanning several parts reports an ETag and an upload ID,
@@ -53,7 +54,7 @@ async fn test_mpu_upload_stores_source_bytes() {
     m.handle.shutdown().await.expect("shutdown");
 }
 
-async fn test_mpu_upload_concurrent(rt: RuntimeMode) {
+async fn test_mpu_upload_concurrent(rt: RuntimeConfig) {
     let m = mock_tm(rt).await;
 
     let mut uploads = Vec::new();
@@ -96,12 +97,12 @@ async fn test_mpu_upload_concurrent(rt: RuntimeMode) {
 
 #[tokio::test]
 async fn test_mpu_upload_concurrent_mock_gp() {
-    test_mpu_upload_concurrent(RuntimeMode::Managed).await;
+    test_mpu_upload_concurrent(RuntimeConfig::default()).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_mpu_upload_concurrent_tokio_mt() {
-    test_mpu_upload_concurrent(RuntimeMode::MultiThreadTokio).await;
+    test_mpu_upload_concurrent(RuntimeConfig::multi_thread_tokio()).await;
 }
 
 /// Part size for the part-order tests, set on the client so that every part but the last is
@@ -208,7 +209,7 @@ where
 {
     let expected = ordered_object();
 
-    let m = mock_tm_with(RuntimeMode::Managed, |b| {
+    let m = mock_tm_with(RuntimeConfig::default(), |b| {
         b.part_size(PartSize::Target(ORDERED_PART_SIZE as u64))
     })
     .await;

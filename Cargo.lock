@@ -262,7 +262,9 @@ dependencies = [
  "aws-sdk-s3",
  "aws-smithy-checksums",
  "aws-smithy-dns",
+ "aws-smithy-execution",
  "aws-smithy-http-client",
+ "aws-smithy-managed-http",
  "aws-smithy-mocks",
  "aws-smithy-runtime",
  "aws-smithy-runtime-api",
@@ -304,6 +306,23 @@ dependencies = [
  "tracing-subscriber",
  "walkdir",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "aws-sdk-s3-transfer-manager-ext"
+version = "0.1.0"
+dependencies = [
+ "aws-credential-types",
+ "aws-sdk-s3-transfer-manager",
+ "aws-smithy-checksums",
+ "aws-smithy-execution",
+ "aws-smithy-http-client",
+ "aws-smithy-managed-http",
+ "aws-smithy-runtime-api",
+ "aws-types",
+ "crossbeam-skiplist",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

@@ -5,6 +5,7 @@ Each design document states a subsystem's requirements, architecture, and correc
 | Document | Covers | Code |
 |---|---|---|
 | [scheduler.md](scheduler.md) | Work generation, fair scheduling, concurrency control, backpressure, and the contracts every `Transfer` state machine upholds | `scheduler/`, `transfer.rs` |
+| [runtime.md](runtime.md) | Execution ownership, configured HTTP precedence, and file-I/O placement | `config/runtime.rs`, `runtime/` |
 | [memory.md](memory.md) | The shared buffer pool: admission, accounting, reuse, and reclamation | `runtime/buffer_pool/` |
 | [paged-recv-buffer.md](paged-recv-buffer.md) | Download reassembly, the occupancy gate, and read-ahead | `operation/download/recv_buffer.rs`, `operation/download/read_ahead.rs` |
 | [retry.md](retry.md) | The outer retry loop, failure classification, and throttle recovery | `retry.rs` |
