@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.4.0] - Unreleased
 
+### Added
+- `UploadHandle::abort_handle` returns a cloneable, independently owned upload abort control that remains usable while the original handle is being joined. Dropping a control does not cancel the upload.
+
+### Fixed
+- Upload joins and abort controls share the original cancellation idle receipt, including when the owning handle or an abort wait is dropped. Cancellation completion waits until dispatched work has stopped before releasing request/source custody.
+
 ### Changed
 - The `dial9` feature depends on `dial9` 0.5 instead of `dial9-tokio-telemetry` 0.3, and compiles
   without `--cfg tokio_unstable`. Per-task poll, spawn, and terminate events and per-worker queue

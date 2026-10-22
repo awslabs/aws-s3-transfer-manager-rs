@@ -3,11 +3,14 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+use std::sync::{Arc, OnceLock};
+
 use tracing::Instrument;
 
 use crate::error::{Error, ErrorKind};
 use crate::operation::upload::transfer::UploadTransfer;
 use crate::operation::upload::UploadOutput;
+use crate::scheduler::Cancellation;
 use crate::transfer::StateMachineTerminalReceiver;
 use crate::types::AbortedUpload;
 use crate::types::FailedMultipartUploadPolicy;
@@ -34,6 +37,9 @@ use crate::types::FailedMultipartUploadPolicy;
 /// ```
 ///
 /// # Cancellation
+///
+/// Obtain [`abort_handle`](Self::abort_handle) before `join()` to retain independent
+/// cancellation while the original handle is consumed by the join.
 ///
 /// The operation can be cancelled either by dropping this handle or by calling
 /// [`abort`](Self::abort). Both methods stop the transfer, but they differ in behavior:
@@ -69,6 +75,41 @@ use crate::types::FailedMultipartUploadPolicy;
 pub struct UploadHandle {
     completion_rx: Option<StateMachineTerminalReceiver>,
     transfer: UploadTransfer,
+    cancellation: OnceLock<Arc<UploadAbortState>>,
+}
+
+/// Independently owned cancellation for an upload, including one being joined.
+///
+/// Cloning or dropping this handle does not cancel the upload. Aborting waits
+/// for managed work to become idle before applying multipart cleanup policy.
+#[derive(Clone, Debug)]
+pub struct UploadAbortHandle {
+    state: Arc<UploadAbortState>,
+}
+
+#[derive(Debug)]
+struct UploadAbortState {
+    transfer: UploadTransfer,
+    cancellation: OnceLock<Cancellation>,
+}
+
+impl UploadAbortState {
+    fn cancel(&self) -> &Cancellation {
+        let ctx = self.transfer.ctx();
+        self.cancellation
+            .get_or_init(|| ctx.handle.scheduler.cancel_transfer(ctx.id))
+    }
+}
+
+impl UploadAbortHandle {
+    /// Abort the upload using the cleanup contract of [`UploadHandle::abort`].
+    ///
+    /// Cancelling this future does not undo cancellation already requested.
+    /// Another clone can be used to wait for abortion again.
+    pub async fn abort(self) -> Result<AbortedUpload, Error> {
+        self.state.cancel().wait_for_idle().await;
+        abort_multipart(&self.state.transfer).await
+    }
 }
 
 impl UploadHandle {
@@ -79,6 +120,22 @@ impl UploadHandle {
         Self {
             completion_rx: Some(completion_rx),
             transfer,
+            cancellation: OnceLock::new(),
+        }
+    }
+
+    /// Obtain cancellation ownership before consuming this handle in [`Self::join`].
+    pub fn abort_handle(&self) -> UploadAbortHandle {
+        UploadAbortHandle {
+            state: self
+                .cancellation
+                .get_or_init(|| {
+                    Arc::new(UploadAbortState {
+                        transfer: self.transfer.clone(),
+                        cancellation: OnceLock::new(),
+                    })
+                })
+                .clone(),
         }
     }
 
@@ -99,16 +156,13 @@ impl UploadHandle {
         let ctx = self.transfer.ctx();
 
         if ctx.is_failed() {
-            ctx.handle
-                .scheduler
-                .cancel_transfer(ctx.id)
-                .wait_for_idle()
-                .await;
+            self.cancel_and_wait().await;
             let err = ctx.take_error().expect("failed transfer must have error");
             return Err(err);
         }
 
         if ctx.is_cancelled() {
+            self.cancel_and_wait().await;
             return Err(Error::new(
                 ErrorKind::OperationCancelled,
                 "upload cancelled",
@@ -119,6 +173,22 @@ impl UploadHandle {
             .transfer
             .take_result()
             .expect("result must be set on successful completion"))
+    }
+
+    async fn cancel_and_wait(&self) {
+        let ctx = self.transfer.ctx();
+        match self.cancellation.get() {
+            Some(state) => {
+                state.cancel().wait_for_idle().await;
+            }
+            None => {
+                ctx.handle
+                    .scheduler
+                    .cancel_transfer(ctx.id)
+                    .wait_for_idle()
+                    .await;
+            }
+        }
     }
 
     /// Abort the upload and cancel any in-progress part uploads.
@@ -133,8 +203,6 @@ impl UploadHandle {
     ///
     // TODO(aws-sdk-rust#1159): Handle already completed upload
     pub async fn abort(self) -> Result<AbortedUpload, Error> {
-        let ctx = self.transfer.ctx();
-
         // Cancel the transfer and wait for idle: queued work is purged, and
         // executing work is either finished or dropped by the time this returns.
         //
@@ -143,53 +211,8 @@ impl UploadHandle {
         // rule removes it. A CompleteMultipartUpload dropped mid-flight leaves the
         // multipart upload open, so it is aborted below, but S3 may already
         // have created the object (see #191).
-        ctx.handle
-            .scheduler
-            .cancel_transfer(ctx.id)
-            .wait_for_idle()
-            .await;
-
-        // Check if we have an open multipart upload to abort
-        let upload_id = self.transfer.open_upload_id();
-
-        if let Some(upload_id) = upload_id {
-            let abort_policy = self
-                .transfer
-                .request()
-                .failed_multipart_upload_policy
-                .clone()
-                .unwrap_or_default();
-
-            match abort_policy {
-                FailedMultipartUploadPolicy::Retain => Ok(AbortedUpload::default()),
-                FailedMultipartUploadPolicy::AbortUpload => {
-                    let resp = crate::sdk_v1::copy_upload_input_fields_to_abort_multipart_upload(
-                        self.transfer.request(),
-                        ctx.s3_client()
-                            .abort_multipart_upload()
-                            .upload_id(&upload_id),
-                    )
-                    .customize()
-                    .config_override(
-                        ctx.handle
-                            .bucket_partition_override(self.transfer.request().bucket()),
-                    )
-                    .send()
-                    .instrument(tracing::debug_span!("send-abort-multipart-upload"))
-                    .await?;
-
-                    Ok(AbortedUpload {
-                        upload_id: Some(upload_id),
-                        request_charged: resp
-                            .request_charged
-                            .as_ref()
-                            .map(crate::sdk_v1::request_charged_from_sdk),
-                    })
-                }
-            }
-        } else {
-            Ok(AbortedUpload::default())
-        }
+        self.cancel_and_wait().await;
+        abort_multipart(&self.transfer).await
     }
 
     /// Get the transfer ID for this upload.
@@ -213,12 +236,63 @@ impl UploadHandle {
     }
 }
 
+async fn abort_multipart(transfer: &UploadTransfer) -> Result<AbortedUpload, Error> {
+    let ctx = transfer.ctx();
+    // Check if we have an open multipart upload to abort
+    let upload_id = transfer.open_upload_id();
+
+    if let Some(upload_id) = upload_id {
+        let abort_policy = transfer
+            .request()
+            .failed_multipart_upload_policy
+            .clone()
+            .unwrap_or_default();
+
+        match abort_policy {
+            FailedMultipartUploadPolicy::Retain => Ok(AbortedUpload::default()),
+            FailedMultipartUploadPolicy::AbortUpload => {
+                let resp = crate::sdk_v1::copy_upload_input_fields_to_abort_multipart_upload(
+                    transfer.request(),
+                    ctx.s3_client()
+                        .abort_multipart_upload()
+                        .upload_id(&upload_id),
+                )
+                .customize()
+                .config_override(
+                    ctx.handle
+                        .bucket_partition_override(transfer.request().bucket()),
+                )
+                .send()
+                .instrument(tracing::debug_span!("send-abort-multipart-upload"))
+                .await?;
+
+                Ok(AbortedUpload {
+                    upload_id: Some(upload_id),
+                    request_charged: resp
+                        .request_charged
+                        .as_ref()
+                        .map(crate::sdk_v1::request_charged_from_sdk),
+                })
+            }
+        }
+    } else {
+        Ok(AbortedUpload::default())
+    }
+}
+
 impl Drop for UploadHandle {
     fn drop(&mut self) {
         let ctx = self.transfer.ctx();
         if ctx.is_active() {
             ctx.set_cancelled();
-            ctx.handle.scheduler.cancel_transfer(ctx.id);
+            match self.cancellation.get() {
+                Some(state) => {
+                    state.cancel();
+                }
+                None => {
+                    ctx.handle.scheduler.cancel_transfer(ctx.id);
+                }
+            }
         }
     }
 }
