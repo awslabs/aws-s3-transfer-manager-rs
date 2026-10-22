@@ -1,0 +1,38 @@
+[package]
+name = "aws-smithy-managed-http"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license = "Apache-2.0"
+repository = "https://github.com/awslabs/aws-s3-transfer-manager-rs"
+description = "HTTP transport with connection pooling and managed execution."
+readme = "README.md"
+categories = ["asynchronous", "network-programming"]
+keywords = ["aws", "smithy", "http", "https"]
+
+[dependencies]
+aws-smithy-execution = { version = "0.1.0", path = "../aws-smithy-execution", optional = true }
+aws-smithy-http-client = { workspace = true, default-features = false, features = ["default-client", "rt-tokio"], optional = true }
+aws-smithy-runtime-api = { workspace = true, features = ["client"], optional = true }
+aws-smithy-types = { workspace = true, optional = true }
+fastrand = { version = "2.4", optional = true }
+
+[dev-dependencies]
+aws-smithy-async = { workspace = true, features = ["rt-tokio"] }
+aws-smithy-http-client = { workspace = true, features = ["wire-mock", "rustls-ring"] }
+aws-smithy-runtime-api = { workspace = true, features = ["client", "http-1x", "test-util"] }
+aws-smithy-types = { workspace = true, features = ["http-body-1-x"] }
+dial9 = { version = "0.5.3", default-features = false, features = ["tokio"] }
+http-body-util = "0.1"
+tokio = { version = "1.53.1", default-features = false, features = ["rt", "net", "time", "sync", "macros"] }
+
+[features]
+client = [
+    "dep:aws-smithy-execution",
+    "dep:aws-smithy-http-client",
+    "dep:aws-smithy-runtime-api",
+    "dep:aws-smithy-types",
+    "dep:fastrand",
+]
+dial9 = ["client", "aws-smithy-execution/dial9"]
