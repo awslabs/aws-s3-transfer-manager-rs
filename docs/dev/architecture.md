@@ -24,6 +24,11 @@ resource and platform contracts.
 for targeted Send task submission. Its topology re-export describes placement;
 its runtime owner controls shutdown. Execution handles do not retain ownership.
 
+`crates/aws-smithy-managed-http/` combines native Smithy connection pools with
+managed execution. Transport configuration remains on the native pool builder;
+the wrapper retains execution handles and native clients without owning runtime
+shutdown. It supplies Smithy's HTTP client interface independently of TM.
+
 ## Boundaries
 
 - `transfer.rs`, `scheduler/`, and `runtime/` do not depend on `operation/`. Operation-specific behavior reaches them only through the `Transfer` trait.

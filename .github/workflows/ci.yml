@@ -498,6 +498,9 @@ jobs:
       - name: Check execution API
         run: cargo check-external-types --all-features --config external-types.toml
         working-directory: crates/aws-smithy-execution
+      - name: Check managed HTTP API
+        run: cargo check-external-types --all-features --config external-types.toml
+        working-directory: crates/aws-smithy-managed-http
 
   check-deny:
     name: check deps with cargo-deny
