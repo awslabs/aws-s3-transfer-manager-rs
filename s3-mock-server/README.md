@@ -127,6 +127,20 @@ async fn test_filesystem_storage() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+### Request Counts
+
+The server counts the requests it receives per operation:
+
+```rust
+use s3_mock_server::Operation;
+
+// ... run the code under test ...
+
+assert_eq!(server.request_count(Operation::HeadObject), 2);
+```
+
+Counts apply per HTTP request, so each retry and each part request counts.
+
 ## License
 
 This project is licensed under the Apache License, Version 2.0.

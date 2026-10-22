@@ -8,6 +8,7 @@
 use crate::error::Error;
 use crate::storage::models::ObjectMetadata;
 use crate::storage::StorageBackend;
+use crate::Operation;
 use async_trait::async_trait;
 use aws_sdk_s3::types::ChecksumType;
 use aws_smithy_checksums::ChecksumAlgorithm;
@@ -104,53 +105,33 @@ fn xor_first_byte_of_checksum(output: &mut s3s::dto::GetObjectOutput) {
     }
 }
 
-/// Inner implementation of the s3s::S3 trait.
-///
-/// This struct implements the s3s::S3 trait, delegating all operations to the storage backend.
-/// It is stateless and focuses purely on S3 API semantics and validation.
-#[derive(Debug, Clone)]
-pub(crate) struct Inner<S: StorageBackend + 'static> {
-    /// The storage backend.
-    storage: S,
+/// Server state shared by the server handle and every request it serves.
+#[derive(Debug, Default)]
+pub(crate) struct ServerState {
     /// Key-scoped fault injection registry.
-    faults: std::sync::Arc<crate::faults::FaultRegistry>,
-    /// Server-wide load-driven throttle, shared with the owning server. `None`
-    /// until one is installed.
-    throttle:
-        std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<crate::throttle::RateThrottle>>>>,
+    pub(crate) faults: crate::faults::FaultRegistry,
+    /// Server-wide load-driven throttle. `None` until one is installed.
+    pub(crate) throttle: std::sync::Mutex<Option<std::sync::Arc<crate::throttle::RateThrottle>>>,
+    /// Requests received per operation.
+    pub(crate) requests: crate::operation::RequestCounters,
 }
 
-impl<S: StorageBackend + 'static> Inner<S> {
-    /// Create a new Inner with the given storage backend (no faults, no throttle).
-    #[cfg(test)]
-    pub(crate) fn new(storage: S) -> Self {
-        Self {
-            storage,
-            faults: std::sync::Arc::new(crate::faults::FaultRegistry::default()),
-            throttle: std::sync::Arc::new(std::sync::Mutex::new(None)),
+impl ServerState {
+    /// Admit a request: count it, then apply the throttle.
+    ///
+    /// Called first in every S3 handler. The throttle applies to the operations
+    /// [`Operation::is_throttled`] names; a shed request returns 503 `SlowDown`.
+    pub(crate) fn admit(&self, operation: Operation) -> S3Result<()> {
+        self.requests.record(operation);
+        if operation.is_throttled() {
+            self.check_throttle()?;
         }
-    }
-
-    /// Create a new Inner sharing an external fault registry and throttle.
-    pub(crate) fn with_faults_and_throttle(
-        storage: S,
-        faults: std::sync::Arc<crate::faults::FaultRegistry>,
-        throttle: std::sync::Arc<
-            std::sync::Mutex<Option<std::sync::Arc<crate::throttle::RateThrottle>>>,
-        >,
-    ) -> Self {
-        Self {
-            storage,
-            faults,
-            throttle,
-        }
+        Ok(())
     }
 
     /// Decide whether to serve or shed this request under the installed throttle;
-    /// a shed request returns 503 `SlowDown`. Called first in every S3 handler so
-    /// the throttle applies to all operations uniformly. The throttle lock is
-    /// released before consulting the rate limiter, so it is never held across the
-    /// handler body.
+    /// a shed request returns 503 `SlowDown`. The throttle lock is released before
+    /// consulting the rate limiter, so it is never held across the handler body.
     fn check_throttle(&self) -> S3Result<()> {
         let throttle = self.throttle.lock().unwrap().clone();
         match throttle {
@@ -159,6 +140,31 @@ impl<S: StorageBackend + 'static> Inner<S> {
             }
             _ => Ok(()),
         }
+    }
+}
+
+/// Inner implementation of the s3s::S3 trait.
+///
+/// This struct implements the s3s::S3 trait, delegating all operations to the storage backend.
+/// It is stateless and focuses purely on S3 API semantics and validation.
+#[derive(Debug, Clone)]
+pub(crate) struct Inner<S: StorageBackend + 'static> {
+    /// The storage backend.
+    storage: S,
+    /// Faults, throttle and request counters, shared with the owning server.
+    state: std::sync::Arc<ServerState>,
+}
+
+impl<S: StorageBackend + 'static> Inner<S> {
+    /// Create a new Inner with the given storage backend (no faults, no throttle).
+    #[cfg(test)]
+    pub(crate) fn new(storage: S) -> Self {
+        Self::with_state(storage, Default::default())
+    }
+
+    /// Create a new Inner sharing the state of an owning server.
+    pub(crate) fn with_state(storage: S, state: std::sync::Arc<ServerState>) -> Self {
+        Self { storage, state }
     }
 
     /// Apply a registered fault to a GET response, if one fires for this request.
@@ -170,7 +176,7 @@ impl<S: StorageBackend + 'static> Inner<S> {
         conn_fault: Option<&std::sync::Arc<crate::socket_fault::ConnectionFault>>,
         output: &mut s3s::dto::GetObjectOutput,
     ) -> S3Result<()> {
-        match self.faults.next_fault(bucket, key) {
+        match self.state.faults.next_fault(bucket, key) {
             Some(crate::faults::FaultType::WrongStoredChecksum) => {
                 xor_first_byte_of_checksum(output);
             }
@@ -354,7 +360,7 @@ impl<S: StorageBackend + 'static> Inner<S> {
     /// Consume the next fault for an upload request and return it. Both upload
     /// handlers call this once so the queue advances deterministically.
     fn next_upload_fault(&self, bucket: &str, key: &str) -> Option<crate::faults::FaultType> {
-        self.faults.next_fault(bucket, key)
+        self.state.faults.next_fault(bucket, key)
     }
 }
 
@@ -364,7 +370,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         &self,
         req: S3Request<s3s::dto::GetObjectInput>,
     ) -> S3Result<S3Response<s3s::dto::GetObjectOutput>> {
-        self.check_throttle()?;
+        self.state.admit(Operation::GetObject)?;
         let conn_fault = req
             .extensions
             .get::<std::sync::Arc<crate::socket_fault::ConnectionFault>>()
@@ -487,7 +493,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         &self,
         req: S3Request<s3s::dto::HeadObjectInput>,
     ) -> S3Result<S3Response<s3s::dto::HeadObjectOutput>> {
-        self.check_throttle()?;
+        self.state.admit(Operation::HeadObject)?;
         let input = req.input;
         let bucket = &input.bucket;
         let key = &input.key;
@@ -557,7 +563,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         &self,
         req: S3Request<s3s::dto::PutObjectInput>,
     ) -> S3Result<S3Response<s3s::dto::PutObjectOutput>> {
-        self.check_throttle()?;
+        self.state.admit(Operation::PutObject)?;
         let input = req.input;
         tracing::trace!(bucket = %input.bucket, key = %input.key, "PutObject");
         if input.key.is_empty() {
@@ -646,7 +652,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         &self,
         req: S3Request<s3s::dto::CreateMultipartUploadInput>,
     ) -> S3Result<S3Response<s3s::dto::CreateMultipartUploadOutput>> {
-        self.check_throttle()?;
+        self.state.admit(Operation::CreateMultipartUpload)?;
         let input = req.input;
         tracing::trace!(bucket = %input.bucket, key = %input.key, "CreateMultipartUpload");
         let key = &input.key;
@@ -733,7 +739,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         &self,
         req: S3Request<s3s::dto::UploadPartInput>,
     ) -> S3Result<S3Response<s3s::dto::UploadPartOutput>> {
-        self.check_throttle()?;
+        self.state.admit(Operation::UploadPart)?;
         let input = req.input;
         let upload_id = &input.upload_id;
         let part_number = input.part_number;
@@ -830,7 +836,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         &self,
         req: S3Request<s3s::dto::CompleteMultipartUploadInput>,
     ) -> S3Result<S3Response<s3s::dto::CompleteMultipartUploadOutput>> {
-        self.check_throttle()?;
+        self.state.admit(Operation::CompleteMultipartUpload)?;
         let input = req.input;
         tracing::trace!(bucket = %input.bucket, key = %input.key, upload_id = %input.upload_id, "CompleteMultipartUpload");
         let bucket = input.bucket.clone();
@@ -893,7 +899,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         &self,
         req: S3Request<s3s::dto::AbortMultipartUploadInput>,
     ) -> S3Result<S3Response<s3s::dto::AbortMultipartUploadOutput>> {
-        self.check_throttle()?;
+        self.state.admit(Operation::AbortMultipartUpload)?;
         let input = req.input;
         tracing::trace!(bucket = %input.bucket, key = %input.key, upload_id = %input.upload_id, "AbortMultipartUpload");
         let upload_id = &input.upload_id;
@@ -910,7 +916,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         &self,
         req: S3Request<s3s::dto::ListObjectsV2Input>,
     ) -> S3Result<S3Response<s3s::dto::ListObjectsV2Output>> {
-        self.check_throttle()?;
+        self.state.admit(Operation::ListObjectsV2)?;
         let input = req.input;
         tracing::trace!(bucket = %input.bucket, prefix = ?input.prefix, delimiter = ?input.delimiter, "ListObjectsV2");
 
@@ -1044,6 +1050,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         &self,
         req: S3Request<HeadBucketInput>,
     ) -> S3Result<S3Response<HeadBucketOutput>> {
+        self.state.admit(Operation::HeadBucket)?;
         let input = req.input;
         tracing::trace!(bucket = %input.bucket, "HeadBucket");
         if self.storage.head_bucket(&input.bucket).await? {
@@ -1060,7 +1067,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         &self,
         req: S3Request<s3s::dto::DeleteObjectInput>,
     ) -> S3Result<S3Response<s3s::dto::DeleteObjectOutput>> {
-        self.check_throttle()?;
+        self.state.admit(Operation::DeleteObject)?;
         let input = req.input;
         tracing::trace!(bucket = %input.bucket, key = %input.key, "DeleteObject");
         self.storage
@@ -1073,6 +1080,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         &self,
         req: S3Request<s3s::dto::CreateBucketInput>,
     ) -> S3Result<S3Response<s3s::dto::CreateBucketOutput>> {
+        self.state.admit(Operation::CreateBucket)?;
         let input = req.input;
         tracing::trace!(bucket = %input.bucket, "CreateBucket");
         self.storage.create_bucket(&input.bucket).await?;
@@ -1086,6 +1094,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         &self,
         req: S3Request<s3s::dto::DeleteBucketInput>,
     ) -> S3Result<S3Response<s3s::dto::DeleteBucketOutput>> {
+        self.state.admit(Operation::DeleteBucket)?;
         let input = req.input;
         tracing::trace!(bucket = %input.bucket, "DeleteBucket");
         self.storage.delete_bucket(&input.bucket).await?;
@@ -1096,6 +1105,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         &self,
         _req: S3Request<s3s::dto::ListBucketsInput>,
     ) -> S3Result<S3Response<s3s::dto::ListBucketsOutput>> {
+        self.state.admit(Operation::ListBuckets)?;
         tracing::trace!("ListBuckets");
         let buckets = self.storage.list_buckets().await?;
         let bucket_list: Vec<s3s::dto::Bucket> = buckets
