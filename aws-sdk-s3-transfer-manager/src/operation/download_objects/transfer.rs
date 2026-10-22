@@ -475,7 +475,6 @@ impl DownloadObjectsTransfer {
 
     fn spawn_children(&self, entries: Vec<Object>) -> Vec<(Object, Result<ChildTransfer, Error>)> {
         let handle = &self.inner.ctx.handle;
-        let parent_id = self.inner.ctx.id.id;
 
         tracing::trace!(
             target: crate::telemetry::TARGET_TRANSFER,
@@ -491,7 +490,7 @@ impl DownloadObjectsTransfer {
                     .key()
                     .expect("S3Walk yields objects with keys")
                     .to_string();
-                let result = self.spawn_single_child(handle, &key, parent_id);
+                let result = self.spawn_single_child(handle, &key);
                 (obj, result.map(|h| ChildTransfer { handle: h, key }))
             })
             .collect()
@@ -510,7 +509,6 @@ impl DownloadObjectsTransfer {
         &self,
         handle: &Arc<crate::client::Handle>,
         key: &str,
-        parent_id: u64,
     ) -> Result<ManagedDownloadHandle, Error> {
         let dest_path = local_key_path(
             &self.inner.destination,
@@ -563,7 +561,7 @@ impl DownloadObjectsTransfer {
                 )
             })?;
         let sink = FileSinkFactory.create(file, true).map_err(|e| {
-            // No handle owns the temp file yet, so remove it here.
+            // No transfer owns the temp file yet, so remove it here.
             let _ = std::fs::remove_file(&temp_path);
             error::Error::new(
                 ErrorKind::IOError,
@@ -571,8 +569,19 @@ impl DownloadObjectsTransfer {
             )
         })?;
 
-        let inner = Download::orchestrate_with_sink(handle.clone(), input, sink, Some(parent_id))?;
-        Ok(ManagedDownloadHandle::new(inner, temp_path, dest_path))
+        let inner = Download::orchestrate_with_sink(
+            handle.clone(),
+            input,
+            sink,
+            Some(&self.inner.ctx),
+            None,
+            None,
+            Some(crate::operation::download::CommitTarget {
+                temp: temp_path,
+                dest: dest_path,
+            }),
+        )?;
+        Ok(ManagedDownloadHandle::new(inner))
     }
 
     /// Merge results of child spawning back into state. Inserts each child into
@@ -854,24 +863,12 @@ impl DownloadObjectsTransfer {
         let children = batch.take_children();
         for child in children {
             let key = child.key;
-            // Snapshot metrics before `join()` consumes the handle.
-            let metrics = child.handle.metrics();
             match child.handle.join().await {
                 Ok(_output) => {
                     let mut state = self.inner.state.lock();
                     state.successful_downloads += 1;
                     drop(state);
-                    // Aggregate the child's bytes into the parent's per-transfer
-                    // MetricsState directly (not via record_io on the child's
-                    // context, which already updated the client-level counters
-                    // during the child transfer) so DownloadObjectsOutput.metrics
-                    // reflects the whole directory download without double-counting.
-                    self.inner.ctx.metrics.record_io(&crate::metrics::IoSample {
-                        network_tx: metrics.network_tx,
-                        network_rx: metrics.network_rx,
-                        disk_read: metrics.disk_read,
-                        disk_write: metrics.disk_write,
-                    });
+                    // The child's bytes reached this transfer's metrics as they moved.
                 }
                 Err(err) => {
                     let mut state = self.inner.state.lock();
@@ -1314,6 +1311,83 @@ mod tests {
         assert_eq!(transfer.successful_downloads(), 0);
         let failed = transfer.take_failed().unwrap();
         assert_eq!(failed.len(), 1);
+    }
+
+    // ref: awslabs/aws-s3-transfer-manager-rs#197
+    /// Under `Continue`, an object that fails after one of its ranges was received still
+    /// counts that range in the operation's metrics, which `join` reports: a child's bytes
+    /// reach its parent as they are recorded, whatever the child's outcome.
+    ///
+    /// One object of two parts. Discovery receives the first part and the second range fails
+    /// with SDK retries disabled, so exactly one part's bytes were received. Counting a
+    /// child's bytes only when it succeeds leaves both counters at 0.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn a_failed_object_still_counts_the_bytes_it_received() {
+        use crate::operation::download::test_util::fixtures::{
+            object_bytes, object_client_failing_at,
+        };
+
+        let dir = tempdir().unwrap();
+        let part_size = crate::config::MIN_MULTIPART_PART_SIZE_BYTES;
+        let object_size = 2 * part_size;
+        let list = mock!(aws_sdk_s3::Client::list_objects_v2).then_output(move || {
+            ListObjectsV2Output::builder()
+                .set_contents(Some(vec![Object::builder()
+                    .key("a.txt")
+                    .size(object_size as i64)
+                    .build()]))
+                .build()
+        });
+        let lister = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[list]);
+        let config = crate::Config::builder()
+            .sdk_client(object_client_failing_at(
+                object_bytes(object_size as usize),
+                part_size,
+            ))
+            .part_size(crate::types::PartSize::Target(part_size))
+            .build();
+        let handle = crate::client::Handle::test_handle_tokio(config);
+        let walk = S3Walker::builder().build().walk(
+            S3WalkContext::builder()
+                .sdk_client(lister)
+                .bucket("test-bucket")
+                .build(),
+        );
+        let (ctx, completion_rx) = TransferContext::new(handle);
+        ctx.handle
+            .scheduler
+            .register_empty_group_for_test(ctx.id.id);
+        let input = crate::operation::download_objects::DownloadObjectsInput::builder()
+            .bucket("test-bucket")
+            .destination(dir.path())
+            .failure_policy(FailedTransferPolicy::Continue)
+            .build()
+            .unwrap();
+        let transfer = DownloadObjectsTransfer::new(ctx, &input, walk, 1000);
+
+        timeout(Duration::from_secs(10), async {
+            drive_transfer(&transfer).await;
+            let _ = completion_rx.await;
+        })
+        .await
+        .expect("transfer should complete within timeout");
+
+        assert_eq!(transfer.successful_downloads(), 0);
+        assert_eq!(
+            Some(1),
+            transfer.take_failed().map(|failed| failed.len()),
+            "the object must have failed"
+        );
+        let m = transfer.ctx().metrics();
+        assert_eq!(
+            part_size, m.network_rx,
+            "the part the failed object received must reach the operation's metrics"
+        );
+        assert_eq!(
+            part_size, m.bytes_transferred,
+            "the part the failed object completed must reach the operation's metrics"
+        );
     }
 
     #[cfg_attr(miri, ignore)]

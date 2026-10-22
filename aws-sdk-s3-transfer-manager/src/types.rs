@@ -13,6 +13,7 @@ pub use crate::model::{
     ObjectStorageClass, Owner, ReplicationStatus, RequestCharged, RequestPayer, RestoreStatus,
     ServerSideEncryption, StorageClass, UploadInput, UploadOutput,
 };
+pub use crate::transfer::{PendingCategory, PendingCause};
 
 /// The target part size for an upload or download request.
 #[non_exhaustive]
@@ -297,6 +298,11 @@ impl TransferStatus {
 }
 
 /// Snapshot of transfer progress and IO metrics.
+///
+/// For progress, compare [`bytes_transferred`](Self::bytes_transferred) with
+/// [`total_bytes`](Self::total_bytes). The byte counters overlap, so adding them together
+/// double-counts. A directory operation's counters include the bytes each of its objects has
+/// moved, even an object that fails or is cancelled.
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub struct TransferMetrics {
@@ -308,12 +314,103 @@ pub struct TransferMetrics {
     pub disk_read: u64,
     /// Bytes written to disk.
     pub disk_write: u64,
+    /// Payload bytes of the parts that have completed, in either direction.
+    ///
+    /// Grows a whole part at a time, so a single-part transfer goes from 0 to its total in
+    /// one step. Equals [`total_bytes`](Self::total_bytes), when known, once the transfer
+    /// succeeds.
+    pub bytes_transferred: u64,
     /// Expected total payload bytes, if known.
     pub total_bytes: Option<u64>,
     /// When the transfer was initiated.
     pub started_at: std::time::Instant,
     /// When the transfer reached a terminal state, if it has.
     pub finished_at: Option<std::time::Instant>,
+}
+
+/// Read-only view of one transfer's live counters, handed out on
+/// [`TransferEvent::Started`](crate::events::TransferEvent::Started).
+///
+/// Readable at any time, even after the operation's handle is joined or dropped. A view
+/// holds its transfer's counters in memory, so drop it once the transfer's
+/// [`TransferEvent::Finished`](crate::events::TransferEvent::Finished) arrives.
+#[derive(Debug, Clone)]
+pub struct TransferView {
+    metrics: std::sync::Arc<crate::transfer::MetricsState>,
+    status: crate::transfer::StateMachineStatus,
+    pending: std::sync::Arc<crate::transfer::PendingCauseSlot>,
+}
+
+impl TransferView {
+    pub(crate) fn new(
+        metrics: std::sync::Arc<crate::transfer::MetricsState>,
+        status: crate::transfer::StateMachineStatus,
+        pending: std::sync::Arc<crate::transfer::PendingCauseSlot>,
+    ) -> Self {
+        Self {
+            metrics,
+            status,
+            pending,
+        }
+    }
+
+    /// A snapshot of this transfer's counters.
+    ///
+    /// Each counter is a running total that never decreases. For final values, use the
+    /// result of the operation's `join()`.
+    pub fn metrics(&self) -> TransferMetrics {
+        self.metrics.snapshot()
+    }
+
+    /// Why this transfer is blocked, or `None` while it is not.
+    ///
+    /// A cause is reported until the transfer resumes, so it can outlast the condition that
+    /// set it. A transfer whose status is no longer [`TransferStatus::Active`] reports `None`.
+    pub fn pending_cause(&self) -> Option<PendingCause> {
+        let cause = self.pending.get()?;
+        // Status after the slot: a status never returns to `Active`, so an `Active` reading
+        // here means the transfer was still active when `cause` was read.
+        self.status.is_active().then_some(cause)
+    }
+
+    /// This transfer's total payload bytes. See [`Total`].
+    ///
+    /// `Unknown` until the transfer knows its length, then `Final`. An upload whose body
+    /// length is not known in advance learns it only as it completes.
+    pub fn byte_total(&self) -> Total {
+        self.metrics.byte_total()
+    }
+
+    /// How many entries a directory operation acts on, one per object. See [`Total`].
+    ///
+    /// [`Total::Unknown`] for a single-object transfer.
+    pub fn entry_total(&self) -> Total {
+        self.metrics.entry_total()
+    }
+
+    /// How many of a directory operation's entries have finished, whether they succeeded,
+    /// failed or were cancelled.
+    ///
+    /// 0 for a single-object transfer.
+    pub fn entries_settled(&self) -> u64 {
+        self.metrics.entries_settled()
+    }
+}
+
+/// A total that may not be known yet, or may still change.
+///
+/// The unit comes from the accessor: [`byte_total`](TransferView::byte_total) counts
+/// payload bytes and [`entry_total`](TransferView::entry_total) counts entries. A
+/// percentage is defined only for [`Total::Final`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Total {
+    /// No total is known yet, and one may never be.
+    Unknown,
+    /// A total that can still change.
+    Provisional(u64),
+    /// The total, which will not change.
+    Final(u64),
 }
 
 /// Type of the bucket for the transfer

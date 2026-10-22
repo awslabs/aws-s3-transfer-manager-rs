@@ -142,7 +142,7 @@ async fn fluent_and_modeled_builder_initiation_return_canonical_metadata_and_tra
         assert_eq!(output.key(), None);
         assert_eq!(output.size(), None);
         assert_eq!(output.metrics().total_bytes, Some(7));
-        assert_eq!(output.metrics().network_tx, 0);
+        assert_eq!(output.metrics().network_tx, 7);
     }
 }
 

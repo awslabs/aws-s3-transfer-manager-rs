@@ -11,7 +11,7 @@
 //!
 //! # Scheduling Model
 //!
-//! Transfers are state machines that implement [`Transfer`](crate::transfer::Transfer). The scheduler polls
+//! Transfers are state machines that implement [`Transfer`]. The scheduler polls
 //! them via `poll_work()` when capacity is available, receiving work items or
 //! signals that the transfer is blocked (`Pending`) or finished (`Done`).
 //!
@@ -83,7 +83,7 @@
 //!
 //! # State Machine Contracts
 //!
-//! A [`Transfer`](crate::transfer::Transfer) implementation must uphold:
+//! A [`Transfer`] implementation must uphold:
 //! - **Failed lifecycle**: record the error and signal termination before returning
 //!   a failure outcome.
 //! - **Poll-time pending/wake obligation**: every `PollWork::Pending` must record
@@ -106,7 +106,7 @@
 
 use super::CompletionSample;
 use crate::telemetry;
-use crate::transfer::{BoxTransfer, PollWork, TransferId, WorkOutcome};
+use crate::transfer::{BoxTransfer, PollWork, Transfer, TransferId, WorkOutcome};
 
 use crate::runtime::sync::{Submission, SubmissionQueue};
 use crate::runtime::ScheduledWork;
@@ -250,7 +250,15 @@ impl Scheduler {
                     drop(transfers);
                     let ctx = transfer.ctx();
                     ctx.set_cancelled();
-                    transfer.on_terminal();
+                    // Contained so a panic cannot skip the `signal_terminal` that resolves
+                    // this child's handle.
+                    if !run_terminal_hook(transfer.as_ref()) {
+                        tracing::error!(
+                            target: telemetry::TARGET_SCHEDULING,
+                            tid = %tid,
+                            "on_terminal panicked; transfer cleanup is incomplete",
+                        );
+                    }
                     ctx.signal_terminal();
                     return;
                 }
@@ -541,6 +549,15 @@ impl Scheduler {
             // handle observes completion. Idempotent if already signaled.
             if let Some(completed) = completed {
                 completed.transfer().ctx().signal_terminal();
+                // Contained so a panic cannot skip the `generate_work` below, which
+                // refills the slot this completion freed.
+                if !run_on_terminal(&completed) {
+                    tracing::error!(
+                        target: telemetry::TARGET_SCHEDULING,
+                        tid = %completed.id(),
+                        "on_terminal panicked; transfer cleanup is incomplete",
+                    );
+                }
             }
         }
 
@@ -786,6 +803,15 @@ impl Scheduler {
                             "poll_work.done",
                         );
                         claim.release();
+                        // Only once the status is published: `Done` can precede it, and the
+                        // hook's status-derived work is one-shot.
+                        if desc.is_terminal() && !run_on_terminal(&desc) {
+                            tracing::error!(
+                                target: telemetry::TARGET_SCHEDULING,
+                                tid = %desc.id(),
+                                "on_terminal panicked; transfer cleanup is incomplete",
+                            );
+                        }
                         let desc_id = desc.id();
                         let (_completed, orphans) = self.remove_transfer_atomic(desc_id);
                         // The parent's `_completed` descriptor is the same one
@@ -963,11 +989,13 @@ impl Scheduler {
 ///
 /// Returns `false` if `on_terminal` panicked; its cleanup may be partial. The
 /// panic is not re-raised, so the caller's remaining terminal steps always run.
+fn run_terminal_hook(transfer: &dyn Transfer) -> bool {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| transfer.on_terminal())).is_ok()
+}
+
+/// [`run_terminal_hook`] on the descriptor's transfer.
 fn run_on_terminal(desc: &TransferDescriptor) -> bool {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        desc.transfer().on_terminal()
-    }))
-    .is_ok()
+    run_terminal_hook(desc.transfer())
 }
 
 #[cfg(test)]
@@ -977,8 +1005,9 @@ mod tests {
     use crate::scheduler::descriptor::TransferDescriptor;
     use crate::scheduler::descriptor::{vruntime_delta_for_cost, IO_WORK_COST, SPAWN_WORK_COST};
     use crate::scheduler::transfer::mock::{
-        BuggyDoneMock, FixedWorkCount, FusedReadySpawnedMock, MockStateMachine,
-        TerminalWithoutSignalMock, WithDelay, WithExecute,
+        BuggyDoneMock, DoneWhileActiveMock, FixedWorkCount, FusedReadySpawnedMock,
+        MockStateMachine, PanickingTerminalHookMock, TerminalWithoutSignalMock, WithDelay,
+        WithExecute,
     };
     use crate::scheduler::MockTransfer;
     use crate::transfer::{
@@ -1110,6 +1139,86 @@ mod tests {
             .expect("summary diagnostics enabled");
         assert_eq!(stats.category(PendingCategory::Memory).count, 1);
         assert_eq!(stats.terminal_cause, None);
+        handle.runtime.shutdown();
+    }
+
+    /// Transfer that parks on its first poll and, on its second, records the cause its
+    /// view reported as that poll began.
+    #[derive(Debug)]
+    struct ParkThenObserveTransfer {
+        ctx: TransferContext,
+        polls: AtomicUsize,
+        /// `Some` once the second poll ran, holding what the view reported then.
+        cause_at_repoll: Arc<std::sync::Mutex<Option<Option<PendingCause>>>>,
+    }
+
+    impl Transfer for ParkThenObserveTransfer {
+        fn ctx(&self) -> &TransferContext {
+            &self.ctx
+        }
+
+        fn poll_work(&self) -> PollWork {
+            if self.polls.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.ctx
+                    .set_pending(PendingCause::new(PendingCategory::Memory, "test"));
+                PollWork::Pending
+            } else {
+                *self.cause_at_repoll.lock().unwrap() = Some(self.ctx.view().pending_cause());
+                self.ctx.set_completed();
+                self.ctx.signal_terminal();
+                PollWork::Done
+            }
+        }
+
+        fn execute<'a>(
+            &'a self,
+            _work: &'a mut IoRequest,
+        ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
+            Box::pin(async { unreachable!("test transfer produces no work") })
+        }
+    }
+
+    /// A parked transfer's view reports its cause until the scheduler polls it again, and
+    /// that poll begins with the cause cleared.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn the_next_poll_clears_the_cause_a_view_reports() {
+        let handle = test_handle(1);
+        let id = TransferId {
+            id: 40_004,
+            parent: None,
+        };
+        let (ctx, completion_rx) = TransferContext::with_id(id, handle.clone());
+        let observer = ctx.clone();
+        let cause_at_repoll = Arc::new(std::sync::Mutex::new(None));
+        // Runs the first poll on this thread before it returns.
+        handle
+            .scheduler
+            .enqueue_transfer(Box::new(ParkThenObserveTransfer {
+                ctx,
+                polls: AtomicUsize::new(0),
+                cause_at_repoll: Arc::clone(&cause_at_repoll),
+            }));
+
+        assert_eq!(
+            Some(PendingCategory::Memory),
+            observer
+                .view()
+                .pending_cause()
+                .map(|cause| cause.category()),
+            "a parked transfer reports the cause it parked on"
+        );
+        observer.try_wake();
+        tokio::time::timeout(Duration::from_secs(5), completion_rx)
+            .await
+            .expect("the wake never repolled the transfer")
+            .expect("the second poll completes the transfer");
+
+        assert_eq!(
+            Some(None),
+            *cause_at_repoll.lock().unwrap(),
+            "the next poll must begin with the parked cause cleared"
+        );
         handle.runtime.shutdown();
     }
 
@@ -3587,6 +3696,216 @@ mod tests {
         })
         .await
         .expect("scheduler should reach idle; orphaned children would hang it");
+
+        handle.runtime.shutdown();
+    }
+
+    // ref: awslabs/aws-s3-transfer-manager-rs#197
+    /// The Done arm does not run `on_terminal` while the status is still `Active`.
+    ///
+    /// The mock answers `Done` before it publishes a terminal status, as a transfer does
+    /// between claiming its terminal state and publishing that status. If the Done arm ran
+    /// the hook there, the hook would observe `Active`, and its one-shot summary and
+    /// `Finished` event would describe a transfer that has not finished.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn done_arm_skips_on_terminal_while_the_status_is_active() {
+        let _logs = show_test_logs();
+        let handle = test_handle(2);
+        let scheduler = &handle.scheduler;
+
+        let id = TransferId {
+            id: 1,
+            parent: None,
+        };
+        let (mock, observed) = DoneWhileActiveMock::new(id, handle.clone());
+        scheduler.enqueue_transfer(Box::new(mock));
+        // `enqueue_transfer` runs `generate_work` on this thread, and only the Done arm
+        // removes this transfer.
+        assert_eq!(
+            0,
+            scheduler.transfer_count(),
+            "the scheduler never polled the mock to Done"
+        );
+
+        let seen = *observed.lock().unwrap();
+        assert!(
+            seen.is_none(),
+            "the Done arm ran on_terminal while the status was still Active, so a \
+             succeeding transfer publishes Finished {{ Cancelled }} and the real completion \
+             finds the terminal report already spent: {seen:?}"
+        );
+
+        handle.runtime.shutdown();
+    }
+
+    /// Transfer that hands out one work item and then parks, recording the status its
+    /// `on_terminal` observes.
+    #[derive(Debug)]
+    struct OneItemThenParkTransfer {
+        ctx: TransferContext,
+        polls: Arc<AtomicUsize>,
+        /// The status `on_terminal` observed, or `None` if it never ran.
+        terminal_status: Arc<std::sync::Mutex<Option<crate::types::TransferStatus>>>,
+    }
+
+    impl Transfer for OneItemThenParkTransfer {
+        fn ctx(&self) -> &TransferContext {
+            &self.ctx
+        }
+
+        fn poll_work(&self) -> PollWork {
+            if self.polls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return PollWork::ready(IoRequest { data: None });
+            }
+            self.ctx.set_pending(PendingCause::other("test"));
+            PollWork::Pending
+        }
+
+        fn execute<'a>(
+            &'a self,
+            _work: &'a mut IoRequest,
+        ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
+            Box::pin(async { WorkOutcome::Success { data: None } })
+        }
+
+        fn on_terminal(&self) {
+            *self.terminal_status.lock().unwrap() = Some(self.ctx.transfer_status());
+        }
+    }
+
+    // ref: awslabs/aws-s3-transfer-manager-rs#197
+    /// A work item that completes while its transfer is still active neither removes the
+    /// transfer nor runs `on_terminal`.
+    ///
+    /// The transfer hands out one item and then parks, so the item's completion leaves it
+    /// idle and `Active`. At concurrency 1 the scheduler does not poll it again until that
+    /// completion, so the second poll comes from the completion's own `generate_work`,
+    /// after its removal check. If that check removed every idle transfer, the completion
+    /// would run `on_terminal` on an `Active` transfer, release its handle, and leave
+    /// nothing to poll it again.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn completion_keeps_an_idle_transfer_that_is_still_active() {
+        let _logs = show_test_logs();
+        let handle = test_handle(1);
+        let scheduler = &handle.scheduler;
+        let id = TransferId {
+            id: 40_010,
+            parent: None,
+        };
+        let (ctx, mut completion_rx) = TransferContext::with_id(id, handle.clone());
+        let polls = Arc::new(AtomicUsize::new(0));
+        let terminal_status = Arc::new(std::sync::Mutex::new(None));
+        scheduler.enqueue_transfer(Box::new(OneItemThenParkTransfer {
+            ctx,
+            polls: Arc::clone(&polls),
+            terminal_status: Arc::clone(&terminal_status),
+        }));
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while polls.load(Ordering::SeqCst) < 2 && terminal_status.lock().unwrap().is_none() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the work item's completion never reached the scheduler");
+
+        assert_eq!(
+            None,
+            *terminal_status.lock().unwrap(),
+            "the completion ran on_terminal on a transfer that is still active"
+        );
+        assert!(
+            scheduler.0.transfers.read().unwrap().contains_key(&id),
+            "the completion removed a transfer that is still active"
+        );
+        assert_eq!(
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty),
+            completion_rx.try_recv(),
+            "the completion released the handle of a transfer that is still active"
+        );
+
+        drop(scheduler.cancel_transfer(id));
+        handle.runtime.shutdown();
+    }
+
+    // ref: awslabs/aws-s3-transfer-manager-rs#197
+    /// A panic in `on_terminal` must not escape the Done arm or skip its removal.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn a_panicking_terminal_hook_is_contained_in_the_done_arm() {
+        let _logs = show_test_logs();
+        let handle = test_handle(2);
+        let scheduler = &handle.scheduler;
+
+        let id = TransferId {
+            id: 1,
+            parent: None,
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mock = PanickingTerminalHookMock::new(id, handle.clone(), calls.clone());
+
+        // Runs the Done arm on this thread, so an escaping panic fails the test here.
+        scheduler.enqueue_transfer(Box::new(mock));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // The removal check below passes even for a Done arm that never calls the hook.
+        assert_eq!(
+            1,
+            calls.load(Ordering::SeqCst),
+            "the Done arm never called `on_terminal`, so nothing here exercises the \
+             containment"
+        );
+        assert!(
+            scheduler.0.transfers.read().unwrap().get(&id).is_none(),
+            "the hook panicked and took `remove_transfer_atomic` with it, so the \
+             descriptor is still in the map"
+        );
+
+        handle.runtime.shutdown();
+    }
+
+    // ref: awslabs/aws-s3-transfer-manager-rs#197
+    /// A panicking hook must not cost a child its terminal signal.
+    ///
+    /// A child enqueued after its parent's group is gone is cancelled at enqueue, before
+    /// any descriptor exists. If the panic skipped `signal_terminal`, the child's `join()`
+    /// would never return.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn a_panicking_terminal_hook_still_signals_an_orphaned_child() {
+        let _logs = show_test_logs();
+        let handle = test_handle(2);
+        let scheduler = &handle.scheduler;
+
+        // Parent 999 was never registered, so the child is cancelled at enqueue.
+        let child_id = TransferId {
+            id: 2,
+            parent: Some(999),
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (mock, mut completion_rx, child_ctx) =
+            PanickingTerminalHookMock::with_receiver(child_id, handle.clone(), calls.clone());
+
+        scheduler.enqueue_transfer(Box::new(mock));
+
+        assert_eq!(
+            1,
+            calls.load(Ordering::SeqCst),
+            "the orphan path never called `on_terminal`, so nothing here exercises the \
+             containment"
+        );
+        assert!(
+            completion_rx.try_recv().is_ok(),
+            "the hook panicked and took `signal_terminal` with it, so this child's \
+             handle would wait on join() forever"
+        );
+        // Read off the context: the child never enters the map.
+        assert_eq!(
+            crate::types::TransferStatus::Cancelled,
+            child_ctx.transfer_status(),
+        );
 
         handle.runtime.shutdown();
     }

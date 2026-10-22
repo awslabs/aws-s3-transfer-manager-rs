@@ -345,7 +345,7 @@ mod tests {
         let sink = ScriptedSinkFactory(Arc::clone(script))
             .create(file, false)
             .unwrap();
-        let (writer, _consumer) = new_recv_body_with_disk_mode(sink);
+        let (writer, _consumer) = new_recv_body_with_disk_mode(sink, None);
         writer.prepare(0, expected_len).unwrap();
         writer
     }
@@ -471,7 +471,7 @@ mod tests {
         fill(&writer, 0, b"new");
 
         let error = writer
-            .finalize(3)
+            .finalize(3, || true)
             .expect_err("finalize is scripted to fail");
         assert_eq!(error.source.kind(), io::ErrorKind::PermissionDenied);
         assert_eq!(std::fs::read(&path).unwrap(), b"newle contents");
@@ -509,6 +509,7 @@ mod tests {
             Arc::clone(&handle),
             input,
             dest.clone(),
+            None,
             None,
             &ScriptedSinkFactory(Arc::clone(&script)),
         )
@@ -554,7 +555,7 @@ mod tests {
         writer.drain(DrainMode::Eager).unwrap();
         script.mark("between");
         fill(&writer, 2, b"cd");
-        writer.finalize(4).unwrap();
+        writer.finalize(4, || true).unwrap();
         script.mark("end");
 
         let first = Op::Write { pos: 0, len: 2 };

@@ -22,6 +22,214 @@ async fn setup() -> MockTm {
     mock_tm(RuntimeMode::Managed).await
 }
 
+/// An upload with a registered sink reports exactly one root `Started` carrying a view and
+/// exactly one succeeding `Finished` for the same id; the view reports the payload on
+/// `network_tx` against the `Final` total of its known-length body.
+#[tokio::test]
+async fn test_upload_reports_events() {
+    use aws_sdk_s3_transfer_manager::events::{Outcome, TransferEvent};
+    use aws_sdk_s3_transfer_manager::types::Total;
+    use std::time::Duration;
+
+    // Two parts at the 8 MiB default, so the transfer is a real MPU rather than a single PUT.
+    let size = 16 * ByteUnit::Mebibyte.as_bytes_usize();
+    let m = setup().await;
+
+    let (sink, mut stream) = aws_sdk_s3_transfer_manager::events::channel(
+        std::num::NonZeroUsize::new(8).expect("capacity > 0"),
+    );
+
+    let handle = m
+        .client
+        .upload()
+        .bucket("test-bucket")
+        .key("ev-upload-key")
+        .body(InputStream::from(vec![7u8; size]))
+        .events(sink)
+        .initiate()
+        .expect("initiate");
+
+    handle.join().await.expect("join upload");
+
+    // Sending `Finished` releases the sink, so the stream ends once drained. Drained to the
+    // end rather than to the first `Finished`, so a duplicate fails the count below.
+    let mut started = Vec::new();
+    let mut finished = Vec::new();
+    let mut view = None;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(event) = stream.recv().await {
+            match event {
+                TransferEvent::Started(p) => {
+                    started.push(p.id());
+                    view = p.view().cloned();
+                }
+                TransferEvent::Finished(e) => {
+                    finished.push((e.id(), matches!(e.outcome(), Outcome::Succeeded { .. })))
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("the stream did not end, so the sink outlived the transfer");
+
+    assert_eq!(
+        1,
+        started.len(),
+        "a registered sink must receive exactly one Started"
+    );
+    assert_eq!(
+        started,
+        finished.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        "and exactly one Finished, for the same id"
+    );
+    assert!(
+        finished.iter().all(|(_, succeeded)| *succeeded),
+        "an upload that joined Ok reported a Finished that did not succeed"
+    );
+    assert_eq!(
+        None,
+        started[0].parent(),
+        "a single-object upload is its own root"
+    );
+    let view = view.expect("a real transfer owes a view");
+    assert_eq!(
+        Total::Final(size as u64),
+        view.byte_total(),
+        "a known-length body gives the leaf a final total up front"
+    );
+    assert_eq!(
+        size as u64,
+        view.metrics().network_tx,
+        "network_tx must reach the payload"
+    );
+
+    m.handle.shutdown().await.expect("shutdown");
+}
+
+/// An upload's `bytes_transferred`, read from its view, reaches the final byte total on both
+/// upload paths.
+///
+/// 1 MiB is one `PutObject` and 16 MiB is two `UploadPart`s at the 8 MiB default, so the two
+/// cases cover the two sites that record an upload's bytes.
+#[tokio::test]
+async fn test_upload_bytes_transferred_reaches_the_byte_total() {
+    use aws_sdk_s3_transfer_manager::events::TransferEvent;
+    use aws_sdk_s3_transfer_manager::types::Total;
+    use std::time::Duration;
+
+    let m = setup().await;
+    for size in [1, 16].map(|mib| mib * ByteUnit::Mebibyte.as_bytes_usize()) {
+        let (sink, mut stream) = aws_sdk_s3_transfer_manager::events::channel(
+            std::num::NonZeroUsize::new(8).expect("capacity > 0"),
+        );
+        let handle = m
+            .client
+            .upload()
+            .bucket("test-bucket")
+            .key(format!("transferred-{size}"))
+            .body(InputStream::from(vec![3u8; size]))
+            .events(sink)
+            .initiate()
+            .expect("initiate");
+
+        handle.join().await.expect("join upload");
+
+        // Sending `Finished` releases the sink, so the stream ends once drained.
+        let mut view = None;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(event) = stream.recv().await {
+                if let TransferEvent::Started(p) = event {
+                    view = p.view().cloned();
+                }
+            }
+        })
+        .await
+        .expect("the stream did not end, so the sink outlived the transfer");
+        let view = view.expect("a real transfer owes a view");
+
+        assert_eq!(Total::Final(size as u64), view.byte_total(), "{size} bytes");
+        assert_eq!(
+            size as u64,
+            view.metrics().bytes_transferred,
+            "{size} bytes: the upload's progress numerator must reach its total"
+        );
+    }
+
+    m.handle.shutdown().await.expect("shutdown");
+}
+
+/// An empty-object upload reads as a success that moved zero bytes: a `Started` carrying a
+/// view, exactly one succeeding `Finished`, `network_tx` of 0 and a `Final(0)` total.
+///
+/// Its progress ratio is `0 / 0`, so these are all that distinguish it from a transfer that
+/// never started or whose total is unknown.
+#[tokio::test]
+async fn test_upload_empty_object_is_observable_as_zero_bytes() {
+    use aws_sdk_s3_transfer_manager::events::{Outcome, TransferEvent};
+    use aws_sdk_s3_transfer_manager::types::Total;
+    use std::time::Duration;
+
+    let m = setup().await;
+
+    let (sink, mut stream) = aws_sdk_s3_transfer_manager::events::channel(
+        std::num::NonZeroUsize::new(16).expect("capacity > 0"),
+    );
+
+    let handle = m
+        .client
+        .upload()
+        .bucket("test-bucket")
+        .key("empty-object-key")
+        .body(InputStream::from(Vec::new()))
+        .events(sink)
+        .initiate()
+        .expect("initiate");
+
+    handle.join().await.expect("join upload");
+
+    // Sending `Finished` releases the sink, so the stream ends once drained.
+    let mut view = None;
+    let mut outcomes = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(event) = stream.recv().await {
+            match event {
+                TransferEvent::Started(p) => view = p.view().cloned(),
+                TransferEvent::Finished(e) => outcomes.push(e.outcome().clone()),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("the stream did not end, so the sink outlived the transfer");
+    m.handle.shutdown().await.expect("shutdown");
+
+    assert_eq!(
+        1,
+        outcomes.len(),
+        "a zero-length PUT succeeds, so exactly one terminal must arrive: {outcomes:?}"
+    );
+    let outcome = outcomes.remove(0);
+    assert!(
+        matches!(outcome, Outcome::Succeeded { .. }),
+        "a zero-length PUT succeeds; got {outcome:?}"
+    );
+
+    let view =
+        view.expect("the entry must announce itself with a view, or there is nothing to read");
+    assert_eq!(
+        0,
+        view.metrics().network_tx,
+        "an empty body moves no payload bytes"
+    );
+    assert_eq!(
+        Total::Final(0),
+        view.byte_total(),
+        "the reading must be *reported*, not merely absent -- `Final(0)` is what \
+         distinguishes a transfer that moved nothing from one whose total is still unknown"
+    );
+}
+
 /// A multipart upload of patterned data spanning several parts reports an ETag and an upload ID,
 /// and stores exactly the source bytes.
 #[tokio::test]
@@ -232,6 +440,92 @@ where
     assert_ordered_content(&expected, &stored);
 
     m.handle.shutdown().await.expect("shutdown");
+}
+
+// ref: awslabs/aws-s3-transfer-manager-rs#197
+/// A `while let Some(ev) = stream.recv().await` loop ends once the operation does, with the
+/// handle still held: a caller rendering events in that loop has not yet called `join(self)`,
+/// which consumes the handle.
+///
+/// Phases 2 and 3 re-run the loop after `join()` and again after the client is dropped. They
+/// feed only the failure message, which then shows how long the sink outlives the operation.
+#[tokio::test]
+async fn test_event_stream_ends_with_the_operation() {
+    use aws_sdk_s3_transfer_manager::events::{Outcome, TransferEvent};
+    use std::time::Duration;
+
+    // Two parts at the 8 MiB default, so this is a real MPU, as in `test_upload_reports_events`.
+    let size = 16 * ByteUnit::Mebibyte.as_bytes_usize();
+    let m = setup().await;
+
+    let (sink, mut stream) = aws_sdk_s3_transfer_manager::events::channel(
+        std::num::NonZeroUsize::new(64).expect("capacity > 0"),
+    );
+
+    let handle = m
+        .client
+        .upload()
+        .bucket("test-bucket")
+        .key("drain-loop-key")
+        .body(InputStream::from(vec![9u8; size]))
+        .events(sink)
+        .initiate()
+        .expect("initiate");
+
+    // Phase 1: the drain loop, with the handle still held.
+    let mut seen = 0usize;
+    let mut succeeded = false;
+    let phase1 = tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(ev) = stream.recv().await {
+            seen += 1;
+            if let TransferEvent::Finished(e) = &ev {
+                if e.id().parent().is_none() && matches!(e.outcome(), Outcome::Succeeded { .. }) {
+                    succeeded = true;
+                }
+            }
+        }
+    })
+    .await;
+
+    // Phase 2 control: `join` takes the handle by value, so after this nothing the caller
+    // holds refers to the transfer.
+    handle.join().await.expect("join upload");
+    let phase2 = tokio::time::timeout(Duration::from_secs(3), async {
+        while stream.recv().await.is_some() {}
+    })
+    .await;
+
+    // Phase 3 control: the client owns the scheduler and the runtime.
+    drop(m.client);
+    let phase3 = tokio::time::timeout(Duration::from_secs(3), async {
+        while stream.recv().await.is_some() {}
+    })
+    .await;
+
+    m.handle.shutdown().await.expect("shutdown");
+
+    let ended = |r: &Result<(), tokio::time::error::Elapsed>| {
+        if r.is_ok() {
+            "ended"
+        } else {
+            "hung"
+        }
+    };
+
+    assert!(
+        succeeded,
+        "the upload itself must finish, or phase 1 proves nothing about the loop: \
+         saw {seen} events, terminal Succeeded = {succeeded}"
+    );
+    assert!(
+        phase1.is_ok(),
+        "`while let Some(ev) = stream.recv().await` must end when the operation does. It did \
+         not: the upload reached a successful terminal, {seen} events were delivered, and then \
+         the loop hung -- so a caller rendering events in that loop never reaches `join()`. \
+         Controls: after join() consumed the handle the same loop {}; after drop(client) it {}.",
+        ended(&phase2),
+        ended(&phase3)
+    );
 }
 
 /// Parts that arrive in a fixed order other than part-number order, with the short last part

@@ -440,8 +440,8 @@ windows should shrink as concurrency rises remains open.
 paths can replace `FileSink`'s `pwritev` without touching the buffer or the drain orchestration.
 
 **Move blocking file operations off the runtime.** The disk drain executes its positioned write inline
-on the execute path, and temp-file create/rename happen on the caller's runtime. Moving these onto
-managed threads is orthogonal to the buffer and tracked separately.
+on the execute path, as does the temp-file rename, and temp-file create happens on the caller's runtime.
+Moving these onto managed threads is orthogonal to the buffer and tracked separately.
 
 **Proactive reclaim.** Reclaim today is front-only and opportunistic — a segment is freed on the next
 `claim` once it is fully delivered or drained, so the buffer never sheds memory ahead of delivery. A

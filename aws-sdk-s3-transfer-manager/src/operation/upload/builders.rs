@@ -15,6 +15,7 @@ use super::{UploadHandle, UploadInputBuilder};
 pub struct UploadFluentBuilder {
     handle: Arc<crate::client::Handle>,
     pub(crate) inner: UploadInputBuilder,
+    events: Option<crate::events::TransferEventSink>,
 }
 
 impl UploadFluentBuilder {
@@ -22,7 +23,19 @@ impl UploadFluentBuilder {
         Self {
             handle,
             inner: Default::default(),
+            events: None,
         }
+    }
+
+    /// Report lifecycle events for this transfer to `sink`.
+    ///
+    /// Calling this twice adds a second consumer rather than replacing the first.
+    pub fn events(mut self, sink: crate::events::TransferEventSink) -> Self {
+        self.events = Some(match self.events.take() {
+            Some(existing) => existing.merge(sink),
+            None => sink,
+        });
+        self
     }
 
     /// Initiate an upload transfer for a single object.
@@ -32,12 +45,15 @@ impl UploadFluentBuilder {
     ))]
     pub fn initiate(self) -> Result<UploadHandle, crate::error::Error> {
         let input = self.inner.build()?;
-        crate::operation::upload::Upload::orchestrate(self.handle, input)
+        crate::operation::upload::Upload::orchestrate(self.handle, input, self.events)
     }
 }
 
 impl UploadInputBuilder {
     /// Initiate an upload transfer for a single object using the given client.
+    ///
+    /// This entry point reports no [events](crate::events); [`UploadFluentBuilder::events`]
+    /// registers a sink.
     pub fn initiate_with(
         self,
         client: &crate::Client,
