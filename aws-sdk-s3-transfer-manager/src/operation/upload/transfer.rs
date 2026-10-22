@@ -970,7 +970,7 @@ impl UploadTransfer {
         self.report_terminal();
         // Emit before the joiner is released, not only from `on_terminal`: the scheduler
         // runs `on_terminal` after this, so a consumer that writes `join().await` and then
-        // drains once would miss this operation's own `Ended`. `finish` is exactly-once, so
+        // drains once would miss this operation's own `Finished`. `finish` is exactly-once, so
         // whichever of the two paths runs first emits and the other is a no-op.
         if let Some(lc) = &self.inner.lifecycle {
             if let Some(emit) = lc.finish(self.inner.ctx.terminal_outcome()) {
@@ -1086,7 +1086,7 @@ impl UploadTransfer {
         self.report_terminal();
         // Emit before the joiner is released, not only from `on_terminal`: the scheduler
         // runs `on_terminal` after this, so a consumer that writes `join().await` and then
-        // drains once would miss this operation's own `Ended`. `finish` is exactly-once, so
+        // drains once would miss this operation's own `Finished`. `finish` is exactly-once, so
         // whichever of the two paths runs first emits and the other is a no-op.
         if let Some(lc) = &self.inner.lifecycle {
             if let Some(emit) = lc.finish(self.inner.ctx.terminal_outcome()) {
@@ -1109,7 +1109,7 @@ impl UploadTransfer {
         self.report_terminal();
         // Emit before the joiner is released, not only from `on_terminal`: the scheduler
         // runs `on_terminal` after this, so a consumer that writes `join().await` and then
-        // drains once would miss this operation's own `Ended`. `finish` is exactly-once, so
+        // drains once would miss this operation's own `Finished`. `finish` is exactly-once, so
         // whichever of the two paths runs first emits and the other is a no-op.
         if let Some(lc) = &self.inner.lifecycle {
             if let Some(emit) = lc.finish(self.inner.ctx.terminal_outcome()) {
@@ -1220,7 +1220,7 @@ impl Transfer for UploadTransfer {
     /// first -- normal completion, cancellation, a worker panic, or completion-driven
     /// removal. Reaching it more than once is harmless: each obligation is claimed by
     /// exactly one caller, and the completion paths emit for themselves before releasing
-    /// the joiner, so a consumer that drains after `join()` still sees this `Ended`.
+    /// the joiner, so a consumer that drains after `join()` still sees this `Finished`.
     ///
     /// Requires the status to be published already -- see the early return.
     fn on_terminal(&self) {
@@ -1847,6 +1847,40 @@ mod tests {
         assert_eq!(summary.request_total.requests, 1);
         assert_eq!(summary.requests.put_object.requests, 1);
         assert_eq!(summary.multipart, None);
+    }
+
+    /// An upload's view reports the cause it parked on, and reports none once the upload
+    /// finishes.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn a_parked_upload_reports_its_cause_until_it_finishes() {
+        use aws_sdk_s3::operation::put_object::PutObjectOutput;
+        let put_object = mock!(aws_sdk_s3::Client::put_object)
+            .then_output(|| PutObjectOutput::builder().e_tag("test-etag").build());
+        let transfer = create_test_transfer(
+            mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[put_object]),
+            vec![0u8; 1024],
+        );
+        let view = transfer.ctx().view();
+
+        let mut put = assert_ready(transfer.poll_work());
+        assert_pending(transfer.poll_work());
+        assert_eq!(
+            Some(crate::types::PendingCategory::InFlightWork),
+            view.pending_cause().map(|cause| cause.category()),
+            "an upload waiting on its PutObject reports the request in flight"
+        );
+
+        let outcome = transfer.execute(&mut put).await;
+        assert!(
+            matches!(outcome, WorkOutcome::Success { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            None,
+            view.pending_cause(),
+            "a finished upload must not report the cause it last parked on"
+        );
     }
 
     #[cfg_attr(miri, ignore)]

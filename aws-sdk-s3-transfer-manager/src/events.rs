@@ -7,22 +7,19 @@
 //!
 //! An *entry* is one thing a run acts on: an object uploaded, an object
 //! downloaded, the root of a directory operation. Every entry produces one
-//! [`TransferEvent::Planned`] the moment its action is chosen, and — only if that
-//! action was attempted — one [`TransferEvent::Ended`] when the attempt ends. A
-//! skip attempts nothing, so its `Planned` is its terminal; a run that decides
-//! without attempting produces decisions only, which is the absence of the second
-//! event rather than a flag on the first.
+//! [`TransferEvent::Started`] when its transfer starts and one
+//! [`TransferEvent::Finished`] when that transfer ends.
 //!
 //! **Every event stands alone.** Delivery is bounded and lossy, so no event may
 //! depend on the caller having seen an earlier one: [`TransferRef`] and
-//! [`Decision`] appear on both variants, and a consumer needs no side map.
+//! [`TransferId`] appear on both variants, and a consumer needs no side map.
 //!
 //! **Lifecycle is pushed; quantities are pulled.** No event carries a byte count or an
-//! object count. Each [`TransferEvent::Planned`] instead hands over a
+//! object count. Each [`TransferEvent::Started`] instead hands over a
 //! [`TransferView`](crate::types::TransferView) — a read-only handle you keep and read
 //! whenever you want to repaint.
 //!
-//! **At most one `Ended` arrives per `Planned`**, however the entry ended. Because delivery
+//! **At most one `Finished` arrives per `Started`**, however the entry ended. Because delivery
 //! is lossy, a total summed from the stream is only a lower bound; read a counter off the
 //! view, such as [`TransferView::entries_settled`](crate::types::TransferView::entries_settled),
 //! for the number the operation itself reports.
@@ -34,38 +31,23 @@
 //! Printing one of the familiar per-entry lines takes one event and nothing else:
 //!
 //! ```
-//! use aws_sdk_s3_transfer_manager::events::{Decision, Direction, Outcome, TransferEvent};
+//! use aws_sdk_s3_transfer_manager::events::{Direction, Outcome, TransferEvent};
 //!
-//! /// `upload: <src> to <dest>` / `download:` / `copy:` / `delete: <dest>`.
-//! ///
-//! /// `dry_run` is the caller's own fact, not the event's: a run that attempts
-//! /// nothing produces the same `Planned` a run that attempts everything does, so
-//! /// the events carry no mode flag for whoever chose the mode to read back.
-//! fn line(event: &TransferEvent, dry_run: bool) -> Option<String> {
+//! /// `upload: <src> to <dest>` or `download: <src> to <dest>`.
+//! fn line(event: &TransferEvent) -> Option<String> {
 //!     let transfer = event.transfer();
-//!     // Every pattern takes `{ .. }`: that is what `#[non_exhaustive]` costs an
-//!     // external consumer, and what keeps a later variant additive.
-//!     let verb = match event.decision() {
-//!         Decision::Delete { .. } => "delete",
-//!         // A skip prints a warning or nothing, never one of the four lines.
-//!         Decision::Skip { .. } => return None,
-//!         _ => match transfer.direction() {
-//!             Direction::Upload => "upload",
-//!             Direction::Download => "download",
-//!             Direction::Copy => "copy",
-//!             _ => "transfer",
-//!         },
+//!     let verb = match transfer.direction() {
+//!         Direction::Upload => "upload",
+//!         Direction::Download => "download",
+//!         _ => "transfer",
 //!     };
-//!     // A delete names one end, which is the CLI's single-location line.
-//!     let location = match event.decision() {
-//!         Decision::Delete { .. } => transfer.destination().to_string(),
-//!         _ => format!("{} to {}", transfer.source(), transfer.destination()),
-//!     };
+//!     let location = format!("{} to {}", transfer.source(), transfer.destination());
 //!     Some(match event {
-//!         TransferEvent::Planned(_) if dry_run => format!("(dryrun) {verb}: {location}"),
-//!         // Planned, and the attempt is still to come: the line prints at `Ended`.
-//!         TransferEvent::Planned(_) => return None,
-//!         TransferEvent::Ended(ended) => match ended.outcome() {
+//!         // The transfer has only started: the line prints at `Finished`.
+//!         TransferEvent::Started(_) => return None,
+//!         TransferEvent::Finished(finished) => match finished.outcome() {
+//!             // `Outcome`'s variants are `#[non_exhaustive]`, so external code matches
+//!             // them with `{ .. }`, and the `_` arm admits later variants.
 //!             Outcome::Failed { .. } => format!("{verb} failed: {location}"),
 //!             Outcome::Cancelled { .. } => return None,
 //!             _ => format!("{verb}: {location}"),
@@ -81,24 +63,24 @@
 //! the bar below:
 //!
 //! ```
-//! use aws_sdk_s3_transfer_manager::events::{TransferEvent, TransferEventStream, TryNextError};
+//! use aws_sdk_s3_transfer_manager::events::{TransferEvent, TransferEventStream, TryRecvError};
 //! use aws_sdk_s3_transfer_manager::types::{Total, TransferView};
 //!
 //! /// Drain whatever has arrived, then draw. Called on the caller's own clock — every
 //! /// 100 ms, on a keypress, whenever suits — not once per event.
 //! fn repaint(stream: &mut TransferEventStream, root: &mut Option<TransferView>) -> Option<String> {
 //!     loop {
-//!         match stream.try_next() {
-//!             // `Planned` for the root carries the view the bar is drawn from.
-//!             Ok(TransferEvent::Planned(p)) if p.parent().is_none() => {
+//!         match stream.try_recv() {
+//!             // `Started` for the root carries the view the bar is drawn from.
+//!             Ok(TransferEvent::Started(p)) if p.id().parent().is_none() => {
 //!                 *root = p.view().cloned();
 //!             }
 //!             Ok(_) => continue,
 //!             // Nothing new. The view is still live, so draw from what is already held.
-//!             Err(TryNextError::Empty) => break,
+//!             Err(TryRecvError::Empty) => break,
 //!             // Every sink is gone: this is the last frame.
-//!             Err(TryNextError::Disconnected) => break,
-//!             // `TryNextError` is `#[non_exhaustive]`, so external code needs this arm.
+//!             Err(TryRecvError::Disconnected) => break,
+//!             // `TryRecvError` is `#[non_exhaustive]`, so external code needs this arm.
 //!             // Stopping the drain is the safe default for an unfamiliar reason: it
 //!             // still repaints from the view it holds, and it cannot spin.
 //!             Err(_) => break,
@@ -146,7 +128,7 @@ use std::sync::{Arc, Mutex};
 // `std::sync::Arc` — they appear in the public types, which must not change shape
 // under a test cfg.
 use crate::runtime::sync::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use crate::transfer::TransferId;
+pub use crate::transfer::TransferId;
 
 /// Which way an entry's bytes move.
 ///
@@ -161,8 +143,6 @@ pub enum Direction {
     Upload,
     /// S3 to local filesystem.
     Download,
-    /// S3 to S3.
-    Copy,
 }
 
 /// One end of an entry.
@@ -210,8 +190,8 @@ pub enum Endpoint {
 impl fmt::Display for Endpoint {
     /// `s3://bucket/key`, the path (lossy for a non-UTF-8 name), `(local file)` for a
     /// local file whose path is unknown, `-` for a caller-owned stream, or
-    /// `(unresolved)`. This is the rendering the `upload:` / `download:` / `copy:` /
-    /// `delete:` lines use, so no consumer writes a formatter of its own.
+    /// `(unresolved)`. This is the rendering the `upload:` / `download:` lines use, so no
+    /// consumer writes a formatter of its own.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Endpoint::S3 { bucket, key } => write!(f, "s3://{bucket}/{key}"),
@@ -263,10 +243,6 @@ impl TransferRef {
     }
 
     /// Which way the bytes move.
-    ///
-    /// Carried rather than derived from the endpoint pair, because a delete has one
-    /// meaningful end: an S3 object removed at the destination could belong to an
-    /// upload run or to a copy run, and the pair cannot tell them apart.
     pub fn direction(&self) -> Direction {
         self.direction
     }
@@ -276,119 +252,10 @@ impl TransferRef {
         &self.source
     }
 
-    /// Where the entry is written to, and the end a [`Decision::Delete`] removes.
+    /// Where the entry is written to.
     pub fn destination(&self) -> &Endpoint {
         &self.destination
     }
-}
-
-/// Why an entry needs moving.
-///
-/// Every variant is a fact about comparing two present-or-absent ends, so none can
-/// reach a delete or a skip: those decisions have no field of this type. Braced
-/// throughout with a per-variant `#[non_exhaustive]`, because each has an obvious
-/// field to gain — the two sizes, the two times, what forced it.
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-pub enum TransferReason {
-    /// The destination has no entry under this name.
-    #[non_exhaustive]
-    NotAtDestination {},
-    /// Both ends have the entry and their sizes differ.
-    #[non_exhaustive]
-    SizeDiffers {},
-    /// Both ends have the entry and their modification times differ.
-    #[non_exhaustive]
-    TimeDiffers {},
-    /// No comparison was made: the transfer was asked for unconditionally.
-    #[non_exhaustive]
-    Forced {},
-}
-
-/// Why an entry was left alone.
-///
-/// Carries no severity. The same reason is silent, a warning, a skip, or a hard
-/// failure depending on how the run was configured, so severity belongs to whoever
-/// holds the configuration and cannot be structural here.
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-pub enum SkipReason {
-    /// Present at both ends, and they compared equal.
-    ///
-    /// A variant of its own rather than a shade of the two unknowns below, because
-    /// the three read alike in a log line and the first means the opposite of the
-    /// other two: this one says everything matched, those say the run could not
-    /// look.
-    #[non_exhaustive]
-    Unchanged {},
-    /// Removed by an include/exclude rule, on whichever side the rule applied to.
-    ///
-    /// One variant, not one per side: a caller counting filtered entries must be
-    /// able to count them by matching a single reason.
-    #[non_exhaustive]
-    ExcludedByFilter {},
-    /// In an archival storage class and not restored, so its bytes cannot be read.
-    #[non_exhaustive]
-    ArchivalStorageClass {},
-    /// Another entry differing from this one only by case already claims the
-    /// destination this entry would have taken.
-    #[non_exhaustive]
-    CaseConflict {},
-    /// Present, and not a regular file — a device, FIFO, or socket.
-    ///
-    /// Distinct from the two unknowns, and the distinction is a safety property
-    /// rather than a wording one: this entry **was** classified, so it is present,
-    /// so it holds a delete back.
-    #[non_exhaustive]
-    Untransferable {},
-    /// Present only at the destination, with delete mode off.
-    #[non_exhaustive]
-    DestinationOnly {},
-    /// The source side could not be seen here, so nothing may be deleted: "nothing
-    /// is there" licenses a delete, "I could not look" does not.
-    #[non_exhaustive]
-    ///
-    /// Braced so it can gain the cause, for the same reason [`Outcome::Failed`] does
-    /// not carry one yet.
-    SourceUnknown {},
-    /// The destination side could not be seen here, so nothing may be written:
-    /// treating an unknown destination as absent skips the comparison and can
-    /// overwrite a newer entry.
-    #[non_exhaustive]
-    DestinationUnknown {},
-}
-
-/// The action decided for an entry, and the reason for it.
-///
-/// The reason lives on the decision rather than on the outcome, because a decision
-/// is the thing that has a reason: four of the reasons a caller must distinguish
-/// explain why an entry *was* moved, and a deleted or never-attempted entry has no
-/// outcome to hang one on. Splitting the reason set per action is what makes the
-/// compiler reject a transfer paired with "excluded by a filter", rather than a doc
-/// comment asking a reader not to write it.
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-pub enum Decision {
-    /// Move the entry. The direction is [`TransferRef::direction`].
-    #[non_exhaustive]
-    Transfer {
-        /// Why it needs moving.
-        reason: TransferReason,
-    },
-    /// Remove [`TransferRef::destination`].
-    ///
-    /// Carries no reason because the reason is the action: present at the
-    /// destination, absent at the source, delete mode on. Braced-but-empty so it
-    /// can gain one compatibly if a second way to reach a delete appears.
-    #[non_exhaustive]
-    Delete {},
-    /// Leave the entry alone. Nothing is attempted, so this decision is terminal on
-    /// arrival and no [`TransferEvent::Ended`] follows it.
-    #[non_exhaustive]
-    Skip {
-        /// Why nothing was done.
-        reason: SkipReason,
-    },
 }
 
 /// How an attempted action ended.
@@ -422,48 +289,37 @@ pub enum Outcome {
 
 /// One fact about one entry.
 ///
-/// `parent: None` marks the operation the caller invoked. For
-/// [`upload`](crate::Client::upload) or [`download`](crate::Client::download) that event is
+/// An entry whose [`TransferId::parent`] is `None` is the operation the caller invoked. For
+/// [`upload`](crate::Client::upload) or [`download`](crate::Client::download) that entry is
 /// the file itself; for [`upload_objects`](crate::Client::upload_objects) or
 /// [`download_objects`](crate::Client::download_objects) it is the directory, whose endpoints
-/// are a source directory and a key prefix, and every object under it carries
-/// `parent: Some(root_id)`.
+/// are a source directory and a key prefix, and every object under it has the directory's
+/// id as its parent.
 ///
-/// A consumer acting per file should therefore skip the `parent: None` event for the
-/// directory operations only — skipping it always drops every single-file transfer.
+/// A consumer acting per file should therefore skip the root event for the directory
+/// operations only — skipping it always drops every single-file transfer.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum TransferEvent {
-    /// An action was planned for the entry. Exactly one per entry.
-    Planned(Planned),
-    /// A planned action reached a terminal state. At most one per
-    /// [`TransferEvent::Planned`], and none at all for a plan that attempts nothing.
-    Ended(Ended),
+    /// The entry's transfer started. Exactly one per entry.
+    Started(Started),
+    /// The entry's transfer reached a terminal state. At most one per
+    /// [`TransferEvent::Started`].
+    Finished(Finished),
 }
 
-/// An action was planned for one entry.
-///
-/// The fields are private and read through accessors, so a later field is additive and
-/// the representation stays free after the first release. That is also what permits an
-/// opaque id that can grow a generation without breaking a caller's pattern.
+/// One entry's transfer started.
 #[derive(Debug, Clone)]
-pub struct Planned {
+pub struct Started {
     id: TransferId,
     transfer: TransferRef,
-    decision: Decision,
     view: Option<crate::types::TransferView>,
 }
 
-impl Planned {
-    /// Opaque entry id, unique within the client.
-    pub fn id(&self) -> u64 {
-        self.id.id
-    }
-
-    /// The id of the directory operation this entry belongs to, or `None` when this
-    /// event *is* that operation.
-    pub fn parent(&self) -> Option<u64> {
-        self.id.parent
+impl Started {
+    /// This entry's id.
+    pub fn id(&self) -> TransferId {
+        self.id
     }
 
     /// The entry, and where its two ends are.
@@ -471,53 +327,32 @@ impl Planned {
         &self.transfer
     }
 
-    /// What was planned, and why.
-    pub fn decision(&self) -> &Decision {
-        &self.decision
-    }
-
-    /// Read-only view of this entry's byte counters, for as long as you keep it.
+    /// Read-only view of this entry's counters, for as long as you keep it.
     ///
-    /// `None` when the entry never became a transfer — a skip, or an entry the
-    /// operation abandoned before it could be started — so there are no counters to
-    /// read. Distinct from a live transfer sitting at zero bytes.
+    /// `None` when no counters can be read for this entry. Distinct from a live transfer
+    /// sitting at zero bytes.
     pub fn view(&self) -> Option<&crate::types::TransferView> {
         self.view.as_ref()
     }
 }
 
-/// A planned action reached a terminal state.
-///
-/// Private fields for the same reason as [`Planned`].
+/// One entry's transfer reached a terminal state.
 #[derive(Debug, Clone)]
-pub struct Ended {
+pub struct Finished {
     id: TransferId,
     transfer: TransferRef,
-    decision: Decision,
     outcome: Outcome,
 }
 
-impl Ended {
-    /// Opaque entry id, matching the [`Planned`] this ends.
-    pub fn id(&self) -> u64 {
-        self.id.id
-    }
-
-    /// The id of the directory operation this entry belongs to, or `None` when this
-    /// event *is* that operation.
-    pub fn parent(&self) -> Option<u64> {
-        self.id.parent
+impl Finished {
+    /// This entry's id, equal to its [`Started::id`].
+    pub fn id(&self) -> TransferId {
+        self.id
     }
 
     /// The entry. Repeated so no consumer needs a side map.
     pub fn transfer(&self) -> &TransferRef {
         &self.transfer
-    }
-
-    /// Repeated for the same reason: a lost [`Planned`] must not cost the caller the
-    /// verb it prints or the reason it reports.
-    pub fn decision(&self) -> &Decision {
-        &self.decision
     }
 
     /// How it ended.
@@ -530,16 +365,8 @@ impl TransferEvent {
     /// The entry this event is about. Present on every variant.
     pub fn transfer(&self) -> &TransferRef {
         match self {
-            TransferEvent::Planned(e) => e.transfer(),
-            TransferEvent::Ended(e) => e.transfer(),
-        }
-    }
-
-    /// What was planned for the entry, and why. Present on every variant.
-    pub fn decision(&self) -> &Decision {
-        match self {
-            TransferEvent::Planned(e) => e.decision(),
-            TransferEvent::Ended(e) => e.decision(),
+            TransferEvent::Started(e) => e.transfer(),
+            TransferEvent::Finished(e) => e.transfer(),
         }
     }
 }
@@ -571,23 +398,6 @@ pub fn channel(capacity: NonZeroUsize) -> (TransferEventSink, TransferEventStrea
     )
 }
 
-/// Combine the client-level sink with the request-level one.
-///
-/// Merged rather than overridden, both directions: a client-wide observer must not be
-/// switched off by a request that registers its own sink, and a request's sink must not be
-/// ignored because the client has one. Called at every operation entry point, which is why it
-/// lives here rather than being rewritten six times.
-pub(crate) fn resolve_sink(
-    client_level: Option<&TransferEventSink>,
-    request_level: Option<TransferEventSink>,
-) -> Option<TransferEventSink> {
-    match (client_level, request_level) {
-        (None, request) => request,
-        (Some(client), None) => Some(client.clone()),
-        (Some(client), Some(request)) => Some(client.clone().merge(request)),
-    }
-}
-
 /// One stream's receiving end, as seen from the producing side.
 #[derive(Debug)]
 struct Outlet {
@@ -614,8 +424,8 @@ impl TransferEventSink {
     /// and its own [`dropped`](TransferEventStream::dropped) count, so a consumer that stops
     /// draining loses its own events and nobody else's.
     ///
-    /// Merging the same sink twice is a no-op rather than a doubling, so registering one
-    /// sink at both the client and the request level delivers each event once.
+    /// Merging the same sink twice is a no-op rather than a doubling, so a consumer
+    /// registered twice receives each event once.
     pub fn merge(self, other: TransferEventSink) -> TransferEventSink {
         let mut outlets: Vec<Outlet> = Vec::with_capacity(self.outlets.len() + other.outlets.len());
         for src in [&self.outlets, &other.outlets] {
@@ -691,25 +501,22 @@ pub struct TransferEventStream {
 }
 
 impl TransferEventStream {
-    /// Next event, or `None` once every sink is gone and the queue is drained.
-    pub async fn next(&mut self) -> Option<TransferEvent> {
+    /// Waits for the next event, or returns `None` once every sink is gone and the queue is
+    /// drained.
+    pub async fn recv(&mut self) -> Option<TransferEvent> {
         self.rx.recv().await
     }
 
-    /// Non-blocking receive.
+    /// Returns the next queued event without waiting.
     ///
-    /// The two failures are distinct answers for a polling consumer: [`Empty`]
-    /// means come back, [`Disconnected`] means the operation is over and there
-    /// will never be another event. Collapsing them into one `None` makes a
-    /// consumer either spin forever or stop early.
-    ///
-    /// [`Empty`]: TryNextError::Empty
-    /// [`Disconnected`]: TryNextError::Disconnected
-    pub fn try_next(&mut self) -> Result<TransferEvent, TryNextError> {
-        use tokio::sync::mpsc::error::TryRecvError;
+    /// Fails with [`TryRecvError::Empty`] while no event is queued and a sink still exists,
+    /// and with [`TryRecvError::Disconnected`] once every sink is gone and the queue is
+    /// drained.
+    pub fn try_recv(&mut self) -> Result<TransferEvent, TryRecvError> {
+        use tokio::sync::mpsc::error::TryRecvError as MpscTryRecvError;
         self.rx.try_recv().map_err(|e| match e {
-            TryRecvError::Empty => TryNextError::Empty,
-            TryRecvError::Disconnected => TryNextError::Disconnected,
+            MpscTryRecvError::Empty => TryRecvError::Empty,
+            MpscTryRecvError::Disconnected => TryRecvError::Disconnected,
         })
     }
 
@@ -727,35 +534,31 @@ impl TransferEventStream {
     }
 }
 
-/// Why [`TransferEventStream::try_next`] had nothing to return.
-///
-/// Not a failure in the usual sense: `Empty` is the ordinary answer for a consumer
-/// polling faster than events arrive.
+/// Why [`TransferEventStream::try_recv`] returned no event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum TryNextError {
-    /// No event is queued, but the operation is still running. Poll again.
+pub enum TryRecvError {
+    /// No event is queued and a sink still exists, so an event may still arrive.
     Empty,
-    /// Every sink is gone and the queue is drained. There will never be another
-    /// event, so a consumer should stop rather than poll again.
+    /// Every sink is gone and the queue is drained, so no event will arrive.
     Disconnected,
 }
 
-impl fmt::Display for TryNextError {
+impl fmt::Display for TryRecvError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            TryNextError::Empty => write!(f, "no event queued"),
-            TryNextError::Disconnected => write!(f, "event stream closed"),
+            TryRecvError::Empty => write!(f, "no event queued"),
+            TryRecvError::Disconnected => write!(f, "event stream closed"),
         }
     }
 }
 
-impl std::error::Error for TryNextError {}
+impl std::error::Error for TryRecvError {}
 
 /// Per-entry emitter, owning the terminal obligation.
 ///
 /// The obligation is deliberately **not** the transfer status. A status CAS says
-/// which thread won the transition; this flag says whether a `Ended` is still
+/// which thread won the transition; this flag says whether a `Finished` is still
 /// owed. They come apart in both directions: an entry refused by the failure
 /// policy has an obligation and no status, and a transfer that was never announced
 /// has a status and no obligation.
@@ -767,19 +570,12 @@ pub(crate) struct TransferLifecycle {
     /// inner, whose context holds a strong `Arc<Handle>`, so holding the sink by value
     /// kept a request-level `Sender` -- and with it the scheduler, runtime, memory budget
     /// and retry cache -- alive for the process. A consumer then has no way to drain to
-    /// completion: `next()` never returns `None` and `try_next` never answers
-    /// [`TryNextError::Disconnected`], because "every sink is gone" never becomes true.
+    /// completion: `recv()` never returns `None` and `try_recv` never answers
+    /// [`TryRecvError::Disconnected`], because "every sink is gone" never becomes true.
     /// So the release is explicit, at the one instant the transfer is known to be over.
     sink: Arc<Mutex<Option<TransferEventSink>>>,
     id: TransferId,
     transfer: TransferRef,
-    /// The decision both of this entry's events report.
-    ///
-    /// Stored once so the pair cannot disagree. The transfer manager compares
-    /// nothing — it has no second side to compare against and no filters — so
-    /// every entry it decides is an unconditional transfer, and the field is not a
-    /// constructor parameter until a producer exists that can vary it.
-    decision: Decision,
     /// The view `announce` hands out, or `None` for an entry with no transfer behind it.
     ///
     /// Held rather than passed to `announce`, because the obligation and the thing it
@@ -828,36 +624,22 @@ impl TransferLifecycle {
             sink: Arc::new(Mutex::new(Some(sink))),
             id,
             transfer,
-            decision: Decision::Transfer {
-                reason: TransferReason::Forced {},
-            },
             view,
             owes_finish: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    /// Announce the decision and take on the terminal obligation.
+    /// Emit [`TransferEvent::Started`] and take on the terminal obligation.
     ///
-    /// The obligation is taken even if the send is dropped, so a lost `Planned`
-    /// cannot silently cancel the matching `Ended`. That keeps the two counts
+    /// The obligation is taken even if the send is dropped, so a lost `Started`
+    /// cannot silently cancel the matching `Finished`. That keeps the two counts
     /// comparable, which is what makes a dropped event visible.
-    ///
-    /// A [`Decision::Skip`] takes no obligation, which is what enforces that variant's
-    /// "no `Ended` follows it": `finish` cannot answer for a lifecycle that never owed a
-    /// terminal, so no shared terminal path can emit one for an entry nothing was attempted
-    /// on. That matters to a consumer keying per-entry state off `Planned` and freeing it on
-    /// `Ended`: a terminal for an entry that was never attempted is state it never
-    /// allocated, and the decision alone is what tells the two shapes apart.
-    /// Currently unreachable — [`new`](Self::new) constructs only `Transfer`.
     pub(crate) fn announce(&self) {
-        if !matches!(self.decision, Decision::Skip { .. }) {
-            self.owes_finish.store(true, Ordering::Release);
-        }
+        self.owes_finish.store(true, Ordering::Release);
         if let Some(sink) = &*lock_sink(&self.sink) {
-            sink.emit(TransferEvent::Planned(Planned {
+            sink.emit(TransferEvent::Started(Started {
                 id: self.id,
                 transfer: self.transfer.clone(),
-                decision: self.decision.clone(),
                 view: self.view.clone(),
             }));
         }
@@ -875,10 +657,9 @@ impl TransferLifecycle {
         Some(PendingEmit {
             sink: self.sink.clone(),
             owes_finish: self.owes_finish.clone(),
-            event: Some(TransferEvent::Ended(Ended {
+            event: Some(TransferEvent::Finished(Finished {
                 id: self.id,
                 transfer: self.transfer.clone(),
-                decision: self.decision.clone(),
                 outcome,
             })),
         })
@@ -938,7 +719,7 @@ impl Drop for PendingEmit {
     ///
     /// Without this, an early `return` or a `?` on a path that has already
     /// claimed consumes the obligation with a value that never reached the
-    /// channel: `finish` returns `None` forever after, so the `Ended` is lost
+    /// channel: `finish` returns `None` forever after, so the `Finished` is lost
     /// and nothing records that it was owed. Re-arming makes the loss recoverable
     /// by the next terminal site instead.
     ///
@@ -988,32 +769,21 @@ mod tests {
         Outcome::Failed {}
     }
 
-    /// The doc example, run against every shape of event a run can produce. It is
-    /// the requirement as an assertion: the four familiar lines come from one event,
-    /// with no side map and no second lookup.
+    /// The doc example's line printer: each line it prints comes from one event, with no
+    /// side map and no second lookup.
     ///
-    /// One difference from the doc example, which is compiled as an external crate:
-    /// `#[non_exhaustive]` does not apply in the defining crate, so the wildcard
-    /// [`Direction`] arm an external consumer must write is unreachable here.
-    fn line(event: &TransferEvent, dry_run: bool) -> Option<String> {
+    /// Unlike the doc example, which compiles as an external crate, this has no wildcard
+    /// [`Direction`] arm: `#[non_exhaustive]` does not apply in the defining crate.
+    fn line(event: &TransferEvent) -> Option<String> {
         let transfer = event.transfer();
-        let verb = match event.decision() {
-            Decision::Delete { .. } => "delete",
-            Decision::Skip { .. } => return None,
-            _ => match transfer.direction() {
-                Direction::Upload => "upload",
-                Direction::Download => "download",
-                Direction::Copy => "copy",
-            },
+        let verb = match transfer.direction() {
+            Direction::Upload => "upload",
+            Direction::Download => "download",
         };
-        let location = match event.decision() {
-            Decision::Delete { .. } => transfer.destination().to_string(),
-            _ => format!("{} to {}", transfer.source(), transfer.destination()),
-        };
+        let location = format!("{} to {}", transfer.source(), transfer.destination());
         Some(match event {
-            TransferEvent::Planned(_) if dry_run => format!("(dryrun) {verb}: {location}"),
-            TransferEvent::Planned(_) => return None,
-            TransferEvent::Ended(ended) => match ended.outcome() {
+            TransferEvent::Started(_) => return None,
+            TransferEvent::Finished(finished) => match finished.outcome() {
                 Outcome::Failed { .. } => format!("{verb} failed: {location}"),
                 Outcome::Cancelled { .. } => return None,
                 _ => format!("{verb}: {location}"),
@@ -1021,224 +791,73 @@ mod tests {
         })
     }
 
-    fn ended(transfer: TransferRef, decision: Decision, outcome: Outcome) -> TransferEvent {
-        TransferEvent::Ended(Ended {
+    fn finished(transfer: TransferRef, outcome: Outcome) -> TransferEvent {
+        TransferEvent::Finished(Finished {
             id: tid(1, Some(0)),
             transfer,
-            decision,
             outcome,
         })
-    }
-
-    fn forced() -> Decision {
-        Decision::Transfer {
-            reason: TransferReason::Forced {},
-        }
     }
 
     #[test]
     fn every_printed_line_comes_from_one_event() {
         let ok = Outcome::Succeeded {};
         assert_eq!(
-            line(&ended(upload_ref(), forced(), ok.clone()), false).as_deref(),
+            line(&finished(upload_ref(), ok.clone())).as_deref(),
             Some("upload: ./a.txt to s3://bucket/k/a.txt"),
             "an upload's line must be printable from the event alone"
         );
 
         let down = TransferRef::download(s3("bucket", "k/a.txt"), local("./a.txt"));
         assert_eq!(
-            line(&ended(down, forced(), ok.clone()), false).as_deref(),
+            line(&finished(down, ok)).as_deref(),
             Some("download: s3://bucket/k/a.txt to ./a.txt"),
             "a download's line must name the S3 side as the source"
-        );
-
-        // Copy and delete have no producer in this crate yet, so they are built
-        // here from the fields directly. They are what fixes `direction` as a
-        // carried value: a delete names one end, and that end cannot say which
-        // kind of run removed it.
-        let copy = TransferRef {
-            direction: Direction::Copy,
-            source: s3("src", "k"),
-            destination: s3("dst", "k"),
-        };
-        assert_eq!(
-            line(&ended(copy, forced(), ok.clone()), false).as_deref(),
-            Some("copy: s3://src/k to s3://dst/k"),
-            "a copy's line must name both S3 ends"
-        );
-
-        let del = TransferRef {
-            direction: Direction::Upload,
-            source: Endpoint::Unresolved {},
-            destination: s3("dst", "gone"),
-        };
-        assert_eq!(
-            line(&ended(del.clone(), Decision::Delete {}, ok), false).as_deref(),
-            Some("delete: s3://dst/gone"),
-            "a delete's line must name only the end it removes"
         );
 
         // The entry a failure names comes from the event itself, so a consumer never
         // has to pair a failure with a separate lookup to know which entry broke. The
         // cause is not on the event -- it is read from the handle's `join()`.
         assert_eq!(
-            line(&ended(upload_ref(), forced(), failed()), false).as_deref(),
+            line(&finished(upload_ref(), failed())).as_deref(),
             Some("upload failed: ./a.txt to s3://bucket/k/a.txt"),
             "a failure must name its entry from the same event"
         );
 
-        // A dry run's only event is the decision, and whether the run is dry is the
-        // caller's own fact, which is why nothing on the event says so.
-        let planned = TransferEvent::Planned(Planned {
+        let started = TransferEvent::Started(Started {
             id: tid(1, Some(0)),
             transfer: upload_ref(),
-            decision: forced(),
             view: None,
         });
         assert_eq!(
-            line(&planned, true).as_deref(),
-            Some("(dryrun) upload: ./a.txt to s3://bucket/k/a.txt"),
-            "a decision must print the same line without an outcome"
-        );
-        assert_eq!(
-            line(&planned, false),
+            line(&started),
             None,
-            "outside a dry run the line prints at the terminal, not the decision"
-        );
-    }
-
-    /// The four line kinds, each formatted from a single event with nothing else in
-    /// hand: no operation input, no side map, no second lookup. FR-Obs-1 is met only
-    /// if all four strings come out of `line`, which reads `direction`, `decision`,
-    /// `source`, `destination`, and `outcome` off the event and nothing more.
-    ///
-    /// Two of the four have no producer in this crate, so they are built from the
-    /// fields directly: `TransferRef` exposes `upload` and `download` constructors
-    /// only, and `TransferLifecycle::new` fixes every decision to
-    /// `Transfer { Forced }`. That is a gap in the *emitters*, not in the event
-    /// shape — the shape carries both, which is what this asserts.
-    #[test]
-    fn the_four_cli_line_kinds_each_come_from_one_event() {
-        let ok = Outcome::Succeeded {};
-        let cases = [
-            (
-                "upload: ./local/a to s3://bucket/a",
-                TransferRef::upload(local("./local/a"), s3("bucket", "a")),
-                forced(),
-            ),
-            (
-                "download: s3://bucket/a to ./local/a",
-                TransferRef::download(s3("bucket", "a"), local("./local/a")),
-                forced(),
-            ),
-            (
-                "copy: s3://src/a to s3://dst/a",
-                TransferRef {
-                    direction: Direction::Copy,
-                    source: s3("src", "a"),
-                    destination: s3("dst", "a"),
-                },
-                forced(),
-            ),
-            (
-                // A delete names one end. `direction` is still carried and still
-                // ignored by the line: an S3 object removed at the destination could
-                // belong to an upload run or a copy run, so the endpoint pair cannot
-                // supply the verb and the decision must.
-                "delete: s3://bucket/a",
-                TransferRef {
-                    direction: Direction::Upload,
-                    source: Endpoint::Unresolved {},
-                    destination: s3("bucket", "a"),
-                },
-                Decision::Delete {},
-            ),
-        ];
-
-        for (expected, transfer, decision) in cases {
-            let event = ended(transfer, decision, ok.clone());
-            assert_eq!(
-                line(&event, false).as_deref(),
-                Some(expected),
-                "the line must be printable from this event alone: {event:?}"
-            );
-        }
-    }
-
-    /// Each of the reasons a caller must be able to tell apart, named once. The
-    /// test is the enumeration: a reason that is not reachable from a decision or an
-    /// outcome cannot be reported at all.
-    #[test]
-    fn every_required_reason_is_reachable_from_a_decision_or_an_outcome() {
-        let transfer_reasons = [
-            TransferReason::NotAtDestination {},
-            TransferReason::SizeDiffers {},
-            TransferReason::TimeDiffers {},
-            TransferReason::Forced {},
-        ];
-        for reason in transfer_reasons {
-            assert!(
-                matches!(
-                    Decision::Transfer { reason },
-                    Decision::Transfer {
-                        reason: TransferReason::NotAtDestination {}
-                            | TransferReason::SizeDiffers {}
-                            | TransferReason::TimeDiffers {}
-                            | TransferReason::Forced {}
-                    }
-                ),
-                "a reason for moving an entry must reach a transfer decision"
-            );
-        }
-
-        let skip_reasons = [
-            SkipReason::Unchanged {},
-            SkipReason::ExcludedByFilter {},
-            SkipReason::ArchivalStorageClass {},
-            SkipReason::CaseConflict {},
-            SkipReason::Untransferable {},
-            SkipReason::DestinationOnly {},
-            SkipReason::SourceUnknown {},
-            SkipReason::DestinationUnknown {},
-        ];
-        assert_eq!(
-            skip_reasons.len(),
-            8,
-            "the seven reasons for holding an entry back, plus unchanged: an \
-             unknown entry and an unchanged one read alike in a log line and mean \
-             opposite things, so they are separate variants"
-        );
-        for reason in skip_reasons {
-            assert!(
-                matches!(Decision::Skip { reason }, Decision::Skip { .. }),
-                "a reason for leaving an entry alone must reach a skip decision"
-            );
-        }
-
-        assert!(
-            matches!(failed(), Outcome::Failed { .. }),
-            "failure is an outcome, not a reason: it does not replace the reason the \
-             entry was selected, which stays on the decision"
+            "the line prints when the transfer finishes, not when it starts"
         );
     }
 
     #[test]
-    fn both_events_carry_the_entry_and_the_decision() {
+    fn both_events_carry_the_entry_and_its_id() {
         let (lc, mut stream) = lifecycle();
         lc.announce();
         lc.finish(Outcome::Succeeded {}).expect("owed").send();
 
         for expected_outcome in [false, true] {
-            let ev = stream.try_next().expect("both events reached the channel");
+            let ev = stream.try_recv().expect("both events reached the channel");
             assert_eq!(
-                matches!(ev, TransferEvent::Ended(_)),
+                matches!(ev, TransferEvent::Finished(_)),
                 expected_outcome,
-                "the decision arrives before the terminal: {ev:?}"
+                "the start arrives before the terminal: {ev:?}"
             );
-            assert!(
-                matches!(ev.decision(), Decision::Transfer { .. }),
-                "delivery is lossy, so the decision must be on the terminal too, or \
-                 a consumer that missed the first event has no verb to print: {ev:?}"
+            let id = match &ev {
+                TransferEvent::Started(started) => started.id(),
+                TransferEvent::Finished(finished) => finished.id(),
+            };
+            assert_eq!(
+                tid(1, None),
+                id,
+                "delivery is lossy, so the terminal must carry the start's id, or a \
+                 consumer that missed the first event cannot tell which entry ended: {ev:?}"
             );
             assert_eq!(
                 ev.transfer().destination().to_string(),
@@ -1275,7 +894,7 @@ mod tests {
         assert!(
             lc.finish(failed()).is_some(),
             "an abandoned claim must re-arm: otherwise the obligation is consumed \
-             by a value that never reached the channel, and the `Ended` is lost \
+             by a value that never reached the channel, and the `Finished` is lost \
              with nothing recording that it was owed"
         );
     }
@@ -1291,7 +910,7 @@ mod tests {
 
     #[test]
     fn a_full_channel_drops_and_counts_rather_than_waiting() {
-        // Capacity 1: the decision fits, the terminal does not. Nothing is
+        // Capacity 1: the `Started` fits, the `Finished` does not. Nothing is
         // reserved, so the loss is at the end rather than the beginning -- and it is
         // counted, which is the whole of what bounded delivery promises.
         let (sink, mut stream) = channel(NonZeroUsize::new(1).unwrap());
@@ -1299,10 +918,10 @@ mod tests {
         lc.announce();
         lc.finish(Outcome::Succeeded {}).expect("owed").send();
 
-        let ev = stream.try_next().expect("the decision reached the channel");
+        let ev = stream.try_recv().expect("the start reached the channel");
         assert!(
-            matches!(&ev, TransferEvent::Planned(p) if p.id() == 7),
-            "the first event through an empty channel is the decision: {ev:?}"
+            matches!(&ev, TransferEvent::Started(p) if p.id() == tid(7, None)),
+            "the first event through an empty channel is the start: {ev:?}"
         );
         assert_eq!(
             stream.dropped(),
@@ -1311,7 +930,7 @@ mod tests {
              slow down waiting for the consumer"
         );
         assert!(
-            matches!(stream.try_next(), Err(TryNextError::Disconnected)),
+            matches!(stream.try_recv(), Err(TryRecvError::Disconnected)),
             "a dropped event must not be delivered late -- and since `send` released the \
              sink, the stream is closed rather than merely empty"
         );
@@ -1328,12 +947,9 @@ mod tests {
     fn dropped_counts_a_full_channel_but_not_a_closed_one() {
         let (sink, mut stream) = channel(NonZeroUsize::new(1).unwrap());
         let ev = || {
-            TransferEvent::Planned(Planned {
+            TransferEvent::Started(Started {
                 id: tid(1, None),
                 transfer: upload_ref(),
-                decision: Decision::Transfer {
-                    reason: TransferReason::Forced {},
-                },
                 view: None,
             })
         };
@@ -1345,7 +961,7 @@ mod tests {
         assert_eq!(1, stream.dropped(), "a full channel is a lost event");
 
         // Drain, so the next failure can only be attributed to closure.
-        stream.try_next().expect("the queued event");
+        stream.try_recv().expect("the queued event");
         let dropped_before_close = stream.dropped();
 
         drop(stream);
@@ -1361,41 +977,31 @@ mod tests {
             "a closed receiver must not be counted as lost events"
         );
     }
-    /// The same sink at both registration levels must not double-deliver.
-    ///
-    /// `Config::builder().events(sink.clone())` plus `.download_objects().events(sink)` is the
-    /// documented way to observe at both levels, and a caller reaches it by accident as easily
-    /// as on purpose. `resolve_sink` merges the two, so without deduplication one emit is sent
-    /// twice down one channel. `owes_finish` does not catch it: it guarantees a single emit, and
-    /// the fan-out is downstream of that -- so the count is exact at the producer and doubled at
-    /// the consumer, which is where a `mv --recursive` consumer deletes each source twice.
-    #[tokio::test]
-    async fn the_same_sink_at_both_levels_delivers_each_event_once() {
-        let (sink, mut stream) = channel(std::num::NonZeroUsize::new(16).expect("capacity > 0"));
-        let resolved =
-            resolve_sink(Some(&sink), Some(sink.clone())).expect("both levels registered");
 
-        resolved.emit(TransferEvent::Ended(Ended {
+    /// One sink registered twice on a request must not double-deliver.
+    ///
+    /// A request's `events()` merges each sink it is given, so registering the same sink
+    /// twice merges it with itself. `owes_finish` guarantees one emit and the fan-out is
+    /// downstream of it, so without deduplication the consumer receives that emit twice.
+    #[tokio::test]
+    async fn merging_a_sink_with_itself_delivers_each_event_once() {
+        let (sink, mut stream) = channel(std::num::NonZeroUsize::new(16).expect("capacity > 0"));
+        let registered = sink.clone().merge(sink);
+
+        registered.emit(TransferEvent::Finished(Finished {
             id: tid(7, Some(1)),
             transfer: TransferRef::download(Endpoint::Stream {}, Endpoint::Stream {}),
-            decision: Decision::Transfer {
-                reason: TransferReason::Forced {},
-            },
             outcome: Outcome::Succeeded {},
         }));
-        drop(resolved);
-        drop(sink);
+        drop(registered);
 
         let mut settled = 0;
-        while let Some(ev) = stream.next().await {
-            if matches!(ev, TransferEvent::Ended(_)) {
+        while let Some(ev) = stream.recv().await {
+            if matches!(ev, TransferEvent::Finished(_)) {
                 settled += 1;
             }
         }
-        assert_eq!(
-            1, settled,
-            "one terminal must reach one stream once; a second delivery is a second delete"
-        );
+        assert_eq!(1, settled, "one terminal must reach one stream once");
         assert_eq!(
             0,
             stream.dropped(),
@@ -1413,19 +1019,16 @@ mod tests {
         let (b, mut sb) = channel(std::num::NonZeroUsize::new(8).expect("capacity > 0"));
         let merged = a.merge(b);
 
-        merged.emit(TransferEvent::Ended(Ended {
+        merged.emit(TransferEvent::Finished(Finished {
             id: tid(9, None),
             transfer: TransferRef::download(Endpoint::Stream {}, Endpoint::Stream {}),
-            decision: Decision::Transfer {
-                reason: TransferReason::Forced {},
-            },
             outcome: Outcome::Succeeded {},
         }));
         drop(merged);
 
         let count = |s: &mut TransferEventStream| {
             let mut n = 0;
-            while s.try_next().is_ok() {
+            while s.try_recv().is_ok() {
                 n += 1;
             }
             n

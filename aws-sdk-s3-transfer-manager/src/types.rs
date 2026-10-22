@@ -13,6 +13,7 @@ pub use crate::model::{
     ObjectStorageClass, Owner, ReplicationStatus, RequestCharged, RequestPayer, RestoreStatus,
     ServerSideEncryption, StorageClass, UploadInput, UploadOutput,
 };
+pub use crate::transfer::{PendingCategory, PendingCause};
 
 /// The target part size for an upload or download request.
 #[non_exhaustive]
@@ -337,24 +338,34 @@ pub struct TransferMetrics {
     pub finished_at: Option<std::time::Instant>,
 }
 
-/// Detached, read-only view of one transfer's live byte counters.
+/// Detached, read-only view of one transfer's live counters and pending cause.
 ///
-/// Handed out on [`TransferEvent::Planned`](crate::events::TransferEvent::Planned). Owns
+/// Handed out on [`TransferEvent::Started`](crate::events::TransferEvent::Started). Owns
 /// nothing the caller can act with and borrows nothing, so it outlives the `join(self)`
 /// that consumes the operation handle. Read it whenever you repaint; nothing pushes.
 ///
 /// Drop it once that entry's
-/// [`TransferEvent::Ended`](crate::events::TransferEvent::Ended) arrives — it keeps
-/// one small allocation alive until then, so retaining every view of a million-object
-/// directory transfer retains a million of them.
+/// [`TransferEvent::Finished`](crate::events::TransferEvent::Finished) arrives — it keeps
+/// that transfer's counters, status and pending cause allocated until then, so retaining
+/// every view of a million-object directory transfer retains a million of each.
 #[derive(Debug, Clone)]
 pub struct TransferView {
     metrics: std::sync::Arc<crate::transfer::MetricsState>,
+    status: crate::transfer::StateMachineStatus,
+    pending: std::sync::Arc<crate::transfer::PendingCauseSlot>,
 }
 
 impl TransferView {
-    pub(crate) fn new(metrics: std::sync::Arc<crate::transfer::MetricsState>) -> Self {
-        Self { metrics }
+    pub(crate) fn new(
+        metrics: std::sync::Arc<crate::transfer::MetricsState>,
+        status: crate::transfer::StateMachineStatus,
+        pending: std::sync::Arc<crate::transfer::PendingCauseSlot>,
+    ) -> Self {
+        Self {
+            metrics,
+            status,
+            pending,
+        }
     }
 
     /// Point-in-time reading of this transfer's counters.
@@ -376,12 +387,17 @@ impl TransferView {
         self.metrics.snapshot()
     }
 
-    /// Why this transfer produced no work on its most recent poll, if it produced none.
+    /// Why this transfer is parked, or `None` while it is not parked.
     ///
-    /// `None` means it produced work, so a reading of `None` is not a promise that bytes are
-    /// moving — only that the transfer was not parked when last asked.
-    pub fn pending_reason(&self) -> Option<PendingReason> {
-        self.metrics.pending_reason()
+    /// A cause is reported from the poll that parks the transfer until the scheduler next
+    /// polls it, which can be after the wake that unblocked it. `None` does not mean bytes
+    /// are moving: a transfer waiting for scheduler capacity is not parked. A transfer whose
+    /// status is no longer [`TransferStatus::Active`] reports `None`.
+    pub fn pending_cause(&self) -> Option<PendingCause> {
+        let cause = self.pending.get()?;
+        // Status after the slot: a status never returns to `Active`, so an `Active` reading
+        // here means the transfer was still active when `cause` was read.
+        self.status.is_active().then_some(cause)
     }
 
     /// This transfer's byte denominator. See [`Total`].
@@ -416,7 +432,7 @@ impl TransferView {
     /// would show work remaining forever on a run with failures.
     ///
     /// Incremented at the same instant the entry's
-    /// [`TransferEvent::Ended`](crate::events::TransferEvent::Ended) is claimed, so
+    /// [`TransferEvent::Finished`](crate::events::TransferEvent::Finished) is claimed, so
     /// this is exactly what a consumer would tally from the stream if no event were ever
     /// dropped — and unlike that tally, it stays exact when events are.
     ///
@@ -424,38 +440,6 @@ impl TransferView {
     pub fn entries_settled(&self) -> u64 {
         self.metrics.entries_settled()
     }
-}
-
-/// Why a transfer is producing no work right now.
-///
-/// Answers *"why is nothing moving"*, which byte counters cannot: a bar sitting still looks
-/// identical whether the consumer has stopped reading, the memory budget is full, or the
-/// listing has not returned. Read it from
-/// [`TransferView::pending_reason`](TransferView::pending_reason); `None` means the transfer
-/// produced work on its most recent poll.
-///
-/// Not every reason is a problem — [`PendingReason::WorkInFlight`] is the normal tail of a
-/// transfer. Reported for downloads; an upload's park sites are not labelled, so a parked
-/// upload reports `None` rather than a wrong reason.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum PendingReason {
-    /// The read-ahead window is full: prefetched data is waiting for the caller to read it.
-    /// Issuance resumes when the consumer drains.
-    #[non_exhaustive]
-    ReadAheadWindow {},
-    /// The client's memory budget has no room for another part. Resumes when an in-flight
-    /// part completes and releases its reservation.
-    #[non_exhaustive]
-    MemoryBudget {},
-    /// The initial `GetObject`/`HeadObject` has not returned, so the transfer does not yet
-    /// know what to fetch.
-    #[non_exhaustive]
-    Discovery {},
-    /// Every unit of work has been issued and the transfer is waiting for the last
-    /// in-flight requests to retire. The normal tail of a transfer.
-    #[non_exhaustive]
-    WorkInFlight {},
 }
 
 /// A denominator a transfer is still discovering, and how much to trust it.

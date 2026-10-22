@@ -1183,6 +1183,86 @@ mod tests {
         handle.runtime.shutdown();
     }
 
+    /// Transfer that parks on its first poll and, on its second, records the cause its
+    /// view reported as that poll began.
+    #[derive(Debug)]
+    struct ParkThenObserveTransfer {
+        ctx: TransferContext,
+        polls: AtomicUsize,
+        /// `Some` once the second poll ran, holding what the view reported then.
+        cause_at_repoll: Arc<std::sync::Mutex<Option<Option<PendingCause>>>>,
+    }
+
+    impl Transfer for ParkThenObserveTransfer {
+        fn ctx(&self) -> &TransferContext {
+            &self.ctx
+        }
+
+        fn poll_work(&self) -> PollWork {
+            if self.polls.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.ctx
+                    .set_pending(PendingCause::new(PendingCategory::Memory, "test"));
+                PollWork::Pending
+            } else {
+                *self.cause_at_repoll.lock().unwrap() = Some(self.ctx.view().pending_cause());
+                self.ctx.set_completed();
+                self.ctx.signal_terminal();
+                PollWork::Done
+            }
+        }
+
+        fn execute<'a>(
+            &'a self,
+            _work: &'a mut IoRequest,
+        ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
+            Box::pin(async { unreachable!("test transfer produces no work") })
+        }
+    }
+
+    /// A parked transfer's view reports its cause until the scheduler polls it again, and
+    /// that poll begins with the cause cleared.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn the_next_poll_clears_the_cause_a_view_reports() {
+        let handle = test_handle(1);
+        let id = TransferId {
+            id: 40_004,
+            parent: None,
+        };
+        let (ctx, completion_rx) = TransferContext::with_id(id, handle.clone());
+        let observer = ctx.clone();
+        let cause_at_repoll = Arc::new(std::sync::Mutex::new(None));
+        // Runs the first poll on this thread before it returns.
+        handle
+            .scheduler
+            .enqueue_transfer(Box::new(ParkThenObserveTransfer {
+                ctx,
+                polls: AtomicUsize::new(0),
+                cause_at_repoll: Arc::clone(&cause_at_repoll),
+            }));
+
+        assert_eq!(
+            Some(PendingCategory::Memory),
+            observer
+                .view()
+                .pending_cause()
+                .map(|cause| cause.category()),
+            "a parked transfer reports the cause it parked on"
+        );
+        observer.try_wake();
+        tokio::time::timeout(Duration::from_secs(5), completion_rx)
+            .await
+            .expect("the wake never repolled the transfer")
+            .expect("the second poll completes the transfer");
+
+        assert_eq!(
+            Some(None),
+            *cause_at_repoll.lock().unwrap(),
+            "the next poll must begin with the parked cause cleared"
+        );
+        handle.runtime.shutdown();
+    }
+
     /// Cancellation completes direction cleanup before notifying terminal waiters.
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
@@ -3698,7 +3778,7 @@ mod tests {
         assert!(
             seen.is_none(),
             "the Done arm ran on_terminal while the status was still Active, so a \
-             succeeding transfer publishes Ended {{ Cancelled }} and the real completion \
+             succeeding transfer publishes Finished {{ Cancelled }} and the real completion \
              finds the terminal report already spent: {seen:?}"
         );
 

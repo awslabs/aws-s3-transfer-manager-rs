@@ -342,11 +342,6 @@ impl DownloadTransfer {
             tracing::debug!("not active, returning Done");
             return PollWork::Done;
         }
-        // Cleared at entry and set again by whichever park site this poll reaches, so the
-        // reason describes the most recent poll rather than the last one that happened to
-        // park. Without the clear, a transfer that parked once would report that reason for
-        // the rest of its life, including while moving bytes.
-        self.inner.ctx.set_pending_reason(None);
 
         let mut state = self.inner.state.lock().unwrap();
 
@@ -359,11 +354,6 @@ impl DownloadTransfer {
                 })
             }
             DownloadState::DiscoveryInFlight => {
-                self.inner
-                    .ctx
-                    .set_pending_reason(Some(crate::types::PendingReason::from(
-                        DownloadPendingReason::Discovery,
-                    )));
                 self.inner.ctx.set_pending(DownloadPendingReason::Discovery);
                 self.inner
                     .observability
@@ -572,11 +562,7 @@ impl DownloadTransfer {
     /// waker re-readies it: the consumer freeing occupancy, or a GET
     /// completion decrementing the in-flight count. Memory reservations use their
     /// own scheduler-backed task waker.
-    ///
-    /// The cause is named once and reaches both readers: the aggregate diagnostics and
-    /// the public [`PendingReason`](crate::types::PendingReason) a view reports.
     fn park(&self, reason: DownloadPendingReason, snapshot: DownloadStateSnapshot) -> PollWork {
-        self.inner.ctx.set_pending_reason(Some(reason.into()));
         self.inner.ctx.set_pending(reason);
         self.inner.observability.observe_state(snapshot);
         PollWork::Pending
@@ -618,14 +604,6 @@ impl DownloadTransfer {
                 data: Some(Box::new(DownloadWork::DrainResident)),
             })
         } else {
-            // Not routed through `park`: the reservation future has already registered
-            // its own waker, so this path arms the pending state without park's wake
-            // contract. The public cause still has to be set, by the same derivation.
-            self.inner
-                .ctx
-                .set_pending_reason(Some(crate::types::PendingReason::from(
-                    DownloadPendingReason::MemoryAdmission,
-                )));
             self.inner
                 .ctx
                 .set_pending(DownloadPendingReason::MemoryAdmission);
@@ -1419,7 +1397,7 @@ impl DownloadTransfer {
         self.report_terminal(state_snapshot);
         // Emit before the joiner is released, not only from `on_terminal`: the scheduler
         // runs `on_terminal` after this, so a consumer that writes `join().await` and then
-        // drains once would miss this operation's own `Ended`. `finish` is exactly-once, so
+        // drains once would miss this operation's own `Finished`. `finish` is exactly-once, so
         // whichever of the two paths runs first emits and the other is a no-op.
         if let Some(lc) = &self.inner.lifecycle {
             if let Some(emit) = lc.finish(self.inner.ctx.terminal_outcome()) {
@@ -1502,7 +1480,7 @@ impl DownloadTransfer {
         self.report_terminal(snapshot);
         // Emit before the joiner is released, not only from `on_terminal`: the scheduler
         // runs `on_terminal` after this, so a consumer that writes `join().await` and then
-        // drains once would miss this operation's own `Ended`. `finish` is exactly-once, so
+        // drains once would miss this operation's own `Finished`. `finish` is exactly-once, so
         // whichever of the two paths runs first emits and the other is a no-op.
         if let Some(lc) = &self.inner.lifecycle {
             if let Some(emit) = lc.finish(self.inner.ctx.terminal_outcome()) {
@@ -2350,13 +2328,13 @@ mod tests {
         (transfer, lifecycle, stream)
     }
 
-    /// Every `Ended` outcome the stream holds, as a label, so the sequence is
+    /// Every `Finished` outcome the stream holds, as a label, so the sequence is
     /// assertable (`Outcome` is deliberately not `PartialEq`).
     fn drain_terminals(stream: &mut crate::events::TransferEventStream) -> Vec<&'static str> {
         let mut terminals = Vec::new();
-        while let Ok(event) = stream.try_next() {
-            if let crate::events::TransferEvent::Ended(ended) = event {
-                terminals.push(match ended.outcome() {
+        while let Ok(event) = stream.try_recv() {
+            if let crate::events::TransferEvent::Finished(finished) = event {
+                terminals.push(match finished.outcome() {
                     crate::events::Outcome::Succeeded {} => "Succeeded",
                     crate::events::Outcome::Failed {} => "Failed",
                     crate::events::Outcome::Cancelled {} => "Cancelled",
@@ -2446,6 +2424,41 @@ mod tests {
         let transfer = create_download(24 * MB, 8 * MB);
         let _work = assert_ready(transfer.poll_work());
         assert_pending(transfer.poll_work());
+    }
+
+    /// A download's view reports the cause it parked on, and reports none once the
+    /// download finishes.
+    ///
+    /// The object is one part, so executing discovery completes the download and no poll
+    /// runs after the park to clear the cause: the `None` comes from the finished status.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn a_parked_download_reports_its_cause_until_it_finishes() {
+        let transfer = create_download(8 * MB, 8 * MB);
+        let view = transfer.ctx().view();
+
+        let mut discovery = assert_ready(transfer.poll_work());
+        assert_pending(transfer.poll_work());
+        assert_eq!(
+            Some(crate::types::PendingCategory::InFlightWork),
+            view.pending_cause().map(|cause| cause.category()),
+            "a download waiting on discovery reports the request in flight"
+        );
+
+        let outcome = execute(&transfer, &mut discovery).await;
+        assert!(
+            matches!(outcome, WorkOutcome::Success { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            crate::types::TransferStatus::Completed,
+            transfer.ctx().transfer_status()
+        );
+        assert_eq!(
+            None,
+            view.pending_cause(),
+            "a finished download must not report the cause it last parked on"
+        );
     }
 
     #[cfg_attr(miri, ignore)]
@@ -2867,7 +2880,7 @@ mod tests {
     /// `desc.is_terminal()` -- `!ctx.is_active()` -- is still false, so nothing in
     /// `generate_work` skips it. The `Done` arm then calls `on_terminal()`, which emits
     /// `terminal_outcome()`, and that maps `Active` through `_ => Cancelled`.
-    /// `owes_finish` is a one-shot swap, so the wrong outcome is the only `Ended` the
+    /// `owes_finish` is a one-shot swap, so the wrong outcome is the only `Finished` the
     /// consumer ever sees for a download that goes on to complete.
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
@@ -2967,22 +2980,22 @@ mod tests {
 
         // What the consumer saw.
         let mut events = Vec::new();
-        while let Ok(event) = stream.try_next() {
+        while let Ok(event) = stream.try_recv() {
             events.push(event);
         }
         assert_eq!(stream.dropped(), 0, "no event was lost to capacity");
-        let ended: Vec<_> = events
+        let finished: Vec<_> = events
             .iter()
             .filter_map(|e| match e {
-                crate::events::TransferEvent::Ended(ended) => Some(ended),
+                crate::events::TransferEvent::Finished(finished) => Some(finished),
                 _ => None,
             })
             .collect();
-        assert_eq!(ended.len(), 1, "exactly one terminal event: {events:?}");
+        assert_eq!(finished.len(), 1, "exactly one terminal event: {events:?}");
         assert!(
-            matches!(ended[0].outcome(), crate::events::Outcome::Succeeded {}),
+            matches!(finished[0].outcome(), crate::events::Outcome::Succeeded {}),
             "a download whose status reads Completed reported {:?} to its consumer",
-            ended[0].outcome(),
+            finished[0].outcome(),
         );
     }
 

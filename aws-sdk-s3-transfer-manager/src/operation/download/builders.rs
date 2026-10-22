@@ -25,12 +25,8 @@ impl DownloadFluentBuilder {
 
     /// Report lifecycle events for this transfer to `sink`.
     ///
-    /// Merged with any sink set on the client, and calling this twice adds a second
-    /// consumer rather than replacing the first.
+    /// Calling this twice adds a second consumer rather than replacing the first.
     pub fn events(mut self, sink: crate::events::TransferEventSink) -> Self {
-        // Appends rather than replaces, so every registered consumer sees every event: the
-        // SEP asks for "a list of progress listeners", and a replacing setter would make a
-        // client-level sink and a request-level sink mutually exclusive.
         self.events = Some(match self.events.take() {
             Some(existing) => existing.merge(sink),
             None => sink,
@@ -45,14 +41,12 @@ impl DownloadFluentBuilder {
     ))]
     pub fn initiate(self) -> Result<DownloadHandle, crate::error::Error> {
         let input = self.inner.build()?;
-        // Resolved before the handle moves into `orchestrate`.
-        let events =
-            crate::events::resolve_sink(self.handle.config.events(), self.events).map(|sink| {
-                crate::operation::download::EventRegistration {
-                    sink,
-                    // The caller drains the body itself, so there is no file to name.
-                    destination: crate::events::Endpoint::Stream {},
-                }
+        let events = self
+            .events
+            .map(|sink| crate::operation::download::EventRegistration {
+                sink,
+                // The caller drains the body itself, so there is no file to name.
+                destination: crate::events::Endpoint::Stream {},
             });
         crate::operation::download::Download::orchestrate(self.handle, input, false, events)
     }
@@ -75,14 +69,13 @@ impl DownloadFluentBuilder {
     ) -> Result<ManagedDownloadHandle, crate::error::Error> {
         let input = self.inner.build()?;
         let path = path.into();
-        let events =
-            crate::events::resolve_sink(self.handle.config.events(), self.events).map(|sink| {
-                crate::operation::download::EventRegistration {
-                    sink,
-                    destination: crate::events::Endpoint::Local {
-                        path: Some(std::sync::Arc::from(path.as_path())),
-                    },
-                }
+        let events = self
+            .events
+            .map(|sink| crate::operation::download::EventRegistration {
+                sink,
+                destination: crate::events::Endpoint::Local {
+                    path: Some(std::sync::Arc::from(path.as_path())),
+                },
             });
         crate::operation::download::Download::orchestrate_to_path(
             self.handle,
@@ -126,12 +119,11 @@ impl DownloadFluentBuilder {
         // `Local { path: None }`: the caller opened the file and this method is never told
         // its path, so naming one would put an address in the event that the transfer
         // manager cannot know.
-        let events =
-            crate::events::resolve_sink(self.handle.config.events(), self.events).map(|sink| {
-                crate::operation::download::EventRegistration {
-                    sink,
-                    destination: crate::events::Endpoint::Local { path: None },
-                }
+        let events = self
+            .events
+            .map(|sink| crate::operation::download::EventRegistration {
+                sink,
+                destination: crate::events::Endpoint::Local { path: None },
             });
         crate::operation::download::Download::orchestrate_to_file(
             self.handle,
@@ -146,8 +138,8 @@ impl DownloadFluentBuilder {
 impl DownloadInputBuilder {
     /// Initiate a download transfer for a single object with this input using the given client.
     ///
-    /// This entry point reports no [events](crate::events) — an input builder has no sink to
-    /// carry. Use [`initiate_with_events`](Self::initiate_with_events) to register one.
+    /// This entry point reports no [events](crate::events); [`DownloadFluentBuilder::events`]
+    /// registers a sink.
     pub fn initiate_with(
         self,
         client: &crate::Client,
@@ -155,22 +147,5 @@ impl DownloadInputBuilder {
         let mut fluent_builder = client.download();
         fluent_builder.inner = self;
         fluent_builder.initiate()
-    }
-
-    /// Initiate a download transfer for a single object, reporting lifecycle
-    /// [events](crate::events) to `sink`.
-    ///
-    /// The events-carrying form of [`initiate_with`](Self::initiate_with). It exists because a
-    /// sink is registered on the fluent builder, which this entry point bypasses — without it,
-    /// a caller who assembled an input directly has no way to observe the transfer, and the
-    /// silence would look like a transfer that never produced events.
-    pub fn initiate_with_events(
-        self,
-        client: &crate::Client,
-        sink: crate::events::TransferEventSink,
-    ) -> Result<DownloadHandle, crate::error::Error> {
-        let mut fluent_builder = client.download();
-        fluent_builder.inner = self;
-        fluent_builder.events(sink).initiate()
     }
 }

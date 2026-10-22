@@ -13,14 +13,13 @@ use std::any::Any;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Wake, Waker};
 
 use pending::TransferPendingState;
-pub(crate) use pending::{
-    emit_pending_details, PendingCategory, PendingCause, TransferPendingStats,
-};
+pub(crate) use pending::{emit_pending_details, PendingCauseSlot, TransferPendingStats};
+pub use pending::{PendingCategory, PendingCause};
 
 /// Edge-triggered wake flag for transfer state machines.
 ///
@@ -159,11 +158,21 @@ impl<T: Any + Send + std::fmt::Debug> WorkData for T {
     }
 }
 
-/// Unique identifier for a transfer, with optional parent for hierarchy
+/// Identifies one transfer: a [`Started`](crate::events::Started) and its
+/// [`Finished`](crate::events::Finished) carry the same id, and each object a directory
+/// operation transfers has a [`parent`](Self::parent) equal to the operation's id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct TransferId {
+pub struct TransferId {
     pub(crate) id: u64,
     pub(crate) parent: Option<u64>,
+}
+
+impl TransferId {
+    /// The id of the directory operation this transfer belongs to, or `None` when this
+    /// transfer is the operation the caller invoked.
+    pub fn parent(&self) -> Option<TransferId> {
+        self.parent.map(|id| TransferId { id, parent: None })
+    }
 }
 
 impl std::fmt::Display for TransferId {
@@ -493,19 +502,6 @@ pub(crate) struct MetricsState {
     /// so this can exceed the payload actually received, and after a retry it can exceed
     /// `total_bytes`. `network_rx` remains the exact counter.
     bytes_streamed: AtomicU64,
-    /// Why this transfer produced no work on its most recent poll, as a
-    /// [`PendingReason`](crate::types::PendingReason) discriminant; 0 for "not parked".
-    ///
-    /// Not rolled up to the parent, unlike every byte counter here: a composite's own poll
-    /// parks for its own reasons, and inheriting a child's reason would report a directory as
-    /// read-ahead-blocked because one of nine hundred objects is.
-    ///
-    /// Lives here rather than beside the wake flag because
-    /// [`TransferView`](crate::types::TransferView) already carries an
-    /// `Arc<MetricsState>` and carries nothing else, and because the wake flag's `pending` bit
-    /// is consumed by a destructive swap — a reader that peeked at it would race the
-    /// scheduler's wake.
-    pending_reason: AtomicU8,
     /// Running sum of the payload sizes of the entries enumerated so far, for a
     /// composite; always 0 for a leaf, which learns its total in one piece.
     ///
@@ -517,7 +513,7 @@ pub(crate) struct MetricsState {
     /// Entries enumerated so far, counted at the same site and under the same lock as
     /// `discovered_bytes`, from the same batch. Always 0 for a leaf.
     discovered_entries: AtomicU64,
-    /// Entries that reached a terminal state, counted where the entry's `Ended` is
+    /// Entries that reached a terminal state, counted where the entry's `Finished` is
     /// claimed rather than where its status transitions — so this equals the number of
     /// terminal events the stream would have delivered had none been dropped.
     ///
@@ -558,7 +554,6 @@ impl MetricsState {
             disk_read: AtomicU64::new(0),
             disk_write: AtomicU64::new(0),
             bytes_streamed: AtomicU64::new(0),
-            pending_reason: AtomicU8::new(0),
             discovered_bytes: AtomicU64::new(0),
             discovered_entries: AtomicU64::new(0),
             settled_entries: AtomicU64::new(0),
@@ -615,35 +610,6 @@ impl MetricsState {
         }
     }
 
-    /// Record why this transfer produced no work, or clear it with `None`.
-    ///
-    /// Written on every poll by the operation's `poll_work` — cleared at entry, set again if
-    /// that poll parks — so the value describes the most recent poll and cannot go stale while
-    /// the transfer is running.
-    pub(crate) fn set_pending_reason(&self, reason: Option<crate::types::PendingReason>) {
-        use crate::types::PendingReason as R;
-        let code = match reason {
-            None => 0u8,
-            Some(R::ReadAheadWindow {}) => 1,
-            Some(R::MemoryBudget {}) => 2,
-            Some(R::Discovery {}) => 3,
-            Some(R::WorkInFlight {}) => 4,
-        };
-        self.pending_reason.store(code, Ordering::Relaxed);
-    }
-
-    /// Why this transfer last produced no work, if it did not.
-    pub(crate) fn pending_reason(&self) -> Option<crate::types::PendingReason> {
-        use crate::types::PendingReason as R;
-        match self.pending_reason.load(Ordering::Relaxed) {
-            1 => Some(R::ReadAheadWindow {}),
-            2 => Some(R::MemoryBudget {}),
-            3 => Some(R::Discovery {}),
-            4 => Some(R::WorkInFlight {}),
-            _ => None,
-        }
-    }
-
     /// Set the expected total payload bytes. No-op if already set.
     pub(crate) fn set_total_bytes(&self, n: u64) {
         let _ = self.total_bytes.set(n);
@@ -697,16 +663,8 @@ impl MetricsState {
     }
 
     /// Mark the transfer as finished. No-op if already set.
-    ///
-    /// Clears the pending reason here rather than on each terminal path, because `poll_work`
-    /// is the only other place that clears it and it returns early on `!is_active()` -- so a
-    /// transfer that parked and then went terminal would report the reason it last parked on
-    /// for the rest of its life. A consumer polling the view would read
-    /// "waiting for the last in-flight requests to finish" about a download that already
-    /// failed. Every winning terminal CAS reaches this, so one clear covers them all.
     pub(crate) fn set_finished(&self) {
         let _ = self.finished_at.set(std::time::Instant::now());
-        self.set_pending_reason(None);
     }
 
     /// Claims the single terminal tracing record for this transfer.
@@ -775,6 +733,8 @@ pub(crate) struct TransferContext {
     completion_tx: Arc<Mutex<Option<StateMachineTerminalSender>>>,
     /// Set when `poll_work` returns `Pending`, cleared by a wake or resumed poll.
     wake_flag: Arc<wake_flag::WakeFlag>,
+    /// The cause of the current park, read by this transfer's views.
+    pending_cause: Arc<PendingCauseSlot>,
     /// Optional scheduler-visible pending interval accounting.
     pending_state: Option<Arc<TransferPendingState>>,
     /// Per-transfer metrics backing store
@@ -1051,6 +1011,7 @@ impl TransferContext {
             error: Arc::new(crate::runtime::sync::Mutex::new(None)),
             completion_tx: Arc::new(Mutex::new(Some(completion_tx))),
             wake_flag: Arc::new(wake_flag::WakeFlag::new()),
+            pending_cause: Arc::new(PendingCauseSlot::new()),
             pending_state,
         };
         (ctx, completion_rx)
@@ -1067,6 +1028,9 @@ impl TransferContext {
     }
 
     /// Record that `poll_work` is about to return `Pending`.
+    ///
+    /// The transfer's views report `cause` while it is active, until [`Self::begin_poll`]
+    /// clears it. Storing it takes no part in the wake protocol below.
     ///
     /// # Wake primitive protocol
     ///
@@ -1118,14 +1082,15 @@ impl TransferContext {
     pub(crate) fn set_pending(&self, cause: impl Into<PendingCause>) {
         let cause = cause.into();
         self.wake_flag.set_pending();
+        self.pending_cause.set(cause);
         if let Some(pending) = &self.pending_state {
             pending.record_pending(self.id, cause);
         }
         tracing::trace!(
             target: crate::telemetry::TARGET_SCHEDULING,
             tid = %self.id,
-            category = cause.category.as_str(),
-            reason = cause.reason,
+            category = cause.category().as_str(),
+            reason = cause.reason(),
             "ctx.set_pending",
         );
     }
@@ -1182,8 +1147,11 @@ impl TransferContext {
     ///
     /// Clearing the edge-triggered flag here also handles registered-future
     /// wakes, which enter through [`Self::waker`] rather than [`Self::try_wake`].
+    /// The cause [`Self::set_pending`] stored is cleared too, so a view reports a cause
+    /// only between a poll that parks and the next poll.
     pub(crate) fn begin_poll(&self) {
         self.wake_flag.take_pending();
+        self.pending_cause.clear();
         if let Some(pending) = &self.pending_state {
             pending.record_poll_started(self.id);
         }
@@ -1291,7 +1259,7 @@ impl TransferContext {
     /// A still-`Active` transfer reports `Cancelled`, which is wrong for one that is about
     /// to succeed. A published status is therefore a precondition, not something this
     /// derives around: every caller guards on `!is_active()` first. The terminal report
-    /// and the `Ended` event are both one-shot, so a wrong outcome cannot be corrected.
+    /// and the `Finished` event are both one-shot, so a wrong outcome cannot be corrected.
     pub(crate) fn terminal_outcome(&self) -> crate::events::Outcome {
         match self.transfer_status() {
             crate::types::TransferStatus::Completed => crate::events::Outcome::Succeeded {},
@@ -1348,11 +1316,8 @@ impl TransferContext {
             let _ = tx.send(());
         }
         // Wake the parent transfer (if any) so it can reap this child.
-        if let Some(parent_id) = self.id.parent {
-            self.handle.scheduler.wake(TransferId {
-                id: parent_id,
-                parent: None,
-            });
+        if let Some(parent) = self.id.parent() {
+            self.handle.scheduler.wake(parent);
         }
     }
 
@@ -1400,11 +1365,6 @@ impl TransferContext {
     /// and this counter overcounts under retry.
     pub(crate) fn record_bytes_streamed(&self, n: u64) {
         self.metrics.record_bytes_streamed(n);
-    }
-
-    /// Record why this transfer produced no work on this poll, or clear it with `None`.
-    pub(crate) fn set_pending_reason(&self, reason: Option<crate::types::PendingReason>) {
-        self.metrics.set_pending_reason(reason);
     }
 
     /// Record one request in the transfer aggregate.
@@ -1462,13 +1422,17 @@ impl TransferContext {
         self.metrics.snapshot()
     }
 
-    /// A detached, read-only view of this transfer's counters.
+    /// A detached, read-only view of this transfer's counters, status and pending cause.
     ///
-    /// Clones the metrics `Arc` only. Nothing else from the context comes along — in
+    /// Clones those three `Arc`s only. Nothing else from the context comes along — in
     /// particular not `handle`, whose `Drop` shuts the runtime down, so a view parked in
     /// a slow consumer's queue cannot defer that shutdown.
     pub(crate) fn view(&self) -> crate::types::TransferView {
-        crate::types::TransferView::new(self.metrics.clone())
+        crate::types::TransferView::new(
+            self.metrics.clone(),
+            self.status.clone(),
+            self.pending_cause.clone(),
+        )
     }
 
     /// Get scheduling controls for this transfer.
@@ -1671,6 +1635,22 @@ mod tests {
             assert_eq!(
                 ctx.transfer_status(),
                 crate::types::TransferStatus::Cancelled
+            );
+        }
+
+        /// A child's `parent()` is its operation's own id, so a consumer can pair each
+        /// object of a directory operation with the operation's events.
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn a_child_id_names_its_operation_as_parent() {
+            let handle = test_handle();
+            let (operation, _rx) = TransferContext::new(handle.clone());
+            let (child, _child_rx) = TransferContext::new_child(handle, &operation);
+            assert_eq!(None, operation.id.parent(), "the operation has no parent");
+            assert_eq!(
+                Some(operation.id),
+                child.id.parent(),
+                "a child's parent must equal the operation's own id"
             );
         }
 

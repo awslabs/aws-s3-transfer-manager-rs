@@ -328,13 +328,8 @@ async fn test_download_write_to_file() {
 /// Covered as a table over every single-object download entry point rather than as one
 /// test for the one that was broken, because the defect is *per entry point* and a fourth
 /// would be just as silent. A single-object transfer is one entry, so the shape is the same
-/// for all of them: one `Planned` with no parent carrying a view, one `Ended` succeeding, and
-/// the view's counter reaching the object size.
-///
-/// `InitiateWith` is the fourth, and it was silent for the same reason with a different cause:
-/// `DownloadInputBuilder::initiate_with` builds a *fresh* fluent builder and copies only the
-/// input across, so `events` was structurally unreachable rather than dropped — there was no
-/// parameter to pass one. `initiate_with_events` is that parameter.
+/// for all of them: one `Started` with no parent carrying a view, one `Finished` succeeding,
+/// and the view's counter reaching the object size.
 #[cfg(any(unix, windows))]
 #[tokio::test]
 async fn test_download_single_object_entry_points_all_report_events() {
@@ -347,12 +342,11 @@ async fn test_download_single_object_entry_points_all_report_events() {
         Path,
         File,
         Body,
-        InitiateWith,
     }
 
     let size = 8 * ByteUnit::Mebibyte.as_bytes_usize();
 
-    for variant in [Sink::Path, Sink::File, Sink::Body, Sink::InitiateWith] {
+    for variant in [Sink::Path, Sink::File, Sink::Body] {
         let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
         let m = setup_concurrent(part_size, 8).await;
         let content = deterministic_data(size);
@@ -365,15 +359,12 @@ async fn test_download_single_object_entry_points_all_report_events() {
             std::num::NonZeroUsize::new(8).expect("capacity > 0"),
         );
         let dir = tempfile::tempdir().unwrap();
-        // Cloned so the `InitiateWith` arm, which bypasses the fluent builder entirely, still
-        // has a sink to register. An extra live clone only means the stream never disconnects,
-        // which the deadline loop below already tolerates.
         let req = m
             .client
             .download()
             .bucket("test-bucket")
             .key("ev-key")
-            .events(sink.clone());
+            .events(sink);
 
         // Each arm drives the transfer to completion and drops its handle, which is what
         // releases the sink and ends the stream.
@@ -395,41 +386,30 @@ async fn test_download_single_object_entry_points_all_report_events() {
                 drain_body(&mut h).await.expect("drain body");
                 h.join().await.expect("join");
             }
-            Sink::InitiateWith => {
-                drop(req); // this arm is about the input-builder path, not the fluent one
-                let mut h =
-                    aws_sdk_s3_transfer_manager::operation::download::DownloadInput::builder()
-                        .bucket("test-bucket")
-                        .key("ev-key")
-                        .initiate_with_events(&m.client, sink)
-                        .expect("initiate_with_events");
-                drain_body(&mut h).await.expect("drain body");
-                h.join().await.expect("join");
-            }
         }
 
-        // A single-object transfer's `Ended` is emitted from `on_terminal`, which the
+        // A single-object transfer's `Finished` is emitted from `on_terminal`, which the
         // scheduler runs *after* `join()` has returned — `signal_terminal` wakes the joiner
         // first. So a consumer-facing fact: `join()` returning does not mean the terminal
         // event has been delivered. Polled with a deadline rather than awaiting stream
-        // termination (the sink outlives the handle, so awaiting `None` hangs) and rather
-        // than draining once (which passes or fails on the rename's wall-clock — the
-        // `write_to_path` arm of this test did exactly that before the deadline was added).
-        let mut decided = 0usize;
+        // termination, and rather than draining once (which passes or fails on the rename's
+        // wall-clock — the `write_to_path` arm of this test did exactly that before the
+        // deadline was added).
+        let mut started = 0usize;
         let mut settled = 0usize;
         let mut view = None;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         while settled == 0 && tokio::time::Instant::now() < deadline {
-            match stream.try_next() {
-                Ok(TransferEvent::Planned(p)) if p.parent().is_none() => {
-                    decided += 1;
+            match stream.try_recv() {
+                Ok(TransferEvent::Started(p)) if p.id().parent().is_none() => {
+                    started += 1;
                     view = p.view().cloned();
                 }
-                Ok(TransferEvent::Ended(e)) if e.parent().is_none() => settled += 1,
+                Ok(TransferEvent::Finished(e)) if e.id().parent().is_none() => settled += 1,
                 Ok(_) => continue,
                 // Empty: the terminal has not been emitted yet. Disconnected: every sink is
                 // gone, so nothing more is coming and the loop should stop.
-                Err(aws_sdk_s3_transfer_manager::events::TryNextError::Empty) => {
+                Err(aws_sdk_s3_transfer_manager::events::TryRecvError::Empty) => {
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
                 Err(_) => break,
@@ -437,10 +417,10 @@ async fn test_download_single_object_entry_points_all_report_events() {
         }
 
         assert_eq!(
-            1, decided,
-            "{variant:?}: a registered sink must receive exactly one Planned"
+            1, started,
+            "{variant:?}: a registered sink must receive exactly one Started"
         );
-        assert_eq!(1, settled, "{variant:?}: and exactly one Ended");
+        assert_eq!(1, settled, "{variant:?}: and exactly one Finished");
         let view = view.unwrap_or_else(|| panic!("{variant:?}: a real transfer owes a view"));
         assert_eq!(
             size as u64,
@@ -1081,10 +1061,10 @@ async fn test_download_bytes_streamed_conserves_against_network_rx() {
     let mut view = None;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while view.is_none() && tokio::time::Instant::now() < deadline {
-        match stream.try_next() {
-            Ok(TransferEvent::Planned(p)) if p.view().is_some() => view = p.view().cloned(),
+        match stream.try_recv() {
+            Ok(TransferEvent::Started(p)) if p.view().is_some() => view = p.view().cloned(),
             Ok(_) => continue,
-            Err(aws_sdk_s3_transfer_manager::events::TryNextError::Empty) => {
+            Err(aws_sdk_s3_transfer_manager::events::TryRecvError::Empty) => {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
             Err(_) => break,
@@ -1139,10 +1119,10 @@ async fn test_upload_leaves_bytes_streamed_at_zero() {
     let mut view = None;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while view.is_none() && tokio::time::Instant::now() < deadline {
-        match stream.try_next() {
-            Ok(TransferEvent::Planned(p)) if p.view().is_some() => view = p.view().cloned(),
+        match stream.try_recv() {
+            Ok(TransferEvent::Started(p)) if p.view().is_some() => view = p.view().cloned(),
             Ok(_) => continue,
-            Err(aws_sdk_s3_transfer_manager::events::TryNextError::Empty) => {
+            Err(aws_sdk_s3_transfer_manager::events::TryRecvError::Empty) => {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
             Err(_) => break,
@@ -1159,39 +1139,24 @@ async fn test_upload_leaves_bytes_streamed_at_zero() {
         0, metrics.bytes_streamed,
         "bytes_streamed is a download counter and must stay 0 for an upload"
     );
-    // The other half of the same rule: an upload's park sites are not labelled, so the
-    // reason reads `None` rather than a download reason that would name a window this
-    // transfer does not have.
-    assert!(
-        view.pending_reason().is_none(),
-        "an upload must report no pending reason, not a download's; got {:?}",
-        view.pending_reason()
-    );
 
     m.handle.shutdown().await.expect("shutdown");
 }
 
-/// A parked download says *why* it is parked.
+/// A download whose body is never read reports the consumer as the cause it waits on.
 ///
-/// This is Aaron's pending-reason item. Byte counters cannot answer it: a bar sitting still
-/// looks identical whether the consumer stopped reading, the memory budget is full, or the
-/// listing has not returned — and the first is the caller's own doing, which is the one case
-/// they can fix.
-///
-/// The case exercised is the one a caller actually causes: initiate a download and never read
-/// the body. Prefetch fills the read-ahead window, the gate closes, and the transfer parks. A
-/// consumer polling the view then reads `ReadAheadWindow` rather than a still bar with no
-/// explanation.
+/// Prefetch fills the read-ahead window, the gate closes, and the transfer parks on it,
+/// which its view reports as `PendingCategory::Consumer`.
 #[tokio::test]
-async fn test_download_parked_on_read_ahead_reports_the_reason() {
+async fn test_download_parked_on_read_ahead_reports_the_consumer() {
     use aws_sdk_s3_transfer_manager::events::TransferEvent;
-    use aws_sdk_s3_transfer_manager::types::PendingReason;
+    use aws_sdk_s3_transfer_manager::types::PendingCategory;
     use std::time::Duration;
 
-    // The window must close *before* every range is issued, or the transfer parks on
-    // `AwaitingCompletion` first and the read-ahead gate is never reached — which is what
-    // 8 parts at concurrency 8 does. So: many parts, a window of 2, and concurrency below
-    // the part count.
+    // The window must close *before* every range is issued, or the transfer parks on range
+    // completion first and the read-ahead gate is never reached — which is what 8 parts at
+    // concurrency 8 does. So: many parts, a window of 2, and concurrency below the part
+    // count.
     let size = 40 * ByteUnit::Mebibyte.as_bytes_usize();
     let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
     let m = mock_tm_with(RuntimeMode::Managed, |b| {
@@ -1222,10 +1187,10 @@ async fn test_download_parked_on_read_ahead_reports_the_reason() {
     let mut view = None;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while view.is_none() && tokio::time::Instant::now() < deadline {
-        match stream.try_next() {
-            Ok(TransferEvent::Planned(p)) if p.view().is_some() => view = p.view().cloned(),
+        match stream.try_recv() {
+            Ok(TransferEvent::Started(p)) if p.view().is_some() => view = p.view().cloned(),
             Ok(_) => continue,
-            Err(aws_sdk_s3_transfer_manager::events::TryNextError::Empty) => {
+            Err(aws_sdk_s3_transfer_manager::events::TryRecvError::Empty) => {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
             Err(_) => break,
@@ -1234,26 +1199,23 @@ async fn test_download_parked_on_read_ahead_reports_the_reason() {
     let view = view.expect("a real transfer owes a view");
 
     // Poll until the transfer parks. It has to issue and fill the window first, so the
-    // reason is not available on the first reading.
+    // cause is not available on the first reading.
     let mut seen = None;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while tokio::time::Instant::now() < deadline {
-        if let Some(reason) = view.pending_reason() {
-            seen = Some(reason);
-            // `matches!` with `{ .. }`, not `==`: every `PendingReason` variant is
-            // `#[non_exhaustive]`, so an external crate cannot construct one to compare
-            // against — it matches instead. This is the shape a real consumer writes.
-            if matches!(reason, PendingReason::ReadAheadWindow { .. }) {
+        if let Some(cause) = view.pending_cause() {
+            seen = Some(cause.category());
+            if cause.category() == PendingCategory::Consumer {
                 break;
             }
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
-    assert!(
-        matches!(seen, Some(PendingReason::ReadAheadWindow { .. })),
-        "a download whose body is never read must report the read-ahead window as the reason \
-         it stopped, not an unexplained still bar; got {seen:?}"
+    assert_eq!(
+        Some(PendingCategory::Consumer),
+        seen,
+        "a download whose body is never read must report the consumer as its cause"
     );
 
     m.handle.shutdown().await.expect("shutdown");
