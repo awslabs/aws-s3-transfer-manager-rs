@@ -470,6 +470,21 @@ impl fmt::Debug for StateMachineStatus {
     }
 }
 
+/// Sets `Failed` and stores the error under `slot`'s lock, so a reader that sees `Failed`
+/// and then locks the slot finds the error. Returns whether this call made the transition.
+fn fail_with<E>(
+    status: &StateMachineStatus,
+    slot: &crate::runtime::sync::Mutex<Option<E>>,
+    err: impl FnOnce() -> E,
+) -> bool {
+    let mut held = slot.lock();
+    let won = status.set_failed();
+    if won {
+        *held = Some(err());
+    }
+    won
+}
+
 /// Per-transfer cumulative metrics.
 pub(crate) struct MetricsState {
     /// The parent transfer's metrics, which every sample recorded here also reaches.
@@ -1132,10 +1147,7 @@ impl TransferContext {
     /// [`signal_terminal`]: Self::signal_terminal
     /// [`set_failed_and_signal`]: Self::set_failed_and_signal
     pub(crate) fn set_failed(&self, err: impl Into<error::Error>) -> bool {
-        let mut slot = self.error.lock();
-        if self.status.set_failed() {
-            *slot = Some(Box::new(err.into()));
-            drop(slot);
+        if fail_with(&self.status, &self.error, || Box::new(err.into())) {
             self.metrics.set_finished();
             true
         } else {
@@ -2085,7 +2097,7 @@ mod loom_tests {
     /// Nothing here sets completed, so `Completed` can only come from a derivation that
     /// loads the status more than once and sees the cancel land between its loads.
     #[test]
-    fn transfer_status_loom_never_reports_completed_for_a_cancelled_transfer() {
+    fn status_loom_never_reports_completed_for_a_cancelled_transfer() {
         loom::model(|| {
             let status = super::StateMachineStatus::new();
 
@@ -2106,34 +2118,26 @@ mod loom_tests {
         });
     }
 
-    /// The real [`StateMachineStatus`](super::StateMachineStatus), backed by a loom atomic
-    /// under `s3_tm_loom`, beside an error slot, ordered as `TransferContext::set_failed`
-    /// and its readers order them.
+    /// The real [`StateMachineStatus`](super::StateMachineStatus) and error slot type, both
+    /// loom-backed under `s3_tm_loom`, failed through the [`fail_with`](super::fail_with)
+    /// that `TransferContext::set_failed` calls, and read as its readers read them.
     ///
     /// Stands in for `TransferContext`, which needs a client `Handle` to build.
     struct FailHarness {
         status: super::StateMachineStatus,
-        error: Mutex<Option<u32>>,
+        error: crate::runtime::sync::Mutex<Option<u32>>,
     }
 
     impl FailHarness {
         fn new() -> Self {
             Self {
                 status: super::StateMachineStatus::new(),
-                error: Mutex::new(None),
+                error: crate::runtime::sync::Mutex::new(None),
             }
         }
 
-        /// `set_failed`'s ordering: the slot is held across the CAS, so the status cannot
-        /// become visible before the error that explains it.
         fn set_failed(&self, err: u32) -> bool {
-            let mut slot = self.error.lock().unwrap();
-            if self.status.set_failed() {
-                *slot = Some(err);
-                true
-            } else {
-                false
-            }
+            super::fail_with(&self.status, &self.error, || err)
         }
 
         /// A reader's ordering, as in `take_error` and `error_kind`: check the status, then
@@ -2143,7 +2147,7 @@ mod loom_tests {
         /// `Some(None)` is the defect: `Failed` with an empty slot.
         fn error(&self) -> Option<Option<u32>> {
             if self.status.is_failed() {
-                Some(*self.error.lock().unwrap())
+                Some(*self.error.lock())
             } else {
                 None
             }
