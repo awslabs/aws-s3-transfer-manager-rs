@@ -233,7 +233,7 @@ impl SraCachingResolver {
         // Config runtime || create a new runtime
         if let Some(config_runtime) = config.runtime {
             config_runtime.spawn(async move {
-                resolver_impl.run();
+                resolver_impl.run().await;
             });
         } else {
             let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -243,7 +243,7 @@ impl SraCachingResolver {
                 .unwrap();
 
             runtime.spawn(async move {
-                resolver_impl.run();
+                resolver_impl.run().await;
             });
 
             // need to keep this alive, a handle is insufficient
