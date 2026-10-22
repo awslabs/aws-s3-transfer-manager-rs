@@ -1387,8 +1387,6 @@ impl Transfer for DoneWhileActiveMock {
     }
 
     fn poll_work(&self) -> PollWork {
-        // No status transition here, exactly like the download's
-        // `DownloadState::Terminal => PollWork::Done` arm.
         PollWork::Done
     }
 
@@ -1400,7 +1398,6 @@ impl Transfer for DoneWhileActiveMock {
             crate::events::Outcome::Cancelled {} => "Cancelled",
         };
         *self.observed.lock().unwrap() = Some((self.ctx.transfer_status(), outcome));
-        // The status lands after the `Done` poll.
         self.ctx.set_completed();
         self.ctx.signal_terminal();
     }
@@ -1414,10 +1411,6 @@ impl Transfer for DoneWhileActiveMock {
 }
 
 /// Polls `Done` with a published terminal status, and panics in `on_terminal`.
-///
-/// Stands in for a real hook panicking in any of the four things it now does -- taking
-/// the state lock, draining, reporting the summary, emitting the lifecycle event. A
-/// poisoned state lock from an earlier worker panic reaches the first of those.
 pub(crate) struct PanickingTerminalHookMock {
     ctx: TransferContext,
     calls: Arc<AtomicUsize>,
@@ -1430,9 +1423,7 @@ impl std::fmt::Debug for PanickingTerminalHookMock {
 }
 
 impl PanickingTerminalHookMock {
-    /// `calls` counts hook entries. A test needs it because the cleanup around the hook
-    /// runs whether or not the hook was reached, so asserting on cleanup alone passes
-    /// against a call site that skips the hook entirely.
+    /// `calls` counts entries into `on_terminal`.
     pub(crate) fn new(
         id: TransferId,
         handle: Arc<crate::client::Handle>,
@@ -1442,10 +1433,8 @@ impl PanickingTerminalHookMock {
         Self { ctx, calls }
     }
 
-    /// Returns the mock plus its completion receiver, so a test can assert the handle
-    /// was resolved even though the hook panicked, and a clone of its context: the
-    /// orphan path returns before inserting a descriptor, so the context is the only
-    /// place the status can be read from.
+    /// Like [`Self::new`], also returning the completion receiver and a clone of the
+    /// context.
     pub(crate) fn with_receiver(
         id: TransferId,
         handle: Arc<crate::client::Handle>,
@@ -1469,16 +1458,13 @@ impl Transfer for PanickingTerminalHookMock {
     }
 
     fn poll_work(&self) -> PollWork {
-        // Terminal is published *in* the poll, not before it: a descriptor that is
-        // already terminal when the ready set pops it is skipped without being polled,
-        // so the Done arm is only reachable this way. It is also the real order --
-        // `finalize_completion` publishes the status, and a later poll answers `Done`.
+        // Published in the poll rather than before it: a descriptor that is already
+        // terminal when popped is skipped unpolled, so it would never reach the Done arm.
         self.ctx.set_completed();
         PollWork::Done
     }
 
     fn on_terminal(&self) {
-        // Bump before the panic, so the count records the entry the unwind interrupts.
         self.calls.fetch_add(1, Ordering::SeqCst);
         panic!("on_terminal panicked");
     }

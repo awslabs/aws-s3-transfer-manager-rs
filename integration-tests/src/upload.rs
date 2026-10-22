@@ -22,9 +22,9 @@ async fn setup() -> MockTm {
     mock_tm(RuntimeMode::Managed).await
 }
 
-/// An upload with a registered sink reports exactly one `Started` carrying a view and exactly
-/// one `Finished` that succeeded, and the view reports the payload on `network_tx` against a
-/// `Final` total the leaf knows from its own size hint before a byte moves.
+/// An upload with a registered sink reports exactly one root `Started` carrying a view and
+/// exactly one succeeding `Finished` for the same id; the view reports the payload on
+/// `network_tx` against the `Final` total of its known-length body.
 #[tokio::test]
 async fn test_upload_reports_events() {
     use aws_sdk_s3_transfer_manager::events::{Outcome, TransferEvent};
@@ -51,9 +51,8 @@ async fn test_upload_reports_events() {
 
     handle.join().await.expect("join upload");
 
-    // The transfer emits `Finished` before `join()` returns, and sending it releases the
-    // sink, so the stream ends once drained. Draining to the end rather than to the first
-    // `Finished` is what lets a second `Finished` fail the count below.
+    // Sending `Finished` releases the sink, so the stream ends once drained. Drained to the
+    // end rather than to the first `Finished`, so a duplicate fails the count below.
     let mut started = Vec::new();
     let mut finished = Vec::new();
     let mut view = None;
@@ -136,8 +135,7 @@ async fn test_upload_bytes_transferred_reaches_the_byte_total() {
 
         handle.join().await.expect("join upload");
 
-        // `Finished` is sent before `join()` returns and releases the sink, so the stream
-        // ends once drained.
+        // Sending `Finished` releases the sink, so the stream ends once drained.
         let mut view = None;
         tokio::time::timeout(Duration::from_secs(10), async {
             while let Some(event) = stream.recv().await {
@@ -161,17 +159,11 @@ async fn test_upload_bytes_transferred_reaches_the_byte_total() {
     m.handle.shutdown().await.expect("shutdown");
 }
 
-/// A successful empty-object upload must still be observable as having moved zero bytes.
+/// An empty-object upload reads as a success that moved zero bytes: a `Started` carrying a
+/// view, exactly one succeeding `Finished`, `network_tx` of 0 and a `Final(0)` total.
 ///
-/// Progress must be reported at least once for a successful transfer, whatever the count. An
-/// empty object is a successful transfer: S3 accepts a zero-length PUT, and `aws s3 sync` of a
-/// tree containing an empty file must not report that file as never having been acted on.
-///
-/// What this rules out: a 0-byte entry that a consumer cannot distinguish from one that never
-/// started. The evidence has to be readable rather than inferable — a bar drawn from
-/// `network_tx / byte_total()` is `0 / 0` for this transfer, so the entry's own `Started`,
-/// its `Finished { Succeeded }`, and a `Final(0)` denominator are what say "this happened and
-/// moved nothing" instead of "nothing happened".
+/// Its progress ratio is `0 / 0`, so these are all that distinguish it from a transfer that
+/// never started or whose total is unknown.
 #[tokio::test]
 async fn test_upload_empty_object_is_observable_as_zero_bytes() {
     use aws_sdk_s3_transfer_manager::events::{Outcome, TransferEvent};
@@ -196,8 +188,7 @@ async fn test_upload_empty_object_is_observable_as_zero_bytes() {
 
     handle.join().await.expect("join upload");
 
-    // The transfer emits `Finished` before `join()` returns, and sending it releases the
-    // sink, so the stream ends once drained.
+    // Sending `Finished` releases the sink, so the stream ends once drained.
     let mut view = None;
     let mut outcomes = Vec::new();
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -451,16 +442,13 @@ where
     m.handle.shutdown().await.expect("shutdown");
 }
 
-/// `while let Some(ev) = stream.recv().await` must end once the operation does, while the
-/// caller still holds the handle.
+// ref: awslabs/aws-s3-transfer-manager-rs#197
+/// A `while let Some(ev) = stream.recv().await` loop ends once the operation does, with the
+/// handle still held: a caller rendering events in that loop has not yet called `join(self)`,
+/// which consumes the handle.
 ///
-/// Phase 1 is that loop with the handle still held, which is where a caller is when the loop
-/// is their render loop: `join(self)` consumes the handle, and reaching it is what the loop is
-/// supposed to let them do.
-///
-/// Phases 2 and 3 are controls that say how far the sink's lifetime actually extends, so the
-/// failure cannot be read as "you should have joined first": phase 2 re-runs the loop after
-/// `join()` has consumed the handle, and phase 3 after the client is gone as well.
+/// Phases 2 and 3 re-run the loop after `join()` and again after the client is dropped. They
+/// feed only the failure message, which then shows how long the sink outlives the operation.
 #[tokio::test]
 async fn test_event_stream_ends_with_the_operation() {
     use aws_sdk_s3_transfer_manager::events::{Outcome, TransferEvent};
@@ -507,7 +495,7 @@ async fn test_event_stream_ends_with_the_operation() {
     })
     .await;
 
-    // Phase 3 control: and the client is the owner of the scheduler and the runtime.
+    // Phase 3 control: the client owns the scheduler and the runtime.
     drop(m.client);
     let phase3 = tokio::time::timeout(Duration::from_secs(3), async {
         while stream.recv().await.is_some() {}

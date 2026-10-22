@@ -47,7 +47,6 @@ pub(crate) struct Upload;
 
 impl Upload {
     /// Execute a single `Upload` transfer operation.
-    /// `events` is `None` unless the caller registered a sink on the builder.
     pub(crate) fn orchestrate(
         handle: Arc<crate::client::Handle>,
         input: crate::operation::upload::UploadInput,
@@ -62,17 +61,11 @@ impl Upload {
     /// the child wakes the parent (letting the parent's state machine reap it), cancelling
     /// the parent cascades to this child, and the child's bytes roll up into the parent's
     /// metrics as they move.
-    ///
-    /// Takes the parent context rather than its id so the id link and the metrics link
-    /// cannot be established separately — and so a child that reports no bytes upward is
-    /// not silently possible.
     pub(crate) fn orchestrate_child(
         handle: Arc<crate::client::Handle>,
         input: crate::operation::upload::UploadInput,
         parent: &crate::transfer::TransferContext,
     ) -> Result<UploadHandle, error::Error> {
-        // No sink: a composite announces its own children, so passing one here
-        // would announce every child twice.
         Self::orchestrate_inner(handle, input, Some(parent), None)
     }
 
@@ -110,9 +103,6 @@ impl Upload {
             Some(parent) => TransferContext::new_child(handle.clone(), parent),
             None => TransferContext::new(handle.clone()),
         };
-        // The source is the body the caller supplied: a path when the body reads
-        // from a file, and a stream otherwise. Naming a path for an in-memory body
-        // would report a file the transfer manager never opened.
         let ctx = match events {
             Some(sink) => {
                 let source = match stream.source_path() {

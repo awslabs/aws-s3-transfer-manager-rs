@@ -574,13 +574,8 @@ impl DownloadObjectsTransfer {
             input,
             sink,
             Some(&self.inner.ctx),
-            // No events for a child here: the composite's own event wiring lands with
-            // `download_objects`, which is where a child would be announced.
             None,
             None,
-            // The child renames its own temp file before it reports Completed, so a
-            // path that reads the status without joining does not see a destination
-            // the rename has not created.
             Some(crate::operation::download::CommitTarget {
                 temp: temp_path,
                 dest: dest_path,
@@ -868,15 +863,12 @@ impl DownloadObjectsTransfer {
         let children = batch.take_children();
         for child in children {
             let key = child.key;
-            // Snapshot metrics before `join()` consumes the handle.
             match child.handle.join().await {
                 Ok(_output) => {
                     let mut state = self.inner.state.lock();
                     state.successful_downloads += 1;
                     drop(state);
-                    // No manual rollup: the child's context is linked to this one, so
-                    // the child's own `record_io` already walked up to the parent as the
-                    // bytes moved. Adding them again here counted every byte twice.
+                    // The child's bytes reached this transfer's metrics as they moved.
                 }
                 Err(err) => {
                     let mut state = self.inner.state.lock();

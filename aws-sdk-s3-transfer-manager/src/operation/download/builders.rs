@@ -45,7 +45,6 @@ impl DownloadFluentBuilder {
             .events
             .map(|sink| crate::operation::download::EventRegistration {
                 sink,
-                // The caller drains the body itself, so there is no file to name.
                 destination: crate::events::Endpoint::Stream {},
             });
         crate::operation::download::Download::orchestrate(self.handle, input, false, events)
@@ -116,9 +115,7 @@ impl DownloadFluentBuilder {
         file: std::fs::File,
     ) -> Result<ManagedDownloadHandle, crate::error::Error> {
         let input = self.inner.build()?;
-        // `Local { path: None }`: the caller opened the file and this method is never told
-        // its path, so naming one would put an address in the event that the transfer
-        // manager cannot know.
+        // `path: None`: the caller opened the file, and this method is never told its path.
         let events = self
             .events
             .map(|sink| crate::operation::download::EventRegistration {

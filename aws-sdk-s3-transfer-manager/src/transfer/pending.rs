@@ -90,7 +90,7 @@ impl PendingCause {
         self.category
     }
 
-    /// A diagnostic label naming the transfer state that parked.
+    /// A diagnostic label for the state the transfer is waiting in.
     ///
     /// Labels may change in any release. Branch on [`category`](Self::category), not on this.
     pub fn reason(&self) -> &'static str {

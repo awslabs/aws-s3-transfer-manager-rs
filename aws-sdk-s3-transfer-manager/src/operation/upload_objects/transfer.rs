@@ -1143,9 +1143,8 @@ impl UploadObjectsTransfer {
             match result {
                 Ok(_output) => {
                     state.successful_uploads += 1;
-                    // No manual rollup: the child's context is linked to this one, so
-                    // the child's own `record_io` already walked up to the parent as the
-                    // bytes moved. Adding them again here counted every byte twice.
+                    // The child's linked context has already rolled its bytes into this
+                    // transfer's metrics.
                     tracing::trace!(
                         target: crate::telemetry::TARGET_TRANSFER,
                         tid = %self.inner.ctx.id,

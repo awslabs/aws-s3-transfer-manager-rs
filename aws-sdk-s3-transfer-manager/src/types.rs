@@ -299,13 +299,12 @@ impl TransferStatus {
 
 /// Snapshot of transfer progress and IO metrics.
 ///
-/// The byte counters are views of the same payload, not addends: a file-backed upload
-/// records its bytes as `disk_read`, `network_tx` and `bytes_transferred`.
+/// The byte counters measure the same payload, so summing them double-counts: a
+/// file-backed upload counts its bytes in `disk_read`, `network_tx` and
+/// `bytes_transferred`. Progress is [`bytes_transferred`](Self::bytes_transferred) against
+/// [`total_bytes`](Self::total_bytes), in either direction.
 ///
-/// Draw progress from [`bytes_transferred`](Self::bytes_transferred) against
-/// [`total_bytes`](Self::total_bytes), in either direction. A directory operation aggregates
-/// its children into the same counters, so the same rule applies. Prefer
-/// [`TransferView::byte_total`] where a still-growing total must be told from a final one.
+/// A directory operation's byte counters include its objects' bytes as they are recorded.
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub struct TransferMetrics {
@@ -331,16 +330,13 @@ pub struct TransferMetrics {
     pub finished_at: Option<std::time::Instant>,
 }
 
-/// Detached, read-only view of one transfer's live counters and pending cause.
+/// Read-only view of one transfer's live counters and pending cause.
 ///
-/// Handed out on [`TransferEvent::Started`](crate::events::TransferEvent::Started). Owns
-/// nothing the caller can act with and borrows nothing, so it outlives the `join(self)`
-/// that consumes the operation handle. Read it whenever you repaint; nothing pushes.
+/// Handed out on [`TransferEvent::Started`](crate::events::TransferEvent::Started), and
+/// readable at any time, including after the operation's handle is joined or dropped.
 ///
-/// Drop it once that entry's
-/// [`TransferEvent::Finished`](crate::events::TransferEvent::Finished) arrives — it keeps
-/// that transfer's counters, status and pending cause allocated until then, so retaining
-/// every view of a million-object directory transfer retains a million of each.
+/// A view keeps its transfer's counters allocated while it is held, so drop it once the
+/// transfer's [`TransferEvent::Finished`](crate::events::TransferEvent::Finished) arrives.
 #[derive(Debug, Clone)]
 pub struct TransferView {
     metrics: std::sync::Arc<crate::transfer::MetricsState>,
@@ -363,28 +359,22 @@ impl TransferView {
 
     /// Point-in-time reading of this transfer's counters.
     ///
-    /// Every counter is an **absolute cumulative total for this transfer, never a
-    /// delta**: a rate is the caller's own difference between two readings. Each is
-    /// monotonically non-decreasing, so a later reading never returns less than an
-    /// earlier one.
+    /// Each counter is a cumulative total for this transfer, not a delta, and never
+    /// decreases from one reading to the next.
     ///
-    /// The progress numerator is [`TransferMetrics::bytes_transferred`] in either
-    /// direction. Summing the byte counters double-counts — see [`TransferMetrics`].
-    ///
-    /// [`TransferMetrics::finished_at`] is set on the transfer's terminal transition,
-    /// which happens while in-flight work may still be draining, so a counter can still
-    /// grow after it is `Some`. For exact final numbers use the operation's own `join()`
-    /// result.
+    /// [`TransferMetrics::finished_at`] is set when the transfer reaches a terminal status,
+    /// and work still in flight can grow the counters after that. For final values, use
+    /// the result of the operation's `join()`.
     pub fn metrics(&self) -> TransferMetrics {
         self.metrics.snapshot()
     }
 
-    /// Why this transfer is parked, or `None` while it is not parked.
+    /// Why this transfer is blocked, or `None` while it is not.
     ///
-    /// A cause is reported from the poll that parks the transfer until the scheduler next
-    /// polls it, which can be after the wake that unblocked it. `None` does not mean bytes
-    /// are moving: a transfer waiting for scheduler capacity is not parked. A transfer whose
-    /// status is no longer [`TransferStatus::Active`] reports `None`.
+    /// A cause is reported from the moment the transfer blocks until the scheduler next runs
+    /// it, so a transfer whose condition has cleared keeps reporting the cause while it waits
+    /// for scheduler capacity. A transfer that has not blocked since the scheduler last ran it
+    /// reports `None`, as does one whose status is no longer [`TransferStatus::Active`].
     pub fn pending_cause(&self) -> Option<PendingCause> {
         let cause = self.pending.get()?;
         // Status after the slot: a status never returns to `Active`, so an `Active` reading
@@ -392,41 +382,23 @@ impl TransferView {
         self.status.is_active().then_some(cause)
     }
 
-    /// This transfer's byte denominator. See [`Total`].
+    /// This transfer's total payload bytes. See [`Total`].
     ///
-    /// For a single-object transfer this is `Final` as soon as the length is known, and
-    /// `Unknown` for an unknown-length streaming upload. For a directory operation it
-    /// climbs through `Provisional` while enumeration runs and becomes `Final` only if
-    /// enumeration completed — a run cancelled mid-listing never seals, because nobody
-    /// knows the total.
+    /// `Unknown` until the transfer knows its length, then `Final`. An upload whose body
+    /// length is not known in advance learns it only as it completes.
     pub fn byte_total(&self) -> Total {
         self.metrics.byte_total()
     }
 
-    /// This transfer's entry denominator: how many objects the directory operation will
-    /// act on. See [`Total`].
+    /// How many entries a directory operation acts on, one per object. See [`Total`].
     ///
-    /// Always [`Total::Unknown`] for a single-object transfer, which is one entry and
-    /// is itself the thing being counted.
-    ///
-    /// Becomes `Final` with [`byte_total`](Self::byte_total), so one is never `Final` while
-    /// the other is still `Provisional`.
+    /// [`Total::Unknown`] for a single-object transfer.
     pub fn entry_total(&self) -> Total {
         self.metrics.entry_total()
     }
 
-    /// Entries that have reached a terminal state, however they ended.
-    ///
-    /// Counts successes, failures, cancellations and entries abandoned before they
-    /// started — "no longer pending", not "succeeded". This is the numerator for a
-    /// `N of M objects` or `M - N remaining` display, where
-    /// [`entry_total`](Self::entry_total) is `M`: a caller that counted only successes
-    /// would show work remaining forever on a run with failures.
-    ///
-    /// Incremented at the same instant the entry's
-    /// [`TransferEvent::Finished`](crate::events::TransferEvent::Finished) is claimed, so
-    /// this is exactly what a consumer would tally from the stream if no event were ever
-    /// dropped — and unlike that tally, it stays exact when events are.
+    /// How many of a directory operation's entries have finished, whether they succeeded,
+    /// failed or were cancelled.
     ///
     /// 0 for a single-object transfer.
     pub fn entries_settled(&self) -> u64 {
@@ -434,24 +406,19 @@ impl TransferView {
     }
 }
 
-/// A denominator a transfer is still discovering, and how much to trust it.
+/// A total that may not be known yet, or may still change.
 ///
-/// The unit comes from the accessor, not from this type:
-/// [`byte_total`](TransferView::byte_total) returns payload bytes,
-/// [`entry_total`](TransferView::entry_total) returns entries. A percentage is defined
-/// only for [`Total::Final`].
+/// The unit comes from the accessor: [`byte_total`](TransferView::byte_total) counts
+/// payload bytes and [`entry_total`](TransferView::entry_total) counts entries. A
+/// percentage is defined only for [`Total::Final`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Total {
-    /// No total is known, and none may ever be: an unknown-length streaming upload, a
-    /// single-object transfer asked for its entry count, or a directory operation
-    /// cancelled before enumeration finished. Render what is done, not a fraction.
+    /// No total is known yet, and one may never be.
     Unknown,
-    /// A lower bound. Enumeration is still running, so this will only grow. Do not treat
-    /// it as final even when a later reading repeats it — only [`Total::Final`] says
-    /// enumeration is over.
+    /// A total that can still change.
     Provisional(u64),
-    /// Enumeration finished and this will not change again.
+    /// The total, which will not change.
     Final(u64),
 }
 

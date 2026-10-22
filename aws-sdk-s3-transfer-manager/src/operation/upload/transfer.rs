@@ -941,7 +941,7 @@ impl UploadTransfer {
         // with how `network_tx` is attributed.
         //
         // Recorded before the output is built, because the output carries a snapshot
-        // of these counters and a caller has no other view of them.
+        // of these counters.
         let disk_read = if is_file_backed { content_length } else { 0 };
         self.inner.ctx.record_io(&crate::metrics::IoSample {
             network_tx: content_length,
@@ -958,10 +958,7 @@ impl UploadTransfer {
         *self.inner.result.lock().expect("lock poisoned") = Some(result);
 
         // Status before state, because `poll_work` answers `Done` off the state while every
-        // reporting path derives its outcome from the status. Published the other way round,
-        // a poll landing between the two lines saw a finished transfer that still read
-        // `Active`, and the terminal it published was `Cancelled` for an upload that had
-        // just succeeded.
+        // reporting path derives its outcome from the status.
         self.inner.ctx.set_completed();
         *self.inner.state.lock().expect("lock poisoned") = UploadState::Done;
         self.report_terminal();
@@ -2191,10 +2188,8 @@ mod tests {
             "disk_read should equal the file size for a file-backed PutObject"
         );
 
-        // `UploadOutput` is the only view a caller of `upload()` gets, and it used to be
-        // built before the sample above was recorded -- so both counters read 0 in the
-        // output while `ctx().metrics()` read the real numbers, and the two views of one
-        // transfer disagreed.
+        // The output a caller receives reports the same counters. Building it before the
+        // sample is recorded leaves both at 0.
         let out = transfer
             .take_result()
             .expect("a successful PutObject leaves a result");

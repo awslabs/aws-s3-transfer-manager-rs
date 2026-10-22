@@ -94,12 +94,7 @@ pub(crate) fn temp_file_candidates(
 #[derive(Clone, Default, Debug)]
 pub(crate) struct Download;
 
-/// Where a download's events go, and the end it writes to.
-///
-/// One value rather than two parameters: a sink is only ever useful alongside the
-/// destination to report with it, and only the entry point that chose the
-/// destination knows what it is — a file for `write_to_path`, the caller's own body
-/// for a streaming download.
+/// The sink for a download's events and the destination those events report.
 pub(crate) struct EventRegistration {
     pub(crate) sink: crate::events::TransferEventSink,
     pub(crate) destination: crate::events::Endpoint,
@@ -194,7 +189,6 @@ impl Download {
                 return Err(error::from_kind(error::ErrorKind::IOError)(e));
             }
         };
-        // No listing behind this entry point, so the size comes from discovery as before.
         let inner = Self::orchestrate_with_sink(
             handle,
             input,
@@ -236,17 +230,15 @@ impl Download {
             }
         })?;
         let inner = Self::orchestrate_with_sink(handle, input, sink, None, events, None, None)?;
-        // No temp path and nothing to commit — caller manages the file lifecycle
+        // No temp/dest paths — caller manages the file lifecycle
         Ok(ManagedDownloadHandle::new(inner))
     }
 
     /// Shared orchestration for disk downloads: the transfer writes the object
     /// through `sink`.
     ///
-    /// `known_size` is the object's size when the caller already learned it — a composite
-    /// has it from its listing. Seeding it here rather than waiting for discovery is what
-    /// gives the entry a byte denominator it keeps even if its own `GetObject` never
-    /// succeeds; see the note at the `set_total_bytes` call below.
+    /// `known_size`, if the caller already knows the object's size, is the transfer's
+    /// provisional byte total until discovery confirms the real one.
     ///
     /// When `parent` is `Some`, the transfer is linked as a child of the
     /// given composite transfer via [`TransferContext::new_child`](crate::transfer::TransferContext::new_child).
@@ -280,18 +272,7 @@ impl Download {
             None => ctx,
         };
 
-        // Before `enqueue_transfer`, so the value is in place by the time the transfer can be
-        // polled and no reader sees an entry with no denominator at all.
-        //
-        // The listed size is what the entry is *expected* to move. An object refused before
-        // its first body byte — a 403, an integrity failure — never reaches discovery, so
-        // without this its denominator would stay `Unknown` and a consumer could not tell how
-        // much that entry failed to transfer. That shortfall is what the AWS CLI banks into
-        // `bytes_failed_to_transfer` to reach 100% on a run with failures.
-        //
-        // `set_expected_bytes` and not `set_total_bytes`: see its doc comment. The short
-        // version is that the listed size is an estimate until the object is opened, so it
-        // reads `Provisional` and discovery still gets to publish the real total.
+        // Before the transfer is announced or scheduled, so no reader sees it without a size.
         if let Some(size) = known_size {
             ctx.set_expected_bytes(size);
         }

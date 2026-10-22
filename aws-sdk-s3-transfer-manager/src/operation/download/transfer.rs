@@ -1342,16 +1342,14 @@ impl DownloadTransfer {
 
     /// Finalize a transfer whose successful completion `_claim` proves: flush the tail to
     /// disk (returning the last carrier charges as `ChunkOutput`s drop), establish the
-    /// destination length, commit a managed path (rename it into place, or remove its
-    /// temporary file if the transfer is no longer active), set the terminal status,
-    /// and signal waiters. A finalization error fails the transfer with
-    /// `ErrorKind::IOError` instead.
+    /// destination length, rename a managed path's temporary file into place (or remove
+    /// it if the transfer is no longer active), set the terminal status, and signal
+    /// waiters. A finalization error fails the transfer with `ErrorKind::IOError` instead.
     ///
-    /// The rename precedes the status, so a reader that observes `Completed` without
-    /// joining finds the object at its destination, and a cancellation that lands after
-    /// the commit's status check leaves the object there under a `Cancelled` status.
-    /// The state is already `Terminal`, entered when the claim was taken; this runs
-    /// after the state lock is released so disk IO never happens under it.
+    /// The rename precedes the status, so a reader that observes `Completed` finds the
+    /// object at its destination. The state is already `Terminal`, entered when the claim
+    /// was taken; this runs after the state lock is released so disk IO never happens
+    /// under it.
     fn finalize_completion(&self, _claim: CompletionClaim) -> WorkOutcome {
         let expected_len = *self
             .inner
@@ -1377,8 +1375,7 @@ impl DownloadTransfer {
             );
         }
         // A cancellation that wins this CAS after the rename leaves the object in place:
-        // the caller's previous file is already replaced, so removing the object would
-        // leave nothing there.
+        // the caller's previous file is already replaced.
         self.inner.ctx.set_completed();
         self.inner.writer.notify_consumer();
         self.report_terminal(state_snapshot);
@@ -2326,8 +2323,6 @@ mod tests {
         let client = mock_client!(aws_sdk_s3, &[&ranged, &part]);
         let transfer = create_download_with_client_and_detail(client, part_size, 1);
 
-        // No ranges, so discovery is the last item to retire: its own `execute` claims
-        // completion and finalizes, and the next poll is `Done`.
         assert_discovery_succeeds(&transfer).await;
         assert_done(transfer.poll_work());
 
@@ -2390,8 +2385,8 @@ mod tests {
         assert_done(transfer.poll_work());
     }
 
-    /// Build a download on `ctx` writing through `sink`, whose writer renames `temp` to
-    /// `dest` when it finalizes and otherwise removes `temp` once its last reference drops.
+    /// Build a download on `ctx` that writes through `sink` into `temp` and commits it to
+    /// `dest`.
     fn transfer_committing_to(
         ctx: TransferContext,
         sink: Box<dyn crate::operation::download::sink::SinkWrite>,
@@ -2408,13 +2403,11 @@ mod tests {
         DownloadTransfer::new(ctx, BucketType::Standard, input, writer)
     }
 
-    /// Build a two-part download into `temp` whose writer renames `temp` to `dest` when it
-    /// finalizes.
+    /// Build a two-part download into `temp` that commits it to `dest`.
     ///
     /// Two parts, so discovery delivers the first and `poll_work` hands out the last range
-    /// as a separate item that a test can cancel before it runs. The client answers each
-    /// range with exactly the requested bytes, so the last range validates and retiring it
-    /// claims completion.
+    /// as a separate item. The client answers each range with exactly the requested bytes,
+    /// so the last range validates and retiring it claims completion.
     fn committing_transfer(
         dest: std::path::PathBuf,
         temp: std::path::PathBuf,
@@ -2556,8 +2549,7 @@ mod tests {
     ///
     /// The destination's directory does not exist, so the rename in `finalize` fails after
     /// the resize succeeds. If that error were dropped, the transfer would report `Success`
-    /// and `Scheduler::on_completion` would record a clean completion for a destination that
-    /// was never created.
+    /// for a destination that was never created.
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn a_failed_commit_reports_failed_not_success() {
@@ -2584,9 +2576,8 @@ mod tests {
             !dest.exists(),
             "a failed rename must not create the destination"
         );
-        // The failure released the transfer's reference to the temporary file, so the
-        // work item's reference was the last and the file went with it. A rename that
-        // dropped the target when it failed would leave the file behind.
+        // `fail` released the transfer's reference, so the work item's was the last. A
+        // failed rename that cleared the target would leave the file behind.
         assert!(
             !temp.exists(),
             "the temporary file outlived the work item whose rename failed"
@@ -2670,10 +2661,9 @@ mod tests {
     /// A cancelled download's terminal hook removes its temporary file when no work item
     /// holds it, while the transfer itself stays alive.
     ///
-    /// The scheduler runs `on_terminal` when it cancels a transfer, and a handle or a
-    /// descriptor can keep the transfer alive after that. If the hook kept the transfer's
-    /// reference to the temporary file, the file would stay until the last of them
-    /// dropped.
+    /// A handle or a descriptor can keep a cancelled transfer alive after its hook runs.
+    /// If the hook kept the transfer's reference to the temporary file, the file would
+    /// stay until the last of them dropped.
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn a_cancelled_download_removes_its_temp_file_at_its_terminal_hook() {
@@ -2740,11 +2730,10 @@ mod tests {
     /// A poll that answers `Done` before the completion publishes its status leaves the
     /// terminal summary to that completion.
     ///
-    /// Claiming completion makes the state `Terminal` while the status is still `Active`,
-    /// and `finalize_completion` publishes the status afterwards. The scheduler polls the
-    /// transfer inside that window, gets `Done`, and removes it. If it ran `on_terminal`
-    /// there, the hook would spend the one-shot summary on an `Active` transfer, and the
-    /// completion would find nothing left to report.
+    /// Claiming completion makes the state `Terminal` while the status is still `Active`.
+    /// The scheduler polls the transfer inside that window, gets `Done`, and removes it.
+    /// If it ran `on_terminal` there, the hook would spend the one-shot summary on an
+    /// `Active` transfer, and the completion would find nothing left to report.
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn a_done_poll_in_the_finalize_window_leaves_the_summary_to_the_completion() {
@@ -2927,10 +2916,9 @@ mod tests {
             transfer.ctx().transfer_status(),
             crate::types::TransferStatus::Completed
         );
-        // A later terminal path runs the hook again, which must emit nothing.
+        // A terminal path that runs the hook after the completion must emit nothing more.
         transfer.on_terminal();
 
-        // What the consumer saw.
         let mut events = Vec::new();
         while let Ok(event) = stream.try_recv() {
             events.push(event);
@@ -3833,15 +3821,9 @@ mod tests {
     }
 
     // ref: awslabs/aws-s3-transfer-manager-rs#197
-    /// A managed path download must have committed its destination by the time any
-    /// reader can observe `Completed`.
+    /// A path download's destination exists by the time its status reads `Completed`.
     ///
-    /// The assertion deliberately never joins. `join()` is reachable by exactly one
-    /// caller, so a rename performed there leaves every other reader -- a metrics
-    /// snapshot, an event consumer, the composite's orphan drain -- reading
-    /// `Completed` for a path that does not exist. Reading the status is the only thing
-    /// a reporting path can do, so the status is what the destination has to be ready
-    /// for.
+    /// The test never joins, so a rename left to `join` fails it.
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_destination_exists_when_status_reads_completed() {
@@ -3895,7 +3877,6 @@ mod tests {
             "expected Success, got {outcome:?}"
         );
 
-        // No join() anywhere above. This is what every reporting path sees.
         assert_eq!(
             transfer.ctx().transfer_status(),
             crate::types::TransferStatus::Completed,

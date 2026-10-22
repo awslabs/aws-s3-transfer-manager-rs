@@ -186,8 +186,12 @@ pub(crate) struct CommitTarget {
     pub(crate) dest: std::path::PathBuf,
 }
 
-/// Reference-counted [`CommitTarget`]: dropping the last reference removes the
-/// temporary file unless [`BodyWriter::finalize`] already renamed or removed it.
+/// A [`CommitTarget`] whose temporary file is removed on drop unless
+/// [`BodyWriter::finalize`] already renamed or removed it.
+///
+/// Reference-counted rather than removed by `on_terminal`, because that hook can run while
+/// work still writes to the file: cancellation runs it before executing work is interrupted,
+/// and a transfer removed on a `Done` poll can still have work executing.
 #[derive(Debug)]
 pub(crate) struct TempFile {
     /// Taken when the file is renamed or removed, so that happens at most once.
@@ -195,11 +199,9 @@ pub(crate) struct TempFile {
 }
 
 impl TempFile {
-    /// Renames the temporary file to its destination if `is_active` returns true,
-    /// and removes it otherwise. Does nothing once the file has been renamed or
-    /// removed.
-    ///
-    /// A failed rename leaves the file for the last reference's drop to remove.
+    /// Renames the temporary file to its destination if `is_active` returns true, and
+    /// removes it otherwise. Does nothing once the file has been renamed or removed. A
+    /// failed rename leaves the file for drop to remove.
     fn commit(&self, is_active: impl FnOnce() -> bool) -> std::io::Result<()> {
         let mut target = self
             .target
@@ -209,6 +211,10 @@ impl TempFile {
             return Ok(());
         };
         if is_active() {
+            // TODO(vnext): consider an opt-in download durability policy. Managed path
+            // downloads would sync file data before rename and the parent directory after
+            // rename where supported. The latency and cross-platform semantics make this
+            // a client/API policy rather than the default.
             std::fs::rename(&paths.temp, &paths.dest)?;
         } else {
             let _ = std::fs::remove_file(&paths.temp);
@@ -364,10 +370,8 @@ impl BodyWriter {
         matches!(&*self.mode, Mode::Disk { .. })
     }
 
-    /// A reference to the temporary file. Holding it defers the removal that dropping
-    /// the last reference performs.
-    ///
-    /// `None` without a [`CommitTarget`], or once
+    /// A reference to the temporary file, which defers the removal that dropping the
+    /// last reference performs. `None` without a [`CommitTarget`] or once
     /// [`release_temp_file`](Self::release_temp_file) has run.
     pub(crate) fn temp_file(&self) -> Option<std::sync::Arc<TempFile>> {
         match &*self.mode {
@@ -653,10 +657,10 @@ pub(crate) fn new_recv_body() -> (BodyWriter, RecvBodyConsumer) {
 }
 
 /// Create a producer/consumer pair writing to an arbitrary [`SinkWrite`] target.
-/// Positioned writes land at `chunk.offset - object_range_start` in the sink. With a
-/// `commit` target, [`finalize`](BodyWriter::finalize) renames its temporary file to
-/// its destination, and a file it does not rename is removed once every
-/// [`TempFile`] reference has dropped.
+/// Positioned writes land at `chunk.offset - object_range_start` in the sink.
+/// With a `commit` target, the writer owns its temporary file:
+/// [`finalize`](BodyWriter::finalize) renames it into place, and otherwise it is
+/// removed by the time the last [`TempFile`] reference drops.
 ///
 /// Issuance backpressure is owned by the per-transfer [`ReadAhead`] controller.
 ///
@@ -1371,9 +1375,8 @@ mod tests {
     /// Once `finalize` has renamed or removed the temporary file, dropping the writer
     /// leaves alone a file another download has since created under that name.
     ///
-    /// The last reference's drop removes the temporary file only if `finalize` has not
-    /// already acted on it. A rename or a removal that left its target in place would
-    /// have that drop remove the other download's file.
+    /// If `finalize` left the commit target set after acting on it, the drop would
+    /// remove the other download's file.
     #[test]
     fn finalize_frees_the_temporary_name_for_good() {
         for active in [true, false] {

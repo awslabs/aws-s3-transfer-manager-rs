@@ -317,19 +317,14 @@ async fn test_download_write_to_file() {
     m.handle.shutdown().await.expect("shutdown");
 }
 
-/// Every entry point that accepts `.events(sink)` must actually report.
+// ref: awslabs/aws-s3-transfer-manager-rs#197
+/// Every single-object download entry point reports to a sink registered with
+/// `.events(sink)`: exactly one root `Started` carrying a view, exactly one succeeding
+/// `Finished` for the same id, and a view whose `network_rx` and `Final` total equal the
+/// object size.
 ///
-/// `write_to_file` took a sink and threw it away: it built the input and called
-/// `orchestrate_to_file`, which passed `None` for events, so a caller got a handle, a
-/// correct download, and total silence on a stream it had registered. Nothing failed and
-/// nothing warned — the failure mode of a builder method that quietly ignores half its
-/// configuration.
-///
-/// Covered as a table over every single-object download entry point rather than as one
-/// test for the one that was broken, because the defect is *per entry point* and a fourth
-/// would be just as silent. A single-object transfer is one entry, so the shape is the same
-/// for all of them: one `Started` with no parent carrying a view, one `Finished` succeeding,
-/// and the view's counter reaching the object size.
+/// An entry point that discards its sink still downloads correctly; only its event stream
+/// shows the loss.
 #[cfg(any(unix, windows))]
 #[tokio::test]
 async fn test_download_single_object_entry_points_all_report_events() {
@@ -366,7 +361,6 @@ async fn test_download_single_object_entry_points_all_report_events() {
             .key("ev-key")
             .events(sink);
 
-        // Each arm drives the transfer to completion.
         match variant {
             Sink::Path => {
                 let h = req
@@ -387,9 +381,8 @@ async fn test_download_single_object_entry_points_all_report_events() {
             }
         }
 
-        // The transfer emits `Finished` before `join()` returns, and sending it releases the
-        // sink, so the stream ends once drained. Draining to the end rather than to the first
-        // `Finished` is what lets a second `Finished` fail the count below.
+        // Sending `Finished` releases the sink, so the stream ends once drained. Drained to
+        // the end rather than to the first `Finished`, so a duplicate fails the count below.
         let mut started = Vec::new();
         let mut finished = Vec::new();
         let mut view = None;
@@ -1168,10 +1161,9 @@ async fn test_download_parked_on_read_ahead_reports_the_consumer() {
     use aws_sdk_s3_transfer_manager::types::PendingCategory;
     use std::time::Duration;
 
-    // The window must close *before* every range is issued, or the transfer parks on range
-    // completion first and the read-ahead gate is never reached — which is what 8 parts at
-    // concurrency 8 does. So: many parts, a window of 2, and concurrency below the part
-    // count.
+    // 8 parts at concurrency 2 and a window of 2, so the window closes before every range is
+    // issued. A transfer that issues every range first parks on range completion and never
+    // reaches the read-ahead gate.
     let size = 40 * ByteUnit::Mebibyte.as_bytes_usize();
     let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
     let m = mock_tm_with(RuntimeMode::Managed, |b| {
@@ -1188,8 +1180,7 @@ async fn test_download_parked_on_read_ahead_reports_the_consumer() {
     let (sink, mut stream) = aws_sdk_s3_transfer_manager::events::channel(
         std::num::NonZeroUsize::new(8).expect("capacity > 0"),
     );
-    // Deliberately not joined and the body deliberately not drained: the handle is held so
-    // the transfer stays alive while parked.
+    // Held but never joined, and the body never read, so the transfer stays alive and parked.
     let _handle = m
         .client
         .download()
@@ -1213,8 +1204,8 @@ async fn test_download_parked_on_read_ahead_reports_the_consumer() {
     }
     let view = view.expect("a real transfer owes a view");
 
-    // Poll until the transfer parks. It has to issue and fill the window first, so the
-    // cause is not available on the first reading.
+    // The transfer issues ranges and fills the window before it parks, so the first reading
+    // may have no cause.
     let mut seen = None;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while tokio::time::Instant::now() < deadline {

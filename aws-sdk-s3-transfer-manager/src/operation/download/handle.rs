@@ -107,18 +107,16 @@ impl DownloadHandleInner {
         ))
     }
 
-    /// Core abort logic: cancel the transfer, notify the consumer, and wait for the
-    /// transfer's executing work to stop.
+    /// Core abort logic: cancel transfer, notify consumer, and wait for idle.
     pub(crate) async fn abort(&self) {
         let ctx = self.transfer.ctx();
 
-        // Cancelled through the scheduler before the status is set. A status set first
-        // lets a completing work item remove the transfer and run its terminal hook, and
-        // the wait below would then return before that hook finishes.
+        // Cancel before setting the status: a status set first lets a completing work
+        // item remove the transfer and run its terminal hook, and the wait below would
+        // return before the hook finishes.
         let cancellation = ctx.handle.scheduler.cancel_transfer(self.transfer.id());
-        // Still needed when the scheduler had already removed the transfer: a finalizing
-        // download that sees the status removes its temporary file instead of renaming it
-        // into place.
+        // Still needed if the scheduler already removed the transfer: a finalizing download
+        // that sees this status removes its temporary file instead of renaming it.
         ctx.set_cancelled();
         self.transfer.writer().notify_consumer();
 
@@ -339,10 +337,9 @@ impl Drop for DownloadHandle {
 /// this handle does not expose a body — the transfer manager writes data
 /// directly to disk.
 ///
-/// Data is written to a temporary file (`{dest}.s3tmp.{id}`) beside the
-/// destination and renamed into place before [`status`](Self::status) reports
-/// `Completed`. On failure, cancellation, or drop, the temporary file is removed
-/// once the transfer's in-flight requests stop.
+/// A download to a path writes to a temporary file (`{dest}.s3tmp.{id}`) beside the
+/// destination and renames it into place on success. On failure, cancellation, or drop,
+/// the temporary file is deleted. A download to a caller's file writes to that file directly.
 ///
 /// Success means the operating system accepted every byte and, for a managed
 /// path, completed the rename. The transfer manager does not call `sync_data`,
@@ -372,11 +369,11 @@ impl ManagedDownloadHandle {
 
     /// Wait for the download to complete.
     ///
-    /// On success, the object is at the destination path. On failure, returns the
-    /// transfer's error, and on cancellation an
-    /// [`OperationCancelled`](crate::error::ErrorKind::OperationCancelled) error; the
-    /// temporary file is removed once the transfer's in-flight requests stop, which can
-    /// be after this returns. No outcome adds a filesystem durability barrier.
+    /// On success, the object is at the destination path, or in the caller's file for a
+    /// download to a file. A cancelled download returns an
+    /// [`OperationCancelled`](crate::error::ErrorKind::OperationCancelled) error. On failure or
+    /// cancellation, a download to a path deletes its temporary file, possibly after this
+    /// returns. This does not add a filesystem durability barrier.
     pub async fn join(
         mut self,
     ) -> Result<crate::operation::download::output::DownloadOutput, error::Error> {
@@ -413,11 +410,6 @@ impl ManagedDownloadHandle {
     pub fn metrics(&self) -> crate::types::TransferMetrics {
         self.inner.transfer.ctx().metrics()
     }
-
-    // TODO(vnext): consider an opt-in download durability policy. Managed path
-    // downloads would sync file data before rename and the parent directory after
-    // rename where supported. The latency and cross-platform semantics make this a
-    // client/API policy rather than the default.
 }
 
 impl Drop for ManagedDownloadHandle {

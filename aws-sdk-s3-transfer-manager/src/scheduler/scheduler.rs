@@ -250,10 +250,8 @@ impl Scheduler {
                     drop(transfers);
                     let ctx = transfer.ctx();
                     ctx.set_cancelled();
-                    // Contained, because `signal_terminal` below is what resolves this
-                    // child's handle. An escaping panic skips it and the handle's
-                    // `join()` never returns -- and the panic leaves the scheduler on
-                    // whichever thread enqueued the child.
+                    // Contained so a panic cannot skip the `signal_terminal` that resolves
+                    // this child's handle.
                     if !run_terminal_hook(transfer.as_ref()) {
                         tracing::error!(
                             target: telemetry::TARGET_SCHEDULING,
@@ -551,19 +549,8 @@ impl Scheduler {
             // handle observes completion. Idempotent if already signaled.
             if let Some(completed) = completed {
                 completed.transfer().ctx().signal_terminal();
-                // The fourth and last removal path. A transfer whose status went
-                // terminal while work was still in flight is removed here, by the
-                // completing work rather than by a later poll, so it never reaches
-                // the `Done` arm. Without this call that transfer's `on_terminal`
-                // never runs, and an observer sees it start and never finish.
-                //
-                // Safe to reach from more than one path: the hook's work is
-                // guarded by a claim that exactly one caller can win.
-                //
-                // Contained like the cancel and panic paths, because the hook takes the
-                // state lock, drains, reports and emits -- four steps that can panic. An
-                // escaping panic would skip the `generate_work` below, so the slot this
-                // completion just freed would never produce replacement work.
+                // Contained so a panic cannot skip the `generate_work` below, which
+                // refills the slot this completion freed.
                 if !run_on_terminal(&completed) {
                     tracing::error!(
                         target: telemetry::TARGET_SCHEDULING,
@@ -816,32 +803,8 @@ impl Scheduler {
                             "poll_work.done",
                         );
                         claim.release();
-                        // Symmetric with the cancel and panic paths. `on_terminal` is a
-                        // defaulted trait method, so this is additive for every operation
-                        // that ignores it. Called before the descriptor is removed, so the
-                        // transfer is still reachable, and outside any state guard.
-                        //
-                        // Conditional, because `Done` and a published status are two
-                        // different facts. A transfer answers `Done` off its own terminal
-                        // state, and both operations claim that state before they publish
-                        // the status -- download's `decrement_in_flight` claims it under
-                        // the state lock, and `set_completed` does not run until the tail
-                        // flush and the rename are done. `on_terminal` reads
-                        // `terminal_outcome()`, which maps a still-`Active` status to
-                        // `Cancelled`, and claims the one-shot terminal report -- so
-                        // running it inside that window would tell the consumer a
-                        // succeeding transfer was cancelled and spend the report the real
-                        // completion still owes. Both of those are one-shot, so neither
-                        // can be corrected afterwards. Skipping loses nothing: every
-                        // completion path emits and reports for itself, and the
-                        // cancel/panic paths publish the status before they get here.
-                        //
-                        // Contained for the same reason the cancel and panic paths are:
-                        // an escaping panic would skip `remove_transfer_atomic` below,
-                        // leaving the descriptor in the map with its children running,
-                        // and skip the `sub.submit()` that returns this dispatch slot.
-                        // It would also leave the scheduler through `enqueue_transfer`
-                        // on the caller's thread.
+                        // Only once the status is published: `Done` can precede it, and the
+                        // hook's status-derived work is one-shot.
                         if desc.is_terminal() && !run_on_terminal(&desc) {
                             tracing::error!(
                                 target: telemetry::TARGET_SCHEDULING,
@@ -1026,15 +989,11 @@ impl Scheduler {
 ///
 /// Returns `false` if `on_terminal` panicked; its cleanup may be partial. The
 /// panic is not re-raised, so the caller's remaining terminal steps always run.
-///
-/// Takes the transfer rather than a descriptor because one terminal path runs before a
-/// descriptor exists -- a child whose parent group is already gone is cancelled inside
-/// `enqueue_transfer`, and that path still owes its handle a terminal signal.
 fn run_terminal_hook(transfer: &dyn Transfer) -> bool {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| transfer.on_terminal())).is_ok()
 }
 
-/// [`run_terminal_hook`] for a transfer the scheduler already holds a descriptor for.
+/// [`run_terminal_hook`] on the descriptor's transfer.
 fn run_on_terminal(desc: &TransferDescriptor) -> bool {
     run_terminal_hook(desc.transfer())
 }
@@ -3871,14 +3830,8 @@ mod tests {
         handle.runtime.shutdown();
     }
 
+    // ref: awslabs/aws-s3-transfer-manager-rs#197
     /// A panic in `on_terminal` must not escape the Done arm or skip its removal.
-    ///
-    /// The hook takes the state lock, drains, reports the summary and emits the
-    /// lifecycle event, so four steps can panic where cleanup used to sit. Called
-    /// bare, the unwind skips `remove_transfer_atomic` on the next line -- leaving the
-    /// descriptor in the map with any children still running -- skips the `sub.submit()`
-    /// that returns the dispatch slot, and leaves the scheduler through
-    /// `enqueue_transfer` on this thread.
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn a_panicking_terminal_hook_is_contained_in_the_done_arm() {
@@ -3893,14 +3846,11 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let mock = PanickingTerminalHookMock::new(id, handle.clone(), calls.clone());
 
-        // `enqueue_transfer` runs `generate_work` on this thread, so an escaping panic
-        // would unwind through this call rather than being reported as a failed
-        // assertion below.
+        // Runs the Done arm on this thread, so an escaping panic fails the test here.
         scheduler.enqueue_transfer(Box::new(mock));
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        // The removal below runs whether or not the hook was reached, so on its own it
-        // also passes against a Done arm that skips the hook entirely.
+        // The removal check below passes even for a Done arm that never calls the hook.
         assert_eq!(
             1,
             calls.load(Ordering::SeqCst),
@@ -3916,13 +3866,12 @@ mod tests {
         handle.runtime.shutdown();
     }
 
+    // ref: awslabs/aws-s3-transfer-manager-rs#197
     /// A panicking hook must not cost a child its terminal signal.
     ///
-    /// A child enqueued after its parent's group is gone is cancelled inside
-    /// `enqueue_transfer`, before any descriptor exists, and the `signal_terminal` on the
-    /// line after the hook is the only thing that resolves its handle. An escaping panic
-    /// skips it, so `join()` never returns -- and the unwind leaves the scheduler on
-    /// whichever thread enqueued the child.
+    /// A child enqueued after its parent's group is gone is cancelled at enqueue, before
+    /// any descriptor exists. If the panic skipped `signal_terminal`, the child's `join()`
+    /// would never return.
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn a_panicking_terminal_hook_still_signals_an_orphaned_child() {
@@ -3930,8 +3879,7 @@ mod tests {
         let handle = test_handle(2);
         let scheduler = &handle.scheduler;
 
-        // A parent group that was never registered, so `resolve_group_vruntime` misses
-        // and the child takes the cancel-on-enqueue path.
+        // Parent 999 was never registered, so the child is cancelled at enqueue.
         let child_id = TransferId {
             id: 2,
             parent: Some(999),
@@ -3953,9 +3901,7 @@ mod tests {
             "the hook panicked and took `signal_terminal` with it, so this child's \
              handle would wait on join() forever"
         );
-        // Read the status off the context, not the map: this path returns before
-        // `transfers.insert`, so a map lookup is always `None` and any default it falls
-        // back to is the expected value.
+        // Read off the context: the child never enters the map.
         assert_eq!(
             crate::types::TransferStatus::Cancelled,
             child_ctx.transfer_status(),

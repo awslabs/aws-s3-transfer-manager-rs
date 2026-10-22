@@ -100,9 +100,7 @@ impl InputStream {
     /// The file this stream reads from, or `None` for an in-memory or
     /// caller-supplied stream.
     ///
-    /// The path as given, not canonicalized: it is reported to an observer as the
-    /// upload's source, and a caller that passed a relative path is entitled to
-    /// read its own back.
+    /// The path is returned as given, not canonicalized.
     pub(crate) fn source_path(&self) -> Option<&Path> {
         match &self.inner {
             RawInputStream::Fs(body) => Some(&body.path),
