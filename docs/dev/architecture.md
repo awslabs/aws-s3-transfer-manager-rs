@@ -20,6 +20,10 @@ and explicit CPU binding independently of transfer scheduling. Discovery owns
 no threads and does not change affinity. Its crate documentation states the
 resource and platform contracts.
 
+`crates/aws-smithy-execution/` owns managed threads and exposes partition handles
+for targeted Send task submission. Its topology re-export describes placement;
+its runtime owner controls shutdown. Execution handles do not retain ownership.
+
 ## Boundaries
 
 - `transfer.rs`, `scheduler/`, and `runtime/` do not depend on `operation/`. Operation-specific behavior reaches them only through the `Transfer` trait.
