@@ -299,14 +299,13 @@ impl TransferStatus {
 
 /// Snapshot of transfer progress and IO metrics.
 ///
-/// The four byte counters are four views of the same payload, not four addends: a
-/// file-backed upload records its bytes as both `disk_read` and `network_tx`.
+/// The byte counters are views of the same payload, not addends: a file-backed upload
+/// records its bytes as `disk_read`, `network_tx` and `bytes_transferred`.
 ///
-/// Draw progress from the counter matching the direction — `network_tx` for an upload,
-/// `network_rx` for a download — against [`total_bytes`](Self::total_bytes). A directory
-/// operation aggregates its children into the same four counters, so the same rule applies.
-/// Prefer [`TransferView::byte_total`] where a still-growing total must be told from a final
-/// one.
+/// Draw progress from [`bytes_transferred`](Self::bytes_transferred) against
+/// [`total_bytes`](Self::total_bytes), in either direction. A directory operation aggregates
+/// its children into the same counters, so the same rule applies. Prefer
+/// [`TransferView::byte_total`] where a still-growing total must be told from a final one.
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub struct TransferMetrics {
@@ -318,18 +317,12 @@ pub struct TransferMetrics {
     pub disk_read: u64,
     /// Bytes written to disk.
     pub disk_write: u64,
-    /// Download payload bytes read off a socket, counted per chunk as they arrive rather
-    /// than per part at confirmed success.
+    /// Payload bytes of the parts that have completed, in either direction.
     ///
-    /// Use this when you need a numerator that moves *inside* a part: `network_rx` advances
-    /// once per part, so a single-part transfer shows nothing between 0 and done, and at the
-    /// 5 MiB download default most small-file transfers are single-part.
-    ///
-    /// **An optimistic estimate, not an accounting figure.** Monotonic, but a retried or
-    /// hedged attempt's partial bytes are counted and never removed, so this can exceed
-    /// `network_rx` permanently and can exceed `total_bytes`. Clamp it when rendering, and
-    /// use `network_rx` for any total that has to be right. Always 0 for an upload.
-    pub bytes_streamed: u64,
+    /// A part counts once, when its request succeeds, so a single-part transfer moves from 0
+    /// to its total in one step. Once the transfer succeeds this equals
+    /// [`total_bytes`](Self::total_bytes), where that is known.
+    pub bytes_transferred: u64,
     /// Expected total payload bytes, if known.
     pub total_bytes: Option<u64>,
     /// When the transfer was initiated.
@@ -375,9 +368,8 @@ impl TransferView {
     /// monotonically non-decreasing, so a later reading never returns less than an
     /// earlier one.
     ///
-    /// Which counter is the numerator depends on the direction — see
-    /// [`TransferMetrics`]. Summing all four double-counts: a file-backed upload records
-    /// the same payload as both `network_tx` and `disk_read`.
+    /// The progress numerator is [`TransferMetrics::bytes_transferred`] in either
+    /// direction. Summing the byte counters double-counts — see [`TransferMetrics`].
     ///
     /// [`TransferMetrics::finished_at`] is set on the transfer's terminal transition,
     /// which happens while in-flight work may still be draining, so a counter can still

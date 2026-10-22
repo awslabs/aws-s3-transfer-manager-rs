@@ -1321,6 +1321,83 @@ mod tests {
         assert_eq!(failed.len(), 1);
     }
 
+    // ref: awslabs/aws-s3-transfer-manager-rs#197
+    /// Under `Continue`, an object that fails after one of its ranges was received still
+    /// counts that range in the operation's metrics, which `join` reports: a child's bytes
+    /// reach its parent as they are recorded, whatever the child's outcome.
+    ///
+    /// One object of two parts. Discovery receives the first part and the second range fails
+    /// with SDK retries disabled, so exactly one part's bytes were received. Counting a
+    /// child's bytes only when it succeeds leaves both counters at 0.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn a_failed_object_still_counts_the_bytes_it_received() {
+        use crate::operation::download::test_util::fixtures::{
+            object_bytes, object_client_failing_at,
+        };
+
+        let dir = tempdir().unwrap();
+        let part_size = crate::config::MIN_MULTIPART_PART_SIZE_BYTES;
+        let object_size = 2 * part_size;
+        let list = mock!(aws_sdk_s3::Client::list_objects_v2).then_output(move || {
+            ListObjectsV2Output::builder()
+                .set_contents(Some(vec![Object::builder()
+                    .key("a.txt")
+                    .size(object_size as i64)
+                    .build()]))
+                .build()
+        });
+        let lister = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[list]);
+        let config = crate::Config::builder()
+            .sdk_client(object_client_failing_at(
+                object_bytes(object_size as usize),
+                part_size,
+            ))
+            .part_size(crate::types::PartSize::Target(part_size))
+            .build();
+        let handle = crate::client::Handle::test_handle_tokio(config);
+        let walk = S3Walker::builder().build().walk(
+            S3WalkContext::builder()
+                .sdk_client(lister)
+                .bucket("test-bucket")
+                .build(),
+        );
+        let (ctx, completion_rx) = TransferContext::new(handle);
+        ctx.handle
+            .scheduler
+            .register_empty_group_for_test(ctx.id.id);
+        let input = crate::operation::download_objects::DownloadObjectsInput::builder()
+            .bucket("test-bucket")
+            .destination(dir.path())
+            .failure_policy(FailedTransferPolicy::Continue)
+            .build()
+            .unwrap();
+        let transfer = DownloadObjectsTransfer::new(ctx, &input, walk, 1000);
+
+        timeout(Duration::from_secs(10), async {
+            drive_transfer(&transfer).await;
+            let _ = completion_rx.await;
+        })
+        .await
+        .expect("transfer should complete within timeout");
+
+        assert_eq!(transfer.successful_downloads(), 0);
+        assert_eq!(
+            Some(1),
+            transfer.take_failed().map(|failed| failed.len()),
+            "the object must have failed"
+        );
+        let m = transfer.ctx().metrics();
+        assert_eq!(
+            part_size, m.network_rx,
+            "the part the failed object received must reach the operation's metrics"
+        );
+        assert_eq!(
+            part_size, m.bytes_transferred,
+            "the part the failed object completed must reach the operation's metrics"
+        );
+    }
+
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_child_failure_abort() {

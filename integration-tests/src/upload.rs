@@ -23,8 +23,8 @@ async fn setup() -> MockTm {
 }
 
 /// An upload with a registered sink reports exactly one `Started` carrying a view and exactly
-/// one `Finished` that succeeded, and the view reports the payload on `network_tx`, the upload
-/// numerator, against a `Final` total the leaf knows from its own size hint before a byte moves.
+/// one `Finished` that succeeded, and the view reports the payload on `network_tx` against a
+/// `Final` total the leaf knows from its own size hint before a byte moves.
 #[tokio::test]
 async fn test_upload_reports_events() {
     use aws_sdk_s3_transfer_manager::events::{Outcome, TransferEvent};
@@ -102,8 +102,61 @@ async fn test_upload_reports_events() {
     assert_eq!(
         size as u64,
         view.metrics().network_tx,
-        "upload's numerator is network_tx, and it must reach the payload"
+        "network_tx must reach the payload"
     );
+
+    m.handle.shutdown().await.expect("shutdown");
+}
+
+/// An upload's `bytes_transferred`, read from its view, reaches the final byte total on both
+/// upload paths.
+///
+/// 1 MiB is one `PutObject` and 16 MiB is two `UploadPart`s at the 8 MiB default, so the two
+/// cases cover the two sites that record an upload's bytes.
+#[tokio::test]
+async fn test_upload_bytes_transferred_reaches_the_byte_total() {
+    use aws_sdk_s3_transfer_manager::events::TransferEvent;
+    use aws_sdk_s3_transfer_manager::types::Total;
+    use std::time::Duration;
+
+    let m = setup().await;
+    for size in [1, 16].map(|mib| mib * ByteUnit::Mebibyte.as_bytes_usize()) {
+        let (sink, mut stream) = aws_sdk_s3_transfer_manager::events::channel(
+            std::num::NonZeroUsize::new(8).expect("capacity > 0"),
+        );
+        let handle = m
+            .client
+            .upload()
+            .bucket("test-bucket")
+            .key(format!("transferred-{size}"))
+            .body(InputStream::from(vec![3u8; size]))
+            .events(sink)
+            .initiate()
+            .expect("initiate");
+
+        handle.join().await.expect("join upload");
+
+        // `Finished` is sent before `join()` returns and releases the sink, so the stream
+        // ends once drained.
+        let mut view = None;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(event) = stream.recv().await {
+                if let TransferEvent::Started(p) = event {
+                    view = p.view().cloned();
+                }
+            }
+        })
+        .await
+        .expect("the stream did not end, so the sink outlived the transfer");
+        let view = view.expect("a real transfer owes a view");
+
+        assert_eq!(Total::Final(size as u64), view.byte_total(), "{size} bytes");
+        assert_eq!(
+            size as u64,
+            view.metrics().bytes_transferred,
+            "{size} bytes: the upload's progress numerator must reach its total"
+        );
+    }
 
     m.handle.shutdown().await.expect("shutdown");
 }

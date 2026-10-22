@@ -786,6 +786,14 @@ impl UploadTransfer {
             .set_checksum_sha256(resp.checksum_sha256.clone())
             .build();
 
+        // Recorded before the part is marked complete: once every part is, another worker can
+        // build the output, which carries a snapshot of these counters.
+        self.inner.ctx.record_io(&crate::metrics::IoSample {
+            network_tx: bytes_sent,
+            bytes_transferred: bytes_sent,
+            ..Default::default()
+        });
+
         let (should_wake, completion_snapshot) = {
             let mut state = self.inner.state.lock().expect("lock poisoned");
             let UploadState::Transferring { parts, .. } = &mut *state else {
@@ -805,11 +813,6 @@ impl UploadTransfer {
             request_elapsed,
             completion_snapshot,
         );
-
-        self.inner.ctx.record_io(&crate::metrics::IoSample {
-            network_tx: bytes_sent,
-            ..Default::default()
-        });
 
         if should_wake {
             self.inner.ctx.try_wake();
@@ -943,6 +946,7 @@ impl UploadTransfer {
         self.inner.ctx.record_io(&crate::metrics::IoSample {
             network_tx: content_length,
             disk_read,
+            bytes_transferred: content_length,
             ..Default::default()
         });
 

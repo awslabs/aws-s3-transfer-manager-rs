@@ -1015,28 +1015,15 @@ async fn test_concurrent_disk_downloads_under_tight_memory_budget_do_not_wedge_t
     .await;
 }
 
-/// `bytes_streamed` is wired to the one shared body loop, and conserves.
+/// A multipart download's `bytes_transferred`, read from its view, reaches the final byte
+/// total.
 ///
-/// This is Aaron's `bytes_in_flight` item: `network_rx` is recorded once per *part*, so a
-/// single-part transfer shows nothing between 0 and done, and at the 5 MiB download default
-/// most small-file transfers are single-part — precisely where a per-file progress line is
-/// read. `bytes_streamed` advances per chunk on the body-read path instead, so a consumer has
-/// a numerator that moves inside a part.
-///
-/// Asserted here: conservation at completion. Every streamed byte is a received byte and
-/// vice versa, across a multi-part download, which is what rules out the two ways the hook
-/// can be wrong — counting a chunk twice (the loop runs per chunk and per part), or missing
-/// the discovery path (`read_body_stream` serves both, so a hook placed in the caller rather
-/// than the loop would cover only one).
-///
-/// **Not asserted: that a reading is visible mid-part.** That needs a body delivered slower
-/// than the sampler ticks, and the mock's only throttle sheds requests with a 503 rather than
-/// rate-limiting a body. So the intra-part *visibility* this feature exists for is reasoned
-/// from the hook site, not observed — the honest label is assumed, where conservation is
-/// verified.
+/// 16 MiB at 5 MiB parts is a discovery range and three more, which record their bytes at
+/// separate sites; missing either site leaves the counter short of the total.
 #[tokio::test]
-async fn test_download_bytes_streamed_conserves_against_network_rx() {
+async fn test_download_bytes_transferred_reaches_the_byte_total() {
     use aws_sdk_s3_transfer_manager::events::TransferEvent;
+    use aws_sdk_s3_transfer_manager::types::Total;
     use std::time::Duration;
 
     let size = 16 * ByteUnit::Mebibyte.as_bytes_usize();
@@ -1045,7 +1032,7 @@ async fn test_download_bytes_streamed_conserves_against_network_rx() {
     m.server
         .add_object(
             "test-bucket",
-            "streamed-key",
+            "transferred-key",
             deterministic_data(size),
             None,
         )
@@ -1060,7 +1047,7 @@ async fn test_download_bytes_streamed_conserves_against_network_rx() {
         .client
         .download()
         .bucket("test-bucket")
-        .key("streamed-key")
+        .key("transferred-key")
         .events(sink)
         .write_to_path(dir.path().join("out.bin"))
         .await
@@ -1081,73 +1068,12 @@ async fn test_download_bytes_streamed_conserves_against_network_rx() {
         }
     }
     let view = view.expect("a real transfer owes a view");
-    let metrics = view.metrics();
 
+    assert_eq!(Total::Final(size as u64), view.byte_total());
     assert_eq!(
-        size as u64, metrics.network_rx,
-        "the confirmed numerator must reach the payload"
-    );
-    assert_eq!(
-        metrics.network_rx, metrics.bytes_streamed,
-        "every streamed byte is a received byte on a run with no retries: \
-         streamed {} against received {}",
-        metrics.bytes_streamed, metrics.network_rx
-    );
-
-    m.handle.shutdown().await.expect("shutdown");
-}
-
-/// `bytes_streamed` stays 0 for an upload, so a caller cannot read it as a generic numerator.
-///
-/// The counter is fed from the download body-read loop only. An upload's payload leaves
-/// through `network_tx`, and a caller that added `bytes_streamed` to a bar would double-count
-/// if this ever became non-zero without the doc changing with it.
-#[tokio::test]
-async fn test_upload_leaves_bytes_streamed_at_zero() {
-    use aws_sdk_s3_transfer_manager::events::TransferEvent;
-    use aws_sdk_s3_transfer_manager::io::InputStream;
-    use std::time::Duration;
-
-    let size = 16 * ByteUnit::Mebibyte.as_bytes_usize();
-    let m = setup().await;
-
-    let (sink, mut stream) = aws_sdk_s3_transfer_manager::events::channel(
-        std::num::NonZeroUsize::new(8).expect("capacity > 0"),
-    );
-    let handle = m
-        .client
-        .upload()
-        .bucket("test-bucket")
-        .key("streamed-upload-key")
-        .body(InputStream::from(vec![3u8; size]))
-        .events(sink)
-        .initiate()
-        .expect("initiate");
-
-    handle.join().await.expect("join upload");
-
-    let mut view = None;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while view.is_none() && tokio::time::Instant::now() < deadline {
-        match stream.try_recv() {
-            Ok(TransferEvent::Started(p)) if p.view().is_some() => view = p.view().cloned(),
-            Ok(_) => continue,
-            Err(aws_sdk_s3_transfer_manager::events::TryRecvError::Empty) => {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-            Err(_) => break,
-        }
-    }
-    let view = view.expect("a real transfer owes a view");
-    let metrics = view.metrics();
-
-    assert_eq!(
-        size as u64, metrics.network_tx,
-        "the upload numerator must reach the payload"
-    );
-    assert_eq!(
-        0, metrics.bytes_streamed,
-        "bytes_streamed is a download counter and must stay 0 for an upload"
+        size as u64,
+        view.metrics().bytes_transferred,
+        "the download's progress numerator must reach its total"
     );
 
     m.handle.shutdown().await.expect("shutdown");

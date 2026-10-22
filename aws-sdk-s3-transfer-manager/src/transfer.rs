@@ -486,22 +486,7 @@ pub(crate) struct MetricsState {
     network_rx: AtomicU64,
     disk_read: AtomicU64,
     disk_write: AtomicU64,
-    /// Payload bytes read off a socket, counted as each chunk arrives rather than at
-    /// confirmed success.
-    ///
-    /// Exists because `network_rx` is recorded once per *part*, so a single-part transfer
-    /// moves 0 → done with nothing in between, and at the 5 MiB download default most
-    /// small-file transfers are single-part. This counter moves during the body read.
-    ///
-    /// Monotonic and never decremented. Add-on-read / subtract-on-confirm cannot be made
-    /// leak-free here: both body-read sites run inside a `retry::retry` closure with hedging
-    /// enabled, so a losing attempt's future is dropped mid-read and no release path on it
-    /// ever runs, stranding its partial bytes in the counter and in the parent's rollup.
-    ///
-    /// The cost: a retried or hedged attempt's partial bytes are counted and never removed,
-    /// so this can exceed the payload actually received, and after a retry it can exceed
-    /// `total_bytes`. `network_rx` remains the exact counter.
-    bytes_streamed: AtomicU64,
+    bytes_transferred: AtomicU64,
     /// Running sum of the payload sizes of the entries enumerated so far, for a
     /// composite; always 0 for a leaf, which learns its total in one piece.
     ///
@@ -553,7 +538,7 @@ impl MetricsState {
             network_rx: AtomicU64::new(0),
             disk_read: AtomicU64::new(0),
             disk_write: AtomicU64::new(0),
-            bytes_streamed: AtomicU64::new(0),
+            bytes_transferred: AtomicU64::new(0),
             discovered_bytes: AtomicU64::new(0),
             discovered_entries: AtomicU64::new(0),
             settled_entries: AtomicU64::new(0),
@@ -585,27 +570,8 @@ impl MetricsState {
             m.network_rx.fetch_add(sample.network_rx, Ordering::Relaxed);
             m.disk_read.fetch_add(sample.disk_read, Ordering::Relaxed);
             m.disk_write.fetch_add(sample.disk_write, Ordering::Relaxed);
-            cur = m.parent.as_deref();
-        }
-    }
-
-    /// Record payload bytes read off a socket, into this transfer and every composite above
-    /// it.
-    ///
-    /// Separate from [`record_io`](Self::record_io) and deliberately not folded into
-    /// `IoSample`: every other counter there is recorded once per part at confirmed success,
-    /// and this one is recorded per chunk on the body-read path. Sharing the sample type
-    /// would mean every existing call site had to pass a zero for a field whose recording
-    /// discipline is not theirs, and one that forgot would silently report streamed bytes it
-    /// never saw.
-    ///
-    /// Never feeds `IOWindow` or the adaptive concurrency controller: those sample
-    /// confirmed-success bytes deliberately, and mixing in a counter that overcounts under
-    /// retry would make the goodput signal optimistic exactly when the link is worst.
-    pub(crate) fn record_bytes_streamed(&self, n: u64) {
-        let mut cur = Some(self);
-        while let Some(m) = cur {
-            m.bytes_streamed.fetch_add(n, Ordering::Relaxed);
+            m.bytes_transferred
+                .fetch_add(sample.bytes_transferred, Ordering::Relaxed);
             cur = m.parent.as_deref();
         }
     }
@@ -692,7 +658,7 @@ impl MetricsState {
             network_rx: self.network_rx.load(Ordering::Relaxed),
             disk_read: self.disk_read.load(Ordering::Relaxed),
             disk_write: self.disk_write.load(Ordering::Relaxed),
-            bytes_streamed: self.bytes_streamed.load(Ordering::Relaxed),
+            bytes_transferred: self.bytes_transferred.load(Ordering::Relaxed),
             total_bytes: self.total_bytes.get().copied(),
             started_at: self.started_at,
             finished_at: self.finished_at.get().copied(),
@@ -707,6 +673,10 @@ impl std::fmt::Debug for MetricsState {
             .field("network_rx", &self.network_rx.load(Ordering::Relaxed))
             .field("disk_read", &self.disk_read.load(Ordering::Relaxed))
             .field("disk_write", &self.disk_write.load(Ordering::Relaxed))
+            .field(
+                "bytes_transferred",
+                &self.bytes_transferred.load(Ordering::Relaxed),
+            )
             .field("request_metrics", &self.request_metrics())
             .finish()
     }
@@ -1391,15 +1361,6 @@ impl TransferContext {
         self.handle.telemetry.io_counters.record(sample);
     }
 
-    /// Record payload bytes read off a socket, per chunk.
-    ///
-    /// Per-transfer metrics only, and deliberately not `handle.telemetry.io_counters`: those
-    /// counters are the client-wide confirmed-success totals that the goodput signal reads,
-    /// and this counter overcounts under retry.
-    pub(crate) fn record_bytes_streamed(&self, n: u64) {
-        self.metrics.record_bytes_streamed(n);
-    }
-
     /// Record one request in the transfer aggregate.
     pub(crate) fn record_request_metrics(&self, metrics: &crate::metrics::RequestMetrics) {
         self.metrics.record_request(metrics);
@@ -1697,6 +1658,7 @@ mod tests {
             assert_eq!(stats.network_rx, 0);
             assert_eq!(stats.disk_read, 0);
             assert_eq!(stats.disk_write, 0);
+            assert_eq!(stats.bytes_transferred, 0);
             assert_eq!(stats.total_bytes, None);
             assert!(stats.started_at.elapsed().as_secs() < 1);
             assert!(stats.finished_at.is_none());
@@ -1712,18 +1674,21 @@ mod tests {
                 network_rx: 200,
                 disk_read: 300,
                 disk_write: 400,
+                bytes_transferred: 500,
             });
             ctx.record_io(&crate::metrics::IoSample {
                 network_tx: 10,
                 network_rx: 20,
                 disk_read: 30,
                 disk_write: 40,
+                bytes_transferred: 50,
             });
             let stats = ctx.metrics();
             assert_eq!(stats.network_tx, 110);
             assert_eq!(stats.network_rx, 220);
             assert_eq!(stats.disk_read, 330);
             assert_eq!(stats.disk_write, 440);
+            assert_eq!(stats.bytes_transferred, 550);
         }
 
         /// The status-to-outcome mapping lives in exactly one place, and each terminal
@@ -2053,6 +2018,7 @@ mod tests {
                 network_rx: 2 * n,
                 disk_read: 3 * n,
                 disk_write: 4 * n,
+                bytes_transferred: 5 * n,
             };
 
             let parent = Arc::new(MetricsState::new());
@@ -2073,6 +2039,7 @@ mod tests {
             assert_eq!(40, p.network_rx);
             assert_eq!(60, p.disk_read);
             assert_eq!(80, p.disk_write);
+            assert_eq!(100, p.bytes_transferred);
         }
 
         /// A parent that also has a parent rolls the whole way up, which is why
@@ -2089,6 +2056,7 @@ mod tests {
                 network_rx: 0,
                 disk_read: 0,
                 disk_write: 0,
+                bytes_transferred: 0,
             });
 
             assert_eq!(5, leaf.snapshot().network_tx);
@@ -2177,6 +2145,7 @@ mod tests {
                 network_rx: 0,
                 disk_read: 0,
                 disk_write: 0,
+                bytes_transferred: 0,
             });
             ctx.set_total_bytes(11);
             drop(ctx);

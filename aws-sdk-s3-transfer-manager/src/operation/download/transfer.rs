@@ -1059,7 +1059,6 @@ impl DownloadTransfer {
                     reservation,
                     expected_len,
                     || ctx.is_active(),
-                    |n| ctx.record_bytes_streamed(n),
                 )
                 .await
                 .map_err(crate::retry::GuardError::Inner)
@@ -1120,6 +1119,7 @@ impl DownloadTransfer {
             u64::try_from(expected_len).expect("validated discovery length originated from u64");
         self.inner.ctx.record_io(&crate::metrics::IoSample {
             network_rx: bytes_received,
+            bytes_transferred: bytes_received,
             ..Default::default()
         });
 
@@ -1207,7 +1207,6 @@ impl DownloadTransfer {
                         reservation,
                         expected_len,
                         || ctx.is_active(),
-                        |n| ctx.record_bytes_streamed(n),
                     )
                     .await
                     .map_err(crate::retry::GuardError::Inner)?;
@@ -1263,6 +1262,7 @@ impl DownloadTransfer {
             u64::try_from(expected_len).expect("validated range length originated from u64");
         self.inner.ctx.record_io(&crate::metrics::IoSample {
             network_rx: bytes_received,
+            bytes_transferred: bytes_received,
             ..Default::default()
         });
 
@@ -1614,7 +1614,6 @@ async fn collect_response_body(
     reservation: &Reservation,
     expected_len: usize,
     is_active: impl Fn() -> bool,
-    on_bytes: impl Fn(u64),
 ) -> Result<SegmentedBytes, Error> {
     if expected_len == 0 {
         return Err(response_length_error(0, 0));
@@ -1641,11 +1640,6 @@ async fn collect_response_body(
             debug_assert!(pooled.remaining_mut() >= data.len());
             pooled.put_slice(&data);
             bytes_received += data.len();
-            // Per chunk, not per part: the only counter that moves inside a part, and the
-            // one that lets a single-part transfer show progress between 0 and done. This
-            // is the single body path for both the ranged and the discovery read, so one
-            // hook covers both.
-            on_bytes(data.len() as u64);
         }
 
         if !is_active() {
@@ -1925,7 +1919,6 @@ mod tests {
             reservation,
             expected_len,
             is_active,
-            |_| {},
         ));
         let mut context = Context::from_waker(Waker::noop());
         match future.as_mut().poll(&mut context) {
