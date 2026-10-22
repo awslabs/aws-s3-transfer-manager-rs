@@ -475,13 +475,7 @@ async fn test_service_error_fault_returns_status() -> Result<()> {
     let handle = server.start().await?;
     seed(&handle).await?;
 
-    server.insert_fault(
-        B,
-        K,
-        FaultType::ServiceError { status: 503 },
-        0,
-        Occurrence::Once,
-    );
+    server.insert_fault(B, K, FaultType::slow_down(), 0, Occurrence::Once);
 
     let s3 = fresh_client_no_retry(&handle).await;
     let err = s3

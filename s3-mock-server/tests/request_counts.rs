@@ -145,7 +145,7 @@ async fn test_request_counts_include_retries() -> Result {
     f.server.insert_fault(
         &f.bucket,
         "a",
-        FaultType::ServiceError { status: 500 },
+        FaultType::internal_error(),
         0,
         Occurrence::Once,
     );

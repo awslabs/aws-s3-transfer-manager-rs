@@ -108,7 +108,7 @@ fn xor_first_byte_of_checksum(output: &mut s3s::dto::GetObjectOutput) {
 /// Server state shared by the server handle and every request it serves.
 #[derive(Debug, Default)]
 pub(crate) struct ServerState {
-    /// Key-scoped fault injection registry.
+    /// Target-scoped fault injection registry.
     pub(crate) faults: crate::faults::FaultRegistry,
     /// Server-wide load-driven throttle. `None` until one is installed.
     pub(crate) throttle: std::sync::Mutex<Option<std::sync::Arc<crate::throttle::RateThrottle>>>,
@@ -117,16 +117,31 @@ pub(crate) struct ServerState {
 }
 
 impl ServerState {
-    /// Admit a request: count it, then apply the throttle.
+    /// Admit a request: count it, apply the throttle, then draw its fault.
     ///
     /// Called first in every S3 handler. The throttle applies to the operations
-    /// [`Operation::is_throttled`] names; a shed request returns 503 `SlowDown`.
-    pub(crate) fn admit(&self, operation: Operation) -> S3Result<()> {
+    /// [`Operation::is_throttled`] names; a shed request returns 503 `SlowDown` and draws no fault.
+    /// A fault that fails the request before it is served (`ServiceError`) is
+    /// returned as the error; any other fault is returned for
+    /// the handler to apply, and has no effect on an operation it does not shape.
+    pub(crate) fn admit(
+        &self,
+        operation: Operation,
+        bucket: Option<&str>,
+        key: Option<&str>,
+    ) -> S3Result<Option<crate::faults::FaultType>> {
         self.requests.record(operation);
         if operation.is_throttled() {
             self.check_throttle()?;
         }
-        Ok(())
+        let fault = self.faults.next_fault(operation, bucket, key);
+        match fault
+            .as_ref()
+            .and_then(crate::faults::FaultType::error_response)
+        {
+            Some(error) => Err(error),
+            None => Ok(fault),
+        }
     }
 
     /// Decide whether to serve or shed this request under the installed throttle;
@@ -167,16 +182,15 @@ impl<S: StorageBackend + 'static> Inner<S> {
         Self { storage, state }
     }
 
-    /// Apply a registered fault to a GET response, if one fires for this request.
-    /// Effects are deterministic transforms (XOR) so a faulted value is derivable.
+    /// Apply the fault drawn for a GET request to its response. Effects are
+    /// deterministic transforms (XOR) so a faulted value is derivable.
     async fn apply_get_fault(
         &self,
-        bucket: &str,
-        key: &str,
+        fault: Option<crate::faults::FaultType>,
         conn_fault: Option<&std::sync::Arc<crate::socket_fault::ConnectionFault>>,
         output: &mut s3s::dto::GetObjectOutput,
     ) -> S3Result<()> {
-        match self.state.faults.next_fault(bucket, key) {
+        match fault {
             Some(crate::faults::FaultType::WrongStoredChecksum) => {
                 xor_first_byte_of_checksum(output);
             }
@@ -335,18 +349,12 @@ impl<S: StorageBackend + 'static> Inner<S> {
                     fault.arm(after_bytes);
                 }
             }
-            Some(crate::faults::FaultType::ServiceError { status }) => {
-                // Send-time HTTP error: reaches the SDK retry/token-bucket layer
-                // (not the TM body-read loop). Map the status to an S3 error code.
-                let code = match status {
-                    500 => s3s::S3ErrorCode::InternalError,
-                    503 => s3s::S3ErrorCode::SlowDown,
-                    _ => s3s::S3ErrorCode::ServiceUnavailable,
-                };
-                return Err(s3s::S3Error::new(code));
-            }
-            // Upload-only faults are no-ops on the GET path.
-            Some(crate::faults::FaultType::StallRequestRead { .. }) => {}
+            // Send-time errors are returned by `ServerState::admit`; upload-only faults are
+            // no-ops on the GET path.
+            Some(
+                crate::faults::FaultType::ServiceError { .. }
+                | crate::faults::FaultType::StallRequestRead { .. },
+            ) => {}
             Some(crate::faults::FaultType::WithholdResponseHeaders) => {
                 // Never return, so s3s never writes the status line or headers.
                 std::future::pending::<()>().await;
@@ -356,12 +364,6 @@ impl<S: StorageBackend + 'static> Inner<S> {
         }
         Ok(())
     }
-
-    /// Consume the next fault for an upload request and return it. Both upload
-    /// handlers call this once so the queue advances deterministically.
-    fn next_upload_fault(&self, bucket: &str, key: &str) -> Option<crate::faults::FaultType> {
-        self.state.faults.next_fault(bucket, key)
-    }
 }
 
 #[async_trait]
@@ -370,7 +372,11 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         &self,
         req: S3Request<s3s::dto::GetObjectInput>,
     ) -> S3Result<S3Response<s3s::dto::GetObjectOutput>> {
-        self.state.admit(Operation::GetObject)?;
+        let fault = self.state.admit(
+            Operation::GetObject,
+            Some(&req.input.bucket),
+            Some(&req.input.key),
+        )?;
         let conn_fault = req
             .extensions
             .get::<std::sync::Arc<crate::socket_fault::ConnectionFault>>()
@@ -484,7 +490,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         output.content_language = stream_metadata.content_language.map(|s| s.parse().unwrap());
 
         apply_response_defaults_get(&mut output);
-        self.apply_get_fault(bucket, key, conn_fault.as_ref(), &mut output)
+        self.apply_get_fault(fault, conn_fault.as_ref(), &mut output)
             .await?;
         Ok(S3Response::new(output))
     }
@@ -493,7 +499,11 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         &self,
         req: S3Request<s3s::dto::HeadObjectInput>,
     ) -> S3Result<S3Response<s3s::dto::HeadObjectOutput>> {
-        self.state.admit(Operation::HeadObject)?;
+        self.state.admit(
+            Operation::HeadObject,
+            Some(&req.input.bucket),
+            Some(&req.input.key),
+        )?;
         let input = req.input;
         let bucket = &input.bucket;
         let key = &input.key;
@@ -563,23 +573,15 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         &self,
         req: S3Request<s3s::dto::PutObjectInput>,
     ) -> S3Result<S3Response<s3s::dto::PutObjectOutput>> {
-        self.state.admit(Operation::PutObject)?;
+        let fault = self.state.admit(
+            Operation::PutObject,
+            Some(&req.input.bucket),
+            Some(&req.input.key),
+        )?;
         let input = req.input;
         tracing::trace!(bucket = %input.bucket, key = %input.key, "PutObject");
         if input.key.is_empty() {
             return Err(s3s::s3_error!(InvalidRequest));
-        }
-
-        let fault = self.next_upload_fault(&input.bucket, &input.key);
-
-        // ServiceError: return before consuming the body.
-        if let Some(crate::faults::FaultType::ServiceError { status }) = fault {
-            let code = match status {
-                500 => s3s::S3ErrorCode::InternalError,
-                503 => s3s::S3ErrorCode::SlowDown,
-                _ => s3s::S3ErrorCode::ServiceUnavailable,
-            };
-            return Err(s3s::S3Error::new(code));
         }
 
         let client_checksums = crate::types::ClientChecksums::from(&input);
@@ -652,7 +654,11 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         &self,
         req: S3Request<s3s::dto::CreateMultipartUploadInput>,
     ) -> S3Result<S3Response<s3s::dto::CreateMultipartUploadOutput>> {
-        self.state.admit(Operation::CreateMultipartUpload)?;
+        self.state.admit(
+            Operation::CreateMultipartUpload,
+            Some(&req.input.bucket),
+            Some(&req.input.key),
+        )?;
         let input = req.input;
         tracing::trace!(bucket = %input.bucket, key = %input.key, "CreateMultipartUpload");
         let key = &input.key;
@@ -739,23 +745,15 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         &self,
         req: S3Request<s3s::dto::UploadPartInput>,
     ) -> S3Result<S3Response<s3s::dto::UploadPartOutput>> {
-        self.state.admit(Operation::UploadPart)?;
+        let fault = self.state.admit(
+            Operation::UploadPart,
+            Some(&req.input.bucket),
+            Some(&req.input.key),
+        )?;
         let input = req.input;
         let upload_id = &input.upload_id;
         let part_number = input.part_number;
         tracing::trace!(%upload_id, part_number, "UploadPart");
-
-        let fault = self.next_upload_fault(&input.bucket, &input.key);
-
-        // ServiceError: return before consuming the body.
-        if let Some(crate::faults::FaultType::ServiceError { status }) = fault {
-            let code = match status {
-                500 => s3s::S3ErrorCode::InternalError,
-                503 => s3s::S3ErrorCode::SlowDown,
-                _ => s3s::S3ErrorCode::ServiceUnavailable,
-            };
-            return Err(s3s::S3Error::new(code));
-        }
 
         let client_checksums = crate::types::ClientChecksums::from(&input);
         let mut integrity_checks = crate::types::ObjectIntegrityChecks::from(&client_checksums);
@@ -836,7 +834,11 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         &self,
         req: S3Request<s3s::dto::CompleteMultipartUploadInput>,
     ) -> S3Result<S3Response<s3s::dto::CompleteMultipartUploadOutput>> {
-        self.state.admit(Operation::CompleteMultipartUpload)?;
+        self.state.admit(
+            Operation::CompleteMultipartUpload,
+            Some(&req.input.bucket),
+            Some(&req.input.key),
+        )?;
         let input = req.input;
         tracing::trace!(bucket = %input.bucket, key = %input.key, upload_id = %input.upload_id, "CompleteMultipartUpload");
         let bucket = input.bucket.clone();
@@ -899,7 +901,11 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         &self,
         req: S3Request<s3s::dto::AbortMultipartUploadInput>,
     ) -> S3Result<S3Response<s3s::dto::AbortMultipartUploadOutput>> {
-        self.state.admit(Operation::AbortMultipartUpload)?;
+        self.state.admit(
+            Operation::AbortMultipartUpload,
+            Some(&req.input.bucket),
+            Some(&req.input.key),
+        )?;
         let input = req.input;
         tracing::trace!(bucket = %input.bucket, key = %input.key, upload_id = %input.upload_id, "AbortMultipartUpload");
         let upload_id = &input.upload_id;
@@ -916,7 +922,11 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         &self,
         req: S3Request<s3s::dto::ListObjectsV2Input>,
     ) -> S3Result<S3Response<s3s::dto::ListObjectsV2Output>> {
-        self.state.admit(Operation::ListObjectsV2)?;
+        self.state.admit(
+            Operation::ListObjectsV2,
+            Some(&req.input.bucket),
+            req.input.prefix.as_deref(),
+        )?;
         let input = req.input;
         tracing::trace!(bucket = %input.bucket, prefix = ?input.prefix, delimiter = ?input.delimiter, "ListObjectsV2");
 
@@ -1050,7 +1060,8 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         &self,
         req: S3Request<HeadBucketInput>,
     ) -> S3Result<S3Response<HeadBucketOutput>> {
-        self.state.admit(Operation::HeadBucket)?;
+        self.state
+            .admit(Operation::HeadBucket, Some(&req.input.bucket), None)?;
         let input = req.input;
         tracing::trace!(bucket = %input.bucket, "HeadBucket");
         if self.storage.head_bucket(&input.bucket).await? {
@@ -1067,7 +1078,11 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         &self,
         req: S3Request<s3s::dto::DeleteObjectInput>,
     ) -> S3Result<S3Response<s3s::dto::DeleteObjectOutput>> {
-        self.state.admit(Operation::DeleteObject)?;
+        self.state.admit(
+            Operation::DeleteObject,
+            Some(&req.input.bucket),
+            Some(&req.input.key),
+        )?;
         let input = req.input;
         tracing::trace!(bucket = %input.bucket, key = %input.key, "DeleteObject");
         self.storage
@@ -1080,7 +1095,8 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         &self,
         req: S3Request<s3s::dto::CreateBucketInput>,
     ) -> S3Result<S3Response<s3s::dto::CreateBucketOutput>> {
-        self.state.admit(Operation::CreateBucket)?;
+        self.state
+            .admit(Operation::CreateBucket, Some(&req.input.bucket), None)?;
         let input = req.input;
         tracing::trace!(bucket = %input.bucket, "CreateBucket");
         self.storage.create_bucket(&input.bucket).await?;
@@ -1094,7 +1110,8 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         &self,
         req: S3Request<s3s::dto::DeleteBucketInput>,
     ) -> S3Result<S3Response<s3s::dto::DeleteBucketOutput>> {
-        self.state.admit(Operation::DeleteBucket)?;
+        self.state
+            .admit(Operation::DeleteBucket, Some(&req.input.bucket), None)?;
         let input = req.input;
         tracing::trace!(bucket = %input.bucket, "DeleteBucket");
         self.storage.delete_bucket(&input.bucket).await?;
@@ -1105,7 +1122,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         &self,
         _req: S3Request<s3s::dto::ListBucketsInput>,
     ) -> S3Result<S3Response<s3s::dto::ListBucketsOutput>> {
-        self.state.admit(Operation::ListBuckets)?;
+        self.state.admit(Operation::ListBuckets, None, None)?;
         tracing::trace!("ListBuckets");
         let buckets = self.storage.list_buckets().await?;
         let bucket_list: Vec<s3s::dto::Bucket> = buckets

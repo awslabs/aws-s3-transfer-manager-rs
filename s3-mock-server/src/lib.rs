@@ -23,7 +23,7 @@ mod types;
 
 pub use error::Error;
 pub use error::Result;
-pub use faults::{BodyCadence, FaultType, Occurrence};
+pub use faults::{BodyCadence, FaultTarget, FaultType, Occurrence};
 pub use operation::Operation;
 pub use server::{
     AddObjectRequest, ObjectData, ObjectListEntry, S3MockServer, S3MockServerBuilder, ServerConfig,

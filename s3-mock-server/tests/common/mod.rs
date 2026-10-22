@@ -63,6 +63,24 @@ impl Fixture {
             .expect("etag")
     }
 
+    /// The stored content of `key`, read directly from storage.
+    pub async fn content(&self, key: &str) -> Vec<u8> {
+        self.server
+            .get_object(&self.bucket, key)
+            .await
+            .expect("get object")
+            .unwrap_or_else(|| panic!("{key} should exist"))
+            .body
+            .to_vec()
+    }
+
+    pub async fn exists(&self, key: &str) -> bool {
+        self.server
+            .object_exists(&self.bucket, key)
+            .await
+            .expect("object exists")
+    }
+
     pub async fn shutdown(self) {
         self.handle.shutdown().await.expect("shutdown");
     }

@@ -6,6 +6,7 @@
 //! S3 Mock Server implementation.
 
 use crate::error::{Error, Result};
+use crate::faults::{FaultTarget, FaultType, Occurrence};
 use crate::s3s::{Inner, ServerState};
 use crate::storage::filesystem::FilesystemStorage;
 use crate::storage::in_memory::InMemoryStorage;
@@ -296,27 +297,55 @@ impl S3MockServer {
         self.storage.create_bucket(bucket).await
     }
 
-    /// Register a fault for `(bucket, key)`. Faults form an ordered queue
-    /// consumed over successive matching requests: the first `skip` matching
-    /// requests pass cleanly, then the fault fires per `occurrence`. Firing is
-    /// deterministic; every fire logs the request number under
-    /// `target: "s3_mock_server::fault"`.
+    /// Register a fault for the GetObject, PutObject and UploadPart requests for
+    /// `(bucket, key)`; the same as [`insert_fault_for`](Self::insert_fault_for)
+    /// with [`FaultTarget::object`].
     pub fn insert_fault(
         &self,
         bucket: &str,
         key: &str,
-        fault: crate::faults::FaultType,
+        fault: FaultType,
         skip: u32,
-        occurrence: crate::faults::Occurrence,
+        occurrence: Occurrence,
     ) {
-        self.state
-            .faults
-            .insert(bucket, key, fault, skip, occurrence);
+        self.insert_fault_for(FaultTarget::object(bucket, key), fault, skip, occurrence);
     }
 
-    /// Drop the entire fault queue for `(bucket, key)`.
+    /// Register a fault for the requests that `target` matches. The faults of a
+    /// target form an ordered queue consumed over successive matching requests:
+    /// the first `skip` matching requests pass cleanly, then the fault fires per
+    /// `occurrence`. `skip` is compared with the number of matching requests the
+    /// target has seen since it was first registered, or last cleared with
+    /// [`clear_fault`](Self::clear_fault) or [`clear_faults`](Self::clear_faults),
+    /// not since this call. When several targets match a request, each counts it,
+    /// and only the first target registered whose next fault is due fires.
+    ///
+    /// A fault is drawn when its handler starts, before the request is validated
+    /// or served, so a request that then fails (for example with NoSuchKey) still
+    /// consumes it. A request the rate throttle fails with SlowDown draws no
+    /// fault and is not seen by any target. A fault that does not apply to the
+    /// operation, such as a body fault on HeadObject, is consumed without effect.
+    /// Firing is deterministic; every fire logs the request number under
+    /// `target: "s3_mock_server::fault"`.
+    pub fn insert_fault_for(
+        &self,
+        target: FaultTarget,
+        fault: FaultType,
+        skip: u32,
+        occurrence: Occurrence,
+    ) {
+        self.state.faults.insert(target, fault, skip, occurrence);
+    }
+
+    /// Drop the entire fault queue for `(bucket, key)`, as registered by
+    /// [`insert_fault`](Self::insert_fault).
     pub fn clear_fault(&self, bucket: &str, key: &str) {
-        self.state.faults.clear(bucket, key);
+        self.state.faults.clear(&FaultTarget::object(bucket, key));
+    }
+
+    /// Drop the fault queues of every target.
+    pub fn clear_faults(&self) {
+        self.state.faults.clear_all();
     }
 
     /// Number of requests received for `operation`, including throttled and
