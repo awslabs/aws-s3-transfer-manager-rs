@@ -11,7 +11,7 @@
 //!
 //! [`DirectFileBody`] performs positioned reads on a managed polling thread.
 //! [`OffloadedFileBody`] moves the same operation through `spawn_blocking` and
-//! a bounded channel when the shared Tokio runtime must not block. Both emit
+//! a bounded channel when the HTTP polling thread's ownership is unknown. Both emit
 //! owner-backed `Bytes` frames from pooled chunks and reacquire storage for each
 //! retry attempt.
 

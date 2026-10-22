@@ -72,10 +72,9 @@ async fn setup_with_fault(
         .build();
 
     let tm_config = aws_sdk_s3_transfer_manager::Config::builder()
-        .s3_config(
-            aws_sdk_s3_transfer_manager::config::S3ClientConfig::new(&shared_config)
-                .enable_runtime_http(false),
-        )
+        .s3_config(aws_sdk_s3_transfer_manager::config::S3ClientConfig::new(
+            &shared_config,
+        ))
         .part_size(PartSize::Target(PART_SIZE))
         .build();
     let tm = aws_sdk_s3_transfer_manager::Client::new(tm_config);
@@ -231,12 +230,9 @@ mod server_faults {
         };
         let tm = TmClient::new(
             aws_sdk_s3_transfer_manager::Config::builder()
-                .s3_config(
-                    aws_sdk_s3_transfer_manager::config::S3ClientConfig::new(
-                        &handle.shared_config().await,
-                    )
-                    .enable_runtime_http(false),
-                )
+                .s3_config(aws_sdk_s3_transfer_manager::config::S3ClientConfig::new(
+                    &handle.shared_config().await,
+                ))
                 .part_size(PART_SIZE)
                 .multipart_threshold(threshold)
                 .build(),

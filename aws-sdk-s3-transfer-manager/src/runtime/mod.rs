@@ -11,10 +11,7 @@ mod tokio_mt;
 pub(crate) use tokio_mt::TokioMultiThreadRuntime;
 
 mod managed;
-pub(crate) use managed::ManagedThreadRuntime;
-
-mod topology;
-pub(crate) use topology::Topology;
+pub(crate) use managed::{prepare_components, ManagedExecution};
 
 #[allow(dead_code)]
 pub(crate) mod buffer_pool;
@@ -48,7 +45,7 @@ pub(crate) trait ExecutionRuntime: Send + Sync + std::fmt::Debug {
     /// Dispatch a batch of IO requests for execution.
     fn dispatch(&self, batch: &mut SubmissionGuard<'_, ScheduledWork>);
 
-    /// Shut down the runtime, draining in-flight work.
+    /// Requests execution shutdown.
     fn shutdown(&self);
 
     /// Remove all pending work for a transfer. Returns count removed.
@@ -80,6 +77,8 @@ pub(crate) struct RuntimeComponents {
     /// When true, file I/O runs directly on the calling thread (managed threads).
     /// When false, file I/O is offloaded via spawn_blocking (shared runtimes).
     direct_io: bool,
+    /// Whether file bodies may read synchronously on the HTTP polling thread.
+    direct_body_io: bool,
 }
 
 impl RuntimeComponents {
@@ -88,18 +87,22 @@ impl RuntimeComponents {
         self.http_client.as_ref()
     }
 
-    /// Set the HTTP client.
-    pub(crate) fn set_http_client(&mut self, client: SharedHttpClient) {
-        self.http_client = Some(client);
-    }
-
     /// Whether file I/O should run directly on the calling thread.
     pub(crate) fn direct_io(&self) -> bool {
         self.direct_io
     }
 
-    /// Set direct I/O mode.
-    pub(crate) fn set_direct_io(&mut self, direct: bool) {
-        self.direct_io = direct;
+    /// Whether file bodies may read synchronously when HTTP polls them.
+    pub(crate) fn direct_body_io(&self) -> bool {
+        self.direct_body_io
+    }
+
+    /// Enables direct transfer reads, and direct body reads only for owned HTTP.
+    pub(crate) fn managed(http_client: Option<SharedHttpClient>) -> Self {
+        Self {
+            direct_io: true,
+            direct_body_io: http_client.is_some(),
+            http_client,
+        }
     }
 }

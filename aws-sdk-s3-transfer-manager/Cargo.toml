@@ -13,6 +13,8 @@ categories = ["asynchronous", "concurrency"]
 keywords = ["AWS", "Amazon", "S3", "high-performance", "transfer-manager"]
 
 [dependencies]
+aws-smithy-execution = { workspace = true }
+aws-smithy-managed-http = { workspace = true, features = ["client"] }
 aws-config = { workspace = true, features = ["behavior-version-latest"] }
 aws-sdk-s3 = { workspace = true, features = ["behavior-version-latest"] }
 aws-smithy-runtime-api = { workspace = true }
@@ -43,7 +45,9 @@ arc-swap = "1.9.2"
 smallvec = "1"
 
 [features]
-dial9 = ["dep:dial9"]
+# Version-coupled adoption hook used by the unstable extension crate.
+__unstable_ext = []
+dial9 = ["dep:dial9", "aws-smithy-execution/dial9", "aws-smithy-managed-http/dial9"]
 # Interoperability with AWS SDK for Rust S3 v1 types and client configuration.
 sdk-v1 = []
 

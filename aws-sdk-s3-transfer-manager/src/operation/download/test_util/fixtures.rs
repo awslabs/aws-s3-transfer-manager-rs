@@ -109,7 +109,7 @@ pub(crate) fn disk_test_handle(
     crate::client::Handle::test_handle_tokio(config)
 }
 
-/// A test handle whose work runs on four managed threads under a fixed
+/// A test handle whose work runs on up to four managed threads under a fixed
 /// `concurrency` target.
 ///
 /// A held destination write blocks its managed thread, and work routed to that
@@ -119,17 +119,26 @@ pub(crate) fn managed_test_handle(
     config: crate::Config,
     concurrency: usize,
 ) -> Arc<crate::client::Handle> {
-    crate::client::Handle::new_for_test_with_runtime(
+    managed_test_handle_with_max_partitions(config, concurrency, 4).0
+}
+
+/// Builds managed execution and returns the number of discovered partitions.
+pub(crate) fn managed_test_handle_with_max_partitions(
+    config: crate::Config,
+    concurrency: usize,
+    max_partitions: usize,
+) -> (Arc<crate::client::Handle>, usize) {
+    let mut partition_count = 0;
+    let handle = crate::client::Handle::new_for_test_with_runtime(
         config,
         Arc::new(crate::scheduler::FixedConcurrency::new(concurrency)),
         |weak| {
-            Arc::new(
-                crate::runtime::ManagedThreadRuntime::builder(weak)
-                    .topology(crate::runtime::Topology::uniform(4))
-                    .build(),
-            )
+            let execution = crate::runtime::ManagedExecution::for_test(weak, max_partitions);
+            partition_count = execution.partition_count();
+            Arc::new(execution)
         },
-    )
+    );
+    (handle, partition_count)
 }
 
 /// A disk download transfer on `handle`, writing through a sink that `sinks`

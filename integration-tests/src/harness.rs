@@ -27,8 +27,8 @@
 //! [`S3ClientConfig`]: aws_sdk_s3_transfer_manager::config::S3ClientConfig
 
 use aws_sdk_s3_transfer_manager::config::S3ClientConfig;
-use aws_sdk_s3_transfer_manager::types::RuntimeMode;
 use aws_sdk_s3_transfer_manager::Client as TmClient;
+use aws_sdk_s3_transfer_manager::RuntimeConfig;
 use s3_mock_server::S3MockServer;
 
 /// Installs a process-global tracing subscriber for test diagnosis, once.
@@ -93,14 +93,14 @@ impl MockTm {
 }
 
 /// Build a mock TM on the given runtime with default config.
-pub(crate) async fn mock_tm(runtime: RuntimeMode) -> MockTm {
+pub(crate) async fn mock_tm(runtime: RuntimeConfig) -> MockTm {
     mock_tm_with(runtime, |b| b).await
 }
 
 /// Build a mock TM, applying `configure` to the TM Config builder (part size,
 /// concurrency, ...). The runtime mode is set by the harness after `configure`.
 pub(crate) async fn mock_tm_with(
-    runtime: RuntimeMode,
+    runtime: RuntimeConfig,
     configure: impl FnOnce(
         aws_sdk_s3_transfer_manager::config::Builder,
     ) -> aws_sdk_s3_transfer_manager::config::Builder,
@@ -112,7 +112,7 @@ pub(crate) async fn mock_tm_with(
 /// [`S3ClientConfig`] (runtime-HTTP options) and `configure` to the TM Config
 /// builder.
 pub(crate) async fn mock_tm_with_s3_config(
-    runtime: RuntimeMode,
+    runtime: RuntimeConfig,
     configure_s3: impl FnOnce(S3ClientConfig) -> S3ClientConfig,
     configure: impl FnOnce(
         aws_sdk_s3_transfer_manager::config::Builder,
@@ -126,7 +126,7 @@ pub(crate) async fn mock_tm_with_s3_config(
     let handle = server.start().await.expect("start mock server");
     let s3_config = configure_s3(mock_s3_config(&handle).await);
     let cfg = configure(aws_sdk_s3_transfer_manager::Config::builder().s3_config(s3_config))
-        .runtime_mode(runtime)
+        .runtime_config(runtime)
         .build();
     MockTm {
         server,

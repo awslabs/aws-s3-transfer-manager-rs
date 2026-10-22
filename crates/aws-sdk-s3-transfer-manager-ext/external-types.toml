@@ -1,0 +1,4 @@
+allowed_external_types = [
+    "aws_sdk_s3_transfer_manager::*",
+    "aws_smithy_execution::*",
+]
