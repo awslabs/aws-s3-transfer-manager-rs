@@ -97,10 +97,8 @@ impl InputStream {
         matches!(self.inner, RawInputStream::Fs(_))
     }
 
-    /// The file this stream reads from, or `None` for an in-memory or
+    /// The file this stream reads from, as given, or `None` for an in-memory or
     /// caller-supplied stream.
-    ///
-    /// The path is returned as given, not canonicalized.
     pub(crate) fn source_path(&self) -> Option<&Path> {
         match &self.inner {
             RawInputStream::Fs(body) => Some(&body.path),

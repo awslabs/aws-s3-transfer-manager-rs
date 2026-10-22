@@ -114,10 +114,8 @@ impl PendingCause {
     }
 }
 
-/// At most one pending cause, readable from any thread.
-///
-/// `stored` is written only under the lock and mirrors whether a cause is held, so
-/// [`clear`](Self::clear) and [`get`](Self::get) skip the lock while the slot is empty.
+/// At most one pending cause, readable from any thread. `stored` mirrors whether one is held
+/// and is written only under the lock, so `clear` and `get` skip the lock when it's empty.
 pub(crate) struct PendingCauseSlot {
     stored: AtomicBool,
     cause: Mutex<Option<PendingCause>>,

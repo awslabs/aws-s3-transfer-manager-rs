@@ -9,18 +9,13 @@
 //! Register the sink with a request's `events()` method, such as
 //! [`DownloadFluentBuilder::events`](crate::operation::download::builders::DownloadFluentBuilder::events).
 //! Each transfer the request runs sends one [`TransferEvent::Started`] when it starts and at
-//! most one [`TransferEvent::Finished`] when it reaches a terminal state. Both carry the
-//! transfer's [`TransferId`] and [`TransferRef`].
+//! most one [`TransferEvent::Finished`] when it reaches a terminal state.
 //!
-//! Events carry no byte or object counts. A `Started` carries a
-//! [`TransferView`](crate::types::TransferView) instead, which reads the transfer's live
-//! counters on demand, so a progress display redraws on its own schedule rather than once
-//! per event.
+//! For progress, read the [`TransferView`](crate::types::TransferView) a `Started` carries;
+//! it reads the transfer's live counters on demand. `examples/progress.rs` draws a progress
+//! bar from it.
 //!
-//! Sending never blocks a transfer or runs caller code. A stream receives a transfer's
-//! `Started` only if it has room for the `Finished` as well, so a `Finished` is never lost to
-//! a full stream. A transfer that finds no room is left off the stream, and
-//! [`TransferEventStream::dropped`] counts both of its events.
+//! A transfer never waits on the stream. [`channel`] says how to size it so no event is lost.
 //!
 //! ```no_run
 //! use aws_sdk_s3_transfer_manager::events::{self, TransferEvent};
@@ -35,7 +30,7 @@
 //!     .events(sink)
 //!     .write_to_path("my-key")
 //!     .await?;
-//! // Ends once the transfer has sent its `Finished` and released the sink.
+//! // Ends once the transfer finishes.
 //! while let Some(event) = stream.recv().await {
 //!     if let TransferEvent::Finished(finished) = event {
 //!         println!("{:?}: {}", finished.outcome(), finished.transfer().destination());
@@ -45,8 +40,6 @@
 //! # Ok(())
 //! # }
 //! ```
-//!
-//! `examples/progress.rs` draws a progress bar from the view.
 
 use std::fmt;
 use std::num::NonZeroUsize;
@@ -249,13 +242,11 @@ const MAX_CAPACITY: usize = usize::MAX >> 3;
 
 /// Create a sink/stream pair. The caller owns the stream and drains it.
 ///
-/// A transfer never waits for room on the stream. One that starts with at least two slots
-/// free holds room for both of its events until the consumer receives them; one that starts
-/// with fewer is left off the stream, and [`TransferEventStream::dropped`] counts both of its
-/// events. A sink used by one transfer never drops an event at capacity 2. A stream fed by
-/// several transfers, through clones or [`merge`](TransferEventSink::merge), drops nothing
-/// while its capacity is at least twice the number of transfers that are running or whose
-/// events the consumer has not yet received. A capacity below 2 is raised to 2.
+/// A transfer takes room on the stream for both of its events or neither, and never waits
+/// for room. Allow two slots per transfer that is running or has events you haven't received;
+/// a sink used by one transfer needs 2. A transfer that finds fewer than two free slots still
+/// runs, but its events are left off the stream and counted by
+/// [`TransferEventStream::dropped`]. A capacity below 2 is raised to 2.
 pub fn channel(capacity: NonZeroUsize) -> (TransferEventSink, TransferEventStream) {
     let (tx, rx) = tokio::sync::mpsc::channel(capacity.get().clamp(2, MAX_CAPACITY));
     let dropped = Arc::new(AtomicU64::new(0));
@@ -282,18 +273,14 @@ struct Outlet {
 type Permit = tokio::sync::mpsc::OwnedPermit<TransferEvent>;
 
 impl Outlet {
-    /// Reserves two slots, or none.
-    ///
-    /// Counts two dropped events when the channel has room for fewer than two, and nothing
-    /// when the receiver is gone.
+    /// Reserves two slots or none, counting two dropped events when fewer than two are free.
     fn reserve_pair(&self) -> Option<(Permit, Permit)> {
         use tokio::sync::mpsc::error::TrySendError;
         let refused = match self.tx.clone().try_reserve_owned() {
             Ok(first) => match self.tx.clone().try_reserve_owned() {
                 Ok(second) => return Some((first, second)),
                 Err(refused) => {
-                    // Released, not kept: a lone slot would deliver a `Started` with no room
-                    // for its `Finished`, and would hold room a later transfer could use.
+                    // A lone slot would deliver a `Started` with no room for its `Finished`.
                     drop(first);
                     refused
                 }
@@ -359,8 +346,7 @@ impl TransferEventSink {
         }
     }
 
-    /// Reserves two slots on every outlet with room for both, split into the slots for a
-    /// `Started` and the slots for its `Finished`.
+    /// Reserves a pair on every outlet with room, split into `Started` and `Finished` slots.
     fn reserve_pairs(&self) -> (Vec<Permit>, Vec<Permit>) {
         self.outlets.iter().filter_map(Outlet::reserve_pair).unzip()
     }
@@ -368,16 +354,12 @@ impl TransferEventSink {
 
 /// The receiving half of an event channel, created by [`channel`].
 ///
-/// [`recv`](Self::recv) waits for the next event. It returns `None` once every sink feeding
-/// this stream has been dropped and every queued event received. A transfer drops the sink
-/// it was registered with after sending its [`TransferEvent::Finished`], so a stream whose
-/// sinks were all moved into requests ends after the last of those transfers finishes.
+/// [`recv`](Self::recv) waits for the next event. A stream whose sinks were all moved into
+/// requests ends after the last of those transfers finishes.
 ///
 /// [`try_recv`](Self::try_recv) returns at once, for a loop that redraws on its own
 /// schedule: take whatever events are queued, then read the
 /// [`TransferView`](crate::types::TransferView) each `Started` carried.
-///
-/// [`dropped`](Self::dropped) counts the events this stream lost for lack of room.
 ///
 /// ```
 /// use aws_sdk_s3_transfer_manager::events::{TransferEvent, TransferEventStream, TryRecvError};
@@ -409,10 +391,6 @@ impl TransferEventStream {
     }
 
     /// Returns the next queued event without waiting.
-    ///
-    /// Fails with [`TryRecvError::Empty`] while no event is queued and a sink still exists,
-    /// and with [`TryRecvError::Disconnected`] once every sink is gone and the queue is
-    /// drained.
     pub fn try_recv(&mut self) -> Result<TransferEvent, TryRecvError> {
         use tokio::sync::mpsc::error::TryRecvError as MpscTryRecvError;
         self.rx.try_recv().map_err(|e| match e {
@@ -421,10 +399,9 @@ impl TransferEventStream {
         })
     }
 
-    /// Events this stream lost for lack of room: two for each transfer that found no room
-    /// for both of its events.
+    /// Events this stream lost for lack of room, two per transfer left off it.
     ///
-    /// A total assembled from received events is complete only while this is zero.
+    /// A total built from received events is complete only while this is zero.
     pub fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
     }
@@ -453,17 +430,13 @@ impl std::error::Error for TryRecvError {}
 
 /// Emits one transfer's events, and owns the obligation to emit its `Finished`.
 pub(crate) struct TransferLifecycle {
-    /// The sink and the slots held for the `Finished`, taken by the send that delivers it.
-    ///
-    /// Taken at that send rather than when the lifecycle drops: the lifecycle lives as long
-    /// as any clone of the transfer's context, and a stream cannot end while its sink is held.
+    /// The sink and the `Finished` slots. The send takes them, so the stream can end before
+    /// every clone of the transfer's context drops.
     route: Arc<Mutex<Option<Route>>>,
     transfer: TransferRef,
     /// The view the `Started` carries.
     view: Option<crate::types::TransferView>,
-    /// Whether a `Finished` is owed: set by [`announce`](Self::announce), cleared by the
-    /// [`finish`](Self::finish) that claims it, and set again by a [`PendingEmit`] dropped
-    /// unsent.
+    /// Whether a `Finished` is owed. A [`PendingEmit`] dropped unsent sets it again.
     owes_finish: Arc<AtomicBool>,
 }
 
@@ -486,11 +459,8 @@ struct Route {
     finish: Vec<Permit>,
 }
 
-/// Locks the route, ignoring poison.
-///
-/// A terminal path can run after a caught panic, so a lock that panic poisoned must not lose
-/// the `Finished`. The slot holds a route or `None`, and no unwind leaves it in any other
-/// state, so the value is always safe to take.
+/// Locks the route, ignoring poison: a terminal path can run after a caught panic, and the
+/// slot always holds a whole route or `None`.
 fn lock_route(slot: &Mutex<Option<Route>>) -> std::sync::MutexGuard<'_, Option<Route>> {
     slot.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -513,19 +483,12 @@ impl TransferLifecycle {
         }
     }
 
-    /// Emits [`TransferEvent::Started`] for the transfer `id` and takes on the obligation to
-    /// emit its `Finished`.
-    ///
-    /// Each outlet with room for both events receives the `Started` and holds a slot for the
-    /// `Finished`. Each outlet without that room receives neither and counts both as dropped,
-    /// unless its receiver is gone.
-    ///
-    /// The obligation is taken even where no outlet had room, because discharging it is what
-    /// releases the sink.
+    /// Emits [`TransferEvent::Started`] for `id` on each outlet with room for both events and
+    /// holds a slot there for the `Finished`. Owes the `Finished` even when no outlet had room,
+    /// since sending it is what releases the sink.
     pub(crate) fn announce(&self, id: TransferId) {
         let mut slot = lock_route(&self.route);
-        // Under the lock, so a terminal claimed from here on sends only after the slots it
-        // sends through are reserved and the `Started` is queued ahead of it.
+        // Under the lock, so a `Finished` claimed from here on queues behind this `Started`.
         self.owes_finish.store(true, Ordering::Release);
         let Some(route) = slot.as_mut() else {
             return;
@@ -542,9 +505,8 @@ impl TransferLifecycle {
         );
     }
 
-    /// Claims the `Finished` for the transfer `id`, the id [`announce`](Self::announce) was
-    /// given, or returns `None` when none is owed: before `announce`, while another claim is
-    /// outstanding, or once it has been sent.
+    /// Claims the owed `Finished` for `id`, which must be the id given to
+    /// [`announce`](Self::announce), or `None` when none is owed.
     pub(crate) fn finish(&self, id: TransferId, outcome: Outcome) -> Option<PendingEmit> {
         if !self.owes_finish.swap(false, Ordering::AcqRel) {
             return None;
@@ -561,10 +523,8 @@ impl TransferLifecycle {
     }
 }
 
-/// A claimed `Finished` that has not been sent.
-///
-/// Claiming and sending are separate, so a claim made under a state guard can be sent after
-/// the guard is released.
+/// A claimed `Finished`, sent separately so a claim made under a state guard can be sent
+/// after the guard is released.
 pub(crate) struct PendingEmit {
     /// The lifecycle's route: the send takes it, and a claim dropped unsent leaves it, with
     /// its held slots, for the next claim.
@@ -583,14 +543,8 @@ impl fmt::Debug for PendingEmit {
 }
 
 impl PendingEmit {
-    /// Sends the `Finished` through the slots `announce` held for it, so a full channel cannot
-    /// drop it, then releases the sink. An outlet that had no room at `announce` receives
-    /// nothing.
-    ///
-    /// Never awaits or waits for room, so it can be called while holding a state guard.
-    ///
-    /// The sink is released here rather than at the claim, because a claim dropped unsent
-    /// re-arms the obligation, and the next claim still needs the slots to send through.
+    /// Sends the `Finished` through the slots `announce` held and releases the sink. Never
+    /// waits, so it can run under a state guard.
     pub(crate) fn send(mut self) {
         let Some(event) = self.event.take() else {
             return;

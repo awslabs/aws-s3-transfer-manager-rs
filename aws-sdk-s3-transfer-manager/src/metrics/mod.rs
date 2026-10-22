@@ -631,8 +631,7 @@ impl IOCounters {
 
     /// Record an I/O sample into the appropriate windows.
     ///
-    /// `bytes_transferred` has no window: it repeats the payload the sample carries as
-    /// `network_tx` or `network_rx`, so adding it would double the network throughput.
+    /// `bytes_transferred` has no window: it repeats `network_tx` or `network_rx`.
     pub(crate) fn record(&self, sample: &IoSample) {
         self.network_tx.add(sample.network_tx);
         self.network_rx.add(sample.network_rx);

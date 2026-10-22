@@ -189,9 +189,7 @@ pub(crate) struct CommitTarget {
 /// A [`CommitTarget`] whose temporary file is removed on drop unless
 /// [`BodyWriter::finalize`] already renamed or removed it.
 ///
-/// Reference-counted rather than removed by `on_terminal`, because that hook can run while
-/// work still writes to the file: cancellation runs it before executing work is interrupted,
-/// and a transfer removed on a `Done` poll can still have work executing.
+/// Reference-counted so the file outlives every work item still writing to it.
 #[derive(Debug)]
 pub(crate) struct TempFile {
     /// Taken when the file is renamed or removed, so that happens at most once.
@@ -383,10 +381,7 @@ impl BodyWriter {
         }
     }
 
-    /// Drops the transfer's reference to the temporary file.
-    ///
-    /// The file is removed when the last reference drops, unless
-    /// [`finalize`](Self::finalize) renamed or removed it. Later calls do nothing.
+    /// Drops the transfer's reference to the temporary file. Later calls do nothing.
     pub(crate) fn release_temp_file(&self) {
         if let Mode::Disk { temp_file, .. } = &*self.mode {
             let released = temp_file
@@ -505,11 +500,10 @@ impl BodyWriter {
     /// That error, a failed resize, and a failed rename carry what the terminal
     /// drain wrote.
     ///
-    /// The temporary file is renamed or removed only after the resize succeeds:
-    /// renamed to its destination if `is_active` returns true, and removed otherwise.
-    /// A failed rename, or a call after [`release_temp_file`](Self::release_temp_file),
-    /// leaves the file for the last reference's drop to remove. The rename is not
-    /// atomic with `is_active`.
+    /// After the resize succeeds, the temporary file is renamed if `is_active` returns true
+    /// and removed otherwise; the rename is not atomic with that check. A failed rename, or a
+    /// call after [`release_temp_file`](Self::release_temp_file), leaves the file for the last
+    /// reference's drop to remove.
     pub(crate) fn finalize(
         &self,
         expected_download_len: u64,

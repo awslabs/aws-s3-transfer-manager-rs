@@ -131,11 +131,10 @@ pub(crate) trait Transfer: Send + Sync + std::fmt::Debug {
     /// Called after the transfer's status becomes terminal. Allows the transfer to clean up
     /// resources and notify waiters that would otherwise block indefinitely.
     ///
-    /// Must be short and non-blocking. May be called more than once.
-    ///
-    /// Not guaranteed: when `poll_work` returns [`PollWork::Done`] while the status is still
-    /// `Active`, the scheduler removes the transfer without calling this. Such a transfer
-    /// does its terminal work on the path that sets its status.
+    /// Must be short and non-blocking. May be called more than once. When `poll_work` returns
+    /// [`PollWork::Done`] while the status is still `Active`, the scheduler removes the
+    /// transfer without calling this; such a transfer does its terminal work where it sets
+    /// its status.
     fn on_terminal(&self) {}
 }
 
@@ -430,10 +429,8 @@ impl StateMachineStatus {
         self.0.load(Ordering::Acquire) == STATUS_CANCELLED
     }
 
-    /// The status, read in one load.
-    ///
-    /// Derive a status from this, not from several `is_*` calls: each of those loads
-    /// separately, so a transition between them can yield a status the transfer never had.
+    /// The status, read in one load. Derive a status from this, not from several `is_*`
+    /// calls, which can straddle a transition.
     #[inline]
     pub(crate) fn status(&self) -> crate::types::TransferStatus {
         use crate::types::TransferStatus;
@@ -517,10 +514,8 @@ impl MetricsState {
         Self::with_parent(None)
     }
 
-    /// Metrics whose samples also roll up into `parent`.
-    ///
-    /// `parent` is held strongly: metrics point only upward, so no cycle can form, and a
-    /// child still recording after its parent has finished keeps reaching it.
+    /// Metrics whose samples also roll up into `parent`, held strongly since links only point
+    /// upward.
     pub(crate) fn with_parent(parent: Option<Arc<MetricsState>>) -> Self {
         Self {
             parent,
@@ -541,10 +536,7 @@ impl MetricsState {
         }
     }
 
-    /// Record an IO sample into this transfer and every ancestor.
-    ///
-    /// Each counter is updated separately, so a reader can see an ancestor and its
-    /// descendants disagree while a sample is being recorded.
+    /// Record an IO sample into this transfer and every ancestor, one counter at a time.
     pub(crate) fn record_io(&self, sample: &crate::metrics::IoSample) {
         let mut cur = Some(self);
         while let Some(m) = cur {
@@ -958,10 +950,8 @@ impl TransferContext {
         (ctx, completion_rx)
     }
 
-    /// Reports this transfer's events to `sink`, describing the transfer as `transfer`.
-    ///
-    /// Only the returned context and its later clones emit, so attach the sink before the
-    /// context is cloned.
+    /// Reports this transfer's events to `sink`. Only the returned context and its later
+    /// clones emit, so attach the sink before cloning.
     pub(crate) fn with_events(
         mut self,
         sink: crate::events::TransferEventSink,
@@ -1180,10 +1170,8 @@ impl TransferContext {
     }
 
     /// Take the error if the transfer failed. `None` if it did not fail or the error was
-    /// already taken.
-    ///
-    /// The error belongs to the operation's result; [`Self::error_kind`] reads its kind
-    /// without taking it.
+    /// already taken. The error belongs to the operation's result; [`Self::error_kind`] reads
+    /// the kind without taking it.
     pub(crate) fn take_error(&self) -> Option<error::Error> {
         if self.status.is_failed() {
             self.error.lock().take().map(|e| *e)
@@ -1193,9 +1181,7 @@ impl TransferContext {
     }
 
     /// The event outcome this transfer's terminal status implies, read without taking the
-    /// error.
-    ///
-    /// Requires a terminal status: a still-`Active` transfer maps to `Cancelled`.
+    /// error. Requires a terminal status: a still-`Active` transfer maps to `Cancelled`.
     pub(crate) fn terminal_outcome(&self) -> crate::events::Outcome {
         match self.transfer_status() {
             crate::types::TransferStatus::Completed => crate::events::Outcome::Succeeded {},
@@ -1213,11 +1199,9 @@ impl TransferContext {
     }
 
     /// Emits [`TransferEvent::Finished`](crate::events::TransferEvent::Finished) with the
-    /// outcome the terminal status implies, if a sink is registered.
-    ///
-    /// Only the first call after [`Self::announce`] emits; every other call does nothing.
-    /// Requires a terminal status. A call made before [`Self::signal_terminal`] sends the
-    /// event before any joiner wakes.
+    /// outcome the terminal status implies, once per [`Self::announce`]. Requires a terminal
+    /// status; call it before [`Self::signal_terminal`] so the event is sent before any joiner
+    /// wakes.
     pub(crate) fn emit_finished(&self) {
         if let Some(emit) = self
             .lifecycle
@@ -1331,11 +1315,8 @@ impl TransferContext {
         self.metrics.set_total_bytes(n);
     }
 
-    /// Record `n` as this transfer's expected payload bytes, reported as a provisional byte
-    /// total until [`Self::set_total_bytes`] sets the final one.
-    ///
-    /// Unlike `set_total_bytes`, this leaves the total open, so a transfer that finds a
-    /// size other than `n` reports the size it found.
+    /// Record `n` as a provisional byte total, until [`Self::set_total_bytes`] sets the final
+    /// one.
     pub(crate) fn set_expected_bytes(&self, n: u64) {
         self.metrics.add_discovered(n, 0);
     }
@@ -1355,10 +1336,8 @@ impl TransferContext {
         self.metrics.snapshot()
     }
 
-    /// A detached, read-only view of this transfer's counters, status and pending cause.
-    ///
-    /// The view holds no reference to `handle`, whose drop shuts the runtime down, so a
-    /// view a consumer keeps cannot delay that shutdown.
+    /// A read-only view of this transfer's counters, status and pending cause. It holds no
+    /// `handle`, so a view a consumer keeps cannot delay runtime shutdown.
     pub(crate) fn view(&self) -> crate::types::TransferView {
         crate::types::TransferView::new(
             self.metrics.clone(),

@@ -299,12 +299,10 @@ impl TransferStatus {
 
 /// Snapshot of transfer progress and IO metrics.
 ///
-/// The byte counters measure the same payload, so summing them double-counts: a
-/// file-backed upload counts its bytes in `disk_read`, `network_tx` and
-/// `bytes_transferred`. Progress is [`bytes_transferred`](Self::bytes_transferred) against
-/// [`total_bytes`](Self::total_bytes), in either direction.
-///
-/// A directory operation's byte counters include its objects' bytes as they are recorded.
+/// For progress, compare [`bytes_transferred`](Self::bytes_transferred) with
+/// [`total_bytes`](Self::total_bytes). The byte counters overlap, so adding them together
+/// double-counts. A directory operation's counters include the bytes each of its objects has
+/// moved, even an object that fails or is cancelled.
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub struct TransferMetrics {
@@ -318,9 +316,9 @@ pub struct TransferMetrics {
     pub disk_write: u64,
     /// Payload bytes of the parts that have completed, in either direction.
     ///
-    /// A part counts once, when its request succeeds, so a single-part transfer moves from 0
-    /// to its total in one step. Once the transfer succeeds this equals
-    /// [`total_bytes`](Self::total_bytes), where that is known.
+    /// Grows a whole part at a time, so a single-part transfer goes from 0 to its total in
+    /// one step. Equals [`total_bytes`](Self::total_bytes), when known, once the transfer
+    /// succeeds.
     pub bytes_transferred: u64,
     /// Expected total payload bytes, if known.
     pub total_bytes: Option<u64>,
@@ -330,13 +328,12 @@ pub struct TransferMetrics {
     pub finished_at: Option<std::time::Instant>,
 }
 
-/// Read-only view of one transfer's live counters and pending cause.
+/// Read-only view of one transfer's live counters, handed out on
+/// [`TransferEvent::Started`](crate::events::TransferEvent::Started).
 ///
-/// Handed out on [`TransferEvent::Started`](crate::events::TransferEvent::Started), and
-/// readable at any time, including after the operation's handle is joined or dropped.
-///
-/// A view keeps its transfer's counters allocated while it is held, so drop it once the
-/// transfer's [`TransferEvent::Finished`](crate::events::TransferEvent::Finished) arrives.
+/// Readable at any time, even after the operation's handle is joined or dropped. A view
+/// holds its transfer's counters in memory, so drop it once the transfer's
+/// [`TransferEvent::Finished`](crate::events::TransferEvent::Finished) arrives.
 #[derive(Debug, Clone)]
 pub struct TransferView {
     metrics: std::sync::Arc<crate::transfer::MetricsState>,
@@ -357,24 +354,18 @@ impl TransferView {
         }
     }
 
-    /// Point-in-time reading of this transfer's counters.
+    /// A snapshot of this transfer's counters.
     ///
-    /// Each counter is a cumulative total for this transfer, not a delta, and never
-    /// decreases from one reading to the next.
-    ///
-    /// [`TransferMetrics::finished_at`] is set when the transfer reaches a terminal status,
-    /// and work still in flight can grow the counters after that. For final values, use
-    /// the result of the operation's `join()`.
+    /// Each counter is a running total that never decreases. For final values, use the
+    /// result of the operation's `join()`.
     pub fn metrics(&self) -> TransferMetrics {
         self.metrics.snapshot()
     }
 
     /// Why this transfer is blocked, or `None` while it is not.
     ///
-    /// A cause is reported from the moment the transfer blocks until the scheduler next runs
-    /// it, so a transfer whose condition has cleared keeps reporting the cause while it waits
-    /// for scheduler capacity. A transfer that has not blocked since the scheduler last ran it
-    /// reports `None`, as does one whose status is no longer [`TransferStatus::Active`].
+    /// A cause is reported until the transfer resumes, so it can outlast the condition that
+    /// set it. A transfer whose status is no longer [`TransferStatus::Active`] reports `None`.
     pub fn pending_cause(&self) -> Option<PendingCause> {
         let cause = self.pending.get()?;
         // Status after the slot: a status never returns to `Active`, so an `Active` reading

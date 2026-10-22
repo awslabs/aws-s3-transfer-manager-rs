@@ -83,8 +83,7 @@ fn s3_uri(uri: &str) -> Option<(&str, &str)> {
     uri.strip_prefix("s3://")?.split_once('/')
 }
 
-/// Redraws every 100 ms until the stream ends, which it does once the transfer has sent its
-/// `Finished`.
+/// Redraws every 100 ms until the transfer finishes and its stream ends.
 async fn show_progress(mut stream: TransferEventStream) -> std::io::Result<()> {
     let mut stdout = std::io::stdout();
     let mut view = None;
