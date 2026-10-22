@@ -59,9 +59,9 @@ mod object_meta;
 
 use crate::config::user_agent::OperationFeatures;
 use crate::error;
-use aws_runtime::sdk_feature::AwsSdkFeature;
 use crate::operation::download::body::new_recv_body;
 use crate::types::BucketType;
+use aws_runtime::sdk_feature::AwsSdkFeature;
 use std::sync::Arc;
 
 /// Most names tried for the temporary file of one path download.

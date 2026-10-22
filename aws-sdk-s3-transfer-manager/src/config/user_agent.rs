@@ -594,14 +594,13 @@ mod tests {
         http_client: aws_smithy_runtime_api::client::http::SharedHttpClient,
         tweak: impl FnOnce(crate::config::Builder) -> crate::config::Builder,
     ) -> crate::Client {
-        let s3_config = crate::config::S3ClientConfig::new(
-            aws_sdk_s3::config::Builder::default()
-                .http_client(http_client)
-                .region(Region::from_static("us-west-2"))
-                .credentials_provider(test_credentials())
-                .behavior_version(BehaviorVersion::latest()),
-        )
-        .enable_runtime_http(false);
+        let shared = aws_types::SdkConfig::builder()
+            .http_client(http_client)
+            .region(Region::from_static("us-west-2"))
+            .credentials_provider(test_credentials())
+            .behavior_version(BehaviorVersion::latest())
+            .build();
+        let s3_config = crate::config::S3ClientConfig::new(&shared).enable_runtime_http(false);
         crate::Client::new(
             tweak(
                 crate::Config::builder()
@@ -660,9 +659,21 @@ mod tests {
         };
         let cases: Vec<(&str, Tweak, &[&str])> = vec![
             ("defaults", Box::new(|b| b), &[]),
-            ("part size", Box::new(|b| b.part_size(PartSize::Target(8 << 20))), &["AX"]),
-            ("concurrency", Box::new(|b| b.concurrency(ConcurrencyMode::Explicit(4))), &["AY"]),
-            ("memory", Box::new(|b| b.memory(MemoryConfig::Explicit(pool))), &["AZ"]),
+            (
+                "part size",
+                Box::new(|b| b.part_size(PartSize::Target(8 << 20))),
+                &["AX"],
+            ),
+            (
+                "concurrency",
+                Box::new(|b| b.concurrency(ConcurrencyMode::Explicit(4))),
+                &["AY"],
+            ),
+            (
+                "memory",
+                Box::new(|b| b.memory(MemoryConfig::Explicit(pool))),
+                &["AZ"],
+            ),
             ("ec2", Box::new(|b| b.machine_profile(Some(ec2))), &["Aa"]),
         ];
         for (name, tweak, expected) in cases {
@@ -687,16 +698,30 @@ mod tests {
             .await;
         let children = seen.lock().unwrap().len();
         let body = crate::io::InputStream::from(bytes::Bytes::from_static(b"x"));
-        let _ = tm.upload().bucket("foo").key("k").body(body).initiate().unwrap().join().await;
+        let _ = tm
+            .upload()
+            .bucket("foo")
+            .key("k")
+            .body(body)
+            .initiate()
+            .unwrap()
+            .join()
+            .await;
 
         let seen = seen.lock().unwrap();
         assert!(children > 0);
         for (uri, ids) in &seen[..children] {
-            assert!(has(ids, "9") && has(ids, "Ab") && !has(ids, "+"), "{uri}: {ids:?}");
+            assert!(
+                has(ids, "9") && has(ids, "Ab") && !has(ids, "+"),
+                "{uri}: {ids:?}"
+            );
         }
         // The markers belong to the operation: a later plain upload from the same client has none.
         let ids = &seen[children].1;
-        assert!(has(ids, "G") && !has(ids, "9") && !has(ids, "Ab"), "{ids:?}");
+        assert!(
+            has(ids, "G") && !has(ids, "9") && !has(ids, "Ab"),
+            "{ids:?}"
+        );
     }
 
     #[cfg_attr(miri, ignore)]
@@ -723,13 +748,22 @@ mod tests {
             .partition(|(uri, _)| uri.contains("list-type=2"));
         assert!(!listings.is_empty() && !objects.is_empty(), "{seen:?}");
         for (uri, ids) in listings {
-            assert!(has(ids, "+") && !has(ids, "Ab") && !has(ids, "9"), "{uri}: {ids:?}");
+            assert!(
+                has(ids, "+") && !has(ids, "Ab") && !has(ids, "9"),
+                "{uri}: {ids:?}"
+            );
         }
         for (uri, ids) in objects {
-            assert!(has(ids, "+") && has(ids, "Ab") && !has(ids, "9"), "{uri}: {ids:?}");
+            assert!(
+                has(ids, "+") && has(ids, "Ab") && !has(ids, "9"),
+                "{uri}: {ids:?}"
+            );
         }
         // The markers belong to the operation: a later plain download from the same client has none.
         let ids = &seen[children].1;
-        assert!(has(ids, "G") && !has(ids, "+") && !has(ids, "Ab"), "{ids:?}");
+        assert!(
+            has(ids, "G") && !has(ids, "+") && !has(ids, "Ab"),
+            "{ids:?}"
+        );
     }
 }

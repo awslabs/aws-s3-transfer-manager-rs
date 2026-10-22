@@ -23,8 +23,8 @@ use std::sync::Arc;
 
 use crate::config::user_agent::OperationFeatures;
 use crate::io::walk::{S3WalkContext, S3Walker};
-use aws_runtime::sdk_feature::AwsSdkFeature;
 use crate::transfer::TransferContext;
+use aws_runtime::sdk_feature::AwsSdkFeature;
 
 /// Operation struct for downloading multiple objects from Amazon S3
 #[derive(Clone, Default, Debug)]

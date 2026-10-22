@@ -36,9 +36,9 @@ pub use crate::model::builders::UploadOutputBuilder;
 pub use crate::model::UploadInput;
 /// Response type for uploads to Amazon S3
 pub use crate::model::UploadOutput;
-use aws_runtime::sdk_feature::AwsSdkFeature;
 use crate::transfer::TransferContext;
 use crate::types::BucketType;
+use aws_runtime::sdk_feature::AwsSdkFeature;
 pub use handle::UploadHandle;
 
 use std::sync::Arc;
