@@ -25,8 +25,9 @@
 //! for the number the operation itself reports.
 //!
 //! **Emitting never blocks, awaits, or runs your code.** Your sink is not called back on a
-//! transfer's own thread, and an event that finds a full channel is dropped and counted by
-//! [`TransferEventStream::dropped`] rather than making a transfer wait on you.
+//! transfer's own thread, and a transfer that finds no room for its events is left off the
+//! stream, with its events counted by [`TransferEventStream::dropped`], rather than made to
+//! wait on you.
 //!
 //! Printing one of the familiar per-entry lines takes one event and nothing else:
 //!
@@ -378,14 +379,17 @@ pub const MAX_CAPACITY: usize = usize::MAX >> 3;
 
 /// Create a sink/stream pair. The caller owns the stream and drains it.
 ///
-/// Delivery is bounded and lossy: a transfer never waits on the consumer, so a stream that
-/// is drained slowly — or not at all — misses events once `capacity` is full.
-/// [`TransferEventStream::dropped`] counts what was lost. Size `capacity` against how far
-/// behind the consumer may fall.
+/// A transfer never waits for room on the stream. One that starts with at least two slots
+/// free holds room for both of its events until the consumer receives them; one that starts
+/// with fewer is left off the stream, and [`TransferEventStream::dropped`] counts both of its
+/// events. A sink used by one transfer never drops an event at capacity 2. A stream fed by
+/// several transfers, through clones or [`merge`](TransferEventSink::merge), drops nothing
+/// while its capacity is at least twice the number of transfers that are running or whose
+/// events the consumer has not yet received. A capacity below 2 is raised to 2.
 ///
 /// Capacities above [`MAX_CAPACITY`] are clamped to it rather than panicking.
 pub fn channel(capacity: NonZeroUsize) -> (TransferEventSink, TransferEventStream) {
-    let (tx, rx) = tokio::sync::mpsc::channel(capacity.get().min(MAX_CAPACITY));
+    let (tx, rx) = tokio::sync::mpsc::channel(capacity.get().clamp(2, MAX_CAPACITY));
     let dropped = Arc::new(AtomicU64::new(0));
     (
         TransferEventSink {
@@ -406,6 +410,50 @@ struct Outlet {
     /// losing events says nothing about another, and a shared counter would report a
     /// fast consumer's stream as lossy because a different one fell behind.
     dropped: Arc<AtomicU64>,
+}
+
+/// A slot on one outlet, reserved before the event that fills it.
+type Permit = tokio::sync::mpsc::OwnedPermit<TransferEvent>;
+
+impl Outlet {
+    /// Reserves two slots, or none.
+    ///
+    /// Counts two dropped events when the channel has room for fewer than two, and nothing
+    /// when the receiver is gone.
+    fn reserve_pair(&self) -> Option<(Permit, Permit)> {
+        use tokio::sync::mpsc::error::TrySendError;
+        let refused = match self.tx.clone().try_reserve_owned() {
+            Ok(first) => match self.tx.clone().try_reserve_owned() {
+                Ok(second) => return Some((first, second)),
+                Err(refused) => {
+                    // Released, not kept: a lone slot would deliver a `Started` with no room
+                    // for its `Finished`, and would hold room a later transfer could use.
+                    drop(first);
+                    refused
+                }
+            },
+            Err(refused) => refused,
+        };
+        // A gone receiver is not counted: there is no consumer left to lose the events.
+        if let TrySendError::Full(_) = refused {
+            self.dropped.fetch_add(2, Ordering::Relaxed);
+        }
+        None
+    }
+}
+
+/// Sends `event` through every permit.
+fn deliver(permits: Vec<Permit>, event: TransferEvent) {
+    let mut permits = permits.into_iter();
+    let Some(mut permit) = permits.next() else {
+        return;
+    };
+    // The last permit takes `event` by move, so a single-outlet sink clones nothing.
+    for next in permits {
+        permit.send(event.clone());
+        permit = next;
+    }
+    permit.send(event);
 }
 
 /// Registration endpoint. Cheap to clone; every clone feeds the same stream or streams.
@@ -432,7 +480,7 @@ impl TransferEventSink {
             for outlet in src.iter() {
                 // Keyed on the channel rather than on the sink, because a sink is `Clone` and
                 // two clones are the same consumer. `owes_finish` guarantees one *emit*; the
-                // fan-out in `emit` is downstream of it, so a duplicate outlet breaks
+                // fan-out to each outlet is downstream of it, so a duplicate outlet breaks
                 // exactly-once at the only place it means anything -- the consumer.
                 if outlets
                     .iter()
@@ -451,45 +499,10 @@ impl TransferEventSink {
         }
     }
 
-    /// Non-blocking send to every outlet. Counts the event as dropped on each outlet whose
-    /// channel was full.
-    ///
-    /// Returns whether the event reached **at least one** consumer. A `false` return covers
-    /// two different facts, and only the first is counted in
-    /// [`TransferEventStream::dropped`]: the channel was full (the consumer lost an event),
-    /// or the receiver is gone (there is no consumer to lose anything). Either way the
-    /// producer does not stall, on any outlet.
-    fn emit(&self, event: TransferEvent) -> bool {
-        // The last outlet takes the event by move and the others clone, so a single-outlet
-        // sink — the common case by far — clones nothing. Cloning is refcount-only anyway:
-        // the endpoints a `TransferRef` carries are `Arc<str>`/`Arc<Path>`.
-        let Some((last, rest)) = self.outlets.split_last() else {
-            return false;
-        };
-        let mut delivered = false;
-        for outlet in rest {
-            delivered |= Self::push(outlet, event.clone());
-        }
-        delivered | Self::push(last, event)
-    }
-
-    /// Try one outlet, counting a full channel as a loss and a closed one as nothing.
-    fn push(outlet: &Outlet, event: TransferEvent) -> bool {
-        use tokio::sync::mpsc::error::TrySendError;
-        match outlet.tx.try_send(event) {
-            Ok(()) => true,
-            // Counted: the consumer is still there and lost this one, which is what
-            // `dropped()` reports.
-            Err(TrySendError::Full(_)) => {
-                outlet.dropped.fetch_add(1, Ordering::Relaxed);
-                false
-            }
-            // NOT counted. The receiver is gone, so every subsequent event is also
-            // undeliverable and counting them would run `dropped()` up by the number of
-            // remaining entries — turning "you lost some events" into a number that says
-            // nothing about delivery. A consumer that stopped listening did not lose data.
-            Err(TrySendError::Closed(_)) => false,
-        }
+    /// Reserves two slots on every outlet with room for both, split into the slots for a
+    /// `Started` and the slots for its `Finished`.
+    fn reserve_pairs(&self) -> (Vec<Permit>, Vec<Permit>) {
+        self.outlets.iter().filter_map(Outlet::reserve_pair).unzip()
     }
 }
 
@@ -520,7 +533,8 @@ impl TransferEventStream {
         })
     }
 
-    /// Events the consumer lost because the channel was full.
+    /// Events the consumer lost for lack of room, two for each transfer that found no room
+    /// for both of its events.
     ///
     /// Read this before trusting any total assembled from the stream: such a total
     /// is complete only while this is zero.
@@ -563,12 +577,14 @@ impl std::error::Error for TryRecvError {}
 /// policy has an obligation and no status, and a transfer that was never announced
 /// has a status and no obligation.
 pub(crate) struct TransferLifecycle {
-    /// The sink, shared with each claimed emit and released by the one that sends.
+    /// The sink and the slots held for the `Finished`, shared with each claimed emit and
+    /// released by the one that sends.
     ///
     /// Released at that send rather than when the lifecycle drops: the lifecycle lives as
     /// long as any clone of its transfer's context, and a consumer's stream reports
-    /// [`TryRecvError::Disconnected`] only once every sink is gone.
-    sink: Arc<Mutex<Option<TransferEventSink>>>,
+    /// [`TryRecvError::Disconnected`] only once every sink, and every slot held on it, is
+    /// gone.
+    route: Arc<Mutex<Option<Route>>>,
     id: TransferId,
     transfer: TransferRef,
     /// The view `announce` hands out, or `None` for an entry with no transfer behind it.
@@ -596,14 +612,22 @@ impl fmt::Debug for TransferLifecycle {
     }
 }
 
-/// Lock the shared sink slot, tolerating poison.
+/// Where a lifecycle's events go.
+#[derive(Debug)]
+struct Route {
+    /// Kept until the `Finished` is sent: an outlet that had no room holds no slot, and its
+    /// stream must not end while the transfer is still running.
+    sink: TransferEventSink,
+    /// A slot for the `Finished` on each outlet that had room for both events at `announce`.
+    finish: Vec<Permit>,
+}
+
+/// Lock the shared route slot, tolerating poison.
 ///
 /// A terminal path runs during a worker panic, so an unwind that poisoned this lock must
-/// not take the terminal event with it. The slot holds a usable sink or `None`, and an
+/// not take the terminal event with it. The slot holds a usable route or `None`, and an
 /// unwind cannot leave it in any third state, so the inner value is always safe to take.
-fn lock_sink(
-    slot: &Mutex<Option<TransferEventSink>>,
-) -> std::sync::MutexGuard<'_, Option<TransferEventSink>> {
+fn lock_route(slot: &Mutex<Option<Route>>) -> std::sync::MutexGuard<'_, Option<Route>> {
     slot.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
@@ -616,7 +640,10 @@ impl TransferLifecycle {
         view: Option<crate::types::TransferView>,
     ) -> Self {
         Self {
-            sink: Arc::new(Mutex::new(Some(sink))),
+            route: Arc::new(Mutex::new(Some(Route {
+                sink,
+                finish: Vec::new(),
+            }))),
             id,
             transfer,
             view,
@@ -626,18 +653,30 @@ impl TransferLifecycle {
 
     /// Emit [`TransferEvent::Started`] and take on the terminal obligation.
     ///
-    /// The obligation is taken even if the send is dropped, so a lost `Started`
-    /// cannot silently cancel the matching `Finished`. That keeps the two counts
-    /// comparable, which is what makes a dropped event visible.
+    /// Each outlet with room for both events receives the `Started` and holds a slot for the
+    /// `Finished`. Each outlet without that room receives neither and counts both as dropped,
+    /// unless its receiver is gone.
+    ///
+    /// The obligation is taken even where no outlet had room, because discharging it is what
+    /// releases the sink.
     pub(crate) fn announce(&self) {
+        let mut slot = lock_route(&self.route);
+        // Under the lock, so a terminal claimed from here on sends only after the slots it
+        // sends through are reserved and the `Started` is queued ahead of it.
         self.owes_finish.store(true, Ordering::Release);
-        if let Some(sink) = &*lock_sink(&self.sink) {
-            sink.emit(TransferEvent::Started(Started {
+        let Some(route) = slot.as_mut() else {
+            return;
+        };
+        let (start, finish) = route.sink.reserve_pairs();
+        route.finish = finish;
+        deliver(
+            start,
+            TransferEvent::Started(Started {
                 id: self.id,
                 transfer: self.transfer.clone(),
                 view: self.view.clone(),
-            }));
-        }
+            }),
+        );
     }
 
     /// Claim the terminal obligation. Returns the emit as a value; sending is the
@@ -650,7 +689,7 @@ impl TransferLifecycle {
             return None;
         }
         Some(PendingEmit {
-            sink: self.sink.clone(),
+            route: self.route.clone(),
             owes_finish: self.owes_finish.clone(),
             event: Some(TransferEvent::Finished(Finished {
                 id: self.id,
@@ -666,9 +705,9 @@ impl TransferLifecycle {
 /// Claiming and sending are separate so a site holding a state guard can claim
 /// under the guard and publish after releasing it.
 pub(crate) struct PendingEmit {
-    /// The lifecycle's own handle, not a copy of the sink: sending is also what releases
-    /// it, so both sides must see the same slot.
-    sink: Arc<Mutex<Option<TransferEventSink>>>,
+    /// The lifecycle's own route, not a copy: sending is also what releases it, and a claim
+    /// dropped unsent leaves the held slots there for the next claim.
+    route: Arc<Mutex<Option<Route>>>,
     /// `None` once sent. Distinguishes a discharged emit from an abandoned one in
     /// [`Drop`].
     event: Option<TransferEvent>,
@@ -687,9 +726,8 @@ impl PendingEmit {
     /// Send it. Never blocks and never awaits, so this is legal from any site,
     /// including one holding a state guard.
     ///
-    /// A full channel drops the event and counts it. Nothing was reserved for it:
-    /// the one consumer that needs every terminal reads it from `join()`, which is
-    /// exact.
+    /// The event goes through the slots `announce` held for it, so a full channel cannot
+    /// drop it. An outlet that had no room at `announce` receives nothing.
     ///
     /// Sending is also where the sink is released, in the same critical section. This is
     /// the only point of no return: `finish` can be claimed and abandoned, and
@@ -701,11 +739,10 @@ impl PendingEmit {
         let Some(event) = self.event.take() else {
             return;
         };
-        let mut slot = lock_sink(&self.sink);
-        if let Some(sink) = &*slot {
-            sink.emit(event);
+        let mut slot = lock_route(&self.route);
+        if let Some(route) = slot.take() {
+            deliver(route.finish, event);
         }
-        *slot = None;
     }
 }
 
@@ -758,6 +795,25 @@ mod tests {
             TransferLifecycle::new(sink, tid(1, None), upload_ref(), None),
             stream,
         )
+    }
+
+    /// A lifecycle on `sink` for transfer `id`, already announced.
+    fn announced(sink: &TransferEventSink, id: u64) -> TransferLifecycle {
+        let lc = TransferLifecycle::new(sink.clone(), tid(id, None), upload_ref(), None);
+        lc.announce();
+        lc
+    }
+
+    /// Each queued event as its variant and transfer id, in arrival order.
+    fn drain_ids(stream: &mut TransferEventStream) -> Vec<(&'static str, TransferId)> {
+        let mut seen = Vec::new();
+        while let Ok(ev) = stream.try_recv() {
+            seen.push(match ev {
+                TransferEvent::Started(started) => ("Started", started.id()),
+                TransferEvent::Finished(finished) => ("Finished", finished.id()),
+            });
+        }
+        seen
     }
 
     fn failed() -> Outcome {
@@ -851,8 +907,8 @@ mod tests {
             assert_eq!(
                 tid(1, None),
                 id,
-                "delivery is lossy, so the terminal must carry the start's id, or a \
-                 consumer that missed the first event cannot tell which entry ended: {ev:?}"
+                "the terminal must carry the start's id, or a consumer of several transfers \
+                 cannot tell which one ended: {ev:?}"
             );
             assert_eq!(
                 ev.transfer().destination().to_string(),
@@ -882,15 +938,22 @@ mod tests {
 
     #[test]
     fn a_claim_dropped_unsent_hands_the_obligation_back() {
-        let (lc, _stream) = lifecycle();
+        let (lc, mut stream) = lifecycle();
         lc.announce();
         // A site that claims and then returns early without publishing.
         drop(lc.finish(failed()));
-        assert!(
-            lc.finish(failed()).is_some(),
-            "an abandoned claim must re-arm: otherwise the obligation is consumed \
-             by a value that never reached the channel, and the `Finished` is lost \
-             with nothing recording that it was owed"
+        lc.finish(failed())
+            .expect(
+                "an abandoned claim must re-arm: otherwise the obligation is consumed \
+                 by a value that never reached the channel, and the `Finished` is lost \
+                 with nothing recording that it was owed",
+            )
+            .send();
+        assert_eq!(
+            vec![("Started", tid(1, None)), ("Finished", tid(1, None))],
+            drain_ids(&mut stream),
+            "the abandoned claim must leave the slot `announce` held for the `Finished`, \
+             so the re-armed claim still has room to send through"
         );
     }
 
@@ -903,73 +966,168 @@ mod tests {
         );
     }
 
+    // ref: awslabs/aws-s3-transfer-manager-rs#197
+    /// A capacity below 2 is raised to 2, so a transfer alone on its sink delivers both of
+    /// its events.
+    ///
+    /// Capacity 1 could never hold a pair: every transfer would be granted one slot, refused
+    /// the second, and left off the stream.
     #[test]
-    fn a_full_channel_drops_and_counts_rather_than_waiting() {
-        // Capacity 1: the `Started` fits, the `Finished` does not. Nothing is
-        // reserved, so the loss is at the end rather than the beginning -- and it is
-        // counted, which is the whole of what bounded delivery promises.
+    fn a_capacity_of_one_still_delivers_a_whole_transfer() {
         let (sink, mut stream) = channel(NonZeroUsize::new(1).unwrap());
         let lc = TransferLifecycle::new(sink, tid(7, None), upload_ref(), None);
         lc.announce();
         lc.finish(Outcome::Succeeded {}).expect("owed").send();
 
-        let ev = stream.try_recv().expect("the start reached the channel");
-        assert!(
-            matches!(&ev, TransferEvent::Started(p) if p.id() == tid(7, None)),
-            "the first event through an empty channel is the start: {ev:?}"
+        assert_eq!(
+            vec![("Started", tid(7, None)), ("Finished", tid(7, None))],
+            drain_ids(&mut stream),
+            "a transfer alone on its sink must deliver both of its events"
         );
         assert_eq!(
+            0,
             stream.dropped(),
-            1,
-            "an event with no room is discarded and counted, and the run does not \
-             slow down waiting for the consumer"
+            "nothing was lost, so nothing is counted"
         );
         assert!(
             matches!(stream.try_recv(), Err(TryRecvError::Disconnected)),
-            "a dropped event must not be delivered late -- and since `send` released the \
-             sink, the stream is closed rather than merely empty"
+            "sending the `Finished` released the sink, so the stream is closed rather than \
+             merely empty"
         );
     }
 
+    // ref: awslabs/aws-s3-transfer-manager-rs#197
     /// `dropped()` counts events the consumer lost, and only those.
     ///
-    /// A full channel is a loss: the consumer is listening and did not get the event, so
-    /// any total it assembles is short and `dropped()` is how it finds out. A gone
-    /// receiver is not a loss — nobody is there to lose anything — and counting it made
-    /// `dropped()` grow with however much transfer remained after the consumer stopped,
-    /// so the number reported the size of the tail rather than anything about delivery.
+    /// A transfer that finds no room is a loss: the consumer is listening and gets neither
+    /// of its events, so any total it assembles is short and `dropped()` is how it finds
+    /// out. A gone receiver is not a loss, because nobody is there to lose anything, and
+    /// counting it would make `dropped()` grow with however much transfer remains after the
+    /// consumer stops rather than with anything about delivery.
     #[test]
-    fn dropped_counts_a_full_channel_but_not_a_closed_one() {
-        let (sink, mut stream) = channel(NonZeroUsize::new(1).unwrap());
-        let ev = || {
-            TransferEvent::Started(Started {
-                id: tid(1, None),
-                transfer: upload_ref(),
-                view: None,
-            })
-        };
+    fn dropped_counts_a_transfer_without_room_but_not_a_closed_stream() {
+        let (sink, stream) = channel(NonZeroUsize::new(2).unwrap());
+        let _holder = announced(&sink, 1);
+        assert_eq!(
+            0,
+            stream.dropped(),
+            "the first transfer has room for both of its events"
+        );
 
-        assert!(sink.emit(ev()), "the first event fits");
-        assert_eq!(0, stream.dropped());
-
-        assert!(!sink.emit(ev()), "capacity 1 is now full");
-        assert_eq!(1, stream.dropped(), "a full channel is a lost event");
-
-        // Drain, so the next failure can only be attributed to closure.
-        stream.try_recv().expect("the queued event");
-        let dropped_before_close = stream.dropped();
+        let _crowded_out = announced(&sink, 2);
+        assert_eq!(
+            2,
+            stream.dropped(),
+            "a transfer with no room loses both of its events"
+        );
 
         drop(stream);
-        assert!(!sink.emit(ev()), "no receiver, so it cannot be delivered");
-        assert!(!sink.emit(ev()), "and again");
+        let _after_close = announced(&sink, 3);
         assert_eq!(
-            1, dropped_before_close,
-            "sanity: exactly one loss happened before the close"
-        );
-        assert_eq!(
-            1,
+            2,
             sink.outlets[0].dropped.load(Ordering::Relaxed),
             "a closed receiver must not be counted as lost events"
+        );
+    }
+
+    // ref: awslabs/aws-s3-transfer-manager-rs#197
+    /// A transfer granted one slot and refused the second keeps neither.
+    ///
+    /// Capacity 3: the first transfer holds two slots, so the second is granted the third and
+    /// refused a fourth. Its `Started` must not arrive, because its `Finished` would have no
+    /// room. The slot it was granted must go back to the channel: once the first transfer's
+    /// `Started` is received, a third transfer needs both free slots. The second finishes
+    /// last, with every slot free, so a `Finished` sent without a held slot would arrive as
+    /// half a pair.
+    #[test]
+    fn a_transfer_granted_one_slot_keeps_neither() {
+        let (sink, mut stream) = channel(NonZeroUsize::new(3).unwrap());
+        let first = announced(&sink, 1);
+        let second = announced(&sink, 2);
+
+        let ev = stream.try_recv().expect("the first transfer's `Started`");
+        assert!(
+            matches!(&ev, TransferEvent::Started(started) if started.id() == tid(1, None)),
+            "the first transfer had room for both of its events: {ev:?}"
+        );
+        assert!(
+            matches!(stream.try_recv(), Err(TryRecvError::Empty)),
+            "the second transfer's `Started` must not arrive without room for its `Finished`"
+        );
+        assert_eq!(
+            2,
+            stream.dropped(),
+            "both of the second transfer's events are counted"
+        );
+
+        let third = announced(&sink, 3);
+        assert_eq!(
+            2,
+            stream.dropped(),
+            "the slot the second transfer was granted must go back to the channel, so the \
+             third has room for both of its events"
+        );
+
+        for lc in [&first, &third] {
+            lc.finish(Outcome::Succeeded {}).expect("owed").send();
+        }
+        assert_eq!(
+            vec![
+                ("Started", tid(3, None)),
+                ("Finished", tid(1, None)),
+                ("Finished", tid(3, None)),
+            ],
+            drain_ids(&mut stream),
+            "each transfer with room delivers its `Finished` through the slot it held"
+        );
+
+        second.finish(Outcome::Succeeded {}).expect("owed").send();
+        assert_eq!(
+            Vec::<(&str, TransferId)>::new(),
+            drain_ids(&mut stream),
+            "a transfer left off the stream must not deliver its `Finished` once room frees up"
+        );
+    }
+
+    // ref: awslabs/aws-s3-transfer-manager-rs#197
+    /// A lifecycle dropped without sending its `Finished` releases the slot it held, and the
+    /// sender inside it.
+    ///
+    /// Capacity 2: the abandoned transfer's `Started` is queued and its held slot fills the
+    /// channel. A slot that outlived the lifecycle would leave the next transfer one slot
+    /// short once that `Started` is received, and would keep the stream open with no
+    /// transfer left to close it.
+    #[test]
+    fn a_lifecycle_dropped_unsent_releases_its_slot() {
+        let (sink, mut stream) = channel(NonZeroUsize::new(2).unwrap());
+        let abandoned = announced(&sink, 1);
+        // A claim dropped unsent re-arms, so the lifecycle still owes its `Finished` when it
+        // goes.
+        drop(abandoned.finish(failed()));
+        drop(abandoned);
+        assert_eq!(
+            vec![("Started", tid(1, None))],
+            drain_ids(&mut stream),
+            "a lifecycle that never sends delivers no `Finished`"
+        );
+
+        let next = announced(&sink, 2);
+        drop(sink);
+        assert_eq!(
+            0,
+            stream.dropped(),
+            "the abandoned slot must go back to the channel, so the next transfer has room \
+             for both of its events"
+        );
+        next.finish(Outcome::Succeeded {}).expect("owed").send();
+        assert_eq!(
+            vec![("Started", tid(2, None)), ("Finished", tid(2, None))],
+            drain_ids(&mut stream),
+            "the next transfer delivers both of its events"
+        );
+        assert!(
+            matches!(stream.try_recv(), Err(TryRecvError::Disconnected)),
+            "no sender may outlive the transfers on the sink, or the stream never ends"
         );
     }
 
@@ -983,12 +1141,14 @@ mod tests {
         let (sink, mut stream) = channel(std::num::NonZeroUsize::new(16).expect("capacity > 0"));
         let registered = sink.clone().merge(sink);
 
-        registered.emit(TransferEvent::Finished(Finished {
-            id: tid(7, Some(1)),
-            transfer: TransferRef::download(Endpoint::Stream {}, Endpoint::Stream {}),
-            outcome: Outcome::Succeeded {},
-        }));
-        drop(registered);
+        let lc = TransferLifecycle::new(
+            registered,
+            tid(7, Some(1)),
+            TransferRef::download(Endpoint::Stream {}, Endpoint::Stream {}),
+            None,
+        );
+        lc.announce();
+        lc.finish(Outcome::Succeeded {}).expect("owed").send();
 
         let mut settled = 0;
         while let Some(ev) = stream.recv().await {
@@ -1012,23 +1172,77 @@ mod tests {
     async fn merging_two_distinct_sinks_delivers_to_both() {
         let (a, mut sa) = channel(std::num::NonZeroUsize::new(8).expect("capacity > 0"));
         let (b, mut sb) = channel(std::num::NonZeroUsize::new(8).expect("capacity > 0"));
-        let merged = a.merge(b);
 
-        merged.emit(TransferEvent::Finished(Finished {
-            id: tid(9, None),
-            transfer: TransferRef::download(Endpoint::Stream {}, Endpoint::Stream {}),
-            outcome: Outcome::Succeeded {},
-        }));
-        drop(merged);
+        let lc = TransferLifecycle::new(
+            a.merge(b),
+            tid(9, None),
+            TransferRef::download(Endpoint::Stream {}, Endpoint::Stream {}),
+            None,
+        );
+        lc.announce();
+        lc.finish(Outcome::Succeeded {}).expect("owed").send();
 
-        let count = |s: &mut TransferEventStream| {
-            let mut n = 0;
-            while s.try_recv().is_ok() {
-                n += 1;
-            }
-            n
-        };
-        assert_eq!(1, count(&mut sa), "the first consumer receives");
-        assert_eq!(1, count(&mut sb), "the second consumer receives");
+        let both = vec![("Started", tid(9, None)), ("Finished", tid(9, None))];
+        assert_eq!(both, drain_ids(&mut sa), "the first consumer receives");
+        assert_eq!(both, drain_ids(&mut sb), "the second consumer receives");
+    }
+
+    // ref: awslabs/aws-s3-transfer-manager-rs#197
+    /// A stream with no room for a transfer does not keep that transfer off another stream of
+    /// the same merged sink.
+    ///
+    /// Capacity 2 on both streams, with `a`'s two slots held by transfer 1: transfer 2 has room
+    /// on `b` only. Reserving on every stream or on none would keep both of its events from
+    /// `b`.
+    #[test]
+    fn a_full_stream_does_not_keep_a_transfer_off_another() {
+        let (a, mut sa) = channel(NonZeroUsize::new(2).unwrap());
+        let (b, mut sb) = channel(NonZeroUsize::new(2).unwrap());
+        let _holder = announced(&a, 1);
+
+        let lc = announced(&a.merge(b), 2);
+        lc.finish(Outcome::Succeeded {}).expect("owed").send();
+
+        assert_eq!(
+            vec![("Started", tid(2, None)), ("Finished", tid(2, None))],
+            drain_ids(&mut sb),
+            "`b` had room for both events, so a full `a` must not keep the transfer off it"
+        );
+        assert_eq!(0, sb.dropped(), "nothing was lost on `b`");
+        assert_eq!(
+            vec![("Started", tid(1, None))],
+            drain_ids(&mut sa),
+            "`a` had no room for the second transfer"
+        );
+        assert_eq!(
+            2,
+            sa.dropped(),
+            "both of the second transfer's events are counted on `a`"
+        );
+    }
+
+    // ref: awslabs/aws-s3-transfer-manager-rs#197
+    /// A stream whose receiver is gone does not keep a transfer off another stream of the same
+    /// merged sink, and counts nothing.
+    #[test]
+    fn a_closed_stream_does_not_keep_a_transfer_off_another() {
+        let (a, sa) = channel(NonZeroUsize::new(2).unwrap());
+        let (b, mut sb) = channel(NonZeroUsize::new(2).unwrap());
+        drop(sa);
+
+        let lc = announced(&a.clone().merge(b), 1);
+        lc.finish(Outcome::Succeeded {}).expect("owed").send();
+
+        assert_eq!(
+            vec![("Started", tid(1, None)), ("Finished", tid(1, None))],
+            drain_ids(&mut sb),
+            "a gone receiver on `a` must not keep the transfer off `b`"
+        );
+        assert_eq!(0, sb.dropped(), "nothing was lost on `b`");
+        assert_eq!(
+            0,
+            a.outlets[0].dropped.load(Ordering::Relaxed),
+            "a gone receiver is not counted as lost events"
+        );
     }
 }

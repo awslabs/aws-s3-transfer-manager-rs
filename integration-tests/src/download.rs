@@ -447,6 +447,85 @@ async fn test_download_single_object_entry_points_all_report_events() {
     }
 }
 
+// ref: awslabs/aws-s3-transfer-manager-rs#197
+/// Two downloads share a capacity-2 sink, and nothing is received until both have finished.
+///
+/// `write_to_path` starts its transfer before returning, so the first download holds both
+/// slots before the second asks for any: its `Started` is queued and the slot for its
+/// `Finished` is held. The second finds no room, so neither of its events arrives and both are
+/// counted. The first's `Finished` still arrives, through the slot it held, although the
+/// channel was full when it finished.
+#[cfg(any(unix, windows))]
+#[tokio::test]
+async fn test_download_without_room_for_its_events_is_dropped_whole() {
+    use aws_sdk_s3_transfer_manager::events::TransferEvent;
+    use std::time::Duration;
+
+    let m = setup().await;
+    for key in ["first", "second"] {
+        m.server
+            .add_object("test-bucket", key, deterministic_data(1024), None)
+            .await
+            .expect("add object");
+    }
+    let (sink, mut stream) = aws_sdk_s3_transfer_manager::events::channel(
+        std::num::NonZeroUsize::new(2).expect("capacity > 0"),
+    );
+    let dir = tempfile::tempdir().unwrap();
+
+    let mut handles = Vec::new();
+    for (key, sink) in [("first", sink.clone()), ("second", sink)] {
+        let handle = m
+            .client
+            .download()
+            .bucket("test-bucket")
+            .key(key)
+            .events(sink)
+            .write_to_path(dir.path().join(key))
+            .await
+            .expect("write_to_path");
+        handles.push(handle);
+    }
+    // A transfer never waits for room, so both finish while the stream is unread.
+    for handle in handles {
+        handle.join().await.expect("join");
+    }
+
+    let mut events = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(event) = stream.recv().await {
+            let kind = match event {
+                TransferEvent::Started(_) => "Started",
+                TransferEvent::Finished(_) => "Finished",
+                _ => "unknown",
+            };
+            events.push(format!("{kind} {}", event.transfer().source()));
+        }
+    })
+    .await
+    .expect("the stream did not end, so a sink or a held slot outlived its transfer");
+
+    assert_eq!(
+        Some("Started s3://test-bucket/first"),
+        events.first().map(String::as_str),
+        "the first download had room for both of its events: {events:?}"
+    );
+    assert_eq!(
+        Some("Finished s3://test-bucket/first"),
+        events.get(1).map(String::as_str),
+        "the first download's `Finished` goes through the slot it held, so a full channel \
+         cannot drop it: {events:?}"
+    );
+    assert_eq!(
+        2,
+        events.len(),
+        "the second download had no room, so neither of its events arrives: {events:?}"
+    );
+    assert_eq!(2, stream.dropped(), "and both of its events are counted");
+
+    m.handle.shutdown().await.expect("shutdown");
+}
+
 /// A caller-provided file that cannot be written or finalized wakes joiners.
 #[cfg(any(unix, windows))]
 #[tokio::test]
