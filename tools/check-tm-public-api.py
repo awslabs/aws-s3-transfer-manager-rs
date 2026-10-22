@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Audit ordinary TM, experimental adoption, and TM extensions separately."""
+"""Audit TM, its unstable integrations, and the reusable runtime components."""
 
 import os
 from pathlib import Path
@@ -67,6 +67,9 @@ def main():
         "__unstable_ext",
     )
     check(ROOT / ADAPTER, "external-types.toml")
+    check(ROOT / "crates/aws-smithy-topology", "external-types.toml")
+    check(ROOT / "crates/aws-smithy-execution", "external-types.toml", "--all-features")
+    check(ROOT / "crates/aws-smithy-managed-http", "external-types.toml", "--all-features")
 
 
 if __name__ == "__main__":
