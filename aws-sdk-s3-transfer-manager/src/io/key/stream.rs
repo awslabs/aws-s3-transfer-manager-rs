@@ -2106,6 +2106,45 @@ mod tests {
     #[cfg(unix)]
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
+    async fn an_unfollowed_link_reports_no_size_or_time_where_a_socket_reports_both() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join("real")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("real"), dir.path().join("link")).unwrap();
+        let _socket = std::os::unix::net::UnixListener::bind(dir.path().join("sock")).unwrap();
+
+        let mut walk = FsWalker::builder()
+            .recursive(true)
+            .sort(SortOrder::WholeWalk)
+            .include_special_files(true)
+            .build()
+            .walk(FsWalkContext::builder().root(dir.path()).build());
+
+        let mut seen = Vec::new();
+        while let Some(next) = walk.next_entry().await {
+            seen.push(next.expect("no failure"));
+        }
+        let [link, sock] = seen.as_slice() else {
+            panic!("expected the link and the socket, got {seen:?}")
+        };
+
+        assert_eq!(link.key, "link");
+        assert_eq!(link.meta.size, None, "the link reported a size");
+        assert_eq!(
+            link.meta.last_modified_secs, None,
+            "the link reported a time"
+        );
+
+        assert_eq!(sock.key, "sock");
+        assert!(sock.meta.size.is_some(), "the socket reported no size");
+        assert!(
+            sock.meta.last_modified_secs.is_some(),
+            "the socket reported no time"
+        );
+    }
+
+    #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
     async fn a_broken_symlink_costs_the_keys_under_its_name() {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("a.txt"), "").unwrap();

@@ -4071,6 +4071,31 @@ async fn a_download_replaces_a_link_at_its_own_name_as_download_objects_does() {
 }
 
 #[cfg(unix)]
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn a_link_whose_lstat_matches_the_object_is_not_read_as_unchanged() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path().canonicalize().expect("canonical root");
+    // The link's `lstat` and the object both report five bytes. The object is newer.
+    std::os::unix::fs::symlink("datum", root.join("a.jpg")).expect("symlink");
+    let (client, gets) = a_bucket_recording_gets(&["a.jpg"], 4_000_000_000);
+
+    let (t, ctx, rx) = downloading_into(&root, client, DeleteMode::Off);
+    run_managed(&t, &ctx, rx).await;
+
+    assert_eq!(
+        *gets.lock(),
+        ["a.jpg"],
+        "the run read the link's own stat and left the key alone"
+    );
+    assert_eq!(
+        t.inner.state.lock().snapshot().decided.skipped.unchanged,
+        0,
+        "the link's stat matched the object, so the key was counted as unchanged"
+    );
+}
+
+#[cfg(unix)]
 async fn through_a_destination_link(delete_mode: DeleteMode) -> Vec<String> {
     let outside = tempfile::tempdir().expect("outside");
     let dir = tempfile::tempdir().expect("temp dir");

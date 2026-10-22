@@ -950,15 +950,9 @@ impl FsWalk {
                     if rejected {
                         self.push_excluded_link(&mut result.children, path);
                     } else if self.config.include_special_files {
-                        // The walk left the link unread, so the entry describes the link itself.
-                        // The metadata is the link's own, from `lstat`.
-                        self.push_entry(
-                            &mut result.children,
-                            path,
-                            entry.metadata().ok(),
-                            FileType::Symlink,
-                            false,
-                        );
+                        // `DirEntry::metadata` would describe the link itself, so this entry carries
+                        // no target metadata.
+                        self.push_entry(&mut result.children, path, None, FileType::Symlink, false);
                     }
                     continue;
                 }
