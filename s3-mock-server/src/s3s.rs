@@ -341,6 +341,11 @@ impl<S: StorageBackend + 'static> Inner<S> {
             }
             // Upload-only faults are no-ops on the GET path.
             Some(crate::faults::FaultType::StallRequestRead { .. }) => {}
+            Some(crate::faults::FaultType::WithholdResponseHeaders) => {
+                // Never return, so s3s never writes the status line or headers.
+                std::future::pending::<()>().await;
+                unreachable!("pending future never resolves");
+            }
             None => {}
         }
         Ok(())
@@ -609,6 +614,12 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
 
         let stored_meta = self.storage.put_object(request).await?;
 
+        // WithholdResponseHeaders: body is consumed and stored; never respond.
+        if let Some(crate::faults::FaultType::WithholdResponseHeaders) = fault {
+            std::future::pending::<()>().await;
+            unreachable!("pending future never resolves");
+        }
+
         // Validate client-provided checksums
         if let Err(msg) = stored_meta.object_integrity.validate(&client_checksums) {
             return Err(s3s::s3_error!(BadDigest, "{}", msg));
@@ -790,6 +801,12 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             content,
         };
         let response = self.storage.upload_part(request).await?;
+
+        // WithholdResponseHeaders: part is consumed and stored; never respond.
+        if let Some(crate::faults::FaultType::WithholdResponseHeaders) = fault {
+            std::future::pending::<()>().await;
+            unreachable!("pending future never resolves");
+        }
 
         // Build response with checksums
         let output = s3s::dto::UploadPartOutput {

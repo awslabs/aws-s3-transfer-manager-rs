@@ -565,4 +565,115 @@ mod retry_tests {
             "should have made 4 requests (including retry)"
         );
     }
+
+    /// Test that SDK retries an `InternalError` embedded in a CompleteMultipartUpload HTTP 200.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_complete_mpu_http_200_internal_error_retry() {
+        // Responses in order: CreateMPU, UploadPart, CompleteMPU (200 + error), CompleteMPU (retry)
+        let http_client = StaticReplayClient::new(vec![
+            // CreateMultipartUpload - success
+            ReplayEvent::new(
+                dummy_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::from(
+                        r#"<?xml version="1.0" encoding="UTF-8"?>
+                        <InitiateMultipartUploadResult>
+                            <Bucket>test-bucket</Bucket>
+                            <Key>test-key</Key>
+                            <UploadId>test-upload-id</UploadId>
+                        </InitiateMultipartUploadResult>"#,
+                    ))
+                    .unwrap(),
+            ),
+            // UploadPart - success
+            ReplayEvent::new(
+                dummy_request(),
+                http::Response::builder()
+                    .status(200)
+                    .header("ETag", "\"test-etag\"")
+                    .body(SdkBody::empty())
+                    .unwrap(),
+            ),
+            // CompleteMultipartUpload - HTTP 200 carrying an InternalError body
+            ReplayEvent::new(
+                dummy_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::from(
+                        r#"<?xml version="1.0" encoding="UTF-8"?>
+                        <Error>
+                            <Code>InternalError</Code>
+                            <Message>We encountered an internal error. Please try again.</Message>
+                            <RequestId>656c76696e6727732072657175657374</RequestId>
+                            <HostId>Uuag1LuByRx9e6j5Onimru9pO4ZVKnJ2Qz7/C1NPcfTWAtRPf==</HostId>
+                        </Error>"#,
+                    ))
+                    .unwrap(),
+            ),
+            // CompleteMultipartUpload - retry succeeds
+            ReplayEvent::new(
+                dummy_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::from(
+                        r#"<?xml version="1.0" encoding="UTF-8"?>
+                        <CompleteMultipartUploadResult>
+                            <Location>https://test-bucket.s3.amazonaws.com/test-key</Location>
+                            <Bucket>test-bucket</Bucket>
+                            <Key>test-key</Key>
+                            <ETag>"final-etag"</ETag>
+                        </CompleteMultipartUploadResult>"#,
+                    ))
+                    .unwrap(),
+            ),
+        ]);
+
+        let s3_client = aws_sdk_s3::Client::from_conf(
+            aws_sdk_s3::config::Config::builder()
+                .http_client(http_client.clone())
+                .region(Region::from_static("us-west-2"))
+                .retry_config(aws_config::retry::RetryConfig::standard().with_max_attempts(3))
+                .with_test_defaults()
+                .build(),
+        );
+
+        let tm_config = crate::Config::builder()
+            .concurrency(ConcurrencyMode::Explicit(1))
+            .set_multipart_threshold(PartSize::Target(10))
+            .set_target_part_size(PartSize::Target(5 * ByteUnit::Mebibyte.as_bytes_u64()))
+            .sdk_client(s3_client)
+            .build();
+
+        let tm = crate::Client::new(tm_config);
+
+        let body = Bytes::from_static(b"every adolescent dog goes bonkers early");
+        let stream = InputStream::from(body);
+
+        let handle = tm
+            .upload()
+            .bucket("test-bucket")
+            .key("test-key")
+            .body(stream)
+            .initiate()
+            .unwrap();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), handle.join())
+            .await
+            .expect("join timed out");
+        assert!(
+            result.is_ok(),
+            "upload should succeed after CompleteMultipartUpload retry: {:?}",
+            result.err()
+        );
+
+        // Verify all 4 requests were made (including the retry)
+        let requests: Vec<_> = http_client.actual_requests().collect();
+        assert_eq!(
+            4,
+            requests.len(),
+            "should have made 4 requests (including retry)"
+        );
+    }
 }
