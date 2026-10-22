@@ -467,6 +467,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-smithy-execution"
+version = "0.1.0"
+dependencies = [
+ "aws-smithy-topology",
+ "dial9",
+ "tokio",
+]
+
+[[package]]
 name = "aws-smithy-http"
 version = "0.64.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
