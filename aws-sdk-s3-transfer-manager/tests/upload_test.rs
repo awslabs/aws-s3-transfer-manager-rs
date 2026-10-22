@@ -46,29 +46,58 @@ const SEND_DATA_TIMEOUT_S: u64 = 10;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 pin_project! {
+    /// The TestStream that emits each `Bytes` as the next sequential part, numbering parts from 1.
+    /// Closing the sender ends the stream.
+    ///
+    /// - `size_hint` is returned verbatim from `size_hint()`: an exact or bounded hint drives the
+    ///   known-length path; the default (no upper bound) drives the unknown-length path.
+    /// - `full_object_checksum`, when set, is returned from `full_object_checksum()`.
+    /// - `observed_part_size` records the most recent `StreamContext::part_size()` seen in
+    ///   `poll_part`, so a test can read back the runtime-chosen part size.
     #[derive(Debug)]
     struct TestStream {
         next_part_num: u64,
         rx: mpsc::Receiver<Bytes>,
         size_hint: SizeHint,
+        full_object_checksum: Option<String>,
         observed_part_size: Arc<AtomicUsize>,
     }
 }
 
 impl TestStream {
+    /// Declares an exact size of `size` bytes, driving the known-length path.
     fn exact(rx: mpsc::Receiver<Bytes>, size: u64) -> Self {
         Self::with_size_hint(rx, SizeHint::exact(size))
     }
 
+    /// Reports `size_hint` as-is; all other constructors build on this one.
     fn with_size_hint(rx: mpsc::Receiver<Bytes>, size_hint: SizeHint) -> Self {
         Self {
             next_part_num: 1,
             rx,
             size_hint,
+            full_object_checksum: None,
             observed_part_size: Arc::new(AtomicUsize::new(0)),
         }
     }
 
+    /// Reports no upper bound, driving the unknown-length path.
+    fn unknown_length(rx: mpsc::Receiver<Bytes>) -> Self {
+        Self::with_size_hint(rx, SizeHint::default())
+    }
+
+    /// Unknown length that also reports `full_object_checksum` from `full_object_checksum()`.
+    fn unknown_length_with_checksum(
+        rx: mpsc::Receiver<Bytes>,
+        full_object_checksum: String,
+    ) -> Self {
+        Self {
+            full_object_checksum: Some(full_object_checksum),
+            ..Self::unknown_length(rx)
+        }
+    }
+
+    /// Returns the handle holding the latest `part_size()` recorded by `poll_part`.
     fn observed_part_size(&self) -> Arc<AtomicUsize> {
         Arc::clone(&self.observed_part_size)
     }
@@ -95,48 +124,9 @@ impl PartStream for TestStream {
     fn size_hint(&self) -> SizeHint {
         self.size_hint
     }
-}
 
-pin_project! {
-    /// A `PartStream` whose total size is not known up front: `size_hint` has no upper bound.
-    ///
-    /// Mirrors a caller like Mountpoint, which writes an object whose final size is only known once
-    /// the writer closes. Parts arrive over a channel; closing the sender is end-of-stream.
-    #[derive(Debug)]
-    struct UnknownLengthStream {
-        next_part_num: u64,
-        rx: mpsc::Receiver<Bytes>,
-    }
-}
-
-impl UnknownLengthStream {
-    fn new(rx: mpsc::Receiver<Bytes>) -> Self {
-        Self {
-            next_part_num: 1,
-            rx,
-        }
-    }
-}
-
-impl PartStream for UnknownLengthStream {
-    fn poll_part(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        _stream_cx: &StreamContext,
-    ) -> Poll<Option<std::io::Result<PartData>>> {
-        let this = self.project();
-        let data = ready!(this.rx.poll_recv(cx));
-        let part = data.map(|b| {
-            let part_num = *this.next_part_num;
-            *this.next_part_num += 1;
-            Ok(PartData::new(part_num, b))
-        });
-        Poll::Ready(part)
-    }
-
-    /// No upper bound — this is what routes the upload down the unknown-length path.
-    fn size_hint(&self) -> SizeHint {
-        SizeHint::default()
+    fn full_object_checksum(&self) -> Option<String> {
+        self.full_object_checksum.clone()
     }
 }
 
@@ -806,7 +796,9 @@ async fn test_unknown_length_multipart_upload() {
         .upload()
         .bucket("test-bucket")
         .key("test-key")
-        .body(InputStream::from_part_stream(UnknownLengthStream::new(rx)))
+        .body(InputStream::from_part_stream(TestStream::unknown_length(
+            rx,
+        )))
         .initiate()
         .unwrap();
 
@@ -831,9 +823,9 @@ async fn test_unknown_length_multipart_upload() {
 async fn test_unknown_length_empty_stream() {
     let (tx, rx) = mpsc::channel(1);
     drop(tx);
-    assert_single_empty_multipart_upload(InputStream::from_part_stream(UnknownLengthStream::new(
-        rx,
-    )))
+    assert_single_empty_multipart_upload(InputStream::from_part_stream(
+        TestStream::unknown_length(rx),
+    ))
     .await;
 }
 
@@ -884,7 +876,9 @@ async fn test_unknown_length_mpu_object_size_is_running_sum() {
         .upload()
         .bucket("test-bucket")
         .key("test-key")
-        .body(InputStream::from_part_stream(UnknownLengthStream::new(rx)))
+        .body(InputStream::from_part_stream(TestStream::unknown_length(
+            rx,
+        )))
         .initiate()
         .unwrap();
 
@@ -1142,7 +1136,9 @@ async fn test_unknown_length_with_data_never_sends_empty_part() {
         .upload()
         .bucket("test-bucket")
         .key("test-key")
-        .body(InputStream::from_part_stream(UnknownLengthStream::new(rx)))
+        .body(InputStream::from_part_stream(TestStream::unknown_length(
+            rx,
+        )))
         .initiate()
         .unwrap();
 
@@ -1170,56 +1166,6 @@ async fn test_unknown_length_with_data_never_sends_empty_part() {
     );
 }
 
-pin_project! {
-    /// An unknown-length `PartStream` that also supplies a full-object checksum.
-    ///
-    /// `full_object_checksum` is consulted once, after the final part, and only when the
-    /// upload uses a `FullObject` checksum strategy without a value set up front. Pairing
-    /// it with an unknown length is the combination the design flagged as needing
-    /// coverage: the size is not known when the strategy is chosen.
-    #[derive(Debug)]
-    struct UnknownLengthChecksumStream {
-        next_part_num: u64,
-        rx: mpsc::Receiver<Bytes>,
-        full_object_checksum: Option<String>,
-    }
-}
-
-impl UnknownLengthChecksumStream {
-    fn new(rx: mpsc::Receiver<Bytes>, full_object_checksum: Option<String>) -> Self {
-        Self {
-            next_part_num: 1,
-            rx,
-            full_object_checksum,
-        }
-    }
-}
-
-impl PartStream for UnknownLengthChecksumStream {
-    fn poll_part(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        _stream_cx: &StreamContext,
-    ) -> Poll<Option<std::io::Result<PartData>>> {
-        let this = self.project();
-        let data = ready!(this.rx.poll_recv(cx));
-        let part = data.map(|b| {
-            let part_num = *this.next_part_num;
-            *this.next_part_num += 1;
-            Ok(PartData::new(part_num, b))
-        });
-        Poll::Ready(part)
-    }
-
-    fn size_hint(&self) -> SizeHint {
-        SizeHint::default()
-    }
-
-    fn full_object_checksum(&self) -> Option<String> {
-        self.full_object_checksum.clone()
-    }
-}
-
 /// A full-object checksum supplied by the stream must reach CompleteMultipartUpload even
 /// though the length was never declared.
 ///
@@ -1236,7 +1182,7 @@ async fn test_unknown_length_forwards_full_object_checksum() {
     let tm = mock.tm();
 
     let (tx, rx) = mpsc::channel(1);
-    let stream = UnknownLengthChecksumStream::new(rx, Some(expected_checksum.to_owned()));
+    let stream = TestStream::unknown_length_with_checksum(rx, expected_checksum.to_owned());
     let handle = tm
         .upload()
         .bucket("test-bucket")
@@ -1281,7 +1227,9 @@ async fn test_unknown_length_reports_total_bytes_after_completion() {
         .upload()
         .bucket("test-bucket")
         .key("test-key")
-        .body(InputStream::from_part_stream(UnknownLengthStream::new(rx)))
+        .body(InputStream::from_part_stream(TestStream::unknown_length(
+            rx,
+        )))
         .initiate()
         .unwrap();
 
@@ -1385,7 +1333,9 @@ async fn test_unknown_length_many_parts_grows_part_list() {
         .upload()
         .bucket("test-bucket")
         .key("test-key")
-        .body(InputStream::from_part_stream(UnknownLengthStream::new(rx)))
+        .body(InputStream::from_part_stream(TestStream::unknown_length(
+            rx,
+        )))
         .initiate()
         .unwrap();
 
