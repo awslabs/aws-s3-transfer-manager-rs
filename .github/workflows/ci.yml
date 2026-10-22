@@ -490,6 +490,9 @@ jobs:
       - name: Check topology API
         run: cargo check-external-types --no-default-features --features '' --config external-types.toml
         working-directory: crates/aws-smithy-topology
+      - name: Check execution API
+        run: cargo check-external-types --all-features --config external-types.toml
+        working-directory: crates/aws-smithy-execution
 
   check-deny:
     name: check deps with cargo-deny
