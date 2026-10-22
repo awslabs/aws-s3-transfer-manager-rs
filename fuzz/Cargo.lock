@@ -192,6 +192,7 @@ dependencies = [
  "aws-smithy-dns",
  "aws-smithy-execution",
  "aws-smithy-http-client",
+ "aws-smithy-managed-http",
  "aws-smithy-runtime",
  "aws-smithy-runtime-api",
  "aws-smithy-types",
@@ -421,6 +422,17 @@ dependencies = [
  "aws-smithy-runtime-api",
  "aws-smithy-schema",
  "aws-smithy-types",
+]
+
+[[package]]
+name = "aws-smithy-managed-http"
+version = "0.1.0"
+dependencies = [
+ "aws-smithy-execution",
+ "aws-smithy-http-client",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "fastrand",
 ]
 
 [[package]]

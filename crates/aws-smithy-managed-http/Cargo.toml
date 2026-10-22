@@ -14,6 +14,9 @@ keywords = ["aws", "smithy", "http", "https"]
 [dependencies]
 aws-smithy-execution = { version = "0.1.0", path = "../aws-smithy-execution", optional = true }
 aws-smithy-http-client = { workspace = true, default-features = false, features = ["default-client", "rt-tokio"], optional = true }
+aws-smithy-runtime-api = { workspace = true, features = ["client"], optional = true }
+aws-smithy-types = { workspace = true, optional = true }
+fastrand = { version = "2.4", optional = true }
 
 [dev-dependencies]
 aws-smithy-async = { workspace = true, features = ["rt-tokio"] }
@@ -25,5 +28,11 @@ http-body-util = "0.1"
 tokio = { version = "1.53.1", default-features = false, features = ["rt", "net", "time", "sync", "macros"] }
 
 [features]
-client = ["dep:aws-smithy-execution", "dep:aws-smithy-http-client"]
+client = [
+    "dep:aws-smithy-execution",
+    "dep:aws-smithy-http-client",
+    "dep:aws-smithy-runtime-api",
+    "dep:aws-smithy-types",
+    "dep:fastrand",
+]
 dial9 = ["client", "aws-smithy-execution/dial9"]

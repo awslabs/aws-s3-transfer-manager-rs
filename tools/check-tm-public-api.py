@@ -30,7 +30,12 @@ def check_ordinary():
     # The adapter enables the experimental feature in workspace resolution.
     # An identical-source workspace without that member keeps the ordinary
     # allowlist strict; --no-default-features alone does not undo unification.
-    packages = [TM, "crates/aws-smithy-execution", "crates/aws-smithy-topology"]
+    packages = [
+        TM,
+        "crates/aws-smithy-managed-http",
+        "crates/aws-smithy-execution",
+        "crates/aws-smithy-topology",
+    ]
     with tempfile.TemporaryDirectory(prefix="tm-public-api-") as directory:
         snapshot = Path(directory)
         for package in packages:

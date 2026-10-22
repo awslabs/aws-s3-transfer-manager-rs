@@ -22,7 +22,7 @@ use aws_smithy_runtime_api::client::http::{
 use aws_smithy_runtime_api::client::orchestrator::HttpRequest;
 use aws_smithy_runtime_api::client::runtime_components::RuntimeComponentsBuilder;
 use aws_smithy_runtime_api::shared::IntoShared;
-use aws_smithy_types::body::SdkBody;
+use aws_smithy_types::{body::SdkBody, config_bag::ConfigBag};
 use http_body_util::BodyExt;
 use std::{
     error::Error,
@@ -199,7 +199,42 @@ impl ResolveDns for Resolver {
     }
 }
 
-fn exercise_http(runtime: &ManagedRuntime) {
+fn build_managed_pool(
+    transport: pool::Builder,
+    execution: ManagedRuntimeHandle,
+) -> ManagedHttpPool {
+    ManagedHttpPool::builder()
+        .pool_builder(transport)
+        .runtime(execution)
+        .build()
+        .unwrap()
+}
+
+fn build_manual_pool(transport: pool::Builder, execution: ManagedRuntimeHandle) -> ManagedHttpPool {
+    let partitions = execution.partitions().iter().map(|target| {
+        let id = pool::PartitionId::from_index(target.id().index());
+        let target = target.clone();
+        let partition = pool::Partition::new(
+            id,
+            pool::DriverSpawner::from_fn(move |task| {
+                let handle = target.spawn(task);
+                drop(handle);
+            }),
+        );
+        #[cfg(target_os = "linux")]
+        let partition = partition.interface("lo");
+        #[cfg(target_os = "macos")]
+        let partition = partition.interface("lo0");
+        partition
+    });
+    let native = transport.partitions(partitions).build_http().unwrap();
+    ManagedHttpPool::from_pool(execution, native).unwrap()
+}
+
+fn exercise_http(
+    runtime: &ManagedRuntime,
+    build: fn(pool::Builder, ManagedRuntimeHandle) -> ManagedHttpPool,
+) {
     let execution = runtime.handle();
     let awaiting = caller();
     let harnesses = awaiting.block_on(async {
@@ -243,11 +278,7 @@ fn exercise_http(runtime: &ManagedRuntime) {
                     .push(event.establishment().partition());
             }
         });
-    let http = ManagedHttpPool::builder()
-        .pool_builder(transport)
-        .runtime(execution.clone())
-        .build()
-        .unwrap();
+    let http = build(transport, execution.clone());
     let components = RuntimeComponentsBuilder::for_tests()
         .with_sleep_impl(Some(SharedAsyncSleep::new(TokioSleep::new())))
         .build()
@@ -323,8 +354,123 @@ fn exercise_http(runtime: &ManagedRuntime) {
 #[test]
 fn native_configuration_reuse_and_driver_placement_work_from_another_executor() {
     let runtime = runtime();
-    exercise_http(&runtime);
+    exercise_http(&runtime, build_managed_pool);
     caller().block_on(runtime.shutdown()).unwrap();
+}
+
+#[test]
+fn manual_pool_preserves_interface_configuration_reuse_and_driver_placement() {
+    let runtime = runtime();
+    exercise_http(&runtime, build_manual_pool);
+    caller().block_on(runtime.shutdown()).unwrap();
+}
+
+#[test]
+fn manual_pool_rejects_missing_execution_partitions() {
+    let runtime = runtime();
+    let execution = runtime.handle();
+    let native = pool::ConnectionPool::builder()
+        .partitions([pool::Partition::new(
+            pool::PartitionId::from_index(execution.partitions().len()),
+            pool::DriverSpawner::from_fn(drop),
+        )])
+        .build_http()
+        .unwrap();
+    let error = ManagedHttpPool::from_pool(execution.clone(), native).unwrap_err();
+    let missing = error
+        .source()
+        .unwrap()
+        .downcast_ref::<pool::ClientBuildError>()
+        .unwrap();
+    assert_eq!(missing.partition(), Some(pool::PartitionId::from_index(0)));
+    assert!(
+        error
+            .to_string()
+            .contains(&execution.partitions()[0].id().to_string())
+    );
+    caller().block_on(runtime.shutdown()).unwrap();
+}
+
+#[tokio::test]
+async fn local_foreign_and_outside_requests_retain_native_configuration_and_driver_placement() {
+    let owner = runtime();
+    let foreign = runtime();
+    let execution = owner.handle();
+    let observed_execution = execution.clone();
+    let opened = Arc::new(Mutex::new(Vec::new()));
+    let observed = opened.clone();
+    let http = {
+        let pool = ManagedHttpPool::builder()
+            .pool_builder(
+                pool::ConnectionPool::builder()
+                    .max_connections_per_host(3)
+                    .event_listener(move |event: &pool::ConnectionEvent<'_>| {
+                        if let pool::ConnectionEvent::Opened(event) = event {
+                            observed.lock().unwrap().push((
+                                event.establishment().partition(),
+                                observed_execution.current_partition().unwrap().id(),
+                            ));
+                        }
+                    }),
+            )
+            .runtime(execution.clone())
+            .build()
+            .unwrap();
+        pool.clone()
+        // Dropping this wrapper must preserve the native clients' shared pool.
+    };
+    assert!(http.connector_metadata().is_some());
+    http.validate_base_client_config(&RuntimeComponentsBuilder::for_tests(), &ConfigBag::base())
+        .unwrap();
+
+    let components = RuntimeComponentsBuilder::for_tests().build().unwrap();
+    let settings = HttpConnectorSettings::builder().build();
+    for index in 0..execution.partitions().len() + 2 {
+        // Fresh origins prevent connection reuse from masking client selection.
+        let harness = ConnectionTestHarness::builder()
+            .endpoint(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                EndpointPlan::repeat_n(1, Http1Script::responses([Http1Response::ok()])),
+            )
+            .build()
+            .await
+            .unwrap();
+        let mut request = HttpRequest::new(SdkBody::empty());
+        request
+            .set_uri(format!("http://127.0.0.1:{}/", harness.port()))
+            .unwrap();
+        let http = http.clone();
+        let settings = settings.clone();
+        let components = components.clone();
+        let send = async move {
+            tokio::time::timeout(
+                WAIT,
+                http.http_connector(&settings, &components).call(request),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+        };
+        let response = if let Some(partition) = execution.partitions().get(index) {
+            partition.spawn(send).await.unwrap()
+        } else if index == execution.partitions().len() {
+            foreign.handle().partitions()[0].spawn(send).await.unwrap()
+        } else {
+            send.await
+        };
+        assert_eq!(response.status().as_u16(), 200);
+        assert_eq!(harness.tcp_accepted_count(), 1);
+        let (native, driver) = opened.lock().unwrap()[index];
+        assert_eq!(driver.runtime_id(), execution.id());
+        assert_eq!(native, pool::PartitionId::from_index(driver.index()));
+        if index < execution.partitions().len() {
+            assert_eq!(driver, execution.partitions()[index].id());
+        }
+        drop(response);
+        harness.shutdown().await.unwrap();
+    }
+    owner.shutdown().await.unwrap();
+    foreign.shutdown().await.unwrap();
 }
 
 #[cfg(feature = "dial9")]
@@ -369,10 +515,12 @@ mod tracing {
             .dial9_handle(recorder.handle().clone())
             .build()
             .unwrap();
-        exercise_http(&runtime);
+        exercise_http(&runtime, build_managed_pool);
+        exercise_http(&runtime, build_manual_pool);
         caller().block_on(runtime.shutdown()).unwrap();
         recorder.graceful_shutdown(WAIT);
-        let mut driver_polls = 0;
+        let mut managed_polls = 0;
+        let mut manual_polls = 0;
         for bytes in captured.lock().unwrap().iter() {
             Decoder::new(bytes)
                 .unwrap()
@@ -380,12 +528,14 @@ mod tracing {
                     if event.name == "PollStartEvent" {
                         for (name, field) in event.field_names().zip(event.fields) {
                             if let ("spawn_loc", FieldValueRef::PooledString(id)) = (name, field)
-                                && event.string_pool.get(*id).is_some_and(|location| {
-                                    location.contains("aws-smithy-managed-http")
-                                        && location.contains("builder.rs")
-                                })
+                                && let Some(location) = event.string_pool.get(*id)
+                                && location.contains("aws-smithy-managed-http")
                             {
-                                driver_polls += 1;
+                                if location.contains("builder.rs") {
+                                    managed_polls += 1;
+                                } else if location.contains("smoke.rs") {
+                                    manual_polls += 1;
+                                }
                             }
                         }
                     }
@@ -393,8 +543,12 @@ mod tracing {
                 .unwrap();
         }
         assert!(
-            driver_polls > 0,
-            "HTTP connection tasks were not wrapped by partition.spawn"
+            managed_polls > 0,
+            "generated partition tasks were not wrapped by partition.spawn"
+        );
+        assert!(
+            manual_polls > 0,
+            "manual partition tasks were not wrapped by partition.spawn"
         );
     }
 }

@@ -5,12 +5,11 @@
 
 //! Transfer execution on owned managed partitions.
 
-mod http;
-
 use aws_smithy_execution::{ManagedRuntime, ManagedRuntimeHandle, RuntimePartition};
-use aws_smithy_http_client::pool::{self, ConnectionPool, DriverSpawner, Partition, PartitionId};
+use aws_smithy_http_client::pool::{ConnectionPool, DriverSpawner, Partition, PartitionId};
 use aws_smithy_http_client::proxy::ProxyConfig;
 use aws_smithy_http_client::tls::{rustls_provider::CryptoMode, Provider};
+use aws_smithy_managed_http::client::ManagedHttpPool;
 use aws_smithy_runtime_api::{
     box_error::BoxError,
     client::{
@@ -25,7 +24,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-use self::http::ManagedHttpClient;
 use super::{ExecutionRuntime, RuntimeComponents, RuntimeHttpOptions, ScheduledWork};
 use crate::runtime::sync::SubmissionGuard;
 use crate::scheduler::Scheduler;
@@ -112,14 +110,7 @@ fn build_http_client(
         .partitions(partitions)
         .tls_provider(Provider::Rustls(CryptoMode::AwsLc))
         .build_https()?;
-    let clients = execution
-        .partitions()
-        .iter()
-        .map(|target| {
-            pool::Client::from_partition(&pool, PartitionId::from_index(target.id().index()))
-        })
-        .collect::<Result<Arc<[_]>, _>>()?;
-    Ok(ManagedHttpClient::new(execution, clients).into_shared())
+    Ok(ManagedHttpPool::from_pool(execution, pool)?.into_shared())
 }
 
 /// Bind `partition` to the interface assigned to its execution index.
@@ -164,8 +155,8 @@ fn bind_interface(partition: Partition, _index: usize, _interfaces: &[String]) -
 /// assigned to threads round-robin in configuration order. `None` when no
 /// interfaces are configured, leaving selection to OS routing.
 ///
-/// Threads are not pinned to NUMA nodes, so assignment cannot follow NIC
-/// locality; round-robin spreads threads evenly across interfaces.
+/// Assignment does not derive NIC locality from execution topology; round-robin
+/// spreads threads evenly across interfaces.
 #[cfg(any(
     target_os = "android",
     target_os = "fuchsia",

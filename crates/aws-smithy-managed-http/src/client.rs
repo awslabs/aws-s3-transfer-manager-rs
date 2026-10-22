@@ -5,16 +5,22 @@
 
 //! HTTP clients bound to managed execution partitions.
 //!
-//! [`crate::client::ManagedHttpPool`] combines a native connection-pool builder with an
-//! [`aws_smithy_execution::ManagedRuntimeHandle`]. Transport configuration stays on
-//! the native builder. Each lookup returns an existing [`crate::client::Client`] bound to the
-//! explicitly chosen execution partition.
+//! [`crate::client::ManagedHttpPool`] combines native connection-pool configuration with an
+//! [`aws_smithy_execution::ManagedRuntimeHandle`]. Transport settings stay on
+//! the native builder. [`crate::client::ManagedHttpPool::from_pool`] accepts a prebuilt native
+//! pool, preserving its partition configuration. Manually configured native
+//! spawners must submit work to the corresponding execution partitions.
 //!
-//! Clients implement Smithy's `HttpClient` and support its `IntoShared`
-//! conversion. The caller may poll SDK operations on another runtime; connection
-//! establishment and connection-owned tasks use the selected managed partition.
-//! The native pool's reuse scope still determines whether peer connections may
-//! serve a request.
+//! The pool implements Smithy's `HttpClient` and supports its `IntoShared`
+//! conversion. It selects the current partition when the caller is executing
+//! on this runtime, or a random partition for outside or foreign-runtime
+//! callers. [`crate::client::ManagedHttpPool::client_for_partition`] returns an existing
+//! [`crate::client::Client`] for explicit targeting.
+//!
+//! The caller may poll SDK operations on another runtime. Connection
+//! establishment and connection-owned tasks use the native partition's spawner.
+//! The native pool's reuse scope may borrow another partition's connection, so
+//! client selection does not guarantee request-body polling locality.
 //!
 //! Retain the runtime owner while using these clients. Pool construction and
 //! client clones retain execution capabilities, not ownership of runtime
@@ -42,8 +48,8 @@
 //!     .runtime(execution.clone())
 //!     .build()?;
 //! let client = http.client_for_partition(execution.partitions()[0].id())?;
-//! let shared: SharedHttpClient = client.into_shared();
-//! # let _ = shared;
+//! let shared: SharedHttpClient = http.into_shared();
+//! # let _ = (client, shared);
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 

@@ -10,18 +10,10 @@
 use aws_sdk_s3_transfer_manager as tm;
 use aws_sdk_s3_transfer_manager_ext as tm_ext;
 use aws_smithy_execution::{ManagedRuntime, ManagedRuntimeHandle, topology::Topology};
-use aws_smithy_http_client::test_util::wire::connection::{
-    ConnectionTestHarness, EndpointPlan, Http1Response, Http1Script,
-};
+use aws_smithy_http_client::test_util::wire::connection::{ConnectionTestHarness, EndpointPlan};
 use aws_smithy_managed_http::client::{ManagedHttpPool, pool};
-use aws_smithy_runtime_api::client::{
-    http::{HttpClient, HttpConnector, HttpConnectorSettings},
-    orchestrator::HttpRequest,
-    runtime_components::RuntimeComponentsBuilder,
-};
-use aws_smithy_types::{body::SdkBody, config_bag::ConfigBag};
+use aws_smithy_runtime_api::client::http::HttpClient;
 use std::{
-    error::Error,
     future,
     net::{IpAddr, Ipv4Addr},
     sync::{Arc, Mutex},
@@ -59,115 +51,6 @@ async fn assert_stopped(task: tokio::task::JoinHandle<()>) {
 }
 
 #[tokio::test]
-async fn mismatched_pool_is_rejected_before_client_construction() {
-    let owner = runtime();
-    let foreign = runtime();
-    let execution = owner.handle();
-    let pool = ManagedHttpPool::builder()
-        .pool_builder(pool::ConnectionPool::builder())
-        .runtime(execution.clone())
-        .build()
-        .unwrap();
-    // Indices are equal, but the containing runtimes are distinct.
-    assert_eq!(
-        execution.partitions()[0].id().index(),
-        foreign.handle().partitions()[0].id().index()
-    );
-    let error = tm_ext::http_client(foreign.handle(), &pool).unwrap_err();
-    assert!(error.to_string().contains(&execution.id().to_string()));
-    assert!(
-        error
-            .to_string()
-            .contains(&foreign.handle().id().to_string())
-    );
-    assert!(error.source().is_none());
-    owner.shutdown().await.unwrap();
-    foreign.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn local_foreign_and_outside_requests_retain_native_configuration_and_driver_placement() {
-    let owner = runtime();
-    let foreign = runtime();
-    let execution = owner.handle();
-    let observed_execution = execution.clone();
-    let opened = Arc::new(Mutex::new(Vec::new()));
-    let observed = opened.clone();
-    let http = {
-        let pool = ManagedHttpPool::builder()
-            .pool_builder(
-                pool::ConnectionPool::builder()
-                    .max_connections_per_host(3)
-                    .event_listener(move |event: &pool::ConnectionEvent<'_>| {
-                        if let pool::ConnectionEvent::Opened(event) = event {
-                            observed.lock().unwrap().push((
-                                event.establishment().partition(),
-                                observed_execution.current_partition().unwrap().id(),
-                            ));
-                        }
-                    }),
-            )
-            .runtime(execution.clone())
-            .build()
-            .unwrap();
-        tm_ext::http_client(execution.clone(), &pool).unwrap()
-        // Dropping this wrapper must preserve the native clients' shared pool.
-    };
-    assert!(http.connector_metadata().is_some());
-    http.validate_base_client_config(&RuntimeComponentsBuilder::for_tests(), &ConfigBag::base())
-        .unwrap();
-
-    let components = RuntimeComponentsBuilder::for_tests().build().unwrap();
-    let settings = HttpConnectorSettings::builder().build();
-    for index in 0..execution.partitions().len() + 2 {
-        // Fresh origins prevent connection reuse from masking client selection.
-        let harness = ConnectionTestHarness::builder()
-            .endpoint(
-                IpAddr::V4(Ipv4Addr::LOCALHOST),
-                EndpointPlan::repeat_n(1, Http1Script::responses([Http1Response::ok()])),
-            )
-            .build()
-            .await
-            .unwrap();
-        let mut request = HttpRequest::new(SdkBody::empty());
-        request
-            .set_uri(format!("http://127.0.0.1:{}/", harness.port()))
-            .unwrap();
-        let http = http.clone();
-        let settings = settings.clone();
-        let components = components.clone();
-        let send = async move {
-            tokio::time::timeout(
-                WAIT,
-                http.http_connector(&settings, &components).call(request),
-            )
-            .await
-            .unwrap()
-            .unwrap()
-        };
-        let response = if let Some(partition) = execution.partitions().get(index) {
-            partition.spawn(send).await.unwrap()
-        } else if index == execution.partitions().len() {
-            foreign.handle().partitions()[0].spawn(send).await.unwrap()
-        } else {
-            send.await
-        };
-        assert_eq!(response.status().as_u16(), 200);
-        assert_eq!(harness.tcp_accepted_count(), 1);
-        let (native, driver) = opened.lock().unwrap()[index];
-        assert_eq!(driver.runtime_id(), execution.id());
-        assert_eq!(native, pool::PartitionId::from_index(driver.index()));
-        if index < execution.partitions().len() {
-            assert_eq!(driver, execution.partitions()[index].id());
-        }
-        drop(response);
-        harness.shutdown().await.unwrap();
-    }
-    owner.shutdown().await.unwrap();
-    foreign.shutdown().await.unwrap();
-}
-
-#[tokio::test]
 async fn unused_managed_values_and_configs_own_shutdown_despite_retained_http() {
     for use_config in [false, true] {
         let owner = runtime();
@@ -178,7 +61,7 @@ async fn unused_managed_values_and_configs_own_shutdown_despite_retained_http() 
             .runtime(execution.clone())
             .build()
             .unwrap();
-        let http = tm_ext::http_client(execution.clone(), &pool).unwrap();
+        let http = pool.clone();
         let managed = tm_ext::managed(owner);
         if use_config {
             let sdk = aws_types::SdkConfig::builder()
@@ -260,7 +143,7 @@ async fn adopted_file_upload_uses_configured_native_pool_and_retains_runtime_unt
             .runtime(execution.clone())
             .build()
             .unwrap();
-        tm_ext::http_client(execution.clone(), &pool).unwrap()
+        pool.clone()
     };
     let sdk = aws_types::SdkConfig::builder()
         .http_client(http.clone())

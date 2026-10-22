@@ -6,18 +6,33 @@
 use super::{BuildError, Builder, PartitionError};
 use aws_smithy_execution::{ManagedRuntimeHandle, RuntimeId, RuntimePartitionId};
 use aws_smithy_http_client::pool;
+use aws_smithy_runtime_api::{
+    box_error::BoxError,
+    client::{
+        connector_metadata::ConnectorMetadata,
+        http::{HttpClient, HttpConnectorSettings, SharedHttpConnector},
+        runtime_components::{RuntimeComponents, RuntimeComponentsBuilder},
+    },
+};
+use aws_smithy_types::config_bag::ConfigBag;
+use std::sync::Arc;
 
 /// One native connection pool with clients bound to managed execution partitions.
 ///
-/// Each build creates a new pool and resolves each client once. Clients obtained
-/// from that pool share its connections and policy. The runtime owner remains
-/// with the caller.
+/// Construction resolves each native client once. Clones share those clients,
+/// connections, and transport policy. The runtime owner remains with the caller.
+///
+/// This pool implements Smithy's [`HttpClient`]. Connector selection uses the
+/// current execution partition when it belongs to this runtime, or a random
+/// partition for callers outside this runtime. Native connection reuse may
+/// borrow another partition's connection; client selection does not guarantee
+/// request-body polling on the selected partition.
 #[non_exhaustive]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ManagedHttpPool {
     runtime: ManagedRuntimeHandle,
     // Execution guarantees that each partition index equals its slice position.
-    clients: Box<[pool::Client]>,
+    clients: Arc<[pool::Client]>,
 }
 
 impl ManagedHttpPool {
@@ -53,7 +68,23 @@ impl ManagedHttpPool {
             .ok_or_else(|| PartitionError::new(id, self.runtime.id()))
     }
 
-    pub(super) fn from_pool(
+    /// Creates a managed HTTP view over an already configured native pool.
+    ///
+    /// Each execution partition must have a native partition with the same
+    /// index. Configure the native driver spawners to submit work to the
+    /// corresponding execution partitions. This constructor checks that the
+    /// expected native partition IDs exist; it cannot inspect the runtimes
+    /// behind opaque driver spawners.
+    ///
+    /// Native transport settings and partition configuration, including
+    /// interface bindings, are preserved. Clients retain the native pool, while
+    /// the execution handle does not own runtime shutdown.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BuildError`] if a native client cannot be resolved for an
+    /// execution partition.
+    pub fn from_pool(
         runtime: ManagedRuntimeHandle,
         pool: pool::ConnectionPool,
     ) -> Result<Self, BuildError> {
@@ -67,8 +98,38 @@ impl ManagedHttpPool {
                 )
                 .map_err(|source| BuildError::client(partition.id(), source))
             })
-            .collect::<Result<Box<[_]>, _>>()?;
+            .collect::<Result<Arc<[_]>, _>>()?;
         // Native clients retain the shared pool; a second stored pool is unnecessary.
         Ok(Self { runtime, clients })
+    }
+}
+
+impl HttpClient for ManagedHttpPool {
+    fn validate_base_client_config(
+        &self,
+        runtime_components: &RuntimeComponentsBuilder,
+        cfg: &ConfigBag,
+    ) -> Result<(), BoxError> {
+        // Native connector preflight is cached per interface binding. Visiting
+        // each client covers every distinct binding before requests are sent.
+        self.clients
+            .iter()
+            .try_for_each(|client| client.validate_base_client_config(runtime_components, cfg))
+    }
+
+    fn http_connector(
+        &self,
+        settings: &HttpConnectorSettings,
+        components: &RuntimeComponents,
+    ) -> SharedHttpConnector {
+        let index = match self.runtime.current_partition() {
+            Some(partition) => partition.id().index(),
+            None => fastrand::usize(..self.clients.len()),
+        };
+        self.clients[index].http_connector(settings, components)
+    }
+
+    fn connector_metadata(&self) -> Option<ConnectorMetadata> {
+        self.clients.first()?.connector_metadata()
     }
 }

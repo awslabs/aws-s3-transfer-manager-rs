@@ -68,7 +68,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .pool_builder(pool::ConnectionPool::builder())
         .runtime(execution.clone())
         .build()?;
-    let _http = tm_ext::http_client(execution, &pool)?;
+    let _http = pool.clone();
     let _config = tm::RuntimeConfig::managed(tm_ext::managed(runtime));
     Ok(())
 }

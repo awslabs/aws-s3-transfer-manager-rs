@@ -14,6 +14,7 @@ keywords = ["AWS", "Amazon", "S3", "high-performance", "transfer-manager"]
 
 [dependencies]
 aws-smithy-execution = { workspace = true }
+aws-smithy-managed-http = { workspace = true, features = ["client"] }
 aws-config = { workspace = true, features = ["behavior-version-latest"] }
 aws-sdk-s3 = { workspace = true, features = ["behavior-version-latest"] }
 aws-smithy-runtime-api = { workspace = true }
@@ -46,7 +47,7 @@ smallvec = "1"
 [features]
 # Version-coupled adoption hook used by the unstable extension crate.
 __unstable_ext = []
-dial9 = ["dep:dial9", "aws-smithy-execution/dial9"]
+dial9 = ["dep:dial9", "aws-smithy-execution/dial9", "aws-smithy-managed-http/dial9"]
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.189"

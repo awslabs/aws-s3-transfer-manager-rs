@@ -253,6 +253,7 @@ dependencies = [
  "aws-smithy-dns",
  "aws-smithy-execution",
  "aws-smithy-http-client",
+ "aws-smithy-managed-http",
  "aws-smithy-mocks",
  "aws-smithy-runtime",
  "aws-smithy-runtime-api",
@@ -307,10 +308,8 @@ dependencies = [
  "aws-smithy-http-client",
  "aws-smithy-managed-http",
  "aws-smithy-runtime-api",
- "aws-smithy-types",
  "aws-types",
  "crossbeam-skiplist",
- "fastrand",
  "tempfile",
  "tokio",
 ]
@@ -540,6 +539,7 @@ dependencies = [
  "aws-smithy-runtime-api",
  "aws-smithy-types",
  "dial9",
+ "fastrand",
  "http-body-util",
  "tokio",
 ]
