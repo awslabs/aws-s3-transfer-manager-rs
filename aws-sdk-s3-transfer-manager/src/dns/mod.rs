@@ -2,7 +2,11 @@
  * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
-use std::fmt::Formatter;
+
+/// Module for a caching resolver that implements the SRA specification for name resolution
+pub mod sra;
+
+use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 use aws_smithy_runtime_api::client::dns::{DnsFuture, ResolveDns, ResolveDnsError, SharedDnsResolver};
 use tokio::sync::mpsc;
@@ -74,6 +78,7 @@ pub struct CachingResolverConfig {
 }
 
 /// Builder type for caching resolver configuration instances
+#[derive(Debug)]
 pub struct CachingResolverConfigBuilder {
     config: CachingResolverConfig
 }
@@ -98,8 +103,8 @@ impl CachingResolverConfigBuilder {
 
     /// Configures the runtime that will execute our recurrent async processing task as well as
     /// name resolution lookups.  We may need to split into two if we want to use anything other
-    /// than tokio.  The recurrent async processing task requires tokio (mpsc, one-shot, select),
-    /// while the name resolution lookups could use any kind of runtime.
+    /// than tokio.  The recurrent async processing task requires tokio (mpsc, one-shot, select!),
+    /// while the name resolution lookups could use any kind of future-handling runtime.
     pub fn with_runtime(&mut self, runtime: tokio::runtime::Handle) -> &Self {
         self.config.runtime = Some(runtime);
         self
@@ -111,48 +116,134 @@ impl CachingResolverConfigBuilder {
     }
 }
 
-/// Models a name resolution request.  Eventually convert to a builder pattern for future expansion.
-/// Future possibilities could include TTL override, IPv4 vs IPv6 restrictions, etc...
-pub struct CachingResolveRequest {
-
-    /// the host name to perform a name resolution for
-    pub name: String,
-}
-
-/// Why doesn't this exist in smithy dns?
+// Why doesn't this exist in smithy dns?
+/// Fundamental name lookup result type
 pub type ResolveDnsResult = Result<Vec<IpAddr>, ResolveDnsError>;
 
-struct CachingResolveRequestInternal {
+/// Models a name resolution request.
+/// Future possibilities could include TTL override, IPv4 vs IPv6 restrictions, etc...
+/// This is the request type used in the public resolution API.
+#[derive(Debug, Clone)]
+pub struct CachingResolveRequest {
+    name: String,
+}
+
+impl CachingResolveRequest {
+
+    /// the host name to perform a name resolution for
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+/// Builder type for CachingResolveRequest instances
+#[derive(Debug)]
+pub struct CachingResolveRequestBuilder {
+    request: CachingResolveRequest
+}
+
+impl CachingResolveRequestBuilder {
+
+    /// Create a new builder instance
+    pub fn new(name : &str) -> Self {
+        CachingResolveRequestBuilder {
+            request: CachingResolveRequest {
+                name : name.to_string()
+            }
+        }
+    }
+
+    /// Create a new CachingResolveRequest instance
+    pub fn build(&self) -> CachingResolveRequest {
+        self.request.clone()
+    }
+}
+
+/// Internal resolve request type.  Needs to be public so that caching resolver variants can
+/// be implemented by others.
+pub struct CachingResolveRequestInternal {
+
     request: CachingResolveRequest,
 
-    /// this is how we complete the user-facing resolution request future
     result_target: tokio::sync::oneshot::Sender<ResolveDnsResult>
 }
 
+impl CachingResolveRequestInternal {
+
+    /// The name resolution request
+    pub fn request(&self) -> &CachingResolveRequest {
+        &self.request
+    }
+
+    /// Channel that completes the user-facing resolution request's future
+    pub fn result_target(&self) -> &tokio::sync::oneshot::Sender<ResolveDnsResult> {
+        &self.result_target
+    }
+}
+
+impl std::fmt::Debug for CachingResolveRequestInternal {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        self.request.fmt(f)
+    }
+}
+
 /// The result of a name resolution lookup attempt
+#[derive(Debug)]
 pub struct CachingResolveResult {
     name: String,
     result: ResolveDnsResult
+}
+
+impl CachingResolveResult {
+
+    /// Create a new CachingResolveResult instance
+    pub fn new(name: &str, result : ResolveDnsResult) -> Self {
+        CachingResolveResult {
+            name: name.to_string(),
+            result
+        }
+    }
+
+    /// What host name this is a resolve result for
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The result of looking up the host name
+    pub fn result(&self) -> &ResolveDnsResult {
+        &self.result
+    }
 }
 
 /// A connection-related event that could cause us to update our internal bookkeeping that
 /// helps distribute IPs across connections.
 ///
 /// IPReleased, connection(IP) failed, etc...
+#[derive(Debug)]
 pub struct CachingHostEvent {
     // TBD
 }
 
-/// The fundamental operation type that the caching resolver works with.  Operations are submitted
-/// via mpsc.
+/// The fundamental operation type that a caching resolver works with.
 #[non_exhaustive]
+#[derive(Debug)]
 pub enum CachingResolverOperation {
+
+    /// An operation that requests an IP address for a host name
     ResolveRequest(CachingResolveRequestInternal),
+
+    /// An operation holding the result of looking up IP addresses for a host name
     ResolveResult(CachingResolveResult),
+
+    /// An operation detailing an event that may cause the resolver to change how it
+    /// completes resolve requests for a host name
     HostEvent(CachingHostEvent)
 }
 
-struct CachingResolverProcess<T> {
+/// Configuration for the async recurrent task that handles all incoming CachingResolverOperation
+/// instances
+#[derive(Debug)]
+pub struct CachingResolverProcessConfig {
 
     /// resolver that will actually perform lookups.  Lookups are performed on the runtime
     /// associated with the caching resolver
@@ -165,22 +256,30 @@ struct CachingResolverProcess<T> {
     /// input queue receiver, all communication from the outside world (including resolution task
     /// results) comes through here
     receiver: mpsc::UnboundedReceiver<CachingResolverOperation>,
+}
 
+/// Represents the centralized, recurrent task that handles CachingResolverOperation instances
+struct CachingResolverProcess<T> {
+
+    /// (semi-)immutable configuration
+    config: CachingResolverProcessConfig,
+
+    /// the (mutable) bookkeeping state (cache) the caching resolver uses to make resolution decisions
     state: T,
 }
 
-//     operation_handler: Box<dyn Fn(&mut CachingResolverProcess<T>, CachingResolverOperation)>, // should probably return a result
-
 impl <T> CachingResolverProcess<T> where T : Default {
 
-    /// Instantiate a new caching resolver that follows the SRA specification
+    /// Instantiate a new caching resolver
     fn new(internal_resolver: SharedDnsResolver,
            sender: mpsc::UnboundedSender<CachingResolverOperation>,
            receiver: mpsc::UnboundedReceiver<CachingResolverOperation>) -> Self {
         CachingResolverProcess {
-            internal_resolver,
-            sender,
-            receiver,
+            config: CachingResolverProcessConfig {
+                internal_resolver,
+                sender,
+                receiver
+            },
             state: Default::default(),
         }
     }
@@ -192,15 +291,24 @@ impl <T> CachingResolverProcess<T> where T : Default {
     // getaddrinfo) could choke this task's ability to distribute IPs to requests for other names.
     // that aren't having a problem.  Name lookups can take very different amounts of time depending
     // on whether they hit a local system cache or must go out on the network.
-    async fn run(&mut self, operation_handler: Box<dyn Fn(&mut CachingResolverProcess<T>, CachingResolverOperation)>) {
+    //
+    // If we find we need to split them, then we'll need two runtimes.  This function must run on
+    // tokio (due to mpsc and select!), while the resolution lookups could run on anything that can
+    // handle futures.
+
+    /// Core recurrent loop that handles incoming operations
+    async fn run(&mut self, operation_handler: fn (&CachingResolverProcessConfig, &mut T, CachingResolverOperation) -> ()) {
+        let config = &mut self.config;
+        let state = &mut self.state;
+
         // runs until recv returns None implying all input queue Sender clones are gone
         loop {
             // eventually we may select on time too in order to support TTL expiration
             tokio::select! {
-                operation_result = self.receiver.recv() => {
+                operation_result = config.receiver.recv() => {
                     match operation_result {
                         Some(operation) => {
-                            (operation_handler)(&mut *self, operation);
+                            (operation_handler)(config, state, operation);
                         }
                         None => {
                             return;
@@ -212,71 +320,52 @@ impl <T> CachingResolverProcess<T> where T : Default {
     }
 }
 
-struct SraCachingResolverState {
+/// Public API for the caching resolver.  Intentionally distinct from ResolveDns.
+pub trait CachingResolver : Debug + Send + Sync {
 
+    /// Perform a resolution request.  Equivalent to ResolveDns::resolve_dns but with a different
+    /// API to allow for extensibility (additional flags, options, etc...)
+    fn resolve(&self, request: CachingResolveRequest) -> DnsFuture<'static>;
 }
 
-fn handle_operation_sra(sra_impl: &mut CachingResolverProcess<SraCachingResolverState>, operation: CachingResolverOperation) {
-    match operation {
-        CachingResolverOperation::ResolveRequest(request) => {
-            // someone's asking for name resolution
-            //
-            // for proof-of-concept, just submit the resolve request as a task on the runtime
-            // this means we bypass submitting the resolution result and instead just
-            // complete the future directly in the task, which isn't what we'll do in the
-            // real logic
-            let handle = tokio::runtime::Handle::current();
-            let internal_resolver = sra_impl.internal_resolver.clone();
-            let name = request.request.name;
-            let tx = request.result_target;
-            handle.spawn(
-                async move {
-                    let resolve_result = internal_resolver.resolve_dns(&name).await;
-                    tx.send(resolve_result);
-                }
-            );
-        }
-        CachingResolverOperation::ResolveResult(_) => {
-            // a resolve attempt completed
-        }
-        CachingResolverOperation::HostEvent(_) => {
-            // apply a host-related event to our internals
-        }
-    }
-}
-
+/// Internal caching resolver implementation type that serves as the entry point for
+/// resolution requests
+#[derive(Debug)]
 struct CachingResolverImpl {
     self_created_runtime: Option<tokio::runtime::Runtime>,
-    channel: mpsc::UnboundedSender<CachingResolverOperation>
+    operation_channel: mpsc::UnboundedSender<CachingResolverOperation>
 }
 
 impl CachingResolverImpl {
-    pub fn new<T>(config: CachingResolverConfig, operation_handler: Box<dyn Fn(&mut CachingResolverProcess<T>, CachingResolverOperation)>) -> Self where T : Default {
+
+    /// Combines configuration and an operation handler function to create a new caching resolver
+    /// instance.
+    fn new<T>(config: CachingResolverConfig, operation_handler: fn (&CachingResolverProcessConfig, &mut T, CachingResolverOperation) -> ()) -> Self where T : Default + Send + 'static {
         let (tx, rx) : (mpsc::UnboundedSender<CachingResolverOperation>, mpsc::UnboundedReceiver<CachingResolverOperation>) = mpsc::unbounded_channel();
 
         let mut caching_resolver = CachingResolverImpl {
             self_created_runtime : None,
-            channel: tx.clone()
+            operation_channel: tx.clone()
         };
 
         // Config resolver || basic getaddrinfo resolver
         let internal_resolver = config.internal_resolver.unwrap_or(SharedDnsResolver::new(aws_smithy_runtime::client::dns::TokioDnsResolver::new()));
-        let mut resolver_impl : CachingResolverImpl<T> = CachingResolverImpl::new<T>(internal_resolver, tx, rx, operation_handler);
+        let mut resolver_impl = CachingResolverProcess::<T>::new(internal_resolver, tx, rx);
 
         // Config runtime || create a new runtime
         if let Some(config_runtime) = config.runtime {
             config_runtime.spawn(async move {
-                resolver_impl.run().await;
+                resolver_impl.run(operation_handler).await;
             });
         } else {
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
-                .thread_name("sra-caching-resolver-fallback")
+                .thread_name("caching-resolver-fallback-rt")
                 .build()
                 .unwrap();
 
             runtime.spawn(async move {
-                resolver_impl.run().await;
+                resolver_impl.run(operation_handler).await;
             });
 
             // need to keep this alive, a handle is insufficient
@@ -287,22 +376,7 @@ impl CachingResolverImpl {
     }
 }
 
-pub(crate) trait CachingResolver : Send + Sync {
-    fn resolve(&self, request: CachingResolveRequest) -> DnsFuture<'static>;
-}
-
-#[derive(Clone)]
-pub struct CachingResolverHandle {
-    resolver: Arc<dyn CachingResolver>,
-}
-
-impl CachingResolver for CachingResolverHandle {
-    fn resolve(&self, request: CachingResolveRequest) -> DnsFuture<'static>{
-        self.resolver.resolve(request)
-    }
-}
-
-impl CachingResolver for SraCachingResolver {
+impl CachingResolver for CachingResolverImpl {
     fn resolve(&self, request: CachingResolveRequest) -> DnsFuture<'static> {
         let (tx, rx) = tokio::sync::oneshot::channel::<ResolveDnsResult>();
         let internal_request = CachingResolveRequestInternal {
@@ -310,7 +384,7 @@ impl CachingResolver for SraCachingResolver {
             result_target: tx
         };
 
-        let send_result = self.channel.send(CachingResolverOperation::ResolveRequest(internal_request));
+        let send_result = self.operation_channel.send(CachingResolverOperation::ResolveRequest(internal_request));
 
         DnsFuture::new(async move {
             if let Err(send_result_err) = send_result {
@@ -324,9 +398,33 @@ impl CachingResolver for SraCachingResolver {
     }
 }
 
+/// Clonable, sharable handle to a caching resolver.  This is the public-facing instance type for
+/// all caching resolver variants.  It implements both its internal trait (CachingResolver) and the
+/// public external smithy DNS trait (ResolveDns).
+#[derive(Clone)]
+pub struct CachingResolverHandle {
+    resolver: Arc<dyn CachingResolver>,
+}
+
+impl CachingResolverHandle {
+
+    /// Factory function for creating caching resolver instances
+    pub fn new<T>(config: CachingResolverConfig, operation_handler: fn (&CachingResolverProcessConfig, &mut T, CachingResolverOperation) -> ()) -> Self where T : Default + Send + 'static {
+        CachingResolverHandle {
+            resolver: Arc::new(CachingResolverImpl::new(config, operation_handler))
+        }
+    }
+}
+
+impl CachingResolver for CachingResolverHandle {
+    fn resolve(&self, request: CachingResolveRequest) -> DnsFuture<'static>{
+        self.resolver.resolve(request)
+    }
+}
+
 impl std::fmt::Debug for CachingResolverHandle {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        todo!()
+        self.resolver.fmt(f)
     }
 }
 
@@ -337,12 +435,6 @@ impl ResolveDns for CachingResolverHandle {
         };
 
         self.resolve(request)
-    }
-}
-
-pub fn new_sra_caching_resolver(config: CachingResolverConfig) -> CachingResolverHandle {
-    CachingResolverHandle {
-        resolver: Arc::new(SraCachingResolver::new(config))
     }
 }
 
