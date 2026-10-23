@@ -152,7 +152,7 @@ pub enum CachingResolverOperation {
     HostEvent(CachingHostEvent)
 }
 
-struct CachingResolverImpl<T> where T : Default {
+struct CachingResolverProcess<T> {
 
     /// resolver that will actually perform lookups.  Lookups are performed on the runtime
     /// associated with the caching resolver
@@ -166,59 +166,33 @@ struct CachingResolverImpl<T> where T : Default {
     /// results) comes through here
     receiver: mpsc::UnboundedReceiver<CachingResolverOperation>,
 
-    operation_handler: Box<dyn Fn(&mut CachingResolverImpl<T>, CachingResolverOperation)>, // should probably return a result
-
     state: T,
 }
 
-impl SraCachingResolverImpl {
+//     operation_handler: Box<dyn Fn(&mut CachingResolverProcess<T>, CachingResolverOperation)>, // should probably return a result
+
+impl <T> CachingResolverProcess<T> where T : Default {
 
     /// Instantiate a new caching resolver that follows the SRA specification
-    fn new(internal_resolver: SharedDnsResolver, sender: mpsc::UnboundedSender<CachingResolverOperation>, receiver: mpsc::UnboundedReceiver<CachingResolverOperation>) -> Self {
-        SraCachingResolverImpl {
+    fn new(internal_resolver: SharedDnsResolver,
+           sender: mpsc::UnboundedSender<CachingResolverOperation>,
+           receiver: mpsc::UnboundedReceiver<CachingResolverOperation>) -> Self {
+        CachingResolverProcess {
             internal_resolver,
             sender,
             receiver,
-            operation_handler,
             state: Default::default(),
         }
     }
 
-    fn handle_operation(&mut self, operation: CachingResolverOperation) {
-        match operation {
-            CachingResolverOperation::ResolveRequest(request) => {
-                // someone's asking for name resolution
-                //
-                // for proof-of-concept, just submit the resolve request as a task on the runtime
-                // this means we bypass submitting the resolution result and instead just
-                // complete the future directly in the task, which isn't what we'll do in the
-                // real logic
-                let handle = tokio::runtime::Handle::current();
-                let internal_resolver = self.internal_resolver.clone();
-                let name = request.request.name;
-                let tx = request.result_target;
-                handle.spawn(
-                    async move {
-                        let resolve_result = internal_resolver.resolve_dns(&name).await;
-                        tx.send(resolve_result);
-                    }
-                );
-            }
-            CachingResolverOperation::ResolveResult(_) => {
-                // a resolve attempt completed
-            }
-            CachingResolverOperation::HostEvent(_) => {
-                // apply a host-related event to our internals
-            }
-        }
-    }
+
 
     // is it a problem to run this function on the same runtime that the internal resolves are being
     // spawned on?  The worry is that long-running timeouts on blocking-style resolutions (like
     // getaddrinfo) could choke this task's ability to distribute IPs to requests for other names.
     // that aren't having a problem.  Name lookups can take very different amounts of time depending
     // on whether they hit a local system cache or must go out on the network.
-    async fn run(&mut self) {
+    async fn run(&mut self, operation_handler: Box<dyn Fn(&mut CachingResolverProcess<T>, CachingResolverOperation)>) {
         // runs until recv returns None implying all input queue Sender clones are gone
         loop {
             // eventually we may select on time too in order to support TTL expiration
@@ -226,7 +200,7 @@ impl SraCachingResolverImpl {
                 operation_result = self.receiver.recv() => {
                     match operation_result {
                         Some(operation) => {
-                            self.handle_operation(operation);
+                            (operation_handler)(&mut *self, operation);
                         }
                         None => {
                             return;
@@ -238,23 +212,56 @@ impl SraCachingResolverImpl {
     }
 }
 
-struct SraCachingResolver {
+struct SraCachingResolverState {
+
+}
+
+fn handle_operation_sra(sra_impl: &mut CachingResolverProcess<SraCachingResolverState>, operation: CachingResolverOperation) {
+    match operation {
+        CachingResolverOperation::ResolveRequest(request) => {
+            // someone's asking for name resolution
+            //
+            // for proof-of-concept, just submit the resolve request as a task on the runtime
+            // this means we bypass submitting the resolution result and instead just
+            // complete the future directly in the task, which isn't what we'll do in the
+            // real logic
+            let handle = tokio::runtime::Handle::current();
+            let internal_resolver = sra_impl.internal_resolver.clone();
+            let name = request.request.name;
+            let tx = request.result_target;
+            handle.spawn(
+                async move {
+                    let resolve_result = internal_resolver.resolve_dns(&name).await;
+                    tx.send(resolve_result);
+                }
+            );
+        }
+        CachingResolverOperation::ResolveResult(_) => {
+            // a resolve attempt completed
+        }
+        CachingResolverOperation::HostEvent(_) => {
+            // apply a host-related event to our internals
+        }
+    }
+}
+
+struct CachingResolverImpl {
     self_created_runtime: Option<tokio::runtime::Runtime>,
     channel: mpsc::UnboundedSender<CachingResolverOperation>
 }
 
-impl SraCachingResolver {
-    pub fn new(config: CachingResolverConfig) -> Self {
+impl CachingResolverImpl {
+    pub fn new<T>(config: CachingResolverConfig, operation_handler: Box<dyn Fn(&mut CachingResolverProcess<T>, CachingResolverOperation)>) -> Self where T : Default {
         let (tx, rx) : (mpsc::UnboundedSender<CachingResolverOperation>, mpsc::UnboundedReceiver<CachingResolverOperation>) = mpsc::unbounded_channel();
 
-        let mut caching_resolver = SraCachingResolver {
+        let mut caching_resolver = CachingResolverImpl {
             self_created_runtime : None,
             channel: tx.clone()
         };
 
         // Config resolver || basic getaddrinfo resolver
         let internal_resolver = config.internal_resolver.unwrap_or(SharedDnsResolver::new(aws_smithy_runtime::client::dns::TokioDnsResolver::new()));
-        let mut resolver_impl : SraCachingResolverImpl = SraCachingResolverImpl::new(internal_resolver, tx, rx);
+        let mut resolver_impl : CachingResolverImpl<T> = CachingResolverImpl::new<T>(internal_resolver, tx, rx, operation_handler);
 
         // Config runtime || create a new runtime
         if let Some(config_runtime) = config.runtime {
