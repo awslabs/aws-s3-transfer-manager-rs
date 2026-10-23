@@ -17,17 +17,12 @@ connections to a given name.  This resolver can be shared across a transfer mana
 threads, multiple SDK clients, etc...
 
 Shared state via explicit mutual exclusion is a nightmare, so we use a channel-based
-(agent-like) architecture.
+CSP architecture.
 
 The resolver can only be interacted with via a communication channel that can contain resolution
 requests, results, and more.  A lightweight recurrent async task loops on that channel's receiver
 processing incoming operations.  This creates a natural "serialization" of all resolution
-requests regardless of source, with an associated private shared state for bookkeeping.  The resolver
-uses one shot channels to "split" resolution request futures so that a completion handle can be
-passed through the channel and persisted in the shared state.  This also means that async resolution
-requests are dispatched and completed independently of whether anything actually awaits on the future
-returned by the public API (which I personally find to be a desirable feature, but others might
-disagree).
+requests regardless of source, with an associated private shared state for bookkeeping.
 
 A very basic async processing task might behave as follows:
 
@@ -35,7 +30,7 @@ On a resolution request:
    If we have good IPs for that name, resolve the request with the least-used good IP*
    If there are no good IPs for that name, and no resolution is pending, kick off a resolution on
       the resolver's runtime.  Either way, park the request until a resolution returns a result.
-   * - [More advanced] Even if there are good IPs, if the Min(# connections / IP) ratio is above X, spawn
+   * - [More advanced] Even if there are good IPs, if the (# connections / IP) ratio is above X, spawn
       a resolution task to try and find more IPs (but don't park the request) in an effort to drive
       down the ratio (assuming continued use).   This replaces the CRT's DNS "pinging" behavior which
       has been classified as potentially undesirable.
@@ -43,8 +38,8 @@ On a resolution request:
 On a resolution result:
    Process the list of IPs returned, adding new ones to the good IP set for that name and refreshing
      the TTL on existing ones.
-   For all parked requests on that name, complete the request with a good IP or the error if the
-     resolution failed.
+   For all parked requests on that name, complete the request with a good IP (by least-used priority)
+     or the error if the resolution failed.
 
 On a host event:
    (Host events are anything IP-related that might shape our IP distribution decision-making, so
@@ -56,14 +51,14 @@ On a host event:
 Other notes:
     IPs will have a (configurable) TTL.  IPs will be forgotten about if not seen by
       a resolution for that period of time.  Unfortunately, getaddrinfo based resolution does
-      not expose the TTL value in any way, so this will be somewhat artificial.
+      not expose the actual TTL value in any way, so this will be somewhat artificial.
     In addition to good IPs there will also be some sort of bad ip list which good IPs may get
       moved to if host events dictate (connection failures, etc...)
 
 The current proof-of-concept does not perform any of this shared processing.  It just sketches
 the communication channels and rough public API type contracts.  Instead, when a resolution request
-is received internally, a dedicated lookup is performed and the result applied to complete
-the public API future.
+is received internally, a dedicated lookup is performed as an async task and the result applied to
+complete the public API future.
 
 Eventually we should be able to genericize the async processing function and associated shared state
 so that we can create caching resolver variants that compose (and compare) different
@@ -71,17 +66,21 @@ behaviors.  This will allow us to explore if resolution policies are helping in 
 
  */
 
+/// All configuration options for a caching DNS resolver
 #[derive(Clone, Debug)]
 pub struct CachingResolverConfig {
     internal_resolver: Option<SharedDnsResolver>,
     runtime: Option<tokio::runtime::Handle>
 }
 
+/// Builder type for caching resolver configuration instances
 pub struct CachingResolverConfigBuilder {
     config: CachingResolverConfig
 }
 
 impl CachingResolverConfigBuilder {
+
+    /// Creates a new caching resolver configuration builder instance
     pub fn new() -> Self {
         Self {
             config: CachingResolverConfig {
@@ -91,44 +90,61 @@ impl CachingResolverConfigBuilder {
         }
     }
 
-    // this is what will perform our internal name resolution
+    /// Configures what will perform our internal name resolution when the situation requires
     pub fn with_internal_resolver(&mut self, resolver: SharedDnsResolver) -> &Self {
         self.config.internal_resolver = Some(resolver);
         self
     }
 
-    // this is what the async processsing task and all the internal name resolves will run on
+    /// Configures the runtime that will execute our recurrent async processing task as well as
+    /// name resolution lookups.  We may need to split into two if we want to use anything other
+    /// than tokio.  The recurrent async processing task requires tokio (mpsc, one-shot, select),
+    /// while the name resolution lookups could use any kind of runtime.
     pub fn with_runtime(&mut self, runtime: tokio::runtime::Handle) -> &Self {
         self.config.runtime = Some(runtime);
         self
     }
 
+    /// Creates a new configuration instance for caching resolvers
     pub fn build(&self) -> CachingResolverConfig {
         self.config.clone()
     }
 }
 
+/// Models a name resolution request.  Eventually convert to a builder pattern for future expansion.
+/// Future possibilities could include TTL override, IPv4 vs IPv6 restrictions, etc...
 pub struct CachingResolveRequest {
-    name: String,
+
+    /// the host name to perform a name resolution for
+    pub name: String,
 }
 
+/// Why doesn't this exist in smithy dns?
 pub type ResolveDnsResult = Result<Vec<IpAddr>, ResolveDnsError>;
 
 struct CachingResolveRequestInternal {
     request: CachingResolveRequest,
+
+    /// this is how we complete the user-facing resolution request future
     result_target: tokio::sync::oneshot::Sender<ResolveDnsResult>
 }
 
+/// The result of a name resolution lookup attempt
 pub struct CachingResolveResult {
     name: String,
     result: ResolveDnsResult
 }
 
-// IPReleased, connection(IP) failed, etc...
+/// A connection-related event that could cause us to update our internal bookkeeping that
+/// helps distribute IPs across connections.
+///
+/// IPReleased, connection(IP) failed, etc...
 pub struct CachingHostEvent {
     // TBD
 }
 
+/// The fundamental operation type that the caching resolver works with.  Operations are submitted
+/// via mpsc.
 #[non_exhaustive]
 pub enum CachingResolverOperation {
     ResolveRequest(CachingResolveRequestInternal),
@@ -136,26 +152,35 @@ pub enum CachingResolverOperation {
     HostEvent(CachingHostEvent)
 }
 
-struct SraCachingResolverImpl {
-    // resolver that will actually perform lookups.  Lookups are performed on the runtime
-    // associated with the caching resolver
+struct CachingResolverImpl<T> where T : Default {
+
+    /// resolver that will actually perform lookups.  Lookups are performed on the runtime
+    /// associated with the caching resolver
     internal_resolver: SharedDnsResolver,
 
-    // handle to our input queue sender; needed so that resolution tasks can submit their results
-    // as a CachingResolverOperation::ResolveResult
+    /// handle to our input queue sender; needed so that resolution tasks can submit their results
+    /// as a CachingResolverOperation::ResolveResult
     sender: mpsc::UnboundedSender<CachingResolverOperation>,
 
-    // input queue receiver, all communication from the outside world (including resolution task
-    // results) comes through here
-    receiver: mpsc::UnboundedReceiver<CachingResolverOperation>
+    /// input queue receiver, all communication from the outside world (including resolution task
+    /// results) comes through here
+    receiver: mpsc::UnboundedReceiver<CachingResolverOperation>,
+
+    operation_handler: Box<dyn Fn(&mut CachingResolverImpl<T>, CachingResolverOperation)>, // should probably return a result
+
+    state: T,
 }
 
 impl SraCachingResolverImpl {
+
+    /// Instantiate a new caching resolver that follows the SRA specification
     fn new(internal_resolver: SharedDnsResolver, sender: mpsc::UnboundedSender<CachingResolverOperation>, receiver: mpsc::UnboundedReceiver<CachingResolverOperation>) -> Self {
         SraCachingResolverImpl {
             internal_resolver,
             sender,
-            receiver
+            receiver,
+            operation_handler,
+            state: Default::default(),
         }
     }
 
@@ -196,6 +221,7 @@ impl SraCachingResolverImpl {
     async fn run(&mut self) {
         // runs until recv returns None implying all input queue Sender clones are gone
         loop {
+            // eventually we may select on time too in order to support TTL expiration
             tokio::select! {
                 operation_result = self.receiver.recv() => {
                     match operation_result {
