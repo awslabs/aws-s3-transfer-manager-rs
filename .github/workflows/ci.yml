@@ -200,8 +200,8 @@ jobs:
             # exhaust macOS socket buffers without increasing product coverage.
             nextest_args+=(--test-threads 1)
           fi
-          cargo nextest run --locked --workspace --features sdk-v1 --no-fail-fast "${nextest_args[@]}"
-          cargo test --locked --doc --workspace --features sdk-v1 --no-fail-fast
+          cargo nextest run --locked --workspace --all-features --no-fail-fast "${nextest_args[@]}"
+          cargo test --locked --doc --workspace --all-features --no-fail-fast
 
   e2e:
     name: E2E (${{ matrix.name }})
@@ -395,7 +395,7 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: "clippy --all"
-        run: cargo clippy --all --tests --no-deps
+        run: cargo clippy --locked --workspace --all-targets --all-features --no-deps
 
   docs:
     name: docs
@@ -410,7 +410,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: "doc --lib"
         run: |
-          cargo doc --lib --no-deps --document-private-items
+          cargo doc --locked --workspace --all-features --lib --no-deps --document-private-items
         env:
           RUSTFLAGS: -Dwarnings -Adeprecated
           RUSTDOCFLAGS: -Dwarnings --cfg docsrs
@@ -427,7 +427,7 @@ jobs:
           toolchain: ${{ env.rust_min }}
       - uses: Swatinem/rust-cache@v2
       - name: "check --workspace"
-        run: cargo check --workspace
+        run: cargo check --locked --workspace --all-features
         env:
           RUSTFLAGS: "" # remove -Dwarnings
 
@@ -487,6 +487,9 @@ jobs:
         # sdk-v1 enabled by the integration-tests package.
         run: cargo check-external-types --no-default-features --features '' --config external-types.toml
         working-directory: aws-sdk-s3-transfer-manager
+      - name: Check topology API
+        run: cargo check-external-types --no-default-features --features '' --config external-types.toml
+        working-directory: crates/aws-smithy-topology
 
   check-deny:
     name: check deps with cargo-deny

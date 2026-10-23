@@ -13,6 +13,13 @@ A client operation builds a transfer and enqueues it with the scheduler. The sch
 - **`io/`** (public): input streams, part reading, and the filesystem and S3 walkers.
 - **`retry.rs`, `metrics/`, `config/`, `error.rs`**: cross-cutting support.
 
+## Reusable components
+
+`crates/aws-smithy-topology/` provides CPU and NUMA discovery, placement targets,
+and explicit CPU binding independently of transfer scheduling. Discovery owns
+no threads and does not change affinity. Its crate documentation states the
+resource and platform contracts.
+
 ## Boundaries
 
 - `transfer.rs`, `scheduler/`, and `runtime/` do not depend on `operation/`. Operation-specific behavior reaches them only through the `Transfer` trait.
