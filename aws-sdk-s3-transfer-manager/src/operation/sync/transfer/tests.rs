@@ -294,11 +294,25 @@ fn downloading_into(
     TransferContext,
     crate::transfer::StateMachineTerminalReceiver,
 ) {
+    downloading_into_walking(local, client, delete_mode, Walker::builder().build())
+}
+
+fn downloading_into_walking(
+    local: &Path,
+    client: aws_sdk_s3::Client,
+    delete_mode: DeleteMode,
+    walker: Walker,
+) -> (
+    SyncTransfer<S3Walk, crate::operation::sync::walk::LocalDestination>,
+    TransferContext,
+    crate::transfer::StateMachineTerminalReceiver,
+) {
     downloading_into_with(
         local,
         client,
         delete_mode,
         Arc::new(DeleteFromLocalTree::new(local)),
+        walker,
     )
 }
 
@@ -307,6 +321,7 @@ fn downloading_into_with(
     client: aws_sdk_s3::Client,
     delete_mode: DeleteMode,
     deleter: Arc<dyn DeleteKeys>,
+    walker: Walker,
 ) -> (
     SyncTransfer<S3Walk, crate::operation::sync::walk::LocalDestination>,
     TransferContext,
@@ -315,8 +330,7 @@ fn downloading_into_with(
     let config = crate::Config::builder().client(client.clone()).build();
     let handle = crate::client::Handle::test_handle_managed(config);
     let (ctx, rx) = TransferContext::new(handle);
-    let walk = Walker::builder()
-        .build()
+    let walk = walker
         .downloading(
             LocalAndBucket::builder()
                 .local_root(local)
@@ -4096,6 +4110,191 @@ async fn a_link_whose_lstat_matches_the_object_is_not_read_as_unchanged() {
 }
 
 #[cfg(unix)]
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn a_delete_through_a_destination_link_does_not_remove_the_file_it_aliases() {
+    let when = 1_600_000_000i64;
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path().canonicalize().expect("canonical root");
+    std::fs::create_dir(root.join("real")).expect("real dir");
+    std::fs::write(root.join("real/x.txt"), b"hello").expect("x.txt");
+    // the object's time, so the paired key compares unchanged and nothing rewrites it
+    std::fs::File::options()
+        .write(true)
+        .open(root.join("real/x.txt"))
+        .expect("x.txt opens")
+        .set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(when as u64)),
+        )
+        .expect("the object's time applies");
+    std::os::unix::fs::symlink(root.join("real"), root.join("link")).expect("symlink");
+
+    let (t, ctx, rx) = downloading_into_walking(
+        &root,
+        a_bucket_to_download(&["real/x.txt"], when),
+        DeleteMode::On,
+        Walker::builder().follow_symlinks(true).build(),
+    );
+    run_managed(&t, &ctx, rx).await;
+
+    assert_eq!(
+        std::fs::read(root.join("real/x.txt")).unwrap_or_default(),
+        b"hello",
+        "the run removed the file it had decided to keep"
+    );
+}
+
+// A followed link makes two keys name one local file. Each row builds such a tree and names the
+// paths the run must leave resolving, and the paths it must still remove.
+#[cfg(unix)]
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn a_destination_alias_keeps_the_file_another_key_names() {
+    use std::os::unix::fs::symlink;
+    use std::path::PathBuf;
+
+    const WHEN: i64 = 1_600_000_000;
+
+    // Write the bucket's bytes at the object's time, so a paired key compares unchanged.
+    fn stamped(path: &Path) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("parent dir");
+        }
+        std::fs::write(path, b"hello").expect("file");
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("file opens")
+            .set_times(
+                std::fs::FileTimes::new().set_modified(
+                    std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(WHEN as u64),
+                ),
+            )
+            .expect("the object's time applies");
+    }
+
+    struct Tree {
+        root: PathBuf,
+        kept: Vec<PathBuf>,
+        removed: Vec<PathBuf>,
+    }
+
+    // Spell the root through a link, so walked paths and canonical paths differ.
+    fn spelled_root(scratch: &Path) -> PathBuf {
+        std::fs::create_dir_all(scratch.join("actual/dest")).expect("actual dest");
+        symlink(scratch.join("actual"), scratch.join("via")).expect("via");
+        scratch.join("via/dest")
+    }
+
+    fn kept(root: PathBuf, kept: &[&str]) -> Tree {
+        Tree {
+            kept: kept.iter().map(|k| root.join(k)).collect(),
+            removed: Vec::new(),
+            root,
+        }
+    }
+
+    type Case = (&'static str, &'static [&'static str], fn(&Path) -> Tree);
+    let cases: &[Case] = &[
+        // The target's keys pair before the walk reaches `zlink`, so only the read of the root can
+        // hold the target. The link names its target by canonical path, and the walk spells the
+        // root through `via`. Only the canonical root maps that target to a key.
+        (
+            "zlink -> real, bucket keeps zlink/x.txt",
+            &["zlink/x.txt"],
+            |s: &Path| {
+                let root = spelled_root(s);
+                stamped(&root.join("real/x.txt"));
+                symlink(s.join("actual/dest/real"), root.join("zlink")).expect("zlink");
+                kept(root, &["real/x.txt"])
+            },
+        ),
+        // The link's own name maps under the root as spelled. The walk reports the dangling link
+        // ahead of `link/x.txt`, in the same call that records `link`.
+        (
+            "link -> real beside a dangling link, bucket keeps real/x.txt",
+            &["real/x.txt"],
+            |s: &Path| {
+                let root = spelled_root(s);
+                stamped(&root.join("real/x.txt"));
+                symlink("real", root.join("link")).expect("link");
+                symlink("missing", root.join("broken")).expect("broken");
+                kept(root, &["real/x.txt"])
+            },
+        ),
+        (
+            "y.txt -> z.txt -> x.txt, bucket keeps y.txt",
+            &["y.txt"],
+            |s: &Path| {
+                let root = s.join("dest");
+                stamped(&root.join("x.txt"));
+                symlink("x.txt", root.join("z.txt")).expect("z.txt");
+                symlink("z.txt", root.join("y.txt")).expect("y.txt");
+                kept(root, &["y.txt"])
+            },
+        ),
+        // An outside target maps to no name, so a delete elsewhere in the tree still goes out.
+        (
+            "two links to one outside directory, bucket keeps l1/x.txt",
+            &["l1/x.txt"],
+            |s: &Path| {
+                stamped(&s.join("outside/d/x.txt"));
+                let root = s.join("dest");
+                stamped(&root.join("stale.txt"));
+                symlink(s.join("outside/d"), root.join("l1")).expect("l1");
+                symlink(s.join("outside/d"), root.join("l2")).expect("l2");
+                Tree {
+                    kept: vec![s.join("outside/d/x.txt")],
+                    removed: vec![root.join("stale.txt")],
+                    root,
+                }
+            },
+        ),
+        // A file link's own name stays deletable: removing it unlinks the link and keeps `x.txt`.
+        (
+            "y.txt -> x.txt, bucket keeps x.txt",
+            &["x.txt"],
+            |s: &Path| {
+                let root = s.join("dest");
+                stamped(&root.join("x.txt"));
+                symlink("x.txt", root.join("y.txt")).expect("y.txt");
+                Tree {
+                    kept: vec![root.join("x.txt")],
+                    removed: vec![root.join("y.txt")],
+                    root,
+                }
+            },
+        ),
+    ];
+
+    let mut failures = Vec::new();
+    for (name, bucket, build) in cases {
+        let scratch = tempfile::tempdir().expect("temp dir");
+        let base = scratch.path().canonicalize().expect("canonical scratch");
+        let tree = build(&base);
+        let (t, ctx, rx) = downloading_into_walking(
+            &tree.root,
+            a_bucket_to_download(bucket, WHEN),
+            DeleteMode::On,
+            Walker::builder().follow_symlinks(true).build(),
+        );
+        run_managed(&t, &ctx, rx).await;
+        for path in &tree.kept {
+            if std::fs::metadata(path).is_err() {
+                failures.push(format!("{name}: {} no longer resolves", path.display()));
+            }
+        }
+        for path in &tree.removed {
+            if std::fs::symlink_metadata(path).is_ok() {
+                failures.push(format!("{name}: {} was not removed", path.display()));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+#[cfg(unix)]
 async fn through_a_destination_link(delete_mode: DeleteMode) -> Vec<String> {
     let outside = tempfile::tempdir().expect("outside");
     let dir = tempfile::tempdir().expect("temp dir");
@@ -4204,7 +4403,13 @@ async fn downloads_behind_a_refused_removal_fail_without_writing() {
     std::fs::write(root.join("a"), b"old").expect("a file named a");
     let client = a_bucket_to_download(&["a/b", "a/c", "q.txt"], 1_600_000_000);
     let deleter = Arc::new(RecordDeletes::refusing_in_a_tree(1));
-    let (t, ctx, rx) = downloading_into_with(&root, client, DeleteMode::On, deleter);
+    let (t, ctx, rx) = downloading_into_with(
+        &root,
+        client,
+        DeleteMode::On,
+        deleter,
+        Walker::builder().build(),
+    );
 
     run_managed(&t, &ctx, rx).await;
 

@@ -203,7 +203,21 @@ that name alone. The plan reports that it did not account for those keys. With f
 transfers what the link points at and files it under the link's own name on every platform.
 
 So a link `current -> releases/v3/` transfers the files inside `releases/v3/` as `current/...`.
-*`[TM]` the transfer manager design sets `followSymbolicLinks` to `false` for a directory upload and names no symlink setting for a directory download. The CLI follows symlinks by default (`--follow-symlinks | --no-follow-symlinks`). Sync follows the transfer manager, so a caller who combines sync with the directory operations sees one behavior. `[ISSUE]` [#2550](https://github.com/aws/aws-cli/issues/2550) — on Windows, following symlinks uploads each linked file as a 0-byte object.*
+
+On a download whose local walk follows links, a followed link can make two keys name one local
+file. For example, `link/x.txt` and `real/x.txt` name one file when `link` points at `real`. Once
+the walk has met such a link, delete mode MUST keep a destination-only key in three cases:
+
+- Deleting the key would remove a file that another key names.
+- The key is a link that another key's path passes through.
+- The key sits under a followed link to a directory outside the destination.
+
+Sync MUST report each such key as `skipped-unknown`, with delete mode on or off. Sync MUST bound the
+names it holds for followed links (NFR-Mem-1). Past that bound, sync MUST keep every later
+destination-only key and report it the same way. A link the walk meets only after the merge has
+passed its target cannot protect that target. The plan MUST then report that it did not account for
+the target's keys.
+*`[TM]` the transfer manager design sets `followSymbolicLinks` to `false` for a directory upload and names no symlink setting for a directory download. The CLI follows symlinks by default (`--follow-symlinks | --no-follow-symlinks`). Sync follows the transfer manager, so a caller who combines sync with the directory operations sees one behavior. `[ISSUE]` [#2550](https://github.com/aws/aws-cli/issues/2550) — on Windows, following symlinks uploads each linked file as a 0-byte object. `[NEW]` — the three download cases are a strengthening. Without them, a delete through one key removes the file another key keeps. The next run downloads the file again, and the run after that deletes it again. FR-Exec-7 fails on that alternation. `[CLI]` `aws s3 sync --delete` meets the same case by default. `CommandArchitecture.run` hands `follow_symlinks` to both file generators, so the local listing follows links (`subcommands.py`), and the local delete is `os.remove` (`s3handler.py` → `LocalDeleteRequestSubmitter`). This comes from reading the code, without running the CLI.*
 
 **FR-Enum-5** When a local file's modification time falls outside the range this platform can represent,
 sync MUST warn and treat the file as though it were last modified at the UNIX epoch — midnight, 1 January
@@ -469,7 +483,8 @@ NOT quietly offer less than the operation it is built on.
 
 **FR-Exec-2 (delete mode)** When turned on, a key the destination has and the source does not MUST be
 removed from the destination — objects deleted from S3, files deleted from disk. Entries the filters
-excluded are left alone (FR-Filter-3).
+excluded are left alone (FR-Filter-3). On a download that follows links, delete mode also keeps the
+keys in FR-Enum-4's three download cases.
 *`[CLI]` `syncstrategy/delete.py` → `DeleteSync` (registered for `file_not_at_src`, sets `dest_file.operation_name = 'delete'`); `s3handler.py` → `DeleteRequestSubmitter` and `LocalDeleteRequestSubmitter`. `[DOC]` `--delete`, [Example 4](https://docs.aws.amazon.com/cli/latest/reference/s3/sync.html#examples).*
 
 **FR-Exec-3** Delete mode MUST NOT remove empty local directories; downloads MUST create missing local
@@ -678,7 +693,7 @@ Per-entry detail, including the outcome of each delete, reaches the caller as ev
 `skipped-unknown` MUST be distinguishable from `skipped-unchanged`. They look similar and mean opposite
 things: the first says sync could not see what was there and held a delete back, so the destination may
 still hold something that should be gone; the second says everything matched and there was nothing to
-do.
+do. `skipped-unknown` also covers a key in FR-Enum-4's three download cases.
 *`[CLI]` `results.py` → `ResultRecorder` (`files_transferred`, `files_failed`, `files_warned`, `bytes_transferred`, `bytes_failed_to_transfer`, `expected_files_transferred`, `expected_bytes_transferred`) and `CommandResultRecorder`.*
 
 **FR-Fail-5** The result MUST distinguish three overall outcomes: at least one failure; no failures but

@@ -33,6 +33,8 @@ struct ReadDirResult {
     children: Vec<Child>,
     // Non-fatal errors encountered reading individual entries.
     errors: Vec<WalkError>,
+    // The read records every link it followed to a directory or a regular file.
+    followed: Vec<FollowedLink>,
 }
 
 // How the walk is positioned. Which traversal a walk uses follows from its `SortOrder`: ordering
@@ -141,6 +143,14 @@ pub(crate) enum PathFiltered {
     // The walk yields an excluded entry for a link only. A consumer that reads absence from the
     // stream then learns that the link hides the keys under its name.
     Excluded,
+}
+
+// `FollowedLink` records a symlink the walk followed, by what the link points at. When the target
+// sits inside the root, each file the link reaches arrives under two paths.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum FollowedLink {
+    Directory(PathBuf),
+    File(PathBuf),
 }
 
 /// One thing a filesystem walk found.
@@ -416,6 +426,7 @@ impl FsWalker {
             cursor,
             pending_errors,
             done,
+            followed: Vec::new(),
         }
     }
 }
@@ -654,6 +665,10 @@ pub struct FsWalk {
     cursor: Cursor,
     pending_errors: VecDeque<WalkError>,
     done: bool,
+    // A `next` call records here every link it follows to a directory or a regular file, whether it
+    // returns an entry or an error. The call clears the record first, so a walk holds one call's
+    // links at most.
+    followed: Vec<FollowedLink>,
 }
 
 impl std::fmt::Debug for FsWalk {
@@ -675,6 +690,7 @@ impl FsWalk {
     ///   followed by more results as the walk continues.
     /// - `None` when the walk is complete.
     pub async fn next(&mut self) -> Option<Result<FsEntry, WalkError>> {
+        self.followed.clear();
         let mut read_a_directory = false;
         loop {
             if let Some(err) = self.pending_errors.pop_front() {
@@ -739,6 +755,7 @@ impl FsWalk {
             match self.read_dir(&dir.path, dir.depth, &dir.ancestor_handles) {
                 Ok(result) => {
                     self.pending_errors.extend(result.errors);
+                    self.followed.extend(result.followed);
                     match &mut self.cursor {
                         Cursor::Breadth {
                             pending_dirs,
@@ -827,6 +844,7 @@ impl FsWalk {
             },
             pending_errors: VecDeque::new(),
             done: false,
+            followed: Vec::new(),
         })
     }
 
@@ -873,6 +891,10 @@ impl FsWalk {
         }
     }
 
+    pub(crate) fn followed_links(&self) -> &[FollowedLink] {
+        &self.followed
+    }
+
     fn read_dir(
         &self,
         dir: &Path,
@@ -902,6 +924,7 @@ impl FsWalk {
         let mut result = ReadDirResult {
             children: Vec::new(),
             errors: Vec::new(),
+            followed: Vec::new(),
         };
 
         for entry in entries {
@@ -1005,6 +1028,7 @@ impl FsWalk {
                                 continue;
                             }
                             if depth < self.config.max_depth {
+                                result.followed.push(FollowedLink::Directory(path.clone()));
                                 result.children.push(Child::Dir(PendingDir {
                                     path,
                                     depth: depth + 1,
@@ -1029,6 +1053,7 @@ impl FsWalk {
                     if rejected {
                         continue;
                     }
+                    result.followed.push(FollowedLink::File(path.clone()));
                     self.push_entry(
                         &mut result.children,
                         path,
@@ -2337,6 +2362,62 @@ mod tests {
             errors.is_empty(),
             "non-cyclic duplicate should not produce errors"
         );
+    }
+
+    // A call records every link it follows to a directory or a file, across every directory it
+    // reads. A call that returns an error keeps its record. The walk records no cycle and no link the
+    // path filter excludes. The next call starts a new record.
+    #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn each_call_records_the_links_it_followed() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("root");
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(root.join("a/b")).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(root.join("a/b/x.txt"), "x").unwrap();
+        let link = |target: &Path, name: &str| {
+            std::os::unix::fs::symlink(target, root.join(name)).unwrap();
+        };
+        link(&outside, "l0");
+        link(&outside, "a/l1");
+        link(&outside, "a/b/l2");
+        link(&root.join("a/b/x.txt"), "y.txt");
+        link(&root.join("a/b/x.txt"), "z.txt");
+        link(&root, "self");
+
+        let mut walk = walker()
+            .recursive(true)
+            .sort(SortOrder::WholeWalk)
+            .follow_symlinks(true)
+            .path_filter(|p| p != Path::new("z.txt"))
+            .build()
+            .walk(ctx(&root));
+        let recorded = |walk: &FsWalk| {
+            let mut names: Vec<String> = walk
+                .followed_links()
+                .iter()
+                .map(|link| match link {
+                    FollowedLink::Directory(p) => {
+                        format!("{}/", norm(p.strip_prefix(&root).unwrap()))
+                    }
+                    FollowedLink::File(p) => norm(p.strip_prefix(&root).unwrap()),
+                })
+                .collect();
+            names.sort();
+            names
+        };
+
+        // The first call reads the root and returns the cycle that `self` makes.
+        let first = walk.next().await.unwrap();
+        assert_eq!(first.unwrap_err().kind(), WalkErrorKind::SymlinkCycle);
+        assert_eq!(recorded(&walk), ["l0/", "y.txt"]);
+
+        // The second call reads `a`, `a/b`, and the target of `a/b/l2` before it returns a file.
+        let second = walk.next().await.unwrap().unwrap();
+        assert_eq!(norm(second.relative_path()), "a/b/x.txt");
+        assert_eq!(recorded(&walk), ["a/b/l2/", "a/l1/"]);
     }
 
     #[cfg(unix)]

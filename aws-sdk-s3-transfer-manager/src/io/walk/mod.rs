@@ -11,7 +11,7 @@ mod fs;
 mod s3;
 
 pub use error::{WalkError, WalkErrorKind};
-pub(crate) use fs::PathFiltered;
+pub(crate) use fs::{FollowedLink, PathFiltered};
 pub use fs::{
     FsEntry, FsWalk, FsWalkContext, FsWalkContextBuilder, FsWalker, FsWalkerBuilder, SortOrder,
 };

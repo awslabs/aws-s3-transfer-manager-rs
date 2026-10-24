@@ -239,6 +239,21 @@ pub(crate) trait KeyStream {
     // "no key is there". Classifying the error instead would put a second opinion in the
     // consumer, and `WalkErrorKind` is `#[non_exhaustive]`, so the two could disagree.
     fn is_done(&self) -> bool;
+
+    // Each call returns the names followed links aliased since the last call. A delete under an
+    // aliased name can remove a file another key names.
+    fn take_aliased_names(&mut self) -> Vec<AliasedName> {
+        Vec::new()
+    }
+}
+
+// `AliasedName` records a key a followed link aliases, by whether the key names a directory or a
+// file. A consumer reading keys in order passes the two at different points: `link.txt` sorts after
+// the file `link` and before the directory's subtree `link/`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AliasedName {
+    Directory(String),
+    File(String),
 }
 
 // What a failure cost the side that hit it.
