@@ -2,42 +2,85 @@
  * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
-
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use crate::dns::{CachingResolverConfig, CachingResolverHandle, CachingResolverImpl, CachingResolverOperation, CachingResolverProcessConfig};
+use crate::dns::*;
 use aws_smithy_runtime_api::client::dns::{ResolveDns};
+
+struct HostEntry {
+    name: String,
+
+    pending_requests: VecDeque<CachingResolveRequestInternal>
+}
+
+impl HostEntry {
+    pub fn new(name: &str) -> HostEntry {
+        HostEntry {
+            name: name.to_string(),
+            pending_requests: VecDeque::new()
+        }
+    }
+}
 
 #[derive(Default)]
 struct SraCachingResolverState {
-    // eventually, name -> HostEntry which will hold healthy IPs, unhealthy IPs, pending requests,
-    // IP usage, etc...
+    hosts: HashMap<String, HostEntry>
+}
+
+fn find_or_create_host_entry<'a>(state: &'a mut SraCachingResolverState, name: &str) -> &'a mut HostEntry {
+    if !state.hosts.contains_key(name) {
+        state.hosts.insert(name.to_string(), HostEntry::new(name));
+    }
+
+    state.hosts.get_mut(name).unwrap()
+}
+
+fn handle_resolve_request(config: &CachingResolverProcessConfig, state: &mut SraCachingResolverState, request: CachingResolveRequestInternal) {
+    let name = request.request.name.to_string();
+    let host_entry = find_or_create_host_entry(state, &name);
+
+    let name = request.request.name.clone();
+    host_entry.pending_requests.push_back(request);
+
+    let handle = tokio::runtime::Handle::current();
+    let internal_resolver = config.internal_resolver.clone();
+    let operation_channel = config.sender.clone();
+    handle.spawn(
+        async move {
+            let result = internal_resolver.resolve_dns(&name).await;
+            let caching_result = CachingResolverOperation::ResolveResult(
+                CachingResolveResult {
+                    name,
+                    result
+                }
+            );
+            let _ = operation_channel.send(caching_result);
+        }
+    );
+}
+
+fn handle_resolve_result(config: &CachingResolverProcessConfig, state: &mut SraCachingResolverState, result: CachingResolveResult) {
+    if let Some(entry) = state.hosts.get_mut(&result.name) {
+        if let Some(pending_request) = entry.pending_requests.pop_front() {
+            let _ = pending_request.result_target.send(result.result);
+        }
+    }
+}
+
+fn handle_host_event(config: &CachingResolverProcessConfig, state: &mut SraCachingResolverState, event: CachingHostEvent) {
+
 }
 
 fn handle_operation_sra(config: &CachingResolverProcessConfig, state: &mut SraCachingResolverState, operation: CachingResolverOperation) {
     match operation {
         CachingResolverOperation::ResolveRequest(request) => {
-            // someone's asking for name resolution
-            //
-            // for proof-of-concept, just submit the resolve request as a task on the runtime.
-            // this means we bypass submitting the resolution result and instead just
-            // complete the future directly in the task, which isn't what we'll do in the
-            // real logic
-            let handle = tokio::runtime::Handle::current();
-            let internal_resolver = config.internal_resolver.clone();
-            let name = request.request.name;
-            let tx = request.result_target;
-            handle.spawn(
-                async move {
-                    let resolve_result = internal_resolver.resolve_dns(&name).await;
-                    let _ = tx.send(resolve_result);
-                }
-            );
+            handle_resolve_request(config, state, request);
         }
-        CachingResolverOperation::ResolveResult(_) => {
-            // a resolve attempt completed
+        CachingResolverOperation::ResolveResult(result) => {
+            handle_resolve_result(config, state, result);
         }
-        CachingResolverOperation::HostEvent(_) => {
-            // apply a host-related event to our internals
+        CachingResolverOperation::HostEvent(event) => {
+            handle_host_event(config, state, event)
         }
     }
 }
