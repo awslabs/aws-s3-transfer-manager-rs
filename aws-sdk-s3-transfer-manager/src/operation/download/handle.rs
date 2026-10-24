@@ -339,6 +339,21 @@ pub struct ManagedDownloadHandle {
     inner: DownloadHandleInner,
     temp_path: Option<std::path::PathBuf>,
     dest_path: Option<std::path::PathBuf>,
+    // Whether to stamp the finished file with the object modification time. The setter keeps the
+    // stamp off unless a caller asks for it.
+    stamp_modified_time: bool,
+}
+
+// Try to give a file the object's modification time. When the stamp fails, this function logs the
+// failure, and the download still succeeds.
+fn stamp_best_effort(path: &std::path::Path, at: aws_smithy_types::DateTime) {
+    if let Err(err) = crate::io::fs::set_modified_time(path, at) {
+        tracing::debug!(
+            path = %path.display(),
+            error = %err,
+            "could not give the file the object's time; it keeps the time it was written"
+        );
+    }
 }
 
 impl ManagedDownloadHandle {
@@ -351,7 +366,14 @@ impl ManagedDownloadHandle {
             inner,
             temp_path: Some(temp_path),
             dest_path: Some(dest_path),
+            stamp_modified_time: false,
         }
+    }
+
+    // Request the object modification time on the finished file.
+    pub(crate) fn stamp_modified_time(mut self) -> Self {
+        self.stamp_modified_time = true;
+        self
     }
 
     pub(crate) fn new_unmanaged(inner: DownloadHandleInner) -> Self {
@@ -359,6 +381,7 @@ impl ManagedDownloadHandle {
             inner,
             temp_path: None,
             dest_path: None,
+            stamp_modified_time: false,
         }
     }
 
@@ -386,8 +409,10 @@ impl ManagedDownloadHandle {
         let result = self.inner.join().await;
 
         match &result {
-            Ok(_) => {
-                if let Err(e) = self.finalize().await {
+            Ok(output) => {
+                // Use metadata from this response. A listing read earlier can be stale.
+                let modified = output.object_meta.last_modified;
+                if let Err(e) = self.finalize(modified).await {
                     self.cleanup().await;
                     return Err(error::from_kind(error::ErrorKind::IOError)(e));
                 }
@@ -432,8 +457,21 @@ impl ManagedDownloadHandle {
         self.inner.transfer.ctx().metrics()
     }
 
-    async fn finalize(&self) -> std::io::Result<()> {
+    async fn finalize(&self, modified: Option<aws_smithy_types::DateTime>) -> std::io::Result<()> {
         if let (Some(temp), Some(dest)) = (&self.temp_path, &self.dest_path) {
+            // Stamp the temporary file before the rename. The destination then appears with the
+            // object time.
+            if self.stamp_modified_time {
+                match modified {
+                    Some(at) => stamp_best_effort(temp, at),
+                    // The response has no object time. Keep the file write time and log the
+                    // condition.
+                    None => tracing::debug!(
+                        path = %temp.display(),
+                        "the object carried no modification time, so the file keeps its own"
+                    ),
+                }
+            }
             // TODO: consider optional fsync before rename for durability guarantees.
             // Without fsync, a crash between rename and OS writeback leaves a corrupt
             // file at the destination. CRT does not fsync. Fsync of 32 GiB adds ~8s.
@@ -467,6 +505,19 @@ impl Drop for ManagedDownloadHandle {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn setting_a_time_on_a_missing_file_fails_and_is_swallowed() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let missing = dir.path().join("not-there");
+        let at = aws_smithy_types::DateTime::from_secs(1_600_000_000);
+
+        assert!(
+            crate::io::fs::set_modified_time(&missing, at).is_err(),
+            "setting a time on a file that does not exist should fail"
+        );
+        super::stamp_best_effort(&missing, at);
+    }
+
     use super::{DownloadHandle, DownloadHandleInner, ManagedDownloadHandle};
     use crate::error::ErrorKind;
     use crate::operation::download::body::{new_recv_body, RecvBodyConsumer};

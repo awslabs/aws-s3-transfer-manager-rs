@@ -17,12 +17,41 @@ pub(crate) mod stream;
 // Both notions live here, and `strip_key_prefix` and `relative_key` are where they part.
 
 use std::borrow::Cow;
-use std::path::{MAIN_SEPARATOR, MAIN_SEPARATOR_STR};
+use std::path::{Component, Path, PathBuf, MAIN_SEPARATOR, MAIN_SEPARATOR_STR};
+
+use path_clean::PathClean;
 
 use crate::error;
 
-// Default S3 key delimiter.
+// S3 uses this delimiter when a caller sets none.
 pub(crate) const DEFAULT_DELIMITER: &str = "/";
+
+// `BucketRoot` names the place in a bucket that holds a sync run's keys. The run's keys are
+// relative to that place, so each request puts the root back on before it names an object. A
+// request that sent a relative key would reach for an object at the bucket's top level.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BucketRoot {
+    bucket: String,
+    root: String,
+}
+
+impl BucketRoot {
+    pub(crate) fn new(bucket: impl Into<String>, prefix: Option<&str>) -> Self {
+        Self {
+            bucket: bucket.into(),
+            root: stream::root_prefix(prefix).into_owned(),
+        }
+    }
+
+    pub(crate) fn bucket(&self) -> &str {
+        &self.bucket
+    }
+
+    // Return the object that a relative key names under this root.
+    pub(crate) fn object_key(&self, key: &str) -> String {
+        format!("{}{}", self.root, key)
+    }
+}
 
 // Derive the S3 object key for a file at `relative_filename` inside the walk root.
 //
@@ -119,9 +148,181 @@ pub(crate) fn replace_delim<'a>(
     }
 }
 
+// Turn an S3 key into a checked path below the destination root.
+//
+// TODO(sync): Path cleaning and filesystem case folding can map different keys to one local path. A
+// collision must follow the failure policy.
+pub(crate) fn local_key_path(
+    root_dir: &Path,
+    key: &str,
+    prefix: Option<&str>,
+    delimiter: Option<&str>,
+) -> Result<PathBuf, crate::error::Error> {
+    let stripped = strip_key_prefix(key, prefix, delimiter);
+    let relative_path = replace_delim(stripped, delimiter, std::path::MAIN_SEPARATOR_STR);
+
+    let local_path = root_dir.join(relative_path.as_ref()).clean();
+    validate_path(root_dir, &local_path, key)?;
+
+    Ok(local_path)
+}
+
+// Return the file a relative key names below `root`, or refuse the key. The path must stay below
+// the root, and it must still spell the key after path cleaning. Cleaning turns `a//b` and
+// `a/./b` into `a/b`, so either key would act on the file of the key `a/b`. A key ending in the
+// delimiter, such as `photos/2019/`, names a directory. Its path names the file of the key
+// `photos/2019`.
+//
+// Sync uses this function. `download_objects` keeps `local_key_path`.
+pub(crate) fn local_path_strict(root: &Path, key: &str) -> Result<PathBuf, error::Error> {
+    if key.ends_with(DEFAULT_DELIMITER) {
+        return Err(error::Error::new(
+            error::ErrorKind::InputInvalid,
+            format!("the key '{key}' names a place rather than a file"),
+        ));
+    }
+    let path = local_key_path(root, key, None, None)?;
+    let spelled = below_root(root, &path)
+        .and_then(Path::to_str)
+        .is_some_and(|rest| rest == key.replace(DEFAULT_DELIMITER, MAIN_SEPARATOR_STR));
+    if !spelled {
+        return Err(error::Error::new(
+            error::ErrorKind::InputInvalid,
+            format!("the key '{key}' names the file of a different key"),
+        ));
+    }
+    Ok(path)
+}
+
+// Return the part of `path` below `root`. The root itself and paths outside the root return `None`.
+//
+// `local_key_path` already cleans the derived path. Callers pass the root as written, so this
+// function cleans the root too.
+//
+// A normal first component admits the path. `.` and `..` components, roots, and drive prefixes stay
+// outside the root.
+pub(crate) fn below_root<'p>(root: &Path, path: &'p Path) -> Option<&'p Path> {
+    let root = root.clean();
+    let rest = if root == Path::new(".") {
+        path
+    } else {
+        path.strip_prefix(root).ok()?
+    };
+    matches!(rest.components().next(), Some(Component::Normal(_))).then_some(rest)
+}
+
+fn validate_path(root_dir: &Path, local_path: &Path, key: &str) -> Result<(), crate::error::Error> {
+    if below_root(root_dir, local_path).is_none() {
+        return Err(error::Error::new(
+            error::ErrorKind::InputInvalid,
+            format!(
+                "Unable to download key: '{key}', its relative path resolves \
+                 outside the target destination directory"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_root_written_the_long_way_round_still_holds_its_keys() {
+        for root in ["/tmp/./root", "/tmp/other/../root", "/tmp/root/"] {
+            assert_eq!(
+                local_key_path(Path::new(root), "a/b", None, None)
+                    .unwrap_or_else(|e| panic!("root {root:?} rejected a key inside it: {e}")),
+                Path::new("/tmp/root/a/b"),
+            );
+        }
+    }
+
+    #[test]
+    fn the_working_directory_holds_its_keys() {
+        for root in [".", "./", "./."] {
+            assert_eq!(
+                local_key_path(Path::new(root), "a.txt", None, None)
+                    .unwrap_or_else(|e| panic!("root {root:?} rejected a key inside it: {e}")),
+                Path::new("a.txt"),
+            );
+            assert_eq!(
+                local_key_path(Path::new(root), "nested/b.txt", None, None)
+                    .unwrap_or_else(|e| panic!("root {root:?} rejected a nested key: {e}")),
+                Path::new("nested/b.txt"),
+            );
+        }
+        assert!(local_key_path(Path::new("."), "../escape.txt", None, None).is_err());
+    }
+
+    #[test]
+    fn a_key_that_names_an_absolute_path_escapes_the_working_directory() {
+        for key in [
+            "/etc/passwd",
+            "/tmp/elsewhere.txt",
+            "//double/slash",
+            "/",
+            "/nested/under/root.txt",
+        ] {
+            let got = local_key_path(Path::new("."), key, None, None);
+            assert!(
+                got.is_err(),
+                "key {key:?} resolved to {:?}, outside the working directory",
+                got.ok(),
+            );
+        }
+    }
+
+    #[test]
+    fn a_key_that_names_an_absolute_path_escapes_a_named_root() {
+        for root in ["/tmp/root", "relative/root"] {
+            let got = local_key_path(Path::new(root), "/etc/passwd", None, None);
+            assert!(
+                got.is_err(),
+                "root {root:?} accepted an absolute key, resolving it to {:?}",
+                got.ok(),
+            );
+        }
+    }
+
+    #[test]
+    fn a_key_resolving_to_the_root_itself_has_no_local_path() {
+        let root = Path::new("/tmp/root");
+        for key in [".", "a/..", "./.", "a/b/../.."] {
+            assert!(
+                local_key_path(root, key, None, None).is_err(),
+                "key {key:?} resolved to the root itself and was accepted"
+            );
+        }
+        assert_eq!(
+            local_key_path(root, "a/../b", None, None).expect("inside the root"),
+            Path::new("/tmp/root/b")
+        );
+    }
+
     use super::*;
+
+    #[test]
+    fn a_bucket_root_puts_its_place_back_on_each_key() {
+        assert_eq!(BucketRoot::new("b", None).object_key("a.txt"), "a.txt");
+        assert_eq!(
+            BucketRoot::new("b", Some("data")).object_key("a.txt"),
+            "data/a.txt"
+        );
+        assert_eq!(
+            BucketRoot::new("b", Some("data/")).object_key("a.txt"),
+            "data/a.txt"
+        );
+        assert_eq!(BucketRoot::new("b", Some("data")).bucket(), "b");
+    }
+
+    #[test]
+    fn a_key_naming_a_place_still_derives_a_path() {
+        assert_eq!(
+            local_key_path(Path::new("/tmp/root"), "photos/2019/", None, None)
+                .expect("a key naming a place"),
+            Path::new("/tmp/root/photos/2019")
+        );
+    }
 
     #[test]
     fn test_strip_key_prefix() {
