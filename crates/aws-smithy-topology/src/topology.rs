@@ -352,6 +352,8 @@ mod tests {
         let error = fixture()
             .bind_current_thread(LogicalProcessorId(99))
             .unwrap_err();
+        assert_eq!(error.kind(), crate::BindErrorKind::UnknownProcessor);
+        assert_eq!(error.processor(), LogicalProcessorId(99));
         assert!(error.to_string().contains("cpu-99"));
         assert!(error.to_string().contains("not in this topology"));
     }

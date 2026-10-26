@@ -44,6 +44,25 @@ impl DetectError {
     }
 }
 
+/// Classifies a failure to bind a thread to a logical processor.
+///
+/// Native failures and verification failures may leave thread affinity changed.
+/// The classification does not indicate whether affinity was modified.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindErrorKind {
+    /// The processor does not belong to the topology's resource inventory.
+    UnknownProcessor,
+    /// The processor is not available to the calling thread at binding time.
+    UnavailableProcessor,
+    /// Native CPU binding is unsupported on this platform.
+    Unsupported,
+    /// A native affinity query or binding operation failed.
+    NativeFailure,
+    /// Verification did not establish the requested processor restriction.
+    NotBound,
+}
+
 /// Failure to bind the calling thread to an identified logical processor.
 ///
 /// An error after the native binding operation may leave the thread's affinity
@@ -53,22 +72,25 @@ impl DetectError {
 pub struct BindError {
     processor: LogicalProcessorId,
     kind: BindErrorKind,
-}
-
-#[derive(Debug)]
-enum BindErrorKind {
-    UnknownProcessor,
-    UnavailableProcessor,
-    Unsupported,
-    BindingPanic(String),
-    NotBound,
+    message: Option<String>,
 }
 
 impl BindError {
+    /// Returns the classification of this binding failure.
+    pub fn kind(&self) -> BindErrorKind {
+        self.kind
+    }
+
+    /// Returns the target processor for the failed binding operation.
+    pub fn processor(&self) -> LogicalProcessorId {
+        self.processor
+    }
+
     pub(crate) fn unknown_processor(processor: LogicalProcessorId) -> Self {
         Self {
             processor,
             kind: BindErrorKind::UnknownProcessor,
+            message: None,
         }
     }
 
@@ -76,6 +98,7 @@ impl BindError {
         Self {
             processor,
             kind: BindErrorKind::UnavailableProcessor,
+            message: None,
         }
     }
 
@@ -83,6 +106,7 @@ impl BindError {
         Self {
             processor,
             kind: BindErrorKind::Unsupported,
+            message: None,
         }
     }
 
@@ -92,7 +116,8 @@ impl BindError {
     ) -> Self {
         Self {
             processor,
-            kind: BindErrorKind::BindingPanic(panic_message(payload)),
+            kind: BindErrorKind::NativeFailure,
+            message: Some(panic_message(payload)),
         }
     }
 
@@ -100,6 +125,7 @@ impl BindError {
         Self {
             processor,
             kind: BindErrorKind::NotBound,
+            message: None,
         }
     }
 }
@@ -107,7 +133,7 @@ impl BindError {
 impl fmt::Display for BindError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "cannot bind current thread to {}: ", self.processor)?;
-        match &self.kind {
+        match self.kind {
             BindErrorKind::UnknownProcessor => f.write_str("processor is not in this topology"),
             BindErrorKind::UnavailableProcessor => {
                 f.write_str("processor is not currently available to this thread")
@@ -115,13 +141,15 @@ impl fmt::Display for BindError {
             BindErrorKind::Unsupported => {
                 f.write_str("CPU binding is unsupported on this platform")
             }
-            BindErrorKind::BindingPanic(message) => {
-                write!(f, "native CPU binding failed: {message}")
-            }
+            BindErrorKind::NativeFailure => f.write_str("native CPU binding failed"),
             BindErrorKind::NotBound => {
                 f.write_str("CPU binding did not establish the requested processor restriction")
             }
+        }?;
+        if let Some(message) = &self.message {
+            write!(f, ": {message}")?;
         }
+        Ok(())
     }
 }
 
@@ -161,6 +189,32 @@ impl std::error::Error for DetectError {
 mod tests {
     use super::*;
     use std::error::Error;
+
+    // ref: awslabs/aws-s3-transfer-manager-rs#216
+    #[test]
+    fn binding_errors_expose_classification_and_requested_processor() {
+        let target = LogicalProcessorId(42);
+        let errors = [
+            (
+                BindError::unknown_processor(target),
+                BindErrorKind::UnknownProcessor,
+            ),
+            (
+                BindError::unavailable_processor(target),
+                BindErrorKind::UnavailableProcessor,
+            ),
+            (BindError::unsupported(target), BindErrorKind::Unsupported),
+            (
+                BindError::binding_panic(target, Box::new("native affinity query failed")),
+                BindErrorKind::NativeFailure,
+            ),
+            (BindError::not_bound(target), BindErrorKind::NotBound),
+        ];
+        for (error, expected) in errors {
+            assert_eq!(error.kind(), expected);
+            assert_eq!(error.processor(), target);
+        }
+    }
 
     #[test]
     fn parallelism_error_preserves_its_source() {

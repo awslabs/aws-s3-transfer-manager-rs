@@ -81,7 +81,9 @@
 //! the reported restriction after binding. It does not widen existing thread
 //! restrictions or change the selected placements. Count-only topology supplies no
 //! processor IDs to bind; the portable discovery fallback never reports a
-//! successful no-op binding.
+//! successful no-op binding. [`BindError::kind`] classifies failures, and
+//! [`BindError::processor`] identifies the requested target. Classification does
+//! not guarantee that a failed binding left affinity unchanged.
 //!
 //! Bind a newly created worker so the calling thread keeps its own affinity:
 //!
@@ -113,7 +115,7 @@ mod platform;
 mod resource;
 mod topology;
 
-pub use error::{BindError, DetectError};
+pub use error::{BindError, BindErrorKind, DetectError};
 pub use placement::Placement;
 pub use resource::{LogicalProcessor, LogicalProcessorId, NumaNode, NumaNodeId};
 pub use topology::Topology;

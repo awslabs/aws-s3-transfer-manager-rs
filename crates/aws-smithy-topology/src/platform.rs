@@ -344,6 +344,8 @@ mod tests {
             .pin_current_thread_to();
 
         let error = bind_from(&hardware, excluded).unwrap_err();
+        assert_eq!(error.kind(), crate::BindErrorKind::UnavailableProcessor);
+        assert_eq!(error.processor(), excluded);
         assert!(error.to_string().contains(&excluded.to_string()));
         assert!(error.to_string().contains("not currently available"));
         let observed = from_hardware(&hardware);
@@ -356,6 +358,8 @@ mod tests {
         let hardware = fixture(4.0);
         let target = LogicalProcessorId(42);
         let error = verify_binding(&hardware, target).unwrap_err();
+        assert_eq!(error.kind(), crate::BindErrorKind::NotBound);
+        assert_eq!(error.processor(), target);
         assert!(error.to_string().contains("did not establish"));
         bind_from(&hardware, LogicalProcessorId(3)).unwrap();
         assert!(verify_binding(&hardware, target).is_err());
@@ -366,6 +370,8 @@ mod tests {
         let target = LogicalProcessorId(42);
         let error = binding_result(target, || panic!("affinity call failed")).unwrap_err();
         assert!(error.to_string().contains("cpu-42"));
+        assert_eq!(error.kind(), crate::BindErrorKind::NativeFailure);
+        assert_eq!(error.processor(), target);
         assert!(error.to_string().contains("affinity call failed"));
     }
 
@@ -382,6 +388,8 @@ mod tests {
     #[test]
     fn unsupported_platform_does_not_report_successful_binding() {
         let error = bind_current_thread(LogicalProcessorId(0)).unwrap_err();
+        assert_eq!(error.kind(), crate::BindErrorKind::Unsupported);
+        assert_eq!(error.processor(), LogicalProcessorId(0));
         assert!(error.to_string().contains("unsupported on this platform"));
     }
 }
