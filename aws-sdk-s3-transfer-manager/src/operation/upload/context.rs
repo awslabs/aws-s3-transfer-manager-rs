@@ -820,13 +820,11 @@ pub(crate) enum UploadState {
     /// abort reports `AlreadyCompleted`. So does a PutObject whose response
     /// arrived just before the abort could interrupt it.
     ///
-    /// C view: this is one more tag of the tagged union. Each field below is a
-    /// plain flag/field the work handlers write under the state lock, then they
-    /// wake the transfer so `poll_work` re-reads them.
+    /// Work handlers update the fields below under the state lock, then wake
+    /// the transfer so `poll_work` re-reads them.
     Aborting {
         /// Upload to abort. `None` while Create is still in flight, when no
         /// multipart upload exists (PutObject), or when Create never ran.
-        /// `Option<String>` is a nullable owned string.
         upload_id: Option<String>,
         /// CreateMultipartUpload is on the wire; wait for its upload ID.
         create_in_flight: bool,

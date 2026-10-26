@@ -173,9 +173,7 @@ impl UploadHandle {
         let failed_before_abort = self.transfer.ctx().is_failed();
         self.transfer.request_abort();
 
-        // Wait for the transfer's one terminal signal. C view: the receiver is a
-        // one-shot condition variable; awaiting it parks this task until the
-        // transfer calls `signal_terminal()`.
+        // Wait until the transfer calls `signal_terminal()`.
         if let Some(rx) = self.completion_rx.take() {
             let _ = rx.await;
         }

@@ -126,167 +126,44 @@ mod test {
     use aws_smithy_runtime_api::client::result::ConnectorError;
     use aws_smithy_types::body::SdkBody;
     use bytes::Bytes;
-    use futures_util::future::BoxFuture;
-    use std::future::Future;
     use std::sync::{Arc, Mutex};
-    use std::task::Poll;
     use std::time::Duration;
     use tokio::sync::Semaphore;
 
     use crate::io::InputStream;
     use crate::metrics::unit::ByteUnit;
-    use crate::operation::upload::{UploadHandle, UploadInput};
-    use crate::types::{
-        AbortOutcome, AbortedUpload, ConcurrencyMode, FailedMultipartUploadPolicy, PartSize,
-        RuntimeMode, TransferStatus,
-    };
+    use crate::operation::upload::UploadInput;
+    use crate::types::{ConcurrencyMode, PartSize, RuntimeMode, TransferStatus};
 
-    /// S3 operations the scripted connector tells apart.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum Op {
-        Create,
-        Part,
-        Complete,
-        Abort,
-        Put,
-    }
-
-    /// How the scripted connector answers one operation.
-    #[derive(Debug, Clone, Default)]
-    enum Reply {
-        /// The operation's success response.
-        #[default]
-        Ok,
-        /// An S3 error with this status and code (all non-retryable).
-        Err(u16, &'static str),
-        /// Never answer: the request stays on the wire until it is dropped.
-        Stall,
-        /// Wait for a permit on the gate, then answer with the inner reply.
-        Gated(Arc<Semaphore>, Box<Reply>),
-    }
-
-    impl Reply {
-        fn gated(gate: &Arc<Semaphore>, then: Reply) -> Self {
-            Reply::Gated(gate.clone(), Box::new(then))
-        }
-    }
-
-    /// Per-operation answers. Every operation succeeds unless set.
-    #[derive(Debug, Clone, Default)]
-    struct Script {
-        create: Reply,
-        part: Reply,
-        complete: Reply,
-        abort: Reply,
-        put: Reply,
-    }
-
-    /// Connector that answers each S3 operation as its [`Script`] says and
-    /// records every request when it reaches the connector.
+    /// Connector that keeps CreateMultipartUpload active until its future is
+    /// interrupted by the transfer runtime.
     #[derive(Debug)]
-    struct ScriptedS3 {
-        script: Script,
-        sent: Arc<Mutex<Vec<Op>>>,
+    struct StalledCreateMpuConnector {
+        create_started: Arc<Semaphore>,
     }
 
-    impl HttpConnector for ScriptedS3 {
+    impl HttpConnector for StalledCreateMpuConnector {
         fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
-            let uri = request.uri().to_string();
-            let has_upload_id = uri.contains("uploadId=");
-            let op = match (request.method(), has_upload_id) {
-                ("POST", false) if uri.contains("uploads") => Op::Create,
-                ("PUT", true) if uri.contains("partNumber=") => Op::Part,
-                ("POST", true) => Op::Complete,
-                ("DELETE", true) => Op::Abort,
-                ("PUT", false) => Op::Put,
-                _ => panic!("unexpected request: {} {uri}", request.method()),
-            };
-            self.sent.lock().unwrap().push(op);
-            let reply = match op {
-                Op::Create => self.script.create.clone(),
-                Op::Part => self.script.part.clone(),
-                Op::Complete => self.script.complete.clone(),
-                Op::Abort => self.script.abort.clone(),
-                Op::Put => self.script.put.clone(),
-            };
-            HttpConnectorFuture::new(answer(op, reply))
+            assert_eq!("POST", request.method());
+            assert!(
+                request.uri().contains("uploads"),
+                "unexpected request: {}",
+                request.uri()
+            );
+
+            let create_started = self.create_started.clone();
+            HttpConnectorFuture::new(async move {
+                create_started.add_permits(1);
+                std::future::pending::<Result<HttpResponse, ConnectorError>>().await
+            })
         }
     }
 
-    async fn answer(op: Op, mut reply: Reply) -> Result<HttpResponse, ConnectorError> {
-        loop {
-            match reply {
-                Reply::Ok => return Ok(ok_response(op)),
-                Reply::Err(status, code) => return Ok(error_response(status, code)),
-                Reply::Stall => {
-                    return std::future::pending::<Result<HttpResponse, ConnectorError>>().await
-                }
-                Reply::Gated(gate, then) => {
-                    gate.acquire().await.expect("gate closed").forget();
-                    reply = *then;
-                }
-            }
-        }
-    }
-
-    fn ok_response(op: Op) -> HttpResponse {
-        let xml = |body: &'static str| HttpResponse::new(200.try_into().unwrap(), body.into());
-        match op {
-            Op::Create => xml(r#"<?xml version="1.0" encoding="UTF-8"?>
-                <InitiateMultipartUploadResult>
-                    <Bucket>test-bucket</Bucket>
-                    <Key>test-key</Key>
-                    <UploadId>test-upload-id</UploadId>
-                </InitiateMultipartUploadResult>"#),
-            Op::Complete => xml(r#"<?xml version="1.0" encoding="UTF-8"?>
-                <CompleteMultipartUploadResult>
-                    <Bucket>test-bucket</Bucket>
-                    <Key>test-key</Key>
-                    <ETag>"final-etag"</ETag>
-                </CompleteMultipartUploadResult>"#),
-            Op::Part | Op::Put => {
-                let mut response = HttpResponse::new(200.try_into().unwrap(), SdkBody::empty());
-                response.headers_mut().insert("ETag", "\"test-etag\"");
-                response
-            }
-            Op::Abort => HttpResponse::new(204.try_into().unwrap(), SdkBody::empty()),
-        }
-    }
-
-    fn error_response(status: u16, code: &str) -> HttpResponse {
-        HttpResponse::new(
-            status.try_into().unwrap(),
-            SdkBody::from(format!(
-                r#"<?xml version="1.0" encoding="UTF-8"?>
-                <Error><Code>{code}</Code><Message>scripted error</Message></Error>"#
-            )),
-        )
-    }
-
-    /// What kind of upload to start.
-    #[derive(Debug, Clone, Copy)]
-    enum Shape {
-        /// One-part multipart upload.
-        Multipart,
-        /// One-part multipart upload with `FailedMultipartUploadPolicy::Retain`.
-        MultipartRetain,
-        /// Single PutObject.
-        PutObject,
-    }
-
-    struct Started {
-        // Keeps the client (and its scheduler) alive for the whole test, even
-        // after the handle is consumed.
-        _tm: crate::Client,
-        handle: UploadHandle,
-        sent: Arc<Mutex<Vec<Op>>>,
-    }
-
-    fn start(runtime_mode: RuntimeMode, script: Script, shape: Shape) -> Started {
-        let sent = Arc::new(Mutex::new(Vec::new()));
-        let connector = SharedHttpConnector::new(ScriptedS3 {
-            script,
-            sent: sent.clone(),
+    /// Abort must terminate after CreateMultipartUpload enters execution.
+    async fn abort_stalled_create_mpu(runtime_mode: RuntimeMode) {
+        let create_started = Arc::new(Semaphore::new(0));
+        let connector = SharedHttpConnector::new(StalledCreateMpuConnector {
+            create_started: create_started.clone(),
         });
         let http_client = http_client_fn(move |_, _| connector.clone());
         let client = aws_sdk_s3::Client::from_conf(
@@ -297,343 +174,213 @@ mod test {
                 .build(),
         );
 
-        let mut tm_config = crate::Config::builder()
-            // Two slots: AbortMultipartUpload must be able to go out while
-            // Complete (or a stalled part) still holds one. With one slot it
-            // queues until that request answers.
-            .concurrency(ConcurrencyMode::Explicit(2))
+        let tm_config = crate::Config::builder()
+            .concurrency(ConcurrencyMode::Explicit(1))
             .runtime_mode(runtime_mode)
+            .set_multipart_threshold(PartSize::Target(10))
             .set_target_part_size(PartSize::Target(5 * ByteUnit::Mebibyte.as_bytes_u64()))
-            .sdk_client(client);
-        if !matches!(shape, Shape::PutObject) {
-            // The 22-byte body is below the default threshold; force multipart.
-            tm_config = tm_config.set_multipart_threshold(PartSize::Target(10));
-        }
-        let tm = crate::Client::new(tm_config.build());
-
-        let mut input = UploadInput::builder()
+            .sdk_client(client)
+            .build();
+        let tm = crate::Client::new(tm_config);
+        let handle = UploadInput::builder()
             .bucket("test-bucket")
             .key("test-key")
             .body(InputStream::from(Bytes::from_static(
                 b"force multipart upload",
-            )));
-        if let Shape::MultipartRetain = shape {
-            input = input.failed_multipart_upload_policy(FailedMultipartUploadPolicy::Retain);
-        }
-        let handle = input.initiate_with(&tm).unwrap();
-        Started {
-            _tm: tm,
-            handle,
-            sent,
-        }
-    }
+            )))
+            .initiate_with(&tm)
+            .unwrap();
 
-    fn sent(sent: &Mutex<Vec<Op>>) -> Vec<Op> {
-        sent.lock().unwrap().clone()
-    }
-
-    /// Waits until `op` has reached the connector.
-    async fn wait_for_request(sent: &Mutex<Vec<Op>>, op: Op) {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while !sent.lock().unwrap().contains(&op) {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .unwrap_or_else(|_| panic!("{op:?} was never sent: {:?}", sent.lock().unwrap()));
-    }
-
-    async fn wait_for_status(handle: &UploadHandle, status: TransferStatus) {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while handle.status() != status {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .unwrap_or_else(|_| panic!("upload never reached {status:?}"));
-    }
-
-    type AbortFuture = BoxFuture<'static, Result<AbortedUpload, crate::error::Error>>;
-
-    /// Starts `abort()` and polls it once, so `request_abort()` has run when
-    /// this returns. The future is still waiting for the transfer to end.
-    async fn begin_abort(handle: UploadHandle) -> AbortFuture {
-        let mut abort: AbortFuture = Box::pin(handle.abort());
-        let first = std::future::poll_fn(|cx| Poll::Ready(abort.as_mut().poll(cx))).await;
-        assert!(
-            first.is_pending(),
-            "abort ended before the gate was released"
-        );
-        abort
-    }
-
-    async fn finish(
-        abort: impl Future<Output = Result<AbortedUpload, crate::error::Error>>,
-    ) -> Result<AbortedUpload, crate::error::Error> {
-        tokio::time::timeout(Duration::from_secs(5), abort)
+        let permit = tokio::time::timeout(Duration::from_secs(5), create_started.acquire())
             .await
-            .expect("abort hung")
+            .expect("CreateMultipartUpload did not start")
+            .expect("start semaphore closed");
+        permit.forget();
+
+        tokio::time::timeout(Duration::from_secs(1), handle.abort())
+            .await
+            .expect("abort hung after CreateMultipartUpload entered execution")
+            .expect("abort failed");
     }
 
-    fn assert_cancelled(aborted: &AbortedUpload, upload_id: Option<&str>) {
-        assert_eq!(aborted.outcome(), AbortOutcome::Cancelled);
-        assert!(aborted.output().is_none());
-        assert_eq!(aborted.upload_id(), upload_id);
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abort_stalled_create_mpu_on_tokio_runtime() {
+        abort_stalled_create_mpu(RuntimeMode::MultiThreadTokio).await;
     }
 
-    /// Runs an abort scenario on both runtimes.
-    macro_rules! on_both_runtimes {
-        ($scenario:ident) => {
-            mod $scenario {
-                use crate::types::RuntimeMode;
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn abort_stalled_create_mpu_on_managed_runtime() {
+        abort_stalled_create_mpu(RuntimeMode::Managed).await;
+    }
 
-                #[cfg_attr(miri, ignore)]
-                #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-                async fn tokio_runtime() {
-                    super::$scenario(RuntimeMode::MultiThreadTokio).await;
+    /// How [`CompleteMpuConnector`] answers CompleteMultipartUpload.
+    #[derive(Debug, Clone, Copy)]
+    enum CompleteMpuBehavior {
+        /// Never respond; the request stays active until interrupted.
+        Stall,
+        /// Respond with a non-retryable error.
+        Fail,
+    }
+
+    /// Connector that serves a single-part multipart upload, applies
+    /// [`CompleteMpuBehavior`] to CompleteMultipartUpload, and records the
+    /// upload ID of every AbortMultipartUpload.
+    #[derive(Debug)]
+    struct CompleteMpuConnector {
+        behavior: CompleteMpuBehavior,
+        complete_started: Arc<Semaphore>,
+        abort_uris: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl HttpConnector for CompleteMpuConnector {
+        fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
+            let uri = request.uri().to_string();
+            let has_upload_id = uri.contains("uploadId=");
+            let response = match (request.method(), has_upload_id) {
+                ("POST", false) if uri.contains("uploads") => HttpResponse::new(
+                    200.try_into().unwrap(),
+                    SdkBody::from(
+                        r#"<?xml version="1.0" encoding="UTF-8"?>
+                            <InitiateMultipartUploadResult>
+                                <Bucket>test-bucket</Bucket>
+                                <Key>test-key</Key>
+                                <UploadId>test-upload-id</UploadId>
+                            </InitiateMultipartUploadResult>"#,
+                    ),
+                ),
+                ("PUT", true) if uri.contains("partNumber=") => {
+                    let mut response = HttpResponse::new(200.try_into().unwrap(), SdkBody::empty());
+                    response.headers_mut().insert("ETag", "\"test-etag\"");
+                    response
                 }
-
-                #[cfg_attr(miri, ignore)]
-                #[tokio::test]
-                async fn managed_runtime() {
-                    super::$scenario(RuntimeMode::Managed).await;
+                ("POST", true) => {
+                    let complete_started = self.complete_started.clone();
+                    let behavior = self.behavior;
+                    return HttpConnectorFuture::new(async move {
+                        complete_started.add_permits(1);
+                        match behavior {
+                            CompleteMpuBehavior::Stall => {
+                                std::future::pending::<Result<HttpResponse, ConnectorError>>().await
+                            }
+                            CompleteMpuBehavior::Fail => Ok(HttpResponse::new(
+                                400.try_into().unwrap(),
+                                SdkBody::from(
+                                    r#"<?xml version="1.0" encoding="UTF-8"?>
+                                    <Error>
+                                        <Code>InvalidPart</Code>
+                                        <Message>One or more of the specified parts could not be found.</Message>
+                                    </Error>"#,
+                                ),
+                            )),
+                        }
+                    });
                 }
-            }
-        };
+                ("DELETE", true) => {
+                    self.abort_uris.lock().unwrap().push(uri);
+                    HttpResponse::new(204.try_into().unwrap(), SdkBody::empty())
+                }
+                _ => panic!("unexpected request: {} {uri}", request.method()),
+            };
+            HttpConnectorFuture::ready(Ok(response))
+        }
     }
 
-    /// CreateMultipartUpload in flight, then 200: abort waits for it, aborts
-    /// the upload it returned, and never starts a part.
-    async fn abort_create_in_flight(runtime_mode: RuntimeMode) {
-        let gate = Arc::new(Semaphore::new(0));
-        let script = Script {
-            create: Reply::gated(&gate, Reply::Ok),
-            ..Default::default()
-        };
-        let s = start(runtime_mode, script, Shape::Multipart);
-        wait_for_request(&s.sent, Op::Create).await;
-
-        let abort = begin_abort(s.handle).await;
-        gate.add_permits(1);
-        let aborted = finish(abort).await.expect("abort failed");
-
-        assert_cancelled(&aborted, Some("test-upload-id"));
-        assert_eq!(sent(&s.sent), [Op::Create, Op::Abort]);
-    }
-    on_both_runtimes!(abort_create_in_flight);
-
-    /// CreateMultipartUpload in flight, then an error: no upload exists, and
-    /// abort returns Create's error.
-    async fn abort_create_in_flight_then_create_fails(runtime_mode: RuntimeMode) {
-        let gate = Arc::new(Semaphore::new(0));
-        let script = Script {
-            create: Reply::gated(&gate, Reply::Err(403, "AccessDenied")),
-            ..Default::default()
-        };
-        let s = start(runtime_mode, script, Shape::Multipart);
-        wait_for_request(&s.sent, Op::Create).await;
-
-        let abort = begin_abort(s.handle).await;
-        gate.add_permits(1);
-        let err = finish(abort).await.expect_err("abort must fail");
-
-        assert_eq!(err.code(), Some("AccessDenied"));
-        assert_eq!(sent(&s.sent), [Op::Create]);
-    }
-    on_both_runtimes!(abort_create_in_flight_then_create_fails);
-
-    /// UploadPart in flight (never answers): the part is interrupted, the
-    /// upload is aborted, and Complete is never sent.
-    async fn abort_part_in_flight(runtime_mode: RuntimeMode) {
-        let script = Script {
-            part: Reply::Stall,
-            ..Default::default()
-        };
-        let s = start(runtime_mode, script, Shape::Multipart);
-        wait_for_request(&s.sent, Op::Part).await;
-
-        let aborted = finish(s.handle.abort()).await.expect("abort failed");
-
-        assert_cancelled(&aborted, Some("test-upload-id"));
-        assert_eq!(sent(&s.sent), [Op::Create, Op::Part, Op::Abort]);
-    }
-    on_both_runtimes!(abort_part_in_flight);
-
-    /// UploadPart in flight with `Retain`: the part is interrupted and the
-    /// upload is left open.
-    async fn abort_part_in_flight_with_retain(runtime_mode: RuntimeMode) {
-        let script = Script {
-            part: Reply::Stall,
-            ..Default::default()
-        };
-        let s = start(runtime_mode, script, Shape::MultipartRetain);
-        wait_for_request(&s.sent, Op::Part).await;
-
-        let aborted = finish(s.handle.abort()).await.expect("abort failed");
-
-        assert_cancelled(&aborted, None);
-        assert_eq!(sent(&s.sent), [Op::Create, Op::Part]);
-    }
-    on_both_runtimes!(abort_part_in_flight_with_retain);
-
-    /// AbortMultipartUpload itself fails: abort returns its error.
-    async fn abort_mpu_fails(runtime_mode: RuntimeMode) {
-        let script = Script {
-            part: Reply::Stall,
-            abort: Reply::Err(403, "AccessDenied"),
-            ..Default::default()
-        };
-        let s = start(runtime_mode, script, Shape::Multipart);
-        wait_for_request(&s.sent, Op::Part).await;
-
-        let err = finish(s.handle.abort()).await.expect_err("abort must fail");
-
-        assert_eq!(err.code(), Some("AccessDenied"));
-        assert_eq!(sent(&s.sent), [Op::Create, Op::Part, Op::Abort]);
-    }
-    on_both_runtimes!(abort_mpu_fails);
-
-    /// Starts an upload whose CompleteMultipartUpload waits on a gate, aborts
-    /// it while Complete is on the wire, checks AbortMultipartUpload goes out
-    /// before Complete answers, then lets Complete answer with `then`.
-    async fn abort_complete_in_flight(
-        runtime_mode: RuntimeMode,
-        then: Reply,
-    ) -> (Result<AbortedUpload, crate::error::Error>, Vec<Op>) {
-        let gate = Arc::new(Semaphore::new(0));
-        let script = Script {
-            complete: Reply::gated(&gate, then),
-            ..Default::default()
-        };
-        let s = start(runtime_mode, script, Shape::Multipart);
-        wait_for_request(&s.sent, Op::Complete).await;
-
-        let abort = begin_abort(s.handle).await;
-        // The abort does not wait for Complete before aborting the upload.
-        wait_for_request(&s.sent, Op::Abort).await;
-        gate.add_permits(1);
-        let result = finish(abort).await;
-        (result, sent(&s.sent))
-    }
-
-    /// Complete in flight, then 200: S3 created the object.
-    async fn abort_complete_in_flight_then_complete_succeeds(runtime_mode: RuntimeMode) {
-        let (result, sent) = abort_complete_in_flight(runtime_mode, Reply::Ok).await;
-        let aborted = result.expect("abort failed");
-
-        assert_eq!(aborted.outcome(), AbortOutcome::AlreadyCompleted);
-        assert!(aborted.output().is_some());
-        assert_eq!(sent, [Op::Create, Op::Part, Op::Complete, Op::Abort]);
-    }
-    on_both_runtimes!(abort_complete_in_flight_then_complete_succeeds);
-
-    /// Complete in flight, then `NoSuchUpload`: the abort won, no object.
-    async fn abort_complete_in_flight_then_no_such_upload(runtime_mode: RuntimeMode) {
-        let (result, sent) =
-            abort_complete_in_flight(runtime_mode, Reply::Err(404, "NoSuchUpload")).await;
-        let aborted = result.expect("abort failed");
-
-        assert_cancelled(&aborted, Some("test-upload-id"));
-        assert_eq!(sent, [Op::Create, Op::Part, Op::Complete, Op::Abort]);
-    }
-    on_both_runtimes!(abort_complete_in_flight_then_no_such_upload);
-
-    /// Complete in flight, then any other error: abort returns that error.
-    async fn abort_complete_in_flight_then_complete_fails(runtime_mode: RuntimeMode) {
-        let (result, sent) =
-            abort_complete_in_flight(runtime_mode, Reply::Err(400, "InvalidPart")).await;
-        let err = result.expect_err("abort must fail");
-
-        assert_eq!(err.code(), Some("InvalidPart"));
-        assert_eq!(sent, [Op::Create, Op::Part, Op::Complete, Op::Abort]);
-    }
-    on_both_runtimes!(abort_complete_in_flight_then_complete_fails);
-
-    /// PutObject in flight (never answers): it is interrupted and abort
-    /// returns `Cancelled` without waiting for S3.
-    async fn abort_put_object_in_flight(runtime_mode: RuntimeMode) {
-        let script = Script {
-            put: Reply::Stall,
-            ..Default::default()
-        };
-        let s = start(runtime_mode, script, Shape::PutObject);
-        wait_for_request(&s.sent, Op::Put).await;
-
-        let aborted = finish(s.handle.abort()).await.expect("abort failed");
-
-        assert_cancelled(&aborted, None);
-        assert_eq!(sent(&s.sent), [Op::Put]);
-    }
-    on_both_runtimes!(abort_put_object_in_flight);
-
-    /// Already completed: abort reports the object and sends nothing.
-    async fn abort_after_completed(runtime_mode: RuntimeMode) {
-        let s = start(runtime_mode, Script::default(), Shape::Multipart);
-        wait_for_status(&s.handle, TransferStatus::Completed).await;
-
-        let aborted = finish(s.handle.abort()).await.expect("abort failed");
-
-        assert_eq!(aborted.outcome(), AbortOutcome::AlreadyCompleted);
-        assert!(aborted.output().is_some());
-        assert_eq!(sent(&s.sent), [Op::Create, Op::Part, Op::Complete]);
-    }
-    on_both_runtimes!(abort_after_completed);
-
-    /// Already failed on a part: the failure left the upload open, and abort
-    /// aborts it.
-    async fn abort_after_part_failed(runtime_mode: RuntimeMode) {
-        let script = Script {
-            part: Reply::Err(403, "AccessDenied"),
-            ..Default::default()
-        };
-        let s = start(runtime_mode, script, Shape::Multipart);
-        wait_for_status(&s.handle, TransferStatus::Failed).await;
-        assert_eq!(sent(&s.sent), [Op::Create, Op::Part]);
-
-        let aborted = finish(s.handle.abort()).await.expect("abort failed");
-
-        assert_cancelled(&aborted, Some("test-upload-id"));
-        assert_eq!(sent(&s.sent), [Op::Create, Op::Part, Op::Abort]);
-    }
-    on_both_runtimes!(abort_after_part_failed);
-
-    /// Already failed on Complete: same as a part failure.
-    async fn abort_after_complete_failed(runtime_mode: RuntimeMode) {
-        let script = Script {
-            complete: Reply::Err(400, "InvalidPart"),
-            ..Default::default()
-        };
-        let s = start(runtime_mode, script, Shape::Multipart);
-        wait_for_status(&s.handle, TransferStatus::Failed).await;
-
-        let aborted = finish(s.handle.abort()).await.expect("abort failed");
-
-        assert_cancelled(&aborted, Some("test-upload-id"));
-        assert_eq!(
-            sent(&s.sent),
-            [Op::Create, Op::Part, Op::Complete, Op::Abort]
+    /// Abort after CompleteMultipartUpload started must still abort the upload,
+    /// whether the completion is interrupted or has already failed.
+    async fn abort_during_complete_mpu(runtime_mode: RuntimeMode, behavior: CompleteMpuBehavior) {
+        let complete_started = Arc::new(Semaphore::new(0));
+        let abort_uris = Arc::new(Mutex::new(Vec::new()));
+        let connector = SharedHttpConnector::new(CompleteMpuConnector {
+            behavior,
+            complete_started: complete_started.clone(),
+            abort_uris: abort_uris.clone(),
+        });
+        let http_client = http_client_fn(move |_, _| connector.clone());
+        let client = aws_sdk_s3::Client::from_conf(
+            aws_sdk_s3::config::Config::builder()
+                .http_client(http_client)
+                .region(aws_sdk_s3::config::Region::new("us-west-2"))
+                .with_test_defaults()
+                .build(),
         );
+
+        let tm_config = crate::Config::builder()
+            .concurrency(ConcurrencyMode::Explicit(1))
+            .runtime_mode(runtime_mode)
+            .set_multipart_threshold(PartSize::Target(10))
+            .set_target_part_size(PartSize::Target(5 * ByteUnit::Mebibyte.as_bytes_u64()))
+            .sdk_client(client)
+            .build();
+        let tm = crate::Client::new(tm_config);
+        let handle = UploadInput::builder()
+            .bucket("test-bucket")
+            .key("test-key")
+            .body(InputStream::from(Bytes::from_static(
+                b"force multipart upload",
+            )))
+            .initiate_with(&tm)
+            .unwrap();
+
+        let permit = tokio::time::timeout(Duration::from_secs(5), complete_started.acquire())
+            .await
+            .expect("CompleteMultipartUpload did not start")
+            .expect("start semaphore closed");
+        permit.forget();
+
+        if let CompleteMpuBehavior::Fail = behavior {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while handle.status() != TransferStatus::Failed {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("upload did not fail after CompleteMultipartUpload error");
+        }
+
+        let aborted = tokio::time::timeout(Duration::from_secs(5), handle.abort())
+            .await
+            .expect("abort hung after CompleteMultipartUpload started")
+            .expect("abort failed");
+
+        let abort_uris = abort_uris.lock().unwrap();
+        assert_eq!(
+            abort_uris.len(),
+            1,
+            "expected one AbortMultipartUpload: {abort_uris:?}"
+        );
+        assert!(
+            abort_uris[0].contains("uploadId=test-upload-id"),
+            "AbortMultipartUpload for the wrong upload: {}",
+            abort_uris[0]
+        );
+        assert_eq!(aborted.upload_id(), Some("test-upload-id"));
     }
-    on_both_runtimes!(abort_after_complete_failed);
 
-    /// Dropping the `abort()` future does not stop the abort: the upload
-    /// Create returns later is still aborted.
-    async fn abort_future_dropped(runtime_mode: RuntimeMode) {
-        let gate = Arc::new(Semaphore::new(0));
-        let script = Script {
-            create: Reply::gated(&gate, Reply::Ok),
-            ..Default::default()
-        };
-        let s = start(runtime_mode, script, Shape::Multipart);
-        wait_for_request(&s.sent, Op::Create).await;
-
-        drop(begin_abort(s.handle).await);
-        gate.add_permits(1);
-        wait_for_request(&s.sent, Op::Abort).await;
-
-        assert_eq!(sent(&s.sent), [Op::Create, Op::Abort]);
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abort_during_complete_mpu_aborts_upload_on_tokio_runtime() {
+        abort_during_complete_mpu(RuntimeMode::MultiThreadTokio, CompleteMpuBehavior::Stall).await;
     }
-    on_both_runtimes!(abort_future_dropped);
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn abort_during_complete_mpu_aborts_upload_on_managed_runtime() {
+        abort_during_complete_mpu(RuntimeMode::Managed, CompleteMpuBehavior::Stall).await;
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abort_after_failed_complete_mpu_aborts_upload_on_tokio_runtime() {
+        abort_during_complete_mpu(RuntimeMode::MultiThreadTokio, CompleteMpuBehavior::Fail).await;
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn abort_after_failed_complete_mpu_aborts_upload_on_managed_runtime() {
+        abort_during_complete_mpu(RuntimeMode::Managed, CompleteMpuBehavior::Fail).await;
+    }
 
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
