@@ -1492,6 +1492,16 @@ impl UploadTransfer {
     /// Sends AbortMultipartUpload for an upload in `UploadState::Aborting`.
     async fn execute_abort_mpu(&self, upload_id: String) -> WorkOutcome {
         let ctx = &self.inner.ctx;
+        // Complete committed while this request waited for a slot (always the
+        // case at concurrency 1, where Complete holds the only slot). The
+        // object exists and `abort()` reports `AlreadyCompleted`, so there is
+        // no upload left to abort.
+        if matches!(
+            *self.inner.state.lock().expect("lock poisoned"),
+            UploadState::Done
+        ) {
+            return WorkOutcome::Success { data: None };
+        }
         let response = crate::sdk_v1::copy_upload_input_fields_to_abort_multipart_upload(
             &self.inner.request,
             ctx.s3_client()

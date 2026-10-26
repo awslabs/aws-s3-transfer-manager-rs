@@ -178,14 +178,18 @@ impl UploadHandle {
             let _ = rx.await;
         }
 
+        // Let work still in flight drain before returning, whatever the
+        // outcome. After a Complete 200 during an abort, this is
+        // AbortMultipartUpload. When the abort ended through `poll_work`, the
+        // descriptor is already gone and this returns at once.
         let ctx = self.transfer.ctx();
+        ctx.handle
+            .scheduler
+            .cancel_transfer(ctx.id)
+            .wait_for_idle()
+            .await;
+
         if ctx.is_failed() {
-            // Same as `join()`: let work still in flight drain before returning.
-            ctx.handle
-                .scheduler
-                .cancel_transfer(ctx.id)
-                .wait_for_idle()
-                .await;
             if failed_before_abort {
                 // The caller is cleaning up an upload that already failed:
                 // abort whatever multipart upload it left open.
