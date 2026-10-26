@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "aws-sdk-s3-transfer-manager",
+    "crates/aws-smithy-topology",
 
     # internal
     "s3-mock-server",
@@ -9,6 +10,11 @@ members = [
     "integration-tests"
 ]
 exclude = ["fuzz"]
+
+[workspace.package]
+rust-version = "1.94.1"
+edition = "2024"
+authors = ["AWS Rust SDK Team <aws-sdk-rust@amazon.com>"]
 
 [workspace.dependencies]
 aws-config = "1.12.0"

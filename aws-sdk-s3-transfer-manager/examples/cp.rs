@@ -267,7 +267,7 @@ async fn do_single_download(
         drain_body(handle.body_mut()).await?;
         let obj_size_bytes = handle.object_meta().await?.total_object_size();
         handle.join().await?;
-        Ok(obj_size_bytes as u64)
+        Ok(obj_size_bytes)
     } else {
         let handle = tm
             .download()
@@ -277,7 +277,7 @@ async fn do_single_download(
             .await?;
         let obj_size_bytes = handle.object_meta().await?.total_object_size();
         handle.join().await?;
-        Ok(obj_size_bytes as u64)
+        Ok(obj_size_bytes)
     }
 }
 
