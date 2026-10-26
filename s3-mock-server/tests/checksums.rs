@@ -1665,6 +1665,98 @@ async fn test_multipart_full_object_crc32_filesystem() -> Result<()> {
     run_multipart_full_object_checksum(StorageType::Filesystem, ChecksumAlgorithm::Crc32).await
 }
 
+/// S3 reads `x-amz-checksum-type` case-insensitively: a lowercase `full_object` selects the same
+/// full-object checksum as `FULL_OBJECT`, so the upload completes with the whole-object CRC32.
+/// Fails if the type is matched case-sensitively, which stores `full_object` as an unknown type.
+#[tokio::test]
+async fn test_multipart_checksum_type_is_case_insensitive() -> Result<()> {
+    let (server, bucket) = create_server(StorageType::InMemory).await?;
+    let handle = server.start().await?;
+    let s3 = handle.client().await;
+    let key = "lowercase-checksum-type";
+    let part = b"part content";
+
+    let create = s3
+        .create_multipart_upload()
+        .bucket(&bucket)
+        .key(key)
+        .checksum_algorithm(ChecksumAlgorithm::Crc32)
+        .checksum_type(aws_sdk_s3::types::ChecksumType::from("full_object"))
+        .send()
+        .await?;
+    assert_eq!(
+        create.checksum_type(),
+        Some(&aws_sdk_s3::types::ChecksumType::FullObject)
+    );
+    let upload_id = create.upload_id().unwrap();
+    let uploaded = s3
+        .upload_part()
+        .bucket(&bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .part_number(1)
+        .checksum_crc32(calculate_checksum(part, ChecksumAlgorithm::Crc32))
+        .body(Bytes::from_static(part).into())
+        .send()
+        .await?;
+    let complete = s3
+        .complete_multipart_upload()
+        .bucket(&bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .checksum_crc32(calculate_checksum(part, ChecksumAlgorithm::Crc32))
+        .multipart_upload(
+            CompletedMultipartUpload::builder()
+                .parts(
+                    CompletedPart::builder()
+                        .part_number(1)
+                        .e_tag(uploaded.e_tag().unwrap())
+                        .build(),
+                )
+                .build(),
+        )
+        .send()
+        .await?;
+    assert_eq!(
+        complete.checksum_crc32(),
+        Some(calculate_checksum(part, ChecksumAlgorithm::Crc32).as_str())
+    );
+
+    handle.shutdown().await?;
+    Ok(())
+}
+
+/// S3 rejects an `x-amz-checksum-type` other than `COMPOSITE` or `FULL_OBJECT`, in any case,
+/// with 400 InvalidRequest.
+#[tokio::test]
+async fn test_multipart_invalid_checksum_type_fails() -> Result<()> {
+    let (server, bucket) = create_server(StorageType::InMemory).await?;
+    let handle = server.start().await?;
+    let s3 = handle.client().await;
+    for checksum_type in ["none", "bogus"] {
+        let err = s3
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key("invalid-checksum-type")
+            .checksum_algorithm(ChecksumAlgorithm::Crc32)
+            .checksum_type(aws_sdk_s3::types::ChecksumType::from(checksum_type))
+            .send()
+            .await
+            .expect_err(checksum_type);
+        assert_eq!(err.raw_response().unwrap().status().as_u16(), 400);
+        assert_eq!(
+            aws_sdk_s3::error::ProvideErrorMetadata::code(&err),
+            Some("InvalidRequest")
+        );
+        assert_eq!(
+            aws_sdk_s3::error::ProvideErrorMetadata::message(&err),
+            Some("Value for x-amz-checksum-type header is invalid.")
+        );
+    }
+    handle.shutdown().await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_put_object_sha1_correct_filesystem() -> Result<()> {
     run_put_object_correct_checksum(StorageType::Filesystem, ChecksumAlgorithm::Sha1).await

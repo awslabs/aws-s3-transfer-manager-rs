@@ -682,18 +682,25 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             .map_err(|_| Error::InvalidRequest("Unsupported checksum algorithm"))?
             .unwrap_or(ChecksumAlgorithm::Crc64Nvme);
 
-        let checksum_type = input
-            .checksum_type
-            .map(|ct| ChecksumType::from_str(ct.as_str()))
-            .transpose()
-            .map_err(|_| Error::InvalidRequest("Unsupported checksum type"))?
-            .unwrap_or({
-                // Default checksum type based on algorithm
-                match checksum_algorithm {
-                    ChecksumAlgorithm::Crc64Nvme => ChecksumType::FullObject,
-                    _ => ChecksumType::Composite,
+        let checksum_type = match input.checksum_type {
+            // S3 accepts the checksum type in any case, e.g. `full_object`, and rejects any
+            // other value.
+            Some(ct) => {
+                let checksum_type = ChecksumType::from(ct.as_str().to_ascii_uppercase().as_str());
+                if !ChecksumType::values().contains(&checksum_type.as_str()) {
+                    return Err(Error::InvalidRequest(
+                        "Value for x-amz-checksum-type header is invalid.",
+                    )
+                    .into());
                 }
-            });
+                checksum_type
+            }
+            // Default checksum type based on algorithm
+            None => match checksum_algorithm {
+                ChecksumAlgorithm::Crc64Nvme => ChecksumType::FullObject,
+                _ => ChecksumType::Composite,
+            },
+        };
 
         // Extract checksum type (full object vs composite) and validate requested checksum
         validate_checksum_and_type(&checksum_algorithm, Some(&checksum_type))?;
