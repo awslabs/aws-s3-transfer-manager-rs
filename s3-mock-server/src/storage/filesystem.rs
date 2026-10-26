@@ -262,18 +262,32 @@ impl StorageBackend for FilesystemStorage {
             fs::create_dir_all(parent).await?;
         }
 
-        let mut file = fs::File::create(&path).await?;
+        // The body goes to a temporary file outside the bucket's objects directory, so a body
+        // that fails its checksum or ends in a stream error leaves the existing object intact
+        // and never shows up in listings.
+        let temp_path = tempfile::Builder::new()
+            .prefix("put-")
+            .tempfile_in(self.root_dir.join("uploads"))?
+            .into_temp_path();
         let mut content_length = 0u64;
-
-        while let Some(chunk) = body.next().await {
-            let chunk = chunk.map_err(|e| Error::Internal(format!("Stream error: {}", e)))?;
-            integrity_checks.update(&chunk);
-            content_length += chunk.len() as u64;
-            file.write_all(&chunk).await?;
+        {
+            // Closed at the end of the block, before the rename.
+            let mut file = fs::OpenOptions::new().write(true).open(&temp_path).await?;
+            while let Some(chunk) = body.next().await {
+                let chunk = chunk.map_err(|e| Error::Internal(format!("Stream error: {}", e)))?;
+                integrity_checks.update(&chunk);
+                content_length += chunk.len() as u64;
+                file.write_all(&chunk).await?;
+            }
+            file.flush().await?;
         }
-        file.flush().await?;
-
         let object_integrity = integrity_checks.finalize();
+        if let Some(client_checksums) = &request.client_checksums {
+            object_integrity
+                .validate(client_checksums)
+                .map_err(|error_msg| Error::ChecksumMismatch(error_msg.to_string()))?;
+        }
+        temp_path.persist(&path).map_err(|e| e.error)?;
         let last_modified = request.last_modified.unwrap_or_else(SystemTime::now);
 
         let metadata = ObjectMetadata {

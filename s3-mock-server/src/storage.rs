@@ -47,6 +47,10 @@ pub struct StoreObjectRequest {
     pub content_encoding: Option<String>,
     pub content_disposition: Option<String>,
     pub content_language: Option<String>,
+    /// Checksums the client sent with the body. A body that does not match them fails with
+    /// [`Error::ChecksumMismatch`](crate::Error::ChecksumMismatch), and the key is left
+    /// unchanged.
+    pub client_checksums: Option<ClientChecksums>,
 }
 
 /// Request for retrieving an object.
@@ -152,6 +156,7 @@ impl StoreObjectRequest {
             content_encoding: None,
             content_disposition: None,
             content_language: None,
+            client_checksums: None,
         }
     }
 
@@ -199,6 +204,7 @@ impl From<s3s::dto::PutObjectInput> for StoreObjectRequest {
             content_language: input
                 .content_language
                 .map(|s| Cow::<str>::from(s).into_owned()),
+            client_checksums: None,
         }
     }
 }

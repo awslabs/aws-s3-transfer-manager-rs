@@ -582,6 +582,8 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         // Create storage request with configured checksums
         let mut request = crate::storage::StoreObjectRequest::from(input);
         request.integrity_checks = integrity_checks;
+        // Storage rejects a body that does not match them before it replaces the object.
+        request.client_checksums = Some(client_checksums);
 
         // StallRequestRead: wrap the body stream to stall after `after_bytes`.
         if let Some(crate::faults::FaultType::StallRequestRead { after_bytes }) = fault {
@@ -612,17 +614,19 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             request.body = Box::pin(stalled);
         }
 
-        let stored_meta = self.storage.put_object(request).await?;
+        let stored_meta = self
+            .storage
+            .put_object(request)
+            .await
+            .map_err(|error| match error {
+                Error::ChecksumMismatch(msg) => s3s::s3_error!(BadDigest, "{}", msg),
+                error => error.into(),
+            })?;
 
         // WithholdResponseHeaders: body is consumed and stored; never respond.
         if let Some(crate::faults::FaultType::WithholdResponseHeaders) = fault {
             std::future::pending::<()>().await;
             unreachable!("pending future never resolves");
-        }
-
-        // Validate client-provided checksums
-        if let Err(msg) = stored_meta.object_integrity.validate(&client_checksums) {
-            return Err(s3s::s3_error!(BadDigest, "{}", msg));
         }
 
         let output = s3s::dto::PutObjectOutput {
