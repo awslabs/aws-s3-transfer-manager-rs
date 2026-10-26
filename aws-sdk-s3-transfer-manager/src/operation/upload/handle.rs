@@ -142,8 +142,8 @@ impl UploadHandle {
     ///   with HeadObject if that matters. The Java v2 transfer manager behaves
     ///   the same way.
     /// - Already completed: returns `AlreadyCompleted`. The object is not deleted.
-    /// - Already failed: the failure left any multipart upload open, and it is
-    ///   aborted now. Returns `Cancelled`.
+    /// - Already failed: returns that failure's error. The multipart upload
+    ///   is left open, the same as after [`join`](Self::join) returns it.
     ///
     /// Any other error from a request still in flight (including
     /// AbortMultipartUpload itself) is returned as that error, as it would be
@@ -160,6 +160,7 @@ impl UploadHandle {
     /// - The upload and its parts, if a request fails while an abort is
     ///   already running (including AbortMultipartUpload itself failing): the
     ///   transfer fails at once rather than waiting for the abort.
+    /// - The upload and its parts, if the transfer had already failed.
     /// - The upload and its parts, under `FailedMultipartUploadPolicy::Retain`.
     ///
     /// A lifecycle rule for incomplete multipart uploads cleans these up.
@@ -167,10 +168,9 @@ impl UploadHandle {
     /// [`AbortOutcome::Cancelled`]: crate::types::AbortOutcome::Cancelled
     /// [`AbortOutcome::AlreadyCompleted`]: crate::types::AbortOutcome::AlreadyCompleted
     pub async fn abort(mut self) -> Result<AbortedUpload, Error> {
-        // Whether the transfer had already failed before this call. Read before
-        // `request_abort()` so a failure caused during the abort is not mistaken
-        // for one that happened earlier.
-        let failed_before_abort = self.transfer.ctx().is_failed();
+        // TODO: the abort should follow the error handling path
+        //   The error handling should also go through the abort workflow
+        //   A customer requested abort can be treated as an error happened, with a sepcial error code is to cancel the request.
         self.transfer.request_abort();
 
         // Wait until the transfer calls `signal_terminal()`.
@@ -190,12 +190,8 @@ impl UploadHandle {
             .await;
 
         if ctx.is_failed() {
-            if failed_before_abort {
-                // The caller is cleaning up an upload that already failed:
-                // abort whatever multipart upload it left open.
-                return self.transfer.abort_upload_left_by_failure().await;
-            }
-            // The abort was running when a request failed: report that failure.
+            // A request failed, before this call or while the abort ran: report
+            // that failure.
             return Err(ctx.take_error().expect("failed transfer must have error"));
         }
 

@@ -279,60 +279,6 @@ impl UploadTransfer {
         self.inner.result.lock().expect("lock poisoned").take()
     }
 
-    /// Aborts the multipart upload a transfer left open when it failed before
-    /// `abort()` was called.
-    ///
-    /// A failure ends the transfer without aborting its upload (see
-    /// `fail()`). The state machine is no longer polled after that, so this
-    /// sends AbortMultipartUpload directly. There is no race to resolve: a
-    /// failed transfer has no Complete in flight that could still create the
-    /// object. The caller must first wait for in-flight work to drain.
-    pub(crate) async fn abort_upload_left_by_failure(&self) -> Result<AbortedUpload, Error> {
-        let upload_id = {
-            let state = self.inner.state.lock().expect("lock poisoned");
-            match &*state {
-                UploadState::Transferring { upload_id, .. }
-                | UploadState::Completing { upload_id, .. }
-                | UploadState::CompleteInFlight { upload_id } => Some(upload_id.clone()),
-                // Not reached: only `poll_work` enters `Aborting`, after
-                // `request_abort()`, and a failed transfer is not polled.
-                UploadState::Aborting { upload_id, .. } => upload_id.clone(),
-                UploadState::PendingInit { .. }
-                | UploadState::PutObjectInFlight
-                | UploadState::Done => None,
-            }
-        };
-        let Some(upload_id) = upload_id else {
-            return Ok(AbortedUpload::default());
-        };
-        if self.abort_mpu_policy() == AbortMpuProgress::NotNeeded {
-            return Ok(AbortedUpload::default());
-        }
-        let ctx = &self.inner.ctx;
-        let resp = crate::sdk_v1::copy_upload_input_fields_to_abort_multipart_upload(
-            &self.inner.request,
-            ctx.s3_client()
-                .abort_multipart_upload()
-                .upload_id(&upload_id),
-        )
-        .customize()
-        .config_override(
-            ctx.handle
-                .bucket_partition_override(self.inner.request.bucket()),
-        )
-        .send()
-        .instrument(tracing::debug_span!("send-abort-multipart-upload"))
-        .await?;
-        Ok(AbortedUpload {
-            upload_id: Some(upload_id),
-            request_charged: resp
-                .request_charged
-                .as_ref()
-                .map(crate::sdk_v1::request_charged_from_sdk),
-            ..Default::default()
-        })
-    }
-
     /// Start a soft abort: the transfer stays active and its own `poll_work`
     /// drives the abort to an end (see `UploadState::Aborting`).
     ///
