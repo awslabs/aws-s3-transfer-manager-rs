@@ -1,0 +1,20 @@
+[package]
+name = "aws-smithy-execution"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license = "Apache-2.0"
+repository = "https://github.com/awslabs/aws-s3-transfer-manager-rs"
+description = "Managed async execution with topology placement."
+readme = "README.md"
+categories = ["asynchronous", "concurrency"]
+keywords = ["aws", "smithy", "runtime", "execution"]
+
+[dependencies]
+aws-smithy-topology = { version = "0.1.0", path = "../aws-smithy-topology" }
+dial9 = { version = "0.5.3", default-features = false, features = ["tokio"], optional = true }
+tokio = { version = "1.53.1", default-features = false, features = ["rt", "net", "time", "sync"] }
+
+[features]
+dial9 = ["dep:dial9"]

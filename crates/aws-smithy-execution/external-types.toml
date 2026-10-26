@@ -1,0 +1,6 @@
+allowed_external_types = [
+    "aws_smithy_topology",
+    "aws_smithy_topology::*",
+    "tokio::runtime::task::join::JoinHandle",
+    "dial9_core::handle::Dial9Handle",
+]
