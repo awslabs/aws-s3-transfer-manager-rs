@@ -704,6 +704,9 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         // Extract content type and metadata
         let content_type = input.content_type.map(|mime| mime.to_string());
         let user_metadata = input.metadata.unwrap_or_default();
+        let storage_class = input
+            .storage_class
+            .map(|s| std::borrow::Cow::<str>::from(s).into_owned());
 
         // Create metadata for the multipart upload
         let metadata = ObjectMetadata {
@@ -712,6 +715,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             etag: String::new(), // Will be updated when the upload is completed
             last_modified: std::time::SystemTime::now(),
             user_metadata,
+            storage_class,
             checksum_algorithm: Some(checksum_algorithm),
             ..Default::default()
         };

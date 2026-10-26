@@ -256,6 +256,73 @@ async fn test_multipart_upload() -> Result<()> {
     Ok(())
 }
 
+/// An object completed by a multipart upload has the storage class requested at
+/// CreateMultipartUpload, as in S3. Fails if CreateMultipartUpload drops the storage class.
+#[tokio::test]
+async fn test_multipart_upload_keeps_storage_class() -> Result<()> {
+    let server = S3MockServer::builder()
+        .with_in_memory_store()
+        .build()
+        .expect("Failed to build server");
+    let handle = server.start().await.expect("Failed to start mock server");
+    let s3 = handle.client().await;
+    let bucket = format!("test-bucket-{}", Uuid::new_v4());
+    server.create_bucket(&bucket).await?;
+    let key = "test-multipart-storage-class.txt";
+
+    let create_resp = s3
+        .create_multipart_upload()
+        .bucket(&bucket)
+        .key(key)
+        .storage_class(aws_sdk_s3::types::StorageClass::IntelligentTiering)
+        .send()
+        .await
+        .expect("Failed to create multipart upload");
+    let upload_id = create_resp.upload_id().expect("No upload ID returned");
+    let part_resp = s3
+        .upload_part()
+        .bucket(&bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .part_number(1)
+        .body(ByteStream::from_static(b"content"))
+        .send()
+        .await
+        .expect("Failed to upload part");
+    s3.complete_multipart_upload()
+        .bucket(&bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .multipart_upload(
+            CompletedMultipartUpload::builder()
+                .parts(
+                    CompletedPart::builder()
+                        .e_tag(part_resp.e_tag().unwrap())
+                        .part_number(1)
+                        .build(),
+                )
+                .build(),
+        )
+        .send()
+        .await
+        .expect("Failed to complete multipart upload");
+
+    let head_resp = s3
+        .head_object()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await
+        .expect("Failed to head object");
+    assert_eq!(
+        head_resp.storage_class(),
+        Some(&aws_sdk_s3::types::StorageClass::IntelligentTiering)
+    );
+
+    handle.shutdown().await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_abort_multipart_upload() -> Result<()> {
     let server = S3MockServer::builder()
