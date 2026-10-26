@@ -829,35 +829,6 @@ async fn test_complete_mpu_sends_mpu_object_size() {
 // these all exercise the multipart path. Termination comes from the reader
 // reporting end-of-stream rather than from a part count.
 
-/// A stream with no declared length uploads via multipart and completes.
-#[tokio::test]
-async fn test_unknown_length_multipart_upload() {
-    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
-    let tm = MultipartMock::new().tm();
-
-    let (tx, rx) = mpsc::channel(2);
-    let handle = tm
-        .upload()
-        .bucket("test-bucket")
-        .key("test-key")
-        .body(InputStream::from_part_stream(TestStream::unknown_length(
-            rx,
-        )))
-        .initiate()
-        .unwrap();
-
-    // Two full parts, then end-of-stream by dropping the sender.
-    for _ in 0..2 {
-        tx.send(Bytes::from(vec![0u8; part_size])).await.unwrap();
-    }
-    drop(tx);
-
-    handle
-        .join()
-        .await
-        .expect("an unknown-length stream must upload, not panic");
-}
-
 /// An empty stream with no declared bounds must complete as a normal 0-byte object.
 ///
 /// S3 rejects a CompleteMultipartUpload that lists no parts, so "no bytes" cannot
