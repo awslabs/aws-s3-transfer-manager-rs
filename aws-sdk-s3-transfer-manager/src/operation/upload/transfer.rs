@@ -284,32 +284,20 @@ impl UploadTransfer {
     /// Aborts the multipart upload a transfer left open when it failed before
     /// `abort()` was called.
     ///
-    /// A failure normally aborts its own upload before ending (see `fail()`),
-    /// and then this only returns what that abort reported. The upload is
-    /// still open only when the failure came while an abort was already
-    /// running and cut it short (for example AbortMultipartUpload itself
-    /// failed). The state machine has ended by then and is no longer polled,
-    /// so this sends AbortMultipartUpload directly. There is no race to
-    /// resolve: a failed transfer has no commit in flight that could still
-    /// create the object. The caller must first wait for in-flight work to
-    /// drain.
+    /// A failure ends the transfer without aborting its upload (see
+    /// `fail()`). The state machine is no longer polled after that, so this
+    /// sends AbortMultipartUpload directly. There is no race to resolve: a
+    /// failed transfer has no Complete in flight that could still create the
+    /// object. The caller must first wait for in-flight work to drain.
     pub(crate) async fn abort_upload_left_by_failure(&self) -> Result<AbortedUpload, Error> {
         let upload_id = {
             let state = self.inner.state.lock().expect("lock poisoned");
             match &*state {
-                // The failure's own abort already removed the upload. Release
-                // the state lock before taking `aborted`, so the two mutexes
-                // are never held together.
-                UploadState::Aborting {
-                    abort_mpu: AbortMpuProgress::Done,
-                    ..
-                } => {
-                    drop(state);
-                    return Ok(self.take_aborted());
-                }
                 UploadState::Transferring { upload_id, .. }
                 | UploadState::Completing { upload_id, .. }
                 | UploadState::CompleteInFlight { upload_id } => Some(upload_id.clone()),
+                // Not reached: only `poll_work` enters `Aborting`, after
+                // `request_abort()`, and a failed transfer is not polled.
                 UploadState::Aborting { upload_id, .. } => upload_id.clone(),
                 UploadState::PendingInit { .. }
                 | UploadState::PutObjectInFlight
@@ -370,16 +358,6 @@ impl UploadTransfer {
     /// Whether `request_abort()` has been called.
     pub(crate) fn abort_requested(&self) -> bool {
         self.inner.abort_requested.load(Ordering::SeqCst)
-    }
-
-    /// Whether an abort is running: the caller asked for one, or a failure
-    /// started one to clean up its multipart upload.
-    pub(crate) fn abort_in_progress(&self) -> bool {
-        self.abort_requested()
-            || matches!(
-                *self.inner.state.lock().expect("lock poisoned"),
-                UploadState::Aborting { .. }
-            )
     }
 
     /// Take what AbortMultipartUpload reported (upload ID, request charged).
@@ -450,7 +428,6 @@ impl UploadTransfer {
                                 create_in_flight: true,
                                 complete_mpu_in_flight: false,
                                 abort_mpu: self.abort_mpu_policy(),
-                                failure: None,
                             };
                             continue;
                         }
@@ -518,7 +495,6 @@ impl UploadTransfer {
                             create_in_flight: false,
                             complete_mpu_in_flight: false,
                             abort_mpu: self.abort_mpu_policy(),
-                            failure: None,
                         };
                         continue;
                     }
@@ -588,7 +564,6 @@ impl UploadTransfer {
                             create_in_flight: false,
                             complete_mpu_in_flight: false,
                             abort_mpu: self.abort_mpu_policy(),
-                            failure: None,
                         };
                         continue;
                     }
@@ -615,7 +590,6 @@ impl UploadTransfer {
                             create_in_flight: false,
                             complete_mpu_in_flight: true,
                             abort_mpu: self.abort_mpu_policy(),
-                            failure: None,
                         };
                         continue;
                     }
@@ -637,7 +611,6 @@ impl UploadTransfer {
                             create_in_flight: false,
                             complete_mpu_in_flight: false,
                             abort_mpu: AbortMpuProgress::NotNeeded,
-                            failure: None,
                         };
                         continue;
                     }
@@ -651,7 +624,6 @@ impl UploadTransfer {
                     create_in_flight,
                     complete_mpu_in_flight,
                     abort_mpu,
-                    failure,
                 } => {
                     // 1. An upload exists and has not been aborted yet: abort it.
                     //    `if let (Some(id), ToSend) = (..)` is a tag check on
@@ -697,18 +669,7 @@ impl UploadTransfer {
                     }
                     // 3. Nothing outstanding, and no commit succeeded (a commit
                     //    that succeeds moves the state to `Done` itself, so we
-                    //    would not be here).
-                    //    - Started by a failure: the upload is cleaned up, now
-                    //      report the error that started it. `take()` moves the
-                    //      error out and leaves `None` (C view: steal the
-                    //      pointer, NULL the field). The state stays `Aborting`
-                    //      with `abort_mpu == Done`, which tells a later
-                    //      `abort()` the upload is already gone.
-                    //    - Asked for by the caller: the upload is cancelled.
-                    if let Some(error) = failure.take() {
-                        drop(state); // early unlock: end_failed re-locks state
-                        return self.end_failed(error);
-                    }
+                    //    would not be here): the upload is cancelled.
                     *state = UploadState::Done;
                     drop(state); // early unlock: end_aborted re-locks state
                     return self.end_aborted();
@@ -855,7 +816,7 @@ impl UploadTransfer {
                 .build()
             {
                 Ok(reader) => reader,
-                Err(e) => return self.fail_after_create(upload_id, e.into()),
+                Err(e) => return self.fail(e.into()),
             },
         );
 
@@ -1525,11 +1486,8 @@ impl UploadTransfer {
     fn complete_mpu_failed(&self, error: Error) -> WorkOutcome {
         let mut state = self.inner.state.lock().expect("lock poisoned");
         match &mut *state {
-            // `failure: None` = the caller asked for this abort. An abort
-            // started by a failure must still report that failure.
             UploadState::Aborting {
                 complete_mpu_in_flight,
-                failure: None,
                 ..
             } if error.code() == Some("NoSuchUpload") => {
                 *complete_mpu_in_flight = false;
@@ -1601,83 +1559,34 @@ impl UploadTransfer {
         }
     }
 
-    /// Handles an error from any request or source read.
+    /// Handles an error from any request or source read: ends the transfer
+    /// as failed with `error`.
     ///
-    /// - A multipart upload is open and the policy is `AbortUpload`: abort it
-    ///   before reporting the error. Moves to `Aborting { failure: Some(..) }`,
-    ///   interrupts the parts and wakes the transfer; the `Aborting` arm sends
-    ///   AbortMultipartUpload and then ends the transfer with this error.
-    /// - Already `Aborting` (the caller's abort, or an earlier failure): end
-    ///   now, without waiting for the abort to finish. If an earlier failure
-    ///   started the abort, that error is reported, not this one.
-    /// - Anything else (no upload yet, PutObject, `Retain`): end now.
+    /// An open multipart upload stays in the state; `abort()` removes it if
+    /// the caller asks. During the caller's abort this ends the transfer now,
+    /// without waiting for the abort to finish.
     ///
-    /// Must be called without the state lock held: it takes it, and the end
-    /// path takes it again (Rust's `Mutex` is not recursive).
+    /// Must be called without the state lock held: the end path takes it.
     fn fail(&self, error: Error) -> WorkOutcome {
         tracing::debug!(
             target: crate::telemetry::TARGET_TRANSFER,
             %error,
             "upload failed",
         );
-        // Classify before `error` is moved anywhere: the scheduler's
-        // concurrency controller still learns about this failure (for
-        // example a throttle) even when the transfer goes on to abort.
         let classification = crate::scheduler::classify_error(&error);
-
-        let mut state = self.inner.state.lock().expect("lock poisoned");
-        let error = match &mut *state {
-            UploadState::Aborting { failure, .. } => {
-                // `unwrap_or(error)`: the stored error if there is one, else
-                // this one (C view: `stored ? stored : error`).
-                let reported = failure.take().unwrap_or(error);
-                drop(state);
-                self.end_failed(reported);
-                return WorkOutcome::Failed { classification };
-            }
-            UploadState::Transferring { upload_id, .. }
-            | UploadState::Completing { upload_id, .. }
-            | UploadState::CompleteInFlight { upload_id }
-                if self.abort_mpu_policy() == AbortMpuProgress::ToSend =>
-            {
-                // `|` in a pattern matches any of the listed tags; all three
-                // have a `upload_id` field, so it binds whichever one is live.
-                // `if` after the pattern is a guard: the arm is taken only when
-                // it holds, otherwise matching falls through to `_`.
-                let upload_id = std::mem::take(upload_id);
-                // Overwriting the state drops the part state (reader, parked
-                // reads, completed list) and any `CompleteMpuWork` payload is
-                // already gone with the request that failed.
-                *state = UploadState::Aborting {
-                    upload_id: Some(upload_id),
-                    create_in_flight: false,
-                    complete_mpu_in_flight: false,
-                    abort_mpu: AbortMpuProgress::ToSend,
-                    failure: Some(error),
-                };
-                drop(state); // unlock before waking (lock -> mutate -> unlock -> wake)
-                             // Same order as `request_abort()`: stop the parts, then wake
-                             // so `poll_work` emits the abort.
-                self.inner.abort_parts_token.cancel();
-                self.inner.ctx.wake();
-                return WorkOutcome::Failed { classification };
-            }
-            _ => error,
-        };
-        drop(state);
-        self.end_failed(error);
+        self.inner.ctx.set_failed(error);
+        self.report_terminal();
+        self.inner.ctx.signal_terminal();
         WorkOutcome::Failed { classification }
     }
 
     /// Like `fail()`, for an error seen by part work (UploadPart, or a read
     /// of the part source).
     ///
-    /// Once the upload is being aborted, part results no longer matter: the
-    /// abort discards every part, and a part error is often caused by the
-    /// abort itself. So in `Aborting` the error is dropped, the same as
-    /// `abandoned_part`, instead of ending the abort early. This matters most
-    /// for the common case of several parts failing together: the first one
-    /// starts the abort, and the rest must not cut it short.
+    /// Once the caller's abort is running, part results no longer matter:
+    /// the abort discards every part, and a part error is often caused by the
+    /// abort itself (`NoSuchUpload`). So in `Aborting` the error is dropped,
+    /// the same as `abandoned_part`, instead of ending the abort early.
     fn fail_part(&self, error: Error) -> WorkOutcome {
         {
             let state = self.inner.state.lock().expect("lock poisoned");
@@ -1691,62 +1600,6 @@ impl UploadTransfer {
             }
         } // guard dropped here = scoped unlock; fail() takes the lock again
         self.fail(error)
-    }
-
-    /// Like `fail()`, for an error after CreateMultipartUpload succeeded but
-    /// before its upload ID reached the state (the part reader failed to
-    /// build). The state is still `PendingInit`, so `fail()` alone would not
-    /// see the upload; this hands the ID over first.
-    fn fail_after_create(&self, upload_id: String, error: Error) -> WorkOutcome {
-        {
-            let mut state = self.inner.state.lock().expect("lock poisoned");
-            match &mut *state {
-                UploadState::PendingInit { .. }
-                    if self.abort_mpu_policy() == AbortMpuProgress::ToSend =>
-                {
-                    // Abort before reporting, as `fail()` does for an open
-                    // upload. No parts exist yet, so there is nothing to
-                    // interrupt; Create was this transfer's only work.
-                    let classification = crate::scheduler::classify_error(&error);
-                    *state = UploadState::Aborting {
-                        upload_id: Some(upload_id),
-                        create_in_flight: false,
-                        complete_mpu_in_flight: false,
-                        abort_mpu: AbortMpuProgress::ToSend,
-                        failure: Some(error),
-                    };
-                    drop(state);
-                    self.inner.ctx.wake();
-                    return WorkOutcome::Failed { classification };
-                }
-                // `Retain`: leave the upload, fail now.
-                UploadState::PendingInit { .. } => {}
-                // The caller's abort raced in. Give it the ID so the state is
-                // accurate; `fail()` then ends now, as for any failure during
-                // an abort.
-                UploadState::Aborting {
-                    upload_id: slot,
-                    create_in_flight,
-                    ..
-                } => {
-                    *slot = Some(upload_id);
-                    *create_in_flight = false;
-                }
-                _ => unreachable!("Create in flight implies PendingInit or Aborting"),
-            }
-        } // scoped unlock
-        self.fail(error)
-    }
-
-    /// Ends the transfer as failed with `error`.
-    ///
-    /// The caller must have released the state lock: `report_terminal` takes
-    /// it again.
-    fn end_failed(&self, error: Error) -> PollWork {
-        self.inner.ctx.set_failed(error);
-        self.report_terminal();
-        self.inner.ctx.signal_terminal();
-        PollWork::Done
     }
 }
 
@@ -2887,5 +2740,378 @@ mod tests {
         transfer.execute(&mut work).await;
 
         assert!(transfer.take_result().is_some());
+    }
+
+    /// Abort in each state of the state machine, driven by hand.
+    ///
+    /// These tests call `poll_work` and `execute` directly (no scheduler), so
+    /// every interleaving is fixed: `request_abort()` lands exactly between
+    /// two chosen steps. Races with a request that is already on the wire are
+    /// covered end to end in `operation/upload.rs`.
+    mod abort {
+        use super::*;
+        use crate::scheduler::test_util::assert_done;
+        use aws_sdk_s3::operation::abort_multipart_upload::AbortMultipartUploadOutput;
+        use aws_sdk_s3::operation::put_object::PutObjectOutput;
+
+        /// 16 MiB with the default 8 MiB part size and threshold: two parts.
+        const MPU_CONTENT: usize = 16 * 1024 * 1024;
+
+        fn transfer_with_policy(
+            s3_client: aws_sdk_s3::Client,
+            content: Vec<u8>,
+            policy: FailedMultipartUploadPolicy,
+        ) -> UploadTransfer {
+            let handle = crate::client::Handle::test_handle_tokio(
+                crate::Config::builder().sdk_client(s3_client).build(),
+            );
+            let mut input = UploadInput::builder()
+                .bucket("test-bucket")
+                .key("test-key")
+                .body(InputStream::from(content))
+                .failed_multipart_upload_policy(policy)
+                .build()
+                .unwrap();
+            let stream = input.take_body();
+            let (ctx, _completion_rx) = TransferContext::new(handle);
+            UploadTransfer::try_new(ctx, BucketType::Standard, input, stream).unwrap()
+        }
+
+        fn is_abort_mpu(work: &mut IoRequest) -> bool {
+            matches!(
+                work.data_mut::<UploadWork>(),
+                UploadWork::AbortMPU { upload_id } if upload_id == "test-upload-id"
+            )
+        }
+
+        /// Asserts the transfer ended as cancelled and returns what
+        /// AbortMultipartUpload reported.
+        fn assert_cancelled(transfer: &UploadTransfer) -> AbortedUpload {
+            assert!(transfer.ctx().is_cancelled(), "transfer was not cancelled");
+            assert!(transfer.take_result().is_none(), "no object may be created");
+            transfer.take_aborted()
+        }
+
+        /// Drives Create and every part, leaving the state at `Completing`.
+        async fn drive_to_completing(transfer: &UploadTransfer) {
+            let mut create = assert_ready(transfer.poll_work());
+            transfer.execute(&mut create).await;
+            for _ in 0..2 {
+                let mut part = assert_ready(transfer.poll_work());
+                transfer.execute(&mut part).await;
+            }
+            assert!(matches!(
+                &*transfer.inner.state.lock().unwrap(),
+                UploadState::Completing { .. }
+            ));
+        }
+
+        /// Sends the AbortMPU the `Aborting` arm emits next, then expects the
+        /// transfer to end.
+        async fn send_abort_mpu_and_finish(transfer: &UploadTransfer) {
+            let mut abort = assert_ready(transfer.poll_work());
+            assert!(is_abort_mpu(&mut abort));
+            // AbortMPU is in flight: nothing else to emit.
+            assert_pending(transfer.poll_work());
+            transfer.execute(&mut abort).await;
+            assert_done(transfer.poll_work());
+        }
+
+        fn abort_mpu_rule() -> aws_smithy_mocks::Rule {
+            mock!(aws_sdk_s3::Client::abort_multipart_upload)
+                .then_output(|| AbortMultipartUploadOutput::builder().build())
+        }
+
+        /// PendingInit, nothing emitted: ends at once and sends nothing.
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn before_create_sends_nothing() {
+            // No rules: any request would fail the mock.
+            let transfer = create_test_transfer(mock_client!(aws_sdk_s3, []), vec![0; MPU_CONTENT]);
+            transfer.request_abort();
+            assert_done(transfer.poll_work());
+            let aborted = assert_cancelled(&transfer);
+            assert_eq!(aborted.upload_id(), None);
+        }
+
+        /// PendingInit, Create emitted: waits for Create, then aborts the
+        /// upload it returned. No part is started.
+        #[cfg_attr(miri, ignore)]
+        #[tokio::test]
+        async fn create_in_flight_waits_then_aborts_returned_upload() {
+            let create = mock!(aws_sdk_s3::Client::create_multipart_upload).then_output(|| {
+                CreateMultipartUploadOutput::builder()
+                    .upload_id("test-upload-id")
+                    .build()
+            });
+            let part = mock!(aws_sdk_s3::Client::upload_part)
+                .then_output(|| UploadPartOutput::builder().e_tag("etag").build());
+            let abort_mpu = abort_mpu_rule();
+            let client = mock_client!(
+                aws_sdk_s3,
+                RuleMode::MatchAny,
+                &[&create, &part, &abort_mpu]
+            );
+            let transfer = create_test_transfer(client, vec![0; MPU_CONTENT]);
+
+            let mut create_work = assert_ready(transfer.poll_work());
+            transfer.request_abort();
+            // Create's answer carries the upload ID: wait for it.
+            assert_pending(transfer.poll_work());
+            transfer.execute(&mut create_work).await;
+
+            send_abort_mpu_and_finish(&transfer).await;
+            let aborted = assert_cancelled(&transfer);
+            assert_eq!(aborted.upload_id(), Some("test-upload-id"));
+            assert_eq!(create.num_calls(), 1);
+            assert_eq!(part.num_calls(), 0);
+            assert_eq!(abort_mpu.num_calls(), 1);
+        }
+
+        /// PendingInit, Create emitted and then failing: the failure ends the
+        /// transfer, and there is no upload to abort.
+        #[cfg_attr(miri, ignore)]
+        #[tokio::test]
+        async fn create_failing_during_abort_fails_the_transfer() {
+            let create = mock!(aws_sdk_s3::Client::create_multipart_upload)
+                .then_http_response(service_error_response);
+            let abort_mpu = abort_mpu_rule();
+            let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&create, &abort_mpu]);
+            let transfer = create_test_transfer(client, vec![0; MPU_CONTENT]);
+
+            let mut create_work = assert_ready(transfer.poll_work());
+            transfer.request_abort();
+            assert_pending(transfer.poll_work());
+            let outcome = transfer.execute(&mut create_work).await;
+            assert!(matches!(outcome, WorkOutcome::Failed { .. }));
+
+            assert!(transfer.ctx().is_failed());
+            assert_done(transfer.poll_work());
+            assert_eq!(abort_mpu.num_calls(), 0);
+        }
+
+        /// Transferring, parts emitted but not run: AbortMPU goes out at once,
+        /// but the transfer does not end until every part work item is gone,
+        /// whether it runs (and sees the token) or is discarded unrun.
+        #[cfg_attr(miri, ignore)]
+        #[tokio::test]
+        async fn transferring_aborts_and_waits_for_every_part_to_drop() {
+            let part = mock!(aws_sdk_s3::Client::upload_part)
+                .then_output(|| UploadPartOutput::builder().e_tag("etag").build());
+            let complete = mock!(aws_sdk_s3::Client::complete_multipart_upload)
+                .then_output(|| CompleteMultipartUploadOutput::builder().build());
+            let abort_mpu = abort_mpu_rule();
+            let create = mock!(aws_sdk_s3::Client::create_multipart_upload).then_output(|| {
+                CreateMultipartUploadOutput::builder()
+                    .upload_id("test-upload-id")
+                    .build()
+            });
+            let client = mock_client!(
+                aws_sdk_s3,
+                RuleMode::MatchAny,
+                &[&create, &part, &complete, &abort_mpu]
+            );
+            let transfer = create_test_transfer(client, vec![0; MPU_CONTENT]);
+
+            let mut create_work = assert_ready(transfer.poll_work());
+            transfer.execute(&mut create_work).await;
+            let mut part1 = assert_ready(transfer.poll_work());
+            let part2 = assert_ready(transfer.poll_work());
+            assert_eq!(transfer.inner.live_parts.load(Ordering::SeqCst), 2);
+
+            transfer.request_abort();
+            let mut abort = assert_ready(transfer.poll_work());
+            assert!(is_abort_mpu(&mut abort));
+            transfer.execute(&mut abort).await;
+
+            // AbortMPU is done, but both parts are still alive.
+            assert_pending(transfer.poll_work());
+            // A part that runs after the abort sees the token and sends nothing.
+            let outcome = transfer.execute(&mut part1).await;
+            assert!(matches!(outcome, WorkOutcome::Cancelled));
+            assert_pending(transfer.poll_work());
+            // A part the scheduler throws away unrun releases its count too.
+            drop(part2);
+            assert_eq!(transfer.inner.live_parts.load(Ordering::SeqCst), 0);
+            assert_done(transfer.poll_work());
+
+            let aborted = assert_cancelled(&transfer);
+            assert_eq!(aborted.upload_id(), Some("test-upload-id"));
+            assert_eq!(part.num_calls(), 0);
+            assert_eq!(complete.num_calls(), 0);
+            assert_eq!(abort_mpu.num_calls(), 1);
+        }
+
+        /// Completing, Complete not yet emitted: Complete is never sent.
+        #[cfg_attr(miri, ignore)]
+        #[tokio::test]
+        async fn completing_aborts_without_sending_complete() {
+            let complete = mock!(aws_sdk_s3::Client::complete_multipart_upload)
+                .then_output(|| CompleteMultipartUploadOutput::builder().build());
+            let abort_mpu = abort_mpu_rule();
+            let create = mock!(aws_sdk_s3::Client::create_multipart_upload).then_output(|| {
+                CreateMultipartUploadOutput::builder()
+                    .upload_id("test-upload-id")
+                    .build()
+            });
+            let part = mock!(aws_sdk_s3::Client::upload_part)
+                .then_output(|| UploadPartOutput::builder().e_tag("etag").build());
+            let client = mock_client!(
+                aws_sdk_s3,
+                RuleMode::MatchAny,
+                &[&create, &part, &complete, &abort_mpu]
+            );
+            let transfer = create_test_transfer(client, vec![0; MPU_CONTENT]);
+            drive_to_completing(&transfer).await;
+
+            transfer.request_abort();
+            send_abort_mpu_and_finish(&transfer).await;
+
+            let aborted = assert_cancelled(&transfer);
+            assert_eq!(aborted.upload_id(), Some("test-upload-id"));
+            assert_eq!(complete.num_calls(), 0);
+            assert_eq!(abort_mpu.num_calls(), 1);
+        }
+
+        /// CompleteInFlight, Complete emitted but not started: AbortMPU goes
+        /// out without waiting, and Complete, when it runs, sees the abort and
+        /// sends nothing.
+        #[cfg_attr(miri, ignore)]
+        #[tokio::test]
+        async fn complete_queued_is_never_sent() {
+            let complete = mock!(aws_sdk_s3::Client::complete_multipart_upload)
+                .then_output(|| CompleteMultipartUploadOutput::builder().build());
+            let abort_mpu = abort_mpu_rule();
+            let create = mock!(aws_sdk_s3::Client::create_multipart_upload).then_output(|| {
+                CreateMultipartUploadOutput::builder()
+                    .upload_id("test-upload-id")
+                    .build()
+            });
+            let part = mock!(aws_sdk_s3::Client::upload_part)
+                .then_output(|| UploadPartOutput::builder().e_tag("etag").build());
+            let client = mock_client!(
+                aws_sdk_s3,
+                RuleMode::MatchAny,
+                &[&create, &part, &complete, &abort_mpu]
+            );
+            let transfer = create_test_transfer(client, vec![0; MPU_CONTENT]);
+            drive_to_completing(&transfer).await;
+            let mut complete_work = assert_ready(transfer.poll_work());
+            assert!(matches!(
+                complete_work.data_mut::<UploadWork>(),
+                UploadWork::CompleteMPU(_)
+            ));
+
+            transfer.request_abort();
+            let mut abort = assert_ready(transfer.poll_work());
+            assert!(is_abort_mpu(&mut abort));
+            transfer.execute(&mut abort).await;
+            // Still waiting for Complete's handler.
+            assert_pending(transfer.poll_work());
+            let outcome = transfer.execute(&mut complete_work).await;
+            assert!(matches!(outcome, WorkOutcome::Cancelled));
+            assert_done(transfer.poll_work());
+
+            let aborted = assert_cancelled(&transfer);
+            assert_eq!(aborted.upload_id(), Some("test-upload-id"));
+            assert_eq!(complete.num_calls(), 0);
+            assert_eq!(abort_mpu.num_calls(), 1);
+        }
+
+        /// PutObjectInFlight, PutObject emitted but not started: it is
+        /// interrupted before it sends, and no AbortMPU is needed.
+        #[cfg_attr(miri, ignore)]
+        #[tokio::test]
+        async fn put_object_queued_is_never_sent() {
+            let put = mock!(aws_sdk_s3::Client::put_object)
+                .then_output(|| PutObjectOutput::builder().e_tag("etag").build());
+            let abort_mpu = abort_mpu_rule();
+            let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&put, &abort_mpu]);
+            let transfer = create_test_transfer(client, vec![0; 1024]);
+
+            let mut put_work = assert_ready(transfer.poll_work());
+            assert!(matches!(
+                put_work.data_mut::<UploadWork>(),
+                UploadWork::PutObject { .. }
+            ));
+            transfer.request_abort();
+            // Not waiting for S3, only for the work item to be dropped.
+            assert_pending(transfer.poll_work());
+            let outcome = transfer.execute(&mut put_work).await;
+            assert!(matches!(outcome, WorkOutcome::Cancelled));
+            assert_done(transfer.poll_work());
+
+            let aborted = assert_cancelled(&transfer);
+            assert_eq!(aborted.upload_id(), None);
+            assert_eq!(put.num_calls(), 0);
+            assert_eq!(abort_mpu.num_calls(), 0);
+        }
+
+        /// `Retain`: the parts are interrupted but the upload is left open.
+        #[cfg_attr(miri, ignore)]
+        #[tokio::test]
+        async fn retain_policy_does_not_abort_the_upload() {
+            let abort_mpu = abort_mpu_rule();
+            let create = mock!(aws_sdk_s3::Client::create_multipart_upload).then_output(|| {
+                CreateMultipartUploadOutput::builder()
+                    .upload_id("test-upload-id")
+                    .build()
+            });
+            let part = mock!(aws_sdk_s3::Client::upload_part)
+                .then_output(|| UploadPartOutput::builder().e_tag("etag").build());
+            let client = mock_client!(
+                aws_sdk_s3,
+                RuleMode::MatchAny,
+                &[&create, &part, &abort_mpu]
+            );
+            let transfer = transfer_with_policy(
+                client,
+                vec![0; MPU_CONTENT],
+                FailedMultipartUploadPolicy::Retain,
+            );
+
+            let mut create_work = assert_ready(transfer.poll_work());
+            transfer.execute(&mut create_work).await;
+            let part1 = assert_ready(transfer.poll_work());
+
+            transfer.request_abort();
+            assert_pending(transfer.poll_work());
+            drop(part1);
+            assert_done(transfer.poll_work());
+
+            let aborted = assert_cancelled(&transfer);
+            assert_eq!(aborted.upload_id(), None);
+            assert_eq!(abort_mpu.num_calls(), 0);
+        }
+
+        /// `request_abort()` more than once is the same as once.
+        #[cfg_attr(miri, ignore)]
+        #[tokio::test]
+        async fn request_abort_twice_sends_one_abort_mpu() {
+            let abort_mpu = abort_mpu_rule();
+            let create = mock!(aws_sdk_s3::Client::create_multipart_upload).then_output(|| {
+                CreateMultipartUploadOutput::builder()
+                    .upload_id("test-upload-id")
+                    .build()
+            });
+            let part = mock!(aws_sdk_s3::Client::upload_part)
+                .then_output(|| UploadPartOutput::builder().e_tag("etag").build());
+            let client = mock_client!(
+                aws_sdk_s3,
+                RuleMode::MatchAny,
+                &[&create, &part, &abort_mpu]
+            );
+            let transfer = create_test_transfer(client, vec![0; MPU_CONTENT]);
+            drive_to_completing(&transfer).await;
+
+            transfer.request_abort();
+            transfer.request_abort();
+            send_abort_mpu_and_finish(&transfer).await;
+            transfer.request_abort();
+            assert_done(transfer.poll_work());
+
+            assert_cancelled(&transfer);
+            assert_eq!(abort_mpu.num_calls(), 1);
+        }
     }
 }

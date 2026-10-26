@@ -142,6 +142,8 @@ impl UploadHandle {
     ///   with HeadObject if that matters. The Java v2 transfer manager behaves
     ///   the same way.
     /// - Already completed: returns `AlreadyCompleted`. The object is not deleted.
+    /// - Already failed: the failure left any multipart upload open, and it is
+    ///   aborted now. Returns `Cancelled`.
     ///
     /// Any other error from a request still in flight (including
     /// AbortMultipartUpload itself) is returned as that error, as it would be
@@ -235,11 +237,11 @@ impl UploadHandle {
 impl Drop for UploadHandle {
     fn drop(&mut self) {
         let ctx = self.transfer.ctx();
-        // Once an abort is running (from `abort()`, or from a failure cleaning
-        // up its multipart upload), the transfer finishes it on its own. A hard
-        // cancel here (for example from a dropped `abort()` future) would drop
-        // the in-flight Create/Complete/AbortMultipartUpload it is waiting on.
-        if ctx.is_active() && !self.transfer.abort_in_progress() {
+        // Once `abort()` has started, the transfer finishes the abort on its
+        // own. A hard cancel here (for example from a dropped `abort()` future)
+        // would drop the in-flight Create/Complete/AbortMultipartUpload it is
+        // waiting on.
+        if ctx.is_active() && !self.transfer.abort_requested() {
             ctx.set_cancelled();
             ctx.handle.scheduler.cancel_transfer(ctx.id);
         }

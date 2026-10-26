@@ -808,16 +808,13 @@ pub(crate) enum UploadState {
     /// The upload is being aborted, and the transfer is waiting for the
     /// requests that decide the outcome before it ends.
     ///
-    /// Two ways in:
-    /// - The caller asked to abort: `poll_work` moves every other non-terminal
-    ///   state here once it sees the request. `failure` is `None`.
-    /// - A request failed while a multipart upload was open: `fail()` moves
-    ///   here so the upload is aborted before the error is reported. `failure`
-    ///   holds that error.
+    /// Only the caller's abort leads here: `poll_work` moves every other
+    /// non-terminal state here once it sees the request. A request failure
+    /// does not; it ends the transfer as failed and leaves the upload open,
+    /// as before.
     ///
     /// From here it emits at most one AbortMultipartUpload and ends the
-    /// transfer when nothing below is still outstanding: as cancelled, or as
-    /// failed with `failure` if that is set.
+    /// transfer as cancelled when nothing below is still outstanding.
     /// A CompleteMultipartUpload that succeeds while in this state moves
     /// straight to `Done` as an ordinary success: the object exists, so the
     /// abort reports `AlreadyCompleted`. So does a PutObject whose response
@@ -838,9 +835,6 @@ pub(crate) enum UploadState {
         complete_mpu_in_flight: bool,
         /// Progress of the AbortMultipartUpload request.
         abort_mpu: AbortMpuProgress,
-        /// The error that started this abort, reported once the abort ends.
-        /// `None` for an abort the caller asked for.
-        failure: Option<crate::error::Error>,
     },
     /// S3 has committed the object; no multipart upload remains open.
     Done,
