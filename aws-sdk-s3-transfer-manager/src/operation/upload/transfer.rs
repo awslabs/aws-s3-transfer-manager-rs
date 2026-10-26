@@ -32,12 +32,14 @@
 use std::cmp;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use bytes::Bytes;
+use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 use crate::error::{Error, ErrorKind};
@@ -45,8 +47,8 @@ use crate::io::part_reader::{Builder as PartReaderBuilder, PartReadStart};
 use crate::io::{InputStream, PartData};
 use crate::operation::upload::context::{
     apply_content_length, validate_distinct_part_numbers, validate_part_number, validate_size_hint,
-    MultipartCompletion, PartPlan, PartReadWake, PartTransferState, PendingPartRead,
-    UploadPartWork, UploadState,
+    AbortMpuProgress, MultipartCompletion, PartPlan, PartReadWake, PartTransferState,
+    PendingPartRead, UploadPartWork, UploadState,
 };
 #[cfg(test)]
 use crate::operation::upload::observability::UploadTerminalOutcome;
@@ -60,15 +62,24 @@ use crate::operation::upload::request::{
 };
 use crate::operation::upload::{UploadInput, UploadOutput, UploadOutputBuilder};
 use crate::transfer::{IoRequest, PendingCause, PollWork, Transfer, TransferContext, WorkOutcome};
-use crate::types::BucketType;
+use crate::types::{AbortedUpload, BucketType, FailedMultipartUploadPolicy};
 
 /// Upload-specific work data.
 #[derive(Debug)]
 pub(crate) enum UploadWork {
     CreateMPU,
-    UploadPart(UploadPartWork),
+    /// The guard counts this item in `live_parts` until it is dropped.
+    UploadPart(UploadPartWork, LivePart),
     CompleteMPU(Box<CompleteMpuWork>),
-    PutObject { stream: InputStream },
+    /// Interrupted by an abort like UploadPart, so it carries the same guard.
+    PutObject {
+        stream: InputStream,
+        live: LivePart,
+    },
+    /// AbortMultipartUpload, emitted only from `UploadState::Aborting`.
+    AbortMPU {
+        upload_id: String,
+    },
 }
 
 /// Payload for CompleteMultipartUpload, moved out of `UploadState::Completing` when the request is
@@ -77,6 +88,52 @@ pub(crate) enum UploadWork {
 pub(crate) struct CompleteMpuWork {
     parts: PartTransferState,
     response_builder: UploadOutputBuilder,
+}
+
+/// Counts one emitted UploadPart or PutObject work item in
+/// `UploadTransferInner::live_parts` until the item is dropped: after
+/// `execute` finishes it, or when the scheduler discards it unexecuted.
+///
+/// The `Aborting` arm waits for the count to reach zero, so the transfer does
+/// not signal terminal while an interrupted request still holds its HTTP
+/// request, source read or buffer. C view: a refcount taken when the work item
+/// is created and released in its destructor.
+pub(crate) struct LivePart {
+    inner: Arc<UploadTransferInner>,
+}
+
+impl LivePart {
+    /// Called under the state lock, when `poll_work` emits the part.
+    fn new(inner: &Arc<UploadTransferInner>) -> Self {
+        inner.live_parts.fetch_add(1, Ordering::SeqCst);
+        Self {
+            inner: Arc::clone(inner),
+        }
+    }
+}
+
+impl Drop for LivePart {
+    fn drop(&mut self) {
+        let prev = self.inner.live_parts.fetch_sub(1, Ordering::SeqCst);
+        // Only an abort waits on this count, so only wake for the last part of
+        // an abort. The parts token is fired before the wake that starts every
+        // abort: if this load misses it, that later wake polls after our
+        // decrement and sees zero.
+        //
+        // `wake()`, not `try_wake()`: this decrement is not made under the
+        // state lock, so `try_wake()` could miss a poll that read the count
+        // just before it. A scheduler wake that lands during a poll is kept
+        // and causes another poll (see `TransferContext::waker`).
+        if prev == 1 && self.inner.abort_parts_token.is_cancelled() {
+            self.inner.ctx.wake();
+        }
+    }
+}
+
+impl std::fmt::Debug for LivePart {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LivePart")
+    }
 }
 
 /// Maximum number of parts that a single S3 multipart upload supports
@@ -113,6 +170,25 @@ struct UploadTransferInner {
     bucket_type: BucketType,
     /// Stored result for handle to retrieve
     result: Mutex<Option<UploadOutput>>,
+    /// Set once by `request_abort()`: the soft cancel flag.
+    ///
+    /// Unlike `ctx.set_cancelled()`, this keeps the transfer active and
+    /// registered with the scheduler, so `poll_work` keeps running and can
+    /// drive the abort (move to `Aborting`, emit AbortMultipartUpload, wait for
+    /// Create/Complete). C view: an `atomic_bool` read without the state lock.
+    abort_requested: AtomicBool,
+    /// Interrupts in-flight UploadPart (with its part reads) and PutObject.
+    ///
+    /// The scheduler's own token (`descriptor.cancellation_token()`) would also
+    /// drop CreateMultipartUpload and CompleteMultipartUpload, whose responses
+    /// the abort needs, so these get their own. C view: a one-shot event that
+    /// each interruptible request's `select!` waits on next to its real work.
+    abort_parts_token: CancellationToken,
+    /// UploadPart and PutObject work items emitted and not yet dropped (see
+    /// `LivePart`).
+    live_parts: AtomicUsize,
+    /// What AbortMultipartUpload reported, for `UploadHandle::abort` to return.
+    aborted: Mutex<AbortedUpload>,
 }
 
 impl UploadTransfer {
@@ -148,6 +224,10 @@ impl UploadTransfer {
             request: Arc::new(request),
             bucket_type,
             result: Mutex::new(None),
+            abort_requested: AtomicBool::new(false),
+            abort_parts_token: CancellationToken::new(),
+            live_parts: AtomicUsize::new(0),
+            aborted: Mutex::new(AbortedUpload::default()),
         });
 
         Ok(Self { inner })
@@ -196,28 +276,142 @@ impl UploadTransfer {
             });
     }
 
-    /// Get the transfer ID.
-    /// The original request (sans the body as it will have been taken for processing)
-    pub(crate) fn request(&self) -> &UploadInput {
-        &self.inner.request
-    }
-
-    /// The ID of a multipart upload that has been created and not completed.
-    pub(crate) fn open_upload_id(&self) -> Option<String> {
-        let state = self.inner.state.lock().expect("lock poisoned");
-        match &*state {
-            UploadState::Transferring { upload_id, .. }
-            | UploadState::Completing { upload_id, .. }
-            | UploadState::CompleteInFlight { upload_id } => Some(upload_id.clone()),
-            UploadState::PendingInit { .. }
-            | UploadState::PutObjectInFlight
-            | UploadState::Done => None,
-        }
-    }
-
     /// Take the stored result (used by handle after completion).
     pub(crate) fn take_result(&self) -> Option<UploadOutput> {
         self.inner.result.lock().expect("lock poisoned").take()
+    }
+
+    /// Aborts the multipart upload a transfer left open when it failed before
+    /// `abort()` was called.
+    ///
+    /// A failure normally aborts its own upload before ending (see `fail()`),
+    /// and then this only returns what that abort reported. The upload is
+    /// still open only when the failure came while an abort was already
+    /// running and cut it short (for example AbortMultipartUpload itself
+    /// failed). The state machine has ended by then and is no longer polled,
+    /// so this sends AbortMultipartUpload directly. There is no race to
+    /// resolve: a failed transfer has no commit in flight that could still
+    /// create the object. The caller must first wait for in-flight work to
+    /// drain.
+    pub(crate) async fn abort_upload_left_by_failure(&self) -> Result<AbortedUpload, Error> {
+        let upload_id = {
+            let state = self.inner.state.lock().expect("lock poisoned");
+            match &*state {
+                // The failure's own abort already removed the upload. Release
+                // the state lock before taking `aborted`, so the two mutexes
+                // are never held together.
+                UploadState::Aborting {
+                    abort_mpu: AbortMpuProgress::Done,
+                    ..
+                } => {
+                    drop(state);
+                    return Ok(self.take_aborted());
+                }
+                UploadState::Transferring { upload_id, .. }
+                | UploadState::Completing { upload_id, .. }
+                | UploadState::CompleteInFlight { upload_id } => Some(upload_id.clone()),
+                UploadState::Aborting { upload_id, .. } => upload_id.clone(),
+                UploadState::PendingInit { .. }
+                | UploadState::PutObjectInFlight
+                | UploadState::Done => None,
+            }
+        };
+        let Some(upload_id) = upload_id else {
+            return Ok(AbortedUpload::default());
+        };
+        if self.abort_mpu_policy() == AbortMpuProgress::NotNeeded {
+            return Ok(AbortedUpload::default());
+        }
+        let ctx = &self.inner.ctx;
+        let resp = crate::sdk_v1::copy_upload_input_fields_to_abort_multipart_upload(
+            &self.inner.request,
+            ctx.s3_client()
+                .abort_multipart_upload()
+                .upload_id(&upload_id),
+        )
+        .customize()
+        .config_override(
+            ctx.handle
+                .bucket_partition_override(self.inner.request.bucket()),
+        )
+        .send()
+        .instrument(tracing::debug_span!("send-abort-multipart-upload"))
+        .await?;
+        Ok(AbortedUpload {
+            upload_id: Some(upload_id),
+            request_charged: resp
+                .request_charged
+                .as_ref()
+                .map(crate::sdk_v1::request_charged_from_sdk),
+            ..Default::default()
+        })
+    }
+
+    /// Start a soft abort: the transfer stays active and its own `poll_work`
+    /// drives the abort to an end (see `UploadState::Aborting`).
+    ///
+    /// Called by `UploadHandle::abort`. Safe to call more than once and from
+    /// any thread; it takes no lock.
+    pub(crate) fn request_abort(&self) {
+        // SeqCst = the C11 default `atomic_store`: every thread that later
+        // loads the flag and sees `true` also sees everything written before.
+        self.inner.abort_requested.store(true, Ordering::SeqCst);
+        // Stop part work and PutObject now, so we don't keep reading the
+        // source and sending bytes for an upload we are throwing away. A part
+        // that already got its response is handled by `fail_part()` /
+        // `abandoned_part()`, which drop results once the state is `Aborting`.
+        self.inner.abort_parts_token.cancel();
+        // A transfer that returned `PollWork::Pending` is not polled again until
+        // something wakes it. `wake()` is unconditional, unlike `try_wake()`,
+        // which only fires if the last poll published a pending cause.
+        self.inner.ctx.wake();
+    }
+
+    /// Whether `request_abort()` has been called.
+    pub(crate) fn abort_requested(&self) -> bool {
+        self.inner.abort_requested.load(Ordering::SeqCst)
+    }
+
+    /// Whether an abort is running: the caller asked for one, or a failure
+    /// started one to clean up its multipart upload.
+    pub(crate) fn abort_in_progress(&self) -> bool {
+        self.abort_requested()
+            || matches!(
+                *self.inner.state.lock().expect("lock poisoned"),
+                UploadState::Aborting { .. }
+            )
+    }
+
+    /// Take what AbortMultipartUpload reported (upload ID, request charged).
+    pub(crate) fn take_aborted(&self) -> AbortedUpload {
+        std::mem::take(&mut *self.inner.aborted.lock().expect("lock poisoned"))
+    }
+
+    /// Whether `Aborting` should send AbortMultipartUpload once it has an ID.
+    fn abort_mpu_policy(&self) -> AbortMpuProgress {
+        match self
+            .inner
+            .request
+            .failed_multipart_upload_policy
+            .clone()
+            .unwrap_or_default()
+        {
+            FailedMultipartUploadPolicy::Retain => AbortMpuProgress::NotNeeded,
+            // `_` also covers variants added later (the enum is non_exhaustive).
+            _ => AbortMpuProgress::ToSend,
+        }
+    }
+
+    /// Ends an aborted transfer as cancelled.
+    ///
+    /// The caller must have set the state to `Done` and released the state
+    /// lock first: `report_terminal` takes the state lock again, and a Rust
+    /// `Mutex`, like a default pthread mutex, is not recursive.
+    fn end_aborted(&self) -> PollWork {
+        self.inner.ctx.set_cancelled();
+        self.report_terminal();
+        self.inner.ctx.signal_terminal();
+        PollWork::Done
     }
 
     /// Poll for the next work item.
@@ -233,6 +427,11 @@ impl UploadTransfer {
 
         let mut state = self.inner.state.lock().expect("lock poisoned");
 
+        // Read the soft cancel flag once per poll. `request_abort()` wakes the
+        // transfer after setting it, so a flag set after this load is seen on
+        // the next poll.
+        let abort = self.abort_requested();
+
         loop {
             match &mut *state {
                 UploadState::PendingInit {
@@ -241,10 +440,32 @@ impl UploadTransfer {
                     stream,
                 } => {
                     if *init_in_flight {
+                        if abort {
+                            // Create is on the wire and is not interrupted: if S3
+                            // accepted it, there is an upload to abort, and only
+                            // its response carries the ID. The Create handler
+                            // fills `upload_id` in when it returns.
+                            *state = UploadState::Aborting {
+                                upload_id: None,
+                                create_in_flight: true,
+                                complete_mpu_in_flight: false,
+                                abort_mpu: self.abort_mpu_policy(),
+                                failure: None,
+                            };
+                            continue;
+                        }
                         self.inner
                             .ctx
                             .set_pending(PendingCause::in_flight_work("create_multipart_upload"));
                         return PollWork::Pending;
+                    }
+                    if abort {
+                        // Nothing was sent, so nothing exists on S3. End now.
+                        // Assigning `Done` drops the stream (C view: the old
+                        // union member's destructor runs on overwrite).
+                        *state = UploadState::Done;
+                        drop(state); // early unlock: end_aborted re-locks state
+                        return self.end_aborted();
                     }
 
                     let use_mpu = match size_hint.upper() {
@@ -273,11 +494,34 @@ impl UploadTransfer {
                         self.inner.observability.select_mode(UploadMode::PutObject);
                         self.observe_event(UploadEvent::PutObjectScheduled, &state);
                         PollWork::ready(IoRequest {
-                            data: Some(Box::new(UploadWork::PutObject { stream })),
+                            data: Some(Box::new(UploadWork::PutObject {
+                                stream,
+                                live: LivePart::new(&self.inner),
+                            })),
                         })
                     };
                 }
-                UploadState::Transferring { parts, .. } => {
+                UploadState::Transferring {
+                    upload_id, parts, ..
+                } => {
+                    if abort {
+                        // Parts were interrupted by `request_abort()`. Their
+                        // results no longer matter, so drop the part state
+                        // (reader, parked reads, completed list) and go
+                        // straight to aborting the upload.
+                        // `mem::take` moves the String out and leaves an empty
+                        // one behind, like stealing a heap pointer in C and
+                        // setting the old field to NULL.
+                        let upload_id = std::mem::take(upload_id);
+                        *state = UploadState::Aborting {
+                            upload_id: Some(upload_id),
+                            create_in_flight: false,
+                            complete_mpu_in_flight: false,
+                            abort_mpu: self.abort_mpu_policy(),
+                            failure: None,
+                        };
+                        continue;
+                    }
                     if let Some(work) = parts.schedule_part() {
                         let event = if work.is_resumed() {
                             UploadEvent::SourceWakeScheduled
@@ -290,7 +534,10 @@ impl UploadTransfer {
                             parts.snapshot(),
                         );
                         return PollWork::ready(IoRequest {
-                            data: Some(Box::new(UploadWork::UploadPart(work))),
+                            data: Some(Box::new(UploadWork::UploadPart(
+                                work,
+                                LivePart::new(&self.inner),
+                            ))),
                         });
                     }
                     if let Some(work) = parts.maybe_start_empty_object_part() {
@@ -300,7 +547,10 @@ impl UploadTransfer {
                             parts.snapshot(),
                         );
                         return PollWork::ready(IoRequest {
-                            data: Some(Box::new(UploadWork::UploadPart(work))),
+                            data: Some(Box::new(UploadWork::UploadPart(
+                                work,
+                                LivePart::new(&self.inner),
+                            ))),
                         });
                     }
                     let snapshot = parts.snapshot();
@@ -330,6 +580,18 @@ impl UploadTransfer {
                     else {
                         unreachable!("state changed under lock");
                     };
+                    if abort {
+                        // Complete has not been sent, and now never will be:
+                        // the object cannot exist. Same as `Transferring`.
+                        *state = UploadState::Aborting {
+                            upload_id: Some(upload_id),
+                            create_in_flight: false,
+                            complete_mpu_in_flight: false,
+                            abort_mpu: self.abort_mpu_policy(),
+                            failure: None,
+                        };
+                        continue;
+                    }
                     *state = UploadState::CompleteInFlight { upload_id };
                     return PollWork::ready(IoRequest {
                         data: Some(Box::new(UploadWork::CompleteMPU(Box::new(
@@ -340,17 +602,116 @@ impl UploadTransfer {
                         )))),
                     });
                 }
-                UploadState::CompleteInFlight { .. } => {
+                UploadState::CompleteInFlight { upload_id } => {
+                    if abort {
+                        // Complete is (or is about to be) on the wire and is not
+                        // interrupted. Abort the upload right away, so that if
+                        // S3 has not committed yet the abort wins, and let
+                        // Complete's response decide the outcome. S3 accepts
+                        // the abort whether or not Complete committed.
+                        let upload_id = std::mem::take(upload_id);
+                        *state = UploadState::Aborting {
+                            upload_id: Some(upload_id),
+                            create_in_flight: false,
+                            complete_mpu_in_flight: true,
+                            abort_mpu: self.abort_mpu_policy(),
+                            failure: None,
+                        };
+                        continue;
+                    }
                     self.inner
                         .ctx
                         .set_pending(PendingCause::in_flight_work("complete_multipart_upload"));
                     return PollWork::Pending;
                 }
                 UploadState::PutObjectInFlight => {
+                    if abort {
+                        // PutObject is interrupted like a part (see `execute`),
+                        // not waited for: there is no upload to abort, and the
+                        // caller gets `Cancelled` even though S3 may already
+                        // have stored the object. The `Aborting` arm still
+                        // waits for the dropped request to be freed (its
+                        // `LivePart` count).
+                        *state = UploadState::Aborting {
+                            upload_id: None,
+                            create_in_flight: false,
+                            complete_mpu_in_flight: false,
+                            abort_mpu: AbortMpuProgress::NotNeeded,
+                            failure: None,
+                        };
+                        continue;
+                    }
                     self.inner
                         .ctx
                         .set_pending(PendingCause::in_flight_work("put_object"));
                     return PollWork::Pending;
+                }
+                UploadState::Aborting {
+                    upload_id,
+                    create_in_flight,
+                    complete_mpu_in_flight,
+                    abort_mpu,
+                    failure,
+                } => {
+                    // 1. An upload exists and has not been aborted yet: abort it.
+                    //    `if let (Some(id), ToSend) = (..)` is a tag check on
+                    //    both values at once; `id` binds the non-NULL string.
+                    if let (Some(id), AbortMpuProgress::ToSend) = (upload_id.as_ref(), *abort_mpu) {
+                        let upload_id = id.clone();
+                        *abort_mpu = AbortMpuProgress::InFlight;
+                        return PollWork::ready(IoRequest {
+                            data: Some(Box::new(UploadWork::AbortMPU { upload_id })),
+                        });
+                    }
+                    // 2. Something whose answer we need is still on the wire.
+                    //    Each handler updates these fields and wakes us.
+                    if *create_in_flight {
+                        self.inner
+                            .ctx
+                            .set_pending(PendingCause::in_flight_work("create_multipart_upload"));
+                        return PollWork::Pending;
+                    }
+                    if *complete_mpu_in_flight {
+                        self.inner.ctx.set_pending(PendingCause::in_flight_work(
+                            "complete_multipart_upload_during_abort",
+                        ));
+                        return PollWork::Pending;
+                    }
+                    if *abort_mpu == AbortMpuProgress::InFlight {
+                        self.inner
+                            .ctx
+                            .set_pending(PendingCause::in_flight_work("abort_multipart_upload"));
+                        return PollWork::Pending;
+                    }
+                    // Interrupted parts and PutObject drop their future on
+                    // their task's next poll, and queued ones only when they
+                    // run. Don't signal terminal until every one is gone, so
+                    // the caller never gets a result while one still holds its
+                    // request, source read or buffer. The last `LivePart` to
+                    // drop wakes us.
+                    if self.inner.live_parts.load(Ordering::SeqCst) > 0 {
+                        self.inner
+                            .ctx
+                            .set_pending(PendingCause::in_flight_work("interrupted_upload_part"));
+                        return PollWork::Pending;
+                    }
+                    // 3. Nothing outstanding, and no commit succeeded (a commit
+                    //    that succeeds moves the state to `Done` itself, so we
+                    //    would not be here).
+                    //    - Started by a failure: the upload is cleaned up, now
+                    //      report the error that started it. `take()` moves the
+                    //      error out and leaves `None` (C view: steal the
+                    //      pointer, NULL the field). The state stays `Aborting`
+                    //      with `abort_mpu == Done`, which tells a later
+                    //      `abort()` the upload is already gone.
+                    //    - Asked for by the caller: the upload is cancelled.
+                    if let Some(error) = failure.take() {
+                        drop(state); // early unlock: end_failed re-locks state
+                        return self.end_failed(error);
+                    }
+                    *state = UploadState::Done;
+                    drop(state); // early unlock: end_aborted re-locks state
+                    return self.end_aborted();
                 }
                 UploadState::Done => return PollWork::Done,
             }
@@ -361,9 +722,41 @@ impl UploadTransfer {
         // A work item executes once, so execute takes its payload by value.
         match work.take_data::<UploadWork>() {
             UploadWork::CreateMPU => self.execute_create_mpu().await,
-            UploadWork::UploadPart(part) => self.execute_upload_part(part).await,
+            UploadWork::UploadPart(part, live) => {
+                // Race the part against the parts-only abort token. Whichever
+                // future finishes first wins; the loser is dropped, which in
+                // Rust cancels it at its current `.await` (C view: like
+                // abandoning a state machine mid-step, with destructors run).
+                // `biased` checks the token first on every wake-up, so once the
+                // abort fires a part never acts on a response it got later.
+                let token = self.inner.abort_parts_token.clone();
+                let outcome = tokio::select! {
+                    biased;
+                    _ = token.cancelled() => WorkOutcome::Cancelled,
+                    outcome = self.execute_upload_part(part) => outcome,
+                };
+                // The part future is gone by the end of the `let` above, so
+                // release the count only now. C view: the refcount drop comes
+                // after the part's cleanup has run.
+                drop(live);
+                outcome
+            }
             UploadWork::CompleteMPU(completion) => self.execute_complete_mpu(*completion).await,
-            UploadWork::PutObject { stream } => self.execute_put_object(stream).await,
+            UploadWork::PutObject { stream, live } => {
+                // Same race as UploadPart: an abort drops PutObject wherever
+                // it is (body upload, retry backoff or response wait) and the
+                // upload ends as `Cancelled`, matching the Java v2 TM. The
+                // object may still have been stored if S3 had the whole body.
+                let token = self.inner.abort_parts_token.clone();
+                let outcome = tokio::select! {
+                    biased;
+                    _ = token.cancelled() => WorkOutcome::Cancelled,
+                    outcome = self.execute_put_object(stream) => outcome,
+                };
+                drop(live);
+                outcome
+            }
+            UploadWork::AbortMPU { upload_id } => self.execute_abort_mpu(upload_id).await,
         }
     }
 
@@ -410,6 +803,18 @@ impl UploadTransfer {
                 UploadState::PendingInit {
                     stream, size_hint, ..
                 } => (stream.take().expect("stream already taken"), *size_hint),
+                // An abort landed while Create was on the wire. Hand the ID to
+                // the abort instead of starting the parts; `execute_create_mpu`
+                // wakes the transfer after we return.
+                UploadState::Aborting {
+                    upload_id: slot,
+                    create_in_flight,
+                    ..
+                } => {
+                    *slot = Some(upload_id);
+                    *create_in_flight = false;
+                    return WorkOutcome::Success { data: None };
+                }
                 _ => panic!("unexpected state for create_mpu"),
             }
         };
@@ -450,7 +855,7 @@ impl UploadTransfer {
                 .build()
             {
                 Ok(reader) => reader,
-                Err(e) => return self.fail(e.into()),
+                Err(e) => return self.fail_after_create(upload_id, e.into()),
             },
         );
 
@@ -464,6 +869,19 @@ impl UploadTransfer {
         };
         let snapshot = {
             let mut state = self.inner.state.lock().expect("lock poisoned");
+            // The abort can also land after the first lock above, while the part
+            // reader was being built with the lock released. Same handling; the
+            // reader is dropped (closing the source) when we return.
+            if let UploadState::Aborting {
+                upload_id: slot,
+                create_in_flight,
+                ..
+            } = &mut *state
+            {
+                *slot = Some(upload_id);
+                *create_in_flight = false;
+                return WorkOutcome::Success { data: None };
+            }
             *state = UploadState::Transferring {
                 upload_id,
                 parts: PartTransferState::new(
@@ -511,7 +929,7 @@ impl UploadTransfer {
                 UploadState::Transferring { parts, .. } => {
                     (Arc::clone(&parts.part_reader), parts.reads_until_eof())
                 }
-                _ => panic!("unexpected state for read_part"),
+                other => return abandoned_part(other, "for read_part"),
             }
         };
 
@@ -527,7 +945,7 @@ impl UploadTransfer {
                     PartReadStart::Blocked => {
                         let mut state = self.inner.state.lock().expect("lock poisoned");
                         let UploadState::Transferring { parts, .. } = &mut *state else {
-                            panic!("unexpected state while retracting upload part");
+                            return abandoned_part(&state, "while retracting upload part");
                         };
                         parts.retract_scheduled_part();
                         let snapshot = parts.snapshot();
@@ -561,7 +979,7 @@ impl UploadTransfer {
             Poll::Pending => {
                 let mut state = self.inner.state.lock().expect("lock poisoned");
                 let UploadState::Transferring { parts, .. } = &mut *state else {
-                    panic!("unexpected state while parking upload part read");
+                    return abandoned_part(&state, "while parking upload part read");
                 };
                 parts.record_read_pending(&mut timing);
                 let parked_wake = Arc::clone(&wake);
@@ -585,24 +1003,24 @@ impl UploadTransfer {
             Poll::Ready(Ok(None)) => {
                 return self.on_end_of_stream();
             }
-            Poll::Ready(Err(error)) => return self.fail(error.into()),
+            Poll::Ready(Err(error)) => return self.fail_part(error.into()),
         };
 
         {
             let mut state = self.inner.state.lock().expect("lock poisoned");
             let UploadState::Transferring { parts, .. } = &mut *state else {
-                panic!("unexpected state while recording upload part");
+                return abandoned_part(&state, "while recording upload part");
             };
             let parts_read = match parts.observe_part(data.data.len() as u64) {
                 Ok(parts_read) => parts_read,
                 Err(error) => {
                     drop(state);
-                    return self.fail(crate::error::invalid_input(error));
+                    return self.fail_part(crate::error::invalid_input(error));
                 }
             };
             if reads_until_eof && parts_read > MAX_PARTS {
                 drop(state);
-                return self.fail(Error::new(
+                return self.fail_part(Error::new(
                     ErrorKind::InputInvalid,
                     format!(
                         "stream produced more than the maximum of {MAX_PARTS} parts; combine source \
@@ -612,7 +1030,7 @@ impl UploadTransfer {
             }
             if let Err(error) = validate_part_number(data.part_number) {
                 drop(state);
-                return self.fail(crate::error::invalid_input(error));
+                return self.fail_part(crate::error::invalid_input(error));
             }
         }
 
@@ -631,7 +1049,7 @@ impl UploadTransfer {
         let (transitioned, snapshot) = {
             let mut state = self.inner.state.lock().expect("lock poisoned");
             let UploadState::Transferring { parts, .. } = &mut *state else {
-                panic!("unexpected state at upload end-of-stream");
+                return abandoned_part(&state, "at upload end-of-stream");
             };
             let transitioned = parts.record_end_of_stream();
             (transitioned, parts.snapshot())
@@ -670,7 +1088,7 @@ impl UploadTransfer {
                     let source_observation = parts.begin_upload(presentation_segments, timing);
                     (upload_id.clone(), source_observation, parts.snapshot())
                 }
-                _ => panic!("unexpected state for send_part"),
+                other => return abandoned_part(other, "for send_part"),
             }
         };
 
@@ -760,7 +1178,7 @@ impl UploadTransfer {
                 let snapshot = {
                     let state = self.inner.state.lock().expect("lock poisoned");
                     let UploadState::Transferring { parts, .. } = &*state else {
-                        panic!("unexpected state while reporting failed upload part");
+                        return abandoned_part(&state, "while reporting failed upload part");
                     };
                     parts.snapshot()
                 };
@@ -772,7 +1190,7 @@ impl UploadTransfer {
                     request_elapsed,
                     snapshot,
                 );
-                return self.fail(e);
+                return self.fail_part(e);
             }
         };
 
@@ -789,7 +1207,7 @@ impl UploadTransfer {
         let (should_wake, completion_snapshot) = {
             let mut state = self.inner.state.lock().expect("lock poisoned");
             let UploadState::Transferring { parts, .. } = &mut *state else {
-                panic!("unexpected state while completing upload part");
+                return abandoned_part(&state, "while completing upload part");
             };
             parts.complete_part(completed, bytes_sent);
             let should_wake = try_begin_completing(&mut state);
@@ -822,7 +1240,8 @@ impl UploadTransfer {
     fn finish_read_without_part(&self) {
         let mut state = self.inner.state.lock().expect("lock poisoned");
         let UploadState::Transferring { parts, .. } = &mut *state else {
-            panic!("unexpected state while completing empty upload read");
+            abandoned_part(&state, "while completing empty upload read");
+            return;
         };
         let empty_object_ready = parts.finish_read_without_part();
         if empty_object_ready || try_begin_completing(&mut state) {
@@ -834,6 +1253,15 @@ impl UploadTransfer {
     async fn execute_put_object(&self, stream: InputStream) -> WorkOutcome {
         use crate::operation::upload::request::copy_fields_to_put_object_request;
 
+        {
+            let state = self.inner.state.lock().expect("lock poisoned");
+            // The abort landed after dispatch but before we started: never send
+            // PutObject. `execute` normally catches this first (the token is
+            // checked before this future is polled); this is the backstop.
+            if matches!(&*state, UploadState::Aborting { .. }) {
+                return WorkOutcome::Cancelled;
+            }
+        }
         let content_length = stream
             .size_hint()
             .upper()
@@ -966,9 +1394,21 @@ impl UploadTransfer {
         let transfer_diagnostics = self.inner.ctx.handle.config.diagnostics().transfer();
         let completion_timer = UploadDiagnosticTimer::start(transfer_diagnostics);
         let upload_id = {
-            let state = self.inner.state.lock().expect("lock poisoned");
-            match &*state {
+            let mut state = self.inner.state.lock().expect("lock poisoned");
+            match &mut *state {
                 UploadState::CompleteInFlight { upload_id } => upload_id.clone(),
+                // The abort landed after `poll_work` dispatched us but before we
+                // started. Never send Complete, so the object cannot exist, and
+                // tell the abort it no longer has to wait for us.
+                UploadState::Aborting {
+                    complete_mpu_in_flight,
+                    ..
+                } => {
+                    *complete_mpu_in_flight = false;
+                    drop(state); // unlock before waking (lock → mutate → unlock → wake)
+                    self.inner.ctx.try_wake();
+                    return WorkOutcome::Cancelled;
+                }
                 _ => panic!("unexpected state for complete_mpu"),
             }
         };
@@ -1040,7 +1480,16 @@ impl UploadTransfer {
         let _ = req_metrics.finish();
         let resp = match response {
             Ok(resp) => resp,
-            Err(e) => return self.fail(e.into()),
+            Err(e) => {
+                let error: Error = e.into();
+                // The TM SEP requires a warning with the upload ID and cause.
+                tracing::warn!(
+                    upload_id = %upload_id,
+                    error = %error,
+                    "CompleteMultipartUpload failed"
+                );
+                return self.complete_mpu_failed(error);
+            }
         };
         self.inner.observability.finish_multipart(
             final_snapshot.with_state(UploadExecutionState::CompleteMultipartUploadInFlight),
@@ -1064,17 +1513,240 @@ impl UploadTransfer {
         WorkOutcome::Success { data: None }
     }
 
+    /// Handles a CompleteMultipartUpload error.
+    ///
+    /// `NoSuchUpload` during a caller's abort means the abort won: S3 removed
+    /// the upload before Complete committed, so no object exists. Tested
+    /// against S3: abort then Complete returns `NoSuchUpload` and HeadObject
+    /// 404s, while Complete, abort, Complete again returns 200 for the second
+    /// Complete, so a retried Complete after a lost commit does not see
+    /// `NoSuchUpload`. Every other error, and any error outside a caller's
+    /// abort, fails the transfer.
+    fn complete_mpu_failed(&self, error: Error) -> WorkOutcome {
+        let mut state = self.inner.state.lock().expect("lock poisoned");
+        match &mut *state {
+            // `failure: None` = the caller asked for this abort. An abort
+            // started by a failure must still report that failure.
+            UploadState::Aborting {
+                complete_mpu_in_flight,
+                failure: None,
+                ..
+            } if error.code() == Some("NoSuchUpload") => {
+                *complete_mpu_in_flight = false;
+                drop(state); // unlock before waking (lock -> mutate -> unlock -> wake)
+                self.inner.ctx.try_wake(); // the `Aborting` arm ends as cancelled
+                WorkOutcome::Success { data: None }
+            }
+            _ => {
+                drop(state); // fail() re-locks state
+                self.fail(error)
+            }
+        }
+    }
+
+    /// Sends AbortMultipartUpload for an upload in `UploadState::Aborting`.
+    async fn execute_abort_mpu(&self, upload_id: String) -> WorkOutcome {
+        let ctx = &self.inner.ctx;
+        // `&self.inner.request` is a `&Arc<UploadInput>`; Rust auto-dereferences
+        // it to `&UploadInput` here (C view: passing `ptr` where `*ptr` is
+        // expected is fixed up by the compiler).
+        let response = crate::sdk_v1::copy_upload_input_fields_to_abort_multipart_upload(
+            &self.inner.request,
+            ctx.s3_client()
+                .abort_multipart_upload()
+                .upload_id(&upload_id),
+        )
+        .customize()
+        .config_override(
+            ctx.handle
+                .bucket_partition_override(self.inner.request.bucket()),
+        )
+        .send()
+        .instrument(tracing::debug_span!("send-abort-multipart-upload"))
+        .await;
+
+        match response {
+            Ok(resp) => {
+                // Taken alone, never while holding the state lock, so the two
+                // mutexes have no ordering to get wrong.
+                *self.inner.aborted.lock().expect("lock poisoned") = AbortedUpload {
+                    upload_id: Some(upload_id),
+                    request_charged: resp
+                        .request_charged
+                        .as_ref()
+                        .map(crate::sdk_v1::request_charged_from_sdk),
+                    ..Default::default()
+                };
+                let mut state = self.inner.state.lock().expect("lock poisoned");
+                // `Done` here means Complete committed first; nothing to record.
+                if let UploadState::Aborting { abort_mpu, .. } = &mut *state {
+                    *abort_mpu = AbortMpuProgress::Done;
+                }
+                drop(state);
+                ctx.try_wake();
+                WorkOutcome::Success { data: None }
+            }
+            Err(e) => {
+                let completed = matches!(
+                    *self.inner.state.lock().expect("lock poisoned"),
+                    UploadState::Done
+                );
+                if completed {
+                    // Complete committed first, so the abort had nothing to do
+                    // and its error says nothing about the object.
+                    return WorkOutcome::Success { data: None };
+                }
+                self.fail(e.into())
+            }
+        }
+    }
+
+    /// Handles an error from any request or source read.
+    ///
+    /// - A multipart upload is open and the policy is `AbortUpload`: abort it
+    ///   before reporting the error. Moves to `Aborting { failure: Some(..) }`,
+    ///   interrupts the parts and wakes the transfer; the `Aborting` arm sends
+    ///   AbortMultipartUpload and then ends the transfer with this error.
+    /// - Already `Aborting` (the caller's abort, or an earlier failure): end
+    ///   now, without waiting for the abort to finish. If an earlier failure
+    ///   started the abort, that error is reported, not this one.
+    /// - Anything else (no upload yet, PutObject, `Retain`): end now.
+    ///
+    /// Must be called without the state lock held: it takes it, and the end
+    /// path takes it again (Rust's `Mutex` is not recursive).
     fn fail(&self, error: Error) -> WorkOutcome {
         tracing::debug!(
             target: crate::telemetry::TARGET_TRANSFER,
             %error,
             "upload failed",
         );
+        // Classify before `error` is moved anywhere: the scheduler's
+        // concurrency controller still learns about this failure (for
+        // example a throttle) even when the transfer goes on to abort.
         let classification = crate::scheduler::classify_error(&error);
+
+        let mut state = self.inner.state.lock().expect("lock poisoned");
+        let error = match &mut *state {
+            UploadState::Aborting { failure, .. } => {
+                // `unwrap_or(error)`: the stored error if there is one, else
+                // this one (C view: `stored ? stored : error`).
+                let reported = failure.take().unwrap_or(error);
+                drop(state);
+                self.end_failed(reported);
+                return WorkOutcome::Failed { classification };
+            }
+            UploadState::Transferring { upload_id, .. }
+            | UploadState::Completing { upload_id, .. }
+            | UploadState::CompleteInFlight { upload_id }
+                if self.abort_mpu_policy() == AbortMpuProgress::ToSend =>
+            {
+                // `|` in a pattern matches any of the listed tags; all three
+                // have a `upload_id` field, so it binds whichever one is live.
+                // `if` after the pattern is a guard: the arm is taken only when
+                // it holds, otherwise matching falls through to `_`.
+                let upload_id = std::mem::take(upload_id);
+                // Overwriting the state drops the part state (reader, parked
+                // reads, completed list) and any `CompleteMpuWork` payload is
+                // already gone with the request that failed.
+                *state = UploadState::Aborting {
+                    upload_id: Some(upload_id),
+                    create_in_flight: false,
+                    complete_mpu_in_flight: false,
+                    abort_mpu: AbortMpuProgress::ToSend,
+                    failure: Some(error),
+                };
+                drop(state); // unlock before waking (lock -> mutate -> unlock -> wake)
+                             // Same order as `request_abort()`: stop the parts, then wake
+                             // so `poll_work` emits the abort.
+                self.inner.abort_parts_token.cancel();
+                self.inner.ctx.wake();
+                return WorkOutcome::Failed { classification };
+            }
+            _ => error,
+        };
+        drop(state);
+        self.end_failed(error);
+        WorkOutcome::Failed { classification }
+    }
+
+    /// Like `fail()`, for an error seen by part work (UploadPart, or a read
+    /// of the part source).
+    ///
+    /// Once the upload is being aborted, part results no longer matter: the
+    /// abort discards every part, and a part error is often caused by the
+    /// abort itself. So in `Aborting` the error is dropped, the same as
+    /// `abandoned_part`, instead of ending the abort early. This matters most
+    /// for the common case of several parts failing together: the first one
+    /// starts the abort, and the rest must not cut it short.
+    fn fail_part(&self, error: Error) -> WorkOutcome {
+        {
+            let state = self.inner.state.lock().expect("lock poisoned");
+            if matches!(&*state, UploadState::Aborting { .. } | UploadState::Done) {
+                tracing::debug!(
+                    target: crate::telemetry::TARGET_TRANSFER,
+                    %error,
+                    "upload part error ignored: upload is being aborted",
+                );
+                return WorkOutcome::Cancelled;
+            }
+        } // guard dropped here = scoped unlock; fail() takes the lock again
+        self.fail(error)
+    }
+
+    /// Like `fail()`, for an error after CreateMultipartUpload succeeded but
+    /// before its upload ID reached the state (the part reader failed to
+    /// build). The state is still `PendingInit`, so `fail()` alone would not
+    /// see the upload; this hands the ID over first.
+    fn fail_after_create(&self, upload_id: String, error: Error) -> WorkOutcome {
+        {
+            let mut state = self.inner.state.lock().expect("lock poisoned");
+            match &mut *state {
+                UploadState::PendingInit { .. }
+                    if self.abort_mpu_policy() == AbortMpuProgress::ToSend =>
+                {
+                    // Abort before reporting, as `fail()` does for an open
+                    // upload. No parts exist yet, so there is nothing to
+                    // interrupt; Create was this transfer's only work.
+                    let classification = crate::scheduler::classify_error(&error);
+                    *state = UploadState::Aborting {
+                        upload_id: Some(upload_id),
+                        create_in_flight: false,
+                        complete_mpu_in_flight: false,
+                        abort_mpu: AbortMpuProgress::ToSend,
+                        failure: Some(error),
+                    };
+                    drop(state);
+                    self.inner.ctx.wake();
+                    return WorkOutcome::Failed { classification };
+                }
+                // `Retain`: leave the upload, fail now.
+                UploadState::PendingInit { .. } => {}
+                // The caller's abort raced in. Give it the ID so the state is
+                // accurate; `fail()` then ends now, as for any failure during
+                // an abort.
+                UploadState::Aborting {
+                    upload_id: slot,
+                    create_in_flight,
+                    ..
+                } => {
+                    *slot = Some(upload_id);
+                    *create_in_flight = false;
+                }
+                _ => unreachable!("Create in flight implies PendingInit or Aborting"),
+            }
+        } // scoped unlock
+        self.fail(error)
+    }
+
+    /// Ends the transfer as failed with `error`.
+    ///
+    /// The caller must have released the state lock: `report_terminal` takes
+    /// it again.
+    fn end_failed(&self, error: Error) -> PollWork {
         self.inner.ctx.set_failed(error);
         self.report_terminal();
         self.inner.ctx.signal_terminal();
-        WorkOutcome::Failed { classification }
+        PollWork::Done
     }
 }
 
@@ -1100,6 +1772,9 @@ fn snapshot_state(state: &UploadState) -> UploadStateSnapshot {
         }
         UploadState::PutObjectInFlight => {
             UploadStateSnapshot::inactive(UploadExecutionState::PutObjectInFlight)
+        }
+        UploadState::Aborting { .. } => {
+            UploadStateSnapshot::inactive(UploadExecutionState::Aborting)
         }
         UploadState::Done => UploadStateSnapshot::inactive(UploadExecutionState::Done),
     }
@@ -1128,6 +1803,22 @@ fn validate_upload_part_response(
         &resp,
         format!("UploadPart returned no ETag for part {part_number}"),
     ))
+}
+
+/// Part work found the state is no longer `Transferring`.
+///
+/// The only legal cause is an abort: `poll_work` drops the part state when it
+/// moves to `Aborting`, and a part already past its last `.await` can still
+/// reach one of its state locks afterwards. Such a part has nothing left to do;
+/// its result is discarded, and it must not call `fail()`, since an error it saw
+/// (often `NoSuchUpload`) was caused by the abort itself. Any other state is a
+/// bug, so this still panics for those, like the `panic!` it replaces.
+fn abandoned_part(state: &UploadState, step: &str) -> WorkOutcome {
+    assert!(
+        matches!(state, UploadState::Aborting { .. } | UploadState::Done),
+        "unexpected state {step}"
+    );
+    WorkOutcome::Cancelled
 }
 
 fn try_begin_completing(state: &mut UploadState) -> bool {
@@ -1413,7 +2104,7 @@ mod tests {
         ));
 
         let mut empty_object = assert_ready(transfer.poll_work());
-        let UploadWork::UploadPart(work) = empty_object.data_mut::<UploadWork>() else {
+        let UploadWork::UploadPart(work, _) = empty_object.data_mut::<UploadWork>() else {
             panic!("drained empty source did not schedule its required zero-byte part");
         };
         assert!(work.is_empty_object());
@@ -1599,7 +2290,7 @@ mod tests {
         let mut next = assert_ready(transfer.poll_work());
         assert!(matches!(
             next.data_mut::<UploadWork>(),
-            UploadWork::UploadPart(_)
+            UploadWork::UploadPart(..)
         ));
     }
 
@@ -1640,11 +2331,11 @@ mod tests {
 
         let mut work1 = assert_ready(transfer.poll_work());
         let data1 = work1.data_mut::<UploadWork>();
-        assert!(matches!(data1, UploadWork::UploadPart(_)));
+        assert!(matches!(data1, UploadWork::UploadPart(..)));
 
         let mut work2 = assert_ready(transfer.poll_work());
         let data2 = work2.data_mut::<UploadWork>();
-        assert!(matches!(data2, UploadWork::UploadPart(_)));
+        assert!(matches!(data2, UploadWork::UploadPart(..)));
 
         assert_pending(transfer.poll_work());
     }
@@ -1663,7 +2354,7 @@ mod tests {
 
         let mut next = assert_ready(transfer.poll_work());
         let data = next.data_mut::<UploadWork>();
-        assert!(matches!(data, UploadWork::UploadPart(_)));
+        assert!(matches!(data, UploadWork::UploadPart(..)));
     }
 
     #[cfg_attr(miri, ignore)]

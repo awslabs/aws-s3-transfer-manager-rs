@@ -776,7 +776,8 @@ pub(crate) struct MultipartCompletion {
 /// State machine for tracking upload work progress.
 ///
 /// A multipart upload ID is held from `Transferring` through `CompleteInFlight`
-/// and leaves the state only when CompleteMultipartUpload succeeds.
+/// (or `Aborting`) and leaves the state only when CompleteMultipartUpload
+/// succeeds or the abort ends the transfer.
 #[derive(Debug)]
 pub(crate) enum UploadState {
     /// Waiting to start CreateMPU or PutObject.
@@ -804,7 +805,58 @@ pub(crate) enum UploadState {
     CompleteInFlight { upload_id: String },
     /// PutObject is in flight.
     PutObjectInFlight,
+    /// The upload is being aborted, and the transfer is waiting for the
+    /// requests that decide the outcome before it ends.
+    ///
+    /// Two ways in:
+    /// - The caller asked to abort: `poll_work` moves every other non-terminal
+    ///   state here once it sees the request. `failure` is `None`.
+    /// - A request failed while a multipart upload was open: `fail()` moves
+    ///   here so the upload is aborted before the error is reported. `failure`
+    ///   holds that error.
+    ///
+    /// From here it emits at most one AbortMultipartUpload and ends the
+    /// transfer when nothing below is still outstanding: as cancelled, or as
+    /// failed with `failure` if that is set.
+    /// A CompleteMultipartUpload that succeeds while in this state moves
+    /// straight to `Done` as an ordinary success: the object exists, so the
+    /// abort reports `AlreadyCompleted`. So does a PutObject whose response
+    /// arrived just before the abort could interrupt it.
+    ///
+    /// C view: this is one more tag of the tagged union. Each field below is a
+    /// plain flag/field the work handlers write under the state lock, then they
+    /// wake the transfer so `poll_work` re-reads them.
+    Aborting {
+        /// Upload to abort. `None` while Create is still in flight, when no
+        /// multipart upload exists (PutObject), or when Create never ran.
+        /// `Option<String>` is a nullable owned string.
+        upload_id: Option<String>,
+        /// CreateMultipartUpload is on the wire; wait for its upload ID.
+        create_in_flight: bool,
+        /// CompleteMultipartUpload is on the wire. Its response decides
+        /// whether the object exists, so wait for it.
+        complete_mpu_in_flight: bool,
+        /// Progress of the AbortMultipartUpload request.
+        abort_mpu: AbortMpuProgress,
+        /// The error that started this abort, reported once the abort ends.
+        /// `None` for an abort the caller asked for.
+        failure: Option<crate::error::Error>,
+    },
     /// S3 has committed the object; no multipart upload remains open.
+    Done,
+}
+
+/// Progress of the AbortMultipartUpload request while `UploadState::Aborting`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AbortMpuProgress {
+    /// No AbortMultipartUpload will be sent: no multipart upload exists, or
+    /// the request's `FailedMultipartUploadPolicy` is `Retain`.
+    NotNeeded,
+    /// Send it once an upload ID is known.
+    ToSend,
+    /// Emitted; waiting for its response.
+    InFlight,
+    /// S3 answered.
     Done,
 }
 
