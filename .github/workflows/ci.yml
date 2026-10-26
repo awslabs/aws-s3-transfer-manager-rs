@@ -72,6 +72,7 @@ jobs:
     timeout-minutes: 45
     env:
       GRADLE_USER_HOME: ${{ github.workspace }}/target/codegen/gradle-home
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/modeled-ci
     steps:
       - uses: actions/checkout@v4
       - name: Install Java 21
@@ -98,8 +99,12 @@ jobs:
             target/codegen/gradle-home/wrapper
             target/codegen/cargo-home
             target/codegen/models
-          key: ${{ runner.os }}-model-tooling-${{ hashFiles('tools/codegen/s3-tm-model-codegen/gradle.properties', 'tools/codegen/s3-tm-model-codegen/gradle/wrapper/gradle-wrapper.properties', 'tools/codegen/s3-tm-model-codegen/settings.gradle.kts', 'tools/codegen/s3-tm-model-codegen/build.gradle.kts') }}
+          key: ${{ runner.os }}-model-tooling-v2-${{ hashFiles('tools/codegen/s3-tm-model-codegen/gradle.properties', 'tools/codegen/s3-tm-model-codegen/gradle/wrapper/gradle-wrapper.properties', 'tools/codegen/s3-tm-model-codegen/settings.gradle.kts', 'tools/codegen/s3-tm-model-codegen/build.gradle.kts') }}
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Rust cache cleanup must not prune the model tooling under target/codegen.
+          workspaces: ". -> target/modeled-ci"
+          prefix-key: v1-modeled-rust
       - name: Test model tooling and generated fixtures
         run: just test-codegen
       - name: Check installed model and SDK adapters against fresh pinned generation
