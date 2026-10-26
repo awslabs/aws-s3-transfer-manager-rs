@@ -831,8 +831,8 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         }
 
         // Verify part numbers are consecutive starting from 1
-        // S3 requires parts to be listed in ascending part-number order and returns InvalidPartOrder otherwise. 
-        // Validate the order as the client sent it, so an out-of-order or non consecutive list is rejected. 
+        // S3 requires parts to be listed in ascending part-number order and returns InvalidPartOrder otherwise.
+        // Validate the order as the client sent it, so an out-of-order or non consecutive list is rejected.
         for (i, (part_number, _)) in parts.iter().enumerate() {
             if *part_number != (i + 1) as i32 {
                 return Err(Error::InvalidPartOrder.into());
