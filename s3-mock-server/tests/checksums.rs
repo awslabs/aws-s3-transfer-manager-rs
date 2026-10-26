@@ -1406,6 +1406,82 @@ async fn run_multipart_non_consecutive_parts(storage_type: StorageType) -> Resul
     Ok(())
 }
 
+/// A complete part set listed out of ascending order must fail with InvalidPartOrder.
+///
+/// The parts here form a full `1..=2` set but are listed descending (`2, 1`). S3 requires
+/// the `<Part>` entries to appear in ascending part-number order and returns InvalidPartOrder.
+async fn run_multipart_out_of_order_parts(storage_type: StorageType) -> Result<()> {
+    let (server, bucket) = create_server(storage_type).await?;
+    let handle = server.start().await?;
+    let s3 = handle.client().await;
+
+    let key = "test-multipart-out-of-order.txt";
+    let part_data = b"Test part data";
+
+    let create_response = s3
+        .create_multipart_upload()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await?;
+
+    let upload_id = create_response.upload_id().unwrap();
+
+    // Upload a complete, consecutive set of parts (1, 2).
+    let part1_response = s3
+        .upload_part()
+        .bucket(&bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .part_number(1)
+        .body(Bytes::from_static(part_data).into())
+        .send()
+        .await?;
+
+    let part2_response = s3
+        .upload_part()
+        .bucket(&bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .part_number(2)
+        .body(Bytes::from_static(part_data).into())
+        .send()
+        .await?;
+
+    // Complete with the parts listed in descending order (2, 1).
+    let completed_parts = vec![
+        CompletedPart::builder()
+            .part_number(2)
+            .e_tag(part2_response.e_tag().unwrap())
+            .build(),
+        CompletedPart::builder()
+            .part_number(1)
+            .e_tag(part1_response.e_tag().unwrap())
+            .build(),
+    ];
+
+    let result = s3
+        .complete_multipart_upload()
+        .bucket(&bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .multipart_upload(
+            CompletedMultipartUpload::builder()
+                .set_parts(Some(completed_parts))
+                .build(),
+        )
+        .send()
+        .await;
+
+    // Should fail with InvalidPartOrder
+    assert!(result.is_err());
+    let error_msg = format!("{:?}", result.unwrap_err());
+    assert!(error_msg.contains("InvalidPartOrder"));
+
+    handle.shutdown().await?;
+    Ok(())
+}
+
 // ============================================================================
 // CONCRETE TEST IMPLEMENTATIONS
 // ============================================================================
@@ -1456,6 +1532,11 @@ async fn test_multipart_non_consecutive_parts_in_memory() -> Result<()> {
 }
 
 #[tokio::test]
+async fn test_multipart_out_of_order_parts_in_memory() -> Result<()> {
+    run_multipart_out_of_order_parts(StorageType::InMemory).await
+}
+
+#[tokio::test]
 async fn test_multipart_full_object_crc32_in_memory() -> Result<()> {
     run_multipart_full_object_checksum(StorageType::InMemory, ChecksumAlgorithm::Crc32).await
 }
@@ -1498,6 +1579,11 @@ async fn test_put_object_crc32_incorrect_filesystem() -> Result<()> {
 #[tokio::test]
 async fn test_multipart_non_consecutive_parts_filesystem() -> Result<()> {
     run_multipart_non_consecutive_parts(StorageType::Filesystem).await
+}
+
+#[tokio::test]
+async fn test_multipart_out_of_order_parts_filesystem() -> Result<()> {
+    run_multipart_out_of_order_parts(StorageType::Filesystem).await
 }
 
 #[tokio::test]
