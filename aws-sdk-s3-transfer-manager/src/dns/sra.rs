@@ -59,15 +59,15 @@ fn handle_resolve_request(config: &CachingResolverProcessConfig, state: &mut Sra
     );
 }
 
-fn handle_resolve_result(config: &CachingResolverProcessConfig, state: &mut SraCachingResolverState, result: CachingResolveResult) {
+fn handle_resolve_result(_: &CachingResolverProcessConfig, state: &mut SraCachingResolverState, result: CachingResolveResult) {
     if let Some(entry) = state.hosts.get_mut(&result.name) {
         if let Some(pending_request) = entry.pending_requests.pop_front() {
-            let _ = pending_request.result_target.send(result.result);
+            (pending_request.completion_callback)(result.result);
         }
     }
 }
 
-fn handle_host_event(config: &CachingResolverProcessConfig, state: &mut SraCachingResolverState, event: CachingHostEvent) {
+fn handle_host_event(_: &CachingResolverProcessConfig, _: &mut SraCachingResolverState, _: CachingHostEvent) {
 
 }
 
@@ -88,6 +88,6 @@ fn handle_operation_sra(config: &CachingResolverProcessConfig, state: &mut SraCa
 /// Creates a new caching resolver that follows the SRA specification for domain name resolution
 pub fn new_sra_caching_resolver(config: CachingResolverConfig) -> CachingResolverHandle {
     CachingResolverHandle {
-        resolver: Arc::new(CachingResolverImpl::new(config, handle_operation_sra))
+        resolver: Arc::new(CachingResolverImpl::new_default(config, handle_operation_sra))
     }
 }
