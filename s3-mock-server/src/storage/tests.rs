@@ -185,6 +185,7 @@ async fn test_concurrent_operations<S: StorageBackend>(storage: &S) {
             content_encoding: None,
             content_disposition: None,
             content_language: None,
+            client_checksums: None,
         };
 
         storage.put_object(request).await.unwrap();
@@ -249,6 +250,7 @@ async fn test_storage_backend_consistency() {
             content_encoding: None,
             content_disposition: None,
             content_language: None,
+            client_checksums: None,
         };
         let stored_metadata = storage.put_object(request).await.unwrap();
 
@@ -309,4 +311,56 @@ async fn test_checksum_storage_backend<S: StorageBackend + ?Sized>(storage: &S) 
         retrieved_meta.etag,
         stored_meta.object_integrity.etag().unwrap()
     );
+}
+
+/// A PutObject whose body stream fails leaves the existing object, and nothing else, in
+/// storage.
+async fn test_failed_body_keeps_existing_object<S: StorageBackend>(storage: &S) {
+    storage.create_bucket(TEST_BUCKET).await.unwrap();
+    let original = StoreObjectRequest::new(
+        TEST_BUCKET,
+        "object",
+        Box::pin(futures::stream::once(async {
+            Ok(Bytes::from_static(b"original"))
+        })),
+        ObjectIntegrityChecks::new().with_md5(),
+    );
+    storage.put_object(original).await.unwrap();
+
+    let failing = StoreObjectRequest::new(
+        TEST_BUCKET,
+        "object",
+        Box::pin(futures::stream::iter([
+            Ok(Bytes::from_static(b"repl")),
+            Err(std::io::Error::other("client went away")),
+        ])),
+        ObjectIntegrityChecks::new().with_md5(),
+    );
+    assert!(storage.put_object(failing).await.is_err());
+
+    let request = GetObjectRequest {
+        bucket: TEST_BUCKET,
+        key: "object",
+        range: None,
+    };
+    let response = storage.get_object(request).await.unwrap().unwrap();
+    assert_eq!(
+        collect_stream_data(response.stream).await.unwrap(),
+        "original"
+    );
+}
+
+#[tokio::test]
+async fn test_in_memory_failed_body_keeps_existing_object() {
+    test_failed_body_keeps_existing_object(&InMemoryStorage::new()).await;
+}
+
+#[tokio::test]
+async fn test_filesystem_failed_body_keeps_existing_object() {
+    let dir = tempdir().unwrap();
+    let storage = FilesystemStorage::new(dir.path()).await.unwrap();
+    test_failed_body_keeps_existing_object(&storage).await;
+    // The temporary file of the failed write is gone.
+    let mut uploads = std::fs::read_dir(dir.path().join("uploads")).unwrap();
+    assert!(uploads.next().is_none());
 }

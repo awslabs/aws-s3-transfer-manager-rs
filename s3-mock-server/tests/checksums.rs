@@ -1604,3 +1604,58 @@ async fn test_head_object_multipart_sha256_filesystem() -> Result<()> {
     run_head_object_multipart_checksum_retrieval(StorageType::Filesystem, ChecksumAlgorithm::Sha256)
         .await
 }
+
+/// A PutObject whose body does not match its checksum fails with `BadDigest` and leaves the key
+/// as it was: an existing object keeps its content, and a missing key is not created. Fails if
+/// the backend stores the body before validating it.
+async fn run_put_object_bad_digest_leaves_key_unchanged(storage_type: StorageType) -> Result<()> {
+    use aws_sdk_s3::error::ProvideErrorMetadata;
+
+    let (server, bucket) = create_server(storage_type).await?;
+    let handle = server.start().await?;
+    let s3 = handle.client().await;
+
+    s3.put_object()
+        .bucket(&bucket)
+        .key("existing")
+        .body(Bytes::from_static(b"original").into())
+        .send()
+        .await?;
+
+    for key in ["existing", "missing"] {
+        let error = s3
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(Bytes::from_static(b"replacement").into())
+            .checksum_crc32(calculate_checksum(b"original", ChecksumAlgorithm::Crc32))
+            .send()
+            .await
+            .expect_err("PutObject with a mismatching checksum should fail");
+        assert_eq!(error.code(), Some("BadDigest"), "{error:?}");
+    }
+
+    let object = s3
+        .get_object()
+        .bucket(&bucket)
+        .key("existing")
+        .send()
+        .await?;
+    assert_eq!(&object.body.collect().await?.into_bytes()[..], b"original");
+    let listing = s3.list_objects_v2().bucket(&bucket).send().await?;
+    let keys: Vec<_> = listing.contents().iter().filter_map(|o| o.key()).collect();
+    assert_eq!(keys, ["existing"]);
+
+    handle.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_put_object_bad_digest_leaves_key_unchanged_in_memory() -> Result<()> {
+    run_put_object_bad_digest_leaves_key_unchanged(StorageType::InMemory).await
+}
+
+#[tokio::test]
+async fn test_put_object_bad_digest_leaves_key_unchanged_filesystem() -> Result<()> {
+    run_put_object_bad_digest_leaves_key_unchanged(StorageType::Filesystem).await
+}

@@ -92,6 +92,11 @@ impl StorageBackend for InMemoryStorage {
         let content = content.freeze();
         let content_length = content.len() as u64;
         let object_integrity = integrity_checks.finalize();
+        if let Some(client_checksums) = &request.client_checksums {
+            if let Err(error_msg) = object_integrity.validate(client_checksums) {
+                return Err(Error::ChecksumMismatch(error_msg.to_string()));
+            }
+        }
         let last_modified = request.last_modified.unwrap_or_else(SystemTime::now);
 
         let metadata = ObjectMetadata {
