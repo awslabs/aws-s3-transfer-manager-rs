@@ -21,9 +21,18 @@ pub struct RuntimeId(pub(crate) usize);
 impl RuntimeId {
     pub(crate) fn allocate() -> Option<Self> {
         static NEXT: AtomicUsize = AtomicUsize::new(1);
-        NEXT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
-            .ok()
-            .map(Self)
+        Self::allocate_from(&NEXT)
+    }
+
+    fn allocate_from(next: &AtomicUsize) -> Option<Self> {
+        let mut id = next.load(Ordering::Relaxed);
+        loop {
+            let following = id.checked_add(1)?;
+            match next.compare_exchange_weak(id, following, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return Some(Self(id)),
+                Err(observed) => id = observed,
+            }
+        }
     }
 }
 
@@ -106,5 +115,49 @@ impl CurrentPartition {
 impl Drop for CurrentPartition {
     fn drop(&mut self) {
         CURRENT.with(|current| current.set(self.previous));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{collections::HashSet, thread};
+
+    // ref: awslabs/aws-s3-transfer-manager-rs#217
+    #[test]
+    fn identity_exhaustion_does_not_wrap_or_reuse_ids() {
+        let next = AtomicUsize::new(usize::MAX - 1);
+        assert_eq!(
+            RuntimeId::allocate_from(&next),
+            Some(RuntimeId(usize::MAX - 1))
+        );
+        assert_eq!(RuntimeId::allocate_from(&next), None);
+        assert_eq!(RuntimeId::allocate_from(&next), None);
+        assert_eq!(next.load(Ordering::Relaxed), usize::MAX);
+    }
+
+    // ref: awslabs/aws-s3-transfer-manager-rs#217
+    #[test]
+    fn concurrent_identity_allocation_never_reuses_an_id() {
+        let next = AtomicUsize::new(1);
+        let ids = thread::scope(|scope| {
+            let tasks: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        (0..128)
+                            .map(|_| RuntimeId::allocate_from(&next).unwrap())
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            tasks
+                .into_iter()
+                .flat_map(|task| task.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        let unique: HashSet<_> = ids.iter().copied().collect();
+        assert_eq!(unique.len(), ids.len());
+        assert_eq!(unique.iter().min(), Some(&RuntimeId(1)));
+        assert_eq!(unique.iter().max(), Some(&RuntimeId(ids.len())));
     }
 }

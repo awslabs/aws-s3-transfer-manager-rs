@@ -8,6 +8,30 @@ use aws_smithy_topology::{BindError, DetectError};
 use std::{any::Any, error::Error, fmt, io, sync::mpsc::RecvError};
 use tokio::sync::oneshot;
 
+type BoxError = Box<dyn Error + Send + Sync + 'static>;
+
+/// Classifies a failure to construct a managed runtime.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildErrorKind {
+    /// Topology discovery failed.
+    Discovery,
+    /// No unused runtime identity remains.
+    IdentityExhausted,
+    /// The thread name prefix contains a NUL byte.
+    InvalidThreadName,
+    /// A managed OS thread could not be created.
+    Thread,
+    /// A managed thread could not establish its requested CPU binding.
+    Binding,
+    /// A partition's async runtime could not be initialized.
+    RuntimeInitialization,
+    /// A managed thread's initialization panicked.
+    InitializationPanic,
+    /// A managed thread did not report its initialization result.
+    Ready,
+}
+
 /// Failure to discover topology or start all managed threads.
 ///
 /// Threads started before a construction failure are stopped and joined before
@@ -16,55 +40,69 @@ use tokio::sync::oneshot;
 #[non_exhaustive]
 #[derive(Debug)]
 pub struct BuildError {
-    kind: Kind,
-}
-
-#[derive(Debug)]
-enum Kind {
-    Discovery(DetectError),
-    IdentityExhausted,
-    InvalidThreadName,
-    Thread(RuntimePartitionId, io::Error),
-    Binding(RuntimePartitionId, BindError),
-    Tokio(RuntimePartitionId, io::Error),
-    InitializationPanic(RuntimePartitionId, String),
-    Ready(RuntimePartitionId, RecvError),
+    kind: BuildErrorKind,
+    partition: Option<RuntimePartitionId>,
+    source: Option<BoxError>,
+    message: Option<String>,
 }
 
 impl BuildError {
+    /// Returns the classification of this construction failure.
+    pub fn kind(&self) -> BuildErrorKind {
+        self.kind
+    }
+
     pub(crate) fn discovery(source: DetectError) -> Self {
         Self {
-            kind: Kind::Discovery(source),
+            kind: BuildErrorKind::Discovery,
+            partition: None,
+            source: Some(Box::new(source)),
+            message: None,
         }
     }
 
     pub(crate) fn identity_exhausted() -> Self {
         Self {
-            kind: Kind::IdentityExhausted,
+            kind: BuildErrorKind::IdentityExhausted,
+            partition: None,
+            source: None,
+            message: None,
         }
     }
 
     pub(crate) fn invalid_thread_name() -> Self {
         Self {
-            kind: Kind::InvalidThreadName,
+            kind: BuildErrorKind::InvalidThreadName,
+            partition: None,
+            source: None,
+            message: None,
         }
     }
 
     pub(crate) fn thread(id: RuntimePartitionId, source: io::Error) -> Self {
         Self {
-            kind: Kind::Thread(id, source),
+            kind: BuildErrorKind::Thread,
+            partition: Some(id),
+            source: Some(Box::new(source)),
+            message: None,
         }
     }
 
     pub(crate) fn binding(id: RuntimePartitionId, source: BindError) -> Self {
         Self {
-            kind: Kind::Binding(id, source),
+            kind: BuildErrorKind::Binding,
+            partition: Some(id),
+            source: Some(Box::new(source)),
+            message: None,
         }
     }
 
     pub(crate) fn tokio(id: RuntimePartitionId, source: io::Error) -> Self {
         Self {
-            kind: Kind::Tokio(id, source),
+            kind: BuildErrorKind::RuntimeInitialization,
+            partition: Some(id),
+            source: Some(Box::new(source)),
+            message: None,
         }
     }
 
@@ -72,48 +110,88 @@ impl BuildError {
         id: RuntimePartitionId,
         payload: Box<dyn Any + Send>,
     ) -> Self {
-        let message = panic_message(payload.as_ref());
         Self {
-            kind: Kind::InitializationPanic(id, message),
+            kind: BuildErrorKind::InitializationPanic,
+            partition: Some(id),
+            source: None,
+            message: Some(panic_message(payload.as_ref())),
         }
     }
 
     pub(crate) fn ready(id: RuntimePartitionId, source: RecvError) -> Self {
         Self {
-            kind: Kind::Ready(id, source),
+            kind: BuildErrorKind::Ready,
+            partition: Some(id),
+            source: Some(Box::new(source)),
+            message: None,
         }
     }
 }
 
 impl fmt::Display for BuildError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.kind {
-            Kind::Discovery(source) => write!(f, "unable to discover runtime topology: {source}"),
-            Kind::IdentityExhausted => f.write_str("runtime identities exhausted"),
-            Kind::InvalidThreadName => f.write_str("thread name prefix contains a NUL byte"),
-            Kind::Thread(id, source) => write!(f, "unable to create thread {id}: {source}"),
-            Kind::Binding(id, source) => write!(f, "unable to bind thread {id}: {source}"),
-            Kind::Tokio(id, source) => {
-                write!(f, "unable to create Tokio runtime for {id}: {source}")
+        match self.kind {
+            BuildErrorKind::Discovery => f.write_str("unable to discover runtime topology"),
+            BuildErrorKind::IdentityExhausted => f.write_str("runtime identities exhausted"),
+            BuildErrorKind::InvalidThreadName => {
+                f.write_str("thread name prefix contains a NUL byte")
             }
-            Kind::InitializationPanic(id, message) => {
-                write!(f, "thread {id} initialization panicked: {message}")
-            }
-            Kind::Ready(id, source) => write!(f, "thread {id} did not report readiness: {source}"),
+            BuildErrorKind::Thread => write!(
+                f,
+                "unable to create thread {}",
+                self.partition.expect("thread failure has a partition"),
+            ),
+            BuildErrorKind::Binding => write!(
+                f,
+                "unable to bind thread {}",
+                self.partition.expect("binding failure has a partition"),
+            ),
+            BuildErrorKind::RuntimeInitialization => write!(
+                f,
+                "unable to create Tokio runtime for {}",
+                self.partition
+                    .expect("Tokio initialization failure has a partition"),
+            ),
+            BuildErrorKind::InitializationPanic => write!(
+                f,
+                "thread {} initialization panicked",
+                self.partition
+                    .expect("initialization panic has a partition"),
+            ),
+            BuildErrorKind::Ready => write!(
+                f,
+                "thread {} did not report readiness",
+                self.partition.expect("readiness failure has a partition"),
+            ),
+        }?;
+        if let Some(source) = &self.source {
+            write!(f, ": {source}")?;
         }
+        if let Some(message) = &self.message {
+            write!(f, ": {message}")?;
+        }
+        Ok(())
     }
 }
 
 impl Error for BuildError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match &self.kind {
-            Kind::Discovery(source) => Some(source),
-            Kind::Thread(_, source) | Kind::Tokio(_, source) => Some(source),
-            Kind::Binding(_, source) => Some(source),
-            Kind::Ready(_, source) => Some(source),
-            _ => None,
-        }
+        self.source.as_deref().map(|source| source as _)
     }
+}
+
+/// Classifies a failure to wait for a managed runtime's shutdown.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShutdownErrorKind {
+    /// Shutdown was awaited from a thread owned by this runtime.
+    FromRuntime,
+    /// The thread that joins managed threads could not be created.
+    Joiner,
+    /// The shutdown completion result was lost.
+    Completion,
+    /// A managed thread panicked.
+    ThreadPanic,
 }
 
 /// Failure to wait for a managed runtime's shutdown.
@@ -124,70 +202,96 @@ impl Error for BuildError {
 #[non_exhaustive]
 #[derive(Debug)]
 pub struct ShutdownError {
-    kind: ShutdownKind,
-}
-
-#[derive(Debug)]
-enum ShutdownKind {
-    FromRuntime(RuntimeId),
-    Joiner(RuntimeId, io::Error),
-    Completion(RuntimeId, oneshot::error::RecvError),
-    ThreadPanic(RuntimePartitionId, String),
+    kind: ShutdownErrorKind,
+    runtime: RuntimeId,
+    partition: Option<RuntimePartitionId>,
+    source: Option<BoxError>,
+    message: Option<String>,
 }
 
 impl ShutdownError {
+    /// Returns the classification of this shutdown failure.
+    pub fn kind(&self) -> ShutdownErrorKind {
+        self.kind
+    }
+
     pub(crate) fn from_runtime(id: RuntimeId) -> Self {
         Self {
-            kind: ShutdownKind::FromRuntime(id),
+            kind: ShutdownErrorKind::FromRuntime,
+            runtime: id,
+            partition: None,
+            source: None,
+            message: None,
         }
     }
 
     pub(crate) fn joiner(id: RuntimeId, source: io::Error) -> Self {
         Self {
-            kind: ShutdownKind::Joiner(id, source),
+            kind: ShutdownErrorKind::Joiner,
+            runtime: id,
+            partition: None,
+            source: Some(Box::new(source)),
+            message: None,
         }
     }
 
     pub(crate) fn completion(id: RuntimeId, source: oneshot::error::RecvError) -> Self {
         Self {
-            kind: ShutdownKind::Completion(id, source),
+            kind: ShutdownErrorKind::Completion,
+            runtime: id,
+            partition: None,
+            source: Some(Box::new(source)),
+            message: None,
         }
     }
 
     pub(crate) fn thread_panic(id: RuntimePartitionId, payload: Box<dyn Any + Send>) -> Self {
         Self {
-            kind: ShutdownKind::ThreadPanic(id, panic_message(payload.as_ref())),
+            kind: ShutdownErrorKind::ThreadPanic,
+            runtime: id.runtime_id(),
+            partition: Some(id),
+            source: None,
+            message: Some(panic_message(payload.as_ref())),
         }
     }
 }
 
 impl fmt::Display for ShutdownError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.kind {
-            ShutdownKind::FromRuntime(id) => {
-                write!(f, "cannot wait for {id} shutdown from a thread it owns")
-            }
-            ShutdownKind::Joiner(id, source) => write!(
+        match self.kind {
+            ShutdownErrorKind::FromRuntime => write!(
                 f,
-                "unable to start shutdown joining thread for {id}: {source}"
+                "cannot wait for {} shutdown from a thread it owns",
+                self.runtime,
             ),
-            ShutdownKind::Completion(id, source) => {
-                write!(f, "shutdown completion for {id} was lost: {source}")
+            ShutdownErrorKind::Joiner => write!(
+                f,
+                "unable to start shutdown joining thread for {}",
+                self.runtime,
+            ),
+            ShutdownErrorKind::Completion => {
+                write!(f, "shutdown completion for {} was lost", self.runtime,)
             }
-            ShutdownKind::ThreadPanic(id, message) => {
-                write!(f, "managed thread for {id} panicked: {message}")
-            }
+            ShutdownErrorKind::ThreadPanic => write!(
+                f,
+                "managed thread for {} panicked",
+                self.partition
+                    .expect("managed-thread panic has a partition"),
+            ),
+        }?;
+        if let Some(source) = &self.source {
+            write!(f, ": {source}")?;
         }
+        if let Some(message) = &self.message {
+            write!(f, ": {message}")?;
+        }
+        Ok(())
     }
 }
 
 impl Error for ShutdownError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match &self.kind {
-            ShutdownKind::Joiner(_, source) => Some(source),
-            ShutdownKind::Completion(_, source) => Some(source),
-            _ => None,
-        }
+        self.source.as_deref().map(|source| source as _)
     }
 }
 

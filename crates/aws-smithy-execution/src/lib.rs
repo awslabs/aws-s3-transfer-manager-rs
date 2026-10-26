@@ -32,8 +32,14 @@
 //! Enabling the feature alone does not attach a recorder. Shut down the runtime
 //! before shutting down the recorder so managed-thread events can flush.
 //!
-//! Each partition currently permits one Tokio blocking-pool thread. These
-//! helper threads are outside the execution partition collection.
+//! Each partition permits one Tokio blocking-pool thread, shared by
+//! `tokio::task::spawn_blocking`, Tokio filesystem operations, and hostname
+//! resolution through Tokio's `ToSocketAddrs`. Additional blocking operations
+//! queue while that thread is busy. A blocking task that waits for work requiring
+//! the same pool can prevent progress. These helper threads are outside the
+//! execution partition collection. Synchronous work performed directly inside a
+//! partition's async task runs on its managed thread and delays other tasks on
+//! that partition; it does not use the blocking pool.
 //! Thread binding does not establish a memory allocation policy.
 //!
 //! ```rust
@@ -67,7 +73,7 @@ mod runtime;
 mod shutdown;
 mod thread;
 
-pub use error::{BuildError, ShutdownError};
+pub use error::{BuildError, BuildErrorKind, ShutdownError, ShutdownErrorKind};
 pub use handle::ManagedRuntimeHandle;
 pub use identity::{RuntimeId, RuntimePartitionId};
 pub use partition::RuntimePartition;

@@ -297,6 +297,7 @@ impl Drop for Startup {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::BuildErrorKind;
     use std::{error::Error, sync::mpsc};
 
     fn topology() -> Topology {
@@ -332,6 +333,7 @@ mod tests {
                 })
             })
             .unwrap_err();
+        assert_eq!(error.kind(), BuildErrorKind::RuntimeInitialization);
         assert!(error.to_string().contains("partition-"));
         assert_eq!(
             error.source().unwrap().to_string(),
@@ -362,6 +364,7 @@ mod tests {
                 ))
             })
             .unwrap_err();
+        assert_eq!(error.kind(), BuildErrorKind::Thread);
         assert_eq!(
             error
                 .source()
@@ -380,6 +383,7 @@ mod tests {
             .thread_name_prefix("invalid\0name")
             .build()
             .unwrap_err();
+        assert_eq!(error.kind(), BuildErrorKind::InvalidThreadName);
         assert!(error.to_string().contains("NUL byte"));
     }
 }

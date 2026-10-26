@@ -64,6 +64,7 @@ async fn join_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ShutdownErrorKind;
     use std::{
         error::Error,
         future::Future,
@@ -96,6 +97,7 @@ mod tests {
         ));
         drop(release_tx);
         let error = caller().block_on(shutdown).unwrap_err();
+        assert_eq!(error.kind(), ShutdownErrorKind::ThreadPanic);
         assert!(error.to_string().contains("partition-0"));
         assert!(error.to_string().contains("first thread failed"));
         assert!(!error.to_string().contains("second thread failed"));
@@ -113,6 +115,7 @@ mod tests {
                 ))
             }))
             .unwrap_err();
+        assert_eq!(error.kind(), ShutdownErrorKind::Joiner);
         assert_eq!(
             error
                 .source()
@@ -135,6 +138,7 @@ mod tests {
             })
         }));
         let error = result.unwrap_err();
+        assert_eq!(error.kind(), ShutdownErrorKind::Completion);
         assert!(error.to_string().contains("completion"));
         assert!(error.source().unwrap().is::<oneshot::error::RecvError>());
     }

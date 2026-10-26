@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use aws_smithy_execution::{ManagedRuntime, topology::Topology};
+use aws_smithy_execution::{ManagedRuntime, ShutdownErrorKind, topology::Topology};
 use std::{
     future::{self, Future},
     io::Write,
@@ -345,6 +345,7 @@ fn shutdown_from_managed_thread_returns_error() {
     let error = caller()
         .block_on(async { tokio::time::timeout(TIMEOUT, task).await.unwrap().unwrap() })
         .unwrap_err();
+    assert_eq!(error.kind(), ShutdownErrorKind::FromRuntime);
     assert!(error.to_string().contains("thread it owns"));
     assert!(error.to_string().contains(&id.to_string()));
 }
@@ -367,6 +368,7 @@ fn shutdown_from_own_blocking_thread_rejects_foreign_tokio_context() {
         .await;
     });
     let error = result.recv_timeout(TIMEOUT).unwrap().unwrap_err();
+    assert_eq!(error.kind(), ShutdownErrorKind::FromRuntime);
     assert!(error.to_string().contains("thread it owns"));
     if let Err(error) = caller().block_on(task) {
         assert!(error.is_cancelled());
@@ -517,6 +519,7 @@ mod tracing {
             .await;
         });
         let error = result.recv_timeout(TIMEOUT).unwrap().unwrap().unwrap_err();
+        assert_eq!(error.kind(), ShutdownErrorKind::FromRuntime);
         assert!(error.to_string().contains("thread it owns"));
         if let Err(error) = caller().block_on(task) {
             assert!(error.is_cancelled());
