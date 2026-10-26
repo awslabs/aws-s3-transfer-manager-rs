@@ -61,15 +61,6 @@ Other notes:
     In addition to good IPs there will also be some sort of bad ip list which good IPs may get
       moved to if host events dictate (connection failures, etc...)
 
-The current proof-of-concept does not perform any of this shared processing.  It just sketches
-the communication channels and rough public API type contracts.  Instead, when a resolution request
-is received internally, a dedicated lookup is performed as an async task and the result applied to
-complete the public API future.
-
-Eventually we should be able to genericize the async processing function and associated shared state
-so that we can create caching resolver variants that compose (and compare) different
-behaviors.  This will allow us to explore if resolution policies are helping in adverse scenarios.
-
  */
 
 /// All configuration options for a caching DNS resolver
@@ -158,14 +149,15 @@ impl CachingResolveRequestBuilder {
     }
 }
 
-type ResolutionCompletionFn = Box<dyn FnOnce(ResolveDnsResult) -> () + Send + Sync>;
+/// Type signature for a resolution request's completion callback
+pub type ResolutionCompletionFn = Box<dyn FnOnce(ResolveDnsResult) -> () + Send + Sync>;
 
 /// Internal resolve request type.  Needs to be public so that caching resolver variants can
 /// be implemented by others.
 pub struct CachingResolveRequestInternal {
     request: CachingResolveRequest,
 
-    completion_callback: ResolutionCompletionFn, //tokio::sync::oneshot::Sender<ResolveDnsResult>
+    completion_callback: ResolutionCompletionFn,
 }
 
 impl CachingResolveRequestInternal {
@@ -214,7 +206,7 @@ impl CachingResolveResult {
 }
 
 /// Notification that a user of the resolver has stopped using an IP address.  It is assumed that
-/// something beings using an address as soon as its completes.  It is critical that every lookup
+/// something begins using an address as soon as its completes.  It is critical that every lookup
 /// has a matching release so that the internal cache can correctly track IP distribution.
 #[derive(Debug)]
 pub struct CachingHostEventIpReleased {
