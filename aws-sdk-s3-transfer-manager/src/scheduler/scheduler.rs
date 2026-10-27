@@ -3910,6 +3910,127 @@ mod tests {
         handle.runtime.shutdown();
     }
 
+    /// Transfer that hands out one work item whose execution completes it, and whose
+    /// `on_terminal` counts its calls and then panics.
+    #[derive(Debug)]
+    struct CompletesInExecuteThenPanicsInHook {
+        ctx: TransferContext,
+        polls: AtomicUsize,
+        hook_calls: Arc<AtomicUsize>,
+    }
+
+    impl Transfer for CompletesInExecuteThenPanicsInHook {
+        fn ctx(&self) -> &TransferContext {
+            &self.ctx
+        }
+
+        fn poll_work(&self) -> PollWork {
+            if self.polls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return PollWork::ready(IoRequest { data: None });
+            }
+            self.ctx.set_pending(PendingCause::other("test"));
+            PollWork::Pending
+        }
+
+        fn execute<'a>(
+            &'a self,
+            _work: &'a mut IoRequest,
+        ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
+            Box::pin(async move {
+                self.ctx.set_completed();
+                WorkOutcome::Success { data: None }
+            })
+        }
+
+        fn on_terminal(&self) {
+            self.hook_calls.fetch_add(1, Ordering::SeqCst);
+            panic!("on_terminal panicked");
+        }
+    }
+
+    /// Transfer that completes on its first poll.
+    #[derive(Debug)]
+    struct CompletesOnPoll {
+        ctx: TransferContext,
+    }
+
+    impl Transfer for CompletesOnPoll {
+        fn ctx(&self) -> &TransferContext {
+            &self.ctx
+        }
+
+        fn poll_work(&self) -> PollWork {
+            self.ctx.set_completed();
+            self.ctx.signal_terminal();
+            PollWork::Done
+        }
+
+        fn execute<'a>(
+            &'a self,
+            _work: &'a mut IoRequest,
+        ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
+            Box::pin(async { unreachable!("test transfer produces no work") })
+        }
+    }
+
+    // ref: awslabs/aws-s3-transfer-manager-rs#197
+    /// A panic in `on_terminal` on the completion path must not skip the `generate_work`
+    /// that refills the slot the completion freed.
+    ///
+    /// At concurrency 1 the second transfer is queued behind the first one's only work
+    /// item, so the completion's own `generate_work` is the only edge that polls it.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn a_panicking_terminal_hook_on_completion_still_refills_the_slot() {
+        let _logs = show_test_logs();
+        let handle = test_handle(1);
+        let scheduler = &handle.scheduler;
+
+        let first = TransferId {
+            id: 40_020,
+            parent: None,
+        };
+        let (first_ctx, first_rx) = TransferContext::with_id(first, handle.clone());
+        let hook_calls = Arc::new(AtomicUsize::new(0));
+        scheduler.enqueue_transfer(Box::new(CompletesInExecuteThenPanicsInHook {
+            ctx: first_ctx,
+            polls: AtomicUsize::new(0),
+            hook_calls: Arc::clone(&hook_calls),
+        }));
+        assert_eq!(
+            1,
+            scheduler.dispatched_for_test(),
+            "the first transfer's work item was not dispatched"
+        );
+
+        let second = TransferId {
+            id: 40_021,
+            parent: None,
+        };
+        let (second_ctx, second_rx) = TransferContext::with_id(second, handle.clone());
+        scheduler.enqueue_transfer(Box::new(CompletesOnPoll { ctx: second_ctx }));
+
+        tokio::time::timeout(Duration::from_secs(5), first_rx)
+            .await
+            .expect("the first transfer's handle was never released")
+            .expect("the first transfer signals terminal");
+        let second_done = tokio::time::timeout(Duration::from_secs(5), second_rx).await;
+
+        assert_eq!(
+            1,
+            hook_calls.load(Ordering::SeqCst),
+            "the completion never called `on_terminal`, so nothing here exercises the \
+             containment"
+        );
+        assert!(
+            matches!(second_done, Ok(Ok(_))),
+            "the hook panicked and took `generate_work` with it, so the transfer queued \
+             behind the freed slot never ran"
+        );
+
+        handle.runtime.shutdown();
+    }
+
     /// Verifies the Done-branch defensive cleanup actually cancels the
     /// orphaned children (calls `cancel_descriptor`), not just removing
     /// them from the map. Each child's terminal receiver should fire so
