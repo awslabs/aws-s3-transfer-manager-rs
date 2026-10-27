@@ -42,7 +42,7 @@ fn opt_etag_from_quoted(s: Option<String>) -> Option<ETag> {
 /// metadata, so — like real S3's name-based routing — it recognizes a directory
 /// bucket by this suffix.
 ///
-/// https://docs.aws.amazon.com/AmazonS3/latest/userguide/directory-bucket-naming-rules.html
+/// <https://docs.aws.amazon.com/AmazonS3/latest/userguide/directory-bucket-naming-rules.html>
 fn is_directory_bucket(bucket: &str) -> bool {
     bucket.ends_with("--x-s3")
 }
@@ -856,7 +856,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         // part number and returns InvalidPartOrder otherwise. Gaps are allowed in
         // the general case (e.g. 1, 2, 5) — part numbers need not be contiguous.
         //
-        // https://docs.aws.amazon.com/AmazonS3/latest/API/API_CompleteMultipartUpload.html
+        // <https://docs.aws.amazon.com/AmazonS3/latest/API/API_CompleteMultipartUpload.html>
         let mut previous_part_number = 0;
         for (part_number, _) in &parts {
             if *part_number <= previous_part_number {
