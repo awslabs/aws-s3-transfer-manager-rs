@@ -188,6 +188,8 @@ async fn test_concurrent_operations<S: StorageBackend>(storage: &S) {
             content_language: None,
             client_checksums: None,
             precondition: Default::default(),
+            etag: None,
+            restore_status: None,
         };
 
         storage.put_object(request).await.unwrap();
@@ -255,6 +257,8 @@ async fn test_storage_backend_consistency() {
             content_language: None,
             client_checksums: None,
             precondition: Default::default(),
+            etag: None,
+            restore_status: None,
         };
         let stored_metadata = storage.put_object(request).await.unwrap();
 
@@ -534,4 +538,54 @@ async fn test_in_memory_update_metadata() {
 async fn test_filesystem_update_metadata() {
     let dir = tempdir().unwrap();
     test_update_metadata(&FilesystemStorage::new(dir.path()).await.unwrap()).await;
+}
+
+/// `list_multipart_uploads` reports the uploads in progress in one bucket, ordered by key, and
+/// drops an upload once it is aborted.
+async fn test_list_multipart_uploads<S: StorageBackend>(storage: &S) {
+    storage.create_bucket(TEST_BUCKET).await.unwrap();
+    storage.create_bucket("other-bucket").await.unwrap();
+    for (bucket, key, upload_id) in [
+        (TEST_BUCKET, "b", "upload-1"),
+        (TEST_BUCKET, "a", "upload-2"),
+        ("other-bucket", "c", "upload-3"),
+    ] {
+        let request = CreateMultipartUploadRequest {
+            bucket,
+            key,
+            upload_id,
+            metadata: ObjectMetadata::default(),
+            checksum_type: aws_sdk_s3::types::ChecksumType::Composite,
+        };
+        storage.create_multipart_upload(request).await.unwrap();
+    }
+    let listed = |uploads: Vec<crate::storage::MultipartUploadInfo>| -> Vec<(String, String)> {
+        uploads
+            .into_iter()
+            .map(|upload| (upload.key, upload.upload_id))
+            .collect()
+    };
+    assert_eq!(
+        listed(storage.list_multipart_uploads(TEST_BUCKET).await.unwrap()),
+        [
+            ("a".to_owned(), "upload-2".to_owned()),
+            ("b".to_owned(), "upload-1".to_owned())
+        ]
+    );
+    storage.abort_multipart_upload("upload-2").await.unwrap();
+    assert_eq!(
+        listed(storage.list_multipart_uploads(TEST_BUCKET).await.unwrap()),
+        [("b".to_owned(), "upload-1".to_owned())]
+    );
+}
+
+#[tokio::test]
+async fn test_in_memory_list_multipart_uploads() {
+    test_list_multipart_uploads(&InMemoryStorage::new()).await;
+}
+
+#[tokio::test]
+async fn test_filesystem_list_multipart_uploads() {
+    let dir = tempdir().unwrap();
+    test_list_multipart_uploads(&FilesystemStorage::new(dir.path()).await.unwrap()).await;
 }

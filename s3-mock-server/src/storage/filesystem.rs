@@ -310,7 +310,10 @@ impl StorageBackend for FilesystemStorage {
         let metadata = ObjectMetadata {
             content_type: request.content_type,
             content_length,
-            etag: object_integrity.etag().unwrap_or_default(),
+            etag: request
+                .etag
+                .clone()
+                .unwrap_or_else(|| object_integrity.etag().unwrap_or_default()),
             last_modified,
             user_metadata: request.user_metadata,
             checksum_algorithm: None,
@@ -326,7 +329,7 @@ impl StorageBackend for FilesystemStorage {
             content_disposition: request.content_disposition,
             content_language: request.content_language,
             parts: Vec::new(),
-            restore_status: None,
+            restore_status: request.restore_status,
         };
         let metadata_path = self.get_object_metadata_path(&request.bucket, &request.key);
         Self::save_metadata(&metadata_path, &metadata).await?;
@@ -809,6 +812,37 @@ impl StorageBackend for FilesystemStorage {
         fs::remove_dir_all(upload_dir).await?;
 
         Ok(())
+    }
+
+    async fn list_multipart_uploads(
+        &self,
+        bucket: &str,
+    ) -> Result<Vec<crate::storage::MultipartUploadInfo>> {
+        let mut uploads = Vec::new();
+        let mut entries = match fs::read_dir(self.root_dir.join("uploads")).await {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(uploads),
+            Err(e) => return Err(e.into()),
+        };
+        while let Some(entry) = entries.next_entry().await? {
+            if !entry.file_type().await?.is_dir() {
+                continue;
+            }
+            let metadata_path = entry.path().join("metadata.json");
+            let Some(upload) =
+                Self::load_metadata::<MultipartUploadMetadata>(&metadata_path).await?
+            else {
+                continue;
+            };
+            if upload.bucket.as_deref() == Some(bucket) {
+                uploads.push(crate::storage::MultipartUploadInfo {
+                    key: upload.key,
+                    upload_id: upload.upload_id,
+                });
+            }
+        }
+        uploads.sort();
+        Ok(uploads)
     }
 
     async fn update_metadata(

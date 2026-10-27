@@ -9,6 +9,20 @@ use aws_smithy_checksums::ChecksumAlgorithm;
 use std::collections::HashMap;
 use std::str::FromStr;
 
+/// The algorithm of a checksum the server stores, from its S3 name in any case: CRC32, CRC32C,
+/// CRC64NVME, SHA1 or SHA256. `None` for any other name, including MD5, which
+/// `aws_smithy_checksums` parses as CRC32.
+pub(crate) fn stored_checksum_algorithm(name: &str) -> Option<ChecksumAlgorithm> {
+    match name.to_ascii_uppercase().as_str() {
+        "CRC32" => Some(ChecksumAlgorithm::Crc32),
+        "CRC32C" => Some(ChecksumAlgorithm::Crc32c),
+        "CRC64NVME" => Some(ChecksumAlgorithm::Crc64Nvme),
+        "SHA1" => Some(ChecksumAlgorithm::Sha1),
+        "SHA256" => Some(ChecksumAlgorithm::Sha256),
+        _ => None,
+    }
+}
+
 /// Client-provided checksums from S3 API requests
 #[derive(Debug, Clone)]
 pub struct ClientChecksums {

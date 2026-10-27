@@ -178,6 +178,12 @@ and, when requested, restore status.
 Create buckets with CreateBucket or `S3MockServer::create_bucket` before using them: object
 requests for a missing bucket fail with NoSuchBucket.
 
+### Seeding and Inspection
+
+`add_object_with` seeds an object directly in storage. `AddObjectRequest` sets the content type,
+user metadata and last-modified time, and also an explicit ETag, storage class, restore status and
+checksum algorithms. `list_multipart_uploads` reports the multipart uploads in progress.
+
 ### Request Counts and Faults
 
 The server counts the requests it receives per operation, and can fail or reshape the requests a

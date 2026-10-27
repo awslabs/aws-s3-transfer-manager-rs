@@ -105,7 +105,10 @@ impl StorageBackend for InMemoryStorage {
         let metadata = ObjectMetadata {
             content_type: request.content_type,
             content_length,
-            etag: object_integrity.etag().unwrap_or_default(),
+            etag: request
+                .etag
+                .clone()
+                .unwrap_or_else(|| object_integrity.etag().unwrap_or_default()),
             last_modified,
             user_metadata: request.user_metadata,
             checksum_algorithm: None,
@@ -121,7 +124,7 @@ impl StorageBackend for InMemoryStorage {
             content_disposition: request.content_disposition,
             content_language: request.content_language,
             parts: Vec::new(),
-            restore_status: None,
+            restore_status: request.restore_status,
         };
 
         let mut buckets = self.buckets.write().await;
@@ -647,6 +650,24 @@ impl StorageBackend for InMemoryStorage {
         multipart.parts.remove(upload_id);
 
         Ok(())
+    }
+
+    async fn list_multipart_uploads(
+        &self,
+        bucket: &str,
+    ) -> Result<Vec<crate::storage::MultipartUploadInfo>> {
+        let multipart = self.multipart.read().await;
+        let mut uploads: Vec<_> = multipart
+            .uploads
+            .values()
+            .filter(|upload| upload.bucket.as_deref() == Some(bucket))
+            .map(|upload| crate::storage::MultipartUploadInfo {
+                key: upload.key.clone(),
+                upload_id: upload.upload_id.clone(),
+            })
+            .collect();
+        uploads.sort();
+        Ok(uploads)
     }
 
     async fn update_metadata(

@@ -29,8 +29,8 @@ pub use error::Result;
 pub use faults::{BodyCadence, FaultTarget, FaultType, Occurrence};
 pub use operation::Operation;
 pub use server::{
-    AddObjectRequest, ObjectData, ObjectListEntry, S3MockServer, S3MockServerBuilder, ServerConfig,
-    ServerHandle,
+    AddObjectRequest, MultipartUploadEntry, ObjectData, ObjectListEntry, S3MockServer,
+    S3MockServerBuilder, ServerConfig, ServerHandle,
 };
 pub use storage::models::RestoreStatus;
 pub use types::composite_checksum;

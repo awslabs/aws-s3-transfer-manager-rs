@@ -135,6 +135,18 @@ pub fn md5_etag(content: &[u8]) -> String {
     format!("\"{}\"", hex::encode(md5::compute(content).0))
 }
 
+pub fn crc32(data: &[u8]) -> String {
+    let mut digest = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc);
+    digest.update(data);
+    base64::engine::general_purpose::STANDARD.encode((digest.finalize() as u32).to_be_bytes())
+}
+
+pub fn crc32c(data: &[u8]) -> String {
+    let mut digest = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32Iscsi);
+    digest.update(data);
+    base64::engine::general_purpose::STANDARD.encode((digest.finalize() as u32).to_be_bytes())
+}
+
 pub fn crc64nvme(data: &[u8]) -> String {
     let mut digest = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc64Nvme);
     digest.update(data);

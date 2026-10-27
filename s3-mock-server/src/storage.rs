@@ -54,6 +54,10 @@ pub struct StoreObjectRequest {
     /// Condition on the current state of the key, checked atomically with the write by
     /// backends that support it.
     pub precondition: WritePrecondition,
+    /// When set, the quoted ETag stored instead of the MD5 of the body.
+    pub etag: Option<String>,
+    /// Restore status to store, for an object in an archival storage class.
+    pub restore_status: Option<crate::storage::models::RestoreStatus>,
 }
 
 /// Condition on the current state of a key for a write to succeed.
@@ -146,6 +150,13 @@ pub(crate) struct ObjectInfo {
     pub metadata: ObjectMetadata,
 }
 
+/// An in-progress multipart upload.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct MultipartUploadInfo {
+    pub key: String,
+    pub upload_id: String,
+}
+
 /// Information about a bucket.
 pub(crate) struct BucketInfo {
     pub name: String,
@@ -220,6 +231,8 @@ impl StoreObjectRequest {
             content_language: None,
             client_checksums: None,
             precondition: WritePrecondition::None,
+            etag: None,
+            restore_status: None,
         }
     }
 
@@ -278,6 +291,8 @@ impl From<s3s::dto::PutObjectInput> for StoreObjectRequest {
                 .map(|s| Cow::<str>::from(s).into_owned()),
             client_checksums: None,
             precondition,
+            etag: None,
+            restore_status: None,
         }
     }
 }
@@ -401,6 +416,9 @@ pub(crate) trait StorageBackend: Send + Sync + Debug {
     /// Abort a multipart upload and clean up all associated data.
     async fn abort_multipart_upload(&self, upload_id: &str) -> Result<()>;
 
+    /// The multipart uploads in progress in `bucket`, ordered by key and then upload id.
+    async fn list_multipart_uploads(&self, bucket: &str) -> Result<Vec<MultipartUploadInfo>>;
+
     /// Change the stored metadata of an object in place, leaving its data unchanged.
     ///
     /// Fails with `NoSuchBucket` or `NoSuchKey` when the object does not exist.
@@ -489,6 +507,10 @@ impl StorageBackend for std::sync::Arc<dyn StorageBackend + '_> {
 
     async fn abort_multipart_upload(&self, upload_id: &str) -> Result<()> {
         (**self).abort_multipart_upload(upload_id).await
+    }
+
+    async fn list_multipart_uploads(&self, bucket: &str) -> Result<Vec<MultipartUploadInfo>> {
+        (**self).list_multipart_uploads(bucket).await
     }
 
     async fn update_metadata(&self, bucket: &str, key: &str, update: MetadataUpdate) -> Result<()> {
