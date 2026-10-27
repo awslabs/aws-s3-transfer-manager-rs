@@ -482,6 +482,34 @@ fn fail_with<E>(
     won
 }
 
+/// Sets `Cancelled` under `slot`'s lock, so it cannot land inside a [`complete_with`].
+/// Returns whether this call made the transition.
+fn cancel_with<E>(
+    status: &StateMachineStatus,
+    slot: &crate::runtime::sync::Mutex<Option<E>>,
+) -> bool {
+    let _held = slot.lock();
+    status.set_cancelled()
+}
+
+/// Runs `publish` and then sets `Completed`, both under `slot`'s lock. Failure and
+/// cancellation take that lock too, so neither lands between the two. Skips `publish` and
+/// returns `Ok(false)` if the transfer has already left `Active`. A `publish` error is
+/// returned with the transfer still `Active`, so `publish` must make nothing visible when
+/// it fails.
+fn complete_with<E, P>(
+    status: &StateMachineStatus,
+    slot: &crate::runtime::sync::Mutex<Option<E>>,
+    publish: impl FnOnce() -> Result<(), P>,
+) -> Result<bool, P> {
+    let _held = slot.lock();
+    if !status.is_active() {
+        return Ok(false);
+    }
+    publish()?;
+    Ok(status.set_completed())
+}
+
 /// Per-transfer cumulative metrics.
 pub(crate) struct MetricsState {
     /// The parent transfer's metrics, which every sample recorded here also reaches.
@@ -662,7 +690,8 @@ pub(crate) struct TransferContext {
     pub(crate) handle: Arc<crate::client::Handle>,
     /// Transfer lifecycle status
     status: StateMachineStatus,
-    /// Error storage (only used when status == Failed)
+    /// Error storage (only used when status == Failed). Failure and cancellation change the
+    /// status under this lock, so neither lands inside [`Self::complete_with`].
     error: Arc<crate::runtime::sync::Mutex<Option<Box<error::Error>>>>,
     /// Completion signal sender - signals "state machine reached terminal state"
     completion_tx: Arc<Mutex<Option<StateMachineTerminalSender>>>,
@@ -1157,11 +1186,27 @@ impl TransferContext {
         }
     }
 
+    /// Runs `publish`, then marks the transfer completed, with no failure or cancellation able
+    /// to land in between: one that arrives while `publish` runs waits for it. Skips `publish`
+    /// and returns `Ok(false)` if the transfer has already left `Active`. A `publish` error is
+    /// returned with the transfer still `Active`, so `publish` must make nothing visible when
+    /// it fails.
+    pub(crate) fn complete_with<E>(
+        &self,
+        publish: impl FnOnce() -> Result<(), E>,
+    ) -> Result<bool, E> {
+        let completed = complete_with(&self.status, &self.error, publish)?;
+        if completed {
+            self.metrics.set_finished();
+        }
+        Ok(completed)
+    }
+
     /// Mark transfer as cancelled.
     /// First-write-wins - returns true if this call set the status.
     #[inline]
     pub(crate) fn set_cancelled(&self) -> bool {
-        if self.status.set_cancelled() {
+        if cancel_with(&self.status, &self.error) {
             self.metrics.set_finished();
             true
         } else {
@@ -2098,16 +2143,17 @@ mod loom_tests {
     }
 
     /// The real [`StateMachineStatus`](super::StateMachineStatus) and error slot type, both
-    /// loom-backed under `s3_tm_loom`, failed through the [`fail_with`](super::fail_with)
-    /// that `TransferContext::set_failed` calls, and read as its readers read them.
+    /// loom-backed under `s3_tm_loom`, moved through the [`fail_with`](super::fail_with),
+    /// [`cancel_with`](super::cancel_with) and [`complete_with`](super::complete_with) that
+    /// `TransferContext` calls, and read as its readers read them.
     ///
     /// Stands in for `TransferContext`, which needs a client `Handle` to build.
-    struct FailHarness {
+    struct StatusHarness {
         status: super::StateMachineStatus,
         error: crate::runtime::sync::Mutex<Option<u32>>,
     }
 
-    impl FailHarness {
+    impl StatusHarness {
         fn new() -> Self {
             Self {
                 status: super::StateMachineStatus::new(),
@@ -2117,6 +2163,20 @@ mod loom_tests {
 
         fn set_failed(&self, err: u32) -> bool {
             super::fail_with(&self.status, &self.error, || err)
+        }
+
+        fn set_cancelled(&self) -> bool {
+            super::cancel_with(&self.status, &self.error)
+        }
+
+        /// Completes with a `publish` that sets `published`, as a download's rename puts its
+        /// object at the destination.
+        fn complete(&self, published: &AtomicBool) -> bool {
+            super::complete_with(&self.status, &self.error, || {
+                published.store(true, Ordering::SeqCst);
+                Ok::<(), ()>(())
+            })
+            .unwrap()
         }
 
         /// A reader's ordering, as in `take_error` and `error_kind`: check the status, then
@@ -2142,7 +2202,7 @@ mod loom_tests {
     #[test]
     fn set_failed_loom_publishes_status_after_its_error() {
         loom::model(|| {
-            let h = Arc::new(FailHarness::new());
+            let h = Arc::new(StatusHarness::new());
 
             let h2 = h.clone();
             let first = thread::spawn(move || h2.set_failed(1));
@@ -2180,6 +2240,53 @@ mod loom_tests {
                 Some(true),
                 h.error().map(|slot| slot.is_some()),
                 "a Failed status must always have an error behind it"
+            );
+        });
+    }
+
+    // ref: awslabs/aws-s3-transfer-manager-rs#197
+    /// A completion that publishes a result races a cancel and a failure. Exactly one wins,
+    /// and the result is published only if the completion won.
+    ///
+    /// A cancel or failure that changed the status outside the lock could land after
+    /// `publish` and before the completion, leaving the result behind another status: a
+    /// download's object renamed over the caller's file and reported as cancelled.
+    #[test]
+    fn complete_with_loom_publishes_only_for_a_completed_transfer() {
+        loom::model(|| {
+            let h = Arc::new(StatusHarness::new());
+            let published = Arc::new(AtomicBool::new(false));
+
+            let completer = {
+                let (h, published) = (h.clone(), published.clone());
+                thread::spawn(move || h.complete(&published))
+            };
+            let h2 = h.clone();
+            let canceller = thread::spawn(move || h2.set_cancelled());
+            let h3 = h.clone();
+            let failer = thread::spawn(move || h3.set_failed(1));
+
+            let completed = completer.join().unwrap();
+            let cancelled = canceller.join().unwrap();
+            let failed = failer.join().unwrap();
+
+            assert_eq!(
+                1,
+                [completed, cancelled, failed]
+                    .into_iter()
+                    .filter(|won| *won)
+                    .count(),
+                "exactly one transition wins: completed={completed} cancelled={cancelled} \
+                 failed={failed}"
+            );
+            assert_eq!(
+                completed,
+                published.load(Ordering::SeqCst),
+                "a result was published for a transfer that did not complete"
+            );
+            assert_eq!(
+                completed,
+                h.status.status() == crate::types::TransferStatus::Completed
             );
         });
     }

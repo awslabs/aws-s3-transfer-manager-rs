@@ -436,7 +436,7 @@ impl DownloadObservability {
     }
 
     /// Records whether successful destination finalization completed.
-    pub(crate) fn destination_finalized(&self, result: &Result<u64, std::io::Error>) {
+    pub(crate) fn destination_finalized(&self, result: Result<u64, &std::io::Error>) {
         if let Self::Enabled(enabled) = self {
             let mut state = enabled.state.lock().expect("lock poisoned");
             match result {
@@ -444,7 +444,7 @@ impl DownloadObservability {
                     state.destination_work.terminal_drain_parts = state
                         .destination_work
                         .terminal_drain_parts
-                        .saturating_add(*parts);
+                        .saturating_add(parts);
                     if state.destination == DownloadDestination::File {
                         state.destination_work.file_finalized = true;
                     }
@@ -910,7 +910,7 @@ mod tests {
         observability.record_range_scheduled();
         observability.record_range_completed(2);
         observability.record_memory_relief_completed(1);
-        observability.destination_finalized(&Ok(3));
+        observability.destination_finalized(Ok(3));
 
         let summary = observability
             .report_terminal(terminal_report(

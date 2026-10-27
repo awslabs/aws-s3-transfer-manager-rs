@@ -471,7 +471,7 @@ mod tests {
         fill(&writer, 0, b"new");
 
         let error = writer
-            .finalize(3, || true)
+            .finalize(3)
             .expect_err("finalize is scripted to fail");
         assert_eq!(error.source.kind(), io::ErrorKind::PermissionDenied);
         assert_eq!(std::fs::read(&path).unwrap(), b"newle contents");
@@ -555,7 +555,7 @@ mod tests {
         writer.drain(DrainMode::Eager).unwrap();
         script.mark("between");
         fill(&writer, 2, b"cd");
-        writer.finalize(4, || true).unwrap();
+        writer.finalize(4).unwrap();
         script.mark("end");
 
         let first = Op::Write { pos: 0, len: 2 };

@@ -187,7 +187,7 @@ pub(crate) struct CommitTarget {
 }
 
 /// A [`CommitTarget`] whose temporary file is removed when the last reference drops, unless
-/// [`BodyWriter::finalize`] renamed it or [`BodyWriter::discard_temp_file`] removed it first.
+/// [`BodyWriter::commit`] renamed it or [`BodyWriter::discard_temp_file`] removed it first.
 ///
 /// Reference-counted so the transfer's own terminal paths leave the file to the last work
 /// item still holding it.
@@ -209,32 +209,6 @@ fn remove_temp_file(target: &std::sync::Mutex<Option<CommitTarget>>) {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(paths) = target.take() {
         let _ = std::fs::remove_file(&paths.temp);
-    }
-}
-
-impl TempFile {
-    /// Renames the temporary file to its destination if `is_active` returns true, and
-    /// removes it otherwise. Does nothing once the file has been renamed or removed. A
-    /// failed rename leaves the file for drop to remove.
-    fn commit(&self, is_active: impl FnOnce() -> bool) -> std::io::Result<()> {
-        let mut target = self
-            .target
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(paths) = target.as_ref() else {
-            return Ok(());
-        };
-        if is_active() {
-            // TODO(vnext): consider an opt-in download durability policy. Managed path
-            // downloads would sync file data before rename and the parent directory after
-            // rename where supported. The latency and cross-platform semantics make this
-            // a client/API policy rather than the default.
-            std::fs::rename(&paths.temp, &paths.dest)?;
-        } else {
-            let _ = std::fs::remove_file(&paths.temp);
-        }
-        *target = None;
-        Ok(())
     }
 }
 
@@ -405,12 +379,44 @@ impl BodyWriter {
         }
     }
 
+    /// Renames the temporary file to its destination. Does nothing without a
+    /// [`CommitTarget`], or once the file has been renamed or removed. A failed rename leaves
+    /// the file for the last reference's drop to remove.
+    ///
+    /// Call it inside [`TransferContext::complete_with`](crate::transfer::TransferContext::complete_with),
+    /// so no cancellation lands between the rename and `Completed`.
+    pub(crate) fn commit(&self) -> std::io::Result<()> {
+        if let Mode::Disk { commit_target, .. } = &*self.mode {
+            let mut target = commit_target
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(paths) = target.as_ref() {
+                // TODO(vnext): consider an opt-in download durability policy. Managed path
+                // downloads would sync file data before rename and the parent directory after
+                // rename where supported. The latency and cross-platform semantics make this
+                // a client/API policy rather than the default.
+                std::fs::rename(&paths.temp, &paths.dest)?;
+                *target = None;
+            }
+        }
+        Ok(())
+    }
+
     /// Removes the temporary file now, even while work items still hold it, and returns once
     /// the temporary name is gone. Call only after the transfer has left `Active`: a later
-    /// [`finalize`](Self::finalize) treats a removed file as already committed.
+    /// [`commit`](Self::commit) treats a removed file as already committed.
     pub(crate) fn discard_temp_file(&self) {
         if let Mode::Disk { commit_target, .. } = &*self.mode {
             remove_temp_file(commit_target);
+        }
+    }
+
+    /// Locks the commit target, so a rename or removal waits until the guard drops.
+    #[cfg(test)]
+    pub(crate) fn hold_commit_target(&self) -> std::sync::MutexGuard<'_, Option<CommitTarget>> {
+        match &*self.mode {
+            Mode::Disk { commit_target, .. } => commit_target.lock().unwrap(),
+            Mode::Stream => panic!("a stream download has no commit target"),
         }
     }
 
@@ -507,8 +513,8 @@ impl BodyWriter {
         Ok(drained)
     }
 
-    /// Flush terminal payloads, establish the successful disk target length, and
-    /// rename or remove the temporary file when the writer has a [`CommitTarget`].
+    /// Flush terminal payloads and establish the successful disk target length. Leaves the
+    /// temporary file for [`commit`](Self::commit) to rename.
     ///
     /// Returns what the terminal drain wrote. A failed terminal drain returns its
     /// [`DrainError`]. Fails with
@@ -517,18 +523,8 @@ impl BodyWriter {
     /// bytes across every drain. A run claimed by a drain that has not finished
     /// writing is invisible to the terminal drain, so without this check its
     /// region would be published holding zeros or the file's previous bytes.
-    /// That error, a failed resize, and a failed rename carry what the terminal
-    /// drain wrote.
-    ///
-    /// After the resize succeeds, the temporary file is renamed if `is_active` returns true
-    /// and removed otherwise; the rename is not atomic with that check. A failed rename, or a
-    /// call after [`release_temp_file`](Self::release_temp_file), leaves the file for the last
-    /// reference's drop to remove.
-    pub(crate) fn finalize(
-        &self,
-        expected_download_len: u64,
-        is_active: impl FnOnce() -> bool,
-    ) -> Result<Drained, DrainError> {
+    /// That error and a failed resize carry what the terminal drain wrote.
+    pub(crate) fn finalize(&self, expected_download_len: u64) -> Result<Drained, DrainError> {
         let drained = self.terminal_drain()?;
         if let Mode::Disk { sink, written, .. } = &*self.mode {
             let written = written.load(Ordering::Acquire);
@@ -545,11 +541,6 @@ impl BodyWriter {
             }
             sink.finalize(expected_download_len)
                 .map_err(|source| DrainError { drained, source })?;
-            if let Some(temp_file) = self.temp_file() {
-                temp_file
-                    .commit(is_active)
-                    .map_err(|source| DrainError { drained, source })?;
-            }
         }
         Ok(drained)
     }
@@ -673,7 +664,7 @@ pub(crate) fn new_recv_body() -> (BodyWriter, RecvBodyConsumer) {
 /// Create a producer/consumer pair writing to an arbitrary [`SinkWrite`] target.
 /// Positioned writes land at `chunk.offset - object_range_start` in the sink.
 /// With a `commit` target, the writer owns its temporary file:
-/// [`finalize`](BodyWriter::finalize) renames it into place, and otherwise it is
+/// [`commit`](BodyWriter::commit) renames it into place, and otherwise it is
 /// removed by the time the last [`TempFile`] reference drops.
 ///
 /// Issuance backpressure is owned by the per-transfer [`ReadAhead`] controller.
@@ -1230,7 +1221,7 @@ mod tests {
             slot.fill(chunk_at(i, offset, &data));
         }
 
-        writer.finalize(expected.len() as u64, || true).unwrap();
+        writer.finalize(expected.len() as u64).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), expected);
     }
 
@@ -1261,7 +1252,7 @@ mod tests {
             "terminal cleanup must not establish the successful length"
         );
 
-        writer.finalize(3, || true).unwrap();
+        writer.finalize(3).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"new");
     }
 
@@ -1342,7 +1333,7 @@ mod tests {
         assert_eq!(writer.written(), 3, "the whole object was written");
 
         let error = writer
-            .finalize(3, || true)
+            .finalize(3)
             .expect_err("the resize is scripted to fail");
         assert_eq!(error.source.kind(), std::io::ErrorKind::PermissionDenied);
         let contents = std::fs::read(&path).unwrap();
@@ -1351,52 +1342,14 @@ mod tests {
     }
 
     // ref: awslabs/aws-s3-transfer-manager-rs#197
-    /// A resize that fails leaves the commit target unrenamed. If the rename ran first,
-    /// the destination would hold a file whose length was never established, in place
-    /// of what the caller had there.
-    #[test]
-    fn finalize_renames_only_after_the_resize_succeeds() {
-        let script = Arc::new(WriteScript::default()).on(
-            Match::Finalize,
-            Action::Fail(std::io::ErrorKind::PermissionDenied),
-        );
-        let dir = tempfile::tempdir().unwrap();
-        let temp = dir.path().join("out.s3tmp");
-        let dest = dir.path().join("out");
-        std::fs::write(&dest, b"previous").unwrap();
-        let file = std::fs::File::create(&temp).unwrap();
-        let (writer, _consumer) = new_recv_body_with_disk_mode(
-            ScriptedSinkFactory(Arc::clone(&script))
-                .create(file, false)
-                .unwrap(),
-            Some(CommitTarget {
-                temp: temp.clone(),
-                dest: dest.clone(),
-            }),
-        );
-        writer.prepare(0, 3).unwrap();
-        writer.claim().fill(chunk_at(0, 0, b"new"));
-
-        let error = writer
-            .finalize(3, || true)
-            .expect_err("the resize is scripted to fail");
-        assert_eq!(error.source.kind(), std::io::ErrorKind::PermissionDenied);
-        assert_eq!(
-            std::fs::read(&dest).unwrap(),
-            b"previous",
-            "a failed resize renamed the target over the destination"
-        );
-        assert_eq!(std::fs::read(&temp).unwrap(), b"new");
-    }
-
-    // ref: awslabs/aws-s3-transfer-manager-rs#197
-    /// Once `finalize` has renamed or removed the temporary file, dropping the writer
-    /// leaves alone a file another download has since created under that name.
+    /// Once `commit` has renamed the temporary file, or `discard_temp_file` removed it,
+    /// dropping the writer leaves alone a file another download has since created under
+    /// that name.
     ///
-    /// If `finalize` left the commit target set after acting on it, the drop would
-    /// remove the other download's file.
+    /// If either left the commit target set after acting on it, the drop would remove the
+    /// other download's file.
     #[test]
-    fn finalize_frees_the_temporary_name_for_good() {
+    fn commit_and_discard_free_the_temporary_name_for_good() {
         for active in [true, false] {
             let dir = tempfile::tempdir().unwrap();
             let temp = dir.path().join("out.s3tmp");
@@ -1411,7 +1364,12 @@ mod tests {
             );
             writer.prepare(0, 3).unwrap();
             writer.claim().fill(chunk_at(0, 0, b"new"));
-            writer.finalize(3, || active).unwrap();
+            writer.finalize(3).unwrap();
+            if active {
+                writer.commit().unwrap();
+            } else {
+                writer.discard_temp_file();
+            }
             assert_eq!(
                 std::fs::read(&dest).ok().as_deref(),
                 active.then_some(b"new".as_slice()),
@@ -1425,7 +1383,7 @@ mod tests {
             assert_eq!(
                 std::fs::read(&temp).ok().as_deref(),
                 Some(b"another download".as_slice()),
-                "active: {active}: dropping the writer removed a name its finalize had freed"
+                "active: {active}: dropping the writer removed a name it had freed"
             );
         }
     }
@@ -1453,7 +1411,7 @@ mod tests {
 
             writer.claim().fill(chunk_at(1, 2, b"cd"));
             let error = writer
-                .finalize(4, || true)
+                .finalize(4)
                 .expect_err("two of four bytes reached the destination");
             assert_eq!(error.source.kind(), std::io::ErrorKind::UnexpectedEof);
             assert!(
@@ -1488,7 +1446,7 @@ mod tests {
         writer.prepare(0, 0).unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 8);
 
-        writer.finalize(0, || true).unwrap();
+        writer.finalize(0).unwrap();
         assert!(std::fs::read(&path).unwrap().is_empty());
     }
 
@@ -1511,7 +1469,7 @@ mod tests {
             slot.fill(chunk_at(i, offset, &data));
         }
 
-        writer.finalize(expected.len() as u64, || true).unwrap();
+        writer.finalize(expected.len() as u64).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), expected);
     }
 
@@ -1565,7 +1523,7 @@ mod tests {
             h.await.unwrap();
         }
 
-        writer.finalize((n * CHUNK_LEN) as u64, || true).unwrap();
+        writer.finalize((n * CHUNK_LEN) as u64).unwrap();
 
         let contents = std::fs::read(&path).unwrap();
         for seq in 0..n as u64 {
