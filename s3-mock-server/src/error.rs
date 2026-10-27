@@ -84,6 +84,21 @@ impl From<Error> for s3s::S3Error {
             _ => s3s::S3ErrorCode::InternalError,
         };
 
-        s3s::S3Error::with_source(error_kind, Box::new(error))
+        // S3's messages for the errors clients see most, which they may log or show.
+        let message = match error {
+            Error::NoSuchKey => Some("The specified key does not exist."),
+            Error::NoSuchBucket => Some("The specified bucket does not exist"),
+            Error::NoSuchUpload => Some("The specified upload does not exist. The upload ID may be invalid, or the upload may have been aborted or completed."),
+            Error::InvalidRange => Some("The requested range is not satisfiable"),
+            Error::PreconditionFailed => {
+                Some("At least one of the pre-conditions you specified did not hold")
+            }
+            _ => None,
+        };
+        let mut error = s3s::S3Error::with_source(error_kind, Box::new(error));
+        if let Some(message) = message {
+            error.set_message(message);
+        }
+        error
     }
 }

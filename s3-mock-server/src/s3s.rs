@@ -978,10 +978,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
 
         // Real S3 returns NoSuchBucket if the bucket doesn't exist
         if !self.storage.head_bucket(&input.bucket).await? {
-            return Err(s3s::s3_error!(
-                NoSuchBucket,
-                "The specified bucket does not exist"
-            ));
+            return Err(Error::NoSuchBucket.into());
         }
 
         let prefix = input.prefix.as_deref();
@@ -1113,10 +1110,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         if self.storage.head_bucket(&input.bucket).await? {
             Ok(S3Response::new(HeadBucketOutput::default()))
         } else {
-            Err(s3s::s3_error!(
-                NoSuchBucket,
-                "The specified bucket does not exist"
-            ))
+            Err(Error::NoSuchBucket.into())
         }
     }
 
