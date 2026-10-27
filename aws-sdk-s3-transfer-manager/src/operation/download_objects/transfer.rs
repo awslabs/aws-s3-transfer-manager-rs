@@ -868,7 +868,6 @@ impl DownloadObjectsTransfer {
                     let mut state = self.inner.state.lock();
                     state.successful_downloads += 1;
                     drop(state);
-                    // The child's bytes reached this transfer's metrics as they moved.
                 }
                 Err(err) => {
                     let mut state = self.inner.state.lock();

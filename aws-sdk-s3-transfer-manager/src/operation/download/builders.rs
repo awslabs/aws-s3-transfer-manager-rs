@@ -26,6 +26,11 @@ impl DownloadFluentBuilder {
     /// Report lifecycle events for this transfer to `sink`.
     ///
     /// Calling this twice adds a second consumer rather than replacing the first.
+    ///
+    /// A download started with [`initiate`](Self::initiate) holds only a bounded amount of
+    /// unread body, so read the body while you read the events. A loop that waits for
+    /// [`Finished`](crate::events::TransferEvent::Finished) before reading the body can wait
+    /// forever.
     pub fn events(mut self, sink: crate::events::TransferEventSink) -> Self {
         self.events = Some(match self.events.take() {
             Some(existing) => existing.merge(sink),

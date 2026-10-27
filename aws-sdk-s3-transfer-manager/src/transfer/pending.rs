@@ -27,19 +27,21 @@ use super::TransferId;
 
 const PENDING_CATEGORY_COUNT: usize = 5;
 
-/// Coarse resource or work class preventing a transfer from producing work.
+/// What a transfer is waiting on.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum PendingCategory {
-    /// Caller-provided source data or source work is not ready.
+    /// A caller's [`PartStream`](crate::io::PartStream), which has no next part ready, or has
+    /// ended while its last parts upload.
     Source,
-    /// Shared buffer-pool admission is pending.
+    /// Memory for a download's next part, which the client's transfers share.
     Memory,
-    /// Downstream delivery or consumption must release capacity.
+    /// Room in the download's [`ReadAhead`](crate::types::ReadAhead) window. A part takes room
+    /// from when it is requested until its bytes are read from the body or written to the file.
     Consumer,
-    /// Dispatched transfer work must retire.
+    /// Requests or file writes the transfer has already started, to finish.
     InFlightWork,
-    /// Direction-specific state without a common category.
+    /// Something outside the other categories.
     Other,
 }
 
@@ -75,7 +77,7 @@ impl PendingCategory {
     }
 }
 
-/// Common pending category paired with direction-owned detail.
+/// Why a transfer is waiting: a [`PendingCategory`] and a label for diagnostics.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PendingCause {
     /// Common category used for aggregation across transfer kinds.

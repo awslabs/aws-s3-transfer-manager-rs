@@ -1105,12 +1105,11 @@ impl UploadObjectsTransfer {
     }
 
     /// Consume every child handle via `join()` to capture each one's final
-    /// `Ok(UploadOutput)` / `Err(Error)`. The parent's `MetricsState` is
-    /// updated with the child's cumulative IO on success, and the child's
-    /// actual error is stored in `FailedUpload.error` on failure or
-    /// cancellation. Under `Abort` policy with an active parent, the first
-    /// failure in the batch threads its cause text into `abort()`; later
-    /// children in the batch are recorded but do not re-trigger abort.
+    /// `Ok(UploadOutput)` / `Err(Error)`. The child's actual error is stored
+    /// in `FailedUpload.error` on failure or cancellation. Under `Abort`
+    /// policy with an active parent, the first failure in the batch threads
+    /// its cause text into `abort()`; later children in the batch are
+    /// recorded but do not re-trigger abort.
     async fn execute_join_children(&self, mut batch: ReapingBatch) -> WorkOutcome {
         let children = batch.take_children();
         let n_children = children.len();

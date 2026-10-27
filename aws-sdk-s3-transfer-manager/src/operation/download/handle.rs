@@ -337,9 +337,10 @@ impl Drop for DownloadHandle {
 /// this handle does not expose a body — the transfer manager writes data
 /// directly to disk.
 ///
-/// A download to a path writes to a temporary file (`{dest}.s3tmp.{id}`) beside the
-/// destination and renames it into place on success. On failure, cancellation, or drop,
-/// the temporary file is deleted. A download to a caller's file writes to that file directly.
+/// A download to a path writes to a temporary file beside the destination, named after it
+/// with `.s3tmp.` and a random suffix, and renames it into place on success. On failure,
+/// cancellation, or drop, the temporary file is deleted. A download to a caller's file writes
+/// to that file directly.
 ///
 /// Success means the operating system accepted every byte and, for a managed
 /// path, completed the rename. The transfer manager does not call `sync_data`,

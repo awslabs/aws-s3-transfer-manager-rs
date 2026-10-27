@@ -1059,7 +1059,7 @@ impl UploadTransfer {
             completion_timer.elapsed(),
         );
 
-        // Stamped before the output's snapshot, as on the `PutObject` path above.
+        // Stamped before the output is built, because the output snapshots the metrics.
         self.inner.ctx.metrics.set_finished();
         let result = crate::sdk_v1::update_upload_output_from_complete_multipart_upload(
             response_builder,
@@ -1070,7 +1070,8 @@ impl UploadTransfer {
         .expect("valid response");
 
         *self.inner.result.lock().expect("lock poisoned") = Some(result);
-        // Status before state, for the reason given on the `PutObject` path above.
+        // Status before state, because `poll_work` answers `Done` off the state while every
+        // reporting path derives its outcome from the status.
         self.inner.ctx.set_completed();
         *self.inner.state.lock().expect("lock poisoned") = UploadState::Done;
         self.report_terminal();

@@ -74,7 +74,9 @@ pub enum Endpoint {
     /// A file on the local filesystem.
     #[non_exhaustive]
     Local {
-        /// The path as the caller gave it, not canonicalized.
+        /// The path as the caller gave it, not canonicalized. An upload of part of the file,
+        /// with an offset or length on its [`PathBodyBuilder`](crate::io::PathBodyBuilder),
+        /// still names the whole file.
         ///
         /// `None` for a file the caller opened, as with
         /// [`write_to_file`](crate::operation::download::builders::DownloadFluentBuilder::write_to_file).
@@ -523,8 +525,8 @@ impl TransferLifecycle {
     }
 }
 
-/// A claimed `Finished`, sent separately so a claim made under a state guard can be sent
-/// after the guard is released.
+/// A claimed `Finished`, sent by [`send`](Self::send). Dropping it unsent hands the
+/// obligation back.
 pub(crate) struct PendingEmit {
     /// The lifecycle's route: the send takes it, and a claim dropped unsent leaves it, with
     /// its held slots, for the next claim.
@@ -627,9 +629,6 @@ mod tests {
 
     /// The line a finished transfer prints, such as `upload: <source> to <destination>`, built
     /// from the event alone.
-    ///
-    /// No wildcard [`Direction`] or [`TransferEvent`] arm: `#[non_exhaustive]` does not apply
-    /// in the defining crate.
     fn line(event: &TransferEvent) -> Option<String> {
         let transfer = event.transfer();
         let verb = match transfer.direction() {
@@ -724,7 +723,7 @@ mod tests {
     fn finish_is_claimed_once() {
         let (lc, _stream) = lifecycle();
         lc.announce(ID);
-        // Held: dropping the claim would hand the obligation back, which the next test covers.
+        // Held: dropping the claim would hand the obligation back.
         let first = lc.finish(ID, failed()).expect("first claim wins");
         assert!(
             lc.finish(ID, failed()).is_none(),
@@ -767,7 +766,6 @@ mod tests {
         );
     }
 
-    // ref: awslabs/aws-s3-transfer-manager-rs#197
     /// A capacity below 2 is raised to 2, so a transfer alone on its sink delivers both of
     /// its events.
     ///
@@ -799,7 +797,6 @@ mod tests {
         );
     }
 
-    // ref: awslabs/aws-s3-transfer-manager-rs#197
     /// `dropped()` counts a transfer that found no room, and not one that started after the
     /// stream was dropped.
     ///
@@ -832,7 +829,6 @@ mod tests {
         );
     }
 
-    // ref: awslabs/aws-s3-transfer-manager-rs#197
     /// A transfer granted one slot and refused the second keeps neither.
     ///
     /// Capacity 3: the first transfer holds two slots, so the second is granted the third and
@@ -896,7 +892,6 @@ mod tests {
         );
     }
 
-    // ref: awslabs/aws-s3-transfer-manager-rs#197
     /// A lifecycle dropped without sending its `Finished` releases the slot it held, and the
     /// sender inside it.
     ///
@@ -997,7 +992,6 @@ mod tests {
         assert_eq!(both, drain_ids(&mut sb), "the second consumer receives");
     }
 
-    // ref: awslabs/aws-s3-transfer-manager-rs#197
     /// A stream with no room for a transfer does not keep that transfer off another stream of
     /// the same merged sink.
     ///
@@ -1033,7 +1027,6 @@ mod tests {
         );
     }
 
-    // ref: awslabs/aws-s3-transfer-manager-rs#197
     /// A stream whose receiver is gone does not keep a transfer off another stream of the same
     /// merged sink, and counts nothing.
     #[test]

@@ -690,8 +690,9 @@ pub(crate) struct TransferContext {
     pub(crate) handle: Arc<crate::client::Handle>,
     /// Transfer lifecycle status
     status: StateMachineStatus,
-    /// Error storage (only used when status == Failed). Failure and cancellation change the
-    /// status under this lock, so neither lands inside [`Self::complete_with`].
+    /// The error, once the status is Failed. Also the lock that failure, cancellation and
+    /// [`Self::complete_with`] change the status under, so neither failure nor cancellation
+    /// lands inside `complete_with`. [`Self::set_completed`] does not take it.
     error: Arc<crate::runtime::sync::Mutex<Option<Box<error::Error>>>>,
     /// Completion signal sender - signals "state machine reached terminal state"
     completion_tx: Arc<Mutex<Option<StateMachineTerminalSender>>>,
@@ -1297,7 +1298,6 @@ impl TransferContext {
     /// transition must therefore reach exactly one `signal_terminal`. It is safe
     /// to call while in-flight work is still draining.
     pub(crate) fn signal_terminal(&self) {
-        // A backstop for `finished_at`, which the winning status transition stamps first.
         self.finalize_terminal_metrics();
         if let Some(tx) = self.completion_tx.lock().unwrap().take() {
             let _ = tx.send(());

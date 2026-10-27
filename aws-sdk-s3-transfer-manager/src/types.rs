@@ -362,10 +362,12 @@ impl TransferView {
         self.metrics.snapshot()
     }
 
-    /// Why this transfer is blocked, or `None` while it is not.
+    /// What this transfer is waiting on, if anything. See [`PendingCategory`].
     ///
-    /// A cause is reported until the transfer resumes, so it can outlast the condition that
-    /// set it. A transfer whose status is no longer [`TransferStatus::Active`] reports `None`.
+    /// A cause is set each time the transfer has to wait and cleared the next time it tries
+    /// to start work, so it can outlast the condition that set it. Waiting for a share of the
+    /// client's concurrency is never a cause. `None` once the status is no longer
+    /// [`TransferStatus::Active`].
     pub fn pending_cause(&self) -> Option<PendingCause> {
         let cause = self.pending.get()?;
         // Status after the slot: a status never returns to `Active`, so an `Active` reading

@@ -440,7 +440,6 @@ async fn test_download_single_object_entry_points_all_report_events() {
     }
 }
 
-// ref: awslabs/aws-s3-transfer-manager-rs#197
 /// Two downloads share a capacity-2 sink, and nothing is received until both have finished.
 ///
 /// `write_to_path` starts its transfer before returning, so the first download holds both
