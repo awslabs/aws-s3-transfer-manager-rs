@@ -145,8 +145,13 @@ impl UploadHandle {
     ///   with HeadObject if that matters. The Java v2 transfer manager behaves
     ///   the same way.
     /// - Already completed: returns `AlreadyCompleted`. The object is not deleted.
-    /// - Already failed: returns that failure's error. The multipart upload
-    ///   is left open, the same as after [`join`](Self::join) returns it.
+    /// - Already failed or failing: returns that failure's error at once,
+    ///   without starting an abort or waiting for requests still finishing.
+    ///   The multipart upload is left open, the same as after
+    ///   [`join`](Self::join) returns it.
+    /// - Already cancelled (hard-cancelled, for example by a parent
+    ///   `upload_objects`): returns an `ErrorKind::OperationCancelled` error
+    ///   at once.
     ///
     /// Any other error from a request still in flight (including
     /// AbortMultipartUpload itself) is returned as that error, as it would be
@@ -175,27 +180,42 @@ impl UploadHandle {
         // TODO: the abort should follow the error handling path
         //   The error handling should also go through the abort workflow
         //   A customer requested abort can be treated as an error happened, with a sepcial error code is to cancel the request.
+
+        // Already failing or cancelled: there is nothing to abort. Report that
+        // right away without starting an abort or waiting for the transfer.
+        //
+        // TODO: `abort_requested()` is not checked because it is always false
+        //   here: `abort()` consumes the handle, and the only other caller of
+        //   `request_abort()` is `Drop`. Check it once either changes:
+        //   - a failure goes through `request_abort()` (the unified-finish
+        //     TODO above), so a failing transfer is also aborting;
+        //   - the upload can be aborted without consuming the handle (for
+        //     example an `abort_handle()` that can be cloned and used while
+        //     `join()` holds the handle), so a second abort can arrive.
+        let ctx = self.transfer.ctx();
+        if ctx.is_failed() {
+            if let Some(err) = ctx.take_error() {
+                return Err(err);
+            }
+            // `set_failed` flips the status before it stores the error; the
+            // error is stored before terminal is signalled, so wait for that.
+            if let Some(rx) = self.completion_rx.take() {
+                let _ = rx.await;
+            }
+            return Err(ctx.take_error().expect("failed transfer must have error"));
+        }
+
         self.transfer.request_abort();
 
-        // Wait until the transfer calls `signal_terminal()`.
+        // Wait until the transfer calls `signal_terminal()`. It only does so
+        // once every request it sent has finished or been dropped, so nothing
+        // of ours is still in flight after this.
         if let Some(rx) = self.completion_rx.take() {
             let _ = rx.await;
         }
 
-        // Let work still in flight drain before returning, whatever the
-        // outcome. After a Complete 200 during an abort, this is
-        // AbortMultipartUpload. When the abort ended through `poll_work`, the
-        // descriptor is already gone and this returns at once.
-        let ctx = self.transfer.ctx();
-        ctx.handle
-            .scheduler
-            .cancel_transfer(ctx.id)
-            .wait_for_idle()
-            .await;
-
         if ctx.is_failed() {
-            // A request failed, before this call or while the abort ran: report
-            // that failure.
+            // A request failed while the abort ran: report that failure.
             return Err(ctx.take_error().expect("failed transfer must have error"));
         }
 
