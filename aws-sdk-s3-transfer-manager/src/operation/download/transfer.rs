@@ -1780,8 +1780,10 @@ mod tests {
 
     use super::*;
     use crate::model::{ChecksumType, ChunkMetadata};
-    use crate::operation::download::body::{new_recv_body_with_disk_mode, CommitTarget};
-    use crate::operation::download::sink::{FileSink, FileSinkFactory};
+    use crate::operation::download::body::{
+        new_recv_body_with_disk_mode, CommitTarget, DiskWriteCursor,
+    };
+    use crate::operation::download::sink::{FileSink, FileSinkFactory, SinkWrite};
     use crate::operation::download::test_util::fixtures::{
         assert_discovery_succeeds, disk_test_handle, disk_transfer, execute, finalize_started,
         object_client_failing_at, relief_scenario, spawn_relief,
@@ -2418,6 +2420,29 @@ mod tests {
         DownloadTransfer::new(ctx, BucketType::Standard, input, writer)
     }
 
+    /// File sink that reports when its finalizing resize returns.
+    #[derive(Debug)]
+    struct SignalOnFinalize {
+        file: FileSink,
+        finalized: std::sync::mpsc::Sender<()>,
+    }
+
+    impl SinkWrite for SignalOnFinalize {
+        fn write_all_at(&self, buf: &mut DiskWriteCursor<'_>, pos: u64) -> std::io::Result<()> {
+            self.file.write_all_at(buf, pos)
+        }
+
+        fn prepare(&self, expected_download_len: u64) -> std::io::Result<()> {
+            self.file.prepare(expected_download_len)
+        }
+
+        fn finalize(&self, expected_download_len: u64) -> std::io::Result<()> {
+            self.file.finalize(expected_download_len)?;
+            let _ = self.finalized.send(());
+            Ok(())
+        }
+    }
+
     /// Build a two-part download into `temp` that commits it to `dest`.
     ///
     /// Two parts, so discovery delivers the first and `poll_work` hands out the last range
@@ -2495,8 +2520,6 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn a_cancel_during_finalize_leaves_a_pre_existing_destination_alone() {
-        use crate::operation::download::body::DiskWriteCursor;
-        use crate::operation::download::sink::SinkWrite;
         use crate::operation::download::test_util::fixtures::{object_bytes, object_client};
 
         /// File sink that cancels `ctx` once its finalizing resize succeeds.
@@ -2572,34 +2595,9 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn a_cancel_during_the_rename_finds_the_download_completed() {
-        use crate::operation::download::body::DiskWriteCursor;
-        use crate::operation::download::sink::SinkWrite;
         use crate::operation::download::test_util::fixtures::{object_bytes, object_client};
         use std::sync::mpsc;
         use std::time::Duration;
-
-        /// File sink that reports when its finalizing resize returns.
-        #[derive(Debug)]
-        struct SignalOnFinalize {
-            file: FileSink,
-            finalized: mpsc::Sender<()>,
-        }
-
-        impl SinkWrite for SignalOnFinalize {
-            fn write_all_at(&self, buf: &mut DiskWriteCursor<'_>, pos: u64) -> std::io::Result<()> {
-                self.file.write_all_at(buf, pos)
-            }
-
-            fn prepare(&self, expected_download_len: u64) -> std::io::Result<()> {
-                self.file.prepare(expected_download_len)
-            }
-
-            fn finalize(&self, expected_download_len: u64) -> std::io::Result<()> {
-                self.file.finalize(expected_download_len)?;
-                let _ = self.finalized.send(());
-                Ok(())
-            }
-        }
 
         let part_size = 8 * MB;
         let dir = tempfile::tempdir().unwrap();
@@ -3996,77 +3994,83 @@ mod tests {
     // ref: awslabs/aws-s3-transfer-manager-rs#197
     /// A path download's destination exists by the time its status reads `Completed`.
     ///
-    /// The test never joins, so a rename left to `join` fails it.
+    /// The test holds the commit target, so the rename waits, and reads the status while it
+    /// waits: a status that reads `Completed` before the rename has run fails it. The test
+    /// never joins, so a rename left to `join` fails it too.
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_destination_exists_when_status_reads_completed() {
+        use crate::operation::download::test_util::fixtures::{object_bytes, object_client};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
         let part_size = 8 * MB;
-        let object_size = part_size;
-
-        let chunk = vec![0u8; part_size as usize];
-        let get_obj = mock!(aws_sdk_s3::Client::get_object).then_output(move || {
-            GetObjectOutput::builder()
-                .content_length(part_size as i64)
-                .content_range(format!("bytes 0-{}/{}", part_size - 1, object_size))
-                .e_tag("test-etag")
-                .body(ByteStream::from(chunk.clone()))
-                .build()
-        });
-        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get_obj]);
-
-        let config = crate::Config::builder()
-            .sdk_client(client)
-            .part_size(crate::types::PartSize::Target(part_size))
-            .build();
-        let handle = crate::client::Handle::test_handle_tokio(config);
-
-        let input = DownloadInput::builder()
-            .bucket("test-bucket")
-            .key("test-key")
-            .build()
-            .unwrap();
-
-        // The same temp/dest split `orchestrate_to_path` sets up.
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("out.dat");
         let temp = dir.path().join("out.dat.s3tmp.deadbeef");
-        let file = std::fs::File::create(&temp).unwrap();
-        let (writer, _consumer) = new_recv_body_with_disk_mode(
-            Box::new(FileSink::new(file, true)),
-            Some(CommitTarget {
-                temp: temp.clone(),
-                dest: dest.clone(),
-            }),
-        );
-        let (ctx, _completion_rx) = TransferContext::new(handle);
-        let transfer = DownloadTransfer::new(ctx, BucketType::Standard, input, writer);
+        let object = object_bytes(2 * part_size as usize);
+        let client = object_client(object.clone());
+        let (ctx, _completion_rx) = TransferContext::new(disk_test_handle(client, part_size));
+        let (finalized_tx, finalized_rx) = mpsc::channel();
+        let sink = SignalOnFinalize {
+            file: FileSink::new(std::fs::File::create(&temp).unwrap(), true),
+            finalized: finalized_tx,
+        };
+        let transfer = transfer_committing_to(ctx, Box::new(sink), temp.clone(), dest.clone());
+        assert_discovery_succeeds(&transfer).await;
+        let mut last = assert_ready(transfer.poll_work());
 
-        // Single chunk: discovery fetches the whole object and the terminal completion
-        // runs inside this one execute.
-        let mut work = assert_ready(transfer.poll_work());
-        let outcome = execute(&transfer, &mut work).await;
+        let (held_tx, held_rx) = mpsc::channel();
+        let observer = std::thread::spawn({
+            let transfer = transfer.clone();
+            let dest = dest.clone();
+            move || {
+                let held = transfer.inner.writer.hold_commit_target();
+                held_tx.send(()).unwrap();
+                // Bounded, so a range that never reaches the resize fails the test instead
+                // of hanging it on the held target.
+                finalized_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("the last range never reached the finalizing resize");
+                // Long enough for the work item to reach the rename and wait on the target.
+                std::thread::sleep(Duration::from_millis(50));
+                let seen = (transfer.ctx().transfer_status(), dest.exists());
+                drop(held);
+                seen
+            }
+        });
+        held_rx.recv().unwrap();
+        // Runs on this thread, and waits at the rename until the observer releases the target.
+        let outcome = execute(&transfer, &mut last).await;
+        let (status_while_waiting, dest_while_waiting) = observer.join().unwrap();
+
         assert!(
             matches!(outcome, WorkOutcome::Success { .. }),
-            "expected Success, got {outcome:?}"
-        );
-
-        assert_eq!(
-            transfer.ctx().transfer_status(),
-            crate::types::TransferStatus::Completed,
-            "the terminal execute must have set the completed status"
+            "the last range reported {outcome:?}"
         );
         assert!(
-            dest.exists(),
-            "status reads Completed but the destination does not exist"
+            !dest_while_waiting,
+            "the rename ran while the commit target was held, so nothing here waited for it"
+        );
+        assert_eq!(
+            crate::types::TransferStatus::Active,
+            status_while_waiting,
+            "the status left Active before the rename ran"
+        );
+        assert_eq!(
+            crate::types::TransferStatus::Completed,
+            transfer.ctx().transfer_status()
+        );
+        let at_dest =
+            std::fs::read(&dest).expect("status reads Completed but there is no destination");
+        // Compared as a bool: on failure the destination holds the whole object.
+        assert!(
+            at_dest == *object,
+            "the destination does not hold the object"
         );
         assert!(
             !temp.exists(),
             "the temp file must have been renamed away, not copied"
-        );
-        assert_eq!(
-            std::fs::read(&dest).unwrap().len(),
-            part_size as usize,
-            "the committed destination must hold every byte"
         );
     }
 
