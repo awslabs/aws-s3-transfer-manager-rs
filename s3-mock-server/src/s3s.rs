@@ -872,11 +872,11 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         //   * Composite (part-level) checksums — declared via checksum_type, or
         //     signalled by per-part checksums on the completion. A gap here is an
         //     HTTP 500 Internal Server error.
-        //     https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity-upload.html
+        //     <https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity-upload.html>
         //
         //   * Directory buckets (S3 Express One Zone). A gap here is an HTTP 400
         //     Bad Request error.
-        //     https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-express-differences.html
+        //     <https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-express-differences.html>
         let composite_checksum = input
             .checksum_type
             .as_ref()
