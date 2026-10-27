@@ -61,6 +61,10 @@ pub enum Error {
     #[error("internal error: {0}")]
     Internal(String),
 
+    /// An `If-Match` or `If-None-Match` condition did not hold.
+    #[error("precondition failed")]
+    PreconditionFailed,
+
     /// An internal error occurred.
     #[error("invalid server configuration: {0}")]
     InvalidConfiguration(String),
@@ -76,6 +80,7 @@ impl From<Error> for s3s::S3Error {
             Error::InvalidPartOrder => s3s::S3ErrorCode::InvalidPartOrder,
             Error::ChecksumMismatch(_) => s3s::S3ErrorCode::BadDigest,
             Error::InvalidRange => s3s::S3ErrorCode::InvalidRange,
+            Error::PreconditionFailed => s3s::S3ErrorCode::PreconditionFailed,
             _ => s3s::S3ErrorCode::InternalError,
         };
 

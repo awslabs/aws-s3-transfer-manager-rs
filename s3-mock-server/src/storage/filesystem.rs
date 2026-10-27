@@ -287,6 +287,12 @@ impl StorageBackend for FilesystemStorage {
                 .validate(client_checksums)
                 .map_err(|error_msg| Error::ChecksumMismatch(error_msg.to_string()))?;
         }
+        // Checked just before the object is replaced, but not atomically with it: a concurrent
+        // write to the same key can land in between.
+        if request.precondition != crate::storage::WritePrecondition::None {
+            let current = self.head_object(&request.bucket, &request.key).await?;
+            request.precondition.check(current.as_ref())?;
+        }
         temp_path.persist(&path).map_err(|e| e.error)?;
         let last_modified = request.last_modified.unwrap_or_else(SystemTime::now);
 

@@ -125,6 +125,10 @@ impl StorageBackend for InMemoryStorage {
         let bucket_state = buckets
             .entry(request.bucket)
             .or_insert_with(BucketState::new);
+        // Checked under the write lock, so the condition holds at the moment of the write.
+        request
+            .precondition
+            .check(bucket_state.objects.get(&request.key).map(|(_, m)| m))?;
         bucket_state
             .objects
             .insert(request.key.clone(), (content, metadata));
@@ -173,6 +177,22 @@ impl StorageBackend for InMemoryStorage {
         let mut buckets = self.buckets.write().await;
         let bucket_state = buckets.get_mut(bucket).ok_or(Error::NoSuchBucket)?;
         // DeleteObject is idempotent: deleting a non-existent key is not an error.
+        bucket_state.objects.remove(key);
+        Ok(())
+    }
+
+    async fn delete_object_if_match(
+        &self,
+        bucket: &str,
+        key: &str,
+        if_match: &s3s::dto::ETagCondition,
+    ) -> Result<()> {
+        let mut buckets = self.buckets.write().await;
+        let bucket_state = buckets.get_mut(bucket).ok_or(Error::NoSuchBucket)?;
+        crate::storage::check_delete_if_match(
+            if_match,
+            bucket_state.objects.get(key).map(|(_, metadata)| metadata),
+        )?;
         bucket_state.objects.remove(key);
         Ok(())
     }

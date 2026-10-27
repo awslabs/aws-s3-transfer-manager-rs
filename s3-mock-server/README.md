@@ -127,6 +127,12 @@ async fn test_filesystem_storage() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+### Conditional Requests
+
+- GetObject, HeadObject and DeleteObject honor `If-Match`; PutObject honors `If-Match` with an
+  ETag and `If-None-Match: *`. The server ignores other conditions. The in-memory store checks a
+  write's or a delete's condition atomically with it.
+
 ### Request Counts and Faults
 
 The server counts the requests it receives per operation, and can fail or reshape the requests a

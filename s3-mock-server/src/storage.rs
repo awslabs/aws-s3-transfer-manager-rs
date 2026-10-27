@@ -51,6 +51,64 @@ pub struct StoreObjectRequest {
     /// [`Error::ChecksumMismatch`](crate::Error::ChecksumMismatch), and the key is left
     /// unchanged.
     pub client_checksums: Option<ClientChecksums>,
+    /// Condition on the current state of the key, checked atomically with the write by
+    /// backends that support it.
+    pub precondition: WritePrecondition,
+}
+
+/// Condition on the current state of a key for a write to succeed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum WritePrecondition {
+    /// Unconditional write.
+    #[default]
+    None,
+    /// `If-Match`: the key must exist with this ETag, compared without quotes. A missing key
+    /// fails with [`Error::NoSuchKey`](crate::Error::NoSuchKey).
+    IfMatch(String),
+    /// `If-None-Match: *`: the key must not exist.
+    IfNoneMatchAny,
+}
+
+impl WritePrecondition {
+    /// Check the precondition against the current metadata of the key.
+    pub(crate) fn check(&self, current: Option<&ObjectMetadata>) -> Result<()> {
+        match (self, current) {
+            (WritePrecondition::None, _) | (WritePrecondition::IfNoneMatchAny, None) => Ok(()),
+            (WritePrecondition::IfMatch(_), None) => Err(crate::Error::NoSuchKey),
+            (WritePrecondition::IfMatch(etag), Some(metadata))
+                if etags_match(etag, &metadata.etag) =>
+            {
+                Ok(())
+            }
+            (WritePrecondition::IfMatch(_), Some(_))
+            | (WritePrecondition::IfNoneMatchAny, Some(_)) => Err(crate::Error::PreconditionFailed),
+        }
+    }
+}
+
+/// Check DeleteObject's `If-Match` against the current metadata of the key.
+pub(crate) fn check_delete_if_match(
+    if_match: &s3s::dto::ETagCondition,
+    current: Option<&ObjectMetadata>,
+) -> Result<()> {
+    match current {
+        None => Err(crate::Error::NoSuchKey),
+        Some(metadata) if etag_condition_holds(if_match, &metadata.etag) => Ok(()),
+        Some(_) => Err(crate::Error::PreconditionFailed),
+    }
+}
+
+/// Whether two ETags are equal, ignoring surrounding quotes.
+pub(crate) fn etags_match(a: &str, b: &str) -> bool {
+    a.trim_matches('"') == b.trim_matches('"')
+}
+
+/// Whether an `If-Match` condition holds for an object with `etag`: `*` matches any object.
+pub(crate) fn etag_condition_holds(condition: &s3s::dto::ETagCondition, etag: &str) -> bool {
+    match condition {
+        s3s::dto::ETagCondition::ETag(expected) => etags_match(expected.value(), etag),
+        s3s::dto::ETagCondition::Any => true,
+    }
 }
 
 /// Request for retrieving an object.
@@ -157,6 +215,7 @@ impl StoreObjectRequest {
             content_disposition: None,
             content_language: None,
             client_checksums: None,
+            precondition: WritePrecondition::None,
         }
     }
 
@@ -168,6 +227,15 @@ impl StoreObjectRequest {
 
 impl From<s3s::dto::PutObjectInput> for StoreObjectRequest {
     fn from(input: s3s::dto::PutObjectInput) -> Self {
+        // S3 supports only `If-Match` with an ETag and `If-None-Match: *` on writes; other
+        // conditions are ignored.
+        let precondition = match (&input.if_match, &input.if_none_match) {
+            (Some(s3s::dto::ETagCondition::ETag(etag)), None) => {
+                WritePrecondition::IfMatch(etag.value().to_owned())
+            }
+            (None, Some(s3s::dto::ETagCondition::Any)) => WritePrecondition::IfNoneMatchAny,
+            _ => WritePrecondition::None,
+        };
         let stream = input
             .body
             .unwrap_or_else(|| {
@@ -205,6 +273,7 @@ impl From<s3s::dto::PutObjectInput> for StoreObjectRequest {
                 .content_language
                 .map(|s| Cow::<str>::from(s).into_owned()),
             client_checksums: None,
+            precondition,
         }
     }
 }
@@ -261,6 +330,20 @@ pub(crate) trait StorageBackend: Send + Sync + Debug {
 
     /// Delete an object and its metadata.
     async fn delete_object(&self, bucket: &str, key: &str) -> Result<()>;
+
+    /// Delete an object only if its ETag matches `if_match`, compared without quotes, or
+    /// `if_match` is `*` (DeleteObject with `If-Match`). Fails with `NoSuchKey` for a missing key and
+    /// `PreconditionFailed` for a different ETag, deleting nothing. The default implementation
+    /// checks the ETag and then deletes, which is not atomic.
+    async fn delete_object_if_match(
+        &self,
+        bucket: &str,
+        key: &str,
+        if_match: &s3s::dto::ETagCondition,
+    ) -> Result<()> {
+        check_delete_if_match(if_match, self.head_object(bucket, key).await?.as_ref())?;
+        self.delete_object(bucket, key).await
+    }
 
     /// List all objects with a given prefix.
     async fn list_objects(&self, request: ListObjectsRequest<'_>) -> Result<ListObjectsResponse>;
@@ -323,6 +406,15 @@ impl StorageBackend for std::sync::Arc<dyn StorageBackend + '_> {
 
     async fn delete_object(&self, bucket: &str, key: &str) -> Result<()> {
         (**self).delete_object(bucket, key).await
+    }
+
+    async fn delete_object_if_match(
+        &self,
+        bucket: &str,
+        key: &str,
+        if_match: &s3s::dto::ETagCondition,
+    ) -> Result<()> {
+        (**self).delete_object_if_match(bucket, key, if_match).await
     }
 
     async fn list_objects(&self, request: ListObjectsRequest<'_>) -> Result<ListObjectsResponse> {

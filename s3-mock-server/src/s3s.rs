@@ -391,6 +391,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             Some(metadata) => metadata,
             None => return Err(Error::NoSuchKey.into()),
         };
+        check_if_match(input.if_match.as_ref(), &metadata)?;
 
         // Convert s3s Range to std Range if present
         let mut range = input
@@ -436,6 +437,9 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         };
 
         let (stream, stream_metadata) = (response.stream, response.metadata);
+        // The object can be replaced between the lookup above and this read: the condition must
+        // also hold for the object whose data is returned.
+        check_if_match(input.if_match.as_ref(), &stream_metadata)?;
 
         let mut output = s3s::dto::GetObjectOutput::default();
 
@@ -514,6 +518,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             Some(metadata) => metadata,
             None => return Err(Error::NoSuchKey.into()),
         };
+        check_if_match(input.if_match.as_ref(), &metadata)?;
 
         // A HEAD carrying a `Range` is answered 206: `Content-Length` is the range's
         // length and `Content-Range` names the offsets, which is the only thing that
@@ -1085,9 +1090,18 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         )?;
         let input = req.input;
         tracing::trace!(bucket = %input.bucket, key = %input.key, "DeleteObject");
-        self.storage
-            .delete_object(&input.bucket, &input.key)
-            .await?;
+        match &input.if_match {
+            Some(condition) => {
+                self.storage
+                    .delete_object_if_match(&input.bucket, &input.key, condition)
+                    .await?
+            }
+            None => {
+                self.storage
+                    .delete_object(&input.bucket, &input.key)
+                    .await?
+            }
+        }
         Ok(S3Response::new(s3s::dto::DeleteObjectOutput::default()))
     }
 
@@ -1139,6 +1153,19 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         };
         Ok(S3Response::new(output))
     }
+}
+
+/// Fail with `PreconditionFailed` if an `If-Match` condition does not hold for the object.
+fn check_if_match(
+    condition: Option<&s3s::dto::ETagCondition>,
+    metadata: &ObjectMetadata,
+) -> S3Result<()> {
+    if condition
+        .is_some_and(|condition| !crate::storage::etag_condition_holds(condition, &metadata.etag))
+    {
+        return Err(Error::PreconditionFailed.into());
+    }
+    Ok(())
 }
 
 fn validate_checksum_and_type(

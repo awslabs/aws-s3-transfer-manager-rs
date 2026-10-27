@@ -127,3 +127,8 @@ pub fn assert_failure(failure: &Failure, status: u16, code: &str) {
     assert_eq!(failure.status, status, "{failure:?}");
     assert_eq!(failure.code.as_deref(), Some(code), "{failure:?}");
 }
+
+/// The quoted MD5 ETag S3 gives an object uploaded in one request.
+pub fn md5_etag(content: &[u8]) -> String {
+    format!("\"{}\"", hex::encode(md5::compute(content).0))
+}

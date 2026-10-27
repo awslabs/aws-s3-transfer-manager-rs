@@ -186,6 +186,7 @@ async fn test_concurrent_operations<S: StorageBackend>(storage: &S) {
             content_disposition: None,
             content_language: None,
             client_checksums: None,
+            precondition: Default::default(),
         };
 
         storage.put_object(request).await.unwrap();
@@ -251,6 +252,7 @@ async fn test_storage_backend_consistency() {
             content_disposition: None,
             content_language: None,
             client_checksums: None,
+            precondition: Default::default(),
         };
         let stored_metadata = storage.put_object(request).await.unwrap();
 
@@ -363,4 +365,129 @@ async fn test_filesystem_failed_body_keeps_existing_object() {
     // The temporary file of the failed write is gone.
     let mut uploads = std::fs::read_dir(dir.path().join("uploads")).unwrap();
     assert!(uploads.next().is_none());
+}
+
+fn store_request(key: &str, content: &'static [u8]) -> StoreObjectRequest {
+    StoreObjectRequest::new(
+        TEST_BUCKET,
+        key,
+        Box::pin(futures::stream::once(async move {
+            Ok(Bytes::from_static(content))
+        })),
+        ObjectIntegrityChecks::new().with_md5(),
+    )
+}
+
+async fn content_of<S: StorageBackend>(storage: &S, key: &str) -> Option<Bytes> {
+    let request = GetObjectRequest {
+        bucket: TEST_BUCKET,
+        key,
+        range: None,
+    };
+    let response = storage.get_object(request).await.unwrap()?;
+    Some(collect_stream_data(response.stream).await.unwrap())
+}
+
+/// `If-Match` and `If-None-Match: *` writes succeed only when their condition holds, and leave the
+/// key unchanged when it does not.
+async fn test_write_preconditions<S: StorageBackend>(storage: &S) {
+    use crate::storage::WritePrecondition;
+    storage.create_bucket(TEST_BUCKET).await.unwrap();
+
+    let mut create = store_request("conditional", b"v1");
+    create.precondition = WritePrecondition::IfNoneMatchAny;
+    let stored = storage.put_object(create).await.unwrap();
+    let etag = stored.object_integrity.etag().unwrap();
+
+    let mut overwrite = store_request("conditional", b"v2");
+    overwrite.precondition = WritePrecondition::IfNoneMatchAny;
+    let result = storage.put_object(overwrite).await;
+    assert!(
+        matches!(result, Err(crate::Error::PreconditionFailed)),
+        "{result:?}"
+    );
+
+    let mut stale = store_request("conditional", b"v2");
+    stale.precondition = WritePrecondition::IfMatch("\"stale\"".to_owned());
+    let result = storage.put_object(stale).await;
+    assert!(
+        matches!(result, Err(crate::Error::PreconditionFailed)),
+        "{result:?}"
+    );
+    assert_eq!(content_of(storage, "conditional").await.unwrap(), "v1");
+
+    let mut matching = store_request("conditional", b"v2");
+    matching.precondition = WritePrecondition::IfMatch(etag.trim_matches('"').to_owned());
+    storage.put_object(matching).await.unwrap();
+    assert_eq!(content_of(storage, "conditional").await.unwrap(), "v2");
+
+    let mut missing = store_request("missing", b"v1");
+    missing.precondition = WritePrecondition::IfMatch(etag);
+    let result = storage.put_object(missing).await;
+    assert!(matches!(result, Err(crate::Error::NoSuchKey)), "{result:?}");
+    assert!(storage
+        .head_object(TEST_BUCKET, "missing")
+        .await
+        .unwrap()
+        .is_none());
+}
+
+/// `delete_object_if_match` deletes the object only when its ETag matches, quoted or not, or the
+/// condition is `*`, fails with `PreconditionFailed` otherwise, and with `NoSuchKey` for a
+/// missing key.
+async fn test_delete_object_if_match<S: StorageBackend>(storage: &S) {
+    use s3s::dto::{ETag, ETagCondition};
+    let matching = |etag: &str| ETagCondition::ETag(ETag::Strong(etag.to_owned()));
+    storage.create_bucket(TEST_BUCKET).await.unwrap();
+    let etag = storage
+        .put_object(store_request("object", b"content"))
+        .await
+        .unwrap()
+        .object_integrity
+        .etag()
+        .unwrap();
+    let result = storage
+        .delete_object_if_match(TEST_BUCKET, "object", &matching("other"))
+        .await;
+    assert!(
+        matches!(result, Err(crate::Error::PreconditionFailed)),
+        "{result:?}"
+    );
+    assert_eq!(content_of(storage, "object").await.unwrap(), "content");
+    storage
+        .delete_object_if_match(TEST_BUCKET, "object", &matching(etag.trim_matches('"')))
+        .await
+        .unwrap();
+    assert!(content_of(storage, "object").await.is_none());
+    let result = storage
+        .delete_object_if_match(TEST_BUCKET, "object", &matching(&etag))
+        .await;
+    assert!(matches!(result, Err(crate::Error::NoSuchKey)), "{result:?}");
+    // `*` matches any existing object.
+    storage
+        .put_object(store_request("object", b"content"))
+        .await
+        .unwrap();
+    storage
+        .delete_object_if_match(TEST_BUCKET, "object", &ETagCondition::Any)
+        .await
+        .unwrap();
+    assert!(content_of(storage, "object").await.is_none());
+    let result = storage
+        .delete_object_if_match(TEST_BUCKET, "object", &ETagCondition::Any)
+        .await;
+    assert!(matches!(result, Err(crate::Error::NoSuchKey)), "{result:?}");
+}
+
+#[tokio::test]
+async fn test_in_memory_write_preconditions() {
+    test_write_preconditions(&InMemoryStorage::new()).await;
+    test_delete_object_if_match(&InMemoryStorage::new()).await;
+}
+
+#[tokio::test]
+async fn test_filesystem_write_preconditions() {
+    let dir = tempdir().unwrap();
+    test_write_preconditions(&FilesystemStorage::new(dir.path().join("a")).await.unwrap()).await;
+    test_delete_object_if_match(&FilesystemStorage::new(dir.path().join("b")).await.unwrap()).await;
 }
