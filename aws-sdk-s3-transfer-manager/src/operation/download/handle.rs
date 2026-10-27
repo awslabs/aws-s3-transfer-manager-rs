@@ -372,8 +372,8 @@ impl ManagedDownloadHandle {
     /// On success, the object is at the destination path, or in the caller's file for a
     /// download to a file. A cancelled download returns an
     /// [`OperationCancelled`](crate::error::ErrorKind::OperationCancelled) error. On failure or
-    /// cancellation, a download to a path deletes its temporary file, possibly after this
-    /// returns. This does not add a filesystem durability barrier.
+    /// cancellation, a download to a path deletes its temporary file. This does not add a
+    /// filesystem durability barrier.
     pub async fn join(
         mut self,
     ) -> Result<crate::operation::download::output::DownloadOutput, error::Error> {
@@ -422,6 +422,8 @@ impl Drop for ManagedDownloadHandle {
                 .scheduler
                 .cancel_transfer(self.inner.transfer.id());
         }
+        // The process can exit before the last request holding the file drops it.
+        self.inner.transfer.writer().discard_temp_file();
     }
 }
 
@@ -493,5 +495,46 @@ mod tests {
             .await
             .expect_err("join on cancelled transfer must return Err");
         assert_eq!(err.kind(), &ErrorKind::OperationCancelled);
+    }
+
+    // ref: awslabs/aws-s3-transfer-manager-rs#197
+    /// Dropping a running download to a path removes its temporary file before the drop
+    /// returns, while a request still holds a reference to it.
+    ///
+    /// The second range's response is held, so a request is still running when the handle
+    /// drops. The test runs on one thread and does not yield after the drop, so that request
+    /// cannot finish first. If removal were left to the last request, a process that exits
+    /// right after the drop would leave the file behind.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn dropping_a_running_path_download_removes_its_temp_file() {
+        use crate::operation::download::test_util::fixtures::{
+            disk_test_handle, object_bytes, object_client_holding,
+        };
+
+        let part_size = 5 * 1024 * 1024;
+        let (client, held) =
+            object_client_holding(object_bytes(2 * part_size as usize), u64::MAX, part_size);
+        let tm = crate::Client {
+            handle: disk_test_handle(client, part_size),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let handle = tm
+            .download()
+            .bucket("test-bucket")
+            .key("test-key")
+            .write_to_path(dir.path().join("out.dat"))
+            .await
+            .unwrap();
+        held.arrived().await;
+
+        drop(handle);
+
+        let left: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert!(left.is_empty(), "files left right after the drop: {left:?}");
+        held.release();
     }
 }

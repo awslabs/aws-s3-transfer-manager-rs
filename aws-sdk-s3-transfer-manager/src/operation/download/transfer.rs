@@ -2470,11 +2470,11 @@ mod tests {
     }
 
     // ref: awslabs/aws-s3-transfer-manager-rs#197
-    /// A cancel that lands after completion is claimed and before the rename leaves a
-    /// pre-existing destination alone and removes the temporary file.
+    /// A cancel that lands after completion is claimed and before the commit checks the
+    /// status leaves a pre-existing destination alone and removes the temporary file.
     ///
     /// The sink cancels the transfer from its finalizing resize, so the cancel lands after
-    /// the last range claimed completion and before the rename. If `finalize` renamed
+    /// the last range claimed completion and before that check. If `finalize` renamed
     /// anyway, the caller's file would be replaced under a `Cancelled` status.
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
@@ -2592,8 +2592,8 @@ mod tests {
     }
 
     // ref: awslabs/aws-s3-transfer-manager-rs#197
-    /// A failed download that nobody joins keeps its temporary file while a request is
-    /// still running, and removes it once that request stops.
+    /// A failed download whose handle has not dropped keeps its temporary file while a
+    /// request is still running, and removes it once that request stops.
     ///
     /// The object has three parts. The third range is sent first and its response is
     /// held, so it is still running when the second range fails. If the failure removed

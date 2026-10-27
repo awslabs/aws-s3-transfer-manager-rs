@@ -186,14 +186,30 @@ pub(crate) struct CommitTarget {
     pub(crate) dest: std::path::PathBuf,
 }
 
-/// A [`CommitTarget`] whose temporary file is removed on drop unless
-/// [`BodyWriter::finalize`] already renamed or removed it.
+/// A [`CommitTarget`] whose temporary file is removed when the last reference drops, unless
+/// [`BodyWriter::finalize`] renamed it or [`BodyWriter::discard_temp_file`] removed it first.
 ///
-/// Reference-counted so the file outlives every work item still writing to it.
+/// Reference-counted so the transfer's own terminal paths leave the file to the last work
+/// item still holding it.
 #[derive(Debug)]
 pub(crate) struct TempFile {
-    /// Taken when the file is renamed or removed, so that happens at most once.
-    target: std::sync::Mutex<Option<CommitTarget>>,
+    /// Taken when the file is renamed or removed, so that happens at most once. Shared with
+    /// the writer, which can remove the file before the last reference drops.
+    target: SharedTarget,
+}
+
+/// A commit target, taken under its lock by whichever rename or removal runs first.
+type SharedTarget = std::sync::Arc<std::sync::Mutex<Option<CommitTarget>>>;
+
+/// Removes the temporary file unless it was already renamed or removed. Holds the lock
+/// across the removal, so a caller that finds nothing left to remove knows it is gone.
+fn remove_temp_file(target: &std::sync::Mutex<Option<CommitTarget>>) {
+    let mut target = target
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(paths) = target.take() {
+        let _ = std::fs::remove_file(&paths.temp);
+    }
 }
 
 impl TempFile {
@@ -224,14 +240,7 @@ impl TempFile {
 
 impl Drop for TempFile {
     fn drop(&mut self) {
-        let target = self
-            .target
-            .get_mut()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        if let Some(target) = target {
-            let _ = std::fs::remove_file(&target.temp);
-        }
+        remove_temp_file(&self.target);
     }
 }
 
@@ -250,6 +259,8 @@ enum Mode {
         /// The transfer's reference to its temporary file, until
         /// [`BodyWriter::release_temp_file`] drops it.
         temp_file: std::sync::Mutex<Option<std::sync::Arc<TempFile>>>,
+        /// The temporary file's commit target, shared with every [`TempFile`] reference.
+        commit_target: SharedTarget,
     },
 }
 
@@ -391,6 +402,15 @@ impl BodyWriter {
             // Dropped after the lock is released: dropping the last reference
             // removes the file.
             drop(released);
+        }
+    }
+
+    /// Removes the temporary file now, even while work items still hold it, and returns once
+    /// the temporary name is gone. Call only after the transfer has left `Active`: a later
+    /// [`finalize`](Self::finalize) treats a removed file as already committed.
+    pub(crate) fn discard_temp_file(&self) {
+        if let Mode::Disk { commit_target, .. } = &*self.mode {
+            remove_temp_file(commit_target);
         }
     }
 
@@ -666,6 +686,13 @@ pub(crate) fn new_recv_body_with_disk_mode(
     let (buffer, consumer) = PagedRecvBuffer::new_with_segment_size(SEG_SIZE);
     let notify = Arc::new(WakeNotify::new());
     let resolved_range_start = std::sync::OnceLock::new();
+    let has_commit = commit.is_some();
+    let commit_target: SharedTarget = std::sync::Arc::new(std::sync::Mutex::new(commit));
+    let temp_file = has_commit.then(|| {
+        std::sync::Arc::new(TempFile {
+            target: commit_target.clone(),
+        })
+    });
     let writer = BodyWriter {
         buffer,
         notify: notify.clone(),
@@ -673,11 +700,8 @@ pub(crate) fn new_recv_body_with_disk_mode(
             sink,
             object_range_start: resolved_range_start,
             written: AtomicU64::new(0),
-            temp_file: std::sync::Mutex::new(commit.map(|target| {
-                std::sync::Arc::new(TempFile {
-                    target: std::sync::Mutex::new(Some(target)),
-                })
-            })),
+            temp_file: std::sync::Mutex::new(temp_file),
+            commit_target,
         }),
     };
     let slot_consumer = RecvBodyConsumer { consumer, notify };
