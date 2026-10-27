@@ -13,6 +13,7 @@
 mod bucket;
 mod error;
 mod faults;
+mod list;
 mod operation;
 mod s3s;
 mod server;

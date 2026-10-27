@@ -993,118 +993,59 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
 
         check_bucket(&self.storage, &input.bucket).await?;
 
-        let prefix = input.prefix.as_deref();
-        let delimiter = input.delimiter.as_deref();
-        let max_keys = input.max_keys.unwrap_or(1000).min(1000) as usize;
-        let start_after = input.start_after.as_deref();
-        let continuation_token = input.continuation_token.as_deref();
+        let prefix = input.prefix.as_deref().unwrap_or("");
+        let max_keys = input.max_keys.unwrap_or(1000).clamp(0, 1000) as usize;
+        let include_restore_status = input
+            .optional_object_attributes
+            .as_ref()
+            .is_some_and(|attrs| attrs.iter().any(|a| a.as_str() == "RestoreStatus"));
 
-        // List objects from storage
         let request = crate::storage::ListObjectsRequest {
             bucket: &input.bucket,
+            prefix: Some(prefix),
+        };
+        let objects = self.storage.list_objects(request).await?.objects;
+        let list_request = crate::list::ListRequest {
             prefix,
+            delimiter: input.delimiter.as_deref(),
+            max_keys,
+            continuation_token: input.continuation_token.as_deref(),
+            start_after: input.start_after.as_deref(),
         };
-        let mut response = self.storage.list_objects(request).await?;
-
-        // Apply start_after or continuation token if specified
-        if let Some(continuation_token) = continuation_token {
-            // Decode the continuation token to get the last key
-            if let Ok(decoded) =
-                base64::engine::general_purpose::STANDARD.decode(continuation_token)
-            {
-                if let Ok(last_key) = String::from_utf8(decoded) {
-                    response
-                        .objects
-                        .retain(|obj| obj.key.as_str() > last_key.as_str());
-                }
+        let page = crate::list::list_page(objects, &list_request).map_err(|error| match error {
+            crate::list::ListError::InvalidContinuationToken => {
+                Error::InvalidArgument("The continuation token provided is incorrect")
             }
-        } else if let Some(start_after) = start_after {
-            response
-                .objects
-                .retain(|obj| obj.key.as_str() > start_after);
-        }
+        })?;
 
-        // Sort by key for consistent ordering
-        response.objects.sort_by(|a, b| a.key.cmp(&b.key));
-
-        // Process delimiter if specified
-        let mut contents = Vec::new();
-        let mut common_prefixes = Vec::new();
-
-        if let Some(delimiter) = delimiter {
-            let mut seen_prefixes = std::collections::HashSet::new();
-
-            for obj in response.objects {
-                if let Some(rest) = obj.key.strip_prefix(prefix.unwrap_or("")) {
-                    if let Some(index) = rest.find(delimiter) {
-                        // This is a common prefix
-                        let common_prefix = format!("{}{}", prefix.unwrap_or(""), &rest[..=index]);
-                        if seen_prefixes.insert(common_prefix.clone()) {
-                            let prefix_obj = s3s::dto::CommonPrefix {
-                                prefix: Some(common_prefix),
-                            };
-                            common_prefixes.push(prefix_obj);
-                        }
-                        continue;
-                    }
-                }
-
-                // This is a regular object
-                let object = s3s::dto::Object {
-                    key: Some(obj.key),
-                    size: Some(obj.metadata.content_length as i64),
-                    e_tag: Some(etag_from_quoted(&obj.metadata.etag)),
-                    last_modified: Some(Timestamp::from(obj.metadata.last_modified)),
-                    ..Default::default()
-                };
-
-                contents.push(object);
-            }
-        } else {
-            // No delimiter - just convert all objects
-            for obj in response.objects {
-                let object = s3s::dto::Object {
-                    key: Some(obj.key),
-                    size: Some(obj.metadata.content_length as i64),
-                    e_tag: Some(etag_from_quoted(&obj.metadata.etag)),
-                    last_modified: Some(Timestamp::from(obj.metadata.last_modified)),
-                    ..Default::default()
-                };
-
-                contents.push(object);
-            }
-        }
-
-        // Handle pagination
-        let total_objects = contents.len() + common_prefixes.len();
-        let is_truncated = total_objects > max_keys;
-
-        // Truncate results if needed
-        if is_truncated {
-            let remaining_slots = max_keys.saturating_sub(common_prefixes.len());
-            contents.truncate(remaining_slots);
-        }
-
-        // Calculate continuation token if truncated
-        let next_continuation_token = if is_truncated {
-            contents
-                .last()
-                .and_then(|obj| obj.key.as_ref())
-                .map(|last_key| base64::engine::general_purpose::STANDARD.encode(last_key))
-        } else {
-            None
-        };
+        let contents: Vec<s3s::dto::Object> = page
+            .objects
+            .into_iter()
+            .map(|obj| list_entry(obj, include_restore_status))
+            .collect();
+        let common_prefixes: Vec<s3s::dto::CommonPrefix> = page
+            .common_prefixes
+            .into_iter()
+            .map(|prefix| s3s::dto::CommonPrefix {
+                prefix: Some(prefix),
+            })
+            .collect();
 
         let output = s3s::dto::ListObjectsV2Output {
-            contents: Some(contents.clone()),
-            common_prefixes: Some(common_prefixes.clone()),
-            is_truncated: Some(is_truncated),
             key_count: Some((contents.len() + common_prefixes.len()) as i32),
+            contents: Some(contents),
+            common_prefixes: Some(common_prefixes),
+            is_truncated: Some(page.next_continuation_token.is_some()),
             max_keys: Some(max_keys as i32),
-            prefix: prefix.map(|s| s.to_string()),
-            delimiter: delimiter.map(|s| s.to_string()),
+            prefix: input.prefix,
+            delimiter: input.delimiter,
             name: Some(input.bucket.to_string()),
-            next_continuation_token,
+            // S3 echoes `start-after` only when it applies, without a continuation token.
+            start_after: input
+                .start_after
+                .filter(|_| input.continuation_token.is_none()),
+            continuation_token: input.continuation_token,
+            next_continuation_token: page.next_continuation_token,
             ..Default::default()
         };
 
@@ -1263,6 +1204,40 @@ pub(crate) async fn check_bucket(
         Ok(())
     } else {
         Err(Error::NoSuchBucket.into())
+    }
+}
+
+/// The ListObjectsV2 entry of an object. The restore status is included only when requested, as
+/// in S3.
+fn list_entry(obj: crate::storage::ObjectInfo, include_restore_status: bool) -> s3s::dto::Object {
+    let algorithms = obj.metadata.checksum_algorithms();
+    s3s::dto::Object {
+        size: Some(obj.metadata.content_length as i64),
+        e_tag: Some(etag_from_quoted(&obj.metadata.etag)),
+        last_modified: Some(Timestamp::from(obj.metadata.last_modified)),
+        storage_class: obj.metadata.storage_class.clone().map(Into::into),
+        checksum_algorithm: (!algorithms.is_empty()).then(|| {
+            algorithms
+                .iter()
+                .map(|a| s3s::dto::ChecksumAlgorithm::from(a.as_str().to_ascii_uppercase()))
+                .collect()
+        }),
+        restore_status: obj
+            .metadata
+            .restore_status
+            .filter(|_| include_restore_status)
+            .map(|status| match status {
+                RestoreStatus::InProgress => s3s::dto::RestoreStatus {
+                    is_restore_in_progress: Some(true),
+                    restore_expiry_date: None,
+                },
+                RestoreStatus::Restored { expiry } => s3s::dto::RestoreStatus {
+                    is_restore_in_progress: Some(false),
+                    restore_expiry_date: Some(Timestamp::from(expiry)),
+                },
+            }),
+        key: Some(obj.key),
+        ..Default::default()
     }
 }
 

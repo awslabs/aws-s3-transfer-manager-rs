@@ -140,6 +140,7 @@ pub(crate) struct ListObjectsResponse {
 }
 
 /// Information about an object.
+#[derive(Debug)]
 pub(crate) struct ObjectInfo {
     pub key: String,
     pub metadata: ObjectMetadata,

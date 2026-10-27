@@ -220,6 +220,21 @@ impl ObjectMetadata {
     pub(crate) fn parts_count(&self) -> usize {
         self.parts.len()
     }
+
+    /// The algorithms of the checksums the object stores.
+    pub(crate) fn checksum_algorithms(&self) -> Vec<aws_smithy_checksums::ChecksumAlgorithm> {
+        use aws_smithy_checksums::ChecksumAlgorithm;
+        [
+            (self.crc32.is_some(), ChecksumAlgorithm::Crc32),
+            (self.crc32c.is_some(), ChecksumAlgorithm::Crc32c),
+            (self.crc64nvme.is_some(), ChecksumAlgorithm::Crc64Nvme),
+            (self.sha1.is_some(), ChecksumAlgorithm::Sha1),
+            (self.sha256.is_some(), ChecksumAlgorithm::Sha256),
+        ]
+        .into_iter()
+        .filter_map(|(stored, algorithm)| stored.then_some(algorithm))
+        .collect()
+    }
 }
 
 impl Default for ObjectMetadata {

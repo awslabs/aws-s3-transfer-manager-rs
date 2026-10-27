@@ -143,6 +143,12 @@ async fn test_filesystem_storage() -> Result<(), Box<dyn std::error::Error>> {
   including a restore in progress, which a further RestoreObject fails with 409.
 - A RestoreObject without `Days` restores the object for 1 day.
 
+### Listing
+
+ListObjectsV2 pages hold at most `max-keys` entries, counting each common prefix once, and never
+split a common prefix across pages. Listed objects report their checksum algorithms, storage class
+and, when requested, restore status.
+
 ### Buckets
 
 Create buckets with CreateBucket or `S3MockServer::create_bucket` before using them: object
