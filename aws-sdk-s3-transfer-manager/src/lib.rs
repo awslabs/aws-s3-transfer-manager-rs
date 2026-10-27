@@ -161,6 +161,9 @@ pub mod operation;
 /// Transfer manager configuration
 pub mod config;
 
+/// DNS-related types and functionality
+pub mod dns;
+
 /// Payload-memory configuration and shared pooled storage.
 ///
 /// Transfer-manager clients construct a pool automatically by default.
