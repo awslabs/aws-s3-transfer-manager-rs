@@ -204,6 +204,51 @@ async fn test_invalid_part_order_message() -> Result {
     Ok(())
 }
 
+/// Directory buckets serve RenameObject and appends; general purpose buckets fail them with 501,
+/// as in S3.
+#[tokio::test]
+async fn test_renames_and_appends() -> Result {
+    let (server, _handle, s3) = setup(S3MockServer::builder()).await;
+    put(&s3, DIRECTORY, "a").await;
+    s3.rename_object()
+        .bucket(DIRECTORY)
+        .key("b")
+        .rename_source("a")
+        .send()
+        .await?;
+    s3.put_object()
+        .bucket(DIRECTORY)
+        .key("b")
+        .write_offset_bytes(5)
+        .body(ByteStream::from_static(b" world"))
+        .send()
+        .await?;
+    let data = server.get_object(DIRECTORY, "b").await?.unwrap();
+    assert_eq!(&data.body[..], b"hello world");
+
+    put(&s3, GENERAL_PURPOSE, "a").await;
+    let fail = failure(
+        s3.rename_object()
+            .bucket(GENERAL_PURPOSE)
+            .key("b")
+            .rename_source("a")
+            .send()
+            .await,
+    );
+    assert_failure(&fail, 501, "NotImplemented");
+    let fail = failure(
+        s3.put_object()
+            .bucket(GENERAL_PURPOSE)
+            .key("a")
+            .write_offset_bytes(5)
+            .body(ByteStream::from_static(b" world"))
+            .send()
+            .await,
+    );
+    assert_failure(&fail, 501, "NotImplemented");
+    Ok(())
+}
+
 /// ListObjectsV2 in a directory bucket lists every key, in no particular order, and fails as S3
 /// does for the parameters directory buckets do not support: a delimiter other than `/` or a
 /// prefix that does not end in `/` with 400 InvalidRequest, `start-after` with 501 NotSupported.

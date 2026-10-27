@@ -16,6 +16,7 @@ mod express;
 mod faults;
 mod list;
 mod operation;
+mod rename;
 mod s3s;
 mod server;
 mod service;

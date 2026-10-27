@@ -47,6 +47,7 @@ impl MockService {
     /// - A request signed for `s3express` is authenticated here. If that fails, it is answered
     ///   with the error; otherwise it is passed on to s3s without its signature, marked as
     ///   verified.
+    /// - A RenameObject to a key longer than s3s accepts is answered with KeyTooLongError.
     pub(crate) async fn serve(
         &self,
         request: http::Request<Body>,
@@ -61,6 +62,11 @@ impl MockService {
                 }
                 Err(error) => return Ok(error.into_response()),
             };
+        if let Some(response) =
+            crate::rename::reject_rename_to_long_key(&self.state, request.method(), request.uri())
+        {
+            return Ok(response);
+        }
         self.service.call(request).await
     }
 }

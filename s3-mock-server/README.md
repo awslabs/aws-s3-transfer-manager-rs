@@ -144,7 +144,7 @@ async fn test_filesystem_storage() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-### Conditional Writes and Appends
+### Conditional Writes, Appends and Renames
 
 - GetObject, HeadObject and DeleteObject honor `If-Match`; PutObject honors `If-Match` with an
   ETag and `If-None-Match: *`. The server ignores other conditions. The in-memory store checks a
@@ -156,6 +156,12 @@ async fn test_filesystem_storage() -> Result<(), Box<dyn std::error::Error>> {
   object's algorithm (CRC64NVME if it has none), and the appended object has no parts and a CRC of
   the combined content, or for SHA-1 and SHA-256 a composite checksum of its segments: its parts or
   the data it was created with, then each append.
+- RenameObject is served in directory buckets (in-memory store only), and fails with 501
+  NotImplemented in general purpose buckets, as in S3. `x-amz-rename-source` is the source key
+  in the same bucket, percent-decoded, as S3 reads it. Conditions other than `If-Match`,
+  `If-None-Match: *` and `x-amz-rename-source-if-match` fail with 501. A rename retried with the
+  `x-amz-client-token` of a rename that succeeded succeeds without renaming again, and fails with
+  400 IdempotentParameterMismatch if its source, destination or conditions differ.
 
 ### Archived Objects
 
@@ -251,7 +257,8 @@ write signed with a session.
 - A range or `partNumber` read of part of a multipart object with a full-object checksum
   returns the part's checksum if the part was uploaded with one; general purpose buckets
   return none.
-- Appends are served; general purpose buckets fail them with 501 NotImplemented.
+- Appends and RenameObject are served; general purpose buckets fail them with 501
+  NotImplemented.
 
 ### Buckets
 

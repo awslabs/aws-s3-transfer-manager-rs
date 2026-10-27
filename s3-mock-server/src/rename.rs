@@ -1,0 +1,275 @@
+/*
+ * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+//! RenameObject, which s3s does not model, served as a custom s3s route.
+//!
+//! A rename is `PUT /{bucket}/{key}?renameObject` with the source key in `x-amz-rename-source`,
+//! as S3 directory buckets serve it; s3s would serve it as a PutObject with an empty body. Only
+//! path-style requests are supported. [`RenameRoute`] serves renames once s3s has parsed them
+//! and they are authenticated. s3s rejects a key over 1,024 bytes while parsing the path, before
+//! any route runs, so [`reject_rename_to_long_key`] answers renames to such keys ahead of the s3s
+//! service.
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use http::{Extensions, HeaderMap, Method, Uri};
+use s3s::route::S3Route;
+use s3s::{Body, S3Request, S3Response, S3Result};
+
+use crate::bucket::BucketType;
+use crate::error::Error;
+use crate::s3s::ServerState;
+use crate::storage::{RenamePreconditions, RenameRequest, StorageBackend};
+use crate::Operation;
+
+const RENAME_QUERY_PARAM: &str = "renameObject";
+const RENAME_SOURCE_HEADER: &str = "x-amz-rename-source";
+const RENAME_SOURCE_IF_MATCH_HEADER: &str = "x-amz-rename-source-if-match";
+const CLIENT_TOKEN_HEADER: &str = "x-amz-client-token";
+/// The longest client token S3 accepts, in characters.
+const MAX_CLIENT_TOKEN_LENGTH: usize = 64;
+/// Rename conditions S3 evaluates and the server does not; a rename with any of them fails with
+/// NotImplemented rather than ignoring it.
+const UNSUPPORTED_CONDITION_HEADERS: &[&str] = &[
+    "if-modified-since",
+    "if-unmodified-since",
+    "x-amz-rename-source-if-none-match",
+    "x-amz-rename-source-if-modified-since",
+    "x-amz-rename-source-if-unmodified-since",
+];
+/// The longest key S3 accepts, in bytes of UTF-8.
+pub(crate) const MAX_KEY_LENGTH: usize = 1024;
+
+/// Serves authenticated RenameObject requests.
+pub(crate) struct RenameRoute {
+    storage: Arc<dyn StorageBackend>,
+    state: Arc<ServerState>,
+}
+
+impl RenameRoute {
+    pub(crate) fn new(storage: Arc<dyn StorageBackend>, state: Arc<ServerState>) -> Self {
+        Self { storage, state }
+    }
+}
+
+#[async_trait]
+impl S3Route for RenameRoute {
+    fn is_match(
+        &self,
+        method: &Method,
+        uri: &Uri,
+        _headers: &HeaderMap,
+        _extensions: &mut Extensions,
+    ) -> bool {
+        is_rename(method, uri)
+    }
+
+    /// Admit renames s3s authenticated and renames to directory buckets whose S3 Express
+    /// signature the server verified.
+    async fn check_access(&self, req: &mut S3Request<Body>) -> S3Result<()> {
+        if req.credentials.is_some() || crate::express::is_verified(&req.extensions) {
+            Ok(())
+        } else {
+            Err(s3s::s3_error!(AccessDenied, "Signature is required"))
+        }
+    }
+
+    async fn call(&self, req: S3Request<Body>) -> S3Result<S3Response<Body>> {
+        let (bucket, dst_key) = split_path(req.uri.path())?;
+        let fault = self
+            .state
+            .admit(Operation::RenameObject, Some(&bucket), Some(&dst_key))?;
+        if BucketType::of(&bucket) == BucketType::GeneralPurpose {
+            return Err(Error::NotImplemented.into());
+        }
+
+        let header = |name: &str| {
+            req.headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+        };
+        for unsupported in UNSUPPORTED_CONDITION_HEADERS {
+            if req.headers.contains_key(*unsupported) {
+                return Err(Error::NotImplemented.into());
+            }
+        }
+        // S3 accepts an empty token, as no token.
+        let client_token = client_token(&req.headers)?;
+        let if_none_match = header("if-none-match");
+        if if_none_match.as_deref().is_some_and(|value| value != "*") {
+            return Err(Error::NotImplemented.into());
+        }
+        // S3 percent-decodes the source key, which may also be sent unencoded, so it need not be
+        // ASCII.
+        let src_key = req
+            .headers
+            .get(RENAME_SOURCE_HEADER)
+            .ok_or(Error::InvalidRequest("Missing x-amz-rename-source"))?;
+        let src_key = std::str::from_utf8(src_key.as_bytes())
+            .map_err(|_| Error::InvalidArgument("x-amz-rename-source is not UTF-8"))?;
+        // The source is the key itself: S3 resolves `/{bucket}/{key}` to that literal key.
+        let src_key = percent_decode(src_key)?;
+        tracing::trace!(%bucket, %src_key, %dst_key, "RenameObject");
+        crate::s3s::check_bucket(self.storage.as_ref(), &bucket).await?;
+
+        let request = RenameRequest {
+            src_key,
+            dst_key,
+            preconditions: RenamePreconditions {
+                if_match: header("if-match"),
+                if_none_match_any: if_none_match.is_some(),
+                source_if_match: header(RENAME_SOURCE_IF_MATCH_HEADER),
+            },
+            client_token,
+        };
+        match self.storage.rename_object(&bucket, request).await {
+            Ok(()) => {
+                // WithholdResponseHeaders: the rename is applied; never respond.
+                if let Some(crate::faults::FaultType::WithholdResponseHeaders) = fault {
+                    std::future::pending::<()>().await;
+                    unreachable!("pending future never resolves");
+                }
+                Ok(S3Response::new(Body::empty()))
+            }
+            // S3 names the failed condition in a `Condition` element, which an s3s error
+            // cannot carry, so the route answers with the error response.
+            Err(error @ Error::RenamePreconditionFailed(_)) => {
+                let (parts, body) = error.into_response().into_parts();
+                let mut response = S3Response::with_status(body, parts.status);
+                response.headers = parts.headers;
+                Ok(response)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
+/// The request's `x-amz-client-token`, if it has a non-empty one. Fails, as S3 does, with 400
+/// InvalidRequest for a token longer than 64 characters or with characters outside ASCII 33 to
+/// 126.
+fn client_token(headers: &HeaderMap) -> crate::Result<Option<String>> {
+    let Some(token) = headers
+        .get(CLIENT_TOKEN_HEADER)
+        .map(|value| value.as_bytes())
+        .filter(|token| !token.is_empty())
+    else {
+        return Ok(None);
+    };
+    if token.len() > MAX_CLIENT_TOKEN_LENGTH {
+        return Err(Error::InvalidRequest(
+            "Invalid header: Value for x-amz-client-token header is too long.",
+        ));
+    }
+    if !token.iter().all(|byte| (33..=126).contains(byte)) {
+        return Err(Error::InvalidRequest(
+            "Invalid header: Value for x-amz-client-token header is invalid.",
+        ));
+    }
+    Ok(Some(
+        String::from_utf8(token.to_vec()).expect("an ASCII token is UTF-8"),
+    ))
+}
+
+/// Check a RenameObject's destination key length ahead of the s3s service, which would reject a
+/// key longer than 1,024 bytes while parsing the path, before [`RenameRoute`] runs. Returns the
+/// response for a rename to such a key, and `None` for any other request, which goes on to s3s.
+/// A rename to such a key is answered with 400 `KeyTooLongError`, reporting the key's `Size` and
+/// the `MaxSizeAllowed`, as S3 does.
+///
+/// Such a request is counted and draws its fault like any other rename, and gets 501 in a
+/// general purpose bucket. A fault that fails the request answers it instead; any other fault it
+/// draws has no effect. A rename to a missing bucket gets `KeyTooLongError`, not
+/// NoSuchBucket. It is authenticated only when it is signed for S3 Express sessions (see
+/// [`crate::express`]).
+pub(crate) fn reject_rename_to_long_key(
+    state: &ServerState,
+    method: &Method,
+    uri: &Uri,
+) -> Option<http::Response<Body>> {
+    if !is_rename(method, uri) {
+        return None;
+    }
+    let (bucket, dst_key) = split_path(uri.path()).ok()?;
+    if dst_key.len() <= MAX_KEY_LENGTH {
+        return None;
+    }
+    let error = match state.admit(Operation::RenameObject, Some(&bucket), Some(&dst_key)) {
+        Err(error) => error,
+        Ok(_) if BucketType::of(&bucket) == BucketType::GeneralPurpose => Error::NotImplemented,
+        Ok(_) => Error::KeyTooLong {
+            size: dst_key.len(),
+        },
+    };
+    Some(error.into_response())
+}
+
+fn is_rename(method: &Method, uri: &Uri) -> bool {
+    method == Method::PUT
+        && uri.query().is_some_and(|query| {
+            query
+                .split('&')
+                .any(|param| param.split('=').next() == Some(RENAME_QUERY_PARAM))
+        })
+}
+
+/// The bucket and decoded key of a path-style request path.
+fn split_path(path: &str) -> crate::Result<(String, String)> {
+    let path = path.strip_prefix('/').unwrap_or(path);
+    match path.split_once('/') {
+        Some((bucket, key)) if !bucket.is_empty() && !key.is_empty() => {
+            Ok((percent_decode(bucket)?, percent_decode(key)?))
+        }
+        _ => Err(Error::InvalidRequest(
+            "Expected a path-style /{bucket}/{key} request",
+        )),
+    }
+}
+
+fn percent_decode(s: &str) -> crate::Result<String> {
+    percent_encoding::percent_decode_str(s)
+        .decode_utf8()
+        .map(|decoded| decoded.into_owned())
+        .map_err(|_| Error::InvalidUri)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn splits_and_decodes_path_style_paths() {
+        assert_eq!(
+            split_path("/bucket/dir/key%20x%E2%9C%93").unwrap(),
+            ("bucket".to_owned(), "dir/key x\u{2713}".to_owned())
+        );
+        assert!(split_path("/bucket").is_err());
+        assert!(split_path("/bucket/").is_err());
+        assert!(split_path("/bucket/%FF").is_err());
+    }
+
+    #[test]
+    fn matches_only_put_with_rename_query() {
+        let route = RenameRoute::new(
+            Arc::new(crate::storage::in_memory::InMemoryStorage::new()),
+            Default::default(),
+        );
+        let mut ext = Extensions::new();
+        let headers = HeaderMap::new();
+        let matches = |method: Method, uri: &str, ext: &mut Extensions| {
+            route.is_match(&method, &uri.parse().unwrap(), &headers, ext)
+        };
+        assert!(matches(Method::PUT, "/b/k?renameObject", &mut ext));
+        assert!(matches(
+            Method::PUT,
+            "/b/k?x-id=RenameObject&renameObject=",
+            &mut ext
+        ));
+        assert!(!matches(Method::GET, "/b/k?renameObject", &mut ext));
+        assert!(!matches(Method::PUT, "/b/k?partNumber=1", &mut ext));
+        assert!(!matches(Method::PUT, "/b/k?renameObjects", &mut ext));
+    }
+}

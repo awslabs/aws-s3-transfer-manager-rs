@@ -81,6 +81,18 @@ pub enum Error {
     #[error("Content-MD5 not implemented")]
     ContentMd5NotImplemented,
 
+    /// A key is longer than S3 allows. Carries its length in bytes, which S3 reports in the
+    /// error's `Size` element.
+    #[error("key too long: {size} bytes")]
+    KeyTooLong {
+        /// The length of the key in bytes.
+        size: usize,
+    },
+
+    /// A request's path or a key it names is not valid percent-encoded UTF-8.
+    #[error("invalid URI")]
+    InvalidUri,
+
     /// The request uses a parameter the bucket does not support.
     #[error("not supported: {0}")]
     NotSupported(&'static str),
@@ -92,6 +104,15 @@ pub enum Error {
     /// An `If-Match` or `If-None-Match` condition did not hold.
     #[error("precondition failed")]
     PreconditionFailed,
+
+    /// A RenameObject condition did not hold. Carries the name of the condition header that S3
+    /// reports in the error's `Condition` element.
+    #[error("rename precondition failed: {0}")]
+    RenamePreconditionFailed(&'static str),
+
+    /// A RenameObject reuses the client token of an earlier rename with other parameters.
+    #[error("idempotent parameter mismatch")]
+    IdempotentParameterMismatch,
 
     /// The bucket to delete has objects.
     #[error("bucket not empty")]
@@ -197,8 +218,19 @@ const INTERNAL_ERROR_MESSAGE: &str = "We encountered an internal error. Please t
 
 impl Error {
     /// The HTTP response to a request that fails with this error, for the requests the server
-    /// answers without s3s: the error document of the `S3Error` the error converts into.
+    /// answers without s3s: the error document of the `S3Error` the error converts into, with the
+    /// elements S3 adds to some error documents and an `S3Error` cannot carry, the `Condition` of
+    /// a failed RenameObject condition and the `Size` and `MaxSizeAllowed` of a key that is too
+    /// long.
     pub(crate) fn into_response(self) -> http::Response<s3s::Body> {
+        let condition = match &self {
+            Error::RenamePreconditionFailed(condition) => Some(*condition),
+            _ => None,
+        };
+        let key_size = match &self {
+            Error::KeyTooLong { size } => Some(*size),
+            _ => None,
+        };
         let error = s3s::S3Error::from(self);
         let mut body = Vec::new();
         let mut serializer = s3s::xml::Serializer::new(&mut body);
@@ -207,7 +239,15 @@ impl Error {
             .and_then(|()| {
                 serializer.element("Error", |s| {
                     s.content("Code", error.code().as_str())?;
-                    s.content("Message", error.message().unwrap_or_default())
+                    s.content("Message", error.message().unwrap_or_default())?;
+                    if let Some(condition) = condition {
+                        s.content("Condition", condition)?;
+                    }
+                    if let Some(size) = key_size {
+                        s.content("Size", &i64::try_from(size).unwrap_or(i64::MAX))?;
+                        s.content("MaxSizeAllowed", &(crate::rename::MAX_KEY_LENGTH as i64))?;
+                    }
+                    Ok(())
                 })
             })
             .expect("an error document serializes into memory");
@@ -330,6 +370,16 @@ impl From<Error> for s3s::S3Error {
                 StatusCode::NOT_IMPLEMENTED,
                 "This bucket does not support Content Md5 header.".into(),
             ),
+            Error::KeyTooLong { .. } => (
+                S3ErrorCode::KeyTooLongError,
+                StatusCode::BAD_REQUEST,
+                "Your key is too long".into(),
+            ),
+            Error::InvalidUri => (
+                S3ErrorCode::InvalidURI,
+                StatusCode::BAD_REQUEST,
+                "The path is not valid percent-encoded UTF-8".into(),
+            ),
             Error::NotSupported(message) => (
                 S3ErrorCode::Custom("NotSupported".into()),
                 StatusCode::NOT_IMPLEMENTED,
@@ -340,10 +390,17 @@ impl From<Error> for s3s::S3Error {
                 StatusCode::RANGE_NOT_SATISFIABLE,
                 "The requested range is not satisfiable".into(),
             ),
-            Error::PreconditionFailed => (
+            Error::PreconditionFailed | Error::RenamePreconditionFailed(_) => (
                 S3ErrorCode::PreconditionFailed,
                 StatusCode::PRECONDITION_FAILED,
                 "At least one of the pre-conditions you specified did not hold".into(),
+            ),
+            Error::IdempotentParameterMismatch => (
+                S3ErrorCode::Custom("IdempotentParameterMismatch".into()),
+                StatusCode::BAD_REQUEST,
+                "Parameters on this idempotent request are inconsistent with parameters used in \
+                 previous request(s)."
+                    .into(),
             ),
             Error::BucketNotEmpty => (
                 S3ErrorCode::BucketNotEmpty,

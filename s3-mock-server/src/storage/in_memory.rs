@@ -38,6 +38,8 @@ struct MultipartState {
 struct BucketState {
     created_at: SystemTime,
     objects: HashMap<String, (Bytes, ObjectMetadata)>,
+    /// The renames that succeeded with a client token, by token.
+    renames: HashMap<String, crate::storage::RenameRequest>,
 }
 
 impl BucketState {
@@ -45,6 +47,7 @@ impl BucketState {
         Self {
             created_at: SystemTime::now(),
             objects: HashMap::new(),
+            renames: HashMap::new(),
         }
     }
 }
@@ -792,6 +795,35 @@ impl StorageBackend for InMemoryStorage {
             .objects
             .insert(request.put_object.key, (content, metadata));
         Ok(StoredObjectMetadata { object_integrity })
+    }
+
+    async fn rename_object(
+        &self,
+        bucket: &str,
+        request: crate::storage::RenameRequest,
+    ) -> Result<()> {
+        let mut buckets = self.buckets.write().await;
+        let bucket_state = buckets.get_mut(bucket).ok_or(Error::NoSuchBucket)?;
+        if let Some(token) = &request.client_token {
+            match bucket_state.renames.get(token) {
+                Some(previous) if *previous == request => return Ok(()),
+                Some(_) => return Err(Error::IdempotentParameterMismatch),
+                None => {}
+            }
+        }
+        request.preconditions.check(
+            bucket_state.objects.get(&request.src_key).map(|(_, m)| m),
+            bucket_state.objects.get(&request.dst_key).map(|(_, m)| m),
+        )?;
+        let object = bucket_state
+            .objects
+            .remove(&request.src_key)
+            .expect("the preconditions check that the source exists");
+        bucket_state.objects.insert(request.dst_key.clone(), object);
+        if let Some(token) = request.client_token.clone() {
+            bucket_state.renames.insert(token, request);
+        }
+        Ok(())
     }
 
     async fn list_multipart_uploads(

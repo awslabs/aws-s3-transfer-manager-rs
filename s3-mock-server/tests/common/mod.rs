@@ -164,3 +164,18 @@ pub fn crc64nvme(data: &[u8]) -> String {
     digest.update(data);
     base64::engine::general_purpose::STANDARD.encode(digest.finalize().to_be_bytes())
 }
+
+/// The `Condition` element of the error document of a failed request, if any. The response is
+/// an XML error document.
+pub fn condition<E>(err: &SdkError<E, HttpResponse>) -> Option<String> {
+    let response = err.raw_response().unwrap();
+    assert_eq!(
+        response.headers().get("content-type"),
+        Some("application/xml"),
+        "{response:?}"
+    );
+    let body = String::from_utf8(response.body().bytes().unwrap().to_vec()).unwrap();
+    let (_, rest) = body.split_once("<Condition>")?;
+    let (condition, _) = rest.split_once("</Condition>")?;
+    Some(condition.to_owned())
+}

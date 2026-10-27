@@ -35,9 +35,11 @@ fn build_service(
     storage: Arc<dyn StorageBackend>,
     state: Arc<ServerState>,
 ) -> crate::service::MockService {
+    let rename_route = crate::rename::RenameRoute::new(storage.clone(), state.clone());
     let mut builder = S3ServiceBuilder::new(Inner::with_state(storage.clone(), state.clone()));
     builder.set_auth(SimpleAuth::from_single(TEST_ACCESS_KEY, TEST_SECRET_KEY));
     builder.set_access(crate::express::ExpressAccess);
+    builder.set_route(rename_route);
     crate::service::MockService::new(
         builder.build(),
         state,
