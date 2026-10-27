@@ -183,9 +183,10 @@ GetObject and HeadObject omit `x-amz-storage-class` for `STANDARD` objects; List
 
 ### Listing
 
-ListObjectsV2 pages hold at most `max-keys` entries, counting each common prefix once, and never
-split a common prefix across pages. Listed objects report their checksum algorithms, storage class
-and, when requested, restore status.
+ListObjectsV2 pages hold at most `max-keys` entries, counting each common prefix once. Listed
+objects report their checksum algorithms, storage class and, when requested, restore status.
+General purpose buckets list keys in lexicographic order and never split a common prefix across
+pages; directory buckets list them in a fixed pseudo-random order, as S3 directory buckets may.
 
 ### Directory Buckets
 
@@ -237,6 +238,9 @@ write signed with a session.
 - Objects are EXPRESS_ONEZONE. Any other storage class fails with 400 InvalidStorageClass,
   as EXPRESS_ONEZONE does in general purpose buckets.
 - `Content-MD5` fails with 501 NotImplemented.
+- ListObjectsV2 lists keys in no particular order, with each common prefix as one entry. It
+  fails with 400 InvalidRequest for a delimiter other than `/` or a prefix that does not end in
+  `/`, and with 501 NotSupported for `start-after`.
 
 ### Buckets
 

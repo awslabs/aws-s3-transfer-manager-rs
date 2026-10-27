@@ -1047,6 +1047,10 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             prefix: Some(prefix),
         };
         let objects = self.storage.list_objects(request).await?.objects;
+        let order = match bucket_type {
+            BucketType::GeneralPurpose => crate::list::ListOrder::Lexicographic,
+            BucketType::Directory => crate::list::ListOrder::Unordered,
+        };
         let list_request = crate::list::ListRequest {
             prefix,
             delimiter: input.delimiter.as_deref(),
@@ -1054,11 +1058,12 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             continuation_token: input.continuation_token.as_deref(),
             start_after: input.start_after.as_deref(),
         };
-        let page = crate::list::list_page(objects, &list_request).map_err(|error| match error {
-            crate::list::ListError::InvalidContinuationToken => {
-                Error::InvalidArgument("The continuation token provided is incorrect")
-            }
-        })?;
+        let page =
+            crate::list::list_page(objects, &list_request, order).map_err(|error| match error {
+                crate::list::ListError::InvalidContinuationToken => {
+                    Error::InvalidArgument("The continuation token provided is incorrect")
+                }
+            })?;
 
         let contents: Vec<s3s::dto::Object> = page
             .objects

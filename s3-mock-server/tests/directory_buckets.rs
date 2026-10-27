@@ -203,3 +203,77 @@ async fn test_invalid_part_order_message() -> Result {
     }
     Ok(())
 }
+
+/// ListObjectsV2 in a directory bucket lists every key, in no particular order, and fails as S3
+/// does for the parameters directory buckets do not support: a delimiter other than `/` or a
+/// prefix that does not end in `/` with 400 InvalidRequest, `start-after` with 501 NotSupported.
+#[tokio::test]
+async fn test_listing() -> Result {
+    let (server, _handle, s3) = setup(S3MockServer::builder()).await;
+    let keys: Vec<String> = (0..20).map(|i| format!("dir/key-{i:02}")).collect();
+    for key in &keys {
+        server.add_object(DIRECTORY, key, "x", None).await?;
+    }
+    let listed: Vec<String> = s3
+        .list_objects_v2()
+        .bucket(DIRECTORY)
+        .prefix("dir/")
+        .send()
+        .await?
+        .contents()
+        .iter()
+        .map(|object| object.key().unwrap().to_owned())
+        .collect();
+    assert_ne!(listed, keys, "keys should not be in lexicographic order");
+    let mut sorted = listed.clone();
+    sorted.sort();
+    assert_eq!(sorted, keys);
+    s3.list_objects_v2()
+        .bucket(DIRECTORY)
+        .delimiter("/")
+        .send()
+        .await?;
+
+    let fail = failure(
+        s3.list_objects_v2()
+            .bucket(DIRECTORY)
+            .prefix("dir/key")
+            .send()
+            .await,
+    );
+    assert_failure(&fail, 400, "InvalidRequest");
+    let fail = failure(
+        s3.list_objects_v2()
+            .bucket(DIRECTORY)
+            .prefix("dir/")
+            .delimiter("-")
+            .send()
+            .await,
+    );
+    assert_failure(&fail, 400, "InvalidRequest");
+    assert_eq!(
+        fail.message.as_deref(),
+        Some("This bucket only supports '/' as a delimiter")
+    );
+    let fail = failure(
+        s3.list_objects_v2()
+            .bucket(DIRECTORY)
+            .start_after("dir/key-01")
+            .send()
+            .await,
+    );
+    assert_failure(&fail, 501, "NotSupported");
+
+    // General purpose buckets list in order, and accept all three.
+    server
+        .add_object(GENERAL_PURPOSE, "dir/key", "x", None)
+        .await?;
+    s3.list_objects_v2()
+        .bucket(GENERAL_PURPOSE)
+        .prefix("dir/k")
+        .delimiter("-")
+        .start_after("a")
+        .send()
+        .await?;
+    Ok(())
+}
