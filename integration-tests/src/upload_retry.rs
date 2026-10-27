@@ -271,7 +271,7 @@ mod server_faults {
         server.insert_fault(
             "test-bucket",
             "obj",
-            FaultType::ServiceError { status: 503 },
+            FaultType::slow_down(),
             0,
             Occurrence::Once,
         );
@@ -305,7 +305,7 @@ mod server_faults {
         server.insert_fault(
             "test-bucket",
             "obj",
-            FaultType::ServiceError { status: 503 },
+            FaultType::slow_down(),
             0,
             Occurrence::Always,
         );

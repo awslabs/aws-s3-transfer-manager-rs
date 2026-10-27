@@ -729,7 +729,7 @@ async fn discovery_service_error_surfaces_underlying_cause() {
     mock.insert_fault(
         t.bucket(),
         &t.key("obj"),
-        FaultType::ServiceError { status: 503 },
+        FaultType::slow_down(),
         0,
         Occurrence::Always,
     );
@@ -768,7 +768,7 @@ async fn discovery_single_service_error_recovers() {
     mock.insert_fault(
         t.bucket(),
         &t.key("obj"),
-        FaultType::ServiceError { status: 503 },
+        FaultType::slow_down(),
         0,
         Occurrence::Once,
     );

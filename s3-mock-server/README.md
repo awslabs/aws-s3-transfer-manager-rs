@@ -127,6 +127,30 @@ async fn test_filesystem_storage() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+### Request Counts and Faults
+
+The server counts the requests it receives per operation, and can fail or reshape the requests a
+`FaultTarget` matches:
+
+```rust
+use s3_mock_server::{FaultTarget, FaultType, Occurrence, Operation};
+
+// Fail the second HeadObject request for `key` that the target sees with 403 AccessDenied.
+server.insert_fault_for(
+    FaultTarget::operation(Operation::HeadObject).bucket("test-bucket").key("key"),
+    FaultType::ServiceError { status: 403, code: "AccessDenied" },
+    1,
+    Occurrence::Once,
+);
+
+// ... run the code under test ...
+
+assert_eq!(server.request_count(Operation::HeadObject), 2);
+```
+
+`insert_fault(bucket, key, ..)` targets the GetObject, PutObject and UploadPart requests for one
+key. Counts and faults apply per HTTP request, so each retry and each part request counts.
+
 ## License
 
 This project is licensed under the Apache License, Version 2.0.

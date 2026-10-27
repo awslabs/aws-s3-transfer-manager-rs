@@ -6,19 +6,22 @@
 //! S3 Mock Server implementation.
 
 use crate::error::{Error, Result};
-use crate::s3s::Inner;
+use crate::faults::{FaultTarget, FaultType, Occurrence};
+use crate::s3s::{Inner, ServerState};
 use crate::storage::filesystem::FilesystemStorage;
 use crate::storage::in_memory::InMemoryStorage;
 use crate::storage::StorageBackend;
+use crate::Operation;
 use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as ConnBuilder;
 use s3s::auth::SimpleAuth;
 use s3s::service::S3ServiceBuilder;
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -154,9 +157,8 @@ impl S3MockServerBuilder {
 
         Ok(S3MockServer {
             storage,
-            faults: Arc::new(crate::faults::FaultRegistry::default()),
+            state: Arc::new(ServerState::default()),
             connect_reset: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            throttle: Arc::new(Mutex::new(None)),
             config: self.config,
         })
     }
@@ -229,17 +231,13 @@ pub struct S3MockServer {
     /// Storage backend.
     storage: Arc<dyn StorageBackend>,
 
-    /// Key-scoped fault injection registry (shared with the serving task).
-    faults: Arc<crate::faults::FaultRegistry>,
+    /// Faults, throttle and request counters (shared with the serving task).
+    state: Arc<ServerState>,
 
     /// Connect-time reset: number of freshly accepted connections to abort (RST)
     /// immediately, before serving any request. Server-scoped because no request
     /// exists at connect time; decremented per reset. Shared with the serving task.
     connect_reset: Arc<std::sync::atomic::AtomicU64>,
-
-    /// Server-wide load-driven throttle. Shared with the serving task; `None`
-    /// until one is installed via [`set_rate_throttle`](Self::set_rate_throttle).
-    throttle: Arc<Mutex<Option<Arc<crate::throttle::RateThrottle>>>>,
 
     /// Server configuration.
     config: ServerConfig,
@@ -299,33 +297,82 @@ impl S3MockServer {
         self.storage.create_bucket(bucket).await
     }
 
-    /// Register a fault for `(bucket, key)`. Faults form an ordered queue
-    /// consumed over successive matching requests: the first `skip` matching
-    /// requests pass cleanly, then the fault fires per `occurrence`. Firing is
-    /// deterministic; every fire logs the request number under
-    /// `target: "s3_mock_server::fault"`.
+    /// Register a fault for the GetObject, PutObject and UploadPart requests for
+    /// `(bucket, key)`; the same as [`insert_fault_for`](Self::insert_fault_for)
+    /// with [`FaultTarget::object`].
     pub fn insert_fault(
         &self,
         bucket: &str,
         key: &str,
-        fault: crate::faults::FaultType,
+        fault: FaultType,
         skip: u32,
-        occurrence: crate::faults::Occurrence,
+        occurrence: Occurrence,
     ) {
-        self.faults.insert(bucket, key, fault, skip, occurrence);
+        self.insert_fault_for(FaultTarget::object(bucket, key), fault, skip, occurrence);
     }
 
-    /// Drop the entire fault queue for `(bucket, key)`.
+    /// Register a fault for the requests that `target` matches. The faults of a
+    /// target form an ordered queue consumed over successive matching requests:
+    /// the first `skip` matching requests pass cleanly, then the fault fires per
+    /// `occurrence`. `skip` is compared with the number of matching requests the
+    /// target has seen since it was first registered, or last cleared with
+    /// [`clear_fault`](Self::clear_fault) or [`clear_faults`](Self::clear_faults),
+    /// not since this call. When several targets match a request, each counts it,
+    /// and only the first target registered whose next fault is due fires.
+    ///
+    /// A fault is drawn when its handler starts, before the request is validated
+    /// or served, so a request that then fails (for example with NoSuchKey) still
+    /// consumes it. A request the rate throttle fails with SlowDown draws no
+    /// fault and is not seen by any target. A fault that does not apply to the
+    /// operation, such as a body fault on HeadObject, is consumed without effect.
+    /// Firing is deterministic; every fire logs the request number under
+    /// `target: "s3_mock_server::fault"`.
+    pub fn insert_fault_for(
+        &self,
+        target: FaultTarget,
+        fault: FaultType,
+        skip: u32,
+        occurrence: Occurrence,
+    ) {
+        self.state.faults.insert(target, fault, skip, occurrence);
+    }
+
+    /// Drop the entire fault queue for `(bucket, key)`, as registered by
+    /// [`insert_fault`](Self::insert_fault).
     pub fn clear_fault(&self, bucket: &str, key: &str) {
-        self.faults.clear(bucket, key);
+        self.state.faults.clear(&FaultTarget::object(bucket, key));
+    }
+
+    /// Drop the fault queues of every target.
+    pub fn clear_faults(&self) {
+        self.state.faults.clear_all();
+    }
+
+    /// Number of requests received for `operation`, including throttled and
+    /// failed ones. A request is counted when its handler starts; requests that
+    /// fail authentication or request parsing are not counted.
+    pub fn request_count(&self, operation: Operation) -> u64 {
+        self.state.requests.get(operation)
+    }
+
+    /// Number of requests received per operation, for every operation with at
+    /// least one request. Counted as [`request_count`](Self::request_count) counts.
+    pub fn request_counts(&self) -> BTreeMap<Operation, u64> {
+        self.state.requests.snapshot()
+    }
+
+    /// Reset every request count to zero.
+    pub fn reset_request_counts(&self) {
+        self.state.requests.reset();
     }
 
     /// Install a server-wide load-driven throttle admitting a sustained `rate`
     /// requests/sec with a `burst` allowance; a shed request returns 503
-    /// `SlowDown`. Checked on every S3 operation before touching storage, and
-    /// replaces any previously installed throttle.
+    /// `SlowDown`. Checked on every S3 operation except CreateBucket, DeleteBucket,
+    /// HeadBucket and ListBuckets, before touching storage, and replaces any
+    /// previously installed throttle.
     pub fn set_rate_throttle(&self, rate: f64, burst: f64) {
-        *self.throttle.lock().unwrap() =
+        *self.state.throttle.lock().unwrap() =
             Some(Arc::new(crate::throttle::RateThrottle::new(rate, burst)));
     }
 
@@ -401,7 +448,8 @@ impl S3MockServer {
         self.storage.delete_object(bucket, key).await
     }
 
-    /// Reset all state (clear all buckets, objects, and in-flight uploads).
+    /// Remove all buckets, objects and in-flight uploads. Faults, the throttle and request
+    /// counts are kept.
     pub async fn reset(&self) -> Result<()> {
         self.storage.reset().await
     }
@@ -425,14 +473,13 @@ impl S3MockServer {
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
 
         let storage = self.storage.clone();
-        let faults = self.faults.clone();
+        let state = self.state.clone();
         let connect_reset = self.connect_reset.clone();
-        let throttle = self.throttle.clone();
         let server_task = tokio::spawn(async move {
             let http_server = ConnBuilder::new(TokioExecutor::new());
             let graceful = hyper_util::server::graceful::GracefulShutdown::new();
 
-            let inner = Inner::with_faults_and_throttle(storage, faults, throttle);
+            let inner = Inner::with_state(storage, state);
             let service = {
                 let mut b = S3ServiceBuilder::new(inner);
                 b.set_auth(SimpleAuth::from_single(TEST_ACCESS_KEY, TEST_SECRET_KEY));

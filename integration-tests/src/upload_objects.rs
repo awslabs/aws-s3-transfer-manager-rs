@@ -538,7 +538,7 @@ async fn upload_objects_throttle_storm_aborts_transfer() {
             m.server.insert_fault(
                 bucket,
                 &key,
-                s3_mock_server::FaultType::ServiceError { status: 503 },
+                s3_mock_server::FaultType::slow_down(),
                 0,
                 s3_mock_server::Occurrence::Always,
             );
