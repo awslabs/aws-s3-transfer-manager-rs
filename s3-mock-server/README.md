@@ -133,6 +133,13 @@ async fn test_filesystem_storage() -> Result<(), Box<dyn std::error::Error>> {
   ETag and `If-None-Match: *`. The server ignores other conditions. The in-memory store checks a
   write's or a delete's condition atomically with it.
 
+### S3 Behavior Options
+
+Behaviors that the Transfer Manager's tests do not expect are opt-in on `S3MockServerBuilder`:
+
+- `with_bucket_check(true)`: fail object requests for a missing bucket with NoSuchBucket, instead
+  of creating the bucket on write.
+
 ### Request Counts and Faults
 
 The server counts the requests it receives per operation, and can fail or reshape the requests a

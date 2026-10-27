@@ -7,7 +7,7 @@
 
 use crate::error::{Error, Result};
 use crate::faults::{FaultTarget, FaultType, Occurrence};
-use crate::s3s::{Inner, ServerState};
+use crate::s3s::{Inner, ServerOptions, ServerState};
 use crate::storage::filesystem::FilesystemStorage;
 use crate::storage::in_memory::InMemoryStorage;
 use crate::storage::StorageBackend;
@@ -113,6 +113,9 @@ pub struct S3MockServerBuilder {
 
     /// Storage backend.
     storage: Option<Arc<dyn StorageBackend>>,
+
+    /// S3 behavior options.
+    options: ServerOptions,
 }
 
 impl Default for S3MockServerBuilder {
@@ -127,7 +130,17 @@ impl S3MockServerBuilder {
         Self {
             config: ServerConfig::default(),
             storage: None,
+            options: ServerOptions::default(),
         }
+    }
+
+    /// Fail requests for objects in a missing bucket with NoSuchBucket, as S3 does, including
+    /// the multipart upload requests of an upload whose bucket was deleted. Disabled by default:
+    /// a read from a missing bucket fails as for a missing key, and a write creates the bucket.
+    /// ListObjectsV2 checks the bucket either way.
+    pub fn with_bucket_check(mut self, enabled: bool) -> Self {
+        self.options.bucket_check = enabled;
+        self
     }
 
     /// Use in-memory storage.
@@ -157,7 +170,10 @@ impl S3MockServerBuilder {
 
         Ok(S3MockServer {
             storage,
-            state: Arc::new(ServerState::default()),
+            state: Arc::new(ServerState {
+                options: self.options,
+                ..Default::default()
+            }),
             connect_reset: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             config: self.config,
         })
