@@ -12,11 +12,13 @@
 
 mod bucket;
 mod error;
+mod express;
 mod faults;
 mod list;
 mod operation;
 mod s3s;
 mod server;
+mod service;
 mod socket_fault;
 mod storage;
 mod streaming;

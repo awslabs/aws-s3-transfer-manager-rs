@@ -16,6 +16,7 @@ pub enum Operation {
     CompleteMultipartUpload,
     CreateBucket,
     CreateMultipartUpload,
+    CreateSession,
     DeleteBucket,
     DeleteObject,
     GetObject,

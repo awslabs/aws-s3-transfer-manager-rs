@@ -21,6 +21,7 @@ http = "1.4.0"
 hyper = "1"
 hyper-util = {  version = "0.1.13", features = ["server-graceful", "server-auto", "server", "http1", "http2", "tokio"]}
 md5 = "0.7.0"
+percent-encoding = "2.3.2"
 pin-project = "1.1.10"
 s3s = "0.14.0"
 serde = { version = "1.0", features = ["derive"] }

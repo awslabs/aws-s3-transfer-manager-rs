@@ -3799,6 +3799,7 @@ dependencies = [
  "hyper 1.11.1",
  "hyper-util",
  "md5",
+ "percent-encoding",
  "pin-project",
  "s3s",
  "serde",

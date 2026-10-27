@@ -30,6 +30,24 @@ use tokio::task::JoinHandle;
 const TEST_ACCESS_KEY: &str = "mock-akid";
 const TEST_SECRET_KEY: &str = "mock-secret";
 
+/// The service serving the S3 API over `storage`, sharing `state` with the server.
+fn build_service(
+    storage: Arc<dyn StorageBackend>,
+    state: Arc<ServerState>,
+) -> crate::service::MockService {
+    let mut builder = S3ServiceBuilder::new(Inner::with_state(storage.clone(), state.clone()));
+    builder.set_auth(SimpleAuth::from_single(TEST_ACCESS_KEY, TEST_SECRET_KEY));
+    builder.set_access(crate::express::ExpressAccess);
+    crate::service::MockService::new(
+        builder.build(),
+        state,
+        storage,
+        crate::express::ServerCredentials {
+            access_key: TEST_ACCESS_KEY,
+        },
+    )
+}
+
 /// Configuration for the S3 Mock Server.
 #[derive(Debug, Clone, Default)]
 pub struct ServerConfig {
@@ -561,9 +579,12 @@ impl S3MockServer {
         self.storage.delete_object(bucket, key).await
     }
 
-    /// Remove all buckets, objects and in-flight uploads. Faults, the throttle and request
-    /// counts are kept.
+    /// Remove all buckets, objects, in-flight uploads and S3 Express sessions. Faults, the
+    /// throttle and request counts are kept. Clients create a session again only when theirs
+    /// expires, so a client that holds one gets AccessDenied for its directory buckets after a
+    /// reset: use a new client.
     pub async fn reset(&self) -> Result<()> {
+        self.state.sessions.clear();
         self.storage.reset().await
     }
 
@@ -588,12 +609,7 @@ impl S3MockServer {
             let http_server = ConnBuilder::new(TokioExecutor::new());
             let graceful = hyper_util::server::graceful::GracefulShutdown::new();
 
-            let inner = Inner::with_state(storage, state);
-            let service = {
-                let mut b = S3ServiceBuilder::new(inner);
-                b.set_auth(SimpleAuth::from_single(TEST_ACCESS_KEY, TEST_SECRET_KEY));
-                b.build()
-            };
+            let service = build_service(storage, state);
             loop {
                 let (socket, peer) = tokio::select! {
                         res =  listener.accept() => {

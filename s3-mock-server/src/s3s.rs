@@ -104,6 +104,8 @@ pub(crate) struct ServerState {
     pub(crate) throttle: std::sync::Mutex<Option<std::sync::Arc<crate::throttle::RateThrottle>>>,
     /// Requests received per operation.
     pub(crate) requests: crate::operation::RequestCounters,
+    /// S3 Express sessions created with CreateSession.
+    pub(crate) sessions: crate::express::Sessions,
 }
 
 impl ServerState {
@@ -1232,11 +1234,11 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
 pub(crate) async fn check_bucket(
     storage: &(impl StorageBackend + ?Sized),
     bucket: &str,
-) -> S3Result<()> {
+) -> crate::Result<()> {
     if storage.head_bucket(bucket).await? {
         Ok(())
     } else {
-        Err(Error::NoSuchBucket.into())
+        Err(Error::NoSuchBucket)
     }
 }
 

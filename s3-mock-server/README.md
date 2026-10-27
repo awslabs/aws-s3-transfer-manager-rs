@@ -187,6 +187,51 @@ ListObjectsV2 pages hold at most `max-keys` entries, counting each common prefix
 split a common prefix across pages. Listed objects report their checksum algorithms, storage class
 and, when requested, restore status.
 
+### Directory Buckets
+
+Buckets whose names end in `--x-s3`, such as `amzn-s3-demo-bucket--usw2-az1--x-s3`, are directory
+buckets (S3 Express One Zone). The server authenticates requests to them with S3 Express sessions
+and, where directory buckets differ from general purpose buckets, answers as S3 does.
+
+**Sessions.** The server serves CreateSession (`GET /{bucket}?session`), which returns credentials
+valid for five minutes, in `ReadWrite` or `ReadOnly` mode. It accepts requests to a directory
+bucket signed for the `s3express` service, either with a session's credentials and its token in
+`x-amz-s3session-token`, or with the server's credentials and no token. It answers 403
+AccessDenied to a request:
+
+- with a session that has expired, or that was created for another bucket;
+- with a `ReadOnly` session, unless it is a GET or HEAD;
+- that is a bucket-level write (CreateBucket, DeleteBucket, bucket configuration) signed with a
+  session.
+
+CreateSession requests that pass these checks are counted as `Operation::CreateSession`, and one
+for a missing bucket fails with 404 NoSuchBucket. `S3MockServer::reset` forgets all sessions. The
+server also serves requests to a directory bucket signed for the `s3` service with its credentials,
+which s3s verifies, and answers requests to a general purpose bucket signed for `s3express` with
+501 NotImplemented.
+
+**Request bodies and signatures.** The server does not verify `s3express` signatures or
+`x-amz-content-sha256`, and does not support presigned URLs or SigV4a. It decodes chunked bodies,
+signed or unsigned, and checks only their trailing checksums, as it checks checksum headers. To
+decode a chunked body, the server reads it in full before it counts the request and applies faults,
+so faults that act on the body, such as `StallRequestRead`, take effect only after the client has
+sent all of it.
+
+**CreateSession without a bucket.** The server reads the bucket of a directory bucket request from
+its path (`/{bucket}/{key}`), as the client from `ServerHandle::client` sends it. Clients can send
+CreateSession as `GET /?session`, with the bucket only in the host name, even when they send their
+other requests with the bucket in the path. Such a CreateSession names no bucket, so the server
+answers it with a session valid for every directory bucket, which S3 does not have, and a fault that
+targets a bucket does not match it.
+
+**Creating and deleting directory buckets.** Create them with `S3MockServer::create_bucket`, and
+remove them with `S3MockServer::reset`. S3 serves CreateBucket and DeleteBucket for directory
+buckets at a separate regional endpoint, which the SDK signs with the caller's credentials. Against
+a custom endpoint such as the server's, the SDK signs them with a session instead: a CreateBucket
+first sends a CreateSession for the bucket, which fails with NoSuchBucket because the bucket does
+not exist yet, as it would in S3, and a DeleteBucket fails with 403 AccessDenied, as a bucket-level
+write signed with a session.
+
 ### Buckets
 
 Create buckets with CreateBucket or `S3MockServer::create_bucket` before using them: object
@@ -223,6 +268,10 @@ assert_eq!(server.request_count(Operation::HeadObject), 2);
 key. Counts and faults apply per HTTP request, so each retry and each part request counts.
 `FaultType::Error(Error::Custom { code, status, message })` answers with an error the server does
 not otherwise send, such as 400 RequestTimeout.
+
+In directory buckets, a request draws its fault once it is authenticated and, for a chunked body,
+once the body has been read (see *Directory Buckets*). CreateSession is affected only by faults
+that fail the request (`FaultType::Error`).
 
 ## License
 

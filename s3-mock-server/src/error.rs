@@ -4,8 +4,9 @@
  */
 //! Error types for the S3 Mock Server.
 //!
-//! Handlers and storage fail with an [`Error`](enum@Error), whose conversion into an
-//! `s3s::S3Error` is the only place the server builds an S3 error response.
+//! Handlers, routes and storage fail with an [`Error`](enum@Error), whose conversion into an
+//! `s3s::S3Error` is the only place the server builds an S3 error response. `Error::into_response`
+//! writes that response for the requests the server answers without s3s.
 
 use std::borrow::Cow;
 use std::io;
@@ -122,6 +123,10 @@ pub enum Error {
     #[error("access denied")]
     AccessDenied,
 
+    /// An S3 Express request names credentials the server does not have.
+    #[error("invalid access key ID")]
+    InvalidAccessKeyId,
+
     /// The throttle shed the request.
     #[error("slow down")]
     SlowDown,
@@ -164,6 +169,34 @@ impl From<io::Error> for Error {
 
 /// S3's message for an internal error.
 const INTERNAL_ERROR_MESSAGE: &str = "We encountered an internal error. Please try again.";
+
+impl Error {
+    /// The HTTP response to a request that fails with this error, for the requests the server
+    /// answers without s3s: the error document of the `S3Error` the error converts into.
+    pub(crate) fn into_response(self) -> http::Response<s3s::Body> {
+        let error = s3s::S3Error::from(self);
+        let mut body = Vec::new();
+        let mut serializer = s3s::xml::Serializer::new(&mut body);
+        serializer
+            .decl()
+            .and_then(|()| {
+                serializer.element("Error", |s| {
+                    s.content("Code", error.code().as_str())?;
+                    s.content("Message", error.message().unwrap_or_default())
+                })
+            })
+            .expect("an error document serializes into memory");
+        http::Response::builder()
+            .status(
+                error
+                    .status_code()
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            )
+            .header(http::header::CONTENT_TYPE, "application/xml")
+            .body(s3s::Body::from(body))
+            .expect("status and header are valid")
+    }
+}
 
 /// The S3 error response to a request that fails with `error`, which it keeps as its source: the
 /// code, HTTP status and message of each variant's response.
@@ -326,6 +359,11 @@ impl From<Error> for s3s::S3Error {
                 StatusCode::FORBIDDEN,
                 "Access Denied".into(),
             ),
+            Error::InvalidAccessKeyId => (
+                S3ErrorCode::InvalidAccessKeyId,
+                StatusCode::FORBIDDEN,
+                "The AWS Access Key Id you provided does not exist in our records.".into(),
+            ),
             Error::SlowDown => (
                 S3ErrorCode::SlowDown,
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -357,6 +395,26 @@ impl From<Error> for s3s::S3Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn error_responses_escape_xml() {
+        let error = Error::Custom {
+            code: "Custom".to_owned(),
+            status: StatusCode::BAD_REQUEST,
+            message: "a < b & c".to_owned(),
+        };
+        let body = error
+            .into_response()
+            .into_body()
+            .store_all_limited(usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            body.contains("<Message>a &lt; b &amp; c</Message>"),
+            "{body}"
+        );
+    }
 
     #[test]
     fn internal_errors_have_s3_message_and_keep_their_source() {
