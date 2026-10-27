@@ -79,6 +79,13 @@ impl From<Error> for s3s::S3Error {
             _ => s3s::S3ErrorCode::InternalError,
         };
 
-        s3s::S3Error::with_source(error_kind, Box::new(error))
+        // Preserve a human-readable message where the variant carries one, so it
+        // reaches the response body. (Real S3 returns a bare InternalError with no
+        // message; the mock surfaces the message to make failures diagnosable and
+        // to let tests assert which specific internal check rejected the request.)
+        let message = error.to_string();
+        let mut s3_error = s3s::S3Error::with_source(error_kind, Box::new(error));
+        s3_error.set_message(message);
+        s3_error
     }
 }

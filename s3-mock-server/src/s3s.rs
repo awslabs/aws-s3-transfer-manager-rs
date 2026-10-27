@@ -35,6 +35,18 @@ fn opt_etag_from_quoted(s: Option<String>) -> Option<ETag> {
     s.map(|v| etag_from_quoted(&v))
 }
 
+/// Whether a bucket name denotes an S3 Express One Zone directory bucket.
+///
+/// A directory bucket name ends with the suffix `--x-s3`, preceded by its
+/// zone-id (e.g. `my-bucket--use1-az1--x-s3`). The mock has no separate bucket
+/// metadata, so — like real S3's name-based routing — it recognizes a directory
+/// bucket by this suffix.
+///
+/// https://docs.aws.amazon.com/AmazonS3/latest/userguide/directory-bucket-naming-rules.html
+fn is_directory_bucket(bucket: &str) -> bool {
+    bucket.ends_with("--x-s3")
+}
+
 /// Apply defaults to a HeadObject response matching post-2023 prod S3
 /// behavior on a fresh bucket: SSE-S3 (AES256) default encryption, and
 /// `ChecksumType::FullObject` whenever any checksum is present.
@@ -818,24 +830,83 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         // Extract client checksums before consuming input
         let client_checksums = crate::types::ClientChecksums::from(&input);
 
-        // Extract part information
+        // Extract part information. Track whether any part carries a per-part
+        // checksum (one of the signals that part numbers must be contiguous below).
         let mut parts = Vec::new();
+        let mut any_part_level_checksum = false;
         if let Some(completed_parts) = input.multipart_upload.and_then(|u| u.parts) {
             for part in completed_parts {
                 let part_number = part
                     .part_number
                     .ok_or_else(|| s3s::s3_error!(InvalidRequest))?;
                 let etag = part.e_tag.ok_or_else(|| s3s::s3_error!(InvalidRequest))?;
+                if part.checksum_crc32.is_some()
+                    || part.checksum_crc32c.is_some()
+                    || part.checksum_crc64nvme.is_some()
+                    || part.checksum_sha1.is_some()
+                    || part.checksum_sha256.is_some()
+                {
+                    any_part_level_checksum = true;
+                }
                 parts.push((part_number, format!("\"{}\"", etag.value())));
             }
         }
 
-        // Verify part numbers are consecutive starting from 1
-        // S3 requires parts to be listed in ascending part-number order and returns InvalidPartOrder otherwise.
-        // Validate the order as the client sent it, so an out-of-order or non consecutive list is rejected.
-        for (i, (part_number, _)) in parts.iter().enumerate() {
-            if *part_number != (i + 1) as i32 {
+        // General-purpose S3 requires the parts list to be in ascending order by
+        // part number and returns InvalidPartOrder otherwise. Gaps are allowed in
+        // the general case (e.g. 1, 2, 5) — part numbers need not be contiguous.
+        //
+        // https://docs.aws.amazon.com/AmazonS3/latest/API/API_CompleteMultipartUpload.html
+        let mut previous_part_number = 0;
+        for (part_number, _) in &parts {
+            if *part_number <= previous_part_number {
                 return Err(Error::InvalidPartOrder.into());
+            }
+            previous_part_number = *part_number;
+        }
+
+        // Some conditions impose the STRICTER rule that part numbers must be
+        // CONSECUTIVE and begin with 1 (no gaps), not merely ascending. S3 requires
+        // this for two independent reasons, which return DIFFERENT errors on a gap:
+        //
+        //   * Composite (part-level) checksums — declared via checksum_type, or
+        //     signalled by per-part checksums on the completion. A gap here is an
+        //     HTTP 500 Internal Server error.
+        //     https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity-upload.html
+        //
+        //   * Directory buckets (S3 Express One Zone). A gap here is an HTTP 400
+        //     Bad Request error.
+        //     https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-express-differences.html
+        let composite_checksum = input
+            .checksum_type
+            .as_ref()
+            .is_some_and(|t| t.as_str() == s3s::dto::ChecksumType::COMPOSITE)
+            || any_part_level_checksum;
+        // The mock has no separate bucket metadata, so a directory bucket is
+        // recognized by its S3 Express name suffix (`--x-s3`), the same way S3's
+        // name-based routing distinguishes it from a general-purpose bucket.
+        let directory_bucket = is_directory_bucket(&bucket);
+
+        if composite_checksum || directory_bucket {
+            let contiguous = parts
+                .iter()
+                .enumerate()
+                .all(|(i, (part_number, _))| *part_number == (i + 1) as i32);
+            if !contiguous {
+                // Directory bucket takes precedence as a 400; composite-only is a 500.
+                if directory_bucket {
+                    return Err(s3s::s3_error!(
+                        InvalidRequest,
+                        "directory bucket multipart upload requires consecutive part \
+                         numbers beginning with 1"
+                    ));
+                }
+                return Err(Error::Internal(
+                    "composite checksum multipart upload requires consecutive part \
+                     numbers beginning with 1"
+                        .to_string(),
+                )
+                .into());
             }
         }
 
@@ -1522,6 +1593,107 @@ mod tests {
             .complete_multipart_upload(s3_request(invalid_input))
             .await;
         assert!(invalid_result.is_err());
+    }
+
+    #[test]
+    fn test_is_directory_bucket() {
+        // Directory bucket names end with the `--x-s3` suffix (base name + zone-id).
+        assert!(is_directory_bucket("my-bucket--usw2-az1--x-s3"));
+        assert!(is_directory_bucket("x--x-s3"));
+        // General-purpose bucket names are not directory buckets.
+        assert!(!is_directory_bucket("my-bucket"));
+        assert!(!is_directory_bucket("my-bucket--usw2-az1")); // zone-id but no suffix
+        assert!(!is_directory_bucket("x-s3"));
+        assert!(!is_directory_bucket(""));
+    }
+
+    #[tokio::test]
+    async fn test_directory_bucket_requires_contiguous_parts() {
+        // Drive the handler directly: the AWS SDK client rejects `--x-s3` names
+        // client-side (InvalidBucketName) before a request can reach the server,
+        // so a directory-bucket gap can only be exercised at the handler level.
+        let storage = InMemoryStorage::new();
+        let inner = Inner::new(storage);
+
+        let bucket = "test-dir-bucket--usw2-az1--x-s3";
+        let key = "dir-gap-key";
+
+        let create_input = s3s::dto::CreateMultipartUploadInput::builder()
+            .bucket(s3s::dto::BucketName::from(bucket))
+            .key(s3s::dto::ObjectKey::from(key))
+            .build()
+            .unwrap();
+        let upload_id = inner
+            .create_multipart_upload(s3_request(create_input))
+            .await
+            .expect("create mpu")
+            .output
+            .upload_id
+            .unwrap();
+
+        // Upload real parts 1 and 3 (a gap), no checksums.
+        let mut etags = Vec::new();
+        for part_num in [1, 3] {
+            let content = format!("part {part_num}");
+            let input = s3s::dto::UploadPartInput::builder()
+                .bucket(s3s::dto::BucketName::from(bucket))
+                .key(s3s::dto::ObjectKey::from(key))
+                .upload_id(upload_id.clone())
+                .part_number(part_num)
+                .body(Some(s3s::dto::StreamingBlob::wrap(
+                    futures_util::stream::once(async move {
+                        Ok::<_, std::io::Error>(bytes::Bytes::from(content))
+                    }),
+                )))
+                .build()
+                .unwrap();
+            etags.push(
+                inner
+                    .upload_part(s3_request(input))
+                    .await
+                    .expect("upload part")
+                    .output
+                    .e_tag
+                    .unwrap(),
+            );
+        }
+
+        let parts = vec![
+            s3s::dto::CompletedPart {
+                part_number: Some(1),
+                e_tag: Some(etags[0].clone()),
+                ..Default::default()
+            },
+            s3s::dto::CompletedPart {
+                part_number: Some(3),
+                e_tag: Some(etags[1].clone()),
+                ..Default::default()
+            },
+        ];
+        let complete_input = s3s::dto::CompleteMultipartUploadInput::builder()
+            .bucket(s3s::dto::BucketName::from(bucket))
+            .key(s3s::dto::ObjectKey::from(key))
+            .upload_id(upload_id)
+            .multipart_upload(Some(s3s::dto::CompletedMultipartUpload {
+                parts: Some(parts),
+            }))
+            .build()
+            .unwrap();
+
+        let err = inner
+            .complete_multipart_upload(s3_request(complete_input))
+            .await
+            .expect_err("a directory-bucket gap must be rejected");
+
+        // Directory buckets return HTTP 400 Bad Request (InvalidRequest) for a gap,
+        // distinct from the HTTP 500 that composite checksums return.
+        assert_eq!(*err.code(), s3s::S3ErrorCode::InvalidRequest);
+        assert!(
+            err.message()
+                .is_some_and(|m| m.contains("consecutive part numbers beginning with 1")),
+            "expected the contiguity message, got: {:?}",
+            err.message()
+        );
     }
 
     #[tokio::test]
