@@ -949,6 +949,8 @@ impl UploadTransfer {
             bytes_transferred: content_length,
             ..Default::default()
         });
+        // The finish time too: `set_completed` stamps it only after the result is stored.
+        self.inner.ctx.metrics.set_finished();
 
         let result = crate::sdk_v1::upload_output_from_put_object(&resp)
             .metrics(self.inner.ctx.metrics())
@@ -1057,6 +1059,8 @@ impl UploadTransfer {
             completion_timer.elapsed(),
         );
 
+        // Stamped before the output's snapshot, as on the `PutObject` path above.
+        self.inner.ctx.metrics.set_finished();
         let result = crate::sdk_v1::update_upload_output_from_complete_multipart_upload(
             response_builder,
             &resp,

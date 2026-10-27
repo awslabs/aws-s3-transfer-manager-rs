@@ -143,6 +143,7 @@ async fn fluent_and_modeled_builder_initiation_return_canonical_metadata_and_tra
         assert_eq!(output.size(), None);
         assert_eq!(output.metrics().total_bytes, Some(7));
         assert_eq!(output.metrics().network_tx, 7);
+        assert!(output.metrics().finished_at.is_some());
     }
 }
 
@@ -254,6 +255,7 @@ async fn multipart_runtime_merges_response_metadata_without_synthesizing_absent_
         assert_eq!(output.checksum_xxhash128(), Some("server-xxhash128"));
         assert_eq!(output.size(), None);
         assert_eq!(output.metrics().network_tx, 7);
+        assert!(output.metrics().finished_at.is_some());
         assert_eq!(create.num_calls(), 1);
         assert_eq!(part.num_calls(), 1);
         assert_eq!(complete.num_calls(), 1);
