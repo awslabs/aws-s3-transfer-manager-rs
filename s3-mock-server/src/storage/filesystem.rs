@@ -326,6 +326,7 @@ impl StorageBackend for FilesystemStorage {
             content_disposition: request.content_disposition,
             content_language: request.content_language,
             parts: Vec::new(),
+            restore_status: None,
         };
         let metadata_path = self.get_object_metadata_path(&request.bucket, &request.key);
         Self::save_metadata(&metadata_path, &metadata).await?;
@@ -808,6 +809,21 @@ impl StorageBackend for FilesystemStorage {
         fs::remove_dir_all(upload_dir).await?;
 
         Ok(())
+    }
+
+    async fn update_metadata(
+        &self,
+        bucket: &str,
+        key: &str,
+        update: crate::storage::MetadataUpdate,
+    ) -> Result<()> {
+        // Not atomic with concurrent writes to the same key.
+        let metadata_path = self.get_object_metadata_path(bucket, key);
+        let mut metadata: ObjectMetadata = Self::load_metadata(&metadata_path)
+            .await?
+            .ok_or(Error::NoSuchKey)?;
+        update(&mut metadata);
+        Self::save_metadata(&metadata_path, &metadata).await
     }
 
     async fn reset(&self) -> Result<()> {

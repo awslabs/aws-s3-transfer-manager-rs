@@ -111,6 +111,9 @@ pub(crate) fn etag_condition_holds(condition: &s3s::dto::ETagCondition, etag: &s
     }
 }
 
+/// An in-place change to the stored metadata of an object.
+pub(crate) type MetadataUpdate = Box<dyn FnOnce(&mut ObjectMetadata) + Send>;
+
 /// Request for retrieving an object.
 pub(crate) struct GetObjectRequest<'a> {
     pub bucket: &'a str,
@@ -397,6 +400,11 @@ pub(crate) trait StorageBackend: Send + Sync + Debug {
     /// Abort a multipart upload and clean up all associated data.
     async fn abort_multipart_upload(&self, upload_id: &str) -> Result<()>;
 
+    /// Change the stored metadata of an object in place, leaving its data unchanged.
+    ///
+    /// Fails with `NoSuchBucket` or `NoSuchKey` when the object does not exist.
+    async fn update_metadata(&self, bucket: &str, key: &str, update: MetadataUpdate) -> Result<()>;
+
     /// Reset all state, removing all buckets, objects, and in-flight uploads.
     async fn reset(&self) -> Result<()>;
 }
@@ -480,6 +488,10 @@ impl StorageBackend for std::sync::Arc<dyn StorageBackend + '_> {
 
     async fn abort_multipart_upload(&self, upload_id: &str) -> Result<()> {
         (**self).abort_multipart_upload(upload_id).await
+    }
+
+    async fn update_metadata(&self, bucket: &str, key: &str, update: MetadataUpdate) -> Result<()> {
+        (**self).update_metadata(bucket, key, update).await
     }
 
     async fn reset(&self) -> Result<()> {

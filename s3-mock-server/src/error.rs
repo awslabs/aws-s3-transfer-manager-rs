@@ -79,6 +79,18 @@ pub enum Error {
     #[error("bucket already exists")]
     BucketAlreadyExists,
 
+    /// The object's storage class does not allow the operation: a read of an archived object
+    /// that has not been restored, or a restore of an object in another storage class.
+    #[error("invalid object state")]
+    InvalidObjectState {
+        /// Whether the operation is a restore.
+        restore: bool,
+    },
+
+    /// A restore of the object is already in progress.
+    #[error("restore already in progress")]
+    RestoreAlreadyInProgress,
+
     /// The request is invalid. Carries the message of the response, chosen where the request is
     /// checked.
     #[error("invalid request")]
@@ -226,6 +238,21 @@ impl From<Error> for s3s::S3Error {
                 "The requested bucket name is not available. The bucket namespace is shared by \
                  all users of the system. Please select a different name and try again."
                     .into(),
+            ),
+            Error::InvalidObjectState { restore: false } => (
+                S3ErrorCode::InvalidObjectState,
+                StatusCode::FORBIDDEN,
+                "The operation is not valid for the object's storage class".into(),
+            ),
+            Error::InvalidObjectState { restore: true } => (
+                S3ErrorCode::InvalidObjectState,
+                StatusCode::FORBIDDEN,
+                "Restore is not allowed for the object's current storage class".into(),
+            ),
+            Error::RestoreAlreadyInProgress => (
+                S3ErrorCode::RestoreAlreadyInProgress,
+                StatusCode::CONFLICT,
+                "Object restore is already in progress".into(),
             ),
             Error::InvalidRequest(message) => (
                 S3ErrorCode::InvalidRequest,

@@ -121,6 +121,7 @@ impl StorageBackend for InMemoryStorage {
             content_disposition: request.content_disposition,
             content_language: request.content_language,
             parts: Vec::new(),
+            restore_status: None,
         };
 
         let mut buckets = self.buckets.write().await;
@@ -645,6 +646,23 @@ impl StorageBackend for InMemoryStorage {
         }
         multipart.parts.remove(upload_id);
 
+        Ok(())
+    }
+
+    async fn update_metadata(
+        &self,
+        bucket: &str,
+        key: &str,
+        update: crate::storage::MetadataUpdate,
+    ) -> Result<()> {
+        let mut buckets = self.buckets.write().await;
+        let (_, metadata) = buckets
+            .get_mut(bucket)
+            .ok_or(Error::NoSuchBucket)?
+            .objects
+            .get_mut(key)
+            .ok_or(Error::NoSuchKey)?;
+        update(metadata);
         Ok(())
     }
 

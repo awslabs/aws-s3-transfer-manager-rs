@@ -10,6 +10,7 @@ use crate::faults::{FaultTarget, FaultType, Occurrence};
 use crate::s3s::{Inner, ServerState};
 use crate::storage::filesystem::FilesystemStorage;
 use crate::storage::in_memory::InMemoryStorage;
+use crate::storage::models::RestoreStatus;
 use crate::storage::StorageBackend;
 use crate::Operation;
 use aws_sdk_s3::config::{Credentials, Region};
@@ -178,6 +179,10 @@ pub struct ObjectData {
     pub last_modified: std::time::SystemTime,
     /// User-defined metadata.
     pub metadata: std::collections::HashMap<String, String>,
+    /// Storage class, if one was set when the object was stored.
+    pub storage_class: Option<String>,
+    /// Restore status of an object in an archival storage class.
+    pub restore_status: Option<RestoreStatus>,
 }
 
 /// Summary information about an object in a listing.
@@ -420,7 +425,27 @@ impl S3MockServer {
             etag: response.metadata.etag,
             last_modified: response.metadata.last_modified,
             metadata: response.metadata.user_metadata,
+            storage_class: response.metadata.storage_class,
+            restore_status: response.metadata.restore_status,
         }))
+    }
+
+    /// Set the restore status of an object, leaving its data and its storage class unchanged.
+    ///
+    /// Fails with [`Error::NoSuchKey`] or [`Error::NoSuchBucket`] if the object does not exist.
+    pub async fn set_restore_status(
+        &self,
+        bucket: &str,
+        key: &str,
+        status: Option<RestoreStatus>,
+    ) -> Result<()> {
+        self.storage
+            .update_metadata(
+                bucket,
+                key,
+                Box::new(move |metadata| metadata.restore_status = status),
+            )
+            .await
     }
 
     /// List objects in a bucket with optional prefix.

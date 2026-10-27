@@ -42,6 +42,8 @@ async fn test_missing_bucket() -> Result {
     // HEAD errors have no body, so the SDK only sees a 404.
     let fail = failure(f.s3.head_object().bucket(missing).key("a").send().await);
     assert_eq!(fail.status, 404);
+    let fail = failure(f.s3.restore_object().bucket(missing).key("a").send().await);
+    assert_failure(&fail, 404, "NoSuchBucket");
     // The failed writes did not create the bucket.
     let fail = failure(f.s3.head_bucket().bucket(missing).send().await);
     assert_eq!(fail.status, 404);

@@ -494,3 +494,44 @@ async fn test_filesystem_write_preconditions() {
     test_write_preconditions(&FilesystemStorage::new(dir.path().join("a")).await.unwrap()).await;
     test_delete_object_if_match(&FilesystemStorage::new(dir.path().join("b")).await.unwrap()).await;
 }
+
+/// `update_metadata` changes the stored metadata and leaves the data alone, and fails with
+/// `NoSuchKey` for a missing key.
+async fn test_update_metadata<S: StorageBackend>(storage: &S) {
+    storage.create_bucket(TEST_BUCKET).await.unwrap();
+    storage
+        .put_object(store_request("object", b"content"))
+        .await
+        .unwrap();
+    storage
+        .update_metadata(
+            TEST_BUCKET,
+            "object",
+            Box::new(|metadata| metadata.storage_class = Some("GLACIER".to_owned())),
+        )
+        .await
+        .unwrap();
+    let metadata = storage
+        .head_object(TEST_BUCKET, "object")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(metadata.storage_class.as_deref(), Some("GLACIER"));
+    assert_eq!(content_of(storage, "object").await.unwrap(), "content");
+
+    let result = storage
+        .update_metadata(TEST_BUCKET, "missing", Box::new(|_| {}))
+        .await;
+    assert!(matches!(result, Err(crate::Error::NoSuchKey)), "{result:?}");
+}
+
+#[tokio::test]
+async fn test_in_memory_update_metadata() {
+    test_update_metadata(&InMemoryStorage::new()).await;
+}
+
+#[tokio::test]
+async fn test_filesystem_update_metadata() {
+    let dir = tempdir().unwrap();
+    test_update_metadata(&FilesystemStorage::new(dir.path()).await.unwrap()).await;
+}

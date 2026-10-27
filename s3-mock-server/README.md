@@ -135,6 +135,14 @@ async fn test_filesystem_storage() -> Result<(), Box<dyn std::error::Error>> {
   ETag and `If-None-Match: *`. The server ignores other conditions. The in-memory store checks a
   write's or a delete's condition atomically with it.
 
+### Archived Objects
+
+- Objects in `GLACIER` and `DEEP_ARCHIVE` cannot be read until restored (403
+  InvalidObjectState). RestoreObject restores them immediately, answering 200 (S3 answers 202 for
+  a new restore); `S3MockServer::set_restore_status` sets any restore status,
+  including a restore in progress, which a further RestoreObject fails with 409.
+- A RestoreObject without `Days` restores the object for 1 day.
+
 ### Buckets
 
 Create buckets with CreateBucket or `S3MockServer::create_bucket` before using them: object

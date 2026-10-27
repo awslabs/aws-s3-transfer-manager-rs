@@ -115,6 +115,23 @@ pub(crate) struct ObjectMetadata {
     /// part's checksum (matching real S3).
     #[serde(default)]
     pub parts: Vec<ObjectPart>,
+
+    /// Restore status of an object in an archival storage class, reported in the
+    /// `x-amz-restore` header.
+    #[serde(default)]
+    pub restore_status: Option<RestoreStatus>,
+}
+
+/// Restore status of an object in an archival storage class (`GLACIER`, `DEEP_ARCHIVE`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RestoreStatus {
+    /// A restore is in progress; the object cannot be read yet.
+    InProgress,
+    /// A restored copy is readable until `expiry`.
+    Restored {
+        /// When the restored copy expires.
+        expiry: SystemTime,
+    },
 }
 
 /// A completed multipart object's part: its size and per-algorithm checksum.
@@ -183,6 +200,22 @@ impl ObjectMetadata {
         Some(start..end)
     }
 
+    /// Whether the object is in an archival storage class without a restored copy, so its data
+    /// cannot be read. The expiry of a restored copy is not enforced.
+    pub(crate) fn is_archived(&self) -> bool {
+        self.is_archival_class()
+            && !matches!(self.restore_status, Some(RestoreStatus::Restored { .. }))
+    }
+
+    /// Whether the object is in a storage class whose data must be restored before it can be
+    /// read: `GLACIER` or `DEEP_ARCHIVE`.
+    pub(crate) fn is_archival_class(&self) -> bool {
+        matches!(
+            self.storage_class.as_deref(),
+            Some("GLACIER") | Some("DEEP_ARCHIVE")
+        )
+    }
+
     /// Number of stored parts for a completed multipart object (0 for single-PUT).
     pub(crate) fn parts_count(&self) -> usize {
         self.parts.len()
@@ -210,6 +243,7 @@ impl Default for ObjectMetadata {
             content_disposition: None,
             content_language: None,
             parts: Vec::new(),
+            restore_status: None,
         }
     }
 }

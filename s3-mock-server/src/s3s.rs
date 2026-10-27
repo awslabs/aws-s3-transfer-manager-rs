@@ -7,7 +7,7 @@
 
 use crate::bucket::BucketType;
 use crate::error::Error;
-use crate::storage::models::ObjectMetadata;
+use crate::storage::models::{ObjectMetadata, RestoreStatus};
 use crate::storage::StorageBackend;
 use crate::Operation;
 use async_trait::async_trait;
@@ -388,6 +388,9 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             None => return Err(Error::NoSuchKey.into()),
         };
         check_if_match(input.if_match.as_ref(), &metadata)?;
+        if metadata.is_archived() {
+            return Err(Error::InvalidObjectState { restore: false }.into());
+        }
 
         // Convert s3s Range to std Range if present
         let mut range = input
@@ -488,6 +491,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             .content_disposition
             .map(|s| s.parse().unwrap());
         output.content_language = stream_metadata.content_language.map(|s| s.parse().unwrap());
+        output.restore = stream_metadata.restore_status.map(restore_header);
 
         apply_response_defaults_get(&mut output);
         self.apply_get_fault(fault, conn_fault.as_ref(), &mut output)
@@ -566,6 +570,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         output.content_encoding = metadata.content_encoding.map(|s| s.parse().unwrap());
         output.content_disposition = metadata.content_disposition.map(|s| s.parse().unwrap());
         output.content_language = metadata.content_language.map(|s| s.parse().unwrap());
+        output.restore = metadata.restore_status.map(restore_header);
 
         apply_response_defaults_head(&mut output);
         Ok(S3Response::new(output))
@@ -1106,6 +1111,56 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         Ok(S3Response::new(output))
     }
 
+    async fn restore_object(
+        &self,
+        req: S3Request<s3s::dto::RestoreObjectInput>,
+    ) -> S3Result<S3Response<s3s::dto::RestoreObjectOutput>> {
+        self.state.admit(
+            Operation::RestoreObject,
+            Some(&req.input.bucket),
+            Some(&req.input.key),
+        )?;
+        let input = req.input;
+        tracing::trace!(bucket = %input.bucket, key = %input.key, "RestoreObject");
+        check_bucket(&self.storage, &input.bucket).await?;
+        let metadata = self
+            .storage
+            .head_object(&input.bucket, &input.key)
+            .await?
+            .ok_or(Error::NoSuchKey)?;
+        if !metadata.is_archival_class() {
+            return Err(Error::InvalidObjectState { restore: true }.into());
+        }
+        if metadata.restore_status == Some(RestoreStatus::InProgress) {
+            return Err(Error::RestoreAlreadyInProgress.into());
+        }
+        let days = input
+            .restore_request
+            .as_ref()
+            .and_then(|request| request.days)
+            .unwrap_or(1)
+            .max(1) as u64;
+        // A restore completes as soon as it is requested. As in S3, the copy expires at the
+        // first midnight UTC at least `days` days later.
+        let expiry = std::time::SystemTime::now() + std::time::Duration::from_secs(days * 86_400);
+        let since_epoch = expiry
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock is after the epoch")
+            .as_secs();
+        let expiry = std::time::UNIX_EPOCH
+            + std::time::Duration::from_secs(since_epoch.div_ceil(86_400) * 86_400);
+        self.storage
+            .update_metadata(
+                &input.bucket,
+                &input.key,
+                Box::new(move |metadata| {
+                    metadata.restore_status = Some(RestoreStatus::Restored { expiry })
+                }),
+            )
+            .await?;
+        Ok(S3Response::new(s3s::dto::RestoreObjectOutput::default()))
+    }
+
     async fn head_bucket(
         &self,
         req: S3Request<HeadBucketInput>,
@@ -1208,6 +1263,23 @@ pub(crate) async fn check_bucket(
         Ok(())
     } else {
         Err(Error::NoSuchBucket.into())
+    }
+}
+
+/// The `x-amz-restore` header for a restore status.
+fn restore_header(status: RestoreStatus) -> String {
+    match status {
+        RestoreStatus::InProgress => r#"ongoing-request="true""#.to_string(),
+        RestoreStatus::Restored { expiry } => {
+            let mut date = Vec::new();
+            Timestamp::from(expiry)
+                .format(s3s::dto::TimestampFormat::HttpDate, &mut date)
+                .expect("a timestamp formats as an HTTP date");
+            format!(
+                r#"ongoing-request="false", expiry-date="{}""#,
+                String::from_utf8(date).expect("an HTTP date is ASCII")
+            )
+        }
     }
 }
 
