@@ -223,7 +223,7 @@ impl Download {
                 .into_iter()
                 .chain([AwsSdkFeature::S3FilePath]),
         );
-        let ctx = ctx.with_features(features);
+        let ctx = ctx.with_s3_client(features.apply_to_client(&handle.s3_client));
         let transfer = DownloadTransfer::new(ctx.clone(), bucket_type, input, writer);
         handle
             .scheduler

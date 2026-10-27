@@ -389,6 +389,7 @@ impl UploadTransfer {
             .config_override(
                 self.inner
                     .ctx
+                    .handle
                     .bucket_partition_override(self.inner.request.bucket()),
             )
             .send()
@@ -723,7 +724,12 @@ impl UploadTransfer {
             );
             async move {
                 req.customize()
-                    .config_override(self.inner.ctx.upload_override(self.inner.request.bucket()))
+                    .config_override(
+                        self.inner
+                            .ctx
+                            .handle
+                            .upload_override(self.inner.request.bucket()),
+                    )
                     .disable_payload_signing()
                     .send()
                     .instrument(tracing::debug_span!("send-upload-part", part_number))
@@ -883,7 +889,12 @@ impl UploadTransfer {
             async move {
                 put_req
                     .customize()
-                    .config_override(self.inner.ctx.upload_override(self.inner.request.bucket()))
+                    .config_override(
+                        self.inner
+                            .ctx
+                            .handle
+                            .upload_override(self.inner.request.bucket()),
+                    )
                     .disable_payload_signing()
                     .send()
                     .instrument(tracing::debug_span!("send-put-object"))
@@ -1020,6 +1031,7 @@ impl UploadTransfer {
             .config_override(
                 self.inner
                     .ctx
+                    .handle
                     .bucket_partition_override(self.inner.request.bucket()),
             )
             .send()

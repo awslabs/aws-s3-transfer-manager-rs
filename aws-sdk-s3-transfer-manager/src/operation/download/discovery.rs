@@ -185,7 +185,12 @@ async fn discover_obj_with_get_first_part(
             .set_range(None)
             .set_part_number(Some(1))
             .customize()
-            .config_override(transfer.ctx().bucket_partition_override(input.bucket()));
+            .config_override(
+                transfer
+                    .ctx()
+                    .handle
+                    .bucket_partition_override(input.bucket()),
+            );
         async move {
             req.send()
                 .await
@@ -213,7 +218,12 @@ async fn discover_obj_with_head(
         let req =
             copy_fields_to_head_object_request(input, transfer.ctx().s3_client().head_object())
                 .customize()
-                .config_override(transfer.ctx().bucket_partition_override(input.bucket()));
+                .config_override(
+                    transfer
+                        .ctx()
+                        .handle
+                        .bucket_partition_override(input.bucket()),
+                );
         async move {
             req.send()
                 .await
@@ -369,7 +379,12 @@ async fn discover_obj_with_get(
         let req = builder
             .range(header::Range::bytes(byte_range.clone()))
             .customize()
-            .config_override(transfer.ctx().bucket_partition_override(input.bucket()));
+            .config_override(
+                transfer
+                    .ctx()
+                    .handle
+                    .bucket_partition_override(input.bucket()),
+            );
         async move {
             req.send()
                 .await

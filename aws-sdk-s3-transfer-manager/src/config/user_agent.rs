@@ -62,7 +62,7 @@ pub(crate) fn install(
 
 /// The features one operation adds to the requests it issues, on top of the client's.
 ///
-/// Applied per request through `config_override`, so they never mark the shared client.
+/// Applied to a client derived for that operation, so they never mark the shared client.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct OperationFeatures(Arc<[AwsSdkFeature]>);
 
@@ -71,21 +71,13 @@ impl OperationFeatures {
         Self(features.into_iter().collect())
     }
 
-    /// Adds the features to a per-request config override.
-    pub(crate) fn apply(
-        &self,
-        builder: aws_sdk_s3::config::Builder,
-    ) -> aws_sdk_s3::config::Builder {
-        if self.0.is_empty() {
-            builder
-        } else {
-            builder.interceptor(self.clone())
-        }
-    }
-
-    /// Adds the features to a client that issues only this operation's requests.
+    /// A client that adds the features to every request it issues.
     pub(crate) fn apply_to_client(&self, client: &aws_sdk_s3::Client) -> aws_sdk_s3::Client {
-        aws_sdk_s3::Client::from_conf(self.apply(client.config().to_builder()).build())
+        if self.0.is_empty() {
+            return client.clone();
+        }
+        let builder = client.config().to_builder().interceptor(self.clone());
+        aws_sdk_s3::Client::from_conf(builder.build())
     }
 }
 
