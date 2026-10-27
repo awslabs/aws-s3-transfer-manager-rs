@@ -86,22 +86,17 @@ pub enum Endpoint {
     /// streaming download.
     #[non_exhaustive]
     Stream {},
-    /// An end whose address could not be determined, so the transfer never reached it.
-    #[non_exhaustive]
-    Unresolved {},
 }
 
 impl fmt::Display for Endpoint {
     /// `s3://bucket/key`, the path (lossy for a non-UTF-8 name), `(local file)` for a
-    /// local file whose path is unknown, `-` for a caller-owned stream, or
-    /// `(unresolved)`.
+    /// local file whose path is unknown, or `-` for a caller-owned stream.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Endpoint::S3 { bucket, key } => write!(f, "s3://{bucket}/{key}"),
             Endpoint::Local { path: Some(path) } => write!(f, "{}", path.display()),
             Endpoint::Local { path: None } => f.write_str("(local file)"),
             Endpoint::Stream {} => f.write_str("-"),
-            Endpoint::Unresolved {} => f.write_str("(unresolved)"),
         }
     }
 }
