@@ -14,7 +14,7 @@ use aws_smithy_execution::{
 use aws_smithy_http_client::test_util::wire::connection::{
     ConnectionTestHarness, EndpointPlan, Http1Response, Http1Script, MockDnsResolver,
 };
-use aws_smithy_managed_http::client::{Builder, ManagedHttpPool, pool};
+use aws_smithy_managed_http::client::{BuildErrorKind, Builder, ManagedHttpPool, pool};
 use aws_smithy_runtime_api::client::dns::{DnsFuture, ResolveDns};
 use aws_smithy_runtime_api::client::http::{
     HttpClient, HttpConnector, HttpConnectorSettings, SharedHttpClient,
@@ -57,17 +57,18 @@ fn missing_inputs_and_caller_partitions_are_rejected() {
         .pool_builder(pool::ConnectionPool::builder())
         .build()
         .unwrap_err();
+    assert_eq!(error.kind(), BuildErrorKind::MissingRuntime);
+    assert_eq!(error.partition(), None);
+    assert!(error.source().is_none());
     assert!(error.to_string().contains("runtime handle is required"));
 
     let mut builder: Builder<pool::Builder> = Builder::default();
     builder.set_runtime(Some(execution.clone()));
-    assert!(
-        builder
-            .build()
-            .unwrap_err()
-            .to_string()
-            .contains("pool builder is required")
-    );
+    let error = builder.build().unwrap_err();
+    assert_eq!(error.kind(), BuildErrorKind::MissingPoolBuilder);
+    assert_eq!(error.partition(), None);
+    assert!(error.source().is_none());
+    assert!(error.to_string().contains("pool builder is required"));
 
     // Both empty and nonempty declarations belong to the caller; neither may
     // disappear when managed construction supplies its own placement.
@@ -83,6 +84,8 @@ fn missing_inputs_and_caller_partitions_are_rejected() {
             .pool_builder(pool::ConnectionPool::builder().partitions(partitions))
             .build()
             .unwrap_err();
+        assert_eq!(error.kind(), BuildErrorKind::ExplicitPartitions);
+        assert_eq!(error.partition(), None);
         assert!(error.to_string().contains("native partitions conflict"));
         assert!(error.source().is_none());
     }
@@ -109,6 +112,8 @@ fn native_validation_errors_keep_their_sources() {
         .runtime(runtime.handle())
         .build()
         .unwrap_err();
+    assert_eq!(error.kind(), BuildErrorKind::Pool);
+    assert_eq!(error.partition(), None);
     assert!(error.source().unwrap().is::<pool::BuildError>());
     assert!(
         error
@@ -170,6 +175,8 @@ fn https_builder_uses_the_same_managed_construction_and_native_validation() {
         .runtime(runtime.handle())
         .build()
         .unwrap_err();
+    assert_eq!(error.kind(), BuildErrorKind::Pool);
+    assert_eq!(error.partition(), None);
     assert!(error.source().unwrap().is::<pool::BuildError>());
     caller().block_on(runtime.shutdown()).unwrap();
 }
@@ -377,6 +384,8 @@ fn manual_pool_rejects_missing_execution_partitions() {
         .build_http()
         .unwrap();
     let error = ManagedHttpPool::from_pool(execution.clone(), native).unwrap_err();
+    assert_eq!(error.kind(), BuildErrorKind::Client);
+    assert_eq!(error.partition(), Some(execution.partitions()[0].id()));
     let missing = error
         .source()
         .unwrap()

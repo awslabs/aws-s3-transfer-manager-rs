@@ -58,7 +58,7 @@ mod error;
 mod managed;
 
 pub use builder::Builder;
-pub use error::{BuildError, PartitionError};
+pub use error::{BuildError, BuildErrorKind, PartitionError};
 pub use managed::ManagedHttpPool;
 
 /// Native connection-pool configuration, placement, observation, and clients.
