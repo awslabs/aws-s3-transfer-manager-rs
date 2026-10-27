@@ -1968,3 +1968,127 @@ async fn test_put_object_bad_digest_leaves_key_unchanged_in_memory() -> Result<(
 async fn test_put_object_bad_digest_leaves_key_unchanged_filesystem() -> Result<()> {
     run_put_object_bad_digest_leaves_key_unchanged(StorageType::Filesystem).await
 }
+
+/// Objects report the checksum type S3 reports: COMPOSITE for a multipart object whose checksum
+/// combines its parts' checksums, also on a range that returns one part's checksum, and
+/// FULL_OBJECT otherwise. The type appears on GetObject, HeadObject, PutObject and
+/// CompleteMultipartUpload responses and in ListObjectsV2 entries.
+#[tokio::test]
+async fn test_checksum_type_reporting() -> Result<()> {
+    use aws_sdk_s3::types::{ChecksumMode, ChecksumType};
+    let (server, bucket) = create_server(StorageType::InMemory).await?;
+    let handle = server.start().await?;
+    let s3 = handle.client().await;
+    let parts: [&[u8]; 2] = [b"first part", b"second part"];
+
+    let put = s3
+        .put_object()
+        .bucket(&bucket)
+        .key("single")
+        .checksum_crc32(calculate_checksum(b"single", ChecksumAlgorithm::Crc32))
+        .body(Bytes::from_static(b"single").into())
+        .send()
+        .await?;
+    assert_eq!(put.checksum_type(), Some(&ChecksumType::FullObject));
+
+    for (key, algorithm, checksum_type) in [
+        (
+            "composite",
+            ChecksumAlgorithm::Crc32,
+            ChecksumType::Composite,
+        ),
+        (
+            "full",
+            ChecksumAlgorithm::Crc64Nvme,
+            ChecksumType::FullObject,
+        ),
+    ] {
+        let upload_id = s3
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .checksum_algorithm(algorithm.clone())
+            .send()
+            .await?
+            .upload_id
+            .unwrap();
+        let mut completed = Vec::new();
+        for (i, part) in parts.iter().enumerate() {
+            let out = s3
+                .upload_part()
+                .bucket(&bucket)
+                .key(key)
+                .upload_id(&upload_id)
+                .part_number(i as i32 + 1)
+                .checksum_algorithm(algorithm.clone())
+                .body(Bytes::from_static(part).into())
+                .send()
+                .await?;
+            completed.push(
+                CompletedPart::builder()
+                    .part_number(i as i32 + 1)
+                    .e_tag(out.e_tag.unwrap())
+                    .set_checksum_crc32(out.checksum_crc32)
+                    .set_checksum_crc64_nvme(out.checksum_crc64_nvme)
+                    .build(),
+            );
+        }
+        let complete = s3
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .set_parts(Some(completed))
+                    .build(),
+            )
+            .send()
+            .await?;
+        assert_eq!(complete.checksum_type(), Some(&checksum_type), "{key}");
+
+        let get = s3
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .checksum_mode(ChecksumMode::Enabled)
+            .send()
+            .await?;
+        assert_eq!(get.checksum_type(), Some(&checksum_type), "{key}");
+        let head = s3
+            .head_object()
+            .bucket(&bucket)
+            .key(key)
+            .checksum_mode(ChecksumMode::Enabled)
+            .send()
+            .await?;
+        assert_eq!(head.checksum_type(), Some(&checksum_type), "{key}");
+        // A range matching the first part of a composite object returns that part's checksum,
+        // with the object's type.
+        if checksum_type == ChecksumType::Composite {
+            let first_part = s3
+                .get_object()
+                .bucket(&bucket)
+                .key(key)
+                .range(format!("bytes=0-{}", parts[0].len() - 1))
+                .checksum_mode(ChecksumMode::Enabled)
+                .send()
+                .await?;
+            assert_eq!(first_part.checksum_type(), Some(&checksum_type), "{key}");
+        }
+        let listed = s3
+            .list_objects_v2()
+            .bucket(&bucket)
+            .prefix(key)
+            .send()
+            .await?;
+        assert_eq!(
+            listed.contents()[0].checksum_type(),
+            Some(&checksum_type),
+            "{key}"
+        );
+    }
+
+    handle.shutdown().await?;
+    Ok(())
+}

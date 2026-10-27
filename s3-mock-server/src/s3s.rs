@@ -38,17 +38,11 @@ fn opt_etag_from_quoted(s: Option<String>) -> Option<ETag> {
 }
 
 /// Apply defaults to a HeadObject response matching post-2023 prod S3
-/// behavior on a fresh bucket: SSE-S3 (AES256) default encryption, and
-/// `ChecksumType::FullObject` whenever any checksum is present.
+/// behavior on a fresh bucket: SSE-S3 (AES256) default encryption.
 fn apply_response_defaults_head(output: &mut s3s::dto::HeadObjectOutput) {
     if output.server_side_encryption.is_none() {
         output.server_side_encryption = Some(s3s::dto::ServerSideEncryption::from_static(
             s3s::dto::ServerSideEncryption::AES256,
-        ));
-    }
-    if output.checksum_type.is_none() && has_any_checksum_head(output) {
-        output.checksum_type = Some(s3s::dto::ChecksumType::from_static(
-            s3s::dto::ChecksumType::FULL_OBJECT,
         ));
     }
 }
@@ -57,11 +51,6 @@ fn apply_response_defaults_get(output: &mut s3s::dto::GetObjectOutput) {
     if output.server_side_encryption.is_none() {
         output.server_side_encryption = Some(s3s::dto::ServerSideEncryption::from_static(
             s3s::dto::ServerSideEncryption::AES256,
-        ));
-    }
-    if output.checksum_type.is_none() && has_any_checksum_get(output) {
-        output.checksum_type = Some(s3s::dto::ChecksumType::from_static(
-            s3s::dto::ChecksumType::FULL_OBJECT,
         ));
     }
 }
@@ -501,6 +490,10 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             output.checksum_sha256 = None;
             output.checksum_crc64nvme = None;
         }
+        // The type is the object's, also for a range that returns one part's checksum.
+        if has_any_checksum_get(&output) {
+            output.checksum_type = stored_checksum_type(&metadata);
+        }
         apply_response_defaults_get(&mut output);
         self.apply_get_fault(fault, conn_fault.as_ref(), &mut output)
             .await?;
@@ -545,6 +538,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         let content_range = range
             .as_ref()
             .map(|r| content_range_header(r, metadata.content_length));
+        let checksum_type = stored_checksum_type(&metadata);
         if let Some(r) = range.as_ref() {
             metadata.apply_range_checksums(r.start, r.end);
         }
@@ -588,6 +582,9 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             output.checksum_crc64nvme = None;
         }
 
+        if has_any_checksum_head(&output) {
+            output.checksum_type = checksum_type;
+        }
         apply_response_defaults_head(&mut output);
         Ok(S3Response::new(output))
     }
@@ -658,6 +655,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
 
         let output = s3s::dto::PutObjectOutput {
             e_tag: opt_etag_from_quoted(stored_meta.object_integrity.etag()),
+            checksum_type: integrity_checksum_type(&stored_meta.object_integrity),
             checksum_crc32: stored_meta.object_integrity.crc32,
             checksum_crc32c: stored_meta.object_integrity.crc32c,
             checksum_sha1: stored_meta.object_integrity.sha1,
@@ -962,6 +960,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             key: Some(response.key),
             e_tag: Some(etag_from_quoted(&response.etag)),
             bucket: Some(bucket),
+            checksum_type: integrity_checksum_type(&response.object_integrity),
             checksum_crc32: response.object_integrity.crc32,
             checksum_crc32c: response.object_integrity.crc32c,
             checksum_sha1: response.object_integrity.sha1,
@@ -1238,6 +1237,7 @@ fn list_entry(obj: crate::storage::ObjectInfo, include_restore_status: bool) -> 
                 .map(|a| s3s::dto::ChecksumAlgorithm::from(a.as_str().to_ascii_uppercase()))
                 .collect()
         }),
+        checksum_type: stored_checksum_type(&obj.metadata),
         restore_status: obj
             .metadata
             .restore_status
@@ -1255,6 +1255,48 @@ fn list_entry(obj: crate::storage::ObjectInfo, include_restore_status: bool) -> 
         key: Some(obj.key),
         ..Default::default()
     }
+}
+
+/// The checksum type of a stored object: COMPOSITE when its checksum combines part checksums,
+/// which S3 writes with a `-<part count>` suffix, FULL_OBJECT otherwise, and `None` when it has
+/// no checksum.
+fn stored_checksum_type(metadata: &ObjectMetadata) -> Option<s3s::dto::ChecksumType> {
+    checksum_type_of([
+        &metadata.crc32,
+        &metadata.crc32c,
+        &metadata.crc64nvme,
+        &metadata.sha1,
+        &metadata.sha256,
+    ])
+}
+
+/// The checksum type of an object just written with `integrity`, as [`stored_checksum_type`].
+fn integrity_checksum_type(
+    integrity: &crate::types::ObjectIntegrity,
+) -> Option<s3s::dto::ChecksumType> {
+    checksum_type_of([
+        &integrity.crc32,
+        &integrity.crc32c,
+        &integrity.crc64nvme,
+        &integrity.sha1,
+        &integrity.sha256,
+    ])
+}
+
+/// The checksum type of an object with `checksums`, from the first one it has: an object's
+/// checksums all have the same type, since a multipart upload stores the checksum of one
+/// algorithm and other objects have only full-object checksums.
+fn checksum_type_of<'a>(
+    checksums: impl IntoIterator<Item = &'a Option<String>>,
+) -> Option<s3s::dto::ChecksumType> {
+    let checksum = checksums.into_iter().flatten().next()?;
+    Some(s3s::dto::ChecksumType::from_static(
+        if checksum.contains('-') {
+            s3s::dto::ChecksumType::COMPOSITE
+        } else {
+            s3s::dto::ChecksumType::FULL_OBJECT
+        },
+    ))
 }
 
 /// The `x-amz-storage-class` header of a GetObject or HeadObject response: S3 omits it for

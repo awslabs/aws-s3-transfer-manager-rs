@@ -153,6 +153,9 @@ GetObject and HeadObject omit `x-amz-storage-class` for `STANDARD` objects; List
 - GetObject and HeadObject return an object's checksums only when the request sets
   `x-amz-checksum-mode: ENABLED`, as S3 does. The SDK sets it on GetObject unless response
   checksum validation is only performed when required.
+- Objects report their checksum type, on reads, writes and listings:
+  COMPOSITE for a multipart object whose checksum combines its parts' checksums, FULL_OBJECT
+  otherwise.
 
 ### Listing
 
