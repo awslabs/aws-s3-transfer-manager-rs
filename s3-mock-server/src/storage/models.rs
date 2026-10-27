@@ -116,6 +116,12 @@ pub(crate) struct ObjectMetadata {
     #[serde(default)]
     pub parts: Vec<ObjectPart>,
 
+    /// The SHA-1 or SHA-256 checksums of the segments of an appended object with a checksum of
+    /// either: the data it was created with (each part of a multipart object), then each append.
+    /// Its checksum is their composite, as in S3. Empty for other objects.
+    #[serde(default)]
+    pub append_segments: Vec<String>,
+
     /// Restore status of an object in an archival storage class, reported in the
     /// `x-amz-restore` header.
     #[serde(default)]
@@ -279,6 +285,7 @@ impl Default for ObjectMetadata {
             content_disposition: None,
             content_language: None,
             parts: Vec::new(),
+            append_segments: Vec::new(),
             restore_status: None,
         }
     }

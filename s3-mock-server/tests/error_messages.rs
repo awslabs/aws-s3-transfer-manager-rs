@@ -10,8 +10,8 @@ use aws_sdk_s3::types::{ChecksumAlgorithm, ChecksumType, CompletedMultipartUploa
 use common::{assert_failure, failure, no_retry, Fixture, Result};
 use s3_mock_server::S3MockServer;
 
-/// NoSuchKey, NoSuchBucket, NoSuchUpload, InvalidRange and PreconditionFailed carry S3's
-/// messages.
+/// NoSuchKey, NoSuchBucket, NoSuchUpload, InvalidRange, PreconditionFailed and NotImplemented
+/// carry S3's messages.
 #[tokio::test]
 async fn test_common_error_messages() -> Result {
     let f = Fixture::new().await;
@@ -68,6 +68,20 @@ async fn test_common_error_messages() -> Result {
         Some("At least one of the pre-conditions you specified did not hold")
     );
 
+    let fail = failure(
+        f.s3.put_object()
+            .bucket(&f.bucket)
+            .key("a")
+            .write_offset_bytes(5)
+            .body(ByteStream::from_static(b"x"))
+            .send()
+            .await,
+    );
+    assert_failure(&fail, 501, "NotImplemented");
+    assert_eq!(
+        fail.message.as_deref(),
+        Some("A header you provided implies functionality that is not implemented")
+    );
     f.shutdown().await;
     Ok(())
 }

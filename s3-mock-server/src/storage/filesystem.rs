@@ -329,6 +329,7 @@ impl StorageBackend for FilesystemStorage {
             content_disposition: request.content_disposition,
             content_language: request.content_language,
             parts: Vec::new(),
+            append_segments: Vec::new(),
             restore_status: request.restore_status,
         };
         let metadata_path = self.get_object_metadata_path(&request.bucket, &request.key);

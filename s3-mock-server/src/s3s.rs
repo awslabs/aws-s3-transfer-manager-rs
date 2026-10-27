@@ -168,6 +168,75 @@ impl<S: StorageBackend + 'static> Inner<S> {
         Self { storage, state }
     }
 
+    /// Serve a PutObject with `x-amz-write-offset-bytes`: append the body to the object at
+    /// `offset`, or create the object when it does not exist and `offset` is 0.
+    ///
+    /// The body is read in full and checked against the request's checksums before the object
+    /// changes, so a `BadDigest` append leaves the object as it was.
+    async fn append_object(
+        &self,
+        mut request: crate::storage::StoreObjectRequest,
+        offset: i64,
+    ) -> S3Result<S3Response<s3s::dto::PutObjectOutput>> {
+        let offset =
+            u64::try_from(offset).map_err(|_| Error::InvalidArgument("Invalid write offset"))?;
+        let client_checksums = request
+            .client_checksums
+            .take()
+            .expect("PutObject requests carry the client's checksums");
+        let checksum_algorithm = [
+            (client_checksums.crc32.is_some(), ChecksumAlgorithm::Crc32),
+            (client_checksums.crc32c.is_some(), ChecksumAlgorithm::Crc32c),
+            (
+                client_checksums.crc64nvme.is_some(),
+                ChecksumAlgorithm::Crc64Nvme,
+            ),
+            (client_checksums.sha1.is_some(), ChecksumAlgorithm::Sha1),
+            (client_checksums.sha256.is_some(), ChecksumAlgorithm::Sha256),
+        ]
+        .into_iter()
+        .find_map(|(present, algorithm)| present.then_some(algorithm));
+        let precondition = std::mem::take(&mut request.precondition);
+
+        let mut content = BytesMut::new();
+        while let Some(chunk) = request.body.next().await {
+            let chunk = chunk.map_err(|e| Error::Internal(format!("Stream error: {}", e)))?;
+            content.extend_from_slice(&chunk);
+        }
+        let content = content.freeze();
+        let mut checks = crate::types::ObjectIntegrityChecks::from(&client_checksums);
+        checks.update(&content);
+        if let Err(algorithm) = checks.finalize().validate(&client_checksums) {
+            return Err(Error::BadDigest {
+                algorithm,
+                completion: false,
+            }
+            .into());
+        }
+
+        let stored = self
+            .storage
+            .append_object(crate::storage::AppendObjectRequest {
+                offset,
+                content,
+                precondition,
+                checksum_algorithm,
+                put_object: request,
+            })
+            .await?;
+        let output = s3s::dto::PutObjectOutput {
+            e_tag: opt_etag_from_quoted(stored.object_integrity.etag()),
+            checksum_type: integrity_checksum_type(&stored.object_integrity),
+            checksum_crc32: stored.object_integrity.crc32,
+            checksum_crc32c: stored.object_integrity.crc32c,
+            checksum_sha1: stored.object_integrity.sha1,
+            checksum_sha256: stored.object_integrity.sha256,
+            checksum_crc64nvme: stored.object_integrity.crc64nvme,
+            ..Default::default()
+        };
+        Ok(S3Response::new(output))
+    }
+
     /// Apply the fault drawn for a GET request to its response. Effects are
     /// deterministic transforms (XOR) so a faulted value is derivable.
     async fn apply_get_fault(
@@ -621,11 +690,16 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         }
 
         let bucket_type = BucketType::of(&input.bucket);
+        // As in S3, only directory buckets serve appends.
+        if input.write_offset_bytes.is_some() && bucket_type == BucketType::GeneralPurpose {
+            return Err(Error::NotImplemented.into());
+        }
         bucket_type
             .check_storage_class(input.storage_class.as_ref().map(|class| class.as_str()))?;
         bucket_type.check_content_md5(input.content_md5.as_deref())?;
         let client_checksums = crate::types::ClientChecksums::from(&input);
         validate_digest_headers(&client_checksums)?;
+        let write_offset = input.write_offset_bytes;
         let integrity_checks = crate::types::ObjectIntegrityChecks::from(&client_checksums);
 
         // Create storage request with configured checksums
@@ -661,6 +735,16 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
                 },
             );
             request.body = Box::pin(stalled);
+        }
+
+        if let Some(offset) = write_offset {
+            let response = self.append_object(request, offset).await?;
+            // WithholdResponseHeaders: the append is applied; never respond.
+            if let Some(crate::faults::FaultType::WithholdResponseHeaders) = fault {
+                std::future::pending::<()>().await;
+                unreachable!("pending future never resolves");
+            }
+            return Ok(response);
         }
 
         let stored_meta = self.storage.put_object(request).await?;

@@ -35,13 +35,25 @@ impl Fixture {
     }
 
     pub async fn with(builder: S3MockServerBuilder) -> Self {
+        Self::with_bucket(builder, format!("test-bucket-{}", Uuid::new_v4())).await
+    }
+
+    /// A fixture whose bucket is a directory bucket, whose name ends in `--x-s3`.
+    pub async fn directory() -> Self {
+        Self::with_bucket(
+            S3MockServer::builder(),
+            format!("test-{}--usw2-az1--x-s3", Uuid::new_v4()),
+        )
+        .await
+    }
+
+    async fn with_bucket(builder: S3MockServerBuilder, bucket: String) -> Self {
         let server = builder
             .with_in_memory_store()
             .build()
             .expect("build server");
         let handle = server.start().await.expect("start server");
         let s3 = no_retry(&handle.client().await);
-        let bucket = format!("test-bucket-{}", Uuid::new_v4());
         server.create_bucket(&bucket).await.expect("create bucket");
         Self {
             server,

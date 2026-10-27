@@ -144,11 +144,18 @@ async fn test_filesystem_storage() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-### Conditional Requests
+### Conditional Writes and Appends
 
 - GetObject, HeadObject and DeleteObject honor `If-Match`; PutObject honors `If-Match` with an
   ETag and `If-None-Match: *`. The server ignores other conditions. The in-memory store checks a
   write's or a delete's condition atomically with it.
+- PutObject with `x-amz-write-offset-bytes` appends to an object in directory buckets (in-memory
+  store only), and fails with 501 NotImplemented in general purpose buckets, as in S3. Appends
+  honor `If-Match` and `If-None-Match: *` as PutObject does; their 412 does not name the failed
+  condition in a `Condition` element, as S3's does. As in S3, an append carries a checksum of the
+  object's algorithm (CRC64NVME if it has none), and the appended object has no parts and a CRC of
+  the combined content, or for SHA-1 and SHA-256 a composite checksum of its segments: its parts or
+  the data it was created with, then each append.
 
 ### Archived Objects
 
@@ -244,6 +251,7 @@ write signed with a session.
 - A range or `partNumber` read of part of a multipart object with a full-object checksum
   returns the part's checksum if the part was uploaded with one; general purpose buckets
   return none.
+- Appends are served; general purpose buckets fail them with 501 NotImplemented.
 
 ### Buckets
 

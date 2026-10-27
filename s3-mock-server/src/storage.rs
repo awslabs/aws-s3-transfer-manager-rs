@@ -115,6 +115,22 @@ pub(crate) fn etag_condition_holds(condition: &s3s::dto::ETagCondition, etag: &s
     }
 }
 
+/// Request for appending to an object (PutObject with `x-amz-write-offset-bytes`).
+pub(crate) struct AppendObjectRequest {
+    /// Where the appended data must start: the current size of the object.
+    pub offset: u64,
+    /// The data to append. Its checksums have been validated against the request's.
+    pub content: Bytes,
+    /// `If-Match` (the ETag the object must have) or `If-None-Match: *` (the key must not exist).
+    pub precondition: WritePrecondition,
+    /// The algorithm of the request's checksum, if it has one.
+    pub checksum_algorithm: Option<aws_smithy_checksums::ChecksumAlgorithm>,
+    /// The PutObject the append was sent as. When the key does not exist and `offset` is 0, the
+    /// object is created from it, with `content` as its body; otherwise only its bucket and key
+    /// are used.
+    pub put_object: StoreObjectRequest,
+}
+
 /// An in-place change to the stored metadata of an object.
 pub(crate) type MetadataUpdate = Box<dyn FnOnce(&mut ObjectMetadata) + Send>;
 
@@ -418,6 +434,18 @@ pub(crate) trait StorageBackend: Send + Sync + Debug {
     /// Abort a multipart upload and clean up all associated data.
     async fn abort_multipart_upload(&self, upload_id: &str) -> Result<()>;
 
+    /// Append to an object, or create it when the key does not exist and the offset is 0.
+    ///
+    /// Fails with `NoSuchKey` for a missing key at a non-zero offset or with `If-Match`,
+    /// `PreconditionFailed` when `If-Match` does not hold or the key exists with
+    /// `If-None-Match: *`, `InvalidArgument` for an empty append to a non-empty object,
+    /// `InvalidWriteOffset` when the offset is not the object's size, and `ChecksumTypeMismatch`
+    /// when the object stores checksums but none of the request's algorithm, CRC64NVME if the
+    /// request has none.
+    async fn append_object(&self, _request: AppendObjectRequest) -> Result<StoredObjectMetadata> {
+        Err(crate::Error::NotImplemented)
+    }
+
     /// The multipart uploads in progress in `bucket`, ordered by key and then upload id.
     async fn list_multipart_uploads(&self, bucket: &str) -> Result<Vec<MultipartUploadInfo>>;
 
@@ -509,6 +537,10 @@ impl StorageBackend for std::sync::Arc<dyn StorageBackend + '_> {
 
     async fn abort_multipart_upload(&self, upload_id: &str) -> Result<()> {
         (**self).abort_multipart_upload(upload_id).await
+    }
+
+    async fn append_object(&self, request: AppendObjectRequest) -> Result<StoredObjectMetadata> {
+        (**self).append_object(request).await
     }
 
     async fn list_multipart_uploads(&self, bucket: &str) -> Result<Vec<MultipartUploadInfo>> {

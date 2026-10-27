@@ -101,6 +101,19 @@ pub enum Error {
     #[error("bucket already exists")]
     BucketAlreadyExists,
 
+    /// An append's write offset is not the current size of the object.
+    #[error("invalid write offset")]
+    InvalidWriteOffset,
+
+    /// An append carries a checksum of an algorithm the object does not store.
+    #[error("checksum type mismatch: expected {expected}, got {actual}")]
+    ChecksumTypeMismatch {
+        /// Lowercase names of the algorithms the object stores.
+        expected: String,
+        /// Lowercase name of the algorithm of the request's checksum.
+        actual: String,
+    },
+
     /// The object's storage class does not allow the operation: a read of an archived object
     /// that has not been restored, or a restore of an object in another storage class.
     #[error("invalid object state")]
@@ -343,6 +356,21 @@ impl From<Error> for s3s::S3Error {
                 "The requested bucket name is not available. The bucket namespace is shared by \
                  all users of the system. Please select a different name and try again."
                     .into(),
+            ),
+            Error::InvalidWriteOffset => (
+                S3ErrorCode::Custom("InvalidWriteOffset".into()),
+                StatusCode::BAD_REQUEST,
+                "The write offset value that you specified does not match the current object size."
+                    .into(),
+            ),
+            Error::ChecksumTypeMismatch { expected, actual } => (
+                S3ErrorCode::InvalidRequest,
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "Checksum Type mismatch occurred, expected checksum Type: {expected}, actual \
+                     checksum Type: {actual}."
+                )
+                .into(),
             ),
             Error::InvalidObjectState { restore: false } => (
                 S3ErrorCode::InvalidObjectState,
