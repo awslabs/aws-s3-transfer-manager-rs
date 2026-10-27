@@ -910,11 +910,13 @@ mod tests {
     #[tokio::test]
     async fn test_s3walker_page_size() {
         // page_size propagates as max_keys; mock returns a single-item page
-        let rule = mock!(aws_sdk_s3::Client::list_objects_v2).then_output(|| {
-            ListObjectsV2Output::builder()
-                .set_contents(Some(vec![Object::builder().key("only.txt").build()]))
-                .build()
-        });
+        let rule = mock!(aws_sdk_s3::Client::list_objects_v2)
+            .match_requests(|req| req.max_keys() == Some(1))
+            .then_output(|| {
+                ListObjectsV2Output::builder()
+                    .set_contents(Some(vec![Object::builder().key("only.txt").build()]))
+                    .build()
+            });
         let client = mock_client!(aws_sdk_s3, RuleMode::Sequential, &[&rule]);
 
         let mut walk = walker()
