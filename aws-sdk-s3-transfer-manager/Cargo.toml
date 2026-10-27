@@ -26,6 +26,7 @@ bytes-utils = "0.1.4"
 futures-util = "0.3.31"
 path-clean = "1.0.1"
 pin-project-lite = "0.2.16"
+priority-queue = "2.7"
 tokio = { version = "1.43.0", features = ["rt-multi-thread", "io-util", "sync", "fs", "macros"] }
 tracing = "0.1"
 walkdir = "2"

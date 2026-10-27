@@ -205,13 +205,27 @@ impl CachingResolveResult {
     }
 }
 
-/// Notification that a user of the resolver has stopped using an IP address.  It is assumed that
+/// Event emitted when a user of the resolver has stopped using an IP address.  It is assumed that
 /// something begins using an address as soon as its completes.  It is critical that every lookup
 /// has a matching release so that the internal cache can correctly track IP distribution.
 #[derive(Debug)]
 pub struct CachingHostEventIpReleased {
-    /// IP address (as string) that is no longer being used by a dns lookup consumer
-    pub address: String,
+    /// Name of the host that the address was resolver for
+    pub name: String,
+
+    /// IP address that is no longer being used by a dns lookup consumer
+    pub address: IpAddr,
+}
+
+/// Event emitted when a connection attempt using a resolved address fails.  Later we'll add
+/// failure context.
+#[derive(Debug)]
+pub struct CachingHostEventConnectionFailed {
+    /// Name of the host that the address was resolver for
+    pub name: String,
+
+    /// IP address of the connection that failed
+    pub address: IpAddr,
 }
 
 /// A connection-related event that could cause us to update our internal bookkeeping that
@@ -224,6 +238,10 @@ pub enum CachingHostEvent {
     /// Notifies the resolver that a consumer has stopped using an address returned by a resolution
     /// request
     IpReleased(CachingHostEventIpReleased),
+
+    /// Notifies the resolver that a consumer failed to establish a connection using an IP address
+    /// returned by the resolver.
+    ConnectionFailed(CachingHostEventConnectionFailed),
 }
 
 /// The fundamental operation type that a caching resolver works with.
@@ -675,7 +693,8 @@ pub(crate) mod testing {
         );
 
         let host_event = CachingHostEvent::IpReleased(CachingHostEventIpReleased {
-            address: "127.0.0.1".to_string(),
+            name: "localhost".to_string(),
+            address: IpAddr::V4(Ipv4Addr::LOCALHOST),
         });
 
         let notify_result = resolver.notify(host_event);
@@ -685,7 +704,8 @@ pub(crate) mod testing {
 
         match received_event {
             CachingHostEvent::IpReleased(released_event) => {
-                assert_eq!(released_event.address, "127.0.0.1");
+                assert_eq!(released_event.address, IpAddr::V4(Ipv4Addr::LOCALHOST));
+                assert_eq!("localhost", released_event.name);
             }
             _ => {
                 assert!(false);

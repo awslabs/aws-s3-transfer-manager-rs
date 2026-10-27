@@ -4,20 +4,49 @@
  */
 use crate::dns::*;
 use aws_smithy_runtime_api::client::dns::ResolveDns;
+use priority_queue::PriorityQueue;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::time::Instant;
+
+struct AddressEntry {
+    id: u64,
+
+    ip_address: IpAddr,
+
+    use_count: u32, // maybe not needed
+
+    ttl_expiration: Instant, // maybe not needed
+
+    unhealthy_expiration: Instant, // maybe not needed
+}
 
 struct HostEntry {
     name: String,
 
     pending_requests: VecDeque<CachingResolveRequestInternal>,
+
+    addresses: HashMap<u64, AddressEntry>,
+
+    addresses_to_id: HashMap<IpAddr, u64>,
+
+    healthy_addresses_by_use_count: PriorityQueue<u64, u32>,
+
+    unhealthy_addresses_by_expiration: PriorityQueue<u64, Instant>,
+
+    addresses_by_ttl: PriorityQueue<u64, Instant>,
 }
 
 impl HostEntry {
-    pub fn new(name: &str) -> HostEntry {
+    fn new(name: &str) -> HostEntry {
         HostEntry {
             name: name.to_string(),
             pending_requests: VecDeque::new(),
+            addresses: HashMap::new(),
+            addresses_to_id: HashMap::new(),
+            healthy_addresses_by_use_count: PriorityQueue::new(),
+            unhealthy_addresses_by_expiration: PriorityQueue::new(),
+            addresses_by_ttl: PriorityQueue::new(),
         }
     }
 }
