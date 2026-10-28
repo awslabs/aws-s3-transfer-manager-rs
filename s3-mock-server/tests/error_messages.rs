@@ -7,13 +7,12 @@ mod common;
 
 use aws_sdk_s3::primitives::ByteStream;
 use common::{assert_failure, failure, Fixture, Result};
-use s3_mock_server::S3MockServer;
 
 /// NoSuchKey, NoSuchBucket, NoSuchUpload, InvalidRange and PreconditionFailed carry S3's
 /// messages.
 #[tokio::test]
 async fn test_common_error_messages() -> Result {
-    let f = Fixture::with(S3MockServer::builder().with_bucket_check(true)).await;
+    let f = Fixture::new().await;
     f.put("a", "hello").await;
     let get = || f.s3.get_object().bucket(&f.bucket).key("a");
 

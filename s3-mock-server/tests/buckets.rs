@@ -1,20 +1,20 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Opt-in S3 behaviors: the bucket check.
+//! Requests for a missing bucket.
 
 mod common;
 
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use common::{assert_failure, failure, Fixture, Result};
-use s3_mock_server::{FaultTarget, FaultType, Occurrence, Operation, S3MockServer};
+use s3_mock_server::{FaultTarget, FaultType, Occurrence, Operation};
 
-/// With the bucket check, object requests for a missing bucket fail with NoSuchBucket and create
-/// nothing, while a missing key in an existing bucket still fails with NoSuchKey.
+/// Object requests for a missing bucket fail with NoSuchBucket and create nothing, while a missing
+/// key in an existing bucket still fails with NoSuchKey.
 #[tokio::test]
-async fn test_bucket_check() -> Result {
-    let f = Fixture::with(S3MockServer::builder().with_bucket_check(true)).await;
+async fn test_missing_bucket() -> Result {
+    let f = Fixture::new().await;
     f.put("a", "hello").await;
     let missing = "missing-bucket";
 
@@ -65,35 +65,11 @@ async fn test_bucket_check() -> Result {
     Ok(())
 }
 
-/// Without the bucket check, a read from a missing bucket fails with NoSuchKey and a write
-/// creates the bucket.
+/// The requests of a multipart upload whose bucket was deleted fail with NoSuchBucket, and
+/// completing the upload does not create the bucket again.
 #[tokio::test]
-async fn test_no_bucket_check_by_default() -> Result {
+async fn test_missing_bucket_on_multipart_upload() -> Result {
     let f = Fixture::new().await;
-    let fail = failure(
-        f.s3.get_object()
-            .bucket("missing-bucket")
-            .key("a")
-            .send()
-            .await,
-    );
-    assert_failure(&fail, 404, "NoSuchKey");
-    f.s3.put_object()
-        .bucket("created-bucket")
-        .key("a")
-        .body(ByteStream::from_static(b"x"))
-        .send()
-        .await?;
-    assert!(f.server.object_exists("created-bucket", "a").await?);
-    f.shutdown().await;
-    Ok(())
-}
-
-/// With the bucket check, the requests of a multipart upload whose bucket was deleted fail with
-/// NoSuchBucket, and completing the upload does not create the bucket again.
-#[tokio::test]
-async fn test_bucket_check_on_multipart_upload() -> Result {
-    let f = Fixture::with(S3MockServer::builder().with_bucket_check(true)).await;
     f.s3.create_bucket().bucket("doomed").send().await?;
     let upload_id =
         f.s3.create_multipart_upload()

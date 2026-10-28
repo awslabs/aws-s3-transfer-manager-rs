@@ -125,11 +125,20 @@ impl FilesystemStorage {
         self.root_dir.join(bucket).join("objects")
     }
 
-    /// Ensure bucket directories exist (auto-create for backward compat).
+    /// Create the bucket's directories, and the uploads directory the server's writes use.
     async fn ensure_bucket(&self, bucket: &str) -> Result<()> {
         fs::create_dir_all(self.objects_dir(bucket)).await?;
         fs::create_dir_all(self.root_dir.join("uploads")).await?;
         Ok(())
+    }
+
+    /// Fail with `NoSuchBucket` if the bucket has not been created.
+    async fn require_bucket(&self, bucket: &str) -> Result<()> {
+        if self.objects_dir(bucket).is_dir() {
+            Ok(())
+        } else {
+            Err(Error::NoSuchBucket)
+        }
     }
 
     fn get_object_path(&self, bucket: &str, key: &str) -> PathBuf {
@@ -252,8 +261,7 @@ impl StorageBackend for FilesystemStorage {
         &self,
         request: crate::storage::StoreObjectRequest,
     ) -> Result<StoredObjectMetadata> {
-        // Auto-create bucket directories
-        self.ensure_bucket(&request.bucket).await?;
+        self.require_bucket(&request.bucket).await?;
 
         let mut body = request.body;
         let mut integrity_checks = request.integrity_checks;
@@ -430,7 +438,7 @@ impl StorageBackend for FilesystemStorage {
         &self,
         request: crate::storage::CreateMultipartUploadRequest<'_>,
     ) -> Result<()> {
-        self.ensure_bucket(request.bucket).await?;
+        self.require_bucket(request.bucket).await?;
         let upload_dir = self.get_upload_dir(request.upload_id);
         fs::create_dir_all(&upload_dir).await?;
 
@@ -549,6 +557,7 @@ impl StorageBackend for FilesystemStorage {
             .ok_or(Error::NoSuchUpload)?;
 
         let bucket = upload_metadata.bucket.as_deref().unwrap_or(request.bucket);
+        self.require_bucket(bucket).await?;
         let checksum_algorithm = upload_metadata.metadata.checksum_algorithm;
         let checksum_type = upload_metadata.checksum_type;
 

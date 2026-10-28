@@ -114,16 +114,6 @@ pub(crate) struct ServerState {
     pub(crate) throttle: std::sync::Mutex<Option<std::sync::Arc<crate::throttle::RateThrottle>>>,
     /// Requests received per operation.
     pub(crate) requests: crate::operation::RequestCounters,
-    /// Behavior chosen when the server was built.
-    pub(crate) options: ServerOptions,
-}
-
-/// S3 behavior chosen when the server is built.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct ServerOptions {
-    /// Fail object requests for a missing bucket with NoSuchBucket, as S3 does. Otherwise
-    /// reads of a missing bucket fail as for a missing key, and writes create the bucket.
-    pub(crate) bucket_check: bool,
 }
 
 impl ServerState {
@@ -151,20 +141,6 @@ impl ServerState {
         {
             Some(error) => Err(error),
             None => Ok(fault),
-        }
-    }
-
-    /// Fail with NoSuchBucket if the server checks buckets and `bucket` does not exist in
-    /// `storage`.
-    pub(crate) async fn check_bucket(
-        &self,
-        storage: &(impl StorageBackend + ?Sized),
-        bucket: &str,
-    ) -> S3Result<()> {
-        if !self.options.bucket_check || storage.head_bucket(bucket).await? {
-            Ok(())
-        } else {
-            Err(Error::NoSuchBucket.into())
         }
     }
 
@@ -409,7 +385,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         let bucket = &input.bucket;
         let key = &input.key;
         tracing::trace!(%bucket, %key, "GetObject");
-        self.state.check_bucket(&self.storage, bucket).await?;
+        check_bucket(&self.storage, bucket).await?;
 
         // Get metadata first to validate range
         let metadata = match self.storage.head_object(bucket, key).await? {
@@ -537,7 +513,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         let bucket = &input.bucket;
         let key = &input.key;
         tracing::trace!(%bucket, %key, "HeadObject");
-        self.state.check_bucket(&self.storage, bucket).await?;
+        check_bucket(&self.storage, bucket).await?;
 
         // Get object metadata from storage
         let mut metadata = match self.storage.head_object(bucket, key).await? {
@@ -611,9 +587,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         )?;
         let input = req.input;
         tracing::trace!(bucket = %input.bucket, key = %input.key, "PutObject");
-        self.state
-            .check_bucket(&self.storage, &input.bucket)
-            .await?;
+        check_bucket(&self.storage, &input.bucket).await?;
         if input.key.is_empty() {
             return Err(s3s::s3_error!(InvalidRequest));
         }
@@ -695,9 +669,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         )?;
         let input = req.input;
         tracing::trace!(bucket = %input.bucket, key = %input.key, "CreateMultipartUpload");
-        self.state
-            .check_bucket(&self.storage, &input.bucket)
-            .await?;
+        check_bucket(&self.storage, &input.bucket).await?;
         let key = &input.key;
 
         // Extract checksum algorithm if provided, default to CRC64NVME
@@ -791,9 +763,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         let upload_id = &input.upload_id;
         let part_number = input.part_number;
         tracing::trace!(%upload_id, part_number, "UploadPart");
-        self.state
-            .check_bucket(&self.storage, &input.bucket)
-            .await?;
+        check_bucket(&self.storage, &input.bucket).await?;
 
         let client_checksums = crate::types::ClientChecksums::from(&input);
         let mut integrity_checks = crate::types::ObjectIntegrityChecks::from(&client_checksums);
@@ -881,9 +851,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         )?;
         let input = req.input;
         tracing::trace!(bucket = %input.bucket, key = %input.key, upload_id = %input.upload_id, "CompleteMultipartUpload");
-        self.state
-            .check_bucket(&self.storage, &input.bucket)
-            .await?;
+        check_bucket(&self.storage, &input.bucket).await?;
         let bucket = input.bucket.clone();
         let upload_id = &input.upload_id;
 
@@ -951,9 +919,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         )?;
         let input = req.input;
         tracing::trace!(bucket = %input.bucket, key = %input.key, upload_id = %input.upload_id, "AbortMultipartUpload");
-        self.state
-            .check_bucket(&self.storage, &input.bucket)
-            .await?;
+        check_bucket(&self.storage, &input.bucket).await?;
         let upload_id = &input.upload_id;
 
         // Abort the multipart upload
@@ -976,10 +942,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         let input = req.input;
         tracing::trace!(bucket = %input.bucket, prefix = ?input.prefix, delimiter = ?input.delimiter, "ListObjectsV2");
 
-        // Real S3 returns NoSuchBucket if the bucket doesn't exist
-        if !self.storage.head_bucket(&input.bucket).await? {
-            return Err(Error::NoSuchBucket.into());
-        }
+        check_bucket(&self.storage, &input.bucket).await?;
 
         let prefix = input.prefix.as_deref();
         let delimiter = input.delimiter.as_deref();
@@ -1125,9 +1088,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         )?;
         let input = req.input;
         tracing::trace!(bucket = %input.bucket, key = %input.key, "DeleteObject");
-        self.state
-            .check_bucket(&self.storage, &input.bucket)
-            .await?;
+        check_bucket(&self.storage, &input.bucket).await?;
         match &input.if_match {
             Some(condition) => {
                 self.storage
@@ -1190,6 +1151,19 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             ..Default::default()
         };
         Ok(S3Response::new(output))
+    }
+}
+
+/// Fail with NoSuchBucket if `bucket` does not exist in `storage`, as S3 does for requests on
+/// the objects of a missing bucket.
+pub(crate) async fn check_bucket(
+    storage: &(impl StorageBackend + ?Sized),
+    bucket: &str,
+) -> S3Result<()> {
+    if storage.head_bucket(bucket).await? {
+        Ok(())
+    } else {
+        Err(Error::NoSuchBucket.into())
     }
 }
 

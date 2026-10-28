@@ -121,10 +121,9 @@ impl StorageBackend for InMemoryStorage {
         };
 
         let mut buckets = self.buckets.write().await;
-        // Auto-create bucket if it doesn't exist (backward compatibility)
         let bucket_state = buckets
-            .entry(request.bucket)
-            .or_insert_with(BucketState::new);
+            .get_mut(&request.bucket)
+            .ok_or(Error::NoSuchBucket)?;
         // Checked under the write lock, so the condition holds at the moment of the write.
         request
             .precondition
@@ -595,6 +594,9 @@ impl StorageBackend for InMemoryStorage {
 
         // Completion errors leave the upload and its parts available for retry. Remove both only
         // after every request and checksum validation has succeeded.
+        if !self.buckets.read().await.contains_key(&bucket) {
+            return Err(Error::NoSuchBucket);
+        }
         {
             let mut multipart = self.multipart.write().await;
             if multipart.uploads.remove(request.upload_id).is_none() {
@@ -608,8 +610,7 @@ impl StorageBackend for InMemoryStorage {
         // Store the final object
         let combined_data = combined.freeze();
         let mut buckets = self.buckets.write().await;
-        // Auto-create bucket if it doesn't exist
-        let bucket_state = buckets.entry(bucket).or_insert_with(BucketState::new);
+        let bucket_state = buckets.get_mut(&bucket).ok_or(Error::NoSuchBucket)?;
         bucket_state
             .objects
             .insert(key.clone(), (combined_data, final_metadata.clone()));

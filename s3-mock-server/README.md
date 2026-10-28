@@ -30,8 +30,9 @@ async fn test_with_mock_server() -> Result<(), Box<dyn std::error::Error>> {
         .with_port(9000)  // Optional: specify port
         .build()?;
 
-    // Start the server
+    // Start the server, and create the bucket the test uses
     let handle = server.start().await?;
+    server.create_bucket("test-bucket").await?;
     
     // Get an S3 client configured for the mock server
     let s3_client = handle.client().await;
@@ -79,6 +80,7 @@ async fn test_transfer_manager_integration() -> Result<(), Box<dyn std::error::E
         .build()?;
     
     let handle = server.start().await?;
+    server.create_bucket("test-bucket").await?;
     let s3_client = handle.client().await;
 
     // Create Transfer Manager with mock server client
@@ -133,12 +135,10 @@ async fn test_filesystem_storage() -> Result<(), Box<dyn std::error::Error>> {
   ETag and `If-None-Match: *`. The server ignores other conditions. The in-memory store checks a
   write's or a delete's condition atomically with it.
 
-### S3 Behavior Options
+### Buckets
 
-Behaviors that the Transfer Manager's tests do not expect are opt-in on `S3MockServerBuilder`:
-
-- `with_bucket_check(true)`: fail object requests for a missing bucket with NoSuchBucket, instead
-  of creating the bucket on write.
+Create buckets with CreateBucket or `S3MockServer::create_bucket` before using them: object
+requests for a missing bucket fail with NoSuchBucket.
 
 ### Request Counts and Faults
 
