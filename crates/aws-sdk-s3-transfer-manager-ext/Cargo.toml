@@ -13,7 +13,7 @@ keywords = ["aws", "smithy", "s3", "runtime"]
 
 [dependencies]
 aws-smithy-execution.workspace = true
-aws-sdk-s3-transfer-manager = { workspace = true, features = ["__unstable_ext"] }
+aws-sdk-s3-transfer-manager = { workspace = true, default-features = false, features = ["__unstable_ext"] }
 
 [dev-dependencies]
 aws-smithy-managed-http = { workspace = true, features = ["client"] }
