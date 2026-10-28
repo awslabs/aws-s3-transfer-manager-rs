@@ -32,7 +32,8 @@ pub enum BodyCadence {
 #[derive(Debug, Clone)]
 pub enum FaultType {
     /// GET returns a valid-format but incorrect `x-amz-checksum-*` (first byte
-    /// XOR'd). Drives a download checksum mismatch.
+    /// XOR'd). Drives a download checksum mismatch. Has no effect on a GET whose
+    /// response has no checksum to corrupt, such as one without checksum mode.
     WrongStoredChecksum,
     /// GET returns tampered body bytes (byte 0 XOR'd) with the checksum left
     /// intact. Exercises body-content validation, not just header comparison.

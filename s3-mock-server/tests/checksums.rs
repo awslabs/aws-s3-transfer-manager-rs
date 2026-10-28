@@ -3,7 +3,7 @@
 
 //! Integration tests for S3 checksum compliance
 
-use aws_sdk_s3::types::{ChecksumAlgorithm, CompletedMultipartUpload, CompletedPart};
+use aws_sdk_s3::types::{ChecksumAlgorithm, ChecksumMode, CompletedMultipartUpload, CompletedPart};
 use bytes::Bytes;
 use s3_mock_server::S3MockServer;
 use uuid::Uuid;
@@ -441,7 +441,13 @@ async fn run_head_object_checksum_retrieval(
     put_request.send().await?;
 
     // Now head the object and verify checksum is returned
-    let head_response = s3.head_object().bucket(&bucket).key(key).send().await?;
+    let head_response = s3
+        .head_object()
+        .bucket(&bucket)
+        .key(key)
+        .checksum_mode(ChecksumMode::Enabled)
+        .send()
+        .await?;
 
     match algorithm {
         ChecksumAlgorithm::Crc32 => {
@@ -660,7 +666,13 @@ async fn run_head_object_multipart_checksum_retrieval(
         .await?;
 
     // Now head the multipart object and verify checksum is returned
-    let head_response = s3.head_object().bucket(&bucket).key(key).send().await?;
+    let head_response = s3
+        .head_object()
+        .bucket(&bucket)
+        .key(key)
+        .checksum_mode(ChecksumMode::Enabled)
+        .send()
+        .await?;
 
     // Should have some checksum (exact value depends on implementation - full object vs composite)
     match algorithm {

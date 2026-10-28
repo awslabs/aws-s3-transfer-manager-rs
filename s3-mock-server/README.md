@@ -148,6 +148,12 @@ async fn test_filesystem_storage() -> Result<(), Box<dyn std::error::Error>> {
 GetObject and HeadObject omit `x-amz-storage-class` for `STANDARD` objects; ListObjectsV2 reports
 `STANDARD` for objects stored without a storage class, as S3 general purpose buckets do.
 
+### Checksums
+
+- GetObject and HeadObject return an object's checksums only when the request sets
+  `x-amz-checksum-mode: ENABLED`, as S3 does. The SDK sets it on GetObject unless response
+  checksum validation is only performed when required.
+
 ### Listing
 
 ListObjectsV2 pages hold at most `max-keys` entries, counting each common prefix once, and never

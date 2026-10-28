@@ -493,6 +493,14 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         output.content_language = stream_metadata.content_language.map(|s| s.parse().unwrap());
         output.restore = stream_metadata.restore_status.map(restore_header);
 
+        // As in S3, checksums are returned only in checksum mode.
+        if !checksum_mode_enabled(input.checksum_mode.as_ref()) {
+            output.checksum_crc32 = None;
+            output.checksum_crc32c = None;
+            output.checksum_sha1 = None;
+            output.checksum_sha256 = None;
+            output.checksum_crc64nvme = None;
+        }
         apply_response_defaults_get(&mut output);
         self.apply_get_fault(fault, conn_fault.as_ref(), &mut output)
             .await?;
@@ -571,6 +579,14 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         output.content_disposition = metadata.content_disposition.map(|s| s.parse().unwrap());
         output.content_language = metadata.content_language.map(|s| s.parse().unwrap());
         output.restore = metadata.restore_status.map(restore_header);
+        // As in S3, checksums are returned only in checksum mode.
+        if !checksum_mode_enabled(input.checksum_mode.as_ref()) {
+            output.checksum_crc32 = None;
+            output.checksum_crc32c = None;
+            output.checksum_sha1 = None;
+            output.checksum_sha256 = None;
+            output.checksum_crc64nvme = None;
+        }
 
         apply_response_defaults_head(&mut output);
         Ok(S3Response::new(output))
@@ -1255,6 +1271,11 @@ fn listed_storage_class(storage_class: &Option<String>) -> String {
     storage_class
         .clone()
         .unwrap_or_else(|| s3s::dto::StorageClass::STANDARD.to_owned())
+}
+
+/// Whether a request set `x-amz-checksum-mode: ENABLED`.
+fn checksum_mode_enabled(mode: Option<&s3s::dto::ChecksumMode>) -> bool {
+    mode.is_some_and(|mode| mode.as_str().eq_ignore_ascii_case("ENABLED"))
 }
 
 /// The `x-amz-restore` header for a restore status.
