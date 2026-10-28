@@ -822,18 +822,20 @@ mod tests {
         let original = b"original opened file";
         let changed = b"replacement contents";
         assert_eq!(original.len(), changed.len());
-        std::fs::write(&path, original).unwrap();
+        for direct_io in [true, false] {
+            std::fs::write(&path, original).unwrap();
 
-        let pool = test_pool();
-        let stream = InputStream::read_from().path(&path).build().unwrap();
-        let body = stream.into_sdk_body(true, pool.clone()).unwrap();
-        let retry = body.try_clone().expect("file body should be retryable");
-        std::fs::write(&replacement, changed).unwrap();
-        std::fs::rename(&replacement, &path).unwrap();
+            let pool = test_pool();
+            let stream = InputStream::read_from().path(&path).build().unwrap();
+            let body = stream.into_sdk_body(direct_io, pool.clone()).unwrap();
+            let retry = body.try_clone().expect("file body should be retryable");
+            std::fs::write(&replacement, changed).unwrap();
+            std::fs::rename(&replacement, &path).unwrap();
 
-        assert_eq!(collect_body(body).await.unwrap(), original);
-        assert_eq!(collect_body(retry).await.unwrap(), original);
-        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+            assert_eq!(collect_body(body).await.unwrap(), original);
+            assert_eq!(collect_body(retry).await.unwrap(), original);
+            assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        }
     }
 
     #[cfg_attr(miri, ignore)]

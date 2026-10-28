@@ -263,6 +263,58 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_observers_start_one_joiner() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let id = RuntimeId::allocate().unwrap();
+        let (observer, released) = completion(id);
+        observer.release(vec![thread::spawn(|| {})]);
+        released.send_replace(true);
+        let starts = Arc::new(AtomicUsize::new(0));
+        let waiters: Vec<_> = (0..4)
+            .map(|_| {
+                let observer = observer.clone();
+                let starts = starts.clone();
+                thread::spawn(move || {
+                    caller().block_on(observer.wait_with(move |job| {
+                        starts.fetch_add(1, Ordering::SeqCst);
+                        start(job)
+                    }))
+                })
+            })
+            .collect();
+        for waiter in waiters {
+            waiter.join().unwrap().unwrap();
+        }
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        caller().block_on(observer.wait()).unwrap();
+    }
+
+    #[test]
+    fn repeated_waits_share_joiner_failure_and_source() {
+        let id = RuntimeId::allocate().unwrap();
+        let (observer, released) = completion(id);
+        observer.release(Vec::new());
+        released.send_replace(true);
+        let first = caller()
+            .block_on(observer.wait_with(|_| {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "joiner denied",
+                ))
+            }))
+            .unwrap_err();
+        let second = caller()
+            .block_on(observer.wait_with(|_| panic!("a failed join cannot start a second joiner")))
+            .unwrap_err();
+        assert_eq!(first.kind(), ShutdownErrorKind::Joiner);
+        assert_eq!(second.kind(), first.kind());
+        assert!(std::ptr::eq(
+            first.source().unwrap(),
+            second.source().unwrap()
+        ));
+    }
+
+    #[test]
     fn lost_completion_is_reported() {
         let id = RuntimeId::allocate().unwrap();
         let result = caller().block_on(join_with(id, Vec::new(), |job| {

@@ -89,143 +89,156 @@ async fn adopted_file_upload_uses_configured_native_pool_and_retains_runtime_unt
     use aws_smithy_http_client::test_util::wire::connection::{ManualGate, SocketScript};
     use std::io::Write;
 
-    let owner = runtime();
-    let execution = owner.handle();
-    let watch = watch_owner(&execution).await;
-    let completion = owner.shutdown_completion();
-    let gate = ManualGate::new();
-    let payload = vec![0x5a; 128 * 1024];
-    let mut file = tempfile::NamedTempFile::new().unwrap();
-    file.write_all(&payload).unwrap();
-    let mut checksum = aws_smithy_checksums::ChecksumAlgorithm::Crc32.into_impl();
-    checksum.update(&payload);
-    let checksum = checksum.header_value().to_str().unwrap().to_owned();
-    let harness = ConnectionTestHarness::builder()
-        .endpoint(
-            IpAddr::V4(Ipv4Addr::LOCALHOST),
-            EndpointPlan::repeat_n(
-                1,
-                SocketScript::new()
-                    .read_until(b"\r\n\r\n", 64 * 1024)
-                    .expect_bytes(&payload)
-                    .wait(gate.waiter())
-                    .write_all(
+    for cancel in [false, true] {
+        let owner = runtime();
+        let execution = owner.handle();
+        let watch = watch_owner(&execution).await;
+        let completion = owner.shutdown_completion();
+        let gate = ManualGate::new();
+        let payload = vec![0x5a; 128 * 1024];
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&payload).unwrap();
+        let mut checksum = aws_smithy_checksums::ChecksumAlgorithm::Crc32.into_impl();
+        checksum.update(&payload);
+        let checksum = checksum.header_value().to_str().unwrap().to_owned();
+        let harness = ConnectionTestHarness::builder()
+            .endpoint(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                EndpointPlan::repeat_n(1, {
+                    let script = SocketScript::new()
+                        .read_until(b"\r\n\r\n", 64 * 1024)
+                        .expect_bytes(&payload)
+                        .wait(gate.waiter());
+                    if cancel {
+                        script.await_client_close()
+                    } else {
+                        script                    .write_all(
                         b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nETag: \"test-etag\"\r\n\r\n",
                     )
-                    .await_client_close(),
-            ),
-        )
-        .build()
-        .await
-        .unwrap();
-    let opened = Arc::new(Mutex::new(Vec::new()));
-    let observed = opened.clone();
-    let driver_execution = execution.clone();
-    let http = {
-        let pool = ManagedHttpPool::builder()
-            .pool_builder(
-                pool::ConnectionPool::builder()
-                    .max_connections_per_host(1)
-                    .event_listener(move |event: &pool::ConnectionEvent<'_>| {
-                        if let pool::ConnectionEvent::Opened(event) = event {
-                            observed
-                                .lock()
-                                .unwrap()
-                                .push(driver_execution.current_partition().unwrap().id());
-                            assert_eq!(
-                                event.establishment().partition(),
-                                pool::PartitionId::from_index(
-                                    driver_execution.current_partition().unwrap().id().index()
-                                ),
-                            );
-                        }
-                    }),
+.await_client_close()
+                    }
+                }),
             )
-            .runtime(execution.clone())
             .build()
+            .await
             .unwrap();
-        pool.clone()
-    };
-    let sdk = aws_types::SdkConfig::builder()
-        .http_client(http.clone())
-        .region(aws_types::region::Region::new("us-west-2"))
-        .credentials_provider(SharedCredentialsProvider::new(Credentials::new(
-            "test", "test", None, None, "test",
-        )))
-        .endpoint_url(format!("http://127.0.0.1:{}", harness.port()))
-        .behavior_version(
-            aws_smithy_runtime_api::client::behavior_version::BehaviorVersion::latest(),
-        )
-        .build();
-    let client = tm::Client::new(
-        tm::Config::builder()
-            .s3_config(&sdk)
-            .runtime_config(tm::RuntimeConfig::managed(tm_ext::managed(owner)))
-            .build(),
-    );
-    let stopped = client.shutdown_completion().unwrap();
-    let upload = client
-        .upload()
-        .bucket("test-bucket")
-        .key("file")
-        .checksum_strategy(tm::operation::upload::ChecksumStrategy::with_crc32(
-            &checksum,
-        ))
-        .body(tm::io::InputStream::from_path(file.path()).unwrap())
-        .initiate()
-        .unwrap();
-    gate.wait_until_reached(WAIT).await.unwrap();
-    drop(client);
-    assert_eq!(
-        execution.partitions()[0].spawn(async { 42 }).await.unwrap(),
-        42,
-        "an active transfer must retain the adopted owner",
-    );
-    gate.release();
-    let output = tokio::time::timeout(WAIT, upload.join())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(
-        output.upload_id().is_none(),
-        "exercise file-backed single PUT"
-    );
-    assert_eq!(harness.tcp_accepted_count(), 1);
-    {
-        let observed = opened.lock().unwrap();
-        assert_eq!(
-            observed.len(),
-            1,
-            "the configured native pool handled the upload"
+        let opened = Arc::new(Mutex::new(Vec::new()));
+        let observed = opened.clone();
+        let driver_execution = execution.clone();
+        let http = {
+            let pool = ManagedHttpPool::builder()
+                .pool_builder(
+                    pool::ConnectionPool::builder()
+                        .max_connections_per_host(1)
+                        .event_listener(move |event: &pool::ConnectionEvent<'_>| {
+                            if let pool::ConnectionEvent::Opened(event) = event {
+                                observed
+                                    .lock()
+                                    .unwrap()
+                                    .push(driver_execution.current_partition().unwrap().id());
+                                assert_eq!(
+                                    event.establishment().partition(),
+                                    pool::PartitionId::from_index(
+                                        driver_execution.current_partition().unwrap().id().index()
+                                    ),
+                                );
+                            }
+                        }),
+                )
+                .runtime(execution.clone())
+                .build()
+                .unwrap();
+            pool.clone()
+        };
+        let sdk = aws_types::SdkConfig::builder()
+            .http_client(http.clone())
+            .region(aws_types::region::Region::new("us-west-2"))
+            .credentials_provider(SharedCredentialsProvider::new(Credentials::new(
+                "test", "test", None, None, "test",
+            )))
+            .endpoint_url(format!("http://127.0.0.1:{}", harness.port()))
+            .behavior_version(
+                aws_smithy_runtime_api::client::behavior_version::BehaviorVersion::latest(),
+            )
+            .build();
+        let client = tm::Client::new(
+            tm::Config::builder()
+                .s3_config(&sdk)
+                .runtime_config(tm::RuntimeConfig::managed(tm_ext::managed(owner)))
+                .build(),
         );
-        assert_eq!(observed[0].runtime_id(), execution.id());
-    }
-
-    // Scheduler descriptors are retired through the existing global epoch
-    // collector. Advance collection before asserting final owner destruction.
-    tokio::time::timeout(WAIT, async {
-        let retired = crossbeam_skiplist::SkipMap::new();
-        while !watch.is_finished() {
-            for index in 0..256 {
-                retired.insert(index, ());
-                retired.remove(&index);
-            }
-            tokio::task::yield_now().await;
+        let stopped = client.shutdown_completion().unwrap();
+        let upload = client
+            .upload()
+            .bucket("test-bucket")
+            .key("file")
+            .checksum_strategy(tm::operation::upload::ChecksumStrategy::with_crc32(
+                &checksum,
+            ))
+            .body(tm::io::InputStream::from_path(file.path()).unwrap())
+            .initiate()
+            .unwrap();
+        gate.wait_until_reached(WAIT).await.unwrap();
+        drop(client);
+        assert_eq!(
+            execution.partitions()[0].spawn(async { 42 }).await.unwrap(),
+            42,
+            "an active transfer must retain the adopted owner",
+        );
+        if cancel {
+            tokio::time::timeout(WAIT, upload.abort())
+                .await
+                .unwrap()
+                .unwrap();
+            gate.release();
+        } else {
+            gate.release();
+            let output = tokio::time::timeout(WAIT, upload.join())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                output.upload_id().is_none(),
+                "exercise file-backed single PUT"
+            );
         }
-    })
-    .await
-    .unwrap();
-    assert_stopped(watch).await;
-    tokio::time::timeout(WAIT, stopped.wait())
+        assert_eq!(harness.tcp_accepted_count(), 1);
+        {
+            let observed = opened.lock().unwrap();
+            assert_eq!(
+                observed.len(),
+                1,
+                "the configured native pool handled the upload"
+            );
+            assert_eq!(observed[0].runtime_id(), execution.id());
+        }
+
+        // Scheduler descriptors are retired through the existing global epoch
+        // collector. Advance collection before asserting final owner destruction.
+        tokio::time::timeout(WAIT, async {
+            let retired = crossbeam_skiplist::SkipMap::new();
+            while !watch.is_finished() {
+                for index in 0..256 {
+                    retired.insert(index, ());
+                    retired.remove(&index);
+                }
+                tokio::task::yield_now().await;
+            }
+        })
         .await
-        .unwrap()
         .unwrap();
-    completion.wait().await.unwrap();
-    assert!(
-        http.connector_metadata().is_some(),
-        "the HTTP view remains alive"
-    );
-    harness.shutdown().await.unwrap();
+        assert_stopped(watch).await;
+        tokio::time::timeout(WAIT, stopped.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        completion.wait().await.unwrap();
+        assert!(
+            http.connector_metadata().is_some(),
+            "the HTTP view remains alive"
+        );
+        harness.shutdown().await.unwrap();
+    }
 }
 
 #[tokio::test]

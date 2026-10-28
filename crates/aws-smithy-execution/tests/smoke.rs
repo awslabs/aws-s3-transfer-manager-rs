@@ -74,6 +74,8 @@ fn cross_thread_tasks_stay_on_their_partition_and_scope_current_identity() {
         threads.insert(thread.0);
     }
     assert_eq!(threads.len(), execution.partitions().len());
+    awaiting.block_on(first.shutdown()).unwrap();
+    awaiting.block_on(second.shutdown()).unwrap();
 }
 
 #[test]
@@ -106,6 +108,7 @@ fn thread_drives_socket_io_and_timers() {
         *b"ready"
     );
     server.join().unwrap();
+    caller().block_on(runtime.shutdown()).unwrap();
 }
 
 struct DropSignal(mpsc::Sender<()>);
@@ -123,6 +126,7 @@ thread_local! {
 #[test]
 fn retained_handles_do_not_keep_threads_running_after_owner_drop() {
     let runtime = runtime();
+    let completion = runtime.shutdown_completion();
     let execution = runtime.handle();
     let mut pending = Vec::new();
     let mut dropped = Vec::new();
@@ -155,11 +159,13 @@ fn retained_handles_do_not_keep_threads_running_after_owner_drop() {
                 .is_cancelled()
         );
     }
+    caller().block_on(completion.wait()).unwrap();
 }
 
 #[test]
 fn owner_can_be_dropped_on_its_own_thread() {
     let runtime = runtime();
+    let completion = runtime.shutdown_completion();
     let partition = runtime.handle().partitions()[0].clone();
     let task = partition.spawn(async move {
         drop(runtime);
@@ -169,11 +175,13 @@ fn owner_can_be_dropped_on_its_own_thread() {
         caller().block_on(async { tokio::time::timeout(TIMEOUT, task).await.unwrap().unwrap() }),
         42
     );
+    caller().block_on(completion.wait()).unwrap();
 }
 
 #[test]
 fn owner_drop_does_not_wait_for_running_blocking_tasks() {
     let runtime = runtime();
+    let completion = runtime.shutdown_completion();
     let partition = runtime.handle().partitions()[0].clone();
     let (started_tx, started) = mpsc::channel();
     let (release_tx, release) = mpsc::channel::<()>();
@@ -204,6 +212,7 @@ fn owner_drop_does_not_wait_for_running_blocking_tasks() {
     if let Err(error) = awaiting.block_on(task) {
         assert!(error.is_cancelled());
     }
+    caller().block_on(completion.wait()).unwrap();
 }
 
 #[test]
@@ -248,6 +257,7 @@ fn partition_targets_thread_and_blocking_threads_have_no_partition_identity() {
     let (name, blocking_is_outside) = awaiting.block_on(task).unwrap();
     assert!(name.starts_with("thread-test-"));
     assert!(blocking_is_outside);
+    awaiting.block_on(runtime.shutdown()).unwrap();
 }
 
 #[test]
@@ -339,6 +349,7 @@ fn async_shutdown_waits_for_blocking_tasks_without_blocking_caller() {
 #[test]
 fn shutdown_from_managed_thread_returns_error() {
     let runtime = runtime();
+    let completion = runtime.shutdown_completion();
     let id = runtime.handle().id();
     let partition = runtime.handle().partitions()[0].clone();
     let task = partition.spawn(async move { runtime.shutdown().await });
@@ -348,11 +359,13 @@ fn shutdown_from_managed_thread_returns_error() {
     assert_eq!(error.kind(), ShutdownErrorKind::FromRuntime);
     assert!(error.to_string().contains("thread it owns"));
     assert!(error.to_string().contains(&id.to_string()));
+    caller().block_on(completion.wait()).unwrap();
 }
 
 #[test]
 fn shutdown_from_own_blocking_thread_rejects_foreign_tokio_context() {
     let runtime = runtime();
+    let completion = runtime.shutdown_completion();
     let partition = runtime.handle().partitions()[0].clone();
     let (result_tx, result) = mpsc::channel();
     let task = partition.spawn(async move {
@@ -373,12 +386,14 @@ fn shutdown_from_own_blocking_thread_rejects_foreign_tokio_context() {
     if let Err(error) = caller().block_on(task) {
         assert!(error.is_cancelled());
     }
+    caller().block_on(completion.wait()).unwrap();
 }
 
 #[test]
 fn dropping_shutdown_future_keeps_shutdown_requested() {
     for poll_first in [false, true] {
         let runtime = runtime();
+        let completion = runtime.shutdown_completion();
         let execution = runtime.handle();
         let partition = execution.partitions()[0].clone();
         let (started_tx, started) = mpsc::channel();
@@ -415,6 +430,7 @@ fn dropping_shutdown_future_keeps_shutdown_requested() {
                 .unwrap_err()
                 .is_cancelled()
         );
+        caller().block_on(completion.wait()).unwrap();
     }
 }
 
@@ -463,6 +479,7 @@ fn default_pinning_binds_identified_targets() {
         assert_eq!(processors.len(), 1);
         assert_eq!(processors[0].id(), expected);
     }
+    awaiting.block_on(runtime.shutdown()).unwrap();
 }
 
 #[cfg(feature = "dial9")]
@@ -506,6 +523,7 @@ mod tracing {
     }
 
     fn rejects_blocking_self_wait(runtime: ManagedRuntime) {
+        let completion = runtime.shutdown_completion();
         let partition = runtime.handle().partitions()[0].clone();
         let (result_tx, result) = mpsc::channel();
         let task = partition.spawn(async move {
@@ -524,6 +542,7 @@ mod tracing {
         if let Err(error) = caller().block_on(task) {
             assert!(error.is_cancelled());
         }
+        caller().block_on(completion.wait()).unwrap();
     }
 
     #[test]

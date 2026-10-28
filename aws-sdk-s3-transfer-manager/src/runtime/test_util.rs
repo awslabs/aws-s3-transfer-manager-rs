@@ -35,3 +35,17 @@ pub(crate) fn block_on<F: Future>(future: F) -> F::Output {
         }
     }
 }
+
+/// Requests shutdown through the runtime adapter and joins owned threads.
+///
+/// Caller-owned Tokio runtimes remain the test fixture's responsibility.
+pub(crate) async fn shutdown(handle: &crate::client::Handle) {
+    let completion = handle.runtime.shutdown_completion();
+    handle.runtime.shutdown();
+    if let Some(completion) = completion {
+        tokio::time::timeout(std::time::Duration::from_secs(5), completion.wait())
+            .await
+            .expect("managed threads did not finish test teardown")
+            .expect("managed thread shutdown failed");
+    }
+}
