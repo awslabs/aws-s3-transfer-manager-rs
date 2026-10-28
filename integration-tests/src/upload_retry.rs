@@ -61,6 +61,10 @@ async fn setup_with_fault(
         .build()
         .expect("build mock server");
     let handle = server.start().await.expect("start mock server");
+    server
+        .create_bucket("test-bucket")
+        .await
+        .expect("create bucket");
 
     let (http_client, tally) = io_fault_http_client(is_upload_part, fail);
 

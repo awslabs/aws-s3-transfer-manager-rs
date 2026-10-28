@@ -65,7 +65,8 @@ pub(crate) fn init_test_logs() {
 // Lightweight mock-only path
 // ---------------------------------------------------------------------------
 
-/// A transfer-manager client wired to a fresh in-memory mock server.
+/// A transfer-manager client wired to a fresh in-memory mock server, with a bucket named
+/// `test-bucket`.
 ///
 /// The mock-only counterpart to [`Target`]: no bucket-kind / real-S3 / express
 /// machinery, just the boilerplate every mock test repeats. Holds the server
@@ -124,6 +125,10 @@ pub(crate) async fn mock_tm_with_s3_config(
         .build()
         .expect("build mock server");
     let handle = server.start().await.expect("start mock server");
+    server
+        .create_bucket("test-bucket")
+        .await
+        .expect("create bucket");
     let s3_config = configure_s3(mock_s3_config(&handle).await);
     let cfg = configure(aws_sdk_s3_transfer_manager::Config::builder().s3_config(s3_config))
         .runtime_mode(runtime)

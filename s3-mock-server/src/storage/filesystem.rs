@@ -838,6 +838,7 @@ mod tests {
     async fn test_put_and_get_object() {
         let temp_dir = tempdir().unwrap();
         let storage = FilesystemStorage::new(temp_dir.path()).await.unwrap();
+        storage.create_bucket(TEST_BUCKET).await.unwrap();
         let key = "test-key";
         let content = Bytes::from("test content");
         let integrity_checks = ObjectIntegrityChecks::new().with_md5();
@@ -871,6 +872,7 @@ mod tests {
     async fn test_get_object_with_range() {
         let temp_dir = tempdir().unwrap();
         let storage = FilesystemStorage::new(temp_dir.path()).await.unwrap();
+        storage.create_bucket(TEST_BUCKET).await.unwrap();
         let key = "test-key";
         let content = Bytes::from("0123456789");
         let integrity_checks = ObjectIntegrityChecks::new().with_md5();
@@ -902,6 +904,7 @@ mod tests {
     async fn test_delete_object() {
         let temp_dir = tempdir().unwrap();
         let storage = FilesystemStorage::new(temp_dir.path()).await.unwrap();
+        storage.create_bucket(TEST_BUCKET).await.unwrap();
         let key = "test-key";
         let content = Bytes::from("test content");
         let integrity_checks = ObjectIntegrityChecks::new().with_md5();
@@ -940,6 +943,7 @@ mod tests {
     async fn test_list_objects() {
         let temp_dir = tempdir().unwrap();
         let storage = FilesystemStorage::new(temp_dir.path()).await.unwrap();
+        storage.create_bucket(TEST_BUCKET).await.unwrap();
         let content = Bytes::from("test content");
 
         for i in 0..3 {
@@ -977,6 +981,7 @@ mod tests {
     async fn test_multipart_upload() {
         let temp_dir = tempdir().unwrap();
         let storage = FilesystemStorage::new(temp_dir.path()).await.unwrap();
+        storage.create_bucket(TEST_BUCKET).await.unwrap();
         let upload_id = "test-upload-123";
         let key = "test-multipart-key";
         let metadata = create_test_metadata(0);
@@ -1041,6 +1046,7 @@ mod tests {
     async fn test_multipart_upload_missing_part() {
         let temp_dir = tempdir().unwrap();
         let storage = FilesystemStorage::new(temp_dir.path()).await.unwrap();
+        storage.create_bucket(TEST_BUCKET).await.unwrap();
         let upload_id = "test-upload-123";
         let key = "test-multipart-key";
         let metadata = create_test_metadata(0);
@@ -1077,6 +1083,7 @@ mod tests {
     async fn test_abort_multipart_upload() {
         let temp_dir = tempdir().unwrap();
         let storage = FilesystemStorage::new(temp_dir.path()).await.unwrap();
+        storage.create_bucket(TEST_BUCKET).await.unwrap();
         let upload_id = "test-upload-123";
         let key = "test-multipart-key";
         let metadata = create_test_metadata(0);
@@ -1108,6 +1115,7 @@ mod tests {
     async fn test_nested_object_keys() {
         let temp_dir = tempdir().unwrap();
         let storage = FilesystemStorage::new(temp_dir.path()).await.unwrap();
+        storage.create_bucket(TEST_BUCKET).await.unwrap();
         let key = "nested/path/to/test-key";
         let content = Bytes::from("test content");
         let integrity_checks = ObjectIntegrityChecks::new().with_md5();
@@ -1147,6 +1155,7 @@ mod tests {
     async fn test_empty_key() {
         let temp_dir = tempdir().unwrap();
         let storage = FilesystemStorage::new(temp_dir.path()).await.unwrap();
+        storage.create_bucket(TEST_BUCKET).await.unwrap();
         let key = "";
         let content = Bytes::from("test content");
         let integrity_checks = ObjectIntegrityChecks::new().with_md5();

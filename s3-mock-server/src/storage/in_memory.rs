@@ -688,6 +688,7 @@ mod tests {
     #[tokio::test]
     async fn test_put_and_get_object() {
         let storage = InMemoryStorage::new();
+        storage.create_bucket(TEST_BUCKET).await.unwrap();
         let key = "test-key";
         let content = Bytes::from("test content");
         let integrity_checks = ObjectIntegrityChecks::new().with_md5();
@@ -722,6 +723,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_object_with_range() {
         let storage = InMemoryStorage::new();
+        storage.create_bucket(TEST_BUCKET).await.unwrap();
         let key = "test-key";
         let content = Bytes::from("0123456789");
         let integrity_checks = ObjectIntegrityChecks::new().with_md5();
@@ -752,6 +754,7 @@ mod tests {
     #[tokio::test]
     async fn test_delete_object() {
         let storage = InMemoryStorage::new();
+        storage.create_bucket(TEST_BUCKET).await.unwrap();
         let key = "test-key";
         let content = Bytes::from("test content");
         let integrity_checks = ObjectIntegrityChecks::new().with_md5();
@@ -789,6 +792,7 @@ mod tests {
     #[tokio::test]
     async fn test_list_objects() {
         let storage = InMemoryStorage::new();
+        storage.create_bucket(TEST_BUCKET).await.unwrap();
         let content = Bytes::from("test content");
 
         for i in 0..3 {
@@ -825,6 +829,7 @@ mod tests {
     #[tokio::test]
     async fn test_multipart_upload() {
         let storage = InMemoryStorage::new();
+        storage.create_bucket(TEST_BUCKET).await.unwrap();
         let upload_id = "test-upload-123";
         let key = "test-multipart-key";
         let metadata = create_test_metadata(0);
@@ -953,6 +958,7 @@ mod tests {
     #[tokio::test]
     async fn test_rejected_multipart_completion_retains_upload() {
         let storage = InMemoryStorage::new();
+        storage.create_bucket(TEST_BUCKET).await.unwrap();
         let upload_id = "test-upload-123";
         let key = "test-multipart-key";
         let metadata = create_test_metadata(0);
@@ -1007,6 +1013,7 @@ mod tests {
     #[tokio::test]
     async fn test_checksum_rejection_retains_multipart_upload() {
         let storage = InMemoryStorage::new();
+        storage.create_bucket(TEST_BUCKET).await.unwrap();
         let upload_id = "test-upload-checksum";
         let key = "test-multipart-checksum-key";
         let mut metadata = create_test_metadata(0);

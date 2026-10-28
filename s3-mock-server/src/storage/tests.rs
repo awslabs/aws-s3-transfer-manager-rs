@@ -37,6 +37,7 @@ async fn collect_stream_data(
 
 /// Test multipart upload with range requests to ensure no blocking issues
 async fn test_multipart_streaming_comprehensive<S: StorageBackend>(storage: &S) {
+    storage.create_bucket(TEST_BUCKET).await.unwrap();
     let key = "test-multipart-streaming";
     let upload_id = "test-upload-streaming";
     let metadata = ObjectMetadata {
@@ -235,6 +236,7 @@ async fn test_storage_backend_consistency() {
         &fs_storage as &dyn StorageBackend,
         &mem_storage as &dyn StorageBackend,
     ] {
+        storage.create_bucket(TEST_BUCKET).await.unwrap();
         let content_for_stream = content.clone();
         let stream = futures::stream::once(async move { Ok(content_for_stream) });
         let request = StoreObjectRequest {
@@ -284,6 +286,7 @@ async fn test_checksum_storage_and_retrieval() {
 }
 
 async fn test_checksum_storage_backend<S: StorageBackend + ?Sized>(storage: &S) {
+    storage.create_bucket(TEST_BUCKET).await.unwrap();
     let key = "test-checksum-object";
     let test_data = Bytes::from("Hello, checksum world!");
 

@@ -1304,6 +1304,7 @@ mod tests {
     async fn test_get_object_range() {
         // Create a test instance
         let storage = InMemoryStorage::new();
+        storage.create_bucket("test-bucket").await.unwrap();
         let inner = Inner::new(storage);
         let content = "This is a test content that is exactly 100 bytes long to make our range test work properly..........";
         let _ = create_object(&inner, "test-key", content, None).await;
@@ -1345,6 +1346,7 @@ mod tests {
     async fn test_get_object_range_edge_cases() {
         // Create a test instance
         let storage = InMemoryStorage::new();
+        storage.create_bucket("test-bucket").await.unwrap();
         let inner = Inner::new(storage);
         let content = "0123456789"; // 10 bytes
         let _ = create_object(&inner, "test-key", content, None).await;
@@ -1383,6 +1385,7 @@ mod tests {
     #[tokio::test]
     async fn test_checksum_validation() {
         let storage = InMemoryStorage::new();
+        storage.create_bucket("test-bucket").await.unwrap();
         let inner = Inner::new(storage);
 
         let content = b"Hello, checksum world!";
@@ -1432,6 +1435,7 @@ mod tests {
     #[tokio::test]
     async fn test_default_crc64nvme() {
         let storage = InMemoryStorage::new();
+        storage.create_bucket("test-bucket").await.unwrap();
         let inner = Inner::new(storage);
 
         let content = b"Test default checksum";
@@ -1463,6 +1467,7 @@ mod tests {
     #[tokio::test]
     async fn test_upload_part_checksum_validation() {
         let storage = InMemoryStorage::new();
+        storage.create_bucket("test-bucket").await.unwrap();
         let inner = Inner::new(storage);
 
         // First create a multipart upload
@@ -1529,6 +1534,7 @@ mod tests {
     #[tokio::test]
     async fn test_part_number_validation() {
         let storage = InMemoryStorage::new();
+        storage.create_bucket("test-bucket").await.unwrap();
         let inner = Inner::new(storage);
 
         // Create multipart upload
@@ -1641,6 +1647,7 @@ mod tests {
     #[tokio::test]
     async fn test_default_crc64nvme_multipart() {
         let storage = InMemoryStorage::new();
+        storage.create_bucket("test-bucket").await.unwrap();
         let inner = Inner::new(storage);
 
         // Test CreateMultipartUpload without specifying algorithm - should default to CRC64NVME
@@ -1668,6 +1675,7 @@ mod tests {
     #[tokio::test]
     async fn test_checksum_type_validation() {
         let storage = InMemoryStorage::new();
+        storage.create_bucket("test-bucket").await.unwrap();
         let inner = Inner::new(storage);
 
         // Test invalid combination: MD5 with FULL_OBJECT should fail
