@@ -241,6 +241,9 @@ write signed with a session.
 - ListObjectsV2 lists keys in no particular order, with each common prefix as one entry. It
   fails with 400 InvalidRequest for a delimiter other than `/` or a prefix that does not end in
   `/`, and with 501 NotSupported for `start-after`.
+- A range or `partNumber` read of part of a multipart object with a full-object checksum
+  returns the part's checksum if the part was uploaded with one; general purpose buckets
+  return none.
 
 ### Buckets
 

@@ -138,6 +138,9 @@ pub enum RestoreStatus {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct ObjectPart {
     pub size: u64,
+    /// Whether the part was uploaded with a checksum. S3 reports a part's checksum only then.
+    #[serde(default)]
+    pub client_checksum: bool,
     pub crc32: Option<String>,
     pub crc32c: Option<String>,
     pub crc64nvme: Option<String>,
@@ -296,6 +299,10 @@ pub(crate) struct PartMetadata {
     pub crc64nvme: Option<String>,
     pub sha1: Option<String>,
     pub sha256: Option<String>,
+
+    /// Whether the part was uploaded with a checksum.
+    #[serde(default)]
+    pub client_checksum: bool,
 }
 
 /// Metadata for a multipart upload.

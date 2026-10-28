@@ -421,7 +421,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         if let Some(part_number) = input.part_number {
             stream_metadata.apply_part_checksums(part_number);
         }
-        if omits_part_checksums(&metadata, input.part_number, range.as_ref()) {
+        if omits_part_checksums(bucket, &metadata, input.part_number, range.as_ref()) {
             stream_metadata.clear_checksums();
         }
 
@@ -542,7 +542,8 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             .as_ref()
             .map(|r| content_range_header(r, metadata.content_length));
         let checksum_type = stored_checksum_type(&metadata);
-        let omit_checksums = omits_part_checksums(&metadata, input.part_number, range.as_ref());
+        let omit_checksums =
+            omits_part_checksums(bucket, &metadata, input.part_number, range.as_ref());
         match (input.part_number, range.as_ref()) {
             (Some(part_number), _) => metadata.apply_part_checksums(part_number),
             (None, Some(r)) => metadata.apply_range_checksums(r.start, r.end),
@@ -798,6 +799,8 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             Some(&req.input.bucket),
             Some(&req.input.key),
         )?;
+        // s3s keeps a trailing checksum out of the input; the request declares it.
+        let trailing_checksum = req.headers.contains_key("x-amz-trailer");
         let input = req.input;
         let upload_id = &input.upload_id;
         let part_number = input.part_number;
@@ -864,6 +867,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             upload_id,
             part_number,
             content,
+            client_checksum: client_checksums.has_any() || trailing_checksum,
         };
         let response = self.storage.upload_part(request).await?;
 
@@ -1332,19 +1336,24 @@ fn part_number_range(
 }
 
 /// Whether a GetObject or HeadObject of part of `metadata`'s object (a `part_number`, or a
-/// `range` other than the whole object) returns no checksum: S3 returns none for the parts of a
-/// multipart object with a full-object checksum.
+/// `range` other than the whole object) returns no checksum, as in S3: for the parts of a
+/// multipart object uploaded without part checksums, and, in general purpose buckets, for those
+/// of a multipart object with a full-object checksum.
 fn omits_part_checksums(
+    bucket: &str,
     metadata: &ObjectMetadata,
     part_number: Option<i32>,
     range: Option<&std::ops::Range<u64>>,
 ) -> bool {
     let partial = part_number.is_some()
         || range.is_some_and(|range| range.start != 0 || range.end != metadata.content_length);
+    let full_object_in_general_purpose = BucketType::of(bucket) == BucketType::GeneralPurpose
+        && stored_checksum_type(metadata)
+            .is_some_and(|t| t.as_str() == s3s::dto::ChecksumType::FULL_OBJECT);
     partial
         && !metadata.parts.is_empty()
-        && stored_checksum_type(metadata)
-            .is_some_and(|t| t.as_str() == s3s::dto::ChecksumType::FULL_OBJECT)
+        && (full_object_in_general_purpose
+            || metadata.parts.iter().any(|part| !part.client_checksum))
 }
 
 /// Fail a request whose digest headers are malformed before its body is read, as S3 does: a

@@ -67,6 +67,7 @@ async fn test_multipart_streaming_comprehensive<S: StorageBackend>(storage: &S) 
         upload_id,
         part_number: 1,
         content: part1.clone(),
+        client_checksum: false,
     };
     let etag1 = storage.upload_part(request1).await.unwrap().etag;
 
@@ -74,6 +75,7 @@ async fn test_multipart_streaming_comprehensive<S: StorageBackend>(storage: &S) 
         upload_id,
         part_number: 2,
         content: part2.clone(),
+        client_checksum: false,
     };
     let etag2 = storage.upload_part(request2).await.unwrap().etag;
 
@@ -81,6 +83,7 @@ async fn test_multipart_streaming_comprehensive<S: StorageBackend>(storage: &S) 
         upload_id,
         part_number: 3,
         content: part3.clone(),
+        client_checksum: false,
     };
     let etag3 = storage.upload_part(request3).await.unwrap().etag;
 

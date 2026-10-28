@@ -277,3 +277,145 @@ async fn test_listing() -> Result {
         .await?;
     Ok(())
 }
+
+/// A range or partNumber read of part of a multipart object with a full-object checksum, uploaded
+/// with part checksums, returns the part's checksum in a directory bucket, as S3 does (general
+/// purpose buckets return none); a read of the whole object returns the object's checksum.
+#[tokio::test]
+async fn test_part_checksums_of_full_object_multipart_objects() -> Result {
+    use aws_sdk_s3::types::{
+        ChecksumAlgorithm, ChecksumMode, ChecksumType, CompletedMultipartUpload, CompletedPart,
+    };
+    let (_server, _handle, s3) = setup(S3MockServer::builder()).await;
+    let parts: [&'static [u8]; 2] = [b"first part", b"second"];
+    let upload_id = s3
+        .create_multipart_upload()
+        .bucket(DIRECTORY)
+        .key("mpu")
+        .checksum_algorithm(ChecksumAlgorithm::Crc64Nvme)
+        .checksum_type(ChecksumType::FullObject)
+        .send()
+        .await?
+        .upload_id
+        .unwrap();
+    let mut completed = Vec::new();
+    for (i, part) in parts.iter().enumerate() {
+        let out = s3
+            .upload_part()
+            .bucket(DIRECTORY)
+            .key("mpu")
+            .upload_id(&upload_id)
+            .part_number(i as i32 + 1)
+            .checksum_algorithm(ChecksumAlgorithm::Crc64Nvme)
+            .body(ByteStream::from_static(part))
+            .send()
+            .await?;
+        completed.push(
+            CompletedPart::builder()
+                .part_number(i as i32 + 1)
+                .e_tag(out.e_tag.unwrap())
+                .set_checksum_crc64_nvme(out.checksum_crc64_nvme)
+                .build(),
+        );
+    }
+    s3.complete_multipart_upload()
+        .bucket(DIRECTORY)
+        .key("mpu")
+        .upload_id(&upload_id)
+        .multipart_upload(
+            CompletedMultipartUpload::builder()
+                .set_parts(Some(completed))
+                .build(),
+        )
+        .send()
+        .await?;
+    let part = s3
+        .get_object()
+        .bucket(DIRECTORY)
+        .key("mpu")
+        .range(format!("bytes=0-{}", parts[0].len() - 1))
+        .send()
+        .await?;
+    assert_eq!(
+        part.checksum_crc64_nvme.as_deref(),
+        Some(common::crc64nvme(parts[0]).as_str())
+    );
+    let head = s3
+        .head_object()
+        .bucket(DIRECTORY)
+        .key("mpu")
+        .part_number(1)
+        .checksum_mode(ChecksumMode::Enabled)
+        .send()
+        .await?;
+    assert_eq!(
+        head.checksum_crc64_nvme.as_deref(),
+        Some(common::crc64nvme(parts[0]).as_str())
+    );
+    let whole = s3.get_object().bucket(DIRECTORY).key("mpu").send().await?;
+    assert!(whole.checksum_crc64_nvme.is_some());
+    Ok(())
+}
+
+/// A read of part of a multipart object whose parts were uploaded without checksums returns no
+/// checksum, as in S3, although the object has a full-object checksum.
+#[tokio::test]
+async fn test_no_part_checksums_for_parts_uploaded_without_them() -> Result {
+    use aws_sdk_s3::config::RequestChecksumCalculation;
+    use aws_sdk_s3::types::{ChecksumMode, CompletedMultipartUpload, CompletedPart};
+    let (_server, _handle, s3) = setup(S3MockServer::builder()).await;
+    let s3 = aws_sdk_s3::Client::from_conf(
+        s3.config()
+            .to_builder()
+            .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
+            .build(),
+    );
+    let upload_id = s3
+        .create_multipart_upload()
+        .bucket(DIRECTORY)
+        .key("mpu")
+        .send()
+        .await?
+        .upload_id
+        .unwrap();
+    let mut completed = Vec::new();
+    for (i, part) in [&b"first part"[..], b"second"].into_iter().enumerate() {
+        let out = s3
+            .upload_part()
+            .bucket(DIRECTORY)
+            .key("mpu")
+            .upload_id(&upload_id)
+            .part_number(i as i32 + 1)
+            .body(ByteStream::from_static(part))
+            .send()
+            .await?;
+        completed.push(
+            CompletedPart::builder()
+                .part_number(i as i32 + 1)
+                .e_tag(out.e_tag.unwrap())
+                .build(),
+        );
+    }
+    s3.complete_multipart_upload()
+        .bucket(DIRECTORY)
+        .key("mpu")
+        .upload_id(&upload_id)
+        .multipart_upload(
+            CompletedMultipartUpload::builder()
+                .set_parts(Some(completed))
+                .build(),
+        )
+        .send()
+        .await?;
+    let head = |part_number: Option<i32>| {
+        s3.head_object()
+            .bucket(DIRECTORY)
+            .key("mpu")
+            .set_part_number(part_number)
+            .checksum_mode(ChecksumMode::Enabled)
+            .send()
+    };
+    assert_eq!(head(Some(1)).await?.checksum_crc64_nvme, None);
+    assert!(head(None).await?.checksum_crc64_nvme.is_some());
+    Ok(())
+}

@@ -331,6 +331,7 @@ impl StorageBackend for InMemoryStorage {
         let mut part_metadata = PartMetadata {
             etag: etag.clone(),
             size: request.content.len() as u64,
+            client_checksum: request.client_checksum,
             ..Default::default()
         };
 
@@ -464,6 +465,7 @@ impl StorageBackend for InMemoryStorage {
                 total_size += part_metadata.size;
                 final_metadata.parts.push(ObjectPart {
                     size: part_metadata.size,
+                    client_checksum: part_metadata.client_checksum,
                     crc32: part_metadata.crc32.clone(),
                     crc32c: part_metadata.crc32c.clone(),
                     crc64nvme: part_metadata.crc64nvme.clone(),
@@ -906,12 +908,14 @@ mod tests {
             upload_id,
             part_number: 1,
             content: part1.clone(),
+            client_checksum: false,
         };
         let etag1 = storage.upload_part(request1).await.unwrap();
         let request2 = crate::storage::UploadPartRequest {
             upload_id,
             part_number: 2,
             content: part2.clone(),
+            client_checksum: false,
         };
         let etag2 = storage.upload_part(request2).await.unwrap();
 
@@ -995,6 +999,7 @@ mod tests {
                         upload_id: &upload_id,
                         part_number: 1,
                         content: Bytes::from_static(b"part"),
+                        client_checksum: false,
                     })
                     .await
                     .map(|_| ())
@@ -1033,6 +1038,7 @@ mod tests {
             upload_id,
             part_number: 1,
             content: part1,
+            client_checksum: false,
         };
         let etag1 = storage.upload_part(request).await.unwrap();
 
@@ -1091,6 +1097,7 @@ mod tests {
                 upload_id,
                 part_number: 1,
                 content: Bytes::from_static(b"part1"),
+                client_checksum: false,
             })
             .await
             .unwrap()
@@ -1157,6 +1164,7 @@ mod tests {
             upload_id,
             part_number: 1,
             content: part1,
+            client_checksum: false,
         };
         storage.upload_part(request).await.unwrap();
 

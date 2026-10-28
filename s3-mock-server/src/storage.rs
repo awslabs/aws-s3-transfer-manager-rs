@@ -177,6 +177,8 @@ pub(crate) struct UploadPartRequest<'a> {
     pub upload_id: &'a str,
     pub part_number: i32,
     pub content: Bytes,
+    /// Whether the request carried a checksum of the part.
+    pub client_checksum: bool,
 }
 
 /// Response for uploading a part.
