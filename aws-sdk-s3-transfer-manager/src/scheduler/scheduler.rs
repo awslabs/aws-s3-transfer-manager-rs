@@ -1398,6 +1398,48 @@ mod tests {
         )
     }
 
+    // ref: V2429410200
+    /// The scheduler releases a transfer once it has completed and been
+    /// removed, while the client is still alive.
+    ///
+    /// The mock's state machine is owned only by the transfer, so its weak
+    /// reference dies exactly when the scheduler drops the transfer. The
+    /// final drop happens on a worker after the transfer leaves the registry,
+    /// so the check waits a bounded time. A transfer retained by scheduler
+    /// structures past removal keeps its resources, such as a destination
+    /// file and the client handle, alive for the life of the process.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn completed_transfer_is_dropped_while_the_client_is_alive() {
+        let handle = test_handle(1);
+        let scheduler = &handle.scheduler;
+        let id = TransferId {
+            id: 1,
+            parent: None,
+        };
+        let sm = Arc::new(FixedWorkCount::new(2));
+        let released = Arc::downgrade(&sm);
+        scheduler.enqueue_transfer(Box::new(MockTransfer::new_with_handle(
+            id,
+            sm,
+            Arc::clone(&handle),
+        )));
+
+        let dropped = tokio::time::timeout(Duration::from_secs(2), async {
+            while released.strong_count() > 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        let completed = released.upgrade().map(|sm| sm.completed_count());
+        assert_eq!(scheduler.transfer_count(), 0, "transfer was not removed");
+        assert!(
+            dropped.is_ok(),
+            "completed transfer is still retained; completed work items: {completed:?}"
+        );
+        crate::runtime::test_util::shutdown(&handle).await;
+    }
+
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_single_transfer_completes() {
