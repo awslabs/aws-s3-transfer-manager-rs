@@ -699,6 +699,120 @@ async fn test_download_write_to_path() {
     assert!(tmp_files.is_empty(), "leftover temp files: {:?}", tmp_files);
 }
 
+/// Returns the descriptors open in this process that refer to the file
+/// identified by `dev` and `ino`.
+///
+/// Compares `fstat` identity rather than path, so a descriptor on an unlinked
+/// file is still reported.
+#[cfg(unix)]
+// `st_dev` and `st_ino` widths differ across Unix targets.
+#[allow(clippy::unnecessary_cast)]
+fn open_descriptors_on(dev: u64, ino: u64) -> Vec<i32> {
+    let fds: Vec<i32> = std::fs::read_dir("/dev/fd")
+        .unwrap()
+        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
+        .collect();
+    fds.into_iter()
+        .filter(|&fd| {
+            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+            // SAFETY: `fstat` only writes into `stat`, which is read only after
+            // a successful return. A descriptor closed since listing fails
+            // with EBADF and is skipped.
+            unsafe {
+                libc::fstat(fd, stat.as_mut_ptr()) == 0 && {
+                    let stat = stat.assume_init();
+                    stat.st_dev as u64 == dev && stat.st_ino as u64 == ino
+                }
+            }
+        })
+        .collect()
+}
+
+/// Once `write_to_path` joins successfully, the transfer manager holds no
+/// descriptor on the destination, whether or not the client is still alive.
+///
+/// A descriptor retained past `join` keeps an unlinked destination's storage
+/// allocated, so a caller that downloads and deletes files repeatedly
+/// exhausts the filesystem. The check runs immediately after `join`, after a
+/// delay with the client alive, and after the client is dropped and the
+/// destination unlinked, so a release deferred to any later point fails.
+#[cfg(unix)]
+async fn write_to_path_releases_destination(runtime_config: RuntimeConfig) {
+    use std::os::unix::fs::MetadataExt;
+
+    let data = rand_data(8);
+    let http_client = simple_object_connector(&data, data.len());
+    let config = aws_sdk_s3_transfer_manager::Config::builder()
+        .s3_config(common::s3_config(http_client))
+        .runtime_config(runtime_config)
+        .build();
+    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+
+    let dir = tempfile::tempdir().unwrap();
+    let dest_path = dir.path().join("output.dat");
+    tm.download()
+        .bucket("test-bucket")
+        .key("test-object")
+        .write_to_path(&dest_path)
+        .await
+        .unwrap()
+        .join()
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(&dest_path).unwrap(), data.as_ref());
+    let meta = std::fs::metadata(&dest_path).unwrap();
+    let (dev, ino) = (meta.dev(), meta.ino());
+
+    assert_eq!(open_descriptors_on(dev, ino), [0i32; 0], "open after join");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        open_descriptors_on(dev, ino),
+        [0i32; 0],
+        "open with the client alive"
+    );
+    drop(tm);
+    std::fs::remove_file(&dest_path).unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        open_descriptors_on(dev, ino),
+        [0i32; 0],
+        "open after client drop and unlink"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn write_to_path_releases_destination_on_managed_runtime() {
+    write_to_path_releases_destination(RuntimeConfig::default()).await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn write_to_path_releases_destination_on_tokio_runtime() {
+    write_to_path_releases_destination(RuntimeConfig::multi_thread_tokio()).await;
+}
+
+/// Holding a descriptor on a file is reported, and closing it is observed.
+/// Guards the release assertions above against a probe that never matches.
+#[cfg(unix)]
+#[test]
+fn open_descriptors_on_reports_a_held_file() {
+    use std::os::unix::fs::MetadataExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("held.dat");
+    std::fs::write(&path, b"held").unwrap();
+    let meta = std::fs::metadata(&path).unwrap();
+    let (dev, ino) = (meta.dev(), meta.ino());
+    assert_eq!(open_descriptors_on(dev, ino), [0i32; 0]);
+
+    let held = std::fs::File::open(&path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    assert_eq!(open_descriptors_on(dev, ino).len(), 1);
+    drop(held);
+    assert_eq!(open_descriptors_on(dev, ino), [0i32; 0]);
+}
+
 /// A file already at the temporary name `write_to_path` draws is left
 /// untouched, and the download writes through another name. Seeding
 /// `fastrand` on the polling thread, which draws the name, makes the first
