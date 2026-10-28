@@ -37,19 +37,19 @@ use crate::types::{AbortOutcome, AbortedUpload};
 ///
 /// ## Dropping the handle
 ///
-/// When the handle is dropped while the transfer is still running (including
-/// by dropping a pending `join()` future), the transfer is aborted in the
-/// background, the same as [`abort`](Self::abort) but with nobody waiting for
-/// the outcome. Drop returns immediately.
-///
-/// Dropping a pending `abort()` future (for example under a caller's timeout)
-/// hard-cancels instead: the caller has given up on the abort itself.
+/// When the handle is dropped while the transfer is still running (without
+/// calling `join()` or `abort()`, or by dropping a pending `join()` or
+/// `abort()` future):
 /// - The transfer is marked as cancelled
 /// - Queued work is purged from the scheduler
 /// - In-flight work, AbortMultipartUpload included, is interrupted at its next
 ///   await point
-/// - The multipart upload may be left incomplete; use S3 lifecycle rules to
-///   clean these up
+/// - `AbortMultipartUpload` is **not** called (multipart uploads may be left incomplete)
+/// - Drop returns immediately without waiting for in-flight work
+///
+/// **Warning:** Dropping a handle for a multipart upload without calling `abort()` may
+/// leave incomplete multipart uploads on S3. Use S3 lifecycle rules to clean these up,
+/// or call `abort()` explicitly.
 ///
 /// ## Calling `abort()`
 ///
@@ -185,8 +185,9 @@ impl UploadHandle {
         // right away without starting an abort or waiting for the transfer.
         //
         // TODO: `abort_requested()` is not checked because it is always false
-        //   here: `abort()` consumes the handle, and the only other caller of
-        //   `request_abort()` is `Drop`. Check it once either changes:
+        //   here: `abort()` consumes the handle and is the only caller of
+        //   `request_abort()`. Check it once any of these changes:
+        //   - `Drop` calls `request_abort()` (the TODO in `Drop`);
         //   - a failure goes through `request_abort()` (the unified-finish
         //     TODO above), so a failing transfer is also aborting;
         //   - the upload can be aborted without consuming the handle (for
@@ -259,18 +260,18 @@ impl UploadHandle {
 impl Drop for UploadHandle {
     fn drop(&mut self) {
         let ctx = self.transfer.ctx();
-        if !ctx.is_active() {
-            return;
-        }
-        if self.transfer.abort_requested() {
-            // A pending `abort()` future was dropped (for example by a
-            // caller's timeout): the caller gave up on the abort, so
-            // hard-cancel it.
+        // TODO: decide what dropping a running handle should do. Today it
+        //   hard-cancels, the same as before the abort rework, so the multipart
+        //   upload may be left open. Options:
+        //   - dropped while running, including a dropped `join()` future:
+        //     `request_abort()` so the upload is cleaned up in the background
+        //     (fire-and-forget; nobody sees the outcome);
+        //   - dropped pending `abort()` future (the caller gave up on the
+        //     abort itself, e.g. a timeout): keep the hard cancel.
+        //   This depends on the scheduler having both a soft and a hard cancel.
+        if ctx.is_active() {
             ctx.set_cancelled();
             ctx.handle.scheduler.cancel_transfer(ctx.id);
-        } else {
-            // TODO: we basically fire and forget here, but i think it's reasonable to request abort when the join() was dropped?
-            self.transfer.request_abort();
         }
     }
 }
