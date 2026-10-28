@@ -148,6 +148,10 @@ impl ExecutionRuntime for TokioMultiThreadRuntime {
         self.pool.shutdown();
     }
 
+    fn shutdown_completion(&self) -> Option<crate::ShutdownCompletion> {
+        None
+    }
+
     fn remove_pending_for_transfer(&self, id: TransferId) -> usize {
         self.pool.remove_for_transfer(id)
     }

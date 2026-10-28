@@ -72,7 +72,8 @@ impl Default for RuntimeConfig {
 /// Default construction discovers usable execution targets when the client
 /// is created. Active transfers retain the owner after client clones are
 /// dropped. Owner destruction requests shutdown without synchronously joining
-/// the managed threads.
+/// the managed threads. [`crate::Client::shutdown_completion`] provides a
+/// non-owning observer of their joins.
 #[non_exhaustive]
 #[derive(Debug, Default)]
 pub struct Managed {

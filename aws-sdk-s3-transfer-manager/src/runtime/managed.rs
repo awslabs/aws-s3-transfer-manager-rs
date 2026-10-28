@@ -264,6 +264,7 @@ async fn execute_work(work: &mut ScheduledWork, scheduler: &Scheduler) -> Execut
 pub(crate) struct ManagedExecution {
     handle: Weak<crate::client::Handle>,
     owner: Mutex<Option<ManagedRuntime>>,
+    completion: crate::ShutdownCompletion,
     partitions: Box<[RuntimePartition]>,
     in_flight: Box<[Arc<AtomicUsize>]>,
     router: DispatchRouter,
@@ -296,6 +297,7 @@ impl ManagedExecution {
         owner: ManagedRuntime,
         components: RuntimeComponents,
     ) -> Self {
+        let completion = crate::ShutdownCompletion::new(owner.shutdown_completion());
         let partitions: Box<[_]> = owner.handle().partitions().to_vec().into_boxed_slice();
         let in_flight = partitions
             .iter()
@@ -304,6 +306,7 @@ impl ManagedExecution {
         Self {
             handle,
             owner: Mutex::new(Some(owner)),
+            completion,
             partitions,
             in_flight,
             router: DispatchRouter,
@@ -371,6 +374,10 @@ impl ExecutionRuntime for ManagedExecution {
             .expect("managed owner lock poisoned")
             .take();
         drop(owner);
+    }
+
+    fn shutdown_completion(&self) -> Option<crate::ShutdownCompletion> {
+        Some(self.completion.clone())
     }
 
     fn remove_pending_for_transfer(&self, _id: TransferId) -> usize {

@@ -3,21 +3,155 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use crate::{RuntimeId, RuntimePartitionId, ShutdownError};
-use std::{io, thread};
-use tokio::sync::oneshot;
+//! Non-owning observation of managed-thread joins after owner release.
 
-pub(crate) async fn join(
+use crate::{RuntimeId, RuntimePartitionId, ShutdownError, identity};
+use std::{
+    io,
+    sync::{Arc, Mutex},
+    thread,
+};
+use tokio::sync::watch;
+
+/// Observes shutdown completion without retaining runtime ownership.
+///
+/// Waiting does not request shutdown. The owner must be dropped or consumed by
+/// [`crate::ManagedRuntime::shutdown`] before completion can occur. Retained
+/// execution handles and completion observers do not prevent that request.
+/// Clones and repeated waits observe the same join outcome.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct ShutdownCompletion {
+    state: Arc<State>,
+}
+
+#[derive(Debug)]
+struct State {
     id: RuntimeId,
-    threads: Vec<thread::JoinHandle<()>>,
-) -> Result<(), ShutdownError> {
-    join_with(id, threads, start).await
+    released: watch::Receiver<bool>,
+    joining: Mutex<Joining>,
+}
+
+#[derive(Debug)]
+enum Joining {
+    Pending(Option<Vec<thread::JoinHandle<()>>>),
+    Started(watch::Receiver<Option<Result<(), ShutdownError>>>),
+}
+
+pub(crate) fn completion(id: RuntimeId) -> (ShutdownCompletion, watch::Sender<bool>) {
+    let (released, receiver) = watch::channel(false);
+    let completion = ShutdownCompletion {
+        state: Arc::new(State {
+            id,
+            released: receiver,
+            joining: Mutex::new(Joining::Pending(None)),
+        }),
+    };
+    (completion, released)
+}
+
+impl ShutdownCompletion {
+    /// Waits for every managed thread to be joined after its owner is released.
+    ///
+    /// Success includes destruction of each thread's async runtime and
+    /// thread-local values. Outstanding async tasks are cancelled; running
+    /// blocking tasks must finish. Non-yielding or indefinitely blocked work
+    /// can prevent completion. Independently retained HTTP clients or other
+    /// caller-owned resources are outside this completion boundary.
+    ///
+    /// Joining runs on a separate thread and requires no ambient Tokio runtime.
+    /// Dropping the wait future neither requests shutdown nor cancels joining
+    /// that has already started. Another observer can await its outcome.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when polled on this runtime's managed or blocking-pool
+    /// threads, when the joining thread cannot start or loses its result, or
+    /// when a managed thread panics. All managed threads are joined before a
+    /// managed-thread panic is reported.
+    pub async fn wait(&self) -> Result<(), ShutdownError> {
+        self.wait_with(start).await
+    }
+
+    pub(crate) fn release(&self, threads: Vec<thread::JoinHandle<()>>) {
+        let mut joining = self
+            .state
+            .joining
+            .lock()
+            .expect("shutdown state lock poisoned");
+        let Joining::Pending(pending) = &mut *joining else {
+            unreachable!("joining cannot start before owner release");
+        };
+        assert!(
+            pending.is_none(),
+            "runtime owner releases join handles once"
+        );
+        *pending = Some(threads);
+    }
+
+    async fn wait_with(
+        &self,
+        start: impl FnOnce(Job) -> io::Result<thread::JoinHandle<()>>,
+    ) -> Result<(), ShutdownError> {
+        let id = self.state.id;
+        if identity::owns_current_thread(id) {
+            return Err(ShutdownError::from_runtime(id));
+        }
+        let mut released = self.state.released.clone();
+        released
+            .wait_for(|ready| *ready)
+            .await
+            .map_err(|source| ShutdownError::completion(id, source))?;
+
+        let (mut receiver, job) = {
+            let mut joining = self
+                .state
+                .joining
+                .lock()
+                .expect("shutdown state lock poisoned");
+            match &mut *joining {
+                Joining::Started(receiver) => (receiver.clone(), None),
+                Joining::Pending(threads) => {
+                    let (publisher, receiver) = watch::channel(None);
+                    let job = Job {
+                        id,
+                        threads: threads
+                            .take()
+                            .expect("released owner publishes join handles"),
+                        completion: publisher.clone(),
+                    };
+                    *joining = Joining::Started(receiver.clone());
+                    (receiver, Some((job, publisher)))
+                }
+            }
+        };
+        // Keep startup outside the state lock. Its failure is published to every
+        // observer, while a lost joiner closes the channel without a result.
+        if let Some((job, publisher)) = job {
+            match start(job) {
+                Ok(thread) => drop(thread),
+                Err(source) => {
+                    publisher.send_replace(Some(Err(ShutdownError::joiner(id, source))));
+                }
+            }
+        }
+        loop {
+            let result = receiver.borrow_and_update().clone();
+            if let Some(result) = result {
+                return result;
+            }
+            receiver
+                .changed()
+                .await
+                .map_err(|source| ShutdownError::completion(id, source))?;
+        }
+    }
 }
 
 struct Job {
     id: RuntimeId,
     threads: Vec<thread::JoinHandle<()>>,
-    completion: oneshot::Sender<Result<(), ShutdownError>>,
+    completion: watch::Sender<Option<Result<(), ShutdownError>>>,
 }
 
 impl Job {
@@ -33,8 +167,7 @@ impl Job {
                 ));
             }
         }
-        // Cancellation only discards the result; every thread has been joined.
-        let _ = self.completion.send(result);
+        self.completion.send_replace(Some(result));
     }
 }
 
@@ -42,23 +175,6 @@ fn start(job: Job) -> io::Result<thread::JoinHandle<()>> {
     thread::Builder::new()
         .name(format!("smithy-shutdown-{}", job.id.0))
         .spawn(move || job.run())
-}
-
-async fn join_with(
-    id: RuntimeId,
-    threads: Vec<thread::JoinHandle<()>>,
-    start: impl FnOnce(Job) -> io::Result<thread::JoinHandle<()>>,
-) -> Result<(), ShutdownError> {
-    let (completion, receiver) = oneshot::channel();
-    let job = Job {
-        id,
-        threads,
-        completion,
-    };
-    drop(start(job).map_err(|source| ShutdownError::joiner(id, source))?);
-    receiver
-        .await
-        .map_err(|source| ShutdownError::completion(id, source))?
 }
 
 #[cfg(test)]
@@ -71,6 +187,24 @@ mod tests {
         sync::mpsc,
         task::{Context, Poll, Waker},
     };
+
+    async fn join(
+        id: RuntimeId,
+        threads: Vec<thread::JoinHandle<()>>,
+    ) -> Result<(), ShutdownError> {
+        join_with(id, threads, start).await
+    }
+
+    async fn join_with(
+        id: RuntimeId,
+        threads: Vec<thread::JoinHandle<()>>,
+        start: impl FnOnce(Job) -> io::Result<thread::JoinHandle<()>>,
+    ) -> Result<(), ShutdownError> {
+        let (observer, released) = completion(id);
+        observer.release(threads);
+        released.send_replace(true);
+        observer.wait_with(start).await
+    }
 
     fn caller() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_current_thread()
@@ -140,6 +274,6 @@ mod tests {
         let error = result.unwrap_err();
         assert_eq!(error.kind(), ShutdownErrorKind::Completion);
         assert!(error.to_string().contains("completion"));
-        assert!(error.source().unwrap().is::<oneshot::error::RecvError>());
+        assert!(error.source().unwrap().is::<watch::error::RecvError>());
     }
 }

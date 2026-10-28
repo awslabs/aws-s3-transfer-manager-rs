@@ -682,3 +682,106 @@ fn each_partition_limits_blocking_execution_to_one_thread() {
         awaiting.block_on(task).unwrap();
     }
 }
+
+#[test]
+fn completion_observers_do_not_retain_ownership_and_include_thread_local_cleanup() {
+    let runtime = runtime();
+    let execution = runtime.handle();
+    let completion = runtime.shutdown_completion();
+    let other = completion.clone();
+    let mut context = Context::from_waker(Waker::noop());
+    {
+        let mut waiting = Box::pin(completion.wait());
+        assert!(waiting.as_mut().poll(&mut context).is_pending());
+    }
+    drop(runtime.shutdown_completion());
+    let awaiting = caller();
+    assert_eq!(
+        awaiting
+            .block_on(execution.partitions()[0].spawn(async { 42 }))
+            .unwrap(),
+        42
+    );
+    let mut exits = Vec::new();
+    for partition in execution.partitions() {
+        let (started, ready) = mpsc::channel();
+        let (exited, exit) = mpsc::channel();
+        drop(partition.spawn(async move {
+            THREAD_EXIT.with(|value| *value.borrow_mut() = Some(DropSignal(exited)));
+            started.send(()).unwrap();
+            future::pending::<()>().await;
+        }));
+        ready.recv_timeout(TIMEOUT).unwrap();
+        exits.push(exit);
+    }
+    drop(runtime);
+    awaiting.block_on(async {
+        tokio::time::timeout(TIMEOUT, completion.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        other.wait().await.unwrap();
+        completion.wait().await.unwrap();
+    });
+    for exit in exits {
+        exit.try_recv().unwrap();
+    }
+}
+
+#[test]
+fn explicit_shutdown_and_observers_share_completion() {
+    let runtime = runtime();
+    let completion = runtime.shutdown_completion();
+    let other = completion.clone();
+    caller().block_on(async {
+        runtime.shutdown().await.unwrap();
+        completion.wait().await.unwrap();
+        other.wait().await.unwrap();
+    });
+}
+
+#[test]
+fn cancelled_completion_wait_does_not_cancel_joining() {
+    let runtime = runtime();
+    let completion = runtime.shutdown_completion();
+    let partition = runtime.handle().partitions()[0].clone();
+    let (started, ready) = mpsc::channel();
+    let (release, released) = mpsc::channel::<()>();
+    drop(partition.spawn(async move {
+        tokio::task::spawn_blocking(move || {
+            started.send(()).unwrap();
+            let _ = released.recv();
+        })
+        .await
+        .unwrap();
+    }));
+    ready.recv_timeout(TIMEOUT).unwrap();
+    drop(runtime);
+    let mut waiting = Box::pin(completion.wait());
+    let mut context = Context::from_waker(Waker::noop());
+    assert!(waiting.as_mut().poll(&mut context).is_pending());
+    drop(waiting);
+    drop(release);
+    caller().block_on(async {
+        tokio::time::timeout(TIMEOUT, completion.wait())
+            .await
+            .unwrap()
+            .unwrap();
+    });
+}
+
+#[test]
+fn completion_wait_from_managed_thread_rejects_without_requesting_shutdown() {
+    let runtime = runtime();
+    let completion = runtime.shutdown_completion();
+    let partition = runtime.handle().partitions()[0].clone();
+    let task = partition.spawn(async move { completion.wait().await });
+    let awaiting = caller();
+    let error = awaiting.block_on(task).unwrap().unwrap_err();
+    assert_eq!(error.kind(), ShutdownErrorKind::FromRuntime);
+    assert_eq!(
+        awaiting.block_on(partition.spawn(async { 42 })).unwrap(),
+        42
+    );
+    awaiting.block_on(runtime.shutdown()).unwrap();
+}

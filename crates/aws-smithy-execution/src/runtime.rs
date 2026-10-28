@@ -5,7 +5,8 @@
 
 use crate::{
     BuildError, ManagedRuntimeHandle, RuntimeId, RuntimePartition, RuntimePartitionId,
-    ShutdownError, handle::RuntimeState, identity, shutdown, thread as managed_thread,
+    ShutdownCompletion, ShutdownError, handle::RuntimeState, identity, shutdown,
+    thread as managed_thread,
 };
 use aws_smithy_topology::Topology;
 use std::{io, sync::Arc, thread};
@@ -17,18 +18,21 @@ use tokio::sync::watch;
 /// Construction creates one partition per selected topology placement. Retain this
 /// owner while work should run; handles and partitions do not own its lifetime.
 ///
-/// Dropping the owner requests shutdown and detaches its managed threads without
-/// waiting for them, including when called from one of them. Each thread destroys
+/// Dropping the owner requests shutdown without waiting for its managed threads,
+/// including when called from one of them. Each thread destroys
 /// its Tokio runtime as it exits. Running tasks must yield for shutdown, and
 /// Tokio blocking tasks can delay thread exit.
 ///
-/// Use [`Self::shutdown`] to request shutdown and await thread completion.
+/// Use [`Self::shutdown`] to request shutdown and await thread completion, or
+/// retain [`Self::shutdown_completion`] to observe completion after owner drop.
 #[non_exhaustive]
 #[derive(Debug)]
 pub struct ManagedRuntime {
     handle: ManagedRuntimeHandle,
     stop: Option<watch::Sender<()>>,
     threads: Vec<thread::JoinHandle<()>>,
+    completion: ShutdownCompletion,
+    released: watch::Sender<bool>,
 }
 
 impl ManagedRuntime {
@@ -40,6 +44,15 @@ impl ManagedRuntime {
     /// Returns cloneable access to topology and execution partitions.
     pub fn handle(&self) -> ManagedRuntimeHandle {
         self.handle.clone()
+    }
+
+    /// Returns a cloneable observer of managed-thread shutdown completion.
+    ///
+    /// The observer does not retain ownership or request shutdown. Obtain it
+    /// before moving this owner into another component to await thread joins
+    /// after that component releases ownership.
+    pub fn shutdown_completion(&self) -> ShutdownCompletion {
+        self.completion.clone()
     }
 
     /// Requests shutdown and waits for every managed thread to exit.
@@ -63,29 +76,28 @@ impl ManagedRuntime {
     ///
     /// Returns an error if started on this runtime's managed or blocking-pool
     /// threads: they cannot wait for their own exit. The consumed owner still
-    /// requests shutdown and detaches its threads in that case.
+    /// requests shutdown; another observer can await completion.
     ///
     /// Also reports failure to create the joining thread, a lost completion
     /// result, or a managed-thread panic. All threads are joined before reporting
     /// the first panic in partition order. If the joining thread cannot start,
-    /// shutdown is requested and the managed threads detach.
-    pub async fn shutdown(mut self) -> Result<(), ShutdownError> {
+    /// shutdown is requested without confirming thread completion.
+    pub async fn shutdown(self) -> Result<(), ShutdownError> {
         let id = self.handle.id();
         if identity::owns_current_thread(id) {
             return Err(ShutdownError::from_runtime(id));
         }
-        drop(self.stop.take());
-        let threads = std::mem::take(&mut self.threads);
-        shutdown::join(id, threads).await
+        let completion = self.shutdown_completion();
+        drop(self);
+        completion.wait().await
     }
 }
 
 impl Drop for ManagedRuntime {
     fn drop(&mut self) {
         drop(self.stop.take());
-        // Dropping the join handles detaches the threads. Each thread owns its
-        // Tokio runtime and destroys it after observing the shutdown request.
-        self.threads.clear();
+        self.completion.release(std::mem::take(&mut self.threads));
+        self.released.send_replace(true);
     }
 }
 
@@ -270,8 +282,11 @@ impl ManagedRuntimeBuilder {
                 partitions: partitions.into(),
             }),
         };
+        let (completion, released) = shutdown::completion(id);
         Ok(ManagedRuntime {
             handle,
+            completion,
+            released,
             stop: startup.stop.take(),
             threads: std::mem::take(&mut startup.threads),
         })

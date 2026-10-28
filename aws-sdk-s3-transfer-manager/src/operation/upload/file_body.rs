@@ -10,8 +10,8 @@
 //! shared memory pool.
 //!
 //! [`DirectFileBody`] performs positioned reads on a managed polling thread.
-//! [`OffloadedFileBody`] moves the same operation through `spawn_blocking` and
-//! a bounded channel when the HTTP polling thread's ownership is unknown. Both emit
+//! [`OffloadedFileBody`] submits reads through the transfer runtime's blocking
+//! pool and a bounded channel when HTTP polling ownership is unknown. Both emit
 //! owner-backed `Bytes` frames from pooled chunks and reacquire storage for each
 //! retry attempt.
 
@@ -235,10 +235,11 @@ impl Body for DirectFileBody {
     }
 }
 
-/// File-backed HTTP body for callers on the shared tokio runtime.
+/// File-backed HTTP body with reads offloaded through the transfer runtime.
 ///
-/// A spawned reader task acquires and reads pooled chunks via `spawn_blocking`,
-/// then pushes their immutable segments through a bounded channel.
+/// A reader task on `reader_runtime` acquires pooled chunks and reads them via
+/// that runtime's `spawn_blocking` pool, then publishes them through a bounded
+/// channel. Body polling requires no Tokio context.
 /// `poll_frame` drains the channel with ordinary waker registration.
 ///
 /// The reader task is spawned lazily on the first `poll_frame` call. Dropping
@@ -246,6 +247,7 @@ impl Body for DirectFileBody {
 /// read cannot be cancelled, so it retains its buffer until the operating
 /// system call completes.
 pub(crate) struct OffloadedFileBody {
+    reader_runtime: tokio::runtime::Handle,
     state: OffloadedState,
     /// Received bytes not yet emitted by the body.
     progress: FileBodyProgress,
@@ -275,8 +277,14 @@ impl std::fmt::Debug for OffloadedFileBody {
 }
 
 impl OffloadedFileBody {
-    pub(crate) fn new(source: FileBodySource, offset: u64, length: u64) -> Self {
+    pub(crate) fn new(
+        source: FileBodySource,
+        offset: u64,
+        length: u64,
+        reader_runtime: tokio::runtime::Handle,
+    ) -> Self {
         Self {
+            reader_runtime,
             state: OffloadedState::Pending { source, offset },
             progress: FileBodyProgress::new(length),
         }
@@ -309,7 +317,7 @@ impl Body for OffloadedFileBody {
             }
             if let OffloadedState::Pending { source, offset } = &this.state {
                 let (tx, rx) = mpsc::channel(FILE_BODY_READAHEAD);
-                let task = tokio::spawn(read_task(
+                let task = this.reader_runtime.spawn(read_task(
                     source.clone(),
                     *offset,
                     this.progress.remaining,
@@ -649,7 +657,11 @@ mod tests {
     fn empty_offloaded_body_finishes_without_spawning_reader() {
         let tmp = write_tempfile(&[]);
         let pool = test_pool();
-        let mut body = OffloadedFileBody::new(source(tmp.path(), &pool), 0, 0);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let mut body =
+            OffloadedFileBody::new(source(tmp.path(), &pool), 0, 0, runtime.handle().clone());
 
         assert!(matches!(poll_body_once(&mut body), Poll::Ready(None)));
         assert!(matches!(body.state, OffloadedState::Pending { .. }));
@@ -663,6 +675,7 @@ mod tests {
         drop(tx);
         let task = tokio::spawn(async {});
         let mut body = OffloadedFileBody {
+            reader_runtime: tokio::runtime::Handle::current(),
             state: OffloadedState::Active { rx, task },
             progress: FileBodyProgress::new(1),
         };
@@ -688,6 +701,7 @@ mod tests {
         drop(tx);
         let task = tokio::spawn(async {});
         let mut body = OffloadedFileBody {
+            reader_runtime: tokio::runtime::Handle::current(),
             state: OffloadedState::Active { rx, task },
             progress: FileBodyProgress::new(1),
         };
@@ -706,7 +720,12 @@ mod tests {
         let payload: Vec<u8> = (0..1024).map(|i| (i % 251) as u8).collect();
         let tmp = write_tempfile(&payload);
         let pool = test_pool();
-        let body = OffloadedFileBody::new(source(tmp.path(), &pool), 0, payload.len() as u64);
+        let body = OffloadedFileBody::new(
+            source(tmp.path(), &pool),
+            0,
+            payload.len() as u64,
+            tokio::runtime::Handle::current(),
+        );
 
         let out = collect_body(body).await.unwrap();
         assert_eq!(out, payload);
@@ -720,7 +739,12 @@ mod tests {
         let payload: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
         let tmp = write_tempfile(&payload);
         let pool = test_pool();
-        let body = OffloadedFileBody::new(source(tmp.path(), &pool), 0, size as u64);
+        let body = OffloadedFileBody::new(
+            source(tmp.path(), &pool),
+            0,
+            size as u64,
+            tokio::runtime::Handle::current(),
+        );
 
         let out = collect_body(body).await.unwrap();
         assert_eq!(out.len(), size);
@@ -736,7 +760,12 @@ mod tests {
         let offset = 1024;
         let length = 2048;
         let pool = test_pool();
-        let body = OffloadedFileBody::new(source(tmp.path(), &pool), offset, length);
+        let body = OffloadedFileBody::new(
+            source(tmp.path(), &pool),
+            offset,
+            length,
+            tokio::runtime::Handle::current(),
+        );
 
         let out = collect_body(body).await.unwrap();
         assert_eq!(out, &payload[offset as usize..(offset + length) as usize]);
@@ -753,7 +782,12 @@ mod tests {
         let acquisition = pool
             .acquire(&reservation, TEST_POOL_CAPACITY)
             .expect("test pool should be fully available");
-        let mut body = OffloadedFileBody::new(source(tmp.path(), &pool), 0, payload.len() as u64);
+        let mut body = OffloadedFileBody::new(
+            source(tmp.path(), &pool),
+            0,
+            payload.len() as u64,
+            tokio::runtime::Handle::current(),
+        );
 
         assert!(poll_body_once(&mut body).is_pending());
         for _ in 0..100 {
@@ -800,6 +834,80 @@ mod tests {
         assert_eq!(collect_body(body).await.unwrap(), original);
         assert_eq!(collect_body(retry).await.unwrap(), original);
         assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn offloaded_retry_is_rebuilt_and_drained_without_tokio_context() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let payload = vec![0x5a; FILE_BODY_CHUNK_SIZE + 17];
+        let file = write_tempfile(&payload);
+        let pool = test_pool();
+        let body = runtime.block_on(async {
+            InputStream::from_path(file.path())
+                .unwrap()
+                .into_sdk_body(false, pool.clone())
+                .unwrap()
+        });
+        let expected = payload.clone();
+        std::thread::spawn(move || {
+            assert!(tokio::runtime::Handle::try_current().is_err());
+            let retry = body.try_clone().expect("file body is retryable");
+            let first = crate::runtime::test_util::block_on(collect_body(body)).unwrap();
+            let second = crate::runtime::test_util::block_on(collect_body(retry)).unwrap();
+            assert_eq!(first, expected);
+            assert_eq!(second, expected);
+        })
+        .join()
+        .unwrap();
+        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn offloaded_reads_use_the_captured_runtime_in_a_foreign_tokio_context() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        let reader_started = Arc::new(AtomicBool::new(false));
+        let observed = reader_started.clone();
+        let reader = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .on_thread_start(move || observed.store(true, Ordering::SeqCst))
+            .build()
+            .unwrap();
+        let payload = b"read on the captured runtime";
+        let file = write_tempfile(payload);
+        let pool = test_pool();
+        let body = OffloadedFileBody::new(
+            source(file.path(), &pool),
+            0,
+            payload.len() as u64,
+            reader.handle().clone(),
+        );
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let reader_thread = std::thread::spawn(move || {
+            reader.block_on(async { stopped.await.unwrap() });
+        });
+        let foreign_started = Arc::new(AtomicBool::new(false));
+        let observed = foreign_started.clone();
+        let foreign = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .on_thread_start(move || observed.store(true, Ordering::SeqCst))
+            .build()
+            .unwrap();
+        let result = foreign.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), collect_body(body)).await
+        });
+        stop.send(()).unwrap();
+        reader_thread.join().unwrap();
+        assert_eq!(result.unwrap().unwrap(), payload);
+        assert!(reader_started.load(Ordering::SeqCst));
+        assert!(!foreign_started.load(Ordering::SeqCst));
     }
 
     #[test]

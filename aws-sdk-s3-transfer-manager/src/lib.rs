@@ -224,6 +224,7 @@ pub use self::client::Client;
 use self::config::loader::ConfigLoader;
 pub use self::config::S3ClientConfig;
 pub use self::config::{Config, Managed, RuntimeConfig};
+pub use self::runtime::{ShutdownCompletion, ShutdownError, ShutdownErrorKind};
 pub use self::transfer::SchedulingCtl;
 
 /// Create a config loader

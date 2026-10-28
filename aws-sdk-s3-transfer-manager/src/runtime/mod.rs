@@ -10,6 +10,12 @@
 mod tokio_mt;
 pub(crate) use tokio_mt::TokioMultiThreadRuntime;
 
+#[cfg(test)]
+pub(crate) mod test_util;
+
+mod shutdown;
+pub use shutdown::{ShutdownCompletion, ShutdownError, ShutdownErrorKind};
+
 mod managed;
 pub(crate) use managed::{prepare_components, ManagedExecution};
 
@@ -47,6 +53,9 @@ pub(crate) trait ExecutionRuntime: Send + Sync + std::fmt::Debug {
 
     /// Requests execution shutdown.
     fn shutdown(&self);
+
+    /// Returns an observer for owned execution, or None for caller-owned execution.
+    fn shutdown_completion(&self) -> Option<ShutdownCompletion>;
 
     /// Remove all pending work for a transfer. Returns count removed.
     fn remove_pending_for_transfer(&self, id: TransferId) -> usize;

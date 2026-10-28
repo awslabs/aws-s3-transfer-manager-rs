@@ -92,6 +92,7 @@ async fn adopted_file_upload_uses_configured_native_pool_and_retains_runtime_unt
     let owner = runtime();
     let execution = owner.handle();
     let watch = watch_owner(&execution).await;
+    let completion = owner.shutdown_completion();
     let gate = ManualGate::new();
     let payload = vec![0x5a; 128 * 1024];
     let mut file = tempfile::NamedTempFile::new().unwrap();
@@ -162,6 +163,7 @@ async fn adopted_file_upload_uses_configured_native_pool_and_retains_runtime_unt
             .runtime_config(tm::RuntimeConfig::managed(tm_ext::managed(owner)))
             .build(),
     );
+    let stopped = client.shutdown_completion().unwrap();
     let upload = client
         .upload()
         .bucket("test-bucket")
@@ -214,9 +216,129 @@ async fn adopted_file_upload_uses_configured_native_pool_and_retains_runtime_unt
     .await
     .unwrap();
     assert_stopped(watch).await;
+    tokio::time::timeout(WAIT, stopped.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    completion.wait().await.unwrap();
     assert!(
         http.connector_metadata().is_some(),
         "the HTTP view remains alive"
     );
     harness.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn automatic_managed_completion_does_not_retain_client_clones() {
+    let sdk = aws_types::SdkConfig::builder()
+        .behavior_version(
+            aws_smithy_runtime_api::client::behavior_version::BehaviorVersion::latest(),
+        )
+        .build();
+    let client = tm::Client::new(tm::Config::builder().s3_config(&sdk).build());
+    let completion = client
+        .shutdown_completion()
+        .expect("default execution is managed");
+    let other = completion.clone();
+    let retained = client.clone();
+    drop(client);
+    {
+        let mut waiting = Box::pin(completion.wait());
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(std::future::Future::poll(waiting.as_mut(), &mut context).is_pending());
+    }
+    drop(retained);
+    tokio::time::timeout(WAIT, completion.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    other.wait().await.unwrap();
+    completion.wait().await.unwrap();
+}
+
+#[tokio::test]
+async fn caller_tokio_execution_has_no_owned_runtime_completion() {
+    let sdk = aws_types::SdkConfig::builder()
+        .behavior_version(
+            aws_smithy_runtime_api::client::behavior_version::BehaviorVersion::latest(),
+        )
+        .build();
+    let client = tm::Client::new(
+        tm::Config::builder()
+            .s3_config(&sdk)
+            .runtime_config(tm::RuntimeConfig::multi_thread_tokio())
+            .build(),
+    );
+    assert!(client.shutdown_completion().is_none());
+}
+
+#[tokio::test]
+async fn adopted_completion_waits_for_blocking_work_and_thread_local_cleanup() {
+    use test_util::{DropSignal, THREAD_EXIT};
+    let owner = runtime();
+    let completion = owner.shutdown_completion();
+    let execution = owner.handle();
+    let partition = execution.partitions()[0].clone();
+    let (started, ready) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let (exited, exit) = std::sync::mpsc::channel();
+    drop(partition.spawn(async move {
+        THREAD_EXIT.with(|value| *value.borrow_mut() = Some(DropSignal(exited)));
+        tokio::task::spawn_blocking(move || {
+            started.send(()).unwrap();
+            let _ = released.recv();
+        })
+        .await
+        .unwrap();
+    }));
+    ready.recv_timeout(WAIT).unwrap();
+    let sdk = aws_types::SdkConfig::builder()
+        .behavior_version(
+            aws_smithy_runtime_api::client::behavior_version::BehaviorVersion::latest(),
+        )
+        .build();
+    let client = tm::Client::new(
+        tm::Config::builder()
+            .s3_config(&sdk)
+            .runtime_config(tm::RuntimeConfig::managed(tm_ext::managed(owner)))
+            .build(),
+    );
+    let stopped = client.shutdown_completion().unwrap();
+    let self_wait = stopped.clone();
+    let error = partition
+        .spawn(async move { self_wait.wait().await })
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.kind(), tm::ShutdownErrorKind::FromRuntime);
+    drop(client);
+    {
+        let mut waiting = Box::pin(stopped.wait());
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(std::future::Future::poll(waiting.as_mut(), &mut context).is_pending());
+    }
+    drop(release);
+    tokio::time::timeout(WAIT, stopped.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    completion.wait().await.unwrap();
+    exit.try_recv().unwrap();
+    assert!(partition.spawn(async {}).await.unwrap_err().is_cancelled());
+}
+
+mod test_util {
+    use std::{cell::RefCell, sync::mpsc};
+
+    pub(super) struct DropSignal(pub(super) mpsc::Sender<()>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+
+    thread_local! {
+        pub(super) static THREAD_EXIT: RefCell<Option<DropSignal>> = const { RefCell::new(None) };
+    }
 }

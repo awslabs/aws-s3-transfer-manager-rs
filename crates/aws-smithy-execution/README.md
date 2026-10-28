@@ -23,7 +23,9 @@ See the crate documentation for thread ownership, CPU binding, and Tokio
 integration contracts.
 
 Call `runtime.shutdown().await` to wait for thread exit. Dropping the owner
-requests shutdown without waiting.
+requests shutdown without waiting. Retain `runtime.shutdown_completion()` before
+transferring ownership to another component, then await `completion.wait()` after
+that component releases the owner. Completion observers do not keep it alive.
 
 Run the standalone example with:
 

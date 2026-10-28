@@ -37,8 +37,24 @@ cancelled when the partition's Tokio runtime exits. Running blocking tasks and
 async tasks that do not yield can delay thread exit. Scheduler descriptors
 retired through epoch reclamation may retain client ownership until reclamation.
 
-The standalone execution owner provides asynchronous shutdown that waits for
-thread exit. Adopting it transfers that ownership to TM. Configuring a separate
+`Client::shutdown_completion` returns a non-owning observer for automatic and
+adopted managed execution, and `None` for caller-owned Tokio execution. Retaining
+it keeps neither the client nor runtime owner alive. Waiting does not request
+shutdown, cancel transfers, or close independently retained HTTP clients.
+Release client clones and transfer ownership before waiting. Success includes
+joins of every managed thread, runtime destruction, and managed-thread local
+cleanup. Clones and repeated waits observe the same result.
+
+The standalone execution owner provides consuming asynchronous shutdown and a
+separate `ShutdownCompletion` observer. Owner destruction publishes join handles
+without blocking or starting a joining thread. The first external waiter after
+owner release starts the joining thread; cancelling that waiter does not stop
+joins already started. Waits from managed or blocking-pool threads owned by the
+runtime are rejected. A managed-thread panic is reported after all threads have
+been joined. Other failures can prevent confirmation of thread completion.
+
+Adopting an owner transfers shutdown authority to TM while retained completion
+observers remain usable. Configuring a separate
 TM Dial9 recorder for an already built adopted runtime causes client construction
 to panic;
 its recorder must be attached during execution construction.
@@ -74,8 +90,11 @@ use blocking offload.
 `RuntimeComponents::direct_body_io` controls file-backed single-request upload
 bodies separately. It is enabled only when TM constructs its managed transport.
 Configured HTTP controls its polling threads, so its file bodies always offload
-positioned reads to the polling Tokio runtime's blocking pool, including when
-the configured pool and adopted execution share a runtime.
+positioned reads through the transfer request's Tokio runtime and its blocking
+pool. That runtime is captured before HTTP handoff and retained across retries;
+body polling requires no Tokio context. This also applies when the configured
+pool and adopted execution share a runtime. TM-built transport retains direct
+reads on the managed polling thread, including for borrowed connections.
 
 Both file-body paths preserve the same open file identity, memory pool,
 chunk bounds, cancellation behavior, and retry reconstruction. Transport choice

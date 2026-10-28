@@ -247,6 +247,16 @@ impl Drop for Handle {
 }
 
 impl Client {
+    /// Returns a non-owning observer of managed-runtime shutdown completion.
+    ///
+    /// Returns `Some` for automatically created and adopted managed runtimes,
+    /// and `None` for caller-owned Tokio execution. Retaining the observer does
+    /// not keep this client or its runtime owner alive. Waiting does not request
+    /// shutdown: release client clones and transfer ownership first.
+    pub fn shutdown_completion(&self) -> Option<crate::ShutdownCompletion> {
+        self.handle.runtime.shutdown_completion()
+    }
+
     /// Creates a new client from a transfer manager config.
     pub fn new(mut config: Config) -> Client {
         // Machine facts for auto-sizing: use the loader-detected profile if the
@@ -615,11 +625,10 @@ mod tests {
         client.handle.runtime.components().http_client()
     }
 
-    /// A configured transport that polls file bodies on the caller's runtime,
+    /// A configured transport that polls file bodies on a plain thread,
     /// retries the first PUT, and lets the test hold an active transfer.
     #[derive(Debug)]
-    struct CallerHttp {
-        caller: tokio::runtime::Handle,
+    struct ThreadHttp {
         started: Arc<tokio::sync::Semaphore>,
         release: Arc<tokio::sync::Semaphore>,
         bodies: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
@@ -627,7 +636,7 @@ mod tests {
         dispatches: Arc<std::sync::Mutex<Vec<aws_smithy_execution::RuntimePartitionId>>>,
     }
 
-    impl aws_smithy_runtime_api::client::http::HttpConnector for CallerHttp {
+    impl aws_smithy_runtime_api::client::http::HttpConnector for ThreadHttp {
         fn call(
             &self,
             request: aws_smithy_runtime_api::client::orchestrator::HttpRequest,
@@ -647,33 +656,38 @@ mod tests {
             let started = self.started.clone();
             let release = self.release.clone();
             let bodies = self.bodies.clone();
-            let task = self.caller.spawn(async move {
-                let first = bodies.lock().unwrap().is_empty();
-                if first {
-                    started.add_permits(1);
-                    release.acquire().await.unwrap().forget();
-                }
-                let mut body = request.into_body();
-                let mut bytes = Vec::new();
-                while let Some(frame) =
-                    futures_util::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await
-                {
-                    if let Ok(data) = frame.unwrap().into_data() {
-                        bytes.extend_from_slice(&data);
+            let (completed, result) = tokio::sync::oneshot::channel();
+            std::thread::spawn(move || {
+                assert!(tokio::runtime::Handle::try_current().is_err());
+                let response = crate::runtime::test_util::block_on(async move {
+                    let first = bodies.lock().unwrap().is_empty();
+                    if first {
+                        started.add_permits(1);
+                        release.acquire().await.unwrap().forget();
                     }
-                }
-                bodies.lock().unwrap().push(bytes);
-                HttpResponse::try_from(
-                    ::http::Response::builder()
-                        .status(if first { 500 } else { 200 })
-                        .header("etag", "\"test-etag\"")
-                        .body(SdkBody::empty())
-                        .unwrap(),
-                )
-                .unwrap()
+                    let mut body = request.into_body();
+                    let mut bytes = Vec::new();
+                    while let Some(frame) =
+                        futures_util::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await
+                    {
+                        if let Ok(data) = frame.unwrap().into_data() {
+                            bytes.extend_from_slice(&data);
+                        }
+                    }
+                    bodies.lock().unwrap().push(bytes);
+                    HttpResponse::try_from(
+                        ::http::Response::builder()
+                            .status(if first { 500 } else { 200 })
+                            .header("etag", "\"test-etag\"")
+                            .body(SdkBody::empty())
+                            .unwrap(),
+                    )
+                    .unwrap()
+                });
+                let _ = completed.send(response);
             });
             aws_smithy_runtime_api::client::http::HttpConnectorFuture::new(async move {
-                Ok(task.await.unwrap())
+                Ok(result.await.unwrap())
             })
         }
     }
@@ -742,8 +756,7 @@ mod tests {
                 let owner_watch = adopted
                     .as_ref()
                     .map(|execution| execution.partitions()[0].spawn(std::future::pending::<()>()));
-                let connector = SharedHttpConnector::new(CallerHttp {
-                    caller: caller.handle().clone(),
+                let connector = SharedHttpConnector::new(ThreadHttp {
                     started: started.clone(),
                     release: release.clone(),
                     bodies: bodies.clone(),
@@ -775,6 +788,8 @@ mod tests {
                     "configured HTTP controls its polling thread"
                 );
 
+                let completion = client.shutdown_completion();
+                assert_eq!(completion.is_some(), managed);
                 let weak = Arc::downgrade(&client.handle);
                 let upload = client
                     .upload()
@@ -835,6 +850,12 @@ mod tests {
                 .unwrap_or_else(|_| {
                     panic!("finished transfer retains execution (managed={managed})")
                 });
+                if let Some(completion) = completion {
+                    tokio::time::timeout(Duration::from_secs(5), completion.wait())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                }
                 if let Some(watch) = owner_watch {
                     let error = tokio::time::timeout(Duration::from_secs(5), watch)
                         .await

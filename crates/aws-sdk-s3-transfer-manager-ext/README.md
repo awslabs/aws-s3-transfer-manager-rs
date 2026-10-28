@@ -10,9 +10,10 @@ use aws_sdk_s3_transfer_manager_ext as tm_ext;
 use aws_smithy_execution::ManagedRuntime;
 use aws_smithy_managed_http::client::{ManagedHttpPool, pool};
 
-# fn example(sdk_config: aws_types::SdkConfig) -> Result<(), Box<dyn std::error::Error>> {
+# async fn example(sdk_config: aws_types::SdkConfig) -> Result<(), Box<dyn std::error::Error>> {
 let runtime = ManagedRuntime::builder().build()?;
 let execution = runtime.handle();
+let completion = runtime.shutdown_completion();
 
 // Configure transport on the native builder. This example uses cleartext HTTP;
 // for HTTPS, enable and select a native TLS provider on that builder.
@@ -29,7 +30,8 @@ let client = tm::Client::new(
         .runtime_config(tm::RuntimeConfig::managed(tm_ext::managed(runtime)))
         .build(),
 );
-# drop(client);
+drop(client);
+completion.wait().await?;
 # Ok(())
 # }
 ```
@@ -41,12 +43,20 @@ builder. This adapter adds no transport configuration facade.
 
 TM owns the adopted runtime. Active transfers retain TM client state, and owner
 destruction requests shutdown without waiting for managed thread completion.
+Retain `runtime.shutdown_completion()` before adoption, or obtain the TM-owned
+opaque observer from `client.shutdown_completion()`. Both wait for actual
+managed-thread joins after ownership is released. Waiting does not cancel or
+drain transfers, and retained client clones or transfer ownership can delay it.
+Automatic managed execution exposes the same TM observer; caller-owned Tokio
+execution returns `None`.
+
 Execution handles and HTTP clients do not own shutdown. Managed HTTP pool
 clones and targeted native clients retain the shared connection pool. Dropping
 an unused managed value or configuration requests runtime shutdown.
 
 Configured HTTP preserves TM's offloaded file-backed single-PUT body path.
-Reads use the blocking pool of the Tokio runtime on which the body is polled.
+Reads use the blocking pool of the Tokio runtime executing the transfer request.
+The body can be polled outside Tokio; retries retain the captured read runtime.
 Multipart part reads performed by managed transfer tasks retain their direct
 read path.
 

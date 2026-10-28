@@ -5,8 +5,13 @@
 
 use crate::{RuntimeId, RuntimePartitionId};
 use aws_smithy_topology::{BindError, DetectError};
-use std::{any::Any, error::Error, fmt, io, sync::mpsc::RecvError};
-use tokio::sync::oneshot;
+use std::{
+    any::Any,
+    error::Error,
+    fmt, io,
+    sync::{Arc, mpsc::RecvError},
+};
+use tokio::sync::watch;
 
 type BoxError = Box<dyn Error + Send + Sync + 'static>;
 
@@ -196,16 +201,16 @@ pub enum ShutdownErrorKind {
 
 /// Failure to wait for a managed runtime's shutdown.
 ///
-/// Shutdown is requested even when waiting fails. A managed-thread panic is
-/// reported after all managed threads are joined. Other errors can prevent
-/// confirmation that every thread has exited.
+/// A managed-thread panic is reported after all managed threads are joined.
+/// Other errors can prevent confirmation that every thread has exited. Waiting
+/// on a completion observer does not itself request shutdown.
 #[non_exhaustive]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ShutdownError {
     kind: ShutdownErrorKind,
     runtime: RuntimeId,
     partition: Option<RuntimePartitionId>,
-    source: Option<BoxError>,
+    source: Option<Arc<dyn Error + Send + Sync>>,
     message: Option<String>,
 }
 
@@ -230,17 +235,17 @@ impl ShutdownError {
             kind: ShutdownErrorKind::Joiner,
             runtime: id,
             partition: None,
-            source: Some(Box::new(source)),
+            source: Some(Arc::new(source)),
             message: None,
         }
     }
 
-    pub(crate) fn completion(id: RuntimeId, source: oneshot::error::RecvError) -> Self {
+    pub(crate) fn completion(id: RuntimeId, source: watch::error::RecvError) -> Self {
         Self {
             kind: ShutdownErrorKind::Completion,
             runtime: id,
             partition: None,
-            source: Some(Box::new(source)),
+            source: Some(Arc::new(source)),
             message: None,
         }
     }
