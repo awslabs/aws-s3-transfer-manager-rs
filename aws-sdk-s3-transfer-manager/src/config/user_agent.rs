@@ -185,7 +185,7 @@ impl Intercept for S3TransferManagerInterceptor {
 mod tests {
     use crate::types::{ConcurrencyMode, MemoryConfig, PartSize, RuntimeMode};
     use aws_config::{BehaviorVersion, Region};
-    use aws_runtime::user_agent::FrameworkMetadata;
+    use aws_runtime::user_agent::{AwsUserAgent, BusinessMetric, FrameworkMetadata};
     use aws_sdk_s3::config::{
         AppName, Credentials, Intercept, IntoShared, SharedCredentialsProvider,
     };
@@ -389,7 +389,8 @@ mod tests {
             .split_whitespace()
             .find_map(|section| section.strip_prefix("m/"))
             .expect("user agent carries a metrics section");
-        for id in ["G", "AX"] {
+        for metric in [BusinessMetric::S3Transfer, BusinessMetric::S3CustomPartSize] {
+            let id = id_of(metric);
             assert!(
                 metrics.split(',').any(|m| m == id),
                 "{id} missing from {metrics:?} in {ua:?}"
@@ -554,6 +555,14 @@ mod tests {
 
     type Seen = std::sync::Arc<std::sync::Mutex<Vec<(String, Vec<String>)>>>;
 
+    /// The id `aws-runtime` encodes `metric` as, so these tests do not repeat its table.
+    fn id_of(metric: BusinessMetric) -> String {
+        let header = AwsUserAgent::for_tests()
+            .with_business_metric(metric)
+            .aws_ua_header();
+        metric_ids(&header).remove(0)
+    }
+
     /// The business metric ids in a user agent.
     fn metric_ids(ua: &str) -> Vec<String> {
         ua.split_whitespace()
@@ -620,9 +629,19 @@ mod tests {
         seen[0].1.clone()
     }
 
-    fn has(ids: &[String], id: &str) -> bool {
-        ids.iter().any(|i| i == id)
+    fn has(ids: &[String], metric: BusinessMetric) -> bool {
+        ids.contains(&id_of(metric))
     }
+
+    const ATTRIBUTION: [BusinessMetric; 7] = [
+        BusinessMetric::S3CustomPartSize,
+        BusinessMetric::S3CustomThroughput,
+        BusinessMetric::S3CustomMemoryLimit,
+        BusinessMetric::S3OnEc2,
+        BusinessMetric::S3FilePath,
+        BusinessMetric::S3TransferUploadDirectory,
+        BusinessMetric::S3TransferDownloadDirectory,
+    ];
 
     /// The attribution ids a transfer manager's requests carry for its configuration, and for
     /// the operation that issued them.
@@ -630,7 +649,8 @@ mod tests {
         tweak: impl FnOnce(crate::config::Builder) -> crate::config::Builder,
     ) -> Vec<String> {
         let mut ids = download_ids(tweak).await;
-        ids.retain(|id| ["AX", "AY", "AZ", "Aa", "Ab", "9", "+"].contains(&id.as_str()));
+        let ours = ATTRIBUTION.map(id_of);
+        ids.retain(|id| ours.contains(id));
         ids
     }
 
@@ -649,26 +669,27 @@ mod tests {
             vcpus: 2,
             ram_bytes: None,
         };
-        let cases: Vec<(&str, Tweak, &[&str])> = vec![
+        let cases: Vec<(&str, Tweak, &[BusinessMetric])> = vec![
             ("defaults", Box::new(|b| b), &[]),
             (
                 "part size",
                 Box::new(|b| b.part_size(PartSize::Target(8 << 20))),
-                &["AX"],
+                &[BusinessMetric::S3CustomPartSize],
             ),
             (
                 "concurrency",
                 Box::new(|b| b.concurrency(ConcurrencyMode::Explicit(4))),
-                &["AY"],
+                &[BusinessMetric::S3CustomThroughput],
             ),
             (
                 "memory",
                 Box::new(|b| b.memory(MemoryConfig::Explicit(pool))),
-                &["AZ"],
+                &[BusinessMetric::S3CustomMemoryLimit],
             ),
-            ("ec2", Box::new(|b| b.machine_profile(Some(ec2))), &["Aa"]),
+            ("ec2", Box::new(|b| b.machine_profile(Some(ec2))), &[BusinessMetric::S3OnEc2]),
         ];
         for (name, tweak, expected) in cases {
+            let expected: Vec<String> = expected.iter().cloned().map(id_of).collect();
             assert_eq!(expected, attribution_ids(tweak).await, "{name}");
         }
     }
@@ -704,14 +725,14 @@ mod tests {
         assert!(children > 0);
         for (uri, ids) in &seen[..children] {
             assert!(
-                has(ids, "9") && has(ids, "Ab") && !has(ids, "+"),
+                has(ids, BusinessMetric::S3TransferUploadDirectory) && has(ids, BusinessMetric::S3FilePath) && !has(ids, BusinessMetric::S3TransferDownloadDirectory),
                 "{uri}: {ids:?}"
             );
         }
         // The markers belong to the operation: a later plain upload from the same client has none.
         let ids = &seen[children].1;
         assert!(
-            has(ids, "G") && !has(ids, "9") && !has(ids, "Ab"),
+            has(ids, BusinessMetric::S3Transfer) && !has(ids, BusinessMetric::S3TransferUploadDirectory) && !has(ids, BusinessMetric::S3FilePath),
             "{ids:?}"
         );
     }
@@ -741,20 +762,20 @@ mod tests {
         assert!(!listings.is_empty() && !objects.is_empty(), "{seen:?}");
         for (uri, ids) in listings {
             assert!(
-                has(ids, "+") && !has(ids, "Ab") && !has(ids, "9"),
+                has(ids, BusinessMetric::S3TransferDownloadDirectory) && !has(ids, BusinessMetric::S3FilePath) && !has(ids, BusinessMetric::S3TransferUploadDirectory),
                 "{uri}: {ids:?}"
             );
         }
         for (uri, ids) in objects {
             assert!(
-                has(ids, "+") && has(ids, "Ab") && !has(ids, "9"),
+                has(ids, BusinessMetric::S3TransferDownloadDirectory) && has(ids, BusinessMetric::S3FilePath) && !has(ids, BusinessMetric::S3TransferUploadDirectory),
                 "{uri}: {ids:?}"
             );
         }
         // The markers belong to the operation: a later plain download from the same client has none.
         let ids = &seen[children].1;
         assert!(
-            has(ids, "G") && !has(ids, "+") && !has(ids, "Ab"),
+            has(ids, BusinessMetric::S3Transfer) && !has(ids, BusinessMetric::S3TransferDownloadDirectory) && !has(ids, BusinessMetric::S3FilePath),
             "{ids:?}"
         );
     }
