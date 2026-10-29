@@ -3780,6 +3780,7 @@ mod tests {
             .await
             .expect("join returns once the write is released")
             .unwrap();
+        crate::runtime::test_util::shutdown(&handle).await;
         HeldReliefDownload {
             result,
             object,

@@ -625,6 +625,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
+      # Generated consumers resolve dependencies without the workspace lockfile.
+      CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: fallback
       # The checker includes optional features; dial9 needs Tokio's unstable API.
       RUSTFLAGS: "-Dwarnings --cfg tokio_unstable"
     steps:
