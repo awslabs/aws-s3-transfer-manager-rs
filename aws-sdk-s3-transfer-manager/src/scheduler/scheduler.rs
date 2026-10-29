@@ -3044,6 +3044,16 @@ mod tests {
             c1_count
         );
 
+        // The fairness sample can finish before the composite transfers do.
+        // Drain their terminal polls before shutdown cancels remaining tasks.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while !scheduler.is_idle() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("sampled composites should drain before shutdown");
+
         crate::runtime::test_util::shutdown(&handle).await;
     }
 
