@@ -694,7 +694,11 @@ mod tests {
                 Box::new(|b| b.memory(MemoryConfig::Explicit(pool))),
                 &[BusinessMetric::S3CustomMemoryLimit],
             ),
-            ("ec2", Box::new(|b| b.machine_profile(Some(ec2))), &[BusinessMetric::S3OnEc2]),
+            (
+                "ec2",
+                Box::new(|b| b.machine_profile(Some(ec2))),
+                &[BusinessMetric::S3OnEc2],
+            ),
         ];
         for (name, tweak, expected) in cases {
             let expected: Vec<String> = expected.iter().cloned().map(id_of).collect();
@@ -733,14 +737,18 @@ mod tests {
         assert!(children > 0);
         for (uri, ids) in &seen[..children] {
             assert!(
-                has(ids, BusinessMetric::S3TransferUploadDirectory) && has(ids, BusinessMetric::S3FilePath) && !has(ids, BusinessMetric::S3TransferDownloadDirectory),
+                has(ids, BusinessMetric::S3TransferUploadDirectory)
+                    && has(ids, BusinessMetric::S3FilePath)
+                    && !has(ids, BusinessMetric::S3TransferDownloadDirectory),
                 "{uri}: {ids:?}"
             );
         }
         // The markers belong to the operation: a later plain upload from the same client has none.
         let ids = &seen[children].1;
         assert!(
-            has(ids, BusinessMetric::S3Transfer) && !has(ids, BusinessMetric::S3TransferUploadDirectory) && !has(ids, BusinessMetric::S3FilePath),
+            has(ids, BusinessMetric::S3Transfer)
+                && !has(ids, BusinessMetric::S3TransferUploadDirectory)
+                && !has(ids, BusinessMetric::S3FilePath),
             "{ids:?}"
         );
     }
@@ -770,20 +778,26 @@ mod tests {
         assert!(!listings.is_empty() && !objects.is_empty(), "{seen:?}");
         for (uri, ids) in listings {
             assert!(
-                has(ids, BusinessMetric::S3TransferDownloadDirectory) && !has(ids, BusinessMetric::S3FilePath) && !has(ids, BusinessMetric::S3TransferUploadDirectory),
+                has(ids, BusinessMetric::S3TransferDownloadDirectory)
+                    && !has(ids, BusinessMetric::S3FilePath)
+                    && !has(ids, BusinessMetric::S3TransferUploadDirectory),
                 "{uri}: {ids:?}"
             );
         }
         for (uri, ids) in objects {
             assert!(
-                has(ids, BusinessMetric::S3TransferDownloadDirectory) && has(ids, BusinessMetric::S3FilePath) && !has(ids, BusinessMetric::S3TransferUploadDirectory),
+                has(ids, BusinessMetric::S3TransferDownloadDirectory)
+                    && has(ids, BusinessMetric::S3FilePath)
+                    && !has(ids, BusinessMetric::S3TransferUploadDirectory),
                 "{uri}: {ids:?}"
             );
         }
         // The markers belong to the operation: a later plain download from the same client has none.
         let ids = &seen[children].1;
         assert!(
-            has(ids, BusinessMetric::S3Transfer) && !has(ids, BusinessMetric::S3TransferDownloadDirectory) && !has(ids, BusinessMetric::S3FilePath),
+            has(ids, BusinessMetric::S3Transfer)
+                && !has(ids, BusinessMetric::S3TransferDownloadDirectory)
+                && !has(ids, BusinessMetric::S3FilePath),
             "{ids:?}"
         );
     }
