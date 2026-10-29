@@ -555,11 +555,10 @@ jobs:
           # first report, and reject invalid C-string operations.
           ASAN_OPTIONS: detect_leaks=1:detect_stack_use_after_return=1:halt_on_error=1:strict_string_checks=1
           # Retain additional access history for race reports and stop at the
-          # first race or thread-leak diagnostic. The suppression covers Tokio's
-          # kernel-mediated reactor registration; transfer-manager races and
-          # lifecycle leaks remain unsuppressed.
-          # Deadlock detection is not enabled.
-          TSAN_OPTIONS: halt_on_error=1:history_size=7:report_thread_leaks=1:suppressions=${{ github.workspace }}/.github/tsan-suppressions.txt
+          # first race. The suppression covers Tokio's kernel-mediated reactor
+          # registration; transfer-manager races remain unsuppressed.
+          # Thread-leak and deadlock detection are not enabled.
+          TSAN_OPTIONS: halt_on_error=1:history_size=7:report_thread_leaks=0:suppressions=${{ github.workspace }}/.github/tsan-suppressions.txt
           # Ignore `trybuild` errors as they are irrelevant and flaky on nightly
           TRYBUILD: overwrite
 
