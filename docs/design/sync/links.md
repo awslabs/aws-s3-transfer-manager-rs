@@ -1,139 +1,397 @@
-# Design: links in the local tree
+# Symlinks and delete mode
 
-This design implements FR-Enum-4, FR-Enum-14, and FR-Enum-15. Writing those three requirements
-also changed FR-Enum-3, FR-Enum-9, FR-Exec-7, FR-Exec-12, FR-Fail-4, FR-Fail-7, FR-Fail-8, and
-FR-Root-8. The rules come from one model of the local tree, and most of the code already follows it.
+This auxiliary design doc to [execution](execution.md) focuses on symlinks in the local tree when
+delete mode is on. It decides what a run may delete, and what a download may write, while a link
+stands in the tree.
 
-## The model
+A *link* here is a symbolic link in the local tree. A *hold* on a name makes one side of the merge
+answer "unknown" for that name and every key under it. The comparison takes no action on an unknown
+side (**FR-Fail-7**), so a hold stops whatever the run would have done under the name. Each case
+below names the decision that settles it.
 
-The merge pairs one key with one directory entry. A link breaks that pairing, and the follow
-setting decides how the merge sees the break:
+## The cases
 
-- With following off, a link is an entry at its own name, and the walk never looks behind it. The
-  side holding the link cannot account for any key under that name, so the merge holds those keys
-  back. The source side already does this for an upload. The destination side starts doing it for
-  a download.
-- With following on, the walk looks behind each link it can resolve, so two keys can name one file.
-  A delete through either key removes the file both keys name, so delete mode never deletes through
-  a link or at a followed link's target.
+### A. An upload past a link the walk does not follow
 
-One mechanism carries both cases. A side holds a `Stretch` under a name, `Side::missing` answers
-`Unknown(UnknownRange)` for every key under it, and the comparison takes no action on an unknown
-key (FR-Fail-7). The source side's stretches stop deletes. The destination side's stretches stop
-transfers.
+```
+   local source, following off            bucket destination
+   ┌───────────────────────────┐          ┌──────────────────┐
+   │ photos ──► /mnt/nas       │          │ photos/y.jpg     │
+   └───────────────────────────┘          └──────────────────┘
 
-## What HEAD already does
+   key            source               destination   decision
+   ───            ──────               ───────────   ────────
+   photos         the link             absent        skip, nothing to read
+   photos/y.jpg   held under photos    present       skip, unknown
+```
 
-- **An upload with a link the walk did not follow.** `Walk::take_source` adds a source stretch
-  under the link's name.
-- **An upload with a dangling link or a loop.** `cost_of` turns the walk error into a source
-  stretch under the name.
-- **A download with a link at a key's own name.** The link carries no size or time, so the
-  comparison transfers, and the rename replaces the link.
-- **A download delete through a followed link.** `LocalDestination::record_aliases` names the link,
-  its target, and its chain. `Walk::hold_aliased` then adds source stretches.
-- **A bound on held names.** Past `ALIASED_NAMES_HELD` names, the source holds every later key.
-- **A late link.** `hold_aliased` marks the plan incomplete.
-- **A removal before a download under it.** `Deletes.clearing` and `Transfers.held` remove a file
-  at `photos` before `photos/a.jpg` lands.
+The walk stops at `photos`, so the source never lists `photos/y.jpg`. Position alone would read the
+object as absent, and delete mode would remove it from the bucket. The source holds `photos` (D2),
+so `photos/y.jpg` reads as unknown and stays. A dangling link, a loop, and a link whose name the
+filter excludes hide keys the same way.
 
-## Changes
+### B. Two links the filter excludes
 
-Each change names the probe or review comment it closes. The probes ran at HEAD `ea5c6fde`, and
-their output is in `~/Documents/2026/Q4/tm/sync-links/probes-2026-10-28.md`.
+```
+   key order  ────────────────────────────────────────────────────────────►
 
-### C1. Drop an excluded link at the merge position
+                photos               photos/y.jpg              videos
+   source       excluded link                                  excluded link
+   destination                       object
+                                     ▲                         ▲
+                                     not paired yet            an early drop
+                                                               of videos
+```
 
-`Walk::next` drops an excluded head with `Side::take`, and `take` releases every stretch and lost
-key below the link's name. The other side may not have reached those keys yet. So a second excluded
-link released the first link's hold (P1, r4395422459), and one excluded link released the hold of
-an unreadable directory before it (P2).
+On an upload with following off, the filter excludes `photos` and `videos`, and both are links.
+Each excluded link holds the keys under its name. Dropping `videos` from the stream releases every
+hold that sorts before `videos`, because the merge treats those keys as passed. But the destination
+has not paired `photos/y.jpg` yet, and the object would read as absent. The merge drops an excluded
+link only once the other side has no earlier key to pair (D3). So `photos/y.jpg` pairs first, under
+the hold, and stays.
 
-The merge drops an excluded head only when the other side's head does not sort before it. Otherwise
-the loop pairs the other side's earlier key first, with the holds still in place. The change touches
-both excluded-link branches in `Walk::next`, about 12 lines.
+### C. A download through a link the walk does not follow
 
-### C2. Hold the keys under a destination link the walk did not resolve
+```
+   bucket source             local destination, following off
+   ┌──────────────────┐      ┌──────────────────────────────┐
+   │ photos/a.jpg     │      │ photos ──┐                   │
+   └──────────────────┘      └──────────┼───────────────────┘
+                                        ▼
+                             ┌──────────────────────────────┐
+                             │ /mnt/nas, outside the root   │
+                             └──────────────────────────────┘
 
-A new `Walk::take_destination` mirrors `take_source`. When the destination head is an unfollowed
-link, it adds a destination stretch under the link's name. The destination's excluded-link branch
-adds the same stretch before it drops the link. `take_destination_only` and `take_both` call the
-new method. About 15 lines.
+   delete mode   run   the link photos   photos/a.jpg
+   ───────────   ───   ───────────────   ────────────
+   on            1     removed           held, skipped-unknown
+   on            2     gone              downloaded into a real photos/
+   off           any   kept              held, skipped-unknown
+```
 
-Every source key under the link then reads unknown on the destination side, and no transfer under
-the link reaches `claim_one`. The fix closes three cases:
+A download of `photos/a.jpg` would land in `/mnt/nas`. The next walk would stop at the link again,
+so every run would write the file again. The destination holds `photos` (D2), so no run writes
+under the link. With delete mode on, the first run removes the destination-only link, and the
+second run downloads into a real directory. The hold works the same way when the filter excludes
+the link, and when the tree refuses to remove it.
 
-- A download with delete mode off wrote through the link on every run (P5).
-- A download wrote through a link whose name a filter excludes (P6).
-- After a refused removal, later downloads wrote through the link (P3, r4396175840). A refused
-  removal now has no downloads behind it.
+### D. Two keys name one file
 
-Delete mode still removes a destination-only link, and the next run downloads the keys under its
-name. Three tests assert the old behavior and change:
+```
+   keys the walk yields                         the file on disk
+   ────────────────────                         ────────────────
+   link/x.txt ──► link ──► real/ ──┐
+                                   ├──────────► real/x.txt
+   real/x.txt ─────────────────────┘
 
-- `a_download_writes_through_a_destination_link_as_download_objects_does`
-- `each_removal_on_a_path_runs_before_the_downloads_under_it`
-- `an_unfollowed_destination_link_holds_nothing_back`
+   bucket keeps   destination only   deleting the destination-only key
+   ────────────   ────────────────   ─────────────────────────────────
+   real/x.txt     link/x.txt         removes real/x.txt
+   link/x.txt     real/x.txt         removes real/x.txt
+```
 
-The `TODO(vnext)` on `take_source` goes away. `Deletes.clearing` stays, because a file at `photos`
-still has to go before `photos/a.jpg` lands.
+`link` points at `real`, and with following on the walk yields two keys for one file. A delete
+removes one directory entry. Whichever key the bucket lacks, deleting it removes the file the other
+key keeps. The merge holds the link's own name `link` and its target `real` (D4). The
+destination-only key reads as unknown, and the file stays.
 
-### C3. Report a dangling link as an entry at its own name
+### E. A chain of file links
 
-`FsWalk::read_dir` reports a dangling link only as a `BrokenSymlink` error. On a download, the
-error's stretch covers the link's own name. A kept key at that name therefore never downloads, and
-every run fails (P7, r4396285369's file case).
+```
+   y.txt ──────► z.txt ──────► x.txt
+   │             │             │
+   kept          a link,       the file,
+                 destination   destination
+                 only          only
+```
 
-When `include_special_files` is on, the walk also yields the dangling link as a `FileType::Symlink`
-entry with no metadata. The key stream maps it to `Obstruction::UnfollowedLink`, so C2 holds the
-keys under its name, and the comparison replaces the link at its own name. `LocalDestination`
-drops the `BrokenSymlink` error, so a download records no failure. An upload keeps the error, as
-FR-Enum-3 asks. About 15 lines in `fs.rs` and `walk.rs`.
+The bucket keeps `y.txt`. Deleting `z.txt` would leave `y.txt` dangling, and deleting `x.txt` would
+lose the file `y.txt` names. The merge holds every later link on a file link's chain, and the file
+at its end (D4). The link `y.txt` stays deletable, because removing a link leaves its target.
 
-`include_special_files` is crate-private, and only sync sets it in production code. So
-`upload_objects` sees no change.
+### F. A link the walk meets after the merge passed its target
 
-### C4. Hold a followed file link's target when a filter excludes the link
+```
+   key order  ────────────────────────────────────────────────────────────►
 
-`read_dir` records `FollowedLink::File` after the path filter check. An excluded file link
-therefore names no target, and delete mode removed the target while the link stayed (review probe
-Q4). The record moves above the check, about 2 lines.
+                real/x.txt                          z/link/x.txt
+                ▲                                   ▲
+                the merge decides                   the walk reads z/, and only then
+                the delete here                     meets z/link ──► ../real
 
-### C5. Stop at a link to a directory that contains the root
+   run   what happens                               outcome
+   ───   ────────────                               ───────
+   1     delete real/x.txt                          Warned, plan incomplete
+   2     download z/link/x.txt into real/           Clean
+   3     delete real/x.txt again                    Warned, plan incomplete
+```
 
-The walk's cycle check compares a link's target with the directories from the root down. A link
-`up -> ..` points above the root, so the walk entered it and walked the root again under `up/root/`
-(review probe Q1). The walk seeds the root's ancestor chain with the handles of the directories
-above the root, when following is on. A link to any of them then reports a loop at the link.
-About 10 lines in `FsWalker::walk`, plus one `open` and `fstat` per directory above the root. This
-also changes `upload_objects` with following on, where the same link walked the parent tree.
+The bucket keeps `z/link/x.txt`. The walk meets a link only when it reads the directory holding the
+link, and `z/` sorts after `real/`. So the merge decides the delete of `real/x.txt` before any hold
+exists. The run reports an incomplete plan (D6), and the tree alternates between runs. A late file
+link settles after one more run. The delete leaves the link dangling, and the next run replaces the
+link with the downloaded file (D7).
 
-### C6. Resolve a root that is itself a link
+### G. A link at a kept key's own name
 
-`FsWalker::walk` refuses a root that is a link when following is off (review probe Q6). Sync
-resolves an existing root once in `Walker::uploading` and `Walker::downloading`, and the walker
-stays the same. About 8 lines.
+```
+   bucket source       local destination, holding one of
+   ┌──────────────┐    ┌───────────────────────────────────────────────┐
+   │ y.txt        │    │ y.txt ──► missing          a dangling link    │
+   └──────────────┘    │ y.txt ──► /run/app.sock    a link to a socket │
+                       └───────────────────────────────────────────────┘
+```
 
-### C7. Replace a followed link to a special file at a key's own name
+Neither link has bytes the comparison can read. A dangling link would read as unknown at its own
+name, so nothing would download and every run would fail. A followed link to a socket would read as
+the socket, and the comparison would skip the key on every run. The download replaces whatever link
+stands at a key's own name (D7). The rename lands the file at `y.txt` and leaves the link's target
+alone.
 
-With following on, a link to a socket at a kept key's name reads as the socket. The comparison
-then skips it as obstructed (review probe Q3). The key stream maps a followed link with a special
-target to an obstruction that allows the overwrite. About 8 lines in `stream.rs` and `state.rs`.
+### H. Where the run starts
 
-## Deferred
+```
+   /data/
+   ├── sibling/
+   │   └── s.txt            above the root, outside the run
+   ├── current ──► dest     the root the caller named
+   └── dest/
+       ├── a.txt
+       └── up ──► ..        its target contains the root: a loop
+```
 
-- **A download defaults to following.** No caller reaches the crate-private builder's default
-  today. The public sync API applies the per-direction default when it lands.
-- **A late link's target** (r4396285369, directory case). The fix needs every link known before the
-  first delete. Sync would then hold deletes in memory, or spill them to a file the way rsync's
-  `--delete-delay` does. FR-Exec-7 now names this case as its exception.
-- **Two keys that reach one file** (FR-Fail-8). FR-Fail-8 has no implementation yet, and the link
-  case shares its policy.
+The caller names `/data/current`, a link to `/data/dest`. The run starts there with following on or
+off, because the follow setting covers the entries inside the root (D8). Following `up` would walk
+`/data` again, and an upload would send `up/sibling/s.txt` from outside the root. The walk treats a
+link to a directory that contains the root as a loop, and it stops at the link.
 
-## Scope
+## 1. Scope, and why it is this
 
-Before C1 to C7, probes P1 to P7 and the three link review comments each end with a wrong outcome.
-C1 to C4 change about 45 lines of production code, and each probe and review case now ends the way
-the spec says. C5 to C7 close the other cells the spec now decides, at about 26 more lines.
-Each change reuses the walk or the merge mechanism above, so none adds a new kind of state. About
-10 tests change: 7 new ones, and the 3 above that flip.
+This design covers the local tree in both directions. A bucket has no links, and a delete there
+removes one key, so the bucket side needs nothing here.
+
+The merge pairs one key with one directory entry. A link breaks that pairing in two ways.
+
+**A link the walk does not look behind hides keys.** The keys under the link's name exist on the
+other side only, so position alone reads them as absent. An upload would delete them from the
+bucket. A download would write them through the link, wherever it points.
+
+**A link the walk follows gives one file two keys.** A delete removes one directory entry. On a
+download, the delete through either key removes the file the other key keeps. An upload's
+destination is a bucket, so this way reaches downloads only.
+
+The same rules govern the writes a download makes, with delete mode on or off. A write and a delete
+on one name have to agree about what the name is. The decisions below meet **FR-Enum-4**,
+**FR-Enum-14** and **FR-Enum-15** in [`functional-spec.md`](functional-spec.md). Two keys that
+differ only in case (**FR-Fail-8**), and a key that leaves the root through its own path
+(**FR-Root-8**), stay outside this design.
+
+## 2. Design decisions
+
+**D1. One follow setting governs everything sync does to the local tree.** Listing, comparing,
+writing, and deleting all take one value. When the listing and the writes disagree, a download
+writes through a link its listing never looked behind (case C). An upload defaults to not following,
+as `upload_objects` does. A download defaults to following, because `download_objects` writes
+through a link on a directory above a file and has no setting.
+
+With following on, the walk follows every link it can resolve, and a key names whatever its path
+reaches. With following off, a link is an entry at its own name, and sync never reads, writes, or
+deletes through it.
+
+**D2. A link the walk does not resolve holds every key under its name.** With following off, every
+link qualifies. With following on, a dangling link and a loop qualify. The side holding the link
+cannot account for any key under the link's name, so the merge holds the name on that side. On an
+upload the source holds, and delete mode removes no destination key under the name (case A). On a
+download the destination holds, and the run writes no source key under the name (case C). The run
+reports each held key as `skipped-unknown` and marks its plan incomplete.
+
+A held download costs one more run. With delete mode on, the first run removes a destination-only
+link, and the second run downloads the keys under its name. The alternative finishes in one run: it
+holds each download behind the link's removal and fails the download when the tree refuses. But that
+alternative keeps a record of refused names for the rest of the run. It still has to hold the keys
+when delete mode is off, or when the filter excludes the link. The hold covers every case with the
+mechanism an upload already uses.
+
+Execution's D12 removes a file at `photos` before a download of `photos/a.jpg`. A link the walk
+does not resolve never reaches D12, because the hold decides no download under the link.
+
+**D3. The merge drops an excluded link only at the merge position.** A link whose name the filter
+excludes makes no pairing, so the merge drops it from the stream. Dropping an entry releases every
+hold below its key, because the merge treats those keys as passed. An excluded head can sort ahead
+of the merge position while the other side has an earlier key to pair. Dropping the head there
+releases holds the earlier key needs (case B). So the merge drops an excluded head only once the
+other side has no earlier key to pair. The rule protects every other hold too. An excluded link that
+sorts after an unreadable directory leaves that directory's hold in place.
+
+**D4. On a download with following on, a delete never passes through a link or removes what a link
+reaches.** A delete removes one directory entry, and two keys can name one file (case D). For each
+link the destination walk follows, the merge holds names on the source side. The merge holds a
+directory link's own name, so no delete passes through the link. The merge also holds the link's
+resolved target when the target sits inside the root. For a file link, the merge holds every later
+link on the chain as well (case E). A file link's own name stays deletable, because removing a link
+leaves its target.
+
+The holds stand even when the bucket keeps neither key. To delete the target safely, the merge would
+need the bucket's answer for the key through the link. That key can sort after the target, so the
+merge would have to set the delete aside until the key pairs, and D6 gives that cost. So a download
+with following on keeps stale files under a link's target, reports them as `skipped-unknown`, and
+ends `Warned`.
+
+**D5. The merge holds at most 1,024 names for followed links.** A link whose target sorts after it
+keeps the target's name held until the merge passes the target. In a tree with one such link per
+directory, the held names would grow with the tree, and **NFR-Mem-1** rules that out. Past 1,024
+names, the source holds every later delete. The bound matches the 1,024 transfers that may wait
+before the merge pauses (execution's D11), so the held names cost about what that queue costs.
+
+**D6. A late link makes the plan incomplete.** The walk meets a link only when it reads the
+directory holding the link. When that directory sorts after the link's target, the merge has
+already decided deletes under the target (case F). Preventing the deletes under the target needs
+every link known before the first delete. A local delete batch holds one key, and a waiting batch
+pauses the merge (execution's D11). Holding the deletes would stall the merge, and every later
+transfer with it, until the walk ends. Setting the deletes aside keeps the merge moving, but memory
+then grows with the deletes. A spill file bounds that memory, at the cost of a new kind of state.
+
+So when a name arrives after the merge already reached it, the merge marks the plan incomplete, and
+the run ends `Warned`. **FR-Exec-7** names this tree as its one exception. The report fires on every
+run over such a tree, including a run that deleted nothing under the target. The merge does not
+record whether a pairing became a delete, so it cannot tell the two runs apart. A tree with
+`www/current -> ../releases/v3` therefore ends `Warned` on every correct run.
+
+**D7. A download replaces whatever link stands at a key's own name.** The rename that lands a
+download replaces a link and leaves its target alone. The same rename covers a dangling link and a
+followed link to a socket, FIFO, or device (case G). So the walk reports a dangling link in a
+download's destination as an entry at its own name, with no size or time. The walk records no
+failure for that entry. Delete mode removes a destination-only dangling link. The hold on the keys
+under the link's name stays (D2), because the link may stand for a directory on an unmounted
+volume. An upload still reports a dangling link as a failure, because the source has nothing to send
+for its key.
+
+**D8. The run starts at the root the caller named.** The follow setting covers the entries inside
+the root. The run resolves the root itself as spelled, even when the root is a link, and the
+directories above the root stay outside the run (case H). A link to a directory that contains the
+root is a loop, and the walk stops at the link. Checking for that loop costs one `open` and `fstat`
+for each directory above the root, once per run, and only with following on.
+
+## 3. How the pieces fit
+
+### The problem
+
+The merge reads absence from position. A link makes position mislead in two ways: it hides keys from
+one side, and it gives one file two keys. The design answers both with one mechanism the merge
+already has.
+
+### A hold under a name
+
+A side keeps its holds in `gap`, a set of `Stretch` values. A stretch under a name covers the name
+and every key below it. `Side::missing` answers for a key the side did not produce, and a covered
+key reads as unknown. The excerpt below keeps only the hold:
+
+```rust
+fn missing(&mut self, key: &str) -> SideState<K::Source> {
+    self.gap.release_passed(key);
+    if self.gap.covers(key) {
+        return SideState::Unknown(KeysLost::UnknownRange);
+    }
+    SideState::Absent
+}
+```
+
+The side that holds decides what stops:
+
+```
+   hold on            a key under the name reads      so the comparison never
+   ───────            ──────────────────────────      ───────────────────────
+   the source         unknown on the source side      deletes it
+   the destination    unknown on the destination      transfers it
+```
+
+The merge releases a stretch once it passes the name. A hold therefore costs memory only while the
+merge sits before the end of the name's range.
+
+### Where each hold comes from
+
+```
+   link in the local tree    held on      name held                 added in
+   ──────────────────────    ───────      ─────────                 ────────
+   not followed              its side     its own name              take_source, take_destination
+   excluded by the filter    its side     its own name              Walk::next
+   dangling, or in a loop    its side     its own name              cost_of
+   followed, on a download   the source   own name, target, chain   hold_aliased
+```
+
+The first three rows cover a link the walk does not resolve (D2). A link's side is the source on an
+upload and the destination on a download. On a download, the walk yields a dangling link as an
+entry (D7), so `take_destination` adds that hold. `take_destination` mirrors `take_source`:
+
+```rust
+fn take_destination(&mut self) -> Entry<D::Source> {
+    let entry = self.dst.take();
+    if entry.meta.obstruction == Some(Obstruction::UnfollowedLink) {
+        self.dst.gap.add(Stretch {
+            under: Some(entry.key.clone()),
+        });
+    }
+    entry
+}
+```
+
+### The merge position
+
+`Side::take` releases every hold below the key it hands over. The merge calls `take` on an excluded
+head only once the other side has no earlier key:
+
+```rust
+// The destination still has a key that sorts before this link, so that key pairs first.
+let ahead = matches!(
+    (&self.src.head, &self.dst.head),
+    (Head::Entry(src), Head::Entry(dst)) if dst.key < src.key
+);
+if !ahead && self.src.head_is(Obstruction::ExcludedLink) {
+    let link = self.src.take();
+    self.src.gap.add(Stretch { under: Some(link.key) });
+    continue;
+}
+```
+
+The destination's branch mirrors the condition and adds its own stretch.
+
+### Naming what a followed link reaches
+
+`FsWalk` records each link it follows during one `next` call. `LocalDestination` reads the record
+after every call, including a call that returns an error, and turns each link into names. A name
+comes in one of two kinds, because the merge reaches the two at different points:
+
+```rust
+pub(crate) enum AliasedName {
+    // Reached once the merge enters the subtree or passes it.
+    Directory(String),
+    // Reached once the merge pairs the key or a later one.
+    File(String),
+}
+```
+
+`link.txt` sorts after the file `link` and before the directory's subtree `link/`, so the two kinds
+need two tests. A link's own name sits under the root as spelled. A target comes from
+`canonicalize`, so it sits under the resolved root. On macOS a temporary root reads `/var/...` and
+resolves to `/private/var/...`, so each kind of name takes its key under its own root.
+
+`Walk::hold_aliased` adds each name to the source side. A name the merge has already reached marks
+the plan incomplete (D6), and the bound applies at the same point (D5):
+
+```rust
+if self.src.gap.under.len() < ALIASED_NAMES_HELD {
+    self.src.gap.add(stretch);
+} else {
+    // Past the bound, hold every later key.
+    self.src.gap.add(Stretch { under: None });
+}
+```
+
+### What this design does not decide
+
+Sync has no public entry point yet. The crate-private `WalkerBuilder` defaults to not following in
+both directions, so the download default from D1 belongs to the public entry point.
+
+Two keys can reach one local file through a followed link, and both can download. With
+`link -> real` and a bucket holding `link/x.txt` and `real/x.txt`, the last write wins.
+**FR-Fail-8** governs that case, and FR-Fail-8 has no implementation yet.
