@@ -1335,12 +1335,16 @@ async fn run_complete_multipart_incorrect_full_object_checksum(
 // ============================================================================
 
 /// Test multipart upload with part number validation
-async fn run_multipart_non_consecutive_parts(storage_type: StorageType) -> Result<()> {
+/// A gapped but ascending part list (1, 3) completes successfully.
+///
+/// General-purpose S3 requires only that the parts list be in ascending order
+/// by part number
+async fn run_multipart_gapped_parts_succeed(storage_type: StorageType) -> Result<()> {
     let (server, bucket) = create_server(storage_type).await?;
     let handle = server.start().await?;
     let s3 = handle.client().await;
 
-    let key = "test-multipart-non-consecutive.txt";
+    let key = "test-multipart-gapped.txt";
     let part_data = b"Test part data";
 
     let create_response = s3
@@ -1352,7 +1356,7 @@ async fn run_multipart_non_consecutive_parts(storage_type: StorageType) -> Resul
 
     let upload_id = create_response.upload_id().unwrap();
 
-    // Upload parts with non-consecutive numbers (1, 3)
+    // Upload parts with non-contiguous numbers (1, 3) — a gap, but ascending.
     let part1_response = s3
         .upload_part()
         .bucket(&bucket)
@@ -1368,12 +1372,12 @@ async fn run_multipart_non_consecutive_parts(storage_type: StorageType) -> Resul
         .bucket(&bucket)
         .key(key)
         .upload_id(upload_id)
-        .part_number(3) // Non-consecutive!
+        .part_number(3)
         .body(Bytes::from_static(part_data).into())
         .send()
         .await?;
 
-    // Try to complete with non-consecutive parts
+    // Complete with the gapped, ascending list.
     let completed_parts = vec![
         CompletedPart::builder()
             .part_number(1)
@@ -1398,10 +1402,190 @@ async fn run_multipart_non_consecutive_parts(storage_type: StorageType) -> Resul
         .send()
         .await;
 
+    // Should succeed — ascending order with a gap is valid for general-purpose buckets.
+    assert!(
+        result.is_ok(),
+        "a gapped but ascending part list must complete: {:?}",
+        result.err()
+    );
+
+    handle.shutdown().await?;
+    Ok(())
+}
+
+/// Under a composite (part-level) checksum, a non-contiguous part list must be rejected.
+///
+/// The part numbers must be consecutive and begin with 1 if multipart upload with Checksums for composite (or part-level) checksums.
+/// A gapped list (1, 3) carrying per-part checksums must therefore fail. S3 returns an HTTP 500 Internal Server error
+/// for this case.
+///
+/// https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity-upload.html
+async fn run_multipart_composite_checksum_gap_rejected(storage_type: StorageType) -> Result<()> {
+    let (server, bucket) = create_server(storage_type).await?;
+    let handle = server.start().await?;
+    let s3 = handle.client().await;
+
+    let key = "test-multipart-composite-gap.txt";
+    let part1_data = b"First part of a composite-checksum upload.......";
+    let part3_data = b"Third part of a composite-checksum upload.......";
+
+    // Create the upload with a CRC32 composite checksum.
+    let create_response = s3
+        .create_multipart_upload()
+        .bucket(&bucket)
+        .key(key)
+        .checksum_algorithm(ChecksumAlgorithm::Crc32)
+        .checksum_type(aws_sdk_s3::types::ChecksumType::Composite)
+        .send()
+        .await?;
+
+    let upload_id = create_response.upload_id().unwrap();
+
+    // Upload parts with non-contiguous numbers (1, 3), each carrying a per-part checksum.
+    let part1_checksum = calculate_checksum(part1_data, ChecksumAlgorithm::Crc32);
+    let part3_checksum = calculate_checksum(part3_data, ChecksumAlgorithm::Crc32);
+
+    let part1_response = s3
+        .upload_part()
+        .bucket(&bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .part_number(1)
+        .checksum_crc32(part1_checksum.clone())
+        .body(Bytes::from_static(part1_data).into())
+        .send()
+        .await?;
+
+    let part3_response = s3
+        .upload_part()
+        .bucket(&bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .part_number(3)
+        .checksum_crc32(part3_checksum.clone())
+        .body(Bytes::from_static(part3_data).into())
+        .send()
+        .await?;
+
+    // Complete with the gapped list, carrying per-part checksums (composite regime).
+    let completed_parts = vec![
+        CompletedPart::builder()
+            .part_number(1)
+            .e_tag(part1_response.e_tag().unwrap())
+            .checksum_crc32(part1_checksum)
+            .build(),
+        CompletedPart::builder()
+            .part_number(3)
+            .e_tag(part3_response.e_tag().unwrap())
+            .checksum_crc32(part3_checksum)
+            .build(),
+    ];
+
+    let result = s3
+        .complete_multipart_upload()
+        .bucket(&bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .checksum_type(aws_sdk_s3::types::ChecksumType::Composite)
+        .multipart_upload(
+            CompletedMultipartUpload::builder()
+                .set_parts(Some(completed_parts))
+                .build(),
+        )
+        .send()
+        .await;
+
+    // Must fail: composite checksum requires contiguous part numbers. S3 returns
+    // an HTTP 500 Internal Server error for this. Assert on the handler's specific
+    // message so the test fails if the rule is removed (rather than passing on some
+    // other internal error from a deeper layer).
+    let error = result
+        .expect_err("a composite-checksum completion with a part-number gap must be rejected");
+    let error_msg = format!("{error:?}");
+    assert!(
+        error_msg.contains("InternalError"),
+        "expected an InternalError (HTTP 500), got: {error_msg}"
+    );
+    assert!(
+        error_msg.contains("consecutive part numbers beginning with 1"),
+        "expected the composite-checksum contiguity message, got: {error_msg}"
+    );
+
+    handle.shutdown().await?;
+    Ok(())
+}
+
+/// A complete part set listed out of ascending order must fail with InvalidPartOrder.
+///
+/// The parts here form a full `1..=2` set but are listed descending (`2, 1`). S3 requires
+/// the `<Part>` entries to appear in ascending part-number order and returns InvalidPartOrder.
+async fn run_multipart_out_of_order_parts(storage_type: StorageType) -> Result<()> {
+    let (server, bucket) = create_server(storage_type).await?;
+    let handle = server.start().await?;
+    let s3 = handle.client().await;
+
+    let key = "test-multipart-out-of-order.txt";
+    let part_data = b"Test part data";
+
+    let create_response = s3
+        .create_multipart_upload()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await?;
+
+    let upload_id = create_response.upload_id().unwrap();
+
+    // Upload a complete, consecutive set of parts (1, 2).
+    let part1_response = s3
+        .upload_part()
+        .bucket(&bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .part_number(1)
+        .body(Bytes::from_static(part_data).into())
+        .send()
+        .await?;
+
+    let part2_response = s3
+        .upload_part()
+        .bucket(&bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .part_number(2)
+        .body(Bytes::from_static(part_data).into())
+        .send()
+        .await?;
+
+    // Complete with the parts listed in descending order (2, 1).
+    let completed_parts = vec![
+        CompletedPart::builder()
+            .part_number(2)
+            .e_tag(part2_response.e_tag().unwrap())
+            .build(),
+        CompletedPart::builder()
+            .part_number(1)
+            .e_tag(part1_response.e_tag().unwrap())
+            .build(),
+    ];
+
+    let result = s3
+        .complete_multipart_upload()
+        .bucket(&bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .multipart_upload(
+            CompletedMultipartUpload::builder()
+                .set_parts(Some(completed_parts))
+                .build(),
+        )
+        .send()
+        .await;
+
     // Should fail with InvalidPartOrder
     assert!(result.is_err());
     let error_msg = format!("{:?}", result.unwrap_err());
-    assert!(error_msg.contains("InvalidPartOrder") || error_msg.contains("consecutive"));
+    assert!(error_msg.contains("InvalidPartOrder"));
 
     handle.shutdown().await?;
     Ok(())
@@ -1452,8 +1636,18 @@ async fn test_put_object_crc32_correct_filesystem() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_multipart_non_consecutive_parts_in_memory() -> Result<()> {
-    run_multipart_non_consecutive_parts(StorageType::InMemory).await
+async fn test_multipart_gapped_parts_succeed_in_memory() -> Result<()> {
+    run_multipart_gapped_parts_succeed(StorageType::InMemory).await
+}
+
+#[tokio::test]
+async fn test_multipart_composite_checksum_gap_rejected_in_memory() -> Result<()> {
+    run_multipart_composite_checksum_gap_rejected(StorageType::InMemory).await
+}
+
+#[tokio::test]
+async fn test_multipart_out_of_order_parts_in_memory() -> Result<()> {
+    run_multipart_out_of_order_parts(StorageType::InMemory).await
 }
 
 #[tokio::test]
@@ -1497,8 +1691,18 @@ async fn test_put_object_crc32_incorrect_filesystem() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_multipart_non_consecutive_parts_filesystem() -> Result<()> {
-    run_multipart_non_consecutive_parts(StorageType::Filesystem).await
+async fn test_multipart_gapped_parts_succeed_filesystem() -> Result<()> {
+    run_multipart_gapped_parts_succeed(StorageType::Filesystem).await
+}
+
+#[tokio::test]
+async fn test_multipart_composite_checksum_gap_rejected_filesystem() -> Result<()> {
+    run_multipart_composite_checksum_gap_rejected(StorageType::Filesystem).await
+}
+
+#[tokio::test]
+async fn test_multipart_out_of_order_parts_filesystem() -> Result<()> {
+    run_multipart_out_of_order_parts(StorageType::Filesystem).await
 }
 
 #[tokio::test]
