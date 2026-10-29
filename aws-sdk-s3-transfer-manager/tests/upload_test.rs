@@ -2019,9 +2019,10 @@ async fn assert_failure_releases_stream(
         .expect("failed upload retained its stream while the handle was held");
 }
 
+// ref: awslabs/aws-s3-transfer-manager-rs#226
 /// A failed UploadPart releases the custom stream while the caller still holds the handle, so a
 /// producer applying backpressure observes its channel close rather than waiting forever for the
-/// upload to take another part (#226).
+/// upload to take another part.
 #[tokio::test]
 async fn test_upload_part_failure_releases_stream_while_handle_held() {
     let upload_part =
@@ -2036,8 +2037,9 @@ async fn test_upload_part_failure_releases_stream_while_handle_held() {
     assert_eq!(1, upload_part.num_calls());
 }
 
+// ref: awslabs/aws-s3-transfer-manager-rs#226
 /// A failed CreateMultipartUpload releases the custom stream it never read, while the caller still
-/// holds the handle (#226).
+/// holds the handle.
 #[tokio::test]
 async fn test_create_multipart_failure_releases_stream_while_handle_held() {
     let create_mpu =

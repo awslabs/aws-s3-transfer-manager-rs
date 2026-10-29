@@ -42,7 +42,7 @@ use tracing::Instrument;
 
 use crate::error::{Error, ErrorKind};
 use crate::io::part_reader::{Builder as PartReaderBuilder, PartReadStart};
-use crate::io::{InputStream, PartData};
+use crate::io::{InputStream, PartData, SizeHint};
 use crate::operation::upload::context::{
     apply_content_length, validate_distinct_part_numbers, validate_part_number, validate_size_hint,
     MultipartCompletion, PartPlan, PartReadWake, PartTransferState, PendingPartRead,
@@ -165,14 +165,14 @@ impl UploadTransfer {
             .observe_event(self.inner.ctx.id, event, snapshot);
     }
 
-    /// Runs once the transfer status is terminal. Every terminal path ends here: success, failure,
-    /// and termination from outside through [`Transfer::on_terminal`].
+    /// Releases what the state still holds of the caller's body and reports the terminal summary.
     ///
-    /// Snapshots the state for the terminal summary, releases what the state still holds of the
-    /// caller's body, and reports the summary once the state lock is released. A custom
+    /// Requires a terminal transfer status. Snapshots the state for the summary before the
+    /// release, and reports it after releasing the state lock. A custom
     /// [`PartStream`](crate::io::PartStream) is dropped here rather than when the last owner of
-    /// this transfer drops, so a producer waiting on the upload observes it end. The caller
-    /// signals the owning handle afterwards.
+    /// this transfer drops, so a producer waiting on the stream observes the upload end. Calling
+    /// it again releases state installed since the previous call; the terminal metrics and
+    /// summary are recorded once. Does not signal the owning handle.
     fn enter_terminal(&self, mut state: MutexGuard<'_, UploadState>) {
         self.inner.ctx.finalize_terminal_metrics();
         // Taken before the release, so the summary still counts parked reads.
@@ -426,6 +426,22 @@ impl UploadTransfer {
                 _ => panic!("unexpected state for create_mpu"),
             }
         };
+        self.begin_transferring(upload_id, response_builder, stream, size_hint)
+    }
+
+    /// Builds the part reader over `stream` and moves the upload from `PendingInit` to
+    /// `Transferring`. Assign `Transferring` through this method rather than directly.
+    ///
+    /// `stream` must already be out of the state, so a termination while it is out releases
+    /// nothing. `Transferring` is installed either way, keeping the multipart upload ID. If the
+    /// transfer has already ended, what was installed is released and this returns `Cancelled`.
+    fn begin_transferring(
+        &self,
+        upload_id: String,
+        response_builder: UploadOutputBuilder,
+        stream: InputStream,
+        size_hint: SizeHint,
+    ) -> WorkOutcome {
         let reads_until_eof = stream.is_mpu_only();
 
         // An upper bound can size parts so a manager-produced body fits S3's part limit. A stream
@@ -489,6 +505,12 @@ impl UploadTransfer {
                 ),
                 response_builder,
             };
+            // `enter_terminal` requires a terminal status, so a termination that marked the state
+            // while the body was out of it is observed here, and a later one finds `Transferring`.
+            if !self.inner.ctx.is_active() {
+                self.enter_terminal(state);
+                return WorkOutcome::Cancelled;
+            }
             snapshot_state(&state)
         };
         self.inner.observability.multipart_created();
@@ -1106,9 +1128,8 @@ impl UploadTransfer {
 
     /// Records `error` and ends the upload.
     ///
-    /// Takes the state guard so the status becomes terminal in the same critical section that
-    /// releases the caller's body. A caller that found the failure while holding the guard passes
-    /// it on rather than releasing and re-taking the lock.
+    /// Takes the state guard, so the status becomes terminal in the same critical section that
+    /// releases the caller's body.
     fn fail(&self, state: MutexGuard<'_, UploadState>, error: Error) -> WorkOutcome {
         tracing::debug!(
             target: crate::telemetry::TARGET_TRANSFER,
@@ -1219,7 +1240,7 @@ impl Transfer for UploadTransfer {
     }
 
     fn on_terminal(&self) {
-        // Also runs after a worker panic, which may have poisoned the state lock.
+        // Terminal cleanup runs even if a panic poisoned the state lock.
         let state = self
             .inner
             .state
@@ -1711,8 +1732,9 @@ mod tests {
         assert_eq!(snapshot_state(&state).pending_reads, 1);
     }
 
+    // ref: awslabs/aws-s3-transfer-manager-rs#226
     /// A source read parked on a pending source is released when another work item fails the
-    /// upload, rather than retained for as long as the transfer lives (#226).
+    /// upload, rather than retained for as long as the transfer lives.
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn failure_releases_parked_source_read() {
@@ -1734,7 +1756,8 @@ mod tests {
         );
     }
 
-    /// External cancellation releases a source read parked on a pending source (#226).
+    // ref: awslabs/aws-s3-transfer-manager-rs#226
+    /// External cancellation releases a source read parked on a pending source.
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn external_termination_releases_parked_source_read() {
@@ -1751,8 +1774,9 @@ mod tests {
         );
     }
 
+    // ref: awslabs/aws-s3-transfer-manager-rs#226
     /// A failed UploadPart releases a source that no read holds: between reads the stream waits in
-    /// the part reader, which the failed transfer still owns (#226).
+    /// the part reader, which the failed transfer still owns.
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn upload_part_failure_releases_idle_source() {
@@ -1803,10 +1827,13 @@ mod tests {
         ) -> std::task::Poll<Option<std::io::Result<PartData>>> {
             let transfer = self.transfer.lock().expect("transfer slot poisoned").take();
             if let Some(transfer) = transfer {
-                let _ = transfer.fail(
-                    transfer.inner.state.lock().expect("lock poisoned"),
-                    Error::new(ErrorKind::RuntimeError, "sibling failure"),
-                );
+                assert!(matches!(
+                    transfer.fail(
+                        transfer.inner.state.lock().expect("lock poisoned"),
+                        Error::new(ErrorKind::RuntimeError, "sibling failure"),
+                    ),
+                    WorkOutcome::Failed { .. }
+                ));
             }
             std::task::Poll::Pending
         }
@@ -1816,6 +1843,7 @@ mod tests {
         }
     }
 
+    // ref: awslabs/aws-s3-transfer-manager-rs#226
     /// A read whose source returns `Pending` after another work item ended the upload is not
     /// parked: the read reports `Cancelled`, and the stream it held is dropped rather than handed
     /// back to the closed gate.
@@ -1855,6 +1883,7 @@ mod tests {
         );
     }
 
+    // ref: awslabs/aws-s3-transfer-manager-rs#226
     /// A read dispatched before the upload ended, and executed after, starts no source operation.
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
@@ -1878,6 +1907,7 @@ mod tests {
         ));
     }
 
+    // ref: awslabs/aws-s3-transfer-manager-rs#226
     /// CreateMultipartUpload that succeeds after the upload was cancelled, and its body released,
     /// reports `Cancelled` and leaves the state as it was.
     #[cfg_attr(miri, ignore)]
@@ -1904,6 +1934,55 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    // ref: awslabs/aws-s3-transfer-manager-rs#226
+    /// A multipart upload created after the transfer ended, with the body already out of the
+    /// state, is still installed so `abort()` finds its ID, and the body it would have read is
+    /// released.
+    ///
+    /// `begin_transferring` observes nothing shared before its state lock, so ending the transfer
+    /// before the call covers a termination anywhere between taking the body and installing
+    /// `Transferring`.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn multipart_installed_after_termination_is_released() {
+        let (stream, probe) = probed_stream(Vec::new());
+        let transfer = create_test_transfer_with_stream(mock_s3_client_for_mpu(), stream);
+
+        // Take the body as `do_execute_create_mpu` does, then end the transfer: the termination
+        // finds `PendingInit` without a body.
+        let (body, size_hint) = {
+            let mut state = transfer.inner.state.lock().expect("lock poisoned");
+            let UploadState::PendingInit {
+                stream, size_hint, ..
+            } = &mut *state
+            else {
+                panic!("upload left its initial state");
+            };
+            (stream.take().expect("body present"), *size_hint)
+        };
+        transfer.ctx().set_cancelled();
+        Transfer::on_terminal(&transfer);
+        assert!(
+            probe.upgrade().is_some(),
+            "the body is held outside the state"
+        );
+
+        assert!(matches!(
+            transfer.begin_transferring(
+                "test-upload-id".to_string(),
+                UploadOutputBuilder::default(),
+                body,
+                size_hint,
+            ),
+            WorkOutcome::Cancelled
+        ));
+        assert_eq!(transfer.open_upload_id().as_deref(), Some("test-upload-id"));
+        assert!(
+            probe.upgrade().is_none(),
+            "the installed upload retained the body"
+        );
     }
 
     // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)

@@ -418,14 +418,14 @@ impl PendingPartReads {
 
 /// What an upload that has ended still held of the caller's body.
 ///
-/// Built under the upload-state lock and dropped after it is released, so neither a caller's
-/// `Drop` nor the part reader's gate runs under that lock. Dropping it marks the part reader
-/// terminal, then drops the parked reads and the body; each read hands its stream back to the
-/// closed gate, which drops it.
+/// Drop it only after releasing the upload-state lock: dropping it runs the body's `Drop` and
+/// takes the part reader's gate lock. Dropping it marks the part reader terminal, then drops the
+/// parked reads and the body; each read hands its stream back to the closed gate, which drops
+/// it.
 #[must_use = "drop the released body only after releasing the upload-state lock"]
 #[derive(Debug, Default)]
 pub(crate) struct TerminalRelease {
-    /// The body of an upload that ended before CreateMultipartUpload took it.
+    /// The body, if the upload ended before a request took it.
     body: Option<InputStream>,
     /// Source reads that were parked on a pending source.
     reads: SmallVec<[PendingPartRead; 4]>,
@@ -868,9 +868,9 @@ pub(crate) enum UploadState {
 impl UploadState {
     /// Releases what this state still holds of the caller's body once the upload has ended.
     ///
-    /// The variant is unchanged, so `abort()` still finds an open multipart upload ID and work
-    /// items still executing observe the state they expect. A completed upload holds none of the
-    /// body, so this is a no-op there. Calling it again releases nothing further.
+    /// The variant, and with it any open multipart upload ID, is unchanged. A completed upload
+    /// holds none of the body, so this releases nothing there. Calling it again releases nothing
+    /// further.
     pub(crate) fn mark_terminal(&mut self) -> TerminalRelease {
         match self {
             UploadState::PendingInit { stream, .. } => TerminalRelease {
