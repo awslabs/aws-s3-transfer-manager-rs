@@ -249,7 +249,8 @@ impl S3MockServer {
         S3MockServerBuilder::new()
     }
 
-    /// Add an object to the mock server storage.
+    /// Add an object to the mock server storage. Fails with [`Error::NoSuchBucket`] if the
+    /// bucket does not exist.
     pub async fn add_object(
         &self,
         bucket: &str,
@@ -262,7 +263,8 @@ impl S3MockServer {
         self.add_object_with(bucket, key, req).await
     }
 
-    /// Add an object with full control over metadata fields.
+    /// Add an object with full control over metadata fields. Fails with [`Error::NoSuchBucket`]
+    /// if the bucket does not exist.
     pub async fn add_object_with(
         &self,
         bucket: &str,

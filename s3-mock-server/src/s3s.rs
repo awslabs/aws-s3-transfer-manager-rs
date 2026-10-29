@@ -385,12 +385,14 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         let bucket = &input.bucket;
         let key = &input.key;
         tracing::trace!(%bucket, %key, "GetObject");
+        check_bucket(&self.storage, bucket).await?;
 
         // Get metadata first to validate range
         let metadata = match self.storage.head_object(bucket, key).await? {
             Some(metadata) => metadata,
             None => return Err(Error::NoSuchKey.into()),
         };
+        check_if_match(input.if_match.as_ref(), &metadata)?;
 
         // Convert s3s Range to std Range if present
         let mut range = input
@@ -436,6 +438,9 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         };
 
         let (stream, stream_metadata) = (response.stream, response.metadata);
+        // The object can be replaced between the lookup above and this read: the condition must
+        // also hold for the object whose data is returned.
+        check_if_match(input.if_match.as_ref(), &stream_metadata)?;
 
         let mut output = s3s::dto::GetObjectOutput::default();
 
@@ -508,12 +513,14 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         let bucket = &input.bucket;
         let key = &input.key;
         tracing::trace!(%bucket, %key, "HeadObject");
+        check_bucket(&self.storage, bucket).await?;
 
         // Get object metadata from storage
         let mut metadata = match self.storage.head_object(bucket, key).await? {
             Some(metadata) => metadata,
             None => return Err(Error::NoSuchKey.into()),
         };
+        check_if_match(input.if_match.as_ref(), &metadata)?;
 
         // A HEAD carrying a `Range` is answered 206: `Content-Length` is the range's
         // length and `Content-Range` names the offsets, which is the only thing that
@@ -580,6 +587,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         )?;
         let input = req.input;
         tracing::trace!(bucket = %input.bucket, key = %input.key, "PutObject");
+        check_bucket(&self.storage, &input.bucket).await?;
         if input.key.is_empty() {
             return Err(s3s::s3_error!(InvalidRequest));
         }
@@ -661,6 +669,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         )?;
         let input = req.input;
         tracing::trace!(bucket = %input.bucket, key = %input.key, "CreateMultipartUpload");
+        check_bucket(&self.storage, &input.bucket).await?;
         let key = &input.key;
 
         // Extract checksum algorithm if provided, default to CRC64NVME
@@ -754,6 +763,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         let upload_id = &input.upload_id;
         let part_number = input.part_number;
         tracing::trace!(%upload_id, part_number, "UploadPart");
+        check_bucket(&self.storage, &input.bucket).await?;
 
         let client_checksums = crate::types::ClientChecksums::from(&input);
         let mut integrity_checks = crate::types::ObjectIntegrityChecks::from(&client_checksums);
@@ -841,6 +851,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         )?;
         let input = req.input;
         tracing::trace!(bucket = %input.bucket, key = %input.key, upload_id = %input.upload_id, "CompleteMultipartUpload");
+        check_bucket(&self.storage, &input.bucket).await?;
         let bucket = input.bucket.clone();
         let upload_id = &input.upload_id;
 
@@ -908,6 +919,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         )?;
         let input = req.input;
         tracing::trace!(bucket = %input.bucket, key = %input.key, upload_id = %input.upload_id, "AbortMultipartUpload");
+        check_bucket(&self.storage, &input.bucket).await?;
         let upload_id = &input.upload_id;
 
         // Abort the multipart upload
@@ -930,13 +942,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         let input = req.input;
         tracing::trace!(bucket = %input.bucket, prefix = ?input.prefix, delimiter = ?input.delimiter, "ListObjectsV2");
 
-        // Real S3 returns NoSuchBucket if the bucket doesn't exist
-        if !self.storage.head_bucket(&input.bucket).await? {
-            return Err(s3s::s3_error!(
-                NoSuchBucket,
-                "The specified bucket does not exist"
-            ));
-        }
+        check_bucket(&self.storage, &input.bucket).await?;
 
         let prefix = input.prefix.as_deref();
         let delimiter = input.delimiter.as_deref();
@@ -1067,10 +1073,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         if self.storage.head_bucket(&input.bucket).await? {
             Ok(S3Response::new(HeadBucketOutput::default()))
         } else {
-            Err(s3s::s3_error!(
-                NoSuchBucket,
-                "The specified bucket does not exist"
-            ))
+            Err(Error::NoSuchBucket.into())
         }
     }
 
@@ -1085,9 +1088,19 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         )?;
         let input = req.input;
         tracing::trace!(bucket = %input.bucket, key = %input.key, "DeleteObject");
-        self.storage
-            .delete_object(&input.bucket, &input.key)
-            .await?;
+        check_bucket(&self.storage, &input.bucket).await?;
+        match &input.if_match {
+            Some(condition) => {
+                self.storage
+                    .delete_object_if_match(&input.bucket, &input.key, condition)
+                    .await?
+            }
+            None => {
+                self.storage
+                    .delete_object(&input.bucket, &input.key)
+                    .await?
+            }
+        }
         Ok(S3Response::new(s3s::dto::DeleteObjectOutput::default()))
     }
 
@@ -1139,6 +1152,32 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         };
         Ok(S3Response::new(output))
     }
+}
+
+/// Fail with NoSuchBucket if `bucket` does not exist in `storage`, as S3 does for requests on
+/// the objects of a missing bucket.
+pub(crate) async fn check_bucket(
+    storage: &(impl StorageBackend + ?Sized),
+    bucket: &str,
+) -> S3Result<()> {
+    if storage.head_bucket(bucket).await? {
+        Ok(())
+    } else {
+        Err(Error::NoSuchBucket.into())
+    }
+}
+
+/// Fail with `PreconditionFailed` if an `If-Match` condition does not hold for the object.
+fn check_if_match(
+    condition: Option<&s3s::dto::ETagCondition>,
+    metadata: &ObjectMetadata,
+) -> S3Result<()> {
+    if condition
+        .is_some_and(|condition| !crate::storage::etag_condition_holds(condition, &metadata.etag))
+    {
+        return Err(Error::PreconditionFailed.into());
+    }
+    Ok(())
 }
 
 fn validate_checksum_and_type(
@@ -1239,6 +1278,7 @@ mod tests {
     async fn test_get_object_range() {
         // Create a test instance
         let storage = InMemoryStorage::new();
+        storage.create_bucket("test-bucket").await.unwrap();
         let inner = Inner::new(storage);
         let content = "This is a test content that is exactly 100 bytes long to make our range test work properly..........";
         let _ = create_object(&inner, "test-key", content, None).await;
@@ -1280,6 +1320,7 @@ mod tests {
     async fn test_get_object_range_edge_cases() {
         // Create a test instance
         let storage = InMemoryStorage::new();
+        storage.create_bucket("test-bucket").await.unwrap();
         let inner = Inner::new(storage);
         let content = "0123456789"; // 10 bytes
         let _ = create_object(&inner, "test-key", content, None).await;
@@ -1318,6 +1359,7 @@ mod tests {
     #[tokio::test]
     async fn test_checksum_validation() {
         let storage = InMemoryStorage::new();
+        storage.create_bucket("test-bucket").await.unwrap();
         let inner = Inner::new(storage);
 
         let content = b"Hello, checksum world!";
@@ -1367,6 +1409,7 @@ mod tests {
     #[tokio::test]
     async fn test_default_crc64nvme() {
         let storage = InMemoryStorage::new();
+        storage.create_bucket("test-bucket").await.unwrap();
         let inner = Inner::new(storage);
 
         let content = b"Test default checksum";
@@ -1398,6 +1441,7 @@ mod tests {
     #[tokio::test]
     async fn test_upload_part_checksum_validation() {
         let storage = InMemoryStorage::new();
+        storage.create_bucket("test-bucket").await.unwrap();
         let inner = Inner::new(storage);
 
         // First create a multipart upload
@@ -1464,6 +1508,7 @@ mod tests {
     #[tokio::test]
     async fn test_part_number_validation() {
         let storage = InMemoryStorage::new();
+        storage.create_bucket("test-bucket").await.unwrap();
         let inner = Inner::new(storage);
 
         // Create multipart upload
@@ -1576,6 +1621,7 @@ mod tests {
     #[tokio::test]
     async fn test_default_crc64nvme_multipart() {
         let storage = InMemoryStorage::new();
+        storage.create_bucket("test-bucket").await.unwrap();
         let inner = Inner::new(storage);
 
         // Test CreateMultipartUpload without specifying algorithm - should default to CRC64NVME
@@ -1603,6 +1649,7 @@ mod tests {
     #[tokio::test]
     async fn test_checksum_type_validation() {
         let storage = InMemoryStorage::new();
+        storage.create_bucket("test-bucket").await.unwrap();
         let inner = Inner::new(storage);
 
         // Test invalid combination: MD5 with FULL_OBJECT should fail

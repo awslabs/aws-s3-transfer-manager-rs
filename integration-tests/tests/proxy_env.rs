@@ -54,6 +54,10 @@ async fn test_managed_runtime_http_uses_environment_proxy() {
     let handle = server.start().await.expect("start mock server");
     let content = vec![7u8; 64 * 1024];
     server
+        .create_bucket("test-bucket")
+        .await
+        .expect("create bucket");
+    server
         .add_object("test-bucket", "proxied", content.clone(), None)
         .await
         .expect("add object");

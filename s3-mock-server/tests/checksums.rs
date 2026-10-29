@@ -31,6 +31,7 @@ async fn create_server(storage_type: StorageType) -> Result<(S3MockServer, Strin
     };
 
     let bucket = format!("test-bucket-{}", Uuid::new_v4());
+    server.create_bucket(&bucket).await?;
     Ok((server, bucket))
 }
 
