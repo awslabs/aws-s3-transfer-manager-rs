@@ -67,7 +67,7 @@ impl DownloadObjects {
 
         let s3_client = handle.s3_client.clone();
         let walk_ctx = S3WalkContext::builder()
-            .client(s3_client)
+            .sdk_client(s3_client)
             .bucket(&bucket)
             .build();
         let walk = walker.walk(walk_ctx);

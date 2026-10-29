@@ -166,6 +166,7 @@ mod tests {
         use std::collections::HashMap;
 
         let storage = InMemoryStorage::new();
+        storage.create_bucket("test-bucket").await.unwrap();
         let test_data = Bytes::from("This is test data for streaming");
         let _metadata = ObjectMetadata {
             content_type: Some("text/plain".to_string()),

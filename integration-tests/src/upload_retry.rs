@@ -61,16 +61,25 @@ async fn setup_with_fault(
         .build()
         .expect("build mock server");
     let handle = server.start().await.expect("start mock server");
+    server
+        .create_bucket("test-bucket")
+        .await
+        .expect("create bucket");
 
     let (http_client, tally) = io_fault_http_client(is_upload_part, fail);
 
-    // Rebuild the mock's S3 client with our fault connector as the http_client.
-    let base = handle.client().await;
-    let conf = base.config().to_builder().http_client(http_client).build();
-    let s3_client = aws_sdk_s3::Client::from_conf(conf);
+    let shared_config = handle
+        .shared_config()
+        .await
+        .into_builder()
+        .http_client(http_client)
+        .build();
 
     let tm_config = aws_sdk_s3_transfer_manager::Config::builder()
-        .client(s3_client)
+        .s3_config(
+            aws_sdk_s3_transfer_manager::config::S3ClientConfig::new(&shared_config)
+                .enable_runtime_http(false),
+        )
         .part_size(PartSize::Target(PART_SIZE))
         .build();
     let tm = aws_sdk_s3_transfer_manager::Client::new(tm_config);
@@ -206,7 +215,7 @@ mod server_faults {
     const STALL_AFTER_BYTES: u64 = 1024 * 1024;
 
     /// Start a mock server and a transfer manager wired to it via the production
-    /// client-config path (`handle.client()` → `aws_config::defaults(latest())`),
+    /// shared-config path (`handle.shared_config()` → `aws_config::defaults(latest())`),
     /// so stalled-stream protection is enabled exactly as in the field. `path`
     /// selects the multipart threshold so the object exercises the intended path.
     async fn setup(path: Path) -> (S3MockServer, s3_mock_server::ServerHandle, TmClient) {
@@ -226,7 +235,12 @@ mod server_faults {
         };
         let tm = TmClient::new(
             aws_sdk_s3_transfer_manager::Config::builder()
-                .client(handle.client().await)
+                .s3_config(
+                    aws_sdk_s3_transfer_manager::config::S3ClientConfig::new(
+                        &handle.shared_config().await,
+                    )
+                    .enable_runtime_http(false),
+                )
                 .part_size(PART_SIZE)
                 .multipart_threshold(threshold)
                 .build(),
@@ -261,7 +275,7 @@ mod server_faults {
         server.insert_fault(
             "test-bucket",
             "obj",
-            FaultType::ServiceError { status: 503 },
+            FaultType::slow_down(),
             0,
             Occurrence::Once,
         );
@@ -295,7 +309,7 @@ mod server_faults {
         server.insert_fault(
             "test-bucket",
             "obj",
-            FaultType::ServiceError { status: 503 },
+            FaultType::slow_down(),
             0,
             Occurrence::Always,
         );

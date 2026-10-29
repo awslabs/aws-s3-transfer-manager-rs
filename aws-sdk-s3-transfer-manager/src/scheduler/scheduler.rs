@@ -998,14 +998,14 @@ mod tests {
     // note on `test_handle_managed` for the same root cause on managed threads.
     fn test_handle(concurrency: usize) -> Arc<Handle> {
         let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
-        let config = crate::Config::builder().client(s3_client).build();
+        let config = crate::Config::builder().sdk_client(s3_client).build();
         Handle::new_for_test(config, concurrency)
     }
 
     fn test_handle_with_diagnostics(concurrency: usize, detail: u64) -> Arc<Handle> {
         let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
         let config = crate::Config::builder()
-            .client(s3_client)
+            .sdk_client(s3_client)
             .diagnostics_for_test(crate::config::MemoryDiagnosticsConfig::default(), detail)
             .build();
         Handle::new_for_test(config, concurrency)
@@ -1356,7 +1356,7 @@ mod tests {
             samples: AtomicUsize::new(0),
         });
         let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
-        let config = crate::Config::builder().client(s3_client).build();
+        let config = crate::Config::builder().sdk_client(s3_client).build();
         let handle = Handle::new_for_test_with_runtime(config, controller.clone(), |weak| {
             Arc::new(crate::runtime::TokioMultiThreadRuntime::new(weak))
         });
@@ -1395,7 +1395,7 @@ mod tests {
     // until then they are asan-gated rather than leaking the sanitizer run.
     fn test_handle_managed(concurrency: usize) -> Arc<Handle> {
         let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
-        let config = crate::Config::builder().client(s3_client).build();
+        let config = crate::Config::builder().sdk_client(s3_client).build();
         Handle::new_for_test_with_runtime(
             config,
             Arc::new(crate::scheduler::FixedConcurrency::new(concurrency)),
@@ -1870,7 +1870,7 @@ mod tests {
             completions: AtomicUsize::new(0),
         });
         let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
-        let config = crate::Config::builder().client(s3_client).build();
+        let config = crate::Config::builder().sdk_client(s3_client).build();
         let handle =
             Handle::new_for_test_with_runtime(
                 config,
@@ -2859,8 +2859,8 @@ mod tests {
     // =========================================================================
 
     use crate::scheduler::transfer::mock::{
-        CompositeMock, CountedWork, DispatchCounter, DispatchTrace, PanickingCompositeMock,
-        SingleTicketCompositeMock,
+        ChildMockTransfer, CompositeMock, CountedWork, DispatchCounter, DispatchTrace,
+        PanickingCompositeMock, SingleTicketCompositeMock,
     };
 
     async fn impl_single_composite_uses_target_fully(handle: Arc<Handle>) {
@@ -4233,11 +4233,17 @@ mod tests {
         impl_single_ticket_memory_cap_backstops(handle).await;
     }
 
-    /// Spin-guard test: a SingleTicketCompositeMock returning Spawned repeatedly
-    /// while has_capacity stays true must NOT starve a second concurrently-ready
-    /// transfer. The vruntime charge on the Spawned arm prevents monopolization.
+    /// A composite returning Spawned repeatedly must yield to a concurrently-ready
+    /// peer. The vruntime charge on the Spawned arm prevents monopolization.
     async fn impl_spawned_spin_guard_does_not_starve_peer(handle: Arc<Handle>) {
         let scheduler = &handle.scheduler;
+        let poll_log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        // Hold generation so both transfers enter the ready set before either is polled.
+        let mut setup = scheduler
+            .0
+            .generate_work_gate
+            .try_acquire()
+            .expect("scheduler must be idle before setup");
 
         // Composite that spawns via Spawned: 200 children, 1 work each.
         let c_counter = DispatchCounter::new();
@@ -4252,7 +4258,8 @@ mod tests {
             1,       // work_per_child
             100_000, // memory_cap (won't be hit)
             c_counter.clone(),
-        );
+        )
+        .with_poll_log(poll_log.clone());
         scheduler.enqueue_transfer(Box::new(composite));
 
         // Peer single transfer: 200 work items dispatched via Ready.
@@ -4261,33 +4268,14 @@ mod tests {
             id: 2,
             parent: None,
         };
-        let sm = Arc::new(CountedWork::new(200, s_counter.clone()));
-        let peer = MockTransfer::new_with_handle(s_id, sm, handle.clone());
+        let peer = ChildMockTransfer::new(s_id, handle.clone(), 200, s_counter.clone())
+            .with_poll_log(poll_log.clone());
         scheduler.enqueue_transfer(Box::new(peer));
 
-        // Wait until both have made some progress (100 total dispatches).
-        tokio::time::timeout(Duration::from_secs(15), async {
-            loop {
-                let total = c_counter.count() + s_counter.count();
-                if total >= 100 {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("should reach 100 dispatches");
+        // Acknowledge the enqueue requests, release the gate, and drive both together.
+        while !setup.try_release() {}
+        scheduler.generate_work();
 
-        // The peer (Ready path) must have received some share. Without the
-        // spin guard the composite would monopolize all capacity on Spawned
-        // re-polls and the peer would be starved.
-        let s_count = s_counter.count();
-        assert!(
-            s_count > 0,
-            "peer transfer must make progress (got 0 dispatches); spin guard may be broken"
-        );
-
-        // Wait for idle.
         tokio::time::timeout(Duration::from_secs(30), async {
             while !scheduler.is_idle() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -4297,6 +4285,28 @@ mod tests {
         .expect("scheduler should become idle");
 
         handle.runtime.shutdown();
+
+        // Observe scheduler selection, independent of execution order on runtime threads.
+        let log = poll_log.lock().unwrap();
+        assert_eq!(
+            log.first(),
+            Some(&c_id.id),
+            "composite must be polled first"
+        );
+        let first_peer = log
+            .iter()
+            .position(|&id| id == s_id.id)
+            .expect("peer must be polled");
+        let composite_polls = log[..first_peer]
+            .iter()
+            .filter(|&&id| id == c_id.id)
+            .count();
+        assert!(
+            composite_polls < 100,
+            "peer must be polled before 100 composite polls (got {composite_polls}); spin guard may be broken"
+        );
+        assert_eq!(c_counter.count(), 200);
+        assert_eq!(s_counter.count(), 200);
     }
 
     #[cfg_attr(miri, ignore)]

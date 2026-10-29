@@ -7,11 +7,18 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
+use aws_sdk_s3::config::interceptors::BeforeTransmitInterceptorContextRef;
+use aws_sdk_s3::config::{ConfigBag, Intercept, RuntimeComponents};
+use aws_sdk_s3_transfer_manager::config::S3ClientConfig;
 use aws_sdk_s3_transfer_manager::io::{InputStream, PartData, PartStream, SizeHint, StreamContext};
 use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
+use aws_sdk_s3_transfer_manager::operation::upload::ChecksumStrategy;
 use aws_sdk_s3_transfer_manager::types::{PartSize, RuntimeMode};
+use aws_smithy_runtime_api::client::orchestrator::Metadata;
+use s3_mock_server::S3MockServer;
 use tokio::sync::mpsc;
 
 use crate::assertions::assert_same_content;
@@ -263,4 +270,136 @@ async fn test_parts_from_concurrent_producers_assemble_by_part_number() {
         }
     })
     .await;
+}
+
+/// A `PartStream` that yields one prebuilt part, then ends.
+///
+/// The part is complete before the upload starts, so it is held directly instead of arriving
+/// through a channel as in [`ChannelParts`].
+struct SinglePart {
+    /// The part to yield; `None` once it has been yielded.
+    part: Option<PartData>,
+    /// The exact length of the part.
+    size_hint: SizeHint,
+}
+
+impl PartStream for SinglePart {
+    fn poll_part(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _stream_cx: &StreamContext,
+    ) -> Poll<Option<std::io::Result<PartData>>> {
+        // First poll returns the part; later polls return `None`, which ends the stream.
+        Poll::Ready(self.get_mut().part.take().map(Ok))
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.size_hint
+    }
+}
+
+/// Records the operation name of every request attempt the S3 client sends.
+#[derive(Debug, Clone, Default)]
+struct OperationRecorder {
+    /// Operation names in send order, one entry per attempt.
+    seen: Arc<Mutex<Vec<String>>>,
+}
+
+impl OperationRecorder {
+    /// Number of recorded attempts of `operation`.
+    fn count(&self, operation: &str) -> usize {
+        self.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|op| *op == operation)
+            .count()
+    }
+}
+
+impl Intercept for OperationRecorder {
+    fn name(&self) -> &'static str {
+        "OperationRecorder"
+    }
+
+    // Runs once per attempt, so SDK retries are counted.
+    fn read_before_transmit(
+        &self,
+        _context: &BeforeTransmitInterceptorContextRef<'_>,
+        _rc: &RuntimeComponents,
+        cfg: &mut ConfigBag,
+    ) -> Result<(), aws_sdk_s3::error::BoxError> {
+        if let Some(metadata) = cfg.load::<Metadata>() {
+            self.seen.lock().unwrap().push(metadata.name().to_string());
+        }
+        Ok(())
+    }
+}
+
+/// Base64 big-endian CRC32 of `data`, the encoding S3 expects in `x-amz-checksum-crc32`.
+fn crc32_base64(data: &[u8]) -> String {
+    let mut hasher = aws_smithy_checksums::ChecksumAlgorithm::Crc32.into_impl();
+    hasher.update(data);
+    aws_smithy_types::base64::encode(hasher.finalize())
+}
+
+/// A part whose valid CRC32 was calculated over different bytes is rejected by `UploadPart`, and
+/// the upload is never completed.
+#[tokio::test]
+async fn test_part_checksum_over_different_bytes_fails_before_complete() {
+    let server = S3MockServer::builder()
+        .with_in_memory_store()
+        .build()
+        .expect("build mock server");
+    let handle = server.start().await.expect("start mock server");
+    server
+        .create_bucket("test-bucket")
+        .await
+        .expect("create bucket");
+
+    // Record each request attempt so the test can show CompleteMultipartUpload is never sent.
+    let recorder = OperationRecorder::default();
+    let s3 = {
+        let base = handle.client().await;
+        let conf = base
+            .config()
+            .to_builder()
+            .interceptor(recorder.clone())
+            .build();
+        aws_sdk_s3::Client::from_conf(conf)
+    };
+    let tm = aws_sdk_s3_transfer_manager::Client::new(
+        aws_sdk_s3_transfer_manager::Config::builder()
+            .s3_config(S3ClientConfig::new(s3.config().to_builder()).enable_runtime_http(false))
+            .build(),
+    );
+
+    // A validly encoded CRC32 of bytes other than the part body.
+    let sent = b"bytes the transfer manager transmits".to_vec();
+    let checksummed = b"bytes the checksum was computed over".to_vec();
+    let part = PartData::new(1, sent.clone()).with_checksum(crc32_base64(&checksummed));
+
+    // The part checksum is sent only when the upload has a checksum strategy.
+    let result = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("mismatched-checksum")
+        .checksum_strategy(ChecksumStrategy::with_calculated_crc32())
+        .body(InputStream::from_part_stream(SinglePart {
+            part: Some(part),
+            size_hint: SizeHint::exact(sent.len() as u64),
+        }))
+        .initiate()
+        .expect("initiate upload")
+        .join()
+        .await;
+
+    // The mock rejects the part, nothing retries it, and completion is never attempted.
+    let err = result.expect_err("a part checksum that does not match its body must fail");
+    assert_eq!(err.operation_name(), Some("UploadPart"), "{err:?}");
+    assert_eq!(err.code(), Some("BadDigest"), "{err:?}");
+    assert_eq!(recorder.count("UploadPart"), 1);
+    assert_eq!(recorder.count("CompleteMultipartUpload"), 0);
+
+    handle.shutdown().await.expect("shutdown");
 }

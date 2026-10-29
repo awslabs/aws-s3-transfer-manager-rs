@@ -43,12 +43,13 @@
 
 use crate::assertions::{assert_integrity_error, assert_io_error, assert_same_content};
 use crate::harness::Target;
-use aws_sdk_s3::types::ChecksumMode;
 use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
 use aws_sdk_s3_transfer_manager::operation::upload::ChecksumStrategy;
+use aws_sdk_s3_transfer_manager::types::ChecksumMode;
 use aws_sdk_s3_transfer_manager::types::PartSize;
 use aws_sdk_s3_transfer_manager::Client as TmClient;
-use s3_mock_server::{BodyCadence, FaultType, Occurrence, S3MockServer};
+use s3_mock_server::S3MockServer;
+use s3_mock_server::{BodyCadence, FaultType, Occurrence};
 
 /// Part size pinned equally for upload and download so multipart download ranges
 /// align to the uploaded part boundaries (the precondition for per-part
@@ -638,7 +639,10 @@ async fn requests_carry_per_bucket_retry_partition() {
     };
     let tm = TmClient::new(
         aws_sdk_s3_transfer_manager::Config::builder()
-            .client(s3)
+            .s3_config(
+                aws_sdk_s3_transfer_manager::config::S3ClientConfig::new(s3.config().to_builder())
+                    .enable_runtime_http(false),
+            )
             .part_size(PART_SIZE)
             .build(),
     );
@@ -725,7 +729,7 @@ async fn discovery_service_error_surfaces_underlying_cause() {
     mock.insert_fault(
         t.bucket(),
         &t.key("obj"),
-        FaultType::ServiceError { status: 503 },
+        FaultType::slow_down(),
         0,
         Occurrence::Always,
     );
@@ -764,7 +768,7 @@ async fn discovery_single_service_error_recovers() {
     mock.insert_fault(
         t.bucket(),
         &t.key("obj"),
-        FaultType::ServiceError { status: 503 },
+        FaultType::slow_down(),
         0,
         Occurrence::Once,
     );

@@ -445,7 +445,7 @@ async fn test_download_objects_abort_terminates() {
         m.server.insert_fault(
             bucket,
             &format!("{prefix}0000.bin"),
-            FaultType::ServiceError { status: 503 },
+            FaultType::slow_down(),
             0,
             Occurrence::Always,
         );
@@ -562,7 +562,7 @@ async fn test_download_objects_continue_policy_partial_failure() {
         m.server.insert_fault(
             bucket,
             &bad_key,
-            FaultType::ServiceError { status: 500 },
+            FaultType::internal_error(),
             0,
             Occurrence::Always,
         );

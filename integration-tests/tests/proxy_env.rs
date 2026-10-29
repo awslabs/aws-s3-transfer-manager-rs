@@ -54,6 +54,10 @@ async fn test_managed_runtime_http_uses_environment_proxy() {
     let handle = server.start().await.expect("start mock server");
     let content = vec![7u8; 64 * 1024];
     server
+        .create_bucket("test-bucket")
+        .await
+        .expect("create bucket");
+    server
         .add_object("test-bucket", "proxied", content.clone(), None)
         .await
         .expect("add object");
@@ -68,10 +72,10 @@ async fn test_managed_runtime_http_uses_environment_proxy() {
     std::env::remove_var("no_proxy");
     std::env::set_var("HTTP_PROXY", format!("http://{proxy_addr}"));
 
-    let s3_config = handle.client().await.config().to_builder();
+    let s3_config = handle.shared_config().await;
     let tm = aws_sdk_s3_transfer_manager::Client::new(
         aws_sdk_s3_transfer_manager::Config::builder()
-            .s3_config(S3ClientConfig::new(s3_config))
+            .s3_config(S3ClientConfig::new(&s3_config))
             .runtime_mode(RuntimeMode::Managed)
             .build(),
     );

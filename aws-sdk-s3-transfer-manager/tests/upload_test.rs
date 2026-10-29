@@ -374,7 +374,9 @@ impl PartStream for PooledPartStream {
 fn tm_with(client: aws_sdk_s3::Client) -> aws_sdk_s3_transfer_manager::Client {
     aws_sdk_s3_transfer_manager::Client::new(
         aws_sdk_s3_transfer_manager::Config::builder()
-            .client(client)
+            .s3_config(test_common::s3_config_with_test_http(
+                client.config().to_builder(),
+            ))
             .build(),
     )
 }
@@ -633,7 +635,9 @@ async fn test_custom_stream_resumes_after_part_buffer_admission() {
     let held = pool.acquire(&holder, CAPACITY).unwrap();
 
     let config = aws_sdk_s3_transfer_manager::Config::builder()
-        .client(MultipartMock::new().client())
+        .s3_config(test_common::s3_config_with_test_http(
+            MultipartMock::new().client().config().to_builder(),
+        ))
         .memory(MemoryConfig::Explicit(pool.clone()))
         .build();
     let tm = aws_sdk_s3_transfer_manager::Client::new(config);

@@ -1,6 +1,6 @@
 [package]
 name = "aws-sdk-s3-transfer-manager"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2021"
 authors = ["AWS Rust SDK Team <aws-sdk-rust@amazon.com>", "Aaron Todd <todaaron@amazon.com>"]
 license = "Apache-2.0"
@@ -44,6 +44,24 @@ smallvec = "1"
 
 [features]
 dial9 = ["dep:dial9"]
+# Interoperability with AWS SDK for Rust S3 v1 types and client configuration.
+sdk-v1 = []
+
+[[test]]
+name = "upload_test"
+required-features = ["sdk-v1"]
+
+[[test]]
+name = "upload_objects_test"
+required-features = ["sdk-v1"]
+
+[[test]]
+name = "upload_checksum_test"
+required-features = ["sdk-v1"]
+
+[[test]]
+name = "download_objects_test"
+required-features = ["sdk-v1"]
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.189"
@@ -84,4 +102,4 @@ loom = { version = "0.7", features = ["checkpoint"] }
 jemallocator = "0.5.4"
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(e2e_test)', 'cfg(s3_tm_loom)', 'cfg(s3_tm_asan)', 'cfg(s3_tm_fuzz)', 'cfg(s3_tm_tsan)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(e2e_test)', 'cfg(s3_tm_loom)', 'cfg(s3_tm_asan)', 'cfg(s3_tm_fuzz)', 'cfg(s3_tm_tsan)', 'cfg(s3_tm_out_of_tree)'] }

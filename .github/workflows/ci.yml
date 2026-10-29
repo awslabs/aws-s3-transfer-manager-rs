@@ -52,6 +52,8 @@ jobs:
       - dial9-build
       - miri
       - loom
+      - semver
+      - modeled-codegen
     steps:
       - name: Verify required results
         env:
@@ -63,6 +65,56 @@ jobs:
               <<<"$NEEDS_JSON" >&2
             exit 1
           fi
+
+  modeled-codegen:
+    name: Modeled API generation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      GRADLE_USER_HOME: ${{ github.workspace }}/target/codegen/gradle-home
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/modeled-ci
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: corretto
+          java-version: '21'
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install just
+        uses: extractions/setup-just@v3
+      - name: Install Rust ${{ env.rust_min }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.rust_min }}
+          components: rustfmt
+      - name: Cache model tooling dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            target/codegen/gradle-home/caches
+            target/codegen/gradle-home/wrapper
+            target/codegen/cargo-home
+            target/codegen/models
+          key: ${{ runner.os }}-model-tooling-v2-${{ hashFiles('tools/codegen/s3-tm-model-codegen/gradle.properties', 'tools/codegen/s3-tm-model-codegen/gradle/wrapper/gradle-wrapper.properties', 'tools/codegen/s3-tm-model-codegen/settings.gradle.kts', 'tools/codegen/s3-tm-model-codegen/build.gradle.kts') }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Rust cache cleanup must not prune the model tooling under target/codegen.
+          workspaces: ". -> target/modeled-ci"
+          prefix-key: v1-modeled-rust
+      - name: Test model tooling and generated fixtures
+        run: just test-codegen
+      - name: Check installed model and SDK adapters against fresh pinned generation
+        run: just install-model --check --pinned-only
+      - name: Test installed values with Transfer Manager runtime types
+        run: |
+          cargo test --locked -p aws-sdk-s3-transfer-manager \
+            --lib --test model_api_test
+          cargo test --locked -p aws-sdk-s3-transfer-manager \
+            --lib --test model_api_test --test sdk_v1_compat_test --features sdk-v1
 
  # Basic actions that must pass before we kick off more expensive tests.
   basics:
@@ -153,8 +205,8 @@ jobs:
             # exhaust macOS socket buffers without increasing product coverage.
             nextest_args+=(--test-threads 1)
           fi
-          cargo nextest run --locked --workspace --no-fail-fast "${nextest_args[@]}"
-          cargo test --locked --doc --workspace --no-fail-fast
+          cargo nextest run --locked --workspace --all-features --no-fail-fast "${nextest_args[@]}"
+          cargo test --locked --doc --workspace --all-features --no-fail-fast
 
   e2e:
     name: E2E (${{ matrix.name }})
@@ -228,18 +280,22 @@ jobs:
               adduser -D -h /tmp/tmtest tmtest
               mkdir -p /tmp/cargo /tmp/target
               chown tmtest:tmtest /tmp/cargo /tmp/target
-              su tmtest -c "cargo test --locked --workspace --no-fail-fast"
-              su tmtest -c "cargo test --locked --doc --workspace --no-fail-fast"
+              su tmtest -c "cargo test --locked --workspace --features sdk-v1 --no-fail-fast"
+              su tmtest -c "cargo test --locked --doc --workspace --features sdk-v1 --no-fail-fast"
             '
 
   android:
     name: Android (${{ matrix.name }})
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 15
     needs: basics
     env:
       ANDROID_API_LEVEL: 35
       ANDROID_NDK_VERSION: 28.0.13004108
+      # Hard cap on each individual adb call in the Android test scripts, so a
+      # wedged adb or unresponsive emulator cannot stall a step. Used by both
+      # run-android-tests.sh and android-test-runner.sh.
+      ADB_TIMEOUT_SECONDS: 120
     strategy:
       fail-fast: false
       matrix:
@@ -344,7 +400,7 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: "clippy --all"
-        run: cargo clippy --all --tests --no-deps
+        run: cargo clippy --locked --workspace --all-targets --all-features --no-deps
 
   docs:
     name: docs
@@ -359,7 +415,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: "doc --lib"
         run: |
-          cargo doc --lib --no-deps --document-private-items
+          cargo doc --locked --workspace --all-features --lib --no-deps --document-private-items
         env:
           RUSTFLAGS: -Dwarnings -Adeprecated
           RUSTDOCFLAGS: -Dwarnings --cfg docsrs
@@ -376,7 +432,7 @@ jobs:
           toolchain: ${{ env.rust_min }}
       - uses: Swatinem/rust-cache@v2
       - name: "check --workspace"
-        run: cargo check --workspace
+        run: cargo check --locked --workspace --all-features
         env:
           RUSTFLAGS: "" # remove -Dwarnings
 
@@ -432,8 +488,19 @@ jobs:
         with:
           tool: cargo-check-external-types@0.5.0
       - name: check-external-types
-        run: cargo check-external-types --config external-types.toml
+        # Otherwise the checker forwards workspace-resolved features, including
+        # sdk-v1 enabled by the integration-tests package.
+        run: cargo check-external-types --no-default-features --features '' --config external-types.toml
         working-directory: aws-sdk-s3-transfer-manager
+      - name: Check topology API
+        run: cargo check-external-types --no-default-features --features '' --config external-types.toml
+        working-directory: crates/aws-smithy-topology
+      - name: Check execution API
+        run: cargo check-external-types --all-features --config external-types.toml
+        working-directory: crates/aws-smithy-execution
+      - name: Check managed HTTP API
+        run: cargo check-external-types --all-features --config external-types.toml
+        working-directory: crates/aws-smithy-managed-http
 
   check-deny:
     name: check deps with cargo-deny
@@ -493,7 +560,7 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
       - name: ${{ matrix.sanitizer }}
-        run: cargo test --workspace --target ${{ matrix.target }} --tests -- ${{ matrix.test_args }}
+        run: cargo test --workspace --features sdk-v1 --target ${{ matrix.target }} --tests -- ${{ matrix.test_args }}
         env:
           RUSTFLAGS: -Dwarnings -Adeprecated -C force-frame-pointers=yes --cfg ${{ matrix.cfg }}
           # Detect leaked ownership and stack lifetime errors, stop at the
@@ -566,18 +633,24 @@ jobs:
           if-no-files-found: ignore
           retention-days: 30
 
-  # TODO - re-enable semver check once released
-  # semver:
-  #   name: semver
-  #   needs: basics
-  #   runs-on: ubuntu-24.04
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - name: Check semver
-  #       uses: obi1kenobi/cargo-semver-checks-action@v2
-  #       with:
-  #         rust-toolchain: ${{ env.rust_stable }}
-  #         release-type: minor
+  semver:
+    name: semver
+    needs: basics
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      # The checker includes optional features; dial9 needs Tokio's unstable API.
+      RUSTFLAGS: "-Dwarnings --cfg tokio_unstable"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check semver
+        uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          manifest-path: aws-sdk-s3-transfer-manager/Cargo.toml
+          package: aws-sdk-s3-transfer-manager
+          feature-group: all-features
+          rust-toolchain: ${{ env.rust_min }}
+          baseline-version: '0.3.0'
 
   features:
     name: features

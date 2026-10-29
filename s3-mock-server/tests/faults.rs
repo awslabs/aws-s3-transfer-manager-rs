@@ -475,13 +475,7 @@ async fn test_service_error_fault_returns_status() -> Result<()> {
     let handle = server.start().await?;
     seed(&handle).await?;
 
-    server.insert_fault(
-        B,
-        K,
-        FaultType::ServiceError { status: 503 },
-        0,
-        Occurrence::Once,
-    );
+    server.insert_fault(B, K, FaultType::slow_down(), 0, Occurrence::Once);
 
     let s3 = fresh_client_no_retry(&handle).await;
     let err = s3
@@ -505,6 +499,119 @@ async fn test_service_error_fault_returns_status() -> Result<()> {
         .send()
         .await
         .expect("second GET recovers");
+
+    handle.shutdown().await?;
+    Ok(())
+}
+
+/// How long a test waits for a response that `WithholdResponseHeaders` never sends.
+const NO_RESPONSE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// `WithholdResponseHeaders` on GET: no headers arrive, so `send()` never returns.
+#[tokio::test]
+async fn test_withhold_response_headers_get_never_responds() -> Result<()> {
+    let server = S3MockServer::builder().with_in_memory_store().build()?;
+    let handle = server.start().await?;
+    seed(&handle).await?;
+
+    server.insert_fault(
+        B,
+        K,
+        FaultType::WithholdResponseHeaders,
+        0,
+        Occurrence::Always,
+    );
+
+    let s3 = handle.client().await;
+    let outcome =
+        tokio::time::timeout(NO_RESPONSE_WAIT, s3.get_object().bucket(B).key(K).send()).await;
+    assert!(outcome.is_err(), "GET must not receive a response");
+
+    handle.shutdown().await?;
+    Ok(())
+}
+
+/// `WithholdResponseHeaders` with `Once`: the first GET gets no response, the next succeeds.
+#[tokio::test]
+async fn test_withhold_response_headers_once_then_recovers() -> Result<()> {
+    let server = S3MockServer::builder().with_in_memory_store().build()?;
+    let handle = server.start().await?;
+    seed(&handle).await?;
+
+    server.insert_fault(
+        B,
+        K,
+        FaultType::WithholdResponseHeaders,
+        0,
+        Occurrence::Once,
+    );
+
+    let s3 = handle.client().await;
+    let outcome =
+        tokio::time::timeout(NO_RESPONSE_WAIT, s3.get_object().bucket(B).key(K).send()).await;
+    assert!(outcome.is_err(), "first GET must not receive a response");
+    validating_get(&handle).await.expect("second GET recovers");
+
+    handle.shutdown().await?;
+    Ok(())
+}
+
+/// On PUT, `WithholdResponseHeaders` stores the body before withholding the response;
+/// `StallRequestRead` never finishes reading it, so nothing is stored.
+#[tokio::test]
+async fn test_withhold_response_headers_put_stores_body_unlike_stall_request_read() -> Result<()> {
+    const HELD: &str = "held-response";
+    const STALLED: &str = "stalled-request";
+
+    let server = S3MockServer::builder().with_in_memory_store().build()?;
+    let handle = server.start().await?;
+    let s3 = handle.client().await;
+    s3.create_bucket().bucket(B).send().await.ok();
+
+    server.insert_fault(
+        B,
+        HELD,
+        FaultType::WithholdResponseHeaders,
+        0,
+        Occurrence::Always,
+    );
+    server.insert_fault(
+        B,
+        STALLED,
+        FaultType::StallRequestRead { after_bytes: 4 },
+        0,
+        Occurrence::Always,
+    );
+
+    let held_put = s3
+        .put_object()
+        .bucket(B)
+        .key(HELD)
+        .body(Bytes::from_static(BODY).into())
+        .send();
+    assert!(
+        tokio::time::timeout(NO_RESPONSE_WAIT, held_put)
+            .await
+            .is_err(),
+        "PUT must not receive a response"
+    );
+
+    let stalled_put = s3
+        .put_object()
+        .bucket(B)
+        .key(STALLED)
+        .body(Bytes::from_static(BODY).into())
+        .send();
+    let _ = tokio::time::timeout(NO_RESPONSE_WAIT, stalled_put).await;
+
+    assert!(
+        server.object_exists(B, HELD).await?,
+        "withheld response: body must be fully read and stored"
+    );
+    assert!(
+        !server.object_exists(B, STALLED).await?,
+        "stalled request read: body must not be stored"
+    );
 
     handle.shutdown().await?;
     Ok(())

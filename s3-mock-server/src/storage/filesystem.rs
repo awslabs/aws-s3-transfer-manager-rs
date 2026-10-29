@@ -125,11 +125,20 @@ impl FilesystemStorage {
         self.root_dir.join(bucket).join("objects")
     }
 
-    /// Ensure bucket directories exist (auto-create for backward compat).
+    /// Create the bucket's directories, and the uploads directory the server's writes use.
     async fn ensure_bucket(&self, bucket: &str) -> Result<()> {
         fs::create_dir_all(self.objects_dir(bucket)).await?;
         fs::create_dir_all(self.root_dir.join("uploads")).await?;
         Ok(())
+    }
+
+    /// Fail with `NoSuchBucket` if the bucket has not been created.
+    async fn require_bucket(&self, bucket: &str) -> Result<()> {
+        if self.objects_dir(bucket).is_dir() {
+            Ok(())
+        } else {
+            Err(Error::NoSuchBucket)
+        }
     }
 
     fn get_object_path(&self, bucket: &str, key: &str) -> PathBuf {
@@ -252,8 +261,7 @@ impl StorageBackend for FilesystemStorage {
         &self,
         request: crate::storage::StoreObjectRequest,
     ) -> Result<StoredObjectMetadata> {
-        // Auto-create bucket directories
-        self.ensure_bucket(&request.bucket).await?;
+        self.require_bucket(&request.bucket).await?;
 
         let mut body = request.body;
         let mut integrity_checks = request.integrity_checks;
@@ -262,18 +270,38 @@ impl StorageBackend for FilesystemStorage {
             fs::create_dir_all(parent).await?;
         }
 
-        let mut file = fs::File::create(&path).await?;
+        // The body goes to a temporary file outside the bucket's objects directory, so a body
+        // that fails its checksum or ends in a stream error leaves the existing object intact
+        // and never shows up in listings.
+        let temp_path = tempfile::Builder::new()
+            .prefix("put-")
+            .tempfile_in(self.root_dir.join("uploads"))?
+            .into_temp_path();
         let mut content_length = 0u64;
-
-        while let Some(chunk) = body.next().await {
-            let chunk = chunk.map_err(|e| Error::Internal(format!("Stream error: {}", e)))?;
-            integrity_checks.update(&chunk);
-            content_length += chunk.len() as u64;
-            file.write_all(&chunk).await?;
+        {
+            // Closed at the end of the block, before the rename.
+            let mut file = fs::OpenOptions::new().write(true).open(&temp_path).await?;
+            while let Some(chunk) = body.next().await {
+                let chunk = chunk.map_err(|e| Error::Internal(format!("Stream error: {}", e)))?;
+                integrity_checks.update(&chunk);
+                content_length += chunk.len() as u64;
+                file.write_all(&chunk).await?;
+            }
+            file.flush().await?;
         }
-        file.flush().await?;
-
         let object_integrity = integrity_checks.finalize();
+        if let Some(client_checksums) = &request.client_checksums {
+            object_integrity
+                .validate(client_checksums)
+                .map_err(|error_msg| Error::ChecksumMismatch(error_msg.to_string()))?;
+        }
+        // Checked just before the object is replaced, but not atomically with it: a concurrent
+        // write to the same key can land in between.
+        if request.precondition != crate::storage::WritePrecondition::None {
+            let current = self.head_object(&request.bucket, &request.key).await?;
+            request.precondition.check(current.as_ref())?;
+        }
+        temp_path.persist(&path).map_err(|e| e.error)?;
         let last_modified = request.last_modified.unwrap_or_else(SystemTime::now);
 
         let metadata = ObjectMetadata {
@@ -410,7 +438,7 @@ impl StorageBackend for FilesystemStorage {
         &self,
         request: crate::storage::CreateMultipartUploadRequest<'_>,
     ) -> Result<()> {
-        self.ensure_bucket(request.bucket).await?;
+        self.require_bucket(request.bucket).await?;
         let upload_dir = self.get_upload_dir(request.upload_id);
         fs::create_dir_all(&upload_dir).await?;
 
@@ -529,6 +557,7 @@ impl StorageBackend for FilesystemStorage {
             .ok_or(Error::NoSuchUpload)?;
 
         let bucket = upload_metadata.bucket.as_deref().unwrap_or(request.bucket);
+        self.require_bucket(bucket).await?;
         let checksum_algorithm = upload_metadata.metadata.checksum_algorithm;
         let checksum_type = upload_metadata.checksum_type;
 
@@ -818,6 +847,7 @@ mod tests {
     async fn test_put_and_get_object() {
         let temp_dir = tempdir().unwrap();
         let storage = FilesystemStorage::new(temp_dir.path()).await.unwrap();
+        storage.create_bucket(TEST_BUCKET).await.unwrap();
         let key = "test-key";
         let content = Bytes::from("test content");
         let integrity_checks = ObjectIntegrityChecks::new().with_md5();
@@ -851,6 +881,7 @@ mod tests {
     async fn test_get_object_with_range() {
         let temp_dir = tempdir().unwrap();
         let storage = FilesystemStorage::new(temp_dir.path()).await.unwrap();
+        storage.create_bucket(TEST_BUCKET).await.unwrap();
         let key = "test-key";
         let content = Bytes::from("0123456789");
         let integrity_checks = ObjectIntegrityChecks::new().with_md5();
@@ -882,6 +913,7 @@ mod tests {
     async fn test_delete_object() {
         let temp_dir = tempdir().unwrap();
         let storage = FilesystemStorage::new(temp_dir.path()).await.unwrap();
+        storage.create_bucket(TEST_BUCKET).await.unwrap();
         let key = "test-key";
         let content = Bytes::from("test content");
         let integrity_checks = ObjectIntegrityChecks::new().with_md5();
@@ -920,6 +952,7 @@ mod tests {
     async fn test_list_objects() {
         let temp_dir = tempdir().unwrap();
         let storage = FilesystemStorage::new(temp_dir.path()).await.unwrap();
+        storage.create_bucket(TEST_BUCKET).await.unwrap();
         let content = Bytes::from("test content");
 
         for i in 0..3 {
@@ -957,6 +990,7 @@ mod tests {
     async fn test_multipart_upload() {
         let temp_dir = tempdir().unwrap();
         let storage = FilesystemStorage::new(temp_dir.path()).await.unwrap();
+        storage.create_bucket(TEST_BUCKET).await.unwrap();
         let upload_id = "test-upload-123";
         let key = "test-multipart-key";
         let metadata = create_test_metadata(0);
@@ -1021,6 +1055,7 @@ mod tests {
     async fn test_multipart_upload_missing_part() {
         let temp_dir = tempdir().unwrap();
         let storage = FilesystemStorage::new(temp_dir.path()).await.unwrap();
+        storage.create_bucket(TEST_BUCKET).await.unwrap();
         let upload_id = "test-upload-123";
         let key = "test-multipart-key";
         let metadata = create_test_metadata(0);
@@ -1057,6 +1092,7 @@ mod tests {
     async fn test_abort_multipart_upload() {
         let temp_dir = tempdir().unwrap();
         let storage = FilesystemStorage::new(temp_dir.path()).await.unwrap();
+        storage.create_bucket(TEST_BUCKET).await.unwrap();
         let upload_id = "test-upload-123";
         let key = "test-multipart-key";
         let metadata = create_test_metadata(0);
@@ -1088,6 +1124,7 @@ mod tests {
     async fn test_nested_object_keys() {
         let temp_dir = tempdir().unwrap();
         let storage = FilesystemStorage::new(temp_dir.path()).await.unwrap();
+        storage.create_bucket(TEST_BUCKET).await.unwrap();
         let key = "nested/path/to/test-key";
         let content = Bytes::from("test content");
         let integrity_checks = ObjectIntegrityChecks::new().with_md5();
@@ -1127,6 +1164,7 @@ mod tests {
     async fn test_empty_key() {
         let temp_dir = tempdir().unwrap();
         let storage = FilesystemStorage::new(temp_dir.path()).await.unwrap();
+        storage.create_bucket(TEST_BUCKET).await.unwrap();
         let key = "";
         let content = Bytes::from("test content");
         let integrity_checks = ObjectIntegrityChecks::new().with_md5();

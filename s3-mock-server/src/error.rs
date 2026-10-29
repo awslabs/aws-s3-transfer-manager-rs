@@ -61,6 +61,10 @@ pub enum Error {
     #[error("internal error: {0}")]
     Internal(String),
 
+    /// An `If-Match` or `If-None-Match` condition did not hold.
+    #[error("precondition failed")]
+    PreconditionFailed,
+
     /// An internal error occurred.
     #[error("invalid server configuration: {0}")]
     InvalidConfiguration(String),
@@ -76,16 +80,25 @@ impl From<Error> for s3s::S3Error {
             Error::InvalidPartOrder => s3s::S3ErrorCode::InvalidPartOrder,
             Error::ChecksumMismatch(_) => s3s::S3ErrorCode::BadDigest,
             Error::InvalidRange => s3s::S3ErrorCode::InvalidRange,
+            Error::PreconditionFailed => s3s::S3ErrorCode::PreconditionFailed,
             _ => s3s::S3ErrorCode::InternalError,
         };
 
-        // Preserve a human-readable message where the variant carries one, so it
-        // reaches the response body. (Real S3 returns a bare InternalError with no
-        // message; the mock surfaces the message to make failures diagnosable and
-        // to let tests assert which specific internal check rejected the request.)
-        let message = error.to_string();
-        let mut s3_error = s3s::S3Error::with_source(error_kind, Box::new(error));
-        s3_error.set_message(message);
-        s3_error
+        // S3's messages for the errors clients see most, which they may log or show.
+        let message = match error {
+            Error::NoSuchKey => Some("The specified key does not exist."),
+            Error::NoSuchBucket => Some("The specified bucket does not exist"),
+            Error::NoSuchUpload => Some("The specified upload does not exist. The upload ID may be invalid, or the upload may have been aborted or completed."),
+            Error::InvalidRange => Some("The requested range is not satisfiable"),
+            Error::PreconditionFailed => {
+                Some("At least one of the pre-conditions you specified did not hold")
+            }
+            _ => None,
+        };
+        let mut error = s3s::S3Error::with_source(error_kind, Box::new(error));
+        if let Some(message) = message {
+            error.set_message(message);
+        }
+        error
     }
 }

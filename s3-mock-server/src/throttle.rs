@@ -6,7 +6,7 @@
 //! Server-wide, load-driven throttling that recovers.
 //!
 //! Models an S3 prefix shedding a burst of load and then relenting — the shape a
-//! high-fan-out transfer provokes. Unlike the per-`(bucket, key)`
+//! high-fan-out transfer provokes. Unlike the target-scoped
 //! [`FaultRegistry`](crate::faults::FaultRegistry), a [`RateThrottle`] is scoped
 //! to the whole server, so it models "the service is throttling *you*" across
 //! every object in a fan-out. A persistent storm (one that never relents) is the

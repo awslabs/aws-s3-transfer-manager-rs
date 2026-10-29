@@ -13,6 +13,22 @@ A client operation builds a transfer and enqueues it with the scheduler. The sch
 - **`io/`** (public): input streams, part reading, and the filesystem and S3 walkers.
 - **`retry.rs`, `metrics/`, `config/`, `error.rs`**: cross-cutting support.
 
+## Reusable components
+
+`crates/aws-smithy-topology/` provides CPU and NUMA discovery, placement targets,
+and explicit CPU binding independently of transfer scheduling. Discovery owns
+no threads and does not change affinity. Its crate documentation states the
+resource and platform contracts.
+
+`crates/aws-smithy-execution/` owns managed threads and exposes partition handles
+for targeted Send task submission. Its topology re-export describes placement;
+its runtime owner controls shutdown. Execution handles do not retain ownership.
+
+`crates/aws-smithy-managed-http/` combines native Smithy connection pools with
+managed execution. Transport configuration remains on the native pool builder;
+the wrapper retains execution handles and native clients without owning runtime
+shutdown. It supplies Smithy's HTTP client interface independently of TM.
+
 ## Boundaries
 
 - `transfer.rs`, `scheduler/`, and `runtime/` do not depend on `operation/`. Operation-specific behavior reaches them only through the `Transfer` trait.

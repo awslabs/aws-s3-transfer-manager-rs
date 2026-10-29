@@ -30,8 +30,9 @@ async fn test_with_mock_server() -> Result<(), Box<dyn std::error::Error>> {
         .with_port(9000)  // Optional: specify port
         .build()?;
 
-    // Start the server
+    // Start the server, and create the bucket the test uses
     let handle = server.start().await?;
+    server.create_bucket("test-bucket").await?;
     
     // Get an S3 client configured for the mock server
     let s3_client = handle.client().await;
@@ -79,6 +80,7 @@ async fn test_transfer_manager_integration() -> Result<(), Box<dyn std::error::E
         .build()?;
     
     let handle = server.start().await?;
+    server.create_bucket("test-bucket").await?;
     let s3_client = handle.client().await;
 
     // Create Transfer Manager with mock server client
@@ -126,6 +128,41 @@ async fn test_filesystem_storage() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+### Conditional Requests
+
+- GetObject, HeadObject and DeleteObject honor `If-Match`; PutObject honors `If-Match` with an
+  ETag and `If-None-Match: *`. The server ignores other conditions. The in-memory store checks a
+  write's or a delete's condition atomically with it.
+
+### Buckets
+
+Create buckets with CreateBucket or `S3MockServer::create_bucket` before using them: object
+requests for a missing bucket fail with NoSuchBucket.
+
+### Request Counts and Faults
+
+The server counts the requests it receives per operation, and can fail or reshape the requests a
+`FaultTarget` matches:
+
+```rust
+use s3_mock_server::{FaultTarget, FaultType, Occurrence, Operation};
+
+// Fail the second HeadObject request for `key` that the target sees with 403 AccessDenied.
+server.insert_fault_for(
+    FaultTarget::operation(Operation::HeadObject).bucket("test-bucket").key("key"),
+    FaultType::ServiceError { status: 403, code: "AccessDenied" },
+    1,
+    Occurrence::Once,
+);
+
+// ... run the code under test ...
+
+assert_eq!(server.request_count(Operation::HeadObject), 2);
+```
+
+`insert_fault(bucket, key, ..)` targets the GetObject, PutObject and UploadPart requests for one
+key. Counts and faults apply per HTTP request, so each retry and each part request counts.
 
 ## License
 
