@@ -37,7 +37,7 @@ pub use crate::model::UploadInput;
 pub use crate::model::UploadOutput;
 use crate::transfer::TransferContext;
 use crate::types::BucketType;
-pub use handle::UploadHandle;
+pub use handle::{UploadAbortHandle, UploadHandle};
 
 use std::sync::Arc;
 

@@ -168,6 +168,7 @@ impl std::fmt::Debug for Scheduler {
 /// work to drain before continuing. Pending (queued but not yet
 /// dispatched) work is purged synchronously during cancel; only work
 /// that was already dispatched needs draining.
+#[derive(Debug)]
 pub(crate) struct Cancellation {
     pub(super) target: Option<TransferDescriptor>,
     pub(super) children: Vec<TransferDescriptor>,
@@ -176,11 +177,11 @@ pub(crate) struct Cancellation {
 impl Cancellation {
     /// Wait until the cancelled parent and each cancelled child report idle
     /// (no queued or executing work), checking each descriptor in turn.
-    pub(crate) async fn wait_for_idle(self) {
-        if let Some(d) = self.target {
+    pub(crate) async fn wait_for_idle(&self) {
+        if let Some(d) = &self.target {
             d.wait_for_idle().await;
         }
-        for d in self.children {
+        for d in &self.children {
             d.wait_for_idle().await;
         }
     }

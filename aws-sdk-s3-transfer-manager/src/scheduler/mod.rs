@@ -12,7 +12,7 @@ mod transfer;
 pub(crate) use concurrency::{
     classify_error, CompletionSample, ConcurrencyController, FixedConcurrency,
 };
-pub(crate) use scheduler::Scheduler;
+pub(crate) use scheduler::{Cancellation, Scheduler};
 
 pub(crate) mod descriptor;
 mod ready_set;
