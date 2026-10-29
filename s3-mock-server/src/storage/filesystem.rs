@@ -546,6 +546,17 @@ impl StorageBackend for FilesystemStorage {
         Ok(result)
     }
 
+    async fn multipart_checksum_type(
+        &self,
+        upload_id: &str,
+    ) -> Result<Option<aws_sdk_s3::types::ChecksumType>> {
+        let metadata_path = self.get_upload_metadata_path(upload_id);
+        let upload_metadata: MultipartUploadMetadata = Self::load_metadata(&metadata_path)
+            .await?
+            .ok_or(Error::NoSuchUpload)?;
+        Ok(upload_metadata.checksum_type)
+    }
+
     async fn complete_multipart_upload(
         &self,
         request: crate::storage::CompleteMultipartUploadRequest<'_>,

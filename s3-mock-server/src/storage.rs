@@ -380,6 +380,13 @@ pub(crate) trait StorageBackend: Send + Sync + Debug {
     #[allow(dead_code)]
     async fn list_parts(&self, upload_id: &str) -> Result<Vec<PartInfo>>;
 
+    /// Return the checksum type (FULL_OBJECT vs COMPOSITE) recorded when the
+    /// multipart upload was created, or `Error::NoSuchUpload` if it does not exist.
+    async fn multipart_checksum_type(
+        &self,
+        upload_id: &str,
+    ) -> Result<Option<aws_sdk_s3::types::ChecksumType>>;
+
     /// Complete a multipart upload by combining parts into a final object.
     async fn complete_multipart_upload(
         &self,
@@ -454,6 +461,13 @@ impl StorageBackend for std::sync::Arc<dyn StorageBackend + '_> {
 
     async fn list_parts(&self, upload_id: &str) -> Result<Vec<PartInfo>> {
         (**self).list_parts(upload_id).await
+    }
+
+    async fn multipart_checksum_type(
+        &self,
+        upload_id: &str,
+    ) -> Result<Option<aws_sdk_s3::types::ChecksumType>> {
+        (**self).multipart_checksum_type(upload_id).await
     }
 
     async fn complete_multipart_upload(

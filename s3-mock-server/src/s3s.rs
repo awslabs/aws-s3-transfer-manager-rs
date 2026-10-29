@@ -870,24 +870,14 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         // Extract client checksums before consuming input
         let client_checksums = crate::types::ClientChecksums::from(&input);
 
-        // Extract part information. Track whether any part carries a per-part
-        // checksum (one of the signals that part numbers must be contiguous below).
+        // Extract part information
         let mut parts = Vec::new();
-        let mut any_part_level_checksum = false;
         if let Some(completed_parts) = input.multipart_upload.and_then(|u| u.parts) {
             for part in completed_parts {
                 let part_number = part
                     .part_number
                     .ok_or_else(|| s3s::s3_error!(InvalidRequest))?;
                 let etag = part.e_tag.ok_or_else(|| s3s::s3_error!(InvalidRequest))?;
-                if part.checksum_crc32.is_some()
-                    || part.checksum_crc32c.is_some()
-                    || part.checksum_crc64nvme.is_some()
-                    || part.checksum_sha1.is_some()
-                    || part.checksum_sha256.is_some()
-                {
-                    any_part_level_checksum = true;
-                }
                 parts.push((part_number, format!("\"{}\"", etag.value())));
             }
         }
@@ -909,19 +899,17 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         // CONSECUTIVE and begin with 1 (no gaps), not merely ascending. S3 requires
         // this for two independent reasons, which return DIFFERENT errors on a gap:
         //
-        //   * Composite (part-level) checksums — declared via checksum_type, or
-        //     signalled by per-part checksums on the completion. A gap here is an
+        //   * Composite (part-level) checksums — the checksum type fixed by
+        //     CreateMultipartUpload. Per-part checksums on the completion are not a
+        //     signal: a FULL_OBJECT upload may carry them too. A gap here is an
         //     HTTP 500 Internal Server error.
         //     <https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity-upload.html>
         //
         //   * Directory buckets (S3 Express One Zone). A gap here is an HTTP 400
         //     Bad Request error.
         //     <https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-express-differences.html>
-        let composite_checksum = input
-            .checksum_type
-            .as_ref()
-            .is_some_and(|t| t.as_str() == s3s::dto::ChecksumType::COMPOSITE)
-            || any_part_level_checksum;
+        let composite_checksum =
+            self.storage.multipart_checksum_type(upload_id).await? == Some(ChecksumType::Composite);
         // The mock has no separate bucket metadata, so a directory bucket is
         // recognized by its S3 Express name suffix (`--x-s3`), the same way S3's
         // name-based routing distinguishes it from a general-purpose bucket.
@@ -936,7 +924,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
                 // Directory bucket takes precedence as a 400; composite-only is a 500.
                 if directory_bucket {
                     return Err(s3s::s3_error!(
-                        InvalidRequest,
+                        InvalidPartOrder,
                         "directory bucket multipart upload requires consecutive part \
                          numbers beginning with 1"
                     ));

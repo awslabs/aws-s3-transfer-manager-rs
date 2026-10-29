@@ -397,6 +397,18 @@ impl StorageBackend for InMemoryStorage {
         Ok(result)
     }
 
+    async fn multipart_checksum_type(
+        &self,
+        upload_id: &str,
+    ) -> Result<Option<aws_sdk_s3::types::ChecksumType>> {
+        let multipart = self.multipart.read().await;
+        let upload = multipart
+            .uploads
+            .get(upload_id)
+            .ok_or(Error::NoSuchUpload)?;
+        Ok(upload.checksum_type.clone())
+    }
+
     async fn complete_multipart_upload(
         &self,
         request: crate::storage::CompleteMultipartUploadRequest<'_>,
