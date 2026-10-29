@@ -1345,6 +1345,138 @@ impl MockStateMachine for FusedReadySpawnedMock {
     }
 }
 
+/// Polls `Done` while its status is still `Active`, as a transfer does between claiming
+/// its terminal state and publishing its terminal status.
+///
+/// `on_terminal` records what it observes, then publishes `Completed`.
+pub(crate) struct DoneWhileActiveMock {
+    ctx: TransferContext,
+    /// What `on_terminal` observed, or `None` if it was never called.
+    observed: ObservedTerminal,
+}
+
+/// The status `on_terminal` observed, and a label for the outcome
+/// [`TransferContext::terminal_outcome`] derives from it.
+pub(crate) type ObservedTerminal =
+    Arc<std::sync::Mutex<Option<(crate::types::TransferStatus, &'static str)>>>;
+
+impl std::fmt::Debug for DoneWhileActiveMock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DoneWhileActiveMock").finish()
+    }
+}
+
+impl DoneWhileActiveMock {
+    pub(crate) fn new(
+        id: TransferId,
+        handle: Arc<crate::client::Handle>,
+    ) -> (Self, ObservedTerminal) {
+        let (ctx, _rx) = TransferContext::with_id(id, handle);
+        let observed: ObservedTerminal = Arc::new(std::sync::Mutex::new(None));
+        let mock = Self {
+            ctx,
+            observed: observed.clone(),
+        };
+        (mock, observed)
+    }
+}
+
+impl Transfer for DoneWhileActiveMock {
+    fn ctx(&self) -> &TransferContext {
+        &self.ctx
+    }
+
+    fn poll_work(&self) -> PollWork {
+        PollWork::Done
+    }
+
+    fn on_terminal(&self) {
+        // A label, because `Outcome` is not `PartialEq`.
+        let outcome = match self.ctx.terminal_outcome() {
+            crate::events::Outcome::Succeeded {} => "Succeeded",
+            crate::events::Outcome::Failed {} => "Failed",
+            crate::events::Outcome::Cancelled {} => "Cancelled",
+        };
+        *self.observed.lock().unwrap() = Some((self.ctx.transfer_status(), outcome));
+        self.ctx.set_completed();
+        self.ctx.signal_terminal();
+    }
+
+    fn execute<'a>(
+        &'a self,
+        _work: &'a mut IoRequest,
+    ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
+        unreachable!("DoneWhileActiveMock never returns PollWork::Ready")
+    }
+}
+
+/// Polls `Done` with a published terminal status, and panics in `on_terminal`.
+pub(crate) struct PanickingTerminalHookMock {
+    ctx: TransferContext,
+    calls: Arc<AtomicUsize>,
+}
+
+impl std::fmt::Debug for PanickingTerminalHookMock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PanickingTerminalHookMock").finish()
+    }
+}
+
+impl PanickingTerminalHookMock {
+    /// `calls` counts entries into `on_terminal`.
+    pub(crate) fn new(
+        id: TransferId,
+        handle: Arc<crate::client::Handle>,
+        calls: Arc<AtomicUsize>,
+    ) -> Self {
+        let (ctx, _rx) = TransferContext::with_id(id, handle);
+        Self { ctx, calls }
+    }
+
+    /// Like [`Self::new`], also returning the completion receiver and a clone of the
+    /// context.
+    pub(crate) fn with_receiver(
+        id: TransferId,
+        handle: Arc<crate::client::Handle>,
+        calls: Arc<AtomicUsize>,
+    ) -> (Self, StateMachineTerminalReceiver, TransferContext) {
+        let (ctx, completion_rx) = TransferContext::with_id(id, handle);
+        (
+            Self {
+                ctx: ctx.clone(),
+                calls,
+            },
+            completion_rx,
+            ctx,
+        )
+    }
+}
+
+impl Transfer for PanickingTerminalHookMock {
+    fn ctx(&self) -> &TransferContext {
+        &self.ctx
+    }
+
+    fn poll_work(&self) -> PollWork {
+        // Published in the poll rather than before it: a descriptor that is already
+        // terminal when popped is skipped unpolled, so it would never reach the Done arm.
+        self.ctx.set_completed();
+        PollWork::Done
+    }
+
+    fn on_terminal(&self) {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        panic!("on_terminal panicked");
+    }
+
+    fn execute<'a>(
+        &'a self,
+        _work: &'a mut IoRequest,
+    ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
+        unreachable!("PanickingTerminalHookMock never returns PollWork::Ready")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

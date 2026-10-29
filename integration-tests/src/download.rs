@@ -317,6 +317,207 @@ async fn test_download_write_to_file() {
     m.handle.shutdown().await.expect("shutdown");
 }
 
+// ref: awslabs/aws-s3-transfer-manager-rs#197
+/// Every single-object download entry point reports to a sink registered with
+/// `.events(sink)`: exactly one root `Started` carrying a view, exactly one succeeding
+/// `Finished` for the same id, and a view whose `network_rx` and `Final` total equal the
+/// object size.
+///
+/// An entry point that discards its sink still downloads correctly; only its event stream
+/// shows the loss.
+#[cfg(any(unix, windows))]
+#[tokio::test]
+async fn test_download_single_object_entry_points_all_report_events() {
+    use aws_sdk_s3_transfer_manager::events::{Outcome, TransferEvent};
+    use aws_sdk_s3_transfer_manager::types::Total;
+    use std::time::Duration;
+
+    #[derive(Debug)]
+    enum Sink {
+        Path,
+        File,
+        Body,
+    }
+
+    let size = 8 * ByteUnit::Mebibyte.as_bytes_usize();
+
+    for variant in [Sink::Path, Sink::File, Sink::Body] {
+        let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+        let m = setup_concurrent(part_size, 8).await;
+        let content = deterministic_data(size);
+        m.server
+            .add_object("test-bucket", "ev-key", content.clone(), None)
+            .await
+            .expect("add object");
+
+        let (sink, mut stream) = aws_sdk_s3_transfer_manager::events::channel(
+            std::num::NonZeroUsize::new(8).expect("capacity > 0"),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let req = m
+            .client
+            .download()
+            .bucket("test-bucket")
+            .key("ev-key")
+            .events(sink);
+
+        match variant {
+            Sink::Path => {
+                let h = req
+                    .write_to_path(dir.path().join("out.dat"))
+                    .await
+                    .expect("write_to_path");
+                h.join().await.expect("join");
+            }
+            Sink::File => {
+                let f = std::fs::File::create(dir.path().join("out.dat")).unwrap();
+                let h = req.write_to_file(f).expect("write_to_file");
+                h.join().await.expect("join");
+            }
+            Sink::Body => {
+                let mut h = req.initiate().expect("initiate");
+                drain_body(&mut h).await.expect("drain body");
+                h.join().await.expect("join");
+            }
+        }
+
+        // Sending `Finished` releases the sink, so the stream ends once drained. Drained to
+        // the end rather than to the first `Finished`, so a duplicate fails the count below.
+        let mut started = Vec::new();
+        let mut finished = Vec::new();
+        let mut view = None;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(event) = stream.recv().await {
+                match event {
+                    TransferEvent::Started(p) => {
+                        started.push(p.id());
+                        view = p.view().cloned();
+                    }
+                    TransferEvent::Finished(e) => {
+                        finished.push((e.id(), matches!(e.outcome(), Outcome::Succeeded { .. })))
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!("{variant:?}: the stream did not end, so the sink outlived the transfer")
+        });
+
+        assert_eq!(
+            1,
+            started.len(),
+            "{variant:?}: a registered sink must receive exactly one Started"
+        );
+        assert_eq!(
+            started,
+            finished.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            "{variant:?}: and exactly one Finished, for the same id"
+        );
+        assert!(
+            finished.iter().all(|(_, succeeded)| *succeeded),
+            "{variant:?}: a download that joined Ok reported a Finished that did not succeed"
+        );
+        assert_eq!(
+            None,
+            started[0].parent(),
+            "{variant:?}: a single-object download is its own root"
+        );
+        let view = view.unwrap_or_else(|| panic!("{variant:?}: a real transfer owes a view"));
+        assert_eq!(
+            size as u64,
+            view.metrics().network_rx,
+            "{variant:?}: the view must report the bytes that moved"
+        );
+        assert_eq!(
+            Total::Final(size as u64),
+            view.byte_total(),
+            "{variant:?}: a single object's length is known, so its total is final"
+        );
+
+        m.handle.shutdown().await.expect("shutdown");
+    }
+}
+
+/// Two downloads share a capacity-2 sink, and nothing is received until both have finished.
+///
+/// `write_to_path` starts its transfer before returning, so the first download holds both
+/// slots before the second asks for any: its `Started` is queued and the slot for its
+/// `Finished` is held. The second finds no room, so neither of its events arrives and both are
+/// counted. The first's `Finished` still arrives, through the slot it held, although the
+/// channel was full when it finished.
+#[cfg(any(unix, windows))]
+#[tokio::test]
+async fn test_download_without_room_for_its_events_is_dropped_whole() {
+    use aws_sdk_s3_transfer_manager::events::TransferEvent;
+    use std::time::Duration;
+
+    let m = setup().await;
+    for key in ["first", "second"] {
+        m.server
+            .add_object("test-bucket", key, deterministic_data(1024), None)
+            .await
+            .expect("add object");
+    }
+    let (sink, mut stream) = aws_sdk_s3_transfer_manager::events::channel(
+        std::num::NonZeroUsize::new(2).expect("capacity > 0"),
+    );
+    let dir = tempfile::tempdir().unwrap();
+
+    let mut handles = Vec::new();
+    for (key, sink) in [("first", sink.clone()), ("second", sink)] {
+        let handle = m
+            .client
+            .download()
+            .bucket("test-bucket")
+            .key(key)
+            .events(sink)
+            .write_to_path(dir.path().join(key))
+            .await
+            .expect("write_to_path");
+        handles.push(handle);
+    }
+    // A transfer never waits for room, so both finish while the stream is unread.
+    for handle in handles {
+        handle.join().await.expect("join");
+    }
+
+    let mut events = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(event) = stream.recv().await {
+            let kind = match event {
+                TransferEvent::Started(_) => "Started",
+                TransferEvent::Finished(_) => "Finished",
+                _ => "unknown",
+            };
+            events.push(format!("{kind} {}", event.transfer().source()));
+        }
+    })
+    .await
+    .expect("the stream did not end, so a sink or a held slot outlived its transfer");
+
+    assert_eq!(
+        Some("Started s3://test-bucket/first"),
+        events.first().map(String::as_str),
+        "the first download had room for both of its events: {events:?}"
+    );
+    assert_eq!(
+        Some("Finished s3://test-bucket/first"),
+        events.get(1).map(String::as_str),
+        "the first download's `Finished` goes through the slot it held, so a full channel \
+         cannot drop it: {events:?}"
+    );
+    assert_eq!(
+        2,
+        events.len(),
+        "the second download had no room, so neither of its events arrives: {events:?}"
+    );
+    assert_eq!(2, stream.dropped(), "and both of its events are counted");
+
+    m.handle.shutdown().await.expect("shutdown");
+}
+
 /// A caller-provided file that cannot be written or finalized wakes joiners.
 #[cfg(any(unix, windows))]
 #[tokio::test]
@@ -883,4 +1084,144 @@ async fn test_concurrent_disk_downloads_under_tight_memory_budget_do_not_wedge_t
         RuntimeMode::MultiThreadTokio,
     )
     .await;
+}
+
+/// A multipart download's `bytes_transferred`, read from its view, reaches the final byte
+/// total.
+///
+/// 16 MiB at 5 MiB parts is a discovery range and three more, which record their bytes at
+/// separate sites; missing either site leaves the counter short of the total.
+#[tokio::test]
+async fn test_download_bytes_transferred_reaches_the_byte_total() {
+    use aws_sdk_s3_transfer_manager::events::TransferEvent;
+    use aws_sdk_s3_transfer_manager::types::Total;
+    use std::time::Duration;
+
+    let size = 16 * ByteUnit::Mebibyte.as_bytes_usize();
+    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let m = setup_concurrent(part_size, 8).await;
+    m.server
+        .add_object(
+            "test-bucket",
+            "transferred-key",
+            deterministic_data(size),
+            None,
+        )
+        .await
+        .expect("add object");
+
+    let (sink, mut stream) = aws_sdk_s3_transfer_manager::events::channel(
+        std::num::NonZeroUsize::new(8).expect("capacity > 0"),
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let handle = m
+        .client
+        .download()
+        .bucket("test-bucket")
+        .key("transferred-key")
+        .events(sink)
+        .write_to_path(dir.path().join("out.bin"))
+        .await
+        .expect("write_to_path");
+
+    handle.join().await.expect("join download");
+
+    let mut view = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while view.is_none() && tokio::time::Instant::now() < deadline {
+        match stream.try_recv() {
+            Ok(TransferEvent::Started(p)) if p.view().is_some() => view = p.view().cloned(),
+            Ok(_) => continue,
+            Err(aws_sdk_s3_transfer_manager::events::TryRecvError::Empty) => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(_) => break,
+        }
+    }
+    let view = view.expect("a real transfer owes a view");
+
+    assert_eq!(Total::Final(size as u64), view.byte_total());
+    assert_eq!(
+        size as u64,
+        view.metrics().bytes_transferred,
+        "the download's progress numerator must reach its total"
+    );
+
+    m.handle.shutdown().await.expect("shutdown");
+}
+
+/// A download whose body is never read reports the consumer as the cause it waits on.
+///
+/// Prefetch fills the read-ahead window, the gate closes, and the transfer parks on it,
+/// which its view reports as `PendingCategory::Consumer`.
+#[tokio::test]
+async fn test_download_parked_on_read_ahead_reports_the_consumer() {
+    use aws_sdk_s3_transfer_manager::events::TransferEvent;
+    use aws_sdk_s3_transfer_manager::types::PendingCategory;
+    use std::time::Duration;
+
+    // 8 parts at concurrency 2 and a window of 2, so the window closes before every range is
+    // issued. A transfer that issues every range first parks on range completion and never
+    // reaches the read-ahead gate.
+    let size = 40 * ByteUnit::Mebibyte.as_bytes_usize();
+    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let m = mock_tm_with(RuntimeMode::Managed, |b| {
+        b.part_size(PartSize::Target(part_size as u64))
+            .concurrency(ConcurrencyMode::Explicit(2))
+            .read_ahead(aws_sdk_s3_transfer_manager::types::ReadAhead::Parts(2))
+    })
+    .await;
+    m.server
+        .add_object("test-bucket", "stall-key", deterministic_data(size), None)
+        .await
+        .expect("add object");
+
+    let (sink, mut stream) = aws_sdk_s3_transfer_manager::events::channel(
+        std::num::NonZeroUsize::new(8).expect("capacity > 0"),
+    );
+    // Held but never joined, and the body never read, so the transfer stays alive and parked.
+    let _handle = m
+        .client
+        .download()
+        .bucket("test-bucket")
+        .key("stall-key")
+        .events(sink)
+        .initiate()
+        .expect("initiate");
+
+    let mut view = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while view.is_none() && tokio::time::Instant::now() < deadline {
+        match stream.try_recv() {
+            Ok(TransferEvent::Started(p)) if p.view().is_some() => view = p.view().cloned(),
+            Ok(_) => continue,
+            Err(aws_sdk_s3_transfer_manager::events::TryRecvError::Empty) => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(_) => break,
+        }
+    }
+    let view = view.expect("a real transfer owes a view");
+
+    // The transfer issues ranges and fills the window before it parks, so the first reading
+    // may have no cause.
+    let mut seen = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        if let Some(cause) = view.pending_cause() {
+            seen = Some(cause.category());
+            if cause.category() == PendingCategory::Consumer {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    assert_eq!(
+        Some(PendingCategory::Consumer),
+        seen,
+        "a download whose body is never read must report the consumer as its cause"
+    );
+
+    m.handle.shutdown().await.expect("shutdown");
 }

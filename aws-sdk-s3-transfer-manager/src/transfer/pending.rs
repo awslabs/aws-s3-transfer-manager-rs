@@ -7,7 +7,8 @@
 //!
 //! Transfer state machines record why a poll cannot produce work. The
 //! scheduler records the first wake and the next poll. This module joins those
-//! boundaries for diagnostics without participating in scheduling decisions.
+//! boundaries for diagnostics, and holds the cause a transfer's view reports,
+//! without participating in scheduling decisions.
 //!
 //! ```text
 //! set_pending()             first wake              next poll starts
@@ -26,19 +27,21 @@ use super::TransferId;
 
 const PENDING_CATEGORY_COUNT: usize = 5;
 
-/// Coarse resource or work class preventing a transfer from producing work.
+/// What a transfer is waiting on.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum PendingCategory {
-    /// Caller-provided source data or source work is not ready.
+#[non_exhaustive]
+pub enum PendingCategory {
+    /// A caller's [`PartStream`](crate::io::PartStream), which has no next part ready, or has
+    /// ended while its last parts upload.
     Source,
-    /// Shared buffer-pool admission is pending.
+    /// Memory for a download's next part, which the client's transfers share.
     Memory,
-    /// Downstream delivery or consumption must release capacity.
+    /// Room in the download's [`ReadAhead`](crate::types::ReadAhead) window. A part takes room
+    /// from when it is requested until its bytes are read from the body or written to the file.
     Consumer,
-    /// Dispatched transfer work must retire.
+    /// Requests or file writes the transfer has already started, to finish.
     InFlightWork,
-    /// Direction-specific state without a common category.
-    #[allow(dead_code)] // Reserved escape hatch for future transfer kinds.
+    /// Something outside the other categories.
     Other,
 }
 
@@ -74,16 +77,28 @@ impl PendingCategory {
     }
 }
 
-/// Common pending category paired with direction-owned detail.
+/// Why a transfer is waiting: a [`PendingCategory`] and a label for diagnostics.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct PendingCause {
+pub struct PendingCause {
     /// Common category used for aggregation across transfer kinds.
-    pub(crate) category: PendingCategory,
+    category: PendingCategory,
     /// Static direction-specific reason used in diagnostic records.
-    pub(crate) reason: &'static str,
+    reason: &'static str,
 }
 
 impl PendingCause {
+    /// The class of resource or work the transfer is waiting on.
+    pub fn category(&self) -> PendingCategory {
+        self.category
+    }
+
+    /// A diagnostic label for the state the transfer is waiting in.
+    ///
+    /// Labels may change in any release. Branch on [`category`](Self::category), not on this.
+    pub fn reason(&self) -> &'static str {
+        self.reason
+    }
+
     /// Creates a cause from a common category and direction-specific reason.
     pub(crate) const fn new(category: PendingCategory, reason: &'static str) -> Self {
         Self { category, reason }
@@ -98,6 +113,56 @@ impl PendingCause {
     #[allow(dead_code)] // Used by test transfers; reserved for future production causes.
     pub(crate) const fn other(reason: &'static str) -> Self {
         Self::new(PendingCategory::Other, reason)
+    }
+}
+
+/// At most one pending cause, readable from any thread. `stored` mirrors whether one is held
+/// and is written only under the lock, so `clear` and `get` skip the lock when it's empty.
+pub(crate) struct PendingCauseSlot {
+    stored: AtomicBool,
+    cause: Mutex<Option<PendingCause>>,
+}
+
+impl PendingCauseSlot {
+    /// Creates an empty slot.
+    pub(crate) fn new() -> Self {
+        Self {
+            stored: AtomicBool::new(false),
+            cause: Mutex::new(None),
+        }
+    }
+
+    /// Holds `cause`, replacing any cause already held.
+    pub(crate) fn set(&self, cause: PendingCause) {
+        let mut held = self.cause.lock();
+        *held = Some(cause);
+        self.stored.store(true, Ordering::Release);
+    }
+
+    /// Drops the held cause, if any.
+    pub(crate) fn clear(&self) {
+        if !self.stored.load(Ordering::Acquire) {
+            return;
+        }
+        let mut held = self.cause.lock();
+        *held = None;
+        self.stored.store(false, Ordering::Release);
+    }
+
+    /// The held cause, if any.
+    pub(crate) fn get(&self) -> Option<PendingCause> {
+        if !self.stored.load(Ordering::Acquire) {
+            return None;
+        }
+        *self.cause.lock()
+    }
+}
+
+impl std::fmt::Debug for PendingCauseSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("PendingCauseSlot")
+            .field(&self.get())
+            .finish()
     }
 }
 
@@ -657,6 +722,33 @@ mod loom_tests {
             let stats = pending.snapshot().category(PendingCategory::Memory);
             assert_eq!(stats.count, 1);
             assert_eq!(stats.pending_to_wake, Duration::ZERO);
+        });
+    }
+
+    /// After a racing `set` and `clear`, the lock-free check agrees with what the slot holds.
+    ///
+    /// Storing the flag outside the lock, before the cause is written, admits a `clear`
+    /// between the two that leaves a held cause behind a cleared flag, which `get` then
+    /// reports as `None` until the next `set`.
+    #[test]
+    fn pending_cause_slot_flag_never_hides_a_held_cause() {
+        loom::model(|| {
+            let slot = Arc::new(PendingCauseSlot::new());
+            let cause = PendingCause::new(PendingCategory::Memory, "loom");
+
+            let setter = {
+                let slot = Arc::clone(&slot);
+                thread::spawn(move || slot.set(cause))
+            };
+            let clearer = {
+                let slot = Arc::clone(&slot);
+                thread::spawn(move || slot.clear())
+            };
+            setter.join().unwrap();
+            clearer.join().unwrap();
+
+            let held = *slot.cause.lock();
+            assert_eq!(held, slot.get(), "the flag hides a held cause");
         });
     }
 }

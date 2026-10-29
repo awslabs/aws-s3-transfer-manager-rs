@@ -768,6 +768,68 @@ async fn test_download_write_to_path_abort_cleans_up() {
     assert!(tmp_files.is_empty(), "leftover temp files: {:?}", tmp_files);
 }
 
+// ref: awslabs/aws-s3-transfer-manager-rs#197
+/// A download to a path that has completed keeps its object when its handle is dropped or
+/// aborted without `join`.
+///
+/// The transfer renames the file into place when it completes, so the handle has nothing
+/// left to finalize. A rename left to `join` leaves the temporary file to be removed with
+/// the handle, and the destination never appears.
+#[cfg(any(unix, windows))]
+#[tokio::test]
+async fn test_download_write_to_path_keeps_a_completed_object_without_join() {
+    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    for abort in [false, true] {
+        let data = rand_data(2 * part_size);
+        let (tm, _http_client) = simple_test_tm(&data, part_size);
+        let dir = tempfile::tempdir().unwrap();
+        let dest_path = dir.path().join("output.dat");
+
+        let handle = tm
+            .download()
+            .bucket("test-bucket")
+            .key("test-object")
+            .write_to_path(&dest_path)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match handle.status() {
+                    TransferStatus::Completed => break,
+                    TransferStatus::Active => tokio::time::sleep(Duration::from_millis(5)).await,
+                    other => panic!("abort={abort}: the download ended {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("the download completes without a join");
+
+        if abort {
+            handle.abort().await;
+        } else {
+            drop(handle);
+        }
+
+        let written = std::fs::read(&dest_path).unwrap_or_else(|e| {
+            panic!("abort={abort}: the completed object is not at its destination: {e}")
+        });
+        assert_eq!(
+            written,
+            data.as_ref(),
+            "abort={abort}: the destination holds the object"
+        );
+        let tmp_files: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.path().to_string_lossy().contains(".s3tmp"))
+            .collect();
+        assert!(
+            tmp_files.is_empty(),
+            "abort={abort}: leftover temp files: {tmp_files:?}"
+        );
+    }
+}
+
 /// Test that a mid-transfer error cleans up temp and destination files.
 #[cfg(any(unix, windows))]
 #[tokio::test]

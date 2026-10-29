@@ -59,6 +59,7 @@ async fn test_upload_metrics_and_status() {
 
     let output = handle.join().await.expect("join");
     assert_eq!(output.metrics.network_tx, size as u64);
+    assert!(output.metrics.finished_at.is_some());
 
     m.handle.shutdown().await.expect("shutdown");
 }

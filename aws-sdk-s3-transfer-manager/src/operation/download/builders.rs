@@ -11,6 +11,7 @@ use super::{DownloadHandle, DownloadInputBuilder, ManagedDownloadHandle};
 pub struct DownloadFluentBuilder {
     handle: Arc<crate::client::Handle>,
     pub(crate) inner: DownloadInputBuilder,
+    events: Option<crate::events::TransferEventSink>,
 }
 
 impl DownloadFluentBuilder {
@@ -18,7 +19,24 @@ impl DownloadFluentBuilder {
         Self {
             handle,
             inner: ::std::default::Default::default(),
+            events: None,
         }
+    }
+
+    /// Report lifecycle events for this transfer to `sink`.
+    ///
+    /// Calling this twice adds a second consumer rather than replacing the first.
+    ///
+    /// A download started with [`initiate`](Self::initiate) holds only a bounded amount of
+    /// unread body, so read the body while you read the events. A loop that waits for
+    /// [`Finished`](crate::events::TransferEvent::Finished) before reading the body can wait
+    /// forever.
+    pub fn events(mut self, sink: crate::events::TransferEventSink) -> Self {
+        self.events = Some(match self.events.take() {
+            Some(existing) => existing.merge(sink),
+            None => sink,
+        });
+        self
     }
 
     /// Initiate a download transfer for a single object.
@@ -28,7 +46,13 @@ impl DownloadFluentBuilder {
     ))]
     pub fn initiate(self) -> Result<DownloadHandle, crate::error::Error> {
         let input = self.inner.build()?;
-        crate::operation::download::Download::orchestrate(self.handle, input, false)
+        let events = self
+            .events
+            .map(|sink| crate::operation::download::EventRegistration {
+                sink,
+                destination: crate::events::Endpoint::Stream {},
+            });
+        crate::operation::download::Download::orchestrate(self.handle, input, false, events)
     }
 
     /// Download the object and write it to the given file path.
@@ -48,11 +72,21 @@ impl DownloadFluentBuilder {
         path: impl Into<std::path::PathBuf>,
     ) -> Result<ManagedDownloadHandle, crate::error::Error> {
         let input = self.inner.build()?;
+        let path = path.into();
+        let events = self
+            .events
+            .map(|sink| crate::operation::download::EventRegistration {
+                sink,
+                destination: crate::events::Endpoint::Local {
+                    path: Some(std::sync::Arc::from(path.as_path())),
+                },
+            });
         crate::operation::download::Download::orchestrate_to_path(
             self.handle,
             input,
-            path.into(),
+            path,
             None,
+            events,
             &crate::operation::download::sink::FileSinkFactory,
         )
         .await
@@ -86,10 +120,18 @@ impl DownloadFluentBuilder {
         file: std::fs::File,
     ) -> Result<ManagedDownloadHandle, crate::error::Error> {
         let input = self.inner.build()?;
+        // `path: None`: the caller opened the file, and this method is never told its path.
+        let events = self
+            .events
+            .map(|sink| crate::operation::download::EventRegistration {
+                sink,
+                destination: crate::events::Endpoint::Local { path: None },
+            });
         crate::operation::download::Download::orchestrate_to_file(
             self.handle,
             input,
             file,
+            events,
             &crate::operation::download::sink::FileSinkFactory,
         )
     }
@@ -97,6 +139,9 @@ impl DownloadFluentBuilder {
 
 impl DownloadInputBuilder {
     /// Initiate a download transfer for a single object with this input using the given client.
+    ///
+    /// This entry point reports no [events](crate::events); [`DownloadFluentBuilder::events`]
+    /// registers a sink.
     pub fn initiate_with(
         self,
         client: &crate::Client,

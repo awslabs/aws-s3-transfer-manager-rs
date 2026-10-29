@@ -179,6 +179,45 @@ impl Buf for DiskWriteCursor<'_> {
     }
 }
 
+/// A disk download's temporary file and the destination it is renamed to.
+#[derive(Debug)]
+pub(crate) struct CommitTarget {
+    pub(crate) temp: std::path::PathBuf,
+    pub(crate) dest: std::path::PathBuf,
+}
+
+/// A [`CommitTarget`] whose temporary file is removed when the last reference drops, unless
+/// [`BodyWriter::commit`] renamed it or [`BodyWriter::discard_temp_file`] removed it first.
+///
+/// Reference-counted so the transfer's own terminal paths leave the file to the last work
+/// item still holding it.
+#[derive(Debug)]
+pub(crate) struct TempFile {
+    /// Taken when the file is renamed or removed, so that happens at most once. Shared with
+    /// the writer, which can remove the file before the last reference drops.
+    target: SharedTarget,
+}
+
+/// A commit target, taken under its lock by whichever rename or removal runs first.
+type SharedTarget = std::sync::Arc<std::sync::Mutex<Option<CommitTarget>>>;
+
+/// Removes the temporary file unless it was already renamed or removed. Holds the lock
+/// across the removal, so a caller that finds nothing left to remove knows it is gone.
+fn remove_temp_file(target: &std::sync::Mutex<Option<CommitTarget>>) {
+    let mut target = target
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(paths) = target.take() {
+        let _ = std::fs::remove_file(&paths.temp);
+    }
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        remove_temp_file(&self.target);
+    }
+}
+
 /// Stream vs disk discrimination. Mutually exclusive per transfer.
 #[derive(Debug)]
 enum Mode {
@@ -191,6 +230,11 @@ enum Mode {
         /// Bytes the sink has accepted across every drain. Only completed run
         /// writes are counted, so this never exceeds what reached the sink.
         written: AtomicU64,
+        /// The transfer's reference to its temporary file, until
+        /// [`BodyWriter::release_temp_file`] drops it.
+        temp_file: std::sync::Mutex<Option<std::sync::Arc<TempFile>>>,
+        /// The temporary file's commit target, shared with every [`TempFile`] reference.
+        commit_target: SharedTarget,
     },
 }
 
@@ -309,6 +353,73 @@ impl BodyWriter {
         matches!(&*self.mode, Mode::Disk { .. })
     }
 
+    /// A reference to the temporary file, which defers the removal that dropping the
+    /// last reference performs. `None` without a [`CommitTarget`] or once
+    /// [`release_temp_file`](Self::release_temp_file) has run.
+    pub(crate) fn temp_file(&self) -> Option<std::sync::Arc<TempFile>> {
+        match &*self.mode {
+            Mode::Disk { temp_file, .. } => temp_file
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+            Mode::Stream => None,
+        }
+    }
+
+    /// Drops the transfer's reference to the temporary file. Later calls do nothing.
+    pub(crate) fn release_temp_file(&self) {
+        if let Mode::Disk { temp_file, .. } = &*self.mode {
+            let released = temp_file
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            // Dropped after the lock is released: dropping the last reference
+            // removes the file.
+            drop(released);
+        }
+    }
+
+    /// Renames the temporary file to its destination. Does nothing without a
+    /// [`CommitTarget`], or once the file has been renamed or removed. A failed rename leaves
+    /// the file for the last reference's drop to remove.
+    ///
+    /// Call it inside [`TransferContext::complete_with`](crate::transfer::TransferContext::complete_with),
+    /// so no cancellation lands between the rename and `Completed`.
+    pub(crate) fn commit(&self) -> std::io::Result<()> {
+        if let Mode::Disk { commit_target, .. } = &*self.mode {
+            let mut target = commit_target
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(paths) = target.as_ref() {
+                // TODO(vnext): consider an opt-in download durability policy. Managed path
+                // downloads would sync file data before rename and the parent directory after
+                // rename where supported. The latency and cross-platform semantics make this
+                // a client/API policy rather than the default.
+                std::fs::rename(&paths.temp, &paths.dest)?;
+                *target = None;
+            }
+        }
+        Ok(())
+    }
+
+    /// Removes the temporary file now, even while work items still hold it, and returns once
+    /// the temporary name is gone. Call only after the transfer has left `Active`: a later
+    /// [`commit`](Self::commit) treats a removed file as already committed.
+    pub(crate) fn discard_temp_file(&self) {
+        if let Mode::Disk { commit_target, .. } = &*self.mode {
+            remove_temp_file(commit_target);
+        }
+    }
+
+    /// Locks the commit target, so a rename or removal waits until the guard drops.
+    #[cfg(test)]
+    pub(crate) fn hold_commit_target(&self) -> std::sync::MutexGuard<'_, Option<CommitTarget>> {
+        match &*self.mode {
+            Mode::Disk { commit_target, .. } => commit_target.lock().unwrap(),
+            Mode::Stream => panic!("a stream download has no commit target"),
+        }
+    }
+
     /// Bytes the destination sink has accepted across every drain, including
     /// drains that went on to fail. Stream mode: 0.
     ///
@@ -351,6 +462,7 @@ impl BodyWriter {
             sink,
             object_range_start,
             written,
+            ..
         } = &*self.mode
         {
             let Some(object_range_start) = object_range_start.get().copied() else {
@@ -401,7 +513,8 @@ impl BodyWriter {
         Ok(drained)
     }
 
-    /// Flush terminal payloads and establish the successful disk target length.
+    /// Flush terminal payloads and establish the successful disk target length. Leaves the
+    /// temporary file for [`commit`](Self::commit) to rename.
     ///
     /// Returns what the terminal drain wrote. A failed terminal drain returns its
     /// [`DrainError`]. Fails with
@@ -410,7 +523,7 @@ impl BodyWriter {
     /// bytes across every drain. A run claimed by a drain that has not finished
     /// writing is invisible to the terminal drain, so without this check its
     /// region would be published holding zeros or the file's previous bytes.
-    /// That error, and a failed resize, carry what the terminal drain wrote.
+    /// That error and a failed resize carry what the terminal drain wrote.
     pub(crate) fn finalize(&self, expected_download_len: u64) -> Result<Drained, DrainError> {
         let drained = self.terminal_drain()?;
         if let Mode::Disk { sink, written, .. } = &*self.mode {
@@ -550,16 +663,27 @@ pub(crate) fn new_recv_body() -> (BodyWriter, RecvBodyConsumer) {
 
 /// Create a producer/consumer pair writing to an arbitrary [`SinkWrite`] target.
 /// Positioned writes land at `chunk.offset - object_range_start` in the sink.
+/// With a `commit` target, the writer owns its temporary file:
+/// [`commit`](BodyWriter::commit) renames it into place, and otherwise it is
+/// removed by the time the last [`TempFile`] reference drops.
 ///
 /// Issuance backpressure is owned by the per-transfer [`ReadAhead`] controller.
 ///
 /// [`ReadAhead`]: super::read_ahead::ReadAhead
 pub(crate) fn new_recv_body_with_disk_mode(
     sink: Box<dyn SinkWrite>,
+    commit: Option<CommitTarget>,
 ) -> (BodyWriter, RecvBodyConsumer) {
     let (buffer, consumer) = PagedRecvBuffer::new_with_segment_size(SEG_SIZE);
     let notify = Arc::new(WakeNotify::new());
     let resolved_range_start = std::sync::OnceLock::new();
+    let has_commit = commit.is_some();
+    let commit_target: SharedTarget = std::sync::Arc::new(std::sync::Mutex::new(commit));
+    let temp_file = has_commit.then(|| {
+        std::sync::Arc::new(TempFile {
+            target: commit_target.clone(),
+        })
+    });
     let writer = BodyWriter {
         buffer,
         notify: notify.clone(),
@@ -567,6 +691,8 @@ pub(crate) fn new_recv_body_with_disk_mode(
             sink,
             object_range_start: resolved_range_start,
             written: AtomicU64::new(0),
+            temp_file: std::sync::Mutex::new(temp_file),
+            commit_target,
         }),
     };
     let slot_consumer = RecvBodyConsumer { consumer, notify };
@@ -580,7 +706,7 @@ pub(crate) fn new_recv_body_with_sink(
     file: std::fs::File,
     owns_file: bool,
 ) -> (BodyWriter, RecvBodyConsumer) {
-    new_recv_body_with_disk_mode(Box::new(super::sink::FileSink::new(file, owns_file)))
+    new_recv_body_with_disk_mode(Box::new(super::sink::FileSink::new(file, owns_file)), None)
 }
 
 /// Stream of [ChunkOutput] representing an Amazon S3 Object's contents and metadata.
@@ -852,10 +978,10 @@ mod tests {
     // --- Disk driver tests ---
 
     use super::{
-        new_recv_body_with_disk_mode, new_recv_body_with_sink, BodyWriter as Writer,
+        new_recv_body_with_disk_mode, new_recv_body_with_sink, BodyWriter as Writer, CommitTarget,
         DiskWriteCursor, DrainMode, Drained, RecvBodyConsumer, Reservation,
     };
-    use crate::operation::download::sink::{SinkFactory, SinkWrite};
+    use crate::operation::download::sink::{FileSinkFactory, SinkFactory, SinkWrite};
     use crate::operation::download::test_util::sink::{
         Action, Match, Op, ScriptedSinkFactory, WriteScript,
     };
@@ -949,7 +1075,7 @@ mod tests {
                 self.0.write_all_at(buf, pos)
             }
         }
-        let (writer, consumer) = new_recv_body_with_disk_mode(Box::new(Shared(sink.clone())));
+        let (writer, consumer) = new_recv_body_with_disk_mode(Box::new(Shared(sink.clone())), None);
         writer.prepare(object_range_start, 0).unwrap();
         (writer, consumer, sink)
     }
@@ -1145,6 +1271,7 @@ mod tests {
             ScriptedSinkFactory(Arc::clone(script))
                 .create(file, false)
                 .unwrap(),
+            None,
         )
     }
 
@@ -1212,6 +1339,53 @@ mod tests {
         let contents = std::fs::read(&path).unwrap();
         assert_eq!(contents.len(), 8, "a failed resize keeps the length");
         assert_eq!(&contents[..3], b"new");
+    }
+
+    // ref: awslabs/aws-s3-transfer-manager-rs#197
+    /// Once `commit` has renamed the temporary file, or `discard_temp_file` removed it,
+    /// dropping the writer leaves alone a file another download has since created under
+    /// that name.
+    ///
+    /// If either left the commit target set after acting on it, the drop would remove the
+    /// other download's file.
+    #[test]
+    fn commit_and_discard_free_the_temporary_name_for_good() {
+        for active in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let temp = dir.path().join("out.s3tmp");
+            let dest = dir.path().join("out");
+            let file = std::fs::File::create(&temp).unwrap();
+            let (writer, _consumer) = new_recv_body_with_disk_mode(
+                FileSinkFactory.create(file, true).unwrap(),
+                Some(CommitTarget {
+                    temp: temp.clone(),
+                    dest: dest.clone(),
+                }),
+            );
+            writer.prepare(0, 3).unwrap();
+            writer.claim().fill(chunk_at(0, 0, b"new"));
+            writer.finalize(3).unwrap();
+            if active {
+                writer.commit().unwrap();
+            } else {
+                writer.discard_temp_file();
+            }
+            assert_eq!(
+                std::fs::read(&dest).ok().as_deref(),
+                active.then_some(b"new".as_slice()),
+                "active: {active}"
+            );
+            assert!(!temp.exists(), "active: {active}");
+
+            std::fs::write(&temp, b"another download").unwrap();
+            drop(writer);
+
+            assert_eq!(
+                std::fs::read(&temp).ok().as_deref(),
+                Some(b"another download".as_slice()),
+                "active: {active}: dropping the writer removed a name it had freed"
+            );
+        }
     }
 
     /// A run claimed by a drain that has not finished writing it leaves the

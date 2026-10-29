@@ -56,6 +56,19 @@ async fn setup_with_fault(
     aws_sdk_s3_transfer_manager::Client,
     fault_connector::InjectionTally,
 ) {
+    setup_with_fault_configured(fail, |config| config).await
+}
+
+/// [`setup_with_fault`], with `configure` applied to the shared config the client is
+/// built from.
+async fn setup_with_fault_configured(
+    fail: FailCount,
+    configure: impl FnOnce(aws_types::sdk_config::Builder) -> aws_types::sdk_config::Builder,
+) -> (
+    s3_mock_server::ServerHandle,
+    aws_sdk_s3_transfer_manager::Client,
+    fault_connector::InjectionTally,
+) {
     let server = S3MockServer::builder()
         .with_in_memory_store()
         .build()
@@ -68,12 +81,14 @@ async fn setup_with_fault(
 
     let (http_client, tally) = io_fault_http_client(is_upload_part, fail);
 
-    let shared_config = handle
-        .shared_config()
-        .await
-        .into_builder()
-        .http_client(http_client)
-        .build();
+    let shared_config = configure(
+        handle
+            .shared_config()
+            .await
+            .into_builder()
+            .http_client(http_client),
+    )
+    .build();
 
     let tm_config = aws_sdk_s3_transfer_manager::Config::builder()
         .s3_config(
@@ -112,6 +127,47 @@ async fn upload_part_single_dispatch_io_error_recovers() {
         "expected exactly one injected UploadPart dispatch failure"
     );
     result.expect("a single transient UploadPart dispatch IO error must recover");
+}
+
+// ref: awslabs/aws-s3-transfer-manager-rs#197
+/// A part whose first dispatch fails and which the transfer re-sends counts its bytes once,
+/// so `bytes_transferred` ends equal to `total_bytes`.
+///
+/// The SDK's own retry is disabled, so the re-send is a second attempt of the transfer's
+/// retry loop rather than one hidden inside a single `send()`. A counter that recorded
+/// every attempt would finish one 5 MiB part past the total.
+#[tokio::test]
+async fn upload_part_reissue_counts_the_part_once() {
+    let (_server, tm, tally) = setup_with_fault_configured(FailCount::First(1), |config| {
+        config.retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
+    })
+    .await;
+
+    let body = many_part_body();
+    let total = body.len() as u64;
+    let output = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("obj")
+        .checksum_strategy(ChecksumStrategy::with_calculated_crc32())
+        .body(InputStream::from(bytes::Bytes::from(body)))
+        .initiate()
+        .expect("initiate upload")
+        .join()
+        .await
+        .expect("the transfer's retry must recover a single dispatch failure");
+
+    assert_eq!(
+        tally.count(),
+        1,
+        "expected exactly one injected UploadPart dispatch failure"
+    );
+    assert_eq!(Some(total), output.metrics().total_bytes);
+    assert_eq!(
+        total,
+        output.metrics().bytes_transferred,
+        "the re-sent part must be counted once"
+    );
 }
 
 /// Correlated transient burst: fault every part's first dispatch at once. The

@@ -345,7 +345,7 @@ mod tests {
         let sink = ScriptedSinkFactory(Arc::clone(script))
             .create(file, false)
             .unwrap();
-        let (writer, _consumer) = new_recv_body_with_disk_mode(sink);
+        let (writer, _consumer) = new_recv_body_with_disk_mode(sink, None);
         writer.prepare(0, expected_len).unwrap();
         writer
     }
@@ -509,6 +509,7 @@ mod tests {
             Arc::clone(&handle),
             input,
             dest.clone(),
+            None,
             None,
             &ScriptedSinkFactory(Arc::clone(&script)),
         )

@@ -353,6 +353,8 @@ pub(crate) struct IoSample {
     pub disk_read: u64,
     /// Bytes written to disk (download sink)
     pub disk_write: u64,
+    /// Payload bytes of a confirmed part or range (either direction)
+    pub bytes_transferred: u64,
 }
 
 /// Aggregate measurements for transfer-manager service requests.
@@ -628,6 +630,8 @@ impl IOCounters {
     }
 
     /// Record an I/O sample into the appropriate windows.
+    ///
+    /// `bytes_transferred` has no window: it repeats `network_tx` or `network_rx`.
     pub(crate) fn record(&self, sample: &IoSample) {
         self.network_tx.add(sample.network_tx);
         self.network_rx.add(sample.network_rx);
@@ -1004,6 +1008,21 @@ mod tests {
             (tp - 10_000_000.0).abs() < 1.0,
             "expected ~10MB/s, got {tp}"
         );
+    }
+
+    /// A confirmed range records its payload as both `network_rx` and
+    /// `bytes_transferred`. The network throughput the concurrency controller reads must
+    /// count it once; adding `bytes_transferred` to a network window doubles it.
+    #[test]
+    fn io_counters_count_bytes_transferred_once() {
+        let c = IOCounters::new(Duration::from_secs(1));
+        c.record(&IoSample {
+            network_rx: 2_000_000,
+            bytes_transferred: 2_000_000,
+            ..Default::default()
+        });
+        let tp = c.network_throughput();
+        assert!((tp - 2_000_000.0).abs() < 1.0, "expected ~2MB/s, got {tp}");
     }
 
     #[test]
