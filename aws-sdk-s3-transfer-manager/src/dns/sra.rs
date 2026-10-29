@@ -11,14 +11,20 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::Instant;
 
-struct GenerationalAddressSet<T> where T : Hash + Eq + Clone {
+struct GenerationalAddressSet<T>
+where
+    T: Hash + Eq + Clone,
+{
     current_generation: u32,
 
     healthy_addresses: PriorityQueue<T, u32>,
     unhealthy_addresses_by_expiration: PriorityQueue<T, Instant>,
 }
 
-impl<T> GenerationalAddressSet<T> where T : Hash + Eq + Clone {
+impl<T> GenerationalAddressSet<T>
+where
+    T: Hash + Eq + Clone,
+{
     fn new() -> Self {
         GenerationalAddressSet {
             current_generation: 1,
@@ -28,7 +34,8 @@ impl<T> GenerationalAddressSet<T> where T : Hash + Eq + Clone {
     }
 
     fn contains(&self, value: &T) -> bool {
-        self.healthy_addresses.contains(value) || self.unhealthy_addresses_by_expiration.contains(value)
+        self.healthy_addresses.contains(value)
+            || self.unhealthy_addresses_by_expiration.contains(value)
     }
 
     fn empty(&self) -> bool {
@@ -74,7 +81,8 @@ impl<T> GenerationalAddressSet<T> where T : Hash + Eq + Clone {
             self.current_generation += 1;
         }
 
-        self.healthy_addresses.push(item.clone(), self.current_generation);
+        self.healthy_addresses
+            .push(item.clone(), self.current_generation);
 
         Some(item)
     }
@@ -83,9 +91,12 @@ impl<T> GenerationalAddressSet<T> where T : Hash + Eq + Clone {
         self.healthy_addresses.remove(&address);
 
         let expiration = Instant::now() + duration;
-        self.unhealthy_addresses_by_expiration.push(address, expiration);
+        self.unhealthy_addresses_by_expiration
+            .push(address, expiration);
     }
 }
+
+const MINIMUM_DELAY_BETWEEN_RESOLVES: Duration = Duration::from_secs(1);
 
 struct HostEntry {
     name: String,
@@ -113,7 +124,7 @@ impl HostEntry {
             addresses_by_ttl: PriorityQueue::new(),
             last_resolution_timepoint: None,
             pending_resolution: false,
-            ttl
+            ttl,
         }
     }
 
@@ -173,26 +184,91 @@ impl HostEntry {
         }
     }
 
+    fn handle_connection_error(&mut self, address: IpAddr, error: CachingHostEventConnectionError) {
+        let mut demotion_duration: Option<Duration> = None;
+
+        match error.category {
+            ConnectionErrorCategory::Fatal => {
+                // remove from the sets, keep in TTL, effectively banishes the address until
+                // forgotten
+                match address {
+                    IpAddr::V4(v4addr) => {
+                        self.ipv4_addresses.remove_address(&v4addr);
+                    }
+                    IpAddr::V6(v6addr) => {
+                        self.ipv6_addresses.remove_address(&v6addr);
+                    }
+                }
+
+                return;
+            }
+            ConnectionErrorCategory::Major => {
+                demotion_duration = Some(self.ttl);
+            }
+            ConnectionErrorCategory::Standard(duration) => {
+                demotion_duration = Some(duration);
+            }
+        }
+
+        match address {
+            IpAddr::V4(v4addr) => {
+                self.ipv4_addresses
+                    .demote_address(v4addr, demotion_duration.unwrap());
+            }
+            IpAddr::V6(v6addr) => {
+                self.ipv6_addresses
+                    .demote_address(v6addr, demotion_duration.unwrap());
+            }
+        }
+    }
+
+    pub fn complete_request(&mut self, request: CachingResolveRequestInternal) {
+        let mut addresses: Vec<IpAddr> = Vec::new();
+
+        let v4_addr_option = self.ipv4_addresses.acquire_address();
+        if let Some(v4_addr) = v4_addr_option {
+            addresses.push(IpAddr::V4(v4_addr));
+        }
+
+        let v6_addr_option = self.ipv6_addresses.acquire_address();
+        if let Some(v6_addr) = v6_addr_option {
+            addresses.push(IpAddr::V6(v6_addr));
+        }
+
+        (request.completion_callback)(Ok(addresses));
+    }
+
     fn handle_resolve_request(
         &mut self,
         request: CachingResolveRequestInternal,
-        config: &CachingResolverProcessConfig,
+        context: &CachingOperationHandlerContext,
     ) {
-        let name = request.request.name.clone();
-        self.pending_requests.push_back(request);
+        self.purge_expired();
 
-        let handle = tokio::runtime::Handle::current();
-        let internal_resolver = config.internal_resolver.clone();
-        let operation_channel = config.sender.clone();
-        handle.spawn(async move {
-            let result = internal_resolver.resolve_dns(&name).await;
-            let caching_result =
-                CachingResolverOperation::ResolveResult(CachingResolveResult { name, result });
-            let _ = operation_channel.send(caching_result);
-        });
+        let now = Instant::now();
+        if let Some(last_resolution_timepoint) = self.last_resolution_timepoint {
+            if now >= last_resolution_timepoint + MINIMUM_DELAY_BETWEEN_RESOLVES
+                && !self.pending_resolution
+            {
+                self.pending_resolution = true;
+                self.last_resolution_timepoint = Some(now);
+
+                (context.resolution_function)(request.request.name.clone());
+            }
+        }
+
+        if self.ipv4_addresses.empty() && self.ipv6_addresses.empty() {
+            self.pending_requests.push_back(request);
+            return;
+        }
+
+        self.complete_request(request);
     }
 
     fn handle_resolve_result(&mut self, result: CachingResolveResult) {
+        self.purge_expired();
+        self.pending_resolution = false;
+
         match result.result {
             Ok(addresses) => {
                 for address in addresses {
@@ -200,20 +276,32 @@ impl HostEntry {
                 }
             }
             Err(err) => {
-                for pending_request in self.pending_requests {
-                    (pending_request.completion_callback)(Err(err.clone()))
+                while !self.pending_requests.is_empty() {
+                    let pending_request = self.pending_requests.pop_front().unwrap();
+                    // we can't actually clone errors but we need to complete one or more requests
+                    // with the resolve error.  This is the best I could come up with =/
+                    let cloned = ResolveDnsError::new(err.to_string());
+                    (pending_request.completion_callback)(Err(cloned));
                 }
                 return;
             }
         }
 
-        if let Some(pending_request) = self.pending_requests.pop_front() {
-            (pending_request.completion_callback)(result.result);
+        while !self.pending_requests.is_empty() {
+            let pending_request = self.pending_requests.pop_front().unwrap();
+            self.complete_request(pending_request);
         }
     }
 
     fn handle_host_event(&mut self, event: CachingHostEvent) {
+        self.purge_expired();
 
+        match event.event_data {
+            CachingHostEventInformation::ConnectionError(error) => {
+                self.handle_connection_error(event.address, error)
+            }
+            _ => {}
+        }
     }
 }
 
@@ -222,26 +310,21 @@ struct SraCachingResolverState {
     hosts: HashMap<String, HostEntry>,
 }
 
-fn find_or_create_host_entry<'a>(
-    state: &'a mut SraCachingResolverState,
-    name: &str,
-) -> &'a mut HostEntry {
-    if !state.hosts.contains_key(name) {
-        state.hosts.insert(name.to_string(), HostEntry::new(name));
-    }
-
-    state.hosts.get_mut(name).unwrap()
-}
-
 fn handle_resolve_request(
-    config: &CachingResolverProcessConfig,
+    context: &CachingOperationHandlerContext,
     state: &mut SraCachingResolverState,
     request: CachingResolveRequestInternal,
 ) {
-    let name = request.request.name.to_string();
-    let host_entry = find_or_create_host_entry(state, &request.request.name);
+    if !state.hosts.contains_key(&request.request.name) {
+        let name = request.request.name.clone();
+        state
+            .hosts
+            .insert(name.to_string(), HostEntry::new(&name, context.ttl));
+    }
 
-    host_entry.handle_resolve_request(request, config);
+    let host_entry = state.hosts.get_mut(&request.request.name).unwrap();
+
+    host_entry.handle_resolve_request(request, context);
 }
 
 fn handle_resolve_result(state: &mut SraCachingResolverState, result: CachingResolveResult) {
@@ -257,13 +340,13 @@ fn handle_host_event(state: &mut SraCachingResolverState, event: CachingHostEven
 }
 
 fn handle_operation_sra(
-    config: &CachingResolverProcessConfig,
+    context: &CachingOperationHandlerContext,
     state: &mut SraCachingResolverState,
     operation: CachingResolverOperation,
 ) {
     match operation {
         CachingResolverOperation::ResolveRequest(request) => {
-            handle_resolve_request(config, state, request);
+            handle_resolve_request(context, state, request);
         }
         CachingResolverOperation::ResolveResult(result) => {
             handle_resolve_result(state, result);

@@ -304,27 +304,28 @@ pub enum CachingResolverOperation {
     HostEvent(CachingHostEvent),
 }
 
+pub type ResolutionFunction = Box<dyn Fn(String) + Send + Sync>;
+
 /// Configuration for the async recurrent task that handles all incoming CachingResolverOperation
 /// instances
-#[derive(Debug)]
-pub struct CachingResolverProcessConfig {
-    /// resolver that will actually perform lookups.  Lookups are performed on the runtime
+pub struct CachingOperationHandlerContext {
+    /// function object that will actually perform lookups.  Lookups are performed on the runtime
     /// associated with the caching resolver
-    internal_resolver: SharedDnsResolver,
+    resolution_function: ResolutionFunction,
 
-    /// handle to our input queue sender; needed so that resolution tasks can submit their results
-    /// as a CachingResolverOperation::ResolveResult
-    sender: mpsc::UnboundedSender<CachingResolverOperation>,
-
-    /// input queue receiver, all communication from the outside world (including resolution task
-    /// results) comes through here
-    receiver: mpsc::UnboundedReceiver<CachingResolverOperation>,
+    /// How long a lookup stays cached; may be extended indefinitely by future lookups refreshing
+    /// an individual address's ttl
+    ttl: Duration,
 }
 
 /// Represents the centralized, recurrent task that handles CachingResolverOperation instances
 struct CachingResolverProcess<T> {
     /// (semi-)immutable configuration
-    config: CachingResolverProcessConfig,
+    context: CachingOperationHandlerContext,
+
+    /// input queue receiver, all communication from the outside world (including resolution task
+    /// results) comes through here
+    receiver: mpsc::UnboundedReceiver<CachingResolverOperation>,
 
     /// the (mutable) bookkeeping state (cache) the caching resolver uses to make resolution decisions
     state: T,
@@ -340,13 +341,32 @@ where
         internal_resolver: SharedDnsResolver,
         sender: mpsc::UnboundedSender<CachingResolverOperation>,
         receiver: mpsc::UnboundedReceiver<CachingResolverOperation>,
+        ttl: Duration,
     ) -> Self {
+        let resolver = internal_resolver.clone();
+        let operation_channel = sender.clone();
+        let resolution_function: ResolutionFunction = Box::new(move |name| {
+            let handle = tokio::runtime::Handle::current();
+            let internal_name = name.to_string();
+            let internal_resolver = resolver.clone();
+            let internal_channel = operation_channel.clone();
+            handle.spawn(async move {
+                let result = internal_resolver.resolve_dns(&internal_name).await;
+                let caching_result =
+                    CachingResolverOperation::ResolveResult(CachingResolveResult {
+                        name: internal_name,
+                        result,
+                    });
+                let _ = internal_channel.send(caching_result);
+            });
+        });
+
         CachingResolverProcess {
-            config: CachingResolverProcessConfig {
-                internal_resolver,
-                sender,
-                receiver,
+            context: CachingOperationHandlerContext {
+                resolution_function,
+                ttl,
             },
+            receiver,
             state,
         }
     }
@@ -365,22 +385,23 @@ where
     async fn run(
         &mut self,
         operation_handler: fn(
-            &CachingResolverProcessConfig,
+            context: &CachingOperationHandlerContext,
             &mut T,
             CachingResolverOperation,
         ) -> (),
     ) {
-        let config = &mut self.config;
+        let receiver = &mut self.receiver;
+        let context = &mut self.context;
         let state = &mut self.state;
 
         // runs until recv returns None implying all input queue Sender clones are gone
         loop {
             // eventually we may select on time too in order to support TTL expiration
             tokio::select! {
-                operation_result = config.receiver.recv() => {
+                operation_result = receiver.recv() => {
                     match operation_result {
                         Some(operation) => {
-                            (operation_handler)(config, state, operation);
+                            (operation_handler)(&context, state, operation);
                         }
                         None => {
                             return;
@@ -406,6 +427,10 @@ pub trait CachingResolver: Debug + Send + Sync {
     fn notify(&self, event: CachingHostEvent) -> ResolverResult;
 }
 
+/// Function object signature for the logic that will perform a lookup for a name and
+/// route the result back to the caching resolver via the input channel
+pub type ResolverFunction = Box<dyn Fn(String)>;
+
 /// Internal caching resolver implementation type that serves as the entry point for
 /// resolution requests
 #[derive(Debug)]
@@ -414,11 +439,13 @@ struct CachingResolverImpl {
     operation_channel: mpsc::UnboundedSender<CachingResolverOperation>,
 }
 
+const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(60);
+
 impl CachingResolverImpl {
     fn new_default<T>(
         config: CachingResolverConfig,
         operation_handler: fn(
-            &CachingResolverProcessConfig,
+            context: &CachingOperationHandlerContext,
             &mut T,
             CachingResolverOperation,
         ) -> (),
@@ -435,7 +462,7 @@ impl CachingResolverImpl {
         config: CachingResolverConfig,
         state: T,
         operation_handler: fn(
-            &CachingResolverProcessConfig,
+            context: &CachingOperationHandlerContext,
             &mut T,
             CachingResolverOperation,
         ) -> (),
@@ -457,7 +484,13 @@ impl CachingResolverImpl {
         let internal_resolver = config.internal_resolver.unwrap_or(SharedDnsResolver::new(
             aws_smithy_runtime::client::dns::TokioDnsResolver::new(),
         ));
-        let mut resolver_impl = CachingResolverProcess::<T>::new(state, internal_resolver, tx, rx);
+        let mut resolver_impl = CachingResolverProcess::<T>::new(
+            state,
+            internal_resolver,
+            tx,
+            rx,
+            config.default_ttl.unwrap_or(DEFAULT_CACHE_TTL),
+        );
 
         // Config runtime || create a new runtime
         if let Some(config_runtime) = config.runtime {
@@ -529,7 +562,7 @@ impl CachingResolverHandle {
     pub fn new<T>(
         config: CachingResolverConfig,
         operation_handler: fn(
-            &CachingResolverProcessConfig,
+            context: &CachingOperationHandlerContext,
             &mut T,
             CachingResolverOperation,
         ) -> (),
