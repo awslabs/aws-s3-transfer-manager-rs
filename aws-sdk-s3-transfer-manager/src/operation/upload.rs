@@ -109,8 +109,8 @@ impl Upload {
                 .into_iter()
                 .chain(stream.is_file_backed().then_some(AwsSdkFeature::S3FilePath)),
         );
-        let ctx = ctx.with_s3_client(features.apply_to_client(&handle.s3_client));
-        let transfer = UploadTransfer::try_new(ctx, bucket_type, input, stream)?;
+        let transfer =
+            UploadTransfer::try_new(ctx.with_features(features), bucket_type, input, stream)?;
 
         handle
             .scheduler

@@ -171,8 +171,7 @@ impl UploadHandle {
                     )
                     .customize()
                     .config_override(
-                        ctx.handle
-                            .bucket_partition_override(self.transfer.request().bucket()),
+                        ctx.bucket_partition_override(self.transfer.request().bucket()),
                     )
                     .send()
                     .instrument(tracing::debug_span!("send-abort-multipart-upload"))
