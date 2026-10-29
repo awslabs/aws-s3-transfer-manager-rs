@@ -10,6 +10,7 @@
 //! required by the Transfer Manager, allowing for comprehensive testing of
 //! concurrent operations, error handling, and performance characteristics.
 
+mod bucket;
 mod error;
 mod faults;
 mod operation;
@@ -21,6 +22,7 @@ mod streaming;
 mod throttle;
 mod types;
 
+pub use bucket::BucketType;
 pub use error::Error;
 pub use error::Result;
 pub use faults::{BodyCadence, FaultTarget, FaultType, Occurrence};

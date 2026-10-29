@@ -10,15 +10,12 @@ mod common;
 use aws_sdk_s3::config::ResponseChecksumValidation;
 use aws_sdk_s3::primitives::ByteStream;
 use common::{assert_failure, failure, Fixture, Result};
-use s3_mock_server::{FaultTarget, FaultType, Occurrence, Operation};
+use s3_mock_server::{Error, FaultTarget, FaultType, Occurrence, Operation};
 
-const ACCESS_DENIED: FaultType = FaultType::ServiceError {
-    status: 403,
-    code: "AccessDenied",
-};
+const ACCESS_DENIED: FaultType = FaultType::Error(Error::AccessDenied);
 
-/// The first `skip` matching requests are served; the next one fails with the fault's status,
-/// code and message; with `Once`, later requests are served again.
+/// The first `skip` matching requests are served; the next one fails with the fault's error;
+/// with `Once`, later requests are served again.
 #[tokio::test]
 async fn test_error_response_skip_then_once() -> Result {
     let f = Fixture::new().await;
@@ -33,7 +30,7 @@ async fn test_error_response_skip_then_once() -> Result {
     f.s3.get_object().bucket(&f.bucket).key("a").send().await?;
     let fail = failure(f.s3.get_object().bucket(&f.bucket).key("a").send().await);
     assert_failure(&fail, 403, "AccessDenied");
-    assert_eq!(fail.message.as_deref(), Some("Injected fault"));
+    assert_eq!(fail.message.as_deref(), Some("Access Denied"));
     f.s3.get_object().bucket(&f.bucket).key("a").send().await?;
     f.shutdown().await;
     Ok(())
@@ -49,10 +46,7 @@ async fn test_target_scopes_by_operation_and_key() -> Result {
         FaultTarget::operation(Operation::GetObject)
             .bucket(&f.bucket)
             .key("a"),
-        FaultType::ServiceError {
-            status: 404,
-            code: "NoSuchKey",
-        },
+        FaultType::Error(Error::NoSuchKey),
         1,
         Occurrence::NTimes(2),
     );
@@ -78,10 +72,7 @@ async fn test_error_response_precedes_storage_and_clear_faults() -> Result {
     f.put("a", "hello").await;
     f.server.insert_fault_for(
         FaultTarget::operation(Operation::PutObject),
-        FaultType::ServiceError {
-            status: 400,
-            code: "SomethingNew",
-        },
+        FaultType::internal_error(),
         0,
         Occurrence::Always,
     );
@@ -94,7 +85,7 @@ async fn test_error_response_precedes_storage_and_clear_faults() -> Result {
                 .send()
                 .await,
         );
-        assert_failure(&fail, 400, "SomethingNew");
+        assert_failure(&fail, 500, "InternalError");
     }
     assert_eq!(f.content("a").await, b"hello");
     assert!(!f.exists("b").await);
@@ -158,10 +149,7 @@ async fn test_error_response_on_head_and_list() -> Result {
 
     f.server.insert_fault_for(
         FaultTarget::operation(Operation::ListObjectsV2).key("dir/"),
-        FaultType::ServiceError {
-            status: 503,
-            code: "SlowDown",
-        },
+        FaultType::Error(Error::SlowDown),
         0,
         Occurrence::Once,
     );
@@ -219,10 +207,7 @@ async fn test_error_response_on_bucket_operations() -> Result {
 
     f.server.insert_fault_for(
         FaultTarget::operation(Operation::CreateBucket),
-        FaultType::ServiceError {
-            status: 409,
-            code: "BucketAlreadyExists",
-        },
+        FaultType::Error(Error::BucketAlreadyExists),
         0,
         Occurrence::Once,
     );
@@ -231,10 +216,7 @@ async fn test_error_response_on_bucket_operations() -> Result {
 
     f.server.insert_fault_for(
         FaultTarget::operation(Operation::DeleteBucket),
-        FaultType::ServiceError {
-            status: 409,
-            code: "BucketNotEmpty",
-        },
+        FaultType::Error(Error::BucketNotEmpty),
         0,
         Occurrence::Once,
     );

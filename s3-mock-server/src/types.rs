@@ -222,31 +222,32 @@ impl ObjectIntegrity {
         }
     }
 
-    /// Validate against client-provided checksums
-    pub fn validate(&self, client: &ClientChecksums) -> Result<(), &'static str> {
+    /// Validate against client-provided checksums. On a mismatch, returns the algorithm of the
+    /// first checksum that does not match.
+    pub fn validate(&self, client: &ClientChecksums) -> Result<(), ChecksumAlgorithm> {
         if let Some(expected) = &client.crc32 {
             if self.crc32.as_ref() != Some(expected) {
-                return Err("checksum_crc32 mismatch");
+                return Err(ChecksumAlgorithm::Crc32);
             }
         }
         if let Some(expected) = &client.crc32c {
             if self.crc32c.as_ref() != Some(expected) {
-                return Err("checksum_crc32c mismatch");
+                return Err(ChecksumAlgorithm::Crc32c);
             }
         }
         if let Some(expected) = &client.sha1 {
             if self.sha1.as_ref() != Some(expected) {
-                return Err("checksum_sha1 mismatch");
+                return Err(ChecksumAlgorithm::Sha1);
             }
         }
         if let Some(expected) = &client.sha256 {
             if self.sha256.as_ref() != Some(expected) {
-                return Err("checksum_sha256 mismatch");
+                return Err(ChecksumAlgorithm::Sha256);
             }
         }
         if let Some(expected) = &client.crc64nvme {
             if self.crc64nvme.as_ref() != Some(expected) {
-                return Err("checksum_crc64nvme mismatch");
+                return Err(ChecksumAlgorithm::Crc64Nvme);
             }
         }
         Ok(())

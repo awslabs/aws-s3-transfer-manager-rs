@@ -146,12 +146,12 @@ The server counts the requests it receives per operation, and can fail or reshap
 `FaultTarget` matches:
 
 ```rust
-use s3_mock_server::{FaultTarget, FaultType, Occurrence, Operation};
+use s3_mock_server::{Error, FaultTarget, FaultType, Occurrence, Operation};
 
 // Fail the second HeadObject request for `key` that the target sees with 403 AccessDenied.
 server.insert_fault_for(
     FaultTarget::operation(Operation::HeadObject).bucket("test-bucket").key("key"),
-    FaultType::ServiceError { status: 403, code: "AccessDenied" },
+    FaultType::Error(Error::AccessDenied),
     1,
     Occurrence::Once,
 );

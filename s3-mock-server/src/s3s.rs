@@ -5,6 +5,7 @@
 
 //! s3s integration layer.
 
+use crate::bucket::BucketType;
 use crate::error::Error;
 use crate::storage::models::ObjectMetadata;
 use crate::storage::StorageBackend;
@@ -34,18 +35,6 @@ fn etag_from_quoted(s: &str) -> ETag {
 /// Convert a quoted etag string to `Option<ETag::Strong>`.
 fn opt_etag_from_quoted(s: Option<String>) -> Option<ETag> {
     s.map(|v| etag_from_quoted(&v))
-}
-
-/// Whether a bucket name denotes an S3 Express One Zone directory bucket.
-///
-/// A directory bucket name ends with the suffix `--x-s3`, preceded by its
-/// zone-id (e.g. `my-bucket--use1-az1--x-s3`). The mock has no separate bucket
-/// metadata, so — like real S3's name-based routing — it recognizes a directory
-/// bucket by this suffix.
-///
-/// <https://docs.aws.amazon.com/AmazonS3/latest/userguide/directory-bucket-naming-rules.html>
-fn is_directory_bucket(bucket: &str) -> bool {
-    bucket.ends_with("--x-s3")
 }
 
 /// Apply defaults to a HeadObject response matching post-2023 prod S3
@@ -133,7 +122,7 @@ impl ServerState {
     ///
     /// Called first in every S3 handler. The throttle applies to the operations
     /// [`Operation::is_throttled`] names; a shed request returns 503 `SlowDown` and draws no fault.
-    /// A fault that fails the request before it is served (`ServiceError`) is
+    /// A fault that fails the request before it is served (`FaultType::Error`) is
     /// returned as the error; any other fault is returned for
     /// the handler to apply, and has no effect on an operation it does not shape.
     pub(crate) fn admit(
@@ -141,30 +130,24 @@ impl ServerState {
         operation: Operation,
         bucket: Option<&str>,
         key: Option<&str>,
-    ) -> S3Result<Option<crate::faults::FaultType>> {
+    ) -> crate::Result<Option<crate::faults::FaultType>> {
         self.requests.record(operation);
         if operation.is_throttled() {
             self.check_throttle()?;
         }
-        let fault = self.faults.next_fault(operation, bucket, key);
-        match fault
-            .as_ref()
-            .and_then(crate::faults::FaultType::error_response)
-        {
-            Some(error) => Err(error),
-            None => Ok(fault),
+        match self.faults.next_fault(operation, bucket, key) {
+            Some(crate::faults::FaultType::Error(error)) => Err(error),
+            fault => Ok(fault),
         }
     }
 
     /// Decide whether to serve or shed this request under the installed throttle;
     /// a shed request returns 503 `SlowDown`. The throttle lock is released before
     /// consulting the rate limiter, so it is never held across the handler body.
-    fn check_throttle(&self) -> S3Result<()> {
+    fn check_throttle(&self) -> crate::Result<()> {
         let throttle = self.throttle.lock().unwrap().clone();
         match throttle {
-            Some(rt) if !rt.try_take(std::time::Instant::now()) => {
-                Err(s3s::S3Error::new(s3s::S3ErrorCode::SlowDown))
-            }
+            Some(rt) if !rt.try_take(std::time::Instant::now()) => Err(Error::SlowDown),
             _ => Ok(()),
         }
     }
@@ -364,7 +347,7 @@ impl<S: StorageBackend + 'static> Inner<S> {
             // Send-time errors are returned by `ServerState::admit`; upload-only faults are
             // no-ops on the GET path.
             Some(
-                crate::faults::FaultType::ServiceError { .. }
+                crate::faults::FaultType::Error(_)
                 | crate::faults::FaultType::StallRequestRead { .. },
             ) => {}
             Some(crate::faults::FaultType::WithholdResponseHeaders) => {
@@ -427,13 +410,13 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         if let Some(pn) = input.part_number {
             if parts_count == 0 {
                 if pn != 1 {
-                    return Err(Error::InvalidPart.into());
+                    return Err(Error::InvalidPartNumber.into());
                 }
                 // pn == 1, single-PUT: leave range as-is (whole object).
             } else {
                 match metadata.part_range(pn) {
                     Some(r) => range = Some(r),
-                    None => return Err(Error::InvalidPart.into()),
+                    None => return Err(Error::InvalidPartNumber.into()),
                 }
             }
         }
@@ -601,7 +584,9 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         tracing::trace!(bucket = %input.bucket, key = %input.key, "PutObject");
         check_bucket(&self.storage, &input.bucket).await?;
         if input.key.is_empty() {
-            return Err(s3s::s3_error!(InvalidRequest));
+            return Err(
+                Error::InvalidArgument("User key must have a length greater than 0.").into(),
+            );
         }
 
         let client_checksums = crate::types::ClientChecksums::from(&input);
@@ -642,14 +627,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             request.body = Box::pin(stalled);
         }
 
-        let stored_meta = self
-            .storage
-            .put_object(request)
-            .await
-            .map_err(|error| match error {
-                Error::ChecksumMismatch(msg) => s3s::s3_error!(BadDigest, "{}", msg),
-                error => error.into(),
-            })?;
+        let stored_meta = self.storage.put_object(request).await?;
 
         // WithholdResponseHeaders: body is consumed and stored; never respond.
         if let Some(crate::faults::FaultType::WithholdResponseHeaders) = fault {
@@ -701,14 +679,14 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
                 }
             })
             .transpose()
-            .map_err(|_| s3s::s3_error!(InvalidRequest, "Unsupported checksum algorithm"))?
+            .map_err(|_| Error::InvalidRequest("Unsupported checksum algorithm"))?
             .unwrap_or(ChecksumAlgorithm::Crc64Nvme);
 
         let checksum_type = input
             .checksum_type
             .map(|ct| ChecksumType::from_str(ct.as_str()))
             .transpose()
-            .map_err(|_| s3s::s3_error!(InvalidRequest, "Unsupported checksum type"))?
+            .map_err(|_| Error::InvalidRequest("Unsupported checksum type"))?
             .unwrap_or({
                 // Default checksum type based on algorithm
                 match checksum_algorithm {
@@ -812,7 +790,9 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
                         integrity_checks.update(&chunk);
                         content.extend_from_slice(&chunk);
                     }
-                    Err(_) => return Err(s3s::s3_error!(InternalError, "Failed to read body")),
+                    Err(e) => {
+                        return Err(Error::Internal(format!("Failed to read body: {e}")).into())
+                    }
                 }
             }
         }
@@ -820,8 +800,12 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         let calculated_integrity = integrity_checks.finalize();
 
         // Validate client-provided checksums
-        if let Err(msg) = calculated_integrity.validate(&client_checksums) {
-            return Err(s3s::s3_error!(BadDigest, "{}", msg));
+        if let Err(algorithm) = calculated_integrity.validate(&client_checksums) {
+            return Err(Error::BadDigest {
+                algorithm,
+                completion: false,
+            }
+            .into());
         }
 
         // Store the part and get its ETag
@@ -874,10 +858,8 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         let mut parts = Vec::new();
         if let Some(completed_parts) = input.multipart_upload.and_then(|u| u.parts) {
             for part in completed_parts {
-                let part_number = part
-                    .part_number
-                    .ok_or_else(|| s3s::s3_error!(InvalidRequest))?;
-                let etag = part.e_tag.ok_or_else(|| s3s::s3_error!(InvalidRequest))?;
+                let part_number = part.part_number.ok_or(Error::MalformedXml)?;
+                let etag = part.e_tag.ok_or(Error::MalformedXml)?;
                 parts.push((part_number, format!("\"{}\"", etag.value())));
             }
         }
@@ -887,10 +869,11 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         // the general case (e.g. 1, 2, 5) — part numbers need not be contiguous.
         //
         // <https://docs.aws.amazon.com/AmazonS3/latest/API/API_CompleteMultipartUpload.html>
+        let bucket_type = BucketType::of(&bucket);
         let mut previous_part_number = 0;
         for (part_number, _) in &parts {
             if *part_number <= previous_part_number {
-                return Err(Error::InvalidPartOrder.into());
+                return Err(Error::InvalidPartOrder { bucket_type }.into());
             }
             previous_part_number = *part_number;
         }
@@ -910,30 +893,23 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         //     <https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-express-differences.html>
         let composite_checksum =
             self.storage.multipart_checksum_type(upload_id).await? == Some(ChecksumType::Composite);
-        // The mock has no separate bucket metadata, so a directory bucket is
-        // recognized by its S3 Express name suffix (`--x-s3`), the same way S3's
-        // name-based routing distinguishes it from a general-purpose bucket.
-        let directory_bucket = is_directory_bucket(&bucket);
 
-        if composite_checksum || directory_bucket {
+        if composite_checksum || bucket_type == BucketType::Directory {
             let contiguous = parts
                 .iter()
                 .enumerate()
                 .all(|(i, (part_number, _))| *part_number == (i + 1) as i32);
             if !contiguous {
                 // Directory bucket takes precedence as a 400; composite-only is a 500.
-                if directory_bucket {
-                    return Err(s3s::s3_error!(
-                        InvalidPartOrder,
-                        "directory bucket multipart upload requires consecutive part \
-                         numbers beginning with 1"
-                    ));
+                if bucket_type == BucketType::Directory {
+                    return Err(Error::InvalidPartOrder { bucket_type }.into());
                 }
-                return Err(s3s::s3_error!(
-                    InternalError,
-                    "composite checksum multipart upload requires consecutive part \
-                     numbers beginning with 1"
-                ));
+                return Err(Error::Internal(
+                    "composite checksum multipart upload requires consecutive part numbers \
+                     beginning with 1"
+                        .to_string(),
+                )
+                .into());
             }
         }
 
@@ -1240,25 +1216,23 @@ fn check_if_match(
 fn validate_checksum_and_type(
     checksum_algorithm: &ChecksumAlgorithm,
     checksum_type: Option<&aws_sdk_s3::types::ChecksumType>,
-) -> Result<(), s3s::S3Error> {
+) -> crate::Result<()> {
     // Validate algorithm restrictions for multipart uploads
     match checksum_algorithm {
         #[allow(deprecated)]
         ChecksumAlgorithm::Md5 => {
             // MD5 doesn't support full object checksums in multipart uploads
             if checksum_type == Some(&ChecksumType::FullObject) {
-                return Err(s3s::s3_error!(
-                        InvalidRequest,
-                        "MD5 algorithm does not support full object checksum type for multipart uploads"
-                    ));
+                return Err(Error::InvalidRequest(
+                    "MD5 algorithm does not support full object checksum type for multipart uploads",
+                ));
             }
         }
         ChecksumAlgorithm::Crc64Nvme => {
             // CRC64NVME only supports full object checksums
             if checksum_type == Some(&ChecksumType::Composite) {
-                return Err(s3s::s3_error!(
-                    InvalidRequest,
-                    "CRC64NVME algorithm only supports full object checksum type"
+                return Err(Error::InvalidRequest(
+                    "CRC64NVME algorithm only supports full object checksum type",
                 ));
             }
         }
@@ -1270,10 +1244,7 @@ fn validate_checksum_and_type(
         }
         _ => {
             // Handle any future algorithms or unknown variants
-            return Err(s3s::s3_error!(
-                InvalidRequest,
-                "Unsupported checksum algorithm"
-            ));
+            return Err(Error::InvalidRequest("Unsupported checksum algorithm"));
         }
     }
     Ok(())
@@ -1461,6 +1432,28 @@ mod tests {
 
         let result_wrong = inner.put_object(s3_request(input_wrong)).await;
         assert!(result_wrong.is_err());
+    }
+
+    /// A PutObject with an empty key, which only a POST Object request can send, fails with
+    /// 400 InvalidArgument.
+    #[tokio::test]
+    async fn test_put_object_empty_key() {
+        let storage = InMemoryStorage::new();
+        storage.create_bucket("test-bucket").await.unwrap();
+        let inner = Inner::new(storage);
+        let input = s3s::dto::PutObjectInput::builder()
+            .bucket(s3s::dto::BucketName::from("test-bucket"))
+            .key(s3s::dto::ObjectKey::from(""))
+            .build()
+            .unwrap();
+
+        let error = inner.put_object(s3_request(input)).await.unwrap_err();
+        assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidArgument);
+        assert_eq!(error.status_code(), Some(http::StatusCode::BAD_REQUEST));
+        assert_eq!(
+            error.message(),
+            Some("User key must have a length greater than 0.")
+        );
     }
 
     #[tokio::test]
@@ -1675,18 +1668,6 @@ mod tests {
         assert!(invalid_result.is_err());
     }
 
-    #[test]
-    fn test_is_directory_bucket() {
-        // Directory bucket names end with the `--x-s3` suffix (base name + zone-id).
-        assert!(is_directory_bucket("my-bucket--usw2-az1--x-s3"));
-        assert!(is_directory_bucket("x--x-s3"));
-        // General-purpose bucket names are not directory buckets.
-        assert!(!is_directory_bucket("my-bucket"));
-        assert!(!is_directory_bucket("my-bucket--usw2-az1")); // zone-id but no suffix
-        assert!(!is_directory_bucket("x-s3"));
-        assert!(!is_directory_bucket(""));
-    }
-
     #[tokio::test]
     async fn test_directory_bucket_requires_contiguous_parts() {
         // Drive the handler directly: the AWS SDK client rejects `--x-s3` names
@@ -1771,8 +1752,8 @@ mod tests {
         assert_eq!(*err.code(), s3s::S3ErrorCode::InvalidPartOrder);
         assert!(
             err.message()
-                .is_some_and(|m| m.contains("consecutive part numbers beginning with 1")),
-            "expected the contiguity message, got: {:?}",
+                .is_some_and(|m| m.contains("did not have consecutive part numbers")),
+            "expected the directory bucket message, got: {:?}",
             err.message()
         );
     }

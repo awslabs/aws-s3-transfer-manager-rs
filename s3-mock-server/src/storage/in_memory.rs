@@ -93,8 +93,11 @@ impl StorageBackend for InMemoryStorage {
         let content_length = content.len() as u64;
         let object_integrity = integrity_checks.finalize();
         if let Some(client_checksums) = &request.client_checksums {
-            if let Err(error_msg) = object_integrity.validate(client_checksums) {
-                return Err(Error::ChecksumMismatch(error_msg.to_string()));
+            if let Err(algorithm) = object_integrity.validate(client_checksums) {
+                return Err(Error::BadDigest {
+                    algorithm,
+                    completion: false,
+                });
             }
         }
         let last_modified = request.last_modified.unwrap_or_else(SystemTime::now);
@@ -253,9 +256,7 @@ impl StorageBackend for InMemoryStorage {
     async fn delete_bucket(&self, bucket: &str) -> Result<()> {
         let mut buckets = self.buckets.write().await;
         match buckets.get(bucket) {
-            Some(state) if !state.objects.is_empty() => {
-                Err(Error::Internal("bucket is not empty".to_string()))
-            }
+            Some(state) if !state.objects.is_empty() => Err(Error::BucketNotEmpty),
             Some(_) => {
                 buckets.remove(bucket);
                 Ok(())
@@ -443,7 +444,7 @@ impl StorageBackend for InMemoryStorage {
                         return Err(Error::InvalidPart);
                     }
                 }
-                None => return Err(Error::NoSuchPart),
+                None => return Err(Error::InvalidPart),
             }
         }
 
@@ -587,8 +588,11 @@ impl StorageBackend for InMemoryStorage {
 
         // Validate against client-provided checksum if present
         if let Some(client_checksums) = request.client_checksums {
-            if let Err(error_msg) = object_integrity.validate(client_checksums) {
-                return Err(Error::ChecksumMismatch(error_msg.to_string()));
+            if let Err(algorithm) = object_integrity.validate(client_checksums) {
+                return Err(Error::BadDigest {
+                    algorithm,
+                    completion: true,
+                });
             }
         }
 
@@ -1068,7 +1072,13 @@ mod tests {
                 client_checksums: Some(&invalid_checksum),
             })
             .await;
-        assert!(matches!(result, Err(Error::ChecksumMismatch(_))));
+        assert!(matches!(
+            result,
+            Err(Error::BadDigest {
+                completion: true,
+                ..
+            })
+        ));
         assert_eq!(
             storage.list_parts(upload_id).await.unwrap().len(),
             1,

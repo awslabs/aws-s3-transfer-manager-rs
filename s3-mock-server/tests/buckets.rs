@@ -8,7 +8,7 @@ mod common;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use common::{assert_failure, failure, Fixture, Result};
-use s3_mock_server::{FaultTarget, FaultType, Occurrence, Operation};
+use s3_mock_server::{Error, FaultTarget, FaultType, Occurrence, Operation};
 
 /// Object requests for a missing bucket fail with NoSuchBucket and create nothing, while a missing
 /// key in an existing bucket still fails with NoSuchKey.
@@ -48,10 +48,7 @@ async fn test_missing_bucket() -> Result {
     // The bucket is checked after the request is counted and its fault drawn.
     f.server.insert_fault_for(
         FaultTarget::operation(Operation::GetObject).bucket(missing),
-        FaultType::ServiceError {
-            status: 403,
-            code: "AccessDenied",
-        },
+        FaultType::Error(Error::AccessDenied),
         0,
         Occurrence::Once,
     );

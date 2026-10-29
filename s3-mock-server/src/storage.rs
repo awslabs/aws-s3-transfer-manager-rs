@@ -48,7 +48,7 @@ pub struct StoreObjectRequest {
     pub content_disposition: Option<String>,
     pub content_language: Option<String>,
     /// Checksums the client sent with the body. A body that does not match them fails with
-    /// [`Error::ChecksumMismatch`](crate::Error::ChecksumMismatch), and the key is left
+    /// [`Error::BadDigest`](crate::Error::BadDigest), and the key is left
     /// unchanged.
     pub client_checksums: Option<ClientChecksums>,
     /// Condition on the current state of the key, checked atomically with the write by
@@ -356,7 +356,8 @@ pub(crate) trait StorageBackend: Send + Sync + Debug {
     /// Create a new bucket.
     async fn create_bucket(&self, bucket: &str) -> Result<()>;
 
-    /// Delete a bucket. Fails if the bucket is non-empty.
+    /// Delete a bucket. Fails with [`Error::BucketNotEmpty`](crate::Error::BucketNotEmpty) if the
+    /// bucket has objects.
     async fn delete_bucket(&self, bucket: &str) -> Result<()>;
 
     /// Check if a bucket exists.

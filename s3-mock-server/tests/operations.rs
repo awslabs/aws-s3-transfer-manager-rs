@@ -723,31 +723,45 @@ async fn test_list_buckets() -> Result<()> {
     Ok(())
 }
 
+/// DeleteBucket of a non-empty bucket fails with 409 BucketNotEmpty and S3's message, in both
+/// backends.
 #[tokio::test]
 async fn test_delete_nonempty_bucket() -> Result<()> {
-    let server = S3MockServer::builder()
-        .with_in_memory_store()
-        .build()
-        .expect("Failed to build server");
+    let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    for builder in [
+        S3MockServer::builder().with_in_memory_store(),
+        S3MockServer::builder()
+            .with_local_dir_store(temp_dir.path())
+            .await?,
+    ] {
+        let server = builder.build().expect("Failed to build server");
+        let handle = server.start().await.expect("Failed to start mock server");
+        let s3 = handle.client().await;
+        let bucket = format!("test-bucket-{}", Uuid::new_v4());
+        server.create_bucket(&bucket).await?;
 
-    let handle = server.start().await.expect("Failed to start mock server");
-    let s3 = handle.client().await;
-    let bucket = format!("test-bucket-{}", Uuid::new_v4());
-    server.create_bucket(&bucket).await?;
+        s3.put_object()
+            .bucket(&bucket)
+            .key("still-here.txt")
+            .body(ByteStream::from_static(b"data"))
+            .send()
+            .await
+            .expect("Failed to put object");
 
-    // Put an object
-    s3.put_object()
-        .bucket(&bucket)
-        .key("still-here.txt")
-        .body(ByteStream::from_static(b"data"))
-        .send()
-        .await
-        .expect("Failed to put object");
+        let err = s3
+            .delete_bucket()
+            .bucket(&bucket)
+            .send()
+            .await
+            .expect_err("Deleting a non-empty bucket should fail");
+        assert_eq!(err.raw_response().map(|r| r.status().as_u16()), Some(409));
+        assert_eq!(err.code(), Some("BucketNotEmpty"));
+        assert_eq!(
+            err.message(),
+            Some("The bucket you tried to delete is not empty")
+        );
 
-    // Try to delete non-empty bucket — should fail
-    let result = s3.delete_bucket().bucket(&bucket).send().await;
-    assert!(result.is_err(), "Deleting a non-empty bucket should fail");
-
-    handle.shutdown().await?;
+        handle.shutdown().await?;
+    }
     Ok(())
 }
