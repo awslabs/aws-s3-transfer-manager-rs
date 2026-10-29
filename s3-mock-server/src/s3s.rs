@@ -1692,11 +1692,12 @@ mod tests {
         // Drive the handler directly: the AWS SDK client rejects `--x-s3` names
         // client-side (InvalidBucketName) before a request can reach the server,
         // so a directory-bucket gap can only be exercised at the handler level.
-        let storage = InMemoryStorage::new();
-        let inner = Inner::new(storage);
-
         let bucket = "test-dir-bucket--usw2-az1--x-s3";
         let key = "dir-gap-key";
+
+        let storage = InMemoryStorage::new();
+        storage.create_bucket(bucket).await.unwrap();
+        let inner = Inner::new(storage);
 
         let create_input = s3s::dto::CreateMultipartUploadInput::builder()
             .bucket(s3s::dto::BucketName::from(bucket))
@@ -1765,9 +1766,9 @@ mod tests {
             .await
             .expect_err("a directory-bucket gap must be rejected");
 
-        // Directory buckets return HTTP 400 Bad Request (InvalidRequest) for a gap,
+        // Directory buckets return HTTP 400 Bad Request (InvalidPartOrder) for a gap,
         // distinct from the HTTP 500 that composite checksums return.
-        assert_eq!(*err.code(), s3s::S3ErrorCode::InvalidRequest);
+        assert_eq!(*err.code(), s3s::S3ErrorCode::InvalidPartOrder);
         assert!(
             err.message()
                 .is_some_and(|m| m.contains("consecutive part numbers beginning with 1")),
