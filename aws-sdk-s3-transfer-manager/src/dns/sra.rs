@@ -6,19 +6,85 @@ use crate::dns::*;
 use aws_smithy_runtime_api::client::dns::ResolveDns;
 use priority_queue::PriorityQueue;
 use std::collections::{HashMap, VecDeque};
+use std::hash::Hash;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::Instant;
 
-struct AddressEntry {
-    id: u64,
+struct GenerationalAddressSet<T> where T : Hash + Eq + Clone {
+    current_generation: u32,
 
-    ip_address: IpAddr,
+    healthy_addresses: PriorityQueue<T, u32>,
+    unhealthy_addresses_by_expiration: PriorityQueue<T, Instant>,
+}
 
-    use_count: u32, // maybe not needed
+impl<T> GenerationalAddressSet<T> where T : Hash + Eq + Clone {
+    fn new() -> Self {
+        GenerationalAddressSet {
+            current_generation: 1,
+            healthy_addresses: PriorityQueue::new(),
+            unhealthy_addresses_by_expiration: PriorityQueue::new(),
+        }
+    }
 
-    ttl_expiration: Instant, // maybe not needed
+    fn contains(&self, value: &T) -> bool {
+        self.healthy_addresses.contains(value) || self.unhealthy_addresses_by_expiration.contains(value)
+    }
 
-    unhealthy_expiration: Instant, // maybe not needed
+    fn empty(&self) -> bool {
+        self.healthy_addresses.is_empty() && self.unhealthy_addresses_by_expiration.is_empty()
+    }
+
+    fn add_address(&mut self, value: T) {
+        if !self.contains(&value) {
+            self.healthy_addresses.push(value, 0);
+        }
+    }
+
+    fn remove_address(&mut self, value: &T) {
+        self.healthy_addresses.remove(value);
+        self.unhealthy_addresses_by_expiration.remove(value);
+    }
+
+    fn acquire_address(&mut self) -> Option<T> {
+        if self.empty() {
+            return None;
+        }
+
+        // promote any addresses whose demotion has expired
+        let now = Instant::now();
+        while !self.unhealthy_addresses_by_expiration.is_empty() {
+            if self.unhealthy_addresses_by_expiration.peek().unwrap().1 <= &now {
+                let promoted_addr = self.unhealthy_addresses_by_expiration.pop().unwrap().0;
+                self.healthy_addresses.push(promoted_addr, 0);
+            } else {
+                break;
+            }
+        }
+
+        // force promote an address if no healthy address exists
+        if self.healthy_addresses.is_empty() {
+            let promoted_addr = self.unhealthy_addresses_by_expiration.pop().unwrap().0;
+            self.healthy_addresses.push(promoted_addr, 0);
+        }
+
+        // guaranteed to have a healthy address at this point
+        let (item, generation) = self.healthy_addresses.pop().unwrap();
+        if generation == self.current_generation {
+            self.current_generation += 1;
+        }
+
+        self.healthy_addresses.push(item.clone(), self.current_generation);
+
+        Some(item)
+    }
+
+    fn demote_address(&mut self, address: T, duration: Duration) {
+        self.healthy_addresses.remove(&address);
+
+        let expiration = Instant::now() + duration;
+        self.unhealthy_addresses_by_expiration.push(address, expiration);
+    }
 }
 
 struct HostEntry {
@@ -26,28 +92,128 @@ struct HostEntry {
 
     pending_requests: VecDeque<CachingResolveRequestInternal>,
 
-    addresses: HashMap<u64, AddressEntry>,
+    ipv4_addresses: GenerationalAddressSet<Ipv4Addr>,
+    ipv6_addresses: GenerationalAddressSet<Ipv6Addr>,
 
-    addresses_to_id: HashMap<IpAddr, u64>,
+    addresses_by_ttl: PriorityQueue<IpAddr, Instant>,
 
-    healthy_addresses_by_use_count: PriorityQueue<u64, u32>,
+    last_resolution_timepoint: Option<Instant>,
+    pending_resolution: bool,
 
-    unhealthy_addresses_by_expiration: PriorityQueue<u64, Instant>,
-
-    addresses_by_ttl: PriorityQueue<u64, Instant>,
+    ttl: Duration,
 }
 
 impl HostEntry {
-    fn new(name: &str) -> HostEntry {
+    fn new(name: &str, ttl: Duration) -> HostEntry {
         HostEntry {
             name: name.to_string(),
             pending_requests: VecDeque::new(),
-            addresses: HashMap::new(),
-            addresses_to_id: HashMap::new(),
-            healthy_addresses_by_use_count: PriorityQueue::new(),
-            unhealthy_addresses_by_expiration: PriorityQueue::new(),
+            ipv4_addresses: GenerationalAddressSet::new(),
+            ipv6_addresses: GenerationalAddressSet::new(),
             addresses_by_ttl: PriorityQueue::new(),
+            last_resolution_timepoint: None,
+            pending_resolution: false,
+            ttl
         }
+    }
+
+    fn purge_address(&mut self, address: IpAddr) {
+        self.addresses_by_ttl.remove(&address);
+
+        match &address {
+            IpAddr::V4(v4addr) => {
+                self.ipv4_addresses.remove_address(v4addr);
+            }
+            IpAddr::V6(v6addr) => {
+                self.ipv6_addresses.remove_address(v6addr);
+            }
+        }
+    }
+
+    fn on_address_resolved(&mut self, address: IpAddr) {
+        let ttl = Instant::now() + self.ttl;
+
+        if self.addresses_by_ttl.contains(&address) {
+            self.addresses_by_ttl.change_priority(&address, ttl);
+            return;
+        }
+
+        self.addresses_by_ttl.push(address.clone(), ttl);
+
+        match address {
+            IpAddr::V4(v4addr) => {
+                self.ipv4_addresses.add_address(v4addr);
+            }
+            IpAddr::V6(v6addr) => {
+                self.ipv6_addresses.add_address(v6addr);
+            }
+        }
+    }
+
+    fn demote_address(&mut self, address: IpAddr, duration: Duration) {
+        match address {
+            IpAddr::V4(v4addr) => {
+                self.ipv4_addresses.demote_address(v4addr, duration);
+            }
+            IpAddr::V6(v6addr) => {
+                self.ipv6_addresses.demote_address(v6addr, duration);
+            }
+        }
+    }
+
+    fn purge_expired(&mut self) {
+        let now = Instant::now();
+        while !self.addresses_by_ttl.is_empty() {
+            if self.addresses_by_ttl.peek().unwrap().1 <= &now {
+                let purged = self.addresses_by_ttl.pop().unwrap().0;
+                self.purge_address(purged);
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn handle_resolve_request(
+        &mut self,
+        request: CachingResolveRequestInternal,
+        config: &CachingResolverProcessConfig,
+    ) {
+        let name = request.request.name.clone();
+        self.pending_requests.push_back(request);
+
+        let handle = tokio::runtime::Handle::current();
+        let internal_resolver = config.internal_resolver.clone();
+        let operation_channel = config.sender.clone();
+        handle.spawn(async move {
+            let result = internal_resolver.resolve_dns(&name).await;
+            let caching_result =
+                CachingResolverOperation::ResolveResult(CachingResolveResult { name, result });
+            let _ = operation_channel.send(caching_result);
+        });
+    }
+
+    fn handle_resolve_result(&mut self, result: CachingResolveResult) {
+        match result.result {
+            Ok(addresses) => {
+                for address in addresses {
+                    self.on_address_resolved(address);
+                }
+            }
+            Err(err) => {
+                for pending_request in self.pending_requests {
+                    (pending_request.completion_callback)(Err(err.clone()))
+                }
+                return;
+            }
+        }
+
+        if let Some(pending_request) = self.pending_requests.pop_front() {
+            (pending_request.completion_callback)(result.result);
+        }
+    }
+
+    fn handle_host_event(&mut self, event: CachingHostEvent) {
+
     }
 }
 
@@ -73,39 +239,21 @@ fn handle_resolve_request(
     request: CachingResolveRequestInternal,
 ) {
     let name = request.request.name.to_string();
-    let host_entry = find_or_create_host_entry(state, &name);
+    let host_entry = find_or_create_host_entry(state, &request.request.name);
 
-    let name = request.request.name.clone();
-    host_entry.pending_requests.push_back(request);
-
-    let handle = tokio::runtime::Handle::current();
-    let internal_resolver = config.internal_resolver.clone();
-    let operation_channel = config.sender.clone();
-    handle.spawn(async move {
-        let result = internal_resolver.resolve_dns(&name).await;
-        let caching_result =
-            CachingResolverOperation::ResolveResult(CachingResolveResult { name, result });
-        let _ = operation_channel.send(caching_result);
-    });
+    host_entry.handle_resolve_request(request, config);
 }
 
-fn handle_resolve_result(
-    _: &CachingResolverProcessConfig,
-    state: &mut SraCachingResolverState,
-    result: CachingResolveResult,
-) {
+fn handle_resolve_result(state: &mut SraCachingResolverState, result: CachingResolveResult) {
     if let Some(entry) = state.hosts.get_mut(&result.name) {
-        if let Some(pending_request) = entry.pending_requests.pop_front() {
-            (pending_request.completion_callback)(result.result);
-        }
+        entry.handle_resolve_result(result);
     }
 }
 
-fn handle_host_event(
-    _: &CachingResolverProcessConfig,
-    _: &mut SraCachingResolverState,
-    _: CachingHostEvent,
-) {
+fn handle_host_event(state: &mut SraCachingResolverState, event: CachingHostEvent) {
+    if let Some(entry) = state.hosts.get_mut(&event.name) {
+        entry.handle_host_event(event);
+    }
 }
 
 fn handle_operation_sra(
@@ -118,9 +266,9 @@ fn handle_operation_sra(
             handle_resolve_request(config, state, request);
         }
         CachingResolverOperation::ResolveResult(result) => {
-            handle_resolve_result(config, state, result);
+            handle_resolve_result(state, result);
         }
-        CachingResolverOperation::HostEvent(event) => handle_host_event(config, state, event),
+        CachingResolverOperation::HostEvent(event) => handle_host_event(state, event),
     }
 }
 

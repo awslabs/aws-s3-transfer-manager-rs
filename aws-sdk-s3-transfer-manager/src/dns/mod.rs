@@ -12,6 +12,7 @@ use aws_smithy_runtime_api::client::dns::{
 use std::fmt::{Debug, Formatter};
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 /*
@@ -63,11 +64,36 @@ Other notes:
 
  */
 
+/// Determines what kind of addresses resolution should return.  Happy eyeballs is implemented
+/// internally in hyper and so if we want to support it we need to return both ipv4 and ipv6
+/// addresses (if they exist).  This makes error correlation much harder (impossible really)
+/// because partial failures aren't detectable (for ex: fail to connect to ipv6 but succeed on
+/// ipv4 will not trigger any detectable way of penalizing the ipv6 address).
+#[derive(Debug, Clone)]
+pub enum NameResolutionAddressTypes {
+    /// Resolution should return at least one ipv4 and ipv6 address, if they exist
+    All,
+
+    /// Resolution should only return ipv4 addresses
+    IpV4,
+
+    /// Resolution should only return ipv6 addresses
+    IpV6,
+}
+
+impl Default for NameResolutionAddressTypes {
+    fn default() -> Self {
+        NameResolutionAddressTypes::All
+    }
+}
+
 /// All configuration options for a caching DNS resolver
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct CachingResolverConfig {
     internal_resolver: Option<SharedDnsResolver>,
     runtime: Option<tokio::runtime::Handle>,
+    address_types: NameResolutionAddressTypes,
+    default_ttl: Option<Duration>,
 }
 
 /// Builder type for caching resolver configuration instances
@@ -80,10 +106,7 @@ impl CachingResolverConfigBuilder {
     /// Creates a new caching resolver configuration builder instance
     pub fn new() -> Self {
         Self {
-            config: CachingResolverConfig {
-                internal_resolver: None,
-                runtime: None,
-            },
+            config: CachingResolverConfig::default(),
         }
     }
 
@@ -99,6 +122,18 @@ impl CachingResolverConfigBuilder {
     /// while the name resolution lookups could use any kind of future-handling runtime.
     pub fn with_runtime(&mut self, runtime: tokio::runtime::Handle) -> &Self {
         self.config.runtime = Some(runtime);
+        self
+    }
+
+    /// Configures what kind of addresses resolution should return
+    pub fn with_address_types(&mut self, address_types: NameResolutionAddressTypes) -> &mut Self {
+        self.config.address_types = address_types;
+        self
+    }
+
+    /// Configures the time-to-live for each resolved address
+    pub fn with_default_ttl(&mut self, default_ttl: Duration) -> &mut Self {
+        self.config.default_ttl = Some(default_ttl);
         self
     }
 
@@ -205,43 +240,53 @@ impl CachingResolveResult {
     }
 }
 
-/// Event emitted when a user of the resolver has stopped using an IP address.  It is assumed that
-/// something begins using an address as soon as its completes.  It is critical that every lookup
-/// has a matching release so that the internal cache can correctly track IP distribution.
-#[derive(Debug)]
-pub struct CachingHostEventIpReleased {
-    /// Name of the host that the address was resolver for
-    pub name: String,
+/// Classifies a connection-related error.  Determines how the address is "penalized" with respect
+/// to future resolution requests.
+#[derive(Debug, Eq, PartialEq)]
+pub enum ConnectionErrorCategory {
+    /// Never use this address again for as long as it's tracked
+    Fatal,
 
-    /// IP address that is no longer being used by a dns lookup consumer
-    pub address: IpAddr,
+    /// Avoid this address unless there's no other alternative
+    /// Equivalent to Standard(Infinite)
+    Major,
+
+    /// Avoid using this address for at least a configurable amount of time
+    Standard(Duration),
 }
 
 /// Event emitted when a connection attempt using a resolved address fails.  Later we'll add
 /// failure context.
 #[derive(Debug)]
-pub struct CachingHostEventConnectionFailed {
-    /// Name of the host that the address was resolver for
-    pub name: String,
+pub struct CachingHostEventConnectionError {
+    /// How the resolver should penalize the address in future resolutions
+    pub category: ConnectionErrorCategory,
 
-    /// IP address of the connection that failed
-    pub address: IpAddr,
+    /// Actual source error triggering this event
+    pub error: Option<Box<dyn std::error::Error + Send + Sync>>, // fix this type into an Into or something
+}
+
+/// Per-host-event-type variants
+#[non_exhaustive]
+#[derive(Debug)]
+pub enum CachingHostEventInformation {
+    /// Notifies the resolver that a consumer encountered an error condition while using an
+    /// address sourced from the resolver
+    ConnectionError(CachingHostEventConnectionError),
 }
 
 /// A connection-related event that could cause us to update our internal bookkeeping that
 /// helps distribute IPs across connections.
-///
-/// IPReleased, connection(IP) failed, etc...
 #[derive(Debug)]
-#[non_exhaustive]
-pub enum CachingHostEvent {
-    /// Notifies the resolver that a consumer has stopped using an address returned by a resolution
-    /// request
-    IpReleased(CachingHostEventIpReleased),
+pub struct CachingHostEvent {
+    /// Name of the host that the address was resolver for
+    pub name: String,
 
-    /// Notifies the resolver that a consumer failed to establish a connection using an IP address
-    /// returned by the resolver.
-    ConnectionFailed(CachingHostEventConnectionFailed),
+    /// IP address of the connection that encountered an error
+    pub address: IpAddr,
+
+    /// Per-event-type data
+    pub event_data: CachingHostEventInformation,
 }
 
 /// The fundamental operation type that a caching resolver works with.
@@ -683,7 +728,7 @@ pub(crate) mod testing {
     }
 
     #[test]
-    fn caching_resolver_ip_released() {
+    fn caching_resolver_connection_error() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let handle = runtime.handle().clone();
         let (resolver, event_future) = new_caching_resolver_mock_host_event(
@@ -692,20 +737,29 @@ pub(crate) mod testing {
                 .build(),
         );
 
-        let host_event = CachingHostEvent::IpReleased(CachingHostEventIpReleased {
+        let host_event = CachingHostEvent {
             name: "localhost".to_string(),
             address: IpAddr::V4(Ipv4Addr::LOCALHOST),
-        });
+            event_data: CachingHostEventInformation::ConnectionError(
+                CachingHostEventConnectionError {
+                    category: ConnectionErrorCategory::Fatal,
+                    error: None,
+                },
+            ),
+        };
 
         let notify_result = resolver.notify(host_event);
         assert!(notify_result.is_ok());
 
         let received_event = runtime.block_on(event_future);
 
-        match received_event {
-            CachingHostEvent::IpReleased(released_event) => {
-                assert_eq!(released_event.address, IpAddr::V4(Ipv4Addr::LOCALHOST));
-                assert_eq!("localhost", released_event.name);
+        assert_eq!(IpAddr::V4(Ipv4Addr::LOCALHOST), received_event.address);
+        assert_eq!("localhost", received_event.name);
+
+        match received_event.event_data {
+            CachingHostEventInformation::ConnectionError(error_event) => {
+                assert_eq!(ConnectionErrorCategory::Fatal, error_event.category);
+                assert!(error_event.error.is_none());
             }
             _ => {
                 assert!(false);
