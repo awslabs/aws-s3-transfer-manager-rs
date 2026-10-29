@@ -1966,3 +1966,91 @@ async fn test_complete_mpu_412_surfaces_precondition_failed_code() {
         "source should be the underlying CompleteMultipartUpload SdkError"
     );
 }
+
+// --- Source release on failure -----------------------------------------------
+
+/// How long a producer may wait, once the upload has failed, for its channel to close.
+const SOURCE_RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A non-retryable error response.
+fn precondition_failed() -> HttpResponse {
+    HttpResponse::new(
+        StatusCode::try_from(412).unwrap(),
+        SdkBody::from("<Error><Code>PreconditionFailed</Code></Error>"),
+    )
+}
+
+/// Starts an unknown-length upload of the stream fed by the returned sender. A channel of one
+/// part is a producer applying backpressure: a second `send` waits until the upload takes the
+/// first part.
+fn upload_from_channel(
+    mock: &MultipartMock,
+) -> (
+    mpsc::Sender<Bytes>,
+    aws_sdk_s3_transfer_manager::operation::upload::UploadHandle,
+) {
+    let (tx, rx) = mpsc::channel(1);
+    let handle = mock
+        .tm()
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .body(InputStream::from_part_stream(UnknownLengthStream::new(rx)))
+        .initiate()
+        .unwrap();
+    (tx, handle)
+}
+
+/// Waits for the upload to fail, then for the producer's channel to close while the handle is
+/// still held. A `send` blocked on the channel returns its error at the same moment.
+async fn assert_failure_releases_stream(
+    tx: &mpsc::Sender<Bytes>,
+    handle: &aws_sdk_s3_transfer_manager::operation::upload::UploadHandle,
+) {
+    tokio::time::timeout(SOURCE_RELEASE_TIMEOUT, async {
+        while handle.status() != aws_sdk_s3_transfer_manager::types::TransferStatus::Failed {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("upload did not fail");
+    tokio::time::timeout(SOURCE_RELEASE_TIMEOUT, tx.closed())
+        .await
+        .expect("failed upload retained its stream while the handle was held");
+}
+
+/// A failed UploadPart releases the custom stream while the caller still holds the handle, so a
+/// producer applying backpressure observes its channel close rather than waiting forever for the
+/// upload to take another part (#226).
+#[tokio::test]
+async fn test_upload_part_failure_releases_stream_while_handle_held() {
+    let upload_part =
+        mock!(aws_sdk_s3::Client::upload_part).then_http_response(precondition_failed);
+    let mock = MultipartMock::new().with_override(&upload_part);
+    let (tx, handle) = upload_from_channel(&mock);
+
+    tx.send(Bytes::from_static(b"part one")).await.unwrap();
+    assert_failure_releases_stream(&tx, &handle).await;
+
+    handle.join().await.expect_err("UploadPart failed");
+    assert_eq!(1, upload_part.num_calls());
+}
+
+/// A failed CreateMultipartUpload releases the custom stream it never read, while the caller still
+/// holds the handle (#226).
+#[tokio::test]
+async fn test_create_multipart_failure_releases_stream_while_handle_held() {
+    let create_mpu =
+        mock!(aws_sdk_s3::Client::create_multipart_upload).then_http_response(precondition_failed);
+    let mock = MultipartMock::new().with_override(&create_mpu);
+    let (tx, handle) = upload_from_channel(&mock);
+
+    tx.send(Bytes::from_static(b"part one")).await.unwrap();
+    assert_failure_releases_stream(&tx, &handle).await;
+
+    handle
+        .join()
+        .await
+        .expect_err("CreateMultipartUpload failed");
+    assert_eq!(0, mock.record().upload_part_calls());
+}

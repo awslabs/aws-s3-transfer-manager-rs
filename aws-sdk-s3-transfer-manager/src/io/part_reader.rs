@@ -176,7 +176,26 @@ impl PartReader {
                 }
                 SourceAccess::Blocked => PartReadStart::Blocked,
                 SourceAccess::Finished => PartReadStart::Finished,
+                SourceAccess::Terminal => PartReadStart::Terminal,
             },
+        }
+    }
+
+    /// Marks the upload that owns this reader as ended without completing.
+    ///
+    /// A custom [`PartStream`] is dropped and not taken back, so a producer on the other end of
+    /// it observes the upload end through the stream's own drop. A source read in progress
+    /// finishes with the stream it holds and drops it then. Reads that start afterwards report
+    /// [`PartReadStart::Terminal`].
+    ///
+    /// In-memory and file readers hold no caller-implemented source, so there is nothing for them
+    /// to release.
+    ///
+    /// [`PartStream`]: crate::io::PartStream
+    pub(crate) fn mark_terminal(&self) {
+        match &self.inner {
+            Inner::Dyn(part_stream) => part_stream.gate.close(),
+            Inner::Bytes(_) | Inner::Fs(_) => {}
         }
     }
 
@@ -211,6 +230,8 @@ pub(crate) enum PartReadStart {
     Blocked,
     /// The source has already reported end-of-stream.
     Finished,
+    /// The upload ended without completing; see [`PartReader::mark_terminal`].
+    Terminal,
 }
 
 /// Owned source operation that may move between scheduler executions.
@@ -493,6 +514,7 @@ impl DynPartReader {
             GateState::Polling | GateState::Blocked => {
                 panic!("part stream checksum requested while a source operation remained")
             }
+            GateState::Closed => panic!("part stream checksum requested after the upload ended"),
         }
     }
 }
@@ -521,6 +543,9 @@ enum GateState {
     Blocked,
     /// End-of-stream was observed; the stream is retained only for final metadata.
     Finished(BoxStream),
+    /// The upload ended without completing. The stream has been dropped, and one handed back
+    /// by an operation still in progress is dropped rather than retained.
+    Closed,
 }
 
 /// Result of trying to take custom-stream polling authority.
@@ -531,6 +556,8 @@ enum SourceAccess {
     Blocked,
     /// End-of-stream was already observed.
     Finished,
+    /// The upload ended and the gate closed.
+    Terminal,
 }
 
 impl PartStreamGate {
@@ -550,6 +577,7 @@ impl PartStreamGate {
                     GateState::Blocked => return SourceAccess::Blocked,
                     GateState::Polling => {}
                     GateState::Finished(_) => return SourceAccess::Finished,
+                    GateState::Closed => return SourceAccess::Terminal,
                     GateState::Available(_) => {
                         let GateState::Available(stream) =
                             std::mem::replace(&mut *state, GateState::Polling)
@@ -567,7 +595,7 @@ impl PartStreamGate {
     fn is_unavailable(&self) -> bool {
         matches!(
             &*self.state.lock().expect("part stream gate poisoned"),
-            GateState::Blocked | GateState::Finished(_)
+            GateState::Blocked | GateState::Finished(_) | GateState::Closed
         )
     }
 
@@ -579,7 +607,9 @@ impl PartStreamGate {
                     *state = GateState::Blocked;
                     true
                 }
-                GateState::Blocked => false,
+                // The gate closed while this operation was polling; the stream it still holds
+                // is dropped when the operation completes or is dropped.
+                GateState::Blocked | GateState::Closed => false,
                 GateState::Available(_) | GateState::Finished(_) => {
                     panic!("part stream became blocked without polling authority")
                 }
@@ -591,26 +621,60 @@ impl PartStreamGate {
     }
 
     fn release(&self, stream: BoxStream) {
-        {
+        let refused = {
             let mut state = self.state.lock().expect("part stream gate poisoned");
-            assert!(
-                matches!(&*state, GateState::Polling | GateState::Blocked),
-                "part stream released without polling authority"
-            );
-            *state = GateState::Available(stream);
+            if matches!(&*state, GateState::Closed) {
+                Some(stream)
+            } else {
+                assert!(
+                    matches!(&*state, GateState::Polling | GateState::Blocked),
+                    "part stream released without polling authority"
+                );
+                *state = GateState::Available(stream);
+                None
+            }
+        };
+        match refused {
+            // Dropped outside the gate lock.
+            Some(stream) => drop(stream),
+            None => self.changed.notify_one(),
         }
-        self.changed.notify_one();
     }
 
     fn finish(&self, stream: BoxStream) {
-        {
+        let refused = {
             let mut state = self.state.lock().expect("part stream gate poisoned");
-            assert!(
-                matches!(&*state, GateState::Polling | GateState::Blocked),
-                "part stream finished without polling authority"
-            );
-            *state = GateState::Finished(stream);
+            if matches!(&*state, GateState::Closed) {
+                Some(stream)
+            } else {
+                assert!(
+                    matches!(&*state, GateState::Polling | GateState::Blocked),
+                    "part stream finished without polling authority"
+                );
+                *state = GateState::Finished(stream);
+                None
+            }
+        };
+        match refused {
+            Some(stream) => drop(stream),
+            None => self.changed.notify_waiters(),
         }
+    }
+
+    /// Drops the stream if the gate holds it and refuses it from then on.
+    ///
+    /// A stream held by an operation in progress comes back through [`Self::release`],
+    /// [`Self::finish`], or the operation's drop, which drop it instead. Callers waiting in
+    /// [`Self::acquire`] behind that operation are woken and observe the closed gate.
+    fn close(&self) {
+        let held = {
+            let mut state = self.state.lock().expect("part stream gate poisoned");
+            match std::mem::replace(&mut *state, GateState::Closed) {
+                GateState::Available(stream) | GateState::Finished(stream) => Some(stream),
+                GateState::Polling | GateState::Blocked | GateState::Closed => None,
+            }
+        };
+        drop(held);
         self.changed.notify_waiters();
     }
 }
