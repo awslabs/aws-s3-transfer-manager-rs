@@ -191,9 +191,34 @@ pub enum FailedMultipartUploadPolicy {
 pub struct AbortedUpload {
     pub(crate) upload_id: Option<String>,
     pub(crate) request_charged: Option<crate::model::RequestCharged>,
+    pub(crate) outcome: AbortOutcome,
+    pub(crate) output: Option<crate::operation::upload::UploadOutput>,
+}
+
+/// What an abort established about the object.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AbortOutcome {
+    /// The upload was stopped before S3 completes the object.
+    #[default]
+    Cancelled,
+    /// S3 finished storing the object before the abort took effect. The object is not
+    /// deleted; its metadata is available from [`AbortedUpload::output`].
+    AlreadyCompleted,
 }
 
 impl AbortedUpload {
+    /// Returns whether the abort stopped the upload or the object already
+    /// exists.
+    pub fn outcome(&self) -> AbortOutcome {
+        self.outcome
+    }
+
+    /// Returns the upload's output when [`outcome`](Self::outcome) is
+    /// [`AbortOutcome::AlreadyCompleted`], and `None` otherwise.
+    pub fn output(&self) -> Option<&crate::operation::upload::UploadOutput> {
+        self.output.as_ref()
+    }
     /// Get the multipart upload ID that was cancelled
     ///
     /// Not present for uploads that did not utilize a multipart upload

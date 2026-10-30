@@ -405,6 +405,11 @@ impl StateMachineStatus {
     }
 
     #[inline]
+    pub(crate) fn is_completed(&self) -> bool {
+        self.0.load(Ordering::Acquire) == STATUS_COMPLETED
+    }
+
+    #[inline]
     pub(crate) fn is_failed(&self) -> bool {
         self.0.load(Ordering::Acquire) == STATUS_FAILED
     }
@@ -1047,6 +1052,12 @@ impl TransferContext {
     #[inline]
     pub(crate) fn is_active(&self) -> bool {
         self.status.is_active()
+    }
+
+    /// Check if transfer completed successfully
+    #[inline]
+    pub(crate) fn is_completed(&self) -> bool {
+        self.status.is_completed()
     }
 
     /// Signal that the transfer has reached a terminal state.

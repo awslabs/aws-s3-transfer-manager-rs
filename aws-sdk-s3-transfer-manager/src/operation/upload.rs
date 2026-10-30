@@ -123,47 +123,88 @@ mod test {
         http_client_fn, HttpConnector, HttpConnectorFuture, SharedHttpConnector,
     };
     use aws_smithy_runtime_api::client::orchestrator::{HttpRequest, HttpResponse};
-    use aws_smithy_runtime_api::client::result::ConnectorError;
     use aws_smithy_types::body::SdkBody;
     use bytes::Bytes;
+    use std::future::Future;
+    use std::pin::Pin;
     use std::sync::{Arc, Mutex};
+    use std::task::Poll;
     use std::time::Duration;
     use tokio::sync::Semaphore;
 
     use crate::io::InputStream;
     use crate::metrics::unit::ByteUnit;
     use crate::operation::upload::UploadInput;
-    use crate::types::{ConcurrencyMode, PartSize, RuntimeMode, TransferStatus};
+    use crate::types::{AbortOutcome, ConcurrencyMode, PartSize, RuntimeMode, TransferStatus};
 
-    /// Connector that keeps CreateMultipartUpload active until its future is
-    /// interrupted by the transfer runtime.
-    #[derive(Debug)]
-    struct StalledCreateMpuConnector {
-        create_started: Arc<Semaphore>,
+    /// Polls `future` once and returns the result of that poll.
+    ///
+    /// `UploadHandle::abort()` calls `request_abort()` before its first
+    /// `.await`, so one poll is enough to know the abort has been requested.
+    async fn poll_once<F: Future + Unpin>(future: &mut F) -> Poll<F::Output> {
+        std::future::poll_fn(|cx| Poll::Ready(Pin::new(&mut *future).poll(cx))).await
     }
 
-    impl HttpConnector for StalledCreateMpuConnector {
-        fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
-            assert_eq!("POST", request.method());
-            assert!(
-                request.uri().contains("uploads"),
-                "unexpected request: {}",
-                request.uri()
-            );
+    /// Connector that holds CreateMultipartUpload until `create_release` gets
+    /// a permit, then accepts it, and records the URI of every
+    /// AbortMultipartUpload.
+    #[derive(Debug)]
+    struct HeldCreateMpuConnector {
+        create_started: Arc<Semaphore>,
+        create_release: Arc<Semaphore>,
+        abort_uris: Arc<Mutex<Vec<String>>>,
+    }
 
-            let create_started = self.create_started.clone();
-            HttpConnectorFuture::new(async move {
-                create_started.add_permits(1);
-                std::future::pending::<Result<HttpResponse, ConnectorError>>().await
-            })
+    impl HttpConnector for HeldCreateMpuConnector {
+        fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
+            let uri = request.uri().to_string();
+            match request.method() {
+                "POST" if uri.contains("uploads") && !uri.contains("uploadId=") => {
+                    let create_started = self.create_started.clone();
+                    let create_release = self.create_release.clone();
+                    HttpConnectorFuture::new(async move {
+                        create_started.add_permits(1);
+                        create_release
+                            .acquire()
+                            .await
+                            .expect("release semaphore closed")
+                            .forget();
+                        Ok(HttpResponse::new(
+                            200.try_into().unwrap(),
+                            SdkBody::from(
+                                r#"<?xml version="1.0" encoding="UTF-8"?>
+                                    <InitiateMultipartUploadResult>
+                                        <Bucket>test-bucket</Bucket>
+                                        <Key>test-key</Key>
+                                        <UploadId>test-upload-id</UploadId>
+                                    </InitiateMultipartUploadResult>"#,
+                            ),
+                        ))
+                    })
+                }
+                "DELETE" if uri.contains("uploadId=") => {
+                    self.abort_uris.lock().unwrap().push(uri);
+                    HttpConnectorFuture::ready(Ok(HttpResponse::new(
+                        204.try_into().unwrap(),
+                        SdkBody::empty(),
+                    )))
+                }
+                method => panic!("unexpected request: {method} {uri}"),
+            }
         }
     }
 
-    /// Abort must terminate after CreateMultipartUpload enters execution.
-    async fn abort_stalled_create_mpu(runtime_mode: RuntimeMode) {
+    /// An abort requested while CreateMultipartUpload is in flight waits for
+    /// Create's response, then aborts the upload Create returned. No part is
+    /// uploaded.
+    async fn abort_during_create_mpu(runtime_mode: RuntimeMode) {
         let create_started = Arc::new(Semaphore::new(0));
-        let connector = SharedHttpConnector::new(StalledCreateMpuConnector {
+        let create_release = Arc::new(Semaphore::new(0));
+        let abort_uris = Arc::new(Mutex::new(Vec::new()));
+        let connector = SharedHttpConnector::new(HeldCreateMpuConnector {
             create_started: create_started.clone(),
+            create_release: create_release.clone(),
+            abort_uris: abort_uris.clone(),
         });
         let http_client = http_client_fn(move |_, _| connector.clone());
         let client = aws_sdk_s3::Client::from_conf(
@@ -197,40 +238,66 @@ mod test {
             .expect("start semaphore closed");
         permit.forget();
 
-        tokio::time::timeout(Duration::from_secs(1), handle.abort())
+        let mut abort = Box::pin(handle.abort());
+        assert!(
+            poll_once(&mut abort).await.is_pending(),
+            "abort returned while CreateMultipartUpload was held"
+        );
+        create_release.add_permits(1);
+
+        let aborted = tokio::time::timeout(Duration::from_secs(5), abort)
             .await
-            .expect("abort hung after CreateMultipartUpload entered execution")
+            .expect("abort hung after CreateMultipartUpload returned")
             .expect("abort failed");
+
+        assert_eq!(aborted.outcome(), AbortOutcome::Cancelled);
+        assert_eq!(aborted.upload_id(), Some("test-upload-id"));
+        let abort_uris = abort_uris.lock().unwrap();
+        assert_eq!(
+            abort_uris.len(),
+            1,
+            "expected one AbortMultipartUpload: {abort_uris:?}"
+        );
+        assert!(
+            abort_uris[0].contains("uploadId=test-upload-id"),
+            "AbortMultipartUpload for the wrong upload: {}",
+            abort_uris[0]
+        );
     }
 
     #[cfg_attr(miri, ignore)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn abort_stalled_create_mpu_on_tokio_runtime() {
-        abort_stalled_create_mpu(RuntimeMode::MultiThreadTokio).await;
+    async fn abort_during_create_mpu_on_tokio_runtime() {
+        abort_during_create_mpu(RuntimeMode::MultiThreadTokio).await;
     }
 
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
-    async fn abort_stalled_create_mpu_on_managed_runtime() {
-        abort_stalled_create_mpu(RuntimeMode::Managed).await;
+    async fn abort_during_create_mpu_on_managed_runtime() {
+        abort_during_create_mpu(RuntimeMode::Managed).await;
     }
 
     /// How [`CompleteMpuConnector`] answers CompleteMultipartUpload.
     #[derive(Debug, Clone, Copy)]
     enum CompleteMpuBehavior {
-        /// Never respond; the request stays active until interrupted.
-        Stall,
+        /// Wait until `complete_release` gets a permit, then answer
+        /// `NoSuchUpload`, as S3 does when the upload was aborted before
+        /// Complete committed.
+        HoldThenNoSuchUpload,
         /// Respond with a non-retryable error.
         Fail,
     }
 
     /// Connector that serves a single-part multipart upload, applies
     /// [`CompleteMpuBehavior`] to CompleteMultipartUpload, and records the
-    /// upload ID of every AbortMultipartUpload.
+    /// upload ID of every AbortMultipartUpload. Each AbortMultipartUpload adds
+    /// a permit to `abort_started`.
     #[derive(Debug)]
     struct CompleteMpuConnector {
         behavior: CompleteMpuBehavior,
         complete_started: Arc<Semaphore>,
+        complete_release: Arc<Semaphore>,
+        abort_started: Arc<Semaphore>,
         abort_uris: Arc<Mutex<Vec<String>>>,
     }
 
@@ -257,12 +324,27 @@ mod test {
                 }
                 ("POST", true) => {
                     let complete_started = self.complete_started.clone();
+                    let complete_release = self.complete_release.clone();
                     let behavior = self.behavior;
                     return HttpConnectorFuture::new(async move {
                         complete_started.add_permits(1);
                         match behavior {
-                            CompleteMpuBehavior::Stall => {
-                                std::future::pending::<Result<HttpResponse, ConnectorError>>().await
+                            CompleteMpuBehavior::HoldThenNoSuchUpload => {
+                                complete_release
+                                    .acquire()
+                                    .await
+                                    .expect("release semaphore closed")
+                                    .forget();
+                                Ok(HttpResponse::new(
+                                    404.try_into().unwrap(),
+                                    SdkBody::from(
+                                        r#"<?xml version="1.0" encoding="UTF-8"?>
+                                    <Error>
+                                        <Code>NoSuchUpload</Code>
+                                        <Message>The specified upload does not exist.</Message>
+                                    </Error>"#,
+                                    ),
+                                ))
                             }
                             CompleteMpuBehavior::Fail => Ok(HttpResponse::new(
                                 400.try_into().unwrap(),
@@ -279,6 +361,7 @@ mod test {
                 }
                 ("DELETE", true) => {
                     self.abort_uris.lock().unwrap().push(uri);
+                    self.abort_started.add_permits(1);
                     HttpResponse::new(204.try_into().unwrap(), SdkBody::empty())
                 }
                 _ => panic!("unexpected request: {} {uri}", request.method()),
@@ -287,15 +370,34 @@ mod test {
         }
     }
 
-    /// Abort after CompleteMultipartUpload started must still abort the upload,
-    /// whether the completion is interrupted or has already failed.
-    async fn abort_during_complete_mpu(runtime_mode: RuntimeMode, behavior: CompleteMpuBehavior) {
-        let complete_started = Arc::new(Semaphore::new(0));
-        let abort_uris = Arc::new(Mutex::new(Vec::new()));
+    /// Semaphores and recorded requests shared with a [`CompleteMpuConnector`].
+    struct CompleteMpuProbe {
+        complete_started: Arc<Semaphore>,
+        complete_release: Arc<Semaphore>,
+        abort_started: Arc<Semaphore>,
+        abort_uris: Arc<Mutex<Vec<String>>>,
+    }
+
+    /// Starts a single-part multipart upload against a
+    /// [`CompleteMpuConnector`] and waits until CompleteMultipartUpload has
+    /// been sent.
+    async fn start_upload_until_complete_mpu(
+        runtime_mode: RuntimeMode,
+        behavior: CompleteMpuBehavior,
+        concurrency: usize,
+    ) -> (crate::operation::upload::UploadHandle, CompleteMpuProbe) {
+        let probe = CompleteMpuProbe {
+            complete_started: Arc::new(Semaphore::new(0)),
+            complete_release: Arc::new(Semaphore::new(0)),
+            abort_started: Arc::new(Semaphore::new(0)),
+            abort_uris: Arc::new(Mutex::new(Vec::new())),
+        };
         let connector = SharedHttpConnector::new(CompleteMpuConnector {
             behavior,
-            complete_started: complete_started.clone(),
-            abort_uris: abort_uris.clone(),
+            complete_started: probe.complete_started.clone(),
+            complete_release: probe.complete_release.clone(),
+            abort_started: probe.abort_started.clone(),
+            abort_uris: probe.abort_uris.clone(),
         });
         let http_client = http_client_fn(move |_, _| connector.clone());
         let client = aws_sdk_s3::Client::from_conf(
@@ -307,7 +409,7 @@ mod test {
         );
 
         let tm_config = crate::Config::builder()
-            .concurrency(ConcurrencyMode::Explicit(1))
+            .concurrency(ConcurrencyMode::Explicit(concurrency))
             .runtime_mode(runtime_mode)
             .set_multipart_threshold(PartSize::Target(10))
             .set_target_part_size(PartSize::Target(5 * ByteUnit::Mebibyte.as_bytes_u64()))
@@ -323,28 +425,49 @@ mod test {
             .initiate_with(&tm)
             .unwrap();
 
-        let permit = tokio::time::timeout(Duration::from_secs(5), complete_started.acquire())
+        tokio::time::timeout(Duration::from_secs(5), probe.complete_started.acquire())
             .await
             .expect("CompleteMultipartUpload did not start")
-            .expect("start semaphore closed");
-        permit.forget();
+            .expect("start semaphore closed")
+            .forget();
+        (handle, probe)
+    }
 
-        if let CompleteMpuBehavior::Fail = behavior {
-            tokio::time::timeout(Duration::from_secs(5), async {
-                while handle.status() != TransferStatus::Failed {
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-            })
-            .await
-            .expect("upload did not fail after CompleteMultipartUpload error");
-        }
+    /// An abort requested while CompleteMultipartUpload is in flight sends
+    /// AbortMultipartUpload without interrupting Complete. When Complete then
+    /// returns `NoSuchUpload` (the abort won), the upload is cancelled.
+    ///
+    /// Concurrency 2 so AbortMultipartUpload can go out while Complete holds a
+    /// slot; Complete is released only after S3 has seen the abort, as in the
+    /// real race.
+    async fn abort_during_complete_mpu(runtime_mode: RuntimeMode) {
+        let (handle, probe) = start_upload_until_complete_mpu(
+            runtime_mode,
+            CompleteMpuBehavior::HoldThenNoSuchUpload,
+            2,
+        )
+        .await;
 
-        let aborted = tokio::time::timeout(Duration::from_secs(5), handle.abort())
+        let mut abort = Box::pin(handle.abort());
+        assert!(
+            poll_once(&mut abort).await.is_pending(),
+            "abort returned while CompleteMultipartUpload was held"
+        );
+        tokio::time::timeout(Duration::from_secs(5), probe.abort_started.acquire())
             .await
-            .expect("abort hung after CompleteMultipartUpload started")
+            .expect("AbortMultipartUpload was not sent while Complete was in flight")
+            .expect("abort semaphore closed")
+            .forget();
+        probe.complete_release.add_permits(1);
+
+        let aborted = tokio::time::timeout(Duration::from_secs(5), abort)
+            .await
+            .expect("abort hung after CompleteMultipartUpload returned")
             .expect("abort failed");
 
-        let abort_uris = abort_uris.lock().unwrap();
+        assert_eq!(aborted.outcome(), AbortOutcome::Cancelled);
+        assert_eq!(aborted.upload_id(), Some("test-upload-id"));
+        let abort_uris = probe.abort_uris.lock().unwrap();
         assert_eq!(
             abort_uris.len(),
             1,
@@ -355,31 +478,60 @@ mod test {
             "AbortMultipartUpload for the wrong upload: {}",
             abort_uris[0]
         );
-        assert_eq!(aborted.upload_id(), Some("test-upload-id"));
     }
 
     #[cfg_attr(miri, ignore)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn abort_during_complete_mpu_aborts_upload_on_tokio_runtime() {
-        abort_during_complete_mpu(RuntimeMode::MultiThreadTokio, CompleteMpuBehavior::Stall).await;
+        abort_during_complete_mpu(RuntimeMode::MultiThreadTokio).await;
     }
 
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn abort_during_complete_mpu_aborts_upload_on_managed_runtime() {
-        abort_during_complete_mpu(RuntimeMode::Managed, CompleteMpuBehavior::Stall).await;
+        abort_during_complete_mpu(RuntimeMode::Managed).await;
+    }
+
+    /// `abort()` on an upload that already failed returns the failure at once
+    /// and sends nothing.
+    ///
+    /// TODO: failures don't go through the abort path yet, so the multipart
+    /// upload is left open here. Once they do, this should expect one
+    /// AbortMultipartUpload for `test-upload-id`.
+    async fn abort_after_failed_complete_mpu(runtime_mode: RuntimeMode) {
+        let (handle, probe) =
+            start_upload_until_complete_mpu(runtime_mode, CompleteMpuBehavior::Fail, 1).await;
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while handle.status() != TransferStatus::Failed {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("upload did not fail after CompleteMultipartUpload error");
+
+        let error = tokio::time::timeout(Duration::from_secs(5), handle.abort())
+            .await
+            .expect("abort hung on a failed upload")
+            .expect_err("abort on a failed upload must return its error");
+        assert_eq!(error.code(), Some("InvalidPart"));
+        let abort_uris = probe.abort_uris.lock().unwrap();
+        assert!(
+            abort_uris.is_empty(),
+            "unexpected AbortMultipartUpload: {abort_uris:?}"
+        );
     }
 
     #[cfg_attr(miri, ignore)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn abort_after_failed_complete_mpu_aborts_upload_on_tokio_runtime() {
-        abort_during_complete_mpu(RuntimeMode::MultiThreadTokio, CompleteMpuBehavior::Fail).await;
+    async fn abort_after_failed_complete_mpu_returns_error_on_tokio_runtime() {
+        abort_after_failed_complete_mpu(RuntimeMode::MultiThreadTokio).await;
     }
 
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
-    async fn abort_after_failed_complete_mpu_aborts_upload_on_managed_runtime() {
-        abort_during_complete_mpu(RuntimeMode::Managed, CompleteMpuBehavior::Fail).await;
+    async fn abort_after_failed_complete_mpu_returns_error_on_managed_runtime() {
+        abort_after_failed_complete_mpu(RuntimeMode::Managed).await;
     }
 
     #[cfg_attr(miri, ignore)]
