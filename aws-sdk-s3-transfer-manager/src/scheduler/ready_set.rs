@@ -22,7 +22,7 @@ use std::sync::RwLock;
 
 use crossbeam_skiplist::SkipMap;
 
-use super::descriptor::TransferDescriptor;
+use super::descriptor::{TransferDescriptor, WeakTransferDescriptor};
 use crate::runtime::sync::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use crate::runtime::sync::sync::Arc;
 use crate::transfer::TransferId;
@@ -185,7 +185,11 @@ struct GroupQueue {
     /// Atomic coordination state (member count, root presence, vruntime).
     state: GroupState,
     /// Members of this group, ordered by individual vruntime.
-    inner: SkipMap<ReadyKey, TransferDescriptor>,
+    ///
+    /// Entries do not keep their descriptors alive. A removed `SkipMap` node
+    /// is freed only by epoch-based reclamation, which has no bound on when
+    /// it runs, so an owning entry would keep a retired transfer alive.
+    inner: SkipMap<ReadyKey, WeakTransferDescriptor>,
 }
 
 impl GroupQueue {
@@ -203,20 +207,28 @@ impl GroupQueue {
 
     /// Insert a descriptor. Returns the previous nr_queued count (0 means
     /// this insert transitioned the group from empty to non-empty).
-    fn insert(&self, descriptor: TransferDescriptor) -> usize {
+    fn insert(&self, descriptor: &TransferDescriptor) -> usize {
         let vruntime = descriptor.vruntime();
         let key = ReadyKey::new(vruntime, descriptor.id());
-        self.inner.insert(key, descriptor);
+        self.inner.insert(key, descriptor.downgrade());
         self.state.enqueue()
     }
 
-    /// Pop the member with the lowest vruntime. Returns `None` if the
-    /// group is empty. Advances the group's min_vruntime floor.
-    fn pop(&self) -> Option<TransferDescriptor> {
+    /// Pop the member with the lowest vruntime and advance the group's
+    /// min_vruntime floor.
+    ///
+    /// Removes exactly one entry. Returns `None` if the group is empty, and
+    /// `Some(None)` if the entry's descriptor has already been dropped.
+    ///
+    /// An insert publishes its entry before counting it, so a second removal
+    /// in the same call could take an entry whose `enqueue` has not happened
+    /// and wrap `nr_queued`. One removal per root-tree pop keeps every
+    /// `dequeue` paired with a completed `enqueue`.
+    fn pop(&self) -> Option<Option<TransferDescriptor>> {
         let entry = self.inner.pop_front()?;
         self.state.dequeue();
         self.state.advance_min_vruntime(entry.key().vruntime);
-        Some(entry.value().clone())
+        Some(entry.value().upgrade())
     }
 
     /// Number of members currently queued in this group.
@@ -323,6 +335,10 @@ impl ReadySet {
     /// (queued or being polled) silently returns `Ok(())` - the existing
     /// presence in the ready set or the in-flight poll is the canonical
     /// one.
+    ///
+    /// The ready set does not keep `descriptor` alive. If the caller passed
+    /// the last reference, it is dropped after the ready set's locks have been
+    /// released.
     pub(super) fn insert(&self, descriptor: TransferDescriptor) -> Result<(), OrphanedChild> {
         // try_claim succeeds only when the descriptor is not already
         // claimed. On failure, the existing claim owner is responsible
@@ -368,7 +384,7 @@ impl ReadySet {
     /// between `by_group` and `groups`.
     ///
     /// Lock-ordering invariant: `by_group.read` is held across both
-    /// `group.insert(descriptor)` (into the inner queue) AND
+    /// `group.insert(&descriptor)` (into the inner queue) AND
     /// `self.groups.insert(...)` (into the root tree). A concurrent
     /// `remove_group` (which needs `by_group.write`) blocks until this
     /// method returns. Without this ordering, `remove_group` could clear
@@ -405,7 +421,7 @@ impl ReadySet {
         };
         // From here, by_group.read is held until end-of-scope. Concurrent
         // remove_group blocks waiting for by_group.write.
-        let prev_count = group.insert(descriptor);
+        let prev_count = group.insert(&descriptor);
         if prev_count == 0 && group.state.try_enter_root() {
             let gv = if reset_group_vruntime {
                 let root_min = self.min_vruntime();
@@ -421,6 +437,11 @@ impl ReadySet {
             self.groups.insert(key, group);
         }
         drop(by_group);
+        // The group's entry does not keep the descriptor alive, so this can
+        // be its last owner. Dropping it after the lock is released keeps the
+        // transfer's drop, which can re-enter the scheduler, outside
+        // `by_group`.
+        drop(descriptor);
         Ok(())
     }
 
@@ -435,12 +456,31 @@ impl ReadySet {
     /// through `poll_work` and released by `generate_work` after the
     /// poll outcome is handled. This is what guarantees at most one
     /// worker is inside `poll_work` for any given transfer at a time.
+    ///
+    /// Entries whose descriptors have been dropped are discarded, and the
+    /// pop continues from the root tree. Returns `None` once the root tree
+    /// is empty.
     pub(super) fn pop(&self) -> Option<TransferDescriptor> {
+        loop {
+            if let Some(descriptor) = self.pop_one_group()? {
+                return Some(descriptor);
+            }
+        }
+    }
+
+    /// Pops the lowest group's lowest member and returns the group to the
+    /// root tree if members remain.
+    ///
+    /// Returns `None` if the root tree is empty, and `Some(None)` if the
+    /// popped entry's descriptor has been dropped or the group had no entry.
+    /// The group's root-tree exit and re-entry run in every case, so its
+    /// root membership stays consistent with `nr_queued`.
+    fn pop_one_group(&self) -> Option<Option<TransferDescriptor>> {
         let entry = self.groups.pop_front()?;
         let group_key = *entry.key();
         let group = entry.value().clone();
 
-        let descriptor = group.pop()?;
+        let descriptor = group.pop().flatten();
 
         // Mark group as not in root tree (we just popped it out).
         group.state.exit_root();
@@ -575,7 +615,7 @@ impl ReadySet {
         let root_min = self.min_vruntime();
         let gv_arc = descriptor.group_vruntime_arc();
         let group = Arc::new(GroupQueue::new(gv_arc));
-        group.insert(descriptor);
+        group.insert(&descriptor);
         // Fresh group with a member goes directly into root tree.
         // No CAS needed: we just created it, no one else has a reference.
         group.state.in_root.store(true, Ordering::SeqCst);
@@ -620,7 +660,8 @@ mod tests {
     use crate::scheduler::MockTransfer;
     use std::sync::Arc as StdArc;
 
-    fn make_descriptor(
+    /// A descriptor that only the caller's clones keep alive.
+    fn make_unheld_descriptor(
         id: u64,
         parent: Option<u64>,
         priority: u8,
@@ -635,31 +676,50 @@ mod tests {
         desc
     }
 
+    fn make_descriptor(
+        id: u64,
+        parent: Option<u64>,
+        priority: u8,
+        vruntime: u64,
+    ) -> TransferDescriptor {
+        let desc = make_unheld_descriptor(id, parent, priority, vruntime);
+        // The ready set does not keep descriptors alive. Hold each one for
+        // the test thread's lifetime, as the scheduler registry does for a
+        // live transfer.
+        REGISTRY.with(|registry| registry.borrow_mut().push(desc.clone()));
+        desc
+    }
+
+    thread_local! {
+        static REGISTRY: std::cell::RefCell<Vec<TransferDescriptor>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
     #[cfg_attr(miri, ignore)]
     #[test]
     fn group_queue_insert_pop_single() {
         let gq = GroupQueue::new_with_initial_vruntime(0);
         let desc = make_descriptor(1, None, 128, 0);
-        gq.insert(desc.clone());
+        gq.insert(&desc);
         assert_eq!(gq.count(), 1);
 
-        let popped = gq.pop().unwrap();
+        let popped = gq.pop().flatten().unwrap();
         assert_eq!(popped.id().id, 1);
         assert_eq!(gq.count(), 0);
-        assert!(gq.pop().is_none());
+        assert!(gq.pop().flatten().is_none());
     }
 
     #[cfg_attr(miri, ignore)]
     #[test]
     fn group_queue_pop_lowest_vruntime() {
         let gq = GroupQueue::new_with_initial_vruntime(0);
-        gq.insert(make_descriptor(10, None, 128, 5));
-        gq.insert(make_descriptor(11, None, 128, 1));
-        gq.insert(make_descriptor(12, None, 128, 3));
+        gq.insert(&make_descriptor(10, None, 128, 5));
+        gq.insert(&make_descriptor(11, None, 128, 1));
+        gq.insert(&make_descriptor(12, None, 128, 3));
 
-        assert_eq!(gq.pop().unwrap().id().id, 11); // vruntime 1
-        assert_eq!(gq.pop().unwrap().id().id, 12); // vruntime 3
-        assert_eq!(gq.pop().unwrap().id().id, 10); // vruntime 5
+        assert_eq!(gq.pop().flatten().unwrap().id().id, 11); // vruntime 1
+        assert_eq!(gq.pop().flatten().unwrap().id().id, 12); // vruntime 3
+        assert_eq!(gq.pop().flatten().unwrap().id().id, 10); // vruntime 5
     }
 
     #[cfg_attr(miri, ignore)]
@@ -722,6 +782,122 @@ mod tests {
         // Pop picks group B (lower gv), then its lowest-vruntime member.
         let popped = set.pop().unwrap();
         assert_eq!(popped.id().id, 2);
+    }
+
+    // ref: V2429410200
+    /// A queued descriptor is dropped as soon as its last owner outside the
+    /// ready set drops it.
+    ///
+    /// A removed `SkipMap` node is freed only by epoch-based reclamation,
+    /// which has no bound on when it runs. A ready set that kept descriptors
+    /// alive would retain a retired transfer, and the destination file and
+    /// client handle it owns, after the scheduler drops it.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn ready_set_does_not_keep_descriptors_alive() {
+        let set = ReadySet::new();
+        let desc = make_unheld_descriptor(1, None, 128, 0);
+        let weak = desc.downgrade();
+        set.insert(desc).unwrap();
+
+        assert!(
+            weak.upgrade().is_none(),
+            "the queued entry owns its descriptor"
+        );
+        assert!(set.pop().is_none(), "popped a dropped descriptor");
+        assert!(set.is_empty());
+    }
+
+    // ref: V2429410200
+    /// A pop discards entries whose descriptors were dropped while queued and
+    /// returns the next live descriptor, leaving the emptied group out of the
+    /// root tree and its count at zero.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn pop_skips_dropped_descriptors_to_the_next_live_one() {
+        let set = ReadySet::new();
+        set.insert(make_unheld_descriptor(1, None, 128, 0)).unwrap();
+        set.insert(make_unheld_descriptor(11, Some(1), 128, 0))
+            .unwrap();
+        // Group 1 sorts first: both groups enter the root tree at the same
+        // vruntime, and ties break on the lower group id.
+        set.insert(make_descriptor(2, None, 128, 0)).unwrap();
+
+        assert_eq!(set.pop().map(|d| d.id().id), Some(2));
+        assert!(!set.root_contains_group(1));
+        assert_eq!(set.member_count(1), Some(0));
+        assert!(set.pop().is_none());
+    }
+
+    /// A state machine whose drop removes a group from `set`, standing in for
+    /// a transfer whose drop re-enters the scheduler.
+    struct RemovesGroupOnDrop {
+        set: StdArc<ReadySet>,
+        group_id: u64,
+    }
+
+    impl std::fmt::Debug for RemovesGroupOnDrop {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("RemovesGroupOnDrop")
+                .field("group_id", &self.group_id)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl crate::scheduler::transfer::mock::MockStateMachine for RemovesGroupOnDrop {
+        fn poll_work(&self, _id: TransferId) -> crate::transfer::PollWork {
+            crate::transfer::PollWork::Done
+        }
+
+        fn execute<'a>(
+            &'a self,
+            _work: &'a mut crate::transfer::IoRequest,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::transfer::WorkOutcome> + Send + 'a>,
+        > {
+            Box::pin(async { crate::transfer::WorkOutcome::Success { data: None } })
+        }
+    }
+
+    impl Drop for RemovesGroupOnDrop {
+        fn drop(&mut self) {
+            self.set.remove_group(self.group_id);
+        }
+    }
+
+    // ref: V2429410200
+    /// Inserting a descriptor that no one else holds drops its transfer
+    /// after the ready set's locks are released.
+    ///
+    /// The group's entry does not keep the descriptor alive, so an insert can
+    /// be its last owner. A transfer dropped while `by_group` is held would
+    /// deadlock if its drop re-entered the ready set for a write, as
+    /// `remove_group` does.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn insert_drops_an_unheld_descriptor_outside_the_ready_set_locks() {
+        let set = StdArc::new(ReadySet::new());
+        set.insert(make_descriptor(1, None, 128, 0)).unwrap();
+        let child = TransferDescriptor::new(Box::new(MockTransfer::new(
+            TransferId {
+                id: 11,
+                parent: Some(1),
+            },
+            StdArc::new(RemovesGroupOnDrop {
+                set: StdArc::clone(&set),
+                group_id: 2,
+            }),
+        )));
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let inserter = StdArc::clone(&set);
+        std::thread::spawn(move || {
+            inserter.insert(child).unwrap();
+            done_tx.send(()).unwrap();
+        });
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the insert deadlocked or panicked dropping its descriptor");
     }
 
     #[cfg_attr(miri, ignore)]
@@ -1029,6 +1205,84 @@ mod loom_tests {
 
             assert_eq!(group.count(), 3); // parent + 2 children
             assert!(group.is_in_root());
+        });
+    }
+
+    /// A group whose members may be released, their descriptors dropped,
+    /// while queued.
+    ///
+    /// Mirrors `GroupQueue::{insert, pop}` over non-owning entries, with
+    /// `ReadySet::pop_one_group`'s root exit and re-entry around a pop that
+    /// may remove a dropped member. A member is live while its flag is set.
+    struct LoomWeakGroup {
+        group: LoomGroup,
+        members: loom::sync::Mutex<std::collections::VecDeque<Arc<loom::sync::atomic::AtomicBool>>>,
+    }
+
+    impl LoomWeakGroup {
+        fn insert(&self, alive: Arc<loom::sync::atomic::AtomicBool>) {
+            self.members.lock().unwrap().push_back(alive);
+            let prev = self.group.state.enqueue();
+            if prev == 0 && self.group.state.try_enter_root() {
+                self.group.state.set_group_vruntime(0);
+                self.group.root_entries.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        /// Pops one member and returns whether it was live.
+        fn pop(&self) -> bool {
+            self.group.root_entries.fetch_sub(1, Ordering::SeqCst);
+            let found = match self.members.lock().unwrap().pop_front() {
+                Some(member) => {
+                    self.group.state.dequeue();
+                    member.load(Ordering::SeqCst)
+                }
+                None => false,
+            };
+            self.group.state.exit_root();
+            if self.group.state.nr_queued() > 0 && self.group.state.try_enter_root() {
+                self.group.root_entries.fetch_add(1, Ordering::SeqCst);
+            }
+            found
+        }
+    }
+
+    // ref: V2429410200
+    /// A pop that may remove a member dropped concurrently, racing an
+    /// insert, removes exactly one entry, leaves `nr_queued` equal to the
+    /// entries queued, and leaves the group in the root tree exactly when it
+    /// has members.
+    ///
+    /// Fails if a pop removes more than one entry per root-tree pop: the
+    /// second removal can take the racing insert's entry before its
+    /// `enqueue`, wrapping `nr_queued`.
+    #[test]
+    fn pop_skipping_a_released_member_concurrent_with_insert() {
+        loom::model(|| {
+            let first = Arc::new(loom::sync::atomic::AtomicBool::new(true));
+            let group = Arc::new(LoomWeakGroup {
+                group: LoomGroup::new(1),
+                members: loom::sync::Mutex::new([Arc::clone(&first)].into_iter().collect()),
+            });
+
+            let release = thread::spawn(move || first.store(false, Ordering::SeqCst));
+            let g = Arc::clone(&group);
+            let insert = thread::spawn(move || {
+                g.insert(Arc::new(loom::sync::atomic::AtomicBool::new(true)))
+            });
+            let _live = group.pop();
+            release.join().unwrap();
+            insert.join().unwrap();
+
+            let queued = group.members.lock().unwrap().len();
+            assert_eq!(queued, 1, "one root pop removes exactly one entry");
+            assert_eq!(group.group.count(), queued, "nr_queued drifted");
+            assert_eq!(
+                group.group.is_in_root(),
+                queued > 0,
+                "root membership wrong"
+            );
+            assert!(group.group.root_entries_valid(), "duplicate root entry");
         });
     }
 

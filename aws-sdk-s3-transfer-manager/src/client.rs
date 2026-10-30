@@ -846,15 +846,9 @@ mod tests {
                     assert!(observed.iter().all(|id| id.runtime_id() == execution.id()));
                 }
                 tokio::time::timeout(Duration::from_secs(5), async {
-                    // SkipMap retires scheduler descriptors through its global
-                    // epoch collector. Advance collection before checking final
-                    // owner destruction; retirement need not reclaim immediately.
-                    let retired = crossbeam_skiplist::SkipMap::new();
+                    // The last work item drops its handle on its worker after
+                    // `join` has returned.
                     while weak.upgrade().is_some() {
-                        for index in 0..256 {
-                            retired.insert(index, ());
-                            retired.remove(&index);
-                        }
                         tokio::task::yield_now().await;
                     }
                 })

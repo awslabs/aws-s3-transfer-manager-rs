@@ -34,8 +34,7 @@ panics. Ordinary public configuration exposes no execution crate types.
 Dropping unused adopted configuration or the final client owner requests runtime
 shutdown without synchronously joining managed threads. Pending async tasks are
 cancelled when the partition's Tokio runtime exits. Running blocking tasks and
-async tasks that do not yield can delay thread exit. Scheduler descriptors
-retired through epoch reclamation may retain client ownership until reclamation.
+async tasks that do not yield can delay thread exit.
 
 `Client::shutdown_completion` returns a non-owning observer for automatic and
 adopted managed execution, and `None` for caller-owned Tokio execution. Retaining

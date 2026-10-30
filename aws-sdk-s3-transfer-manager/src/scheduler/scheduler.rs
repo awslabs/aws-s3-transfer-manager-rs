@@ -73,6 +73,11 @@
 //! - **Ready set entries are unique per transfer id.** Duplicates re-open the
 //!   single-poll invariant and produce lock-contention storms under burst
 //!   completions.
+//! - **The registry owns each descriptor.** Ready set entries do not keep a
+//!   descriptor alive, so the scheduler releases its reference to a transfer
+//!   once the transfer has left the registry and no transient holder, such as
+//!   an in-progress poll, a dispatched work item, or a canceller waiting for
+//!   it to go idle, still holds its descriptor.
 //! - **Composite transfers pay their own per-call cost.** A composite's
 //!   `poll_work` may recursively call [`Scheduler::enqueue_transfer`] to spawn
 //!   children. The per-call fan-out must be bounded - cost is
@@ -141,6 +146,9 @@ use super::gate::GenerateWorkGate;
 pub(crate) struct Scheduler(Arc<SchedulerInner>);
 
 struct SchedulerInner {
+    /// Live transfers. The only owner of a descriptor apart from transient
+    /// holders, such as an in-progress poll, a dispatched work item, and a
+    /// canceller waiting for the transfer to go idle.
     transfers: RwLock<HashMap<TransferId, TransferDescriptor>>,
     ready_set: ReadySet,
     handle: Weak<crate::client::Handle>,
@@ -681,6 +689,13 @@ impl Scheduler {
     /// other caller's request is coalesced into an extra pass the runner makes
     /// on its behalf, so no wake is lost.
     fn generate_work(&self) {
+        // A popped or removed descriptor can be the last owner of its
+        // transfer, and through it of the client handle. Holding the handle
+        // keeps it alive until the pass ends. With the client gone there is
+        // nothing to generate.
+        let Some(_handle) = self.0.handle.upgrade() else {
+            return;
+        };
         // Become the sole runner, or bail — a request was recorded for the
         // active runner to drain on our behalf (this is also the re-entrancy
         // guard; see `GenerateWorkGate::try_acquire`).
@@ -1438,6 +1453,64 @@ mod tests {
             "completed transfer is still retained; completed work items: {completed:?}"
         );
         crate::runtime::test_util::shutdown(&handle).await;
+    }
+
+    /// Returns `Pending` on its first poll and `Done` after.
+    #[derive(Debug, Default)]
+    struct PendingThenDone {
+        polls: AtomicUsize,
+    }
+
+    impl MockStateMachine for PendingThenDone {
+        fn poll_work(&self, _id: TransferId) -> PollWork {
+            if self.polls.fetch_add(1, Ordering::SeqCst) == 0 {
+                PollWork::Pending
+            } else {
+                PollWork::Done
+            }
+        }
+
+        fn execute<'a>(
+            &'a self,
+            _work: &'a mut IoRequest,
+        ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
+            Box::pin(async { WorkOutcome::Success { data: None } })
+        }
+    }
+
+    // ref: V2429410200
+    /// A work-generation pass that retires the last transfer holding the
+    /// client handle finishes without panicking, and the handle is dropped
+    /// once the pass ends.
+    ///
+    /// The scheduler holds the handle weakly, and a wake reaches it without a
+    /// handle of its own. Once a retired transfer drops, nothing else may own
+    /// the handle; a pass that did not hold it would fail its next handle
+    /// lookup.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn generation_pass_survives_retiring_the_last_handle_owner() {
+        let handle = test_handle(1);
+        let scheduler = handle.scheduler.clone();
+        let released = Arc::downgrade(&handle);
+        let id = TransferId {
+            id: 1,
+            parent: None,
+        };
+        scheduler.enqueue_transfer(Box::new(MockTransfer::new_with_handle(
+            id,
+            Arc::new(PendingThenDone::default()),
+            Arc::clone(&handle),
+        )));
+        drop(handle);
+        assert!(
+            released.upgrade().is_some(),
+            "the pending transfer holds the handle"
+        );
+
+        scheduler.wake(id);
+        assert_eq!(scheduler.transfer_count(), 0, "transfer was not removed");
+        assert!(released.upgrade().is_none(), "the handle is still alive");
     }
 
     #[cfg_attr(miri, ignore)]

@@ -23,6 +23,7 @@ This index locates each invariant. The linked section is authoritative.
 - [Edge-triggered wake](scheduler.md#edge-triggered-wake)
 - [Execution-time yield](scheduler.md#execution-time-yield)
 - [Single-poll exclusivity](scheduler.md#single-poll-exclusivity)
+- [The registry owns the descriptor](scheduler.md#the-registry-owns-the-descriptor)
 - [Bounded per-call cost](scheduler.md#bounded-per-call-cost)
 
 ### Memory
