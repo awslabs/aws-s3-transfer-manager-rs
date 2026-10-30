@@ -7,6 +7,7 @@
 
 mod pending;
 
+use crate::config::user_agent::OperationFeatures;
 use crate::error;
 use crate::scheduler::concurrency::ErrorKind;
 use std::any::Any;
@@ -558,6 +559,8 @@ pub(crate) struct TransferContext {
     pending_state: Option<Arc<TransferPendingState>>,
     /// Per-transfer metrics backing store
     pub(crate) metrics: Arc<MetricsState>,
+    /// User agent features of the operation this transfer belongs to
+    features: OperationFeatures,
 }
 
 /// In-progress measurement for one logical transfer-manager request.
@@ -820,8 +823,41 @@ impl TransferContext {
             completion_tx: Arc::new(Mutex::new(Some(completion_tx))),
             wake_flag: Arc::new(wake_flag::WakeFlag::new()),
             pending_state,
+            features: OperationFeatures::default(),
         };
         (ctx, completion_rx)
+    }
+
+    /// Marks every request this transfer issues with `features`.
+    pub(crate) fn with_features(mut self, features: OperationFeatures) -> Self {
+        self.features = features;
+        self
+    }
+
+    /// [`Handle::bucket_partition_override`](crate::client::Handle::bucket_partition_override)
+    /// carrying this transfer's user agent features.
+    pub(crate) fn bucket_partition_override(
+        &self,
+        bucket: Option<&str>,
+    ) -> aws_sdk_s3::config::Builder {
+        self.features
+            .apply(self.handle.bucket_partition_override(bucket))
+    }
+
+    /// [`Handle::download_get_override`](crate::client::Handle::download_get_override)
+    /// carrying this transfer's user agent features.
+    pub(crate) fn download_get_override(
+        &self,
+        bucket: Option<&str>,
+    ) -> aws_sdk_s3::config::Builder {
+        self.features
+            .apply(self.handle.download_get_override(bucket))
+    }
+
+    /// [`Handle::upload_override`](crate::client::Handle::upload_override) carrying this
+    /// transfer's user agent features.
+    pub(crate) fn upload_override(&self, bucket: Option<&str>) -> aws_sdk_s3::config::Builder {
+        self.features.apply(self.handle.upload_override(bucket))
     }
 
     /// Create a new transfer context with a specific ID (for testing).
