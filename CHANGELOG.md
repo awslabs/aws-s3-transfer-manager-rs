@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.4.0] - Unreleased
 
+### Fixed
+- A finished transfer could stay alive indefinitely, and keep its client alive after the client was
+  dropped. A download to disk kept its destination file open, so on Windows other opens of the
+  file, such as an exclusive open or one that denies write sharing, failed with a sharing violation
+  after `join` returned.
+
 ### Changed
 - The `dial9` feature depends on `dial9` 0.5 instead of `dial9-tokio-telemetry` 0.3, and compiles
   without `--cfg tokio_unstable`. Per-task poll, spawn, and terminate events and per-worker queue

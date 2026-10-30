@@ -611,6 +611,25 @@ pop / `poll_work` / reinsert cycles, released only when `poll_work` returns
 use `ReadySet::reinsert_under_claim`, which bypasses the CAS because the
 caller still owns the claim.
 
+### Removal releases the descriptor
+
+**Invariant.** Once a descriptor leaves the ready set, by `pop` or by
+`remove_group`, the ready set holds no reference to it.
+
+**What it rules out.** The ready set's skip lists free a removed node only
+after epoch-based reclamation, which has no bound on when it runs. A removed
+node that still owned its descriptor would keep the transfer alive after the
+scheduler retires it. The transfer's context holds the client handle, and the
+handle owns the scheduler, so the retained transfer also forms a reference
+cycle that keeps the client alive after the caller drops it. Resources the
+transfer owns stay held with it: a download's destination file stays open, and
+on Windows other opens of the file fail with a sharing violation.
+
+**Mechanism.** Each group member is stored in a slot, and removing the member
+takes the descriptor out of the slot. `pop` takes the descriptor it returns.
+`remove_group` takes every member still queued in the removed group, which no
+pop reaches once the group leaves the root tree.
+
 ### Bounded per-call cost
 
 **Invariant.** `poll_work` is O(1) per call with a bounded critical
