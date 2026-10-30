@@ -465,7 +465,7 @@ async fn test_connect_time_reset_fails_dispatch() -> Result<()> {
     Ok(())
 }
 
-/// A `ServiceError` fault makes the GET return the configured HTTP error status
+/// An `Error` fault makes the GET return the error's HTTP status and code
 /// at send time (before any body), reaching the SDK's dispatch/retry layer
 /// rather than the body-read path. Retry is disabled so the fault is observed
 /// directly. `Once` fires for the first GET only; the next recovers.

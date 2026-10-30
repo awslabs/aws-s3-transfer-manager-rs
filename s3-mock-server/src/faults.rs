@@ -29,10 +29,11 @@ pub enum BodyCadence {
 
 /// What a fault does to a matching request. One effect per request.
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum FaultType {
     /// GET returns a valid-format but incorrect `x-amz-checksum-*` (first byte
-    /// XOR'd). Drives a download checksum mismatch.
+    /// XOR'd). Drives a download checksum mismatch. Has no effect on a GET whose
+    /// response has no checksum to corrupt, such as one without checksum mode.
     WrongStoredChecksum,
     /// GET returns tampered body bytes (byte 0 XOR'd) with the checksum left
     /// intact. Exercises body-content validation, not just header comparison.
@@ -56,17 +57,16 @@ pub enum FaultType {
     /// are written to the client (counted from when the fault fires). The client
     /// observes a `ConnectionReset`.
     ConnectionReset { after_bytes: u64 },
-    /// The request fails with an HTTP error status before it is served, e.g. 503
-    /// SlowDown. Unlike the body-stream faults, this reaches the SDK's retry and
-    /// token-bucket layer rather than the TM body-read loop. Retryable statuses
-    /// (500/503) drive the SDK to spend retry tokens.
+    /// The request fails with this error before it is served, e.g.
+    /// [`Error::SlowDown`](crate::Error::SlowDown). Unlike the body-stream faults, this
+    /// reaches the SDK's retry and token-bucket layer rather than the TM body-read loop.
+    /// Retryable errors (500/503) drive the SDK to spend retry tokens.
     ///
-    /// The response has HTTP `status` and S3 error `code` (for example 403
-    /// `AccessDenied`); storage is not read or modified, and the request body is not
-    /// read. `status` is meant to be a 4xx or 5xx status: a value that is not a valid
-    /// HTTP status code is sent as 500. [`FaultType::internal_error`] and
-    /// [`FaultType::slow_down`] build the two retryable errors S3 sends.
-    ServiceError { status: u16, code: &'static str },
+    /// The response is the error's S3 error response: its code, HTTP status and message.
+    /// Storage is not read or modified, and the request body is not read.
+    /// [`FaultType::internal_error`] and [`FaultType::slow_down`] build the two retryable errors
+    /// S3 sends.
+    Error(crate::Error),
     /// While reading the request (upload) body, consume up to `after_bytes` then
     /// stall (stop reading, never complete). The client's request-body poll parks
     /// indefinitely, which stalled-stream protection observes as a stall.
@@ -163,41 +163,18 @@ impl FaultTarget {
 }
 
 impl FaultType {
-    /// A [`ServiceError`](Self::ServiceError) with 500 `InternalError`.
-    pub const fn internal_error() -> Self {
-        FaultType::ServiceError {
-            status: 500,
-            code: "InternalError",
-        }
+    /// An [`Error`](Self::Error) fault with 500 `InternalError`, an internal error of the server.
+    pub fn internal_error() -> Self {
+        FaultType::Error(crate::Error::Internal("injected fault".to_string()))
     }
 
-    /// A [`ServiceError`](Self::ServiceError) with 503 `SlowDown`, S3's throttling error.
+    /// An [`Error`](Self::Error) fault with 503 `SlowDown`, S3's throttling error.
     pub const fn slow_down() -> Self {
-        FaultType::ServiceError {
-            status: 503,
-            code: "SlowDown",
-        }
-    }
-
-    /// The error response of a fault that fails the request before it is served.
-    pub(crate) fn error_response(&self) -> Option<s3s::S3Error> {
-        match *self {
-            FaultType::ServiceError { status, code } => {
-                let code = s3s::S3ErrorCode::from_bytes(code.as_bytes())
-                    .unwrap_or_else(|| s3s::S3ErrorCode::Custom(code.into()));
-                let mut error = s3s::S3Error::with_message(code, "Injected fault");
-                match http::StatusCode::from_u16(status) {
-                    Ok(status) => error.set_status_code(status),
-                    Err(_) => error.set_status_code(http::StatusCode::INTERNAL_SERVER_ERROR),
-                }
-                Some(error)
-            }
-            _ => None,
-        }
+        FaultType::Error(crate::Error::SlowDown)
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct FaultEntry {
     fault: FaultType,
     /// Warm-up: matching requests before this entry becomes eligible, measured
@@ -297,7 +274,7 @@ impl FaultRegistry {
             if seen <= entry.skip {
                 continue;
             }
-            let fault = entry.fault;
+            let fault = entry.fault.clone();
             let occurrence = entry.occurrence;
             let pop = match entry.occurrence {
                 Occurrence::Once => true,
@@ -339,10 +316,10 @@ mod tests {
             Occurrence::Always,
         );
         for _ in 0..5 {
-            assert_eq!(
+            assert!(matches!(
                 r.next_fault(Operation::GetObject, Some("b"), Some("k")),
                 Some(FaultType::CorruptBody)
-            );
+            ));
         }
     }
 
@@ -355,14 +332,13 @@ mod tests {
             0,
             Occurrence::Once,
         );
-        assert_eq!(
+        assert!(matches!(
             r.next_fault(Operation::GetObject, Some("b"), Some("k")),
             Some(FaultType::CorruptBody)
-        );
-        assert_eq!(
-            r.next_fault(Operation::GetObject, Some("b"), Some("k")),
-            None
-        );
+        ));
+        assert!(r
+            .next_fault(Operation::GetObject, Some("b"), Some("k"))
+            .is_none());
     }
 
     #[test]
@@ -380,10 +356,9 @@ mod tests {
         assert!(r
             .next_fault(Operation::GetObject, Some("b"), Some("k"))
             .is_some());
-        assert_eq!(
-            r.next_fault(Operation::GetObject, Some("b"), Some("k")),
-            None
-        );
+        assert!(r
+            .next_fault(Operation::GetObject, Some("b"), Some("k"))
+            .is_none());
     }
 
     #[test]
@@ -395,14 +370,12 @@ mod tests {
             2,
             Occurrence::Always,
         );
-        assert_eq!(
-            r.next_fault(Operation::GetObject, Some("b"), Some("k")),
-            None
-        ); // req 1
-        assert_eq!(
-            r.next_fault(Operation::GetObject, Some("b"), Some("k")),
-            None
-        ); // req 2
+        assert!(r
+            .next_fault(Operation::GetObject, Some("b"), Some("k"))
+            .is_none()); // req 1
+        assert!(r
+            .next_fault(Operation::GetObject, Some("b"), Some("k"))
+            .is_none()); // req 2
         assert!(r
             .next_fault(Operation::GetObject, Some("b"), Some("k"))
             .is_some()); // req 3
@@ -426,18 +399,18 @@ mod tests {
             0,
             Occurrence::Always,
         );
-        assert_eq!(
+        assert!(matches!(
             r.next_fault(Operation::GetObject, Some("b"), Some("k")),
             Some(FaultType::CorruptBody)
-        );
-        assert_eq!(
+        ));
+        assert!(matches!(
             r.next_fault(Operation::GetObject, Some("b"), Some("k")),
             Some(FaultType::WrongStoredChecksum)
-        );
-        assert_eq!(
+        ));
+        assert!(matches!(
             r.next_fault(Operation::GetObject, Some("b"), Some("k")),
             Some(FaultType::WrongStoredChecksum)
-        );
+        ));
     }
 
     #[test]
@@ -453,10 +426,9 @@ mod tests {
             .next_fault(Operation::GetObject, Some("b"), Some("k"))
             .is_some());
         r.clear(&FaultTarget::object("b", "k"));
-        assert_eq!(
-            r.next_fault(Operation::GetObject, Some("b"), Some("k")),
-            None
-        );
+        assert!(r
+            .next_fault(Operation::GetObject, Some("b"), Some("k"))
+            .is_none());
     }
 
     #[test]
@@ -468,10 +440,9 @@ mod tests {
             0,
             Occurrence::Always,
         );
-        assert_eq!(
-            r.next_fault(Operation::GetObject, Some("b"), Some("k2")),
-            None
-        );
+        assert!(r
+            .next_fault(Operation::GetObject, Some("b"), Some("k2"))
+            .is_none());
         assert!(r
             .next_fault(Operation::GetObject, Some("b"), Some("k1"))
             .is_some());
@@ -492,97 +463,93 @@ mod tests {
             (Operation::GetObject, "other", "k"),
             (Operation::GetObject, "b", "other"),
         ] {
-            assert_eq!(r.next_fault(operation, Some(bucket), Some(key)), None);
+            assert!(r.next_fault(operation, Some(bucket), Some(key)).is_none());
         }
         // The first covered request is the skipped one; the next ones fire.
-        assert_eq!(
-            r.next_fault(Operation::PutObject, Some("b"), Some("k")),
-            None
-        );
+        assert!(r
+            .next_fault(Operation::PutObject, Some("b"), Some("k"))
+            .is_none());
         for operation in [Operation::UploadPart, Operation::GetObject] {
-            assert_eq!(
+            assert!(matches!(
                 r.next_fault(operation, Some("b"), Some("k")),
                 Some(FaultType::CorruptBody)
-            );
+            ));
         }
     }
 
     #[test]
     fn operation_target_matches_any_bucket_and_key_unless_restricted() {
-        let fault = FaultType::ServiceError {
-            status: 403,
-            code: "AccessDenied",
-        };
         let r = reg();
         r.insert(
             FaultTarget::operation(Operation::ListObjectsV2),
-            fault,
+            FaultType::Error(crate::Error::AccessDenied),
             0,
             Occurrence::Always,
         );
-        assert_eq!(
+        assert!(matches!(
             r.next_fault(Operation::ListObjectsV2, Some("b"), None),
-            Some(fault)
-        );
-        assert_eq!(
+            Some(FaultType::Error(crate::Error::AccessDenied))
+        ));
+        assert!(matches!(
             r.next_fault(Operation::ListObjectsV2, Some("other"), Some("prefix/")),
-            Some(fault)
-        );
-        assert_eq!(
-            r.next_fault(Operation::HeadObject, Some("b"), Some("k")),
-            None
-        );
+            Some(FaultType::Error(crate::Error::AccessDenied))
+        ));
+        assert!(r
+            .next_fault(Operation::HeadObject, Some("b"), Some("k"))
+            .is_none());
 
         let r = reg();
         r.insert(
             FaultTarget::operation(Operation::HeadObject)
                 .bucket("b")
                 .key("k"),
-            fault,
+            FaultType::Error(crate::Error::AccessDenied),
             0,
             Occurrence::Always,
         );
-        assert_eq!(
+        assert!(matches!(
             r.next_fault(Operation::HeadObject, Some("b"), Some("k")),
-            Some(fault)
-        );
-        assert_eq!(
-            r.next_fault(Operation::HeadObject, Some("b"), Some("x")),
-            None
-        );
-        assert_eq!(
-            r.next_fault(Operation::HeadObject, Some("x"), Some("k")),
-            None
-        );
-        assert_eq!(r.next_fault(Operation::HeadObject, Some("b"), None), None);
+            Some(FaultType::Error(crate::Error::AccessDenied))
+        ));
+        assert!(r
+            .next_fault(Operation::HeadObject, Some("b"), Some("x"))
+            .is_none());
+        assert!(r
+            .next_fault(Operation::HeadObject, Some("x"), Some("k"))
+            .is_none());
+        assert!(r
+            .next_fault(Operation::HeadObject, Some("b"), None)
+            .is_none());
     }
 
     #[test]
     fn first_registered_matching_target_fires_and_every_match_counts() {
-        let first = FaultType::internal_error();
-        let second = FaultType::CorruptBody;
         let r = reg();
         r.insert(
             FaultTarget::operation(Operation::GetObject).key("k"),
-            first,
+            FaultType::internal_error(),
             0,
             Occurrence::Once,
         );
-        r.insert(FaultTarget::object("b", "k"), second, 1, Occurrence::Once);
+        r.insert(
+            FaultTarget::object("b", "k"),
+            FaultType::CorruptBody,
+            1,
+            Occurrence::Once,
+        );
         // Both targets count the first request; only the first target fires.
-        assert_eq!(
+        assert!(matches!(
             r.next_fault(Operation::GetObject, Some("b"), Some("k")),
-            Some(first)
-        );
+            Some(FaultType::Error(crate::Error::Internal(_)))
+        ));
         // The second target has seen one request, so its skip of 1 is used up.
-        assert_eq!(
+        assert!(matches!(
             r.next_fault(Operation::GetObject, Some("b"), Some("k")),
-            Some(second)
-        );
-        assert_eq!(
-            r.next_fault(Operation::GetObject, Some("b"), Some("k")),
-            None
-        );
+            Some(FaultType::CorruptBody)
+        ));
+        assert!(r
+            .next_fault(Operation::GetObject, Some("b"), Some("k"))
+            .is_none());
     }
 
     #[test]
@@ -601,60 +568,34 @@ mod tests {
             Occurrence::Always,
         );
         r.clear_all();
-        assert_eq!(
-            r.next_fault(Operation::GetObject, Some("b"), Some("k")),
-            None
-        );
-        assert_eq!(
-            r.next_fault(Operation::HeadObject, Some("b"), Some("k")),
-            None
-        );
+        assert!(r
+            .next_fault(Operation::GetObject, Some("b"), Some("k"))
+            .is_none());
+        assert!(r
+            .next_fault(Operation::HeadObject, Some("b"), Some("k"))
+            .is_none());
     }
 
     #[test]
-    fn service_error_carries_status_and_code() {
-        let error = FaultType::ServiceError {
-            status: 404,
-            code: "NoSuchKey",
-        }
-        .error_response()
-        .unwrap();
-        assert_eq!(error.code(), &s3s::S3ErrorCode::NoSuchKey);
-        assert_eq!(error.status_code(), Some(http::StatusCode::NOT_FOUND));
-
-        let error = FaultType::ServiceError {
-            status: 400,
-            code: "SomethingNew",
-        }
-        .error_response()
-        .unwrap();
-        assert_eq!(error.code().as_str(), "SomethingNew");
-        assert_eq!(error.status_code(), Some(http::StatusCode::BAD_REQUEST));
-
-        let error = FaultType::ServiceError {
-            status: 42,
-            code: "AccessDenied",
-        }
-        .error_response()
-        .unwrap();
-        assert_eq!(
-            error.status_code(),
-            Some(http::StatusCode::INTERNAL_SERVER_ERROR)
-        );
-
-        let error = FaultType::internal_error().error_response().unwrap();
+    fn helpers_fail_with_retryable_errors() {
+        let FaultType::Error(error) = FaultType::internal_error() else {
+            panic!("internal_error is an Error fault");
+        };
+        let error = s3s::S3Error::from(error);
         assert_eq!(error.code(), &s3s::S3ErrorCode::InternalError);
         assert_eq!(
             error.status_code(),
             Some(http::StatusCode::INTERNAL_SERVER_ERROR)
         );
-        let error = FaultType::slow_down().error_response().unwrap();
+
+        let FaultType::Error(error) = FaultType::slow_down() else {
+            panic!("slow_down is an Error fault");
+        };
+        let error = s3s::S3Error::from(error);
         assert_eq!(error.code(), &s3s::S3ErrorCode::SlowDown);
         assert_eq!(
             error.status_code(),
             Some(http::StatusCode::SERVICE_UNAVAILABLE)
         );
-
-        assert!(FaultType::CorruptBody.error_response().is_none());
     }
 }

@@ -374,8 +374,12 @@ async fn slow_progressing_body_download_completes() {
 async fn corrupt_body_always_fails() {
     let t = Target::mock_gp().connect_with(Some(PART_SIZE)).await;
     let data = multipart_data();
-    t.put("obj", data, ChecksumStrategy::with_calculated_crc32())
-        .await;
+    t.put(
+        "obj",
+        data,
+        ChecksumStrategy::with_calculated_crc32_composite_if_multipart(),
+    )
+    .await;
 
     let mock = t.mock().expect("requires the mock backend");
     mock.insert_fault(
@@ -401,8 +405,12 @@ async fn corrupt_body_always_fails() {
 async fn corrupt_body_once_is_not_retried() {
     let t = Target::mock_gp().connect_with(Some(PART_SIZE)).await;
     let data = multipart_data();
-    t.put("obj", data, ChecksumStrategy::with_calculated_crc32())
-        .await;
+    t.put(
+        "obj",
+        data,
+        ChecksumStrategy::with_calculated_crc32_composite_if_multipart(),
+    )
+    .await;
 
     let mock = t.mock().expect("requires the mock backend");
     mock.insert_fault(

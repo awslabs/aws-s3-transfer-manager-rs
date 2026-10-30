@@ -93,8 +93,11 @@ impl StorageBackend for InMemoryStorage {
         let content_length = content.len() as u64;
         let object_integrity = integrity_checks.finalize();
         if let Some(client_checksums) = &request.client_checksums {
-            if let Err(error_msg) = object_integrity.validate(client_checksums) {
-                return Err(Error::ChecksumMismatch(error_msg.to_string()));
+            if let Err(algorithm) = object_integrity.validate(client_checksums) {
+                return Err(Error::BadDigest {
+                    algorithm,
+                    completion: false,
+                });
             }
         }
         let last_modified = request.last_modified.unwrap_or_else(SystemTime::now);
@@ -102,7 +105,10 @@ impl StorageBackend for InMemoryStorage {
         let metadata = ObjectMetadata {
             content_type: request.content_type,
             content_length,
-            etag: object_integrity.etag().unwrap_or_default(),
+            etag: request
+                .etag
+                .clone()
+                .unwrap_or_else(|| object_integrity.etag().unwrap_or_default()),
             last_modified,
             user_metadata: request.user_metadata,
             checksum_algorithm: None,
@@ -118,6 +124,7 @@ impl StorageBackend for InMemoryStorage {
             content_disposition: request.content_disposition,
             content_language: request.content_language,
             parts: Vec::new(),
+            restore_status: request.restore_status,
         };
 
         let mut buckets = self.buckets.write().await;
@@ -253,9 +260,7 @@ impl StorageBackend for InMemoryStorage {
     async fn delete_bucket(&self, bucket: &str) -> Result<()> {
         let mut buckets = self.buckets.write().await;
         match buckets.get(bucket) {
-            Some(state) if !state.objects.is_empty() => {
-                Err(Error::Internal("bucket is not empty".to_string()))
-            }
+            Some(state) if !state.objects.is_empty() => Err(Error::BucketNotEmpty),
             Some(_) => {
                 buckets.remove(bucket);
                 Ok(())
@@ -443,7 +448,7 @@ impl StorageBackend for InMemoryStorage {
                         return Err(Error::InvalidPart);
                     }
                 }
-                None => return Err(Error::NoSuchPart),
+                None => return Err(Error::InvalidPart),
             }
         }
 
@@ -587,8 +592,11 @@ impl StorageBackend for InMemoryStorage {
 
         // Validate against client-provided checksum if present
         if let Some(client_checksums) = request.client_checksums {
-            if let Err(error_msg) = object_integrity.validate(client_checksums) {
-                return Err(Error::ChecksumMismatch(error_msg.to_string()));
+            if let Err(algorithm) = object_integrity.validate(client_checksums) {
+                return Err(Error::BadDigest {
+                    algorithm,
+                    completion: true,
+                });
             }
         }
 
@@ -641,6 +649,41 @@ impl StorageBackend for InMemoryStorage {
         }
         multipart.parts.remove(upload_id);
 
+        Ok(())
+    }
+
+    async fn list_multipart_uploads(
+        &self,
+        bucket: &str,
+    ) -> Result<Vec<crate::storage::MultipartUploadInfo>> {
+        let multipart = self.multipart.read().await;
+        let mut uploads: Vec<_> = multipart
+            .uploads
+            .values()
+            .filter(|upload| upload.bucket.as_deref() == Some(bucket))
+            .map(|upload| crate::storage::MultipartUploadInfo {
+                key: upload.key.clone(),
+                upload_id: upload.upload_id.clone(),
+            })
+            .collect();
+        uploads.sort();
+        Ok(uploads)
+    }
+
+    async fn update_metadata(
+        &self,
+        bucket: &str,
+        key: &str,
+        update: crate::storage::MetadataUpdate,
+    ) -> Result<()> {
+        let mut buckets = self.buckets.write().await;
+        let (_, metadata) = buckets
+            .get_mut(bucket)
+            .ok_or(Error::NoSuchBucket)?
+            .objects
+            .get_mut(key)
+            .ok_or(Error::NoSuchKey)?;
+        update(metadata);
         Ok(())
     }
 
@@ -1058,6 +1101,7 @@ mod tests {
             sha1: None,
             sha256: None,
             crc64nvme: None,
+            md5: None,
         };
 
         let result = storage
@@ -1068,7 +1112,13 @@ mod tests {
                 client_checksums: Some(&invalid_checksum),
             })
             .await;
-        assert!(matches!(result, Err(Error::ChecksumMismatch(_))));
+        assert!(matches!(
+            result,
+            Err(Error::BadDigest {
+                completion: true,
+                ..
+            })
+        ));
         assert_eq!(
             storage.list_parts(upload_id).await.unwrap().len(),
             1,

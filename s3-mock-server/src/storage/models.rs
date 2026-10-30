@@ -115,6 +115,23 @@ pub(crate) struct ObjectMetadata {
     /// part's checksum (matching real S3).
     #[serde(default)]
     pub parts: Vec<ObjectPart>,
+
+    /// Restore status of an object in an archival storage class, reported in the
+    /// `x-amz-restore` header.
+    #[serde(default)]
+    pub restore_status: Option<RestoreStatus>,
+}
+
+/// Restore status of an object in an archival storage class (`GLACIER`, `DEEP_ARCHIVE`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RestoreStatus {
+    /// A restore is in progress; the object cannot be read yet.
+    InProgress,
+    /// A restored copy is readable until `expiry`.
+    Restored {
+        /// When the restored copy expires.
+        expiry: SystemTime,
+    },
 }
 
 /// A completed multipart object's part: its size and per-algorithm checksum.
@@ -166,6 +183,24 @@ impl ObjectMetadata {
         self.clear_checksums();
     }
 
+    /// Resolve the checksum headers for a partNumber GET or HEAD: a multipart object reports the
+    /// checksum of part `part_number`, even when that part is the whole object. An object
+    /// uploaded in one request keeps its checksum, as its single part.
+    pub(crate) fn apply_part_checksums(&mut self, part_number: i32) {
+        let part = usize::try_from(part_number)
+            .ok()
+            .and_then(|n| n.checked_sub(1))
+            .and_then(|index| self.parts.get(index))
+            .cloned();
+        if let Some(part) = part {
+            self.crc32 = part.crc32;
+            self.crc32c = part.crc32c;
+            self.crc64nvme = part.crc64nvme;
+            self.sha1 = part.sha1;
+            self.sha256 = part.sha256;
+        }
+    }
+
     /// Byte range `[start, end)` of the 1-based `part_number` for a completed
     /// multipart object, from the stored part boundaries. `None` if the object
     /// has no parts (single-PUT) or the part number is out of range. Matches S3's
@@ -183,9 +218,40 @@ impl ObjectMetadata {
         Some(start..end)
     }
 
+    /// Whether the object is in an archival storage class without a restored copy, so its data
+    /// cannot be read. The expiry of a restored copy is not enforced.
+    pub(crate) fn is_archived(&self) -> bool {
+        self.is_archival_class()
+            && !matches!(self.restore_status, Some(RestoreStatus::Restored { .. }))
+    }
+
+    /// Whether the object is in a storage class whose data must be restored before it can be
+    /// read: `GLACIER` or `DEEP_ARCHIVE`.
+    pub(crate) fn is_archival_class(&self) -> bool {
+        matches!(
+            self.storage_class.as_deref(),
+            Some("GLACIER") | Some("DEEP_ARCHIVE")
+        )
+    }
+
     /// Number of stored parts for a completed multipart object (0 for single-PUT).
     pub(crate) fn parts_count(&self) -> usize {
         self.parts.len()
+    }
+
+    /// The algorithms of the checksums the object stores.
+    pub(crate) fn checksum_algorithms(&self) -> Vec<aws_smithy_checksums::ChecksumAlgorithm> {
+        use aws_smithy_checksums::ChecksumAlgorithm;
+        [
+            (self.crc32.is_some(), ChecksumAlgorithm::Crc32),
+            (self.crc32c.is_some(), ChecksumAlgorithm::Crc32c),
+            (self.crc64nvme.is_some(), ChecksumAlgorithm::Crc64Nvme),
+            (self.sha1.is_some(), ChecksumAlgorithm::Sha1),
+            (self.sha256.is_some(), ChecksumAlgorithm::Sha256),
+        ]
+        .into_iter()
+        .filter_map(|(stored, algorithm)| stored.then_some(algorithm))
+        .collect()
     }
 }
 
@@ -210,6 +276,7 @@ impl Default for ObjectMetadata {
             content_disposition: None,
             content_language: None,
             parts: Vec::new(),
+            restore_status: None,
         }
     }
 }

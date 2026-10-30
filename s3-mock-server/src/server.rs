@@ -10,6 +10,7 @@ use crate::faults::{FaultTarget, FaultType, Occurrence};
 use crate::s3s::{Inner, ServerState};
 use crate::storage::filesystem::FilesystemStorage;
 use crate::storage::in_memory::InMemoryStorage;
+use crate::storage::models::RestoreStatus;
 use crate::storage::StorageBackend;
 use crate::Operation;
 use aws_sdk_s3::config::{Credentials, Region};
@@ -178,6 +179,10 @@ pub struct ObjectData {
     pub last_modified: std::time::SystemTime,
     /// User-defined metadata.
     pub metadata: std::collections::HashMap<String, String>,
+    /// Storage class, if one was set when the object was stored.
+    pub storage_class: Option<String>,
+    /// Restore status of an object in an archival storage class.
+    pub restore_status: Option<RestoreStatus>,
 }
 
 /// Summary information about an object in a listing.
@@ -198,6 +203,15 @@ pub struct AddObjectRequest {
     pub content_type: Option<String>,
     pub metadata: Option<std::collections::HashMap<String, String>>,
     pub last_modified: Option<std::time::SystemTime>,
+    /// The ETag to store, with or without quotes. Defaults to the MD5 of the content.
+    pub etag: Option<String>,
+    /// The storage class, such as `GLACIER`. Defaults to none, which S3 reports as `STANDARD`.
+    pub storage_class: Option<aws_sdk_s3::types::StorageClass>,
+    /// The restore status of an object in an archival storage class.
+    pub restore_status: Option<RestoreStatus>,
+    /// The algorithms of the checksums to compute and store. Defaults to CRC64NVME, the
+    /// checksum S3 computes for objects uploaded without one; an empty list stores none.
+    pub checksum_algorithms: Option<Vec<aws_sdk_s3::types::ChecksumAlgorithm>>,
 }
 
 impl AddObjectRequest {
@@ -207,6 +221,10 @@ impl AddObjectRequest {
             content_type: None,
             metadata: None,
             last_modified: None,
+            etag: None,
+            storage_class: None,
+            restore_status: None,
+            checksum_algorithms: None,
         }
     }
 
@@ -224,6 +242,42 @@ impl AddObjectRequest {
         self.last_modified = Some(time);
         self
     }
+
+    /// Store `etag` as the object's ETag instead of the MD5 of the content. Quotes are added
+    /// if missing.
+    pub fn etag(mut self, etag: impl Into<String>) -> Self {
+        self.etag = Some(etag.into());
+        self
+    }
+
+    pub fn storage_class(mut self, storage_class: aws_sdk_s3::types::StorageClass) -> Self {
+        self.storage_class = Some(storage_class);
+        self
+    }
+
+    pub fn restore_status(mut self, status: RestoreStatus) -> Self {
+        self.restore_status = Some(status);
+        self
+    }
+
+    /// Compute and store checksums with these algorithms instead of CRC64NVME. An empty list
+    /// stores no checksum.
+    pub fn checksum_algorithms(
+        mut self,
+        algorithms: impl IntoIterator<Item = aws_sdk_s3::types::ChecksumAlgorithm>,
+    ) -> Self {
+        self.checksum_algorithms = Some(algorithms.into_iter().collect());
+        self
+    }
+}
+
+/// A multipart upload in progress.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultipartUploadEntry {
+    /// The key of the object being uploaded.
+    pub key: String,
+    /// The upload ID.
+    pub upload_id: String,
 }
 
 /// S3 Mock Server.
@@ -281,14 +335,38 @@ impl S3MockServer {
 
         // Match HTTP PutObject path's default integrity checks so seeded
         // objects have the same HeadObject state (ETag via md5, default
-        // CRC64NVME checksum) as objects uploaded via the S3 API.
-        let integrity_checks = ObjectIntegrityChecks::new().with_md5().with_crc64nvme();
+        // CRC64NVME checksum) as objects uploaded via the S3 API. The MD5 is
+        // skipped when the ETag is given, since hashing large seeded objects
+        // dominates seeding time in unoptimized test builds.
+        let mut integrity_checks = match request.etag {
+            Some(_) => ObjectIntegrityChecks::new(),
+            None => ObjectIntegrityChecks::new().with_md5(),
+        };
+        match &request.checksum_algorithms {
+            None => integrity_checks = integrity_checks.with_crc64nvme(),
+            Some(algorithms) => {
+                for algorithm in algorithms {
+                    let algorithm = crate::types::stored_checksum_algorithm(algorithm.as_str())
+                        .ok_or_else(|| {
+                            Error::InvalidConfiguration(format!(
+                                "unsupported checksum algorithm {algorithm}"
+                            ))
+                        })?;
+                    integrity_checks = integrity_checks.with_checksum_algorithm(algorithm);
+                }
+            }
+        }
 
         let mut store_req =
             StoreObjectRequest::new(bucket, key.to_string(), boxed_stream, integrity_checks)
                 .with_user_metadata(request.metadata.unwrap_or_default());
         store_req.content_type = request.content_type;
         store_req.last_modified = request.last_modified;
+        store_req.etag = request
+            .etag
+            .map(|etag| format!("\"{}\"", etag.trim_matches('"')));
+        store_req.storage_class = request.storage_class.map(|class| class.as_str().to_owned());
+        store_req.restore_status = request.restore_status;
 
         self.storage.put_object(store_req).await?;
         Ok(())
@@ -420,7 +498,41 @@ impl S3MockServer {
             etag: response.metadata.etag,
             last_modified: response.metadata.last_modified,
             metadata: response.metadata.user_metadata,
+            storage_class: response.metadata.storage_class,
+            restore_status: response.metadata.restore_status,
         }))
+    }
+
+    /// The multipart uploads in progress in `bucket`, ordered by key and then upload ID.
+    pub async fn list_multipart_uploads(&self, bucket: &str) -> Result<Vec<MultipartUploadEntry>> {
+        Ok(self
+            .storage
+            .list_multipart_uploads(bucket)
+            .await?
+            .into_iter()
+            .map(|upload| MultipartUploadEntry {
+                key: upload.key,
+                upload_id: upload.upload_id,
+            })
+            .collect())
+    }
+
+    /// Set the restore status of an object, leaving its data and its storage class unchanged.
+    ///
+    /// Fails with [`Error::NoSuchKey`] or [`Error::NoSuchBucket`] if the object does not exist.
+    pub async fn set_restore_status(
+        &self,
+        bucket: &str,
+        key: &str,
+        status: Option<RestoreStatus>,
+    ) -> Result<()> {
+        self.storage
+            .update_metadata(
+                bucket,
+                key,
+                Box::new(move |metadata| metadata.restore_status = status),
+            )
+            .await
     }
 
     /// List objects in a bucket with optional prefix.

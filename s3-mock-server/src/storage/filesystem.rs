@@ -182,7 +182,7 @@ impl FilesystemStorage {
 
         // Serialize and write metadata
         let json =
-            serde_json::to_string(metadata).map_err(|e| Error::Io(std::io::Error::other(e)))?;
+            serde_json::to_string(metadata).map_err(|e| Error::from(std::io::Error::other(e)))?;
         fs::write(path, json).await?;
         Ok(())
     }
@@ -191,12 +191,12 @@ impl FilesystemStorage {
     async fn load_metadata<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>> {
         match fs::read_to_string(path).await {
             Ok(json) => {
-                let metadata =
-                    serde_json::from_str(&json).map_err(|e| Error::Io(std::io::Error::other(e)))?;
+                let metadata = serde_json::from_str(&json)
+                    .map_err(|e| Error::from(std::io::Error::other(e)))?;
                 Ok(Some(metadata))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(Error::Io(e)),
+            Err(e) => Err(Error::from(e)),
         }
     }
 
@@ -293,7 +293,10 @@ impl StorageBackend for FilesystemStorage {
         if let Some(client_checksums) = &request.client_checksums {
             object_integrity
                 .validate(client_checksums)
-                .map_err(|error_msg| Error::ChecksumMismatch(error_msg.to_string()))?;
+                .map_err(|algorithm| Error::BadDigest {
+                    algorithm,
+                    completion: false,
+                })?;
         }
         // Checked just before the object is replaced, but not atomically with it: a concurrent
         // write to the same key can land in between.
@@ -307,7 +310,10 @@ impl StorageBackend for FilesystemStorage {
         let metadata = ObjectMetadata {
             content_type: request.content_type,
             content_length,
-            etag: object_integrity.etag().unwrap_or_default(),
+            etag: request
+                .etag
+                .clone()
+                .unwrap_or_else(|| object_integrity.etag().unwrap_or_default()),
             last_modified,
             user_metadata: request.user_metadata,
             checksum_algorithm: None,
@@ -323,6 +329,7 @@ impl StorageBackend for FilesystemStorage {
             content_disposition: request.content_disposition,
             content_language: request.content_language,
             parts: Vec::new(),
+            restore_status: request.restore_status,
         };
         let metadata_path = self.get_object_metadata_path(&request.bucket, &request.key);
         Self::save_metadata(&metadata_path, &metadata).await?;
@@ -347,7 +354,7 @@ impl StorageBackend for FilesystemStorage {
         let mut file = match fs::File::open(&path).await {
             Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(Error::Io(e)),
+            Err(e) => return Err(Error::from(e)),
         };
 
         // Handle range request
@@ -400,7 +407,7 @@ impl StorageBackend for FilesystemStorage {
         match fs::remove_file(&path).await {
             Ok(()) => (),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(Error::Io(e)),
+            Err(e) => return Err(Error::from(e)),
         }
 
         // Try to delete metadata, but don't error if it's already gone
@@ -581,7 +588,7 @@ impl StorageBackend for FilesystemStorage {
             let part_metadata_path = self.get_part_metadata_path(request.upload_id, *part_number);
             let part_metadata: PartMetadata = Self::load_metadata(&part_metadata_path)
                 .await?
-                .ok_or(Error::NoSuchPart)?;
+                .ok_or(Error::InvalidPart)?;
 
             if part_metadata.etag != *expected_etag {
                 return Err(Error::InvalidPart);
@@ -680,8 +687,11 @@ impl StorageBackend for FilesystemStorage {
 
         // Validate against client-provided checksum if present
         if let Some(client_checksums) = request.client_checksums {
-            if let Err(error_msg) = object_integrity.validate(client_checksums) {
-                return Err(Error::ChecksumMismatch(error_msg.to_string()));
+            if let Err(algorithm) = object_integrity.validate(client_checksums) {
+                return Err(Error::BadDigest {
+                    algorithm,
+                    completion: true,
+                });
             }
         }
 
@@ -754,7 +764,7 @@ impl StorageBackend for FilesystemStorage {
         if objects_dir.exists() {
             let mut rd = fs::read_dir(&objects_dir).await?;
             if rd.next_entry().await?.is_some() {
-                return Err(Error::Internal("bucket is not empty".to_string()));
+                return Err(Error::BucketNotEmpty);
             }
         }
         fs::remove_dir_all(&bucket_dir).await?;
@@ -802,6 +812,52 @@ impl StorageBackend for FilesystemStorage {
         fs::remove_dir_all(upload_dir).await?;
 
         Ok(())
+    }
+
+    async fn list_multipart_uploads(
+        &self,
+        bucket: &str,
+    ) -> Result<Vec<crate::storage::MultipartUploadInfo>> {
+        let mut uploads = Vec::new();
+        let mut entries = match fs::read_dir(self.root_dir.join("uploads")).await {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(uploads),
+            Err(e) => return Err(e.into()),
+        };
+        while let Some(entry) = entries.next_entry().await? {
+            if !entry.file_type().await?.is_dir() {
+                continue;
+            }
+            let metadata_path = entry.path().join("metadata.json");
+            let Some(upload) =
+                Self::load_metadata::<MultipartUploadMetadata>(&metadata_path).await?
+            else {
+                continue;
+            };
+            if upload.bucket.as_deref() == Some(bucket) {
+                uploads.push(crate::storage::MultipartUploadInfo {
+                    key: upload.key,
+                    upload_id: upload.upload_id,
+                });
+            }
+        }
+        uploads.sort();
+        Ok(uploads)
+    }
+
+    async fn update_metadata(
+        &self,
+        bucket: &str,
+        key: &str,
+        update: crate::storage::MetadataUpdate,
+    ) -> Result<()> {
+        // Not atomic with concurrent writes to the same key.
+        let metadata_path = self.get_object_metadata_path(bucket, key);
+        let mut metadata: ObjectMetadata = Self::load_metadata(&metadata_path)
+            .await?
+            .ok_or(Error::NoSuchKey)?;
+        update(&mut metadata);
+        Self::save_metadata(&metadata_path, &metadata).await
     }
 
     async fn reset(&self) -> Result<()> {

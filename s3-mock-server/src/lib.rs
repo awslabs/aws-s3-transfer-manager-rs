@@ -10,8 +10,10 @@
 //! required by the Transfer Manager, allowing for comprehensive testing of
 //! concurrent operations, error handling, and performance characteristics.
 
+mod bucket;
 mod error;
 mod faults;
+mod list;
 mod operation;
 mod s3s;
 mod server;
@@ -21,12 +23,14 @@ mod streaming;
 mod throttle;
 mod types;
 
+pub use bucket::BucketType;
 pub use error::Error;
 pub use error::Result;
 pub use faults::{BodyCadence, FaultTarget, FaultType, Occurrence};
 pub use operation::Operation;
 pub use server::{
-    AddObjectRequest, ObjectData, ObjectListEntry, S3MockServer, S3MockServerBuilder, ServerConfig,
-    ServerHandle,
+    AddObjectRequest, MultipartUploadEntry, ObjectData, ObjectListEntry, S3MockServer,
+    S3MockServerBuilder, ServerConfig, ServerHandle,
 };
+pub use storage::models::RestoreStatus;
 pub use types::composite_checksum;
