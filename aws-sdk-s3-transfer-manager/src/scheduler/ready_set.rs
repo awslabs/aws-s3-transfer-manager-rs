@@ -18,7 +18,7 @@
 //! fairness across top-level transfers regardless of how many children each spawns.
 
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 
 use crossbeam_skiplist::SkipMap;
 
@@ -185,7 +185,28 @@ struct GroupQueue {
     /// Atomic coordination state (member count, root presence, vruntime).
     state: GroupState,
     /// Members of this group, ordered by individual vruntime.
-    inner: SkipMap<ReadyKey, TransferDescriptor>,
+    inner: SkipMap<ReadyKey, QueuedMember>,
+}
+
+/// A group member's slot in [`GroupQueue::inner`].
+///
+/// The skip list frees a removed node only after epoch-based reclamation,
+/// which has no bound on when it runs. Removing a member takes the descriptor
+/// out of its slot, so a removed node awaiting reclamation holds no reference
+/// to the transfer, and the transfer and the resources it owns (such as a
+/// download's destination file) are released when the scheduler's other
+/// references are dropped.
+struct QueuedMember(Mutex<Option<TransferDescriptor>>);
+
+impl QueuedMember {
+    fn new(descriptor: TransferDescriptor) -> Self {
+        Self(Mutex::new(Some(descriptor)))
+    }
+
+    /// Takes the descriptor out of the slot. Returns `None` once taken.
+    fn take(&self) -> Option<TransferDescriptor> {
+        self.0.lock().unwrap().take()
+    }
 }
 
 impl GroupQueue {
@@ -206,7 +227,7 @@ impl GroupQueue {
     fn insert(&self, descriptor: TransferDescriptor) -> usize {
         let vruntime = descriptor.vruntime();
         let key = ReadyKey::new(vruntime, descriptor.id());
-        self.inner.insert(key, descriptor);
+        self.inner.insert(key, QueuedMember::new(descriptor));
         self.state.enqueue()
     }
 
@@ -216,7 +237,18 @@ impl GroupQueue {
         let entry = self.inner.pop_front()?;
         self.state.dequeue();
         self.state.advance_min_vruntime(entry.key().vruntime);
-        Some(entry.value().clone())
+        // `pop_front` hands each node to exactly one caller, so the slot is
+        // still full here.
+        entry.value().take()
+    }
+
+    /// Remove every queued member, releasing its descriptor. Does not update
+    /// the coordination state: used only on a group that has been removed
+    /// from the ready set.
+    fn release_members(&self) {
+        while let Some(entry) = self.inner.pop_front() {
+            drop(entry.value().take());
+        }
     }
 
     /// Number of members currently queued in this group.
@@ -487,7 +519,7 @@ impl ReadySet {
     /// `parent = Some(group_id)` will return `Err(OrphanedChild)`.
     pub(super) fn remove_group(&self, group_id: u64) {
         let removed = self.by_group.write().unwrap().remove(&group_id);
-        if removed.is_some() {
+        if let Some(group) = removed {
             // Linear scan of root tree to find and remove the entry for this group.
             // Acceptable because remove_group is called once per top-level transfer
             // lifetime (terminal path only), not on the hot scheduling path.
@@ -499,6 +531,10 @@ impl ReadySet {
             if let Some(k) = key {
                 self.groups.remove(&k);
             }
+            // Outside the root tree, the group's remaining members are never
+            // popped. Release them now instead of when reclamation frees the
+            // group.
+            group.release_members();
         }
     }
 
@@ -926,6 +962,53 @@ mod tests {
         assert!(set.root_contains_group(1));
         assert_eq!(set.group_count(), 1);
         assert_eq!(set.member_count(1), Some(1));
+    }
+
+    /// Builds a descriptor and returns the mock transfer's state machine,
+    /// whose strong count drops to 1 once nothing holds the transfer.
+    fn make_tracked_descriptor(
+        id: u64,
+        parent: Option<u64>,
+    ) -> (TransferDescriptor, StdArc<FixedWorkCount>) {
+        let tid = TransferId { id, parent };
+        let sm = StdArc::new(FixedWorkCount::new(1));
+        let transfer = Box::new(MockTransfer::new(tid, StdArc::clone(&sm)));
+        (TransferDescriptor::new(transfer), sm)
+    }
+
+    // A popped descriptor is not retained by the removed skip-list node, so
+    // dropping it releases the transfer without waiting for reclamation.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn pop_releases_descriptor() {
+        let set = ReadySet::new();
+        let (desc, sm) = make_tracked_descriptor(1, None);
+        set.insert(desc).unwrap();
+
+        let popped = set.pop().unwrap();
+        drop(popped);
+
+        assert_eq!(
+            StdArc::strong_count(&sm),
+            1,
+            "ready set retained the transfer"
+        );
+    }
+
+    // remove_group releases members still queued in the removed group.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn remove_group_releases_queued_members() {
+        let set = ReadySet::new();
+        let (parent, parent_sm) = make_tracked_descriptor(1, None);
+        let (child, child_sm) = make_tracked_descriptor(11, Some(1));
+        set.insert(parent).unwrap();
+        set.insert(child).unwrap();
+
+        set.remove_group(1);
+
+        assert_eq!(StdArc::strong_count(&parent_sm), 1, "parent retained");
+        assert_eq!(StdArc::strong_count(&child_sm), 1, "child retained");
     }
 }
 

@@ -698,6 +698,37 @@ async fn test_download_write_to_path() {
     assert!(tmp_files.is_empty(), "leftover temp files: {:?}", tmp_files);
 }
 
+/// Once `join` returns, the download holds no handle to the destination file.
+/// An exclusive open (share mode 0) fails with a sharing violation while any
+/// other handle to the file is open.
+#[cfg(windows)]
+#[tokio::test]
+async fn test_download_write_to_path_releases_file_handle() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let data = rand_data(10 * ByteUnit::Mebibyte.as_bytes_usize());
+    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let (tm, _http_client) = simple_test_tm(&data, part_size);
+
+    let dir = tempfile::tempdir().unwrap();
+    let dest_path = dir.path().join("output.dat");
+
+    let handle = tm
+        .download()
+        .bucket("test-bucket")
+        .key("test-object")
+        .write_to_path(&dest_path)
+        .await
+        .unwrap();
+    handle.join().await.unwrap();
+
+    std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&dest_path)
+        .expect("destination must have no open handle after join");
+}
+
 /// A file already at the temporary name `write_to_path` draws is left
 /// untouched, and the download writes through another name. Seeding
 /// `fastrand` on the polling thread, which draws the name, makes the first
