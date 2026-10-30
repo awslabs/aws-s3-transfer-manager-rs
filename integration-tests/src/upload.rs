@@ -12,6 +12,7 @@ use std::task::{Context, Poll};
 
 use aws_sdk_s3::config::interceptors::BeforeTransmitInterceptorContextRef;
 use aws_sdk_s3::config::{ConfigBag, Intercept, RuntimeComponents};
+use aws_sdk_s3::types::ChecksumAlgorithm;
 use aws_sdk_s3_transfer_manager::config::S3ClientConfig;
 use aws_sdk_s3_transfer_manager::io::{InputStream, PartData, PartStream, SizeHint, StreamContext};
 use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
@@ -298,22 +299,57 @@ impl PartStream for SinglePart {
     }
 }
 
-/// Records the operation name of every request attempt the S3 client sends.
+/// One request attempt the S3 client sent.
+#[derive(Debug, Clone)]
+struct RecordedAttempt {
+    /// The operation name, such as `UploadPart`.
+    operation: String,
+    /// The checksum algorithm the request carried a value for, as an `x-amz-checksum-<algorithm>`
+    /// header or as an aws-chunked trailer named by `x-amz-trailer`. `None` when it carried no
+    /// checksum.
+    checksum: Option<ChecksumAlgorithm>,
+}
+
+/// The checksum algorithm whose value `headers` carry or name as a trailer.
+///
+/// `x-amz-checksum-type` and `x-amz-checksum-mode` name no algorithm and are skipped. A header
+/// for an algorithm the SDK does not model maps to `ChecksumAlgorithm::Unknown`.
+fn sent_checksum(headers: &aws_smithy_runtime_api::http::Headers) -> Option<ChecksumAlgorithm> {
+    const PREFIX: &str = "x-amz-checksum-";
+    let header_names = headers.iter().map(|(name, _)| name);
+    let trailer_names = headers.get("x-amz-trailer").into_iter();
+    header_names
+        .chain(trailer_names)
+        .map(str::to_ascii_lowercase)
+        .find_map(|name| {
+            let algorithm = name.strip_prefix(PREFIX)?;
+            (algorithm != "type" && algorithm != "mode")
+                .then(|| ChecksumAlgorithm::from(algorithm.to_ascii_uppercase().as_str()))
+        })
+}
+
+/// Records every request attempt the S3 client sends.
 #[derive(Debug, Clone, Default)]
 struct OperationRecorder {
-    /// Operation names in send order, one entry per attempt.
-    seen: Arc<Mutex<Vec<String>>>,
+    /// Attempts in send order.
+    seen: Arc<Mutex<Vec<RecordedAttempt>>>,
 }
 
 impl OperationRecorder {
-    /// Number of recorded attempts of `operation`.
-    fn count(&self, operation: &str) -> usize {
+    /// Recorded attempts of `operation`, in send order.
+    fn attempts(&self, operation: &str) -> Vec<RecordedAttempt> {
         self.seen
             .lock()
             .unwrap()
             .iter()
-            .filter(|op| *op == operation)
-            .count()
+            .filter(|a| a.operation == operation)
+            .cloned()
+            .collect()
+    }
+
+    /// Number of recorded attempts of `operation`.
+    fn count(&self, operation: &str) -> usize {
+        self.attempts(operation).len()
     }
 }
 
@@ -322,18 +358,124 @@ impl Intercept for OperationRecorder {
         "OperationRecorder"
     }
 
-    // Runs once per attempt, so SDK retries are counted.
+    // Runs once per attempt, so SDK retries are counted. Runs after the checksum interceptor has
+    // set its header or trailer.
     fn read_before_transmit(
         &self,
-        _context: &BeforeTransmitInterceptorContextRef<'_>,
+        context: &BeforeTransmitInterceptorContextRef<'_>,
         _rc: &RuntimeComponents,
         cfg: &mut ConfigBag,
     ) -> Result<(), aws_sdk_s3::error::BoxError> {
         if let Some(metadata) = cfg.load::<Metadata>() {
-            self.seen.lock().unwrap().push(metadata.name().to_string());
+            self.seen.lock().unwrap().push(RecordedAttempt {
+                operation: metadata.name().to_string(),
+                checksum: sent_checksum(context.request().headers()),
+            });
         }
         Ok(())
     }
+}
+
+/// Helper function that builds a transfer manager whose S3 client uses `RequestChecksumCalculation::WhenRequired` and records
+/// every attempt, on a fresh mock server with a bucket named `test-bucket`.
+async fn when_required_tm() -> (
+    s3_mock_server::ServerHandle,
+    aws_sdk_s3_transfer_manager::Client,
+    OperationRecorder,
+) {
+    let server = S3MockServer::builder()
+        .with_in_memory_store()
+        .build()
+        .expect("build mock server");
+    let handle = server.start().await.expect("start mock server");
+    server
+        .create_bucket("test-bucket")
+        .await
+        .expect("create bucket");
+
+    let recorder = OperationRecorder::default();
+    let s3_config = handle
+        .client()
+        .await
+        .config()
+        .to_builder()
+        .request_checksum_calculation(aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired)
+        .interceptor(recorder.clone());
+    let tm = aws_sdk_s3_transfer_manager::Client::new(
+        aws_sdk_s3_transfer_manager::Config::builder()
+            .s3_config(S3ClientConfig::new(s3_config).enable_runtime_http(false))
+            .build(),
+    );
+    (handle, tm, recorder)
+}
+
+/// Under `WhenRequired`, a single-request upload with `with_calculated_crc32_c()` sends a CRC32C
+/// checksum on `PutObject`: the caller set the algorithm, so the SDK calculates it.
+#[tokio::test]
+#[ignore = "requires an aws-sdk-s3 that calculates a caller-selected request checksum under WhenRequired"]
+async fn test_when_required_calculated_crc32c_sends_put_object_checksum() {
+    let (handle, tm, recorder) = when_required_tm().await;
+    let content = deterministic_data(1024);
+
+    let output = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("when-required-put")
+        .checksum_strategy(ChecksumStrategy::with_calculated_crc32_c())
+        .body(InputStream::from(content.clone()))
+        .initiate()
+        .expect("initiate upload")
+        .join()
+        .await
+        .expect("upload complete");
+    assert!(output.upload_id().is_none(), "expected a single PutObject");
+
+    let puts = recorder.attempts("PutObject");
+    assert!(!puts.is_empty(), "no PutObject was sent");
+    assert!(
+        puts.iter()
+            .all(|a| a.checksum == Some(ChecksumAlgorithm::Crc32C)),
+        "PutObject sent without a CRC32C checksum: {puts:?}"
+    );
+
+    handle.shutdown().await.expect("shutdown");
+}
+
+/// Under `WhenRequired`, a multipart upload with `with_calculated_crc32_c()` sends a CRC32C
+/// checksum on every `UploadPart`.
+#[tokio::test]
+#[ignore = "requires an aws-sdk-s3 that calculates a caller-selected request checksum under WhenRequired"]
+async fn test_when_required_calculated_crc32c_sends_upload_part_checksums() {
+    let (handle, tm, recorder) = when_required_tm().await;
+    // 24 MiB = 3 parts at the default 8 MiB part size.
+    let content = deterministic_data(24 * ByteUnit::Mebibyte.as_bytes_usize());
+
+    let output = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("when-required-mpu")
+        .checksum_strategy(ChecksumStrategy::with_calculated_crc32_c())
+        .body(InputStream::from(content.clone()))
+        .initiate()
+        .expect("initiate upload")
+        .join()
+        .await
+        .expect("upload complete");
+    assert!(output.upload_id().is_some(), "expected a multipart upload");
+
+    let parts = recorder.attempts("UploadPart");
+    assert!(
+        parts.len() >= 3,
+        "expected at least 3 UploadPart attempts: {parts:?}"
+    );
+    assert!(
+        parts
+            .iter()
+            .all(|a| a.checksum == Some(ChecksumAlgorithm::Crc32C)),
+        "UploadPart sent without a CRC32C checksum: {parts:?}"
+    );
+
+    handle.shutdown().await.expect("shutdown");
 }
 
 /// Base64 big-endian CRC32 of `data`, the encoding S3 expects in `x-amz-checksum-crc32`.
