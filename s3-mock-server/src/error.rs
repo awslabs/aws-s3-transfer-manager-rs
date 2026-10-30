@@ -4,8 +4,8 @@
  */
 //! Error types for the S3 Mock Server.
 //!
-//! Handlers and storage fail with an [`Error`], whose conversion into an `s3s::S3Error` is the
-//! only place the server builds an S3 error response.
+//! Handlers and storage fail with an [`Error`](enum@Error), whose conversion into an
+//! `s3s::S3Error` is the only place the server builds an S3 error response.
 
 use std::borrow::Cow;
 use std::io;
