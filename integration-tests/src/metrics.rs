@@ -11,6 +11,7 @@ use aws_sdk_s3_transfer_manager::io::InputStream;
 use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
 use aws_sdk_s3_transfer_manager::types::TransferStatus;
 use aws_sdk_s3_transfer_manager::RuntimeConfig;
+use s3_mock_server::{FaultType, Occurrence, Operation};
 use tokio::time::timeout;
 
 use crate::harness::{mock_tm, MockTm};
@@ -187,6 +188,14 @@ async fn test_download_to_file_metrics_tokio_mt() {
 #[tokio::test]
 async fn test_upload_abort_metrics() {
     let m = setup().await;
+    // Keep parts from finishing so abort cannot race multipart completion.
+    m.server.insert_fault(
+        "test-bucket",
+        "metrics-abort-upload",
+        FaultType::WithholdResponseHeaders,
+        0,
+        Occurrence::Always,
+    );
 
     let size = 16 * ByteUnit::Mebibyte.as_bytes_usize();
     let content = vec![0u8; size];
@@ -203,13 +212,27 @@ async fn test_upload_abort_metrics() {
     // total_bytes is set at initiation, before any I/O
     assert_eq!(handle.metrics().total_bytes, Some(size as u64));
 
-    // Let CreateMPU and some parts start
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    timeout(Duration::from_secs(30), async {
+        while m.server.request_count(Operation::UploadPart) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("upload parts did not start");
 
-    timeout(Duration::from_secs(30), handle.abort())
+    let aborted = timeout(Duration::from_secs(30), handle.abort())
         .await
         .expect("abort timed out")
         .expect("abort");
+    assert!(
+        aborted.upload_id().is_some(),
+        "multipart upload was aborted"
+    );
+    assert_eq!(m.server.request_count(Operation::AbortMultipartUpload), 1);
+    assert_eq!(
+        m.server.request_count(Operation::CompleteMultipartUpload),
+        0
+    );
 
     m.handle.shutdown().await.expect("shutdown");
 }
