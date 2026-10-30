@@ -46,6 +46,7 @@ This index locates each invariant. The linked section is authoritative.
 - [Surface exclusion](paged-recv-buffer.md#surface-exclusion)
 - [Lost-wake safety at the occupancy gate](paged-recv-buffer.md#lost-wake-safety-at-the-occupancy-gate)
 - [Admission-park progress](paged-recv-buffer.md#admission-park-progress)
+- [Destination release at terminal](paged-recv-buffer.md#destination-release-at-terminal)
 - [Caller obligation](paged-recv-buffer.md#caller-obligation)
 
 ### Retry and hedging

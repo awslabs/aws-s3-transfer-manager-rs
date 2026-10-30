@@ -64,7 +64,9 @@ impl DownloadFluentBuilder {
     /// The transfer manager writes to the file using positioned writes at
     /// offsets starting from 0 and resizes it to the exact downloaded length,
     /// removing any previous tail. The file cursor is ignored. Append and
-    /// nonzero destination offsets are not supported by this operation.
+    /// nonzero destination offsets are not supported by this operation. The
+    /// transfer manager closes `file` when the download ends, as
+    /// [`ManagedDownloadHandle`] describes.
     ///
     /// A file that is open in append mode when this method is called, such as
     /// one opened with [`OpenOptions::append`](std::fs::OpenOptions::append),

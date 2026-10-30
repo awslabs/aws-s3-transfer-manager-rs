@@ -122,6 +122,7 @@ impl DownloadHandleInner {
             .cancel_transfer(id)
             .wait_for_idle()
             .await;
+        close_after_cancel(&self.transfer);
     }
 
     /// Get scheduling controls for this transfer.
@@ -332,6 +333,17 @@ impl Drop for DownloadHandle {
     }
 }
 
+/// Releases `transfer`'s reference to its destination. Idempotent, and does
+/// not wait for a write executing on another thread.
+///
+/// The scheduler can retire a cancelled transfer without running its terminal
+/// hook, for example when its last work item retires before the canceller
+/// looks the transfer up, so the canceller cannot rely on that hook to close
+/// the destination.
+fn close_after_cancel(transfer: &DownloadTransfer) {
+    transfer.writer().close_destination();
+}
+
 /// Handle to an in-progress download-to-file operation.
 ///
 /// Returned by `write_to_path` and similar methods. Unlike [`DownloadHandle`],
@@ -342,6 +354,12 @@ impl Drop for DownloadHandle {
 /// transfer. On successful completion via [`join`](Self::join), the temporary
 /// file is atomically renamed to the destination path. On failure,
 /// cancellation, or drop, the temporary file is deleted.
+///
+/// The transfer manager holds no handle on the file it writes once
+/// [`join`](Self::join) or [`abort`](Self::abort) has returned, or once the
+/// handle's drop has returned, unless a write to the file is still executing on
+/// another thread at that point; the file is then closed when that write
+/// returns. After a successful `join` no write is executing.
 ///
 /// Success means the operating system accepted every byte and, for a managed
 /// path, completed the rename. The transfer manager does not call `sync_data`,
@@ -490,6 +508,7 @@ impl Drop for ManagedDownloadHandle {
                 .scheduler
                 .cancel_transfer(self.inner.transfer.id());
         }
+        close_after_cancel(&self.inner.transfer);
         if let Some(temp) = &self.temp_path {
             let _ = std::fs::remove_file(temp);
         }
@@ -508,6 +527,61 @@ mod tests {
 
     fn is_send<T: Send>() {}
     fn is_sync<T: Sync>() {}
+
+    /// A disk transfer the scheduler has never registered, which is where a
+    /// cancellation leaves a transfer whose last work item retired before the
+    /// canceller looked it up. Returns the inner handle, a clone of the
+    /// transfer that keeps it alive, the script counting its live sinks, and
+    /// what the transfer's lifetime needs kept.
+    fn unregistered_disk_handle() -> (
+        DownloadHandleInner,
+        DownloadTransfer,
+        std::sync::Arc<crate::operation::download::test_util::sink::WriteScript>,
+        (RecvBodyConsumer, tempfile::TempDir),
+    ) {
+        use crate::operation::download::test_util::fixtures::{
+            disk_test_handle, disk_transfer, object_bytes, object_client,
+        };
+        use crate::operation::download::test_util::sink::{ScriptedSinkFactory, WriteScript};
+
+        let script = std::sync::Arc::new(WriteScript::default());
+        let handle = disk_test_handle(object_client(object_bytes(8)), 8);
+        let (transfer, consumer, dir) =
+            disk_transfer(handle, &ScriptedSinkFactory(std::sync::Arc::clone(&script)));
+        assert_eq!(script.open_sinks(), 1);
+        let inner = DownloadHandleInner {
+            transfer: transfer.clone(),
+            completion_rx: None,
+        };
+        (inner, transfer, script, (consumer, dir))
+    }
+
+    // ref: V2429410200
+    /// `abort` releases the destination when the scheduler has already
+    /// removed the transfer, so `cancel_transfer` finds nothing to clean up.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn abort_releases_the_destination_of_a_removed_transfer() {
+        let (inner, _transfer, script, _keep) = unregistered_disk_handle();
+        inner.abort().await;
+        assert_eq!(script.open_sinks(), 0, "the destination is still open");
+    }
+
+    // ref: V2429410200
+    /// Dropping a `ManagedDownloadHandle` releases the destination when the
+    /// scheduler has already removed the transfer.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn dropped_handle_releases_the_destination_of_a_removed_transfer() {
+        let (inner, _transfer, script, keep) = unregistered_disk_handle();
+        let dir = keep.1.path().to_owned();
+        drop(ManagedDownloadHandle::new(
+            inner,
+            dir.join("out.s3tmp"),
+            dir.join("dest"),
+        ));
+        assert_eq!(script.open_sinks(), 0, "the destination is still open");
+    }
 
     #[test]
     fn test_handle_properties() {

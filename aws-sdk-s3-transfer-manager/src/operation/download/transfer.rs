@@ -1327,7 +1327,8 @@ impl DownloadTransfer {
 
     /// Finalize a transfer whose successful completion `_claim` proves: flush the tail to
     /// disk (returning the last carrier charges as `ChunkOutput`s drop), establish the
-    /// destination length, set the terminal status, and signal waiters. A finalization
+    /// destination length, release the destination, set the terminal status, and signal
+    /// waiters. A finalization
     /// error fails the transfer with `ErrorKind::IOError` instead.
     ///
     /// The state is already `Terminal`, entered when the claim was taken; this runs after
@@ -1357,6 +1358,9 @@ impl DownloadTransfer {
                 state_snapshot,
             );
         }
+        // Before `set_completed`, so the destination is released by the time
+        // `join` observes success.
+        self.inner.writer.close_destination();
         self.inner.ctx.set_completed();
         self.inner.writer.notify_consumer();
         self.report_terminal(state_snapshot);
@@ -1364,7 +1368,9 @@ impl DownloadTransfer {
         WorkOutcome::Success { data: None }
     }
 
-    /// Transition to terminal failed state. Requires holding the work lock.
+    /// Transition to terminal failed state, flushing the resident tail and
+    /// releasing the destination before signalling waiters. Requires holding
+    /// the work lock.
     fn fail(
         &self,
         mut guard: std::sync::MutexGuard<'_, DownloadState>,
@@ -1408,6 +1414,9 @@ impl DownloadTransfer {
         // Wake all waiters
         self.inner.discovery_notify.notify_waiters();
         self.run_terminal_drain();
+        // After the terminal drain has written the resident tail, and before
+        // `signal_terminal` wakes `join`.
+        self.inner.writer.close_destination();
         self.inner.writer.notify_consumer();
         self.report_terminal(snapshot);
         self.inner.ctx.signal_terminal();
@@ -1485,9 +1494,22 @@ impl Transfer for DownloadTransfer {
         drop(pending);
 
         self.inner.discovery_notify.notify_waiters();
+        // Closes on unwind too, so a panic in the terminal drain does not
+        // leave the destination open until the transfer drops.
+        let close = CloseDestination(&self.inner.writer);
         self.run_terminal_drain();
+        drop(close);
         self.inner.writer.notify_consumer();
         self.report_terminal(snapshot);
+    }
+}
+
+/// Closes a writer's destination when dropped, including during unwinding.
+struct CloseDestination<'a>(&'a BodyWriter);
+
+impl Drop for CloseDestination<'_> {
+    fn drop(&mut self) {
+        self.0.close_destination();
     }
 }
 
@@ -3381,6 +3403,95 @@ mod tests {
             std::fs::read(dir.path().join("out")).unwrap(),
             [[1u8; RUN_LEN as usize], [2u8; RUN_LEN as usize]].concat()
         );
+    }
+
+    /// A two-part disk download on the ambient runtime through a sink scripted
+    /// by `script`, after a successful discovery that filled the first part.
+    /// `client` serves the parts. Returns the transfer, the item for the
+    /// second part, and what the transfer's lifetime needs kept.
+    async fn two_part_disk_transfer_after_discovery(
+        client: aws_sdk_s3::Client,
+        script: &Arc<crate::operation::download::test_util::sink::WriteScript>,
+    ) -> (
+        DownloadTransfer,
+        IoRequest,
+        (
+            crate::operation::download::body::RecvBodyConsumer,
+            tempfile::TempDir,
+        ),
+    ) {
+        use crate::operation::download::test_util::sink::ScriptedSinkFactory;
+
+        let handle = disk_test_handle(client, 5 * MB);
+        let (transfer, consumer, dir) =
+            disk_transfer(handle, &ScriptedSinkFactory(Arc::clone(script)));
+        assert_discovery_succeeds(&transfer).await;
+        let second = assert_ready(transfer.poll_work());
+        assert_eq!(script.open_sinks(), 1);
+        (transfer, second, (consumer, dir))
+    }
+
+    // ref: V2429410200
+    /// Each terminal transition releases the destination while the transfer is
+    /// still alive, so the release does not wait for the scheduler to drop the
+    /// transfer. Success releases it before the transfer reports completion.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn success_releases_the_destination() {
+        use crate::operation::download::test_util::fixtures::{object_bytes, object_client};
+        use crate::operation::download::test_util::sink::WriteScript;
+
+        let script = Arc::new(WriteScript::default());
+        let object = object_bytes(10 * MB as usize);
+        let (transfer, mut second, _keep) =
+            two_part_disk_transfer_after_discovery(object_client(object), &script).await;
+        let outcome = transfer.execute(&mut second).await;
+        assert!(
+            matches!(outcome, WorkOutcome::Success { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            transfer.ctx().transfer_status(),
+            crate::types::TransferStatus::Completed
+        );
+        assert_eq!(script.open_sinks(), 0, "the destination is still open");
+    }
+
+    // ref: V2429410200
+    /// A failed part request fails the transfer and releases the destination.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn body_failure_releases_the_destination() {
+        use crate::operation::download::test_util::fixtures::object_bytes;
+        use crate::operation::download::test_util::sink::WriteScript;
+
+        let script = Arc::new(WriteScript::default());
+        let object = object_bytes(10 * MB as usize);
+        let (transfer, mut second, _keep) = two_part_disk_transfer_after_discovery(
+            object_client_failing_at(object, 5 * MB),
+            &script,
+        )
+        .await;
+        let outcome = transfer.execute(&mut second).await;
+        assert!(matches!(outcome, WorkOutcome::Failed { .. }), "{outcome:?}");
+        assert_eq!(script.open_sinks(), 0, "the destination is still open");
+    }
+
+    // ref: V2429410200
+    /// External termination through `on_terminal` releases the destination.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn on_terminal_releases_the_destination() {
+        use crate::operation::download::test_util::fixtures::{object_bytes, object_client};
+        use crate::operation::download::test_util::sink::WriteScript;
+
+        let script = Arc::new(WriteScript::default());
+        let object = object_bytes(10 * MB as usize);
+        let (transfer, _second, _keep) =
+            two_part_disk_transfer_after_discovery(object_client(object), &script).await;
+        transfer.ctx().set_cancelled();
+        Transfer::on_terminal(&transfer);
+        assert_eq!(script.open_sinks(), 0, "the destination is still open");
     }
 
     /// A finalize that fails its length check still counts the tail its

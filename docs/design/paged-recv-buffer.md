@@ -409,6 +409,30 @@ bytes to return. The drain path ensures a disk-backed transfer does not hide rel
 ownership behind its own reservation wait. Stream-backed transfers instead rely on consumer
 progress, so retained output intentionally applies backpressure to later reservations.
 
+### Destination release at terminal
+
+**Invariant.** A disk download holds no handle on its destination once `join` or `abort` has
+returned, or once its handle's drop has returned, unless a write to the destination is still
+executing on another thread at that point; the destination is then released when that write returns.
+After a successful `join` no write is executing.
+
+**What it rules out.** A destination that stays open after the download has ended. On Windows that
+handle makes other opens that deny write sharing fail with a sharing violation; on any platform it
+keeps an unlinked file's storage allocated and counts against the process's descriptor limit. Tying
+release to the transfer's own drop is not enough: in-flight work for a dropped handle keeps the
+transfer alive until each of its work items has been polled once more.
+
+**Mechanism.** The writer holds its sink in a slot that the transfer closes at each terminal
+transition: on success before it records completion, on failure after the terminal drain and before
+it signals waiters, and on external cancellation after the terminal drain. A cancelled transfer can
+leave the scheduler without the external-cancellation hook running, when its last work item retires
+before the canceller looks it up, so `abort` and the handle's drop also close the slot once their
+cancellation returns. The slot's lock is held only to clone or take the sink, never across a sink
+call, so a close never waits for a write. Each sink call holds its own reference, and the
+destination closes when the last one drops. A drain obtains the sink once per run, so a close stops
+it before its next write. A drain, preparation, or finalization after the close fails without
+writing.
+
 ### Caller obligation
 
 The buffer does not bound its own growth: it allocates a segment whenever a claim reaches a sequence
