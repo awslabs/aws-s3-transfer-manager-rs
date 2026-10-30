@@ -199,22 +199,23 @@ pub struct AbortedUpload {
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum AbortOutcome {
-    /// The upload was stopped before S3 created the object.
+    /// The upload was stopped before S3 completes the object.
     #[default]
     Cancelled,
-    /// S3 created the object before the abort took effect. The object is not
+    /// S3 finished storing the object before the abort took effect. The object is not
     /// deleted; its metadata is available from [`AbortedUpload::output`].
     AlreadyCompleted,
 }
 
 impl AbortedUpload {
-    /// Whether the abort stopped the upload or the object already exists.
+    /// Returns whether the abort stopped the upload or the object already
+    /// exists.
     pub fn outcome(&self) -> AbortOutcome {
         self.outcome
     }
 
-    /// The upload's output when [`outcome`](Self::outcome) is
-    /// [`AbortOutcome::AlreadyCompleted`].
+    /// Returns the upload's output when [`outcome`](Self::outcome) is
+    /// [`AbortOutcome::AlreadyCompleted`], and `None` otherwise.
     pub fn output(&self) -> Option<&crate::operation::upload::UploadOutput> {
         self.output.as_ref()
     }

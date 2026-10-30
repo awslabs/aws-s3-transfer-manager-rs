@@ -805,31 +805,16 @@ pub(crate) enum UploadState {
     CompleteInFlight { upload_id: String },
     /// PutObject is in flight.
     PutObjectInFlight,
-    /// The upload is being aborted, and the transfer is waiting for the
-    /// requests that decide the outcome before it ends.
-    ///
-    /// Only the caller's abort leads here: `poll_work` moves every other
-    /// non-terminal state here once it sees the request. A request failure
-    /// does not; it ends the transfer as failed and leaves the upload open,
-    /// as before.
-    ///
-    /// From here it emits at most one AbortMultipartUpload and ends the
-    /// transfer as cancelled when nothing below is still outstanding.
-    /// A CompleteMultipartUpload that succeeds while in this state moves
-    /// straight to `Done` as an ordinary success: the object exists, so the
-    /// abort reports `AlreadyCompleted`. So does a PutObject whose response
-    /// arrived just before the abort could interrupt it.
-    ///
-    /// Work handlers update the fields below under the state lock, then wake
-    /// the transfer so `poll_work` re-reads them.
+    /// Clean up the upload in S3 when failure or user requested abort.
+    /// Based on the previous state, tracking the nesscary cleanup work here.
     Aborting {
-        /// Upload to abort. `None` while Create is still in flight, when no
-        /// multipart upload exists (PutObject), or when Create never ran.
+        /// S3 Multipart Upload ID to abort.
+        /// `None` before CreateMultipartUpload response received.
         upload_id: Option<String>,
-        /// CreateMultipartUpload is on the wire; wait for its upload ID.
+        /// CreateMultipartUpload has been sent and response has not yet received.
         create_in_flight: bool,
-        /// CompleteMultipartUpload is on the wire. Its response decides
-        /// whether the object exists, so wait for it.
+        /// CompleteMultipartUpload has been sent and and response has not yet received.
+        /// Its response determines whether the object sotored in S3 or not.
         complete_mpu_in_flight: bool,
         /// Progress of the AbortMultipartUpload request.
         abort_mpu: AbortMpuProgress,
@@ -841,14 +826,14 @@ pub(crate) enum UploadState {
 /// Progress of the AbortMultipartUpload request while `UploadState::Aborting`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AbortMpuProgress {
-    /// No AbortMultipartUpload will be sent: no multipart upload exists, or
-    /// the request's `FailedMultipartUploadPolicy` is `Retain`.
+    /// No AbortMultipartUpload will be sent: no multipart upload exists,
+    /// or the request's `FailedMultipartUploadPolicy` is `Retain`.
     NotNeeded,
-    /// Send it once an upload ID is known.
+    /// AbortMultipartUpload is sent once an upload ID is known.
     ToSend,
-    /// Emitted; waiting for its response.
+    /// AbortMultipartUpload has been emitted and has not returned.
     InFlight,
-    /// S3 answered.
+    /// AbortMultipartUpload succeeded.
     Done,
 }
 

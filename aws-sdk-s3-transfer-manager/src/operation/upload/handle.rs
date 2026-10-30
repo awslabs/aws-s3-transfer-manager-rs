@@ -37,13 +37,10 @@ use crate::types::{AbortOutcome, AbortedUpload};
 ///
 /// ## Dropping the handle
 ///
-/// When the handle is dropped while the transfer is still running (without
-/// calling `join()` or `abort()`, or by dropping a pending `join()` or
-/// `abort()` future):
+/// When the handle is dropped without calling `join()` or `abort()`:
 /// - The transfer is marked as cancelled
 /// - Queued work is purged from the scheduler
-/// - In-flight work, AbortMultipartUpload included, is interrupted at its next
-///   await point
+/// - In-flight work is interrupted at its next await point
 /// - `AbortMultipartUpload` is **not** called (multipart uploads may be left incomplete)
 /// - Drop returns immediately without waiting for in-flight work
 ///
@@ -54,13 +51,14 @@ use crate::types::{AbortOutcome, AbortedUpload};
 /// ## Calling `abort()`
 ///
 /// When [`abort`](Self::abort) is called:
-/// - Queued work is purged and in-flight part uploads and PutObject are
-///   interrupted
+/// - No further parts are uploaded, and in-flight part uploads and PutObject
+///   are interrupted
 /// - In-flight CreateMultipartUpload and CompleteMultipartUpload are not
 ///   interrupted; their responses decide the outcome
-/// - The transfer calls `AbortMultipartUpload` if a multipart upload exists
+/// - The transfer calls `AbortMultipartUpload` if a multipart upload started and before ending
+///   (after CreateMultipartUpload sent and before CompleteMultipartUpload completes)
 /// - Returns once the transfer has ended, reporting whether the object was
-///   created ([`AbortOutcome`](crate::types::AbortOutcome))
+///   cancelled or already stored in S3 ([`AbortOutcome`](crate::types::AbortOutcome))
 ///
 /// ## Already completed transfers
 ///
@@ -123,106 +121,68 @@ impl UploadHandle {
             .expect("result must be set on successful completion"))
     }
 
-    /// Abort the upload.
+    /// Consume the handle and abort the upload.
     ///
-    /// Asks the transfer to stop and waits for it to end. The transfer itself
-    /// sends AbortMultipartUpload and decides the outcome from S3's responses:
+    /// Asks the transfer to stop and remove the upload from S3 when possible,
+    /// then waits for that cleanup to finish. No new parts are uploaded, and
+    /// parts or PutObject requests in flight are interrupted.
     ///
-    /// - Before CreateMultipartUpload/PutObject is sent: nothing is sent.
-    ///   Returns [`AbortOutcome::Cancelled`].
-    /// - CreateMultipartUpload in flight: it is not interrupted. If S3 returns
-    ///   an upload ID, that upload is aborted. Returns `Cancelled`.
-    /// - Uploading parts: in-flight parts are interrupted and their results
-    ///   discarded; the upload is aborted. Returns `Cancelled`.
-    /// - CompleteMultipartUpload in flight: it is not interrupted.
-    ///   AbortMultipartUpload is sent right away, and Complete's response
-    ///   decides. Success returns [`AbortOutcome::AlreadyCompleted`] with the
-    ///   output. `NoSuchUpload` means the abort won and returns `Cancelled`.
-    ///   Any other Complete error is returned as that error.
-    /// - PutObject in flight: it is interrupted (including any retries) and
-    ///   returns `Cancelled` without waiting for S3's response. If S3 had
-    ///   already received the whole body, the object may exist anyway; check
-    ///   with HeadObject if that matters. The Java v2 transfer manager behaves
-    ///   the same way.
-    /// - Already completed: returns `AlreadyCompleted`. The object is not deleted.
-    /// - Already failed or failing: returns that failure's error at once,
-    ///   without starting an abort or waiting for requests still finishing.
-    ///   The multipart upload is left open, the same as after
-    ///   [`join`](Self::join) returns it.
-    /// - Already cancelled (hard-cancelled, for example by a parent
-    ///   `upload_objects`): returns an `ErrorKind::OperationCancelled` error
-    ///   at once.
+    /// What happens depends on how far the upload got:
     ///
-    /// Any other error from a request still in flight (including
-    /// AbortMultipartUpload itself) is returned as that error, as it would be
-    /// from [`join`](Self::join).
+    /// - Before CreateMultipartUpload is sent: returns
+    ///   [`AbortOutcome::Cancelled`] with no upload ID.
+    /// - After CreateMultipartUpload is sent: sends AbortMultipartUpload once
+    ///   the upload ID is known. Returns [`AbortOutcome::Cancelled`] with the
+    ///   upload ID.
+    /// - While CompleteMultipartUpload is in flight: also sends
+    ///   AbortMultipartUpload and waits for both. Returns
+    ///   [`AbortOutcome::AlreadyCompleted`] if S3 created the object first,
+    ///   otherwise [`AbortOutcome::Cancelled`].
+    /// - After the object was created: returns
+    ///   [`AbortOutcome::AlreadyCompleted`] with the upload output. The object
+    ///   is not deleted.
     ///
-    /// Dropping the returned future (for example under a caller's timeout)
-    /// hard-cancels the transfer, the same as dropping the handle: requests
-    /// still in flight, including AbortMultipartUpload, are interrupted and
-    /// the multipart upload may be left open.
+    /// AbortMultipartUpload is sent at most once, and not at all when the
+    /// failed multipart upload policy is to retain the upload.
     ///
-    /// # What can still be left behind
+    /// # Errors
     ///
-    /// - An empty multipart upload, if CreateMultipartUpload's response is lost
-    ///   after S3 accepted it.
-    /// - The upload and its parts, if a request fails while an abort is
-    ///   already running (including AbortMultipartUpload itself failing): the
-    ///   transfer fails at once rather than waiting for the abort.
-    /// - The upload and its parts, if the transfer had already failed.
-    /// - The upload and its parts, under `FailedMultipartUploadPolicy::Retain`.
-    ///
-    /// A lifecycle rule for incomplete multipart uploads cleans these up.
+    /// Returns an error if the transfer failed, before or during the abort.
+    /// AbortMultipartUpload is not sent for a transfer that had already
+    /// failed, and its multipart upload is left open.
     ///
     /// [`AbortOutcome::Cancelled`]: crate::types::AbortOutcome::Cancelled
     /// [`AbortOutcome::AlreadyCompleted`]: crate::types::AbortOutcome::AlreadyCompleted
     pub async fn abort(mut self) -> Result<AbortedUpload, Error> {
-        // TODO: the abort should follow the error handling path
-        //   The error handling should also go through the abort workflow
-        //   A customer requested abort can be treated as an error happened, with a sepcial error code is to cancel the request.
+        // TODO: route a caller's abort through the failure path, as a failure
+        //   with a cancellation error, and have that path abort the multipart
+        //   upload.
 
-        // Already failing or cancelled: there is nothing to abort. Report that
-        // right away without starting an abort or waiting for the transfer.
-        //
-        // TODO: `abort_requested()` is not checked because it is always false
-        //   here: `abort()` consumes the handle and is the only caller of
-        //   `request_abort()`. Check it once any of these changes:
-        //   - `Drop` calls `request_abort()` (the TODO in `Drop`);
-        //   - a failure goes through `request_abort()` (the unified-finish
-        //     TODO above), so a failing transfer is also aborting;
-        //   - the upload can be aborted without consuming the handle (for
-        //     example an `abort_handle()` that can be cloned and used while
-        //     `join()` holds the handle), so a second abort can arrive.
-        let ctx = self.transfer.ctx();
-        if ctx.is_failed() {
-            if let Some(err) = ctx.take_error() {
-                return Err(err);
-            }
-            // `set_failed` flips the status before it stores the error; the
-            // error is stored before terminal is signalled, so wait for that.
-            if let Some(rx) = self.completion_rx.take() {
-                let _ = rx.await;
-            }
-            return Err(ctx.take_error().expect("failed transfer must have error"));
-        }
-
+        // TODO: check `abort_requested()` here once an abort can already be
+        //   running when this is called. Today it cannot: `abort()` consumes
+        //   the handle and is the only caller of `request_abort()`. That
+        //   changes if `Drop` calls `request_abort()`, if a failure goes
+        //   through `request_abort()`, or if the upload can be aborted without
+        //   consuming the handle. An abort that is already running should be
+        //   awaited and its outcome reported.
+        // On a transfer that is no longer active, this changes nothing:
+        // `poll_work` returns `Done` before it reads the abort flag.
         self.transfer.request_abort();
 
-        // Wait until the transfer calls `signal_terminal()`. It only does so
-        // once every request it sent has finished or been dropped, so nothing
-        // of ours is still in flight after this.
+        // `signal_terminal()` runs only after every request the transfer sent
+        // has finished or been dropped.
         if let Some(rx) = self.completion_rx.take() {
             let _ = rx.await;
         }
 
+        let ctx = self.transfer.ctx();
         if ctx.is_failed() {
-            // A request failed while the abort ran: report that failure.
             return Err(ctx.take_error().expect("failed transfer must have error"));
         }
 
-        // A stored result means S3 created the object, whether that happened
-        // before this call, while Complete raced the abort, or because
-        // PutObject's response arrived just before it could be interrupted.
+        // A stored result means S3 created the object, either before the
+        // abort or because Complete or PutObject committed before it took
+        // effect.
         if let Some(output) = self.transfer.take_result() {
             return Ok(AbortedUpload {
                 outcome: AbortOutcome::AlreadyCompleted,
@@ -231,9 +191,9 @@ impl UploadHandle {
             });
         }
 
-        // Cancelled. Carries the upload ID and request-charged value when
-        // AbortMultipartUpload was sent; empty otherwise.
-        Ok(self.transfer.take_aborted())
+        // The upload ID and request-charged value are set only when
+        // AbortMultipartUpload was sent.
+        Ok(self.transfer.take_abort_mpu_output())
     }
 
     /// Get the transfer ID for this upload.
@@ -260,15 +220,6 @@ impl UploadHandle {
 impl Drop for UploadHandle {
     fn drop(&mut self) {
         let ctx = self.transfer.ctx();
-        // TODO: decide what dropping a running handle should do. Today it
-        //   hard-cancels, the same as before the abort rework, so the multipart
-        //   upload may be left open. Options:
-        //   - dropped while running, including a dropped `join()` future:
-        //     `request_abort()` so the upload is cleaned up in the background
-        //     (fire-and-forget; nobody sees the outcome);
-        //   - dropped pending `abort()` future (the caller gave up on the
-        //     abort itself, e.g. a timeout): keep the hard cancel.
-        //   This depends on the scheduler having both a soft and a hard cancel.
         if ctx.is_active() {
             ctx.set_cancelled();
             ctx.handle.scheduler.cancel_transfer(ctx.id);
