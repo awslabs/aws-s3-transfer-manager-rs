@@ -3,9 +3,10 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/// Module for a caching resolver that implements the SRA specification for name resolution
+/// Module containing a caching resolver that implements the SRA specification for name resolution
 pub mod sra;
 
+use aws_smithy_runtime_api::box_error::BoxError;
 use aws_smithy_runtime_api::client::dns::{
     DnsFuture, ResolveDns, ResolveDnsError, SharedDnsResolver,
 };
@@ -15,63 +16,15 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-/*
-
-Proof of concept for a resolver that uses shared state to distribute IPs to resolution requests
-from arbitrary sources.  This allows us to properly implement SRA-style name resolution which
-has round-robin IP distribution shared across all threads/runtimes interested in establishing
-connections to a given name.  This resolver can be shared across a transfer manager's runtime
-threads, multiple SDK clients, etc...
-
-Shared state via explicit mutual exclusion is a nightmare, so we use a channel-based
-CSP architecture.
-
-The resolver can only be interacted with via a communication channel that can contain resolution
-requests, results, and more.  A lightweight recurrent async task loops on that channel's receiver
-processing incoming operations.  This creates a natural "serialization" of all resolution
-requests regardless of source, with an associated private shared state for bookkeeping.
-
-A very basic async processing task might behave as follows:
-
-On a resolution request:
-   If we have good IPs for that name, resolve the request with the least-used good IP*
-   If there are no good IPs for that name, and no resolution is pending, kick off a resolution on
-      the resolver's runtime.  Either way, park the request until a resolution returns a result.
-   * - [More advanced] Even if there are good IPs, if the (# connections / IP) ratio is above X, spawn
-      a resolution task to try and find more IPs (but don't park the request) in an effort to drive
-      down the ratio (assuming continued use).   This replaces the CRT's DNS "pinging" behavior which
-      has been classified as potentially undesirable.
-
-On a resolution result:
-   Process the list of IPs returned, adding new ones to the good IP set for that name and refreshing
-     the TTL on existing ones.
-   For all parked requests on that name, complete the request with a good IP (by least-used priority)
-     or the error if the resolution failed.
-
-On a host event:
-   (Host events are anything IP-related that might shape our IP distribution decision-making, so
-    things like a connection failing for some reason, a connection closing, etc...)  These events
-    will tend to update the internal bookkeeping shared state (good IP -> bad IP, # connections for
-    an IP, etc...).  It is unknown how we will connect the systems that know enough to emit the events
-    with the caching resolver public API.
-
-Other notes:
-    IPs will have a (configurable) TTL.  IPs will be forgotten about if not seen by
-      a resolution for that period of time.  Unfortunately, getaddrinfo based resolution does
-      not expose the actual TTL value in any way, so this will be somewhat artificial.
-    In addition to good IPs there will also be some sort of bad ip list which good IPs may get
-      moved to if host events dictate (connection failures, etc...)
-
- */
-
 /// Determines what kind of addresses resolution should return.  Happy eyeballs is implemented
 /// internally in hyper and so if we want to support it we need to return both ipv4 and ipv6
 /// addresses (if they exist).  This makes error correlation much harder (impossible really)
 /// because partial failures aren't detectable (for ex: fail to connect to ipv6 but succeed on
 /// ipv4 will not trigger any detectable way of penalizing the ipv6 address).
-#[derive(Debug, Clone)]
+#[derive(Debug, Default, Clone, Copy)]
 pub enum NameResolutionAddressTypes {
     /// Resolution should return at least one ipv4 and ipv6 address, if they exist
+    #[default]
     All,
 
     /// Resolution should only return ipv4 addresses
@@ -81,35 +34,31 @@ pub enum NameResolutionAddressTypes {
     IpV6,
 }
 
-impl Default for NameResolutionAddressTypes {
-    fn default() -> Self {
-        NameResolutionAddressTypes::All
-    }
-}
-
 /// All configuration options for a caching DNS resolver
 #[derive(Clone, Debug, Default)]
-pub struct CachingResolverConfig {
+pub struct ResolverConfig {
     internal_resolver: Option<SharedDnsResolver>,
     runtime: Option<tokio::runtime::Handle>,
     address_types: NameResolutionAddressTypes,
     default_ttl: Option<Duration>,
 }
 
-/// Builder type for caching resolver configuration instances
-#[derive(Debug)]
-pub struct CachingResolverConfigBuilder {
-    config: CachingResolverConfig,
-}
-
-impl CachingResolverConfigBuilder {
+impl ResolverConfig {
     /// Creates a new caching resolver configuration builder instance
-    pub fn new() -> Self {
-        Self {
-            config: CachingResolverConfig::default(),
+    pub fn builder() -> ResolverConfigBuilder {
+        ResolverConfigBuilder {
+            config: ResolverConfig::default(),
         }
     }
+}
 
+/// Builder type for caching resolver configuration instances
+#[derive(Debug)]
+pub struct ResolverConfigBuilder {
+    config: ResolverConfig,
+}
+
+impl ResolverConfigBuilder {
     /// Configures what will perform our internal name resolution when the situation requires
     pub fn with_internal_resolver(&mut self, resolver: SharedDnsResolver) -> &Self {
         self.config.internal_resolver = Some(resolver);
@@ -138,48 +87,47 @@ impl CachingResolverConfigBuilder {
     }
 
     /// Creates a new configuration instance for caching resolvers
-    pub fn build(&self) -> CachingResolverConfig {
+    pub fn build(&self) -> ResolverConfig {
         self.config.clone()
     }
 }
 
-// Why doesn't this exist in smithy dns?
-/// Fundamental name lookup result type
+/// Fundamental name lookup result type based on what's in smithy-dns
 pub type ResolveDnsResult = Result<Vec<IpAddr>, ResolveDnsError>;
 
 /// Models a name resolution request.
 /// Future possibilities could include TTL override, IPv4 vs IPv6 restrictions, etc...
 /// This is the request type used in the public resolution API.
 #[derive(Debug, Clone)]
-pub struct CachingResolveRequest {
+pub struct ResolveRequest {
     name: String,
 }
 
-impl CachingResolveRequest {
+impl ResolveRequest {
+    /// Create a new request builder instance
+    pub fn builder(name: &str) -> ResolveRequestBuilder {
+        ResolveRequestBuilder {
+            request: ResolveRequest {
+                name: name.to_string(),
+            },
+        }
+    }
+
     /// the host name to perform a name resolution for
     pub fn name(&self) -> &str {
         &self.name
     }
 }
 
-/// Builder type for CachingResolveRequest instances
+/// Builder type for ResolveRequest instances
 #[derive(Debug)]
-pub struct CachingResolveRequestBuilder {
-    request: CachingResolveRequest,
+pub struct ResolveRequestBuilder {
+    request: ResolveRequest,
 }
 
-impl CachingResolveRequestBuilder {
-    /// Create a new builder instance
-    pub fn new(name: &str) -> Self {
-        CachingResolveRequestBuilder {
-            request: CachingResolveRequest {
-                name: name.to_string(),
-            },
-        }
-    }
-
-    /// Create a new CachingResolveRequest instance
-    pub fn build(&self) -> CachingResolveRequest {
+impl ResolveRequestBuilder {
+    /// Create a new ResolveRequest instance
+    pub fn build(&self) -> ResolveRequest {
         self.request.clone()
     }
 }
@@ -188,26 +136,26 @@ impl CachingResolveRequestBuilder {
 pub type ResolutionCompletionFn = Box<dyn FnOnce(ResolveDnsResult) -> () + Send + Sync>;
 
 /// Internal resolve request type.  Needs to be public so that caching resolver variants can
-/// be implemented by others.
-pub struct CachingResolveRequestInternal {
-    request: CachingResolveRequest,
+/// be implemented externally.
+pub struct ResolveRequestInternal {
+    request: ResolveRequest,
 
     completion_callback: ResolutionCompletionFn,
 }
 
-impl CachingResolveRequestInternal {
+impl ResolveRequestInternal {
     /// The name resolution request
-    pub fn request(&self) -> &CachingResolveRequest {
+    pub fn request(&self) -> &ResolveRequest {
         &self.request
     }
 
-    /// Channel that completes the user-facing resolution request's future
+    /// Function that will complete the resolution request's user-facing future
     pub fn completion_callback(&self) -> &ResolutionCompletionFn {
         &self.completion_callback
     }
 }
 
-impl std::fmt::Debug for CachingResolveRequestInternal {
+impl std::fmt::Debug for ResolveRequestInternal {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         self.request.fmt(f)
     }
@@ -215,20 +163,12 @@ impl std::fmt::Debug for CachingResolveRequestInternal {
 
 /// The result of a name resolution lookup attempt
 #[derive(Debug)]
-pub struct CachingResolveResult {
+pub struct ResolveResult {
     name: String,
     result: ResolveDnsResult,
 }
 
-impl CachingResolveResult {
-    /// Create a new CachingResolveResult instance
-    pub fn new(name: &str, result: ResolveDnsResult) -> Self {
-        CachingResolveResult {
-            name: name.to_string(),
-            result,
-        }
-    }
-
+impl ResolveResult {
     /// What host name this is a resolve result for
     pub fn name(&self) -> &str {
         &self.name
@@ -242,6 +182,7 @@ impl CachingResolveResult {
 
 /// Classifies a connection-related error.  Determines how the address is "penalized" with respect
 /// to future resolution requests.
+#[non_exhaustive]
 #[derive(Debug, Eq, PartialEq)]
 pub enum ConnectionErrorCategory {
     /// Never use this address again for as long as it's tracked
@@ -255,94 +196,208 @@ pub enum ConnectionErrorCategory {
     Standard(Duration),
 }
 
-/// Event emitted when a connection attempt using a resolved address fails.  Later we'll add
-/// failure context.
+/// Event emitted when something goes wrong with a connection.  This can either be during
+/// connection establishment or while something is using an established connection.  This event
+/// is used to discourage or route away from the associated IP address.
 #[derive(Debug)]
-pub struct CachingHostEventConnectionError {
-    /// How the resolver should penalize the address in future resolutions
-    pub category: ConnectionErrorCategory,
+pub struct HostEventConnectionError {
+    category: ConnectionErrorCategory,
+
+    source: Option<BoxError>,
+}
+
+impl HostEventConnectionError {
+    /// Creates a new builder for a connection error host event variant
+    pub fn builder(category: ConnectionErrorCategory) -> HostEventConnectionErrorBuilder {
+        return HostEventConnectionErrorBuilder {
+            error: HostEventConnectionError {
+                category,
+                source: None,
+            },
+        };
+    }
+
+    /// How the resolver should penalize the associated address in future resolutions
+    pub fn category(&self) -> &ConnectionErrorCategory {
+        &self.category
+    }
 
     /// Actual source error triggering this event
-    pub error: Option<Box<dyn std::error::Error + Send + Sync>>, // fix this type into an Into or something
+    pub fn source(&self) -> Option<&BoxError> {
+        self.source.as_ref()
+    }
+}
+
+/// Builder type for HostEventConnectionError instances
+#[derive(Debug)]
+pub struct HostEventConnectionErrorBuilder {
+    error: HostEventConnectionError,
+}
+
+impl HostEventConnectionErrorBuilder {
+    /// Sets the source error that caused the connection error
+    pub fn with_source(&mut self, error: BoxError) -> &mut HostEventConnectionErrorBuilder {
+        self.error.source = Some(error);
+        self
+    }
+
+    /// (Consuming) builds a new HostEventConnectionError instance
+    pub fn build(self) -> HostEventConnectionError {
+        self.error
+    }
 }
 
 /// Per-host-event-type variants
 #[non_exhaustive]
 #[derive(Debug)]
-pub enum CachingHostEventInformation {
-    /// Notifies the resolver that a consumer encountered an error condition while using an
-    /// address sourced from the resolver
-    ConnectionError(CachingHostEventConnectionError),
+pub enum HostEventInformation {
+    /// Notifies the resolver that a consumer encountered an error condition while using a
+    /// connection to the address sourced from the resolver
+    ConnectionError(HostEventConnectionError),
 }
 
 /// A connection-related event that could cause us to update our internal bookkeeping that
 /// helps distribute IPs across connections.
 #[derive(Debug)]
-pub struct CachingHostEvent {
+pub struct HostEvent {
     /// Name of the host that the address was resolver for
-    pub name: String,
+    name: String,
 
     /// IP address of the connection that encountered an error
-    pub address: IpAddr,
+    address: IpAddr,
 
     /// Per-event-type data
-    pub event_data: CachingHostEventInformation,
+    event_data: HostEventInformation,
+}
+
+impl HostEvent {
+    /// Creates a new builder for HostEvents
+    pub fn builder(
+        name: &str,
+        address: IpAddr,
+        event_data: HostEventInformation,
+    ) -> HostEventBuilder {
+        HostEventBuilder {
+            event: HostEvent {
+                name: name.to_string(),
+                address,
+                event_data,
+            },
+        }
+    }
+
+    /// Host name this event corresponds to
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// IP address this event corresponds to
+    pub fn address(&self) -> IpAddr {
+        self.address
+    }
+
+    /// Host event variant data
+    pub fn event_data(&self) -> &HostEventInformation {
+        &self.event_data
+    }
+}
+
+/// Builder type for HostEvent instances
+#[derive(Debug)]
+pub struct HostEventBuilder {
+    event: HostEvent,
+}
+
+impl HostEventBuilder {
+    /// Creates a new HostEvent instance
+    pub fn build(self) -> HostEvent {
+        self.event
+    }
 }
 
 /// The fundamental operation type that a caching resolver works with.
 #[non_exhaustive]
 #[derive(Debug)]
-pub enum CachingResolverOperation {
+pub enum ResolverOperation {
     /// An operation that requests an IP address for a host name
-    ResolveRequest(CachingResolveRequestInternal),
+    ResolveRequest(ResolveRequestInternal),
 
     /// An operation holding the result of looking up IP addresses for a host name
-    ResolveResult(CachingResolveResult),
+    ResolveResult(ResolveResult),
 
     /// An operation detailing an event that may cause the resolver to change how it
-    /// completes resolve requests for a host name
-    HostEvent(CachingHostEvent),
+    /// distributes IP addresses to resolve requests
+    HostEvent(HostEvent),
 }
 
+/// Type signature for the function that performs background task name lookup resolution
 pub type ResolutionFunction = Box<dyn Fn(String) + Send + Sync>;
 
-/// Configuration for the async recurrent task that handles all incoming CachingResolverOperation
-/// instances
-pub struct CachingOperationHandlerContext {
-    /// function object that will actually perform lookups.  Lookups are performed on the runtime
-    /// associated with the caching resolver
+/// Configuration for the async recurrent task that handles all incoming ResolverOperation
+/// instances.  This context is passed into the operation handler function a caching resolver
+/// was created with, allowing it to do name lookups and know how long an address should stay
+/// valid.
+pub struct OperationHandlerContext {
     resolution_function: ResolutionFunction,
 
-    /// How long a lookup stays cached; may be extended indefinitely by future lookups refreshing
-    /// an individual address's ttl
     ttl: Duration,
 }
 
-/// Represents the centralized, recurrent task that handles CachingResolverOperation instances
-struct CachingResolverProcess<T> {
-    /// (semi-)immutable configuration
-    context: CachingOperationHandlerContext,
+impl Debug for OperationHandlerContext {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let mut formatter = f.debug_struct("OperationHandlerContext");
+        formatter.field("ttl", &self.ttl);
+        formatter.finish()
+    }
+}
+
+impl OperationHandlerContext {
+    /// function object that will actually perform lookups.  Lookups are performed on the runtime
+    /// associated with the caching resolver
+    pub fn resolution_function(&self) -> &ResolutionFunction {
+        &self.resolution_function
+    }
+
+    /// How long a lookup stays cached; may be extended indefinitely by future lookups refreshing
+    /// an individual address's ttl
+    pub fn ttl(&self) -> Duration {
+        self.ttl
+    }
+}
+
+/// Type signature for a function (pointer) that handles resolver operations together with
+/// an associated bookkeeping context (of type T)
+pub type ResolverOperationHandlerFn<T> =
+    fn(context: &OperationHandlerContext, &mut T, ResolverOperation) -> ();
+
+/// Represents the centralized, recurrent task that handles ResolverOperation instances
+struct ResolverProcess<T> {
+    /// Operation handling context passed to the resolver's operation handler function on each
+    /// incoming operation.
+    context: OperationHandlerContext,
 
     /// input queue receiver, all communication from the outside world (including resolution task
     /// results) comes through here
-    receiver: mpsc::UnboundedReceiver<CachingResolverOperation>,
+    receiver: mpsc::UnboundedReceiver<ResolverOperation>,
 
     /// the (mutable) bookkeeping state (cache) the caching resolver uses to make resolution decisions
     state: T,
 }
 
-impl<T> CachingResolverProcess<T>
+impl<T> ResolverProcess<T>
 where
     T: Default,
 {
-    /// Instantiate a new caching resolver
     fn new(
         state: T,
         internal_resolver: SharedDnsResolver,
-        sender: mpsc::UnboundedSender<CachingResolverOperation>,
-        receiver: mpsc::UnboundedReceiver<CachingResolverOperation>,
+        sender: mpsc::UnboundedSender<ResolverOperation>,
+        receiver: mpsc::UnboundedReceiver<ResolverOperation>,
         ttl: Duration,
     ) -> Self {
+        // build the resolver function that runs resolution as a background task on the tokio
+        // runtime and then takes the result and sends it back to the resolver process via
+        // the operation input channel
         let resolver = internal_resolver.clone();
         let operation_channel = sender.clone();
         let resolution_function: ResolutionFunction = Box::new(move |name| {
@@ -352,17 +407,16 @@ where
             let internal_channel = operation_channel.clone();
             handle.spawn(async move {
                 let result = internal_resolver.resolve_dns(&internal_name).await;
-                let caching_result =
-                    CachingResolverOperation::ResolveResult(CachingResolveResult {
-                        name: internal_name,
-                        result,
-                    });
+                let caching_result = ResolverOperation::ResolveResult(ResolveResult {
+                    name: internal_name,
+                    result,
+                });
                 let _ = internal_channel.send(caching_result);
             });
         });
 
-        CachingResolverProcess {
-            context: CachingOperationHandlerContext {
+        ResolverProcess {
+            context: OperationHandlerContext {
                 resolution_function,
                 ttl,
             },
@@ -382,21 +436,13 @@ where
     // handle futures.
 
     /// Core recurrent loop that handles incoming operations
-    async fn run(
-        &mut self,
-        operation_handler: fn(
-            context: &CachingOperationHandlerContext,
-            &mut T,
-            CachingResolverOperation,
-        ) -> (),
-    ) {
+    async fn run(&mut self, operation_handler: ResolverOperationHandlerFn<T>) {
         let receiver = &mut self.receiver;
         let context = &mut self.context;
         let state = &mut self.state;
 
         // runs until recv returns None implying all input queue Sender clones are gone
         loop {
-            // eventually we may select on time too in order to support TTL expiration
             tokio::select! {
                 operation_result = receiver.recv() => {
                     match operation_result {
@@ -413,69 +459,59 @@ where
     }
 }
 
-/// Unit result type for resolver API(s)
-pub type ResolverResult = Result<(), aws_smithy_runtime_api::box_error::BoxError>;
+/// Unit result type for our public API(s)
+pub type ResolverResult = Result<(), BoxError>;
 
 /// Public API for the caching resolver.  Intentionally distinct from ResolveDns.
-pub trait CachingResolver: Debug + Send + Sync {
+pub trait Resolver: Debug + Send + Sync {
     /// Perform a resolution request.  Equivalent to ResolveDns::resolve_dns but with a different
     /// API to allow for extensibility (additional flags, options, etc...)
-    fn resolve(&self, request: CachingResolveRequest) -> DnsFuture<'static>;
+    fn resolve(&self, request: ResolveRequest) -> DnsFuture<'static>;
 
     /// Notify the resolver of an external host-related event that may affect how it
     /// chooses to distribute IP addresses to resolution requests
-    fn notify(&self, event: CachingHostEvent) -> ResolverResult;
+    fn notify(&self, event: HostEvent) -> ResolverResult;
 }
-
-/// Function object signature for the logic that will perform a lookup for a name and
-/// route the result back to the caching resolver via the input channel
-pub type ResolverFunction = Box<dyn Fn(String)>;
 
 /// Internal caching resolver implementation type that serves as the entry point for
 /// resolution requests
 #[derive(Debug)]
-struct CachingResolverImpl {
+pub struct ResolverImpl {
+    // if we create our own runtime, we need to hold onto it here, since no one else will
     self_created_runtime: Option<tokio::runtime::Runtime>,
-    operation_channel: mpsc::UnboundedSender<CachingResolverOperation>,
+    operation_channel: mpsc::UnboundedSender<ResolverOperation>,
 }
 
 const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(60);
 
-impl CachingResolverImpl {
-    fn new_default<T>(
-        config: CachingResolverConfig,
-        operation_handler: fn(
-            context: &CachingOperationHandlerContext,
-            &mut T,
-            CachingResolverOperation,
-        ) -> (),
+impl ResolverImpl {
+    /// Creates a new resolver implementation using the default constructor for the bookkeeping
+    /// state
+    pub fn new_default<T>(
+        config: ResolverConfig,
+        operation_handler: ResolverOperationHandlerFn<T>,
     ) -> Self
     where
         T: Default + Send + 'static,
     {
-        CachingResolverImpl::new(config, T::default(), operation_handler)
+        ResolverImpl::new(config, T::default(), operation_handler)
     }
 
-    /// Combines configuration and an operation handler function to create a new caching resolver
-    /// instance.
-    fn new<T>(
-        config: CachingResolverConfig,
+    /// Creates a new resolver implementation
+    pub fn new<T>(
+        config: ResolverConfig,
         state: T,
-        operation_handler: fn(
-            context: &CachingOperationHandlerContext,
-            &mut T,
-            CachingResolverOperation,
-        ) -> (),
+        operation_handler: ResolverOperationHandlerFn<T>,
     ) -> Self
     where
         T: Default + Send + 'static,
     {
         let (tx, rx): (
-            mpsc::UnboundedSender<CachingResolverOperation>,
-            mpsc::UnboundedReceiver<CachingResolverOperation>,
+            mpsc::UnboundedSender<ResolverOperation>,
+            mpsc::UnboundedReceiver<ResolverOperation>,
         ) = mpsc::unbounded_channel();
 
-        let mut caching_resolver = CachingResolverImpl {
+        let mut caching_resolver = ResolverImpl {
             self_created_runtime: None,
             operation_channel: tx.clone(),
         };
@@ -484,7 +520,7 @@ impl CachingResolverImpl {
         let internal_resolver = config.internal_resolver.unwrap_or(SharedDnsResolver::new(
             aws_smithy_runtime::client::dns::TokioDnsResolver::new(),
         ));
-        let mut resolver_impl = CachingResolverProcess::<T>::new(
+        let mut resolver_impl = ResolverProcess::<T>::new(
             state,
             internal_resolver,
             tx,
@@ -516,10 +552,10 @@ impl CachingResolverImpl {
     }
 }
 
-impl CachingResolver for CachingResolverImpl {
-    fn resolve(&self, request: CachingResolveRequest) -> DnsFuture<'static> {
+impl Resolver for ResolverImpl {
+    fn resolve(&self, request: ResolveRequest) -> DnsFuture<'static> {
         let (tx, rx) = tokio::sync::oneshot::channel::<ResolveDnsResult>();
-        let internal_request = CachingResolveRequestInternal {
+        let internal_request = ResolveRequestInternal {
             request,
             completion_callback: Box::new(move |result| {
                 // if this fails, there's nothing we can do; it's likely the waiter is gone
@@ -527,9 +563,10 @@ impl CachingResolver for CachingResolverImpl {
             }),
         };
 
+        // kick off the resolve request
         let send_result = self
             .operation_channel
-            .send(CachingResolverOperation::ResolveRequest(internal_request));
+            .send(ResolverOperation::ResolveRequest(internal_request));
 
         DnsFuture::new(async move {
             if let Err(send_result_err) = send_result {
@@ -542,10 +579,10 @@ impl CachingResolver for CachingResolverImpl {
         })
     }
 
-    fn notify(&self, event: CachingHostEvent) -> ResolverResult {
+    fn notify(&self, event: HostEvent) -> ResolverResult {
         self.operation_channel
-            .send(CachingResolverOperation::HostEvent(event))
-            .map_err(|err| err.into()) // don't quite understand what's going on here tbh
+            .send(ResolverOperation::HostEvent(event))
+            .map_err(|err| err.into())
     }
 }
 
@@ -553,48 +590,41 @@ impl CachingResolver for CachingResolverImpl {
 /// all caching resolver variants.  It implements both its internal trait (CachingResolver) and the
 /// public external smithy DNS trait (ResolveDns).
 #[derive(Clone)]
-pub struct CachingResolverHandle {
-    resolver: Arc<dyn CachingResolver>,
+pub struct ResolverHandle {
+    resolver: Arc<dyn Resolver>,
 }
 
-impl CachingResolverHandle {
+impl ResolverHandle {
     /// Factory function for creating caching resolver instances
-    pub fn new<T>(
-        config: CachingResolverConfig,
-        operation_handler: fn(
-            context: &CachingOperationHandlerContext,
-            &mut T,
-            CachingResolverOperation,
-        ) -> (),
-    ) -> Self
+    pub fn new<T>(config: ResolverConfig, operation_handler: ResolverOperationHandlerFn<T>) -> Self
     where
         T: Default + Send + 'static,
     {
-        CachingResolverHandle {
-            resolver: Arc::new(CachingResolverImpl::new_default(config, operation_handler)),
+        ResolverHandle {
+            resolver: Arc::new(ResolverImpl::new_default(config, operation_handler)),
         }
     }
 }
 
-impl CachingResolver for CachingResolverHandle {
-    fn resolve(&self, request: CachingResolveRequest) -> DnsFuture<'static> {
+impl Resolver for ResolverHandle {
+    fn resolve(&self, request: ResolveRequest) -> DnsFuture<'static> {
         self.resolver.resolve(request)
     }
 
-    fn notify(&self, event: CachingHostEvent) -> ResolverResult {
+    fn notify(&self, event: HostEvent) -> ResolverResult {
         self.resolver.notify(event)
     }
 }
 
-impl std::fmt::Debug for CachingResolverHandle {
+impl std::fmt::Debug for ResolverHandle {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         self.resolver.fmt(f)
     }
 }
 
-impl ResolveDns for CachingResolverHandle {
+impl ResolveDns for ResolverHandle {
     fn resolve_dns<'a>(&'a self, name: &'a str) -> DnsFuture<'a> {
-        let request = CachingResolveRequest {
+        let request = ResolveRequest {
             name: name.to_string(),
         };
 
@@ -609,32 +639,30 @@ pub(crate) mod testing {
     use std::net::Ipv4Addr;
 
     #[derive(Default, Debug)]
-    pub(crate) struct MockCachingResolverState {}
+    pub(crate) struct EmptyResolverState {}
 
     fn handle_operation_mock_lookup_success(
-        _: &CachingResolverProcessConfig,
-        _: &mut MockCachingResolverState,
-        operation: CachingResolverOperation,
+        _: &OperationHandlerContext,
+        _: &mut EmptyResolverState,
+        operation: ResolverOperation,
     ) {
         match operation {
-            CachingResolverOperation::ResolveRequest(request) => {
+            ResolverOperation::ResolveRequest(request) => {
                 let address: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
                 let addresses = vec![address];
                 let success_result: ResolveDnsResult = Ok(addresses);
                 (request.completion_callback)(success_result);
             }
 
-            CachingResolverOperation::ResolveResult(_) => {}
+            ResolverOperation::ResolveResult(_) => {}
 
-            CachingResolverOperation::HostEvent(_) => {}
+            ResolverOperation::HostEvent(_) => {}
         }
     }
 
-    fn new_caching_resolver_mock_lookup_success(
-        config: CachingResolverConfig,
-    ) -> CachingResolverHandle {
-        CachingResolverHandle {
-            resolver: Arc::new(CachingResolverImpl::new_default(
+    fn new_caching_resolver_mock_lookup_success(config: ResolverConfig) -> ResolverHandle {
+        ResolverHandle {
+            resolver: Arc::new(ResolverImpl::new_default(
                 config,
                 handle_operation_mock_lookup_success,
             )),
@@ -646,13 +674,12 @@ pub(crate) mod testing {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let handle = runtime.handle().clone();
         let resolver = new_caching_resolver_mock_lookup_success(
-            CachingResolverConfigBuilder::new()
+            ResolverConfig::builder()
                 .with_runtime(handle.clone())
                 .build(),
         );
 
-        let lookup_future =
-            resolver.resolve(CachingResolveRequestBuilder::new("hello.world.com").build());
+        let lookup_future = resolver.resolve(ResolveRequest::builder("hello.world.com").build());
         let lookup_result = handle.block_on(lookup_future);
 
         assert!(lookup_result.is_ok());
@@ -665,28 +692,26 @@ pub(crate) mod testing {
     }
 
     fn handle_operation_mock_lookup_failure(
-        _: &CachingResolverProcessConfig,
-        _: &mut MockCachingResolverState,
-        operation: CachingResolverOperation,
+        _: &OperationHandlerContext,
+        _: &mut EmptyResolverState,
+        operation: ResolverOperation,
     ) {
         match operation {
-            CachingResolverOperation::ResolveRequest(request) => {
+            ResolverOperation::ResolveRequest(request) => {
                 let failure_result: ResolveDnsResult =
                     Err(ResolveDnsError::new("Catastrophic Failure"));
                 (request.completion_callback)(failure_result);
             }
 
-            CachingResolverOperation::ResolveResult(_) => {}
+            ResolverOperation::ResolveResult(_) => {}
 
-            CachingResolverOperation::HostEvent(_) => {}
+            ResolverOperation::HostEvent(_) => {}
         }
     }
 
-    fn new_caching_resolver_mock_lookup_failure(
-        config: CachingResolverConfig,
-    ) -> CachingResolverHandle {
-        CachingResolverHandle {
-            resolver: Arc::new(CachingResolverImpl::new_default(
+    fn new_caching_resolver_mock_lookup_failure(config: ResolverConfig) -> ResolverHandle {
+        ResolverHandle {
+            resolver: Arc::new(ResolverImpl::new_default(
                 config,
                 handle_operation_mock_lookup_failure,
             )),
@@ -698,13 +723,12 @@ pub(crate) mod testing {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let handle = runtime.handle().clone();
         let resolver = new_caching_resolver_mock_lookup_failure(
-            CachingResolverConfigBuilder::new()
+            ResolverConfig::builder()
                 .with_runtime(handle.clone())
                 .build(),
         );
 
-        let lookup_future =
-            resolver.resolve(CachingResolveRequestBuilder::new("hello.world.com").build());
+        let lookup_future = resolver.resolve(ResolveRequest::builder("hello.world.com").build());
         let lookup_result = handle.block_on(lookup_future);
 
         assert!(lookup_result.is_err());
@@ -712,20 +736,20 @@ pub(crate) mod testing {
 
     #[derive(Default)]
     pub(crate) struct MockHostEventCachingResolverState {
-        on_host_event_fn: Option<Box<dyn FnOnce(CachingHostEvent) + Send + Sync>>,
+        on_host_event_fn: Option<Box<dyn FnOnce(HostEvent) + Send + Sync>>,
     }
 
     fn handle_operation_mock_host_event(
-        _: &CachingResolverProcessConfig,
+        _: &OperationHandlerContext,
         state: &mut MockHostEventCachingResolverState,
-        operation: CachingResolverOperation,
+        operation: ResolverOperation,
     ) {
         match operation {
-            CachingResolverOperation::ResolveRequest(_) => {}
+            ResolverOperation::ResolveRequest(_) => {}
 
-            CachingResolverOperation::ResolveResult(_) => {}
+            ResolverOperation::ResolveResult(_) => {}
 
-            CachingResolverOperation::HostEvent(event) => {
+            ResolverOperation::HostEvent(event) => {
                 let completion_callback = state.on_host_event_fn.take();
                 if let Some(callback) = completion_callback {
                     (callback)(event);
@@ -735,21 +759,21 @@ pub(crate) mod testing {
     }
 
     fn new_caching_resolver_mock_host_event(
-        config: CachingResolverConfig,
+        config: ResolverConfig,
     ) -> (
-        CachingResolverHandle,
-        std::pin::Pin<Box<dyn Future<Output = CachingHostEvent>>>,
+        ResolverHandle,
+        std::pin::Pin<Box<dyn Future<Output = HostEvent>>>,
     ) {
-        let (tx, rx) = tokio::sync::oneshot::channel::<CachingHostEvent>();
+        let (tx, rx) = tokio::sync::oneshot::channel::<HostEvent>();
 
         let resolver_state = MockHostEventCachingResolverState {
-            on_host_event_fn: Some(Box::new(move |event: CachingHostEvent| {
+            on_host_event_fn: Some(Box::new(move |event: HostEvent| {
                 let _ = tx.send(event);
             })),
         };
 
-        let resolver = CachingResolverHandle {
-            resolver: Arc::new(CachingResolverImpl::new(
+        let resolver = ResolverHandle {
+            resolver: Arc::new(ResolverImpl::new(
                 config,
                 resolver_state,
                 handle_operation_mock_host_event,
@@ -765,21 +789,19 @@ pub(crate) mod testing {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let handle = runtime.handle().clone();
         let (resolver, event_future) = new_caching_resolver_mock_host_event(
-            CachingResolverConfigBuilder::new()
+            ResolverConfig::builder()
                 .with_runtime(handle.clone())
                 .build(),
         );
 
-        let host_event = CachingHostEvent {
-            name: "localhost".to_string(),
-            address: IpAddr::V4(Ipv4Addr::LOCALHOST),
-            event_data: CachingHostEventInformation::ConnectionError(
-                CachingHostEventConnectionError {
-                    category: ConnectionErrorCategory::Fatal,
-                    error: None,
-                },
-            ),
-        };
+        let connection_error =
+            HostEventConnectionError::builder(ConnectionErrorCategory::Fatal).build();
+        let host_event = HostEvent::builder(
+            "localhost",
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            HostEventInformation::ConnectionError(connection_error),
+        )
+        .build();
 
         let notify_result = resolver.notify(host_event);
         assert!(notify_result.is_ok());
@@ -790,9 +812,9 @@ pub(crate) mod testing {
         assert_eq!("localhost", received_event.name);
 
         match received_event.event_data {
-            CachingHostEventInformation::ConnectionError(error_event) => {
+            HostEventInformation::ConnectionError(error_event) => {
                 assert_eq!(ConnectionErrorCategory::Fatal, error_event.category);
-                assert!(error_event.error.is_none());
+                assert!(error_event.source().is_none());
             }
             _ => {
                 assert!(false);
