@@ -57,9 +57,11 @@ pub(crate) use transfer::DownloadTransfer;
 
 mod object_meta;
 
+use crate::config::user_agent::OperationFeatures;
 use crate::error;
 use crate::operation::download::body::new_recv_body;
 use crate::types::BucketType;
+use aws_runtime::sdk_feature::AwsSdkFeature;
 use std::sync::Arc;
 
 /// Most names tried for the temporary file of one path download.
@@ -215,6 +217,13 @@ impl Download {
             None => TransferContext::new(handle.clone()),
         };
 
+        let features = OperationFeatures::new(
+            parent_id
+                .map(|_| AwsSdkFeature::S3TransferDownloadDirectory)
+                .into_iter()
+                .chain([AwsSdkFeature::S3FilePath]),
+        );
+        let ctx = ctx.with_features(features);
         let transfer = DownloadTransfer::new(ctx.clone(), bucket_type, input, writer);
         handle
             .scheduler

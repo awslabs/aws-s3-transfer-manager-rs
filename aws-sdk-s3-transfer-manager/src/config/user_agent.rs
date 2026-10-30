@@ -9,6 +9,11 @@ use aws_runtime::sdk_feature::AwsSdkFeature;
 use aws_runtime::user_agent::{AdditionalMetadata, ApiMetadata, AwsUserAgent, FrameworkMetadata};
 use aws_sdk_s3::config::{AppName, Intercept, IntoShared};
 use aws_types::os_shim_internal::Env;
+use std::sync::Arc;
+
+use crate::runtime::platform::MachineProfile;
+use crate::types::{ConcurrencyMode, MemoryConfig, PartSize};
+use crate::Config;
 
 /// This crate's name and version, as the `md/` pair the user agent carries. Neither
 /// `aws-sdk-rust/…` nor `api/s3/…` carries the transfer manager's version, and `rust-tm`
@@ -18,12 +23,87 @@ const RUST_TM_VERSION: &str = concat!("rust-tm#", env!("CARGO_PKG_VERSION"));
 /// Identifies our interceptor on a client that already carries one.
 const INTERCEPTOR_NAME: &str = "S3TransferManager";
 
+/// Identifies the per-operation interceptor on an operation's request.
+const OPERATION_INTERCEPTOR_NAME: &str = "S3TransferManagerOperation";
+
+/// The features that describe the client's configuration and environment, carried on every
+/// request it issues.
+pub(crate) fn client_features(config: &Config, profile: &MachineProfile) -> Vec<AwsSdkFeature> {
+    let mut features = Vec::new();
+    if matches!(config.part_size(), PartSize::Target(_)) {
+        features.push(AwsSdkFeature::S3CustomPartSize);
+    }
+    if !matches!(config.concurrency(), ConcurrencyMode::Auto) {
+        features.push(AwsSdkFeature::S3CustomThroughput);
+    }
+    if matches!(config.memory(), MemoryConfig::Explicit(_)) {
+        features.push(AwsSdkFeature::S3CustomMemoryLimit);
+    }
+    if profile.instance_type.is_some() {
+        features.push(AwsSdkFeature::S3OnEc2);
+    }
+    features
+}
+
 /// Install the transfer manager's user agent attribution on an S3 client builder.
 pub(crate) fn install(
     builder: &mut aws_sdk_s3::config::Builder,
     framework_metadata: Option<FrameworkMetadata>,
+    features: Vec<AwsSdkFeature>,
 ) {
-    builder.push_interceptor(S3TransferManagerInterceptor { framework_metadata }.into_shared());
+    builder.push_interceptor(
+        S3TransferManagerInterceptor {
+            framework_metadata,
+            features,
+        }
+        .into_shared(),
+    );
+}
+
+/// The features one operation adds to the requests it issues, on top of the client's.
+///
+/// Applied per request through `config_override`, so they never mark the shared client.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct OperationFeatures(Arc<[AwsSdkFeature]>);
+
+impl OperationFeatures {
+    pub(crate) fn new(features: impl IntoIterator<Item = AwsSdkFeature>) -> Self {
+        Self(features.into_iter().collect())
+    }
+
+    /// Adds the features to a per-request config override.
+    pub(crate) fn apply(
+        &self,
+        builder: aws_sdk_s3::config::Builder,
+    ) -> aws_sdk_s3::config::Builder {
+        if self.0.is_empty() {
+            builder
+        } else {
+            builder.interceptor(self.clone())
+        }
+    }
+
+    /// Adds the features to a client that issues only this operation's requests.
+    pub(crate) fn apply_to_client(&self, client: &aws_sdk_s3::Client) -> aws_sdk_s3::Client {
+        aws_sdk_s3::Client::from_conf(self.apply(client.config().to_builder()).build())
+    }
+}
+
+impl Intercept for OperationFeatures {
+    fn name(&self) -> &'static str {
+        OPERATION_INTERCEPTOR_NAME
+    }
+
+    fn read_before_execution(
+        &self,
+        _ctx: &aws_sdk_s3::config::interceptors::BeforeSerializationInterceptorContextRef<'_>,
+        cfg: &mut aws_sdk_s3::config::ConfigBag,
+    ) -> Result<(), aws_sdk_s3::error::BoxError> {
+        for feature in self.0.iter() {
+            cfg.interceptor_state().store_append(feature.clone());
+        }
+        Ok(())
+    }
 }
 
 /// Install on a client the caller handed over, rebuilding it from its own configuration.
@@ -39,6 +119,7 @@ pub(crate) fn install(
 pub(crate) fn install_on_client(
     client: aws_sdk_s3::Client,
     framework_metadata: Option<FrameworkMetadata>,
+    features: Vec<AwsSdkFeature>,
 ) -> aws_sdk_s3::Client {
     if client
         .config()
@@ -48,13 +129,14 @@ pub(crate) fn install_on_client(
         return client;
     }
     let mut builder = client.config().to_builder();
-    install(&mut builder, framework_metadata);
+    install(&mut builder, framework_metadata, features);
     aws_sdk_s3::Client::from_conf(builder.build())
 }
 
 #[derive(Debug)]
 struct S3TransferManagerInterceptor {
     framework_metadata: Option<FrameworkMetadata>,
+    features: Vec<AwsSdkFeature>,
 }
 
 impl Intercept for S3TransferManagerInterceptor {
@@ -73,6 +155,9 @@ impl Intercept for S3TransferManagerInterceptor {
     ) -> Result<(), aws_sdk_s3::error::BoxError> {
         cfg.interceptor_state()
             .store_append(AwsSdkFeature::S3Transfer);
+        for feature in &self.features {
+            cfg.interceptor_state().store_append(feature.clone());
+        }
 
         let existing = cfg.load::<AwsUserAgent>().cloned();
         let base = existing.or_else(|| {
@@ -106,9 +191,9 @@ impl Intercept for S3TransferManagerInterceptor {
 
 #[cfg(test)]
 mod tests {
-    use crate::types::RuntimeMode;
+    use crate::types::{ConcurrencyMode, MemoryConfig, PartSize, RuntimeMode};
     use aws_config::{BehaviorVersion, Region};
-    use aws_runtime::user_agent::FrameworkMetadata;
+    use aws_runtime::user_agent::{AwsUserAgent, BusinessMetric, FrameworkMetadata};
     use aws_sdk_s3::config::{
         AppName, Credentials, Intercept, IntoShared, SharedCredentialsProvider,
     };
@@ -283,6 +368,7 @@ mod tests {
         let tm = crate::Client::new(
             crate::Config::builder()
                 .runtime_mode(RuntimeMode::MultiThreadTokio)
+                .part_size(PartSize::Target(8 << 20))
                 .sdk_client(client)
                 .build(),
         );
@@ -311,10 +397,13 @@ mod tests {
             .split_whitespace()
             .find_map(|section| section.strip_prefix("m/"))
             .expect("user agent carries a metrics section");
-        assert!(
-            metrics.split(',').any(|id| id == "G"),
-            "S3Transfer metric missing from {metrics:?} in {ua:?}"
-        );
+        for metric in [BusinessMetric::S3Transfer, BusinessMetric::S3CustomPartSize] {
+            let id = id_of(metric);
+            assert!(
+                metrics.split(',').any(|m| m == id),
+                "{id} missing from {metrics:?} in {ua:?}"
+            );
+        }
     }
 
     /// Rebuilding a caller's client must not cost them anything they configured on it, so this
@@ -470,5 +559,246 @@ mod tests {
         })
         .await;
         assert_eq!(ua, OWNED_USER_AGENT);
+    }
+
+    type Seen = std::sync::Arc<std::sync::Mutex<Vec<(String, Vec<String>)>>>;
+
+    /// The id `aws-runtime` encodes `metric` as, so these tests do not repeat its table.
+    fn id_of(metric: BusinessMetric) -> String {
+        let header = AwsUserAgent::for_tests()
+            .with_business_metric(metric)
+            .aws_ua_header();
+        metric_ids(&header).remove(0)
+    }
+
+    /// The business metric ids in a user agent.
+    fn metric_ids(ua: &str) -> Vec<String> {
+        ua.split_whitespace()
+            .find_map(|section| section.strip_prefix("m/"))
+            .map(|metrics| metrics.split(',').map(str::to_owned).collect())
+            .unwrap_or_default()
+    }
+
+    /// A transport that records each request's URI and metric ids, answers listings with one
+    /// object and fails everything else, which is enough for a request to be issued and seen.
+    fn recording_client() -> (aws_smithy_runtime_api::client::http::SharedHttpClient, Seen) {
+        const LISTING: &str = "<ListBucketResult><Name>foo</Name><KeyCount>1</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated><Contents><Key>a.txt</Key><Size>1</Size><LastModified>2020-01-01T00:00:00.000Z</LastModified></Contents></ListBucketResult>";
+        let seen = Seen::default();
+        let recorded = seen.clone();
+        let client = aws_smithy_http_client::test_util::infallible_client_fn(move |req| {
+            let uri = req.uri().to_string();
+            let ua = req.headers()["x-amz-user-agent"].to_str().unwrap();
+            recorded.lock().unwrap().push((uri.clone(), metric_ids(ua)));
+            let (status, body) = if uri.contains("list-type=2") {
+                (200, LISTING)
+            } else {
+                (403, "<Error><Code>AccessDenied</Code></Error>")
+            };
+            http::Response::builder().status(status).body(body).unwrap()
+        });
+        (client, seen)
+    }
+
+    fn tm_over(
+        http_client: aws_smithy_runtime_api::client::http::SharedHttpClient,
+        tweak: impl FnOnce(crate::config::Builder) -> crate::config::Builder,
+    ) -> crate::Client {
+        let shared = aws_types::SdkConfig::builder()
+            .http_client(http_client)
+            .region(Region::from_static("us-west-2"))
+            .credentials_provider(test_credentials())
+            .behavior_version(BehaviorVersion::latest())
+            .build();
+        let s3_config = crate::config::S3ClientConfig::new(&shared).enable_runtime_http(false);
+        crate::Client::new(
+            tweak(
+                crate::Config::builder()
+                    .runtime_mode(RuntimeMode::MultiThreadTokio)
+                    .machine_profile(Some(crate::runtime::platform::MachineProfile {
+                        instance_type: None,
+                        vcpus: 4,
+                        ram_bytes: None,
+                    }))
+                    .s3_config(s3_config),
+            )
+            .build(),
+        )
+    }
+
+    /// The metric ids of the only request a streaming download issues.
+    async fn download_ids(
+        tweak: impl FnOnce(crate::config::Builder) -> crate::config::Builder,
+    ) -> Vec<String> {
+        let (http_client, seen) = recording_client();
+        let tm = tm_over(http_client, tweak);
+        let mut handle = tm.download().bucket("foo").key("bar").initiate().unwrap();
+        let _ = handle.body_mut().next().await;
+        let seen = seen.lock().unwrap();
+        seen[0].1.clone()
+    }
+
+    fn has(ids: &[String], metric: BusinessMetric) -> bool {
+        ids.contains(&id_of(metric))
+    }
+
+    const ATTRIBUTION: [BusinessMetric; 7] = [
+        BusinessMetric::S3CustomPartSize,
+        BusinessMetric::S3CustomThroughput,
+        BusinessMetric::S3CustomMemoryLimit,
+        BusinessMetric::S3OnEc2,
+        BusinessMetric::S3FilePath,
+        BusinessMetric::S3TransferUploadDirectory,
+        BusinessMetric::S3TransferDownloadDirectory,
+    ];
+
+    /// The attribution ids a transfer manager's requests carry for its configuration, and for
+    /// the operation that issued them.
+    async fn attribution_ids(
+        tweak: impl FnOnce(crate::config::Builder) -> crate::config::Builder,
+    ) -> Vec<String> {
+        let mut ids = download_ids(tweak).await;
+        let ours = ATTRIBUTION.map(id_of);
+        ids.retain(|id| ours.contains(id));
+        ids
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn configuration_metrics_follow_the_configuration() {
+        type Tweak = Box<dyn FnOnce(crate::config::Builder) -> crate::config::Builder>;
+        let pool = crate::runtime::buffer_pool::BufferPool::from_capacity(
+            crate::types::MemoryBudgetConfig::Limit(256 * 1024 * 1024),
+            None,
+            Default::default(),
+        )
+        .unwrap();
+        let ec2 = crate::runtime::platform::MachineProfile {
+            instance_type: Some("m6i.large".to_owned()),
+            vcpus: 2,
+            ram_bytes: None,
+        };
+        let cases: Vec<(&str, Tweak, &[BusinessMetric])> = vec![
+            ("defaults", Box::new(|b| b), &[]),
+            (
+                "part size",
+                Box::new(|b| b.part_size(PartSize::Target(8 << 20))),
+                &[BusinessMetric::S3CustomPartSize],
+            ),
+            (
+                "concurrency",
+                Box::new(|b| b.concurrency(ConcurrencyMode::Explicit(4))),
+                &[BusinessMetric::S3CustomThroughput],
+            ),
+            (
+                "memory",
+                Box::new(|b| b.memory(MemoryConfig::Explicit(pool))),
+                &[BusinessMetric::S3CustomMemoryLimit],
+            ),
+            (
+                "ec2",
+                Box::new(|b| b.machine_profile(Some(ec2))),
+                &[BusinessMetric::S3OnEc2],
+            ),
+        ];
+        for (name, tweak, expected) in cases {
+            let expected: Vec<String> = expected.iter().cloned().map(id_of).collect();
+            assert_eq!(expected, attribution_ids(tweak).await, "{name}");
+        }
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn upload_objects_emits_upload_directory_and_file_path() {
+        let (http_client, seen) = recording_client();
+        let tm = tm_over(http_client, |b| b);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"x").unwrap();
+        let _ = tm
+            .upload_objects()
+            .bucket("foo")
+            .source(dir.path())
+            .initiate()
+            .unwrap()
+            .join()
+            .await;
+        let children = seen.lock().unwrap().len();
+        let body = crate::io::InputStream::from(bytes::Bytes::from_static(b"x"));
+        let _ = tm
+            .upload()
+            .bucket("foo")
+            .key("k")
+            .body(body)
+            .initiate()
+            .unwrap()
+            .join()
+            .await;
+
+        let seen = seen.lock().unwrap();
+        assert!(children > 0);
+        for (uri, ids) in &seen[..children] {
+            assert!(
+                has(ids, BusinessMetric::S3TransferUploadDirectory)
+                    && has(ids, BusinessMetric::S3FilePath)
+                    && !has(ids, BusinessMetric::S3TransferDownloadDirectory),
+                "{uri}: {ids:?}"
+            );
+        }
+        // The markers belong to the operation: a later plain upload from the same client has none.
+        let ids = &seen[children].1;
+        assert!(
+            has(ids, BusinessMetric::S3Transfer)
+                && !has(ids, BusinessMetric::S3TransferUploadDirectory)
+                && !has(ids, BusinessMetric::S3FilePath),
+            "{ids:?}"
+        );
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn download_objects_emits_download_directory_and_file_path_on_objects() {
+        let (http_client, seen) = recording_client();
+        let tm = tm_over(http_client, |b| b);
+        let dir = tempfile::tempdir().unwrap();
+        let _ = tm
+            .download_objects()
+            .bucket("foo")
+            .destination(dir.path())
+            .initiate()
+            .unwrap()
+            .join()
+            .await;
+        let children = seen.lock().unwrap().len();
+        let mut stream = tm.download().bucket("foo").key("bar").initiate().unwrap();
+        let _ = stream.body_mut().next().await;
+
+        let seen = seen.lock().unwrap();
+        let (listings, objects): (Vec<_>, Vec<_>) = seen[..children]
+            .iter()
+            .partition(|(uri, _)| uri.contains("list-type=2"));
+        assert!(!listings.is_empty() && !objects.is_empty(), "{seen:?}");
+        for (uri, ids) in listings {
+            assert!(
+                has(ids, BusinessMetric::S3TransferDownloadDirectory)
+                    && !has(ids, BusinessMetric::S3FilePath)
+                    && !has(ids, BusinessMetric::S3TransferUploadDirectory),
+                "{uri}: {ids:?}"
+            );
+        }
+        for (uri, ids) in objects {
+            assert!(
+                has(ids, BusinessMetric::S3TransferDownloadDirectory)
+                    && has(ids, BusinessMetric::S3FilePath)
+                    && !has(ids, BusinessMetric::S3TransferUploadDirectory),
+                "{uri}: {ids:?}"
+            );
+        }
+        // The markers belong to the operation: a later plain download from the same client has none.
+        let ids = &seen[children].1;
+        assert!(
+            has(ids, BusinessMetric::S3Transfer)
+                && !has(ids, BusinessMetric::S3TransferDownloadDirectory)
+                && !has(ids, BusinessMetric::S3FilePath),
+            "{ids:?}"
+        );
     }
 }

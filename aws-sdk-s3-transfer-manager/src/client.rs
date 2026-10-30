@@ -264,6 +264,8 @@ impl Client {
             .cloned()
             .unwrap_or_else(crate::runtime::platform::MachineProfile::detect_local);
 
+        let client_features = crate::config::user_agent::client_features(&config, &profile);
+
         // 1. Create concurrency controller and telemetry
         let (controller, telemetry): (Arc<dyn ConcurrencyController>, _) = {
             // Resolve the concurrency target once, at construction. The preview
@@ -329,6 +331,7 @@ impl Client {
                     crate::config::user_agent::install_on_client(
                         client,
                         config.framework_metadata().cloned(),
+                        client_features,
                     )
                 }
                 crate::config::S3ClientSource::FromConfig(s3_config) => {
@@ -341,6 +344,7 @@ impl Client {
                     crate::config::user_agent::install(
                         &mut builder,
                         config.framework_metadata().cloned(),
+                        client_features,
                     );
                     aws_sdk_s3::Client::from_conf(builder.build())
                 }
