@@ -32,7 +32,7 @@
 use std::cmp;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll};
 
 use aws_sdk_s3::primitives::ByteStream;
@@ -42,7 +42,7 @@ use tracing::Instrument;
 
 use crate::error::{Error, ErrorKind};
 use crate::io::part_reader::{Builder as PartReaderBuilder, PartReadStart};
-use crate::io::{InputStream, PartData};
+use crate::io::{InputStream, PartData, SizeHint};
 use crate::operation::upload::context::{
     apply_content_length, validate_distinct_part_numbers, validate_part_number, validate_size_hint,
     MultipartCompletion, PartPlan, PartReadWake, PartTransferState, PendingPartRead,
@@ -165,22 +165,30 @@ impl UploadTransfer {
             .observe_event(self.inner.ctx.id, event, snapshot);
     }
 
-    /// Emits the upload terminal summary before notifying the owning handle.
-    fn report_terminal(&self) {
+    /// Releases what the state still holds of the caller's body and reports the terminal summary.
+    ///
+    /// Requires a terminal transfer status. Snapshots the state for the summary before the
+    /// release, and reports it after releasing the state lock. A custom
+    /// [`PartStream`](crate::io::PartStream) is dropped here rather than when the last owner of
+    /// this transfer drops, so a producer waiting on the stream observes the upload end. Calling
+    /// it again releases state installed since the previous call; the terminal metrics and
+    /// summary are recorded once. Does not signal the owning handle.
+    fn enter_terminal(&self, mut state: MutexGuard<'_, UploadState>) {
         self.inner.ctx.finalize_terminal_metrics();
+        // Taken before the release, so the summary still counts parked reads.
+        let snapshot = snapshot_state(&state);
+        let released = state.mark_terminal();
+        drop(state);
+        // A caller's `Drop` and the part reader's gate run outside the state lock.
+        drop(released);
+        self.report_terminal(snapshot);
+    }
+
+    /// Emits the upload terminal summary before notifying the owning handle.
+    fn report_terminal(&self, state_snapshot: UploadStateSnapshot) {
         if !self.inner.ctx.claim_terminal_report() {
             return;
         }
-        let state_snapshot = {
-            // The transfer is already terminal: snapshot the state even if a
-            // panic left it inconsistent.
-            let state = self
-                .inner
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            snapshot_state(&state)
-        };
         let pending = self.inner.ctx.pending_stats().unwrap_or_default();
         let _ = self
             .inner
@@ -398,7 +406,7 @@ impl UploadTransfer {
         let _ = req_metrics.finish();
         let resp = match response {
             Ok(resp) => resp,
-            Err(e) => return self.fail(e.into()),
+            Err(e) => return self.fail(self.inner.state.lock().expect("lock poisoned"), e.into()),
         };
 
         let upload_id = resp.upload_id().expect("upload_id present").to_string();
@@ -409,10 +417,31 @@ impl UploadTransfer {
             match &mut *state {
                 UploadState::PendingInit {
                     stream, size_hint, ..
-                } => (stream.take().expect("stream already taken"), *size_hint),
+                } => match stream.take() {
+                    Some(stream) => (stream, *size_hint),
+                    // The upload was cancelled while CreateMultipartUpload was in flight, and
+                    // that released the body.
+                    None => return WorkOutcome::Cancelled,
+                },
                 _ => panic!("unexpected state for create_mpu"),
             }
         };
+        self.begin_transferring(upload_id, response_builder, stream, size_hint)
+    }
+
+    /// Builds the part reader over `stream` and moves the upload from `PendingInit` to
+    /// `Transferring`. Assign `Transferring` through this method rather than directly.
+    ///
+    /// `stream` must already be out of the state, so a termination while it is out releases
+    /// nothing. `Transferring` is installed either way, keeping the multipart upload ID. If the
+    /// transfer has already ended, what was installed is released and this returns `Cancelled`.
+    fn begin_transferring(
+        &self,
+        upload_id: String,
+        response_builder: UploadOutputBuilder,
+        stream: InputStream,
+        size_hint: SizeHint,
+    ) -> WorkOutcome {
         let reads_until_eof = stream.is_mpu_only();
 
         // An upper bound can size parts so a manager-produced body fits S3's part limit. A stream
@@ -450,7 +479,9 @@ impl UploadTransfer {
                 .build()
             {
                 Ok(reader) => reader,
-                Err(e) => return self.fail(e.into()),
+                Err(e) => {
+                    return self.fail(self.inner.state.lock().expect("lock poisoned"), e.into())
+                }
             },
         );
 
@@ -474,6 +505,12 @@ impl UploadTransfer {
                 ),
                 response_builder,
             };
+            // `enter_terminal` requires a terminal status, so a termination that marked the state
+            // while the body was out of it is observed here, and a later one finds `Transferring`.
+            if !self.inner.ctx.is_active() {
+                self.enter_terminal(state);
+                return WorkOutcome::Cancelled;
+            }
             snapshot_state(&state)
         };
         self.inner.observability.multipart_created();
@@ -543,6 +580,8 @@ impl UploadTransfer {
                         self.finish_read_without_part();
                         return WorkOutcome::Yielded;
                     }
+                    // The upload ended while this read waited for the source.
+                    PartReadStart::Terminal => return WorkOutcome::Cancelled,
                 };
                 (
                     future,
@@ -566,11 +605,18 @@ impl UploadTransfer {
                 parts.record_read_pending(&mut timing);
                 let parked_wake = Arc::clone(&wake);
                 let observation = timing.observation();
-                parts.park_read(PendingPartRead {
+                let refused = parts.park_read(PendingPartRead {
                     future,
                     wake,
                     timing,
                 });
+                if let Some(refused) = refused {
+                    // Another work item ended the upload while this read ran. The read, and the
+                    // stream it holds, are dropped outside the state lock.
+                    drop(state);
+                    drop(refused);
+                    return WorkOutcome::Cancelled;
+                }
                 let snapshot = parts.snapshot();
                 drop(state);
                 self.inner.observability.observe_source_pending(
@@ -585,7 +631,12 @@ impl UploadTransfer {
             Poll::Ready(Ok(None)) => {
                 return self.on_end_of_stream();
             }
-            Poll::Ready(Err(error)) => return self.fail(error.into()),
+            Poll::Ready(Err(error)) => {
+                return self.fail(
+                    self.inner.state.lock().expect("lock poisoned"),
+                    error.into(),
+                )
+            }
         };
 
         {
@@ -595,24 +646,20 @@ impl UploadTransfer {
             };
             let parts_read = match parts.observe_part(data.data.len() as u64) {
                 Ok(parts_read) => parts_read,
-                Err(error) => {
-                    drop(state);
-                    return self.fail(crate::error::invalid_input(error));
-                }
+                Err(error) => return self.fail(state, crate::error::invalid_input(error)),
             };
             if reads_until_eof && parts_read > MAX_PARTS {
-                drop(state);
-                return self.fail(Error::new(
+                let error = Error::new(
                     ErrorKind::InputInvalid,
                     format!(
                         "stream produced more than the maximum of {MAX_PARTS} parts; combine source \
                          data into fewer, larger parts"
                     ),
-                ));
+                );
+                return self.fail(state, error);
             }
             if let Err(error) = validate_part_number(data.part_number) {
-                drop(state);
-                return self.fail(crate::error::invalid_input(error));
+                return self.fail(state, crate::error::invalid_input(error));
             }
         }
 
@@ -772,7 +819,7 @@ impl UploadTransfer {
                     request_elapsed,
                     snapshot,
                 );
-                return self.fail(e);
+                return self.fail(self.inner.state.lock().expect("lock poisoned"), e);
             }
         };
 
@@ -853,7 +900,12 @@ impl UploadTransfer {
         let sdk_body =
             match stream.into_sdk_body(direct_io, self.inner.ctx.handle.buffer_pool.clone()) {
                 Ok(body) => body,
-                Err(error) => return self.fail(error.into()),
+                Err(error) => {
+                    return self.fail(
+                        self.inner.state.lock().expect("lock poisoned"),
+                        error.into(),
+                    )
+                }
             };
 
         let transfer_id = self.inner.ctx.id;
@@ -925,7 +977,7 @@ impl UploadTransfer {
                     error = %e,
                     "put_object.send_exit_err",
                 );
-                return self.fail(e);
+                return self.fail(self.inner.state.lock().expect("lock poisoned"), e);
             }
         };
 
@@ -950,9 +1002,10 @@ impl UploadTransfer {
             ..Default::default()
         });
 
-        *self.inner.state.lock().expect("lock poisoned") = UploadState::Done;
+        let mut state = self.inner.state.lock().expect("lock poisoned");
+        *state = UploadState::Done;
         self.inner.ctx.set_completed();
-        self.report_terminal();
+        self.enter_terminal(state);
         self.inner.ctx.signal_terminal();
 
         WorkOutcome::Success { data: None }
@@ -993,12 +1046,20 @@ impl UploadTransfer {
         // Sorted, so a number used twice is adjacent. Checked here rather than per part: the
         // assembled list is the first place a repeat is visible without tracking every number.
         if let Err(error) = validate_distinct_part_numbers(&completed_parts) {
-            return self.fail(crate::error::invalid_input(error));
+            return self.fail(
+                self.inner.state.lock().expect("lock poisoned"),
+                crate::error::invalid_input(error),
+            );
         }
 
         let object_size = match plan.mpu_object_size(bytes_read) {
             Ok(object_size) => object_size,
-            Err(error) => return self.fail(crate::error::invalid_input(error)),
+            Err(error) => {
+                return self.fail(
+                    self.inner.state.lock().expect("lock poisoned"),
+                    crate::error::invalid_input(error),
+                )
+            }
         };
         self.inner.ctx.set_total_bytes(object_size);
 
@@ -1040,7 +1101,7 @@ impl UploadTransfer {
         let _ = req_metrics.finish();
         let resp = match response {
             Ok(resp) => resp,
-            Err(e) => return self.fail(e.into()),
+            Err(e) => return self.fail(self.inner.state.lock().expect("lock poisoned"), e.into()),
         };
         self.inner.observability.finish_multipart(
             final_snapshot.with_state(UploadExecutionState::CompleteMultipartUploadInFlight),
@@ -1056,15 +1117,20 @@ impl UploadTransfer {
         .expect("valid response");
 
         *self.inner.result.lock().expect("lock poisoned") = Some(result);
-        *self.inner.state.lock().expect("lock poisoned") = UploadState::Done;
+        let mut state = self.inner.state.lock().expect("lock poisoned");
+        *state = UploadState::Done;
         self.inner.ctx.set_completed();
-        self.report_terminal();
+        self.enter_terminal(state);
         self.inner.ctx.signal_terminal();
 
         WorkOutcome::Success { data: None }
     }
 
-    fn fail(&self, error: Error) -> WorkOutcome {
+    /// Records `error` and ends the upload.
+    ///
+    /// Takes the state guard, so the status becomes terminal in the same critical section that
+    /// releases the caller's body.
+    fn fail(&self, state: MutexGuard<'_, UploadState>, error: Error) -> WorkOutcome {
         tracing::debug!(
             target: crate::telemetry::TARGET_TRANSFER,
             %error,
@@ -1072,7 +1138,7 @@ impl UploadTransfer {
         );
         let classification = crate::scheduler::classify_error(&error);
         self.inner.ctx.set_failed(error);
-        self.report_terminal();
+        self.enter_terminal(state);
         self.inner.ctx.signal_terminal();
         WorkOutcome::Failed { classification }
     }
@@ -1174,7 +1240,13 @@ impl Transfer for UploadTransfer {
     }
 
     fn on_terminal(&self) {
-        self.report_terminal();
+        // Terminal cleanup runs even if a panic poisoned the state lock.
+        let state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        self.enter_terminal(state);
     }
 }
 
@@ -1601,6 +1673,316 @@ mod tests {
             next.data_mut::<UploadWork>(),
             UploadWork::UploadPart(_)
         ));
+    }
+
+    /// A custom source that yields its scripted parts, then stays pending, as a producer waiting
+    /// on the upload to take its next part does. It never becomes ready again, so it registers no
+    /// wake.
+    ///
+    /// The stream owns `_probe`; a test holding the matching `Weak` observes whether the upload
+    /// still retains the stream.
+    #[derive(Debug)]
+    struct ProbedPartStream {
+        parts: std::collections::VecDeque<PartData>,
+        _probe: Arc<()>,
+    }
+
+    impl crate::io::PartStream for ProbedPartStream {
+        fn poll_part(
+            mut self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _stream_cx: &crate::io::StreamContext,
+        ) -> std::task::Poll<Option<std::io::Result<PartData>>> {
+            match self.parts.pop_front() {
+                Some(part) => std::task::Poll::Ready(Some(Ok(part))),
+                None => std::task::Poll::Pending,
+            }
+        }
+
+        fn size_hint(&self) -> crate::io::SizeHint {
+            crate::io::SizeHint::default()
+        }
+    }
+
+    /// Returns a multipart-only stream of `parts` and a probe that is dead once it is dropped.
+    fn probed_stream(parts: Vec<PartData>) -> (InputStream, std::sync::Weak<()>) {
+        let probe = Arc::new(());
+        let weak = Arc::downgrade(&probe);
+        let stream = ProbedPartStream {
+            parts: parts.into(),
+            _probe: probe,
+        };
+        (InputStream::from_part_stream(stream), weak)
+    }
+
+    /// Creates the multipart upload, then executes one source read that parks on the pending
+    /// source.
+    async fn park_one_source_read(transfer: &UploadTransfer) {
+        let mut create = assert_ready(transfer.poll_work());
+        assert!(matches!(
+            transfer.execute(&mut create).await,
+            WorkOutcome::Success { .. }
+        ));
+        let mut read = assert_ready(transfer.poll_work());
+        assert!(matches!(
+            transfer.execute(&mut read).await,
+            WorkOutcome::Yielded
+        ));
+        let state = transfer.inner.state.lock().expect("lock poisoned");
+        assert_eq!(snapshot_state(&state).pending_reads, 1);
+    }
+
+    // ref: awslabs/aws-s3-transfer-manager-rs#226
+    /// A source read parked on a pending source is released when another work item fails the
+    /// upload, rather than retained for as long as the transfer lives.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn failure_releases_parked_source_read() {
+        let (stream, probe) = probed_stream(Vec::new());
+        let transfer = create_test_transfer_with_stream(mock_s3_client_for_mpu(), stream);
+        park_one_source_read(&transfer).await;
+
+        assert!(matches!(
+            transfer.fail(
+                transfer.inner.state.lock().expect("lock poisoned"),
+                Error::new(ErrorKind::RuntimeError, "sibling failure")
+            ),
+            WorkOutcome::Failed { .. }
+        ));
+
+        assert!(
+            probe.upgrade().is_none(),
+            "failed upload retained its parked source read"
+        );
+    }
+
+    // ref: awslabs/aws-s3-transfer-manager-rs#226
+    /// External cancellation releases a source read parked on a pending source.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn external_termination_releases_parked_source_read() {
+        let (stream, probe) = probed_stream(Vec::new());
+        let transfer = create_test_transfer_with_stream(mock_s3_client_for_mpu(), stream);
+        park_one_source_read(&transfer).await;
+
+        transfer.ctx().set_cancelled();
+        Transfer::on_terminal(&transfer);
+
+        assert!(
+            probe.upgrade().is_none(),
+            "cancelled upload retained its parked source read"
+        );
+    }
+
+    // ref: awslabs/aws-s3-transfer-manager-rs#226
+    /// A failed UploadPart releases a source that no read holds: between reads the stream waits in
+    /// the part reader, which the failed transfer still owns.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn upload_part_failure_releases_idle_source() {
+        let create_mpu = mock!(aws_sdk_s3::Client::create_multipart_upload).then_output(|| {
+            CreateMultipartUploadOutput::builder()
+                .upload_id("test-upload-id")
+                .build()
+        });
+        let upload_part =
+            mock!(aws_sdk_s3::Client::upload_part).then_http_response(service_error_response);
+        let (stream, probe) = probed_stream(vec![PartData::new(1, Bytes::from_static(b"part"))]);
+        let transfer = create_test_transfer_with_stream(
+            mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[create_mpu, upload_part]),
+            stream,
+        );
+
+        let mut create = assert_ready(transfer.poll_work());
+        assert!(matches!(
+            transfer.execute(&mut create).await,
+            WorkOutcome::Success { .. }
+        ));
+        let mut part = assert_ready(transfer.poll_work());
+        assert!(matches!(
+            transfer.execute(&mut part).await,
+            WorkOutcome::Failed { .. }
+        ));
+
+        assert!(
+            probe.upgrade().is_none(),
+            "failed upload retained its idle source"
+        );
+    }
+
+    /// A custom source whose first poll fails the upload, as another work item failing while this
+    /// read runs would, and then reports `Pending`.
+    #[derive(Debug)]
+    struct FailsUploadWhilePolledStream {
+        /// Taken on the first poll, which also breaks the transfer-to-stream cycle.
+        transfer: Arc<Mutex<Option<UploadTransfer>>>,
+        _probe: Arc<()>,
+    }
+
+    impl crate::io::PartStream for FailsUploadWhilePolledStream {
+        fn poll_part(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _stream_cx: &crate::io::StreamContext,
+        ) -> std::task::Poll<Option<std::io::Result<PartData>>> {
+            let transfer = self.transfer.lock().expect("transfer slot poisoned").take();
+            if let Some(transfer) = transfer {
+                assert!(matches!(
+                    transfer.fail(
+                        transfer.inner.state.lock().expect("lock poisoned"),
+                        Error::new(ErrorKind::RuntimeError, "sibling failure"),
+                    ),
+                    WorkOutcome::Failed { .. }
+                ));
+            }
+            std::task::Poll::Pending
+        }
+
+        fn size_hint(&self) -> crate::io::SizeHint {
+            crate::io::SizeHint::default()
+        }
+    }
+
+    // ref: awslabs/aws-s3-transfer-manager-rs#226
+    /// A read whose source returns `Pending` after another work item ended the upload is not
+    /// parked: the read reports `Cancelled`, and the stream it held is dropped rather than handed
+    /// back to the closed gate.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn read_pending_after_failure_is_not_parked() {
+        let probe = Arc::new(());
+        let weak = Arc::downgrade(&probe);
+        let slot = Arc::new(Mutex::new(None));
+        let stream = FailsUploadWhilePolledStream {
+            transfer: Arc::clone(&slot),
+            _probe: probe,
+        };
+        let transfer = create_test_transfer_with_stream(
+            mock_s3_client_for_mpu(),
+            InputStream::from_part_stream(stream),
+        );
+        *slot.lock().expect("transfer slot poisoned") = Some(transfer.clone());
+
+        let mut create = assert_ready(transfer.poll_work());
+        assert!(matches!(
+            transfer.execute(&mut create).await,
+            WorkOutcome::Success { .. }
+        ));
+        let mut read = assert_ready(transfer.poll_work());
+        assert!(matches!(
+            transfer.execute(&mut read).await,
+            WorkOutcome::Cancelled
+        ));
+
+        let state = transfer.inner.state.lock().expect("lock poisoned");
+        assert_eq!(snapshot_state(&state).pending_reads, 0);
+        drop(state);
+        assert!(
+            weak.upgrade().is_none(),
+            "a read pending after the failure retained its source"
+        );
+    }
+
+    // ref: awslabs/aws-s3-transfer-manager-rs#226
+    /// A read dispatched before the upload ended, and executed after, starts no source operation.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn read_started_after_termination_is_cancelled() {
+        let (stream, probe) = probed_stream(Vec::new());
+        let transfer = create_test_transfer_with_stream(mock_s3_client_for_mpu(), stream);
+        let mut create = assert_ready(transfer.poll_work());
+        assert!(matches!(
+            transfer.execute(&mut create).await,
+            WorkOutcome::Success { .. }
+        ));
+        let mut read = assert_ready(transfer.poll_work());
+
+        transfer.ctx().set_cancelled();
+        Transfer::on_terminal(&transfer);
+        assert!(probe.upgrade().is_none());
+
+        assert!(matches!(
+            transfer.execute(&mut read).await,
+            WorkOutcome::Cancelled
+        ));
+    }
+
+    // ref: awslabs/aws-s3-transfer-manager-rs#226
+    /// CreateMultipartUpload that succeeds after the upload was cancelled, and its body released,
+    /// reports `Cancelled` and leaves the state as it was.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn create_multipart_after_termination_is_cancelled() {
+        let (stream, probe) = probed_stream(Vec::new());
+        let transfer = create_test_transfer_with_stream(mock_s3_client_for_mpu(), stream);
+        let mut create = assert_ready(transfer.poll_work());
+
+        transfer.ctx().set_cancelled();
+        Transfer::on_terminal(&transfer);
+        assert!(probe.upgrade().is_none());
+
+        assert!(matches!(
+            transfer.execute(&mut create).await,
+            WorkOutcome::Cancelled
+        ));
+        let state = transfer.inner.state.lock().expect("lock poisoned");
+        assert!(matches!(
+            &*state,
+            UploadState::PendingInit {
+                stream: None,
+                init_in_flight: true,
+                ..
+            }
+        ));
+    }
+
+    // ref: awslabs/aws-s3-transfer-manager-rs#226
+    /// A multipart upload created after the transfer ended, with the body already out of the
+    /// state, is still installed so `abort()` finds its ID, and the body it would have read is
+    /// released.
+    ///
+    /// `begin_transferring` observes nothing shared before its state lock, so ending the transfer
+    /// before the call covers a termination anywhere between taking the body and installing
+    /// `Transferring`.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn multipart_installed_after_termination_is_released() {
+        let (stream, probe) = probed_stream(Vec::new());
+        let transfer = create_test_transfer_with_stream(mock_s3_client_for_mpu(), stream);
+
+        // Take the body as `do_execute_create_mpu` does, then end the transfer: the termination
+        // finds `PendingInit` without a body.
+        let (body, size_hint) = {
+            let mut state = transfer.inner.state.lock().expect("lock poisoned");
+            let UploadState::PendingInit {
+                stream, size_hint, ..
+            } = &mut *state
+            else {
+                panic!("upload left its initial state");
+            };
+            (stream.take().expect("body present"), *size_hint)
+        };
+        transfer.ctx().set_cancelled();
+        Transfer::on_terminal(&transfer);
+        assert!(
+            probe.upgrade().is_some(),
+            "the body is held outside the state"
+        );
+
+        assert!(matches!(
+            transfer.begin_transferring(
+                "test-upload-id".to_string(),
+                UploadOutputBuilder::default(),
+                body,
+                size_hint,
+            ),
+            WorkOutcome::Cancelled
+        ));
+        assert_eq!(transfer.open_upload_id().as_deref(), Some("test-upload-id"));
+        assert!(
+            probe.upgrade().is_none(),
+            "the installed upload retained the body"
+        );
     }
 
     // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)

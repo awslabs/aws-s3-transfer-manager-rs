@@ -16,6 +16,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `recorder.handle().clone()`, and call `Recorder::graceful_shutdown` after the client, its clones,
   and its transfer handles are dropped.
 
+### Fixed
+- A failed or cancelled upload kept its `PartStream` until the `UploadHandle` and the transfer
+  itself were dropped, so a producer waiting for the upload to take its next part waited
+  indefinitely while the caller held the handle to learn why the upload failed. The upload now
+  drops a `PartStream` when it fails or is cancelled, and a producer observes that through the
+  stream's own drop, such as its channel closing.
+  ([#226](https://github.com/awslabs/aws-s3-transfer-manager-rs/issues/226))
+
 ## [0.3.1] - 2026-10-09
 
 ### Fixed

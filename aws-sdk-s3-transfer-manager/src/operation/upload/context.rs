@@ -410,6 +410,39 @@ impl PendingPartReads {
     fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+
+    fn take_all(&mut self) -> SmallVec<[PendingPartRead; 4]> {
+        std::mem::take(&mut self.entries)
+    }
+}
+
+/// What an upload that has ended still held of the caller's body.
+///
+/// Drop it only after releasing the upload-state lock: dropping it runs the body's `Drop` and
+/// takes the part reader's gate lock. Dropping it marks the part reader terminal, then drops the
+/// parked reads and the body; each read hands its stream back to the closed gate, which drops
+/// it.
+#[must_use = "drop the released body only after releasing the upload-state lock"]
+#[derive(Debug, Default)]
+pub(crate) struct TerminalRelease {
+    /// The body, if the upload ended before a request took it.
+    body: Option<InputStream>,
+    /// Source reads that were parked on a pending source.
+    reads: SmallVec<[PendingPartRead; 4]>,
+    /// The reader to mark terminal.
+    part_reader: Option<Arc<PartReader>>,
+}
+
+impl Drop for TerminalRelease {
+    fn drop(&mut self) {
+        // Close the gate first, so each parked read's stream is dropped when the read is
+        // rather than handed back to the reader.
+        if let Some(part_reader) = self.part_reader.take() {
+            part_reader.mark_terminal();
+        }
+        self.reads.clear();
+        self.body = None;
+    }
 }
 
 /// Work retained by one scheduled `UploadPart` execution.
@@ -502,6 +535,8 @@ pub(crate) struct PartTransferState {
     parts_in_flight: usize,
     /// Exact source futures retained after returning `Poll::Pending`.
     pending_reads: PendingPartReads,
+    /// Set once the upload has ended. A source read still executing then is not parked.
+    terminal: bool,
     /// S3 completion records collected as network uploads finish.
     completed_parts: Vec<CompletedPart>,
     /// Number of `PartData` values returned by source reads.
@@ -528,6 +563,7 @@ impl PartTransferState {
             eof: false,
             parts_in_flight: 0,
             pending_reads: PendingPartReads::default(),
+            terminal: false,
             completed_parts: Vec::with_capacity(completed_parts_capacity),
             parts_read: 0,
             bytes_read: 0,
@@ -573,8 +609,28 @@ impl PartTransferState {
     }
 
     /// Retains one exact source operation without changing its in-flight accounting.
-    pub(crate) fn park_read(&mut self, read: PendingPartRead) {
+    ///
+    /// Once the upload has ended the read is returned instead, for the caller to drop after
+    /// releasing the upload-state lock. A read can still be executing when another work item
+    /// ends the upload, and parking it then would retain its stream.
+    #[must_use = "a returned read must be dropped after releasing the upload-state lock"]
+    pub(crate) fn park_read(&mut self, read: PendingPartRead) -> Option<PendingPartRead> {
+        if self.terminal {
+            return Some(read);
+        }
         self.pending_reads.push(read);
+        None
+    }
+
+    /// Marks the upload as ended: later reads are not parked, and the parked reads and the part
+    /// reader are handed over to be released.
+    fn mark_terminal(&mut self) -> TerminalRelease {
+        self.terminal = true;
+        TerminalRelease {
+            body: None,
+            reads: self.pending_reads.take_all(),
+            part_reader: Some(Arc::clone(&self.part_reader)),
+        }
     }
 
     /// Records one source-future poll that could not yet produce a part.
@@ -781,6 +837,7 @@ pub(crate) struct MultipartCompletion {
 pub(crate) enum UploadState {
     /// Waiting to start CreateMPU or PutObject.
     PendingInit {
+        /// The body, until a request takes it or the upload ends first.
         stream: Option<InputStream>,
         size_hint: SizeHint,
         init_in_flight: bool,
@@ -806,6 +863,29 @@ pub(crate) enum UploadState {
     PutObjectInFlight,
     /// S3 has committed the object; no multipart upload remains open.
     Done,
+}
+
+impl UploadState {
+    /// Releases what this state still holds of the caller's body once the upload has ended.
+    ///
+    /// The variant, and with it any open multipart upload ID, is unchanged. A completed upload
+    /// holds none of the body, so this releases nothing there. Calling it again releases nothing
+    /// further.
+    pub(crate) fn mark_terminal(&mut self) -> TerminalRelease {
+        match self {
+            UploadState::PendingInit { stream, .. } => TerminalRelease {
+                body: stream.take(),
+                reads: SmallVec::new(),
+                part_reader: None,
+            },
+            UploadState::Transferring { parts, .. } | UploadState::Completing { parts, .. } => {
+                parts.mark_terminal()
+            }
+            UploadState::CompleteInFlight { .. }
+            | UploadState::PutObjectInFlight
+            | UploadState::Done => TerminalRelease::default(),
+        }
+    }
 }
 
 #[cfg(test)]
