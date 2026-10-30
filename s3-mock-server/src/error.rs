@@ -69,6 +69,18 @@ pub enum Error {
     #[error("invalid digest")]
     InvalidDigest,
 
+    /// A request sets a storage class that the bucket does not have.
+    #[error("invalid storage class")]
+    InvalidStorageClass,
+
+    /// The request uses functionality that S3, or the server, does not implement.
+    #[error("not implemented")]
+    NotImplemented,
+
+    /// A request to a directory bucket sets `Content-MD5`, which directory buckets do not support.
+    #[error("Content-MD5 not implemented")]
+    ContentMd5NotImplemented,
+
     /// The request uses a parameter the bucket does not support.
     #[error("not supported: {0}")]
     NotSupported(&'static str),
@@ -289,6 +301,21 @@ impl From<Error> for s3s::S3Error {
                 S3ErrorCode::InvalidDigest,
                 StatusCode::BAD_REQUEST,
                 "The Content-MD5 you specified was invalid.".into(),
+            ),
+            Error::InvalidStorageClass => (
+                S3ErrorCode::InvalidStorageClass,
+                StatusCode::BAD_REQUEST,
+                "The storage class you specified is not valid".into(),
+            ),
+            Error::NotImplemented => (
+                S3ErrorCode::NotImplemented,
+                StatusCode::NOT_IMPLEMENTED,
+                "A header you provided implies functionality that is not implemented".into(),
+            ),
+            Error::ContentMd5NotImplemented => (
+                S3ErrorCode::NotImplemented,
+                StatusCode::NOT_IMPLEMENTED,
+                "This bucket does not support Content Md5 header.".into(),
             ),
             Error::NotSupported(message) => (
                 S3ErrorCode::Custom("NotSupported".into()),

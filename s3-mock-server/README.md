@@ -232,6 +232,12 @@ first sends a CreateSession for the bucket, which fails with NoSuchBucket becaus
 not exist yet, as it would in S3, and a DeleteBucket fails with 403 AccessDenied, as a bucket-level
 write signed with a session.
 
+**Differences from general purpose buckets.**
+
+- Objects are EXPRESS_ONEZONE. Any other storage class fails with 400 InvalidStorageClass,
+  as EXPRESS_ONEZONE does in general purpose buckets.
+- `Content-MD5` fails with 501 NotImplemented.
+
 ### Buckets
 
 Create buckets with CreateBucket or `S3MockServer::create_bucket` before using them: object

@@ -469,7 +469,8 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         }
 
         // Return stored HTTP headers
-        output.storage_class = storage_class_header(stream_metadata.storage_class);
+        output.storage_class =
+            BucketType::of(bucket).storage_class_header(stream_metadata.storage_class);
         output.cache_control = stream_metadata.cache_control.map(|s| s.parse().unwrap());
         output.content_encoding = stream_metadata.content_encoding.map(|s| s.parse().unwrap());
         output.content_disposition = stream_metadata
@@ -575,7 +576,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         output.checksum_crc64nvme = metadata.crc64nvme;
 
         // Return stored HTTP headers
-        output.storage_class = storage_class_header(metadata.storage_class);
+        output.storage_class = BucketType::of(bucket).storage_class_header(metadata.storage_class);
         output.cache_control = metadata.cache_control.map(|s| s.parse().unwrap());
         output.content_encoding = metadata.content_encoding.map(|s| s.parse().unwrap());
         output.content_disposition = metadata.content_disposition.map(|s| s.parse().unwrap());
@@ -618,6 +619,10 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             );
         }
 
+        let bucket_type = BucketType::of(&input.bucket);
+        bucket_type
+            .check_storage_class(input.storage_class.as_ref().map(|class| class.as_str()))?;
+        bucket_type.check_content_md5(input.content_md5.as_deref())?;
         let client_checksums = crate::types::ClientChecksums::from(&input);
         validate_digest_headers(&client_checksums)?;
         let integrity_checks = crate::types::ObjectIntegrityChecks::from(&client_checksums);
@@ -691,6 +696,8 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         let input = req.input;
         tracing::trace!(bucket = %input.bucket, key = %input.key, "CreateMultipartUpload");
         check_bucket(&self.storage, &input.bucket).await?;
+        BucketType::of(&input.bucket)
+            .check_storage_class(input.storage_class.as_ref().map(|class| class.as_str()))?;
         let key = &input.key;
 
         // Extract checksum algorithm if provided, default to CRC64NVME
@@ -797,6 +804,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         tracing::trace!(%upload_id, part_number, "UploadPart");
         check_bucket(&self.storage, &input.bucket).await?;
 
+        BucketType::of(&input.bucket).check_content_md5(input.content_md5.as_deref())?;
         let client_checksums = crate::types::ClientChecksums::from(&input);
         validate_digest_headers(&client_checksums)?;
         let mut integrity_checks = crate::types::ObjectIntegrityChecks::from(&client_checksums);
@@ -1022,7 +1030,8 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         check_bucket(&self.storage, &input.bucket).await?;
 
         let prefix = input.prefix.as_deref().unwrap_or("");
-        BucketType::of(&input.bucket).check_listing(
+        let bucket_type = BucketType::of(&input.bucket);
+        bucket_type.check_listing(
             prefix,
             input.delimiter.as_deref(),
             input.start_after.is_some(),
@@ -1054,7 +1063,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         let contents: Vec<s3s::dto::Object> = page
             .objects
             .into_iter()
-            .map(|obj| list_entry(obj, include_restore_status))
+            .map(|obj| list_entry(obj, bucket_type, include_restore_status))
             .collect();
         let common_prefixes: Vec<s3s::dto::CommonPrefix> = page
             .common_prefixes
@@ -1244,13 +1253,21 @@ pub(crate) async fn check_bucket(
 
 /// The ListObjectsV2 entry of an object. The restore status is included only when requested, as
 /// in S3.
-fn list_entry(obj: crate::storage::ObjectInfo, include_restore_status: bool) -> s3s::dto::Object {
+fn list_entry(
+    obj: crate::storage::ObjectInfo,
+    bucket_type: BucketType,
+    include_restore_status: bool,
+) -> s3s::dto::Object {
     let algorithms = obj.metadata.checksum_algorithms();
     s3s::dto::Object {
         size: Some(obj.metadata.content_length as i64),
         e_tag: Some(etag_from_quoted(&obj.metadata.etag)),
         last_modified: Some(Timestamp::from(obj.metadata.last_modified)),
-        storage_class: Some(listed_storage_class(&obj.metadata.storage_class).into()),
+        storage_class: Some(
+            bucket_type
+                .listed_storage_class(&obj.metadata.storage_class)
+                .into(),
+        ),
         checksum_algorithm: (!algorithms.is_empty()).then(|| {
             algorithms
                 .iter()
@@ -1419,22 +1436,6 @@ fn checksum_type_of<'a>(
             s3s::dto::ChecksumType::FULL_OBJECT
         },
     ))
-}
-
-/// The `x-amz-storage-class` header of a GetObject or HeadObject response: S3 omits it for
-/// `STANDARD` objects, also when `STANDARD` was requested explicitly.
-fn storage_class_header(storage_class: Option<String>) -> Option<s3s::dto::StorageClass> {
-    storage_class
-        .filter(|class| class != s3s::dto::StorageClass::STANDARD)
-        .map(s3s::dto::StorageClass::from)
-}
-
-/// The storage class of an object in ListObjectsV2 entries, which S3 always reports: `STANDARD`
-/// when none was set.
-fn listed_storage_class(storage_class: &Option<String>) -> String {
-    storage_class
-        .clone()
-        .unwrap_or_else(|| s3s::dto::StorageClass::STANDARD.to_owned())
 }
 
 /// Whether a request set `x-amz-checksum-mode: ENABLED`.
@@ -2002,9 +2003,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_directory_bucket_requires_contiguous_parts() {
-        // Drive the handler directly: the AWS SDK client rejects `--x-s3` names
-        // client-side (InvalidBucketName) before a request can reach the server,
-        // so a directory-bucket gap can only be exercised at the handler level.
+        // A directory bucket rejects a gap in the part numbers (1, 3).
         let bucket = "test-dir-bucket--usw2-az1--x-s3";
         let key = "dir-gap-key";
 
