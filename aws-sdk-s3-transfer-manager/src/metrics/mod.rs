@@ -83,30 +83,39 @@ pub mod unit {
 
         /// The number of bits represented by this unit
         pub const fn as_bits_u64(&self) -> u64 {
-            self.as_bits_usize() as u64
+            self.as_bytes_u64() * 8
         }
 
         /// The number of bits represented by this unit
+        ///
+        /// # Panics
+        ///
+        /// Panics if the bit count exceeds `usize::MAX`, which happens only
+        /// for [`ByteUnit::Gibibyte`] on targets with a 32-bit `usize`. Use
+        /// [`as_bits_u64`](Self::as_bits_u64) there.
         pub const fn as_bits_usize(&self) -> usize {
-            match self {
-                ByteUnit::Byte => 8,
-                ByteUnit::Kilobit => 1_000,
-                ByteUnit::Kibibyte => 1 << 13,
-                ByteUnit::Megabit => 1_000_000,
-                ByteUnit::Mebibyte => 1 << 23,
-                ByteUnit::Gigabit => 1_000_000_000,
-                ByteUnit::Gibibyte => 1 << 33,
-            }
+            let bits = self.as_bits_u64();
+            assert!(bits <= usize::MAX as u64, "bit count exceeds usize::MAX");
+            bits as usize
         }
 
         /// The number of bytes represented by this unit
         pub const fn as_bytes_u64(&self) -> u64 {
-            self.as_bytes_usize() as u64
+            match self {
+                ByteUnit::Byte => 1,
+                ByteUnit::Kilobit => 125,
+                ByteUnit::Kibibyte => 1 << 10,
+                ByteUnit::Megabit => 125_000,
+                ByteUnit::Mebibyte => 1 << 20,
+                ByteUnit::Gigabit => 125_000_000,
+                ByteUnit::Gibibyte => 1 << 30,
+            }
         }
 
         /// The number of bytes represented by this unit
         pub const fn as_bytes_usize(&self) -> usize {
-            self.as_bits_usize() >> 3
+            // Every unit is at most 2^30 bytes, which fits a 32-bit usize.
+            self.as_bytes_u64() as usize
         }
 
         pub(crate) const fn as_str(&self) -> &'static str {
@@ -679,6 +688,36 @@ mod tests {
     use crate::metrics::unit::ByteCountDisplayContext;
 
     use super::{unit::ByteUnit, Throughput};
+
+    /// Every unit reports the same value through its byte and bit accessors,
+    /// at both widths. The byte values are the unit definitions; a regression
+    /// in either derivation changes one of the pairs.
+    #[test]
+    fn byte_unit_accessors_agree() {
+        let units = [
+            (ByteUnit::Byte, 1u64),
+            (ByteUnit::Kilobit, 125),
+            (ByteUnit::Kibibyte, 1024),
+            (ByteUnit::Megabit, 125_000),
+            (ByteUnit::Mebibyte, 1024 * 1024),
+            (ByteUnit::Gigabit, 125_000_000),
+            (ByteUnit::Gibibyte, 1024 * 1024 * 1024),
+        ];
+        for (unit, bytes) in units {
+            assert_eq!(unit.as_bytes_u64(), bytes, "{unit:?} bytes");
+            assert_eq!(
+                unit.as_bytes_usize() as u64,
+                bytes,
+                "{unit:?} bytes as usize"
+            );
+            assert_eq!(unit.as_bits_u64(), bytes * 8, "{unit:?} bits");
+            assert_eq!(
+                unit.as_bits_usize() as u64,
+                bytes * 8,
+                "{unit:?} bits as usize"
+            );
+        }
+    }
 
     #[test]
     fn request_metrics_merge_preserves_counts_totals_and_maximum() {

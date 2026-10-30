@@ -8,9 +8,51 @@ use std::fs::Metadata;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+#[cfg(not(target_os = "wasi"))]
 use same_file::Handle;
 
 use super::error::{WalkError, WalkErrorKind};
+
+/// Identity of a directory, compared to detect symlink cycles.
+///
+/// same-file supports only Unix and Windows, so on WASI this opens the path,
+/// following symbolic links, and identifies the file by the device and inode
+/// `fstat` reports for the open descriptor. As with `same_file::Handle`, the
+/// descriptor stays open for the handle's lifetime, so the identity cannot be
+/// reused by another file while it is compared.
+#[cfg(target_os = "wasi")]
+#[derive(Debug)]
+struct Handle {
+    _file: std::fs::File,
+    dev: u64,
+    ino: u64,
+}
+
+#[cfg(target_os = "wasi")]
+impl PartialEq for Handle {
+    fn eq(&self, other: &Self) -> bool {
+        (self.dev, self.ino) == (other.dev, other.ino)
+    }
+}
+
+#[cfg(target_os = "wasi")]
+impl Eq for Handle {}
+
+#[cfg(target_os = "wasi")]
+impl Handle {
+    /// Opens `path` and reads the identity of the file it names.
+    ///
+    /// Returns the error from opening the path or from `fstat`.
+    fn from_path(path: impl AsRef<Path>) -> std::io::Result<Self> {
+        let file = std::fs::File::open(path)?;
+        let stat = rustix::fs::fstat(&file)?;
+        Ok(Self {
+            _file: file,
+            dev: stat.st_dev,
+            ino: stat.st_ino,
+        })
+    }
+}
 
 /// A directory queued for traversal, carrying the chain of ancestor directory
 /// handles needed for per-path symlink cycle detection.

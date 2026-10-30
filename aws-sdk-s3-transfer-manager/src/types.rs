@@ -86,6 +86,10 @@ pub enum RuntimeMode {
     /// Managed OS threads owned by the transfer manager (default, recommended).
     ///
     /// Spawns and owns its own worker threads; the performance path.
+    ///
+    /// On wasm targets, which cannot run managed threads, this mode behaves as
+    /// [`MultiThreadTokio`](Self::MultiThreadTokio) and accepts a
+    /// current-thread runtime.
     #[default]
     Managed,
     /// Run on the caller's tokio multi-threaded runtime instead of spawning
@@ -98,7 +102,9 @@ pub enum RuntimeMode {
     ///
     /// Requires a multi-threaded runtime: transfer workers run via
     /// `tokio::spawn`, so on a current-thread runtime they serialize onto one
-    /// thread and throughput collapses.
+    /// thread and throughput collapses. wasm targets are the exception: their
+    /// threads are unavailable or cooperative, so a current-thread runtime is
+    /// supported there.
     MultiThreadTokio,
 }
 

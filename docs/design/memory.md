@@ -3470,6 +3470,7 @@ lookup can establish presentation adjacency but cannot recover physical-return a
 | Linux   | Anonymous private `PROT_NONE` mapping      | Whole-range `mprotect(READ \| WRITE)`      | Whole-range `mprotect(NONE)` | `MADV_DONTNEED`         |
 | macOS   | Anonymous private `PROT_NONE` mapping      | Whole-range `mprotect(READ \| WRITE)`      | Whole-range `mprotect(NONE)` | `MADV_FREE`             |
 | Windows | `VirtualAlloc(MEM_RESERVE, PAGE_NOACCESS)` | `VirtualAlloc(MEM_COMMIT, PAGE_READWRITE)` | `VirtualFree(MEM_DECOMMIT)`  | Same decommit operation |
+| wasm    | Page-aligned global-allocator allocation   | No operation                               | No operation                 | No operation            |
 
 All targets must preserve exclusive ownership of the virtual range after every successful or failed
 operation. Failed initial preparation or commit enters `ActivationRecoveryPending`; failed
@@ -3490,6 +3491,12 @@ The Android and Linux operations follow [mmap(2)][mmap2], [mprotect(2)][mprotect
 [madvise(2)][madvise2]. FreeBSD and macOS use the same mapping and protection lifecycle with the
 target-specific `MADV_FREE` contract. Windows reservation, commit, and decommit follow
 [VirtualAlloc][virtual-alloc] and [VirtualFree][virtual-free].
+
+wasm linear memory has no access protection or decommit, so wasm targets use the allocator-backed
+backend that Miri and Loom also use. Address ownership and provenance hold as on the other targets,
+but a deactivated range stays accessible, and its backing returns to the allocator only when the
+range is released. Linear memory never shrinks, so the module's peak prepared capacity remains
+allocated.
 
 Qualification for each supported target includes runtime page and allocation geometry, stable
 address ownership, successful prepare/deactivate/revive, commit or overcommit failure, discard

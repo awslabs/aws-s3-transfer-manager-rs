@@ -74,6 +74,28 @@
 //! * [`download_objects`](crate::Client::download_objects) - download an entire bucket or prefix to a local directory
 //! * [`upload_objects`](crate::Client::upload_objects) - upload an entire local directory to a bucket
 //!
+//! # WebAssembly
+//!
+//! The crate builds for `wasm32-wasip1`, `wasm32-wasip2`, and `wasm32-wasip3`.
+//! Other wasm targets are not supported. On these targets:
+//!
+//! - Build with `RUSTFLAGS="--cfg tokio_unstable"`. The S3 client's tokio
+//!   integration enables tokio's `fs` feature, which tokio accepts on wasm only
+//!   with that flag.
+//! - The AWS SDK's default HTTPS client is not built. Requests fail unless the
+//!   [`aws_types::SdkConfig`] or S3 configuration supplies an HTTP client, for
+//!   example one built on `wasi:http`. `wasm32-wasip1` has no networking
+//!   interface for such a client.
+//! - [`RuntimeMode::Managed`](crate::types::RuntimeMode::Managed) behaves as
+//!   [`RuntimeMode::MultiThreadTokio`](crate::types::RuntimeMode::MultiThreadTokio),
+//!   and a current-thread tokio runtime is supported. File reads and writes run
+//!   inline on the thread that polls the transfer.
+//! - Memory detection is unavailable, so
+//!   [`MemoryBudgetConfig::Auto`](crate::types::MemoryBudgetConfig::Auto) uses
+//!   its 2 GiB fallback. Use
+//!   [`MemoryBudgetConfig::Limit`](crate::types::MemoryBudgetConfig::Limit) to
+//!   fit the module's linear memory.
+//!
 //! # Runtime diagnostics
 //!
 //! `AWS_S3_TM_DIAGNOSTICS` enables optional diagnostic collection without

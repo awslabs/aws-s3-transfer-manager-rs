@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.4.0] - Unreleased
 
+### Added
+- The crate builds for `wasm32-wasip1`, `wasm32-wasip2`, and `wasm32-wasip3` with
+  `RUSTFLAGS="--cfg tokio_unstable"`. On these targets the application supplies the HTTP client,
+  `RuntimeMode::Managed` runs on the caller's tokio runtime, which may be current-thread, and file
+  I/O runs inline. The crate documentation lists the requirements.
+
 ### Changed
 - The `dial9` feature depends on `dial9` 0.5 instead of `dial9-tokio-telemetry` 0.3, and compiles
   without `--cfg tokio_unstable`. Per-task poll, spawn, and terminate events and per-worker queue
@@ -15,6 +21,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `dial9_handle` and take a `dial9::Dial9Handle`. The caller owns the `dial9::Recorder`: pass
   `recorder.handle().clone()`, and call `Recorder::graceful_shutdown` after the client, its clones,
   and its transfer handles are dropped.
+
+### Fixed
+- `ByteUnit::as_bits_usize` defined `Gibibyte` as `1 << 33`, which overflows a 32-bit `usize`
+  and stopped the crate from compiling on such targets. `as_bits_u64` now computes every unit in
+  `u64`, and `as_bits_usize` panics for `Gibibyte` where `usize` is 32 bits. Values on 64-bit
+  targets are unchanged.
 
 ## [0.3.1] - 2026-10-09
 

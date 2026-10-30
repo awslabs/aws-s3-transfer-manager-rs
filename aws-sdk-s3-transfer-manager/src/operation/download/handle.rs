@@ -461,8 +461,8 @@ impl ManagedDownloadHandle {
             // path downloads would sync file data before rename and the parent
             // directory after rename where supported. The latency and cross-platform
             // semantics make this a client/API policy rather than the default.
-            if let Err(e) = tokio::fs::rename(&temp, dest).await {
-                let _ = tokio::fs::remove_file(&temp).await;
+            if let Err(e) = crate::io::fs::rename_async(&temp, dest).await {
+                let _ = crate::io::fs::remove_file_async(&temp).await;
                 return Err(e);
             }
         }
@@ -475,7 +475,7 @@ impl ManagedDownloadHandle {
     /// that name again.
     async fn cleanup(&mut self) {
         if let Some(temp) = self.temp_path.take() {
-            let _ = tokio::fs::remove_file(&temp).await;
+            let _ = crate::io::fs::remove_file_async(&temp).await;
         }
     }
 }

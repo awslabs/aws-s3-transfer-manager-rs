@@ -290,6 +290,7 @@ dependencies = [
  "path-clean",
  "pin-project-lite",
  "proptest",
+ "rustix",
  "same-file",
  "serde",
  "serde_json",

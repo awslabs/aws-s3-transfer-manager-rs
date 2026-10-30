@@ -15,11 +15,15 @@
 //! [`is_append_only`] reports whether a handle's positioned writes would land
 //! at their offsets, and [`create_first_new`] creates the first of several
 //! candidate paths that does not exist yet, without opening any existing entry.
+//!
+//! The `_async` helpers keep blocking filesystem calls off async worker
+//! threads: natively through `tokio::fs` or tokio's blocking pool, and inline
+//! on wasm targets, which have no blocking pool.
 
 use bytes::{Buf, BufMut};
 use std::fs::File;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::io::PartBuffer;
 
@@ -102,8 +106,10 @@ where
     Ok(())
 }
 
-#[cfg(unix)]
-fn validate_unix_range(offset: u64, len: usize) -> io::Result<()> {
+/// Rejects a range whose last byte exceeds `i64::MAX`, the largest `off_t`
+/// on Unix and WASI.
+#[cfg(any(unix, target_os = "wasi"))]
+fn validate_off_t_range(offset: u64, len: usize) -> io::Result<()> {
     if len == 0 {
         return Ok(());
     }
@@ -175,8 +181,8 @@ pub(crate) fn read_exact_at(file: &File, dst: &mut PartBuffer, mut offset: u64) 
 /// after the bytes already written so the caller can observe partial progress.
 ///
 /// Unix uses vectored positioned writes to preserve segment boundaries.
-/// Platforms without positioned-write support return
-/// [`io::ErrorKind::Unsupported`].
+/// Windows and WASI write one segment per call. Platforms without
+/// positioned-write support return [`io::ErrorKind::Unsupported`].
 pub(crate) fn write_all_at(file: &File, buf: &mut impl Buf, offset: u64) -> io::Result<()> {
     sys::write_all_at(file, buf, offset)
 }
@@ -184,9 +190,9 @@ pub(crate) fn write_all_at(file: &File, buf: &mut impl Buf, offset: u64) -> io::
 /// Prepares `file` for an expected final length of `len` bytes.
 ///
 /// Linux reserves the range with `posix_fallocate`, allowing allocation
-/// failures to surface before transfer writes begin. Other Unix systems and
-/// Windows set the logical file length without guaranteeing physical space;
-/// unsupported platforms treat the request as a no-op.
+/// failures to surface before transfer writes begin. Other Unix systems,
+/// Windows, and WASI set the logical file length without guaranteeing physical
+/// space; unsupported platforms treat the request as a no-op.
 ///
 /// This operation does not flush file data or metadata. Successful return is
 /// not a durability guarantee.
@@ -204,8 +210,10 @@ pub(crate) fn preallocate(file: &File, len: u64) -> io::Result<()> {
 ///   `FILE_WRITE_DATA`, as [`OpenOptions::append`](std::fs::OpenOptions::append)
 ///   opens it. Every write through such a handle goes to the end of the file
 ///   regardless of its offset.
-/// - Under Miri, and on targets that are neither Unix nor Windows, the handle
-///   is not inspected and the result is `Ok(false)`.
+/// - On WASI, true when wasi-libc reports `O_APPEND` in the descriptor's status
+///   flags.
+/// - Under Miri, and on other targets, the handle is not inspected and the
+///   result is `Ok(false)`.
 ///
 /// The result describes the handle at the time of the call. An error means
 /// the handle's mode could not be read.
@@ -244,14 +252,75 @@ pub(crate) fn create_first_new(
     ))
 }
 
-/// Runs [`create_first_new`] on the blocking thread pool.
+/// Runs [`create_first_new`] on the blocking thread pool, or inline on wasm
+/// targets.
 ///
 /// Returns its result, or an error if the blocking task panics or is
 /// cancelled.
 pub(crate) async fn create_first_new_async(
     candidates: Vec<PathBuf>,
 ) -> io::Result<(File, PathBuf)> {
-    tokio::task::spawn_blocking(move || create_first_new(candidates)).await?
+    run_blocking(move || create_first_new(candidates)).await
+}
+
+/// Renames `from` to `to`.
+///
+/// Uses [`tokio::fs::rename`], or [`std::fs::rename`] on the calling thread on
+/// wasm targets, where tokio's blocking pool is unavailable. Returns the
+/// rename's result.
+#[cfg(not(target_family = "wasm"))]
+pub(crate) async fn rename_async(from: &Path, to: &Path) -> io::Result<()> {
+    tokio::fs::rename(from, to).await
+}
+
+/// Renames `from` to `to`.
+///
+/// Uses [`tokio::fs::rename`], or [`std::fs::rename`] on the calling thread on
+/// wasm targets, where tokio's blocking pool is unavailable. Returns the
+/// rename's result.
+#[cfg(target_family = "wasm")]
+pub(crate) async fn rename_async(from: &Path, to: &Path) -> io::Result<()> {
+    std::fs::rename(from, to)
+}
+
+/// Removes the file at `path`.
+///
+/// Uses [`tokio::fs::remove_file`], or [`std::fs::remove_file`] on the calling
+/// thread on wasm targets, where tokio's blocking pool is unavailable. Returns
+/// the removal's result.
+#[cfg(not(target_family = "wasm"))]
+pub(crate) async fn remove_file_async(path: &Path) -> io::Result<()> {
+    tokio::fs::remove_file(path).await
+}
+
+/// Removes the file at `path`.
+///
+/// Uses [`tokio::fs::remove_file`], or [`std::fs::remove_file`] on the calling
+/// thread on wasm targets, where tokio's blocking pool is unavailable. Returns
+/// the removal's result.
+#[cfg(target_family = "wasm")]
+pub(crate) async fn remove_file_async(path: &Path) -> io::Result<()> {
+    std::fs::remove_file(path)
+}
+
+/// Runs `operation` on tokio's blocking thread pool.
+///
+/// Returns its result, or an error if the blocking task panics or is
+/// cancelled.
+#[cfg(not(target_family = "wasm"))]
+async fn run_blocking<T: Send + 'static>(
+    operation: impl FnOnce() -> io::Result<T> + Send + 'static,
+) -> io::Result<T> {
+    tokio::task::spawn_blocking(operation).await?
+}
+
+/// Runs `operation` on the calling thread.
+///
+/// wasip1 and wasip2 cannot spawn the threads a blocking pool needs, and
+/// wasip3's cooperative threads run one at a time.
+#[cfg(target_family = "wasm")]
+async fn run_blocking<T>(operation: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+    operation()
 }
 
 #[cfg(all(unix, not(miri)))]
@@ -269,14 +338,14 @@ mod sys {
 
     /// Fills one contiguous destination range without changing the file cursor.
     pub(super) fn read_exact_at(file: &File, dst: &mut [u8], offset: u64) -> io::Result<()> {
-        super::validate_unix_range(offset, dst.len())?;
+        super::validate_off_t_range(offset, dst.len())?;
         super::read_exact_at_loop(dst, offset, |dst, offset| file.read_at(dst, offset))
     }
 
     /// Drains segmented input with as few positioned writes as the iovec limit permits.
     pub(super) fn write_all_at(file: &File, buf: &mut impl Buf, offset: u64) -> io::Result<()> {
         let fd = file.as_fd();
-        super::validate_unix_range(offset, buf.remaining())?;
+        super::validate_off_t_range(offset, buf.remaining())?;
         super::write_all_at_loop(buf, offset, |buf, offset| {
             let mut slices = [IoSlice::new(&[]); MAX_IO_SLICES];
             let n = buf.chunks_vectored(&mut slices);
@@ -326,12 +395,12 @@ mod sys {
     use std::os::unix::fs::FileExt;
 
     pub(super) fn read_exact_at(file: &File, dst: &mut [u8], offset: u64) -> io::Result<()> {
-        super::validate_unix_range(offset, dst.len())?;
+        super::validate_off_t_range(offset, dst.len())?;
         super::read_exact_at_loop(dst, offset, |dst, offset| file.read_at(dst, offset))
     }
 
     pub(super) fn write_all_at(file: &File, buf: &mut impl Buf, offset: u64) -> io::Result<()> {
-        super::validate_unix_range(offset, buf.remaining())?;
+        super::validate_off_t_range(offset, buf.remaining())?;
         super::write_all_at_loop(buf, offset, |buf, offset| {
             file.write_at(buf.chunk(), offset)
         })
@@ -431,7 +500,42 @@ mod sys {
     }
 }
 
-#[cfg(not(any(unix, windows)))]
+#[cfg(target_os = "wasi")]
+mod sys {
+    //! WASI positioned I/O through rustix.
+    //!
+    //! std's `FileExt` positioned reads and writes are unstable on WASI.
+
+    use bytes::Buf;
+    use std::fs::File;
+    use std::io;
+
+    pub(super) fn read_exact_at(file: &File, dst: &mut [u8], offset: u64) -> io::Result<()> {
+        super::validate_off_t_range(offset, dst.len())?;
+        super::read_exact_at_loop(dst, offset, |dst, offset| {
+            Ok(rustix::io::pread(file, dst, offset)?)
+        })
+    }
+
+    pub(super) fn write_all_at(file: &File, buf: &mut impl Buf, offset: u64) -> io::Result<()> {
+        super::validate_off_t_range(offset, buf.remaining())?;
+        super::write_all_at_loop(buf, offset, |buf, offset| {
+            Ok(rustix::io::pwrite(file, buf.chunk(), offset)?)
+        })
+    }
+
+    pub(super) fn preallocate(file: &File, len: u64) -> io::Result<()> {
+        file.set_len(len)
+    }
+
+    /// Reports whether the descriptor's status flags include `O_APPEND`.
+    pub(super) fn is_append_only(file: &File) -> io::Result<bool> {
+        let flags = rustix::fs::fcntl_getfl(file)?;
+        Ok(flags.contains(rustix::fs::OFlags::APPEND))
+    }
+}
+
+#[cfg(not(any(unix, windows, target_os = "wasi")))]
 mod sys {
     //! Fallbacks for platforms without positioned filesystem operations.
 

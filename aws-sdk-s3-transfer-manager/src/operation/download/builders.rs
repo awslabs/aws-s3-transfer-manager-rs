@@ -42,7 +42,7 @@ impl DownloadFluentBuilder {
     /// system and the temporary file was renamed. It does not call `sync_data`,
     /// `sync_all`, or synchronize the parent directory, and therefore does not
     /// promise persistence across a system crash or power loss.
-    #[cfg(any(unix, windows))]
+    #[cfg(any(unix, windows, target_os = "wasi"))]
     pub async fn write_to_path(
         self,
         path: impl Into<std::path::PathBuf>,
@@ -80,7 +80,7 @@ impl DownloadFluentBuilder {
     /// Successful completion does not synchronize file data or metadata. Call
     /// the appropriate synchronization method on another handle when crash
     /// persistence is required.
-    #[cfg(any(unix, windows))]
+    #[cfg(any(unix, windows, target_os = "wasi"))]
     pub fn write_to_file(
         self,
         file: std::fs::File,

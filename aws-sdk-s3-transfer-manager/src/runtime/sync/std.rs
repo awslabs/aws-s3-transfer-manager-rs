@@ -9,6 +9,8 @@
 //!
 //! Under `cfg(miri)`, Mutex/Condvar fall back to `std::sync` because
 //! `parking_lot` uses integer-to-pointer casts that violate strict provenance.
+//! wasm targets also use `std::sync`, because `parking_lot`'s wasm parker
+//! panics whenever a thread would block.
 
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
@@ -43,18 +45,19 @@ impl<T> UnsafeCell<T> {
 // Production: parking_lot (faster Condvar, no poisoning).
 // Miri: std::sync (parking_lot uses integer-to-pointer casts that violate
 //        strict provenance — that's a parking_lot concern, not ours).
+// wasm: std::sync (parking_lot's wasm parker panics whenever a thread would block).
 // ---------------------------------------------------------------------------
 
-#[cfg(not(miri))]
+#[cfg(not(any(miri, target_family = "wasm")))]
 pub(crate) struct Mutex<T>(PhantomData<std::sync::Mutex<T>>, parking_lot::Mutex<T>);
 
-#[cfg(not(miri))]
+#[cfg(not(any(miri, target_family = "wasm")))]
 pub(crate) struct MutexGuard<'a, T>(
     PhantomData<std::sync::MutexGuard<'a, T>>,
     parking_lot::MutexGuard<'a, T>,
 );
 
-#[cfg(not(miri))]
+#[cfg(not(any(miri, target_family = "wasm")))]
 impl<T> Mutex<T> {
     pub(crate) fn new(val: T) -> Self {
         Self(PhantomData, parking_lot::Mutex::new(val))
@@ -65,7 +68,7 @@ impl<T> Mutex<T> {
     }
 }
 
-#[cfg(not(miri))]
+#[cfg(not(any(miri, target_family = "wasm")))]
 impl<T> Deref for MutexGuard<'_, T> {
     type Target = T;
     fn deref(&self) -> &T {
@@ -73,20 +76,20 @@ impl<T> Deref for MutexGuard<'_, T> {
     }
 }
 
-#[cfg(not(miri))]
+#[cfg(not(any(miri, target_family = "wasm")))]
 impl<T> DerefMut for MutexGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
         &mut self.1
     }
 }
 
-#[cfg(miri)]
+#[cfg(any(miri, target_family = "wasm"))]
 pub(crate) struct Mutex<T>(std::sync::Mutex<T>);
 
-#[cfg(miri)]
+#[cfg(any(miri, target_family = "wasm"))]
 pub(crate) struct MutexGuard<'a, T>(std::sync::MutexGuard<'a, T>);
 
-#[cfg(miri)]
+#[cfg(any(miri, target_family = "wasm"))]
 impl<T> Mutex<T> {
     pub(crate) fn new(val: T) -> Self {
         Self(std::sync::Mutex::new(val))
@@ -97,7 +100,7 @@ impl<T> Mutex<T> {
     }
 }
 
-#[cfg(miri)]
+#[cfg(any(miri, target_family = "wasm"))]
 impl<T> Deref for MutexGuard<'_, T> {
     type Target = T;
     fn deref(&self) -> &T {
@@ -105,7 +108,7 @@ impl<T> Deref for MutexGuard<'_, T> {
     }
 }
 
-#[cfg(miri)]
+#[cfg(any(miri, target_family = "wasm"))]
 impl<T> DerefMut for MutexGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
         &mut self.0
@@ -116,10 +119,10 @@ impl<T> DerefMut for MutexGuard<'_, T> {
 // Condvar — ownership-based wait matching loom/std (not parking_lot's &mut)
 // ---------------------------------------------------------------------------
 
-#[cfg(not(miri))]
+#[cfg(not(any(miri, target_family = "wasm")))]
 pub(crate) struct Condvar(PhantomData<std::sync::Condvar>, parking_lot::Condvar);
 
-#[cfg(not(miri))]
+#[cfg(not(any(miri, target_family = "wasm")))]
 impl Condvar {
     pub(crate) fn new() -> Self {
         Self(PhantomData, parking_lot::Condvar::new())
@@ -148,10 +151,10 @@ impl Condvar {
     }
 }
 
-#[cfg(miri)]
+#[cfg(any(miri, target_family = "wasm"))]
 pub(crate) struct Condvar(std::sync::Condvar);
 
-#[cfg(miri)]
+#[cfg(any(miri, target_family = "wasm"))]
 impl Condvar {
     pub(crate) fn new() -> Self {
         Self(std::sync::Condvar::new())

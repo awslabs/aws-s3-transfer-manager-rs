@@ -4,6 +4,7 @@
  */
 
 use crate::metrics::unit::ByteUnit;
+#[cfg(not(target_family = "wasm"))]
 use crate::runtime::ManagedThreadRuntime;
 use crate::scheduler::{ConcurrencyController, FixedConcurrency, Scheduler};
 use crate::telemetry::Telemetry;
@@ -302,6 +303,7 @@ impl Client {
         let handle = Arc::new_cyclic(|weak_handle| {
             let scheduler = Scheduler::new(weak_handle.clone());
             let runtime: Arc<dyn ExecutionRuntime> = match config.runtime_mode() {
+                #[cfg(not(target_family = "wasm"))]
                 RuntimeMode::Managed => {
                     #[allow(unused_mut)]
                     let mut builder =
@@ -312,6 +314,11 @@ impl Client {
                     }
                     Arc::new(builder.build())
                 }
+                // wasm targets have no managed runtime; see `RuntimeMode::Managed`.
+                #[cfg(target_family = "wasm")]
+                RuntimeMode::Managed => Arc::new(crate::runtime::TokioMultiThreadRuntime::new(
+                    weak_handle.clone(),
+                )),
                 RuntimeMode::MultiThreadTokio => {
                     if runtime_http.is_some_and(|http| !http.network_interfaces.is_empty()) {
                         tracing::warn!(

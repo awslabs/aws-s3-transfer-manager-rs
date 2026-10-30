@@ -10,10 +10,17 @@
 mod tokio_mt;
 pub(crate) use tokio_mt::TokioMultiThreadRuntime;
 
+// The managed runtime spawns OS threads and builds a native HTTP transport,
+// neither of which wasm targets provide.
+#[cfg(not(target_family = "wasm"))]
 mod managed;
+#[cfg(not(target_family = "wasm"))]
 pub(crate) use managed::ManagedThreadRuntime;
 
+// CPU placement for managed threads.
+#[cfg(not(target_family = "wasm"))]
 mod topology;
+#[cfg(not(target_family = "wasm"))]
 pub(crate) use topology::Topology;
 
 #[allow(dead_code)]
@@ -68,6 +75,10 @@ pub(crate) struct RuntimeHttpOptions {
     /// round-robin. Empty leaves interface selection to OS routing.
     pub(crate) network_interfaces: Vec<String>,
     /// Maximum connections to one origin across all worker threads.
+    #[cfg_attr(
+        target_family = "wasm",
+        expect(dead_code, reason = "read only by the managed runtime's transport")
+    )]
     pub(crate) max_connections_per_host: usize,
 }
 
@@ -77,7 +88,8 @@ pub(crate) struct RuntimeHttpOptions {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RuntimeComponents {
     http_client: Option<SharedHttpClient>,
-    /// When true, file I/O runs directly on the calling thread (managed threads).
+    /// When true, file I/O runs directly on the calling thread: managed
+    /// threads, and wasm targets, whose threads are unavailable or cooperative.
     /// When false, file I/O is offloaded via spawn_blocking (shared runtimes).
     direct_io: bool,
 }
@@ -89,6 +101,7 @@ impl RuntimeComponents {
     }
 
     /// Set the HTTP client.
+    #[cfg(not(target_family = "wasm"))]
     pub(crate) fn set_http_client(&mut self, client: SharedHttpClient) {
         self.http_client = Some(client);
     }

@@ -240,11 +240,15 @@ impl Config {
 
     /// HTTP options for the runtime-provided transport, or `None` when the
     /// runtime's HTTP client would not be installed: a finished S3 client was
-    /// supplied, or runtime HTTP is disabled.
+    /// supplied, runtime HTTP is disabled, or the target is wasm, which has no
+    /// runtime-provided transport.
     pub(crate) fn runtime_http(
         &self,
         max_connections_per_host: usize,
     ) -> Option<crate::runtime::RuntimeHttpOptions> {
+        if cfg!(target_family = "wasm") {
+            return None;
+        }
         match self.s3_client_source.as_ref()? {
             S3ClientSource::FromConfig(config) if config.enable_runtime_http => {
                 Some(crate::runtime::RuntimeHttpOptions {
