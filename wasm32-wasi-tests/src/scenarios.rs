@@ -25,7 +25,7 @@ use aws_smithy_types::error::display::DisplayErrorContext;
 use aws_types::sdk_config::{RetryConfig, SharedAsyncSleep, SharedCredentialsProvider};
 use aws_types::SdkConfig;
 use bytes::Bytes;
-use memory_s3::MemoryS3;
+use in_memory_s3::MemoryS3;
 
 const KIB: usize = 1024;
 const MIB: usize = 1024 * KIB;

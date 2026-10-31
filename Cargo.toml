@@ -10,7 +10,7 @@ members = [
     "s3-mock-server",
     "benches",
     "integration-tests",
-    "memory-s3",
+    "in-memory-s3",
     "wasm32-wasi-tests",
 ]
 exclude = ["fuzz"]
