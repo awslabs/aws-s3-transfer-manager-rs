@@ -49,6 +49,37 @@ pub(crate) struct Requests {
     pub(crate) get_object: usize,
     /// Requests answered with `503 SlowDown`.
     pub(crate) throttled: usize,
+    /// Object bytes received in `PutObject` and `UploadPart` bodies.
+    pub(crate) bytes_received: usize,
+    /// Object bytes sent in `GetObject` bodies.
+    pub(crate) bytes_sent: usize,
+}
+
+/// Lists the nonzero counters, such as `3 UploadPart, 2 multipart control,
+/// 20971520 bytes received`, or `no requests`.
+impl std::fmt::Display for Requests {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let counters = [
+            (self.put_object, "PutObject"),
+            (self.upload_part, "UploadPart"),
+            (self.multipart_control, "multipart control"),
+            (self.get_object, "GetObject"),
+            (self.throttled, "throttled"),
+            (self.bytes_received, "bytes received"),
+            (self.bytes_sent, "bytes sent"),
+        ];
+        let mut nonzero = counters.iter().filter(|(count, _)| *count != 0).peekable();
+        if nonzero.peek().is_none() {
+            return f.write_str("no requests");
+        }
+        for (index, (count, name)) in nonzero.enumerate() {
+            if index != 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "{count} {name}")?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Default)]
@@ -242,12 +273,14 @@ fn serve(
         "PUT" => match param("partNumber").map(str::parse::<u32>) {
             Some(Ok(number)) => {
                 state.requests.upload_part += 1;
+                state.requests.bytes_received += body.len();
                 state.parts.insert((key, number), body);
                 response(200, &[("etag", format!("\"part-{number}\""))], "")
             }
             Some(Err(_)) => response(400, &[], "<Error><Code>InvalidArgument</Code></Error>"),
             None => {
                 state.requests.put_object += 1;
+                state.requests.bytes_received += body.len();
                 state.objects.insert(key, body);
                 response(200, &[("etag", "\"object\"".to_owned())], "")
             }
@@ -264,6 +297,7 @@ fn serve(
                 None => (0, total - 1),
             };
             let slice = data.slice(start as usize..=end as usize);
+            state.requests.bytes_sent += slice.len();
             let mut resp = response(
                 206,
                 &[

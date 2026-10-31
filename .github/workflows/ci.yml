@@ -513,18 +513,48 @@ jobs:
       - name: Build runtime harness
         run: cargo build --locked -p wasm32-unknown-unknown-tests --target wasm32-unknown-unknown --release
       - name: Run harness under Wasmtime
+        # Wasmtime prints only return values, so `run` returns how many
+        # scenarios passed, and each trap must be a Wasm trap rather than a
+        # missing export or another invocation error.
         run: |
-          wasmtime run --invoke run "$HARNESS"
-          if wasmtime run --invoke client_without_runtime "$HARNESS"; then
-            echo "constructing a client without a runtime did not trap" >&2
+          count=$(wasmtime run --invoke scenario_count "$HARNESS")
+          passed=$(wasmtime run --invoke run "$HARNESS")
+          echo "$passed of $count scenarios passed"
+          if ! (( count > 0 && passed == count )); then
+            echo "the harness reported $passed of $count scenarios passing" >&2
             exit 1
           fi
-          if wasmtime run --invoke client_without_sleep "$HARNESS"; then
-            echo "constructing a client without a sleep implementation did not trap" >&2
-            exit 1
-          fi
+          for export in client_without_runtime client_without_sleep; do
+            log="$RUNNER_TEMP/$export.log"
+            if wasmtime run --invoke "$export" "$HARNESS" 2> "$log"; then
+              echo "$export did not trap" >&2
+              exit 1
+            fi
+            if ! grep -q 'wasm trap: wasm `unreachable` instruction executed' "$log"; then
+              cat "$log" >&2
+              echo "$export failed without trapping" >&2
+              exit 1
+            fi
+            echo "PASS $export: trapped"
+          done
       - name: Run harness under Node
-        run: node wasm32-unknown-unknown-tests/run-node.mjs "$HARNESS"
+        run: |
+          log="$RUNNER_TEMP/node-harness.log"
+          node wasm32-unknown-unknown-tests/run-node.mjs "$HARNESS" | tee "$log"
+          # The runner reports what it ran, so a module or runner that skips
+          # scenarios cannot pass by exiting zero.
+          header='^wasm32-unknown-unknown-tests: ([0-9]+) scenarios under Node$'
+          if ! [[ "$(head -n 1 "$log")" =~ $header ]]; then
+            echo "the harness did not report its scenarios" >&2
+            exit 1
+          fi
+          count=${BASH_REMATCH[1]}
+          passed=$(grep -c '^PASS ' "$log" || true)
+          if (( count == 0 || passed != count )) \
+            || [[ "$(tail -n 1 "$log")" != "$count scenarios passed" ]]; then
+            echo "the harness reported $passed of $count scenarios passing" >&2
+            exit 1
+          fi
 
   check-external-types:
     name: check-external-types (${{ matrix.os }})

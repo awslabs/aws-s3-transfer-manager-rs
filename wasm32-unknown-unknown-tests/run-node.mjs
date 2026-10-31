@@ -2,16 +2,22 @@
 //
 // Usage: node run-node.mjs <module.wasm>
 //
-// Checks that the module imports nothing and that `run` returns zero. Then
-// plays S3 for the host round trip: the module's connector hands each request
-// to this script, which answers it from an in-memory store, newest first. For
-// a single-part and a multipart object, the script checks that every request
-// is signed, that the module sent the expected operations and ranges with
-// multipart requests outstanding together, and that the stored object equals
-// the uploaded bytes; the module checks that the download equals them too.
-// Finally it checks that constructing a client without a runtime or without a
-// sleep implementation traps with the documented message. Each run uses a
-// fresh instance.
+// Checks that the module imports nothing and that `run` passes every scenario
+// that `scenario_count` declares. Then plays S3 for the host round trip: the
+// module's connector hands each request to this script, which answers it from
+// an in-memory store, newest first. For a single-part and a multipart object,
+// the script checks that every request is signed, that the module sent the
+// expected operations and ranges with multipart requests outstanding
+// together, and that the stored object equals the uploaded bytes; the module
+// checks that the download equals them too. Finally it checks that
+// constructing a client without a runtime or without a sleep implementation
+// traps with the documented message. Each run uses a fresh instance.
+//
+// Prints `wasm32-unknown-unknown-tests: <count> scenarios under Node` first,
+// then `PASS <scenario>: <summary>` for each scenario: the module's report
+// for the scenarios `run` runs, then one line for each host round trip and
+// each trap. Prints `<count> scenarios passed` last, only if every scenario
+// passed.
 
 import { readFile } from "node:fs/promises";
 
@@ -39,6 +45,12 @@ const ROUND_TRIPS = [
     ranges: [0, 8 * MIB, 16 * MIB],
     minConcurrent: 2,
   },
+];
+
+// Exports that must trap, and the message each must report.
+const TRAPS = [
+  ["client_without_runtime", "requires wasm::install_runtime"],
+  ["client_without_sleep", "requires an AsyncSleep implementation"],
 ];
 
 const path = process.argv[2];
@@ -347,10 +359,22 @@ function sorted(record) {
 
 let failed = false;
 
+const moduleScenarios = (await invoke("scenario_count")).result;
+const count = moduleScenarios + ROUND_TRIPS.length + TRAPS.length;
+console.log(`wasm32-unknown-unknown-tests: ${count} scenarios under Node`);
+
 const run = await invoke("run");
 process.stdout.write(run.message);
-if (run.trap || run.result !== 0) {
-  console.error(`run failed: ${run.trap ?? `returned ${run.result}`}`);
+const reported = run.message
+  .split("\n")
+  .filter((line) => line.startsWith("PASS ")).length;
+if (run.trap) {
+  console.error(`run failed: ${run.trap}`);
+  failed = true;
+} else if (run.result !== moduleScenarios || reported !== moduleScenarios) {
+  console.error(
+    `run returned ${run.result} and reported ${reported} passing scenarios, expected ${moduleScenarios}`,
+  );
   failed = true;
 }
 
@@ -364,13 +388,10 @@ for (const roundTrip of ROUND_TRIPS) {
   }
 }
 
-for (const [name, expected] of [
-  ["client_without_runtime", "requires wasm::install_runtime"],
-  ["client_without_sleep", "requires an AsyncSleep implementation"],
-]) {
+for (const [name, expected] of TRAPS) {
   const outcome = await invoke(name);
   if (outcome.trap && outcome.message.includes(expected)) {
-    console.log(`PASS ${name}`);
+    console.log(`PASS ${name}: trapped reporting "${expected}"`);
   } else {
     console.error(`FAIL ${name}: expected a trap mentioning "${expected}"`);
     process.stderr.write(outcome.message);
@@ -378,4 +399,5 @@ for (const [name, expected] of [
   }
 }
 
+if (!failed) console.log(`${count} scenarios passed`);
 process.exit(failed ? 1 : 0);

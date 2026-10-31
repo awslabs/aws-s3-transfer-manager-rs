@@ -55,10 +55,12 @@ macro_rules! ensure {
     };
 }
 
-type Scenario = fn() -> Result<(), String>;
+type Scenario = fn() -> Result<String, String>;
 
-/// Scenarios in execution order. Installation runs before all of them.
+/// Scenarios in execution order. The first installs the runtime that the
+/// others use.
 const SCENARIOS: &[(&str, Scenario)] = &[
+    ("installation", installation),
     ("client construction", client_construction),
     ("single-part round trip", single_part_round_trip),
     ("multipart round trip", multipart_round_trip),
@@ -69,15 +71,24 @@ const SCENARIOS: &[(&str, Scenario)] = &[
     ("filesystem unavailable", filesystem_unavailable),
 ];
 
-/// Installs the runtime, then runs every scenario.
-pub(crate) fn run_all() -> Result<(), String> {
-    installation()?;
-    crate::report("PASS installation");
+/// Number of scenarios that [`run_all`] runs.
+pub(crate) fn scenario_count() -> usize {
+    SCENARIOS.len()
+}
+
+/// Runs every scenario in order. Returns how many passed, which is
+/// [`scenario_count`], or the first failure.
+///
+/// Reports `PASS <scenario>: <summary>` for each scenario, where the summary
+/// lists the requests the connector served and the workers that exited.
+pub(crate) fn run_all() -> Result<usize, String> {
+    let mut passed = 0;
     for (name, scenario) in SCENARIOS {
-        scenario().map_err(|message| format!("FAIL {name}: {message}"))?;
-        crate::report(&format!("PASS {name}"));
+        let summary = scenario().map_err(|message| format!("FAIL {name}: {message}"))?;
+        crate::report(&format!("PASS {name}: {summary}"));
+        passed += 1;
     }
-    Ok(())
+    Ok(passed)
 }
 
 /// Builds shared configuration for `connector` with every capability the
@@ -167,9 +178,10 @@ fn ensure_same(expected: &[u8], actual: &[u8]) -> Result<(), String> {
 }
 
 /// Drops `client`, drives the executor, and verifies that every worker the
-/// scenario spawned has exited and that requests waited on host I/O.
-fn shut_down(client: Client, before: host::Stats, store: &MemoryS3) -> Result<(), String> {
-    release(client, before)?;
+/// scenario spawned has exited and that requests waited on host I/O. Returns a
+/// summary of the requests `store` served and the workers that exited.
+fn shut_down(client: Client, before: host::Stats, store: &MemoryS3) -> Result<String, String> {
+    let workers = release(client, before)?;
     let after = host::stats();
     let requests = store.requests();
     let sent = requests.put_object
@@ -183,18 +195,22 @@ fn shut_down(client: Client, before: host::Stats, store: &MemoryS3) -> Result<()
         sent,
         after.io_pending_polls - before.io_pending_polls
     );
-    Ok(())
+    Ok(format!(
+        "{requests}; {workers} tasks exited after the client was dropped"
+    ))
 }
 
 /// Drops `client`, drives the executor, and verifies that every worker spawned
-/// since `before` has exited.
+/// since `before` has exited. Returns how many of those workers were live when
+/// the client was dropped.
 ///
 /// Workers exit when the client's shared state drops. The scheduler's
 /// lock-free sets hand removed transfer descriptors, which reference that
 /// state, to crossbeam-epoch, which destroys them only after the epoch
 /// advances. Flushing the epoch here makes the drop deterministic; worker exit
 /// itself still depends on the host waking each worker's queue notification.
-fn release(client: Client, before: host::Stats) -> Result<(), String> {
+fn release(client: Client, before: host::Stats) -> Result<usize, String> {
+    let workers = host::stats().live_tasks.saturating_sub(before.live_tasks);
     drop(client);
     for _ in 0..EPOCH_FLUSHES {
         crossbeam_epoch::pin().flush();
@@ -206,7 +222,7 @@ fn release(client: Client, before: host::Stats) -> Result<(), String> {
         "{} spawned futures remain live after the client was dropped",
         after.live_tasks - before.live_tasks
     );
-    Ok(())
+    Ok(workers)
 }
 
 static REJECTED_RUNTIME_DROPPED: AtomicBool = AtomicBool::new(false);
@@ -234,7 +250,7 @@ impl Drop for RejectedRuntime {
 /// The first installation succeeds. A second fails, drops its runtime, and
 /// leaves the first active; later scenarios would trap if the rejected
 /// runtime were used.
-fn installation() -> Result<(), String> {
+fn installation() -> Result<String, String> {
     ensure!(
         wasm::install_runtime(LogicalRuntime).is_ok(),
         "first installation failed"
@@ -250,12 +266,12 @@ fn installation() -> Result<(), String> {
         REJECTED_RUNTIME_DROPPED.load(Ordering::SeqCst),
         "rejected runtime was retained"
     );
-    Ok(())
+    Ok("a second runtime was rejected and dropped".to_owned())
 }
 
 /// A client builds from explicit capabilities and default transfer-manager
 /// configuration, and its automatic memory limit is the target's fallback.
-fn client_construction() -> Result<(), String> {
+fn client_construction() -> Result<String, String> {
     let before = host::stats();
     let store = MemoryS3::default();
     let client = client(&store, |config| config);
@@ -268,7 +284,7 @@ fn client_construction() -> Result<(), String> {
 }
 
 /// A 64 KiB object uploads with one `PutObject` and downloads byte for byte.
-fn single_part_round_trip() -> Result<(), String> {
+fn single_part_round_trip() -> Result<String, String> {
     let before = host::stats();
     let store = MemoryS3::default();
     let client = client(&store, |config| config);
@@ -292,7 +308,7 @@ fn single_part_round_trip() -> Result<(), String> {
 
 /// A 20 MiB object uploads as three 8 MiB-target parts and downloads as three
 /// ranged `GetObject` requests.
-fn multipart_round_trip() -> Result<(), String> {
+fn multipart_round_trip() -> Result<String, String> {
     let before = host::stats();
     let store = MemoryS3::default();
     let client = client(&store, |config| {
@@ -318,7 +334,7 @@ fn multipart_round_trip() -> Result<(), String> {
 
 /// A throttled `PutObject` reaches the transfer manager, which waits through
 /// the configured sleep implementation and re-sends it.
-fn outer_retry() -> Result<(), String> {
+fn outer_retry() -> Result<String, String> {
     let before = host::stats();
     let store = MemoryS3::default();
     let client = client(&store, |config| config);
@@ -341,7 +357,7 @@ fn outer_retry() -> Result<(), String> {
 
 /// After warmup, a ranged `GetObject` that outlives its latency deadline is
 /// dropped and re-sent once.
-fn hedge_deadline() -> Result<(), String> {
+fn hedge_deadline() -> Result<String, String> {
     const PART: usize = 5 * MIB;
     const PARTS: usize = 15;
     let before = host::stats();
@@ -380,7 +396,7 @@ fn hedge_deadline() -> Result<(), String> {
 
 /// Aborting an upload whose `PutObject` never completes drops the request and
 /// returns.
-fn cancellation() -> Result<(), String> {
+fn cancellation() -> Result<String, String> {
     let before = host::stats();
     let store = MemoryS3::default();
     let client = client(&store, |config| config);
@@ -413,7 +429,7 @@ fn cancellation() -> Result<(), String> {
 
 /// Hundreds of concurrent uploads cross many 64-entry submission rounds. A
 /// threadless engine traps if submission ever waits on its condition variable.
-fn high_fan_out() -> Result<(), String> {
+fn high_fan_out() -> Result<String, String> {
     const UPLOADS: usize = 300;
     let before = host::stats();
     let store = MemoryS3::default();
@@ -450,7 +466,7 @@ fn high_fan_out() -> Result<(), String> {
 
 /// File-backed inputs and directory uploads fail with errors rather than
 /// panicking, and send no request.
-fn filesystem_unavailable() -> Result<(), String> {
+fn filesystem_unavailable() -> Result<String, String> {
     let before = host::stats();
     let store = MemoryS3::default();
     let client = client(&store, |config| config);

@@ -13,14 +13,16 @@
 //!
 //! Exports:
 //!
-//! - `run() -> i32` installs the runtime, runs every scenario, and returns
-//!   zero. A failure traps.
+//! - `scenario_count() -> i32` returns the number of scenarios `run` runs.
+//! - `run() -> i32` installs the runtime, runs every scenario, and returns how
+//!   many passed, which equals `scenario_count()`. A failure traps.
 //! - `client_without_runtime() -> i32` constructs a client before any runtime
 //!   is installed. It must trap.
 //! - `client_without_sleep() -> i32` installs the runtime and constructs a
 //!   client whose S3 configuration has no sleep implementation. It must trap.
 //! - `message_ptr() -> *const u8` and `message_len() -> usize` locate a UTF-8
-//!   report of passed scenarios followed by the failure or panic message.
+//!   report with a `PASS <scenario>: <summary>` line for each passed scenario,
+//!   followed by the failure or panic message.
 //!
 //! The host round trip sends its requests to the embedding host, which plays
 //! S3. Its exports use the wire format that the `host_http` module documents:
@@ -69,14 +71,24 @@ fn fail(message: String) -> ! {
     panic!("{message}");
 }
 
-/// Runs every scenario. Returns zero on success; any failure traps.
+/// Number of scenarios that [`run`] runs.
+#[no_mangle]
+pub extern "C" fn scenario_count() -> i32 {
+    to_i32(scenarios::scenario_count())
+}
+
+/// Runs every scenario. Returns how many passed; any failure traps.
 #[no_mangle]
 pub extern "C" fn run() -> i32 {
     install_panic_hook();
-    if let Err(message) = scenarios::run_all() {
-        fail(message);
+    match scenarios::run_all() {
+        Ok(passed) => to_i32(passed),
+        Err(message) => fail(message),
     }
-    0
+}
+
+fn to_i32(count: usize) -> i32 {
+    i32::try_from(count).expect("scenario count fits in i32")
 }
 
 /// Constructs a client before installing a runtime. Expected to trap.
