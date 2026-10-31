@@ -446,8 +446,8 @@ pub(crate) struct MetricsState {
     disk_read: AtomicU64,
     disk_write: AtomicU64,
     total_bytes: std::sync::OnceLock<u64>,
-    started_at: std::time::Instant,
-    finished_at: std::sync::OnceLock<std::time::Instant>,
+    started_at: crate::types::TransferInstant,
+    finished_at: std::sync::OnceLock<crate::types::TransferInstant>,
     terminal_reported: AtomicBool,
     request_metrics: crate::metrics::RequestMetricsState,
 }
@@ -460,7 +460,7 @@ impl MetricsState {
             disk_read: AtomicU64::new(0),
             disk_write: AtomicU64::new(0),
             total_bytes: std::sync::OnceLock::new(),
-            started_at: std::time::Instant::now(),
+            started_at: crate::types::TransferInstant::now(),
             finished_at: std::sync::OnceLock::new(),
             terminal_reported: AtomicBool::new(false),
             request_metrics: crate::metrics::RequestMetricsState::default(),
@@ -486,7 +486,7 @@ impl MetricsState {
 
     /// Mark the transfer as finished. No-op if already set.
     pub(crate) fn set_finished(&self) {
-        let _ = self.finished_at.set(std::time::Instant::now());
+        let _ = self.finished_at.set(crate::types::TransferInstant::now());
     }
 
     /// Claims the single terminal tracing record for this transfer.
@@ -571,25 +571,36 @@ pub(crate) struct TransferContext {
 /// measurement was running. A measurement starts running and accrues nothing
 /// while paused.
 ///
-/// Time is read from [`tokio::time::Instant`], which follows the tokio test
-/// clock when it is paused and the system monotonic clock otherwise.
+/// Time is read from [`RequestInstant`].
 #[derive(Debug)]
 pub(crate) struct RequestMeasurement {
     ctx: TransferContext,
     /// Elapsed time accrued by completed running intervals.
     accrued: std::time::Duration,
     /// Start of the current running interval; `None` while paused.
-    running_since: Option<tokio::time::Instant>,
+    running_since: Option<RequestInstant>,
     metrics: crate::metrics::RequestMetrics,
     published: bool,
 }
+
+/// The clock read by [`RequestMeasurement`].
+///
+/// [`tokio::time::Instant`] follows the tokio test clock when it is paused and
+/// the system monotonic clock otherwise. `wasm32-unknown-unknown` has neither,
+/// so request time there comes from the installed runtime.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+type RequestInstant = tokio::time::Instant;
+
+/// The clock read by [`RequestMeasurement`].
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+type RequestInstant = crate::types::TransferInstant;
 
 impl RequestMeasurement {
     fn new(ctx: TransferContext) -> Self {
         Self {
             ctx,
             accrued: std::time::Duration::ZERO,
-            running_since: Some(tokio::time::Instant::now()),
+            running_since: Some(RequestInstant::now()),
             metrics: crate::metrics::RequestMetrics::default(),
             published: false,
         }
@@ -615,7 +626,7 @@ impl RequestMeasurement {
     /// No-op when already running.
     pub(crate) fn resume(&mut self) {
         if self.running_since.is_none() {
-            self.running_since = Some(tokio::time::Instant::now());
+            self.running_since = Some(RequestInstant::now());
         }
     }
 

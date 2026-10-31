@@ -14,7 +14,10 @@
 
 use std::future::Future;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use crate::runtime::Timer;
+use crate::types::TransferInstant as Instant;
 
 /// Successful samples required before a deadline is applied. Below this the
 /// controller only observes latency and buffers samples for the seed;
@@ -322,13 +325,15 @@ impl LatencyTracker {
     /// client-wide aggregate gate.
     ///
     /// On success records the latency (warming the controller and replenishing
-    /// the budget). When armed and the deadline elapses, the in-flight future is
-    /// dropped, the budget is charged, a timeout is recorded against the issued
-    /// deadline, and [`GuardError::DeadlineExceeded`] carries it. A single
+    /// the budget). When armed, `timer` enforces the deadline. When the
+    /// deadline elapses, the in-flight future is dropped, the budget is
+    /// charged, a timeout is recorded against the issued deadline, and
+    /// [`GuardError::DeadlineExceeded`] carries it. A single
     /// attempt: the inner error is returned verbatim as [`GuardError::Inner`].
     /// Retry and classification live in [`crate::retry`].
     pub(crate) async fn guarded<T, E, Fut>(
         &self,
+        timer: &Timer,
         allow_hedge: bool,
         fut: Fut,
     ) -> Result<T, GuardError<E>>
@@ -344,7 +349,7 @@ impl LatencyTracker {
                 }
                 Err(e) => Err(GuardError::Inner(e)),
             },
-            Some(dl) => match tokio::time::timeout(dl, fut).await {
+            Some(dl) => match timer.timeout(dl, fut).await {
                 Ok(Ok(val)) => {
                     self.record(start.elapsed());
                     Ok(val)
@@ -663,7 +668,7 @@ mod tests {
 
         // 100ms would exceed a warm deadline, but cold applies none.
         let result = tracker
-            .guarded(true, async {
+            .guarded(&Timer::tokio(), true, async {
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 Ok::<_, crate::error::Error>(42)
             })
@@ -684,7 +689,9 @@ mod tests {
         assert_eq!(tracker.deadline(), None, "precondition: one sample short");
 
         let result = tracker
-            .guarded(true, async { Ok::<_, crate::error::Error>(42) })
+            .guarded(&Timer::tokio(), true, async {
+                Ok::<_, crate::error::Error>(42)
+            })
             .await;
         assert!(matches!(result, Ok(42)));
         assert!(
@@ -702,7 +709,7 @@ mod tests {
             tracker.record(Duration::from_millis(100));
         }
         let result: Result<(), _> = tracker
-            .guarded(true, async {
+            .guarded(&Timer::tokio(), true, async {
                 tokio::time::sleep(Duration::from_secs(30)).await;
                 Ok::<_, crate::error::Error>(())
             })
@@ -722,7 +729,7 @@ mod tests {
             tracker.record(Duration::from_millis(100));
         }
         let result = tracker
-            .guarded(false, async {
+            .guarded(&Timer::tokio(), false, async {
                 tokio::time::sleep(Duration::from_secs(30)).await;
                 Ok::<_, crate::error::Error>(7)
             })
@@ -751,7 +758,7 @@ mod tests {
             assert!(!c.can_hedge(), "precondition: drained");
         }
         let result = tracker
-            .guarded(true, async {
+            .guarded(&Timer::tokio(), true, async {
                 tokio::time::sleep(Duration::from_secs(30)).await;
                 Ok::<_, crate::error::Error>(9)
             })
@@ -765,7 +772,7 @@ mod tests {
     async fn guarded_inner_error_passed_through() {
         let tracker = LatencyTracker::new();
         let result: Result<(), _> = tracker
-            .guarded(true, async {
+            .guarded(&Timer::tokio(), true, async {
                 Err::<(), _>(crate::error::Error::new(
                     crate::error::ErrorKind::RuntimeError,
                     "simulated SDK error",
@@ -791,7 +798,7 @@ mod tests {
 
         // Resolves immediately with an error — well within the ~800ms deadline.
         let result: Result<(), _> = tracker
-            .guarded(true, async {
+            .guarded(&Timer::tokio(), true, async {
                 Err::<(), _>(crate::error::Error::new(
                     crate::error::ErrorKind::RuntimeError,
                     "simulated SDK error",

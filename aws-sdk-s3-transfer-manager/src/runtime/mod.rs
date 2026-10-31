@@ -27,6 +27,8 @@ pub(crate) use topology::Topology;
 pub(crate) mod buffer_pool;
 pub(crate) mod platform;
 pub(crate) mod sync;
+mod timer;
+pub(crate) use timer::Timer;
 
 use aws_smithy_runtime_api::client::http::SharedHttpClient;
 

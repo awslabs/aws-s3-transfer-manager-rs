@@ -12,6 +12,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `RUSTFLAGS="--cfg tokio_unstable"`. On these targets the application supplies the HTTP client,
   `RuntimeMode::Managed` runs on the caller's tokio runtime, which may be current-thread, and file
   I/O runs inline. The crate documentation lists the requirements.
+- The crate builds and runs on `wasm32-unknown-unknown` without build flags, JavaScript, or WASI.
+  The application installs a `wasm::WasmRuntime`, which supplies a monotonic clock and schedules
+  transfer work, and its S3 configuration supplies the HTTP client, sleep implementation, time
+  source, credentials, and region. Transfer-manager retry backoff and request deadlines use the S3
+  configuration's sleep implementation. Only in-memory and streamed transfers are supported,
+  SigV4a is not enabled, and `MemoryBudgetConfig::Auto` uses 64 MiB.
+- `types::TransferInstant` names the type of `TransferMetrics::started_at` and `finished_at`. It is
+  `std::time::Instant` on every target except `wasm32-unknown-unknown`.
 
 ### Changed
 - The `dial9` feature depends on `dial9` 0.5 instead of `dial9-tokio-telemetry` 0.3, and compiles

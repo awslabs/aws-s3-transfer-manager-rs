@@ -17,10 +17,11 @@
 //!                         pending_duration
 //! ```
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::runtime::sync::sync::atomic::{AtomicBool, Ordering};
 use crate::runtime::sync::sync::Mutex;
+use crate::types::TransferInstant as Instant;
 
 use super::TransferId;
 

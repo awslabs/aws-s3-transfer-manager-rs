@@ -13,7 +13,7 @@ categories = ["asynchronous", "concurrency"]
 keywords = ["AWS", "Amazon", "S3", "high-performance", "transfer-manager"]
 
 [dependencies]
-aws-config = { workspace = true, features = ["behavior-version-latest", "rt-tokio"] }
+aws-config = { workspace = true, features = ["behavior-version-latest"] }
 aws-sdk-s3 = { workspace = true, features = ["behavior-version-latest"] }
 aws-smithy-runtime-api = { workspace = true }
 aws-runtime = { workspace = true }
@@ -48,6 +48,13 @@ aws-sdk-s3 = { workspace = true, features = ["default-https-client"] }
 aws-smithy-http-client = { workspace = true, features = ["rustls-aws-lc", "rt-tokio"] }
 aws-smithy-dns = { workspace = true, features = ["hickory-dns"] }
 tokio = { version = "1.43.0", features = ["rt-multi-thread", "fs"] }
+
+# The SDK's tokio sleep, tokio filesystem body support, and SigV4a signing. SigV4a needs an entropy
+# source, and the SDK's tokio integration needs tokio's timer and filesystem, none of which
+# `wasm32-unknown-unknown` provides. That target takes sleep from the caller's S3 configuration.
+[target.'cfg(not(all(target_family = "wasm", target_os = "unknown")))'.dependencies]
+aws-config = { workspace = true, features = ["rt-tokio"] }
+aws-sdk-s3 = { workspace = true, features = ["rt-tokio", "sigv4a"] }
 
 # Directory identity for symlink cycle detection. same-file does not support WASI.
 [target.'cfg(not(target_os = "wasi"))'.dependencies]

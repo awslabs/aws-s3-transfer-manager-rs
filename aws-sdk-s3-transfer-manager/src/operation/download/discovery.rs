@@ -178,25 +178,30 @@ async fn discover_obj_with_get_first_part(
 ) -> Result<ObjectDiscovery, error::Error> {
     let mut req_metrics = transfer.start_request(DownloadRequestKind::DiscoveryPart);
     let retry_classify = crate::retry::classify_discovery_retry;
-    let result = crate::retry::retry(req_metrics.metrics_mut(), retry_classify, |_allow_hedge| {
-        let builder =
-            copy_fields_to_get_object_request(input, transfer.ctx().s3_client().get_object());
-        let req = builder
-            .set_range(None)
-            .set_part_number(Some(1))
-            .customize()
-            .config_override(
-                transfer
-                    .ctx()
-                    .handle
-                    .bucket_partition_override(input.bucket()),
-            );
-        async move {
-            req.send()
-                .await
-                .map_err(|e| crate::retry::GuardError::Inner(error::Error::from(e)))
-        }
-    })
+    let result = crate::retry::retry(
+        &transfer.ctx().handle.timer,
+        req_metrics.metrics_mut(),
+        retry_classify,
+        |_allow_hedge| {
+            let builder =
+                copy_fields_to_get_object_request(input, transfer.ctx().s3_client().get_object());
+            let req = builder
+                .set_range(None)
+                .set_part_number(Some(1))
+                .customize()
+                .config_override(
+                    transfer
+                        .ctx()
+                        .handle
+                        .bucket_partition_override(input.bucket()),
+                );
+            async move {
+                req.send()
+                    .await
+                    .map_err(|e| crate::retry::GuardError::Inner(error::Error::from(e)))
+            }
+        },
+    )
     .instrument(tracing::debug_span!(
         target: crate::telemetry::TARGET_TRANSFER,
         "discover-get-first-part",
@@ -214,22 +219,27 @@ async fn discover_obj_with_head(
 ) -> Result<ObjectDiscovery, crate::error::Error> {
     let mut req_metrics = transfer.start_request(DownloadRequestKind::DiscoveryHead);
     let retry_classify = crate::retry::classify_discovery_retry;
-    let result = crate::retry::retry(req_metrics.metrics_mut(), retry_classify, |_allow_hedge| {
-        let req =
-            copy_fields_to_head_object_request(input, transfer.ctx().s3_client().head_object())
-                .customize()
-                .config_override(
-                    transfer
-                        .ctx()
-                        .handle
-                        .bucket_partition_override(input.bucket()),
-                );
-        async move {
-            req.send()
-                .await
-                .map_err(|e| crate::retry::GuardError::Inner(error::Error::from(e)))
-        }
-    })
+    let result = crate::retry::retry(
+        &transfer.ctx().handle.timer,
+        req_metrics.metrics_mut(),
+        retry_classify,
+        |_allow_hedge| {
+            let req =
+                copy_fields_to_head_object_request(input, transfer.ctx().s3_client().head_object())
+                    .customize()
+                    .config_override(
+                        transfer
+                            .ctx()
+                            .handle
+                            .bucket_partition_override(input.bucket()),
+                    );
+            async move {
+                req.send()
+                    .await
+                    .map_err(|e| crate::retry::GuardError::Inner(error::Error::from(e)))
+            }
+        },
+    )
     .instrument(tracing::debug_span!(
         target: crate::telemetry::TARGET_TRANSFER,
         "discover-head",
@@ -373,24 +383,29 @@ async fn discover_obj_with_get(
     };
     let mut req_metrics = transfer.start_request(DownloadRequestKind::DiscoveryRange);
     let retry_classify = crate::retry::classify_discovery_retry;
-    let result = crate::retry::retry(req_metrics.metrics_mut(), retry_classify, |_allow_hedge| {
-        let builder =
-            copy_fields_to_get_object_request(input, transfer.ctx().s3_client().get_object());
-        let req = builder
-            .range(header::Range::bytes(byte_range.clone()))
-            .customize()
-            .config_override(
-                transfer
-                    .ctx()
-                    .handle
-                    .bucket_partition_override(input.bucket()),
-            );
-        async move {
-            req.send()
-                .await
-                .map_err(|e| crate::retry::GuardError::Inner(error::Error::from(e)))
-        }
-    })
+    let result = crate::retry::retry(
+        &transfer.ctx().handle.timer,
+        req_metrics.metrics_mut(),
+        retry_classify,
+        |_allow_hedge| {
+            let builder =
+                copy_fields_to_get_object_request(input, transfer.ctx().s3_client().get_object());
+            let req = builder
+                .range(header::Range::bytes(byte_range.clone()))
+                .customize()
+                .config_override(
+                    transfer
+                        .ctx()
+                        .handle
+                        .bucket_partition_override(input.bucket()),
+                );
+            async move {
+                req.send()
+                    .await
+                    .map_err(|e| crate::retry::GuardError::Inner(error::Error::from(e)))
+            }
+        },
+    )
     .instrument(tracing::debug_span!(
         target: crate::telemetry::TARGET_TRANSFER,
         "discover-ranged-get",

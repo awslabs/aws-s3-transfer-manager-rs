@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::memory::BufferPool;
-use crate::runtime::ExecutionRuntime;
+use crate::runtime::{ExecutionRuntime, Timer};
 
 /// Transfer manager client for Amazon Simple Storage Service.
 #[derive(Debug, Clone)]
@@ -29,6 +29,8 @@ pub struct Client {
 pub(crate) struct Handle {
     pub(crate) config: crate::Config,
     pub(crate) s3_client: aws_sdk_s3::Client,
+    /// Sleep and deadline primitives for transfer-manager retries and hedges.
+    pub(crate) timer: Timer,
     pub(crate) scheduler: Scheduler,
     pub(crate) runtime: Arc<dyn ExecutionRuntime>,
     pub(crate) controller: Arc<dyn ConcurrencyController>,
@@ -235,6 +237,7 @@ impl Handle {
             };
             Self {
                 config,
+                timer: Timer::from_s3_client(&s3_client),
                 s3_client,
                 scheduler,
                 runtime,
@@ -255,7 +258,16 @@ impl Drop for Handle {
 
 impl Client {
     /// Creates a new client from a transfer manager config.
+    ///
+    /// # Panics
+    ///
+    /// On `wasm32-unknown-unknown`, panics if no `wasm::WasmRuntime` is
+    /// installed or if the S3 configuration has no
+    /// [`AsyncSleep`](aws_sdk_s3::config::AsyncSleep) implementation.
     pub fn new(mut config: Config) -> Client {
+        #[cfg(all(target_family = "wasm", target_os = "unknown"))]
+        let _ = crate::wasm::runtime();
+
         // Machine facts for auto-sizing: use the loader-detected profile if the
         // config came through `ConfigLoader::load`, else detect locally (DMI +
         // vCPU + RAM — cheap pseudo-file reads, no network). Detected once and
@@ -355,6 +367,7 @@ impl Client {
 
             Handle {
                 config,
+                timer: Timer::from_s3_client(&s3_client),
                 s3_client,
                 scheduler,
                 runtime,

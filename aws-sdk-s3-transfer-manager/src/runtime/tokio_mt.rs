@@ -5,11 +5,12 @@
 
 //! Tokio-based multi-threaded execution runtime.
 
+use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Weak;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use futures_util::FutureExt;
 
@@ -18,6 +19,7 @@ mod worker_pool;
 use super::{ExecutionRuntime, RuntimeComponents, ScheduledWork};
 use crate::runtime::sync::SubmissionGuard;
 use crate::transfer::{TransferId, WorkOutcome};
+use crate::types::TransferInstant as Instant;
 use worker_pool::WorkerPool;
 
 /// Runtime that spawns tokio tasks to execute work from a shared [`WorkerPool`].
@@ -25,7 +27,8 @@ use worker_pool::WorkerPool;
 /// Assumes it is running within an existing tokio multi-threaded runtime context.
 /// Workers are spawned via `tokio::spawn` and pull work from a shared queue.
 /// On wasm targets it runs file I/O inline and also accepts a current-thread
-/// runtime.
+/// runtime. On `wasm32-unknown-unknown` it requires no tokio runtime: workers
+/// run on the installed `wasm::WasmRuntime`.
 #[derive(Debug)]
 pub(crate) struct TokioMultiThreadRuntime {
     pool: Arc<WorkerPool>,
@@ -122,7 +125,7 @@ impl TokioMultiThreadRuntime {
         }
     }
 
-    /// Spawn `count` tokio tasks that pull from the shared worker pool.
+    /// Spawn `count` worker tasks that pull from the shared worker pool.
     ///
     /// Does NOT update `worker_count` — callers own the counter update
     /// so each path (genesis / growth) can publish the authoritative value
@@ -131,11 +134,20 @@ impl TokioMultiThreadRuntime {
         for _ in 0..count {
             let pool = Arc::clone(&self.pool);
             let handle = self.handle.clone();
-            tokio::spawn(async move {
-                worker_loop(pool, handle).await;
-            });
+            spawn_worker(worker_loop(pool, handle));
         }
     }
+}
+
+/// Submits a worker loop to the executor that runs transfer work.
+///
+/// Workers run on the ambient tokio runtime. `wasm32-unknown-unknown` has no
+/// usable tokio runtime, so workers run on the installed `wasm::WasmRuntime`.
+fn spawn_worker(future: impl Future<Output = ()> + Send + 'static) {
+    #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+    drop(tokio::spawn(future));
+    #[cfg(all(target_family = "wasm", target_os = "unknown"))]
+    crate::wasm::runtime().spawn(Box::pin(future));
 }
 
 impl TokioMultiThreadRuntime {

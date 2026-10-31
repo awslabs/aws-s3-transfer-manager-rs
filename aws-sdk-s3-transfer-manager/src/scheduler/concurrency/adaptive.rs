@@ -37,10 +37,11 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use super::{CompletionSample, ConcurrencyController, ErrorKind};
 use crate::metrics::IOCounters;
+use crate::types::TransferInstant as Instant;
 
 /// Configuration for the adaptive concurrency controller.
 #[derive(Debug, Clone)]

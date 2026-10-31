@@ -11,7 +11,9 @@ use std::fmt::{self, Display};
 use std::ops;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use crate::types::TransferInstant as Instant;
 
 /// Point-in-time operational metrics for one transfer-manager client.
 ///

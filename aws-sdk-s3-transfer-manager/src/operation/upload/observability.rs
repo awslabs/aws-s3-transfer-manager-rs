@@ -10,7 +10,7 @@
 //! avoids allocation, clocks, counters, and event snapshots.
 
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::config::TransferDiagnosticsConfig;
 use crate::error::ErrorKind;
@@ -20,7 +20,7 @@ use crate::transfer::{
     emit_pending_details, AttributedRequestMeasurement, RequestMetricsAttribution, TransferContext,
     TransferId, TransferPendingStats,
 };
-use crate::types::{TransferMetrics, TransferStatus};
+use crate::types::{TransferInstant as Instant, TransferMetrics, TransferStatus};
 
 /// Copyable execution-state projection of
 /// [`UploadState`](super::context::UploadState).

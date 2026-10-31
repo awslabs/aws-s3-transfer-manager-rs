@@ -371,7 +371,7 @@ impl PoolInner {
     /// Takes memory and reservation-queue state at one diagnostic boundary.
     fn diagnostic_memory_sample(
         &self,
-        now: std::time::Instant,
+        now: crate::types::TransferInstant,
     ) -> (MemoryMetrics, admission::ReservationQueueDiagnosticSample) {
         let mut admission = self.admission.lock();
         let queue = admission.take_queue_diagnostics(now);
@@ -518,7 +518,7 @@ impl PoolInner {
                 envelope,
                 slot: Arc::clone(&slot),
             },
-            std::time::Instant::now(),
+            crate::types::TransferInstant::now(),
         ) {
             Ok(queue_became_nonempty) => queue_became_nonempty,
             Err(_) => {
@@ -552,7 +552,7 @@ impl PoolInner {
         let mut admission = AdmissionGuard::new(pool.admission.lock());
         let queue_became_empty = admission
             .inner
-            .remove_waiter(slot, std::time::Instant::now());
+            .remove_waiter(slot, crate::types::TransferInstant::now());
         let drained = Self::drain_fifo_locked(pool, &mut admission, queue_became_empty);
         drop(admission);
         if let Some(sample) = drained.queue_sample {
@@ -591,7 +591,9 @@ impl PoolInner {
 
             match &*slot_state {
                 WaitState::Taken => {
-                    let (_, cleared) = admission.inner.pop_front_waiter(std::time::Instant::now());
+                    let (_, cleared) = admission
+                        .inner
+                        .pop_front_waiter(crate::types::TransferInstant::now());
                     queue_became_empty |= cleared;
                     continue;
                 }
@@ -616,7 +618,9 @@ impl PoolInner {
                 Err(error) => WaitState::Failed(error),
             };
 
-            let (removed, cleared) = admission.inner.pop_front_waiter(std::time::Instant::now());
+            let (removed, cleared) = admission
+                .inner
+                .pop_front_waiter(crate::types::TransferInstant::now());
             queue_became_empty |= cleared;
             let Some(removed) = removed else {
                 invariant_violation("reservation head disappeared while admission was held");

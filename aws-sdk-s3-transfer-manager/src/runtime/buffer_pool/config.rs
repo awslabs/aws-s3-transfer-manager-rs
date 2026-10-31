@@ -34,7 +34,17 @@ const AUTO_MEMORY_SHARE_DENOMINATOR: usize = 4;
 const AUTO_CAPACITY_MAX_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 
 /// Automatic capacity when effective memory cannot be detected.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 const AUTO_CAPACITY_FALLBACK_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Automatic capacity when effective memory cannot be detected.
+///
+/// A `wasm32-unknown-unknown` module has no portable way to learn its memory
+/// limit, which is often far below the general fallback and below the 4 GiB
+/// address space. This admits several default-sized parts while bounding
+/// transfer-owned payload storage.
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+const AUTO_CAPACITY_FALLBACK_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Explicit fraction bits stored by an IEEE 754 binary64 value.
 const F64_FRACTION_BITS: u32 = 52;
@@ -97,7 +107,15 @@ impl BufferPoolBuilder {
     ///
     /// Construction fixes capacity and geometry but does not reserve virtual
     /// ranges, prepare physical memory, or start the maintenance worker.
+    ///
+    /// # Panics
+    ///
+    /// On `wasm32-unknown-unknown`, panics if no `wasm::WasmRuntime` is
+    /// installed.
     pub fn build(self) -> Result<super::BufferPool, BufferPoolBuildError> {
+        #[cfg(all(target_family = "wasm", target_os = "unknown"))]
+        let _ = crate::wasm::runtime();
+
         let needs_memory_detection = match self.memory_budget {
             MemoryBudgetConfig::Auto => true,
             MemoryBudgetConfig::Fraction(fraction)

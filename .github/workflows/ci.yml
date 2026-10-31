@@ -149,6 +149,7 @@ jobs:
       - musl
       - freebsd
       - android
+      - wasm32-unknown-unknown
       - e2e
     steps:
       - name: Verify platform results
@@ -459,6 +460,71 @@ jobs:
             . "$HOME/.cargo/env"
             export CMAKE_GENERATOR=Ninja
             cargo test --locked -p aws-sdk-s3-transfer-manager --lib
+
+  wasm32-unknown-unknown:
+    name: wasm32-unknown-unknown
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    needs: basics
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/wasm32-unknown-unknown
+      HARNESS: ${{ github.workspace }}/target/wasm32-unknown-unknown/wasm32-unknown-unknown/release/wasm32_unknown_unknown_tests.wasm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust ${{ env.rust_clippy }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.rust_clippy }}
+          targets: wasm32-unknown-unknown
+          components: clippy
+      - name: Install Wasmtime
+        uses: bytecodealliance/actions/wasmtime/setup@v1
+        with:
+          version: "39.0.1"
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: |
+          cargo clippy --locked -p aws-sdk-s3-transfer-manager -p wasm32-unknown-unknown-tests \
+            --target wasm32-unknown-unknown --no-deps
+          cargo clippy --locked -p aws-sdk-s3-transfer-manager --features sdk-v1 \
+            --target wasm32-unknown-unknown --no-deps
+      - name: Docs
+        run: |
+          cargo doc --locked -p aws-sdk-s3-transfer-manager --target wasm32-unknown-unknown \
+            --no-deps --document-private-items
+        env:
+          RUSTDOCFLAGS: -Dwarnings
+      - name: Check dependency graph
+        # The transfer manager must not depend on a host on this target.
+        run: |
+          forbidden=$(cargo tree --locked -p aws-sdk-s3-transfer-manager \
+              --target wasm32-unknown-unknown -e normal --prefix none \
+            | awk '{print $1}' | sort -u \
+            | grep -xE 'getrandom|wasm-bindgen|js-sys|web-sys|wasi|wasip2|wasip3|wit-bindgen|hyper|rustls|socket2|mio' \
+            || true)
+          if [ -n "$forbidden" ]; then
+            echo "host-specific dependencies on wasm32-unknown-unknown: $forbidden" >&2
+            exit 1
+          fi
+      - name: Build runtime harness
+        run: cargo build --locked -p wasm32-unknown-unknown-tests --target wasm32-unknown-unknown --release
+      - name: Run harness under Wasmtime
+        run: |
+          wasmtime run --invoke run "$HARNESS"
+          if wasmtime run --invoke client_without_runtime "$HARNESS"; then
+            echo "constructing a client without a runtime did not trap" >&2
+            exit 1
+          fi
+          if wasmtime run --invoke client_without_sleep "$HARNESS"; then
+            echo "constructing a client without a sleep implementation did not trap" >&2
+            exit 1
+          fi
+      - name: Run harness under Node
+        run: node wasm32-unknown-unknown-tests/run-node.mjs "$HARNESS"
 
   check-external-types:
     name: check-external-types (${{ matrix.os }})

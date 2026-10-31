@@ -11,7 +11,7 @@
 //! worker wake deadline and do not enter the maintenance state machine. The
 //! worker retains only control state and a weak pool reference while waiting.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use super::admission::AdmissionGuard;
 use super::arena::ArenaTrim;
@@ -19,6 +19,7 @@ use super::geometry::PoolGeometry;
 use super::{CarrierCount, PoolInner};
 use crate::runtime::sync::sync::atomic::{AtomicU64, Ordering as DiagnosticOrdering};
 use crate::runtime::sync::sync::{Arc, Condvar, Mutex};
+use crate::types::TransferInstant as Instant;
 
 #[cfg(not(all(test, s3_tm_loom)))]
 use std::{io, sync::Weak};
@@ -208,12 +209,25 @@ impl MaintenanceCoordinator {
             }
             Err(error) => {
                 self.control.state.lock().disable();
-                tracing::warn!(
-                    target: crate::telemetry::TARGET_MEMORY,
-                    worker = MAINTENANCE_THREAD_NAME,
-                    error = %error,
-                    "buffer-pool background work is disabled after worker creation failed"
-                );
+                // A `wasm32-unknown-unknown` host without threads reports
+                // `Unsupported` for every pool; the disabled state is expected.
+                if cfg!(all(target_family = "wasm", target_os = "unknown"))
+                    && error.kind() == io::ErrorKind::Unsupported
+                {
+                    tracing::debug!(
+                        target: crate::telemetry::TARGET_MEMORY,
+                        worker = MAINTENANCE_THREAD_NAME,
+                        error = %error,
+                        "buffer-pool background work is disabled because threads are unavailable"
+                    );
+                } else {
+                    tracing::warn!(
+                        target: crate::telemetry::TARGET_MEMORY,
+                        worker = MAINTENANCE_THREAD_NAME,
+                        error = %error,
+                        "buffer-pool background work is disabled after worker creation failed"
+                    );
+                }
             }
         }
     }

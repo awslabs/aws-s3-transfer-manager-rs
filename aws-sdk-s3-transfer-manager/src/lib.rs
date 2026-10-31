@@ -76,25 +76,62 @@
 //!
 //! # WebAssembly
 //!
-//! The crate builds for `wasm32-wasip1`, `wasm32-wasip2`, and `wasm32-wasip3`.
-//! Other wasm targets are not supported. On these targets:
+//! The crate builds for `wasm32-wasip1`, `wasm32-wasip2`, `wasm32-wasip3`, and
+//! `wasm32-unknown-unknown`. Other wasm targets are not supported.
 //!
-//! - Build with `RUSTFLAGS="--cfg tokio_unstable"`. The S3 client's tokio
-//!   integration enables tokio's `fs` feature, which tokio accepts on wasm only
-//!   with that flag.
+//! | Target                   | Executor                      | Monotonic clock               | Filesystem     | HTTP                                         |
+//! | ------------------------ | ----------------------------- | ----------------------------- | -------------- | -------------------------------------------- |
+//! | `wasm32-wasip1`          | caller's tokio runtime        | WASI                          | WASI preview 1 | caller-supplied; no standard network interface |
+//! | `wasm32-wasip2`          | caller's tokio runtime        | WASI                          | WASI preview 2 | caller-supplied, for example over `wasi:http` |
+//! | `wasm32-wasip3`          | caller's tokio runtime        | WASI                          | WASI preview 3 | caller-supplied                              |
+//! | `wasm32-unknown-unknown` | installed `wasm::WasmRuntime` | installed `wasm::WasmRuntime` | none           | caller-supplied                              |
+//!
+//! On every wasm target:
+//!
 //! - The AWS SDK's default HTTPS client is not built. Requests fail unless the
-//!   [`aws_types::SdkConfig`] or S3 configuration supplies an HTTP client, for
-//!   example one built on `wasi:http`. `wasm32-wasip1` has no networking
-//!   interface for such a client.
+//!   [`aws_types::SdkConfig`] or S3 configuration supplies an HTTP client.
 //! - [`RuntimeMode::Managed`](crate::types::RuntimeMode::Managed) behaves as
-//!   [`RuntimeMode::MultiThreadTokio`](crate::types::RuntimeMode::MultiThreadTokio),
-//!   and a current-thread tokio runtime is supported. File reads and writes run
-//!   inline on the thread that polls the transfer.
+//!   [`RuntimeMode::MultiThreadTokio`](crate::types::RuntimeMode::MultiThreadTokio).
+//!   File reads and writes run inline on the thread that polls the transfer.
 //! - Memory detection is unavailable, so
 //!   [`MemoryBudgetConfig::Auto`](crate::types::MemoryBudgetConfig::Auto) uses
-//!   its 2 GiB fallback. Use
+//!   a fallback: 2 GiB on the WASI targets and 64 MiB on
+//!   `wasm32-unknown-unknown`. Use
 //!   [`MemoryBudgetConfig::Limit`](crate::types::MemoryBudgetConfig::Limit) to
 //!   fit the module's linear memory.
+//!
+//! On the WASI targets, build with `RUSTFLAGS="--cfg tokio_unstable"`. The S3
+//! client's tokio integration enables tokio's `fs` feature, which tokio accepts
+//! on wasm only with that flag. Transfers run on the caller's tokio runtime,
+//! which may be current-thread.
+//!
+//! ## `wasm32-unknown-unknown`
+//!
+//! This target has no operating system and implies no JavaScript or WASI host.
+//! It needs no build flag.
+//!
+//! - Before constructing a client or a
+//!   [`BufferPool`](crate::memory::BufferPool), install a `wasm::WasmRuntime`
+//!   with `wasm::install_runtime`. The runtime supplies a monotonic clock and
+//!   schedules the transfer manager's futures. The `wasm` module exists only on
+//!   this target.
+//! - The S3 configuration must supply an HTTP client, an
+//!   [`AsyncSleep`](aws_sdk_s3::config::AsyncSleep) implementation, a
+//!   wall-clock [`TimeSource`](aws_types::sdk_config::TimeSource), credentials,
+//!   and a region. [`from_env`] cannot discover them on this target.
+//! - The transfer manager neither requires nor creates a tokio runtime, and it
+//!   does not drive the host's event loop. The host must keep polling spawned
+//!   futures while transfers are active.
+//! - There is no filesystem. `write_to_path` and `write_to_file` are absent.
+//!   Operations on local files, such as
+//!   [`InputStream::from_path`](crate::io::InputStream::from_path) and the
+//!   directory operations [`upload_objects`](crate::Client::upload_objects)
+//!   and [`download_objects`](crate::Client::download_objects), fail when they
+//!   access the filesystem. Upload from memory or a custom stream, and read
+//!   downloads from their body stream.
+//! - SigV4a signing is not enabled, because it needs an entropy source that the
+//!   target does not define. An application that enables the `aws-sdk-s3`
+//!   `sigv4a` feature must also select an entropy backend for `getrandom`.
 //!
 //! # Runtime diagnostics
 //!
@@ -237,6 +274,9 @@ pub mod metrics;
 
 /// Body-read retry loop layered over the latency deadline guard
 pub(crate) mod retry;
+
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+pub mod wasm;
 
 pub use self::client::Client;
 use self::config::loader::ConfigLoader;

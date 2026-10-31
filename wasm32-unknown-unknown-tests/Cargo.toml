@@ -1,0 +1,24 @@
+[package]
+name = "wasm32-unknown-unknown-tests"
+version = "0.1.0"
+edition = "2021"
+authors = ["AWS Rust SDK Team <aws-sdk-rust@amazon.com>"]
+license = "Apache-2.0"
+publish = false
+description = "Runtime tests for aws-sdk-s3-transfer-manager on wasm32-unknown-unknown"
+
+[lib]
+crate-type = ["cdylib"]
+
+# The harness is empty on every other target, so native workspace builds compile none of these.
+[target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
+aws-sdk-s3-transfer-manager = { path = "../aws-sdk-s3-transfer-manager" }
+aws-sdk-s3 = { workspace = true, features = ["behavior-version-latest"] }
+aws-smithy-async = { workspace = true }
+aws-smithy-runtime-api = { workspace = true, features = ["client"] }
+aws-smithy-types = { workspace = true }
+aws-types = { workspace = true }
+bytes = "1"
+tokio = { version = "1.43.0", default-features = false, features = ["sync"] }
+# Reclaims scheduler descriptors deferred by the transfer manager's lock-free sets.
+crossbeam-epoch = "0.9"

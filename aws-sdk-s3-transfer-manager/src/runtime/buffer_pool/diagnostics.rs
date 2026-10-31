@@ -9,13 +9,14 @@
 //! snapshot collection, interval deltas, and tracing output. The maintenance
 //! worker supplies the reporting deadline.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use super::admission::ReservationQueueDiagnosticSample;
 use super::arena::ArenaDiagnosticSnapshot;
 use super::maintenance::MaintenanceDiagnosticSnapshot;
 use super::metrics::MemoryMetrics;
 use super::PoolInner;
+use crate::types::TransferInstant as Instant;
 
 /// Periodic reporting state owned exclusively by the maintenance worker.
 pub(super) struct PeriodicDiagnosticReporter {
