@@ -115,7 +115,7 @@
 //! object, SHA-256 for the composite case.
 
 use crate::assertions::{assert_integrity_error, assert_same_content};
-use crate::harness::Target;
+use crate::harness::{BucketKind, Target};
 use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
 use aws_sdk_s3_transfer_manager::operation::download::DownloadOutput;
 use aws_sdk_s3_transfer_manager::operation::upload::ChecksumStrategy;
@@ -342,6 +342,27 @@ async fn multipart_full_object(target: Target) {
         output.integrity_checks().checksum_crc32().is_none(),
         "must not surface a part checksum as the object checksum"
     );
+
+    // S3 returns the checksum of a part of a FULL_OBJECT multipart object only in directory
+    // buckets; a general purpose bucket returns none.
+    let part = t.head_part("obj", 1).await;
+    match target.bucket_kind {
+        BucketKind::GeneralPurpose => assert!(
+            part.checksum_crc32().is_none(),
+            "a general purpose bucket returns no checksum for a part of a FULL_OBJECT object"
+        ),
+        #[cfg(e2e_test)]
+        BucketKind::Express => {
+            assert!(
+                part.checksum_crc32().is_some(),
+                "a directory bucket returns the checksum of a part of a FULL_OBJECT object"
+            );
+            assert_eq!(
+                part.checksum_type(),
+                Some(&aws_sdk_s3::types::ChecksumType::FullObject)
+            );
+        }
+    }
 
     t.shutdown().await;
 }
