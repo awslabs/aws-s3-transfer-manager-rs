@@ -1767,7 +1767,15 @@ mod tests {
 
         assert!(transfer.ctx().is_failed());
 
-        crate::runtime::test_util::shutdown(&transfer.ctx().handle).await;
+        let ctx = transfer.ctx();
+        timeout(
+            Duration::from_secs(10),
+            ctx.handle.scheduler.cancel_transfer(ctx.id).wait_for_idle(),
+        )
+        .await
+        .expect("failed parent and child work did not drain");
+
+        crate::runtime::test_util::shutdown(&ctx.handle).await;
     }
 
     /// Regression (real scheduler): two claimed-but-failed spawns under Continue
