@@ -4812,8 +4812,11 @@ dependencies = [
  "aws-types",
  "bytes",
  "crossbeam-epoch",
+ "hyper 1.11.1",
+ "hyper-util",
  "in-memory-s3",
  "tokio",
+ "tower-service",
 ]
 
 [[package]]

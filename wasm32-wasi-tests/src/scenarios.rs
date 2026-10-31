@@ -3,29 +3,26 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Transfer scenarios against the in-memory S3 connector.
+//! Transfer scenarios against the in-memory S3 connector and the mock S3
+//! server.
 //!
-//! Each scenario uses a fresh connector and client, then drops the client.
-//! Every task the client spawned must exit by then. File scenarios work in
-//! their own subdirectory of the work directory.
+//! Each scenario uses a fresh [`Store`] and client, then drops both. Every
+//! task they spawned must exit by then. File scenarios work in their own
+//! subdirectory of the work directory.
 
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
-use aws_sdk_s3_transfer_manager::config::Builder as ConfigBuilder;
 use aws_sdk_s3_transfer_manager::error::ErrorKind;
 use aws_sdk_s3_transfer_manager::io::walk::FsWalker;
 use aws_sdk_s3_transfer_manager::io::InputStream;
-use aws_sdk_s3_transfer_manager::types::{FailedTransferPolicy, PartSize};
-use aws_sdk_s3_transfer_manager::{Client, Config};
-use aws_smithy_async::rt::sleep::TokioSleep;
-use aws_smithy_runtime_api::client::http::{http_client_fn, SharedHttpConnector};
+use aws_sdk_s3_transfer_manager::types::FailedTransferPolicy;
+use aws_sdk_s3_transfer_manager::Client;
 use aws_smithy_types::error::display::DisplayErrorContext;
-use aws_types::sdk_config::{RetryConfig, SharedAsyncSleep, SharedCredentialsProvider};
-use aws_types::SdkConfig;
 use bytes::Bytes;
-use in_memory_s3::MemoryS3;
+
+use crate::store::{Store, Transport};
 
 const KIB: usize = 1024;
 const MIB: usize = 1024 * KIB;
@@ -58,60 +55,45 @@ macro_rules! ensure {
     };
 }
 
-/// Runs every scenario in order and returns the first failure.
+/// Runs every scenario in order, once over each of its transports, and returns
+/// the first failure. `server` is the mock S3 server's address.
 ///
-/// Prints `wasm32-wasi-tests: <count> scenarios on <target>` first, then
-/// `PASS <scenario>: <summary>` for each scenario, where the summary lists the
-/// requests the connector served and the tasks that exited, then
-/// `<count> scenarios passed`.
-pub(crate) async fn run_all(work: &Path) -> Result<(), String> {
+/// Prints `wasm32-wasi-tests: <count> scenarios on <target>` first, where each
+/// run over a transport counts as a scenario. Then prints `PASS <transport>
+/// <scenario>: <summary>` for each run, where the transport is `in-memory` or
+/// `HTTP` and the summary lists the requests the run sent and the tasks that
+/// exited. Prints `<count> scenarios passed` last.
+pub(crate) async fn run_all(work: &Path, server: SocketAddr) -> Result<(), String> {
     macro_rules! scenarios {
-        ($($name:literal => $scenario:ident),+ $(,)?) => {{
-            let count = [$($name),+].len();
+        ($($name:literal => $scenario:ident over [$($transport:ident),+]),+ $(,)?) => {{
+            let count = [$($(Transport::$transport),+),+].len();
             println!("wasm32-wasi-tests: {count} scenarios on {TARGET}");
-            $(
-                let summary = $scenario(&work.join($name.replace(' ', "-")))
+            $($(
+                let name = format!("{} {}", Transport::$transport, $name);
+                let store = Store::new(Transport::$transport, server);
+                let summary = $scenario(store, &work.join(name.replace(' ', "-")))
                     .await
-                    .map_err(|message| format!("FAIL {}: {message}", $name))?;
-                println!("PASS {}: {summary}", $name);
-            )+
+                    .map_err(|message| format!("FAIL {name}: {message}"))?;
+                println!("PASS {name}: {summary}");
+            )+)+
             println!("{count} scenarios passed");
         }};
     }
+    // Request-count, range, and throttling checks run on the in-memory
+    // connector, which records requests and can throttle them.
     scenarios! {
-        "client construction" => client_construction,
-        "single-part round trip" => single_part_round_trip,
-        "multipart round trip" => multipart_round_trip,
-        "outer retry" => outer_retry,
-        "upload from file" => upload_from_file,
-        "download to path" => download_to_path,
-        "write to open file" => write_to_open_file,
-        "directory round trip" => directory_round_trip,
-        "symlink cycle" => symlink_cycle,
-        "many files" => many_files,
+        "client construction" => client_construction over [Memory],
+        "single-part round trip" => single_part_round_trip over [Memory, Http],
+        "multipart round trip" => multipart_round_trip over [Memory, Http],
+        "outer retry" => outer_retry over [Memory],
+        "upload from file" => upload_from_file over [Memory, Http],
+        "download to path" => download_to_path over [Memory, Http],
+        "write to open file" => write_to_open_file over [Memory, Http],
+        "directory round trip" => directory_round_trip over [Memory, Http],
+        "symlink cycle" => symlink_cycle over [Memory, Http],
+        "many files" => many_files over [Memory, Http],
     }
     Ok(())
-}
-
-fn client(store: &MemoryS3, configure: impl FnOnce(ConfigBuilder) -> ConfigBuilder) -> Client {
-    let connector = SharedHttpConnector::new(store.clone());
-    let sdk = SdkConfig::builder()
-        .behavior_version(BehaviorVersion::latest())
-        .region(Region::new("us-east-1"))
-        .credentials_provider(SharedCredentialsProvider::new(Credentials::new(
-            "akid", "secret", None, None, "harness",
-        )))
-        .endpoint_url("http://s3.harness.invalid")
-        .http_client(http_client_fn(move |_, _| connector.clone()))
-        .sleep_impl(SharedAsyncSleep::new(TokioSleep::new()))
-        // The SDK makes one attempt, so every retry observed here is the
-        // transfer manager's.
-        .retry_config(RetryConfig::standard().with_max_attempts(1))
-        .build();
-    let config = Config::builder()
-        .s3_config(&sdk)
-        .part_size(PartSize::Target(8 * MIB as u64));
-    Client::new(configure(config).build())
 }
 
 /// Bytes whose value depends on their offset and `seed`, so a misplaced range
@@ -194,21 +176,20 @@ fn write(path: &Path, data: &[u8]) -> Result<(), String> {
     std::fs::write(path, data).map_err(fs_error(path.display()))
 }
 
-/// Drops `client`, waits until every task spawned since the scenario started
-/// has exited, and returns a summary of the work: the requests `store`
-/// served and the number of transfer-manager tasks that exited.
+/// Drops `client` and `store`, waits until every task spawned since the
+/// scenario started has exited, and returns a summary of the work: the
+/// requests the scenario sent and the number of tasks that exited.
 ///
-/// Workers exit when the client's shared state drops. The scheduler's
-/// lock-free sets hand removed transfer descriptors, which reference that
-/// state, to crossbeam-epoch, which destroys them only after the epoch
-/// advances. Flushing the epoch makes the drop deterministic.
-async fn shut_down(
-    client: Client,
-    tasks_before: usize,
-    store: &MemoryS3,
-) -> Result<String, String> {
-    let workers = alive_tasks().saturating_sub(tasks_before);
+/// Workers exit when the client's shared state drops, and HTTP connection
+/// tasks exit when the store's connection pool drops. The scheduler's
+/// lock-free sets hand removed transfer descriptors, which reference the
+/// client's state, to crossbeam-epoch, which destroys them only after the
+/// epoch advances. Flushing the epoch makes the drop deterministic.
+async fn shut_down(client: Client, tasks_before: usize, store: Store) -> Result<String, String> {
+    let tasks = alive_tasks().saturating_sub(tasks_before);
+    let requests = store.to_string();
     drop(client);
+    drop(store);
     let metrics = tokio::runtime::Handle::current().metrics();
     let deadline = tokio::time::Instant::now() + SHUTDOWN_TIMEOUT;
     loop {
@@ -218,8 +199,7 @@ async fn shut_down(
         let alive = metrics.num_alive_tasks();
         if alive <= tasks_before {
             return Ok(format!(
-                "{}; {workers} tasks exited after the client was dropped",
-                store.requests()
+                "{requests}; {tasks} tasks exited after the client was dropped"
             ));
         }
         ensure!(
@@ -239,101 +219,102 @@ fn alive_tasks() -> usize {
 
 /// A client builds from explicit capabilities, and its automatic memory limit
 /// is the target's fallback.
-async fn client_construction(_work: &Path) -> Result<String, String> {
+async fn client_construction(store: Store, _work: &Path) -> Result<String, String> {
     let before = alive_tasks();
-    let store = MemoryS3::default();
-    let client = client(&store, |config| config);
+    let client = store.client(|config| config);
     let capacity = client.metrics().memory().configured_capacity_bytes();
     ensure!(
         capacity == AUTO_MEMORY_BYTES,
         "automatic memory capacity is {capacity} bytes, expected {AUTO_MEMORY_BYTES}"
     );
-    shut_down(client, before, &store).await
+    shut_down(client, before, store).await
 }
 
 /// A 64 KiB object uploads with one `PutObject` and downloads byte for byte.
-async fn single_part_round_trip(_work: &Path) -> Result<String, String> {
+async fn single_part_round_trip(store: Store, _work: &Path) -> Result<String, String> {
     let before = alive_tasks();
-    let store = MemoryS3::default();
-    let client = client(&store, |config| config);
+    let client = store.client(|config| config);
     let data = pattern(64 * KIB, 1);
     upload(&client, "single", InputStream::from(data.clone())).await?;
     ensure_same("single", &data, &download(&client, "single").await?)?;
-    let requests = store.requests();
-    ensure!(
-        requests.put_object == 1 && requests.upload_part == 0 && requests.get_object == 1,
-        "unexpected requests: {requests:?}"
-    );
-    shut_down(client, before, &store).await
+    if let Some(memory) = store.memory() {
+        let requests = memory.requests();
+        ensure!(
+            requests.put_object == 1 && requests.upload_part == 0 && requests.get_object == 1,
+            "unexpected requests: {requests:?}"
+        );
+    }
+    shut_down(client, before, store).await
 }
 
 /// A 20 MiB object uploads as three 8 MiB-target parts and downloads as three
 /// ranged `GetObject` requests.
-async fn multipart_round_trip(_work: &Path) -> Result<String, String> {
+async fn multipart_round_trip(store: Store, _work: &Path) -> Result<String, String> {
     let before = alive_tasks();
-    let store = MemoryS3::default();
-    let client = client(&store, |config| config);
+    let client = store.client(|config| config);
     let data = pattern(20 * MIB, 2);
     upload(&client, "multipart", InputStream::from(data.clone())).await?;
     ensure_same("multipart", &data, &download(&client, "multipart").await?)?;
-    let requests = store.requests();
-    ensure!(
-        requests.upload_part == 3 && requests.multipart_control == 2,
-        "unexpected upload requests: {requests:?}"
-    );
-    let mut ranges = store.get_ranges();
-    ranges.sort_unstable();
-    let expected = [0, 8 * MIB as u64, 16 * MIB as u64].map(Some);
-    ensure!(ranges == expected, "unexpected download ranges: {ranges:?}");
-    shut_down(client, before, &store).await
+    if let Some(memory) = store.memory() {
+        let requests = memory.requests();
+        ensure!(
+            requests.upload_part == 3 && requests.multipart_control == 2,
+            "unexpected upload requests: {requests:?}"
+        );
+        let mut ranges = memory.get_ranges();
+        ranges.sort_unstable();
+        let expected = [0, 8 * MIB as u64, 16 * MIB as u64].map(Some);
+        ensure!(ranges == expected, "unexpected download ranges: {ranges:?}");
+    }
+    shut_down(client, before, store).await
 }
 
 /// A throttled `PutObject` reaches the transfer manager, which waits through
 /// the configured sleep implementation and re-sends it.
-async fn outer_retry(_work: &Path) -> Result<String, String> {
+async fn outer_retry(store: Store, _work: &Path) -> Result<String, String> {
     let before = alive_tasks();
-    let store = MemoryS3::default();
-    let client = client(&store, |config| config);
+    let memory = store
+        .memory()
+        .ok_or("outer retry throttles through the in-memory connector")?;
+    let client = store.client(|config| config);
     let data = pattern(64 * KIB, 3);
-    store.throttle_next(1);
+    memory.throttle_next(1);
     upload(&client, "retried", InputStream::from(data.clone())).await?;
-    let requests = store.requests();
+    let requests = memory.requests();
     ensure!(
         requests.throttled == 1 && requests.put_object == 1,
         "expected one throttled and one accepted PutObject: {requests:?}"
     );
-    let stored = store.object("retried").unwrap_or_default();
-    ensure_same("retried", &data, &stored)?;
-    shut_down(client, before, &store).await
+    ensure_same("retried", &data, &store.object("retried").await?)?;
+    shut_down(client, before, store).await
 }
 
 /// A 20 MiB file uploads as three parts read from the file.
-async fn upload_from_file(work: &Path) -> Result<String, String> {
+async fn upload_from_file(store: Store, work: &Path) -> Result<String, String> {
     let before = alive_tasks();
-    let store = MemoryS3::default();
-    let client = client(&store, |config| config);
+    let client = store.client(|config| config);
     let path = work.join("source.bin");
     let data = pattern(20 * MIB + 7, 4);
     write(&path, &data)?;
     let body = InputStream::from_path(&path).map_err(|e| error("open source", e))?;
     upload(&client, "from-file", body).await?;
-    let requests = store.requests();
-    ensure!(
-        requests.upload_part == 3,
-        "unexpected upload requests: {requests:?}"
-    );
-    let stored = store.object("from-file").unwrap_or_default();
-    ensure_same("from-file", &data, &stored)?;
-    shut_down(client, before, &store).await
+    if let Some(memory) = store.memory() {
+        let requests = memory.requests();
+        ensure!(
+            requests.upload_part == 3,
+            "unexpected upload requests: {requests:?}"
+        );
+    }
+    ensure_same("from-file", &data, &store.object("from-file").await?)?;
+    shut_down(client, before, store).await
 }
 
 /// A multipart object downloads into a new file at a path.
-async fn download_to_path(work: &Path) -> Result<String, String> {
+async fn download_to_path(store: Store, work: &Path) -> Result<String, String> {
     let before = alive_tasks();
-    let store = MemoryS3::default();
-    let client = client(&store, |config| config);
+    let client = store.client(|config| config);
     let data = pattern(18 * MIB + 5, 5);
-    store.insert("to-path", data.clone());
+    store.insert("to-path", data.clone()).await?;
     create_dir(work)?;
     let path = work.join("destination.bin");
     client
@@ -347,18 +328,17 @@ async fn download_to_path(work: &Path) -> Result<String, String> {
         .await
         .map_err(|e| error("download", e))?;
     ensure_same("destination.bin", &data, &read(&path)?)?;
-    shut_down(client, before, &store).await
+    shut_down(client, before, store).await
 }
 
 /// A download into an append-mode file is rejected without touching it. A
 /// download into a longer ordinary file writes at the part offsets and
 /// truncates the file to the object's size.
-async fn write_to_open_file(work: &Path) -> Result<String, String> {
+async fn write_to_open_file(store: Store, work: &Path) -> Result<String, String> {
     let before = alive_tasks();
-    let store = MemoryS3::default();
-    let client = client(&store, |config| config);
+    let client = store.client(|config| config);
     let data = pattern(9 * MIB + 3, 6);
-    store.insert("to-file", data.clone());
+    store.insert("to-file", data.clone()).await?;
 
     let appended = work.join("append.bin");
     write(&appended, b"header")?;
@@ -394,7 +374,7 @@ async fn write_to_open_file(work: &Path) -> Result<String, String> {
         .await
         .map_err(|e| error("download", e))?;
     ensure_same("existing.bin", &data, &read(&target)?)?;
-    let summary = shut_down(client, before, &store).await?;
+    let summary = shut_down(client, before, store).await?;
     Ok(format!("append-mode file rejected; {summary}"))
 }
 
@@ -418,10 +398,9 @@ fn write_tree(root: &Path) -> Result<Vec<(PathBuf, Bytes)>, String> {
 
 /// A recursive directory uploads under a key prefix and downloads into
 /// another directory with the same layout and contents.
-async fn directory_round_trip(work: &Path) -> Result<String, String> {
+async fn directory_round_trip(store: Store, work: &Path) -> Result<String, String> {
     let before = alive_tasks();
-    let store = MemoryS3::default();
-    let client = client(&store, |config| config);
+    let client = store.client(|config| config);
     let source = work.join("source");
     let destination = work.join("destination");
     let tree = write_tree(&source)?;
@@ -445,7 +424,7 @@ async fn directory_round_trip(work: &Path) -> Result<String, String> {
     );
     for (relative, data) in &tree {
         let key = format!("tree/{}", relative.display());
-        ensure_same(&key, data, &store.object(&key).unwrap_or_default())?;
+        ensure_same(&key, data, &store.object(&key).await?)?;
     }
 
     create_dir(&destination)?;
@@ -470,15 +449,14 @@ async fn directory_round_trip(work: &Path) -> Result<String, String> {
         let path = destination.join(relative);
         ensure_same(&path.display().to_string(), data, &read(&path)?)?;
     }
-    shut_down(client, before, &store).await
+    shut_down(client, before, store).await
 }
 
 /// A recursive walk that follows symlinks reports a link to an ancestor as a
 /// cycle and uploads every real file once.
-async fn symlink_cycle(work: &Path) -> Result<String, String> {
+async fn symlink_cycle(store: Store, work: &Path) -> Result<String, String> {
     let before = alive_tasks();
-    let store = MemoryS3::default();
-    let client = client(&store, |config| config);
+    let client = store.client(|config| config);
     let root = work.join("cycle");
     write(&root.join("a.txt"), b"a")?;
     write(&root.join("sub/b.txt"), b"b")?;
@@ -511,7 +489,7 @@ async fn symlink_cycle(work: &Path) -> Result<String, String> {
         "uploaded {} objects, failures {failures}",
         uploaded.objects_uploaded()
     );
-    let summary = shut_down(client, before, &store).await?;
+    let summary = shut_down(client, before, store).await?;
     Ok(format!(
         "{} SymlinkCycle failure; {summary}",
         uploaded.failed_transfers().len()
@@ -519,11 +497,10 @@ async fn symlink_cycle(work: &Path) -> Result<String, String> {
 }
 
 /// Hundreds of small files upload and download as a directory.
-async fn many_files(work: &Path) -> Result<String, String> {
+async fn many_files(store: Store, work: &Path) -> Result<String, String> {
     const FILES: usize = 300;
     let before = alive_tasks();
-    let store = MemoryS3::default();
-    let client = client(&store, |config| config);
+    let client = store.client(|config| config);
     let source = work.join("source");
     let destination = work.join("destination");
     create_dir(&source)?;
@@ -564,5 +541,5 @@ async fn many_files(work: &Path) -> Result<String, String> {
         let path = destination.join(format!("f{index:04}"));
         ensure_same(&path.display().to_string(), &contents(index), &read(&path)?)?;
     }
-    shut_down(client, before, &store).await
+    shut_down(client, before, store).await
 }
