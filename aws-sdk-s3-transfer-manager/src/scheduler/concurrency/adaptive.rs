@@ -41,6 +41,7 @@ use std::time::Duration;
 
 use super::{CompletionSample, ConcurrencyController, ErrorKind};
 use crate::metrics::IOCounters;
+use crate::runtime::Clock;
 use crate::types::TransferInstant as Instant;
 
 /// Configuration for the adaptive concurrency controller.
@@ -197,6 +198,8 @@ pub(crate) struct AdaptiveConcurrencyController {
     /// Shared sliding-window I/O counters. The scheduler records samples;
     /// the controller reads throughput at evaluation boundaries.
     io_counters: Arc<IOCounters>,
+    /// Clock that times evaluation windows.
+    clock: Clock,
     /// Algorithm phase. Stored as AtomicUsize for lock-free reads.
     phase: AtomicUsize,
     /// Algorithm state. Only accessed at window boundaries.
@@ -204,7 +207,7 @@ pub(crate) struct AdaptiveConcurrencyController {
 }
 
 impl AdaptiveConcurrencyController {
-    pub(crate) fn new(config: AdaptiveConfig, io_counters: Arc<IOCounters>) -> Self {
+    pub(crate) fn new(config: AdaptiveConfig, io_counters: Arc<IOCounters>, clock: Clock) -> Self {
         let initial = config.initial_concurrency;
         Self {
             target: AtomicUsize::new(initial),
@@ -218,8 +221,9 @@ impl AdaptiveConcurrencyController {
                 recent_goodput: VecDeque::with_capacity(config.stable.history_size),
                 raw_goodput: VecDeque::with_capacity(config.window.smoothing_window),
                 consecutive_probes: 0,
-                last_evaluation: Instant::now(),
+                last_evaluation: clock.now(),
             }),
+            clock,
             config,
         }
     }
@@ -240,10 +244,10 @@ impl AdaptiveConcurrencyController {
             Phase::SlowStart => self.config.slow_start.evaluation_interval,
             _ => self.config.window.duration,
         };
-        if state.last_evaluation.elapsed() < interval {
+        if self.clock.elapsed(state.last_evaluation) < interval {
             return;
         }
-        state.last_evaluation = Instant::now();
+        state.last_evaluation = self.clock.now();
         let peak = self.peak_in_flight.swap(0, Ordering::Relaxed);
 
         if self.io_counters.is_idle() {
@@ -527,8 +531,12 @@ mod tests {
 
     impl TestController {
         fn new(config: AdaptiveConfig) -> Self {
-            let io_counters = Arc::new(IOCounters::new(config.window.duration));
-            Self(AdaptiveConcurrencyController::new(config, io_counters))
+            let io_counters = Arc::new(IOCounters::new(config.window.duration, Clock::system()));
+            Self(AdaptiveConcurrencyController::new(
+                config,
+                io_counters,
+                Clock::system(),
+            ))
         }
 
         /// Feed a goodput measurement and run the algorithm. Returns new target.
@@ -810,8 +818,9 @@ mod tests {
             },
             ..Default::default()
         };
-        let io_counters = Arc::new(IOCounters::new(Duration::from_secs(1)));
-        let controller = AdaptiveConcurrencyController::new(config, Arc::clone(&io_counters));
+        let io_counters = Arc::new(IOCounters::new(Duration::from_secs(1), Clock::system()));
+        let controller =
+            AdaptiveConcurrencyController::new(config, Arc::clone(&io_counters), Clock::system());
         // Don't record any bytes — IOCounters is idle
         controller.on_dispatch();
         controller.on_completion(Some(&sample(0)));

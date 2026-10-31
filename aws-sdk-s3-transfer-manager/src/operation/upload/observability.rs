@@ -16,6 +16,7 @@ use crate::config::TransferDiagnosticsConfig;
 use crate::error::ErrorKind;
 use crate::io::SizeHint;
 use crate::metrics::RequestMetrics;
+use crate::runtime::Clock;
 use crate::transfer::{
     emit_pending_details, AttributedRequestMeasurement, RequestMetricsAttribution, TransferContext,
     TransferId, TransferPendingStats,
@@ -313,45 +314,59 @@ impl UploadEvent {
 
 /// Optional clock sample whose construction is controlled by diagnostic policy.
 #[derive(Debug)]
-pub(crate) struct UploadDiagnosticTimer(Option<Instant>);
+pub(crate) struct UploadDiagnosticTimer(Option<(Clock, Instant)>);
 
 impl UploadDiagnosticTimer {
-    /// Starts a timer only when summary collection is enabled.
-    pub(crate) fn start(config: TransferDiagnosticsConfig) -> Self {
-        Self(config.enable_summaries().then(Instant::now))
+    /// Starts a timer on `clock` only when summary collection is enabled.
+    pub(crate) fn start(config: TransferDiagnosticsConfig, clock: &Clock) -> Self {
+        if config.enable_summaries() {
+            Self::started(clock)
+        } else {
+            Self::disabled()
+        }
+    }
+
+    fn started(clock: &Clock) -> Self {
+        Self(Some((clock.clone(), clock.now())))
+    }
+
+    fn disabled() -> Self {
+        Self(None)
     }
 
     /// Returns elapsed time when this timer was enabled.
-    pub(crate) fn elapsed(self) -> Option<Duration> {
-        self.0.map(|started_at| started_at.elapsed())
+    pub(crate) fn elapsed(&self) -> Option<Duration> {
+        self.0
+            .as_ref()
+            .map(|(clock, started_at)| clock.elapsed(*started_at))
     }
 }
 
 /// Timing retained with one scheduled source operation.
 #[derive(Debug)]
 pub(crate) struct UploadPartTiming {
-    scheduled_at: Option<Instant>,
+    scheduled: UploadDiagnosticTimer,
     pending_polls: u32,
 }
 
 impl UploadPartTiming {
     fn disabled() -> Self {
         Self {
-            scheduled_at: None,
+            scheduled: UploadDiagnosticTimer::disabled(),
             pending_polls: 0,
         }
     }
 
-    fn started() -> Self {
+    fn started(clock: &Clock) -> Self {
         Self {
-            scheduled_at: Some(Instant::now()),
+            scheduled: UploadDiagnosticTimer::started(clock),
             pending_polls: 0,
         }
     }
 
     /// Records one source poll that returned `Pending`.
     pub(crate) fn record_pending(&mut self) {
-        if self.scheduled_at.is_some() {
+        if self.scheduled.0.is_some() {
             self.pending_polls = self.pending_polls.saturating_add(1);
         }
     }
@@ -363,7 +378,7 @@ impl UploadPartTiming {
     /// Returns the current observation without consuming retained timing state.
     pub(crate) fn observation(&self) -> SourceReadObservation {
         SourceReadObservation {
-            elapsed: self.scheduled_at.map(|scheduled_at| scheduled_at.elapsed()),
+            elapsed: self.scheduled.elapsed(),
             pending_polls: self.pending_polls,
         }
     }
@@ -468,6 +483,7 @@ pub(crate) enum UploadObservability {
 #[derive(Debug)]
 pub(crate) struct EnabledUploadObservability {
     emit_events: bool,
+    clock: Clock,
     state: Mutex<UploadObservabilityState>,
     #[cfg(test)]
     last_summary: Mutex<Option<UploadTransferSummary>>,
@@ -501,13 +517,19 @@ struct UploadObservabilityState {
 }
 
 impl UploadObservability {
-    /// Creates upload observation using the client-level diagnostic policy.
-    pub(crate) fn new(config: TransferDiagnosticsConfig, size_hint: SizeHint) -> Self {
+    /// Creates upload observation using the client-level diagnostic policy and
+    /// the client's clock.
+    pub(crate) fn new(
+        config: TransferDiagnosticsConfig,
+        size_hint: SizeHint,
+        clock: &Clock,
+    ) -> Self {
         if !config.enable_summaries() {
             return Self::Disabled;
         }
         Self::Enabled(Arc::new(EnabledUploadObservability {
             emit_events: config.events_enabled(),
+            clock: clock.clone(),
             state: Mutex::new(UploadObservabilityState {
                 mode: UploadMode::Undecided,
                 length_kind: UploadLengthKind::from_size_hint(size_hint),
@@ -553,7 +575,7 @@ impl UploadObservability {
                 .lock()
                 .expect("lock poisoned")
                 .multipart_started_at
-                .get_or_insert_with(Instant::now);
+                .get_or_insert_with(|| enabled.clock.now());
         }
     }
 
@@ -581,7 +603,7 @@ impl UploadObservability {
     pub(crate) fn part_scheduled(&self) -> UploadPartTiming {
         match self {
             Self::Disabled => UploadPartTiming::disabled(),
-            Self::Enabled(_) => UploadPartTiming::started(),
+            Self::Enabled(enabled) => UploadPartTiming::started(&enabled.clock),
         }
     }
 
@@ -602,7 +624,7 @@ impl UploadObservability {
         let mut state = enabled.state.lock().expect("lock poisoned");
         if closed {
             if state.dispatch_closed_at.is_none() {
-                state.dispatch_closed_at = Some(Instant::now());
+                state.dispatch_closed_at = Some(enabled.clock.now());
             }
         } else {
             state.dispatch_closed_at = None;
@@ -663,7 +685,7 @@ impl UploadObservability {
             return;
         };
         let mut state = enabled.state.lock().expect("lock poisoned");
-        let now = Instant::now();
+        let now = enabled.clock.now();
         state.body_duration = state
             .multipart_started_at
             .map(|started_at| now.saturating_duration_since(started_at));
@@ -1334,10 +1356,14 @@ mod tests {
 
     #[test]
     fn disabled_collection_does_not_start_timers_or_retain_events() {
-        let observability = UploadObservability::new(config(0), exact_size_hint());
+        let observability =
+            UploadObservability::new(config(0), exact_size_hint(), &Clock::system());
         let timing = observability.part_scheduled();
         assert!(matches!(observability, UploadObservability::Disabled));
-        assert_eq!(UploadDiagnosticTimer::start(config(0)).elapsed(), None);
+        assert_eq!(
+            UploadDiagnosticTimer::start(config(0), &Clock::system()).elapsed(),
+            None
+        );
         assert_eq!(timing.finish().elapsed, None);
         observability.observe_event(
             TransferId {
@@ -1351,8 +1377,8 @@ mod tests {
 
     #[test]
     fn summary_and_event_levels_are_distinct() {
-        let summary = UploadObservability::new(config(1), exact_size_hint());
-        let events = UploadObservability::new(config(2), exact_size_hint());
+        let summary = UploadObservability::new(config(1), exact_size_hint(), &Clock::system());
+        let events = UploadObservability::new(config(2), exact_size_hint(), &Clock::system());
         assert!(matches!(
             summary,
             UploadObservability::Enabled(ref enabled) if !enabled.emit_events
@@ -1365,7 +1391,8 @@ mod tests {
 
     #[test]
     fn summary_level_aggregates_without_event_emission() {
-        let observability = UploadObservability::new(config(1), exact_size_hint());
+        let observability =
+            UploadObservability::new(config(1), exact_size_hint(), &Clock::system());
         observability.select_mode(UploadMode::Multipart);
         let mut timing = observability.part_scheduled();
         observability.record_read_pending(&mut timing);
@@ -1457,7 +1484,8 @@ mod tests {
 
     #[test]
     fn terminal_summary_records_mode_and_last_active_state() {
-        let observability = UploadObservability::new(config(1), exact_size_hint());
+        let observability =
+            UploadObservability::new(config(1), exact_size_hint(), &Clock::system());
         observability.select_mode(UploadMode::PutObject);
         let first = observability.report_terminal(terminal_report(
             1,
@@ -1476,7 +1504,8 @@ mod tests {
 
     #[test]
     fn request_kind_metrics_remain_separate() {
-        let observability = UploadObservability::new(config(1), exact_size_hint());
+        let observability =
+            UploadObservability::new(config(1), exact_size_hint(), &Clock::system());
         let mut upload_part = RequestMetrics::default();
         upload_part.record_request(Duration::from_micros(7));
         upload_part.record_retry_reissue(Duration::from_micros(3));

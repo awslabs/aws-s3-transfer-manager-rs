@@ -1358,7 +1358,10 @@ mod tests {
         let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
         let config = crate::Config::builder().sdk_client(s3_client).build();
         let handle = Handle::new_for_test_with_runtime(config, controller.clone(), |weak| {
-            Arc::new(crate::runtime::TokioMultiThreadRuntime::new(weak))
+            Arc::new(crate::runtime::TokioMultiThreadRuntime::new(
+                weak,
+                crate::runtime::Spawner::tokio(),
+            ))
         });
         let id = TransferId {
             id: 1,
@@ -1876,10 +1879,11 @@ mod tests {
                 config,
                 controller.clone(),
                 move |weak| match runtime {
-                    TestRuntime::Tokio => {
-                        Arc::new(crate::runtime::TokioMultiThreadRuntime::new(weak))
-                            as Arc<dyn crate::runtime::ExecutionRuntime>
-                    }
+                    TestRuntime::Tokio => Arc::new(crate::runtime::TokioMultiThreadRuntime::new(
+                        weak,
+                        crate::runtime::Spawner::tokio(),
+                    ))
+                        as Arc<dyn crate::runtime::ExecutionRuntime>,
                     TestRuntime::Managed { threads } => Arc::new(
                         crate::runtime::ManagedThreadRuntime::builder(weak)
                             .topology(crate::runtime::Topology::uniform(threads))

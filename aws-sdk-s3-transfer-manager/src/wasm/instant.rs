@@ -3,29 +3,27 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Monotonic timestamps read from the installed [`WasmRuntime`](super::WasmRuntime).
+//! Monotonic timestamps read from a [`WasmRuntime`].
 
 use std::ops::{Add, AddAssign, Sub, SubAssign};
 use std::time::Duration;
 
+use super::WasmRuntime;
+
 /// A point in time read from the transfer manager's monotonic clock.
 ///
-/// On `wasm32-unknown-unknown` this stores the duration since the installed
-/// [`WasmRuntime`](crate::wasm::WasmRuntime)'s monotonic epoch. It provides the
-/// [`std::time::Instant`] operations that apply to a monotonic clock. Ordering
-/// and differences are meaningful only within one module.
+/// On `wasm32-unknown-unknown` this stores the duration since a
+/// [`WasmRuntime`]'s monotonic epoch. It provides the [`std::time::Instant`]
+/// operations that apply to a monotonic clock, reading the current time from
+/// a runtime passed by the caller. Ordering and differences are meaningful
+/// only between instants from runtimes that share an epoch.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct TransferInstant(Duration);
 
 impl TransferInstant {
-    /// Returns the current time of the installed runtime's clock.
-    ///
-    /// # Panics
-    ///
-    /// Panics if no [`WasmRuntime`](crate::wasm::WasmRuntime) is installed.
-    #[track_caller]
-    pub fn now() -> Self {
-        Self(super::runtime().monotonic_now())
+    /// Returns the current time of `runtime`'s clock.
+    pub fn now<R: WasmRuntime + ?Sized>(runtime: &R) -> Self {
+        Self(runtime.monotonic_now())
     }
 
     /// Returns the time elapsed from `earlier` to `self`, or zero if `earlier`
@@ -46,14 +44,10 @@ impl TransferInstant {
         self.0.saturating_sub(earlier.0)
     }
 
-    /// Returns the time elapsed since `self`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if no [`WasmRuntime`](crate::wasm::WasmRuntime) is installed.
-    #[track_caller]
-    pub fn elapsed(&self) -> Duration {
-        Self::now().saturating_duration_since(*self)
+    /// Returns the time elapsed since `self` on `runtime`'s clock, or zero if
+    /// `self` is later than the current time.
+    pub fn elapsed<R: WasmRuntime + ?Sized>(&self, runtime: &R) -> Duration {
+        Self::now(runtime).saturating_duration_since(*self)
     }
 
     /// Returns `self + duration`, or `None` if the result is not representable.

@@ -64,6 +64,11 @@ pub enum BufferPoolBuildError {
     CapacityOverflow,
     /// Runtime page geometry cannot produce a supported pool layout.
     UnsupportedPageGeometry,
+    /// The builder has no runtime, which `wasm32-unknown-unknown` requires.
+    ///
+    /// Set one with [`BufferPoolBuilder::wasm_runtime`].
+    #[cfg(all(target_family = "wasm", target_os = "unknown"))]
+    MissingWasmRuntime,
 }
 
 impl fmt::Display for BufferPoolBuildError {
@@ -79,6 +84,11 @@ impl fmt::Display for BufferPoolBuildError {
             Self::UnsupportedPageGeometry => {
                 f.write_str("runtime page geometry cannot support the buffer pool")
             }
+            #[cfg(all(target_family = "wasm", target_os = "unknown"))]
+            Self::MissingWasmRuntime => f.write_str(
+                "wasm32-unknown-unknown requires a wasm runtime; set one with \
+                 BufferPoolBuilder::wasm_runtime",
+            ),
         }
     }
 }
@@ -93,6 +103,8 @@ impl std::error::Error for BufferPoolBuildError {}
 #[derive(Clone, Debug, Default)]
 pub struct BufferPoolBuilder {
     memory_budget: MemoryBudgetConfig,
+    #[cfg(all(target_family = "wasm", target_os = "unknown"))]
+    wasm_runtime: Option<crate::wasm::SharedWasmRuntime>,
 }
 
 impl BufferPoolBuilder {
@@ -102,19 +114,37 @@ impl BufferPoolBuilder {
         self
     }
 
+    /// Sets the runtime whose clock timestamps the pool's queue and
+    /// maintenance state.
+    ///
+    /// Required on `wasm32-unknown-unknown`, the only target with this method.
+    /// The pool never schedules futures on the runtime, and it may differ from
+    /// the runtimes of the clients that share the pool.
+    #[cfg(all(target_family = "wasm", target_os = "unknown"))]
+    pub fn wasm_runtime(mut self, runtime: impl crate::wasm::WasmRuntime) -> Self {
+        self.wasm_runtime = Some(crate::wasm::SharedWasmRuntime::new(runtime));
+        self
+    }
+
     /// Constructs an empty pool, detecting machine memory when the selected
     /// capacity policy requires it.
     ///
     /// Construction fixes capacity and geometry but does not reserve virtual
     /// ranges, prepare physical memory, or start the maintenance worker.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// On `wasm32-unknown-unknown`, panics if no `wasm::WasmRuntime` is
-    /// installed.
+    /// Returns [`BufferPoolBuildError`] if the capacity policy cannot resolve
+    /// to a supported pool, or on `wasm32-unknown-unknown` if no runtime is
+    /// set.
     pub fn build(self) -> Result<super::BufferPool, BufferPoolBuildError> {
         #[cfg(all(target_family = "wasm", target_os = "unknown"))]
-        let _ = crate::wasm::runtime();
+        let clock = crate::runtime::Clock::from_runtime(
+            self.wasm_runtime
+                .ok_or(BufferPoolBuildError::MissingWasmRuntime)?,
+        );
+        #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+        let clock = crate::runtime::Clock::system();
 
         let needs_memory_detection = match self.memory_budget {
             MemoryBudgetConfig::Auto => true,
@@ -132,7 +162,7 @@ impl BufferPoolBuilder {
             .then(crate::runtime::platform::available_ram)
             .flatten();
         let diagnostics = crate::config::DiagnosticsConfig::from_env().memory();
-        super::BufferPool::from_capacity(self.memory_budget, detected_memory, diagnostics)
+        super::BufferPool::from_capacity(self.memory_budget, detected_memory, diagnostics, clock)
     }
 }
 
@@ -430,6 +460,7 @@ mod tests {
             MemoryBudgetConfig::Limit(GIB),
             None,
             crate::config::MemoryDiagnosticsConfig::default(),
+            crate::runtime::Clock::system(),
         )
         .unwrap();
         let prepared = pool
@@ -482,6 +513,7 @@ mod tests {
             MemoryBudgetConfig::Limit(GIB),
             Some(8 * GIB),
             crate::config::MemoryDiagnosticsConfig::default(),
+            crate::runtime::Clock::system(),
         )
         .unwrap();
         assert_eq!(pool.inner.geometry.carrier_size(), DEFAULT_CARRIER_BYTES);

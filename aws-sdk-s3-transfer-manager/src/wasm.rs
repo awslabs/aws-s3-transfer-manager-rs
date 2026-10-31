@@ -9,10 +9,12 @@
 //! standard library cannot read a monotonic clock or start threads there, and
 //! the transfer manager assumes no JavaScript environment, WASI interface,
 //! executor, or host import. The application supplies the missing capabilities
-//! by installing one [`WasmRuntime`] with [`install_runtime`] before it
-//! constructs a [`Client`](crate::Client), a
-//! [`BufferPool`](crate::memory::BufferPool), or any other transfer-manager
-//! value.
+//! as a [`WasmRuntime`] in each client's configuration, with
+//! [`RuntimeMode::wasm`](crate::types::RuntimeMode::wasm). A
+//! [`BufferPool`](crate::memory::BufferPool) built for
+//! [`MemoryConfig::Explicit`](crate::types::MemoryConfig::Explicit) takes one
+//! from
+//! [`BufferPoolBuilder::wasm_runtime`](crate::memory::BufferPoolBuilder::wasm_runtime).
 //!
 //! The S3 configuration supplies the remaining host services through the
 //! Smithy interfaces it already defines:
@@ -29,15 +31,19 @@
 //!
 //! # Examples
 //!
-//! A runtime that forwards to an embedding host's clock and executor:
+//! A runtime that forwards to an embedding host's clock and executor, used by
+//! one client:
 //!
 //! ```no_run
 //! use std::time::Duration;
 //!
-//! use aws_sdk_s3_transfer_manager::wasm::{self, BoxFuture, WasmRuntime};
+//! use aws_sdk_s3_transfer_manager::types::RuntimeMode;
+//! use aws_sdk_s3_transfer_manager::wasm::{BoxFuture, WasmRuntime};
+//! use aws_sdk_s3_transfer_manager::{Client, Config};
 //!
 //! # fn host_monotonic_nanos() -> u64 { 0 }
 //! # fn host_executor_spawn(_future: BoxFuture) {}
+//! # fn sdk_config() -> aws_types::SdkConfig { unimplemented!() }
 //! #[derive(Debug)]
 //! struct HostRuntime;
 //!
@@ -51,7 +57,11 @@
 //!     }
 //! }
 //!
-//! wasm::install_runtime(HostRuntime).expect("runtime installed once");
+//! let config = Config::builder()
+//!     .s3_config(&sdk_config())
+//!     .runtime_mode(RuntimeMode::wasm(HostRuntime))
+//!     .build();
+//! let client = Client::new(config);
 //! ```
 //!
 //! A JavaScript host can implement the same trait in application code, for
@@ -73,7 +83,7 @@
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::OnceLock;
+use std::sync::Arc;
 use std::time::Duration;
 
 pub(crate) mod instant;
@@ -83,9 +93,10 @@ pub type BoxFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
 /// Monotonic time and future scheduling supplied by the host application.
 ///
-/// One runtime serves every client, transfer, and buffer pool in the module.
-/// An application that needs several execution domains installs a runtime that
-/// routes futures itself.
+/// A client schedules its futures on, and reads time from, the runtime in its
+/// [`RuntimeMode`](crate::types::RuntimeMode). Clients may share one runtime
+/// or use separate ones. A [`TransferInstant`](crate::types::TransferInstant)
+/// is comparable only with instants from runtimes that share its epoch.
 ///
 /// The `Send` and `Sync` bounds match the transfer manager's own futures and
 /// Smithy's HTTP and sleep interfaces. A single-threaded host satisfies them
@@ -93,7 +104,7 @@ pub type BoxFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 pub trait WasmRuntime: Send + Sync + fmt::Debug + 'static {
     /// Returns the time elapsed since a runtime-defined monotonic epoch.
     ///
-    /// Every call in the module uses the same epoch. Returned values never
+    /// Every call on this runtime uses the same epoch. Returned values never
     /// decrease, are comparable across threads, and do not wrap. The epoch has
     /// no wall-clock meaning: the transfer manager uses only differences and
     /// ordering. Resolution may be coarser than one nanosecond.
@@ -111,50 +122,25 @@ pub trait WasmRuntime: Send + Sync + fmt::Debug + 'static {
     fn spawn(&self, future: BoxFuture);
 }
 
-/// The error returned when a module installs a second [`WasmRuntime`].
+/// A cloneable [`WasmRuntime`] that clients and buffer pools can share.
 ///
-/// The runtime installed first remains active.
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RuntimeAlreadyInstalled;
+/// Clones refer to the same runtime.
+#[derive(Clone, Debug)]
+pub struct SharedWasmRuntime(Arc<dyn WasmRuntime>);
 
-impl fmt::Display for RuntimeAlreadyInstalled {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("a transfer-manager wasm runtime is already installed")
+impl SharedWasmRuntime {
+    /// Wraps `runtime` for sharing.
+    pub fn new(runtime: impl WasmRuntime) -> Self {
+        Self(Arc::new(runtime))
     }
 }
 
-impl std::error::Error for RuntimeAlreadyInstalled {}
+impl WasmRuntime for SharedWasmRuntime {
+    fn monotonic_now(&self) -> Duration {
+        self.0.monotonic_now()
+    }
 
-static RUNTIME: OnceLock<Box<dyn WasmRuntime>> = OnceLock::new();
-
-/// Installs the module's [`WasmRuntime`].
-///
-/// Installation succeeds once per module. The runtime cannot be replaced or
-/// removed afterwards.
-///
-/// # Errors
-///
-/// Returns [`RuntimeAlreadyInstalled`] and drops `runtime` if a runtime is
-/// already installed.
-pub fn install_runtime(runtime: impl WasmRuntime) -> Result<(), RuntimeAlreadyInstalled> {
-    RUNTIME
-        .set(Box::new(runtime))
-        .map_err(|_| RuntimeAlreadyInstalled)
-}
-
-/// Returns the installed runtime.
-///
-/// # Panics
-///
-/// Panics if [`install_runtime`] has not been called.
-#[track_caller]
-pub(crate) fn runtime() -> &'static dyn WasmRuntime {
-    match RUNTIME.get() {
-        Some(runtime) => runtime.as_ref(),
-        None => panic!(
-            "wasm32-unknown-unknown requires wasm::install_runtime before constructing \
-             transfer-manager values"
-        ),
+    fn spawn(&self, future: BoxFuture) {
+        self.0.spawn(future);
     }
 }

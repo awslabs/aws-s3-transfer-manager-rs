@@ -10,8 +10,9 @@
 // expected operations and ranges with multipart requests outstanding
 // together, and that the stored object equals the uploaded bytes; the module
 // checks that the download equals them too. Finally it checks that
-// constructing a client without a runtime or without a sleep implementation
-// traps with the documented message. Each run uses a fresh instance.
+// constructing a client with the default runtime mode or without a sleep
+// implementation traps with the documented message. Each run uses a fresh
+// instance.
 //
 // Prints `wasm32-unknown-unknown-tests: <count> scenarios under Node` first,
 // then `PASS <scenario>: <summary>` for each scenario: the module's report
@@ -49,7 +50,7 @@ const ROUND_TRIPS = [
 
 // Exports that must trap, and the message each must report.
 const TRAPS = [
-  ["client_without_runtime", "requires wasm::install_runtime"],
+  ["client_without_runtime", "requires RuntimeMode::Wasm"],
   ["client_without_sleep", "requires an AsyncSleep implementation"],
 ];
 

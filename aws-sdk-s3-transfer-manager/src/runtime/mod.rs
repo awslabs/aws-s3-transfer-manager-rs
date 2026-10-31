@@ -25,7 +25,11 @@ pub(crate) use topology::Topology;
 
 #[allow(dead_code)]
 pub(crate) mod buffer_pool;
+mod clock;
+pub(crate) use clock::Clock;
 pub(crate) mod platform;
+mod spawner;
+pub(crate) use spawner::Spawner;
 pub(crate) mod sync;
 mod timer;
 pub(crate) use timer::Timer;

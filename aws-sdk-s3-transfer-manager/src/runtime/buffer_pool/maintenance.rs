@@ -19,6 +19,7 @@ use super::geometry::PoolGeometry;
 use super::{CarrierCount, PoolInner};
 use crate::runtime::sync::sync::atomic::{AtomicU64, Ordering as DiagnosticOrdering};
 use crate::runtime::sync::sync::{Arc, Condvar, Mutex};
+use crate::runtime::Clock;
 use crate::types::TransferInstant as Instant;
 
 #[cfg(not(all(test, s3_tm_loom)))]
@@ -111,18 +112,19 @@ pub(super) struct MaintenanceCoordinator {
 }
 
 impl MaintenanceCoordinator {
-    /// Creates a coordinator without starting its worker.
+    /// Creates a coordinator timed by `clock` without starting its worker.
     pub(super) fn new(
         configured_capacity: CarrierCount,
         geometry: PoolGeometry,
         diagnostic_interval: Option<Duration>,
+        clock: Clock,
     ) -> Self {
         Self {
             reclaim_policy: IdleReclaimPolicy {
                 configured_capacity,
                 block_capacity: geometry.carriers_per_block(),
             },
-            control: Arc::new(MaintenanceControl::new()),
+            control: Arc::new(MaintenanceControl::new(clock)),
             diagnostics: Arc::new(MaintenanceDiagnostics::default()),
             diagnostic_interval,
             #[cfg(not(all(test, s3_tm_loom)))]
@@ -138,12 +140,13 @@ impl MaintenanceCoordinator {
 
     /// Arms reclamation after scheduler-global idle.
     pub(super) fn record_idle(&self, pool: &Arc<PoolInner>) {
-        self.record_idle_after(pool, Instant::now(), IDLE_TIMEOUT);
+        self.record_idle_after(pool, self.control.clock.now(), IDLE_TIMEOUT);
     }
 
     /// Requests recovery for a failed mapping cleanup operation.
     pub(super) fn request_cleanup(&self, pool: &Arc<PoolInner>) {
-        if self.control.state.lock().request_cleanup(Instant::now()) {
+        let now = self.control.clock.now();
+        if self.control.state.lock().request_cleanup(now) {
             self.diagnostics.record_cleanup_request();
         }
         self.ensure_worker(pool);
@@ -317,14 +320,17 @@ struct MaintenanceControl {
     state: Mutex<MaintenanceState>,
     /// Deadline, request, and shutdown wakeups.
     wake: Condvar,
+    /// The pool's clock, which times every deadline in `state`.
+    clock: Clock,
 }
 
 impl MaintenanceControl {
-    /// Creates control state with no pending work.
-    fn new() -> Self {
+    /// Creates control state with no pending work, timed by `clock`.
+    fn new(clock: Clock) -> Self {
         Self {
             state: Mutex::new(MaintenanceState::new()),
             wake: Condvar::new(),
+            clock,
         }
     }
 }
@@ -679,7 +685,7 @@ impl MaintenanceWorker {
 
             let action = match task {
                 WorkerTask::Diagnostics => {
-                    self.report(&pool, Instant::now);
+                    self.report(&pool, || pool.clock.now());
                     drop(pool);
                     continue;
                 }
@@ -695,7 +701,7 @@ impl MaintenanceWorker {
                 self.diagnostics.record_reclaim_pass(pass.outcome);
             }
 
-            let now = Instant::now();
+            let now = self.control.clock.now();
             let mut state = self.control.state.lock();
             if pass.cleanup_pending && state.request_cleanup(now) {
                 self.diagnostics.record_cleanup_request();
@@ -736,7 +742,7 @@ impl MaintenanceWorker {
                 return None;
             }
 
-            let now = Instant::now();
+            let now = self.control.clock.now();
             if let Some(action) = state.next_action(
                 now,
                 self.reclaim_policy.configured_capacity,
@@ -1229,7 +1235,7 @@ mod tests {
     #[test]
     fn test_due_maintenance_precedes_a_diagnostic_deadline() {
         let (pool, _) = test_pool(1, 4);
-        let control = Arc::new(MaintenanceControl::new());
+        let control = Arc::new(MaintenanceControl::new(Clock::system()));
         control
             .state
             .lock()
@@ -1258,7 +1264,7 @@ mod tests {
         let (pool, _) = test_pool(1, 1);
         let interval = Duration::from_secs(1);
         let mut worker = MaintenanceWorker::new(
-            Arc::new(MaintenanceControl::new()),
+            Arc::new(MaintenanceControl::new(Clock::system())),
             Arc::new(MaintenanceDiagnostics::default()),
             Arc::downgrade(&pool.inner),
             IdleReclaimPolicy {
@@ -1537,7 +1543,7 @@ mod loom_tests {
     #[test]
     fn test_stop_and_wait_share_the_control_mutex() {
         loom::model(|| {
-            let control = Arc::new(MaintenanceControl::new());
+            let control = Arc::new(MaintenanceControl::new(Clock::system()));
             let waiting = Arc::clone(&control);
             let waiter = thread::spawn(move || {
                 let state = waiting.state.lock();

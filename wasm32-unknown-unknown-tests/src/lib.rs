@@ -14,12 +14,12 @@
 //! Exports:
 //!
 //! - `scenario_count() -> i32` returns the number of scenarios `run` runs.
-//! - `run() -> i32` installs the runtime, runs every scenario, and returns how
-//!   many passed, which equals `scenario_count()`. A failure traps.
-//! - `client_without_runtime() -> i32` constructs a client before any runtime
-//!   is installed. It must trap.
-//! - `client_without_sleep() -> i32` installs the runtime and constructs a
-//!   client whose S3 configuration has no sleep implementation. It must trap.
+//! - `run() -> i32` runs every scenario and returns how many passed, which
+//!   equals `scenario_count()`. A failure traps.
+//! - `client_without_runtime() -> i32` constructs a client with the default
+//!   runtime mode, which this target does not support. It must trap.
+//! - `client_without_sleep() -> i32` constructs a client whose S3
+//!   configuration has no sleep implementation. It must trap.
 //! - `message_ptr() -> *const u8` and `message_len() -> usize` locate a UTF-8
 //!   report with a `PASS <scenario>: <summary>` line for each passed scenario,
 //!   followed by the failure or panic message.
@@ -29,8 +29,8 @@
 //!
 //! - `host_buffer(len) -> *mut u8` returns a `len`-byte buffer for the host to
 //!   fill before the next call below that consumes it.
-//! - `host_round_trip_start() -> i32` installs the runtime and starts
-//!   uploading the buffer's bytes as one object, then downloading it.
+//! - `host_round_trip_start() -> i32` starts uploading the buffer's bytes as
+//!   one object, then downloading it.
 //! - `host_round_trip_step() -> i32` drives the round trip until it needs the
 //!   host. It returns 1 while requests await responses, and 0 once the
 //!   downloaded bytes match the upload and every worker has exited.
@@ -91,12 +91,12 @@ fn to_i32(count: usize) -> i32 {
     i32::try_from(count).expect("scenario count fits in i32")
 }
 
-/// Constructs a client before installing a runtime. Expected to trap.
+/// Constructs a client with the default runtime mode. Expected to trap.
 #[no_mangle]
 pub extern "C" fn client_without_runtime() -> i32 {
     install_panic_hook();
     scenarios::client_without_runtime();
-    report("constructed a client without a runtime");
+    report("constructed a client with the default runtime mode");
     1
 }
 

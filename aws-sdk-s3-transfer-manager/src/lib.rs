@@ -84,15 +84,13 @@
 //! | `wasm32-wasip1`          | caller's tokio runtime        | WASI                          | WASI preview 1 | caller-supplied; no standard network interface |
 //! | `wasm32-wasip2`          | caller's tokio runtime        | WASI                          | WASI preview 2 | caller-supplied, for example over `wasi:http` |
 //! | `wasm32-wasip3`          | caller's tokio runtime        | WASI                          | WASI preview 3 | caller-supplied                              |
-//! | `wasm32-unknown-unknown` | installed `wasm::WasmRuntime` | installed `wasm::WasmRuntime` | none           | caller-supplied                              |
+//! | `wasm32-unknown-unknown` | `RuntimeMode::Wasm` runtime   | `RuntimeMode::Wasm` runtime   | none           | caller-supplied                              |
 //!
 //! On every wasm target:
 //!
 //! - The AWS SDK's default HTTPS client is not built. Requests fail unless the
 //!   [`aws_types::SdkConfig`] or S3 configuration supplies an HTTP client.
-//! - [`RuntimeMode::Managed`](crate::types::RuntimeMode::Managed) behaves as
-//!   [`RuntimeMode::MultiThreadTokio`](crate::types::RuntimeMode::MultiThreadTokio).
-//!   File reads and writes run inline on the thread that polls the transfer.
+//! - File reads and writes run inline on the thread that polls the transfer.
 //! - Memory detection is unavailable, so
 //!   [`MemoryBudgetConfig::Auto`](crate::types::MemoryBudgetConfig::Auto) uses
 //!   a fallback: 2 GiB on the WASI targets and 64 MiB on
@@ -103,18 +101,21 @@
 //! On the WASI targets, build with `RUSTFLAGS="--cfg tokio_unstable"`. The S3
 //! client's tokio integration enables tokio's `fs` feature, which tokio accepts
 //! on wasm only with that flag. Transfers run on the caller's tokio runtime,
-//! which may be current-thread.
+//! which may be current-thread, and
+//! [`RuntimeMode::Managed`](crate::types::RuntimeMode::Managed) behaves as
+//! [`RuntimeMode::MultiThreadTokio`](crate::types::RuntimeMode::MultiThreadTokio).
 //!
 //! ## `wasm32-unknown-unknown`
 //!
 //! This target has no operating system and implies no JavaScript or WASI host.
 //! It needs no build flag.
 //!
-//! - Before constructing a client or a
-//!   [`BufferPool`](crate::memory::BufferPool), install a `wasm::WasmRuntime`
-//!   with `wasm::install_runtime`. The runtime supplies a monotonic clock and
-//!   schedules the transfer manager's futures. The `wasm` module exists only on
-//!   this target.
+//! - Each client's configuration supplies a `wasm::WasmRuntime` through
+//!   `RuntimeMode::wasm`, the only runtime mode on this target. The runtime
+//!   supplies the client's monotonic clock and schedules its futures. A
+//!   [`BufferPool`](crate::memory::BufferPool) built by the caller takes a
+//!   runtime from `BufferPoolBuilder::wasm_runtime`. The `wasm` module, the
+//!   `Wasm` runtime mode, and the builder method exist only on this target.
 //! - The S3 configuration must supply an HTTP client, an
 //!   [`AsyncSleep`](aws_sdk_s3::config::AsyncSleep) implementation, a
 //!   wall-clock [`TimeSource`](aws_types::sdk_config::TimeSource), credentials,

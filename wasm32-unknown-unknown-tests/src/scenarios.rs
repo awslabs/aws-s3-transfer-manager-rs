@@ -12,15 +12,18 @@
 //! The host round trip instead sends its requests to the embedding host
 //! through [`HostHttp`], and the host drives it one call at a time.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, IdentityCache, Region};
 use aws_sdk_s3_transfer_manager::config::Builder as ConfigBuilder;
 use aws_sdk_s3_transfer_manager::io::InputStream;
-use aws_sdk_s3_transfer_manager::types::{ConcurrencyMode, PartSize};
-use aws_sdk_s3_transfer_manager::wasm::{self, BoxFuture, RuntimeAlreadyInstalled, WasmRuntime};
+use aws_sdk_s3_transfer_manager::memory::{BufferPool, BufferPoolBuildError};
+use aws_sdk_s3_transfer_manager::types::{
+    ConcurrencyMode, MemoryBudgetConfig, MemoryConfig, PartSize, RuntimeMode, TransferInstant,
+};
+use aws_sdk_s3_transfer_manager::wasm::{BoxFuture, SharedWasmRuntime, WasmRuntime};
 use aws_sdk_s3_transfer_manager::{Client, Config};
 use aws_smithy_runtime_api::client::http::{http_client_fn, SharedHttpConnector};
 use aws_types::sdk_config::{
@@ -57,10 +60,10 @@ macro_rules! ensure {
 
 type Scenario = fn() -> Result<String, String>;
 
-/// Scenarios in execution order. The first installs the runtime that the
-/// others use.
+/// Scenarios in execution order.
 const SCENARIOS: &[(&str, Scenario)] = &[
-    ("installation", installation),
+    ("per-client runtimes", per_client_runtimes),
+    ("explicit buffer pool", explicit_buffer_pool),
     ("client construction", client_construction),
     ("single-part round trip", single_part_round_trip),
     ("multipart round trip", multipart_round_trip),
@@ -123,7 +126,9 @@ fn client_on(
     connector: SharedHttpConnector,
     configure: impl FnOnce(ConfigBuilder) -> ConfigBuilder,
 ) -> Client {
-    let config = Config::builder().s3_config(&sdk_config(connector, true));
+    let config = Config::builder()
+        .s3_config(&sdk_config(connector, true))
+        .runtime_mode(RuntimeMode::wasm(LogicalRuntime));
     Client::new(configure(config).build())
 }
 
@@ -225,48 +230,113 @@ fn release(client: Client, before: host::Stats) -> Result<usize, String> {
     Ok(workers)
 }
 
-static REJECTED_RUNTIME_DROPPED: AtomicBool = AtomicBool::new(false);
-
-/// A runtime that must never be used.
+/// A runtime on the host's executor whose clock is offset from the host's
+/// logical clock, and which counts the futures it accepts.
 #[derive(Debug)]
-struct RejectedRuntime;
+struct OffsetRuntime {
+    offset: Duration,
+    spawned: Arc<AtomicUsize>,
+}
 
-impl WasmRuntime for RejectedRuntime {
+impl WasmRuntime for OffsetRuntime {
     fn monotonic_now(&self) -> Duration {
-        panic!("the rejected runtime's clock was read")
+        LogicalRuntime.monotonic_now() + self.offset
     }
 
-    fn spawn(&self, _future: BoxFuture) {
-        panic!("the rejected runtime spawned a future")
-    }
-}
-
-impl Drop for RejectedRuntime {
-    fn drop(&mut self) {
-        REJECTED_RUNTIME_DROPPED.store(true, Ordering::SeqCst);
+    fn spawn(&self, future: BoxFuture) {
+        self.spawned.fetch_add(1, Ordering::SeqCst);
+        LogicalRuntime.spawn(future);
     }
 }
 
-/// The first installation succeeds. A second fails, drops its runtime, and
-/// leaves the first active; later scenarios would trap if the rejected
-/// runtime were used.
-fn installation() -> Result<String, String> {
-    ensure!(
-        wasm::install_runtime(LogicalRuntime).is_ok(),
-        "first installation failed"
-    );
+/// Two clients with their own runtimes run their workers on, and timestamp
+/// their transfers with, their own runtime.
+fn per_client_runtimes() -> Result<String, String> {
+    const OFFSETS: [Duration; 2] = [Duration::ZERO, Duration::from_secs(3600)];
+    let before = host::stats();
+    let spawned = OFFSETS.map(|_| Arc::new(AtomicUsize::new(0)));
+    let runtimes: Vec<_> = OFFSETS
+        .iter()
+        .zip(&spawned)
+        .map(|(&offset, spawned)| {
+            SharedWasmRuntime::new(OffsetRuntime {
+                offset,
+                spawned: Arc::clone(spawned),
+            })
+        })
+        .collect();
+    let stores = OFFSETS.map(|_| MemoryS3::default());
+    let mut clients = Vec::new();
+    for (index, runtime) in runtimes.iter().enumerate() {
+        let client = client(&stores[index], |config| {
+            config.runtime_mode(RuntimeMode::Wasm(runtime.clone()))
+        });
+        // The transfer's start time must come from this client's runtime,
+        // whose clock is an hour away from the other's.
+        let earliest = TransferInstant::now(runtime);
+        let handle = client
+            .upload()
+            .bucket("bucket")
+            .key("object")
+            .body(InputStream::from(pattern(64 * KIB)))
+            .initiate()
+            .map_err(|e| format!("initiate upload {index}: {e}"))?;
+        let started_at = handle.metrics().started_at;
+        ensure!(
+            earliest <= started_at && started_at <= TransferInstant::now(runtime),
+            "client {index} did not timestamp its transfer on its own runtime"
+        );
+        block_on(handle.join())?.map_err(|e| format!("upload {index}: {e}"))?;
+        ensure!(
+            spawned[index].load(Ordering::SeqCst) > 0,
+            "client {index} spawned no worker on its own runtime"
+        );
+        clients.push(client);
+    }
+    let second = clients.pop().expect("two clients");
+    drop(clients);
+    let summary = shut_down(second, before, &stores[1])?;
+    Ok(format!(
+        "{} and {} futures on separate runtimes; {summary}",
+        spawned[0].load(Ordering::SeqCst),
+        spawned[1].load(Ordering::SeqCst),
+    ))
+}
+
+/// A caller-built pool requires a runtime, and a client whose memory is that
+/// pool admits transfers against its capacity.
+fn explicit_buffer_pool() -> Result<String, String> {
+    const CAPACITY: usize = 16 * MIB;
+    let builder = BufferPool::builder().memory_budget(MemoryBudgetConfig::Limit(CAPACITY));
     ensure!(
         matches!(
-            wasm::install_runtime(RejectedRuntime),
-            Err(RuntimeAlreadyInstalled { .. })
+            builder.clone().build(),
+            Err(BufferPoolBuildError::MissingWasmRuntime)
         ),
-        "second installation succeeded"
+        "a pool built without a runtime"
     );
+    let pool = builder
+        .wasm_runtime(LogicalRuntime)
+        .build()
+        .map_err(|e| format!("build pool: {e}"))?;
+
+    let before = host::stats();
+    let store = MemoryS3::default();
+    let client = client(&store, |config| {
+        config.memory(MemoryConfig::Explicit(pool.clone()))
+    });
+    let data = pattern(64 * KIB);
+    let received = block_on(async {
+        upload(&client, "pooled", data.clone()).await?;
+        download(&client, "pooled").await
+    })??;
+    ensure_same(&data, &received)?;
+    let capacity = pool.metrics().configured_capacity_bytes();
     ensure!(
-        REJECTED_RUNTIME_DROPPED.load(Ordering::SeqCst),
-        "rejected runtime was retained"
+        capacity == CAPACITY as u64,
+        "pool capacity is {capacity} bytes, expected {CAPACITY}"
     );
-    Ok("a second runtime was rejected and dropped".to_owned())
+    shut_down(client, before, &store)
 }
 
 /// A client builds from explicit capabilities and default transfer-manager
@@ -301,7 +371,7 @@ fn single_part_round_trip() -> Result<String, String> {
     );
     ensure!(
         host::stats().spawned_tasks > before.spawned_tasks,
-        "no worker ran on the installed runtime"
+        "no worker ran on the client's runtime"
     );
     shut_down(client, before, &store)
 }
@@ -505,13 +575,9 @@ struct HostRoundTrip {
 
 static HOST_ROUND_TRIP: Mutex<Option<HostRoundTrip>> = Mutex::new(None);
 
-/// Installs the runtime and starts uploading `object` to `bucket/object` with
-/// 8 MiB-target parts, then downloading it, over [`HostHttp`].
+/// Starts uploading `object` to `bucket/object` with 8 MiB-target parts, then
+/// downloading it, over [`HostHttp`].
 pub(crate) fn host_round_trip_start(object: Bytes) -> Result<(), String> {
-    ensure!(
-        wasm::install_runtime(LogicalRuntime).is_ok(),
-        "a runtime was already installed"
-    );
     let before = host::stats();
     let client = client_on(SharedHttpConnector::new(HostHttp), |config| {
         config.part_size(PartSize::Target(8 * MIB as u64))
@@ -558,20 +624,22 @@ pub(crate) fn host_round_trip_step() -> Result<bool, String> {
     Ok(true)
 }
 
-/// Constructs a client before installing a runtime.
+/// Constructs a client whose runtime mode is the default, which this target
+/// does not support.
 pub(crate) fn client_without_runtime() {
     let store = MemoryS3::default();
-    drop(client(&store, |config| config));
+    let config = Config::builder()
+        .s3_config(&sdk_config(SharedHttpConnector::new(store), true))
+        .build();
+    drop(Client::new(config));
 }
 
-/// Installs the runtime, then constructs a client whose S3 configuration has
-/// no sleep implementation.
+/// Constructs a client whose S3 configuration has no sleep implementation.
 ///
 /// Timeouts, stalled-stream protection, and identity caching are disabled
 /// because the SDK itself rejects a configuration that enables them, or
 /// retries, without a sleep implementation.
 pub(crate) fn client_without_sleep() {
-    let _ = wasm::install_runtime(LogicalRuntime);
     let store = MemoryS3::default();
     let sdk = sdk_config(SharedHttpConnector::new(store), false)
         .into_builder()
@@ -579,6 +647,9 @@ pub(crate) fn client_without_sleep() {
         .stalled_stream_protection(StalledStreamProtectionConfig::disabled())
         .identity_cache(IdentityCache::no_cache())
         .build();
-    let config = Config::builder().s3_config(&sdk).build();
+    let config = Config::builder()
+        .s3_config(&sdk)
+        .runtime_mode(RuntimeMode::wasm(LogicalRuntime))
+        .build();
     drop(Client::new(config));
 }

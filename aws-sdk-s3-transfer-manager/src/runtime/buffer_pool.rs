@@ -22,6 +22,7 @@ use crate::config::MemoryDiagnosticsConfig;
 #[cfg(not(all(test, s3_tm_loom)))]
 use crate::runtime::sync::sync::atomic::{AtomicUsize, Ordering};
 use crate::runtime::sync::sync::{Arc, Mutex};
+use crate::runtime::Clock;
 
 mod acquisition;
 mod admission;
@@ -115,7 +116,8 @@ impl BufferPool {
         self.inner.geometry.carrier_size()
     }
 
-    /// Constructs an empty pool from capacity policy and detected memory.
+    /// Constructs an empty pool from capacity policy and detected memory,
+    /// timestamped by `clock`.
     ///
     /// Capacity and geometry are fixed before publication. Construction does
     /// not reserve virtual ranges, prepare backing, or start maintenance.
@@ -123,6 +125,7 @@ impl BufferPool {
         capacity: MemoryBudgetConfig,
         detected_memory: Option<usize>,
         diagnostics: MemoryDiagnosticsConfig,
+        clock: Clock,
     ) -> Result<Self, BufferPoolBuildError> {
         let resolved = PoolConfig::resolve(capacity, detected_memory)?;
         let arena_options = ArenaOptions::new(
@@ -134,6 +137,7 @@ impl BufferPool {
             resolved.configured_capacity,
             diagnostics,
             arena_options,
+            clock,
         )
         .unwrap_or_else(|_| invariant_violation("validated pool configuration was rejected")))
     }
@@ -144,6 +148,7 @@ impl BufferPool {
         configured_capacity: CarrierCount,
         diagnostics: MemoryDiagnosticsConfig,
         arena_options: ArenaOptions,
+        clock: Clock,
     ) -> Result<Self, ArenaError> {
         if configured_capacity == CarrierCount::ZERO {
             invariant_violation("configured capacity must be nonzero");
@@ -162,6 +167,7 @@ impl BufferPool {
             configured_capacity,
             diagnostics,
             arena_options,
+            clock,
         )?);
         inner.maintenance.start_periodic_diagnostics(&inner);
         tracing::debug!(
@@ -301,6 +307,8 @@ struct PoolInner {
     arena: Arena,
     /// Lazy maintenance and optional diagnostic-reporting worker.
     maintenance: MaintenanceCoordinator,
+    /// Clock that timestamps queue and maintenance observations.
+    clock: Clock,
     /// Per-pool failure injection and test-only observations.
     #[cfg(test)]
     test_hooks: TestHooks,
@@ -337,16 +345,18 @@ struct ReservationDrain {
 }
 
 impl PoolInner {
-    /// Constructs an empty pool domain without reserving virtual ranges.
+    /// Constructs an empty pool domain timed by `clock` without reserving
+    /// virtual ranges.
     fn new(
         geometry: PoolGeometry,
         configured_capacity: CarrierCount,
         diagnostics: MemoryDiagnosticsConfig,
         arena_options: ArenaOptions,
+        clock: Clock,
     ) -> Result<Self, ArenaError> {
         Ok(Self {
             geometry,
-            admission: Mutex::new(AdmissionState::new(configured_capacity)),
+            admission: Mutex::new(AdmissionState::new(configured_capacity, clock.now())),
             reservation_drain: ReservationDrainSignal::new(),
             #[cfg(not(all(test, s3_tm_loom)))]
             active_owner_returns: AtomicUsize::new(0),
@@ -356,7 +366,9 @@ impl PoolInner {
                 configured_capacity,
                 geometry,
                 diagnostics.snapshot_interval(),
+                clock.clone(),
             ),
+            clock,
             #[cfg(test)]
             test_hooks: TestHooks::new(),
         })
@@ -518,7 +530,7 @@ impl PoolInner {
                 envelope,
                 slot: Arc::clone(&slot),
             },
-            crate::types::TransferInstant::now(),
+            pool.clock.now(),
         ) {
             Ok(queue_became_nonempty) => queue_became_nonempty,
             Err(_) => {
@@ -550,9 +562,7 @@ impl PoolInner {
     /// Removes one cancelled queue link and reconsiders the exposed head.
     fn cancel_waiter(pool: &Arc<Self>, slot: &Arc<WaitSlot>) -> Vec<Waker> {
         let mut admission = AdmissionGuard::new(pool.admission.lock());
-        let queue_became_empty = admission
-            .inner
-            .remove_waiter(slot, crate::types::TransferInstant::now());
+        let queue_became_empty = admission.inner.remove_waiter(slot, pool.clock.now());
         let drained = Self::drain_fifo_locked(pool, &mut admission, queue_became_empty);
         drop(admission);
         if let Some(sample) = drained.queue_sample {
@@ -591,9 +601,7 @@ impl PoolInner {
 
             match &*slot_state {
                 WaitState::Taken => {
-                    let (_, cleared) = admission
-                        .inner
-                        .pop_front_waiter(crate::types::TransferInstant::now());
+                    let (_, cleared) = admission.inner.pop_front_waiter(pool.clock.now());
                     queue_became_empty |= cleared;
                     continue;
                 }
@@ -618,9 +626,7 @@ impl PoolInner {
                 Err(error) => WaitState::Failed(error),
             };
 
-            let (removed, cleared) = admission
-                .inner
-                .pop_front_waiter(crate::types::TransferInstant::now());
+            let (removed, cleared) = admission.inner.pop_front_waiter(pool.clock.now());
             queue_became_empty |= cleared;
             let Some(removed) = removed else {
                 invariant_violation("reservation head disappeared while admission was held");

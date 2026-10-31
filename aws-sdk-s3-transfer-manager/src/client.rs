@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::memory::BufferPool;
-use crate::runtime::{ExecutionRuntime, Timer};
+use crate::runtime::{Clock, ExecutionRuntime, Timer};
 
 /// Transfer manager client for Amazon Simple Storage Service.
 #[derive(Debug, Clone)]
@@ -29,7 +29,7 @@ pub struct Client {
 pub(crate) struct Handle {
     pub(crate) config: crate::Config,
     pub(crate) s3_client: aws_sdk_s3::Client,
-    /// Sleep and deadline primitives for transfer-manager retries and hedges.
+    /// Sleep, deadline, and clock primitives for the client's transfers.
     pub(crate) timer: Timer,
     pub(crate) scheduler: Scheduler,
     pub(crate) runtime: Arc<dyn ExecutionRuntime>,
@@ -163,7 +163,12 @@ impl Handle {
         Self::new_for_test_with_runtime(
             config,
             Arc::new(crate::scheduler::FixedConcurrency::new(concurrency)),
-            |weak| Arc::new(crate::runtime::TokioMultiThreadRuntime::new(weak)),
+            |weak| {
+                Arc::new(crate::runtime::TokioMultiThreadRuntime::new(
+                    weak,
+                    crate::runtime::Spawner::tokio(),
+                ))
+            },
         )
     }
 
@@ -222,6 +227,7 @@ impl Handle {
                 crate::types::MemoryBudgetConfig::Limit(DEFAULT_TEST_MEMORY_BUDGET_BYTES),
                 None,
                 memory_diagnostics,
+                Clock::system(),
             )
             .expect("test buffer-pool configuration must be valid"),
             MemoryConfig::Explicit(pool) => pool.clone(),
@@ -237,12 +243,15 @@ impl Handle {
             };
             Self {
                 config,
-                timer: Timer::from_s3_client(&s3_client),
+                timer: Timer::new(Clock::system(), &s3_client),
                 s3_client,
                 scheduler,
                 runtime,
                 controller,
-                telemetry: Arc::new(Telemetry::new(std::time::Duration::from_millis(500))),
+                telemetry: Arc::new(Telemetry::new(
+                    std::time::Duration::from_millis(500),
+                    Clock::system(),
+                )),
                 buffer_pool,
                 retry_partitions: std::sync::Mutex::new(std::collections::HashMap::new()),
             }
@@ -261,12 +270,22 @@ impl Client {
     ///
     /// # Panics
     ///
-    /// On `wasm32-unknown-unknown`, panics if no `wasm::WasmRuntime` is
-    /// installed or if the S3 configuration has no
+    /// On `wasm32-unknown-unknown`, panics if the configuration's runtime mode
+    /// is not `RuntimeMode::Wasm` or if the S3 configuration has no
     /// [`AsyncSleep`](aws_sdk_s3::config::AsyncSleep) implementation.
     pub fn new(mut config: Config) -> Client {
         #[cfg(all(target_family = "wasm", target_os = "unknown"))]
-        let _ = crate::wasm::runtime();
+        let wasm_runtime = match config.runtime_mode() {
+            RuntimeMode::Wasm(runtime) => runtime.clone(),
+            _ => panic!(
+                "wasm32-unknown-unknown requires RuntimeMode::Wasm; set it with \
+                 config::Builder::runtime_mode(RuntimeMode::wasm(runtime))"
+            ),
+        };
+        #[cfg(all(target_family = "wasm", target_os = "unknown"))]
+        let clock = Clock::from_runtime(wasm_runtime.clone());
+        #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+        let clock = Clock::system();
 
         // Machine facts for auto-sizing: use the loader-detected profile if the
         // config came through `ConfigLoader::load`, else detect locally (DMI +
@@ -286,7 +305,7 @@ impl Client {
             let target = resolve_concurrency_target(config.concurrency(), &profile);
             (
                 Arc::new(FixedConcurrency::new(target)),
-                Arc::new(Telemetry::new(Duration::from_millis(500))),
+                Arc::new(Telemetry::new(Duration::from_millis(500), clock.clone())),
             )
         };
 
@@ -301,6 +320,7 @@ impl Client {
                 crate::types::MemoryBudgetConfig::Auto,
                 profile.ram_bytes,
                 memory_diagnostics,
+                clock.clone(),
             )
             .expect("memory configuration must resolve to supported pool geometry"),
             MemoryConfig::Explicit(pool) => pool.clone(),
@@ -314,6 +334,17 @@ impl Client {
         }
         let handle = Arc::new_cyclic(|weak_handle| {
             let scheduler = Scheduler::new(weak_handle.clone());
+            #[cfg(all(target_family = "wasm", target_os = "unknown"))]
+            let runtime: Arc<dyn ExecutionRuntime> = {
+                if runtime_http.is_some_and(|http| !http.network_interfaces.is_empty()) {
+                    tracing::warn!("network interfaces are ignored under RuntimeMode::Wasm");
+                }
+                Arc::new(crate::runtime::TokioMultiThreadRuntime::new(
+                    weak_handle.clone(),
+                    crate::runtime::Spawner::from_runtime(wasm_runtime),
+                ))
+            };
+            #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
             let runtime: Arc<dyn ExecutionRuntime> = match config.runtime_mode() {
                 #[cfg(not(target_family = "wasm"))]
                 RuntimeMode::Managed => {
@@ -326,10 +357,11 @@ impl Client {
                     }
                     Arc::new(builder.build())
                 }
-                // wasm targets have no managed runtime; see `RuntimeMode::Managed`.
+                // WASI targets have no managed runtime; see `RuntimeMode::Managed`.
                 #[cfg(target_family = "wasm")]
                 RuntimeMode::Managed => Arc::new(crate::runtime::TokioMultiThreadRuntime::new(
                     weak_handle.clone(),
+                    crate::runtime::Spawner::tokio(),
                 )),
                 RuntimeMode::MultiThreadTokio => {
                     if runtime_http.is_some_and(|http| !http.network_interfaces.is_empty()) {
@@ -339,6 +371,7 @@ impl Client {
                     }
                     Arc::new(crate::runtime::TokioMultiThreadRuntime::new(
                         weak_handle.clone(),
+                        crate::runtime::Spawner::tokio(),
                     ))
                 }
             };
@@ -367,7 +400,7 @@ impl Client {
 
             Handle {
                 config,
-                timer: Timer::from_s3_client(&s3_client),
+                timer: Timer::new(clock, &s3_client),
                 s3_client,
                 scheduler,
                 runtime,
@@ -699,6 +732,7 @@ mod tests {
             crate::types::MemoryBudgetConfig::Limit(16 * ByteUnit::Mebibyte.as_bytes_usize()),
             None,
             crate::config::MemoryDiagnosticsConfig::default(),
+            crate::runtime::Clock::system(),
         )
         .unwrap();
         let carrier_size = pool.carrier_size();
@@ -754,6 +788,7 @@ mod tests {
             crate::types::MemoryBudgetConfig::Limit(16 * ByteUnit::Mebibyte.as_bytes_usize()),
             None,
             crate::config::MemoryDiagnosticsConfig::default(),
+            crate::runtime::Clock::system(),
         )
         .unwrap();
         let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);

@@ -17,6 +17,7 @@
 
 use crate::metrics::latency::LatencyTracker;
 use crate::metrics::IOCounters;
+use crate::runtime::Clock;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -49,11 +50,12 @@ pub(crate) struct Telemetry {
 }
 
 impl Telemetry {
-    /// Create telemetry with the given window duration for throughput counters.
-    pub(crate) fn new(counter_window: Duration) -> Self {
+    /// Create telemetry timed by `clock` with the given window duration for
+    /// throughput counters.
+    pub(crate) fn new(counter_window: Duration, clock: Clock) -> Self {
         Self {
             recv_latencies: LatencyTracker::new(),
-            io_counters: Arc::new(IOCounters::new(counter_window)),
+            io_counters: Arc::new(IOCounters::new(counter_window, clock)),
         }
     }
 }

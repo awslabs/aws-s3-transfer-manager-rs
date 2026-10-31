@@ -93,7 +93,7 @@ struct PoolDiagnosticSnapshot {
 impl PoolDiagnosticSnapshot {
     /// Captures independent subsystem samples without nesting their locks.
     fn capture(pool: &PoolInner) -> Self {
-        let captured_at = Instant::now();
+        let captured_at = pool.clock.now();
         let (memory, queue) = pool.diagnostic_memory_sample(captured_at);
         let arena = pool.arena.diagnostics();
         let maintenance = pool.maintenance.diagnostics();

@@ -17,7 +17,6 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use crate::runtime::Timer;
-use crate::types::TransferInstant as Instant;
 
 /// Successful samples required before a deadline is applied. Below this the
 /// controller only observes latency and buffers samples for the seed;
@@ -340,18 +339,18 @@ impl LatencyTracker {
     where
         Fut: Future<Output = Result<T, E>>,
     {
-        let start = Instant::now();
+        let start = timer.clock().now();
         match self.hedge_deadline(allow_hedge) {
             None => match fut.await {
                 Ok(val) => {
-                    self.record(start.elapsed());
+                    self.record(timer.clock().elapsed(start));
                     Ok(val)
                 }
                 Err(e) => Err(GuardError::Inner(e)),
             },
             Some(dl) => match timer.timeout(dl, fut).await {
                 Ok(Ok(val)) => {
-                    self.record(start.elapsed());
+                    self.record(timer.clock().elapsed(start));
                     Ok(val)
                 }
                 Ok(Err(e)) => Err(GuardError::Inner(e)),

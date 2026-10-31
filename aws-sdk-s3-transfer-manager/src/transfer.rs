@@ -446,6 +446,7 @@ pub(crate) struct MetricsState {
     disk_read: AtomicU64,
     disk_write: AtomicU64,
     total_bytes: std::sync::OnceLock<u64>,
+    clock: crate::runtime::Clock,
     started_at: crate::types::TransferInstant,
     finished_at: std::sync::OnceLock<crate::types::TransferInstant>,
     terminal_reported: AtomicBool,
@@ -453,14 +454,16 @@ pub(crate) struct MetricsState {
 }
 
 impl MetricsState {
-    pub(crate) fn new() -> Self {
+    /// Creates metrics for a transfer starting now on `clock`.
+    pub(crate) fn new(clock: crate::runtime::Clock) -> Self {
         Self {
             network_tx: AtomicU64::new(0),
             network_rx: AtomicU64::new(0),
             disk_read: AtomicU64::new(0),
             disk_write: AtomicU64::new(0),
             total_bytes: std::sync::OnceLock::new(),
-            started_at: crate::types::TransferInstant::now(),
+            started_at: clock.now(),
+            clock,
             finished_at: std::sync::OnceLock::new(),
             terminal_reported: AtomicBool::new(false),
             request_metrics: crate::metrics::RequestMetricsState::default(),
@@ -486,7 +489,7 @@ impl MetricsState {
 
     /// Mark the transfer as finished. No-op if already set.
     pub(crate) fn set_finished(&self) {
-        let _ = self.finished_at.set(crate::types::TransferInstant::now());
+        let _ = self.finished_at.set(self.clock.now());
     }
 
     /// Claims the single terminal tracing record for this transfer.
@@ -587,7 +590,7 @@ pub(crate) struct RequestMeasurement {
 ///
 /// [`tokio::time::Instant`] follows the tokio test clock when it is paused and
 /// the system monotonic clock otherwise. `wasm32-unknown-unknown` has neither,
-/// so request time there comes from the installed runtime.
+/// so request time there comes from the client's clock.
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 type RequestInstant = tokio::time::Instant;
 
@@ -597,12 +600,26 @@ type RequestInstant = crate::types::TransferInstant;
 
 impl RequestMeasurement {
     fn new(ctx: TransferContext) -> Self {
+        let running_since = Some(Self::now(&ctx));
         Self {
             ctx,
             accrued: std::time::Duration::ZERO,
-            running_since: Some(RequestInstant::now()),
+            running_since,
             metrics: crate::metrics::RequestMetrics::default(),
             published: false,
+        }
+    }
+
+    /// Reads [`RequestInstant`] for the transfer described by `ctx`.
+    fn now(ctx: &TransferContext) -> RequestInstant {
+        #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+        {
+            let _ = ctx;
+            RequestInstant::now()
+        }
+        #[cfg(all(target_family = "wasm", target_os = "unknown"))]
+        {
+            ctx.handle.timer.clock().now()
         }
     }
 
@@ -617,7 +634,7 @@ impl RequestMeasurement {
     /// No-op when already paused.
     pub(crate) fn pause(&mut self) {
         if let Some(since) = self.running_since.take() {
-            self.accrued += since.elapsed();
+            self.accrued += Self::now(&self.ctx).saturating_duration_since(since);
         }
     }
 
@@ -626,16 +643,16 @@ impl RequestMeasurement {
     /// No-op when already running.
     pub(crate) fn resume(&mut self) {
         if self.running_since.is_none() {
-            self.running_since = Some(RequestInstant::now());
+            self.running_since = Some(Self::now(&self.ctx));
         }
     }
 
     /// Elapsed time accrued so far, including the current running interval.
     fn elapsed(&self) -> std::time::Duration {
         self.accrued
-            + self
-                .running_since
-                .map_or(std::time::Duration::ZERO, |s| s.elapsed())
+            + self.running_since.map_or(std::time::Duration::ZERO, |s| {
+                Self::now(&self.ctx).saturating_duration_since(s)
+            })
     }
 
     /// Complete and publish this logical request.
@@ -819,12 +836,16 @@ impl TransferContext {
     ) -> (Self, StateMachineTerminalReceiver) {
         let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
         let diagnostics = handle.config.diagnostics().transfer();
-        let pending_state = diagnostics
-            .enable_summaries()
-            .then(|| Arc::new(TransferPendingState::new(diagnostics.events_enabled())));
+        let clock = handle.timer.clock();
+        let pending_state = diagnostics.enable_summaries().then(|| {
+            Arc::new(TransferPendingState::new(
+                diagnostics.events_enabled(),
+                clock.clone(),
+            ))
+        });
         let ctx = Self {
             id,
-            metrics: Arc::new(MetricsState::new()),
+            metrics: Arc::new(MetricsState::new(clock.clone())),
             handle,
             status: StateMachineStatus::new(),
             error: Arc::new(Mutex::new(None)),

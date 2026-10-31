@@ -278,7 +278,7 @@ pub(crate) async fn rename_async(from: &Path, to: &Path) -> io::Result<()> {
 
 /// Renames `from` to `to`.
 ///
-/// Uses [`tokio::fs::rename`], or [`std::fs::rename`] on the calling thread on
+/// Uses `tokio::fs::rename`, or [`std::fs::rename`] on the calling thread on
 /// wasm targets, where tokio's blocking pool is unavailable. Returns the
 /// rename's result.
 #[cfg(target_family = "wasm")]
@@ -298,7 +298,7 @@ pub(crate) async fn remove_file_async(path: &Path) -> io::Result<()> {
 
 /// Removes the file at `path`.
 ///
-/// Uses [`tokio::fs::remove_file`], or [`std::fs::remove_file`] on the calling
+/// Uses `tokio::fs::remove_file`, or [`std::fs::remove_file`] on the calling
 /// thread on wasm targets, where tokio's blocking pool is unavailable. Returns
 /// the removal's result.
 #[cfg(target_family = "wasm")]

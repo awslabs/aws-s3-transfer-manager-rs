@@ -88,10 +88,9 @@ pub enum RuntimeMode {
     ///
     /// Spawns and owns its own worker threads; the performance path.
     ///
-    /// On wasm targets, which cannot run managed threads, this mode behaves as
-    /// [`MultiThreadTokio`](Self::MultiThreadTokio) and accepts a
-    /// current-thread runtime. On `wasm32-unknown-unknown`, both modes run on
-    /// the installed `wasm::WasmRuntime` and need no tokio runtime.
+    /// On the WASI targets, which cannot run managed threads, this mode
+    /// behaves as [`MultiThreadTokio`](Self::MultiThreadTokio) and accepts a
+    /// current-thread runtime. `wasm32-unknown-unknown` supports only `Wasm`.
     #[default]
     Managed,
     /// Run on the caller's tokio multi-threaded runtime instead of spawning
@@ -104,11 +103,26 @@ pub enum RuntimeMode {
     ///
     /// Requires a multi-threaded runtime: transfer workers run via
     /// `tokio::spawn`, so on a current-thread runtime they serialize onto one
-    /// thread and throughput collapses. wasm targets are the exception: their
-    /// threads are unavailable or cooperative, so a current-thread runtime is
-    /// supported there. On `wasm32-unknown-unknown`, workers run on the
-    /// installed `wasm::WasmRuntime` instead of a tokio runtime.
+    /// thread and throughput collapses. The WASI targets are the exception:
+    /// their threads are unavailable or cooperative, so a current-thread
+    /// runtime is supported there. `wasm32-unknown-unknown` supports only
+    /// `Wasm`.
     MultiThreadTokio,
+    /// Run on a host-supplied runtime, which also supplies the monotonic
+    /// clock.
+    ///
+    /// The only mode on `wasm32-unknown-unknown`, which has no tokio runtime
+    /// or monotonic clock of its own. [`wasm`](Self::wasm) constructs it.
+    #[cfg(all(target_family = "wasm", target_os = "unknown"))]
+    Wasm(crate::wasm::SharedWasmRuntime),
+}
+
+impl RuntimeMode {
+    /// Runs the client on `runtime`.
+    #[cfg(all(target_family = "wasm", target_os = "unknown"))]
+    pub fn wasm(runtime: impl crate::wasm::WasmRuntime) -> Self {
+        Self::Wasm(crate::wasm::SharedWasmRuntime::new(runtime))
+    }
 }
 
 /// The concurrency mode the client should use for executing requests.
@@ -330,7 +344,8 @@ pub struct TransferMetrics {
 /// This is [`std::time::Instant`] on every target except
 /// `wasm32-unknown-unknown`. That target has no standard monotonic clock, so it
 /// uses a type with the same monotonic operations whose time comes from the
-/// installed `wasm::WasmRuntime`.
+/// client's `wasm::WasmRuntime`. Its `now` and `elapsed` take that runtime as
+/// an argument.
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 pub type TransferInstant = std::time::Instant;
 

@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use crate::runtime::sync::sync::atomic::{AtomicBool, Ordering};
 use crate::runtime::sync::sync::Mutex;
+use crate::runtime::Clock;
 use crate::types::TransferInstant as Instant;
 
 use super::TransferId;
@@ -220,15 +221,18 @@ impl Default for PendingData {
 pub(crate) struct TransferPendingState {
     interval_open: AtomicBool,
     emit_events: bool,
+    clock: Clock,
     data: Mutex<PendingData>,
 }
 
 impl TransferPendingState {
-    /// Creates enabled state with optional per-event diagnostic records.
-    pub(crate) fn new(emit_events: bool) -> Self {
+    /// Creates enabled state that reads `clock`, with optional per-event
+    /// diagnostic records.
+    pub(crate) fn new(emit_events: bool, clock: Clock) -> Self {
         Self {
             interval_open: AtomicBool::new(false),
             emit_events,
+            clock,
             data: Mutex::new(PendingData::default()),
         }
     }
@@ -241,7 +245,7 @@ impl TransferPendingState {
             return;
         }
 
-        if self.record_pending_at(cause, Instant::now()) && self.emit_events {
+        if self.record_pending_at(cause, self.clock.now()) && self.emit_events {
             tracing::trace!(
                 target: crate::telemetry::TARGET_TRANSFER,
                 tid = %id,
@@ -262,7 +266,7 @@ impl TransferPendingState {
             return;
         }
 
-        if let Some((cause, elapsed)) = self.record_wake_at(Instant::now()) {
+        if let Some((cause, elapsed)) = self.record_wake_at(self.clock.now()) {
             if self.emit_events {
                 tracing::trace!(
                     target: crate::telemetry::TARGET_TRANSFER,
@@ -286,7 +290,7 @@ impl TransferPendingState {
             return;
         }
 
-        if let Some(interval) = self.record_poll_started_at(Instant::now()) {
+        if let Some(interval) = self.record_poll_started_at(self.clock.now()) {
             if self.emit_events {
                 if let (Some(wait), Some(scheduler_delay)) =
                     (interval.pending_to_wake, interval.scheduler_delay)
@@ -325,7 +329,7 @@ impl TransferPendingState {
             return;
         }
 
-        if let Some((cause, elapsed)) = self.record_terminal_at(Instant::now()) {
+        if let Some((cause, elapsed)) = self.record_terminal_at(self.clock.now()) {
             if self.emit_events {
                 tracing::trace!(
                     target: crate::telemetry::TARGET_TRANSFER,
@@ -494,7 +498,7 @@ mod tests {
 
     #[test]
     fn pending_wake_and_next_poll_record_one_interval() {
-        let pending = TransferPendingState::new(false);
+        let pending = TransferPendingState::new(false, Clock::system());
         let start = Instant::now();
         let wake = start + Duration::from_millis(7);
         let next_poll = wake + Duration::from_millis(3);
@@ -521,7 +525,7 @@ mod tests {
 
     #[test]
     fn repeated_wakes_keep_the_first_endpoint() {
-        let pending = TransferPendingState::new(false);
+        let pending = TransferPendingState::new(false, Clock::system());
         let start = Instant::now();
 
         assert!(pending.record_pending_at(cause(PendingCategory::Source), start));
@@ -543,7 +547,7 @@ mod tests {
 
     #[test]
     fn wake_before_pending_is_backfilled_once() {
-        let pending = TransferPendingState::new(false);
+        let pending = TransferPendingState::new(false, Clock::system());
         let start = Instant::now();
 
         assert_eq!(pending.record_wake_at(start), None);
@@ -566,7 +570,7 @@ mod tests {
 
     #[test]
     fn terminal_closure_is_idempotent_and_retains_cause() {
-        let pending = TransferPendingState::new(false);
+        let pending = TransferPendingState::new(false, Clock::system());
         let start = Instant::now();
         let cause = cause(PendingCategory::InFlightWork);
 
@@ -588,7 +592,7 @@ mod tests {
 
     #[test]
     fn aggregate_pending_time_includes_polled_and_terminal_intervals() {
-        let pending = TransferPendingState::new(false);
+        let pending = TransferPendingState::new(false, Clock::system());
         let start = Instant::now();
 
         assert!(pending.record_pending_at(cause(PendingCategory::Memory), start));
@@ -613,7 +617,7 @@ mod tests {
 
     #[test]
     fn idle_polls_do_not_create_intervals() {
-        let pending = TransferPendingState::new(false);
+        let pending = TransferPendingState::new(false, Clock::system());
         assert!(pending.record_poll_started_at(Instant::now()).is_none());
         assert_eq!(
             pending.snapshot(),
@@ -633,7 +637,7 @@ mod loom_tests {
     #[test]
     fn wake_racing_pending_is_reconciled_by_backfill() {
         loom::model(|| {
-            let pending = Arc::new(TransferPendingState::new(false));
+            let pending = Arc::new(TransferPendingState::new(false, Clock::system()));
             let now = Instant::now();
 
             let poll_state = Arc::clone(&pending);

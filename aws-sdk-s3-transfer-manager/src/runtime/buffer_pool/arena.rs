@@ -1331,7 +1331,10 @@ mod tests {
     }
 
     fn admission_with_prepared(prepared: CarrierCount) -> Mutex<AdmissionState> {
-        let state = Mutex::new(AdmissionState::new(MAX_PACKED_CARRIERS));
+        let state = Mutex::new(AdmissionState::new(
+            MAX_PACKED_CARRIERS,
+            crate::types::TransferInstant::now(),
+        ));
         {
             let mut admission = AdmissionGuard::new(state.lock());
             *admission.prepared_capacity_mut() = prepared;
@@ -2517,7 +2520,10 @@ mod loom_tests {
     }
 
     fn admission_with_prepared(prepared: CarrierCount) -> Mutex<AdmissionState> {
-        let state = Mutex::new(AdmissionState::new(MAX_PACKED_CARRIERS));
+        let state = Mutex::new(AdmissionState::new(
+            MAX_PACKED_CARRIERS,
+            crate::types::TransferInstant::now(),
+        ));
         {
             let mut admission = AdmissionGuard::new(state.lock());
             *admission.prepared_capacity_mut() = prepared;

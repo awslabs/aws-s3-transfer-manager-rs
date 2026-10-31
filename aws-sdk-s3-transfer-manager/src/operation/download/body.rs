@@ -1516,6 +1516,7 @@ mod tests {
             MemoryBudgetConfig::Limit(1024 * 1024),
             None,
             crate::config::MemoryDiagnosticsConfig::default(),
+            crate::runtime::Clock::system(),
         )
         .expect("test pool");
         let carrier_size = pool.carrier_size();

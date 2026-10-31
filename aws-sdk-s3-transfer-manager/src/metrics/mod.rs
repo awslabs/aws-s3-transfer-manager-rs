@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
+use crate::runtime::Clock;
 use crate::types::TransferInstant as Instant;
 
 /// Point-in-time operational metrics for one transfer-manager client.
@@ -513,6 +514,8 @@ pub(crate) struct IOWindow {
     buckets: [Bucket; IO_WINDOW_BUCKETS],
     /// Monotonic counter. `current_idx % IO_WINDOW_BUCKETS` is the active slot.
     current_idx: AtomicUsize,
+    /// Clock that times bucket rotation.
+    clock: Clock,
     /// Start time of the current bucket's time slice.
     bucket_start: Mutex<Instant>,
     bucket_duration: Duration,
@@ -520,7 +523,7 @@ pub(crate) struct IOWindow {
 }
 
 impl IOWindow {
-    pub(crate) fn new(window_duration: Duration) -> Self {
+    pub(crate) fn new(window_duration: Duration, clock: Clock) -> Self {
         let bucket_duration = window_duration / IO_WINDOW_BUCKETS as u32;
         let buckets = std::array::from_fn(|_| Bucket {
             bytes: AtomicU64::new(0),
@@ -529,7 +532,8 @@ impl IOWindow {
         Self {
             buckets,
             current_idx: AtomicUsize::new(0),
-            bucket_start: Mutex::new(Instant::now()),
+            bucket_start: Mutex::new(clock.now()),
+            clock,
             bucket_duration,
             window_duration,
         }
@@ -542,7 +546,7 @@ impl IOWindow {
     /// If more than `IO_WINDOW_BUCKETS` durations have elapsed, the entire
     /// ring is stale — clears all buckets in one step instead of looping.
     fn maybe_rotate(&self, guard: &mut std::sync::MutexGuard<'_, Instant>) -> usize {
-        let elapsed = guard.elapsed();
+        let elapsed = self.clock.elapsed(**guard);
         if elapsed < self.bucket_duration {
             return self.current_idx.load(Ordering::Acquire);
         }
@@ -560,7 +564,7 @@ impl IOWindow {
             current
         } else {
             let mut current = self.current_idx.load(Ordering::Acquire);
-            while guard.elapsed() >= self.bucket_duration {
+            while self.clock.elapsed(**guard) >= self.bucket_duration {
                 current = self.current_idx.fetch_add(1, Ordering::AcqRel) + 1;
                 let slot = current % IO_WINDOW_BUCKETS;
                 self.buckets[slot].bytes.store(0, Ordering::Release);
@@ -628,13 +632,14 @@ pub(crate) struct IOCounters {
 }
 
 impl IOCounters {
-    /// Create counters with the given window duration for all windows.
-    pub(crate) fn new(window_duration: Duration) -> Self {
+    /// Create counters timed by `clock` with the given window duration for all
+    /// windows.
+    pub(crate) fn new(window_duration: Duration, clock: Clock) -> Self {
         Self {
-            network_tx: IOWindow::new(window_duration),
-            network_rx: IOWindow::new(window_duration),
-            disk_read: IOWindow::new(window_duration),
-            disk_write: IOWindow::new(window_duration),
+            network_tx: IOWindow::new(window_duration, clock.clone()),
+            network_rx: IOWindow::new(window_duration, clock.clone()),
+            disk_read: IOWindow::new(window_duration, clock.clone()),
+            disk_write: IOWindow::new(window_duration, clock),
         }
     }
 
@@ -942,10 +947,11 @@ mod tests {
     // --- IOWindow tests ---
 
     use super::IOWindow;
+    use crate::runtime::Clock;
 
     #[test]
     fn io_window_empty_returns_zero() {
-        let w = IOWindow::new(Duration::from_millis(500));
+        let w = IOWindow::new(Duration::from_millis(500), Clock::system());
         assert_eq!(w.throughput(), 0.0);
         assert!(w.is_idle());
     }
@@ -953,7 +959,7 @@ mod tests {
     #[test]
     fn io_window_single_add() {
         // 1MB in a 1s window = 1MB/s
-        let w = IOWindow::new(Duration::from_secs(1));
+        let w = IOWindow::new(Duration::from_secs(1), Clock::system());
         w.add(1_000_000);
         let tp = w.throughput();
         assert!((tp - 1_000_000.0).abs() < 1.0, "expected ~1MB/s, got {tp}");
@@ -962,7 +968,7 @@ mod tests {
 
     #[test]
     fn io_window_multiple_adds_accumulate() {
-        let w = IOWindow::new(Duration::from_secs(1));
+        let w = IOWindow::new(Duration::from_secs(1), Clock::system());
         w.add(500_000);
         w.add(500_000);
         let tp = w.throughput();
@@ -971,7 +977,7 @@ mod tests {
 
     #[test]
     fn io_window_stale_buckets_evicted() {
-        let w = IOWindow::new(Duration::from_millis(100));
+        let w = IOWindow::new(Duration::from_millis(100), Clock::system());
         w.add(1_000_000);
         assert!(!w.is_idle());
         // Sleep past the full window duration
@@ -985,7 +991,7 @@ mod tests {
     #[test]
     fn io_window_spans_multiple_buckets() {
         // Window = 500ms, bucket = 50ms. Add to two different buckets.
-        let w = IOWindow::new(Duration::from_millis(500));
+        let w = IOWindow::new(Duration::from_millis(500), Clock::system());
         w.add(500_000);
         // Sleep past one bucket duration to force rotation
         std::thread::sleep(Duration::from_millis(60));
@@ -1005,7 +1011,7 @@ mod tests {
 
     #[test]
     fn io_counters_network_throughput() {
-        let c = IOCounters::new(Duration::from_secs(1));
+        let c = IOCounters::new(Duration::from_secs(1), Clock::system());
         c.record(&IoSample {
             network_tx: 1_000_000,
             network_rx: 2_000_000,
@@ -1017,7 +1023,7 @@ mod tests {
 
     #[test]
     fn io_counters_disk_throughput() {
-        let c = IOCounters::new(Duration::from_secs(1));
+        let c = IOCounters::new(Duration::from_secs(1), Clock::system());
         c.record(&IoSample {
             disk_read: 4_000_000,
             disk_write: 1_000_000,
@@ -1029,7 +1035,7 @@ mod tests {
 
     #[test]
     fn io_counters_total_throughput() {
-        let c = IOCounters::new(Duration::from_secs(1));
+        let c = IOCounters::new(Duration::from_secs(1), Clock::system());
         c.record(&IoSample {
             network_tx: 1_000_000,
             network_rx: 2_000_000,
@@ -1049,7 +1055,7 @@ mod tests {
 
     #[test]
     fn io_counters_is_idle_when_all_idle() {
-        let c = IOCounters::new(Duration::from_millis(100));
+        let c = IOCounters::new(Duration::from_millis(100), Clock::system());
         assert!(c.is_idle());
         c.record(&IoSample {
             network_tx: 1_000,

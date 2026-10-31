@@ -128,8 +128,11 @@ impl UploadTransfer {
         // and at completion hold the body to exactly that many bytes.
         let size_hint = apply_content_length(size_hint, request.content_length())
             .map_err(crate::error::invalid_input)?;
-        let observability =
-            UploadObservability::new(ctx.handle.config.diagnostics().transfer(), size_hint);
+        let observability = UploadObservability::new(
+            ctx.handle.config.diagnostics().transfer(),
+            size_hint,
+            ctx.handle.timer.clock(),
+        );
 
         // Only equal bounds are a known total. A bounded stream reports no total while in progress;
         // its actual size is published after EOF.
@@ -974,7 +977,8 @@ impl UploadTransfer {
             response_builder,
         } = completion;
         let transfer_diagnostics = self.inner.ctx.handle.config.diagnostics().transfer();
-        let completion_timer = UploadDiagnosticTimer::start(transfer_diagnostics);
+        let completion_timer =
+            UploadDiagnosticTimer::start(transfer_diagnostics, self.inner.ctx.handle.timer.clock());
         let upload_id = {
             let state = self.inner.state.lock().expect("lock poisoned");
             match &*state {

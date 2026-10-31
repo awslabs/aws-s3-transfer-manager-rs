@@ -6,6 +6,7 @@
 //! Deterministic pool construction for tests and fuzzing.
 
 use crate::config::MemoryDiagnosticsConfig;
+use crate::runtime::Clock;
 
 use super::super::arena::ArenaOptions;
 use super::super::geometry::PoolGeometry;
@@ -37,6 +38,7 @@ pub(in crate::runtime::buffer_pool) fn test_pool_with_carrier_size(
         CarrierCount::new(configured),
         diagnostics,
         options,
+        Clock::system(),
     )
     .expect("valid test pool");
     (pool, carrier_size)
@@ -60,6 +62,7 @@ pub(in crate::runtime::buffer_pool) fn test_guarded_pool(
         CarrierCount::new(configured),
         MemoryDiagnosticsConfig::for_test(None, 1),
         options,
+        Clock::system(),
     )
     .expect("valid guarded pool");
     (pool, page_size)
@@ -101,6 +104,7 @@ pub(in crate::runtime::buffer_pool) fn test_pool_with_scan_and_diagnostics(
         CarrierCount::new(configured),
         diagnostics,
         options,
+        Clock::system(),
     )
     .expect("valid test pool");
     (pool, page_size)
