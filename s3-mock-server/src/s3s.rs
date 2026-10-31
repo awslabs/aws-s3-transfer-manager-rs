@@ -517,10 +517,10 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         };
         check_if_match(input.if_match.as_ref(), &metadata)?;
 
-        // A HEAD carrying a `Range` is answered 206: `Content-Length` is the range's
+        // A HEAD carrying a `Range` describes the range: `Content-Length` is the range's
         // length and `Content-Range` names the offsets, which is the only thing that
-        // tells a caller WHERE a suffix or open-ended range landed. Checksums follow
-        // the same rule as a ranged GET.
+        // tells a caller WHERE a suffix or open-ended range landed. s3s answers 200, where
+        // S3 answers 206. Checksums follow the same rule as a ranged GET.
         let mut range = input
             .range
             .as_ref()
