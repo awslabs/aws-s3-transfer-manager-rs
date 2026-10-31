@@ -2499,16 +2499,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "in-memory-s3"
-version = "0.1.0"
-dependencies = [
- "aws-smithy-runtime-api",
- "aws-smithy-types",
- "bytes",
- "tokio",
-]
-
-[[package]]
 name = "indexmap"
 version = "2.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4814,7 +4804,6 @@ dependencies = [
  "crossbeam-epoch",
  "hyper 1.11.1",
  "hyper-util",
- "in-memory-s3",
  "tokio",
  "tower-service",
 ]

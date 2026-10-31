@@ -10,20 +10,19 @@
 //! is an empty, writable directory that the host preopens, and
 //! `<server-address>` is the IP address and port of a running
 //! `s3-mock-server`, such as `127.0.0.1:49152`. The server must have the
-//! bucket `bucket`, and the host must let the module open TCP connections to
-//! the address.
+//! bucket `bucket` and answer the first request for `bucket/retried` with
+//! `503 SlowDown`, as `s3-mock-server --slow-down-once bucket/retried bucket`
+//! does. The host must let the module open TCP connections to the address.
 //!
-//! The binary runs every scenario on a current-thread tokio runtime. Most
-//! scenarios run twice: against an in-memory S3 connector, and over HTTP to the
-//! server. File scenarios read and write under `<work-dir>`. The binary first
-//! prints `wasm32-wasi-tests: <count> scenarios on <target>`, where each run
-//! counts as a scenario. For each run that passes it prints `PASS <transport>
-//! <scenario>: <summary>`, where the transport is `in-memory` or `HTTP`, and
-//! the summary counts the requests the run sent and the tasks that exited when
-//! its client was dropped. After the last run it prints `<count> scenarios
-//! passed`. On the first failure it prints `FAIL <transport> <scenario>:
-//! <reason>` to standard error and exits with status 1. A panic aborts the
-//! module.
+//! The binary runs every scenario on a current-thread tokio runtime, sending
+//! requests over HTTP to the server, and file scenarios read and write under
+//! `<work-dir>`. It first prints `wasm32-wasi-tests: <count> scenarios on
+//! <target>`. For each scenario that passes it prints `PASS <scenario>:
+//! <summary>`, where the summary counts the requests the scenario's clients
+//! sent and the tasks that exited when its client was dropped. After the last
+//! scenario it prints `<count> scenarios passed`. On the first failure it
+//! prints `FAIL <scenario>: <reason>` to standard error and exits with status
+//! 1. A panic aborts the module.
 //!
 //! On other targets the binary prints an error and exits with status 1.
 

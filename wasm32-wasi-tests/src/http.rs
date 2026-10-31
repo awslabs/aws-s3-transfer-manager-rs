@@ -25,45 +25,37 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::net::TcpStream;
 
-#[derive(Debug, Default)]
-struct Counts {
-    requests: AtomicUsize,
-    connections: AtomicUsize,
-}
-
 /// Sends every request to one server over a pool of HTTP/1.1 connections,
 /// whatever the request URI's authority.
 ///
-/// Clones share the pool and the counts. A spawned task drives each
+/// Clones share the pool and the connection count. A spawned task drives each
 /// connection and exits once the connection closes or every clone is dropped
 /// while the connection is idle. Every request error is reported as an I/O
 /// error.
 #[derive(Clone, Debug)]
 pub(crate) struct TcpHttp {
     client: Client<Connect, SdkBody>,
-    counts: Arc<Counts>,
+    connections: Arc<AtomicUsize>,
 }
 
 impl TcpHttp {
     /// Returns a connector with an empty pool for `server`.
     pub(crate) fn new(server: SocketAddr) -> Self {
-        let counts = Arc::new(Counts::default());
+        let connections = Arc::new(AtomicUsize::new(0));
         let connect = Connect {
             server,
-            counts: Arc::clone(&counts),
+            connections: Arc::clone(&connections),
         };
         let client = Client::builder(TokioExecutor::new()).build(connect);
-        Self { client, counts }
-    }
-
-    /// The number of requests sent.
-    pub(crate) fn requests(&self) -> usize {
-        self.counts.requests.load(Ordering::Relaxed)
+        Self {
+            client,
+            connections,
+        }
     }
 
     /// The number of connections opened.
     pub(crate) fn connections(&self) -> usize {
-        self.counts.connections.load(Ordering::Relaxed)
+        self.connections.load(Ordering::Relaxed)
     }
 }
 
@@ -73,7 +65,6 @@ impl HttpConnector for TcpHttp {
             Ok(request) => request,
             Err(e) => return HttpConnectorFuture::ready(Err(ConnectorError::user(e.into()))),
         };
-        self.counts.requests.fetch_add(1, Ordering::Relaxed);
         let response = self.client.request(request);
         HttpConnectorFuture::new(async move {
             let response = response.await.map_err(|e| ConnectorError::io(e.into()))?;
@@ -87,7 +78,7 @@ impl HttpConnector for TcpHttp {
 #[derive(Clone, Debug)]
 struct Connect {
     server: SocketAddr,
-    counts: Arc<Counts>,
+    connections: Arc<AtomicUsize>,
 }
 
 impl tower_service::Service<hyper::Uri> for Connect {
@@ -101,11 +92,11 @@ impl tower_service::Service<hyper::Uri> for Connect {
 
     fn call(&mut self, _uri: hyper::Uri) -> Self::Future {
         let server = self.server;
-        let counts = Arc::clone(&self.counts);
+        let connections = Arc::clone(&self.connections);
         Box::pin(async move {
             let stream = TcpStream::connect(server).await?;
             stream.set_nodelay(true)?;
-            counts.connections.fetch_add(1, Ordering::Relaxed);
+            connections.fetch_add(1, Ordering::Relaxed);
             Ok(TokioIo::new(stream))
         })
     }

@@ -427,7 +427,7 @@ jobs:
           log="$RUNNER_TEMP/wasi-harness.log"
           server_log="$RUNNER_TEMP/s3-mock-server.log"
           mkdir -p "$work"
-          target/debug/s3-mock-server bucket > "$server_log" 2>&1 &
+          target/debug/s3-mock-server --slow-down-once bucket/retried bucket > "$server_log" 2>&1 &
           server=$!
           trap 'kill "$server" 2>/dev/null || true' EXIT
           # The server prints its loopback address once it accepts connections.

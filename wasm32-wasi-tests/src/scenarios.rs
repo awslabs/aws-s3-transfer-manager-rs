@@ -3,8 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Transfer scenarios against the in-memory S3 connector and the mock S3
-//! server.
+//! Transfer scenarios against the mock S3 server.
 //!
 //! Each scenario uses a fresh [`Store`] and client, then drops both. Every
 //! task they spawned must exit by then. File scenarios work in their own
@@ -22,7 +21,7 @@ use aws_sdk_s3_transfer_manager::Client;
 use aws_smithy_types::error::display::DisplayErrorContext;
 use bytes::Bytes;
 
-use crate::store::{Store, Transport};
+use crate::store::Store;
 
 const KIB: usize = 1024;
 const MIB: usize = 1024 * KIB;
@@ -55,43 +54,38 @@ macro_rules! ensure {
     };
 }
 
-/// Runs every scenario in order, once over each of its transports, and returns
-/// the first failure. `server` is the mock S3 server's address.
+/// Runs every scenario in order and returns the first failure. `server` is the
+/// mock S3 server's address.
 ///
-/// Prints `wasm32-wasi-tests: <count> scenarios on <target>` first, where each
-/// run over a transport counts as a scenario. Then prints `PASS <transport>
-/// <scenario>: <summary>` for each run, where the transport is `in-memory` or
-/// `HTTP` and the summary lists the requests the run sent and the tasks that
-/// exited. Prints `<count> scenarios passed` last.
+/// Prints `wasm32-wasi-tests: <count> scenarios on <target>` first, then
+/// `PASS <scenario>: <summary>` for each scenario, where the summary lists the
+/// requests the scenario's clients sent and the tasks that exited, then
+/// `<count> scenarios passed`.
 pub(crate) async fn run_all(work: &Path, server: SocketAddr) -> Result<(), String> {
     macro_rules! scenarios {
-        ($($name:literal => $scenario:ident over [$($transport:ident),+]),+ $(,)?) => {{
-            let count = [$($(Transport::$transport),+),+].len();
+        ($($name:literal => $scenario:ident),+ $(,)?) => {{
+            let count = [$($name),+].len();
             println!("wasm32-wasi-tests: {count} scenarios on {TARGET}");
-            $($(
-                let name = format!("{} {}", Transport::$transport, $name);
-                let store = Store::new(Transport::$transport, server);
-                let summary = $scenario(store, &work.join(name.replace(' ', "-")))
+            $(
+                let summary = $scenario(Store::new(server), &work.join($name.replace(' ', "-")))
                     .await
-                    .map_err(|message| format!("FAIL {name}: {message}"))?;
-                println!("PASS {name}: {summary}");
-            )+)+
+                    .map_err(|message| format!("FAIL {}: {message}", $name))?;
+                println!("PASS {}: {summary}", $name);
+            )+
             println!("{count} scenarios passed");
         }};
     }
-    // Request-count, range, and throttling checks run on the in-memory
-    // connector, which records requests and can throttle them.
     scenarios! {
-        "client construction" => client_construction over [Memory],
-        "single-part round trip" => single_part_round_trip over [Memory, Http],
-        "multipart round trip" => multipart_round_trip over [Memory, Http],
-        "outer retry" => outer_retry over [Memory],
-        "upload from file" => upload_from_file over [Memory, Http],
-        "download to path" => download_to_path over [Memory, Http],
-        "write to open file" => write_to_open_file over [Memory, Http],
-        "directory round trip" => directory_round_trip over [Memory, Http],
-        "symlink cycle" => symlink_cycle over [Memory, Http],
-        "many files" => many_files over [Memory, Http],
+        "client construction" => client_construction,
+        "single-part round trip" => single_part_round_trip,
+        "multipart round trip" => multipart_round_trip,
+        "outer retry" => outer_retry,
+        "upload from file" => upload_from_file,
+        "download to path" => download_to_path,
+        "write to open file" => write_to_open_file,
+        "directory round trip" => directory_round_trip,
+        "symlink cycle" => symlink_cycle,
+        "many files" => many_files,
     }
     Ok(())
 }
@@ -178,13 +172,13 @@ fn write(path: &Path, data: &[u8]) -> Result<(), String> {
 
 /// Drops `client` and `store`, waits until every task spawned since the
 /// scenario started has exited, and returns a summary of the work: the
-/// requests the scenario sent and the number of tasks that exited.
+/// requests the scenario's clients sent and the number of tasks that exited.
 ///
-/// Workers exit when the client's shared state drops, and HTTP connection
-/// tasks exit when the store's connection pool drops. The scheduler's
-/// lock-free sets hand removed transfer descriptors, which reference the
-/// client's state, to crossbeam-epoch, which destroys them only after the
-/// epoch advances. Flushing the epoch makes the drop deterministic.
+/// Workers exit when the client's shared state drops, and connection tasks
+/// exit when the store's connection pool drops. The scheduler's lock-free sets
+/// hand removed transfer descriptors, which reference the client's state, to
+/// crossbeam-epoch, which destroys them only after the epoch advances.
+/// Flushing the epoch makes the drop deterministic.
 async fn shut_down(client: Client, tasks_before: usize, store: Store) -> Result<String, String> {
     let tasks = alive_tasks().saturating_sub(tasks_before);
     let requests = store.to_string();
@@ -237,13 +231,11 @@ async fn single_part_round_trip(store: Store, _work: &Path) -> Result<String, St
     let data = pattern(64 * KIB, 1);
     upload(&client, "single", InputStream::from(data.clone())).await?;
     ensure_same("single", &data, &download(&client, "single").await?)?;
-    if let Some(memory) = store.memory() {
-        let requests = memory.requests();
-        ensure!(
-            requests.put_object == 1 && requests.upload_part == 0 && requests.get_object == 1,
-            "unexpected requests: {requests:?}"
-        );
-    }
+    let requests = store.requests();
+    ensure!(
+        requests.put_object == 1 && requests.upload_part == 0 && requests.get_object == 1,
+        "unexpected requests: {requests:?}"
+    );
     shut_down(client, before, store).await
 }
 
@@ -255,35 +247,31 @@ async fn multipart_round_trip(store: Store, _work: &Path) -> Result<String, Stri
     let data = pattern(20 * MIB, 2);
     upload(&client, "multipart", InputStream::from(data.clone())).await?;
     ensure_same("multipart", &data, &download(&client, "multipart").await?)?;
-    if let Some(memory) = store.memory() {
-        let requests = memory.requests();
-        ensure!(
-            requests.upload_part == 3 && requests.multipart_control == 2,
-            "unexpected upload requests: {requests:?}"
-        );
-        let mut ranges = memory.get_ranges();
-        ranges.sort_unstable();
-        let expected = [0, 8 * MIB as u64, 16 * MIB as u64].map(Some);
-        ensure!(ranges == expected, "unexpected download ranges: {ranges:?}");
-    }
+    let requests = store.requests();
+    ensure!(
+        requests.upload_part == 3 && requests.multipart_control == 2,
+        "unexpected upload requests: {requests:?}"
+    );
+    let mut ranges = store.get_ranges();
+    ranges.sort_unstable();
+    let expected = [0, 8 * MIB as u64, 16 * MIB as u64].map(Some);
+    ensure!(ranges == expected, "unexpected download ranges: {ranges:?}");
     shut_down(client, before, store).await
 }
 
-/// A throttled `PutObject` reaches the transfer manager, which waits through
-/// the configured sleep implementation and re-sends it.
+/// The server answers the first `PutObject` for `retried` with `503
+/// SlowDown`. The error reaches the transfer manager, which waits through the
+/// configured sleep implementation and re-sends the request.
 async fn outer_retry(store: Store, _work: &Path) -> Result<String, String> {
     let before = alive_tasks();
-    let memory = store
-        .memory()
-        .ok_or("outer retry throttles through the in-memory connector")?;
     let client = store.client(|config| config);
     let data = pattern(64 * KIB, 3);
-    memory.throttle_next(1);
     upload(&client, "retried", InputStream::from(data.clone())).await?;
-    let requests = memory.requests();
+    let requests = store.requests();
     ensure!(
-        requests.throttled == 1 && requests.put_object == 1,
-        "expected one throttled and one accepted PutObject: {requests:?}"
+        requests.throttled == 1 && requests.put_object == 2,
+        "expected one throttled and one accepted PutObject, which needs the server's \
+         `--slow-down-once bucket/retried`: {requests:?}"
     );
     ensure_same("retried", &data, &store.object("retried").await?)?;
     shut_down(client, before, store).await
@@ -298,13 +286,11 @@ async fn upload_from_file(store: Store, work: &Path) -> Result<String, String> {
     write(&path, &data)?;
     let body = InputStream::from_path(&path).map_err(|e| error("open source", e))?;
     upload(&client, "from-file", body).await?;
-    if let Some(memory) = store.memory() {
-        let requests = memory.requests();
-        ensure!(
-            requests.upload_part == 3,
-            "unexpected upload requests: {requests:?}"
-        );
-    }
+    let requests = store.requests();
+    ensure!(
+        requests.upload_part == 3,
+        "unexpected upload requests: {requests:?}"
+    );
     ensure_same("from-file", &data, &store.object("from-file").await?)?;
     shut_down(client, before, store).await
 }
