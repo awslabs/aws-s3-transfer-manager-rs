@@ -6,17 +6,18 @@
 //! Download integration tests.
 
 use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
-use aws_sdk_s3_transfer_manager::types::{ConcurrencyMode, PartSize, RuntimeMode};
+use aws_sdk_s3_transfer_manager::types::{ConcurrencyMode, PartSize};
+use aws_sdk_s3_transfer_manager::RuntimeConfig;
 
 use crate::harness::{mock_tm, mock_tm_with, MockTm};
 use crate::test_data::deterministic_data;
 
 async fn setup() -> MockTm {
-    mock_tm(RuntimeMode::Managed).await
+    mock_tm(RuntimeConfig::default()).await
 }
 
 async fn setup_concurrent(part_size: usize, concurrency: usize) -> MockTm {
-    mock_tm_with(RuntimeMode::Managed, |b| {
+    mock_tm_with(RuntimeConfig::default(), |b| {
         b.part_size(PartSize::Target(part_size as u64))
             .concurrency(ConcurrencyMode::Explicit(concurrency))
     })
@@ -178,7 +179,7 @@ async fn test_download_object_meta() {
 }
 
 /// Test concurrent downloads
-async fn test_download_concurrent(rt: RuntimeMode) {
+async fn test_download_concurrent(rt: RuntimeConfig) {
     let m = mock_tm(rt).await;
 
     // Add multiple objects directly to server
@@ -226,12 +227,12 @@ async fn test_download_concurrent(rt: RuntimeMode) {
 
 #[tokio::test]
 async fn test_download_concurrent_mock_gp() {
-    test_download_concurrent(RuntimeMode::Managed).await;
+    test_download_concurrent(RuntimeConfig::default()).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_download_concurrent_tokio_mt() {
-    test_download_concurrent(RuntimeMode::MultiThreadTokio).await;
+    test_download_concurrent(RuntimeConfig::multi_thread_tokio()).await;
 }
 
 /// Test download to file path with concurrent multi-part download (100 MB, 5 MB parts, 8 workers).
@@ -796,7 +797,7 @@ async fn test_download_to_disk_below_segment_window_drains_in_runs() {
 /// a memory budget too small to hold them all at once, must all complete. A regression
 /// re-wedges and the timeout fires.
 #[cfg(any(unix, windows))]
-async fn test_concurrent_disk_downloads_under_tight_memory_budget_do_not_wedge(rt: RuntimeMode) {
+async fn test_concurrent_disk_downloads_under_tight_memory_budget_do_not_wedge(rt: RuntimeConfig) {
     use aws_sdk_s3_transfer_manager::memory::{BufferPool, MemoryBudgetConfig, MemoryConfig};
     use std::time::Duration;
     use tokio::time::timeout;
@@ -872,7 +873,7 @@ async fn test_concurrent_disk_downloads_under_tight_memory_budget_do_not_wedge(r
 #[cfg(any(unix, windows))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_concurrent_disk_downloads_under_tight_memory_budget_do_not_wedge_mock_gp() {
-    test_concurrent_disk_downloads_under_tight_memory_budget_do_not_wedge(RuntimeMode::Managed)
+    test_concurrent_disk_downloads_under_tight_memory_budget_do_not_wedge(RuntimeConfig::default())
         .await;
 }
 
@@ -880,7 +881,7 @@ async fn test_concurrent_disk_downloads_under_tight_memory_budget_do_not_wedge_m
 #[tokio::test(flavor = "multi_thread")]
 async fn test_concurrent_disk_downloads_under_tight_memory_budget_do_not_wedge_tokio_mt() {
     test_concurrent_disk_downloads_under_tight_memory_budget_do_not_wedge(
-        RuntimeMode::MultiThreadTokio,
+        RuntimeConfig::multi_thread_tokio(),
     )
     .await;
 }

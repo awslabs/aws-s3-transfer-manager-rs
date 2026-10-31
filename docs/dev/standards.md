@@ -148,3 +148,22 @@ Do not manufacture red-first tests for documentation, formatting, renames, or be
 - Record qualification that CI does not run, such as benchmarks, real-service runs, or manual platform runs, with its method and result.
 - Preserve artifacts for fuzz crashes, sanitizer failures, minimized reproducers, or benchmark results needed for review.
 - Never imply that a platform, sanitizer, service, or toolchain check ran when it did not.
+
+### Sanitizer targets
+
+Required sanitizer jobs run on Linux x86_64 using the pinned nightly from
+`.github/workflows/ci.yml`. The `x86_64-unknown-linux-gnuasan` and
+`x86_64-unknown-linux-gnutsan` targets instrument the standard library as well as
+workspace code. Install those targets with `rustup target add` and provide an
+LLVM symbolizer. Run workspace tests with `sdk-v1`, the matching `s3_tm_asan` or
+`s3_tm_tsan` cfg, frame pointers, and one test thread as the workflow specifies.
+
+ASan leak detection and TSan thread-leak detection are enabled. Lifecycle tests
+must release running blocking work and await owned-runtime thread completion.
+Caller-owned runtimes require their own teardown. Task cancellation or a signal
+before thread-local destruction is insufficient evidence of thread completion.
+
+The TSan suppression file permits only the named Tokio reactor registration
+race whose ordering crosses kernel delivery. It does not suppress runtime
+thread leaks or transfer-manager races. Preserve the intentional sanitizer
+handling of guard-page death tests and buffer poisoning.

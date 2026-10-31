@@ -537,6 +537,8 @@ mod tests {
                 Ok(())
             ))
         );
+
+        crate::runtime::test_util::shutdown(&handle).await;
     }
 
     /// Markers and operations are logged in the order they happen, and a

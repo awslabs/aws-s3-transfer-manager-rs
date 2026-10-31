@@ -1,0 +1,110 @@
+#!/usr/bin/env python3
+"""Audit TM, its unstable integrations, and the reusable runtime components."""
+
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import tempfile
+
+
+ROOT = Path(__file__).resolve().parents[1]
+TM = "aws-sdk-s3-transfer-manager"
+ADAPTER = "crates/aws-sdk-s3-transfer-manager-ext"
+
+
+def check(package, config, *features):
+    print(f"Checking {package}: {config}", flush=True)
+    environment = os.environ.copy()
+    environment.setdefault("CARGO_TARGET_DIR", str(ROOT / "target"))
+    subprocess.run(
+        ["cargo", "check-external-types", "--config", config, *features],
+        cwd=package,
+        env=environment,
+        check=True,
+    )
+
+
+def check_sdk_v1(package, config, *features):
+    # SDK model types are allowed only when interoperability is explicitly enabled.
+    text = (package / config).read_text()
+    text = text.replace(
+        "allowed_external_types = [",
+        'allowed_external_types = [\n    "aws_sdk_s3::*",\n    "aws_types::request_id::RequestId",',
+        1,
+    )
+    with tempfile.TemporaryDirectory(prefix="tm-sdk-api-") as directory:
+        configuration = Path(directory) / "external-types-sdk-v1.toml"
+        configuration.write_text(text)
+        check(
+            package,
+            str(configuration),
+            "--no-default-features",
+            "--features",
+            ",".join(("sdk-v1", *features)),
+        )
+
+
+def check_ordinary():
+    # The adapter enables the experimental feature in workspace resolution.
+    # An identical-source workspace without that member keeps the ordinary
+    # allowlist strict; --no-default-features alone does not undo unification.
+    packages = [
+        TM,
+        "crates/aws-smithy-managed-http",
+        "crates/aws-smithy-execution",
+        "crates/aws-smithy-topology",
+    ]
+    with tempfile.TemporaryDirectory(prefix="tm-public-api-") as directory:
+        snapshot = Path(directory)
+        for package in packages:
+            shutil.copytree(
+                ROOT / package,
+                snapshot / package,
+                ignore=shutil.ignore_patterns("target", ".git"),
+            )
+        manifest = (ROOT / "Cargo.toml").read_text()
+        members = "members = [" + ", ".join(f'"{p}"' for p in packages) + "]"
+        manifest, replaced = re.subn(r"members = \[.*?\]", members, manifest, count=1, flags=re.S)
+        if replaced != 1:
+            raise RuntimeError("expected one workspace member list")
+
+        def path(match):
+            value = match.group(1)
+            base = snapshot if value in packages else ROOT
+            return f'path = "{(base / value).resolve()}"'
+
+        # Preserve versions/features and workspace metadata; only relocate path
+        # dependencies and remove the member that opts into experimental APIs.
+        manifest = re.sub(r'path = "([^"]+)"', path, manifest)
+        (snapshot / "Cargo.toml").write_text(manifest)
+        shutil.copyfile(ROOT / "Cargo.lock", snapshot / "Cargo.lock")
+        check(
+            snapshot / TM,
+            "external-types.toml",
+            "--no-default-features",
+            "--features",
+            "",
+        )
+        check_sdk_v1(snapshot / TM, "external-types.toml")
+
+
+def main():
+    check_ordinary()
+    check(
+        ROOT / TM,
+        "external-types-experimental.toml",
+        "--no-default-features",
+        "--features",
+        "__unstable_ext",
+    )
+    check_sdk_v1(ROOT / TM, "external-types-experimental.toml", "__unstable_ext")
+    check(ROOT / ADAPTER, "external-types.toml", "--all-features")
+    check(ROOT / "crates/aws-smithy-topology", "external-types.toml")
+    check(ROOT / "crates/aws-smithy-execution", "external-types.toml", "--all-features")
+    check(ROOT / "crates/aws-smithy-managed-http", "external-types.toml", "--all-features")
+
+
+if __name__ == "__main__":
+    main()

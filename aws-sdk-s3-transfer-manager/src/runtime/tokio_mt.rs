@@ -66,9 +66,9 @@ impl TokioMultiThreadRuntime {
             ) {
                 tracing::warn!(
                     target: crate::telemetry::TARGET_SCHEDULING,
-                    "RuntimeMode::MultiThreadTokio selected on a current-thread runtime; \
+                    "Caller Tokio execution selected on a current-thread runtime; \
                      transfer workers will serialize onto one thread. Use a \
-                     multi-threaded runtime or RuntimeMode::Managed."
+                     multi-threaded runtime or owned managed execution."
                 );
             }
 
@@ -146,6 +146,10 @@ impl ExecutionRuntime for TokioMultiThreadRuntime {
 
     fn shutdown(&self) {
         self.pool.shutdown();
+    }
+
+    fn shutdown_completion(&self) -> Option<crate::ShutdownCompletion> {
+        None
     }
 
     fn remove_pending_for_transfer(&self, id: TransferId) -> usize {

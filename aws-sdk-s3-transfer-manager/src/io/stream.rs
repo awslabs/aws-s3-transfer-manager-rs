@@ -112,7 +112,8 @@ impl InputStream {
     ///
     /// `direct_io` selects between the two file-body implementations: `true`
     /// when the caller owns the polling thread (managed-thread direct I/O),
-    /// `false` when the body may be polled by the shared tokio runtime.
+    /// `false` when HTTP may poll the body on any thread. Offloaded readers use
+    /// the Tokio runtime executing this conversion, including across retries.
     ///
     /// File-backed bodies acquire bounded chunks from `buffer_pool`.
     ///
@@ -122,6 +123,7 @@ impl InputStream {
     ///
     /// # Panics
     ///
+    /// Panics when converting an offloaded file body outside Tokio execution.
     /// Panics on `Dyn` streams. Dyn sources cannot be rewound and must route
     /// through the multipart upload path (see [`is_mpu_only`](Self::is_mpu_only)).
     ///
@@ -150,11 +152,13 @@ impl InputStream {
                         SdkBody::from_body_1_x(DirectFileBody::new(source.clone(), offset, length))
                     }))
                 } else {
+                    let reader_runtime = tokio::runtime::Handle::current();
                     Ok(SdkBody::retryable(move || {
                         SdkBody::from_body_1_x(OffloadedFileBody::new(
                             source.clone(),
                             offset,
                             length,
+                            reader_runtime.clone(),
                         ))
                     }))
                 }

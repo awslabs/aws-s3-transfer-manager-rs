@@ -106,7 +106,7 @@ impl Intercept for S3TransferManagerInterceptor {
 
 #[cfg(test)]
 mod tests {
-    use crate::types::RuntimeMode;
+    use crate::RuntimeConfig;
     use aws_config::{BehaviorVersion, Region};
     use aws_runtime::user_agent::FrameworkMetadata;
     use aws_sdk_s3::config::{
@@ -138,7 +138,7 @@ mod tests {
     /// seed `AwsUserAgent::for_tests()` into the config bag and short-circuit the
     /// assembly under test; credentials and behavior version are set directly instead.
     async fn captured_user_agent(
-        runtime_mode: RuntimeMode,
+        runtime_config: RuntimeConfig,
         framework_metadata: Option<FrameworkMetadata>,
         tweak: impl FnOnce(aws_sdk_s3::config::Builder) -> aws_sdk_s3::config::Builder,
     ) -> String {
@@ -151,12 +151,11 @@ mod tests {
 
         // The capture-request client is the transport under test, so the runtime must
         // not substitute its own.
-        let s3_config = crate::config::S3ClientConfig::from_sdk_builder(tweak(builder))
-            .enable_runtime_http(false);
+        let s3_config = crate::config::S3ClientConfig::from_sdk_builder(tweak(builder));
 
         let tm = crate::Client::new(
             crate::Config::builder()
-                .runtime_mode(runtime_mode)
+                .runtime_config(runtime_config)
                 .framework_metadata(framework_metadata)
                 .s3_config(s3_config)
                 .build(),
@@ -181,7 +180,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn preserves_customer_app_name() {
-        let ua = captured_user_agent(RuntimeMode::MultiThreadTokio, None, |b| {
+        let ua = captured_user_agent(RuntimeConfig::multi_thread_tokio(), None, |b| {
             b.app_name(AppName::new("my-app").unwrap())
         })
         .await;
@@ -193,7 +192,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn emits_transfer_manager_version() {
-        let ua = captured_user_agent(RuntimeMode::MultiThreadTokio, None, |b| b).await;
+        let ua = captured_user_agent(RuntimeConfig::multi_thread_tokio(), None, |b| b).await;
         let expected = concat!("md/rust-tm#", env!("CARGO_PKG_VERSION"));
         assert!(ua.contains(expected), "{expected:?} missing from {ua:?}");
     }
@@ -204,7 +203,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn emits_our_marker_once() {
-        let ua = captured_user_agent(RuntimeMode::Managed, None, |b| b).await;
+        let ua = captured_user_agent(RuntimeConfig::default(), None, |b| b).await;
         assert_eq!(ua.matches("md/rust-tm#").count(), 1, "{ua:?}");
     }
 
@@ -215,7 +214,8 @@ mod tests {
     async fn framework_metadata_joins_our_attribution() {
         let framework =
             FrameworkMetadata::new("some-framework", Some(Cow::Borrowed("1.3"))).unwrap();
-        let ua = captured_user_agent(RuntimeMode::MultiThreadTokio, Some(framework), |b| b).await;
+        let ua =
+            captured_user_agent(RuntimeConfig::multi_thread_tokio(), Some(framework), |b| b).await;
         assert!(
             ua.contains("lib/some-framework/1.3"),
             "framework metadata missing from {ua:?}"
@@ -233,7 +233,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn preserves_user_agent_already_in_config_bag() {
-        let ua = captured_user_agent(RuntimeMode::MultiThreadTokio, None, |b| {
+        let ua = captured_user_agent(RuntimeConfig::multi_thread_tokio(), None, |b| {
             b.with_test_defaults()
         })
         .await;
@@ -253,7 +253,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn emits_s3_transfer_business_metric() {
-        let ua = captured_user_agent(RuntimeMode::MultiThreadTokio, None, |b| b).await;
+        let ua = captured_user_agent(RuntimeConfig::multi_thread_tokio(), None, |b| b).await;
         let metrics = ua
             .split_whitespace()
             .find_map(|section| section.strip_prefix("m/"))
@@ -282,7 +282,7 @@ mod tests {
     async fn download_through(client: aws_sdk_s3::Client) {
         let tm = crate::Client::new(
             crate::Config::builder()
-                .runtime_mode(RuntimeMode::MultiThreadTokio)
+                .runtime_config(RuntimeConfig::multi_thread_tokio())
                 .sdk_client(client)
                 .build(),
         );
@@ -406,7 +406,7 @@ mod tests {
         let (http_client, captured) = capture_request(None);
         let first = crate::Client::new(
             crate::Config::builder()
-                .runtime_mode(RuntimeMode::MultiThreadTokio)
+                .runtime_config(RuntimeConfig::multi_thread_tokio())
                 .sdk_client(provided_client(http_client))
                 .build(),
         );
@@ -464,7 +464,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn a_caller_can_own_both_headers() {
-        let ua = captured_user_agent(RuntimeMode::MultiThreadTokio, None, |mut b| {
+        let ua = captured_user_agent(RuntimeConfig::multi_thread_tokio(), None, |mut b| {
             b.push_interceptor(OverrideUserAgent.into_shared());
             b
         })
