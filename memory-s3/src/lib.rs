@@ -6,11 +6,12 @@
 //! An in-memory S3 connector covering the requests that object and directory
 //! transfers send.
 //!
-//! The connector supports `PutObject`, multipart upload creation, parts, and
-//! completion, ranged `GetObject`, and single-page `ListObjectsV2`. Every
-//! request yields to the runtime once before it is served, so each request
-//! future returns `Pending` at least once. Tests can answer requests with
-//! `503 SlowDown`.
+//! [`MemoryS3`] is an [`HttpConnector`] for an S3 client, so tests run
+//! transfers without a network on any target. The connector supports
+//! `PutObject`, multipart upload creation, parts, and completion, ranged
+//! `GetObject`, and single-page `ListObjectsV2`. Every request yields to the
+//! runtime once before it is served, so each request future returns `Pending`
+//! at least once. Tests can answer requests with `503 SlowDown`.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
@@ -27,23 +28,23 @@ use bytes::Bytes;
 
 /// Request counters.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Requests {
+pub struct Requests {
     /// `PutObject` requests.
-    pub(crate) put_object: usize,
+    pub put_object: usize,
     /// `UploadPart` requests.
-    pub(crate) upload_part: usize,
+    pub upload_part: usize,
     /// `CreateMultipartUpload` and `CompleteMultipartUpload` requests.
-    pub(crate) multipart_control: usize,
+    pub multipart_control: usize,
     /// `GetObject` requests.
-    pub(crate) get_object: usize,
+    pub get_object: usize,
     /// `ListObjectsV2` requests.
-    pub(crate) list_objects: usize,
+    pub list_objects: usize,
     /// Requests answered with `503 SlowDown`.
-    pub(crate) throttled: usize,
+    pub throttled: usize,
     /// Object bytes received in `PutObject` and `UploadPart` bodies.
-    pub(crate) bytes_received: usize,
+    pub bytes_received: usize,
     /// Object bytes sent in `GetObject` bodies.
-    pub(crate) bytes_sent: usize,
+    pub bytes_sent: usize,
 }
 
 /// Lists the nonzero counters, such as `3 UploadPart, 2 multipart control,
@@ -92,35 +93,35 @@ struct Shared {
     throttle_next: AtomicUsize,
 }
 
-/// The connector and its object store.
+/// The connector and its object store. Clones share one store.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct MemoryS3 {
+pub struct MemoryS3 {
     shared: Arc<Shared>,
 }
 
 impl MemoryS3 {
     /// Stores `data` under `key` without sending a request.
-    pub(crate) fn insert(&self, key: &str, data: Bytes) {
+    pub fn insert(&self, key: &str, data: Bytes) {
         self.state().objects.insert(key.to_owned(), data);
     }
 
     /// Returns the object stored under `key`.
-    pub(crate) fn object(&self, key: &str) -> Option<Bytes> {
+    pub fn object(&self, key: &str) -> Option<Bytes> {
         self.state().objects.get(key).cloned()
     }
 
     /// Answers the next `count` requests with `503 SlowDown`.
-    pub(crate) fn throttle_next(&self, count: usize) {
+    pub fn throttle_next(&self, count: usize) {
         self.shared.throttle_next.store(count, Ordering::SeqCst);
     }
 
     /// Returns the request counters.
-    pub(crate) fn requests(&self) -> Requests {
+    pub fn requests(&self) -> Requests {
         self.state().requests
     }
 
     /// Returns the range start of every `GetObject` request in order.
-    pub(crate) fn get_ranges(&self) -> Vec<Option<u64>> {
+    pub fn get_ranges(&self) -> Vec<Option<u64>> {
         self.state().get_ranges.clone()
     }
 
