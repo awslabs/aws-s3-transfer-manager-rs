@@ -159,7 +159,8 @@ told apart:
   pointing at nothing or into an endless chain of links: a failure, following the global policy
   (FR-Fail-9). The entry is still there, still naming something a run was asked to copy, so a
   destination without it does not match the source. A file that went away is the other case, and
-  FR-Enum-8 has it. FR-Enum-14 covers a dangling link in a download's destination.
+  FR-Enum-8 has it. FR-Enum-14 covers a dangling link or an endless chain in a download's
+  destination.
 - **No key it could take** — a local name that is not valid UTF-8. An S3 object key is Unicode encoded as
   UTF-8, so no key corresponds to such a name. It MUST be reported as `skipped-with-warning`, naming the
   file with its invalid bytes escaped. It MUST NOT be converted lossily to make a key: two names
@@ -210,7 +211,9 @@ following, as `upload_objects` does. A download MUST default to following, becau
 
 Each rule about passing through a link holds for the tree as it stands when sync acts. A link
 created after the walk read its directory counts. So does a link whose name the filesystem matches
-to a key without regard to case or Unicode form, as macOS and Windows do by default.
+to a key without regard to case or Unicode form, as macOS and Windows do by default. A key whose
+read, write, or delete would pass through such a link MUST get no action, and sync MUST report it
+as `skipped-unknown`.
 
 When a download writes a key whose own name holds a link, dangling or not, it MUST replace the link
 and MUST NOT write through it. Delete mode removes a link as a link and leaves its target. The
@@ -299,24 +302,30 @@ the comparison depends on and multiplies the number of requests.
 
 **FR-Enum-14** A link that the local walk does not resolve MUST hold back every key under its name
 on the other side. With following off, every link qualifies. With following on, a dangling link, a
-link into an endless chain of links, and a link in a loop (FR-Enum-9) qualify. A link whose name a
-filter excludes qualifies in both settings, because sync never resolves an excluded link. On an
-upload, sync MUST NOT delete a destination key under such a link. On a download, sync MUST NOT
-write a source key under it. Sync MUST report each key it holds back as `skipped-unknown` and MUST
-mark the plan incomplete, with delete mode on or off. An excluded link reports its keys too
-(FR-Filter-5).
+link into an endless chain of links, a link in a loop (FR-Enum-9), and a link whose target sync
+cannot read qualify. A link whose name a filter excludes qualifies in both settings, because sync
+never resolves an excluded link. On an upload, sync MUST NOT delete a destination key under such a
+link. On a download, sync MUST NOT write a source key under it. Sync MUST report each key it holds
+back as `skipped-unknown` and MUST mark the plan incomplete, with delete mode on or off. An excluded
+link reports its keys too (FR-Filter-5), and it protects nothing it points at: delete mode may
+remove an excluded file link's target.
 
 On a download, a link the walk does not resolve still counts at its own name:
 
 - With following off, the link is an entry at its own name, dangling or not. A download replaces
   it when it writes that key (FR-Enum-4), and delete mode removes a destination-only link. The
   next run then downloads the keys under the link's name.
-- With following on, a dangling link names nothing at its own name. A download can land there and
-  replace the link, and delete mode leaves it in place.
+- With following on, a dangling link or an endless chain names nothing at its own name. A download
+  can land there and replace the link, and delete mode leaves it in place.
+- With following on, a loop reaches a directory, so its own name counts as a directory
+  (FR-Cmp-4), and only the keys below it stay held.
+- With following on, a link whose target sync cannot read leaves its own name unknown as well. The
+  keys at and under its name stay held, and the failure follows the global policy (FR-Fail-9).
 - When a filter excludes the link's name, delete mode leaves the link in place (FR-Filter-3), and
   every run holds back the keys under it.
 
-A dangling link in a download's destination is no failure in either setting. The keys under its
+A dangling link or an endless chain in a download's destination is no failure in either setting.
+The keys under its
 name stay held, because the link may stand for a directory on an unmounted volume.
 
 Take a destination holding `photos -> /mnt/nas` and a bucket holding `photos/a.jpg`. A download
@@ -417,7 +426,8 @@ MUST keep agreeing: repeated runs over an unchanged pair MUST NOT flip between t
 **FR-Cmp-8** The same side states and the same options MUST always produce the same plan. Both sides
 arrive in key order (FR-Enum-13); beyond that, the plan MUST NOT depend on how the two interleave, or on
 the order in which earlier transfers finished. A download with following on is the one exception:
-the run's own writes and deletes through a link can change what its walk reads later (FR-Enum-15).
+the run's own writes and deletes through a link can change what its walk reads later (FR-Enum-4,
+FR-Enum-15).
 
 "The same plan" means the same decision and the same reason for every key. It does not mean the same
 sequence: FR-Exec-12 lets transfers happen in any order, so nothing downstream depends on the order
@@ -499,7 +509,8 @@ require holding either side's full listing in memory.
 
 **FR-Filter-5** An entry the filters exclude MUST NOT produce a warning and MUST NOT change the run's
 outcome — not even when it is unreadable, or a device or pipe, or has just been deleted. Sync asked to
-ignore it, so problems with it are not problems.
+ignore it, so problems with it are not problems. The paragraphs below give two exceptions: a link,
+and a name whose type sync cannot read.
 
 This means filtering MUST happen before skip-warnings are produced.
 
@@ -569,8 +580,10 @@ per key precisely because partial success is normal.
 
 **FR-Exec-7 (running it twice changes nothing)** Running the same sync again straight after a successful
 one, a run that ended clean (FR-Fail-5), MUST decide to do nothing at all: no transfers, no deletes.
-This MUST hold in every direction and in every comparison mode. The one exception is a download
-through a link the walk meets only after the merge passed the link's target (FR-Enum-15).
+This MUST hold in every direction and in every comparison mode. Two cases are exceptions. The first
+is a download through a link the walk meets only after the merge passed the link's target
+(FR-Enum-15). The second is two keys that land on one local file while FR-Fail-8's policy is
+`ignore`.
 *`[DERIVED]` from FR-Cmp-1 plus FR-Exec-5 (the write-back is what makes the download direction stable). `[DOC]` Description: "Recursively copies new and updated files from the source directory to the destination."*
 
 **FR-Exec-8** Properties the caller supplies — user metadata, ACL and grants, encryption settings, storage
@@ -753,7 +766,7 @@ Per-entry detail, including the outcome of each delete, reaches the caller as ev
 `skipped-unknown` MUST be distinguishable from `skipped-unchanged`. They look similar and mean opposite
 things. The first says sync held back an action it could not vouch for, so the destination may still
 differ from the source. The second says everything matched and sync had nothing to do.
-`skipped-unknown` also covers a key that FR-Enum-14 or FR-Enum-15 holds back.
+`skipped-unknown` also covers a key that FR-Enum-4, FR-Enum-14, or FR-Enum-15 holds back.
 *`[CLI]` `results.py` → `ResultRecorder` (`files_transferred`, `files_failed`, `files_warned`, `bytes_transferred`, `bytes_failed_to_transfer`, `expected_files_transferred`, `expected_bytes_transferred`) and `CommandResultRecorder`.*
 
 **FR-Fail-5** The result MUST distinguish three overall outcomes: at least one failure; no failures but

@@ -212,12 +212,12 @@ bucket. A download would write them through the link, wherever it points.
 download, the delete through either key removes the file the other key keeps. An upload's
 destination is a bucket, so this way reaches downloads only.
 
-The same rules govern the writes a download makes, with delete mode on or off. A write and a delete
-on one name have to agree about what the name is. The decisions below meet **FR-Enum-4**,
-**FR-Enum-14** and **FR-Enum-15** in [`functional-spec.md`](functional-spec.md). Two keys that
-differ only in case (**FR-Fail-8**), and a key that leaves the root through its own path
-(**FR-Root-8**), stay outside this design. A key whose name matches a link's name only without
-regard to case is inside it (case I).
+The rules for a link the walk does not resolve also govern the writes a download makes, with delete
+mode on or off (D2). A write and a delete on one name have to agree about what the name is. The
+decisions below meet **FR-Enum-4**, **FR-Enum-14** and **FR-Enum-15** in
+[`functional-spec.md`](functional-spec.md). Two keys that differ only in case (**FR-Fail-8**), and a
+key that leaves the root through its own path (**FR-Root-8**), stay outside this design. A key whose
+name matches a link's name only without regard to case is inside it (case I).
 
 ## 2. Design decisions
 
@@ -232,9 +232,9 @@ With following on, the walk follows every link it can resolve, except a link the
 name, and sync never reads, writes, or deletes through it.
 
 **D2. A link the walk does not resolve holds every key under its name.** With following off, every
-link qualifies. With following on, a dangling link, a link into an endless chain, and a loop
-qualify. A link the filter excludes qualifies in both settings. The walk checks the filter before it
-resolves a link, so sync never looks behind an excluded link.
+link qualifies. With following on, a dangling link, a link into an endless chain, a loop, and a link
+whose target the walk cannot read qualify. A link the filter excludes qualifies in both settings.
+The walk checks the filter before it resolves a link, so sync never looks behind an excluded link.
 
 The side holding the link cannot account for any key under the link's name, so the merge holds the
 name on that side. On an upload the source holds, and delete mode removes no destination key under
@@ -301,11 +301,18 @@ transfer with it, until the walk ends. Setting the deletes aside keeps the merge
 then grows with the deletes. A spill file bounds that memory, at the cost of a new kind of state.
 
 So with delete mode on, when a name arrives after the merge already reached it, the merge marks the
-plan incomplete, and the run ends `Warned`. **FR-Exec-7** names this tree as its one exception. The
-report fires on every run over such a tree, including a run that deleted nothing under the target.
-The merge does not record whether a pairing became a delete, so it cannot tell the two runs apart. A
-tree with `www/current -> ../releases/v3` therefore ends `Warned` on every correct run with delete
-mode on. With delete mode off, the merge holds no names (D4), so no name can arrive late.
+plan incomplete, and the run ends `Warned`. **FR-Exec-7** names this tree as an exception. The
+report fires on each run that pairs a key at or past the target before the walk reads the link's
+directory. It fires even when the run deleted nothing under the target. In case F's small tree, run
+2 pairs nothing there and ends `Clean`. One key sorting between `real/` and `z/` makes run 2
+`Warned` too. The merge does not record whether a pairing became a delete, so it cannot tell such
+runs apart. A tree with `www/current -> ../releases/v3` pairs `releases/v3/` before it reads `www/`,
+so with delete mode on it ends `Warned` on every correct run. With delete mode off, the merge holds
+no names (D4), so no name can arrive late.
+
+The same timing reaches a dry run. A real download with following on can delete or write through a
+link before its walk reads the link's target, and a dry run performs neither. So the dry run's plan
+can differ from the real run's, the exception **FR-Dry-2** allows.
 
 **D7. What stands at a key's own name counts the way the follow setting says.** With following off,
 a link at a key's own name is an entry with no size or time. No comparison can show that it
@@ -323,12 +330,16 @@ With following on, a link at a key's own name counts as what it reaches:
 - A link to a socket, FIFO, or device reads as that file, and every mode skips the key as
   obstructed.
 - A link to a directory leaves no entry at its name, because the walk descends into it. The default
-  modes download and replace the link, as **FR-Enum-4** says. No-overwrite keeps it. Just before the
-  rename, the download checks the final name with links resolved, and it skips the key when the name
-  reaches anything.
+  modes download and replace the link, as **FR-Enum-4** says. No-overwrite keeps it. Just before
+  the rename, a no-overwrite download checks the final name with links resolved. When the name
+  reaches anything, the download skips the key and reports it as already at the destination.
+- A loop reaches a directory too. The walk stops at the loop, and only the keys below its name stay
+  held, so its own name counts like a link to a directory.
+- A link whose target the walk cannot read stays unknown at its own name as well. Its name and the
+  keys below it stay held, and the failure follows the run's failure policy.
 
-A dangling link in a download's destination is no failure in either setting. An upload still reports
-one as a failure, because the source has nothing to send for its key.
+A dangling link or an endless chain in a download's destination is no failure in either setting. An
+upload still reports one as a failure, because the source has nothing to send for its key.
 
 **D8. The run starts at the root the caller named.** The follow setting covers the entries inside
 the root. The run resolves the root itself as spelled, even when the root is a link, and the
@@ -348,13 +359,14 @@ past them (case I). The filesystem can match a key's name to a link's name witho
 Unicode form, and the merge compares bytes. A link can also appear after the walk read its
 directory.
 
-So before each local delete, and before each download write with following off, sync calls `lstat`
-on each component of the key's path below the root. When a component is a link, sync skips the
-action, reports the key as `skipped-unknown`, and marks the plan incomplete. The key's own name
-stays out of the check, because delete mode removes a link as a link and a download replaces one. A
-download with following on writes through a link above the file (D1), so its writes skip the check.
-The download opens its temporary file with `create_new`, so a link planted at that name refuses the
-open.
+So sync calls `lstat` on each component of the key's path below the root before it acts. It does
+that before each local delete, and with following off before each upload read and each download
+write. When a component is a link, sync skips the action, reports the key as `skipped-unknown`, and
+marks the plan incomplete. The key's own name stays out of the check, because delete mode removes a
+link as a link and a download replaces one. With following on, a read or a write passes through a
+link above the file by design (D1), so it skips the check. The download opens its temporary file
+with `create_new`, so a link planted at that name refuses the open, and the download retries with a
+new name.
 
 The check costs one `lstat` per path component per action. A window stays between the check and the
 system call. Closing the window needs a path lookup that refuses links, such as `openat2` with
@@ -398,6 +410,8 @@ The merge releases a stretch once it passes the name. A hold therefore costs mem
 merge sits before the end of the name's range. A dangling link on a download with following on adds
 a stretch over only the keys below its name. A download can then still land at the name itself
 (D7). Each stretch also records what caused it, so a held key's event can say why (**FR-Obs-1**).
+The excerpts in this section show today's `Stretch`, and today's `Stretch` carries only `under`. The
+design adds the cause and the form that covers only the keys below a name.
 
 ### Where each hold comes from
 
@@ -409,16 +423,18 @@ a stretch over only the keys below its name. A download can then still land at t
    excluded by the filter          its side          its own name              Walk::next
    dangling or endless, upload     the source        its own name              cost_of
    dangling or endless, download   the destination   the keys below its name   LocalDestination
-   in a loop                       its side          its own name              cost_of
+   in a loop                       its side          the keys below its name   cost_of
+   target cannot be read           its side          its own name              cost_of
    followed, delete mode on        the source        own name, target, chain   hold_aliased
 ```
 
-The first six rows cover a link the walk does not resolve (D2). A link's side is the source on an
-upload and the destination on a download. The walk checks the path filter before it resolves a
-link, in both settings, and yields an excluded link marked `PathFiltered::Excluded`. With following
-on, the walk reports a dangling link as an error. On a download, `LocalDestination` turns that
-error into a stretch over the keys below the name, and it drops the error. `take_destination`
-mirrors `take_source`:
+Every row but the last covers a link the walk does not resolve (D2). A link's side is the source on
+an upload and the destination on a download. The walk checks the path filter before it resolves a
+link, in both settings, and yields an excluded link marked `PathFiltered::Excluded`. The key stream
+reports that mark as `Obstruction::ExcludedLink`. With following on, the walk reports a dangling
+link, an endless chain, and a loop as errors. On a download, `LocalDestination` turns a dangling
+link or an endless chain into a stretch over the keys below the name, and it drops the error.
+`cost_of` gives a loop that same stretch on both sides. `take_destination` mirrors `take_source`:
 
 ```rust
 fn take_destination(&mut self) -> Entry<D::Source> {
@@ -476,13 +492,26 @@ also spell one directory as `/Users/...` and as `/System/Volumes/Data/Users/...`
 resolved path does not start with the resolved root, the merge compares the identity of the target's
 ancestors with the root's.
 
+A later link on a file link's chain takes its key as its directory stores the name. The merge finds
+that entry in the hop's resolved parent by matching the hop's identity. The link's own text can
+spell the name differently, as `Z.TXT` for a stored `z.txt` on a filesystem that ignores case. A
+hold under that spelling would miss the stored key.
+
 `Walker::downloading` takes the delete mode. With delete mode off, `LocalDestination` names nothing,
 so a download with following on and delete mode off resolves no link targets (D4).
 
-`Walk::hold_aliased` adds each name to the source side. A name the merge has already reached marks
-the plan incomplete (D6), and the bound applies at the same point (D5):
+`Walk::hold_aliased` adds each name the merge has not passed entirely. A name the merge has already
+reached marks the plan incomplete (D6), and the bound counts only the names it adds (D5):
 
 ```rust
+if reached {
+    // A delete under the name may already have gone out (D6).
+    self.incomplete = true;
+}
+if passed {
+    // Nothing under the name is still ahead of the merge, so a hold would cover nothing (D5).
+    return;
+}
 if self.src.gap.under.len() < ALIASED_NAMES_HELD {
     self.src.gap.add(stretch);
 } else {
@@ -493,8 +522,8 @@ if self.src.gap.under.len() < ALIASED_NAMES_HELD {
 
 ### Checking a path when sync acts
 
-Execution runs the D9 check before each local delete, and before each download write with following
-off. The check walks the key's parent components below the root:
+Execution runs the D9 check before each local delete, and with following off before each upload read
+and each download write. The check walks the key's parent components below the root:
 
 ```rust
 // The first link among a key's parent components below the root. A delete or a write through that
@@ -507,7 +536,8 @@ fn link_on_path(root: &Path, key: &str) -> Option<PathBuf> {
         match std::fs::symlink_metadata(&at) {
             Ok(meta) if meta.file_type().is_symlink() => return Some(at),
             Ok(_) => {}
-            // Nothing stands here yet, so nothing below it can be a link.
+            // Nothing below an absent component can be a link, and an unreadable component fails
+            // the action itself.
             Err(_) => return None,
         }
     }
@@ -530,6 +560,12 @@ Two keys can reach one local file through a followed link, and both can download
 A bind mount or a mount point inside the root gives one file two keys with no link, and `lstat`
 cannot tell. D4 holds nothing there. A hard link needs no decision, because a delete removes one
 name and leaves the other.
+
+On Windows a rename cannot replace a directory link, so a download over one fails there. That comes
+from reading Rust's standard library source, without a run on Windows.
+
+**FR-Exec-4** has no implementation yet. When the opt-in that removes emptied directories lands, it
+needs D4's rule: it must not remove a directory through a link.
 
 A Windows device name such as `NUL` names a device in every directory, so a key like that leaves the
 root through its own name. **FR-Root-8** covers it.
