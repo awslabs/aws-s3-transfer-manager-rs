@@ -16,31 +16,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-/// Determines what kind of addresses resolution should return.  Happy eyeballs is implemented
-/// internally in hyper and so if we want to support it we need to return both ipv4 and ipv6
-/// addresses (if they exist).  This makes error correlation much harder (impossible really)
-/// because partial failures aren't detectable (for ex: fail to connect to ipv6 but succeed on
-/// ipv4 will not trigger any detectable way of penalizing the ipv6 address).
-#[derive(Debug, Default, Clone, Copy)]
-pub enum NameResolutionAddressTypes {
-    /// Resolution should return at least one ipv4 and ipv6 address, if they exist
-    #[default]
-    All,
-
-    /// Resolution should only return ipv4 addresses
-    IpV4,
-
-    /// Resolution should only return ipv6 addresses
-    IpV6,
-}
-
 /// All configuration options for a caching DNS resolver
 #[derive(Clone, Debug, Default)]
 pub struct ResolverConfig {
     internal_resolver: Option<SharedDnsResolver>,
     runtime: Option<tokio::runtime::Handle>,
-    address_types: NameResolutionAddressTypes,
-    default_ttl: Option<Duration>,
 }
 
 impl ResolverConfig {
@@ -71,18 +51,6 @@ impl ResolverConfigBuilder {
     /// while the name resolution lookups could use any kind of future-handling runtime.
     pub fn with_runtime(&mut self, runtime: tokio::runtime::Handle) -> &Self {
         self.config.runtime = Some(runtime);
-        self
-    }
-
-    /// Configures what kind of addresses resolution should return
-    pub fn with_address_types(&mut self, address_types: NameResolutionAddressTypes) -> &mut Self {
-        self.config.address_types = address_types;
-        self
-    }
-
-    /// Configures the time-to-live for each resolved address
-    pub fn with_default_ttl(&mut self, default_ttl: Duration) -> &mut Self {
-        self.config.default_ttl = Some(default_ttl);
         self
     }
 
@@ -335,18 +303,14 @@ pub type ResolutionFunction = Box<dyn Fn(String) + Send + Sync>;
 
 /// Configuration for the async recurrent task that handles all incoming ResolverOperation
 /// instances.  This context is passed into the operation handler function a caching resolver
-/// was created with, allowing it to do name lookups and know how long an address should stay
-/// valid.
+/// was created with, allowing it to do name lookups
 pub struct OperationHandlerContext {
     resolution_function: ResolutionFunction,
-
-    ttl: Duration,
 }
 
 impl Debug for OperationHandlerContext {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let mut formatter = f.debug_struct("OperationHandlerContext");
-        formatter.field("ttl", &self.ttl);
         formatter.finish()
     }
 }
@@ -356,12 +320,6 @@ impl OperationHandlerContext {
     /// associated with the caching resolver
     pub fn resolution_function(&self) -> &ResolutionFunction {
         &self.resolution_function
-    }
-
-    /// How long a lookup stays cached; may be extended indefinitely by future lookups refreshing
-    /// an individual address's ttl
-    pub fn ttl(&self) -> Duration {
-        self.ttl
     }
 }
 
@@ -384,16 +342,12 @@ struct ResolverProcess<T> {
     state: T,
 }
 
-impl<T> ResolverProcess<T>
-where
-    T: Default,
-{
+impl<T> ResolverProcess<T> {
     fn new(
         state: T,
         internal_resolver: SharedDnsResolver,
         sender: mpsc::UnboundedSender<ResolverOperation>,
         receiver: mpsc::UnboundedReceiver<ResolverOperation>,
-        ttl: Duration,
     ) -> Self {
         // build the resolver function that runs resolution as a background task on the tokio
         // runtime and then takes the result and sends it back to the resolver process via
@@ -418,7 +372,6 @@ where
         ResolverProcess {
             context: OperationHandlerContext {
                 resolution_function,
-                ttl,
             },
             receiver,
             state,
@@ -504,7 +457,7 @@ impl ResolverImpl {
         operation_handler: ResolverOperationHandlerFn<T>,
     ) -> Self
     where
-        T: Default + Send + 'static,
+        T: Send + 'static,
     {
         let (tx, rx): (
             mpsc::UnboundedSender<ResolverOperation>,
@@ -520,13 +473,7 @@ impl ResolverImpl {
         let internal_resolver = config.internal_resolver.unwrap_or(SharedDnsResolver::new(
             aws_smithy_runtime::client::dns::TokioDnsResolver::new(),
         ));
-        let mut resolver_impl = ResolverProcess::<T>::new(
-            state,
-            internal_resolver,
-            tx,
-            rx,
-            config.default_ttl.unwrap_or(DEFAULT_CACHE_TTL),
-        );
+        let mut resolver_impl = ResolverProcess::<T>::new(state, internal_resolver, tx, rx);
 
         // Config runtime || create a new runtime
         if let Some(config_runtime) = config.runtime {

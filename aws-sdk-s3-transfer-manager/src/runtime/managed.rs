@@ -385,7 +385,7 @@ fn build_http_client(threads: &[ThreadHandle], options: &RuntimeHttpOptions) -> 
     );
     #[cfg(not(target_os = "android"))]
     let dns_resolver = //ShufflingDnsResolver::new(aws_smithy_dns::HickoryDnsResolver::default());
-        crate::dns::sra::new_sra_caching_resolver(crate::dns::ResolverConfig::builder().build());
+        crate::dns::sra::new_sra_caching_resolver(crate::dns::sra::SraResolverConfig::builder().build());
 
     let partitions = threads.iter().map(|th| {
         let partition = Partition::new(
