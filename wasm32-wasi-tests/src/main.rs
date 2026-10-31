@@ -22,8 +22,6 @@
 //! On other targets the binary prints an error and exits with status 1.
 
 #[cfg(target_os = "wasi")]
-mod s3;
-#[cfg(target_os = "wasi")]
 mod scenarios;
 
 #[cfg(target_os = "wasi")]

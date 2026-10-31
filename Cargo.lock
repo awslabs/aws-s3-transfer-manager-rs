@@ -2771,6 +2771,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "memory-s3"
+version = "0.1.0"
+dependencies = [
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "bytes",
+ "tokio",
+]
+
+[[package]]
 name = "metrics"
 version = "0.24.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4802,6 +4812,7 @@ dependencies = [
  "aws-types",
  "bytes",
  "crossbeam-epoch",
+ "memory-s3",
  "tokio",
 ]
 
