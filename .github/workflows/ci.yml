@@ -149,6 +149,7 @@ jobs:
       - musl
       - freebsd
       - android
+      - wasm32-wasi
       - e2e
     steps:
       - name: Verify platform results
@@ -361,6 +362,79 @@ jobs:
           "${{ matrix.abi }}"
           "${{ matrix.page_size }}"
           "${{ matrix.system_image_target }}"
+
+  wasm32-wasi:
+    name: ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    needs: basics
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: wasm32-wasip2
+            nightly: false
+            rustflags: -Dwarnings --cfg tokio_unstable
+          # Only nightly ships a prebuilt wasm32-wasip3 standard library.
+          - target: wasm32-wasip3
+            nightly: true
+            rustflags: -Dwarnings -Adeprecated --cfg tokio_unstable
+    env:
+      # The S3 client's tokio integration enables tokio's `fs` feature, which
+      # tokio accepts on wasm only with `tokio_unstable`.
+      RUSTFLAGS: ${{ matrix.rustflags }}
+      HARNESS: ${{ github.workspace }}/target/${{ matrix.target }}/release/wasm32-wasi-tests.wasm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust ${{ matrix.nightly && env.rust_nightly || env.rust_clippy }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.nightly && env.rust_nightly || env.rust_clippy }}
+          targets: ${{ matrix.target }}
+          components: clippy
+      - name: Install Wasmtime
+        uses: bytecodealliance/actions/wasmtime/setup@v1
+        with:
+          # Wasmtime 39 rejects the wasm32-wasip3 components that the pinned
+          # nightly builds.
+          version: "50.0.0"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Clippy
+        run: |
+          cargo clippy --locked -p aws-sdk-s3-transfer-manager -p wasm32-wasi-tests \
+            --target ${{ matrix.target }} --no-deps
+          cargo clippy --locked -p aws-sdk-s3-transfer-manager --features sdk-v1 \
+            --target ${{ matrix.target }} --no-deps
+      - name: Docs
+        run: |
+          cargo doc --locked -p aws-sdk-s3-transfer-manager --target ${{ matrix.target }} \
+            --no-deps --document-private-items
+        env:
+          RUSTDOCFLAGS: -Dwarnings
+      - name: Build runtime harness
+        run: cargo build --locked -p wasm32-wasi-tests --target ${{ matrix.target }} --release
+      - name: Run harness under Wasmtime
+        run: |
+          work="$RUNNER_TEMP/wasi-work"
+          log="$RUNNER_TEMP/wasi-harness.log"
+          mkdir -p "$work"
+          wasmtime run --dir "$work::/work" "$HARNESS" /work | tee "$log"
+          # The module reports what it ran, so an empty or mistargeted build
+          # cannot pass by exiting zero.
+          header="^wasm32-wasi-tests: ([0-9]+) scenarios on ${{ matrix.target }}$"
+          if ! [[ "$(head -n 1 "$log")" =~ $header ]]; then
+            echo "the harness did not report running on ${{ matrix.target }}" >&2
+            exit 1
+          fi
+          count=${BASH_REMATCH[1]}
+          passed=$(grep -c '^PASS ' "$log" || true)
+          if (( count == 0 || passed != count )) \
+            || [[ "$(tail -n 1 "$log")" != "$count scenarios passed" ]]; then
+            echo "the harness reported $passed of $count scenarios passing" >&2
+            exit 1
+          fi
 
   fmt:
     name: fmt

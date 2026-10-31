@@ -4791,6 +4791,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "wasm32-wasi-tests"
+version = "0.1.0"
+dependencies = [
+ "aws-sdk-s3",
+ "aws-sdk-s3-transfer-manager",
+ "aws-smithy-async",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "crossbeam-epoch",
+ "tokio",
+]
+
+[[package]]
 name = "web-sys"
 version = "0.3.105"
 source = "registry+https://github.com/rust-lang/crates.io-index"

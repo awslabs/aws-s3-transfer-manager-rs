@@ -9,7 +9,8 @@ members = [
     # internal
     "s3-mock-server",
     "benches",
-    "integration-tests"
+    "integration-tests",
+    "wasm32-wasi-tests",
 ]
 exclude = ["fuzz"]
 
