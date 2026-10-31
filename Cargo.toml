@@ -11,6 +11,7 @@ members = [
     "benches",
     "integration-tests",
     "wasm32-unknown-unknown-tests",
+    "wasm32-wasi-tests",
 ]
 exclude = ["fuzz"]
 

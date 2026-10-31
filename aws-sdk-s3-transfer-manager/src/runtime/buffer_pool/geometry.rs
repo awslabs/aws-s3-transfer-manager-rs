@@ -120,7 +120,7 @@ impl PoolGeometry {
             });
         }
 
-        let carriers_per_block = NonZeroUsize::new(block_size.get() / carrier_size.get())
+        let carriers_per_block = NonZeroUsize::new(block_size.get() / carrier_size)
             .expect("a nonzero whole-carrier block contains a carrier");
         u32::try_from(carriers_per_block.get() - 1).map_err(|_| {
             GeometryError::CarrierIndexOverflow {

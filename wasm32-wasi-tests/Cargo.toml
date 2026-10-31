@@ -1,0 +1,21 @@
+[package]
+name = "wasm32-wasi-tests"
+version = "0.1.0"
+edition = "2021"
+authors = ["AWS Rust SDK Team <aws-sdk-rust@amazon.com>"]
+license = "Apache-2.0"
+publish = false
+description = "Runtime tests for aws-sdk-s3-transfer-manager on wasm32-wasip2 and wasm32-wasip3"
+
+# The binary only reports an error on other targets, so native workspace builds compile none of these.
+[target.'cfg(target_os = "wasi")'.dependencies]
+aws-sdk-s3-transfer-manager = { path = "../aws-sdk-s3-transfer-manager" }
+aws-sdk-s3 = { workspace = true, features = ["behavior-version-latest"] }
+aws-smithy-async = { workspace = true, features = ["rt-tokio"] }
+aws-smithy-runtime-api = { workspace = true, features = ["client"] }
+aws-smithy-types = { workspace = true }
+aws-types = { workspace = true }
+bytes = "1"
+# Reclaims scheduler descriptors deferred by the transfer manager's lock-free sets.
+crossbeam-epoch = "0.9"
+tokio = { version = "1.43.0", features = ["rt", "time"] }
