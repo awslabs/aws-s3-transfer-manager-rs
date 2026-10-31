@@ -12,11 +12,13 @@ description = "Runtime tests for aws-sdk-s3-transfer-manager on wasm32-wasip2 an
 aws-sdk-s3-transfer-manager = { path = "../aws-sdk-s3-transfer-manager" }
 aws-sdk-s3 = { workspace = true, features = ["behavior-version-latest"] }
 aws-smithy-async = { workspace = true, features = ["rt-tokio"] }
-aws-smithy-runtime-api = { workspace = true, features = ["client"] }
-aws-smithy-types = { workspace = true }
+aws-smithy-runtime-api = { workspace = true, features = ["client", "http-1x"] }
+aws-smithy-types = { workspace = true, features = ["http-body-1-x"] }
 aws-types = { workspace = true }
 bytes = "1"
 # Reclaims scheduler descriptors deferred by the transfer manager's lock-free sets.
 crossbeam-epoch = "0.9"
-in-memory-s3 = { path = "../in-memory-s3" }
-tokio = { version = "1.43.0", features = ["rt", "time"] }
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1.20", features = ["client-legacy", "http1", "tokio"] }
+tokio = { version = "1.43.0", features = ["net", "rt", "time"] }
+tower-service = "0.3"

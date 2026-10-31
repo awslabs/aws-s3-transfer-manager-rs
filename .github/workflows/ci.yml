@@ -381,8 +381,9 @@ jobs:
             nightly: true
             rustflags: -Dwarnings -Adeprecated --cfg tokio_unstable
     env:
-      # The S3 client's tokio integration enables tokio's `fs` feature, which
-      # tokio accepts on wasm only with `tokio_unstable`.
+      # The S3 client's tokio integration enables tokio's `fs` feature, and the
+      # harness's HTTP connector enables `net`. tokio accepts both on wasm only
+      # with `tokio_unstable`.
       RUSTFLAGS: ${{ matrix.rustflags }}
       HARNESS: ${{ github.workspace }}/target/${{ matrix.target }}/release/wasm32-wasi-tests.wasm
     steps:
@@ -416,12 +417,34 @@ jobs:
           RUSTDOCFLAGS: -Dwarnings
       - name: Build runtime harness
         run: cargo build --locked -p wasm32-wasi-tests --target ${{ matrix.target }} --release
+      - name: Build mock S3 server
+        run: cargo build --locked -p s3-mock-server --bin s3-mock-server
+        env:
+          # The server runs on the host, so the wasm flags do not apply.
+          RUSTFLAGS: ""
       - name: Run harness under Wasmtime
         run: |
           work="$RUNNER_TEMP/wasi-work"
           log="$RUNNER_TEMP/wasi-harness.log"
+          server_log="$RUNNER_TEMP/s3-mock-server.log"
           mkdir -p "$work"
-          wasmtime run --dir "$work::/work" "$HARNESS" /work | tee "$log"
+          target/debug/s3-mock-server --slow-down-once bucket/retried bucket > "$server_log" 2>&1 &
+          server=$!
+          trap 'kill "$server" 2>/dev/null || true' EXIT
+          # The server prints its loopback address once it accepts connections.
+          address=
+          for _ in {1..100}; do
+            address=$(grep -m 1 -E '^127\.0\.0\.1:[0-9]+$' "$server_log" || true)
+            [[ -n "$address" ]] && break
+            sleep 0.1
+          done
+          if [[ -z "$address" ]]; then
+            echo "s3-mock-server did not report an address" >&2
+            exit 1
+          fi
+          # `inherit-network` lets the module connect to the server.
+          wasmtime run -S inherit-network --dir "$work::/work" "$HARNESS" /work "$address" \
+            | tee "$log"
           # The module reports what it ran, so an empty or mistargeted build
           # cannot pass by exiting zero.
           header="^wasm32-wasi-tests: ([0-9]+) scenarios on ${{ matrix.target }}$"
@@ -436,6 +459,9 @@ jobs:
             echo "the harness reported $passed of $count scenarios passing" >&2
             exit 1
           fi
+      - name: Show mock S3 server output
+        if: failure()
+        run: cat "$RUNNER_TEMP/s3-mock-server.log" || true
 
   fmt:
     name: fmt

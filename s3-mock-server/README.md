@@ -16,6 +16,21 @@ The S3 Mock Server provides a local HTTP server that implements the S3 API opera
 
 ## Usage
 
+### Command Line
+
+The `s3-mock-server` binary serves in-memory storage on an ephemeral port of `127.0.0.1` until it
+receives SIGINT:
+
+```sh
+cargo run -p s3-mock-server -- [--slow-down-once <bucket>/<key>]... [<bucket>...]
+```
+
+It creates each bucket named on the command line, and answers the first GetObject, PutObject, or
+UploadPart request for each `--slow-down-once` object with 503 SlowDown. It then prints its
+address, such as `127.0.0.1:49152`, as the first line of standard output once it accepts
+connections. Clients sign requests with access key `mock-akid` and secret key `mock-secret`, and
+address buckets path-style.
+
 ### Basic Setup
 
 ```rust
