@@ -9,12 +9,16 @@
 //! [`MemoryS3`] is an [`HttpConnector`] for an S3 client, so tests run
 //! transfers without a network on any target. The connector supports
 //! `PutObject`, multipart upload creation, parts, and completion, ranged
-//! `GetObject`, and single-page `ListObjectsV2`. Every request yields to the
-//! runtime once before it is served, so each request future returns `Pending`
-//! at least once. Tests can answer requests with `503 SlowDown`.
+//! `GetObject`, and single-page `ListObjectsV2`. Every request awaits the
+//! connector's [`RequestWait`] before it is served. The default wait yields to
+//! the tokio runtime once, so each request future returns `Pending` at least
+//! once. Tests can answer requests with `503 SlowDown` and hold one matching
+//! request until its future is dropped.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -25,6 +29,20 @@ use aws_smithy_runtime_api::http::StatusCode;
 use aws_smithy_types::body::SdkBody;
 use aws_smithy_types::byte_stream::ByteStream;
 use bytes::Bytes;
+use tokio::sync::Notify;
+
+/// A future that a request awaits before the connector serves it.
+pub type RequestWait = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+/// A request that [`MemoryS3::hold`] keeps pending.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HoldRule {
+    /// HTTP method, such as `PUT`.
+    pub method: &'static str,
+    /// First byte of the requested range, or `None` to match any request with
+    /// this method.
+    pub range_start: Option<u64>,
+}
 
 /// Request counters.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -85,12 +103,17 @@ struct State {
     requests: Requests,
     /// `GetObject` range starts in request order.
     get_ranges: Vec<Option<u64>>,
+    hold: Option<HoldRule>,
 }
 
 #[derive(Debug, Default)]
 struct Shared {
     state: Mutex<State>,
     throttle_next: AtomicUsize,
+    /// Replaces the default wait when set.
+    wait: Option<fn() -> RequestWait>,
+    held_dropped: AtomicUsize,
+    held: Notify,
 }
 
 /// The connector and its object store. Clones share one store.
@@ -100,6 +123,17 @@ pub struct MemoryS3 {
 }
 
 impl MemoryS3 {
+    /// Returns an empty connector whose requests each await `wait()` instead
+    /// of the default wait.
+    pub fn with_request_wait(wait: fn() -> RequestWait) -> Self {
+        Self {
+            shared: Arc::new(Shared {
+                wait: Some(wait),
+                ..Shared::default()
+            }),
+        }
+    }
+
     /// Stores `data` under `key` without sending a request.
     pub fn insert(&self, key: &str, data: Bytes) {
         self.state().objects.insert(key.to_owned(), data);
@@ -113,6 +147,21 @@ impl MemoryS3 {
     /// Answers the next `count` requests with `503 SlowDown`.
     pub fn throttle_next(&self, count: usize) {
         self.shared.throttle_next.store(count, Ordering::SeqCst);
+    }
+
+    /// Holds the first later request matching `rule` until its future is dropped.
+    pub fn hold(&self, rule: HoldRule) {
+        self.state().hold = Some(rule);
+    }
+
+    /// Completes after a request has been held.
+    pub async fn wait_held(&self) {
+        self.shared.held.notified().await;
+    }
+
+    /// Number of held request futures that have been dropped.
+    pub fn held_dropped(&self) -> usize {
+        self.shared.held_dropped.load(Ordering::SeqCst)
     }
 
     /// Returns the request counters.
@@ -130,11 +179,23 @@ impl MemoryS3 {
     }
 }
 
+/// Counts the drop of a held request future.
+struct HeldGuard(Arc<Shared>);
+
+impl Drop for HeldGuard {
+    fn drop(&mut self) {
+        self.0.held_dropped.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 impl HttpConnector for MemoryS3 {
     fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
         let shared = Arc::clone(&self.shared);
         HttpConnectorFuture::new(async move {
-            tokio::task::yield_now().await;
+            match shared.wait {
+                Some(wait) => wait().await,
+                None => tokio::task::yield_now().await,
+            }
             let method = request.method().to_owned();
             let (key, query) = split_uri(request.uri());
             let chunked = request
@@ -156,6 +217,24 @@ impl HttpConnector for MemoryS3 {
             } else {
                 body
             };
+
+            let held = {
+                let mut state = shared.state.lock().unwrap();
+                let matches = state.hold.as_ref().is_some_and(|rule| {
+                    rule.method == method
+                        && (rule.range_start.is_none()
+                            || rule.range_start == range.map(|(start, _)| start))
+                });
+                if matches {
+                    state.hold = None;
+                }
+                matches
+            };
+            if held {
+                let _guard = HeldGuard(Arc::clone(&shared));
+                shared.held.notify_one();
+                std::future::pending::<()>().await;
+            }
 
             let throttled = shared
                 .throttle_next

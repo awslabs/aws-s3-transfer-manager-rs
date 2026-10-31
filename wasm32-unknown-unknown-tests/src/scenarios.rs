@@ -31,13 +31,13 @@ use aws_types::sdk_config::{
 };
 use aws_types::SdkConfig;
 use bytes::Bytes;
+use memory_s3::{HoldRule, MemoryS3};
 
 use crate::host::{
     self, block_on, run_until_idle, Driver, LogicalRuntime, LogicalSleep, LogicalWallClock,
     Progress,
 };
 use crate::host_http::{self, HostHttp};
-use crate::s3::{HoldRule, MemoryS3};
 
 const KIB: usize = 1024;
 const MIB: usize = 1024 * KIB;
@@ -116,6 +116,12 @@ fn sdk_config(connector: SharedHttpConnector, with_sleep: bool) -> SdkConfig {
         builder
     };
     builder.build()
+}
+
+/// Returns an empty store whose requests each wait for one simulated host I/O
+/// completion, so they resume only through the executor's wake path.
+fn new_store() -> MemoryS3 {
+    MemoryS3::with_request_wait(|| Box::pin(host::host_io()))
 }
 
 fn client(store: &MemoryS3, configure: impl FnOnce(ConfigBuilder) -> ConfigBuilder) -> Client {
@@ -265,7 +271,7 @@ fn per_client_runtimes() -> Result<String, String> {
             })
         })
         .collect();
-    let stores = OFFSETS.map(|_| MemoryS3::default());
+    let stores = OFFSETS.map(|_| new_store());
     let mut clients = Vec::new();
     for (index, runtime) in runtimes.iter().enumerate() {
         let client = client(&stores[index], |config| {
@@ -321,7 +327,7 @@ fn explicit_buffer_pool() -> Result<String, String> {
         .map_err(|e| format!("build pool: {e}"))?;
 
     let before = host::stats();
-    let store = MemoryS3::default();
+    let store = new_store();
     let client = client(&store, |config| {
         config.memory(MemoryConfig::Explicit(pool.clone()))
     });
@@ -343,7 +349,7 @@ fn explicit_buffer_pool() -> Result<String, String> {
 /// configuration, and its automatic memory limit is the target's fallback.
 fn client_construction() -> Result<String, String> {
     let before = host::stats();
-    let store = MemoryS3::default();
+    let store = new_store();
     let client = client(&store, |config| config);
     let capacity = client.metrics().memory().configured_capacity_bytes();
     ensure!(
@@ -356,7 +362,7 @@ fn client_construction() -> Result<String, String> {
 /// A 64 KiB object uploads with one `PutObject` and downloads byte for byte.
 fn single_part_round_trip() -> Result<String, String> {
     let before = host::stats();
-    let store = MemoryS3::default();
+    let store = new_store();
     let client = client(&store, |config| config);
     let data = pattern(64 * KIB);
     let received = block_on(async {
@@ -380,7 +386,7 @@ fn single_part_round_trip() -> Result<String, String> {
 /// ranged `GetObject` requests.
 fn multipart_round_trip() -> Result<String, String> {
     let before = host::stats();
-    let store = MemoryS3::default();
+    let store = new_store();
     let client = client(&store, |config| {
         config.part_size(PartSize::Target(8 * MIB as u64))
     });
@@ -406,7 +412,7 @@ fn multipart_round_trip() -> Result<String, String> {
 /// the configured sleep implementation and re-sends it.
 fn outer_retry() -> Result<String, String> {
     let before = host::stats();
-    let store = MemoryS3::default();
+    let store = new_store();
     let client = client(&store, |config| config);
     let data = pattern(64 * KIB);
     store.throttle_next(1);
@@ -419,7 +425,7 @@ fn outer_retry() -> Result<String, String> {
     let sleeps = host::stats().fired_sleeps - before.fired_sleeps;
     ensure!(sleeps == 1, "expected one backoff sleep, observed {sleeps}");
     ensure!(
-        store.object("/retried").as_deref() == Some(&data[..]),
+        store.object("retried").as_deref() == Some(&data[..]),
         "stored object differs from the upload"
     );
     shut_down(client, before, &store)
@@ -431,9 +437,9 @@ fn hedge_deadline() -> Result<String, String> {
     const PART: usize = 5 * MIB;
     const PARTS: usize = 15;
     let before = host::stats();
-    let store = MemoryS3::default();
+    let store = new_store();
     let data = pattern(PARTS * PART);
-    store.insert("/hedged", data.clone());
+    store.insert("hedged", data.clone());
     // Two workers keep requests in order, so the last range starts after the
     // ten successful requests that warm the deadline.
     let client = client(&store, |config| {
@@ -468,7 +474,7 @@ fn hedge_deadline() -> Result<String, String> {
 /// returns.
 fn cancellation() -> Result<String, String> {
     let before = host::stats();
-    let store = MemoryS3::default();
+    let store = new_store();
     let client = client(&store, |config| config);
     store.hold(HoldRule {
         method: "PUT",
@@ -491,7 +497,7 @@ fn cancellation() -> Result<String, String> {
         "the held PutObject future was not dropped"
     );
     ensure!(
-        store.object("/cancelled").is_none(),
+        store.object("cancelled").is_none(),
         "aborted upload stored an object"
     );
     shut_down(client, before, &store)
@@ -502,7 +508,7 @@ fn cancellation() -> Result<String, String> {
 fn high_fan_out() -> Result<String, String> {
     const UPLOADS: usize = 300;
     let before = host::stats();
-    let store = MemoryS3::default();
+    let store = new_store();
     let client = client(&store, |config| {
         config.concurrency(ConcurrencyMode::Explicit(128))
     });
@@ -538,7 +544,7 @@ fn high_fan_out() -> Result<String, String> {
 /// panicking, and send no request.
 fn filesystem_unavailable() -> Result<String, String> {
     let before = host::stats();
-    let store = MemoryS3::default();
+    let store = new_store();
     let client = client(&store, |config| config);
     ensure!(
         InputStream::from_path("/data/object").is_err(),
@@ -627,7 +633,7 @@ pub(crate) fn host_round_trip_step() -> Result<bool, String> {
 /// Constructs a client whose runtime mode is the default, which this target
 /// does not support.
 pub(crate) fn client_without_runtime() {
-    let store = MemoryS3::default();
+    let store = new_store();
     let config = Config::builder()
         .s3_config(&sdk_config(SharedHttpConnector::new(store), true))
         .build();
@@ -640,7 +646,7 @@ pub(crate) fn client_without_runtime() {
 /// because the SDK itself rejects a configuration that enables them, or
 /// retries, without a sleep implementation.
 pub(crate) fn client_without_sleep() {
-    let store = MemoryS3::default();
+    let store = new_store();
     let sdk = sdk_config(SharedHttpConnector::new(store), false)
         .into_builder()
         .timeout_config(TimeoutConfig::disabled())

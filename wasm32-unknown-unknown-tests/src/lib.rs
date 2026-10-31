@@ -46,7 +46,6 @@
 
 mod host;
 mod host_http;
-mod s3;
 mod scenarios;
 
 use std::sync::Mutex;

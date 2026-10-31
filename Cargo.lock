@@ -4812,7 +4812,7 @@ dependencies = [
  "aws-types",
  "bytes",
  "crossbeam-epoch",
- "tokio",
+ "memory-s3",
 ]
 
 [[package]]

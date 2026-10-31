@@ -19,6 +19,6 @@ aws-smithy-runtime-api = { workspace = true, features = ["client"] }
 aws-smithy-types = { workspace = true }
 aws-types = { workspace = true }
 bytes = "1"
-tokio = { version = "1.43.0", default-features = false, features = ["sync"] }
 # Reclaims scheduler descriptors deferred by the transfer manager's lock-free sets.
 crossbeam-epoch = "0.9"
+memory-s3 = { path = "../memory-s3" }
