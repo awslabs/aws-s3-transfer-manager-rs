@@ -31,7 +31,7 @@ use aws_types::sdk_config::{
 };
 use aws_types::SdkConfig;
 use bytes::Bytes;
-use memory_s3::{HoldRule, MemoryS3};
+use in_memory_s3::{HoldRule, MemoryS3};
 
 use crate::host::{
     self, block_on, run_until_idle, Driver, LogicalRuntime, LogicalSleep, LogicalWallClock,

@@ -1,5 +1,5 @@
 [package]
-name = "memory-s3"
+name = "in-memory-s3"
 version = "0.1.0"
 edition = "2021"
 authors = ["AWS Rust SDK Team <aws-sdk-rust@amazon.com>"]

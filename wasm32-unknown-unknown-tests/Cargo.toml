@@ -21,4 +21,4 @@ aws-types = { workspace = true }
 bytes = "1"
 # Reclaims scheduler descriptors deferred by the transfer manager's lock-free sets.
 crossbeam-epoch = "0.9"
-memory-s3 = { path = "../memory-s3" }
+in-memory-s3 = { path = "../in-memory-s3" }
