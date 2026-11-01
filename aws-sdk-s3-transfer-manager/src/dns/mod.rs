@@ -101,7 +101,7 @@ impl ResolveRequestBuilder {
 }
 
 /// Type signature for a resolution request's completion callback
-pub type ResolutionCompletionFn = Box<dyn FnOnce(ResolveDnsResult) -> () + Send + Sync>;
+pub type ResolutionCompletionFn = Box<dyn FnOnce(ResolveDnsResult) + Send + Sync>;
 
 /// Internal resolve request type.  Needs to be public so that caching resolver variants can
 /// be implemented externally.
@@ -177,12 +177,12 @@ pub struct HostEventConnectionError {
 impl HostEventConnectionError {
     /// Creates a new builder for a connection error host event variant
     pub fn builder(category: ConnectionErrorCategory) -> HostEventConnectionErrorBuilder {
-        return HostEventConnectionErrorBuilder {
+        HostEventConnectionErrorBuilder {
             error: HostEventConnectionError {
                 category,
                 source: None,
             },
-        };
+        }
     }
 
     /// How the resolver should penalize the associated address in future resolutions
@@ -400,7 +400,7 @@ impl<T> ResolverProcess<T> {
                 operation_result = receiver.recv() => {
                     match operation_result {
                         Some(operation) => {
-                            (operation_handler)(&context, state, operation);
+                            (operation_handler)(context, state, operation);
                         }
                         None => {
                             return;

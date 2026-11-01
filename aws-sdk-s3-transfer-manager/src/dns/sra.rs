@@ -88,7 +88,7 @@ impl Default for SraResolverConfig {
         Self {
             address_types: NameResolutionAddressTypes::default(),
             resolution_ttl: DEFAULT_CACHE_TTL,
-            clock: Arc::new(|| Instant::now()),
+            clock: Arc::new(Instant::now),
         }
     }
 }
@@ -133,7 +133,6 @@ pub struct SraResolverConfigBuilder {
 }
 
 impl SraResolverConfigBuilder {
-
     /// Configures what kind of addresses resolution should return
     pub fn with_address_types(&mut self, address_types: NameResolutionAddressTypes) -> &mut Self {
         self.config.address_types = address_types;
@@ -299,16 +298,11 @@ struct HostEntry {
 
     /// is an async resolution task currently outstanding?
     pending_resolution: bool,
-
-    /// what is the base TTL value for addresses that we resolve?  An address may live longer than
-    /// the TTL.  Every time a resolve sees an address, if it is already known, we extend its
-    /// lifetime accordingly.
-    ttl: Duration,
 }
 
 impl HostEntry {
     /// Create a new HostEntry instance
-    fn new(ttl: Duration) -> HostEntry {
+    fn new() -> HostEntry {
         HostEntry {
             pending_requests: VecDeque::new(),
             ipv4_addresses: GenerationalAddressSet::new(),
@@ -316,7 +310,6 @@ impl HostEntry {
             addresses_by_ttl: PriorityQueue::new(),
             last_resolution_timepoint: None,
             pending_resolution: false,
-            ttl,
         }
     }
 
@@ -335,8 +328,8 @@ impl HostEntry {
     }
 
     /// Updates the entry with a newly-resolved address
-    fn on_address_resolved(&mut self, address: IpAddr, now: Instant) {
-        let ttl = now + self.ttl;
+    fn on_address_resolved(&mut self, address: IpAddr, config: &SraResolverConfig) {
+        let ttl = (config.clock)() + config.resolution_ttl;
 
         // If we already know about this address, just extend its TTL, regardless of any other
         // (healthy/unhealthy/banned) status
@@ -346,7 +339,7 @@ impl HostEntry {
         }
 
         // track the address by lifetime
-        self.addresses_by_ttl.push(address.clone(), ttl);
+        self.addresses_by_ttl.push(address, ttl);
 
         // add it to the correct set
         match address {
@@ -361,7 +354,8 @@ impl HostEntry {
 
     /// Mark an address as unhealthy.  If the address is already unhealthy, extend the duration
     /// it will stay in that state.
-    fn demote_address(&mut self, address: IpAddr, duration: Duration, now: Instant) {
+    fn demote_address(&mut self, address: IpAddr, duration: Duration, config: &SraResolverConfig) {
+        let now = (config.clock)();
         match address {
             IpAddr::V4(v4addr) => {
                 self.ipv4_addresses.demote_address(v4addr, duration, now);
@@ -373,7 +367,9 @@ impl HostEntry {
     }
 
     /// Removes all addresses whose TTL have expired from the host entry
-    fn purge_expired(&mut self, now: Instant) {
+    fn purge_expired(&mut self, config: &SraResolverConfig) {
+        let now = (config.clock)();
+
         while !self.addresses_by_ttl.is_empty() {
             if self.addresses_by_ttl.peek().unwrap().1 <= &now {
                 let purged = self.addresses_by_ttl.pop().unwrap().0;
@@ -389,7 +385,7 @@ impl HostEntry {
         &mut self,
         address: IpAddr,
         error: HostEventConnectionError,
-        now: Instant,
+        config: &SraResolverConfig,
     ) {
         match error.category {
             ConnectionErrorCategory::Fatal => {
@@ -403,23 +399,22 @@ impl HostEntry {
                         self.ipv6_addresses.remove_address(&v6addr);
                     }
                 }
-
-                return;
             }
             ConnectionErrorCategory::Major => {
-                self.demote_address(address, self.ttl, now);
+                self.demote_address(address, config.resolution_ttl, config);
             }
             ConnectionErrorCategory::Standard(duration) => {
-                self.demote_address(address, duration, now);
+                self.demote_address(address, duration, config);
             }
         }
     }
 
     /// Pulls addresses from the cache to complete a resolution request.  If no addresses exist,
     /// fail the request
-    fn complete_request(&mut self, request: ResolveRequestInternal, now: Instant) {
+    fn complete_request(&mut self, request: ResolveRequestInternal, config: &SraResolverConfig) {
         let mut addresses: Vec<IpAddr> = Vec::new();
 
+        let now = (config.clock)();
         let v4_addr_option = self.ipv4_addresses.acquire_address(now);
         if let Some(v4_addr) = v4_addr_option {
             addresses.push(IpAddr::V4(v4_addr));
@@ -445,10 +440,11 @@ impl HostEntry {
         &mut self,
         request: ResolveRequestInternal,
         context: &OperationHandlerContext,
-        now: Instant,
+        config: &SraResolverConfig,
     ) {
-        self.purge_expired(now);
+        self.purge_expired(config);
 
+        let now = (config.clock)();
         // if it's our first request or enough time has passed since the last one
         let mut should_spawn_resolve: bool = self.last_resolution_timepoint.is_none();
         if let Some(last_resolution_timepoint) = self.last_resolution_timepoint {
@@ -474,20 +470,20 @@ impl HostEntry {
         }
 
         // complete the request with what we have
-        self.complete_request(request, now);
+        self.complete_request(request, config);
     }
 
     /// applies the result of a background resolution task to the host entry.  If resolution was
     /// a failure, then fail all pending requests.  Otherwise, apply all resolved addresses
     /// to the cached state appropriately, then attempt to complete pending requests normally.
-    fn handle_resolve_result(&mut self, result: ResolveResult, now: Instant) {
-        self.purge_expired(now);
+    fn handle_resolve_result(&mut self, result: ResolveResult, config: &SraResolverConfig) {
+        self.purge_expired(config);
         self.pending_resolution = false;
 
         match result.result {
             Ok(addresses) => {
                 for address in addresses {
-                    self.on_address_resolved(address, now);
+                    self.on_address_resolved(address, config);
                 }
             }
             Err(err) => {
@@ -505,17 +501,17 @@ impl HostEntry {
         // complete any pending requests with what we have available, if anything
         while !self.pending_requests.is_empty() {
             let pending_request = self.pending_requests.pop_front().unwrap();
-            self.complete_request(pending_request, now);
+            self.complete_request(pending_request, config);
         }
     }
 
     /// Applies a host event to a host's entry in the resolver
-    fn handle_host_event(&mut self, event: HostEvent, now: Instant) {
-        self.purge_expired(now);
+    fn handle_host_event(&mut self, event: HostEvent, config: &SraResolverConfig) {
+        self.purge_expired(config);
 
         match event.event_data {
             HostEventInformation::ConnectionError(error) => {
-                self.handle_connection_error(event.address, error, now)
+                self.handle_connection_error(event.address, error, config)
             }
         }
     }
@@ -543,25 +539,23 @@ fn handle_resolve_request(
 ) {
     if !state.hosts.contains_key(&request.request.name) {
         let name = request.request.name.clone();
-        state
-            .hosts
-            .insert(name.to_string(), HostEntry::new(state.resolution_ttl));
+        state.hosts.insert(name.to_string(), HostEntry::new());
     }
 
     let host_entry = state.hosts.get_mut(&request.request.name).unwrap();
 
-    host_entry.handle_resolve_request(request, context, (state.clock)());
+    host_entry.handle_resolve_request(request, context, &state.sra_config);
 }
 
 fn handle_resolve_result(state: &mut SraCachingResolverState, result: ResolveResult) {
     if let Some(entry) = state.hosts.get_mut(&result.name) {
-        entry.handle_resolve_result(result, (state.clock)());
+        entry.handle_resolve_result(result, &state.sra_config);
     }
 }
 
 fn handle_host_event(state: &mut SraCachingResolverState, event: HostEvent) {
     if let Some(entry) = state.hosts.get_mut(&event.name) {
-        entry.handle_host_event(event, (state.clock)());
+        entry.handle_host_event(event, &state.sra_config);
     }
 }
 
@@ -582,7 +576,10 @@ fn handle_operation_sra(
 }
 
 /// Creates a new caching resolver that follows the SRA specification for domain name resolution
-pub fn new_sra_caching_resolver(sra_config: SraResolverConfig, caching_config: ResolverConfig) -> ResolverHandle {
+pub fn new_sra_caching_resolver(
+    sra_config: SraResolverConfig,
+    caching_config: ResolverConfig,
+) -> ResolverHandle {
     let state = SraCachingResolverState::new(sra_config);
     ResolverHandle {
         resolver: Arc::new(ResolverImpl::new(
