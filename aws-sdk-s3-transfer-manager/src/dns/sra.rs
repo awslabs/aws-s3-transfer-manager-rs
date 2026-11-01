@@ -73,16 +73,24 @@ pub enum NameResolutionAddressTypes {
     IpV6,
 }
 
-/// Configuration options for an SRA Resolver
-#[derive(Clone, Default)]
+/// Configuration options specific to an SRA Resolver
+#[derive(Clone)]
 pub struct SraResolverConfig {
-    caching_config: ResolverConfig,
-
     address_types: NameResolutionAddressTypes,
 
-    resolution_ttl: Option<Duration>,
+    resolution_ttl: Duration,
 
-    clock: Option<ClockFn>,
+    clock: ClockFn,
+}
+
+impl Default for SraResolverConfig {
+    fn default() -> Self {
+        Self {
+            address_types: NameResolutionAddressTypes::default(),
+            resolution_ttl: DEFAULT_CACHE_TTL,
+            clock: Arc::new(|| Instant::now()),
+        }
+    }
 }
 
 impl SraResolverConfig {
@@ -93,32 +101,25 @@ impl SraResolverConfig {
         }
     }
 
-    /// Caching resolver configuration to use
-    pub fn caching_config(&self) -> ResolverConfig {
-        self.caching_config.clone()
-    }
-
     /// What types of addresses to resolve
     pub fn address_types(&self) -> NameResolutionAddressTypes {
         self.address_types
     }
 
     /// What TTL value to use for resolved addresses
-    pub fn resolution_ttl(&self) -> Option<Duration> {
+    pub fn resolution_ttl(&self) -> Duration {
         self.resolution_ttl
     }
 
-    /// (Test-only) Clock function to use when computing time stamps
-    #[cfg(test)]
-    pub fn clock(&self) -> Option<ClockFn> {
+    /// Clock function to use when computing time stamps
+    pub fn clock(&self) -> ClockFn {
         self.clock.clone()
     }
 }
 
 impl Debug for SraResolverConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut formatter = f.debug_struct("OperationHandlerContext");
-        formatter.field("caching_config", &self.caching_config);
+        let mut formatter = f.debug_struct("SraResolverConfig");
         formatter.field("address_types", &self.address_types);
         formatter.field("resolution_ttl", &self.resolution_ttl);
         formatter.finish()
@@ -132,11 +133,6 @@ pub struct SraResolverConfigBuilder {
 }
 
 impl SraResolverConfigBuilder {
-    /// Sets caching resolver configuration to use
-    pub fn with_caching_config(&mut self, caching_config: ResolverConfig) -> &mut Self {
-        self.config.caching_config = caching_config;
-        self
-    }
 
     /// Configures what kind of addresses resolution should return
     pub fn with_address_types(&mut self, address_types: NameResolutionAddressTypes) -> &mut Self {
@@ -146,14 +142,14 @@ impl SraResolverConfigBuilder {
 
     /// Configures the time-to-live for each resolved address
     pub fn with_resolution_ttl(&mut self, ttl: Duration) -> &mut Self {
-        self.config.resolution_ttl = Some(ttl);
+        self.config.resolution_ttl = ttl;
         self
     }
 
     /// (Test-only) Clock function to use when computing time stamps
     #[cfg(test)]
     pub fn with_clock(&mut self, clock: ClockFn) -> &mut Self {
-        self.config.clock = Some(clock.clone());
+        self.config.clock = clock.clone();
         self
     }
 
@@ -528,21 +524,14 @@ impl HostEntry {
 struct SraCachingResolverState {
     hosts: HashMap<String, HostEntry>,
 
-    // config-copied
-    address_types: NameResolutionAddressTypes,
-
-    resolution_ttl: Duration,
-
-    clock: ClockFn,
+    sra_config: SraResolverConfig,
 }
 
 impl SraCachingResolverState {
-    fn new(config: SraResolverConfig) -> Self {
+    fn new(sra_config: SraResolverConfig) -> Self {
         SraCachingResolverState {
             hosts: HashMap::new(),
-            address_types: config.address_types,
-            resolution_ttl: config.resolution_ttl.unwrap_or(DEFAULT_CACHE_TTL),
-            clock: config.clock.unwrap_or(Arc::new(|| Instant::now())),
+            sra_config,
         }
     }
 }
@@ -593,9 +582,8 @@ fn handle_operation_sra(
 }
 
 /// Creates a new caching resolver that follows the SRA specification for domain name resolution
-pub fn new_sra_caching_resolver(config: SraResolverConfig) -> ResolverHandle {
-    let caching_config = config.caching_config();
-    let state = SraCachingResolverState::new(config);
+pub fn new_sra_caching_resolver(sra_config: SraResolverConfig, caching_config: ResolverConfig) -> ResolverHandle {
+    let state = SraCachingResolverState::new(sra_config);
     ResolverHandle {
         resolver: Arc::new(ResolverImpl::new(
             caching_config,
