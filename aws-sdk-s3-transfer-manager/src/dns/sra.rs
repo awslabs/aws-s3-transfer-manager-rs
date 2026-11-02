@@ -2,9 +2,9 @@
  * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
-
 use crate::dns::*;
 use priority_queue::PriorityQueue;
+use std::cmp::Reverse;
 use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -13,7 +13,7 @@ use std::time::Instant;
 
 /*
 
-Proof of concept for a resolver that uses shared state to distribute IPs to resolution requests
+A resolver that uses shared state to distribute IPs to resolution requests
 from arbitrary sources.  This allows us to properly implement SRA-style name resolution which
 has round-robin IP distribution shared across all threads/runtimes interested in establishing
 connections to a given name.  This resolver can be shared across a transfer manager's runtime
@@ -25,14 +25,18 @@ CSP architecture.
 The resolver can only be interacted with via a communication channel that can contain resolution
 requests, results, and more.  A lightweight recurrent async task loops on that channel's receiver
 processing incoming operations.  This creates a natural "serialization" of all resolution
-requests regardless of source, with an associated private shared state for bookkeeping.
+requests regardless of source/location, with an associated private shared state for bookkeeping.
 
-The async processing task might behave as follows:
+Currently, the async processing task behaves as follows:
 
 On a resolution request:
    If we have good IPs for that name, resolve the request with the least-used good IP
-   If there are 1. no good IPs for that name or 2. it's been a while since we last resolved that
-      name, and no resolution is pending, kick off a resolution on the resolver's runtime.  If the
+   If there are
+
+      1. no good IPs for that name or
+      2. it's been a while since we last resolved that name
+
+      and no resolution is pending, kick off a resolution on the resolver's runtime.  If the
       request was not resolved earlier, park the request until a resolution returns a result.
 
 On a resolution result:
@@ -51,8 +55,11 @@ On a host event:
 On IP TTL expiration:
    Remove the ip from the resolver cache completely
 
+IP TTL expiration (or promotion) is processed lazily.
+
  */
 
+// it's useful to be able to override the resolver's notion of elapsed time when testing
 type ClockFn = Arc<dyn Fn() -> Instant + Send + Sync>;
 
 /// Determines what kind of addresses resolution should return.  Happy eyeballs is implemented
@@ -62,7 +69,7 @@ type ClockFn = Arc<dyn Fn() -> Instant + Send + Sync>;
 /// ipv4 will not trigger any detectable way of penalizing the ipv6 address).
 #[derive(Debug, Default, Clone, Copy)]
 pub enum NameResolutionAddressTypes {
-    /// Resolution should return at least one ipv4 and ipv6 address, if they exist
+    /// Resolution should return one ipv4 and ipv6 address, if they exist
     #[default]
     All,
 
@@ -178,11 +185,11 @@ where
     current_generation: u32,
 
     /// Priority queue of IpAddress structs ordered by the generation they were last acquired in
-    healthy_addresses: PriorityQueue<T, u32>,
+    healthy_addresses: PriorityQueue<T, Reverse<u32>>,
 
     /// Priority queue of IpAddress structs ordered by the timepoint that the address should
     /// move from unhealthy back to healthy
-    unhealthy_addresses_by_expiration: PriorityQueue<T, Instant>,
+    unhealthy_addresses_by_expiration: PriorityQueue<T, Reverse<Instant>>,
 }
 
 impl<T> GenerationalAddressSet<T>
@@ -212,7 +219,7 @@ where
     /// Add an address to the set by inserting it into the healthy subset.
     fn add_address(&mut self, value: T) {
         if !self.contains(&value) {
-            self.healthy_addresses.push(value, 0);
+            self.healthy_addresses.push(value, Reverse(0));
         }
     }
 
@@ -230,9 +237,9 @@ where
 
         // promote any addresses whose demotion has expired
         while !self.unhealthy_addresses_by_expiration.is_empty() {
-            if self.unhealthy_addresses_by_expiration.peek().unwrap().1 <= &now {
+            if self.unhealthy_addresses_by_expiration.peek().unwrap().1 .0 <= now {
                 let promoted_addr = self.unhealthy_addresses_by_expiration.pop().unwrap().0;
-                self.healthy_addresses.push(promoted_addr, 0);
+                self.healthy_addresses.push(promoted_addr, Reverse(0));
             } else {
                 break;
             }
@@ -242,7 +249,7 @@ where
         // address exists because we previously checked if we were empty.
         if self.healthy_addresses.is_empty() {
             let promoted_addr = self.unhealthy_addresses_by_expiration.pop().unwrap().0;
-            self.healthy_addresses.push(promoted_addr, 0);
+            self.healthy_addresses.push(promoted_addr, Reverse(0));
         }
 
         // guaranteed to have a healthy address at this point
@@ -250,13 +257,13 @@ where
 
         // if the best address's generation is current, we've acquired every healthy address in the
         // set while this generation is active, so increment the generation.
-        if generation == self.current_generation {
+        if generation.0 >= self.current_generation {
             self.current_generation += 1;
         }
 
         // push the address back on the set using the current generation value
         self.healthy_addresses
-            .push(item.clone(), self.current_generation);
+            .push(item.clone(), Reverse(self.current_generation));
 
         Some(item)
     }
@@ -267,9 +274,42 @@ where
 
         let expiration = now + duration;
         self.unhealthy_addresses_by_expiration
-            .push(address, expiration);
+            .push(address, Reverse(expiration));
+    }
+
+    #[cfg(test)]
+    fn current_generation(&self) -> u32 {
+        self.current_generation
+    }
+
+    #[cfg(test)]
+    fn get_healthy_data(&self, address: T) -> Option<u32> {
+        if self.healthy_addresses.contains(&address) {
+            Some(self.healthy_addresses.get(&address).unwrap().1 .0)
+        } else {
+            None
+        }
+    }
+
+    #[cfg(test)]
+    fn get_unhealthy_timestamp(&self, address: T) -> Option<Instant> {
+        if self.unhealthy_addresses_by_expiration.contains(&address) {
+            Some(
+                self.unhealthy_addresses_by_expiration
+                    .get(&address)
+                    .unwrap()
+                    .1
+                     .0,
+            )
+        } else {
+            None
+        }
     }
 }
+
+// generation tests
+//
+// acquire with unhealthy promotion by necessity (new, add, demote, acquire)
 
 /// Amount of time that needs to elapse between resolves on a given name.  We may want to
 /// make this an external configuration option.  Unlike the CRT, we don't "ping" resolves at
@@ -587,5 +627,227 @@ pub fn new_sra_caching_resolver(
             state,
             handle_operation_sra,
         )),
+    }
+}
+
+#[cfg(test)]
+mod testing {
+    use super::*;
+
+    #[test]
+    fn generational_address_set_newly_created_is_empty() {
+        let address_set: GenerationalAddressSet<Ipv4Addr> = GenerationalAddressSet::new();
+
+        assert!(address_set.empty());
+        assert!(!address_set.contains(&Ipv4Addr::new(127, 0, 0, 1)));
+    }
+
+    #[test]
+    fn generational_address_set_add_multiple_are_present() {
+        let mut address_set: GenerationalAddressSet<Ipv4Addr> = GenerationalAddressSet::new();
+
+        let loopback = Ipv4Addr::new(127, 0, 0, 1);
+        address_set.add_address(loopback);
+        assert!(!address_set.empty());
+        assert!(address_set.contains(&loopback));
+        assert_eq!(Some(0), address_set.get_healthy_data(loopback));
+        assert_eq!(None, address_set.get_unhealthy_timestamp(loopback));
+
+        let local = Ipv4Addr::new(192, 168, 0, 1);
+        address_set.add_address(local);
+        assert!(!address_set.empty());
+        assert!(address_set.contains(&local));
+        assert_eq!(Some(0), address_set.get_healthy_data(local));
+        assert_eq!(None, address_set.get_unhealthy_timestamp(local));
+    }
+
+    #[test]
+    fn generational_address_set_remove_multiple_no_longer_present() {
+        let mut address_set: GenerationalAddressSet<Ipv4Addr> = GenerationalAddressSet::new();
+
+        let loopback = Ipv4Addr::new(127, 0, 0, 1);
+        address_set.add_address(loopback);
+        let local = Ipv4Addr::new(192, 168, 0, 1);
+        address_set.add_address(local);
+
+        // local is gone
+        address_set.remove_address(&local);
+        assert!(!address_set.empty());
+        assert!(!address_set.contains(&local));
+        assert_eq!(None, address_set.get_healthy_data(local));
+        assert_eq!(None, address_set.get_unhealthy_timestamp(local));
+
+        // nothing has happened to loopback yet
+        assert!(address_set.contains(&loopback));
+        assert_eq!(Some(0), address_set.get_healthy_data(loopback));
+        assert_eq!(None, address_set.get_unhealthy_timestamp(loopback));
+
+        // loopback is gone
+        address_set.remove_address(&loopback);
+        assert!(address_set.empty());
+        assert!(!address_set.contains(&loopback));
+        assert_eq!(None, address_set.get_healthy_data(loopback));
+        assert_eq!(None, address_set.get_unhealthy_timestamp(loopback));
+    }
+
+    #[test]
+    fn generational_address_set_acquire_multiple_single_generation() {
+        let mut address_set: GenerationalAddressSet<Ipv4Addr> = GenerationalAddressSet::new();
+
+        let loopback = Ipv4Addr::new(127, 0, 0, 1);
+        address_set.add_address(loopback);
+        let local = Ipv4Addr::new(192, 168, 0, 1);
+        address_set.add_address(local);
+
+        let now = Instant::now();
+        let mut acquired_addresses: Vec<Ipv4Addr> = Vec::new();
+        acquired_addresses.push(address_set.acquire_address(now).unwrap());
+        acquired_addresses.push(address_set.acquire_address(now).unwrap());
+
+        assert!(acquired_addresses.contains(&loopback));
+        assert!(acquired_addresses.contains(&local));
+        assert_eq!(1, address_set.current_generation());
+    }
+
+    #[test]
+    fn generational_address_set_acquire_multiple_only_one_available() {
+        let mut address_set: GenerationalAddressSet<Ipv4Addr> = GenerationalAddressSet::new();
+
+        let loopback = Ipv4Addr::new(127, 0, 0, 1);
+        address_set.add_address(loopback);
+
+        let now = Instant::now();
+        let mut acquired_addresses: Vec<Ipv4Addr> = Vec::new();
+        acquired_addresses.push(address_set.acquire_address(now).unwrap());
+        acquired_addresses.push(address_set.acquire_address(now).unwrap());
+        acquired_addresses.push(address_set.acquire_address(now).unwrap());
+
+        for address in &acquired_addresses {
+            assert_eq!(loopback, *address);
+        }
+
+        assert_eq!(3, address_set.current_generation());
+    }
+
+    #[test]
+    fn generational_address_set_acquire_multiple_multiple_generations() {
+        let mut address_set: GenerationalAddressSet<Ipv4Addr> = GenerationalAddressSet::new();
+
+        let loopback = Ipv4Addr::new(127, 0, 0, 1);
+        address_set.add_address(loopback);
+        let local = Ipv4Addr::new(192, 168, 0, 1);
+        address_set.add_address(local);
+
+        let now = Instant::now();
+        let mut acquired_addresses: Vec<Ipv4Addr> = Vec::new();
+        acquired_addresses.push(address_set.acquire_address(now).unwrap());
+        acquired_addresses.push(address_set.acquire_address(now).unwrap());
+        acquired_addresses.push(address_set.acquire_address(now).unwrap());
+        acquired_addresses.push(address_set.acquire_address(now).unwrap());
+        acquired_addresses.push(address_set.acquire_address(now).unwrap());
+        acquired_addresses.push(address_set.acquire_address(now).unwrap());
+
+        for idx in 0..3 {
+            let start_index = idx * 2;
+            let end_index = start_index + 2;
+
+            let generation_slice = &acquired_addresses[start_index..end_index];
+            assert!(generation_slice.contains(&loopback));
+            assert!(generation_slice.contains(&local));
+        }
+
+        assert_eq!(3, address_set.current_generation());
+    }
+
+    #[test]
+    fn generational_address_set_empty_acquire_failure() {
+        let mut address_set: GenerationalAddressSet<Ipv4Addr> = GenerationalAddressSet::new();
+
+        let now = Instant::now();
+
+        assert!(address_set.acquire_address(now).is_none());
+        assert!(address_set.acquire_address(now).is_none());
+    }
+
+    #[test]
+    fn generational_address_set_demote() {
+        let mut address_set: GenerationalAddressSet<Ipv4Addr> = GenerationalAddressSet::new();
+
+        let loopback = Ipv4Addr::new(127, 0, 0, 1);
+        address_set.add_address(loopback);
+
+        let now = Instant::now();
+        let unhealthy_duration = Duration::from_secs(10);
+        address_set.demote_address(loopback, unhealthy_duration, now);
+
+        assert!(!address_set.empty());
+        assert!(address_set.contains(&loopback));
+        assert_eq!(None, address_set.get_healthy_data(loopback));
+        assert_eq!(
+            Some(now + unhealthy_duration),
+            address_set.get_unhealthy_timestamp(loopback)
+        );
+    }
+
+    #[test]
+    fn generational_address_set_acquire_unhealthy_promoted_by_time() {
+        let mut address_set: GenerationalAddressSet<Ipv4Addr> = GenerationalAddressSet::new();
+
+        let loopback = Ipv4Addr::new(127, 0, 0, 1);
+        address_set.add_address(loopback);
+
+        let local = Ipv4Addr::new(192, 168, 0, 1);
+        address_set.add_address(local);
+
+        let mut now = Instant::now();
+        let unhealthy_duration = Duration::from_secs(10);
+        address_set.demote_address(local, unhealthy_duration, now);
+
+        let mut acquired_addresses: Vec<Ipv4Addr> = Vec::new();
+        // only loopback should resolve since local is unhealthy for 10 seconds
+        acquired_addresses.push(address_set.acquire_address(now).unwrap());
+        acquired_addresses.push(address_set.acquire_address(now).unwrap());
+        assert_eq!(loopback, acquired_addresses[0]);
+        assert_eq!(loopback, acquired_addresses[1]);
+
+        // acquire with advanced "time" so that local should now be healthy
+        acquired_addresses.clear();
+        now += unhealthy_duration;
+        acquired_addresses.push(address_set.acquire_address(now).unwrap());
+        acquired_addresses.push(address_set.acquire_address(now).unwrap());
+        assert!(acquired_addresses.contains(&loopback));
+        assert!(acquired_addresses.contains(&local));
+    }
+
+    #[test]
+    fn generational_address_set_acquire_unhealthy_promoted_by_necessity() {
+        let mut address_set: GenerationalAddressSet<Ipv4Addr> = GenerationalAddressSet::new();
+
+        let loopback = Ipv4Addr::new(127, 0, 0, 1);
+        address_set.add_address(loopback);
+
+        let local = Ipv4Addr::new(192, 168, 0, 1);
+        address_set.add_address(local);
+
+        let now = Instant::now();
+        let unhealthy_duration = Duration::from_secs(10);
+        address_set.demote_address(local, unhealthy_duration, now);
+
+        let mut acquired_addresses: Vec<Ipv4Addr> = Vec::new();
+        // only loopback should resolve since local is unhealthy for 10 seconds
+        acquired_addresses.push(address_set.acquire_address(now).unwrap());
+        acquired_addresses.push(address_set.acquire_address(now).unwrap());
+        assert_eq!(loopback, acquired_addresses[0]);
+        assert_eq!(loopback, acquired_addresses[1]);
+
+        // remove loopback, leaving only an unhealthy local
+        address_set.remove_address(&loopback);
+
+        // acquire with current time, forcing local to be promoted
+        acquired_addresses.clear();
+        acquired_addresses.push(address_set.acquire_address(now).unwrap());
+        acquired_addresses.push(address_set.acquire_address(now).unwrap());
+        assert_eq!(local, acquired_addresses[0]);
+        assert_eq!(local, acquired_addresses[1]);
     }
 }

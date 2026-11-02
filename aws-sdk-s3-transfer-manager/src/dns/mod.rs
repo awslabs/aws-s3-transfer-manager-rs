@@ -763,9 +763,6 @@ pub(crate) mod testing {
                 assert_eq!(ConnectionErrorCategory::Fatal, error_event.category);
                 assert!(error_event.source().is_none());
             }
-            _ => {
-                assert!(false);
-            } // is there a better way to verify variant?
         }
     }
 }
