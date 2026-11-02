@@ -600,6 +600,7 @@ fn multipart_output_updates_retain_real_metrics_and_create_only_members() {
         network_rx: 1,
         disk_read: 42,
         disk_write: 0,
+        bytes_transferred: 42,
         total_bytes: Some(42),
         started_at: std::time::Instant::now(),
         finished_at: None,

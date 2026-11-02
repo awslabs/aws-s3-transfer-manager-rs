@@ -786,6 +786,14 @@ impl UploadTransfer {
             .set_checksum_sha256(resp.checksum_sha256.clone())
             .build();
 
+        // Recorded before the part is marked complete: once every part is, another worker can
+        // build the output, which carries a snapshot of these counters.
+        self.inner.ctx.record_io(&crate::metrics::IoSample {
+            network_tx: bytes_sent,
+            bytes_transferred: bytes_sent,
+            ..Default::default()
+        });
+
         let (should_wake, completion_snapshot) = {
             let mut state = self.inner.state.lock().expect("lock poisoned");
             let UploadState::Transferring { parts, .. } = &mut *state else {
@@ -805,11 +813,6 @@ impl UploadTransfer {
             request_elapsed,
             completion_snapshot,
         );
-
-        self.inner.ctx.record_io(&crate::metrics::IoSample {
-            network_tx: bytes_sent,
-            ..Default::default()
-        });
 
         if should_wake {
             self.inner.ctx.try_wake();
@@ -929,13 +932,6 @@ impl UploadTransfer {
             }
         };
 
-        let result = crate::sdk_v1::upload_output_from_put_object(&resp)
-            .metrics(self.inner.ctx.metrics())
-            .build()
-            .expect("valid response");
-
-        *self.inner.result.lock().expect("lock poisoned") = Some(result);
-
         // A successful response means the SDK fully read the body and
         // the bytes made it to the wire. For file-backed sources, the
         // body implementations above have therefore read `content_length`
@@ -943,16 +939,32 @@ impl UploadTransfer {
         // per-chunk inside the body) so that there is a single semantic
         // anchor — "recorded when the SDK confirms success" — consistent
         // with how `network_tx` is attributed.
+        //
+        // Recorded before the output is built, because the output carries a snapshot
+        // of these counters.
         let disk_read = if is_file_backed { content_length } else { 0 };
         self.inner.ctx.record_io(&crate::metrics::IoSample {
             network_tx: content_length,
             disk_read,
+            bytes_transferred: content_length,
             ..Default::default()
         });
+        // The finish time too: `set_completed` stamps it only after the result is stored.
+        self.inner.ctx.metrics.set_finished();
 
-        *self.inner.state.lock().expect("lock poisoned") = UploadState::Done;
+        let result = crate::sdk_v1::upload_output_from_put_object(&resp)
+            .metrics(self.inner.ctx.metrics())
+            .build()
+            .expect("valid response");
+
+        *self.inner.result.lock().expect("lock poisoned") = Some(result);
+
+        // Status before state, because `poll_work` answers `Done` off the state while every
+        // reporting path derives its outcome from the status.
         self.inner.ctx.set_completed();
+        *self.inner.state.lock().expect("lock poisoned") = UploadState::Done;
         self.report_terminal();
+        self.inner.ctx.emit_finished();
         self.inner.ctx.signal_terminal();
 
         WorkOutcome::Success { data: None }
@@ -1047,6 +1059,8 @@ impl UploadTransfer {
             completion_timer.elapsed(),
         );
 
+        // Stamped before the output is built, because the output snapshots the metrics.
+        self.inner.ctx.metrics.set_finished();
         let result = crate::sdk_v1::update_upload_output_from_complete_multipart_upload(
             response_builder,
             &resp,
@@ -1056,9 +1070,12 @@ impl UploadTransfer {
         .expect("valid response");
 
         *self.inner.result.lock().expect("lock poisoned") = Some(result);
-        *self.inner.state.lock().expect("lock poisoned") = UploadState::Done;
+        // Status before state, because `poll_work` answers `Done` off the state while every
+        // reporting path derives its outcome from the status.
         self.inner.ctx.set_completed();
+        *self.inner.state.lock().expect("lock poisoned") = UploadState::Done;
         self.report_terminal();
+        self.inner.ctx.emit_finished();
         self.inner.ctx.signal_terminal();
 
         WorkOutcome::Success { data: None }
@@ -1073,6 +1090,7 @@ impl UploadTransfer {
         let classification = crate::scheduler::classify_error(&error);
         self.inner.ctx.set_failed(error);
         self.report_terminal();
+        self.inner.ctx.emit_finished();
         self.inner.ctx.signal_terminal();
         WorkOutcome::Failed { classification }
     }
@@ -1173,8 +1191,10 @@ impl Transfer for UploadTransfer {
         Box::pin(UploadTransfer::execute(self, work))
     }
 
+    /// Reports the terminal summary and emits `Finished`, each at most once per transfer.
     fn on_terminal(&self) {
         self.report_terminal();
+        self.inner.ctx.emit_finished();
     }
 }
 
@@ -1785,6 +1805,40 @@ mod tests {
         assert_eq!(summary.multipart, None);
     }
 
+    /// An upload's view reports the cause it parked on, and reports none once the upload
+    /// finishes.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn a_parked_upload_reports_its_cause_until_it_finishes() {
+        use aws_sdk_s3::operation::put_object::PutObjectOutput;
+        let put_object = mock!(aws_sdk_s3::Client::put_object)
+            .then_output(|| PutObjectOutput::builder().e_tag("test-etag").build());
+        let transfer = create_test_transfer(
+            mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[put_object]),
+            vec![0u8; 1024],
+        );
+        let view = transfer.ctx().view();
+
+        let mut put = assert_ready(transfer.poll_work());
+        assert_pending(transfer.poll_work());
+        assert_eq!(
+            Some(crate::types::PendingCategory::InFlightWork),
+            view.pending_cause().map(|cause| cause.category()),
+            "an upload waiting on its PutObject reports the request in flight"
+        );
+
+        let outcome = transfer.execute(&mut put).await;
+        assert!(
+            matches!(outcome, WorkOutcome::Success { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            None,
+            view.pending_cause(),
+            "a finished upload must not report the cause it last parked on"
+        );
+    }
+
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn diagnostic_levels_preserve_put_object_outcome() {
@@ -2137,6 +2191,24 @@ mod tests {
             payload.len() as u64,
             metrics.disk_read,
             "disk_read should equal the file size for a file-backed PutObject"
+        );
+
+        // The output a caller receives reports the same counters. Building it before the
+        // sample is recorded leaves both at 0.
+        let out = transfer
+            .take_result()
+            .expect("a successful PutObject leaves a result");
+        assert_eq!(
+            payload.len() as u64,
+            out.metrics.network_tx,
+            "the output a caller reads reports {} bytes sent",
+            out.metrics.network_tx
+        );
+        assert_eq!(
+            payload.len() as u64,
+            out.metrics.disk_read,
+            "the output a caller reads reports {} bytes read from disk",
+            out.metrics.disk_read
         );
     }
 

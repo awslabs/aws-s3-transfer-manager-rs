@@ -24,6 +24,7 @@ pub mod builders;
 
 /// Abstractions for responses and consuming data streams.
 mod body;
+pub(crate) use body::CommitTarget;
 pub use body::{Body, ChunkOutput};
 
 /// In-order delivery buffer (out-of-order arrival → in-order stream).
@@ -93,12 +94,40 @@ pub(crate) fn temp_file_candidates(
 #[derive(Clone, Default, Debug)]
 pub(crate) struct Download;
 
+/// The sink for a download's events and the destination those events report.
+pub(crate) struct EventRegistration {
+    pub(crate) sink: crate::events::TransferEventSink,
+    pub(crate) destination: crate::events::Endpoint,
+}
+
+impl EventRegistration {
+    /// Returns `ctx` with this registration's sink attached, describing the transfer as a
+    /// download of `input`'s object to this registration's destination.
+    fn attach(
+        self,
+        ctx: crate::transfer::TransferContext,
+        input: &DownloadInput,
+    ) -> crate::transfer::TransferContext {
+        ctx.with_events(
+            self.sink,
+            crate::events::TransferRef::download(
+                crate::events::Endpoint::S3 {
+                    bucket: Arc::from(input.bucket().unwrap_or_default()),
+                    key: Arc::from(input.key().unwrap_or_default()),
+                },
+                self.destination,
+            ),
+        )
+    }
+}
+
 impl Download {
     /// Execute a single `Download` transfer operation
     pub(crate) fn orchestrate(
         handle: Arc<crate::client::Handle>,
         input: DownloadInput,
         _use_current_span_as_parent_for_tasks: bool,
+        events: Option<EventRegistration>,
     ) -> Result<DownloadHandle, error::Error> {
         use crate::transfer::TransferContext;
 
@@ -112,8 +141,13 @@ impl Download {
         let (writer, consumer) = new_recv_body();
 
         let (ctx, completion_rx) = TransferContext::new(handle.clone());
+        let ctx = match events {
+            Some(events) => events.attach(ctx, &input),
+            None => ctx,
+        };
 
-        let transfer = DownloadTransfer::new(ctx.clone(), bucket_type, input, writer);
+        let transfer = DownloadTransfer::new(ctx, bucket_type, input, writer);
+        transfer.ctx().announce();
         handle
             .scheduler
             .enqueue_transfer(Box::new(transfer.clone()));
@@ -129,14 +163,15 @@ impl Download {
     /// [`ErrorKind::IOError`](error::ErrorKind::IOError); a temp file whose sink
     /// could not be created is removed.
     ///
-    /// When `parent_id` is `Some`, the transfer is linked as a child of the
+    /// When `parent` is `Some`, the transfer is linked as a child of the
     /// given composite transfer via [`TransferContext::new_child`](crate::transfer::TransferContext::new_child).
     #[cfg(any(unix, windows))]
     pub(crate) async fn orchestrate_to_path(
         handle: Arc<crate::client::Handle>,
         input: DownloadInput,
         dest_path: std::path::PathBuf,
-        parent_id: Option<u64>,
+        parent: Option<&crate::transfer::TransferContext>,
+        events: Option<EventRegistration>,
         sinks: &dyn sink::SinkFactory,
     ) -> Result<ManagedDownloadHandle, error::Error> {
         // Generate temp file in the same directory as destination
@@ -149,13 +184,24 @@ impl Download {
         let sink = match sinks.create(file, true) {
             Ok(sink) => sink,
             Err(e) => {
-                // No handle owns the temp file yet, so remove it here.
+                // No transfer owns the temp file yet, so remove it here.
                 let _ = tokio::fs::remove_file(&temp_path).await;
                 return Err(error::from_kind(error::ErrorKind::IOError)(e));
             }
         };
-        let inner = Self::orchestrate_with_sink(handle, input, sink, parent_id)?;
-        Ok(ManagedDownloadHandle::new(inner, temp_path, dest_path))
+        let inner = Self::orchestrate_with_sink(
+            handle,
+            input,
+            sink,
+            parent,
+            events,
+            None,
+            Some(CommitTarget {
+                temp: temp_path,
+                dest: dest_path,
+            }),
+        )?;
+        Ok(ManagedDownloadHandle::new(inner))
     }
 
     /// Orchestrate a download that writes to a caller-provided file.
@@ -173,6 +219,7 @@ impl Download {
         handle: Arc<crate::client::Handle>,
         input: DownloadInput,
         file: std::fs::File,
+        events: Option<EventRegistration>,
         sinks: &dyn sink::SinkFactory,
     ) -> Result<ManagedDownloadHandle, error::Error> {
         let sink = sinks.create(file, false).map_err(|e| {
@@ -182,22 +229,28 @@ impl Download {
                 error::from_kind(error::ErrorKind::IOError)(e)
             }
         })?;
-        let inner = Self::orchestrate_with_sink(handle, input, sink, None)?;
+        let inner = Self::orchestrate_with_sink(handle, input, sink, None, events, None, None)?;
         // No temp/dest paths — caller manages the file lifecycle
-        Ok(ManagedDownloadHandle::new_unmanaged(inner))
+        Ok(ManagedDownloadHandle::new(inner))
     }
 
     /// Shared orchestration for disk downloads: the transfer writes the object
     /// through `sink`.
     ///
-    /// When `parent_id` is `Some`, the transfer is linked as a child of the
+    /// `known_size`, if the caller already knows the object's size, is the transfer's
+    /// provisional byte total until discovery confirms the real one.
+    ///
+    /// When `parent` is `Some`, the transfer is linked as a child of the
     /// given composite transfer via [`TransferContext::new_child`](crate::transfer::TransferContext::new_child).
     #[cfg(any(unix, windows))]
     pub(crate) fn orchestrate_with_sink(
         handle: Arc<crate::client::Handle>,
         input: DownloadInput,
         sink: Box<dyn sink::SinkWrite>,
-        parent_id: Option<u64>,
+        parent: Option<&crate::transfer::TransferContext>,
+        events: Option<EventRegistration>,
+        known_size: Option<u64>,
+        commit: Option<CommitTarget>,
     ) -> Result<DownloadHandleInner, error::Error> {
         use crate::transfer::TransferContext;
 
@@ -208,14 +261,24 @@ impl Download {
         let bucket_type =
             BucketType::from_bucket_name(input.bucket().expect("bucket is available"));
 
-        let (writer, _consumer) = body::new_recv_body_with_disk_mode(sink);
+        let (writer, _consumer) = body::new_recv_body_with_disk_mode(sink, commit);
 
-        let (ctx, completion_rx) = match parent_id {
-            Some(pid) => TransferContext::new_child(handle.clone(), pid),
+        let (ctx, completion_rx) = match parent {
+            Some(parent) => TransferContext::new_child(handle.clone(), parent),
             None => TransferContext::new(handle.clone()),
         };
+        let ctx = match events {
+            Some(events) => events.attach(ctx, &input),
+            None => ctx,
+        };
 
-        let transfer = DownloadTransfer::new(ctx.clone(), bucket_type, input, writer);
+        // Before the transfer is announced or scheduled, so no reader sees it without a size.
+        if let Some(size) = known_size {
+            ctx.set_expected_bytes(size);
+        }
+
+        let transfer = DownloadTransfer::new(ctx, bucket_type, input, writer);
+        transfer.ctx().announce();
         handle
             .scheduler
             .enqueue_transfer(Box::new(transfer.clone()));

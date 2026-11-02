@@ -390,8 +390,8 @@ mod tests {
 
         for (reason, category, detail) in cases {
             let cause = crate::transfer::PendingCause::from(reason);
-            assert_eq!(cause.category, category);
-            assert_eq!(cause.reason, detail);
+            assert_eq!(cause.category(), category);
+            assert_eq!(cause.reason(), detail);
         }
     }
 }

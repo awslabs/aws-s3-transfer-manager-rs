@@ -13,14 +13,13 @@ use std::any::Any;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Wake, Waker};
 
 use pending::TransferPendingState;
-pub(crate) use pending::{
-    emit_pending_details, PendingCategory, PendingCause, TransferPendingStats,
-};
+pub(crate) use pending::{emit_pending_details, PendingCauseSlot, TransferPendingStats};
+pub use pending::{PendingCategory, PendingCause};
 
 /// Edge-triggered wake flag for transfer state machines.
 ///
@@ -105,9 +104,9 @@ pub(crate) mod wake_flag {
 ///   visible to other work or to the handle must be consistent at every
 ///   `.await` point.
 ///
-/// ## `on_terminal` — external termination hook
-/// - Called from outside the normal lifecycle (panic, cancellation, drop) to
-///   let the transfer release held resources and notify waiters.
+/// ## `on_terminal` — termination hook
+/// - Called after the status becomes terminal, to let the transfer release held
+///   resources and notify waiters. Not guaranteed; see [`Transfer::on_terminal`].
 /// - Must be short and must not block.
 pub(crate) trait Transfer: Send + Sync + std::fmt::Debug {
     /// The transfer's shared context (id, handle, status).
@@ -129,12 +128,13 @@ pub(crate) trait Transfer: Send + Sync + std::fmt::Debug {
         work: &'a mut IoRequest,
     ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>>;
 
-    /// Called when the transfer is forced into a terminal state from outside
-    /// (e.g. worker panic, external cancellation). Allows the transfer to
-    /// clean up resources and notify waiters that would otherwise block
-    /// indefinitely.
+    /// Called after the transfer's status becomes terminal. Allows the transfer to clean up
+    /// resources and notify waiters that would otherwise block indefinitely.
     ///
-    /// Must be short and non-blocking.
+    /// Must be short and non-blocking. May be called more than once. When `poll_work` returns
+    /// [`PollWork::Done`] while the status is still `Active`, the scheduler removes the
+    /// transfer without calling this; such a transfer does its terminal work where it sets
+    /// its status.
     fn on_terminal(&self) {}
 }
 
@@ -153,17 +153,28 @@ impl<T: Any + Send + std::fmt::Debug> WorkData for T {
     }
 }
 
-/// Unique identifier for a transfer, with optional parent for hierarchy
+/// Identifies one transfer: a [`Started`](crate::events::Started) and its
+/// [`Finished`](crate::events::Finished) carry the same id, and each object a directory
+/// operation transfers has a [`parent`](Self::parent) equal to the operation's id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct TransferId {
+pub struct TransferId {
     pub(crate) id: u64,
     pub(crate) parent: Option<u64>,
 }
 
+impl TransferId {
+    /// The id of the directory operation this transfer belongs to, or `None` when this
+    /// transfer is the operation the caller invoked.
+    pub fn parent(&self) -> Option<TransferId> {
+        self.parent.map(|id| TransferId { id, parent: None })
+    }
+}
+
 impl std::fmt::Display for TransferId {
+    /// `parent/child`, or just the id for a root.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.parent {
-            Some(parent) => write!(f, "{}-{}", self.id, parent),
+            Some(parent) => write!(f, "{}/{}", parent, self.id),
             None => write!(f, "{}", self.id),
         }
     }
@@ -345,7 +356,9 @@ pub(crate) type StateMachineTerminalReceiver = tokio::sync::oneshot::Receiver<()
 /// | Failed    | Yes (take once) | No               |
 /// | Cancelled | No              | No               |
 #[derive(Clone)]
-pub(crate) struct StateMachineStatus(Arc<AtomicU8>);
+pub(crate) struct StateMachineStatus(
+    crate::runtime::sync::sync::Arc<crate::runtime::sync::sync::atomic::AtomicU8>,
+);
 
 // Status constants
 const STATUS_ACTIVE: u8 = 0;
@@ -357,7 +370,9 @@ impl StateMachineStatus {
     /// Create a new status in the Active state
     #[inline]
     pub(crate) fn new() -> Self {
-        Self(Arc::new(AtomicU8::new(STATUS_ACTIVE)))
+        Self(crate::runtime::sync::sync::Arc::new(
+            crate::runtime::sync::sync::atomic::AtomicU8::new(STATUS_ACTIVE),
+        ))
     }
 
     /// Transition to Completed. Returns true if this call made the transition.
@@ -414,6 +429,19 @@ impl StateMachineStatus {
         self.0.load(Ordering::Acquire) == STATUS_CANCELLED
     }
 
+    /// The status, read in one load. Derive a status from this, not from several `is_*`
+    /// calls, which can straddle a transition.
+    #[inline]
+    pub(crate) fn status(&self) -> crate::types::TransferStatus {
+        use crate::types::TransferStatus;
+        match self.0.load(Ordering::Acquire) {
+            STATUS_COMPLETED => TransferStatus::Completed,
+            STATUS_FAILED => TransferStatus::Failed,
+            STATUS_CANCELLED => TransferStatus::Cancelled,
+            _ => TransferStatus::Active,
+        }
+    }
+
     fn as_str(&self) -> &'static str {
         match self.0.load(Ordering::Acquire) {
             STATUS_ACTIVE => "Active",
@@ -439,13 +467,69 @@ impl fmt::Debug for StateMachineStatus {
     }
 }
 
+/// Sets `Failed` and stores the error under `slot`'s lock, so a reader that sees `Failed`
+/// and then locks the slot finds the error. Returns whether this call made the transition.
+fn fail_with<E>(
+    status: &StateMachineStatus,
+    slot: &crate::runtime::sync::Mutex<Option<E>>,
+    err: impl FnOnce() -> E,
+) -> bool {
+    let mut held = slot.lock();
+    let won = status.set_failed();
+    if won {
+        *held = Some(err());
+    }
+    won
+}
+
+/// Sets `Cancelled` under `slot`'s lock, so it cannot land inside a [`complete_with`].
+/// Returns whether this call made the transition.
+fn cancel_with<E>(
+    status: &StateMachineStatus,
+    slot: &crate::runtime::sync::Mutex<Option<E>>,
+) -> bool {
+    let _held = slot.lock();
+    status.set_cancelled()
+}
+
+/// Runs `publish` and then sets `Completed`, both under `slot`'s lock. Failure and
+/// cancellation take that lock too, so neither lands between the two. Skips `publish` and
+/// returns `Ok(false)` if the transfer has already left `Active`. A `publish` error is
+/// returned with the transfer still `Active`, so `publish` must make nothing visible when
+/// it fails.
+fn complete_with<E, P>(
+    status: &StateMachineStatus,
+    slot: &crate::runtime::sync::Mutex<Option<E>>,
+    publish: impl FnOnce() -> Result<(), P>,
+) -> Result<bool, P> {
+    let _held = slot.lock();
+    if !status.is_active() {
+        return Ok(false);
+    }
+    publish()?;
+    Ok(status.set_completed())
+}
+
 /// Per-transfer cumulative metrics.
 pub(crate) struct MetricsState {
+    /// The parent transfer's metrics, which every sample recorded here also reaches.
+    parent: Option<Arc<MetricsState>>,
     network_tx: AtomicU64,
     network_rx: AtomicU64,
     disk_read: AtomicU64,
     disk_write: AtomicU64,
+    bytes_transferred: AtomicU64,
+    /// Expected payload bytes, reported as a provisional byte total while `total_bytes`
+    /// is unset.
+    discovered_bytes: AtomicU64,
+    /// Expected entries, reported as a provisional entry total while `total_entries` is
+    /// unset.
+    discovered_entries: AtomicU64,
+    /// Entries that have reached a terminal state, however they ended.
+    settled_entries: AtomicU64,
     total_bytes: std::sync::OnceLock<u64>,
+    /// The final entry count, once known.
+    total_entries: std::sync::OnceLock<u64>,
     started_at: std::time::Instant,
     finished_at: std::sync::OnceLock<std::time::Instant>,
     terminal_reported: AtomicBool,
@@ -453,13 +537,26 @@ pub(crate) struct MetricsState {
 }
 
 impl MetricsState {
+    /// Metrics with no parent.
     pub(crate) fn new() -> Self {
+        Self::with_parent(None)
+    }
+
+    /// Metrics whose samples also roll up into `parent`, held strongly since links only point
+    /// upward.
+    pub(crate) fn with_parent(parent: Option<Arc<MetricsState>>) -> Self {
         Self {
+            parent,
             network_tx: AtomicU64::new(0),
             network_rx: AtomicU64::new(0),
             disk_read: AtomicU64::new(0),
             disk_write: AtomicU64::new(0),
+            bytes_transferred: AtomicU64::new(0),
+            discovered_bytes: AtomicU64::new(0),
+            discovered_entries: AtomicU64::new(0),
+            settled_entries: AtomicU64::new(0),
             total_bytes: std::sync::OnceLock::new(),
+            total_entries: std::sync::OnceLock::new(),
             started_at: std::time::Instant::now(),
             finished_at: std::sync::OnceLock::new(),
             terminal_reported: AtomicBool::new(false),
@@ -467,21 +564,61 @@ impl MetricsState {
         }
     }
 
-    /// Record an IO sample (per-transfer cumulative counters only).
+    /// Record an IO sample into this transfer and every ancestor, one counter at a time.
     pub(crate) fn record_io(&self, sample: &crate::metrics::IoSample) {
-        self.network_tx
-            .fetch_add(sample.network_tx, Ordering::Relaxed);
-        self.network_rx
-            .fetch_add(sample.network_rx, Ordering::Relaxed);
-        self.disk_read
-            .fetch_add(sample.disk_read, Ordering::Relaxed);
-        self.disk_write
-            .fetch_add(sample.disk_write, Ordering::Relaxed);
+        let mut cur = Some(self);
+        while let Some(m) = cur {
+            m.network_tx.fetch_add(sample.network_tx, Ordering::Relaxed);
+            m.network_rx.fetch_add(sample.network_rx, Ordering::Relaxed);
+            m.disk_read.fetch_add(sample.disk_read, Ordering::Relaxed);
+            m.disk_write.fetch_add(sample.disk_write, Ordering::Relaxed);
+            m.bytes_transferred
+                .fetch_add(sample.bytes_transferred, Ordering::Relaxed);
+            cur = m.parent.as_deref();
+        }
     }
 
     /// Set the expected total payload bytes. No-op if already set.
     pub(crate) fn set_total_bytes(&self, n: u64) {
         let _ = self.total_bytes.set(n);
+    }
+
+    /// Add `bytes` and `entries` to the expected totals, in one call so the two describe
+    /// the same work.
+    pub(crate) fn add_discovered(&self, bytes: u64, entries: u64) {
+        self.discovered_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.discovered_entries
+            .fetch_add(entries, Ordering::Relaxed);
+    }
+
+    /// Entries that reached a terminal state.
+    pub(crate) fn entries_settled(&self) -> u64 {
+        self.settled_entries.load(Ordering::Relaxed)
+    }
+
+    /// This transfer's byte total: `Final` once `total_bytes` is set, and until then
+    /// `Provisional` with the expected bytes, or `Unknown` if none are expected.
+    pub(crate) fn byte_total(&self) -> crate::types::Total {
+        use crate::types::Total;
+        if let Some(n) = self.total_bytes.get().copied() {
+            return Total::Final(n);
+        }
+        match self.discovered_bytes.load(Ordering::Relaxed) {
+            0 => Total::Unknown,
+            n => Total::Provisional(n),
+        }
+    }
+
+    /// Like [`byte_total`](Self::byte_total), for entries.
+    pub(crate) fn entry_total(&self) -> crate::types::Total {
+        use crate::types::Total;
+        if let Some(n) = self.total_entries.get().copied() {
+            return Total::Final(n);
+        }
+        match self.discovered_entries.load(Ordering::Relaxed) {
+            0 => Total::Unknown,
+            n => Total::Provisional(n),
+        }
     }
 
     /// Mark the transfer as finished. No-op if already set.
@@ -514,6 +651,7 @@ impl MetricsState {
             network_rx: self.network_rx.load(Ordering::Relaxed),
             disk_read: self.disk_read.load(Ordering::Relaxed),
             disk_write: self.disk_write.load(Ordering::Relaxed),
+            bytes_transferred: self.bytes_transferred.load(Ordering::Relaxed),
             total_bytes: self.total_bytes.get().copied(),
             started_at: self.started_at,
             finished_at: self.finished_at.get().copied(),
@@ -528,6 +666,10 @@ impl std::fmt::Debug for MetricsState {
             .field("network_rx", &self.network_rx.load(Ordering::Relaxed))
             .field("disk_read", &self.disk_read.load(Ordering::Relaxed))
             .field("disk_write", &self.disk_write.load(Ordering::Relaxed))
+            .field(
+                "bytes_transferred",
+                &self.bytes_transferred.load(Ordering::Relaxed),
+            )
             .field("request_metrics", &self.request_metrics())
             .finish()
     }
@@ -548,16 +690,22 @@ pub(crate) struct TransferContext {
     pub(crate) handle: Arc<crate::client::Handle>,
     /// Transfer lifecycle status
     status: StateMachineStatus,
-    /// Error storage (only used when status == Failed)
-    error: Arc<Mutex<Option<Box<error::Error>>>>,
+    /// The error, once the status is Failed. Also the lock that failure, cancellation and
+    /// [`Self::complete_with`] change the status under, so neither failure nor cancellation
+    /// lands inside `complete_with`. [`Self::set_completed`] does not take it.
+    error: Arc<crate::runtime::sync::Mutex<Option<Box<error::Error>>>>,
     /// Completion signal sender - signals "state machine reached terminal state"
     completion_tx: Arc<Mutex<Option<StateMachineTerminalSender>>>,
     /// Set when `poll_work` returns `Pending`, cleared by a wake or resumed poll.
     wake_flag: Arc<wake_flag::WakeFlag>,
+    /// The cause of the current park, if any.
+    pending_cause: Arc<PendingCauseSlot>,
     /// Optional scheduler-visible pending interval accounting.
     pending_state: Option<Arc<TransferPendingState>>,
     /// Per-transfer metrics backing store
     pub(crate) metrics: Arc<MetricsState>,
+    /// Emitter of this transfer's events, `None` unless a caller registered a sink.
+    lifecycle: Option<Arc<crate::events::TransferLifecycle>>,
 }
 
 /// In-progress measurement for one logical transfer-manager request.
@@ -784,27 +932,33 @@ impl TransferContext {
     /// Create a new transfer context.
     /// Returns the context and a receiver for terminal state notification.
     pub(crate) fn new(handle: Arc<crate::client::Handle>) -> (Self, StateMachineTerminalReceiver) {
-        Self::new_inner(handle, next_transfer_id())
+        Self::new_inner(handle, next_transfer_id(), Arc::new(MetricsState::new()))
     }
 
-    /// Returns a context + receiver for a child transfer linked to `parent_id`.
+    /// Returns a context + receiver for a child transfer of `parent`, linked by id and by
+    /// metrics.
     ///
-    /// Child transfers share the scheduler with their parent. `signal_terminal`
-    /// on the child wakes the parent so the parent state machine can reap it.
-    /// `scheduler.cancel_transfer(parent_id)` cascades to children via the
-    /// parent linkage.
+    /// Child transfers share the scheduler with their parent. `signal_terminal` on the
+    /// child wakes the parent so the parent state machine can reap it, and
+    /// `scheduler.cancel_transfer` on the parent cascades to children via the same
+    /// linkage. Bytes the child records roll up into the parent's counters as they move.
     pub(crate) fn new_child(
         handle: Arc<crate::client::Handle>,
-        parent_id: u64,
+        parent: &TransferContext,
     ) -> (Self, StateMachineTerminalReceiver) {
         let mut id = next_transfer_id();
-        id.parent = Some(parent_id);
-        Self::new_inner(handle, id)
+        id.parent = Some(parent.id.id);
+        Self::new_inner(
+            handle,
+            id,
+            Arc::new(MetricsState::with_parent(Some(parent.metrics.clone()))),
+        )
     }
 
     fn new_inner(
         handle: Arc<crate::client::Handle>,
         id: TransferId,
+        metrics: Arc<MetricsState>,
     ) -> (Self, StateMachineTerminalReceiver) {
         let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
         let diagnostics = handle.config.diagnostics().transfer();
@@ -813,15 +967,32 @@ impl TransferContext {
             .then(|| Arc::new(TransferPendingState::new(diagnostics.events_enabled())));
         let ctx = Self {
             id,
-            metrics: Arc::new(MetricsState::new()),
+            metrics,
             handle,
             status: StateMachineStatus::new(),
-            error: Arc::new(Mutex::new(None)),
+            error: Arc::new(crate::runtime::sync::Mutex::new(None)),
             completion_tx: Arc::new(Mutex::new(Some(completion_tx))),
             wake_flag: Arc::new(wake_flag::WakeFlag::new()),
+            pending_cause: Arc::new(PendingCauseSlot::new()),
             pending_state,
+            lifecycle: None,
         };
         (ctx, completion_rx)
+    }
+
+    /// Reports this transfer's events to `sink`. Only the returned context and its later
+    /// clones emit, so attach the sink before cloning.
+    pub(crate) fn with_events(
+        mut self,
+        sink: crate::events::TransferEventSink,
+        transfer: crate::events::TransferRef,
+    ) -> Self {
+        self.lifecycle = Some(Arc::new(crate::events::TransferLifecycle::new(
+            sink,
+            transfer,
+            Some(self.view()),
+        )));
+        self
     }
 
     /// Create a new transfer context with a specific ID (for testing).
@@ -831,10 +1002,13 @@ impl TransferContext {
         id: TransferId,
         handle: Arc<crate::client::Handle>,
     ) -> (Self, StateMachineTerminalReceiver) {
-        Self::new_inner(handle, id)
+        Self::new_inner(handle, id, Arc::new(MetricsState::new()))
     }
 
     /// Record that `poll_work` is about to return `Pending`.
+    ///
+    /// The transfer's views report `cause` while it is active, until [`Self::begin_poll`]
+    /// clears it. Storing it takes no part in the wake protocol below.
     ///
     /// # Wake primitive protocol
     ///
@@ -886,14 +1060,15 @@ impl TransferContext {
     pub(crate) fn set_pending(&self, cause: impl Into<PendingCause>) {
         let cause = cause.into();
         self.wake_flag.set_pending();
+        self.pending_cause.set(cause);
         if let Some(pending) = &self.pending_state {
             pending.record_pending(self.id, cause);
         }
         tracing::trace!(
             target: crate::telemetry::TARGET_SCHEDULING,
             tid = %self.id,
-            category = cause.category.as_str(),
-            reason = cause.reason,
+            category = cause.category().as_str(),
+            reason = cause.reason(),
             "ctx.set_pending",
         );
     }
@@ -950,8 +1125,10 @@ impl TransferContext {
     ///
     /// Clearing the edge-triggered flag here also handles registered-future
     /// wakes, which enter through [`Self::waker`] rather than [`Self::try_wake`].
+    /// The cause [`Self::set_pending`] stored is cleared too.
     pub(crate) fn begin_poll(&self) {
         self.wake_flag.take_pending();
+        self.pending_cause.clear();
         if let Some(pending) = &self.pending_state {
             pending.record_poll_started(self.id);
         }
@@ -984,11 +1161,14 @@ impl TransferContext {
     /// or once in-flight work drains). For the common fail-and-abort case use
     /// [`set_failed_and_signal`], which bundles both.
     ///
+    /// The status changes while the error slot is locked, so a reader that sees `Failed`
+    /// and then locks the slot finds the error, unless it has been taken.
+    ///
     /// [`signal_terminal`]: Self::signal_terminal
     /// [`set_failed_and_signal`]: Self::set_failed_and_signal
     pub(crate) fn set_failed(&self, err: impl Into<error::Error>) -> bool {
-        if self.status.set_failed() {
-            *self.error.lock().unwrap() = Some(Box::new(err.into()));
+        if fail_with(&self.status, &self.error, || Box::new(err.into())) {
+            self.metrics.set_finished();
             true
         } else {
             false
@@ -999,33 +1179,90 @@ impl TransferContext {
     /// First-write-wins - returns true if this call set the status.
     #[inline]
     pub(crate) fn set_completed(&self) -> bool {
-        self.status.set_completed()
+        if self.status.set_completed() {
+            self.metrics.set_finished();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Runs `publish`, then marks the transfer completed, with no failure or cancellation able
+    /// to land in between: one that arrives while `publish` runs waits for it. Skips `publish`
+    /// and returns `Ok(false)` if the transfer has already left `Active`. A `publish` error is
+    /// returned with the transfer still `Active`, so `publish` must make nothing visible when
+    /// it fails.
+    pub(crate) fn complete_with<E>(
+        &self,
+        publish: impl FnOnce() -> Result<(), E>,
+    ) -> Result<bool, E> {
+        let completed = complete_with(&self.status, &self.error, publish)?;
+        if completed {
+            self.metrics.set_finished();
+        }
+        Ok(completed)
     }
 
     /// Mark transfer as cancelled.
     /// First-write-wins - returns true if this call set the status.
     #[inline]
     pub(crate) fn set_cancelled(&self) -> bool {
-        self.status.set_cancelled()
+        if cancel_with(&self.status, &self.error) {
+            self.metrics.set_finished();
+            true
+        } else {
+            false
+        }
     }
 
-    /// Take the error if transfer failed. Returns None if not failed or already taken.
+    /// Take the error if the transfer failed. `None` if it did not fail or the error was
+    /// already taken. The error belongs to the operation's result; [`Self::error_kind`] reads
+    /// the kind without taking it.
     pub(crate) fn take_error(&self) -> Option<error::Error> {
         if self.status.is_failed() {
-            self.error.lock().unwrap().take().map(|e| *e)
+            self.error.lock().take().map(|e| *e)
         } else {
             None
         }
     }
 
-    /// Peek at the error kind if transfer failed. Returns None if not failed or already taken.
+    /// The event outcome this transfer's terminal status implies, read without taking the
+    /// error. Requires a terminal status: a still-`Active` transfer maps to `Cancelled`.
+    pub(crate) fn terminal_outcome(&self) -> crate::events::Outcome {
+        match self.transfer_status() {
+            crate::types::TransferStatus::Completed => crate::events::Outcome::Succeeded {},
+            crate::types::TransferStatus::Failed => crate::events::Outcome::Failed {},
+            _ => crate::events::Outcome::Cancelled {},
+        }
+    }
+
+    /// Emits [`TransferEvent::Started`](crate::events::TransferEvent::Started) if a sink
+    /// is registered, and makes the matching `Finished` owed.
+    pub(crate) fn announce(&self) {
+        if let Some(lifecycle) = &self.lifecycle {
+            lifecycle.announce(self.id);
+        }
+    }
+
+    /// Emits [`TransferEvent::Finished`](crate::events::TransferEvent::Finished) with the
+    /// outcome the terminal status implies, once per [`Self::announce`]. Requires a terminal
+    /// status; call it before [`Self::signal_terminal`] so the event is sent before any joiner
+    /// wakes.
+    pub(crate) fn emit_finished(&self) {
+        if let Some(emit) = self
+            .lifecycle
+            .as_ref()
+            .and_then(|lifecycle| lifecycle.finish(self.id, self.terminal_outcome()))
+        {
+            emit.send();
+        }
+    }
+
+    /// Peek at the error kind if transfer failed. `None` if it did not fail or the error
+    /// was already taken.
     pub(crate) fn error_kind(&self) -> Option<error::ErrorKind> {
         if self.status.is_failed() {
-            self.error
-                .lock()
-                .unwrap()
-                .as_ref()
-                .map(|e| e.kind().clone())
+            self.error.lock().as_ref().map(|e| e.kind().clone())
         } else {
             None
         }
@@ -1066,11 +1303,8 @@ impl TransferContext {
             let _ = tx.send(());
         }
         // Wake the parent transfer (if any) so it can reap this child.
-        if let Some(parent_id) = self.id.parent {
-            self.handle.scheduler.wake(TransferId {
-                id: parent_id,
-                parent: None,
-            });
+        if let Some(parent) = self.id.parent() {
+            self.handle.scheduler.wake(parent);
         }
     }
 
@@ -1126,18 +1360,15 @@ impl TransferContext {
         self.metrics.set_total_bytes(n);
     }
 
+    /// Record `n` as a provisional byte total, until [`Self::set_total_bytes`] sets the final
+    /// one.
+    pub(crate) fn set_expected_bytes(&self, n: u64) {
+        self.metrics.add_discovered(n, 0);
+    }
+
     /// Get current transfer status as a public enum.
     pub(crate) fn transfer_status(&self) -> crate::types::TransferStatus {
-        use crate::types::TransferStatus;
-        if self.status.is_cancelled() {
-            TransferStatus::Cancelled
-        } else if self.is_failed() {
-            TransferStatus::Failed
-        } else if !self.is_active() {
-            TransferStatus::Completed
-        } else {
-            TransferStatus::Active
-        }
+        self.status.status()
     }
 
     /// Claims the single terminal tracing record for this transfer.
@@ -1148,6 +1379,16 @@ impl TransferContext {
     /// Snapshot current transfer metrics.
     pub(crate) fn metrics(&self) -> crate::types::TransferMetrics {
         self.metrics.snapshot()
+    }
+
+    /// A read-only view of this transfer's counters, status and pending cause. It holds no
+    /// `handle`, so a view a consumer keeps cannot delay runtime shutdown.
+    pub(crate) fn view(&self) -> crate::types::TransferView {
+        crate::types::TransferView::new(
+            self.metrics.clone(),
+            self.status.clone(),
+            self.pending_cause.clone(),
+        )
     }
 
     /// Get scheduling controls for this transfer.
@@ -1353,6 +1594,22 @@ mod tests {
             );
         }
 
+        /// A child's `parent()` is its operation's own id, so a consumer can pair each
+        /// object of a directory operation with the operation's events.
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn a_child_id_names_its_operation_as_parent() {
+            let handle = test_handle();
+            let (operation, _rx) = TransferContext::new(handle.clone());
+            let (child, _child_rx) = TransferContext::new_child(handle, &operation);
+            assert_eq!(None, operation.id.parent(), "the operation has no parent");
+            assert_eq!(
+                Some(operation.id),
+                child.id.parent(),
+                "a child's parent must equal the operation's own id"
+            );
+        }
+
         #[cfg_attr(miri, ignore)]
         #[test]
         fn stats_initial_values() {
@@ -1363,6 +1620,7 @@ mod tests {
             assert_eq!(stats.network_rx, 0);
             assert_eq!(stats.disk_read, 0);
             assert_eq!(stats.disk_write, 0);
+            assert_eq!(stats.bytes_transferred, 0);
             assert_eq!(stats.total_bytes, None);
             assert!(stats.started_at.elapsed().as_secs() < 1);
             assert!(stats.finished_at.is_none());
@@ -1378,18 +1636,66 @@ mod tests {
                 network_rx: 200,
                 disk_read: 300,
                 disk_write: 400,
+                bytes_transferred: 500,
             });
             ctx.record_io(&crate::metrics::IoSample {
                 network_tx: 10,
                 network_rx: 20,
                 disk_read: 30,
                 disk_write: 40,
+                bytes_transferred: 50,
             });
             let stats = ctx.metrics();
             assert_eq!(stats.network_tx, 110);
             assert_eq!(stats.network_rx, 220);
             assert_eq!(stats.disk_read, 330);
             assert_eq!(stats.disk_write, 440);
+            assert_eq!(stats.bytes_transferred, 550);
+        }
+
+        /// Each terminal status maps to its own outcome, and deriving the outcome leaves a
+        /// failed transfer's error in place.
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn terminal_outcome_derives_each_terminal() {
+            let (ctx, _rx) = TransferContext::new(test_handle());
+            assert!(ctx.set_completed());
+            assert!(
+                matches!(
+                    ctx.terminal_outcome(),
+                    crate::events::Outcome::Succeeded { .. }
+                ),
+                "a completed transfer licenses deleting a source"
+            );
+
+            let (ctx, _rx) = TransferContext::new(test_handle());
+            assert!(ctx.set_cancelled());
+            assert!(
+                matches!(
+                    ctx.terminal_outcome(),
+                    crate::events::Outcome::Cancelled { .. }
+                ),
+                "a cancelled transfer licenses no retry and no alert"
+            );
+
+            let (ctx, _rx) = TransferContext::new(test_handle());
+            assert!(ctx.set_failed(crate::error::Error::new(
+                crate::error::ErrorKind::ObjectNotDiscoverable,
+                "the real cause",
+            )));
+            match ctx.terminal_outcome() {
+                crate::events::Outcome::Failed { .. } => {}
+                other => panic!("a failed transfer must report Failed, got {other:?}"),
+            }
+            // A derivation that took the error would leave `join()` nothing to return.
+            let err = ctx
+                .take_error()
+                .expect("deriving the outcome must leave the error for join()");
+            assert!(
+                matches!(err.kind(), crate::error::ErrorKind::ObjectNotDiscoverable),
+                "the joiner gets the real cause, got {:?}",
+                err.kind()
+            );
         }
 
         #[cfg_attr(miri, ignore)]
@@ -1611,6 +1917,127 @@ mod tests {
             assert!(ctx.metrics().finished_at.is_some());
         }
 
+        // ref: awslabs/aws-s3-transfer-manager-rs#197
+        /// `finished_at` is stamped by the status transition itself, not by
+        /// `signal_terminal`.
+        ///
+        /// No transition here is followed by `signal_terminal`, so the test fails if the
+        /// stamp is made only there.
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn finished_at_set_without_signal_terminal() {
+            for transition in ["cancelled", "completed", "failed"] {
+                let (ctx, _rx) = TransferContext::new(test_handle());
+                assert!(ctx.metrics().finished_at.is_none());
+                match transition {
+                    "cancelled" => assert!(ctx.set_cancelled()),
+                    "completed" => assert!(ctx.set_completed()),
+                    _ => assert!(ctx.set_failed(crate::error::Error::new(
+                        crate::error::ErrorKind::ChildOperationFailed,
+                        "test",
+                    ))),
+                }
+                assert!(
+                    ctx.metrics().finished_at.is_some(),
+                    "{transition} must stamp finished_at without signal_terminal"
+                );
+                assert!(ctx.transfer_status().is_terminal());
+            }
+        }
+
+        /// The stamp is first-write-wins, like the status CAS it rides on, so a losing
+        /// transition cannot move a time the winner already published.
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn finished_at_is_first_write_wins() {
+            let (ctx, _rx) = TransferContext::new(test_handle());
+            assert!(ctx.set_completed());
+            let first = ctx.metrics().finished_at.expect("stamped by set_completed");
+            assert!(!ctx.set_cancelled(), "second transition must lose");
+            ctx.signal_terminal();
+            assert_eq!(
+                Some(first),
+                ctx.metrics().finished_at,
+                "a losing transition, and signal_terminal, must not re-stamp"
+            );
+        }
+
+        // ref: awslabs/aws-s3-transfer-manager-rs#197
+        /// A child's bytes reach its parent as they are recorded, and the parent equals
+        /// the sum of its children once everything is quiescent.
+        ///
+        /// No child finishes here, so a parent that collected a child's bytes only when
+        /// the child finished, or only when it succeeded, reads zero.
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn record_io_rolls_up_into_the_parent() {
+            let sample = |n: u64| crate::metrics::IoSample {
+                network_tx: n,
+                network_rx: 2 * n,
+                disk_read: 3 * n,
+                disk_write: 4 * n,
+                bytes_transferred: 5 * n,
+            };
+
+            let parent = Arc::new(MetricsState::new());
+            let child_a = MetricsState::with_parent(Some(parent.clone()));
+            let child_b = MetricsState::with_parent(Some(parent.clone()));
+
+            child_a.record_io(&sample(10));
+            child_b.record_io(&sample(7));
+            child_a.record_io(&sample(3));
+
+            // Each child keeps its own total.
+            assert_eq!(13, child_a.snapshot().network_tx);
+            assert_eq!(7, child_b.snapshot().network_tx);
+
+            // The parent is the sum, on every counter.
+            let p = parent.snapshot();
+            assert_eq!(20, p.network_tx);
+            assert_eq!(40, p.network_rx);
+            assert_eq!(60, p.disk_read);
+            assert_eq!(80, p.disk_write);
+            assert_eq!(100, p.bytes_transferred);
+        }
+
+        /// A sample reaches every ancestor, not only the immediate parent.
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn record_io_rolls_up_through_more_than_one_level() {
+            let root = Arc::new(MetricsState::new());
+            let mid = Arc::new(MetricsState::with_parent(Some(root.clone())));
+            let leaf = MetricsState::with_parent(Some(mid.clone()));
+
+            leaf.record_io(&crate::metrics::IoSample {
+                network_tx: 5,
+                network_rx: 0,
+                disk_read: 0,
+                disk_write: 0,
+                bytes_transferred: 0,
+            });
+
+            assert_eq!(5, leaf.snapshot().network_tx);
+            assert_eq!(5, mid.snapshot().network_tx);
+            assert_eq!(5, root.snapshot().network_tx, "the root must see it too");
+        }
+
+        /// The rollup carries bytes only: a child's `total_bytes` and `finished_at` stay its
+        /// own, so a child finishing does not finish its parent.
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn rollup_does_not_propagate_total_bytes_or_finished_at() {
+            let parent = Arc::new(MetricsState::new());
+            let child = MetricsState::with_parent(Some(parent.clone()));
+
+            child.set_total_bytes(999);
+            child.set_finished();
+
+            assert_eq!(Some(999), child.snapshot().total_bytes);
+            assert_eq!(None, parent.snapshot().total_bytes);
+            assert!(child.snapshot().finished_at.is_some());
+            assert!(parent.snapshot().finished_at.is_none());
+        }
+
         #[cfg_attr(miri, ignore)]
         #[test]
         fn set_total_bytes() {
@@ -1619,6 +2046,64 @@ mod tests {
             assert_eq!(ctx.metrics().total_bytes, None);
             ctx.set_total_bytes(42);
             assert_eq!(ctx.metrics().total_bytes, Some(42));
+        }
+
+        /// Only IO samples roll up: a child's expected bytes stay out of its parent's byte
+        /// total.
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn discovered_bytes_do_not_roll_up() {
+            let parent = Arc::new(MetricsState::new());
+            let child = MetricsState::with_parent(Some(parent.clone()));
+
+            child.add_discovered(7, 1);
+
+            assert_eq!(crate::types::Total::Provisional(7), child.byte_total());
+            assert_eq!(crate::types::Total::Unknown, parent.byte_total());
+        }
+
+        /// A single-object transfer has no entry total and no settled entries: it is one
+        /// entry, not a set of them.
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn a_leaf_has_no_entry_total() {
+            let handle = test_handle();
+            let (ctx, _rx) = TransferContext::new(handle);
+            ctx.set_total_bytes(512);
+
+            let view = ctx.view();
+            assert_eq!(crate::types::Total::Final(512), view.byte_total());
+            assert_eq!(
+                crate::types::Total::Unknown,
+                view.entry_total(),
+                "a single-object transfer enumerates nothing"
+            );
+            assert_eq!(0, view.entries_settled());
+        }
+
+        /// A view outlives the context it came from, and still reads the live counters.
+        ///
+        /// `join(self)` consumes the operation handle, and a view must stay readable after
+        /// it.
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn a_view_outlives_its_context_and_still_reads() {
+            let handle = test_handle();
+            let (ctx, _rx) = TransferContext::new(handle);
+            let view = ctx.view();
+
+            ctx.record_io(&crate::metrics::IoSample {
+                network_tx: 11,
+                network_rx: 0,
+                disk_read: 0,
+                disk_write: 0,
+                bytes_transferred: 0,
+            });
+            ctx.set_total_bytes(11);
+            drop(ctx);
+
+            assert_eq!(11, view.metrics().network_tx);
+            assert_eq!(crate::types::Total::Final(11), view.byte_total());
         }
     }
 }
@@ -1629,6 +2114,182 @@ mod loom_tests {
     use loom::sync::atomic::{AtomicBool, Ordering};
     use loom::sync::{Arc, Mutex};
     use loom::thread;
+
+    // ref: awslabs/aws-s3-transfer-manager-rs#197
+    /// A status read while `set_cancelled` lands is never `Completed`.
+    ///
+    /// Nothing here sets completed, so `Completed` can only come from a derivation that
+    /// loads the status more than once and sees the cancel land between its loads.
+    #[test]
+    fn status_loom_never_reports_completed_for_a_cancelled_transfer() {
+        loom::model(|| {
+            let status = super::StateMachineStatus::new();
+
+            let writer = {
+                let status = status.clone();
+                thread::spawn(move || assert!(status.set_cancelled()))
+            };
+
+            let observed = status.status();
+
+            writer.join().unwrap();
+
+            assert_ne!(
+                crate::types::TransferStatus::Completed,
+                observed,
+                "nothing set Completed, and the derived status reads Completed"
+            );
+        });
+    }
+
+    /// The real [`StateMachineStatus`](super::StateMachineStatus) and error slot type, both
+    /// loom-backed under `s3_tm_loom`, moved through the [`fail_with`](super::fail_with),
+    /// [`cancel_with`](super::cancel_with) and [`complete_with`](super::complete_with) that
+    /// `TransferContext` calls, and read as its readers read them.
+    ///
+    /// Stands in for `TransferContext`, which needs a client `Handle` to build.
+    struct StatusHarness {
+        status: super::StateMachineStatus,
+        error: crate::runtime::sync::Mutex<Option<u32>>,
+    }
+
+    impl StatusHarness {
+        fn new() -> Self {
+            Self {
+                status: super::StateMachineStatus::new(),
+                error: crate::runtime::sync::Mutex::new(None),
+            }
+        }
+
+        fn set_failed(&self, err: u32) -> bool {
+            super::fail_with(&self.status, &self.error, || err)
+        }
+
+        fn set_cancelled(&self) -> bool {
+            super::cancel_with(&self.status, &self.error)
+        }
+
+        /// Completes with a `publish` that sets `published`, as a download's rename puts its
+        /// object at the destination.
+        fn complete(&self, published: &AtomicBool) -> bool {
+            super::complete_with(&self.status, &self.error, || {
+                published.store(true, Ordering::SeqCst);
+                Ok::<(), ()>(())
+            })
+            .unwrap()
+        }
+
+        /// A reader's ordering, as in `take_error` and `error_kind`: check the status, then
+        /// take the lock.
+        ///
+        /// `None` if the reader did not see `Failed`, otherwise what the slot held.
+        /// `Some(None)` is the defect: `Failed` with an empty slot.
+        fn error(&self) -> Option<Option<u32>> {
+            if self.status.is_failed() {
+                Some(*self.error.lock())
+            } else {
+                None
+            }
+        }
+    }
+
+    // ref: awslabs/aws-s3-transfer-manager-rs#197
+    /// Two callers race to fail one transfer while a third reads. Exactly one wins, and
+    /// the reader never sees `Failed` with an empty error slot.
+    ///
+    /// Publishing the status outside the slot's lock opens a window between the CAS and
+    /// the store, and a reader landing there fails the test.
+    #[test]
+    fn set_failed_loom_publishes_status_after_its_error() {
+        loom::model(|| {
+            let h = Arc::new(StatusHarness::new());
+
+            let h2 = h.clone();
+            let first = thread::spawn(move || h2.set_failed(1));
+
+            let h3 = h.clone();
+            let second = thread::spawn(move || h3.set_failed(2));
+
+            let h4 = h.clone();
+            let reader = thread::spawn(move || h4.error());
+
+            let won_first = first.join().unwrap();
+            let won_second = second.join().unwrap();
+            let seen = reader.join().unwrap();
+
+            assert!(
+                won_first ^ won_second,
+                "exactly one caller wins the CAS: first={won_first} second={won_second}"
+            );
+
+            // The lock keeps the reader out of the window between the winner's CAS and its
+            // store, so a reader that saw `Failed` finds an error.
+            if let Some(slot) = seen {
+                let err = slot.expect(
+                    "observed Failed with an empty error slot: the status was published \
+                     before the error that explains it",
+                );
+                assert!(
+                    err == 1 || err == 2,
+                    "a reader that saw Failed must see one of the two real errors, got {err}"
+                );
+            }
+
+            // And once every writer is done, the error is unconditionally there.
+            assert_eq!(
+                Some(true),
+                h.error().map(|slot| slot.is_some()),
+                "a Failed status must always have an error behind it"
+            );
+        });
+    }
+
+    // ref: awslabs/aws-s3-transfer-manager-rs#197
+    /// A completion that publishes a result races a cancel and a failure. Exactly one wins,
+    /// and the result is published only if the completion won.
+    ///
+    /// A cancel or failure that changed the status outside the lock could land after
+    /// `publish` and before the completion, leaving the result behind another status: a
+    /// download's object renamed over the caller's file and reported as cancelled.
+    #[test]
+    fn complete_with_loom_publishes_only_for_a_completed_transfer() {
+        loom::model(|| {
+            let h = Arc::new(StatusHarness::new());
+            let published = Arc::new(AtomicBool::new(false));
+
+            let completer = {
+                let (h, published) = (h.clone(), published.clone());
+                thread::spawn(move || h.complete(&published))
+            };
+            let h2 = h.clone();
+            let canceller = thread::spawn(move || h2.set_cancelled());
+            let h3 = h.clone();
+            let failer = thread::spawn(move || h3.set_failed(1));
+
+            let completed = completer.join().unwrap();
+            let cancelled = canceller.join().unwrap();
+            let failed = failer.join().unwrap();
+
+            assert_eq!(
+                1,
+                [completed, cancelled, failed]
+                    .into_iter()
+                    .filter(|won| *won)
+                    .count(),
+                "exactly one transition wins: completed={completed} cancelled={cancelled} \
+                 failed={failed}"
+            );
+            assert_eq!(
+                completed,
+                published.load(Ordering::SeqCst),
+                "a result was published for a transfer that did not complete"
+            );
+            assert_eq!(
+                completed,
+                h.status.status() == crate::types::TransferStatus::Completed
+            );
+        });
+    }
 
     /// Harness wrapping the real `WakeFlag` with a simulated gated
     /// resource (a `Mutex<u32>` where 0 = blocked and non-zero = unblocked).

@@ -530,7 +530,7 @@ impl UploadObjectsTransfer {
                                 let outcome = Upload::orchestrate_child(
                                     self.inner.ctx.handle.clone(),
                                     input,
-                                    self.inner.ctx.id.id,
+                                    &self.inner.ctx,
                                 );
                                 (outcome, source_path, key)
                             })
@@ -1105,12 +1105,11 @@ impl UploadObjectsTransfer {
     }
 
     /// Consume every child handle via `join()` to capture each one's final
-    /// `Ok(UploadOutput)` / `Err(Error)`. The parent's `MetricsState` is
-    /// updated with the child's cumulative IO on success, and the child's
-    /// actual error is stored in `FailedUpload.error` on failure or
-    /// cancellation. Under `Abort` policy with an active parent, the first
-    /// failure in the batch threads its cause text into `abort()`; later
-    /// children in the batch are recorded but do not re-trigger abort.
+    /// `Ok(UploadOutput)` / `Err(Error)`. The child's actual error is stored
+    /// in `FailedUpload.error` on failure or cancellation. Under `Abort`
+    /// policy with an active parent, the first failure in the batch threads
+    /// its cause text into `abort()`; later children in the batch are
+    /// recorded but do not re-trigger abort.
     async fn execute_join_children(&self, mut batch: ReapingBatch) -> WorkOutcome {
         let children = batch.take_children();
         let n_children = children.len();
@@ -1125,13 +1124,11 @@ impl UploadObjectsTransfer {
         // the pattern open for handles whose completion signal has not yet
         // fully drained.
         let futures = children.into_iter().map(|child| {
-            // Snapshot metrics before `join()` consumes the handle.
-            let metrics = child.handle.metrics();
             let source_path = child.source_path;
             let key = child.key;
             async move {
                 let result = child.handle.join().await;
-                (result, metrics, source_path, key)
+                (result, source_path, key)
             }
         });
         let results = futures_util::future::join_all(futures).await;
@@ -1141,22 +1138,12 @@ impl UploadObjectsTransfer {
         let reaped = results.len();
         let mut aborted_in_batch = false;
 
-        for (result, metrics, source_path, key) in results {
+        for (result, source_path, key) in results {
             match result {
                 Ok(_output) => {
                     state.successful_uploads += 1;
-                    // Record directly into the parent's `MetricsState` via
-                    // the field (rather than `TransferContext::record_io`)
-                    // so the child's bytes are aggregated into the parent's
-                    // per-transfer metrics without double-counting them in
-                    // the client-level telemetry counters, which the child's
-                    // own context already updated during its transfer.
-                    self.inner.ctx.metrics.record_io(&crate::metrics::IoSample {
-                        network_tx: metrics.network_tx,
-                        network_rx: metrics.network_rx,
-                        disk_read: metrics.disk_read,
-                        disk_write: metrics.disk_write,
-                    });
+                    // The child's linked context has already rolled its bytes into this
+                    // transfer's metrics.
                     tracing::trace!(
                         target: crate::telemetry::TARGET_TRANSFER,
                         tid = %self.inner.ctx.id,

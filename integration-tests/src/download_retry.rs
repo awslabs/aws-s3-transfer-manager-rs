@@ -132,6 +132,50 @@ async fn truncate_body_once_recovers() {
     t.shutdown().await;
 }
 
+// ref: awslabs/aws-s3-transfer-manager-rs#197
+/// A range that fails mid-body and is re-issued counts its bytes once, from the attempt
+/// that succeeded, so `bytes_transferred` ends equal to `total_bytes`.
+///
+/// The object is discovery plus four 8 MiB ranges. The fault skips discovery and cuts the
+/// first range GET 6 MiB into its body, so that range is read twice; a counter fed from the
+/// body stream would finish up to 6 MiB past the total.
+#[tokio::test]
+async fn truncate_body_once_counts_the_reissued_range_once() {
+    let t = Target::mock_gp().connect_with(Some(PART_SIZE)).await;
+    let data = multipart_data();
+    t.put(
+        "obj",
+        data.clone(),
+        ChecksumStrategy::with_calculated_crc32(),
+    )
+    .await;
+
+    let mock = t.mock().expect("requires the mock backend");
+    mock.insert_fault(
+        t.bucket(),
+        &t.key("obj"),
+        FaultType::TruncateBody {
+            after_bytes: FAULT_AFTER_BYTES,
+        },
+        SKIP_DISCOVERY,
+        Occurrence::Once,
+    );
+
+    let (bytes, output) = t
+        .download("obj", Some(ChecksumMode::Enabled))
+        .await
+        .expect("download recovers via retry");
+    assert_same_content(&data, &bytes);
+    let total = data.len() as u64;
+    assert_eq!(Some(total), output.metrics.total_bytes);
+    assert_eq!(
+        total, output.metrics.bytes_transferred,
+        "the re-issued range must be counted once"
+    );
+
+    t.shutdown().await;
+}
+
 /// A connection reset on one chunk, injected `Once`, is recovered by retry.
 #[tokio::test]
 async fn connection_reset_once_recovers() {

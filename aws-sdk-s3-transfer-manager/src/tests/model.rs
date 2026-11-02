@@ -57,6 +57,7 @@ fn upload_output_validates_and_preserves_real_transfer_metrics() {
         network_rx: 0,
         disk_read: 42,
         disk_write: 0,
+        bytes_transferred: 42,
         total_bytes: Some(42),
         started_at: std::time::Instant::now(),
         finished_at: None,

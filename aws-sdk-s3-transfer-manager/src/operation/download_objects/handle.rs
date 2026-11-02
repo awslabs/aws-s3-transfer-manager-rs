@@ -83,7 +83,7 @@ impl DownloadObjectsHandle {
         self.transfer.ctx().transfer_status()
     }
 
-    /// Snapshot of aggregated transfer metrics across every completed child.
+    /// Snapshot of aggregated transfer metrics across every object, whatever its outcome.
     pub fn metrics(&self) -> crate::types::TransferMetrics {
         self.transfer.ctx().metrics()
     }
