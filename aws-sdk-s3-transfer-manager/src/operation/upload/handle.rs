@@ -58,7 +58,7 @@ use crate::types::{AbortOutcome, AbortedUpload};
 /// - The transfer calls `AbortMultipartUpload` if a multipart upload started and before ending
 ///   (after CreateMultipartUpload sent and before CompleteMultipartUpload completes)
 /// - Returns once the transfer has ended, reporting whether the object was
-///   cancelled or already stored in S3 ([`AbortOutcome`](crate::types::AbortOutcome))
+///   cancelled or already stored in S3 ([`AbortOutcome`])
 ///
 /// ## Already completed transfers
 ///

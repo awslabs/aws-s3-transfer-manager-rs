@@ -310,27 +310,36 @@ impl UploadTransfer {
     pub(crate) fn request_abort(&self) {
         // A handler that panicked poisoned the lock and the transfer has ended
         // through `on_terminal`; `start_abort` then leaves the state alone.
-        let mut state = self
+        let state = self
             .inner
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.start_abort(&mut state);
+        self.start_abort(state, |_| {});
     }
 
-    /// Starts a soft abort: moves an active `state` to `Aborting`, interrupts
-    /// parts and PutObject, and wakes the transfer so `poll_work` drives it to
-    /// an end. `state` is the held state lock.
+    /// Starts a soft abort: moves an active `state` to `Aborting`, calls
+    /// `then` on it, releases the lock, then interrupts parts and PutObject
+    /// and wakes the transfer so `poll_work` drives it to an end.
+    ///
+    /// `state` is the held state lock. It must be released before the wake:
+    /// `wake()` can run `poll_work` on this thread, which takes the lock.
     ///
     /// Idempotent: the state is left as it is when it is already `Aborting`
     /// or `Done`, or when the transfer has ended, and the flag, token and wake
     /// then have no further effect.
-    fn start_abort(&self, state: &mut UploadState) {
+    fn start_abort(
+        &self,
+        mut state: MutexGuard<'_, UploadState>,
+        then: impl FnOnce(&mut UploadState),
+    ) {
         if self.inner.ctx.is_active()
-            && !matches!(state, UploadState::Aborting { .. } | UploadState::Done)
+            && !matches!(&*state, UploadState::Aborting { .. } | UploadState::Done)
         {
-            self.enter_aborting(state);
+            self.enter_aborting(&mut state);
         }
+        then(&mut state);
+        drop(state);
         // Read by the last `InFlight` to drop, which wakes the transfer so the
         // `Aborting` arm sees the count at zero. Stored before the wake below.
         self.inner.abort_requested.store(true, Ordering::SeqCst);
@@ -341,8 +350,7 @@ impl UploadTransfer {
         self.inner.abort_parts_token.cancel();
         // A transfer that returned `PollWork::Pending` is not polled again until
         // something wakes it. `wake()` is unconditional, unlike `try_wake()`,
-        // which only fires if the last poll published a pending cause. It only
-        // requeues the transfer, so it is safe under the state lock.
+        // which only fires if the last poll published a pending cause.
         self.inner.ctx.wake();
     }
 
@@ -1644,7 +1652,7 @@ impl UploadTransfer {
     /// nothing to settle pass `|_| {}`.
     fn fail(
         &self,
-        mut state: MutexGuard<'_, UploadState>,
+        state: MutexGuard<'_, UploadState>,
         error: Error,
         settle: impl FnOnce(&mut UploadState),
     ) -> WorkOutcome {
@@ -1655,16 +1663,17 @@ impl UploadTransfer {
         );
         let classification = crate::scheduler::classify_error(&error);
         let snapshot = snapshot_state(&state);
-        self.start_abort(&mut state);
-        // Not `Aborting` only if the object was committed or the transfer
-        // already ended; the error is then dropped.
-        if let UploadState::Aborting { failure, .. } = &mut *state {
-            // The first failure is the one reported.
-            if failure.is_none() {
-                *failure = Some(UploadFailure { error, snapshot });
+        self.start_abort(state, |state| {
+            // Not `Aborting` only if the object was committed or the transfer
+            // already ended; the error is then dropped.
+            if let UploadState::Aborting { failure, .. } = state {
+                // The first failure is the one reported.
+                if failure.is_none() {
+                    *failure = Some(UploadFailure { error, snapshot });
+                }
+                settle(state);
             }
-            settle(&mut state);
-        }
+        });
         WorkOutcome::Failed { classification }
     }
 }
