@@ -302,7 +302,7 @@ impl PartStream for SinglePart {
 /// One request attempt the S3 client sent.
 #[derive(Debug, Clone)]
 struct RecordedAttempt {
-    /// The operation name, such as `UploadPart`.
+    /// The operation name
     operation: String,
     /// The checksum algorithm the request carried a value for, as an `x-amz-checksum-<algorithm>`
     /// header or as an aws-chunked trailer named by `x-amz-trailer`. `None` when it carried no
@@ -331,7 +331,7 @@ fn sent_checksum(headers: &aws_smithy_runtime_api::http::Headers) -> Option<Chec
 /// Records every request attempt the S3 client sends.
 #[derive(Debug, Clone, Default)]
 struct OperationRecorder {
-    /// Attempts in send order.
+    /// Attempts in send order, one entry per attempt
     seen: Arc<Mutex<Vec<RecordedAttempt>>>,
 }
 
@@ -358,8 +358,7 @@ impl Intercept for OperationRecorder {
         "OperationRecorder"
     }
 
-    // Runs once per attempt, so SDK retries are counted. Runs after the checksum interceptor has
-    // set its header or trailer.
+    // Runs once per attempt, so SDK retries are counted.
     fn read_before_transmit(
         &self,
         context: &BeforeTransmitInterceptorContextRef<'_>,
