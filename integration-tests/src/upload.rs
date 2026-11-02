@@ -411,7 +411,6 @@ async fn when_required_tm() -> (
 /// Under `WhenRequired`, a single-request upload with `with_calculated_crc32_c()` sends a CRC32C
 /// checksum on `PutObject`: the caller set the algorithm, so the SDK calculates it.
 #[tokio::test]
-#[ignore = "requires an aws-sdk-s3 that calculates a caller-selected request checksum under WhenRequired"]
 async fn test_when_required_calculated_crc32c_sends_put_object_checksum() {
     let (handle, tm, recorder) = when_required_tm().await;
     let content = deterministic_data(1024);
@@ -443,7 +442,6 @@ async fn test_when_required_calculated_crc32c_sends_put_object_checksum() {
 /// Under `WhenRequired`, a multipart upload with `with_calculated_crc32_c()` sends a CRC32C
 /// checksum on every `UploadPart`.
 #[tokio::test]
-#[ignore = "requires an aws-sdk-s3 that calculates a caller-selected request checksum under WhenRequired"]
 async fn test_when_required_calculated_crc32c_sends_upload_part_checksums() {
     let (handle, tm, recorder) = when_required_tm().await;
     // 24 MiB = 3 parts at the default 8 MiB part size.
