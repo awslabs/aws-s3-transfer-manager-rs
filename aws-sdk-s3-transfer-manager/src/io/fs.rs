@@ -15,6 +15,8 @@
 //! [`is_append_only`] reports whether a handle's positioned writes would land
 //! at their offsets, and [`create_first_new`] creates the first of several
 //! candidate paths that does not exist yet, without opening any existing entry.
+//! [`Handle`] identifies the file a path names, so that two paths can be
+//! compared.
 //!
 //! The `_async` helpers keep blocking filesystem calls off async worker
 //! threads: natively through `tokio::fs` or tokio's blocking pool, and inline
@@ -323,6 +325,11 @@ async fn run_blocking<T>(operation: impl FnOnce() -> io::Result<T>) -> io::Resul
     operation()
 }
 
+#[cfg(not(target_os = "wasi"))]
+pub(crate) use same_file::Handle;
+#[cfg(target_os = "wasi")]
+pub(crate) use sys::Handle;
+
 #[cfg(all(unix, not(miri)))]
 mod sys {
     //! Native Unix positioned I/O.
@@ -502,13 +509,52 @@ mod sys {
 
 #[cfg(target_os = "wasi")]
 mod sys {
-    //! WASI positioned I/O through rustix.
+    //! WASI positioned I/O and file identity through rustix.
     //!
-    //! std's `FileExt` positioned reads and writes are unstable on WASI.
+    //! std's `FileExt` positioned reads and writes are unstable on WASI, and
+    //! same-file supports only Unix and Windows.
 
     use bytes::Buf;
     use std::fs::File;
     use std::io;
+    use std::path::Path;
+
+    /// Identity of the file a path names.
+    ///
+    /// Opens the path, following symbolic links, and identifies the file by
+    /// the device and inode `fstat` reports for the open descriptor. As with
+    /// `same_file::Handle`, the descriptor stays open for the handle's
+    /// lifetime, so the identity cannot be reused by another file while it is
+    /// compared.
+    #[derive(Debug)]
+    pub(crate) struct Handle {
+        _file: File,
+        dev: u64,
+        ino: u64,
+    }
+
+    impl PartialEq for Handle {
+        fn eq(&self, other: &Self) -> bool {
+            (self.dev, self.ino) == (other.dev, other.ino)
+        }
+    }
+
+    impl Eq for Handle {}
+
+    impl Handle {
+        /// Opens `path` and reads the identity of the file it names.
+        ///
+        /// Returns the error from opening the path or from `fstat`.
+        pub(crate) fn from_path(path: impl AsRef<Path>) -> io::Result<Self> {
+            let file = File::open(path)?;
+            let stat = rustix::fs::fstat(&file)?;
+            Ok(Self {
+                _file: file,
+                dev: stat.st_dev,
+                ino: stat.st_ino,
+            })
+        }
+    }
 
     pub(super) fn read_exact_at(file: &File, dst: &mut [u8], offset: u64) -> io::Result<()> {
         super::validate_off_t_range(offset, dst.len())?;
