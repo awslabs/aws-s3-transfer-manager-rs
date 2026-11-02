@@ -1090,6 +1090,14 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         let input = req.input;
         tracing::trace!(bucket = %input.bucket, key = %input.key, "RestoreObject");
         check_bucket(&self.storage, &input.bucket).await?;
+        let days = match input.restore_request.as_ref().map(|request| request.days) {
+            None => return Err(Error::MissingRequestBody.into()),
+            Some(None) => return Err(Error::MalformedXml.into()),
+            Some(Some(days)) if days < 1 => {
+                return Err(Error::InvalidArgument("restoration days should be at least 1").into())
+            }
+            Some(Some(days)) => days as u64,
+        };
         let metadata = self
             .storage
             .head_object(&input.bucket, &input.key)
@@ -1101,12 +1109,6 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         if metadata.restore_status == Some(RestoreStatus::InProgress) {
             return Err(Error::RestoreAlreadyInProgress.into());
         }
-        let days = input
-            .restore_request
-            .as_ref()
-            .and_then(|request| request.days)
-            .unwrap_or(1)
-            .max(1) as u64;
         // A restore completes as soon as it is requested. As in S3, the copy expires at the
         // first midnight UTC at least `days` days later.
         let expiry = std::time::SystemTime::now() + std::time::Duration::from_secs(days * 86_400);

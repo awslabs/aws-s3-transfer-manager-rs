@@ -141,7 +141,6 @@ async fn test_filesystem_storage() -> Result<(), Box<dyn std::error::Error>> {
   InvalidObjectState). RestoreObject restores them immediately, answering 200 (S3 answers 202 for
   a new restore); `S3MockServer::set_restore_status` sets any restore status,
   including a restore in progress, which a further RestoreObject fails with 409.
-- A RestoreObject without `Days` restores the object for 1 day.
 
 ### Storage Classes
 

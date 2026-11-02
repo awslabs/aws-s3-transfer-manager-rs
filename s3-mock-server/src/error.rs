@@ -109,6 +109,10 @@ pub enum Error {
     #[error("malformed XML")]
     MalformedXml,
 
+    /// The request has no body, and needs one.
+    #[error("missing request body")]
+    MissingRequestBody,
+
     /// The request is not allowed.
     #[error("access denied")]
     AccessDenied,
@@ -292,6 +296,11 @@ impl From<Error> for s3s::S3Error {
                 "The XML you provided was not well-formed or did not validate against our \
                  published schema"
                     .into(),
+            ),
+            Error::MissingRequestBody => (
+                S3ErrorCode::MissingRequestBodyError,
+                StatusCode::BAD_REQUEST,
+                "Request Body is empty".into(),
             ),
             Error::AccessDenied => (
                 S3ErrorCode::AccessDenied,

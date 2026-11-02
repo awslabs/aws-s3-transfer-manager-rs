@@ -114,6 +114,7 @@ async fn test_restore_object() -> Result {
         f.s3.restore_object()
             .bucket(&f.bucket)
             .key("standard")
+            .restore_request(RestoreRequest::builder().days(1).build())
             .send()
             .await,
     );
@@ -126,10 +127,50 @@ async fn test_restore_object() -> Result {
         f.s3.restore_object()
             .bucket(&f.bucket)
             .key("missing")
+            .restore_request(RestoreRequest::builder().days(1).build())
             .send()
             .await,
     );
     assert_failure(&fail, 404, "NoSuchKey");
+    f.shutdown().await;
+    Ok(())
+}
+
+/// RestoreObject fails without a body with 400 MissingRequestBodyError, without `Days` with 400
+/// MalformedXML, and with `Days` below 1 with 400 InvalidArgument, and needs no
+/// `GlacierJobParameters`.
+#[tokio::test]
+async fn test_restore_object_request() -> Result {
+    let f = Fixture::new().await;
+    put_in_class(&f, "a", "cold", StorageClass::Glacier).await;
+    let restore = || f.s3.restore_object().bucket(&f.bucket).key("a");
+    let fail = failure(restore().send().await);
+    assert_failure(&fail, 400, "MissingRequestBodyError");
+    assert_eq!(fail.message.as_deref(), Some("Request Body is empty"));
+    let fail = failure(
+        restore()
+            .restore_request(RestoreRequest::builder().build())
+            .send()
+            .await,
+    );
+    assert_failure(&fail, 400, "MalformedXML");
+    for days in [0, -1] {
+        let fail = failure(
+            restore()
+                .restore_request(RestoreRequest::builder().days(days).build())
+                .send()
+                .await,
+        );
+        assert_failure(&fail, 400, "InvalidArgument");
+        assert_eq!(
+            fail.message.as_deref(),
+            Some("restoration days should be at least 1")
+        );
+    }
+    restore()
+        .restore_request(RestoreRequest::builder().days(1).build())
+        .send()
+        .await?;
     f.shutdown().await;
     Ok(())
 }
@@ -186,6 +227,7 @@ async fn test_restore_object_in_progress() -> Result {
         f.s3.restore_object()
             .bucket(&f.bucket)
             .key("a")
+            .restore_request(RestoreRequest::builder().days(1).build())
             .send()
             .await,
     );
