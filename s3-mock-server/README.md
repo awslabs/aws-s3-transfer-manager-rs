@@ -206,6 +206,8 @@ assert_eq!(server.request_count(Operation::HeadObject), 2);
 
 `insert_fault(bucket, key, ..)` targets the GetObject, PutObject and UploadPart requests for one
 key. Counts and faults apply per HTTP request, so each retry and each part request counts.
+`FaultType::Error(Error::Custom { code, status, message })` answers with an error the server does
+not otherwise send, such as 400 RequestTimeout.
 
 ## License
 

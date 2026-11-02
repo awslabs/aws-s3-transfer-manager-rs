@@ -26,6 +26,7 @@ mod types;
 pub use bucket::BucketType;
 pub use error::Error;
 pub use error::Result;
+pub use error::ServerError;
 pub use faults::{BodyCadence, FaultTarget, FaultType, Occurrence};
 pub use operation::Operation;
 pub use server::{

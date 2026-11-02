@@ -65,7 +65,8 @@ pub enum FaultType {
     /// The response is the error's S3 error response: its code, HTTP status and message.
     /// Storage is not read or modified, and the request body is not read.
     /// [`FaultType::internal_error`] and [`FaultType::slow_down`] build the two retryable errors
-    /// S3 sends.
+    /// S3 sends; [`Error::Custom`](crate::Error::Custom) answers with any code, status and
+    /// message.
     Error(crate::Error),
     /// While reading the request (upload) body, consume up to `after_bytes` then
     /// stall (stop reading, never complete). The client's request-body poll parks

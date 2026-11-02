@@ -171,6 +171,37 @@ async fn test_error_response_on_head_and_list() -> Result {
     Ok(())
 }
 
+/// An `Error::Custom` fault answers with its code, status and message, for codes the server does
+/// not otherwise answer.
+#[tokio::test]
+async fn test_custom_error_response() -> Result {
+    let f = Fixture::new().await;
+    f.put("a", "hello").await;
+    f.server.insert_fault_for(
+        FaultTarget::operation(Operation::GetObject).key("a"),
+        FaultType::Error(Error::Custom {
+            code: "RequestTimeout".to_owned(),
+            status: http::StatusCode::BAD_REQUEST,
+            message: "Your socket connection to the server was not read from or written to within \
+                      the timeout period."
+                .to_owned(),
+        }),
+        0,
+        Occurrence::Once,
+    );
+    let fail = failure(f.s3.get_object().bucket(&f.bucket).key("a").send().await);
+    assert_failure(&fail, 400, "RequestTimeout");
+    assert_eq!(
+        fail.message.as_deref(),
+        Some(
+            "Your socket connection to the server was not read from or written to within the \
+             timeout period."
+        )
+    );
+    f.shutdown().await;
+    Ok(())
+}
+
 /// Bucket operations draw faults too: a target restricted to a bucket matches only requests for
 /// that bucket, and ListBuckets, which names no bucket, matches only unrestricted targets.
 #[tokio::test]

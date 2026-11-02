@@ -508,7 +508,8 @@ async fn test_filesystem_storage() -> Result<()> {
     // Create a server with filesystem storage
     let server = S3MockServer::builder()
         .with_local_dir_store(temp_path)
-        .await?
+        .await
+        .expect("Failed to create the local directory store")
         .build()
         .expect("Failed to build server");
 
@@ -799,7 +800,8 @@ async fn test_delete_nonempty_bucket() -> Result<()> {
         S3MockServer::builder().with_in_memory_store(),
         S3MockServer::builder()
             .with_local_dir_store(temp_dir.path())
-            .await?,
+            .await
+            .expect("Failed to create the local directory store"),
     ] {
         let server = builder.build().expect("Failed to build server");
         let handle = server.start().await.expect("Failed to start mock server");

@@ -5,7 +5,7 @@
 
 //! S3 Mock Server implementation.
 
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, ServerError};
 use crate::faults::{FaultTarget, FaultType, Occurrence};
 use crate::s3s::{Inner, ServerState};
 use crate::storage::filesystem::FilesystemStorage;
@@ -139,7 +139,10 @@ impl S3MockServerBuilder {
 
     // FIXME - replace these storage config options with configuring storage directly (e.g. for specifying cleanup options, etc)
     /// Use filesystem storage with the given path.
-    pub async fn with_local_dir_store(mut self, path: impl AsRef<Path>) -> Result<Self> {
+    pub async fn with_local_dir_store(
+        mut self,
+        path: impl AsRef<Path>,
+    ) -> std::result::Result<Self, ServerError> {
         self.storage = Some(Arc::new(FilesystemStorage::new(path).await?));
         Ok(self)
     }
@@ -151,10 +154,10 @@ impl S3MockServerBuilder {
     }
 
     /// Build the S3MockServer.
-    pub fn build(self) -> Result<S3MockServer> {
-        let storage = self.storage.ok_or_else(|| {
-            Error::InvalidConfiguration("Storage backend must be specified".to_string())
-        })?;
+    pub fn build(self) -> std::result::Result<S3MockServer, ServerError> {
+        let storage = self.storage.ok_or(ServerError::InvalidConfiguration(
+            "Storage backend must be specified",
+        ))?;
 
         Ok(S3MockServer {
             storage,
@@ -347,11 +350,7 @@ impl S3MockServer {
             Some(algorithms) => {
                 for algorithm in algorithms {
                     let algorithm = crate::types::stored_checksum_algorithm(algorithm.as_str())
-                        .ok_or_else(|| {
-                            Error::InvalidConfiguration(format!(
-                                "unsupported checksum algorithm {algorithm}"
-                            ))
-                        })?;
+                        .ok_or(Error::InvalidArgument("unsupported checksum algorithm"))?;
                     integrity_checks = integrity_checks.with_checksum_algorithm(algorithm);
                 }
             }
@@ -569,19 +568,15 @@ impl S3MockServer {
     }
 
     /// Start the server.
-    pub async fn start(&self) -> Result<ServerHandle> {
+    pub async fn start(&self) -> std::result::Result<ServerHandle, ServerError> {
         // Create the address to bind to
         // If port is not specified, use port 0 to get an available port
         let addr_str = format!("127.0.0.1:{}", self.config.port.unwrap_or(0));
 
-        let listener = TcpListener::bind(&addr_str)
-            .await
-            .map_err(|e| Error::Internal(format!("Failed to bind to address: {}", e)))?;
+        let listener = TcpListener::bind(&addr_str).await?;
 
         // Get the actual address we're bound to
-        let addr = listener
-            .local_addr()
-            .map_err(|e| Error::Internal(format!("Failed to get local address: {}", e)))?;
+        let addr = listener.local_addr()?;
 
         tracing::info!("S3MockServer listening on {}", addr);
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();

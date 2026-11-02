@@ -21,10 +21,11 @@ use crate::bucket::BucketType;
 /// Result type for S3 Mock Server operations.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Error type for S3 Mock Server operations.
+/// The error a request, or a call that seeds or inspects the server, fails with.
 ///
-/// Each request error is answered with S3's error code. Errors of the server itself, such as
-/// I/O errors, are answered with 500 `InternalError`.
+/// Each error is answered with S3's error code. Failures while serving a request, such as I/O
+/// errors, are answered with 500 `InternalError`. Building and starting the server fail with a
+/// [`ServerError`] instead.
 #[derive(Error, Debug, Clone)]
 pub enum Error {
     /// The specified key does not exist.
@@ -121,14 +122,6 @@ pub enum Error {
     #[error("slow down")]
     SlowDown,
 
-    /// The server is already running.
-    #[error("server already running")]
-    ServerAlreadyRunning,
-
-    /// The server failed to start.
-    #[error("server failed to start: {0}")]
-    ServerStartFailed(String),
-
     /// An I/O error occurred.
     #[error("I/O error: {0}")]
     Io(#[source] Arc<io::Error>),
@@ -137,9 +130,26 @@ pub enum Error {
     #[error("internal error: {0}")]
     Internal(String),
 
-    /// An internal error occurred.
+    /// An error with any code, status and message, for faults with codes the server does not
+    /// otherwise answer, such as 400 `RequestTimeout` or 503 `ServiceUnavailable`.
+    #[error("{code}: {message}")]
+    Custom {
+        code: String,
+        status: StatusCode,
+        message: String,
+    },
+}
+
+/// The error building or starting the server fails with.
+#[derive(Error, Debug)]
+pub enum ServerError {
+    /// The server's configuration is invalid.
     #[error("invalid server configuration: {0}")]
-    InvalidConfiguration(String),
+    InvalidConfiguration(&'static str),
+
+    /// An I/O error, such as binding the listening socket or creating the local-directory store.
+    #[error("I/O error: {0}")]
+    Io(#[from] io::Error),
 }
 
 impl From<io::Error> for Error {
@@ -312,11 +322,16 @@ impl From<Error> for s3s::S3Error {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Please reduce your request rate.".into(),
             ),
-            Error::ServerAlreadyRunning
-            | Error::ServerStartFailed(_)
-            | Error::Io(_)
-            | Error::Internal(_)
-            | Error::InvalidConfiguration(_) => (
+            Error::Custom {
+                code,
+                status,
+                message,
+            } => (
+                S3ErrorCode::Custom(code.clone().into()),
+                *status,
+                message.clone().into(),
+            ),
+            Error::Io(_) | Error::Internal(_) => (
                 S3ErrorCode::InternalError,
                 StatusCode::INTERNAL_SERVER_ERROR,
                 // S3's message does not describe the error, so the server adds it.

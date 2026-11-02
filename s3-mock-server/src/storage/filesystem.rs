@@ -115,7 +115,7 @@ pub(crate) struct FilesystemStorage {
 
 impl FilesystemStorage {
     /// Create a new filesystem storage backend.
-    pub(crate) async fn new(root_dir: impl AsRef<Path>) -> Result<Self> {
+    pub(crate) async fn new(root_dir: impl AsRef<Path>) -> std::io::Result<Self> {
         let root_dir = root_dir.as_ref().to_path_buf();
         fs::create_dir_all(&root_dir).await?;
         Ok(Self { root_dir })

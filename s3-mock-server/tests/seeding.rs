@@ -151,7 +151,7 @@ async fn test_seed_checksum_algorithms_and_storage_class() -> Result {
                     .checksum_algorithms([ChecksumAlgorithm::from("MD4")]),
             )
             .await,
-        Err(s3_mock_server::Error::InvalidConfiguration(_))
+        Err(s3_mock_server::Error::InvalidArgument(_))
     ));
     assert!(matches!(
         f.server
@@ -161,7 +161,7 @@ async fn test_seed_checksum_algorithms_and_storage_class() -> Result {
                 AddObjectRequest::new("hello").checksum_algorithms([ChecksumAlgorithm::Md5]),
             )
             .await,
-        Err(s3_mock_server::Error::InvalidConfiguration(_))
+        Err(s3_mock_server::Error::InvalidArgument(_))
     ));
     assert!(!f.exists("bad").await);
     f.shutdown().await;
