@@ -9,6 +9,8 @@
 //! different operations and answer some requests differently. As in S3 and in its clients, a
 //! bucket's type follows from its name: directory bucket names end in `--x-s3`.
 
+use crate::error::Error;
+
 /// The suffix of directory bucket names.
 const DIRECTORY_BUCKET_SUFFIX: &str = "--x-s3";
 
@@ -29,6 +31,37 @@ impl BucketType {
         } else {
             Self::GeneralPurpose
         }
+    }
+
+    /// Fail a ListObjectsV2 request that buckets of this type do not serve: in directory
+    /// buckets, a delimiter other than `/` or a prefix that does not end in `/` with 400
+    /// InvalidRequest, and `start-after` with 501 NotSupported.
+    pub(crate) fn check_listing(
+        self,
+        prefix: &str,
+        delimiter: Option<&str>,
+        start_after: bool,
+    ) -> crate::Result<()> {
+        if self == Self::GeneralPurpose {
+            return Ok(());
+        }
+        if delimiter.is_some_and(|delimiter| !delimiter.is_empty() && delimiter != "/") {
+            return Err(Error::InvalidRequest(
+                "This bucket only supports '/' as a delimiter",
+            ));
+        }
+        if !prefix.is_empty() && !prefix.ends_with('/') {
+            return Err(Error::InvalidRequest(
+                "This bucket does not support a prefix that does not end in a delimiter. Specify a \
+                 prefix path ending with a delimiter and try again.",
+            ));
+        }
+        if start_after {
+            return Err(Error::NotSupported(
+                "This bucket does not support start-after query parameter for ListObjectsV2 API.",
+            ));
+        }
+        Ok(())
     }
 }
 

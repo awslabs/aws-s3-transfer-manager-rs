@@ -68,6 +68,10 @@ pub enum Error {
     #[error("invalid digest")]
     InvalidDigest,
 
+    /// The request uses a parameter the bucket does not support.
+    #[error("not supported: {0}")]
+    NotSupported(&'static str),
+
     /// The range specified is invalid
     #[error("invalid range")]
     InvalidRange,
@@ -252,6 +256,11 @@ impl From<Error> for s3s::S3Error {
                 S3ErrorCode::InvalidDigest,
                 StatusCode::BAD_REQUEST,
                 "The Content-MD5 you specified was invalid.".into(),
+            ),
+            Error::NotSupported(message) => (
+                S3ErrorCode::Custom("NotSupported".into()),
+                StatusCode::NOT_IMPLEMENTED,
+                (*message).into(),
             ),
             Error::InvalidRange => (
                 S3ErrorCode::InvalidRange,

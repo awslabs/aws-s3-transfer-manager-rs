@@ -1020,6 +1020,11 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         check_bucket(&self.storage, &input.bucket).await?;
 
         let prefix = input.prefix.as_deref().unwrap_or("");
+        BucketType::of(&input.bucket).check_listing(
+            prefix,
+            input.delimiter.as_deref(),
+            input.start_after.is_some(),
+        )?;
         let max_keys = input.max_keys.unwrap_or(1000).clamp(0, 1000) as usize;
         let include_restore_status = input
             .optional_object_attributes
@@ -1926,6 +1931,71 @@ mod tests {
             .complete_multipart_upload(s3_request(invalid_input))
             .await;
         assert!(invalid_result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_directory_bucket_listing_restrictions() {
+        // Driven at the handler level, as in `test_directory_bucket_requires_contiguous_parts`.
+        let directory = "test-dir-bucket--usw2-az1--x-s3";
+        let storage = InMemoryStorage::new();
+        storage.create_bucket(directory).await.unwrap();
+        storage.create_bucket("test-bucket").await.unwrap();
+        let inner = Inner::new(storage);
+        let list = |bucket: &str, prefix: &str, delimiter: &str, start_after: Option<&str>| {
+            s3_request(
+                s3s::dto::ListObjectsV2Input::builder()
+                    .bucket(s3s::dto::BucketName::from(bucket))
+                    .prefix(Some(prefix.to_owned()))
+                    .delimiter(Some(delimiter.to_owned()))
+                    .start_after(start_after.map(str::to_owned))
+                    .build()
+                    .unwrap(),
+            )
+        };
+
+        for (prefix, delimiter, start_after, code, status) in [
+            (
+                "dir/",
+                "-",
+                None,
+                "InvalidRequest",
+                http::StatusCode::BAD_REQUEST,
+            ),
+            (
+                "dir/key",
+                "/",
+                None,
+                "InvalidRequest",
+                http::StatusCode::BAD_REQUEST,
+            ),
+            (
+                "dir/",
+                "/",
+                Some("dir/a"),
+                "NotSupported",
+                http::StatusCode::NOT_IMPLEMENTED,
+            ),
+        ] {
+            let error = inner
+                .list_objects_v2(list(directory, prefix, delimiter, start_after))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.code().as_str(),
+                code,
+                "{prefix} {delimiter} {start_after:?}"
+            );
+            assert_eq!(error.status_code(), Some(status));
+        }
+        inner
+            .list_objects_v2(list(directory, "dir/", "/", None))
+            .await
+            .unwrap();
+        // General purpose buckets accept all three.
+        inner
+            .list_objects_v2(list("test-bucket", "dir/key", "-", Some("dir/a")))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
