@@ -61,6 +61,10 @@ async fn setup_with_fault(
         .build()
         .expect("build mock server");
     let handle = server.start().await.expect("start mock server");
+    server
+        .create_bucket("test-bucket")
+        .await
+        .expect("create bucket");
 
     let (http_client, tally) = io_fault_http_client(is_upload_part, fail);
 
@@ -72,10 +76,9 @@ async fn setup_with_fault(
         .build();
 
     let tm_config = aws_sdk_s3_transfer_manager::Config::builder()
-        .s3_config(
-            aws_sdk_s3_transfer_manager::config::S3ClientConfig::new(&shared_config)
-                .enable_runtime_http(false),
-        )
+        .s3_config(aws_sdk_s3_transfer_manager::config::S3ClientConfig::new(
+            &shared_config,
+        ))
         .part_size(PartSize::Target(PART_SIZE))
         .build();
     let tm = aws_sdk_s3_transfer_manager::Client::new(tm_config);
@@ -231,12 +234,9 @@ mod server_faults {
         };
         let tm = TmClient::new(
             aws_sdk_s3_transfer_manager::Config::builder()
-                .s3_config(
-                    aws_sdk_s3_transfer_manager::config::S3ClientConfig::new(
-                        &handle.shared_config().await,
-                    )
-                    .enable_runtime_http(false),
-                )
+                .s3_config(aws_sdk_s3_transfer_manager::config::S3ClientConfig::new(
+                    &handle.shared_config().await,
+                ))
                 .part_size(PART_SIZE)
                 .multipart_threshold(threshold)
                 .build(),
@@ -271,7 +271,7 @@ mod server_faults {
         server.insert_fault(
             "test-bucket",
             "obj",
-            FaultType::ServiceError { status: 503 },
+            FaultType::slow_down(),
             0,
             Occurrence::Once,
         );
@@ -305,7 +305,7 @@ mod server_faults {
         server.insert_fault(
             "test-bucket",
             "obj",
-            FaultType::ServiceError { status: 503 },
+            FaultType::slow_down(),
             0,
             Occurrence::Always,
         );

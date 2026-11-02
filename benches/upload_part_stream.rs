@@ -146,10 +146,9 @@ async fn setup(
     let handle = server.start().await.expect("mock server should start");
     let shared_config = handle.shared_config().await;
     let config = aws_sdk_s3_transfer_manager::Config::builder()
-        .s3_config(
-            aws_sdk_s3_transfer_manager::config::S3ClientConfig::new(&shared_config)
-                .enable_runtime_http(false),
-        )
+        .s3_config(aws_sdk_s3_transfer_manager::config::S3ClientConfig::new(
+            &shared_config,
+        ))
         .concurrency(ConcurrencyMode::Explicit(concurrency))
         .build();
     let client = aws_sdk_s3_transfer_manager::Client::new(config);

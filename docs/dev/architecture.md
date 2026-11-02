@@ -9,9 +9,36 @@ A client operation builds a transfer and enqueues it with the scheduler. The sch
 - **`operation/`** (public): one module per client operation. It holds the builders, the input and output types, the caller's handle, and the operation's `Transfer` implementation.
 - **`transfer.rs`** (crate-private): what a transfer is. It holds the `Transfer` trait, `TransferContext` (id, status, metrics, and the pending/wake protocol), and the parent/child contract that composite transfers use.
 - **`scheduler/`** (crate-private): work generation, the ready set, fair scheduling, concurrency control, and the gate. Its module documentation states the contracts that every `Transfer` implementation upholds.
-- **`runtime/`** (crate-private): managed threads, platform binding, request dispatch, and the buffer pool. `runtime/sync` is the synchronization layer that Loom models.
+- **`runtime/`** (crate-private): transfer dispatch, managed execution ownership, the default native transport preset, and the buffer pool. `runtime/sync` is the synchronization layer that Loom models.
 - **`io/`** (public): input streams, part reading, and the filesystem and S3 walkers.
 - **`retry.rs`, `metrics/`, `config/`, `error.rs`**: cross-cutting support.
+
+## Reusable components
+
+`crates/aws-smithy-topology/` provides CPU and NUMA discovery, placement targets,
+and explicit CPU binding independently of transfer scheduling. Discovery owns
+no threads and does not change affinity. Its crate documentation states the
+resource and platform contracts.
+
+`crates/aws-smithy-execution/` owns managed threads and exposes partition handles
+for targeted Send task submission. Its topology re-export describes placement;
+its runtime owner controls shutdown. Execution handles do not retain ownership.
+
+`crates/aws-smithy-managed-http/` combines native Smithy connection pools with
+managed execution. Transport configuration remains on the native pool builder;
+the wrapper retains execution handles and native clients without owning runtime
+shutdown. It supplies Smithy's HTTP client interface independently of TM.
+
+`crates/aws-sdk-s3-transfer-manager-ext/` transfers an execution runtime owner into
+opaque TM configuration through the non-default `__unstable_ext` hook. Its
+version constraints define the supported TM and execution pairing. HTTP pool
+composition belongs to managed HTTP independently of this extension.
+
+TM's ordinary configuration keeps component types private. `RuntimeConfig`
+selects TM-owned managed execution or the caller's Tokio runtime. HTTP configured
+through shared SDK configuration takes precedence over TM's default transport;
+S3-specific SDK builder conversions require `sdk-v1`. See
+[../design/runtime.md](../design/runtime.md) for ownership and file-I/O contracts.
 
 ## Boundaries
 

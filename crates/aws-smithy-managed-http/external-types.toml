@@ -1,0 +1,5 @@
+allowed_external_types = [
+    "aws_smithy_execution::*",
+    "aws_smithy_http_client::*",
+    "aws_smithy_runtime_api::*",
+]

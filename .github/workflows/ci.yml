@@ -72,6 +72,7 @@ jobs:
     timeout-minutes: 45
     env:
       GRADLE_USER_HOME: ${{ github.workspace }}/target/codegen/gradle-home
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/modeled-ci
     steps:
       - uses: actions/checkout@v4
       - name: Install Java 21
@@ -98,8 +99,12 @@ jobs:
             target/codegen/gradle-home/wrapper
             target/codegen/cargo-home
             target/codegen/models
-          key: ${{ runner.os }}-model-tooling-${{ hashFiles('tools/codegen/s3-tm-model-codegen/gradle.properties', 'tools/codegen/s3-tm-model-codegen/gradle/wrapper/gradle-wrapper.properties', 'tools/codegen/s3-tm-model-codegen/settings.gradle.kts', 'tools/codegen/s3-tm-model-codegen/build.gradle.kts') }}
+          key: ${{ runner.os }}-model-tooling-v2-${{ hashFiles('tools/codegen/s3-tm-model-codegen/gradle.properties', 'tools/codegen/s3-tm-model-codegen/gradle/wrapper/gradle-wrapper.properties', 'tools/codegen/s3-tm-model-codegen/settings.gradle.kts', 'tools/codegen/s3-tm-model-codegen/build.gradle.kts') }}
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Rust cache cleanup must not prune the model tooling under target/codegen.
+          workspaces: ". -> target/modeled-ci"
+          prefix-key: v1-modeled-rust
       - name: Test model tooling and generated fixtures
         run: just test-codegen
       - name: Check installed model and SDK adapters against fresh pinned generation
@@ -200,8 +205,8 @@ jobs:
             # exhaust macOS socket buffers without increasing product coverage.
             nextest_args+=(--test-threads 1)
           fi
-          cargo nextest run --locked --workspace --features sdk-v1 --no-fail-fast "${nextest_args[@]}"
-          cargo test --locked --doc --workspace --features sdk-v1 --no-fail-fast
+          cargo nextest run --locked --workspace --all-features --no-fail-fast "${nextest_args[@]}"
+          cargo test --locked --doc --workspace --all-features --no-fail-fast
 
   e2e:
     name: E2E (${{ matrix.name }})
@@ -395,7 +400,7 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: "clippy --all"
-        run: cargo clippy --all --tests --no-deps
+        run: cargo clippy --locked --workspace --all-targets --all-features --no-deps
 
   docs:
     name: docs
@@ -410,7 +415,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: "doc --lib"
         run: |
-          cargo doc --lib --no-deps --document-private-items
+          cargo doc --locked --workspace --all-features --lib --no-deps --document-private-items
         env:
           RUSTFLAGS: -Dwarnings -Adeprecated
           RUSTDOCFLAGS: -Dwarnings --cfg docsrs
@@ -427,7 +432,7 @@ jobs:
           toolchain: ${{ env.rust_min }}
       - uses: Swatinem/rust-cache@v2
       - name: "check --workspace"
-        run: cargo check --workspace
+        run: cargo check --locked --workspace --all-features
         env:
           RUSTFLAGS: "" # remove -Dwarnings
 
@@ -482,11 +487,8 @@ jobs:
         uses: taiki-e/cache-cargo-install-action@v2
         with:
           tool: cargo-check-external-types@0.5.0
-      - name: check-external-types
-        # Otherwise the checker forwards workspace-resolved features, including
-        # sdk-v1 enabled by the integration-tests package.
-        run: cargo check-external-types --no-default-features --features '' --config external-types.toml
-        working-directory: aws-sdk-s3-transfer-manager
+      - name: Check TM, extension, and runtime component APIs
+        run: python3 tools/check-tm-public-api.py
 
   check-deny:
     name: check deps with cargo-deny
@@ -553,12 +555,9 @@ jobs:
           # first report, and reject invalid C-string operations.
           ASAN_OPTIONS: detect_leaks=1:detect_stack_use_after_return=1:halt_on_error=1:strict_string_checks=1
           # Retain additional access history for race reports and stop at the
-          # first race diagnostic. Managed-runtime lifecycle tests can leave a
-          # finished Tokio blocking worker for process teardown, so thread-leak
-          # reporting remains disabled until their drain-and-join teardown is
-          # deterministic. The suppression covers Tokio's kernel-mediated
-          # reactor registration; transfer-manager races remain unsuppressed.
-          # Deadlock detection is not enabled.
+          # first race. The suppression covers Tokio's kernel-mediated reactor
+          # registration; transfer-manager races remain unsuppressed.
+          # Thread-leak and deadlock detection are not enabled.
           TSAN_OPTIONS: halt_on_error=1:history_size=7:report_thread_leaks=0:suppressions=${{ github.workspace }}/.github/tsan-suppressions.txt
           # Ignore `trybuild` errors as they are irrelevant and flaky on nightly
           TRYBUILD: overwrite
@@ -625,6 +624,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
+      # Generated consumers resolve dependencies without the workspace lockfile.
+      CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: fallback
       # The checker includes optional features; dial9 needs Tokio's unstable API.
       RUSTFLAGS: "-Dwarnings --cfg tokio_unstable"
     steps:
@@ -654,6 +655,18 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: check --feature-powerset
         run: cargo hack check --all --feature-powerset
+        env:
+          RUSTFLAGS: -Dwarnings -Adeprecated
+      - name: Check ordinary and extension consumers
+        run: python3 tools/check-tm-consumers.py
+      - name: Test ordinary and unstable managed configuration
+        run: |
+          cargo test --locked -p aws-sdk-s3-transfer-manager --no-default-features \
+            --lib client::tests -- --test-threads 1
+          cargo test --locked -p aws-sdk-s3-transfer-manager --no-default-features \
+            --features __unstable_ext --lib client::tests -- --test-threads 1
+          cargo test --locked -p aws-sdk-s3-transfer-manager --no-default-features \
+            --features __unstable_ext --lib config::runtime -- --test-threads 1
         env:
           RUSTFLAGS: -Dwarnings -Adeprecated
 

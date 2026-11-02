@@ -21,5 +21,5 @@ pub fn shared_config(http_client: impl HttpClient + 'static) -> aws_types::SdkCo
 /// Use the supplied test HTTP client without replacement by managed-runtime
 /// transport, regardless of the runtime selected by a test.
 pub fn s3_config(http_client: impl HttpClient + 'static) -> S3ClientConfig {
-    S3ClientConfig::new(&shared_config(http_client)).enable_runtime_http(false)
+    S3ClientConfig::new(&shared_config(http_client))
 }

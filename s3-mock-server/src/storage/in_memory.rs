@@ -92,6 +92,11 @@ impl StorageBackend for InMemoryStorage {
         let content = content.freeze();
         let content_length = content.len() as u64;
         let object_integrity = integrity_checks.finalize();
+        if let Some(client_checksums) = &request.client_checksums {
+            if let Err(error_msg) = object_integrity.validate(client_checksums) {
+                return Err(Error::ChecksumMismatch(error_msg.to_string()));
+            }
+        }
         let last_modified = request.last_modified.unwrap_or_else(SystemTime::now);
 
         let metadata = ObjectMetadata {
@@ -116,10 +121,13 @@ impl StorageBackend for InMemoryStorage {
         };
 
         let mut buckets = self.buckets.write().await;
-        // Auto-create bucket if it doesn't exist (backward compatibility)
         let bucket_state = buckets
-            .entry(request.bucket)
-            .or_insert_with(BucketState::new);
+            .get_mut(&request.bucket)
+            .ok_or(Error::NoSuchBucket)?;
+        // Checked under the write lock, so the condition holds at the moment of the write.
+        request
+            .precondition
+            .check(bucket_state.objects.get(&request.key).map(|(_, m)| m))?;
         bucket_state
             .objects
             .insert(request.key.clone(), (content, metadata));
@@ -168,6 +176,22 @@ impl StorageBackend for InMemoryStorage {
         let mut buckets = self.buckets.write().await;
         let bucket_state = buckets.get_mut(bucket).ok_or(Error::NoSuchBucket)?;
         // DeleteObject is idempotent: deleting a non-existent key is not an error.
+        bucket_state.objects.remove(key);
+        Ok(())
+    }
+
+    async fn delete_object_if_match(
+        &self,
+        bucket: &str,
+        key: &str,
+        if_match: &s3s::dto::ETagCondition,
+    ) -> Result<()> {
+        let mut buckets = self.buckets.write().await;
+        let bucket_state = buckets.get_mut(bucket).ok_or(Error::NoSuchBucket)?;
+        crate::storage::check_delete_if_match(
+            if_match,
+            bucket_state.objects.get(key).map(|(_, metadata)| metadata),
+        )?;
         bucket_state.objects.remove(key);
         Ok(())
     }
@@ -373,6 +397,18 @@ impl StorageBackend for InMemoryStorage {
         Ok(result)
     }
 
+    async fn multipart_checksum_type(
+        &self,
+        upload_id: &str,
+    ) -> Result<Option<aws_sdk_s3::types::ChecksumType>> {
+        let multipart = self.multipart.read().await;
+        let upload = multipart
+            .uploads
+            .get(upload_id)
+            .ok_or(Error::NoSuchUpload)?;
+        Ok(upload.checksum_type.clone())
+    }
+
     async fn complete_multipart_upload(
         &self,
         request: crate::storage::CompleteMultipartUploadRequest<'_>,
@@ -570,6 +606,9 @@ impl StorageBackend for InMemoryStorage {
 
         // Completion errors leave the upload and its parts available for retry. Remove both only
         // after every request and checksum validation has succeeded.
+        if !self.buckets.read().await.contains_key(&bucket) {
+            return Err(Error::NoSuchBucket);
+        }
         {
             let mut multipart = self.multipart.write().await;
             if multipart.uploads.remove(request.upload_id).is_none() {
@@ -583,8 +622,7 @@ impl StorageBackend for InMemoryStorage {
         // Store the final object
         let combined_data = combined.freeze();
         let mut buckets = self.buckets.write().await;
-        // Auto-create bucket if it doesn't exist
-        let bucket_state = buckets.entry(bucket).or_insert_with(BucketState::new);
+        let bucket_state = buckets.get_mut(&bucket).ok_or(Error::NoSuchBucket)?;
         bucket_state
             .objects
             .insert(key.clone(), (combined_data, final_metadata.clone()));
@@ -663,6 +701,7 @@ mod tests {
     #[tokio::test]
     async fn test_put_and_get_object() {
         let storage = InMemoryStorage::new();
+        storage.create_bucket(TEST_BUCKET).await.unwrap();
         let key = "test-key";
         let content = Bytes::from("test content");
         let integrity_checks = ObjectIntegrityChecks::new().with_md5();
@@ -697,6 +736,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_object_with_range() {
         let storage = InMemoryStorage::new();
+        storage.create_bucket(TEST_BUCKET).await.unwrap();
         let key = "test-key";
         let content = Bytes::from("0123456789");
         let integrity_checks = ObjectIntegrityChecks::new().with_md5();
@@ -727,6 +767,7 @@ mod tests {
     #[tokio::test]
     async fn test_delete_object() {
         let storage = InMemoryStorage::new();
+        storage.create_bucket(TEST_BUCKET).await.unwrap();
         let key = "test-key";
         let content = Bytes::from("test content");
         let integrity_checks = ObjectIntegrityChecks::new().with_md5();
@@ -764,6 +805,7 @@ mod tests {
     #[tokio::test]
     async fn test_list_objects() {
         let storage = InMemoryStorage::new();
+        storage.create_bucket(TEST_BUCKET).await.unwrap();
         let content = Bytes::from("test content");
 
         for i in 0..3 {
@@ -800,6 +842,7 @@ mod tests {
     #[tokio::test]
     async fn test_multipart_upload() {
         let storage = InMemoryStorage::new();
+        storage.create_bucket(TEST_BUCKET).await.unwrap();
         let upload_id = "test-upload-123";
         let key = "test-multipart-key";
         let metadata = create_test_metadata(0);
@@ -928,6 +971,7 @@ mod tests {
     #[tokio::test]
     async fn test_rejected_multipart_completion_retains_upload() {
         let storage = InMemoryStorage::new();
+        storage.create_bucket(TEST_BUCKET).await.unwrap();
         let upload_id = "test-upload-123";
         let key = "test-multipart-key";
         let metadata = create_test_metadata(0);
@@ -982,6 +1026,7 @@ mod tests {
     #[tokio::test]
     async fn test_checksum_rejection_retains_multipart_upload() {
         let storage = InMemoryStorage::new();
+        storage.create_bucket(TEST_BUCKET).await.unwrap();
         let upload_id = "test-upload-checksum";
         let key = "test-multipart-checksum-key";
         let mut metadata = create_test_metadata(0);

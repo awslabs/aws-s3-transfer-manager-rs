@@ -20,6 +20,7 @@ async fn test_get_object() -> Result<()> {
     let s3 = handle.client().await;
 
     let bucket = format!("test-bucket-{}", Uuid::new_v4());
+    server.create_bucket(&bucket).await?;
     let bucket_str = bucket.as_str();
 
     let key = "test-file.txt";
@@ -74,6 +75,7 @@ async fn test_head_object() -> Result<()> {
     let handle = server.start().await.expect("Failed to start mock server");
     let s3 = handle.client().await;
     let bucket = format!("test-bucket-{}", Uuid::new_v4());
+    server.create_bucket(&bucket).await?;
     let key = "test-head-object.txt";
     let content = "Content for head object test";
 
@@ -115,6 +117,7 @@ async fn test_list_objects_v2() -> Result<()> {
     let handle = server.start().await.expect("Failed to start mock server");
     let s3 = handle.client().await;
     let bucket = format!("test-bucket-{}", Uuid::new_v4());
+    server.create_bucket(&bucket).await?;
 
     let prefix = "test-prefix/";
     let key1 = format!("{}file1.txt", prefix);
@@ -169,6 +172,7 @@ async fn test_multipart_upload() -> Result<()> {
     let handle = server.start().await.expect("Failed to start mock server");
     let s3 = handle.client().await;
     let bucket = format!("test-bucket-{}", Uuid::new_v4());
+    server.create_bucket(&bucket).await?;
     let key = "test-multipart.txt";
 
     let create_resp = s3
@@ -262,6 +266,7 @@ async fn test_abort_multipart_upload() -> Result<()> {
     let handle = server.start().await.expect("Failed to start mock server");
     let s3 = handle.client().await;
     let bucket = format!("test-bucket-{}", Uuid::new_v4());
+    server.create_bucket(&bucket).await?;
     let key = "test-abort-multipart.txt";
 
     let create_resp = s3
@@ -325,6 +330,7 @@ async fn test_put_object_with_metadata() -> Result<()> {
     let handle = server.start().await.expect("Failed to start mock server");
     let s3 = handle.client().await;
     let bucket = format!("test-bucket-{}", Uuid::new_v4());
+    server.create_bucket(&bucket).await?;
     let key = "test-metadata.txt";
     let content = "Content with metadata";
 
@@ -384,6 +390,7 @@ async fn test_get_object_range() -> Result<()> {
     let handle = server.start().await.expect("Failed to start mock server");
     let s3 = handle.client().await;
     let bucket = format!("test-bucket-{}", Uuid::new_v4());
+    server.create_bucket(&bucket).await?;
     let key = "test-range.txt";
     let content = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
@@ -441,6 +448,7 @@ async fn test_filesystem_storage() -> Result<()> {
     let handle = server.start().await.expect("Failed to start mock server");
     let s3 = handle.client().await;
     let bucket = format!("test-bucket-{}", Uuid::new_v4());
+    server.create_bucket(&bucket).await?;
     let key = "test-file.txt";
     let content = "This is a test file content";
 
@@ -482,6 +490,7 @@ async fn test_error_handling_no_such_key() -> Result<()> {
     let handle = server.start().await.expect("Failed to start mock server");
     let s3 = handle.client().await;
     let bucket = format!("test-bucket-{}", Uuid::new_v4());
+    server.create_bucket(&bucket).await?;
     let key = "non-existent-key.txt";
 
     // Try to get a non-existent object
@@ -515,6 +524,7 @@ async fn test_concurrent_operations() -> Result<()> {
     let handle = server.start().await.expect("Failed to start mock server");
     let s3 = handle.client().await;
     let bucket = format!("test-bucket-{}", Uuid::new_v4());
+    server.create_bucket(&bucket).await?;
 
     // Create multiple upload futures
     let mut upload_futures = Vec::new();
@@ -595,6 +605,7 @@ async fn test_delete_object() -> Result<()> {
     let handle = server.start().await.expect("Failed to start mock server");
     let s3 = handle.client().await;
     let bucket = format!("test-bucket-{}", Uuid::new_v4());
+    server.create_bucket(&bucket).await?;
     let key = "delete-me.txt";
 
     // Put an object
@@ -640,6 +651,7 @@ async fn test_create_and_delete_bucket() -> Result<()> {
     let handle = server.start().await.expect("Failed to start mock server");
     let s3 = handle.client().await;
     let bucket = format!("test-bucket-{}", Uuid::new_v4());
+    server.create_bucket(&bucket).await?;
 
     // Create bucket
     s3.create_bucket()
@@ -680,25 +692,15 @@ async fn test_list_buckets() -> Result<()> {
     let handle = server.start().await.expect("Failed to start mock server");
     let s3 = handle.client().await;
 
-    // Create two buckets by putting objects into them (auto-create)
     let bucket_a = format!("bucket-a-{}", Uuid::new_v4());
     let bucket_b = format!("bucket-b-{}", Uuid::new_v4());
-
-    s3.put_object()
-        .bucket(&bucket_a)
-        .key("obj1.txt")
-        .body(ByteStream::from_static(b"a"))
-        .send()
-        .await
-        .expect("Failed to put object in bucket_a");
-
-    s3.put_object()
-        .bucket(&bucket_b)
-        .key("obj2.txt")
-        .body(ByteStream::from_static(b"b"))
-        .send()
-        .await
-        .expect("Failed to put object in bucket_b");
+    for bucket in [&bucket_a, &bucket_b] {
+        s3.create_bucket()
+            .bucket(bucket)
+            .send()
+            .await
+            .expect("Failed to create bucket");
+    }
 
     let resp = s3
         .list_buckets()
@@ -731,8 +733,9 @@ async fn test_delete_nonempty_bucket() -> Result<()> {
     let handle = server.start().await.expect("Failed to start mock server");
     let s3 = handle.client().await;
     let bucket = format!("test-bucket-{}", Uuid::new_v4());
+    server.create_bucket(&bucket).await?;
 
-    // Put an object (auto-creates bucket)
+    // Put an object
     s3.put_object()
         .bucket(&bucket)
         .key("still-here.txt")

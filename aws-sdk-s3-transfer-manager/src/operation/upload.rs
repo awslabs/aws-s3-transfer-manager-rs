@@ -135,7 +135,8 @@ mod test {
     use crate::io::InputStream;
     use crate::metrics::unit::ByteUnit;
     use crate::operation::upload::UploadInput;
-    use crate::types::{AbortOutcome, ConcurrencyMode, PartSize, RuntimeMode, TransferStatus};
+    use crate::types::{AbortOutcome, ConcurrencyMode, PartSize, TransferStatus};
+    use crate::RuntimeConfig;
 
     /// Polls `future` once and returns the result of that poll.
     ///
@@ -197,7 +198,7 @@ mod test {
     /// An abort requested while CreateMultipartUpload is in flight waits for
     /// Create's response, then aborts the upload Create returned. No part is
     /// uploaded.
-    async fn abort_during_create_mpu(runtime_mode: RuntimeMode) {
+    async fn abort_during_create_mpu(runtime_config: RuntimeConfig) {
         let create_started = Arc::new(Semaphore::new(0));
         let create_release = Arc::new(Semaphore::new(0));
         let abort_uris = Arc::new(Mutex::new(Vec::new()));
@@ -217,7 +218,7 @@ mod test {
 
         let tm_config = crate::Config::builder()
             .concurrency(ConcurrencyMode::Explicit(1))
-            .runtime_mode(runtime_mode)
+            .runtime_config(runtime_config)
             .set_multipart_threshold(PartSize::Target(10))
             .set_target_part_size(PartSize::Target(5 * ByteUnit::Mebibyte.as_bytes_u64()))
             .sdk_client(client)
@@ -268,13 +269,13 @@ mod test {
     #[cfg_attr(miri, ignore)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn abort_during_create_mpu_on_tokio_runtime() {
-        abort_during_create_mpu(RuntimeMode::MultiThreadTokio).await;
+        abort_during_create_mpu(RuntimeConfig::multi_thread_tokio()).await;
     }
 
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn abort_during_create_mpu_on_managed_runtime() {
-        abort_during_create_mpu(RuntimeMode::Managed).await;
+        abort_during_create_mpu(RuntimeConfig::default()).await;
     }
 
     /// How [`CompleteMpuConnector`] answers CompleteMultipartUpload.
@@ -397,7 +398,7 @@ mod test {
     /// [`CompleteMpuConnector`] and waits until CompleteMultipartUpload has
     /// been sent.
     async fn start_upload_until_complete_mpu(
-        runtime_mode: RuntimeMode,
+        runtime_config: RuntimeConfig,
         behavior: CompleteMpuBehavior,
         concurrency: usize,
     ) -> (crate::operation::upload::UploadHandle, CompleteMpuProbe) {
@@ -425,7 +426,7 @@ mod test {
 
         let tm_config = crate::Config::builder()
             .concurrency(ConcurrencyMode::Explicit(concurrency))
-            .runtime_mode(runtime_mode)
+            .runtime_config(runtime_config)
             .set_multipart_threshold(PartSize::Target(10))
             .set_target_part_size(PartSize::Target(5 * ByteUnit::Mebibyte.as_bytes_u64()))
             .sdk_client(client)
@@ -455,9 +456,9 @@ mod test {
     /// Concurrency 2 so AbortMultipartUpload can go out while Complete holds a
     /// slot; Complete is released only after S3 has seen the abort, as in the
     /// real race.
-    async fn abort_during_complete_mpu(runtime_mode: RuntimeMode) {
+    async fn abort_during_complete_mpu(runtime_config: RuntimeConfig) {
         let (handle, probe) = start_upload_until_complete_mpu(
-            runtime_mode,
+            runtime_config,
             CompleteMpuBehavior::HoldThenNoSuchUpload,
             2,
         )
@@ -498,22 +499,22 @@ mod test {
     #[cfg_attr(miri, ignore)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn abort_during_complete_mpu_aborts_upload_on_tokio_runtime() {
-        abort_during_complete_mpu(RuntimeMode::MultiThreadTokio).await;
+        abort_during_complete_mpu(RuntimeConfig::multi_thread_tokio()).await;
     }
 
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn abort_during_complete_mpu_aborts_upload_on_managed_runtime() {
-        abort_during_complete_mpu(RuntimeMode::Managed).await;
+        abort_during_complete_mpu(RuntimeConfig::default()).await;
     }
 
     /// An abort requested while CompleteMultipartUpload is in flight sends
     /// AbortMultipartUpload. When Complete then fails with an error other
     /// than `NoSuchUpload`, `abort()` returns that error instead of
     /// `Cancelled`.
-    async fn complete_mpu_failure_during_abort(runtime_mode: RuntimeMode) {
+    async fn complete_mpu_failure_during_abort(runtime_config: RuntimeConfig) {
         let (handle, probe) =
-            start_upload_until_complete_mpu(runtime_mode, CompleteMpuBehavior::HoldThenFail, 2)
+            start_upload_until_complete_mpu(runtime_config, CompleteMpuBehavior::HoldThenFail, 2)
                 .await;
 
         let mut abort = Box::pin(handle.abort());
@@ -549,21 +550,21 @@ mod test {
     #[cfg_attr(miri, ignore)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn complete_mpu_failure_during_abort_returns_error_on_tokio_runtime() {
-        complete_mpu_failure_during_abort(RuntimeMode::MultiThreadTokio).await;
+        complete_mpu_failure_during_abort(RuntimeConfig::multi_thread_tokio()).await;
     }
 
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn complete_mpu_failure_during_abort_returns_error_on_managed_runtime() {
-        complete_mpu_failure_during_abort(RuntimeMode::Managed).await;
+        complete_mpu_failure_during_abort(RuntimeConfig::default()).await;
     }
 
     /// A failed CompleteMultipartUpload aborts the multipart upload, and
     /// `abort()` on the failed upload returns the failure without sending a
     /// second AbortMultipartUpload.
-    async fn abort_after_failed_complete_mpu(runtime_mode: RuntimeMode) {
+    async fn abort_after_failed_complete_mpu(runtime_config: RuntimeConfig) {
         let (handle, probe) =
-            start_upload_until_complete_mpu(runtime_mode, CompleteMpuBehavior::Fail, 1).await;
+            start_upload_until_complete_mpu(runtime_config, CompleteMpuBehavior::Fail, 1).await;
 
         tokio::time::timeout(Duration::from_secs(5), async {
             while handle.status() != TransferStatus::Failed {
@@ -594,13 +595,13 @@ mod test {
     #[cfg_attr(miri, ignore)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn abort_after_failed_complete_mpu_returns_error_on_tokio_runtime() {
-        abort_after_failed_complete_mpu(RuntimeMode::MultiThreadTokio).await;
+        abort_after_failed_complete_mpu(RuntimeConfig::multi_thread_tokio()).await;
     }
 
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn abort_after_failed_complete_mpu_returns_error_on_managed_runtime() {
-        abort_after_failed_complete_mpu(RuntimeMode::Managed).await;
+        abort_after_failed_complete_mpu(RuntimeConfig::default()).await;
     }
 
     #[cfg_attr(miri, ignore)]
@@ -775,6 +776,117 @@ mod retry_tests {
         assert!(
             result.is_ok(),
             "upload should succeed after retry: {:?}",
+            result.err()
+        );
+
+        // Verify all 4 requests were made (including the retry)
+        let requests: Vec<_> = http_client.actual_requests().collect();
+        assert_eq!(
+            4,
+            requests.len(),
+            "should have made 4 requests (including retry)"
+        );
+    }
+
+    /// Test that SDK retries an `InternalError` embedded in a CompleteMultipartUpload HTTP 200.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_complete_mpu_http_200_internal_error_retry() {
+        // Responses in order: CreateMPU, UploadPart, CompleteMPU (200 + error), CompleteMPU (retry)
+        let http_client = StaticReplayClient::new(vec![
+            // CreateMultipartUpload - success
+            ReplayEvent::new(
+                dummy_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::from(
+                        r#"<?xml version="1.0" encoding="UTF-8"?>
+                        <InitiateMultipartUploadResult>
+                            <Bucket>test-bucket</Bucket>
+                            <Key>test-key</Key>
+                            <UploadId>test-upload-id</UploadId>
+                        </InitiateMultipartUploadResult>"#,
+                    ))
+                    .unwrap(),
+            ),
+            // UploadPart - success
+            ReplayEvent::new(
+                dummy_request(),
+                http::Response::builder()
+                    .status(200)
+                    .header("ETag", "\"test-etag\"")
+                    .body(SdkBody::empty())
+                    .unwrap(),
+            ),
+            // CompleteMultipartUpload - HTTP 200 carrying an InternalError body
+            ReplayEvent::new(
+                dummy_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::from(
+                        r#"<?xml version="1.0" encoding="UTF-8"?>
+                        <Error>
+                            <Code>InternalError</Code>
+                            <Message>We encountered an internal error. Please try again.</Message>
+                            <RequestId>656c76696e6727732072657175657374</RequestId>
+                            <HostId>Uuag1LuByRx9e6j5Onimru9pO4ZVKnJ2Qz7/C1NPcfTWAtRPf==</HostId>
+                        </Error>"#,
+                    ))
+                    .unwrap(),
+            ),
+            // CompleteMultipartUpload - retry succeeds
+            ReplayEvent::new(
+                dummy_request(),
+                http::Response::builder()
+                    .status(200)
+                    .body(SdkBody::from(
+                        r#"<?xml version="1.0" encoding="UTF-8"?>
+                        <CompleteMultipartUploadResult>
+                            <Location>https://test-bucket.s3.amazonaws.com/test-key</Location>
+                            <Bucket>test-bucket</Bucket>
+                            <Key>test-key</Key>
+                            <ETag>"final-etag"</ETag>
+                        </CompleteMultipartUploadResult>"#,
+                    ))
+                    .unwrap(),
+            ),
+        ]);
+
+        let s3_client = aws_sdk_s3::Client::from_conf(
+            aws_sdk_s3::config::Config::builder()
+                .http_client(http_client.clone())
+                .region(Region::from_static("us-west-2"))
+                .retry_config(aws_config::retry::RetryConfig::standard().with_max_attempts(3))
+                .with_test_defaults()
+                .build(),
+        );
+
+        let tm_config = crate::Config::builder()
+            .concurrency(ConcurrencyMode::Explicit(1))
+            .set_multipart_threshold(PartSize::Target(10))
+            .set_target_part_size(PartSize::Target(5 * ByteUnit::Mebibyte.as_bytes_u64()))
+            .sdk_client(s3_client)
+            .build();
+
+        let tm = crate::Client::new(tm_config);
+
+        let body = Bytes::from_static(b"every adolescent dog goes bonkers early");
+        let stream = InputStream::from(body);
+
+        let handle = tm
+            .upload()
+            .bucket("test-bucket")
+            .key("test-key")
+            .body(stream)
+            .initiate()
+            .unwrap();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), handle.join())
+            .await
+            .expect("join timed out");
+        assert!(
+            result.is_ok(),
+            "upload should succeed after CompleteMultipartUpload retry: {:?}",
             result.err()
         );
 
