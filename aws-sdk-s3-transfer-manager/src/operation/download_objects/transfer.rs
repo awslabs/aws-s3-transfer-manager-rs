@@ -1639,6 +1639,8 @@ mod tests {
         assert!(dir.path().join("a.txt").exists());
         assert!(dir.path().join("b.txt").exists());
         assert!(dir.path().join("c.txt").exists());
+
+        crate::runtime::test_util::shutdown(&transfer.ctx().handle).await;
     }
 
     #[cfg_attr(miri, ignore)]
@@ -1708,6 +1710,8 @@ mod tests {
             m.disk_write, 40,
             "child disk_write must aggregate to parent"
         );
+
+        crate::runtime::test_util::shutdown(&transfer.ctx().handle).await;
     }
 
     /// Under `Abort`, a child failure sets the parent failed in an execute
@@ -1762,6 +1766,16 @@ mod tests {
         .expect("Abort failure must signal parent terminal, not strand join()");
 
         assert!(transfer.ctx().is_failed());
+
+        let ctx = transfer.ctx();
+        timeout(
+            Duration::from_secs(10),
+            ctx.handle.scheduler.cancel_transfer(ctx.id).wait_for_idle(),
+        )
+        .await
+        .expect("failed parent and child work did not drain");
+
+        crate::runtime::test_util::shutdown(&ctx.handle).await;
     }
 
     /// Regression (real scheduler): two claimed-but-failed spawns under Continue
@@ -1821,6 +1835,8 @@ mod tests {
             2,
             "both failed entries must be recorded"
         );
+
+        crate::runtime::test_util::shutdown(&transfer.ctx().handle).await;
     }
 
     #[cfg_attr(miri, ignore)]
@@ -1849,6 +1865,8 @@ mod tests {
 
         assert_eq!(transfer.successful_downloads(), 0);
         assert!(transfer.ctx().is_failed());
+
+        crate::runtime::test_util::shutdown(&transfer.ctx().handle).await;
     }
 
     // --- RAII counter guard tests (mirror upload_objects) ---
@@ -2095,6 +2113,8 @@ mod tests {
                 "object {i} must be present on disk"
             );
         }
+
+        crate::runtime::test_util::shutdown(&transfer.ctx().handle).await;
     }
 
     /// Backstop test: with a small max_concurrent set via pipeline_depth,

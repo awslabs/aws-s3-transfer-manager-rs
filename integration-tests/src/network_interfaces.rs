@@ -14,7 +14,8 @@
 use std::time::Duration;
 
 use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
-use aws_sdk_s3_transfer_manager::types::{ConcurrencyMode, PartSize, RuntimeMode};
+use aws_sdk_s3_transfer_manager::types::{ConcurrencyMode, PartSize};
+use aws_sdk_s3_transfer_manager::RuntimeConfig;
 
 use crate::harness::{mock_tm_with_s3_config, MockTm};
 
@@ -26,7 +27,7 @@ const LOOPBACK: &str = "lo0";
 async fn setup(interfaces: &[&str]) -> MockTm {
     let interfaces: Vec<String> = interfaces.iter().map(|s| s.to_string()).collect();
     mock_tm_with_s3_config(
-        RuntimeMode::Managed,
+        RuntimeConfig::default(),
         |s3| s3.network_interfaces(interfaces),
         |b| {
             b.part_size(PartSize::Target(5 * ByteUnit::Mebibyte.as_bytes_u64()))

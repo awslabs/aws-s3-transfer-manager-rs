@@ -2391,6 +2391,13 @@ chunks are waiting in the body, retained by downstream HTTP processing, or owned
 in-progress read. Cancellation prevents further staging and releases ownership as outstanding
 operations complete.
 
+Direct file-body reads are enabled only when TM constructs its managed HTTP
+transport. With configured HTTP or caller-runtime execution, the body performs
+its positioned reads through the polling Tokio runtime's blocking pool. Managed
+transfer-task reads remain direct independently of that body choice. Both body
+variants retain the same source identity, pooled storage, retry cursors, and
+bounded read-ahead. See [runtime.md](runtime.md#file-io-placement).
+
 #### Request bodies
 
 `PartData` owns the immutable payload for one part. Caller-owned `Bytes` remain outside pool
