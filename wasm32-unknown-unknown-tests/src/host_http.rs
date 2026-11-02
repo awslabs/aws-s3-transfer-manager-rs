@@ -3,21 +3,23 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! A connector whose requests the embedding host answers.
+//! A connector whose requests the embedding host performs.
 //!
-//! [`HostHttp`] serializes each request into a queue and returns a future that
-//! stays pending until the host submits a response. The host takes requests
-//! with [`next_request`], writes each response into the buffer returned by
-//! [`buffer`], and submits it with [`respond`], in any order and across any
-//! number of calls into the module.
+//! [`HostHttp`] serializes each request, passes it to the host with the
+//! `http_send` import, and returns a future that stays pending until the host
+//! writes the response into the buffer returned by [`buffer`] and submits it
+//! with [`respond`]. The host answers requests in any order, between calls
+//! into the module. Dropping the future before the host answers calls the
+//! `http_cancel` import.
 //!
 //! A request is `METHOD URI\n`, one `name: value\n` line per header, a blank
 //! line, and the body. A response is `STATUS\n`, header lines in the same form,
 //! a blank line, and the body. Header values contain no newline.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::future::poll_fn;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::task::{Poll, Waker};
 
@@ -29,22 +31,25 @@ use aws_smithy_types::body::SdkBody;
 use aws_smithy_types::byte_stream::ByteStream;
 use bytes::Bytes;
 
+use crate::imports;
+
 static EXCHANGE: Mutex<Exchange> = Mutex::new(Exchange::new());
+
+static SENT: AtomicUsize = AtomicUsize::new(0);
+static PENDING_POLLS: AtomicUsize = AtomicUsize::new(0);
+static CANCELLED: AtomicUsize = AtomicUsize::new(0);
 
 struct Exchange {
     next_id: u32,
-    /// Serialized requests the host has not taken.
-    queued: VecDeque<(u32, Vec<u8>)>,
     /// Requests whose futures are live, by id.
     outstanding: BTreeMap<u32, Outstanding>,
-    /// The request most recently returned by [`next_request`].
-    taken: Vec<u8>,
     /// Bytes the host writes before [`respond`] or another consumer reads them.
     buffer: Vec<u8>,
 }
 
 #[derive(Default)]
 struct Outstanding {
+    answered: bool,
     response: Option<HttpResponse>,
     waker: Option<Waker>,
 }
@@ -53,11 +58,29 @@ impl Exchange {
     const fn new() -> Self {
         Self {
             next_id: 1,
-            queued: VecDeque::new(),
             outstanding: BTreeMap::new(),
-            taken: Vec::new(),
             buffer: Vec::new(),
         }
+    }
+}
+
+/// Request counters.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Stats {
+    /// Requests passed to `http_send`.
+    pub(crate) sent: usize,
+    /// Polls in which a sent request's future returned `Pending`.
+    pub(crate) pending_polls: usize,
+    /// Requests passed to `http_cancel`.
+    pub(crate) cancelled: usize,
+}
+
+/// Returns the current counters.
+pub(crate) fn stats() -> Stats {
+    Stats {
+        sent: SENT.load(Ordering::SeqCst),
+        pending_polls: PENDING_POLLS.load(Ordering::SeqCst),
+        cancelled: CANCELLED.load(Ordering::SeqCst),
     }
 }
 
@@ -65,14 +88,17 @@ impl Exchange {
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct HostHttp;
 
-/// Removes a request from the exchange when its future is dropped.
+/// Removes a request from the exchange when its future is dropped, and
+/// cancels it if the host has not answered it.
 struct Registration(u32);
 
 impl Drop for Registration {
     fn drop(&mut self) {
-        let mut exchange = EXCHANGE.lock().unwrap();
-        exchange.queued.retain(|(id, _)| *id != self.0);
-        exchange.outstanding.remove(&self.0);
+        let removed = EXCHANGE.lock().unwrap().outstanding.remove(&self.0);
+        if removed.is_some_and(|outstanding| !outstanding.answered) {
+            CANCELLED.fetch_add(1, Ordering::SeqCst);
+            imports::http_cancel(self.0);
+        }
     }
 }
 
@@ -95,11 +121,13 @@ impl HttpConnector for HostHttp {
             let registration = {
                 let mut exchange = EXCHANGE.lock().unwrap();
                 let id = exchange.next_id;
-                exchange.next_id += 1;
-                exchange.queued.push_back((id, serialized));
+                exchange.next_id = id.checked_add(1).expect("request ids are exhausted");
                 exchange.outstanding.insert(id, Outstanding::default());
                 Registration(id)
             };
+            SENT.fetch_add(1, Ordering::SeqCst);
+            imports::http_send(registration.0, &serialized);
+            drop(serialized);
             let response = poll_fn(|cx| {
                 let mut exchange = EXCHANGE.lock().unwrap();
                 let outstanding = exchange
@@ -110,6 +138,7 @@ impl HttpConnector for HostHttp {
                     Some(response) => Poll::Ready(response),
                     None => {
                         outstanding.waker = Some(cx.waker().clone());
+                        PENDING_POLLS.fetch_add(1, Ordering::SeqCst);
                         Poll::Pending
                     }
                 }
@@ -120,31 +149,14 @@ impl HttpConnector for HostHttp {
     }
 }
 
-/// Whether any request future is waiting for a response.
+/// Whether any sent request awaits the host's response.
 pub(crate) fn awaiting_host() -> bool {
-    !EXCHANGE.lock().unwrap().outstanding.is_empty()
-}
-
-/// Hands the next queued request to the host. Returns its nonzero id, or zero
-/// when none is queued. [`taken`] holds its bytes until the next call.
-pub(crate) fn next_request() -> u32 {
-    let mut exchange = EXCHANGE.lock().unwrap();
-    match exchange.queued.pop_front() {
-        Some((id, bytes)) => {
-            exchange.taken = bytes;
-            id
-        }
-        None => {
-            exchange.taken.clear();
-            0
-        }
-    }
-}
-
-/// Address and length of the request most recently handed to the host.
-pub(crate) fn taken() -> (*const u8, usize) {
-    let exchange = EXCHANGE.lock().unwrap();
-    (exchange.taken.as_ptr(), exchange.taken.len())
+    EXCHANGE
+        .lock()
+        .unwrap()
+        .outstanding
+        .values()
+        .any(|outstanding| !outstanding.answered)
 }
 
 /// Resizes the host buffer to `len` zeroed bytes and returns its address. The
@@ -164,7 +176,7 @@ pub(crate) fn take_buffer() -> Bytes {
 /// Completes request `id` with the response serialized in the host buffer.
 ///
 /// Returns `Ok(false)` if the request's future was dropped first, and an error
-/// if the response is malformed.
+/// if the response is malformed or the request was already answered.
 pub(crate) fn respond(id: u32) -> Result<bool, String> {
     let response = parse_response(take_buffer())?;
     let waker = {
@@ -172,6 +184,10 @@ pub(crate) fn respond(id: u32) -> Result<bool, String> {
         let Some(outstanding) = exchange.outstanding.get_mut(&id) else {
             return Ok(false);
         };
+        if outstanding.answered {
+            return Err(format!("request {id} was answered twice"));
+        }
+        outstanding.answered = true;
         outstanding.response = Some(response);
         outstanding.waker.take()
     };
@@ -197,10 +213,11 @@ fn parse_response(bytes: Bytes) -> Result<HttpResponse, String> {
     for line in lines {
         let (name, value) = line
             .split_once(": ")
+            .or_else(|| line.strip_suffix(':').map(|name| (name, "")))
             .ok_or_else(|| format!("invalid response header {line:?}"))?;
         response
             .headers_mut()
-            .insert(name.to_owned(), value.to_owned());
+            .append(name.to_owned(), value.to_owned());
     }
     Ok(response)
 }

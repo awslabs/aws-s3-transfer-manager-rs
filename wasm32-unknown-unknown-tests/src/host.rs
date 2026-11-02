@@ -3,52 +3,45 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! A host implemented inside the module: a cooperative single-threaded
-//! executor, a logical monotonic clock, timers on that clock, and simulated
-//! I/O completions.
+//! A cooperative single-threaded executor, clocks, and timers on the
+//! embedding host's clocks.
 //!
-//! The executor polls one ready task at a time. When nothing is ready it first
-//! delivers pending I/O completions, then advances the clock to the earliest
-//! live timer. If neither exists while the awaited future is incomplete, the
-//! run has stalled and [`block_on`] reports it instead of looping. [`Driver`]
-//! instead returns to the embedding host while one of the host's operations is
-//! outstanding, and resumes when the host calls it again. Every scheduling
-//! step advances the clock by [`TICK`], so measured intervals are nonzero and
-//! ordered.
+//! [`Driver`] polls one ready task at a time and fires each timer whose
+//! deadline has passed on the host's monotonic clock. When no task is ready it
+//! completes the [`idle`] futures, and when none remain it returns to the
+//! embedding host with the earliest live timer deadline. HTTP responses and
+//! time arrive only between calls, so the host waits for either and calls
+//! again.
 
 use std::collections::VecDeque;
-use std::future::Future;
-use std::pin::{pin, Pin};
+use std::future::{poll_fn, Future};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
 use aws_sdk_s3_transfer_manager::wasm::{BoxFuture, WasmRuntime};
 use aws_smithy_async::rt::sleep::{AsyncSleep, Sleep};
 use aws_smithy_async::time::TimeSource;
 
-/// Logical time added by each scheduling step.
-const TICK: Duration = Duration::from_micros(1);
+use crate::imports;
 
-/// Scheduling steps after which [`block_on`] reports a runaway run.
+/// Polls after which one [`Driver::drive`] call reports a runaway executor.
 const MAX_STEPS: u64 = 50_000_000;
 
-/// Wall-clock time at the logical clock's epoch.
-const WALL_EPOCH_SECS: u64 = 1_735_689_600;
-
-/// The module's only host.
+/// The module's only executor.
 static HOST: Host = Host::new();
 
 struct Host {
     ready: Mutex<VecDeque<Arc<Task>>>,
+    /// The latest monotonic reading, so the clock never goes backwards.
     now_nanos: AtomicU64,
     timers: Mutex<Vec<Arc<TimerEntry>>>,
-    io: Mutex<Vec<Arc<IoCompletion>>>,
+    idle: Mutex<Vec<IdleWaiter>>,
     live_tasks: AtomicUsize,
     spawned_tasks: AtomicUsize,
     fired_sleeps: AtomicUsize,
-    io_pending_polls: AtomicUsize,
 }
 
 impl Host {
@@ -57,35 +50,29 @@ impl Host {
             ready: Mutex::new(VecDeque::new()),
             now_nanos: AtomicU64::new(0),
             timers: Mutex::new(Vec::new()),
-            io: Mutex::new(Vec::new()),
+            idle: Mutex::new(Vec::new()),
             live_tasks: AtomicUsize::new(0),
             spawned_tasks: AtomicUsize::new(0),
             fired_sleeps: AtomicUsize::new(0),
-            io_pending_polls: AtomicUsize::new(0),
         }
     }
 
     fn now(&self) -> Duration {
-        Duration::from_nanos(self.now_nanos.load(Ordering::SeqCst))
-    }
-
-    fn advance_to(&self, deadline: Duration) {
-        let nanos = u64::try_from(deadline.as_nanos()).expect("logical clock overflowed");
-        self.now_nanos.fetch_max(nanos, Ordering::SeqCst);
+        let reading = u64::try_from(imports::monotonic_now().as_nanos()).unwrap_or(u64::MAX);
+        let previous = self.now_nanos.fetch_max(reading, Ordering::SeqCst);
+        Duration::from_nanos(previous.max(reading))
     }
 }
 
-/// Counters observed by scenarios.
+/// Executor counters observed by scenarios.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Stats {
-    /// Futures accepted by [`LogicalRuntime::spawn`].
+    /// Futures accepted by [`HostRuntime::spawn`].
     pub(crate) spawned_tasks: usize,
     /// Spawned futures that have not completed.
     pub(crate) live_tasks: usize,
     /// Sleeps that completed because their deadline passed.
     pub(crate) fired_sleeps: usize,
-    /// Polls in which a simulated I/O operation returned `Pending`.
-    pub(crate) io_pending_polls: usize,
 }
 
 /// Returns the current counters.
@@ -94,15 +81,14 @@ pub(crate) fn stats() -> Stats {
         spawned_tasks: HOST.spawned_tasks.load(Ordering::SeqCst),
         live_tasks: HOST.live_tasks.load(Ordering::SeqCst),
         fired_sleeps: HOST.fired_sleeps.load(Ordering::SeqCst),
-        io_pending_polls: HOST.io_pending_polls.load(Ordering::SeqCst),
     }
 }
 
-/// The [`WasmRuntime`] backed by this host.
+/// The [`WasmRuntime`] backed by this executor and the host's monotonic clock.
 #[derive(Debug)]
-pub(crate) struct LogicalRuntime;
+pub(crate) struct HostRuntime;
 
-impl WasmRuntime for LogicalRuntime {
+impl WasmRuntime for HostRuntime {
     fn monotonic_now(&self) -> Duration {
         HOST.now()
     }
@@ -167,27 +153,18 @@ impl Wake for MainWake {
     }
 }
 
-/// Polls `future` and every spawned task until `future` completes.
-///
-/// Returns an error if no task can make progress, no I/O is pending, and no
-/// timer is live while `future` is incomplete, or after [`MAX_STEPS`] steps.
-pub(crate) fn block_on<F: Future>(future: F) -> Result<F::Output, String> {
-    let main = Arc::new(MainWake(AtomicBool::new(true)));
-    match drive(pin!(future), &main, &|| false)? {
-        Poll::Ready(output) => Ok(output),
-        Poll::Pending => unreachable!("block_on never waits for the embedding host"),
-    }
-}
-
 /// Result of one [`Driver::drive`] call.
 pub(crate) enum Progress<T> {
     /// The driven future completed with this output.
     Complete(T),
-    /// Nothing can progress until the embedding host completes an operation.
-    AwaitingHost,
+    /// Nothing can progress until a timer's deadline, the earliest of which
+    /// this holds on the host's monotonic clock, or until the host answers a
+    /// request. `None` means no timer is live.
+    Waiting(Option<Duration>),
 }
 
-/// Drives one future across calls from the embedding host.
+/// Drives one future, and every spawned task, across calls from the
+/// embedding host.
 pub(crate) struct Driver<T> {
     main: Arc<MainWake>,
     future: Pin<Box<dyn Future<Output = T> + Send>>,
@@ -201,101 +178,73 @@ impl<T> Driver<T> {
         }
     }
 
-    /// Polls the future and every spawned task as [`block_on`] does, except
-    /// that when nothing is ready, no simulated I/O is pending, and
-    /// `awaiting_host` returns true, it returns [`Progress::AwaitingHost`]
-    /// instead of advancing the clock. A later call resumes the future.
-    pub(crate) fn drive(
-        &mut self,
-        awaiting_host: &dyn Fn() -> bool,
-    ) -> Result<Progress<T>, String> {
-        let poll = drive(self.future.as_mut(), &self.main, awaiting_host)?;
-        Ok(match poll {
-            Poll::Ready(output) => Progress::Complete(output),
-            Poll::Pending => Progress::AwaitingHost,
-        })
-    }
-}
-
-/// Polls `future` and every spawned task. Returns `Pending` when nothing can
-/// progress and `awaiting_host` returns true. Timers advance only while no
-/// host operation is outstanding.
-fn drive<F: Future + ?Sized>(
-    mut future: Pin<&mut F>,
-    main: &Arc<MainWake>,
-    awaiting_host: &dyn Fn() -> bool,
-) -> Result<Poll<F::Output>, String> {
-    let waker = Waker::from(Arc::clone(main));
-    let mut cx = Context::from_waker(&waker);
-    for _ in 0..MAX_STEPS {
-        HOST.advance_to(HOST.now() + TICK);
-        if main.0.swap(false, Ordering::SeqCst) {
-            if let Poll::Ready(output) = future.as_mut().poll(&mut cx) {
-                return Ok(Poll::Ready(output));
+    /// Polls the future and every spawned task until the future completes or
+    /// nothing can progress.
+    ///
+    /// Returns an error after [`MAX_STEPS`] polls without either.
+    pub(crate) fn drive(&mut self) -> Result<Progress<T>, String> {
+        let waker = Waker::from(Arc::clone(&self.main));
+        let mut cx = Context::from_waker(&waker);
+        for _ in 0..MAX_STEPS {
+            if self.main.0.swap(false, Ordering::SeqCst) {
+                if let Poll::Ready(output) = self.future.as_mut().poll(&mut cx) {
+                    return Ok(Progress::Complete(output));
+                }
             }
+            fire_due_timers();
+            if let Some(task) = next_ready() {
+                task.run();
+                continue;
+            }
+            if self.main.0.load(Ordering::SeqCst) || complete_idle() {
+                continue;
+            }
+            return Ok(Progress::Waiting(next_deadline()));
         }
-        fire_due_timers();
-        if let Some(task) = next_ready() {
-            task.run();
-            continue;
-        }
-        if main.0.load(Ordering::SeqCst) || deliver_io() {
-            continue;
-        }
-        if awaiting_host() {
-            return Ok(Poll::Pending);
-        }
-        if advance_to_next_timer() {
-            continue;
-        }
-        return Err(format!(
-            "executor stalled at {:?}: no ready task, pending I/O, or live timer ({:?})",
-            HOST.now(),
+        Err(format!(
+            "executor ran {MAX_STEPS} polls without becoming idle ({:?})",
             stats()
-        ));
+        ))
     }
-    Err(format!(
-        "executor exceeded {MAX_STEPS} steps ({:?})",
-        stats()
-    ))
-}
-
-/// Runs spawned tasks and delivers I/O until neither remains, without
-/// advancing the clock to a timer.
-pub(crate) fn run_until_idle() -> Result<(), String> {
-    for _ in 0..MAX_STEPS {
-        HOST.advance_to(HOST.now() + TICK);
-        fire_due_timers();
-        if let Some(task) = next_ready() {
-            task.run();
-            continue;
-        }
-        if deliver_io() {
-            continue;
-        }
-        return Ok(());
-    }
-    Err(format!(
-        "executor exceeded {MAX_STEPS} steps ({:?})",
-        stats()
-    ))
 }
 
 fn next_ready() -> Option<Arc<Task>> {
     HOST.ready.lock().unwrap().pop_front()
 }
 
-/// Wakes every I/O operation registered so far. Returns whether any existed.
-fn deliver_io() -> bool {
-    let completions = std::mem::take(&mut *HOST.io.lock().unwrap());
-    let delivered = !completions.is_empty();
-    for completion in completions {
-        completion.done.store(true, Ordering::SeqCst);
-        if let Some(waker) = completion.waker.lock().unwrap().take() {
-            waker.wake();
+struct IdleWaiter {
+    done: Arc<AtomicBool>,
+    waker: Waker,
+}
+
+/// Completes once no spawned task is ready to run.
+///
+/// Every task has then run until it waits for a timer, an HTTP response, or
+/// another task.
+pub(crate) async fn idle() {
+    let done = Arc::new(AtomicBool::new(false));
+    poll_fn(|cx| {
+        if done.load(Ordering::SeqCst) {
+            return Poll::Ready(());
         }
+        HOST.idle.lock().unwrap().push(IdleWaiter {
+            done: Arc::clone(&done),
+            waker: cx.waker().clone(),
+        });
+        Poll::Pending
+    })
+    .await;
+}
+
+/// Completes every pending [`idle`] future. Returns whether any existed.
+fn complete_idle() -> bool {
+    let waiters = std::mem::take(&mut *HOST.idle.lock().unwrap());
+    let completed = !waiters.is_empty();
+    for waiter in waiters {
+        waiter.done.store(true, Ordering::SeqCst);
+        waiter.waker.wake();
     }
-    delivered
+    completed
 }
 
 struct TimerEntry {
@@ -330,32 +279,23 @@ fn fire_due_timers() {
     }
 }
 
-/// Advances the clock to the earliest live timer. Returns whether one exists.
-fn advance_to_next_timer() -> bool {
-    let next = HOST
-        .timers
+/// The earliest deadline among live timers.
+fn next_deadline() -> Option<Duration> {
+    HOST.timers
         .lock()
         .unwrap()
         .iter()
         .filter(|entry| !entry.state.lock().unwrap().finished)
         .map(|entry| entry.deadline)
-        .min();
-    match next {
-        Some(deadline) => {
-            HOST.advance_to(deadline);
-            fire_due_timers();
-            true
-        }
-        None => false,
-    }
+        .min()
 }
 
-/// An [`AsyncSleep`] whose sleeps complete when the logical clock reaches
-/// their deadline.
+/// An [`AsyncSleep`] whose sleeps complete when the host's monotonic clock
+/// reaches their deadline.
 #[derive(Debug)]
-pub(crate) struct LogicalSleep;
+pub(crate) struct HostSleep;
 
-impl AsyncSleep for LogicalSleep {
+impl AsyncSleep for HostSleep {
     fn sleep(&self, duration: Duration) -> Sleep {
         let entry = Arc::new(TimerEntry {
             deadline: HOST.now().saturating_add(duration),
@@ -394,39 +334,12 @@ impl Drop for SleepFuture {
     }
 }
 
-/// A wall clock that follows the logical clock from a fixed date.
+/// The host's wall clock.
 #[derive(Debug)]
-pub(crate) struct LogicalWallClock;
+pub(crate) struct HostWallClock;
 
-impl TimeSource for LogicalWallClock {
+impl TimeSource for HostWallClock {
     fn now(&self) -> SystemTime {
-        UNIX_EPOCH + Duration::from_secs(WALL_EPOCH_SECS) + HOST.now()
+        imports::wall_clock_now()
     }
-}
-
-struct IoCompletion {
-    done: AtomicBool,
-    waker: Mutex<Option<Waker>>,
-}
-
-/// Completes after the host delivers one I/O completion.
-///
-/// The first poll registers the operation and returns `Pending`; the executor
-/// wakes it only when no task is ready, as a host would after its event loop
-/// regains control.
-pub(crate) async fn host_io() {
-    let completion = Arc::new(IoCompletion {
-        done: AtomicBool::new(false),
-        waker: Mutex::new(None),
-    });
-    HOST.io.lock().unwrap().push(Arc::clone(&completion));
-    std::future::poll_fn(|cx| {
-        if completion.done.load(Ordering::SeqCst) {
-            return Poll::Ready(());
-        }
-        *completion.waker.lock().unwrap() = Some(cx.waker().clone());
-        HOST.io_pending_polls.fetch_add(1, Ordering::SeqCst);
-        Poll::Pending
-    })
-    .await;
 }

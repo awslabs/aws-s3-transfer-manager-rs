@@ -1,0 +1,21 @@
+[package]
+name = "wasmtime-runner"
+version = "0.1.0"
+edition = "2021"
+authors = ["AWS Rust SDK Team <aws-sdk-rust@amazon.com>"]
+license = "Apache-2.0"
+publish = false
+description = "Runs the wasm32-unknown-unknown runtime harness under Wasmtime, supplying its host imports"
+
+# A separate workspace with its own lockfile, so root workspace builds do not compile Wasmtime.
+[workspace]
+
+[dependencies]
+bytes = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+tokio = { version = "1", features = ["net", "rt-multi-thread", "time"] }
+# The newest Wasmtime that builds with `rust_clippy` (1.94.1), the toolchain of the
+# wasm32-unknown-unknown CI job.
+wasmtime = { version = "47", default-features = false, features = ["cranelift", "runtime", "std"] }

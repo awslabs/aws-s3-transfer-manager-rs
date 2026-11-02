@@ -1,52 +1,33 @@
-// Runs the harness module with Node's WebAssembly API and no bindings.
+// TODO(WASM): This would be better in Typescript. I didn't have time to set up
+// all the machinery around that, but would like to try to do it with tsrs once
+// it stabilizes.
+
+// Runs the harness module with Node's WebAssembly API, supplying its `host`
+// imports, and no bindings.
 //
-// Usage: node run-node.mjs <module.wasm>
+// Usage: node run-node.mjs <module.wasm> <server-address>
 //
-// Checks that the module imports nothing and that `run` passes every scenario
-// that `scenario_count` declares. Then plays S3 for the host round trip: the
-// module's connector hands each request to this script, which answers it from
-// an in-memory store, newest first. For a single-part and a multipart object,
-// the script checks that every request is signed, that the module sent the
-// expected operations and ranges with multipart requests outstanding
-// together, and that the stored object equals the uploaded bytes; the module
-// checks that the download equals them too. Finally it checks that
-// constructing a client with the default runtime mode or without a sleep
-// implementation traps with the documented message. Each run uses a fresh
-// instance.
+// <server-address> is the IP address and port of a running s3-mock-server,
+// such as `127.0.0.1:49152`, that the module's scenarios accept.
+//
+// Checks that the module imports exactly the `host` interface that its crate
+// documentation describes. Runs each scenario in a fresh instance, sending
+// every request the module passes to `http_send` to the server with
+// `node:http`, and drives the scenario with `scenario_step` until it passes.
+// The wasmtime-runner crate runs the same loop under Wasmtime. Finally checks
+// that constructing a client with the default runtime mode or without a
+// sleep implementation traps with the documented message.
 //
 // Prints `wasm32-unknown-unknown-tests: <count> scenarios under Node` first,
-// then `PASS <scenario>: <summary>` for each scenario: the module's report
-// for the scenarios `run` runs, then one line for each host round trip and
-// each trap. Prints `<count> scenarios passed` last, only if every scenario
-// passed.
+// then `PASS <scenario>: <summary>` for each scenario that passes: the
+// module's report for the module's scenarios, then one line for each trap.
+// Prints `<count> scenarios passed` last, only if every scenario passed.
 
 import { readFile } from "node:fs/promises";
+import http from "node:http";
 
-const MIB = 1024 * 1024;
-
-// Calls into the module after which a round trip that has not finished fails.
-const MAX_STEPS = 10_000;
-
-const ROUND_TRIPS = [
-  {
-    name: "host round trip (single part)",
-    size: 64 * 1024,
-    operations: { PutObject: 1, GetObject: 1 },
-    ranges: [0],
-  },
-  {
-    name: "host round trip (multipart)",
-    size: 20 * MIB,
-    operations: {
-      CreateMultipartUpload: 1,
-      UploadPart: 3,
-      CompleteMultipartUpload: 1,
-      GetObject: 3,
-    },
-    ranges: [0, 8 * MIB, 16 * MIB],
-    minConcurrent: 2,
-  },
-];
+// The module's imports from the module `host`.
+const IMPORTS = ["http_cancel", "http_send", "monotonic_now", "wall_clock_now"];
 
 // Exports that must trap, and the message each must report.
 const TRAPS = [
@@ -54,16 +35,31 @@ const TRAPS = [
   ["client_without_sleep", "requires an AsyncSleep implementation"],
 ];
 
-const path = process.argv[2];
-if (!path) {
-  console.error("usage: node run-node.mjs <module.wasm>");
+// How long one scenario may run.
+const SCENARIO_TIMEOUT_MS = 60_000;
+
+// `scenario_step` results.
+const PASSED = -1n;
+const NO_DEADLINE = 0x7fff_ffff_ffff_ffffn;
+
+// Response headers that describe the connection rather than the response.
+const HOP_BY_HOP = new Set(["connection", "keep-alive", "transfer-encoding"]);
+
+const [path, server] = process.argv.slice(2);
+if (!path || !server) {
+  console.error("usage: node run-node.mjs <module.wasm> <server-address>");
   process.exit(2);
 }
 const module = await WebAssembly.compile(await readFile(path));
 
-const imports = WebAssembly.Module.imports(module);
-if (imports.length !== 0) {
-  console.error("the module must import nothing:", imports);
+const imports = WebAssembly.Module.imports(module)
+  .map(({ module, name, kind }) => `${module}.${name} (${kind})`)
+  .sort();
+const expected = IMPORTS.map((name) => `host.${name} (function)`);
+if (JSON.stringify(imports) !== JSON.stringify(expected)) {
+  console.error(
+    `the module must import exactly ${expected.join(", ")}; it imports ${imports.join(", ")}`,
+  );
   process.exit(1);
 }
 
@@ -72,12 +68,247 @@ const decoder = new TextDecoder();
 
 function message(instance) {
   const { memory, message_ptr, message_len } = instance.exports;
-  const bytes = new Uint8Array(memory.buffer, message_ptr(), message_len());
-  return decoder.decode(bytes);
+  return decoder.decode(
+    new Uint8Array(memory.buffer, message_ptr() >>> 0, message_len() >>> 0),
+  );
 }
 
+// Copies `bytes` into the module's host buffer.
+function writeBuffer(exports, bytes) {
+  const ptr = exports.host_buffer(bytes.length) >>> 0;
+  new Uint8Array(exports.memory.buffer, ptr, bytes.length).set(bytes);
+}
+
+function indexOf(bytes, pair) {
+  for (let i = 0; i + 1 < bytes.length; i++) {
+    if (bytes[i] === pair[0] && bytes[i + 1] === pair[1]) return i;
+  }
+  return -1;
+}
+
+// Parses a request in the module's wire format: `METHOD URI\n`, header
+// lines, a blank line, and the body. Returns the headers as name and value
+// pairs in order.
+function parseRequest(bytes) {
+  const split = indexOf(bytes, [10, 10]);
+  if (split < 0) throw new Error("request has no blank line after its head");
+  const [requestLine, ...lines] = decoder
+    .decode(bytes.subarray(0, split))
+    .split("\n");
+  const space = requestLine.indexOf(" ");
+  if (space < 0) throw new Error(`invalid request line ${requestLine}`);
+  const headers = lines.map((line) => {
+    const colon = line.indexOf(": ");
+    if (colon < 0) throw new Error(`invalid request header ${line}`);
+    return [line.slice(0, colon), line.slice(colon + 2)];
+  });
+  return {
+    method: requestLine.slice(0, space),
+    url: new URL(requestLine.slice(space + 1)),
+    headers,
+    body: bytes.subarray(split + 2),
+  };
+}
+
+// Serializes a response in the module's wire format.
+function serializeResponse(response, body) {
+  let head = `${response.statusCode}\n`;
+  const raw = response.rawHeaders;
+  for (let i = 0; i < raw.length; i += 2) {
+    if (!HOP_BY_HOP.has(raw[i].toLowerCase()))
+      head += `${raw[i]}: ${raw[i + 1]}\n`;
+  }
+  return Buffer.concat([encoder.encode(`${head}\n`), body]);
+}
+
+// The `host` imports for one instance. Sends requests only to `server`.
+class Host {
+  // Requests sent and neither answered nor cancelled, by id.
+  inFlight = new Map();
+  // Responses of in-flight requests, in completion order.
+  completed = [];
+  // The first error the host observed.
+  failure = null;
+  memory = null;
+  #wake = null;
+
+  constructor(server) {
+    this.server = server;
+  }
+
+  imports() {
+    return {
+      host: {
+        monotonic_now: () => process.hrtime.bigint(),
+        wall_clock_now: () => BigInt(Date.now()) * 1_000_000n,
+        http_send: (id, ptr, len) => this.#send(id, ptr >>> 0, len >>> 0),
+        http_cancel: (id) => this.#cancel(id),
+      },
+    };
+  }
+
+  #fail(failure) {
+    this.failure ??= failure;
+    this.#wake?.();
+  }
+
+  #send(id, ptr, len) {
+    let request;
+    try {
+      request = parseRequest(
+        new Uint8Array(this.memory.buffer, ptr, len).slice(),
+      );
+    } catch (error) {
+      this.#fail(`request ${id}: ${error.message}`);
+      return;
+    }
+    const { method, url, headers, body } = request;
+    if (url.protocol !== "http:" || url.host !== this.server) {
+      this.#fail(
+        `request ${id} is for ${url.origin}, not http://${this.server}`,
+      );
+      return;
+    }
+    if (this.inFlight.has(id)) {
+      this.#fail(`request ${id} was sent twice`);
+      return;
+    }
+    // Node adds no Host header when the headers are an array, and no
+    // Content-Length header for an empty body.
+    const declared = (wanted) =>
+      headers.some(([name]) => name.toLowerCase() === wanted);
+    if (!declared("host")) headers.push(["host", url.host]);
+    if (
+      !declared("content-length") &&
+      !declared("transfer-encoding") &&
+      (body.length !== 0 || method === "POST" || method === "PUT")
+    ) {
+      headers.push(["content-length", String(body.length)]);
+    }
+    const controller = new AbortController();
+    this.inFlight.set(id, controller);
+    const outgoing = http.request(
+      url,
+      { method, headers: headers.flat(), signal: controller.signal },
+      (response) => {
+        const chunks = [];
+        response.on("data", (chunk) => chunks.push(chunk));
+        response.on("end", () => {
+          if (!this.inFlight.has(id)) return;
+          this.completed.push({
+            id,
+            bytes: serializeResponse(response, Buffer.concat(chunks)),
+          });
+          this.#wake?.();
+        });
+      },
+    );
+    outgoing.on("error", (error) => {
+      if (!controller.signal.aborted)
+        this.#fail(`request ${id}: ${error.message}`);
+    });
+    outgoing.end(body);
+  }
+
+  #cancel(id) {
+    const controller = this.inFlight.get(id);
+    if (!controller) {
+      this.#fail(`request ${id} was cancelled but is not in flight`);
+      return;
+    }
+    this.inFlight.delete(id);
+    this.completed = this.completed.filter((response) => response.id !== id);
+    controller.abort();
+  }
+
+  // Waits until a response completes, the host fails, `next` passes on the
+  // monotonic clock, or `timeoutAt` passes on `performance.now()`.
+  async wait(next, timeoutAt) {
+    if (this.completed.length !== 0 || this.failure) return;
+    let delay = timeoutAt - performance.now();
+    if (next !== NO_DEADLINE) {
+      delay = Math.min(delay, Number(next - process.hrtime.bigint()) / 1e6);
+    }
+    await new Promise((resolve) => {
+      const timer = setTimeout(resolve, Math.max(0, delay));
+      this.#wake = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+    });
+    this.#wake = null;
+  }
+
+  // Removes and returns the completed responses.
+  takeCompleted() {
+    const completed = this.completed;
+    this.completed = [];
+    for (const { id } of completed) this.inFlight.delete(id);
+    return completed;
+  }
+
+  // Aborts every request in flight.
+  close() {
+    for (const controller of this.inFlight.values()) controller.abort();
+    this.inFlight.clear();
+  }
+}
+
+// Runs scenario `index` in a fresh instance. Returns the module's report, and
+// a failure if the scenario did not pass.
+async function runScenario(index) {
+  const host = new Host(server);
+  const instance = await WebAssembly.instantiate(module, host.imports());
+  const { exports } = instance;
+  host.memory = exports.memory;
+  const timeoutAt = performance.now() + SCENARIO_TIMEOUT_MS;
+  try {
+    writeBuffer(exports, encoder.encode(`http://${server}`));
+    exports.scenario_start(index);
+    for (;;) {
+      const next = exports.scenario_step();
+      if (host.failure)
+        return { failure: host.failure, report: message(instance) };
+      if (next === PASSED) return { report: message(instance) };
+      if (host.inFlight.size === 0 && next === NO_DEADLINE) {
+        return {
+          failure: "the module awaits responses but no request is in flight",
+          report: message(instance),
+        };
+      }
+      await host.wait(next, timeoutAt);
+      if (host.failure)
+        return { failure: host.failure, report: message(instance) };
+      for (const { id, bytes } of host.takeCompleted()) {
+        writeBuffer(exports, bytes);
+        if (exports.host_respond(id) !== 1) {
+          return {
+            failure: `the module dropped request ${id} without cancelling it`,
+            report: message(instance),
+          };
+        }
+      }
+      if (performance.now() >= timeoutAt) {
+        return {
+          failure: `did not finish within ${SCENARIO_TIMEOUT_MS} ms`,
+          report: message(instance),
+        };
+      }
+    }
+  } catch (error) {
+    if (!(error instanceof WebAssembly.RuntimeError)) throw error;
+    return { failure: `trapped: ${error.message}`, report: message(instance) };
+  } finally {
+    host.close();
+  }
+}
+
+// Calls export `name` in a fresh instance.
 async function invoke(name) {
-  const instance = await WebAssembly.instantiate(module, {});
+  const instance = await WebAssembly.instantiate(
+    module,
+    new Host(server).imports(),
+  );
   try {
     return { result: instance.exports[name](), message: message(instance) };
   } catch (error) {
@@ -86,306 +317,20 @@ async function invoke(name) {
   }
 }
 
-// Generated bytes, so a misplaced range is detected.
-function pattern(len) {
-  const bytes = new Uint8Array(len);
-  let state = 0x2545f491;
-  for (let i = 0; i < len; i++) {
-    state = (Math.imul(state, 1103515245) + 12345) >>> 0;
-    bytes[i] = state >>> 24;
-  }
-  return bytes;
-}
-
-function concat(chunks) {
-  const out = new Uint8Array(
-    chunks.reduce((len, chunk) => len + chunk.length, 0),
-  );
-  let offset = 0;
-  for (const chunk of chunks) {
-    out.set(chunk, offset);
-    offset += chunk.length;
-  }
-  return out;
-}
-
-function indexOf(bytes, pair, from = 0) {
-  for (let i = from; i + 1 < bytes.length; i++) {
-    if (bytes[i] === pair[0] && bytes[i + 1] === pair[1]) return i;
-  }
-  return -1;
-}
-
-// Parses a request in the module's wire format: `METHOD URI\n`, header
-// lines, a blank line, and the body.
-function parseRequest(bytes) {
-  const split = indexOf(bytes, [10, 10]);
-  if (split < 0) throw new Error("request has no blank line after its head");
-  const [requestLine, ...lines] = decoder
-    .decode(bytes.subarray(0, split))
-    .split("\n");
-  const [method, uri] = requestLine.split(" ");
-  const headers = new Map(
-    lines.map((line) => {
-      const colon = line.indexOf(": ");
-      return [line.slice(0, colon).toLowerCase(), line.slice(colon + 2)];
-    }),
-  );
-  return {
-    method,
-    url: new URL(uri),
-    headers,
-    body: bytes.subarray(split + 2),
-  };
-}
-
-// Serializes a response in the module's wire format.
-function serializeResponse({ status, headers = {}, body = new Uint8Array() }) {
-  const lines = Object.entries(headers).map(
-    ([name, value]) => `${name}: ${value}\n`,
-  );
-  return concat([encoder.encode(`${status}\n${lines.join("")}\n`), body]);
-}
-
-// Decodes an `aws-chunked` body, discarding chunk signatures and trailers.
-function decodeAwsChunked(body) {
-  const chunks = [];
-  let offset = 0;
-  for (;;) {
-    const lineEnd = indexOf(body, [13, 10], offset);
-    if (lineEnd < 0) throw new Error("malformed aws-chunked body");
-    const size = parseInt(
-      decoder.decode(body.subarray(offset, lineEnd)).split(";")[0],
-      16,
-    );
-    if (Number.isNaN(size)) throw new Error("malformed aws-chunked chunk size");
-    offset = lineEnd + 2;
-    if (size === 0) return concat(chunks);
-    chunks.push(body.subarray(offset, offset + size));
-    offset += size + 2;
-  }
-}
-
-// An in-memory S3 that serves PutObject, multipart uploads, and ranged
-// GetObject, and records each operation.
-class HostS3 {
-  objects = new Map();
-  uploads = new Map();
-  log = [];
-  nextUpload = 1;
-
-  handle({ method, url, headers, body }) {
-    const authorization = headers.get("authorization") ?? "";
-    let key = url.pathname;
-    if (key.startsWith("/bucket/")) key = key.slice("/bucket".length);
-    const query = url.searchParams;
-    if (headers.get("content-encoding")?.includes("aws-chunked")) {
-      body = decodeAwsChunked(body);
-    }
-    const record = (operation, extra = {}) =>
-      this.log.push({ operation, authorization, ...extra });
-    const xml = { "content-type": "application/xml" };
-
-    if (method === "POST" && query.has("uploads")) {
-      const uploadId = `upload-${this.nextUpload++}`;
-      this.uploads.set(uploadId, new Map());
-      record("CreateMultipartUpload");
-      return {
-        status: 200,
-        headers: xml,
-        body: encoder.encode(
-          `<InitiateMultipartUploadResult><Bucket>bucket</Bucket><Key>${key.slice(1)}</Key>` +
-            `<UploadId>${uploadId}</UploadId></InitiateMultipartUploadResult>`,
-        ),
-      };
-    }
-    if (method === "POST" && query.has("uploadId")) {
-      const parts = this.uploads.get(query.get("uploadId"));
-      if (!parts)
-        return {
-          status: 404,
-          body: encoder.encode("<Error><Code>NoSuchUpload</Code></Error>"),
-        };
-      this.uploads.delete(query.get("uploadId"));
-      const numbers = [...parts.keys()].sort((a, b) => a - b);
-      this.objects.set(key, concat(numbers.map((number) => parts.get(number))));
-      record("CompleteMultipartUpload");
-      return {
-        status: 200,
-        headers: xml,
-        body: encoder.encode(
-          '<CompleteMultipartUploadResult><ETag>"object"</ETag></CompleteMultipartUploadResult>',
-        ),
-      };
-    }
-    if (method === "PUT" && query.has("partNumber")) {
-      const parts = this.uploads.get(query.get("uploadId"));
-      if (!parts)
-        return {
-          status: 404,
-          body: encoder.encode("<Error><Code>NoSuchUpload</Code></Error>"),
-        };
-      const number = Number(query.get("partNumber"));
-      parts.set(number, body.slice());
-      record("UploadPart");
-      return { status: 200, headers: { etag: `"part-${number}"` } };
-    }
-    if (method === "PUT") {
-      this.objects.set(key, body.slice());
-      record("PutObject");
-      return { status: 200, headers: { etag: '"object"' } };
-    }
-    if (method === "GET") {
-      const range = /^bytes=(\d+)-(\d*)$/.exec(headers.get("range") ?? "");
-      const start = range ? Number(range[1]) : 0;
-      record("GetObject", { start });
-      const data = this.objects.get(key);
-      if (!data)
-        return {
-          status: 404,
-          body: encoder.encode("<Error><Code>NoSuchKey</Code></Error>"),
-        };
-      const end = Math.min(
-        range && range[2] ? Number(range[2]) : data.length - 1,
-        data.length - 1,
-      );
-      const slice = data.subarray(start, end + 1);
-      return {
-        status: 206,
-        headers: {
-          etag: '"object"',
-          "content-range": `bytes ${start}-${end}/${data.length}`,
-          "content-length": String(slice.length),
-        },
-        body: slice,
-      };
-    }
-    record(`unsupported ${method} ${url}`);
-    return { status: 501 };
-  }
-}
-
-// Copies `bytes` into the module's host buffer.
-function writeBuffer(exports, bytes) {
-  const ptr = exports.host_buffer(bytes.length);
-  new Uint8Array(exports.memory.buffer, ptr, bytes.length).set(bytes);
-}
-
-// Uploads and downloads one object with this script as S3. Returns the
-// failures, empty on success, and a summary of the requests.
-async function hostRoundTrip({ size, operations, ranges, minConcurrent = 1 }) {
-  const instance = await WebAssembly.instantiate(module, {});
-  const { exports } = instance;
-  const object = pattern(size);
-  const s3 = new HostS3();
-  const failed = (failure) => ({ failures: [failure] });
-  let maxConcurrent = 0;
-  try {
-    writeBuffer(exports, object);
-    exports.host_round_trip_start();
-    for (let steps = 0; exports.host_round_trip_step() === 1; steps++) {
-      if (steps === MAX_STEPS)
-        return failed(
-          `the round trip did not finish within ${MAX_STEPS} steps`,
-        );
-      const batch = [];
-      for (let id; (id = exports.host_next_request()) !== 0; ) {
-        const bytes = new Uint8Array(
-          exports.memory.buffer,
-          exports.host_request_ptr(),
-          exports.host_request_len(),
-        );
-        batch.push({ id, request: parseRequest(bytes.slice()) });
-      }
-      if (batch.length === 0)
-        return failed("the module awaits the host but queued no request");
-      maxConcurrent = Math.max(maxConcurrent, batch.length);
-      // Answering in reverse arrival order completes requests out of order.
-      for (const { id, request } of batch.reverse()) {
-        writeBuffer(exports, serializeResponse(s3.handle(request)));
-        exports.host_respond(id);
-      }
-    }
-  } catch (error) {
-    if (!(error instanceof WebAssembly.RuntimeError)) throw error;
-    return failed(`trapped: ${error.message}\n${message(instance)}`);
-  }
-
-  const failures = [];
-  const counts = {};
-  for (const { operation } of s3.log)
-    counts[operation] = (counts[operation] ?? 0) + 1;
-  if (JSON.stringify(sorted(counts)) !== JSON.stringify(sorted(operations))) {
-    failures.push(
-      `operations ${JSON.stringify(counts)}, expected ${JSON.stringify(operations)}`,
-    );
-  }
-  const starts = s3.log
-    .filter((entry) => entry.operation === "GetObject")
-    .map((entry) => entry.start);
-  starts.sort((a, b) => a - b);
-  if (JSON.stringify(starts) !== JSON.stringify(ranges)) {
-    failures.push(
-      `GetObject range starts ${JSON.stringify(starts)}, expected ${JSON.stringify(ranges)}`,
-    );
-  }
-  const unsigned = s3.log.filter(
-    (entry) => !entry.authorization.startsWith("AWS4-HMAC-SHA256 "),
-  );
-  if (unsigned.length !== 0) {
-    failures.push(
-      `${unsigned.length} requests lack a SigV4 authorization header`,
-    );
-  }
-  if (maxConcurrent < minConcurrent) {
-    failures.push(
-      `at most ${maxConcurrent} requests were outstanding at once, expected ${minConcurrent}`,
-    );
-  }
-  const stored = s3.objects.get("/object");
-  if (!stored || !Buffer.from(stored).equals(Buffer.from(object))) {
-    failures.push("the stored object differs from the uploaded bytes");
-  }
-  return {
-    failures,
-    summary: `${s3.log.length} requests, up to ${maxConcurrent} outstanding at once`,
-  };
-}
-
-function sorted(record) {
-  return Object.fromEntries(
-    Object.entries(record).sort(([a], [b]) => a.localeCompare(b)),
-  );
-}
-
 let failed = false;
 
-const moduleScenarios = (await invoke("scenario_count")).result;
-const count = moduleScenarios + ROUND_TRIPS.length + TRAPS.length;
+const scenarios = (await invoke("scenario_count")).result;
+const count = scenarios + TRAPS.length;
 console.log(`wasm32-unknown-unknown-tests: ${count} scenarios under Node`);
 
-const run = await invoke("run");
-process.stdout.write(run.message);
-const reported = run.message
-  .split("\n")
-  .filter((line) => line.startsWith("PASS ")).length;
-if (run.trap) {
-  console.error(`run failed: ${run.trap}`);
-  failed = true;
-} else if (run.result !== moduleScenarios || reported !== moduleScenarios) {
-  console.error(
-    `run returned ${run.result} and reported ${reported} passing scenarios, expected ${moduleScenarios}`,
-  );
-  failed = true;
-}
-
-for (const roundTrip of ROUND_TRIPS) {
-  const { failures, summary } = await hostRoundTrip(roundTrip);
-  if (failures.length !== 0) {
-    console.error(`FAIL ${roundTrip.name}:\n  ${failures.join("\n  ")}`);
+for (let index = 0; index < scenarios; index++) {
+  const { failure, report } = await runScenario(index);
+  if (failure) {
+    console.error(`FAIL scenario ${index}: ${failure}`);
+    process.stderr.write(report);
     failed = true;
   } else {
-    console.log(`PASS ${roundTrip.name}: ${summary}`);
+    process.stdout.write(report);
   }
 }
 

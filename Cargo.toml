@@ -10,7 +10,6 @@ members = [
     "s3-mock-server",
     "benches",
     "integration-tests",
-    "in-memory-s3",
     "wasm32-unknown-unknown-tests",
     "wasm32-wasi-tests",
 ]
