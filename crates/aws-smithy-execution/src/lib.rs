@@ -18,13 +18,15 @@
 //! Unknown targets remain unbound.
 //!
 //! Keep the runtime owner alive while threads should run. Dropping it requests
-//! shutdown and detaches its threads without waiting. Handles and partitions do
+//! shutdown without waiting. Handles, partitions, and completion observers do
 //! not prevent that request. Each managed thread destroys its Tokio runtime as
 //! it exits, so owner destruction can occur inside managed work. Async tasks
 //! follow Tokio cancellation behavior. Running blocking tasks or async tasks
 //! that do not yield can delay thread exit.
 //! Use [`ManagedRuntime::shutdown`] to consume the owner and asynchronously wait
-//! for managed-thread exit. It requires no ambient Tokio runtime.
+//! for managed-thread exit. [`ShutdownCompletion`] observes those joins after
+//! owner destruction without requesting shutdown. Neither wait requires an
+//! ambient Tokio runtime.
 //!
 //! With the optional `dial9` feature, the builder accepts a caller-owned
 //! recorder handle. Each partition attaches to that recorder, and partition
@@ -78,6 +80,7 @@ pub use handle::ManagedRuntimeHandle;
 pub use identity::{RuntimeId, RuntimePartitionId};
 pub use partition::RuntimePartition;
 pub use runtime::{ManagedRuntime, ManagedRuntimeBuilder};
+pub use shutdown::ShutdownCompletion;
 
 /// Hardware topology and placement primitives.
 pub use aws_smithy_topology as topology;

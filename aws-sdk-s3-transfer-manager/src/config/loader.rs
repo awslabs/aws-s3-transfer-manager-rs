@@ -7,7 +7,8 @@ use aws_config::BehaviorVersion;
 use aws_runtime::user_agent::FrameworkMetadata;
 
 use crate::config::{Builder, Config, S3ClientConfig};
-use crate::types::{ConcurrencyMode, MemoryConfig, PartSize, RuntimeMode};
+use crate::types::{ConcurrencyMode, MemoryConfig, PartSize};
+use crate::RuntimeConfig;
 
 /// Load transfer manager [`Config`] from the environment.
 #[derive(Default, Debug)]
@@ -54,9 +55,9 @@ impl ConfigLoader {
 
     /// Set the execution runtime this client should use.
     ///
-    /// Default is [RuntimeMode::Managed].
-    pub fn runtime_mode(mut self, mode: RuntimeMode) -> Self {
-        self.builder = self.builder.runtime_mode(mode);
+    /// Defaults to owned managed execution.
+    pub fn runtime_config(mut self, mode: RuntimeConfig) -> Self {
+        self.builder = self.builder.runtime_config(mode);
         self
     }
 

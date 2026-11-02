@@ -992,10 +992,6 @@ mod tests {
     use std::sync::{Arc, Barrier};
     use std::time::Duration;
 
-    // A test that returns with work still in flight leaves a strong `Handle` on the
-    // ambient runtime, so the `Handle` — and the S3 client it owns — is never dropped
-    // and shows up as a leak at process exit. Those tests are asan-gated too; see the
-    // note on `test_handle_managed` for the same root cause on managed threads.
     fn test_handle(concurrency: usize) -> Arc<Handle> {
         let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
         let config = crate::Config::builder().sdk_client(s3_client).build();
@@ -1110,7 +1106,7 @@ mod tests {
             .expect("summary diagnostics enabled");
         assert_eq!(stats.category(PendingCategory::Memory).count, 1);
         assert_eq!(stats.terminal_cause, None);
-        handle.runtime.shutdown();
+        crate::runtime::test_util::shutdown(&handle).await;
     }
 
     /// Cancellation completes direction cleanup before notifying terminal waiters.
@@ -1146,7 +1142,7 @@ mod tests {
         completion_rx
             .await
             .expect("cancellation should signal terminal");
-        handle.runtime.shutdown();
+        crate::runtime::test_util::shutdown(&handle).await;
     }
 
     /// Panic handling completes direction cleanup before notifying terminal waiters.
@@ -1191,7 +1187,7 @@ mod tests {
         completion_rx
             .await
             .expect("panic handling should signal terminal");
-        handle.runtime.shutdown();
+        crate::runtime::test_util::shutdown(&handle).await;
     }
 
     /// Transfer whose `on_terminal` panics on a state mutex poisoned by an
@@ -1280,7 +1276,7 @@ mod tests {
         );
         assert!(!on_panic_panicked, "on_panic must not re-raise");
         assert!(observer.is_idle(), "descriptor should reach idle");
-        handle.runtime.shutdown();
+        crate::runtime::test_util::shutdown(&handle).await;
     }
 
     /// A panicking `on_terminal` during cancellation still cancels the token,
@@ -1326,7 +1322,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(3), cancellation.wait_for_idle())
             .await
             .expect("cancelled transfer should reach idle");
-        handle.runtime.shutdown();
+        crate::runtime::test_util::shutdown(&handle).await;
     }
 
     #[derive(Debug)]
@@ -1383,29 +1379,13 @@ mod tests {
         assert_eq!(controller.samples.load(Ordering::Relaxed), 0);
     }
 
-    // TODO(vnext): tests built on this helper are gated out under asan
-    // (`#[cfg_attr(s3_tm_asan, ignore)]`). Each managed worker thread builds its
-    // own current-thread tokio runtime; that runtime's driver is reclaimed only
-    // when `ManagedThreadRuntime::drop` joins the threads, which requires the
-    // `Handle` Arc to reach zero. A test that returns with work still in flight
-    // leaves a strong `Handle` on a worker (via `handle.upgrade()` in dispatch),
-    // so drop/join never runs and the per-thread runtimes leak at process exit.
-    // The fix is a deterministic drain-and-join teardown for these tests (and a
-    // check that a real consumer running asan does not hit the same at shutdown);
-    // until then they are asan-gated rather than leaking the sanitizer run.
     fn test_handle_managed(concurrency: usize) -> Arc<Handle> {
         let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
         let config = crate::Config::builder().sdk_client(s3_client).build();
         Handle::new_for_test_with_runtime(
             config,
             Arc::new(crate::scheduler::FixedConcurrency::new(concurrency)),
-            |weak| {
-                Arc::new(
-                    crate::runtime::ManagedThreadRuntime::builder(weak)
-                        .topology(crate::runtime::Topology::uniform(4))
-                        .build(),
-                )
-            },
+            |weak| Arc::new(crate::runtime::ManagedExecution::for_test(weak, 4)),
         )
     }
 
@@ -1434,7 +1414,7 @@ mod tests {
 
         assert!(sm.is_complete());
         assert_eq!(sm.completed_count(), 5);
-        handle.runtime.shutdown();
+        crate::runtime::test_util::shutdown(&handle).await;
     }
 
     #[cfg_attr(miri, ignore)]
@@ -1464,7 +1444,7 @@ mod tests {
         assert!(!scheduler.0.idle_candidate.load(Ordering::SeqCst));
         assert_eq!(handle.buffer_pool.diagnostics().idle_deadlines, 1);
         drop(cancellation);
-        handle.runtime.shutdown();
+        crate::runtime::test_util::shutdown(&handle).await;
     }
 
     #[cfg_attr(miri, ignore)]
@@ -1491,7 +1471,7 @@ mod tests {
         assert!(!scheduler.0.idle_candidate.load(Ordering::SeqCst));
         assert_eq!(handle.buffer_pool.diagnostics().idle_deadlines, 1);
         drop(cancellation);
-        handle.runtime.shutdown();
+        crate::runtime::test_util::shutdown(&handle).await;
     }
 
     #[cfg_attr(miri, ignore)]
@@ -1528,7 +1508,7 @@ mod tests {
 
         drop(first_cancellation);
         drop(scheduler.cancel_transfer(second_id));
-        handle.runtime.shutdown();
+        crate::runtime::test_util::shutdown(&handle).await;
     }
 
     #[cfg_attr(miri, ignore)]
@@ -1570,11 +1550,10 @@ mod tests {
             );
         }
 
-        handle.runtime.shutdown();
+        crate::runtime::test_util::shutdown(&handle).await;
     }
 
     #[cfg_attr(miri, ignore)]
-    #[cfg_attr(s3_tm_asan, ignore)]
     #[tokio::test]
     async fn test_single_transfer_completes_managed_runtime() {
         let _logs = show_test_logs();
@@ -1599,7 +1578,7 @@ mod tests {
 
         assert!(sm.is_complete());
         assert_eq!(sm.completed_count(), 5);
-        handle.runtime.shutdown();
+        crate::runtime::test_util::shutdown(&handle).await;
     }
 
     #[cfg_attr(miri, ignore)]
@@ -1631,7 +1610,7 @@ mod tests {
             assert!(sm.is_complete(), "transfer {} should be complete", i);
             assert_eq!(sm.completed_count(), 4);
         }
-        handle.runtime.shutdown();
+        crate::runtime::test_util::shutdown(&handle).await;
     }
 
     /// Regression test: many single-work-item transfers with concurrency target
@@ -1668,7 +1647,7 @@ mod tests {
             assert!(sm.is_complete(), "transfer {} should be complete", i);
             assert_eq!(sm.completed_count(), 1);
         }
-        handle.runtime.shutdown();
+        crate::runtime::test_util::shutdown(&handle).await;
     }
 
     // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
@@ -1716,7 +1695,7 @@ mod tests {
         };
         scheduler.set_priority(fake_id, 100); // Should not panic
 
-        handle.runtime.shutdown();
+        crate::runtime::test_util::shutdown(&handle).await;
     }
 
     /// Mock that always returns Pending (never generates work, never completes)
@@ -1808,7 +1787,7 @@ mod tests {
             .expect("scheduler did not drain released work");
         }
 
-        handle.runtime.shutdown();
+        crate::runtime::test_util::shutdown(&handle).await;
         result.expect("cancellation did not interrupt executing transfer work");
     }
 
@@ -1819,7 +1798,6 @@ mod tests {
     }
 
     #[cfg_attr(miri, ignore)]
-    #[cfg_attr(s3_tm_asan, ignore)]
     #[tokio::test]
     async fn cancellation_interrupts_executing_work_on_managed_runtime() {
         cancellation_interrupts_executing_work(test_handle_managed(1)).await;
@@ -1880,11 +1858,9 @@ mod tests {
                         Arc::new(crate::runtime::TokioMultiThreadRuntime::new(weak))
                             as Arc<dyn crate::runtime::ExecutionRuntime>
                     }
-                    TestRuntime::Managed { threads } => Arc::new(
-                        crate::runtime::ManagedThreadRuntime::builder(weak)
-                            .topology(crate::runtime::Topology::uniform(threads))
-                            .build(),
-                    ),
+                    TestRuntime::Managed { threads } => {
+                        Arc::new(crate::runtime::ManagedExecution::for_test(weak, threads))
+                    }
                 },
             );
         (handle, controller)
@@ -2088,7 +2064,7 @@ mod tests {
         wait_for_scheduler_idle(&handle).await;
         assert!(desc.is_idle());
         assert_eq!(counter.completions(), 1);
-        handle.runtime.shutdown();
+        crate::runtime::test_util::shutdown(&handle).await;
     }
 
     #[cfg_attr(miri, ignore)]
@@ -2098,7 +2074,6 @@ mod tests {
     }
 
     #[cfg_attr(miri, ignore)]
-    #[cfg_attr(s3_tm_asan, ignore)]
     #[tokio::test]
     async fn normal_completion_finishes_work_once_on_managed_runtime() {
         normal_completion_finishes_work_once(TestRuntime::Managed { threads: 4 }).await;
@@ -2131,7 +2106,7 @@ mod tests {
         assert!(desc.is_idle());
         assert_eq!(counter.completions(), 1);
         assert_eq!(state.completed_count(), 0, "terminal work must not execute");
-        handle.runtime.shutdown();
+        crate::runtime::test_util::shutdown(&handle).await;
     }
 
     /// Managed variant of [`terminal_skip_finishes_work_once_on_tokio_runtime`].
@@ -2139,7 +2114,6 @@ mod tests {
     /// A single managed thread is held by [`ThreadBlockingExecute`] so the
     /// target transfer's work stays queued while the transfer turns terminal.
     #[cfg_attr(miri, ignore)]
-    #[cfg_attr(s3_tm_asan, ignore)]
     #[tokio::test]
     async fn terminal_skip_finishes_work_once_on_managed_runtime() {
         let (handle, counter) = counted_handle(TestRuntime::Managed { threads: 1 }, 2);
@@ -2167,7 +2141,7 @@ mod tests {
         // One for the blocker's execute, one for the skipped item.
         assert_eq!(counter.completions(), 2);
         assert_eq!(state.completed_count(), 0, "terminal work must not execute");
-        handle.runtime.shutdown();
+        crate::runtime::test_util::shutdown(&handle).await;
     }
 
     async fn execute_panic_finishes_work_once(runtime: TestRuntime) {
@@ -2196,11 +2170,10 @@ mod tests {
             0,
             "a panicked work item is reported by on_panic, not on_completion"
         );
-        handle.runtime.shutdown();
+        crate::runtime::test_util::shutdown(&handle).await;
     }
 
     #[cfg_attr(miri, ignore)]
-    #[cfg_attr(s3_tm_asan, ignore)]
     #[tokio::test]
     async fn execute_panic_finishes_work_once_on_tokio_runtime() {
         let _logs = show_test_logs();
@@ -2208,7 +2181,6 @@ mod tests {
     }
 
     #[cfg_attr(miri, ignore)]
-    #[cfg_attr(s3_tm_asan, ignore)]
     #[tokio::test]
     async fn execute_panic_finishes_work_once_on_managed_runtime() {
         let _logs = show_test_logs();
@@ -2238,14 +2210,14 @@ mod tests {
         if result.is_err() {
             state.release.notify_one();
             wait_for_scheduler_idle(&handle).await;
-            handle.runtime.shutdown();
+            crate::runtime::test_util::shutdown(&handle).await;
         }
         result.expect("cancellation did not interrupt executing transfer work");
 
         wait_for_scheduler_idle(&handle).await;
         assert!(desc.is_idle());
         assert_eq!(counter.completions(), 1);
-        handle.runtime.shutdown();
+        crate::runtime::test_util::shutdown(&handle).await;
     }
 
     #[cfg_attr(miri, ignore)]
@@ -2255,7 +2227,6 @@ mod tests {
     }
 
     #[cfg_attr(miri, ignore)]
-    #[cfg_attr(s3_tm_asan, ignore)]
     #[tokio::test]
     async fn cancel_while_executing_finishes_work_once_on_managed_runtime() {
         cancel_while_executing_finishes_work_once(TestRuntime::Managed { threads: 4 }).await;
@@ -2307,7 +2278,7 @@ mod tests {
             1,
             "only the follower's work item should report completion"
         );
-        handle.runtime.shutdown();
+        crate::runtime::test_util::shutdown(&handle).await;
     }
 
     /// Managed variant of [`cancel_while_queued_finishes_work_once_on_tokio_runtime`].
@@ -2316,7 +2287,6 @@ mod tests {
     /// nothing; the queued task completes through the terminal-skip path
     /// once the thread is released.
     #[cfg_attr(miri, ignore)]
-    #[cfg_attr(s3_tm_asan, ignore)]
     #[tokio::test]
     async fn cancel_while_queued_finishes_work_once_on_managed_runtime() {
         let (handle, counter) = counted_handle(TestRuntime::Managed { threads: 1 }, 2);
@@ -2350,7 +2320,7 @@ mod tests {
         );
         // One for the blocker's execute, one for the skipped item.
         assert_eq!(counter.completions(), 2);
-        handle.runtime.shutdown();
+        crate::runtime::test_util::shutdown(&handle).await;
     }
 
     /// Mock that generates infinite work and counts executions.
@@ -2439,7 +2409,7 @@ mod tests {
         high_mock.set_done();
         low_mock.set_done();
 
-        handle.runtime.shutdown();
+        crate::runtime::test_util::shutdown(&handle).await;
 
         let high_count = high_mock.count();
         let low_count = low_mock.count();
@@ -2507,7 +2477,7 @@ mod tests {
 
         a_mock.set_done();
         b_mock.set_done();
-        handle.runtime.shutdown();
+        crate::runtime::test_util::shutdown(&handle).await;
 
         let a_after = a_mock.count() - a_before;
         let b_after = b_mock.count() - b_before;
@@ -2550,7 +2520,7 @@ mod tests {
         .expect("scheduler should become idle after failed transfer");
 
         assert!(!scheduler.0.transfers.read().unwrap().contains_key(&id));
-        handle.runtime.shutdown();
+        crate::runtime::test_util::shutdown(&handle).await;
     }
 
     #[derive(Debug)]
@@ -2592,7 +2562,6 @@ mod tests {
     }
 
     #[cfg_attr(miri, ignore)]
-    #[cfg_attr(s3_tm_asan, ignore)]
     #[tokio::test]
     async fn test_panic_transfer_cleaned_up_and_error_propagated() {
         let _logs = show_test_logs();
@@ -2645,7 +2614,7 @@ mod tests {
         assert!(ok_sm.is_complete());
         assert_eq!(ok_sm.completed_count(), 3);
 
-        handle.runtime.shutdown();
+        crate::runtime::test_util::shutdown(&handle).await;
     }
 
     #[cfg_attr(miri, ignore)]
@@ -2688,7 +2657,7 @@ mod tests {
             completed
         );
 
-        handle.runtime.shutdown();
+        crate::runtime::test_util::shutdown(&handle).await;
     }
 
     #[cfg_attr(miri, ignore)]
@@ -2744,7 +2713,7 @@ mod tests {
             assert!(!ctx.is_active(), "child {} should not be active", i + 2);
         }
 
-        handle.runtime.shutdown();
+        crate::runtime::test_util::shutdown(&handle).await;
     }
 
     #[cfg_attr(miri, ignore)]
@@ -2780,7 +2749,7 @@ mod tests {
 
         assert!(!ctx.is_active(), "parent should not be active");
 
-        handle.runtime.shutdown();
+        crate::runtime::test_util::shutdown(&handle).await;
     }
 
     #[cfg_attr(miri, ignore)]
@@ -2833,7 +2802,7 @@ mod tests {
         assert!(parent_ctx.is_active(), "parent should still be active");
         assert!(ctx_b.is_active(), "sibling B should still be active");
 
-        handle.runtime.shutdown();
+        crate::runtime::test_util::shutdown(&handle).await;
     }
 
     #[cfg_attr(miri, ignore)]
@@ -2848,7 +2817,7 @@ mod tests {
         };
         assert!(scheduler.cancel_transfer(fake_id).target.is_none());
 
-        handle.runtime.shutdown();
+        crate::runtime::test_util::shutdown(&handle).await;
     }
 
     // =========================================================================
@@ -2901,7 +2870,7 @@ mod tests {
             elapsed
         );
 
-        handle.runtime.shutdown();
+        crate::runtime::test_util::shutdown(&handle).await;
     }
 
     #[cfg_attr(miri, ignore)]
@@ -2912,7 +2881,6 @@ mod tests {
     }
 
     #[cfg_attr(miri, ignore)]
-    #[cfg_attr(s3_tm_asan, ignore)]
     #[tokio::test]
     async fn test_single_composite_uses_target_fully_managed_runtime() {
         // See note on test_composite_vs_single_fair_share_at_root_managed_runtime
@@ -2976,7 +2944,7 @@ mod tests {
             tolerance
         );
 
-        handle.runtime.shutdown();
+        crate::runtime::test_util::shutdown(&handle).await;
     }
 
     #[cfg_attr(miri, ignore)]
@@ -2987,7 +2955,6 @@ mod tests {
     }
 
     #[cfg_attr(miri, ignore)]
-    #[cfg_attr(s3_tm_asan, ignore)]
     #[tokio::test]
     async fn test_composite_vs_single_fair_share_at_root_managed_runtime() {
         // Lower target than the tokio variant. Under managed runtime with 4
@@ -3077,7 +3044,17 @@ mod tests {
             c1_count
         );
 
-        handle.runtime.shutdown();
+        // The fairness sample can finish before the composite transfers do.
+        // Drain their terminal polls before shutdown cancels remaining tasks.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while !scheduler.is_idle() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("sampled composites should drain before shutdown");
+
+        crate::runtime::test_util::shutdown(&handle).await;
     }
 
     #[cfg_attr(miri, ignore)]
@@ -3088,7 +3065,6 @@ mod tests {
     }
 
     #[cfg_attr(miri, ignore)]
-    #[cfg_attr(s3_tm_asan, ignore)]
     #[tokio::test]
     async fn test_two_composites_fair_share_regardless_of_fan_out_managed_runtime() {
         // See note on test_composite_vs_single_fair_share_at_root_managed_runtime
@@ -3154,7 +3130,7 @@ mod tests {
             "c_small should complete before c_large finishes all 100 items"
         );
 
-        handle.runtime.shutdown();
+        crate::runtime::test_util::shutdown(&handle).await;
     }
 
     #[cfg_attr(miri, ignore)]
@@ -3165,7 +3141,6 @@ mod tests {
     }
 
     #[cfg_attr(miri, ignore)]
-    #[cfg_attr(s3_tm_asan, ignore)]
     #[tokio::test]
     async fn test_heterogeneous_within_group_proportional_share_managed_runtime() {
         let handle = test_handle_managed(4);
@@ -3229,7 +3204,7 @@ mod tests {
         .await
         .expect("scheduler should become idle after cancellation");
 
-        handle.runtime.shutdown();
+        crate::runtime::test_util::shutdown(&handle).await;
     }
 
     #[cfg_attr(miri, ignore)]
@@ -3240,7 +3215,6 @@ mod tests {
     }
 
     #[cfg_attr(miri, ignore)]
-    #[cfg_attr(s3_tm_asan, ignore)]
     #[tokio::test]
     async fn test_memory_cap_returns_pending_at_limit_managed_runtime() {
         let handle = test_handle_managed(10);
@@ -3315,7 +3289,7 @@ mod tests {
         .await
         .expect("scheduler should become idle");
 
-        handle.runtime.shutdown();
+        crate::runtime::test_util::shutdown(&handle).await;
     }
 
     #[cfg_attr(miri, ignore)]
@@ -3326,7 +3300,6 @@ mod tests {
     }
 
     #[cfg_attr(miri, ignore)]
-    #[cfg_attr(s3_tm_asan, ignore)]
     #[tokio::test]
     async fn test_memory_cap_release_resumes_spawning_managed_runtime() {
         let handle = test_handle_managed(10);
@@ -3417,7 +3390,7 @@ mod tests {
         .await
         .expect("scheduler should become idle after cancellation");
 
-        handle.runtime.shutdown();
+        crate::runtime::test_util::shutdown(&handle).await;
     }
 
     #[cfg_attr(miri, ignore)]
@@ -3428,7 +3401,6 @@ mod tests {
     }
 
     #[cfg_attr(miri, ignore)]
-    #[cfg_attr(s3_tm_asan, ignore)]
     #[tokio::test]
     async fn test_priority_change_shifts_root_share_managed_runtime() {
         let handle = test_handle_managed(4);
@@ -3486,7 +3458,7 @@ mod tests {
             "all transfers should be purged"
         );
 
-        handle.runtime.shutdown();
+        crate::runtime::test_util::shutdown(&handle).await;
     }
 
     #[cfg_attr(miri, ignore)]
@@ -3497,7 +3469,6 @@ mod tests {
     }
 
     #[cfg_attr(miri, ignore)]
-    #[cfg_attr(s3_tm_asan, ignore)]
     #[tokio::test]
     async fn test_cancellation_cascades_in_hierarchical_structure_managed_runtime() {
         let handle = test_handle_managed(10);
@@ -3505,7 +3476,6 @@ mod tests {
     }
 
     #[cfg_attr(miri, ignore)]
-    #[cfg_attr(s3_tm_asan, ignore)]
     #[tokio::test]
     async fn test_panic_in_composite_poll_work() {
         let handle = test_handle(4);
@@ -3555,7 +3525,7 @@ mod tests {
         // Scheduler should be fully idle
         assert!(scheduler.is_idle());
 
-        handle.runtime.shutdown();
+        crate::runtime::test_util::shutdown(&handle).await;
     }
 
     /// Regression test: a composite that violates the Transfer contract
@@ -3588,7 +3558,7 @@ mod tests {
         .await
         .expect("scheduler should reach idle; orphaned children would hang it");
 
-        handle.runtime.shutdown();
+        crate::runtime::test_util::shutdown(&handle).await;
     }
 
     /// Verifies the Done-branch defensive cleanup actually cancels the
@@ -3641,7 +3611,7 @@ mod tests {
                 .expect("terminal sender should not have been dropped");
         }
 
-        handle.runtime.shutdown();
+        crate::runtime::test_util::shutdown(&handle).await;
     }
 
     /// A transfer that becomes terminal without calling `signal_terminal`,
@@ -3679,7 +3649,7 @@ mod tests {
         .await
         .expect("scheduler should reach idle");
 
-        handle.runtime.shutdown();
+        crate::runtime::test_util::shutdown(&handle).await;
     }
 
     // =========================================================================
@@ -3757,7 +3727,7 @@ mod tests {
             "dispatched should be 0 after Spawned+Done (no work items dispatched)"
         );
 
-        handle.runtime.shutdown();
+        crate::runtime::test_util::shutdown(&handle).await;
     }
 
     #[cfg_attr(miri, ignore)]
@@ -3768,7 +3738,6 @@ mod tests {
     }
 
     #[cfg_attr(miri, ignore)]
-    #[cfg_attr(s3_tm_asan, ignore)]
     #[tokio::test]
     async fn test_spawned_does_not_increment_dispatched_managed_runtime() {
         let handle = test_handle_managed(4);
@@ -3808,7 +3777,7 @@ mod tests {
             sm.poll_count()
         );
 
-        handle.runtime.shutdown();
+        crate::runtime::test_util::shutdown(&handle).await;
     }
 
     #[cfg_attr(miri, ignore)]
@@ -3819,7 +3788,6 @@ mod tests {
     }
 
     #[cfg_attr(miri, ignore)]
-    #[cfg_attr(s3_tm_asan, ignore)]
     #[tokio::test]
     async fn test_spawned_reinserts_and_repolls_managed_runtime() {
         let handle = test_handle_managed(4);
@@ -3900,7 +3868,7 @@ mod tests {
         .expect("scheduler should become idle after releasing children");
 
         notifier.abort();
-        handle.runtime.shutdown();
+        crate::runtime::test_util::shutdown(&handle).await;
     }
 
     #[cfg_attr(miri, ignore)]
@@ -3911,7 +3879,6 @@ mod tests {
     }
 
     #[cfg_attr(miri, ignore)]
-    #[cfg_attr(s3_tm_asan, ignore)]
     #[tokio::test]
     async fn test_single_ticket_caps_materialization_near_target_managed_runtime() {
         let handle = test_handle_managed(200);
@@ -3925,7 +3892,6 @@ mod tests {
     /// the IO charge; this pins that both are applied so that regression fails.
     // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
     #[cfg_attr(miri, ignore)]
-    #[cfg_attr(s3_tm_asan, ignore)]
     #[tokio::test]
     async fn test_fused_ready_spawned_charges_both_io_and_spawn_vruntime() {
         let handle = test_handle(4);
@@ -3968,7 +3934,7 @@ mod tests {
         );
 
         scheduler.cancel_transfer(id).wait_for_idle().await;
-        handle.runtime.shutdown();
+        crate::runtime::test_util::shutdown(&handle).await;
     }
 
     async fn impl_single_ticket_completes_all(handle: Arc<Handle>) {
@@ -4005,7 +3971,7 @@ mod tests {
             total_children
         );
 
-        handle.runtime.shutdown();
+        crate::runtime::test_util::shutdown(&handle).await;
     }
 
     #[cfg_attr(miri, ignore)]
@@ -4016,7 +3982,6 @@ mod tests {
     }
 
     #[cfg_attr(miri, ignore)]
-    #[cfg_attr(s3_tm_asan, ignore)]
     #[tokio::test]
     async fn test_single_ticket_completes_all_managed_runtime() {
         let handle = test_handle_managed(50);
@@ -4151,7 +4116,7 @@ mod tests {
             c1_count
         );
 
-        handle.runtime.shutdown();
+        crate::runtime::test_util::shutdown(&handle).await;
     }
 
     #[cfg_attr(miri, ignore)]
@@ -4162,7 +4127,6 @@ mod tests {
     }
 
     #[cfg_attr(miri, ignore)]
-    #[cfg_attr(s3_tm_asan, ignore)]
     #[tokio::test]
     async fn test_single_ticket_two_composites_fair_share_managed_runtime() {
         let handle = test_handle_managed(20);
@@ -4215,7 +4179,7 @@ mod tests {
         .await
         .expect("scheduler should become idle after cancellation");
 
-        handle.runtime.shutdown();
+        crate::runtime::test_util::shutdown(&handle).await;
     }
 
     #[cfg_attr(miri, ignore)]
@@ -4226,7 +4190,6 @@ mod tests {
     }
 
     #[cfg_attr(miri, ignore)]
-    #[cfg_attr(s3_tm_asan, ignore)]
     #[tokio::test]
     async fn test_single_ticket_memory_cap_backstops_managed_runtime() {
         let handle = test_handle_managed(200);
@@ -4284,7 +4247,7 @@ mod tests {
         .await
         .expect("scheduler should become idle");
 
-        handle.runtime.shutdown();
+        crate::runtime::test_util::shutdown(&handle).await;
 
         // Observe scheduler selection, independent of execution order on runtime threads.
         let log = poll_log.lock().unwrap();
@@ -4317,7 +4280,6 @@ mod tests {
     }
 
     #[cfg_attr(miri, ignore)]
-    #[cfg_attr(s3_tm_asan, ignore)]
     #[tokio::test]
     async fn test_spawned_spin_guard_does_not_starve_peer_managed_runtime() {
         let handle = test_handle_managed(20);
@@ -4389,7 +4351,7 @@ mod tests {
         .await
         .expect("scheduler should become idle after all children complete");
 
-        handle.runtime.shutdown();
+        crate::runtime::test_util::shutdown(&handle).await;
         (max_dispatched, max_alive)
     }
 
@@ -4442,7 +4404,6 @@ mod tests {
     }
 
     #[cfg_attr(miri, ignore)]
-    #[cfg_attr(s3_tm_asan, ignore)]
     #[tokio::test]
     async fn test_spawn_model_small_objects_managed_runtime() {
         let _logs = show_test_logs();
@@ -4503,7 +4464,6 @@ mod tests {
     }
 
     #[cfg_attr(miri, ignore)]
-    #[cfg_attr(s3_tm_asan, ignore)]
     #[tokio::test]
     async fn test_spawn_model_large_objects_managed_runtime() {
         let _logs = show_test_logs();
@@ -4604,7 +4564,7 @@ mod tests {
         .expect("scheduler should become idle after releasing children");
 
         notifier.abort();
-        handle.runtime.shutdown();
+        crate::runtime::test_util::shutdown(&handle).await;
     }
 
     #[cfg_attr(miri, ignore)]
@@ -4616,7 +4576,6 @@ mod tests {
     }
 
     #[cfg_attr(miri, ignore)]
-    #[cfg_attr(s3_tm_asan, ignore)]
     #[tokio::test]
     async fn test_spawn_model_blocking_children_managed_runtime() {
         let _logs = show_test_logs();
@@ -4703,7 +4662,7 @@ mod tests {
             max_alive,
         );
 
-        handle.runtime.shutdown();
+        crate::runtime::test_util::shutdown(&handle).await;
     }
 
     #[cfg_attr(miri, ignore)]
@@ -4715,7 +4674,6 @@ mod tests {
     }
 
     #[cfg_attr(miri, ignore)]
-    #[cfg_attr(s3_tm_asan, ignore)]
     #[tokio::test]
     async fn test_spawn_child_polled_before_composite_respawns_managed_runtime() {
         let _logs = show_test_logs();
@@ -4817,7 +4775,6 @@ mod tests {
     }
 
     #[cfg_attr(miri, ignore)]
-    #[cfg_attr(s3_tm_asan, ignore)]
     #[tokio::test]
     async fn test_composite_child_poll_interleaving_managed_runtime() {
         let _logs = show_test_logs();

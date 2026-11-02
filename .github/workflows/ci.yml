@@ -487,20 +487,8 @@ jobs:
         uses: taiki-e/cache-cargo-install-action@v2
         with:
           tool: cargo-check-external-types@0.5.0
-      - name: check-external-types
-        # Otherwise the checker forwards workspace-resolved features, including
-        # sdk-v1 enabled by the integration-tests package.
-        run: cargo check-external-types --no-default-features --features '' --config external-types.toml
-        working-directory: aws-sdk-s3-transfer-manager
-      - name: Check topology API
-        run: cargo check-external-types --no-default-features --features '' --config external-types.toml
-        working-directory: crates/aws-smithy-topology
-      - name: Check execution API
-        run: cargo check-external-types --all-features --config external-types.toml
-        working-directory: crates/aws-smithy-execution
-      - name: Check managed HTTP API
-        run: cargo check-external-types --all-features --config external-types.toml
-        working-directory: crates/aws-smithy-managed-http
+      - name: Check TM, extension, and runtime component APIs
+        run: python3 tools/check-tm-public-api.py
 
   check-deny:
     name: check deps with cargo-deny
@@ -567,12 +555,9 @@ jobs:
           # first report, and reject invalid C-string operations.
           ASAN_OPTIONS: detect_leaks=1:detect_stack_use_after_return=1:halt_on_error=1:strict_string_checks=1
           # Retain additional access history for race reports and stop at the
-          # first race diagnostic. Managed-runtime lifecycle tests can leave a
-          # finished Tokio blocking worker for process teardown, so thread-leak
-          # reporting remains disabled until their drain-and-join teardown is
-          # deterministic. The suppression covers Tokio's kernel-mediated
-          # reactor registration; transfer-manager races remain unsuppressed.
-          # Deadlock detection is not enabled.
+          # first race. The suppression covers Tokio's kernel-mediated reactor
+          # registration; transfer-manager races remain unsuppressed.
+          # Thread-leak and deadlock detection are not enabled.
           TSAN_OPTIONS: halt_on_error=1:history_size=7:report_thread_leaks=0:suppressions=${{ github.workspace }}/.github/tsan-suppressions.txt
           # Ignore `trybuild` errors as they are irrelevant and flaky on nightly
           TRYBUILD: overwrite
@@ -639,6 +624,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
+      # Generated consumers resolve dependencies without the workspace lockfile.
+      CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: fallback
       # The checker includes optional features; dial9 needs Tokio's unstable API.
       RUSTFLAGS: "-Dwarnings --cfg tokio_unstable"
     steps:
@@ -668,6 +655,18 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: check --feature-powerset
         run: cargo hack check --all --feature-powerset
+        env:
+          RUSTFLAGS: -Dwarnings -Adeprecated
+      - name: Check ordinary and extension consumers
+        run: python3 tools/check-tm-consumers.py
+      - name: Test ordinary and unstable managed configuration
+        run: |
+          cargo test --locked -p aws-sdk-s3-transfer-manager --no-default-features \
+            --lib client::tests -- --test-threads 1
+          cargo test --locked -p aws-sdk-s3-transfer-manager --no-default-features \
+            --features __unstable_ext --lib client::tests -- --test-threads 1
+          cargo test --locked -p aws-sdk-s3-transfer-manager --no-default-features \
+            --features __unstable_ext --lib config::runtime -- --test-threads 1
         env:
           RUSTFLAGS: -Dwarnings -Adeprecated
 
