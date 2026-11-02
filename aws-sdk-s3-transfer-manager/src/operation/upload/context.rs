@@ -801,7 +801,8 @@ pub(crate) enum UploadState {
     /// CompleteMultipartUpload has been dispatched and has not succeeded.
     ///
     /// The multipart upload remains open in this state, including after the
-    /// request fails or its execution is dropped, so it can still be aborted.
+    /// request's execution is dropped, so it can still be aborted. A failed
+    /// request moves the state to `Aborting`.
     CompleteInFlight { upload_id: String },
     /// PutObject is in flight.
     PutObjectInFlight,
@@ -818,6 +819,9 @@ pub(crate) enum UploadState {
         complete_mpu_in_flight: bool,
         /// Progress of the AbortMultipartUpload request.
         abort_mpu: AbortMpuProgress,
+        /// The first failure, if a failure started or joined the abort. When
+        /// set, the transfer ends as failed with it instead of as cancelled.
+        failure: Option<UploadFailure>,
     },
     /// S3 has committed the object; no multipart upload remains open.
     Done,
@@ -835,6 +839,17 @@ pub(crate) enum AbortMpuProgress {
     InFlight,
     /// AbortMultipartUpload succeeded.
     Done,
+    /// AbortMultipartUpload failed. It is not sent again.
+    Failed,
+}
+
+/// A failure recorded while the transfer aborts.
+#[derive(Debug)]
+pub(crate) struct UploadFailure {
+    /// The error the transfer ends with.
+    pub(crate) error: crate::error::Error,
+    /// The state when the failure happened, for the terminal report.
+    pub(crate) snapshot: UploadStateSnapshot,
 }
 
 #[cfg(test)]

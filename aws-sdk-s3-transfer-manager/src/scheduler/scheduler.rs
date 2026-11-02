@@ -84,8 +84,9 @@
 //! # State Machine Contracts
 //!
 //! A [`Transfer`](crate::transfer::Transfer) implementation must uphold:
-//! - **Failed lifecycle**: record the error and signal termination before returning
-//!   a failure outcome.
+//! - **Failed lifecycle**: record the error before returning a failure outcome, then
+//!   either end the transfer and signal termination, or keep it active with a wake
+//!   path until `poll_work` ends it.
 //! - **Poll-time pending/wake obligation**: every `PollWork::Pending` must record
 //!   its cause through `TransferContext::set_pending` and have a future wake path.
 //!   Transfer-owned mutations use the edge-triggered

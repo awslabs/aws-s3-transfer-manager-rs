@@ -284,6 +284,9 @@ mod test {
         /// `NoSuchUpload`, as S3 does when the upload was aborted before
         /// Complete committed.
         HoldThenNoSuchUpload,
+        /// Wait like `HoldThenNoSuchUpload`, then answer with the same error
+        /// as `Fail`.
+        HoldThenFail,
         /// Respond with a non-retryable error.
         Fail,
     }
@@ -328,6 +331,17 @@ mod test {
                     let behavior = self.behavior;
                     return HttpConnectorFuture::new(async move {
                         complete_started.add_permits(1);
+                        let behavior = match behavior {
+                            CompleteMpuBehavior::HoldThenFail => {
+                                complete_release
+                                    .acquire()
+                                    .await
+                                    .expect("release semaphore closed")
+                                    .forget();
+                                CompleteMpuBehavior::Fail
+                            }
+                            other => other,
+                        };
                         match behavior {
                             CompleteMpuBehavior::HoldThenNoSuchUpload => {
                                 complete_release
@@ -356,6 +370,7 @@ mod test {
                                     </Error>"#,
                                 ),
                             )),
+                            CompleteMpuBehavior::HoldThenFail => unreachable!("resolved above"),
                         }
                     });
                 }
@@ -492,12 +507,60 @@ mod test {
         abort_during_complete_mpu(RuntimeMode::Managed).await;
     }
 
-    /// `abort()` on an upload that already failed returns the failure at once
-    /// and sends nothing.
-    ///
-    /// TODO: failures don't go through the abort path yet, so the multipart
-    /// upload is left open here. Once they do, this should expect one
-    /// AbortMultipartUpload for `test-upload-id`.
+    /// An abort requested while CompleteMultipartUpload is in flight sends
+    /// AbortMultipartUpload. When Complete then fails with an error other
+    /// than `NoSuchUpload`, `abort()` returns that error instead of
+    /// `Cancelled`.
+    async fn complete_mpu_failure_during_abort(runtime_mode: RuntimeMode) {
+        let (handle, probe) =
+            start_upload_until_complete_mpu(runtime_mode, CompleteMpuBehavior::HoldThenFail, 2)
+                .await;
+
+        let mut abort = Box::pin(handle.abort());
+        assert!(
+            poll_once(&mut abort).await.is_pending(),
+            "abort returned while CompleteMultipartUpload was held"
+        );
+        tokio::time::timeout(Duration::from_secs(5), probe.abort_started.acquire())
+            .await
+            .expect("AbortMultipartUpload was not sent while Complete was in flight")
+            .expect("abort semaphore closed")
+            .forget();
+        probe.complete_release.add_permits(1);
+
+        let error = tokio::time::timeout(Duration::from_secs(5), abort)
+            .await
+            .expect("abort hung after CompleteMultipartUpload returned")
+            .expect_err("a Complete failure during abort must be returned");
+        assert_eq!(error.code(), Some("InvalidPart"));
+        let abort_uris = probe.abort_uris.lock().unwrap();
+        assert_eq!(
+            abort_uris.len(),
+            1,
+            "expected one AbortMultipartUpload: {abort_uris:?}"
+        );
+        assert!(
+            abort_uris[0].contains("uploadId=test-upload-id"),
+            "AbortMultipartUpload for the wrong upload: {}",
+            abort_uris[0]
+        );
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn complete_mpu_failure_during_abort_returns_error_on_tokio_runtime() {
+        complete_mpu_failure_during_abort(RuntimeMode::MultiThreadTokio).await;
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn complete_mpu_failure_during_abort_returns_error_on_managed_runtime() {
+        complete_mpu_failure_during_abort(RuntimeMode::Managed).await;
+    }
+
+    /// A failed CompleteMultipartUpload aborts the multipart upload, and
+    /// `abort()` on the failed upload returns the failure without sending a
+    /// second AbortMultipartUpload.
     async fn abort_after_failed_complete_mpu(runtime_mode: RuntimeMode) {
         let (handle, probe) =
             start_upload_until_complete_mpu(runtime_mode, CompleteMpuBehavior::Fail, 1).await;
@@ -516,9 +579,15 @@ mod test {
             .expect_err("abort on a failed upload must return its error");
         assert_eq!(error.code(), Some("InvalidPart"));
         let abort_uris = probe.abort_uris.lock().unwrap();
+        assert_eq!(
+            abort_uris.len(),
+            1,
+            "expected one AbortMultipartUpload: {abort_uris:?}"
+        );
         assert!(
-            abort_uris.is_empty(),
-            "unexpected AbortMultipartUpload: {abort_uris:?}"
+            abort_uris[0].contains("uploadId=test-upload-id"),
+            "AbortMultipartUpload for the wrong upload: {}",
+            abort_uris[0]
         );
     }
 

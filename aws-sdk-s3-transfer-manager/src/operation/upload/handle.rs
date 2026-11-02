@@ -148,25 +148,16 @@ impl UploadHandle {
     /// # Errors
     ///
     /// Returns an error if the transfer failed, before or during the abort.
-    /// AbortMultipartUpload is not sent for a transfer that had already
-    /// failed, and its multipart upload is left open.
+    /// A failure aborts the multipart upload itself (unless the policy is to
+    /// retain it), so this does not send a second AbortMultipartUpload.
     ///
     /// [`AbortOutcome::Cancelled`]: crate::types::AbortOutcome::Cancelled
     /// [`AbortOutcome::AlreadyCompleted`]: crate::types::AbortOutcome::AlreadyCompleted
     pub async fn abort(mut self) -> Result<AbortedUpload, Error> {
-        // TODO: route a caller's abort through the failure path, as a failure
-        //   with a cancellation error, and have that path abort the multipart
-        //   upload.
-
-        // TODO: check `abort_requested()` here once an abort can already be
-        //   running when this is called. Today it cannot: `abort()` consumes
-        //   the handle and is the only caller of `request_abort()`. That
-        //   changes if `Drop` calls `request_abort()`, if a failure goes
-        //   through `request_abort()`, or if the upload can be aborted without
-        //   consuming the handle. An abort that is already running should be
-        //   awaited and its outcome reported.
-        // On a transfer that is no longer active, this changes nothing:
-        // `poll_work` returns `Done` before it reads the abort flag.
+        // A failure may have started the abort already. `request_abort()` is
+        // idempotent, so this then changes nothing, and the wait below
+        // reports the failure. On a transfer that is no longer active it
+        // leaves the state alone too.
         self.transfer.request_abort();
 
         // `signal_terminal()` runs only after every request the transfer sent
