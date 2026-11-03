@@ -16,7 +16,11 @@ pub(crate) mod test_util;
 mod shutdown;
 pub use shutdown::{ShutdownCompletion, ShutdownError, ShutdownErrorKind};
 
+// Managed execution spawns OS threads and builds a native HTTP transport,
+// neither of which wasm targets provide.
+#[cfg(not(target_family = "wasm"))]
 mod managed;
+#[cfg(not(target_family = "wasm"))]
 pub(crate) use managed::{prepare_components, ManagedExecution};
 
 #[allow(dead_code)]
@@ -69,6 +73,10 @@ pub(crate) trait ExecutionRuntime: Send + Sync + std::fmt::Debug {
 /// Present only when that transport will be installed, so a runtime given
 /// `None` builds no HTTP client.
 #[derive(Debug, Clone)]
+#[cfg_attr(
+    target_family = "wasm",
+    expect(dead_code, reason = "read only by the managed runtime's transport")
+)]
 pub(crate) struct RuntimeHttpOptions {
     /// Interfaces to bind connections to, assigned to worker threads
     /// round-robin. Empty leaves interface selection to OS routing.
@@ -83,10 +91,12 @@ pub(crate) struct RuntimeHttpOptions {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RuntimeComponents {
     http_client: Option<SharedHttpClient>,
-    /// When true, file I/O runs directly on the calling thread (managed threads).
+    /// When true, file I/O runs directly on the calling thread: managed
+    /// threads, and wasm targets, whose threads are unavailable or cooperative.
     /// When false, file I/O is offloaded via spawn_blocking (shared runtimes).
     direct_io: bool,
-    /// Whether file bodies may read synchronously on the HTTP polling thread.
+    /// Whether file bodies may read synchronously on the HTTP polling thread:
+    /// with TM-built managed HTTP, and on wasm targets.
     direct_body_io: bool,
 }
 
@@ -107,11 +117,24 @@ impl RuntimeComponents {
     }
 
     /// Enables direct transfer reads, and direct body reads only for owned HTTP.
+    #[cfg(not(target_family = "wasm"))]
     pub(crate) fn managed(http_client: Option<SharedHttpClient>) -> Self {
         Self {
             direct_io: true,
             direct_body_io: http_client.is_some(),
             http_client,
+        }
+    }
+
+    /// Enables direct transfer and body reads without an HTTP client, for
+    /// targets where blocking offload cannot keep a read off the polling
+    /// thread: wasip1 and wasip2 cannot spawn the threads a blocking pool
+    /// needs, and wasip3's cooperative threads run one at a time.
+    pub(crate) fn inline_io() -> Self {
+        Self {
+            direct_io: true,
+            direct_body_io: true,
+            http_client: None,
         }
     }
 }

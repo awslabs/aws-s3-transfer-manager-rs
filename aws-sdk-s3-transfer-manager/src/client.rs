@@ -4,6 +4,7 @@
  */
 
 use crate::metrics::unit::ByteUnit;
+#[cfg(not(target_family = "wasm"))]
 use crate::runtime::ManagedExecution;
 use crate::scheduler::{ConcurrencyController, FixedConcurrency, Scheduler};
 use crate::telemetry::Telemetry;
@@ -303,6 +304,8 @@ impl Client {
         if runtime_http.is_some() {
             log_connection_cap(&connection_cap, controller.target());
         }
+        // wasm targets have no managed execution; see `Managed`.
+        #[cfg(not(target_family = "wasm"))]
         let managed = match config.managed_config_mut() {
             Some(managed) => {
                 let owner = managed
@@ -319,6 +322,7 @@ impl Client {
         };
         let handle = Arc::new_cyclic(|weak_handle| {
             let scheduler = Scheduler::new(weak_handle.clone());
+            #[cfg(not(target_family = "wasm"))]
             let runtime: Arc<dyn ExecutionRuntime> = match managed {
                 Some((owner, components)) => Arc::new(ManagedExecution::new(
                     weak_handle.clone(),
@@ -329,6 +333,10 @@ impl Client {
                     weak_handle.clone(),
                 )),
             };
+            #[cfg(target_family = "wasm")]
+            let runtime: Arc<dyn ExecutionRuntime> = Arc::new(
+                crate::runtime::TokioMultiThreadRuntime::new(weak_handle.clone()),
+            );
 
             let s3_client = match config.take_s3_client_source() {
                 crate::config::S3ClientSource::Provided(client) => {

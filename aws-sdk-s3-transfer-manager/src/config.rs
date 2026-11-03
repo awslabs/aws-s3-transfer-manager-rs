@@ -193,6 +193,7 @@ impl Config {
         &self.runtime_config
     }
 
+    #[cfg(not(target_family = "wasm"))]
     pub(crate) fn managed_config_mut(&mut self) -> Option<&mut Managed> {
         self.runtime_config.managed_config_mut()
     }
@@ -229,11 +230,15 @@ impl Config {
 
     /// HTTP options for the runtime-provided transport, or `None` when the
     /// managed transport would not be installed: HTTP is already configured,
-    /// a finished S3 client was supplied, or execution uses the caller's runtime.
+    /// a finished S3 client was supplied, execution uses the caller's runtime,
+    /// or the target is wasm, which has no managed transport.
     pub(crate) fn runtime_http(
         &self,
         max_connections_per_host: usize,
     ) -> Option<crate::runtime::RuntimeHttpOptions> {
+        if cfg!(target_family = "wasm") {
+            return None;
+        }
         match self.s3_client_source.as_ref()? {
             S3ClientSource::FromConfig(config)
                 if self.runtime_config.managed_config().is_some()

@@ -40,6 +40,8 @@ impl RuntimeConfig {
     ///
     /// Transfer tasks are spawned on the runtime performing dispatch. Use a
     /// multi-thread runtime so concurrent work can execute on different threads.
+    /// wasm targets are the exception: their threads are unavailable or
+    /// cooperative, so a current-thread runtime is supported there.
     pub fn multi_thread_tokio() -> Self {
         Self {
             kind: Kind::MultiThreadTokio,
@@ -53,6 +55,7 @@ impl RuntimeConfig {
         }
     }
 
+    #[cfg(not(target_family = "wasm"))]
     pub(crate) fn managed_config_mut(&mut self) -> Option<&mut Managed> {
         match &mut self.kind {
             Kind::Managed(managed) => Some(managed),
@@ -74,9 +77,17 @@ impl Default for RuntimeConfig {
 /// dropped. Owner destruction requests shutdown without synchronously joining
 /// the managed threads. [`crate::Client::shutdown_completion`] provides a
 /// non-owning observer of their joins.
+///
+/// wasm targets cannot run managed threads. There, managed execution behaves
+/// as [`RuntimeConfig::multi_thread_tokio`], including its support for a
+/// current-thread runtime, and creates no owner to observe.
 #[non_exhaustive]
 #[derive(Debug, Default)]
 pub struct Managed {
+    #[cfg_attr(
+        target_family = "wasm",
+        expect(dead_code, reason = "wasm targets build no managed runtime")
+    )]
     source: Source,
 }
 
@@ -96,6 +107,7 @@ impl Managed {
         }
     }
 
+    #[cfg(not(target_family = "wasm"))]
     pub(crate) fn build(
         &mut self,
         #[cfg(feature = "dial9")] recorder: Option<dial9::Dial9Handle>,

@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.4.0] - Unreleased
 
 ### Added
+- The crate builds for `wasm32-wasip1`, `wasm32-wasip2`, and `wasm32-wasip3` with
+  `RUSTFLAGS="--cfg tokio_unstable"`. On these targets the application supplies the HTTP client,
+  `Managed` execution runs on the caller's tokio runtime, which may be current-thread, and file
+  I/O runs inline. The crate documentation lists the requirements.
 - Experimental managed-runtime adoption through the non-default `__unstable_ext` feature,
   used by the new `aws-sdk-s3-transfer-manager-ext` adapter. The adapter transfers runtime
   ownership into opaque TM configuration. Managed pools implement the Smithy HTTP client
@@ -30,6 +34,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `dial9_handle` and take a `dial9::Dial9Handle`. The caller owns the `dial9::Recorder`: pass
   `recorder.handle().clone()`, and call `Recorder::graceful_shutdown` after the client, its clones,
   and its transfer handles are dropped.
+
+### Fixed
+- `ByteUnit::as_bits_usize` defined `Gibibyte` as `1 << 33`, which overflows a 32-bit `usize`
+  and stopped the crate from compiling on such targets. `as_bits_u64` now computes every unit in
+  `u64`, and `as_bits_usize` panics for `Gibibyte` where `usize` is 32 bits. Values on 64-bit
+  targets are unchanged.
 
 ## [0.3.1] - 2026-10-09
 
