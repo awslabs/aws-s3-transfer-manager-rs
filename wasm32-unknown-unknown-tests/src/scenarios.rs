@@ -20,10 +20,10 @@ use aws_sdk_s3::config::IdentityCache;
 use aws_sdk_s3_transfer_manager::io::InputStream;
 use aws_sdk_s3_transfer_manager::memory::{BufferPool, BufferPoolBuildError};
 use aws_sdk_s3_transfer_manager::types::{
-    ConcurrencyMode, MemoryBudgetConfig, MemoryConfig, PartSize, RuntimeMode, TransferInstant,
+    ConcurrencyMode, MemoryBudgetConfig, MemoryConfig, PartSize, TransferInstant,
 };
 use aws_sdk_s3_transfer_manager::wasm::{BoxFuture, SharedWasmRuntime, WasmRuntime};
-use aws_sdk_s3_transfer_manager::{Client, Config};
+use aws_sdk_s3_transfer_manager::{Client, Config, RuntimeConfig};
 use aws_smithy_runtime_api::client::http::SharedHttpConnector;
 use aws_types::sdk_config::{StalledStreamProtectionConfig, TimeoutConfig};
 use bytes::Bytes;
@@ -298,8 +298,8 @@ async fn per_client_runtimes(endpoint: String) -> Result<String, String> {
     let stores = OFFSETS.map(|_| Store::new(&endpoint));
     let mut clients = Vec::new();
     for (index, runtime) in runtimes.iter().enumerate() {
-        let client =
-            stores[index].client(|config| config.runtime_mode(RuntimeMode::Wasm(runtime.clone())));
+        let client = stores[index]
+            .client(|config| config.runtime_config(RuntimeConfig::wasm(runtime.clone())));
         // The transfer's start time must come from this client's runtime,
         // whose clock is an hour away from the other's.
         let earliest = TransferInstant::now(runtime);
@@ -640,7 +640,7 @@ pub(crate) fn client_without_sleep() {
         .build();
     let config = Config::builder()
         .s3_config(&sdk)
-        .runtime_mode(RuntimeMode::wasm(HostRuntime))
+        .runtime_config(RuntimeConfig::wasm(HostRuntime))
         .build();
     drop(Client::new(config));
 }

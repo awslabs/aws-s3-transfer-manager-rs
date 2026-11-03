@@ -7,14 +7,11 @@
 //! `parking_lot` primitives. Under `cfg(s3_tm_loom)` the sibling `loom` module
 //! provides the same API surface backed by `loom` types.
 //!
-//! Under `cfg(miri)`, Mutex/Condvar fall back to `std::sync` because
-//! `parking_lot` uses integer-to-pointer casts that violate strict provenance.
-//! wasm targets also use `std::sync`, because `parking_lot`'s wasm parker
-//! panics whenever a thread would block.
-
-use std::marker::PhantomData;
-use std::ops::{Deref, DerefMut};
-use std::time::Duration;
+//! `Mutex`, `MutexGuard`, and `Condvar` come from one of two `sys` backends:
+//! `parking_lot` in production, and `std::sync` under `cfg(miri)` and on wasm
+//! targets. `parking_lot` uses integer-to-pointer casts that violate the strict
+//! provenance Miri checks, and its wasm parker panics whenever a thread would
+//! block.
 
 // ---------------------------------------------------------------------------
 // UnsafeCell — closure-based API matching loom::cell::UnsafeCell
@@ -40,145 +37,143 @@ impl<T> UnsafeCell<T> {
 }
 
 // ---------------------------------------------------------------------------
-// Mutex / MutexGuard
-//
-// Production: parking_lot (faster Condvar, no poisoning).
-// Miri: std::sync (parking_lot uses integer-to-pointer casts that violate
-//        strict provenance — that's a parking_lot concern, not ours).
-// wasm: std::sync (parking_lot's wasm parker panics whenever a thread would block).
+// Mutex / MutexGuard / Condvar
 // ---------------------------------------------------------------------------
 
-#[cfg(not(any(miri, target_family = "wasm")))]
-pub(crate) struct Mutex<T>(PhantomData<std::sync::Mutex<T>>, parking_lot::Mutex<T>);
+pub(crate) use sys::{Condvar, Mutex, MutexGuard};
 
 #[cfg(not(any(miri, target_family = "wasm")))]
-pub(crate) struct MutexGuard<'a, T>(
-    PhantomData<std::sync::MutexGuard<'a, T>>,
-    parking_lot::MutexGuard<'a, T>,
-);
+mod sys {
+    //! `parking_lot` backend: a faster `Condvar` and no lock poisoning.
 
-#[cfg(not(any(miri, target_family = "wasm")))]
-impl<T> Mutex<T> {
-    pub(crate) fn new(val: T) -> Self {
-        Self(PhantomData, parking_lot::Mutex::new(val))
+    use std::marker::PhantomData;
+    use std::ops::{Deref, DerefMut};
+    use std::time::Duration;
+
+    pub(crate) struct Mutex<T>(PhantomData<std::sync::Mutex<T>>, parking_lot::Mutex<T>);
+
+    pub(crate) struct MutexGuard<'a, T>(
+        PhantomData<std::sync::MutexGuard<'a, T>>,
+        parking_lot::MutexGuard<'a, T>,
+    );
+
+    impl<T> Mutex<T> {
+        pub(crate) fn new(val: T) -> Self {
+            Self(PhantomData, parking_lot::Mutex::new(val))
+        }
+
+        pub(crate) fn lock(&self) -> MutexGuard<'_, T> {
+            MutexGuard(PhantomData, self.1.lock())
+        }
     }
 
-    pub(crate) fn lock(&self) -> MutexGuard<'_, T> {
-        MutexGuard(PhantomData, self.1.lock())
-    }
-}
-
-#[cfg(not(any(miri, target_family = "wasm")))]
-impl<T> Deref for MutexGuard<'_, T> {
-    type Target = T;
-    fn deref(&self) -> &T {
-        &self.1
-    }
-}
-
-#[cfg(not(any(miri, target_family = "wasm")))]
-impl<T> DerefMut for MutexGuard<'_, T> {
-    fn deref_mut(&mut self) -> &mut T {
-        &mut self.1
-    }
-}
-
-#[cfg(any(miri, target_family = "wasm"))]
-pub(crate) struct Mutex<T>(std::sync::Mutex<T>);
-
-#[cfg(any(miri, target_family = "wasm"))]
-pub(crate) struct MutexGuard<'a, T>(std::sync::MutexGuard<'a, T>);
-
-#[cfg(any(miri, target_family = "wasm"))]
-impl<T> Mutex<T> {
-    pub(crate) fn new(val: T) -> Self {
-        Self(std::sync::Mutex::new(val))
+    impl<T> Deref for MutexGuard<'_, T> {
+        type Target = T;
+        fn deref(&self) -> &T {
+            &self.1
+        }
     }
 
-    pub(crate) fn lock(&self) -> MutexGuard<'_, T> {
-        MutexGuard(self.0.lock().expect("poisoned"))
-    }
-}
-
-#[cfg(any(miri, target_family = "wasm"))]
-impl<T> Deref for MutexGuard<'_, T> {
-    type Target = T;
-    fn deref(&self) -> &T {
-        &self.0
-    }
-}
-
-#[cfg(any(miri, target_family = "wasm"))]
-impl<T> DerefMut for MutexGuard<'_, T> {
-    fn deref_mut(&mut self) -> &mut T {
-        &mut self.0
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Condvar — ownership-based wait matching loom/std (not parking_lot's &mut)
-// ---------------------------------------------------------------------------
-
-#[cfg(not(any(miri, target_family = "wasm")))]
-pub(crate) struct Condvar(PhantomData<std::sync::Condvar>, parking_lot::Condvar);
-
-#[cfg(not(any(miri, target_family = "wasm")))]
-impl Condvar {
-    pub(crate) fn new() -> Self {
-        Self(PhantomData, parking_lot::Condvar::new())
+    impl<T> DerefMut for MutexGuard<'_, T> {
+        fn deref_mut(&mut self) -> &mut T {
+            &mut self.1
+        }
     }
 
-    pub(crate) fn wait<'a, T>(&self, mut guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
-        self.1.wait(&mut guard.1);
-        guard
-    }
+    // Ownership-based wait matching loom and std, not parking_lot's `&mut`.
+    pub(crate) struct Condvar(PhantomData<std::sync::Condvar>, parking_lot::Condvar);
 
-    pub(crate) fn wait_timeout<'a, T>(
-        &self,
-        mut guard: MutexGuard<'a, T>,
-        timeout: Duration,
-    ) -> (MutexGuard<'a, T>, bool) {
-        let result = self.1.wait_for(&mut guard.1, timeout);
-        (guard, result.timed_out())
-    }
+    impl Condvar {
+        pub(crate) fn new() -> Self {
+            Self(PhantomData, parking_lot::Condvar::new())
+        }
 
-    pub(crate) fn notify_one(&self) {
-        self.1.notify_one();
-    }
+        pub(crate) fn wait<'a, T>(&self, mut guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
+            self.1.wait(&mut guard.1);
+            guard
+        }
 
-    pub(crate) fn notify_all(&self) {
-        self.1.notify_all();
+        pub(crate) fn wait_timeout<'a, T>(
+            &self,
+            mut guard: MutexGuard<'a, T>,
+            timeout: Duration,
+        ) -> (MutexGuard<'a, T>, bool) {
+            let result = self.1.wait_for(&mut guard.1, timeout);
+            (guard, result.timed_out())
+        }
+
+        pub(crate) fn notify_one(&self) {
+            self.1.notify_one();
+        }
+
+        pub(crate) fn notify_all(&self) {
+            self.1.notify_all();
+        }
     }
 }
 
 #[cfg(any(miri, target_family = "wasm"))]
-pub(crate) struct Condvar(std::sync::Condvar);
+mod sys {
+    //! `std::sync` backend. Locking or waiting panics if the mutex is
+    //! poisoned.
 
-#[cfg(any(miri, target_family = "wasm"))]
-impl Condvar {
-    pub(crate) fn new() -> Self {
-        Self(std::sync::Condvar::new())
+    use std::ops::{Deref, DerefMut};
+    use std::time::Duration;
+
+    pub(crate) struct Mutex<T>(std::sync::Mutex<T>);
+
+    pub(crate) struct MutexGuard<'a, T>(std::sync::MutexGuard<'a, T>);
+
+    impl<T> Mutex<T> {
+        pub(crate) fn new(val: T) -> Self {
+            Self(std::sync::Mutex::new(val))
+        }
+
+        pub(crate) fn lock(&self) -> MutexGuard<'_, T> {
+            MutexGuard(self.0.lock().expect("poisoned"))
+        }
     }
 
-    pub(crate) fn wait<'a, T>(&self, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
-        MutexGuard(self.0.wait(guard.0).expect("poisoned"))
+    impl<T> Deref for MutexGuard<'_, T> {
+        type Target = T;
+        fn deref(&self) -> &T {
+            &self.0
+        }
     }
 
-    pub(crate) fn wait_timeout<'a, T>(
-        &self,
-        guard: MutexGuard<'a, T>,
-        timeout: Duration,
-    ) -> (MutexGuard<'a, T>, bool) {
-        let (guard, result) = self.0.wait_timeout(guard.0, timeout).expect("poisoned");
-        (MutexGuard(guard), result.timed_out())
+    impl<T> DerefMut for MutexGuard<'_, T> {
+        fn deref_mut(&mut self) -> &mut T {
+            &mut self.0
+        }
     }
 
-    pub(crate) fn notify_one(&self) {
-        self.0.notify_one();
-    }
+    pub(crate) struct Condvar(std::sync::Condvar);
 
-    pub(crate) fn notify_all(&self) {
-        self.0.notify_all();
+    impl Condvar {
+        pub(crate) fn new() -> Self {
+            Self(std::sync::Condvar::new())
+        }
+
+        pub(crate) fn wait<'a, T>(&self, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
+            MutexGuard(self.0.wait(guard.0).expect("poisoned"))
+        }
+
+        pub(crate) fn wait_timeout<'a, T>(
+            &self,
+            guard: MutexGuard<'a, T>,
+            timeout: Duration,
+        ) -> (MutexGuard<'a, T>, bool) {
+            let (guard, result) = self.0.wait_timeout(guard.0, timeout).expect("poisoned");
+            (MutexGuard(guard), result.timed_out())
+        }
+
+        pub(crate) fn notify_one(&self) {
+            self.0.notify_one();
+        }
+
+        pub(crate) fn notify_all(&self) {
+            self.0.notify_all();
+        }
     }
 }
 

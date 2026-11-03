@@ -10,7 +10,7 @@
 //! the transfer manager assumes no JavaScript environment, WASI interface,
 //! executor, or host import. The application supplies the missing capabilities
 //! as a [`WasmRuntime`] in each client's configuration, with
-//! [`RuntimeMode::wasm`](crate::types::RuntimeMode::wasm). A
+//! [`RuntimeConfig::wasm`](crate::RuntimeConfig::wasm). A
 //! [`BufferPool`](crate::memory::BufferPool) built for
 //! [`MemoryConfig::Explicit`](crate::types::MemoryConfig::Explicit) takes one
 //! from
@@ -37,9 +37,8 @@
 //! ```no_run
 //! use std::time::Duration;
 //!
-//! use aws_sdk_s3_transfer_manager::types::RuntimeMode;
 //! use aws_sdk_s3_transfer_manager::wasm::{BoxFuture, WasmRuntime};
-//! use aws_sdk_s3_transfer_manager::{Client, Config};
+//! use aws_sdk_s3_transfer_manager::{Client, Config, RuntimeConfig};
 //!
 //! # fn host_monotonic_nanos() -> u64 { 0 }
 //! # fn host_executor_spawn(_future: BoxFuture) {}
@@ -59,7 +58,7 @@
 //!
 //! let config = Config::builder()
 //!     .s3_config(&sdk_config())
-//!     .runtime_mode(RuntimeMode::wasm(HostRuntime))
+//!     .runtime_config(RuntimeConfig::wasm(HostRuntime))
 //!     .build();
 //! let client = Client::new(config);
 //! ```
@@ -94,7 +93,7 @@ pub type BoxFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 /// Monotonic time and future scheduling supplied by the host application.
 ///
 /// A client schedules its futures on, and reads time from, the runtime in its
-/// [`RuntimeMode`](crate::types::RuntimeMode). Clients may share one runtime
+/// [`RuntimeConfig`](crate::RuntimeConfig). Clients may share one runtime
 /// or use separate ones. A [`TransferInstant`](crate::types::TransferInstant)
 /// is comparable only with instants from runtimes that share its epoch.
 ///

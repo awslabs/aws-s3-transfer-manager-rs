@@ -54,7 +54,7 @@ const IMPORTS: [&str; 4] = [
 
 /// Exports that must trap, and the message each must report.
 const TRAPS: [(&str, &str); 2] = [
-    ("client_without_runtime", "requires RuntimeMode::Wasm"),
+    ("client_without_runtime", "requires RuntimeConfig::wasm"),
     (
         "client_without_sleep",
         "requires an AsyncSleep implementation",

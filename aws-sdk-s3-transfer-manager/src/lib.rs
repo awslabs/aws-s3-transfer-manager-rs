@@ -84,13 +84,17 @@
 //! | `wasm32-wasip1`          | caller's tokio runtime        | WASI                          | WASI preview 1 | caller-supplied; no standard network interface |
 //! | `wasm32-wasip2`          | caller's tokio runtime        | WASI                          | WASI preview 2 | caller-supplied, for example over `wasi:http` |
 //! | `wasm32-wasip3`          | caller's tokio runtime        | WASI                          | WASI preview 3 | caller-supplied                              |
-//! | `wasm32-unknown-unknown` | `RuntimeMode::Wasm` runtime   | `RuntimeMode::Wasm` runtime   | none           | caller-supplied                              |
+//! | `wasm32-unknown-unknown` | `RuntimeConfig::wasm` runtime | `RuntimeConfig::wasm` runtime | none           | caller-supplied                              |
 //!
 //! On every wasm target:
 //!
 //! - The AWS SDK's default HTTPS client is not built. Requests fail unless the
 //!   [`aws_types::SdkConfig`] or S3 configuration supplies an HTTP client.
 //! - File reads and writes run inline on the thread that polls the transfer.
+//! - [`Client::shutdown_completion`] returns `None`, because the transfer
+//!   manager creates no threads on these targets.
+//! - The `__unstable_ext` feature, which adopts a prebuilt managed runtime, is
+//!   unavailable.
 //! - Memory detection is unavailable, so
 //!   [`MemoryBudgetConfig::Auto`](crate::types::MemoryBudgetConfig::Auto) uses
 //!   a fallback: 2 GiB on the WASI targets and 64 MiB on
@@ -101,9 +105,8 @@
 //! On the WASI targets, build with `RUSTFLAGS="--cfg tokio_unstable"`. The S3
 //! client's tokio integration enables tokio's `fs` feature, which tokio accepts
 //! on wasm only with that flag. Transfers run on the caller's tokio runtime,
-//! which may be current-thread, and
-//! [`RuntimeMode::Managed`](crate::types::RuntimeMode::Managed) behaves as
-//! [`RuntimeMode::MultiThreadTokio`](crate::types::RuntimeMode::MultiThreadTokio).
+//! which may be current-thread, and [`Managed`] execution behaves as
+//! [`RuntimeConfig::multi_thread_tokio`].
 //!
 //! ## `wasm32-unknown-unknown`
 //!
@@ -111,11 +114,11 @@
 //! It needs no build flag.
 //!
 //! - Each client's configuration supplies a `wasm::WasmRuntime` through
-//!   `RuntimeMode::wasm`, the only runtime mode on this target. The runtime
-//!   supplies the client's monotonic clock and schedules its futures. A
-//!   [`BufferPool`](crate::memory::BufferPool) built by the caller takes a
-//!   runtime from `BufferPoolBuilder::wasm_runtime`. The `wasm` module, the
-//!   `Wasm` runtime mode, and the builder method exist only on this target.
+//!   `RuntimeConfig::wasm`, the only runtime configuration on this target. The
+//!   runtime supplies the client's monotonic clock and schedules its futures.
+//!   A [`BufferPool`](crate::memory::BufferPool) built by the caller takes a
+//!   runtime from `BufferPoolBuilder::wasm_runtime`. The `wasm` module,
+//!   `RuntimeConfig::wasm`, and the builder method exist only on this target.
 //! - The S3 configuration must supply an HTTP client, an
 //!   [`AsyncSleep`](aws_sdk_s3::config::AsyncSleep) implementation, a
 //!   wall-clock [`TimeSource`](aws_types::sdk_config::TimeSource), credentials,
@@ -221,6 +224,13 @@ pub mod operation;
 /// Transfer manager configuration
 pub mod config;
 
+/// Experimental integrations with version-coupled managed execution.
+#[cfg(feature = "__unstable_ext")]
+pub mod unstable;
+
+#[cfg(all(feature = "__unstable_ext", target_family = "wasm"))]
+compile_error!("`__unstable_ext` adopts a managed runtime, which wasm targets cannot run");
+
 /// Payload-memory configuration and shared pooled storage.
 ///
 /// Transfer-manager clients construct a pool automatically by default.
@@ -281,8 +291,9 @@ pub mod wasm;
 
 pub use self::client::Client;
 use self::config::loader::ConfigLoader;
-pub use self::config::Config;
 pub use self::config::S3ClientConfig;
+pub use self::config::{Config, Managed, RuntimeConfig};
+pub use self::runtime::{ShutdownCompletion, ShutdownError, ShutdownErrorKind};
 pub use self::transfer::SchedulingCtl;
 
 /// Create a config loader

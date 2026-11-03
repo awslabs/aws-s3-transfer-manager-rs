@@ -12,8 +12,7 @@ use std::sync::{Arc, Mutex};
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3_transfer_manager::config::Builder as ConfigBuilder;
-use aws_sdk_s3_transfer_manager::types::RuntimeMode;
-use aws_sdk_s3_transfer_manager::{Client, Config};
+use aws_sdk_s3_transfer_manager::{Client, Config, RuntimeConfig};
 use aws_smithy_runtime_api::client::http::{
     http_client_fn, HttpConnector, HttpConnectorFuture, SharedHttpConnector,
 };
@@ -235,7 +234,7 @@ impl Store {
     pub(crate) fn client(&self, configure: impl FnOnce(ConfigBuilder) -> ConfigBuilder) -> Client {
         let config = Config::builder()
             .s3_config(&self.sdk)
-            .runtime_mode(RuntimeMode::wasm(HostRuntime));
+            .runtime_config(RuntimeConfig::wasm(HostRuntime));
         Client::new(configure(config).build())
     }
 

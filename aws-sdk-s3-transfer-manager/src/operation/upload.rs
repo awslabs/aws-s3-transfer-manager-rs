@@ -133,7 +133,8 @@ mod test {
     use crate::io::InputStream;
     use crate::metrics::unit::ByteUnit;
     use crate::operation::upload::UploadInput;
-    use crate::types::{ConcurrencyMode, PartSize, RuntimeMode, TransferStatus};
+    use crate::types::{ConcurrencyMode, PartSize, TransferStatus};
+    use crate::RuntimeConfig;
 
     /// Connector that keeps CreateMultipartUpload active until its future is
     /// interrupted by the transfer runtime.
@@ -160,7 +161,7 @@ mod test {
     }
 
     /// Abort must terminate after CreateMultipartUpload enters execution.
-    async fn abort_stalled_create_mpu(runtime_mode: RuntimeMode) {
+    async fn abort_stalled_create_mpu(runtime_config: RuntimeConfig) {
         let create_started = Arc::new(Semaphore::new(0));
         let connector = SharedHttpConnector::new(StalledCreateMpuConnector {
             create_started: create_started.clone(),
@@ -176,7 +177,7 @@ mod test {
 
         let tm_config = crate::Config::builder()
             .concurrency(ConcurrencyMode::Explicit(1))
-            .runtime_mode(runtime_mode)
+            .runtime_config(runtime_config)
             .set_multipart_threshold(PartSize::Target(10))
             .set_target_part_size(PartSize::Target(5 * ByteUnit::Mebibyte.as_bytes_u64()))
             .sdk_client(client)
@@ -206,13 +207,13 @@ mod test {
     #[cfg_attr(miri, ignore)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn abort_stalled_create_mpu_on_tokio_runtime() {
-        abort_stalled_create_mpu(RuntimeMode::MultiThreadTokio).await;
+        abort_stalled_create_mpu(RuntimeConfig::multi_thread_tokio()).await;
     }
 
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn abort_stalled_create_mpu_on_managed_runtime() {
-        abort_stalled_create_mpu(RuntimeMode::Managed).await;
+        abort_stalled_create_mpu(RuntimeConfig::default()).await;
     }
 
     /// How [`CompleteMpuConnector`] answers CompleteMultipartUpload.
@@ -289,7 +290,10 @@ mod test {
 
     /// Abort after CompleteMultipartUpload started must still abort the upload,
     /// whether the completion is interrupted or has already failed.
-    async fn abort_during_complete_mpu(runtime_mode: RuntimeMode, behavior: CompleteMpuBehavior) {
+    async fn abort_during_complete_mpu(
+        runtime_config: RuntimeConfig,
+        behavior: CompleteMpuBehavior,
+    ) {
         let complete_started = Arc::new(Semaphore::new(0));
         let abort_uris = Arc::new(Mutex::new(Vec::new()));
         let connector = SharedHttpConnector::new(CompleteMpuConnector {
@@ -308,7 +312,7 @@ mod test {
 
         let tm_config = crate::Config::builder()
             .concurrency(ConcurrencyMode::Explicit(1))
-            .runtime_mode(runtime_mode)
+            .runtime_config(runtime_config)
             .set_multipart_threshold(PartSize::Target(10))
             .set_target_part_size(PartSize::Target(5 * ByteUnit::Mebibyte.as_bytes_u64()))
             .sdk_client(client)
@@ -361,25 +365,33 @@ mod test {
     #[cfg_attr(miri, ignore)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn abort_during_complete_mpu_aborts_upload_on_tokio_runtime() {
-        abort_during_complete_mpu(RuntimeMode::MultiThreadTokio, CompleteMpuBehavior::Stall).await;
+        abort_during_complete_mpu(
+            RuntimeConfig::multi_thread_tokio(),
+            CompleteMpuBehavior::Stall,
+        )
+        .await;
     }
 
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn abort_during_complete_mpu_aborts_upload_on_managed_runtime() {
-        abort_during_complete_mpu(RuntimeMode::Managed, CompleteMpuBehavior::Stall).await;
+        abort_during_complete_mpu(RuntimeConfig::default(), CompleteMpuBehavior::Stall).await;
     }
 
     #[cfg_attr(miri, ignore)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn abort_after_failed_complete_mpu_aborts_upload_on_tokio_runtime() {
-        abort_during_complete_mpu(RuntimeMode::MultiThreadTokio, CompleteMpuBehavior::Fail).await;
+        abort_during_complete_mpu(
+            RuntimeConfig::multi_thread_tokio(),
+            CompleteMpuBehavior::Fail,
+        )
+        .await;
     }
 
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn abort_after_failed_complete_mpu_aborts_upload_on_managed_runtime() {
-        abort_during_complete_mpu(RuntimeMode::Managed, CompleteMpuBehavior::Fail).await;
+        abort_during_complete_mpu(RuntimeConfig::default(), CompleteMpuBehavior::Fail).await;
     }
 
     #[cfg_attr(miri, ignore)]

@@ -31,7 +31,7 @@ const IMPORTS = ["http_cancel", "http_send", "monotonic_now", "wall_clock_now"];
 
 // Exports that must trap, and the message each must report.
 const TRAPS = [
-  ["client_without_runtime", "requires RuntimeMode::Wasm"],
+  ["client_without_runtime", "requires RuntimeConfig::wasm"],
   ["client_without_sleep", "requires an AsyncSleep implementation"],
 ];
 

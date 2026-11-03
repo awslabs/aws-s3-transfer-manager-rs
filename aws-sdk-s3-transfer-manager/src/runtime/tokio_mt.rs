@@ -36,10 +36,13 @@ pub(crate) struct TokioMultiThreadRuntime {
 impl TokioMultiThreadRuntime {
     /// Returns a runtime whose workers run on `spawner`'s executor.
     pub(crate) fn new(handle: Weak<crate::client::Handle>, spawner: Spawner) -> Self {
-        let mut components = RuntimeComponents::default();
         // Without parallel threads, no blocking pool can run file I/O
         // alongside the workers.
-        components.set_direct_io(!spawner.parallel_threads());
+        let components = if spawner.parallel_threads() {
+            RuntimeComponents::default()
+        } else {
+            RuntimeComponents::inline_io()
+        };
         Self {
             pool: Arc::new(WorkerPool::new()),
             handle,
@@ -76,9 +79,9 @@ impl TokioMultiThreadRuntime {
             {
                 tracing::warn!(
                     target: crate::telemetry::TARGET_SCHEDULING,
-                    "RuntimeMode::MultiThreadTokio selected on a current-thread runtime; \
+                    "Caller Tokio execution selected on a current-thread runtime; \
                      transfer workers will serialize onto one thread. Use a \
-                     multi-threaded runtime or RuntimeMode::Managed."
+                     multi-threaded runtime or owned managed execution."
                 );
             }
 
@@ -154,6 +157,10 @@ impl ExecutionRuntime for TokioMultiThreadRuntime {
 
     fn shutdown(&self) {
         self.pool.shutdown();
+    }
+
+    fn shutdown_completion(&self) -> Option<crate::ShutdownCompletion> {
+        None
     }
 
     fn remove_pending_for_transfer(&self, id: TransferId) -> usize {

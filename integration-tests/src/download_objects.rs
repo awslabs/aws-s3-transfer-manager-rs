@@ -17,7 +17,8 @@ use std::time::Duration;
 
 use aws_sdk_s3_transfer_manager::io::walk::S3Walker;
 use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
-use aws_sdk_s3_transfer_manager::types::{FailedTransferPolicy, RuntimeMode};
+use aws_sdk_s3_transfer_manager::types::FailedTransferPolicy;
+use aws_sdk_s3_transfer_manager::RuntimeConfig;
 use s3_mock_server::{FaultType, Occurrence, S3MockServer};
 
 use crate::harness::mock_tm;
@@ -119,7 +120,7 @@ fn count_files_inner(dir: &Path, count: &mut usize) {
 // ---------------------------------------------------------------------------
 
 /// Seed N small objects, download them all, verify count and disk presence.
-async fn test_download_objects_many_small_files(rt: RuntimeMode) {
+async fn test_download_objects_many_small_files(rt: RuntimeConfig) {
     timeout(TEST_TIMEOUT, async {
         let m = mock_tm(rt).await;
 
@@ -155,19 +156,19 @@ async fn test_download_objects_many_small_files(rt: RuntimeMode) {
 
 #[tokio::test]
 async fn test_download_objects_many_small_files_mock_gp() {
-    test_download_objects_many_small_files(RuntimeMode::Managed).await;
+    test_download_objects_many_small_files(RuntimeConfig::default()).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_download_objects_many_small_files_tokio_mt() {
-    test_download_objects_many_small_files(RuntimeMode::MultiThreadTokio).await;
+    test_download_objects_many_small_files(RuntimeConfig::multi_thread_tokio()).await;
 }
 
 /// Per-file byte-content integrity after download.
 #[tokio::test]
 async fn test_download_objects_flat_content_roundtrip() {
     timeout(TEST_TIMEOUT, async {
-        let m = mock_tm(RuntimeMode::Managed).await;
+        let m = mock_tm(RuntimeConfig::default()).await;
 
         let count = 20usize;
         let size = 2 * ByteUnit::Kibibyte.as_bytes_usize();
@@ -222,7 +223,7 @@ async fn test_download_objects_flat_content_roundtrip() {
 #[tokio::test]
 async fn test_download_objects_nested_prefixes() {
     timeout(TEST_TIMEOUT, async {
-        let m = mock_tm(RuntimeMode::Managed).await;
+        let m = mock_tm(RuntimeConfig::default()).await;
 
         let bucket = "test-bucket";
         let prefix = "tree/";
@@ -265,7 +266,7 @@ async fn test_download_objects_nested_prefixes() {
 }
 
 /// Objects large enough to trigger multipart download, content verified.
-async fn test_download_objects_multipart_children(rt: RuntimeMode) {
+async fn test_download_objects_multipart_children(rt: RuntimeConfig) {
     timeout(TEST_TIMEOUT, async {
         let m = mock_tm(rt).await;
 
@@ -327,19 +328,19 @@ async fn test_download_objects_multipart_children(rt: RuntimeMode) {
 
 #[tokio::test]
 async fn test_download_objects_multipart_children_mock_gp() {
-    test_download_objects_multipart_children(RuntimeMode::Managed).await;
+    test_download_objects_multipart_children(RuntimeConfig::default()).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_download_objects_multipart_children_tokio_mt() {
-    test_download_objects_multipart_children(RuntimeMode::MultiThreadTokio).await;
+    test_download_objects_multipart_children(RuntimeConfig::multi_thread_tokio()).await;
 }
 
 /// Empty prefix yields zero downloads with no error.
 #[tokio::test]
 async fn test_download_objects_empty_prefix() {
     timeout(TEST_TIMEOUT, async {
-        let m = mock_tm(RuntimeMode::Managed).await;
+        let m = mock_tm(RuntimeConfig::default()).await;
 
         let bucket = "test-bucket";
         m.server.create_bucket(bucket).await.expect("create bucket");
@@ -378,7 +379,7 @@ async fn test_download_objects_empty_prefix() {
 #[tokio::test]
 async fn test_download_objects_deep_wide_tree() {
     timeout(TEST_TIMEOUT, async {
-        let m = mock_tm(RuntimeMode::Managed).await;
+        let m = mock_tm(RuntimeConfig::default()).await;
 
         let bucket = "test-bucket";
         let root_prefix = "deep/";
@@ -432,7 +433,7 @@ async fn test_download_objects_deep_wide_tree() {
 #[tokio::test]
 async fn test_download_objects_abort_terminates() {
     timeout(TEST_TIMEOUT, async {
-        let m = mock_tm(RuntimeMode::Managed).await;
+        let m = mock_tm(RuntimeConfig::default()).await;
 
         let count = 200usize;
         let size = 1024usize;
@@ -483,7 +484,7 @@ async fn test_download_objects_abort_terminates() {
 /// Seed enough objects to force ListObjectsV2 pagination, verify all objects
 /// across pages are discovered and downloaded. Uses `S3Walker::builder().page_size()`
 /// to force a small page size rather than seeding >1000 objects.
-async fn test_download_objects_listing_pagination(rt: RuntimeMode) {
+async fn test_download_objects_listing_pagination(rt: RuntimeConfig) {
     timeout(TEST_TIMEOUT, async {
         let m = mock_tm(rt).await;
 
@@ -530,12 +531,12 @@ async fn test_download_objects_listing_pagination(rt: RuntimeMode) {
 
 #[tokio::test]
 async fn test_download_objects_listing_pagination_mock_gp() {
-    test_download_objects_listing_pagination(RuntimeMode::Managed).await;
+    test_download_objects_listing_pagination(RuntimeConfig::default()).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_download_objects_listing_pagination_tokio_mt() {
-    test_download_objects_listing_pagination(RuntimeMode::MultiThreadTokio).await;
+    test_download_objects_listing_pagination(RuntimeConfig::multi_thread_tokio()).await;
 }
 
 /// FailedTransferPolicy::Continue with one faulted key: the other objects
@@ -543,7 +544,7 @@ async fn test_download_objects_listing_pagination_tokio_mt() {
 #[tokio::test]
 async fn test_download_objects_continue_policy_partial_failure() {
     timeout(TEST_TIMEOUT, async {
-        let m = mock_tm(RuntimeMode::Managed).await;
+        let m = mock_tm(RuntimeConfig::default()).await;
 
         let bucket = "test-bucket";
         let prefix = "partial/";
@@ -611,7 +612,7 @@ async fn test_download_objects_continue_policy_partial_failure() {
 #[tokio::test]
 async fn test_download_objects_key_path_safety() {
     timeout(TEST_TIMEOUT, async {
-        let m = mock_tm(RuntimeMode::Managed).await;
+        let m = mock_tm(RuntimeConfig::default()).await;
 
         let bucket = "test-bucket";
         let prefix = "safe/";
@@ -690,7 +691,7 @@ async fn test_download_objects_key_path_safety() {
 
 /// Build a nested directory tree, upload it, download it to a fresh dir,
 /// and assert the two trees are byte-identical.
-async fn test_upload_then_download_objects_roundtrip(rt: RuntimeMode) {
+async fn test_upload_then_download_objects_roundtrip(rt: RuntimeConfig) {
     timeout(Duration::from_secs(120), async {
         let m = mock_tm(rt).await;
 
@@ -757,10 +758,10 @@ async fn test_upload_then_download_objects_roundtrip(rt: RuntimeMode) {
 
 #[tokio::test]
 async fn test_upload_then_download_objects_roundtrip_mock_gp() {
-    test_upload_then_download_objects_roundtrip(RuntimeMode::Managed).await;
+    test_upload_then_download_objects_roundtrip(RuntimeConfig::default()).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_upload_then_download_objects_roundtrip_tokio_mt() {
-    test_upload_then_download_objects_roundtrip(RuntimeMode::MultiThreadTokio).await;
+    test_upload_then_download_objects_roundtrip(RuntimeConfig::multi_thread_tokio()).await;
 }
