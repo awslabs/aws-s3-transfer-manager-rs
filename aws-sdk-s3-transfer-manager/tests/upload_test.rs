@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::task::ready;
 use std::{task::Poll, time::Duration};
 
+use aws_sdk_s3::operation::abort_multipart_upload::AbortMultipartUploadOutput;
 use aws_sdk_s3::operation::complete_multipart_upload::{
     CompleteMultipartUploadError, CompleteMultipartUploadInput, CompleteMultipartUploadOutput,
 };
@@ -393,6 +394,8 @@ struct MultipartRecord {
     upload_parts: Mutex<Vec<(i32, i64)>>,
     /// Each CompleteMultipartUpload request, as received.
     completions: Mutex<Vec<CompleteMultipartUploadInput>>,
+    /// How many AbortMultipartUpload requests were answered.
+    aborts: AtomicUsize,
 }
 
 impl MultipartRecord {
@@ -414,6 +417,11 @@ impl MultipartRecord {
     /// How many CompleteMultipartUpload requests were recorded.
     fn complete_calls(&self) -> usize {
         self.completions.lock().unwrap().len()
+    }
+
+    /// How many AbortMultipartUpload requests were recorded.
+    fn abort_calls(&self) -> usize {
+        self.aborts.load(Ordering::SeqCst)
     }
 
     /// The part numbers each recorded CompleteMultipartUpload listed, in the order it listed them.
@@ -444,11 +452,13 @@ impl MultipartRecord {
     }
 }
 
-/// A mock multipart service. CreateMultipartUpload, UploadPart and CompleteMultipartUpload succeed
-/// and are recorded in a [`MultipartRecord`], unless a test overrides one with its own rule.
+/// A mock multipart service. CreateMultipartUpload, UploadPart, CompleteMultipartUpload and
+/// AbortMultipartUpload succeed and are recorded in a [`MultipartRecord`], unless a test overrides
+/// one with its own rule. A failed upload sends AbortMultipartUpload.
 ///
-/// CreateMultipartUpload returns [`MOCK_UPLOAD_ID`]. The default UploadPart and
-/// CompleteMultipartUpload rules match only requests carrying that upload ID, so a request carrying
+/// CreateMultipartUpload returns [`MOCK_UPLOAD_ID`]. The default UploadPart,
+/// CompleteMultipartUpload and AbortMultipartUpload rules match only requests carrying that upload
+/// ID, so a request carrying
 /// any other ID matches no rule and the mock panics. The default UploadPart answer carries the ETag
 /// `etag-{part number}`.
 struct MultipartMock {
@@ -514,11 +524,21 @@ impl MultipartMock {
                 }
             });
 
+        let abort_mpu = mock!(aws_sdk_s3::Client::abort_multipart_upload)
+            .match_requests(|req| req.upload_id() == Some(MOCK_UPLOAD_ID))
+            .then_compute_output({
+                let record = Arc::clone(&self.record);
+                move |_| {
+                    record.aborts.fetch_add(1, Ordering::SeqCst);
+                    AbortMultipartUploadOutput::builder().build()
+                }
+            });
+
         let rules: Vec<Rule> = self
             .overrides
             .iter()
             .cloned()
-            .chain([create_mpu, upload_part, complete_mpu])
+            .chain([create_mpu, upload_part, complete_mpu, abort_mpu])
             .collect();
         mock_client!(aws_sdk_s3, RuleMode::MatchAny, &rules)
     }
@@ -1581,6 +1601,11 @@ async fn upload_failing_on_part_two(part_two: Rule) -> Error {
     );
     assert_eq!(1, part_two.num_calls(), "part 2 must not be re-sent");
     assert_eq!(0, mock.record().complete_calls());
+    assert_eq!(
+        1,
+        mock.record().abort_calls(),
+        "the failed upload must be aborted"
+    );
     error
 }
 

@@ -419,6 +419,14 @@ impl Scheduler {
             self.0.idle_candidate.store(true, Ordering::SeqCst);
         }
         drop(transfers);
+        // The ready-set skiplists defer dropping removed nodes into this
+        // thread's epoch bag, which is only collected once it fills, is
+        // flushed, or the thread exits. A removed group's node holds the
+        // descriptor and so the client `Handle`; if this is a worker that now
+        // goes idle, the bag would keep the client and its runtime alive, and
+        // runtime shutdown (which would exit the worker) waits on them. Flush
+        // so another thread's collection can free it.
+        crossbeam_epoch::pin().flush();
         if registry_became_empty {
             self.publish_global_idle_if_candidate();
         }
