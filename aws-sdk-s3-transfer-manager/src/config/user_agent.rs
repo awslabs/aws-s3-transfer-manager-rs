@@ -191,18 +191,15 @@ impl Intercept for S3TransferManagerInterceptor {
 
 #[cfg(test)]
 mod tests {
+    use crate::runtime::platform::MachineProfile;
     use crate::types::{ConcurrencyMode, MemoryConfig, PartSize};
     use crate::RuntimeConfig;
     use aws_config::{BehaviorVersion, Region};
     use aws_runtime::user_agent::{AwsUserAgent, BusinessMetric, FrameworkMetadata};
+    use aws_sdk_s3::config::interceptors::BeforeTransmitInterceptorContextRef;
     use aws_sdk_s3::config::{
         AppName, Credentials, Intercept, IntoShared, SharedCredentialsProvider,
     };
-    use aws_smithy_http_client::test_util::capture_request;
-    use std::borrow::Cow;
-    use std::sync::{Arc, Mutex};
-    use crate::runtime::platform::MachineProfile;
-    use aws_sdk_s3::config::interceptors::BeforeTransmitInterceptorContextRef;
     use aws_sdk_s3::config::{ConfigBag, RuntimeComponents};
     use aws_sdk_s3::error::BoxError;
     use aws_sdk_s3::operation::get_object::GetObjectOutput;
@@ -210,8 +207,11 @@ mod tests {
     use aws_sdk_s3::operation::put_object::PutObjectOutput;
     use aws_sdk_s3::primitives::ByteStream;
     use aws_sdk_s3::types::Object;
+    use aws_smithy_http_client::test_util::capture_request;
     use aws_smithy_mocks::{mock, mock_client, RuleMode};
     use aws_smithy_runtime_api::client::orchestrator::Metadata;
+    use std::borrow::Cow;
+    use std::sync::{Arc, Mutex};
 
     fn test_credentials() -> SharedCredentialsProvider {
         SharedCredentialsProvider::new(Credentials::new(
@@ -694,12 +694,7 @@ mod tests {
 
     /// Streams the one object the mock S3 serves.
     async fn download(tm: &crate::Client) {
-        let mut handle = tm
-            .download()
-            .bucket("foo")
-            .key("a.txt")
-            .initiate()
-            .unwrap();
+        let mut handle = tm.download().bucket("foo").key("a.txt").initiate().unwrap();
         while handle.body_mut().next().await.is_some() {}
     }
 
