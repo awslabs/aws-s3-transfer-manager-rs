@@ -86,10 +86,12 @@
 //!   [`aws_types::SdkConfig`] or S3 configuration supplies an HTTP client, for
 //!   example one built on `wasi:http`. `wasm32-wasip1` has no networking
 //!   interface for such a client.
-//! - [`RuntimeMode::Managed`](crate::types::RuntimeMode::Managed) behaves as
-//!   [`RuntimeMode::MultiThreadTokio`](crate::types::RuntimeMode::MultiThreadTokio),
-//!   and a current-thread tokio runtime is supported. File reads and writes run
-//!   inline on the thread that polls the transfer.
+//! - [`Managed`] execution behaves as
+//!   [`RuntimeConfig::multi_thread_tokio`], and a current-thread tokio runtime
+//!   is supported. [`Client::shutdown_completion`] returns `None`. File reads
+//!   and writes run inline on the thread that polls the transfer.
+//! - The `__unstable_ext` feature, which adopts a prebuilt managed runtime, is
+//!   unavailable.
 //! - Memory detection is unavailable, so
 //!   [`MemoryBudgetConfig::Auto`](crate::types::MemoryBudgetConfig::Auto) uses
 //!   its 2 GiB fallback. Use
@@ -183,6 +185,13 @@ pub mod operation;
 /// Transfer manager configuration
 pub mod config;
 
+/// Experimental integrations with version-coupled managed execution.
+#[cfg(feature = "__unstable_ext")]
+pub mod unstable;
+
+#[cfg(all(feature = "__unstable_ext", target_family = "wasm"))]
+compile_error!("`__unstable_ext` adopts a managed runtime, which wasm targets cannot run");
+
 /// Payload-memory configuration and shared pooled storage.
 ///
 /// Transfer-manager clients construct a pool automatically by default.
@@ -240,8 +249,9 @@ pub(crate) mod retry;
 
 pub use self::client::Client;
 use self::config::loader::ConfigLoader;
-pub use self::config::Config;
 pub use self::config::S3ClientConfig;
+pub use self::config::{Config, Managed, RuntimeConfig};
+pub use self::runtime::{ShutdownCompletion, ShutdownError, ShutdownErrorKind};
 pub use self::transfer::SchedulingCtl;
 
 /// Create a config loader

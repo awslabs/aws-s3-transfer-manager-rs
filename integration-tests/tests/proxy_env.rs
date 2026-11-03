@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aws_sdk_s3_transfer_manager::config::S3ClientConfig;
-use aws_sdk_s3_transfer_manager::types::RuntimeMode;
+use aws_sdk_s3_transfer_manager::RuntimeConfig;
 use s3_mock_server::S3MockServer;
 use tokio::net::{TcpListener, TcpStream};
 
@@ -76,7 +76,7 @@ async fn test_managed_runtime_http_uses_environment_proxy() {
     let tm = aws_sdk_s3_transfer_manager::Client::new(
         aws_sdk_s3_transfer_manager::Config::builder()
             .s3_config(S3ClientConfig::new(&s3_config))
-            .runtime_mode(RuntimeMode::Managed)
+            .runtime_config(RuntimeConfig::default())
             .build(),
     );
 

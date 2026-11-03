@@ -1573,7 +1573,7 @@ async fn test_stress_multi_iter_reproduce_ec2_hang() {
 ///
 /// # Runtime constraint
 ///
-/// Only valid when the transfer manager uses `ManagedThreadRuntime`
+/// Only valid when the transfer manager uses owned managed execution
 /// (the default). Under `TokioMultiThreadRuntime` the SDK pipeline
 /// runs on tokio worker threads; blocking them with `thread::sleep`
 /// starves the runtime and deadlocks the test.
@@ -1604,7 +1604,7 @@ fn mock_s3_client_for_put_object_with_latency(bucket_name: String, latency: Dura
 ///
 /// # Runtime constraint
 ///
-/// Only valid when the transfer manager uses `ManagedThreadRuntime`
+/// Only valid when the transfer manager uses owned managed execution
 /// (the default). See `mock_s3_client_for_put_object_with_latency`.
 fn mock_s3_client_for_put_object_succeeds_then_fails(
     bucket_name: String,

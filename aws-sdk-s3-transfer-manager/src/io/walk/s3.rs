@@ -613,7 +613,7 @@ mod tests {
             .build();
         let tm = crate::Client::new(
             crate::Config::builder()
-                .s3_config(crate::config::S3ClientConfig::new(&shared).enable_runtime_http(false))
+                .s3_config(crate::config::S3ClientConfig::new(&shared))
                 .build(),
         );
         let context = S3WalkContext::builder()

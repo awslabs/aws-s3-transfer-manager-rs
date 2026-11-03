@@ -36,11 +36,12 @@ pub(crate) struct TokioMultiThreadRuntime {
 
 impl TokioMultiThreadRuntime {
     pub(crate) fn new(handle: Weak<crate::client::Handle>) -> Self {
-        let mut components = RuntimeComponents::default();
-        // wasm targets run file I/O inline: wasip1 and wasip2 cannot spawn
-        // threads for a blocking pool, and wasip3's cooperative threads run
-        // one at a time.
-        components.set_direct_io(cfg!(target_family = "wasm"));
+        // wasm targets have no blocking pool, so file I/O runs inline.
+        let components = if cfg!(target_family = "wasm") {
+            RuntimeComponents::inline_io()
+        } else {
+            RuntimeComponents::default()
+        };
         Self {
             pool: Arc::new(WorkerPool::new()),
             handle,
@@ -77,9 +78,9 @@ impl TokioMultiThreadRuntime {
             {
                 tracing::warn!(
                     target: crate::telemetry::TARGET_SCHEDULING,
-                    "RuntimeMode::MultiThreadTokio selected on a current-thread runtime; \
+                    "Caller Tokio execution selected on a current-thread runtime; \
                      transfer workers will serialize onto one thread. Use a \
-                     multi-threaded runtime or RuntimeMode::Managed."
+                     multi-threaded runtime or owned managed execution."
                 );
             }
 
@@ -157,6 +158,10 @@ impl ExecutionRuntime for TokioMultiThreadRuntime {
 
     fn shutdown(&self) {
         self.pool.shutdown();
+    }
+
+    fn shutdown_completion(&self) -> Option<crate::ShutdownCompletion> {
+        None
     }
 
     fn remove_pending_for_transfer(&self, id: TransferId) -> usize {
