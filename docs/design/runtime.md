@@ -102,12 +102,16 @@ does not alter pool accounting or immutable byte ownership.
 
 ## wasm targets
 
-wasm targets cannot run managed threads or a blocking pool: wasip1 and wasip2
-cannot spawn threads, and wasip3's cooperative threads run one at a time.
-`Managed` configuration therefore runs on the caller's Tokio runtime, as
+wasm targets cannot run managed threads or a blocking pool:
+`wasm32-unknown-unknown`, wasip1, and wasip2 cannot spawn threads, and wasip3's
+cooperative threads run one at a time. On the WASI targets, `Managed`
+configuration therefore runs on the caller's Tokio runtime, as
 `RuntimeConfig::multi_thread_tokio()` does, and a current-thread runtime is
-supported. No managed owner exists, so `Client::shutdown_completion` returns
-`None`, and `__unstable_ext` does not compile.
+supported. `wasm32-unknown-unknown` has no Tokio runtime and accepts only
+`RuntimeConfig::wasm`, whose host-supplied runtime polls the same shared worker
+loops. No managed owner exists on any wasm target, so
+`Client::shutdown_completion` returns `None`, and `__unstable_ext` does not
+compile.
 
 TM builds no transport; the S3 configuration must supply HTTP. Transfer tasks
 and file-backed request bodies both read and write directly on the polling

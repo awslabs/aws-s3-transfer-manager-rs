@@ -12,6 +12,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `RUSTFLAGS="--cfg tokio_unstable"`. On these targets the application supplies the HTTP client,
   `Managed` execution runs on the caller's tokio runtime, which may be current-thread, and file
   I/O runs inline. The crate documentation lists the requirements.
+- The crate builds and runs on `wasm32-unknown-unknown` without build flags, JavaScript, or WASI.
+  Each client's configuration supplies a `wasm::WasmRuntime` with `RuntimeConfig::wasm`, the only
+  runtime configuration on that target. The runtime supplies the client's monotonic clock and schedules its
+  transfer work; a caller-built `BufferPool` takes one from `BufferPoolBuilder::wasm_runtime`. The
+  S3 configuration supplies the HTTP client, sleep implementation, time source, credentials, and
+  region. Transfer-manager retry backoff and request deadlines use the S3 configuration's sleep
+  implementation. Only in-memory and streamed transfers are supported, SigV4a is not enabled, and
+  `MemoryBudgetConfig::Auto` uses 64 MiB.
+- `types::TransferInstant` names the type of `TransferMetrics::started_at` and `finished_at`. It is
+  `std::time::Instant` on every target except `wasm32-unknown-unknown`, where its `now` and
+  `elapsed` take the client's `wasm::WasmRuntime`.
 - Experimental managed-runtime adoption through the non-default `__unstable_ext` feature,
   used by the new `aws-sdk-s3-transfer-manager-ext` adapter. The adapter transfers runtime
   ownership into opaque TM configuration. Managed pools implement the Smithy HTTP client

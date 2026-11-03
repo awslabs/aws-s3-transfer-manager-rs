@@ -26,6 +26,8 @@ pub struct RuntimeConfig {
 enum Kind {
     Managed(Managed),
     MultiThreadTokio,
+    #[cfg(all(target_family = "wasm", target_os = "unknown"))]
+    Wasm(crate::wasm::SharedWasmRuntime),
 }
 
 impl RuntimeConfig {
@@ -40,11 +42,24 @@ impl RuntimeConfig {
     ///
     /// Transfer tasks are spawned on the runtime performing dispatch. Use a
     /// multi-thread runtime so concurrent work can execute on different threads.
-    /// wasm targets are the exception: their threads are unavailable or
+    /// The WASI targets are the exception: their threads are unavailable or
     /// cooperative, so a current-thread runtime is supported there.
+    /// `wasm32-unknown-unknown` supports only `RuntimeConfig::wasm`.
     pub fn multi_thread_tokio() -> Self {
         Self {
             kind: Kind::MultiThreadTokio,
+        }
+    }
+
+    /// Runs transfer-manager work on `runtime`, which also supplies the
+    /// client's monotonic clock.
+    ///
+    /// The only runtime configuration on `wasm32-unknown-unknown`, which has no
+    /// tokio runtime or monotonic clock of its own.
+    #[cfg(all(target_family = "wasm", target_os = "unknown"))]
+    pub fn wasm(runtime: impl crate::wasm::WasmRuntime) -> Self {
+        Self {
+            kind: Kind::Wasm(crate::wasm::SharedWasmRuntime::new(runtime)),
         }
     }
 
@@ -52,6 +67,17 @@ impl RuntimeConfig {
         match &self.kind {
             Kind::Managed(managed) => Some(managed),
             Kind::MultiThreadTokio => None,
+            #[cfg(all(target_family = "wasm", target_os = "unknown"))]
+            Kind::Wasm(_) => None,
+        }
+    }
+
+    /// The host runtime, if this configuration selects one.
+    #[cfg(all(target_family = "wasm", target_os = "unknown"))]
+    pub(crate) fn wasm_runtime(&self) -> Option<&crate::wasm::SharedWasmRuntime> {
+        match &self.kind {
+            Kind::Wasm(runtime) => Some(runtime),
+            Kind::Managed(_) | Kind::MultiThreadTokio => None,
         }
     }
 
@@ -78,9 +104,10 @@ impl Default for RuntimeConfig {
 /// the managed threads. [`crate::Client::shutdown_completion`] provides a
 /// non-owning observer of their joins.
 ///
-/// wasm targets cannot run managed threads. There, managed execution behaves
-/// as [`RuntimeConfig::multi_thread_tokio`], including its support for a
-/// current-thread runtime, and creates no owner to observe.
+/// The WASI targets cannot run managed threads. There, managed execution
+/// behaves as [`RuntimeConfig::multi_thread_tokio`], including its support for
+/// a current-thread runtime, and creates no owner to observe.
+/// `wasm32-unknown-unknown` supports only `RuntimeConfig::wasm`.
 #[non_exhaustive]
 #[derive(Debug, Default)]
 pub struct Managed {

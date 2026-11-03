@@ -709,12 +709,15 @@ mod test {
     }
 
     fn test_metrics() -> std::sync::Arc<crate::transfer::MetricsState> {
-        std::sync::Arc::new(crate::transfer::MetricsState::new())
+        std::sync::Arc::new(crate::transfer::MetricsState::new(
+            crate::runtime::Clock::system(),
+        ))
     }
 
     fn test_telemetry() -> std::sync::Arc<crate::telemetry::Telemetry> {
         std::sync::Arc::new(crate::telemetry::Telemetry::new(
             std::time::Duration::from_secs(1),
+            crate::runtime::Clock::system(),
         ))
     }
 

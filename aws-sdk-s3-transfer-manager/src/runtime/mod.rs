@@ -25,8 +25,14 @@ pub(crate) use managed::{prepare_components, ManagedExecution};
 
 #[allow(dead_code)]
 pub(crate) mod buffer_pool;
+mod clock;
+pub(crate) use clock::Clock;
 pub(crate) mod platform;
+mod spawner;
+pub(crate) use spawner::Spawner;
 pub(crate) mod sync;
+mod timer;
+pub(crate) use timer::Timer;
 
 use aws_smithy_runtime_api::client::http::SharedHttpClient;
 
@@ -128,8 +134,9 @@ impl RuntimeComponents {
 
     /// Enables direct transfer and body reads without an HTTP client, for
     /// targets where blocking offload cannot keep a read off the polling
-    /// thread: wasip1 and wasip2 cannot spawn the threads a blocking pool
-    /// needs, and wasip3's cooperative threads run one at a time.
+    /// thread: `wasm32-unknown-unknown`, `wasm32-wasip1`, and `wasm32-wasip2`
+    /// cannot spawn the threads a blocking pool needs, and `wasm32-wasip3`'s
+    /// cooperative threads run one at a time.
     pub(crate) fn inline_io() -> Self {
         Self {
             direct_io: true,

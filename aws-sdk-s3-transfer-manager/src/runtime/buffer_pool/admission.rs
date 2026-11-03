@@ -13,10 +13,11 @@
 use std::collections::VecDeque;
 use std::fmt;
 use std::task::Waker;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::runtime::sync::sync::atomic::{AtomicU64, Ordering};
 use crate::runtime::sync::sync::{Arc, MutexGuard};
+use crate::types::TransferInstant as Instant;
 
 use super::{invariant_violation, CarrierCount, PoolInner};
 
@@ -104,15 +105,16 @@ pub(super) struct AdmissionState {
 }
 
 impl AdmissionState {
-    /// Creates empty admission state with one immutable normal ceiling.
-    pub(super) fn new(configured_capacity: CarrierCount) -> Self {
+    /// Creates empty admission state with one immutable normal ceiling, whose
+    /// queue observations start at `now`.
+    pub(super) fn new(configured_capacity: CarrierCount, now: Instant) -> Self {
         Self {
             ledger: AdmissionLedger {
                 configured_capacity,
                 prepared_capacity: CarrierCount::ZERO,
                 active_planned_demand: CarrierCount::ZERO,
             },
-            queue: ReservationQueue::new(Instant::now()),
+            queue: ReservationQueue::new(now),
         }
     }
 
@@ -931,7 +933,7 @@ mod tests {
 
     #[test]
     fn test_grant_cannot_publish_before_preparing_its_floor() {
-        let mut admission = AdmissionState::new(CarrierCount::new(1));
+        let mut admission = AdmissionState::new(CarrierCount::new(1), Instant::now());
         let coverage = CoverageState::new();
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

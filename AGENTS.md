@@ -6,6 +6,7 @@ These instructions are for coding agents working in this repository. The same ru
 
 - `aws-sdk-s3-transfer-manager/`: the crate.
 - `integration-tests/`, `s3-mock-server/`: mock-S3 integration tests.
+- `wasm32-unknown-unknown-tests/`: a wasm module that runs transfers on `wasm32-unknown-unknown` over HTTP to `s3-mock-server` through host imports, which its `wasmtime-runner/` workspace and `run-node.mjs` supply.
 - `wasm32-wasi-tests/`: a WASI command that runs transfers over HTTP to `s3-mock-server` on `wasm32-wasip2` and `wasm32-wasip3`.
 - `benches/`: benchmarks.
 - `fuzz/`: a separate Cargo workspace with its own lockfile.

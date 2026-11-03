@@ -42,7 +42,8 @@ pub enum MemoryBudgetConfig {
     ///
     /// Effective memory includes process or container limits where the platform
     /// exposes them. The result is rounded down to complete carriers. If
-    /// detection is unavailable, the pool uses 2 GiB.
+    /// detection is unavailable, the pool uses 2 GiB, or 64 MiB on
+    /// `wasm32-unknown-unknown`.
     #[default]
     Auto,
     /// Use the given fraction of detected effective memory.
@@ -288,10 +289,23 @@ pub struct TransferMetrics {
     /// Expected total payload bytes, if known.
     pub total_bytes: Option<u64>,
     /// When the transfer was initiated.
-    pub started_at: std::time::Instant,
+    pub started_at: TransferInstant,
     /// When the transfer reached a terminal state, if it has.
-    pub finished_at: Option<std::time::Instant>,
+    pub finished_at: Option<TransferInstant>,
 }
+
+/// A point in time read from the transfer manager's monotonic clock.
+///
+/// This is [`std::time::Instant`] on every target except
+/// `wasm32-unknown-unknown`. That target has no standard monotonic clock, so it
+/// uses a type with the same monotonic operations whose time comes from the
+/// client's `wasm::WasmRuntime`. Its `now` and `elapsed` take that runtime as
+/// an argument.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+pub type TransferInstant = std::time::Instant;
+
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+pub use crate::wasm::instant::TransferInstant;
 
 /// Type of the bucket for the transfer
 #[derive(Debug, Clone, Copy, PartialEq)]

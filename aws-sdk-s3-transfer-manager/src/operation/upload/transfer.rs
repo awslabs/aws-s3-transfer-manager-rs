@@ -128,8 +128,11 @@ impl UploadTransfer {
         // and at completion hold the body to exactly that many bytes.
         let size_hint = apply_content_length(size_hint, request.content_length())
             .map_err(crate::error::invalid_input)?;
-        let observability =
-            UploadObservability::new(ctx.handle.config.diagnostics().transfer(), size_hint);
+        let observability = UploadObservability::new(
+            ctx.handle.config.diagnostics().transfer(),
+            size_hint,
+            ctx.handle.timer.clock(),
+        );
 
         // Only equal bounds are a known total. A bounded stream reports no total while in progress;
         // its actual size is published after EOF.
@@ -706,37 +709,42 @@ impl UploadTransfer {
             .observability
             .start_request(&self.inner.ctx, UploadRequestKind::UploadPart);
         let retry_classify = crate::retry::classify_upload_part_retry;
-        let result = crate::retry::retry(req_metrics.metrics_mut(), retry_classify, |_hedge| {
-            let body = sdk_body
-                .try_clone()
-                .expect("UploadPart SdkBody must be retryable");
-            let req = copy_fields_to_upload_part_request(
-                &self.inner.request,
-                self.inner
-                    .ctx
-                    .s3_client()
-                    .upload_part()
-                    .upload_id(&upload_id)
-                    .part_number(part_num_i32)
-                    .content_length(content_length)
-                    .body(ByteStream::new(body)),
-                checksum.as_ref(),
-            );
-            async move {
-                req.customize()
-                    .config_override(
-                        self.inner
-                            .ctx
-                            .handle
-                            .upload_override(self.inner.request.bucket()),
-                    )
-                    .disable_payload_signing()
-                    .send()
-                    .instrument(tracing::debug_span!("send-upload-part", part_number))
-                    .await
-                    .map_err(|e| crate::retry::GuardError::Inner(crate::error::Error::from(e)))
-            }
-        })
+        let result = crate::retry::retry(
+            &self.inner.ctx.handle.timer,
+            req_metrics.metrics_mut(),
+            retry_classify,
+            |_hedge| {
+                let body = sdk_body
+                    .try_clone()
+                    .expect("UploadPart SdkBody must be retryable");
+                let req = copy_fields_to_upload_part_request(
+                    &self.inner.request,
+                    self.inner
+                        .ctx
+                        .s3_client()
+                        .upload_part()
+                        .upload_id(&upload_id)
+                        .part_number(part_num_i32)
+                        .content_length(content_length)
+                        .body(ByteStream::new(body)),
+                    checksum.as_ref(),
+                );
+                async move {
+                    req.customize()
+                        .config_override(
+                            self.inner
+                                .ctx
+                                .handle
+                                .upload_override(self.inner.request.bucket()),
+                        )
+                        .disable_payload_signing()
+                        .send()
+                        .instrument(tracing::debug_span!("send-upload-part", part_number))
+                        .await
+                        .map_err(|e| crate::retry::GuardError::Inner(crate::error::Error::from(e)))
+                }
+            },
+        )
         .instrument(tracing::debug_span!(
             target: crate::telemetry::TARGET_TRANSFER,
             "upload-part",
@@ -874,34 +882,39 @@ impl UploadTransfer {
             .observability
             .start_request(&self.inner.ctx, UploadRequestKind::PutObject);
         let retry_classify = crate::retry::classify_upload_part_retry;
-        let result = crate::retry::retry(req_metrics.metrics_mut(), retry_classify, |_hedge| {
-            let body = sdk_body
-                .try_clone()
-                .expect("PutObject SdkBody must be retryable");
-            let put_req = copy_fields_to_put_object_request(
-                &self.inner.request,
-                self.inner
-                    .ctx
-                    .s3_client()
-                    .put_object()
-                    .body(ByteStream::new(body)),
-            );
-            async move {
-                put_req
-                    .customize()
-                    .config_override(
-                        self.inner
-                            .ctx
-                            .handle
-                            .upload_override(self.inner.request.bucket()),
-                    )
-                    .disable_payload_signing()
-                    .send()
-                    .instrument(tracing::debug_span!("send-put-object"))
-                    .await
-                    .map_err(|e| crate::retry::GuardError::Inner(crate::error::Error::from(e)))
-            }
-        })
+        let result = crate::retry::retry(
+            &self.inner.ctx.handle.timer,
+            req_metrics.metrics_mut(),
+            retry_classify,
+            |_hedge| {
+                let body = sdk_body
+                    .try_clone()
+                    .expect("PutObject SdkBody must be retryable");
+                let put_req = copy_fields_to_put_object_request(
+                    &self.inner.request,
+                    self.inner
+                        .ctx
+                        .s3_client()
+                        .put_object()
+                        .body(ByteStream::new(body)),
+                );
+                async move {
+                    put_req
+                        .customize()
+                        .config_override(
+                            self.inner
+                                .ctx
+                                .handle
+                                .upload_override(self.inner.request.bucket()),
+                        )
+                        .disable_payload_signing()
+                        .send()
+                        .instrument(tracing::debug_span!("send-put-object"))
+                        .await
+                        .map_err(|e| crate::retry::GuardError::Inner(crate::error::Error::from(e)))
+                }
+            },
+        )
         .instrument(tracing::debug_span!(
             target: crate::telemetry::TARGET_TRANSFER,
             "put-object",
@@ -964,7 +977,8 @@ impl UploadTransfer {
             response_builder,
         } = completion;
         let transfer_diagnostics = self.inner.ctx.handle.config.diagnostics().transfer();
-        let completion_timer = UploadDiagnosticTimer::start(transfer_diagnostics);
+        let completion_timer =
+            UploadDiagnosticTimer::start(transfer_diagnostics, self.inner.ctx.handle.timer.clock());
         let upload_id = {
             let state = self.inner.state.lock().expect("lock poisoned");
             match &*state {

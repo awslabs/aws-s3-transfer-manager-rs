@@ -9,13 +9,13 @@ use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Weak;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use futures_util::FutureExt;
 
 mod worker_pool;
 
-use super::{ExecutionRuntime, RuntimeComponents, ScheduledWork};
+use super::{ExecutionRuntime, RuntimeComponents, ScheduledWork, Spawner};
 use crate::runtime::sync::SubmissionGuard;
 use crate::transfer::{TransferId, WorkOutcome};
 use worker_pool::WorkerPool;
@@ -24,29 +24,31 @@ use worker_pool::WorkerPool;
 ///
 /// Assumes it is running within an existing tokio multi-threaded runtime context.
 /// Workers are spawned via `tokio::spawn` and pull work from a shared queue.
-/// On wasm targets it runs file I/O inline and also accepts a current-thread
-/// runtime.
 #[derive(Debug)]
 pub(crate) struct TokioMultiThreadRuntime {
     pool: Arc<WorkerPool>,
     handle: Weak<crate::client::Handle>,
     worker_count: AtomicUsize,
     components: RuntimeComponents,
+    spawner: Spawner,
 }
 
 impl TokioMultiThreadRuntime {
-    pub(crate) fn new(handle: Weak<crate::client::Handle>) -> Self {
-        // wasm targets have no blocking pool, so file I/O runs inline.
-        let components = if cfg!(target_family = "wasm") {
-            RuntimeComponents::inline_io()
-        } else {
+    /// Returns a runtime whose workers run on `spawner`'s executor.
+    pub(crate) fn new(handle: Weak<crate::client::Handle>, spawner: Spawner) -> Self {
+        // Without parallel threads, no blocking pool can run file I/O
+        // alongside the workers.
+        let components = if spawner.parallel_threads() {
             RuntimeComponents::default()
+        } else {
+            RuntimeComponents::inline_io()
         };
         Self {
             pool: Arc::new(WorkerPool::new()),
             handle,
             worker_count: AtomicUsize::new(0),
             components,
+            spawner,
         }
     }
 
@@ -67,10 +69,9 @@ impl TokioMultiThreadRuntime {
 
             // Emit the current-thread guardrail warning once, at the site where
             // workers actually execute (not at Client::new, which may observe a
-            // different runtime). wasm targets are exempt: their threads are
-            // unavailable or cooperative, so no runtime choice avoids
-            // serialization.
-            if !cfg!(target_family = "wasm")
+            // different runtime). Without parallel threads no runtime choice
+            // avoids serialization, so the warning does not apply.
+            if self.spawner.parallel_threads()
                 && matches!(
                     tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()),
                     Ok(tokio::runtime::RuntimeFlavor::CurrentThread)
@@ -123,7 +124,7 @@ impl TokioMultiThreadRuntime {
         }
     }
 
-    /// Spawn `count` tokio tasks that pull from the shared worker pool.
+    /// Spawn `count` worker tasks that pull from the shared worker pool.
     ///
     /// Does NOT update `worker_count` — callers own the counter update
     /// so each path (genesis / growth) can publish the authoritative value
@@ -132,9 +133,7 @@ impl TokioMultiThreadRuntime {
         for _ in 0..count {
             let pool = Arc::clone(&self.pool);
             let handle = self.handle.clone();
-            tokio::spawn(async move {
-                worker_loop(pool, handle).await;
-            });
+            self.spawner.spawn(worker_loop(pool, handle));
         }
     }
 }
@@ -202,7 +201,7 @@ async fn worker_loop(pool: Arc<WorkerPool>, handle: Weak<crate::client::Handle>)
 
         tracing::trace!(target: crate::telemetry::TARGET_EXECUTION, wid, %tid, "executing");
         let transfer = work.descriptor.transfer();
-        let started = Instant::now();
+        let started = h.timer.clock().now();
 
         let token = work.descriptor.cancellation_token().clone();
         let outcome = AssertUnwindSafe(async {
@@ -227,7 +226,7 @@ async fn worker_loop(pool: Arc<WorkerPool>, handle: Weak<crate::client::Handle>)
 
         tracing::trace!(target: crate::telemetry::TARGET_EXECUTION, wid, %tid, ?outcome, "completed");
 
-        let elapsed = started.elapsed();
+        let elapsed = h.timer.clock().elapsed(started);
         pool.complete();
         h.scheduler.on_completion(work, outcome, elapsed);
     }
@@ -280,7 +279,7 @@ mod tests {
         let slot_clone = slot.clone();
 
         let handle = Handle::new_for_test_with_runtime(test_config(), controller.clone(), |weak| {
-            let rt = Arc::new(TokioMultiThreadRuntime::new(weak));
+            let rt = Arc::new(TokioMultiThreadRuntime::new(weak, Spawner::tokio()));
             slot_clone.set(rt.clone()).ok();
             rt
         });

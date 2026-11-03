@@ -149,6 +149,7 @@ jobs:
       - musl
       - freebsd
       - android
+      - wasm32-unknown-unknown
       - wasm32-wasi
       - e2e
     steps:
@@ -422,45 +423,13 @@ jobs:
           # The server runs on the host, so the wasm flags do not apply.
           RUSTFLAGS: ""
       - name: Run harness under Wasmtime
+        # `inherit-network` lets the module connect to the server.
         run: |
           work="$RUNNER_TEMP/wasi-work"
-          log="$RUNNER_TEMP/wasi-harness.log"
-          server_log="$RUNNER_TEMP/s3-mock-server.log"
           mkdir -p "$work"
-          target/debug/s3-mock-server --slow-down-once bucket/retried bucket > "$server_log" 2>&1 &
-          server=$!
-          trap 'kill "$server" 2>/dev/null || true' EXIT
-          # The server prints its loopback address once it accepts connections.
-          address=
-          for _ in {1..100}; do
-            address=$(grep -m 1 -E '^127\.0\.0\.1:[0-9]+$' "$server_log" || true)
-            [[ -n "$address" ]] && break
-            sleep 0.1
-          done
-          if [[ -z "$address" ]]; then
-            echo "s3-mock-server did not report an address" >&2
-            exit 1
-          fi
-          # `inherit-network` lets the module connect to the server.
-          wasmtime run -S inherit-network --dir "$work::/work" "$HARNESS" /work "$address" \
-            | tee "$log"
-          # The module reports what it ran, so an empty or mistargeted build
-          # cannot pass by exiting zero.
-          header="^wasm32-wasi-tests: ([0-9]+) scenarios on ${{ matrix.target }}$"
-          if ! [[ "$(head -n 1 "$log")" =~ $header ]]; then
-            echo "the harness did not report running on ${{ matrix.target }}" >&2
-            exit 1
-          fi
-          count=${BASH_REMATCH[1]}
-          passed=$(grep -c '^PASS ' "$log" || true)
-          if (( count == 0 || passed != count )) \
-            || [[ "$(tail -n 1 "$log")" != "$count scenarios passed" ]]; then
-            echo "the harness reported $passed of $count scenarios passing" >&2
-            exit 1
-          fi
-      - name: Show mock S3 server output
-        if: failure()
-        run: cat "$RUNNER_TEMP/s3-mock-server.log" || true
+          .github/scripts/run-harness.sh target/debug/s3-mock-server \
+            "^wasm32-wasi-tests: ([0-9]+) scenarios on ${{ matrix.target }}$" \
+            wasmtime run -S inherit-network --dir "$work::/work" "$HARNESS" /work
 
   fmt:
     name: fmt
@@ -484,6 +453,11 @@ jobs:
           fi
           if ! cargo fmt --manifest-path fuzz/Cargo.toml -- --check; then
             printf "Please run \`cargo fmt --manifest-path fuzz/Cargo.toml\` to fix fuzz-target formatting.\n" >&2
+            exit 1
+          fi
+          runner=wasm32-unknown-unknown-tests/wasmtime-runner/Cargo.toml
+          if ! cargo fmt --manifest-path "$runner" -- --check; then
+            printf "Please run \`cargo fmt --manifest-path %s\` to fix Wasmtime runner formatting.\n" "$runner" >&2
             exit 1
           fi
 
@@ -559,6 +533,72 @@ jobs:
             . "$HOME/.cargo/env"
             export CMAKE_GENERATOR=Ninja
             cargo test --locked -p aws-sdk-s3-transfer-manager --lib
+
+  wasm32-unknown-unknown:
+    name: wasm32-unknown-unknown
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    needs: basics
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/wasm32-unknown-unknown
+      HARNESS: ${{ github.workspace }}/target/wasm32-unknown-unknown/wasm32-unknown-unknown/release/wasm32_unknown_unknown_tests.wasm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust ${{ env.rust_clippy }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.rust_clippy }}
+          targets: wasm32-unknown-unknown
+          components: clippy
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: |
+          cargo clippy --locked -p aws-sdk-s3-transfer-manager -p wasm32-unknown-unknown-tests \
+            --target wasm32-unknown-unknown --no-deps
+          cargo clippy --locked -p aws-sdk-s3-transfer-manager --features sdk-v1 \
+            --target wasm32-unknown-unknown --no-deps
+          cargo clippy --locked --manifest-path wasm32-unknown-unknown-tests/wasmtime-runner/Cargo.toml \
+            --all-targets --no-deps
+      - name: Docs
+        run: |
+          cargo doc --locked -p aws-sdk-s3-transfer-manager --target wasm32-unknown-unknown \
+            --no-deps --document-private-items
+        env:
+          RUSTDOCFLAGS: -Dwarnings
+      - name: Check dependency graph
+        # The transfer manager must not depend on a host on this target.
+        run: |
+          forbidden=$(cargo tree --locked -p aws-sdk-s3-transfer-manager \
+              --target wasm32-unknown-unknown -e normal --prefix none \
+            | awk '{print $1}' | sort -u \
+            | grep -xE 'getrandom|wasm-bindgen|js-sys|web-sys|wasi|wasip2|wasip3|wit-bindgen|hyper|rustls|socket2|mio' \
+            || true)
+          if [ -n "$forbidden" ]; then
+            echo "host-specific dependencies on wasm32-unknown-unknown: $forbidden" >&2
+            exit 1
+          fi
+      - name: Build runtime harness
+        run: cargo build --locked -p wasm32-unknown-unknown-tests --target wasm32-unknown-unknown --release
+      - name: Build Wasmtime runner
+        run: cargo build --locked --release --manifest-path wasm32-unknown-unknown-tests/wasmtime-runner/Cargo.toml
+      - name: Build mock S3 server
+        run: cargo build --locked -p s3-mock-server --bin s3-mock-server
+      # The script starts a fresh server for each runner, because the server's
+      # `503 SlowDown` fault fires only once.
+      - name: Run harness under Wasmtime
+        run: >-
+          .github/scripts/run-harness.sh "$CARGO_TARGET_DIR/debug/s3-mock-server"
+          '^wasm32-unknown-unknown-tests: ([0-9]+) scenarios under Wasmtime$'
+          "$CARGO_TARGET_DIR/release/wasmtime-runner" "$HARNESS"
+      - name: Run harness under Node
+        run: >-
+          .github/scripts/run-harness.sh "$CARGO_TARGET_DIR/debug/s3-mock-server"
+          '^wasm32-unknown-unknown-tests: ([0-9]+) scenarios under Node$'
+          node wasm32-unknown-unknown-tests/run-node.mjs "$HARNESS"
 
   check-external-types:
     name: check-external-types (${{ matrix.os }})

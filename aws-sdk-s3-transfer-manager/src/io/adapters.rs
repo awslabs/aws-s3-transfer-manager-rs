@@ -197,9 +197,12 @@ mod tests {
                 part_size,
                 buffer_pool.clone(),
                 false,
-                std::sync::Arc::new(crate::transfer::MetricsState::new()),
+                std::sync::Arc::new(crate::transfer::MetricsState::new(
+                    crate::runtime::Clock::system(),
+                )),
                 std::sync::Arc::new(crate::telemetry::Telemetry::new(
                     std::time::Duration::from_secs(1),
+                    crate::runtime::Clock::system(),
                 )),
             ),
             buffer_pool,

@@ -987,6 +987,7 @@ impl DownloadTransfer {
 
         let mut initial = Some(stream);
         let recv_latencies = &self.inner.ctx.handle.telemetry.recv_latencies;
+        let timer = &self.inner.ctx.handle.timer;
         // The deadline guards only the GET response (TTFB); the body-read is
         // untimed. The first attempt reuses the discovery body — no network send
         // — so it skips the `guarded` timer entirely (timing/recording a ~0µs
@@ -994,7 +995,7 @@ impl DownloadTransfer {
         // goes through `guarded`, which times and records its TTFB.
         let reservation = slot.reservation();
         let retry_classify = crate::retry::classify_body_retry;
-        let result = crate::retry::retry(req_metrics.metrics_mut(), retry_classify, |allow_hedge| {
+        let result = crate::retry::retry(timer, req_metrics.metrics_mut(), retry_classify, |allow_hedge| {
             let pre_issued = initial.take();
             let etag = etag.clone();
             let ctx = self.inner.ctx.clone();
@@ -1033,7 +1034,7 @@ impl DownloadTransfer {
                             ));
                         }
                         recv_latencies
-                            .guarded(allow_hedge, async {
+                            .guarded(timer, allow_hedge, async {
                                 req.send()
                                     .await
                                     .map(|resp| resp.body)
@@ -1148,6 +1149,7 @@ impl DownloadTransfer {
         let reservation = slot.reservation();
 
         let recv_latencies = &self.inner.ctx.handle.telemetry.recv_latencies;
+        let timer = &self.inner.ctx.handle.timer;
         // The deadline guards only the GET response (send → headers ≈ TTFB): the
         // `recv_latencies.guarded(send)` wrapper times the send, then the body is
         // read UNTIMED. A large part on a slow-but-healthy link takes a long time
@@ -1157,8 +1159,11 @@ impl DownloadTransfer {
         // the retry loop.
         let mut req_metrics = self.start_request(DownloadRequestKind::Range);
         let retry_classify = crate::retry::classify_body_retry;
-        let result =
-            crate::retry::retry(req_metrics.metrics_mut(), retry_classify, |allow_hedge| {
+        let result = crate::retry::retry(
+            timer,
+            req_metrics.metrics_mut(),
+            retry_classify,
+            |allow_hedge| {
                 let rh = range_header.clone();
                 let etag = etag.clone();
                 let ctx = self.inner.ctx.clone();
@@ -1179,7 +1184,7 @@ impl DownloadTransfer {
                     // so a mismatch is classified before we commit to the body read.
                     let rh_validate = rh.clone();
                     let resp = recv_latencies
-                        .guarded(allow_hedge, async move {
+                        .guarded(timer, allow_hedge, async move {
                             let resp = req.send().await.map_err(crate::error::Error::from)?;
                             validate_content_range(&rh_validate, resp.content_range())?;
                             Ok::<_, crate::error::Error>(resp)
@@ -1198,13 +1203,14 @@ impl DownloadTransfer {
                     .map_err(crate::retry::GuardError::Inner)?;
                     Ok::<_, crate::retry::GuardError<crate::error::Error>>((chunk_meta, bytes))
                 }
-            })
-            .instrument(tracing::debug_span!(
-                target: crate::telemetry::TARGET_TRANSFER,
-                "download-part-reissue",
-                tid = %self.id()
-            ))
-            .await;
+            },
+        )
+        .instrument(tracing::debug_span!(
+            target: crate::telemetry::TARGET_TRANSFER,
+            "download-part-reissue",
+            tid = %self.id()
+        ))
+        .await;
         let _ = req_metrics.finish();
 
         let (chunk_meta, bytes) = match result {
