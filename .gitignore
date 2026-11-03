@@ -68,3 +68,7 @@ fuzz/corpus/
 # python
 __pycache__
 /tools/scripts/**/*.py[cod]
+
+# Kiro context folders
+.kiro/
+.kiro-*/

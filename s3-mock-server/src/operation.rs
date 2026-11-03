@@ -24,6 +24,7 @@ pub enum Operation {
     ListBuckets,
     ListObjectsV2,
     PutObject,
+    RestoreObject,
     UploadPart,
 }
 

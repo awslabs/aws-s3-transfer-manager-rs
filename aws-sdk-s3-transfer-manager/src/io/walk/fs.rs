@@ -8,9 +8,8 @@ use std::fs::Metadata;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use same_file::Handle;
-
 use super::error::{WalkError, WalkErrorKind};
+use crate::io::fs::Handle;
 
 /// A directory queued for traversal, carrying the chain of ancestor directory
 /// handles needed for per-path symlink cycle detection.
