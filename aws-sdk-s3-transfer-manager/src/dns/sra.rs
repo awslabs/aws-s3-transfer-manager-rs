@@ -8,7 +8,7 @@ use std::cmp::Reverse;
 use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Instant;
 
 /*
@@ -338,11 +338,14 @@ struct HostEntry {
 
     /// is an async resolution task currently outstanding?
     pending_resolution: bool,
+
+    /// reference to the resolver's configuration as we need its fields internally
+    config: Arc<SraResolverConfig>,
 }
 
 impl HostEntry {
     /// Create a new HostEntry instance
-    fn new() -> HostEntry {
+    fn new(config: Arc<SraResolverConfig>) -> HostEntry {
         HostEntry {
             pending_requests: VecDeque::new(),
             ipv4_addresses: GenerationalAddressSet::new(),
@@ -350,6 +353,7 @@ impl HostEntry {
             addresses_by_ttl: PriorityQueue::new(),
             last_resolution_timepoint: None,
             pending_resolution: false,
+            config,
         }
     }
 
@@ -368,8 +372,8 @@ impl HostEntry {
     }
 
     /// Updates the entry with a newly-resolved address
-    fn on_address_resolved(&mut self, address: IpAddr, config: &SraResolverConfig) {
-        let ttl = (config.clock)() + config.resolution_ttl;
+    fn on_address_resolved(&mut self, address: IpAddr) {
+        let ttl = (self.config.clock)() + self.config.resolution_ttl;
 
         // If we already know about this address, just extend its TTL, regardless of any other
         // (healthy/unhealthy/banned) status
@@ -394,8 +398,8 @@ impl HostEntry {
 
     /// Mark an address as unhealthy.  If the address is already unhealthy, extend the duration
     /// it will stay in that state.
-    fn demote_address(&mut self, address: IpAddr, duration: Duration, config: &SraResolverConfig) {
-        let now = (config.clock)();
+    fn demote_address(&mut self, address: IpAddr, duration: Duration) {
+        let now = (self.config.clock)();
         match address {
             IpAddr::V4(v4addr) => {
                 self.ipv4_addresses.demote_address(v4addr, duration, now);
@@ -407,8 +411,8 @@ impl HostEntry {
     }
 
     /// Removes all addresses whose TTL have expired from the host entry
-    fn purge_expired(&mut self, config: &SraResolverConfig) {
-        let now = (config.clock)();
+    fn purge_expired(&mut self) {
+        let now = (self.config.clock)();
 
         while !self.addresses_by_ttl.is_empty() {
             if self.addresses_by_ttl.peek().unwrap().1 <= &now {
@@ -421,12 +425,7 @@ impl HostEntry {
     }
 
     /// Penalize an address based on the connection error category
-    fn handle_connection_error(
-        &mut self,
-        address: IpAddr,
-        error: HostEventConnectionError,
-        config: &SraResolverConfig,
-    ) {
+    fn handle_connection_error(&mut self, address: IpAddr, error: HostEventConnectionError) {
         match error.category {
             ConnectionErrorCategory::Fatal => {
                 // remove from the sets, keep in TTL, effectively banishes the address until
@@ -441,20 +440,20 @@ impl HostEntry {
                 }
             }
             ConnectionErrorCategory::Major => {
-                self.demote_address(address, config.resolution_ttl, config);
+                self.demote_address(address, self.config.resolution_ttl);
             }
             ConnectionErrorCategory::Standard(duration) => {
-                self.demote_address(address, duration, config);
+                self.demote_address(address, duration);
             }
         }
     }
 
     /// Pulls addresses from the cache to complete a resolution request.  If no addresses exist,
     /// fail the request
-    fn complete_request(&mut self, request: ResolveRequestInternal, config: &SraResolverConfig) {
+    fn complete_request(&mut self, request: ResolveRequestInternal) {
         let mut addresses: Vec<IpAddr> = Vec::new();
 
-        let now = (config.clock)();
+        let now = (self.config.clock)();
         let v4_addr_option = self.ipv4_addresses.acquire_address(now);
         if let Some(v4_addr) = v4_addr_option {
             addresses.push(IpAddr::V4(v4_addr));
@@ -480,11 +479,10 @@ impl HostEntry {
         &mut self,
         request: ResolveRequestInternal,
         context: &OperationHandlerContext,
-        config: &SraResolverConfig,
     ) {
-        self.purge_expired(config);
+        self.purge_expired();
 
-        let now = (config.clock)();
+        let now = (self.config.clock)();
         // if it's our first request or enough time has passed since the last one
         let mut should_spawn_resolve: bool = self.last_resolution_timepoint.is_none();
         if let Some(last_resolution_timepoint) = self.last_resolution_timepoint {
@@ -510,20 +508,20 @@ impl HostEntry {
         }
 
         // complete the request with what we have
-        self.complete_request(request, config);
+        self.complete_request(request);
     }
 
     /// applies the result of a background resolution task to the host entry.  If resolution was
     /// a failure, then fail all pending requests.  Otherwise, apply all resolved addresses
     /// to the cached state appropriately, then attempt to complete pending requests normally.
-    fn handle_resolve_result(&mut self, result: ResolveResult, config: &SraResolverConfig) {
-        self.purge_expired(config);
+    fn handle_resolve_result(&mut self, result: ResolveResult) {
+        self.purge_expired();
         self.pending_resolution = false;
 
         match result.result {
             Ok(addresses) => {
                 for address in addresses {
-                    self.on_address_resolved(address, config);
+                    self.on_address_resolved(address);
                 }
             }
             Err(err) => {
@@ -541,17 +539,17 @@ impl HostEntry {
         // complete any pending requests with what we have available, if anything
         while !self.pending_requests.is_empty() {
             let pending_request = self.pending_requests.pop_front().unwrap();
-            self.complete_request(pending_request, config);
+            self.complete_request(pending_request);
         }
     }
 
     /// Applies a host event to a host's entry in the resolver
-    fn handle_host_event(&mut self, event: HostEvent, config: &SraResolverConfig) {
-        self.purge_expired(config);
+    fn handle_host_event(&mut self, event: HostEvent) {
+        self.purge_expired();
 
         match event.event_data {
             HostEventInformation::ConnectionError(error) => {
-                self.handle_connection_error(event.address, error, config)
+                self.handle_connection_error(event.address, error)
             }
         }
     }
@@ -560,14 +558,14 @@ impl HostEntry {
 struct SraCachingResolverState {
     hosts: HashMap<String, HostEntry>,
 
-    sra_config: SraResolverConfig,
+    sra_config: Arc<SraResolverConfig>,
 }
 
 impl SraCachingResolverState {
     fn new(sra_config: SraResolverConfig) -> Self {
         SraCachingResolverState {
             hosts: HashMap::new(),
-            sra_config,
+            sra_config: Arc::new(sra_config),
         }
     }
 }
@@ -579,23 +577,25 @@ fn handle_resolve_request(
 ) {
     if !state.hosts.contains_key(&request.request.name) {
         let name = request.request.name.clone();
-        state.hosts.insert(name.to_string(), HostEntry::new());
+        state
+            .hosts
+            .insert(name.to_string(), HostEntry::new(state.sra_config.clone()));
     }
 
     let host_entry = state.hosts.get_mut(&request.request.name).unwrap();
 
-    host_entry.handle_resolve_request(request, context, &state.sra_config);
+    host_entry.handle_resolve_request(request, context);
 }
 
 fn handle_resolve_result(state: &mut SraCachingResolverState, result: ResolveResult) {
     if let Some(entry) = state.hosts.get_mut(&result.name) {
-        entry.handle_resolve_result(result, &state.sra_config);
+        entry.handle_resolve_result(result);
     }
 }
 
 fn handle_host_event(state: &mut SraCachingResolverState, event: HostEvent) {
     if let Some(entry) = state.hosts.get_mut(&event.name) {
-        entry.handle_host_event(event, &state.sra_config);
+        entry.handle_host_event(event);
     }
 }
 
@@ -633,6 +633,7 @@ pub fn new_sra_caching_resolver(
 #[cfg(test)]
 mod testing {
     use super::*;
+    use std::sync::Mutex;
 
     #[test]
     fn generational_address_set_newly_created_is_empty() {
@@ -859,7 +860,7 @@ mod testing {
     impl MockClock {
         fn new() -> Self {
             Self {
-                now: Arc::new(Mutex::new(Instant::now()))
+                now: Arc::new(Mutex::new(Instant::now())),
             }
         }
 
@@ -874,16 +875,15 @@ mod testing {
 
         fn create_clock_wrapper(&self) -> ClockFn {
             let self_clone = self.clone();
-            Arc::new(move || {
-                self_clone.get_current_time()
-            })
+            Arc::new(move || self_clone.get_current_time())
         }
     }
 
     struct HostEntryMockResolveState {
         results: Vec<ResolveDnsResult>,
         current_index: usize,
-        should_loop: bool
+        should_loop: bool,
+        resolutions: VecDeque<ResolveDnsResult>,
     }
 
     impl HostEntryMockResolveState {
@@ -892,6 +892,7 @@ mod testing {
                 results: Vec::new(),
                 current_index: 0,
                 should_loop: true,
+                resolutions: VecDeque::new(),
             }
         }
 
@@ -903,23 +904,30 @@ mod testing {
             self.results.push(result);
         }
 
-        fn resolve(&mut self) -> ResolveDnsResult {
+        fn resolve(&mut self) {
             if self.current_index >= self.results.len() && self.should_loop {
                 self.current_index = 0;
             }
 
             if self.current_index >= self.results.len() {
-                return Err(ResolveDnsError::new("Out of results"));
+                self.resolutions
+                    .push_back(Err(ResolveDnsError::new("Out of results")));
+                return;
             }
 
             match &self.results[self.current_index] {
                 Ok(addresses) => {
-                    Ok(addresses.clone())
+                    self.resolutions.push_back(Ok(addresses.clone()));
                 }
                 Err(error) => {
-                    Err(ResolveDnsError::new(error.to_string()))
+                    self.resolutions
+                        .push_back(Err(ResolveDnsError::new(error.to_string())));
                 }
             }
+        }
+
+        fn pop_resolution(&mut self) -> Option<ResolveDnsResult> {
+            self.resolutions.pop_front()
         }
     }
 
@@ -931,25 +939,30 @@ mod testing {
     impl MockResolveFunctionWrapper {
         fn new() -> Self {
             MockResolveFunctionWrapper {
-                results: Arc::new(Mutex::new(HostEntryMockResolveState::new()))
+                results: Arc::new(Mutex::new(HostEntryMockResolveState::new())),
             }
         }
 
-        fn set_should_loop(&mut self, should_loop: bool) {
+        fn set_should_loop(&self, should_loop: bool) {
             self.results.lock().unwrap().set_should_loop(should_loop);
         }
 
-        fn add_result(&mut self, result: ResolveDnsResult) {
+        fn add_result(&self, result: ResolveDnsResult) {
             self.results.lock().unwrap().add_result(result);
         }
 
-        fn resolve(&mut self) -> ResolveDnsResult {
+        fn resolve(&self) {
             self.results.lock().unwrap().resolve()
+        }
+
+        fn pop_resolution(&self) -> Option<ResolveDnsResult> {
+            self.results.lock().unwrap().pop_resolution()
         }
     }
 
     struct HostEntryTestContext {
-        config: SraResolverConfig,
+        entry: HostEntry,
+        config: Arc<SraResolverConfig>,
         operation_handler_context: OperationHandlerContext,
         mock_clock: MockClock,
         mock_results: MockResolveFunctionWrapper,
@@ -961,18 +974,20 @@ mod testing {
             config_builder.with_clock(mock_clock.create_clock_wrapper());
 
             let mock_results = MockResolveFunctionWrapper::new();
-            let mut results_clone = mock_results.clone();
-            let mock_resolution_function : ResolutionFunction = Box::new(move |name| {
-                results_clone.resolve()
-            });
+            let results_clone = mock_results.clone();
+            let mock_resolution_function: ResolutionFunction =
+                Box::new(move |_| results_clone.resolve());
+
+            let config = Arc::new(config_builder.build());
 
             Self {
-                config: config_builder.build(),
+                entry: HostEntry::new(config.clone()),
+                config,
                 operation_handler_context: OperationHandlerContext {
-                    resolution_function: mock_resolution_function
+                    resolution_function: mock_resolution_function,
                 },
                 mock_clock,
-                mock_results
+                mock_results,
             }
         }
 
@@ -987,9 +1002,121 @@ mod testing {
         }
     }
 
+    const MOCK_HOST: &str = "hello.there.com";
+    const LOCALHOST_IPV4: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+    const LOCALHOST_IPV6: IpAddr = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1));
+
+    fn initialize_resolution_test_context_single(context: &mut HostEntryTestContext) {
+        context.mock_results.set_should_loop(true);
+        context
+            .mock_results
+            .add_result(Ok(vec![LOCALHOST_IPV4, LOCALHOST_IPV6]));
+    }
+
+    fn create_mock_internal_request(
+    ) -> (ResolveRequestInternal, Arc<Mutex<Option<ResolveDnsResult>>>) {
+        let result = Arc::new(Mutex::new(None));
+        let result_clone = result.clone();
+        let request = ResolveRequestInternal {
+            request: ResolveRequest {
+                name: MOCK_HOST.to_string(),
+            },
+            completion_callback: Box::new(move |res| {
+                result_clone.lock().unwrap().replace(res);
+            }),
+        };
+
+        (request, result)
+    }
+
+    fn convert_pending_result_to_resolve_result(pending_result: ResolveDnsResult) -> ResolveResult {
+        ResolveResult {
+            name: MOCK_HOST.to_string(),
+            result: pending_result,
+        }
+    }
 
     #[test]
-    fn host_entry_lookup_and_resolve() {
+    fn host_entry_basic_lookup_and_resolve() {
         let mut context = HostEntryTestContext::default();
+        initialize_resolution_test_context_single(&mut context);
+
+        let (request, result_target) = create_mock_internal_request();
+
+        // submit a request and then check expected internal state
+        context
+            .entry
+            .handle_resolve_request(request, &context.operation_handler_context);
+
+        // expected internal state:
+        //   the request is pending
+        //   no result has been applied/completed to the request
+        //   a resolution is ongoing (running in the background)
+        //   last resolution timepoint is now
+        assert!(!context.entry.pending_requests.is_empty());
+        assert!(result_target.lock().unwrap().take().is_none());
+        assert!(context.entry.pending_resolution);
+        let last_resolution_timepoint = context.entry.last_resolution_timepoint;
+        assert!(last_resolution_timepoint.is_some());
+        assert_eq!(
+            context.mock_clock.get_current_time(),
+            last_resolution_timepoint.unwrap()
+        );
+
+        // advance time a little
+        context.advance_time(Duration::from_millis(10));
+
+        // our resolve function just stuffs a result here, pull it out
+        let pending_result = context.mock_results.pop_resolution();
+        assert!(pending_result.is_some());
+
+        // apply the resolve result to the host entry and verify expected state
+        context
+            .entry
+            .handle_resolve_result(convert_pending_result_to_resolve_result(
+                pending_result.unwrap(),
+            ));
+
+        // expected:
+        //   theres now an ipv4 entry in the cache
+        //   theres now an ipv6 entry in the cache
+        //   the original request is no longer pending
+        //   the state no longer thinks a background resolution is running
+        //   both ipv4 and ipv6 addresses have the correct ttl (now + ttl)
+        assert!(!context.entry.ipv4_addresses.empty());
+        assert!(!context.entry.ipv6_addresses.empty());
+        assert!(context.entry.pending_requests.is_empty());
+        assert!(!context.entry.pending_resolution);
+        let expected_ttl = context.mock_clock.get_current_time() + context.config.resolution_ttl;
+        assert_eq!(
+            expected_ttl,
+            *context
+                .entry
+                .addresses_by_ttl
+                .get(&LOCALHOST_IPV4)
+                .unwrap()
+                .1
+        );
+        assert_eq!(
+            expected_ttl,
+            *context
+                .entry
+                .addresses_by_ttl
+                .get(&LOCALHOST_IPV6)
+                .unwrap()
+                .1
+        );
+
+        // what did our request actually get resolved with?  we expect localhost for both ipv4 and
+        // ipv6
+        let final_result_option = result_target.lock().unwrap().take();
+        assert!(final_result_option.is_some());
+
+        let final_result = final_result_option.unwrap();
+        assert!(final_result.is_ok());
+
+        let addresses = final_result.unwrap();
+        assert!(addresses.contains(&LOCALHOST_IPV6));
+        assert!(addresses.contains(&LOCALHOST_IPV6));
     }
 }
