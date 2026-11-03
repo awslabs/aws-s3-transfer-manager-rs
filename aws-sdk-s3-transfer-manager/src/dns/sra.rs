@@ -8,7 +8,7 @@ use std::cmp::Reverse;
 use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 /*
@@ -849,5 +849,147 @@ mod testing {
         acquired_addresses.push(address_set.acquire_address(now).unwrap());
         assert_eq!(local, acquired_addresses[0]);
         assert_eq!(local, acquired_addresses[1]);
+    }
+
+    #[derive(Clone)]
+    struct MockClock {
+        now: Arc<Mutex<Instant>>,
+    }
+
+    impl MockClock {
+        fn new() -> Self {
+            Self {
+                now: Arc::new(Mutex::new(Instant::now()))
+            }
+        }
+
+        fn advance_time(&mut self, duration: Duration) {
+            let mut current_time = self.now.lock().unwrap();
+            *current_time += duration;
+        }
+
+        fn get_current_time(&self) -> Instant {
+            *self.now.lock().unwrap()
+        }
+
+        fn create_clock_wrapper(&self) -> ClockFn {
+            let self_clone = self.clone();
+            Arc::new(move || {
+                self_clone.get_current_time()
+            })
+        }
+    }
+
+    struct HostEntryMockResolveState {
+        results: Vec<ResolveDnsResult>,
+        current_index: usize,
+        should_loop: bool
+    }
+
+    impl HostEntryMockResolveState {
+        fn new() -> Self {
+            Self {
+                results: Vec::new(),
+                current_index: 0,
+                should_loop: true,
+            }
+        }
+
+        fn set_should_loop(&mut self, should_loop: bool) {
+            self.should_loop = should_loop;
+        }
+
+        fn add_result(&mut self, result: ResolveDnsResult) {
+            self.results.push(result);
+        }
+
+        fn resolve(&mut self) -> ResolveDnsResult {
+            if self.current_index >= self.results.len() && self.should_loop {
+                self.current_index = 0;
+            }
+
+            if self.current_index >= self.results.len() {
+                return Err(ResolveDnsError::new("Out of results"));
+            }
+
+            match &self.results[self.current_index] {
+                Ok(addresses) => {
+                    Ok(addresses.clone())
+                }
+                Err(error) => {
+                    Err(ResolveDnsError::new(error.to_string()))
+                }
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct MockResolveFunctionWrapper {
+        results: Arc<Mutex<HostEntryMockResolveState>>,
+    }
+
+    impl MockResolveFunctionWrapper {
+        fn new() -> Self {
+            MockResolveFunctionWrapper {
+                results: Arc::new(Mutex::new(HostEntryMockResolveState::new()))
+            }
+        }
+
+        fn set_should_loop(&mut self, should_loop: bool) {
+            self.results.lock().unwrap().set_should_loop(should_loop);
+        }
+
+        fn add_result(&mut self, result: ResolveDnsResult) {
+            self.results.lock().unwrap().add_result(result);
+        }
+
+        fn resolve(&mut self) -> ResolveDnsResult {
+            self.results.lock().unwrap().resolve()
+        }
+    }
+
+    struct HostEntryTestContext {
+        config: SraResolverConfig,
+        operation_handler_context: OperationHandlerContext,
+        mock_clock: MockClock,
+        mock_results: MockResolveFunctionWrapper,
+    }
+
+    impl HostEntryTestContext {
+        fn new(mut config_builder: SraResolverConfigBuilder) -> Self {
+            let mock_clock = MockClock::new();
+            config_builder.with_clock(mock_clock.create_clock_wrapper());
+
+            let mock_results = MockResolveFunctionWrapper::new();
+            let mut results_clone = mock_results.clone();
+            let mock_resolution_function : ResolutionFunction = Box::new(move |name| {
+                results_clone.resolve()
+            });
+
+            Self {
+                config: config_builder.build(),
+                operation_handler_context: OperationHandlerContext {
+                    resolution_function: mock_resolution_function
+                },
+                mock_clock,
+                mock_results
+            }
+        }
+
+        fn advance_time(&mut self, duration: Duration) {
+            self.mock_clock.advance_time(duration);
+        }
+    }
+
+    impl Default for HostEntryTestContext {
+        fn default() -> Self {
+            HostEntryTestContext::new(SraResolverConfig::builder())
+        }
+    }
+
+
+    #[test]
+    fn host_entry_lookup_and_resolve() {
+        let mut context = HostEntryTestContext::default();
     }
 }
