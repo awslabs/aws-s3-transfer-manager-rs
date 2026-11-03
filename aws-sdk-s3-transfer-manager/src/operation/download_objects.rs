@@ -21,8 +21,10 @@ use transfer::DownloadObjectsTransfer;
 
 use std::sync::Arc;
 
+use crate::config::user_agent::OperationFeatures;
 use crate::io::walk::{S3WalkContext, S3Walker};
 use crate::transfer::TransferContext;
+use aws_runtime::sdk_feature::AwsSdkFeature;
 
 /// Operation struct for downloading multiple objects from Amazon S3
 #[derive(Clone, Default, Debug)]
@@ -65,7 +67,8 @@ impl DownloadObjects {
             builder.build()
         });
 
-        let s3_client = handle.s3_client.clone();
+        let features = OperationFeatures::new([AwsSdkFeature::S3TransferDownloadDirectory]);
+        let s3_client = features.apply_to_client(&handle.s3_client);
         let walk_ctx = S3WalkContext::builder()
             .sdk_client(s3_client)
             .bucket(&bucket)
