@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.4.0] - Unreleased
 
 ### Added
+- `aws-smithy-topology` 0.1.0: CPU and NUMA discovery, execution placement targets, and
+  explicit CPU binding for use independently of the transfer manager.
+- `aws-smithy-execution` 0.1.0: managed partitioned execution with targeted task submission
+  and explicit shutdown completion.
+- `aws-smithy-managed-http` 0.1.0: native Smithy pool composition with managed execution
+  and the Smithy HTTP client interface, enabled by the `client` feature.
+- `aws-sdk-s3-transfer-manager-ext` 0.1.0: adoption of caller-configured managed execution
+  through TM's `__unstable_ext` feature and an exact TM version dependency.
 - The crate builds for `wasm32-wasip1`, `wasm32-wasip2`, and `wasm32-wasip3` with
   `RUSTFLAGS="--cfg tokio_unstable"`. On these targets the application supplies the HTTP client,
   `Managed` execution runs on the caller's tokio runtime, which may be current-thread, and file

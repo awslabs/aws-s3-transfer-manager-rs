@@ -23,3 +23,8 @@ install-model *args:
 # Compare two projected model files using Smithy's compatibility diff.
 diff-model old new:
     tools/codegen/s3-tm-model-codegen/gradlew --project-dir tools/codegen/s3-tm-model-codegen diffModels -PoldModel={{quote(old)}} -PnewModel={{quote(new)}}
+
+# Prepare, check, or publish the recorded workspace release.
+[positional-arguments]
+release *args:
+    python3 tools/release.py "$@"
