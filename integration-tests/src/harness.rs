@@ -173,8 +173,6 @@ pub(crate) enum BucketKind {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Target {
     pub(crate) backend: Backend,
-    /// Read only on the real-S3 path to pick the bucket name.
-    #[cfg_attr(not(e2e_test), allow(dead_code))]
     pub(crate) bucket_kind: BucketKind,
 }
 
@@ -387,6 +385,30 @@ impl TmTestClient {
         self.s3_client
             .as_ref()
             .expect("s3() requires a real-S3 target")
+    }
+
+    /// HeadObject of part `part_number` of `key`, in checksum mode.
+    pub(crate) async fn head_part(
+        &self,
+        key: &str,
+        part_number: i32,
+    ) -> aws_sdk_s3::operation::head_object::HeadObjectOutput {
+        let client = match &self.mock {
+            Some(mock) => mock.handle.client().await,
+            #[cfg(e2e_test)]
+            None => self.s3().clone(),
+            #[cfg(not(e2e_test))]
+            None => unreachable!("every target is a mock without e2e_test"),
+        };
+        client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(self.key(key))
+            .part_number(part_number)
+            .checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled)
+            .send()
+            .await
+            .expect("HeadObject of a part")
     }
 
     /// Upload `data` under `key` with the given checksum strategy.

@@ -382,7 +382,7 @@ impl Drop for VirtualRange {
     }
 }
 
-#[cfg(not(any(miri, all(test, s3_tm_loom))))]
+#[cfg(not(any(miri, all(test, s3_tm_loom), target_family = "wasm")))]
 mod sys {
     //! Native virtual-memory backends.
 
@@ -693,12 +693,14 @@ mod sys {
     pub(super) use platform::*;
 }
 
-#[cfg(any(miri, all(test, s3_tm_loom)))]
+#[cfg(any(miri, all(test, s3_tm_loom), target_family = "wasm"))]
 mod sys {
-    //! Allocator-backed model for Miri and Loom.
+    //! Allocator-backed model for Miri, Loom, and wasm targets.
     //!
     //! This backend preserves allocation ownership and pointer provenance. It
-    //! does not model operating-system access protection or backing reclaim.
+    //! does not model operating-system access protection or backing reclaim:
+    //! wasm linear memory has no protection or decommit operation, so this is
+    //! also the production backend there.
 
     use std::alloc::{alloc, dealloc, Layout};
     use std::io;

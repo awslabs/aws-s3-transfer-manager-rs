@@ -289,6 +289,7 @@ dependencies = [
  "path-clean",
  "pin-project-lite",
  "proptest",
+ "rustix",
  "same-file",
  "serde",
  "serde_json",
@@ -4757,6 +4758,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "81941cd78d0c92026c33e5e01312845a4cb1e9af3407f9134b100dd03144103e"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "wasm32-wasi-tests"
+version = "0.1.0"
+dependencies = [
+ "aws-sdk-s3",
+ "aws-sdk-s3-transfer-manager",
+ "aws-smithy-async",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "crossbeam-epoch",
+ "hyper 1.11.1",
+ "hyper-util",
+ "tokio",
+ "tower-service",
 ]
 
 [[package]]
