@@ -484,107 +484,82 @@ async fn a_destination_alias_keeps_the_file_another_key_names() {
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
+// A run that downloads `keys` objects under the destination link `photos`. The link points outside
+// the root. `refuse` makes the tree refuse the link's removal. The run returns the names that landed
+// outside, whether the plan came out whole, and whether the link still stands.
 #[cfg(unix)]
-async fn through_a_destination_link(delete_mode: DeleteMode) -> Vec<String> {
+async fn through_a_destination_link(
+    delete_mode: DeleteMode,
+    keys: usize,
+    refuse: bool,
+) -> (Vec<String>, bool, bool) {
     let outside = tempfile::tempdir().expect("outside");
     let dir = tempfile::tempdir().expect("temp dir");
     let root = dir.path().canonicalize().expect("canonical root");
     std::os::unix::fs::symlink(outside.path(), root.join("photos")).expect("symlink");
-    let (client, _gets) = a_bucket_recording_gets(&["photos/a.jpg"], 1_600_000_000);
-    let (t, ctx, rx) = downloading_into(&root, client, delete_mode);
+    let names: Vec<String> = (0..keys).map(|n| format!("photos/k{n:03}.jpg")).collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let deleter: Arc<dyn DeleteKeys> = if refuse {
+        Arc::new(RecordDeletes::refusing_in_a_tree(1))
+    } else {
+        Arc::new(DeleteFromLocalTree::new(&root))
+    };
+    let (t, ctx, rx) = downloading_into_with(
+        &root,
+        a_bucket_to_download(&refs, 1_600_000_000),
+        delete_mode,
+        deleter,
+        Walker::builder().build(),
+    );
     run_managed(&t, &ctx, rx).await;
-    std::fs::read_dir(outside.path())
+    let escaped = std::fs::read_dir(outside.path())
         .expect("outside reads")
         .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
-        .collect()
+        .collect();
+    let link_kept = std::fs::symlink_metadata(root.join("photos"))
+        .is_ok_and(|meta| meta.file_type().is_symlink());
+    (escaped, t.is_plan_complete(), link_kept)
 }
 
 #[cfg(unix)]
 #[cfg_attr(miri, ignore)]
 #[tokio::test]
 async fn a_download_writes_nothing_outside_the_root_through_a_link_it_deletes() {
-    let escaped = through_a_destination_link(DeleteMode::On).await;
+    let (escaped, _, link_kept) = through_a_destination_link(DeleteMode::On, 1, false).await;
     assert!(
         escaped.is_empty(),
         "delete mode on: wrote outside the root: {escaped:?}"
     );
+    assert!(!link_kept, "delete mode on kept a destination-only link");
 }
 
-#[cfg(unix)]
-#[cfg_attr(miri, ignore)]
-#[tokio::test]
-async fn a_download_writes_nothing_through_a_destination_link_it_keeps() {
-    let escaped = through_a_destination_link(DeleteMode::Off).await;
-    assert!(
-        escaped.is_empty(),
-        "delete mode off: wrote outside the root: {escaped:?}"
-    );
-}
-
-// More keys than one merge batch, so the merge decides some of them after the tree refused to remove
-// the link. None of them may write through it.
-#[cfg(unix)]
-#[cfg_attr(miri, ignore)]
-#[tokio::test]
-async fn no_download_writes_through_a_link_the_run_could_not_remove() {
-    let outside = tempfile::tempdir().expect("outside");
-    let dir = tempfile::tempdir().expect("temp dir");
-    let root = dir.path().canonicalize().expect("canonical root");
-    std::os::unix::fs::symlink(outside.path(), root.join("photos")).expect("symlink");
-    let names: Vec<String> = (0..300).map(|n| format!("photos/k{n:03}.jpg")).collect();
-    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-    let (t, ctx, rx) = downloading_into_with(
-        &root,
-        a_bucket_to_download(&refs, 1_600_000_000),
-        DeleteMode::On,
-        Arc::new(RecordDeletes::refusing_in_a_tree(1)),
-        Walker::builder().build(),
-    );
-    run_managed(&t, &ctx, rx).await;
-
-    let written_outside = std::fs::read_dir(outside.path())
-        .expect("outside reads")
-        .count();
-    assert_eq!(
-        written_outside, 0,
-        "downloads wrote through a link the run could not remove"
-    );
-    assert!(
-        !t.is_plan_complete(),
-        "a run that held back keys under a link reported a whole plan"
-    );
-}
-
-// The same 300 keys with delete mode off. The run keeps the link, so every key stays held.
+// 300 keys are more than one merge batch, so the merge decides some of them after the run kept the
+// link. None of them may write through it.
 #[cfg(unix)]
 #[cfg_attr(miri, ignore)]
 #[tokio::test]
 async fn no_download_writes_through_a_link_the_run_keeps() {
-    let outside = tempfile::tempdir().expect("outside");
-    let dir = tempfile::tempdir().expect("temp dir");
-    let root = dir.path().canonicalize().expect("canonical root");
-    std::os::unix::fs::symlink(outside.path(), root.join("photos")).expect("symlink");
-    let names: Vec<String> = (0..300).map(|n| format!("photos/k{n:03}.jpg")).collect();
-    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-    let (t, ctx, rx) = downloading_into(
-        &root,
-        a_bucket_to_download(&refs, 1_600_000_000),
-        DeleteMode::Off,
+    let (escaped, _, link_kept) = through_a_destination_link(DeleteMode::Off, 300, false).await;
+    assert!(
+        escaped.is_empty(),
+        "downloads wrote through a link the run kept: {} of them",
+        escaped.len()
     );
-    run_managed(&t, &ctx, rx).await;
+    assert!(link_kept, "delete mode off removed the link");
+}
 
-    let written_outside = std::fs::read_dir(outside.path())
-        .expect("outside reads")
-        .count();
-    assert_eq!(
-        written_outside, 0,
-        "downloads wrote through a link the run kept"
+#[cfg(unix)]
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn no_download_writes_through_a_link_the_run_could_not_remove() {
+    let (escaped, complete, _) = through_a_destination_link(DeleteMode::On, 300, true).await;
+    assert!(
+        escaped.is_empty(),
+        "downloads wrote through a link the run could not remove: {} of them",
+        escaped.len()
     );
     assert!(
-        std::fs::symlink_metadata(root.join("photos"))
-            .expect("photos exists")
-            .file_type()
-            .is_symlink(),
-        "delete mode off removed the link"
+        !complete,
+        "a run that held back keys under a link reported a whole plan"
     );
 }

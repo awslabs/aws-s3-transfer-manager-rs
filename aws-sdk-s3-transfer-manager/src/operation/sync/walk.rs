@@ -271,6 +271,23 @@ impl<K: KeyStream> Side<K> {
         }
     }
 
+    // Take the head entry, and hold back every key under its name when the entry is a link the walk
+    // did not resolve. The walk never looked behind such a link, so this side cannot account for
+    // any key under the link's name. A key there then reads as unknown on this side and not as
+    // absent. On an upload that stops a delete, and on a download it stops a write through the link.
+    fn take_holding(&mut self) -> Entry<K::Source> {
+        let entry = self.take();
+        if matches!(
+            entry.meta.obstruction,
+            Some(Obstruction::UnfollowedLink | Obstruction::ExcludedLink)
+        ) {
+            self.gap.add(Stretch {
+                under: Some(entry.key.clone()),
+            });
+        }
+        entry
+    }
+
     // What this side says about a key it did not produce. Absent while it is accounting for
     // itself, unknown while a failure has left it unable to, and unknown for a key it named as
     // lost.
@@ -512,22 +529,14 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
             };
             // The filter excluded this link's own name, so the name makes no pairing. The merge
             // skips past it only at the merge position. `take` releases every hold below the key,
-            // and the other side's head can still sort there and need one. A source link still
-            // hides the keys under its name, so the source holds those keys back.
+            // and the other side's head can still sort there and need one. The link still hides the
+            // keys under its name, so its side holds those keys back.
             if order.is_le() && self.src.head_is(Obstruction::ExcludedLink) {
-                let link = self.src.take();
-                self.src.gap.add(Stretch {
-                    under: Some(link.key),
-                });
+                self.src.take_holding();
                 continue;
             }
-            // A destination link hides the keys under its name the same way. A write under the name
-            // would go through the link, so the destination holds those keys back.
             if order.is_ge() && self.dst.head_is(Obstruction::ExcludedLink) {
-                let link = self.dst.take();
-                self.dst.gap.add(Stretch {
-                    under: Some(link.key),
-                });
+                self.dst.take_holding();
                 continue;
             }
             return Some(Ok(match order {
@@ -567,19 +576,6 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
         } else {
             Progress::Pairing
         }
-    }
-
-    // Take the source's head entry. A source link the walk did not follow occupies its name and
-    // hides whatever sits under it, so the source holds back every key under that name. A
-    // destination key there then reads as unknown and not as absent.
-    fn take_source(&mut self) -> Entry<S::Source> {
-        let entry = self.src.take();
-        if entry.meta.obstruction == Some(Obstruction::UnfollowedLink) {
-            self.src.gap.add(Stretch {
-                under: Some(entry.key.clone()),
-            });
-        }
-        entry
     }
 
     // A key one side could not account for leaves a hole in the plan, whether a failure or an
@@ -622,7 +618,7 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
     }
 
     fn take_source_only(&mut self) -> Pairing<S::Source, D::Source> {
-        let entry = self.take_source();
+        let entry = self.src.take_holding();
         let destination = self.dst.missing(&entry.key);
         self.note_unknown(&destination);
         Pairing {
@@ -632,22 +628,8 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
         }
     }
 
-    // Take the destination's head entry. A destination link the walk did not follow occupies its
-    // name and hides whatever sits under it. A download under that name would write through the
-    // link, so the destination holds back every key under the name. A source key there then reads
-    // as unknown and not as absent.
-    fn take_destination(&mut self) -> Entry<D::Source> {
-        let entry = self.dst.take();
-        if entry.meta.obstruction == Some(Obstruction::UnfollowedLink) {
-            self.dst.gap.add(Stretch {
-                under: Some(entry.key.clone()),
-            });
-        }
-        entry
-    }
-
     fn take_destination_only(&mut self) -> Pairing<S::Source, D::Source> {
-        let entry = self.take_destination();
+        let entry = self.dst.take_holding();
         let source = self.src.missing(&entry.key);
         self.note_unknown(&source);
         Pairing {
@@ -659,8 +641,8 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
 
     fn take_both(&mut self) -> Pairing<S::Source, D::Source> {
         // Neither side is missing here, so neither has anything to answer for.
-        let src = self.take_source();
-        let dst = self.take_destination();
+        let src = self.src.take_holding();
+        let dst = self.dst.take_holding();
         Pairing {
             key: src.key.clone(),
             source: SideState::Present(src),
