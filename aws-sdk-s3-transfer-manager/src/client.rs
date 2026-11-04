@@ -4,6 +4,7 @@
  */
 
 use crate::metrics::unit::ByteUnit;
+#[cfg(not(target_family = "wasm"))]
 use crate::runtime::ManagedExecution;
 use crate::scheduler::{ConcurrencyController, FixedConcurrency, Scheduler};
 use crate::telemetry::Telemetry;
@@ -268,6 +269,8 @@ impl Client {
             .cloned()
             .unwrap_or_else(crate::runtime::platform::MachineProfile::detect_local);
 
+        let client_features = crate::config::user_agent::client_features(&config, &profile);
+
         // 1. Create concurrency controller and telemetry
         let (controller, telemetry): (Arc<dyn ConcurrencyController>, _) = {
             // Resolve the concurrency target once, at construction. The preview
@@ -303,6 +306,8 @@ impl Client {
         if runtime_http.is_some() {
             log_connection_cap(&connection_cap, controller.target());
         }
+        // wasm targets have no managed execution; see `Managed`.
+        #[cfg(not(target_family = "wasm"))]
         let managed = match config.managed_config_mut() {
             Some(managed) => {
                 let owner = managed
@@ -319,6 +324,7 @@ impl Client {
         };
         let handle = Arc::new_cyclic(|weak_handle| {
             let scheduler = Scheduler::new(weak_handle.clone());
+            #[cfg(not(target_family = "wasm"))]
             let runtime: Arc<dyn ExecutionRuntime> = match managed {
                 Some((owner, components)) => Arc::new(ManagedExecution::new(
                     weak_handle.clone(),
@@ -329,12 +335,17 @@ impl Client {
                     weak_handle.clone(),
                 )),
             };
+            #[cfg(target_family = "wasm")]
+            let runtime: Arc<dyn ExecutionRuntime> = Arc::new(
+                crate::runtime::TokioMultiThreadRuntime::new(weak_handle.clone()),
+            );
 
             let s3_client = match config.take_s3_client_source() {
                 crate::config::S3ClientSource::Provided(client) => {
                     crate::config::user_agent::install_on_client(
                         client,
                         config.framework_metadata().cloned(),
+                        client_features,
                     )
                 }
                 crate::config::S3ClientSource::FromConfig(s3_config) => {
@@ -345,6 +356,7 @@ impl Client {
                     crate::config::user_agent::install(
                         &mut builder,
                         config.framework_metadata().cloned(),
+                        client_features,
                     );
                     aws_sdk_s3::Client::from_conf(builder.build())
                 }

@@ -8,6 +8,8 @@
 
 use std::fmt::Debug;
 
+use base64::Engine;
+
 use aws_sdk_s3::config::http::HttpResponse;
 use aws_sdk_s3::config::retry::RetryConfig;
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
@@ -131,4 +133,22 @@ pub fn assert_failure(failure: &Failure, status: u16, code: &str) {
 /// The quoted MD5 ETag S3 gives an object uploaded in one request.
 pub fn md5_etag(content: &[u8]) -> String {
     format!("\"{}\"", hex::encode(md5::compute(content).0))
+}
+
+pub fn crc32(data: &[u8]) -> String {
+    let mut digest = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc);
+    digest.update(data);
+    base64::engine::general_purpose::STANDARD.encode((digest.finalize() as u32).to_be_bytes())
+}
+
+pub fn crc32c(data: &[u8]) -> String {
+    let mut digest = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32Iscsi);
+    digest.update(data);
+    base64::engine::general_purpose::STANDARD.encode((digest.finalize() as u32).to_be_bytes())
+}
+
+pub fn crc64nvme(data: &[u8]) -> String {
+    let mut digest = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc64Nvme);
+    digest.update(data);
+    base64::engine::general_purpose::STANDARD.encode(digest.finalize().to_be_bytes())
 }

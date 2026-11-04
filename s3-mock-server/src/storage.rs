@@ -48,12 +48,16 @@ pub struct StoreObjectRequest {
     pub content_disposition: Option<String>,
     pub content_language: Option<String>,
     /// Checksums the client sent with the body. A body that does not match them fails with
-    /// [`Error::ChecksumMismatch`](crate::Error::ChecksumMismatch), and the key is left
+    /// [`Error::BadDigest`](crate::Error::BadDigest), and the key is left
     /// unchanged.
     pub client_checksums: Option<ClientChecksums>,
     /// Condition on the current state of the key, checked atomically with the write by
     /// backends that support it.
     pub precondition: WritePrecondition,
+    /// When set, the quoted ETag stored instead of the MD5 of the body.
+    pub etag: Option<String>,
+    /// Restore status to store, for an object in an archival storage class.
+    pub restore_status: Option<crate::storage::models::RestoreStatus>,
 }
 
 /// Condition on the current state of a key for a write to succeed.
@@ -111,6 +115,9 @@ pub(crate) fn etag_condition_holds(condition: &s3s::dto::ETagCondition, etag: &s
     }
 }
 
+/// An in-place change to the stored metadata of an object.
+pub(crate) type MetadataUpdate = Box<dyn FnOnce(&mut ObjectMetadata) + Send>;
+
 /// Request for retrieving an object.
 pub(crate) struct GetObjectRequest<'a> {
     pub bucket: &'a str,
@@ -137,9 +144,17 @@ pub(crate) struct ListObjectsResponse {
 }
 
 /// Information about an object.
+#[derive(Debug)]
 pub(crate) struct ObjectInfo {
     pub key: String,
     pub metadata: ObjectMetadata,
+}
+
+/// An in-progress multipart upload.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct MultipartUploadInfo {
+    pub key: String,
+    pub upload_id: String,
 }
 
 /// Information about a bucket.
@@ -216,6 +231,8 @@ impl StoreObjectRequest {
             content_language: None,
             client_checksums: None,
             precondition: WritePrecondition::None,
+            etag: None,
+            restore_status: None,
         }
     }
 
@@ -274,6 +291,8 @@ impl From<s3s::dto::PutObjectInput> for StoreObjectRequest {
                 .map(|s| Cow::<str>::from(s).into_owned()),
             client_checksums: None,
             precondition,
+            etag: None,
+            restore_status: None,
         }
     }
 }
@@ -356,7 +375,8 @@ pub(crate) trait StorageBackend: Send + Sync + Debug {
     /// Create a new bucket.
     async fn create_bucket(&self, bucket: &str) -> Result<()>;
 
-    /// Delete a bucket. Fails if the bucket is non-empty.
+    /// Delete a bucket. Fails with [`Error::BucketNotEmpty`](crate::Error::BucketNotEmpty) if the
+    /// bucket has objects.
     async fn delete_bucket(&self, bucket: &str) -> Result<()>;
 
     /// Check if a bucket exists.
@@ -395,6 +415,14 @@ pub(crate) trait StorageBackend: Send + Sync + Debug {
 
     /// Abort a multipart upload and clean up all associated data.
     async fn abort_multipart_upload(&self, upload_id: &str) -> Result<()>;
+
+    /// The multipart uploads in progress in `bucket`, ordered by key and then upload id.
+    async fn list_multipart_uploads(&self, bucket: &str) -> Result<Vec<MultipartUploadInfo>>;
+
+    /// Change the stored metadata of an object in place, leaving its data unchanged.
+    ///
+    /// Fails with `NoSuchBucket` or `NoSuchKey` when the object does not exist.
+    async fn update_metadata(&self, bucket: &str, key: &str, update: MetadataUpdate) -> Result<()>;
 
     /// Reset all state, removing all buckets, objects, and in-flight uploads.
     async fn reset(&self) -> Result<()>;
@@ -479,6 +507,14 @@ impl StorageBackend for std::sync::Arc<dyn StorageBackend + '_> {
 
     async fn abort_multipart_upload(&self, upload_id: &str) -> Result<()> {
         (**self).abort_multipart_upload(upload_id).await
+    }
+
+    async fn list_multipart_uploads(&self, bucket: &str) -> Result<Vec<MultipartUploadInfo>> {
+        (**self).list_multipart_uploads(bucket).await
+    }
+
+    async fn update_metadata(&self, bucket: &str, key: &str, update: MetadataUpdate) -> Result<()> {
+        (**self).update_metadata(bucket, key, update).await
     }
 
     async fn reset(&self) -> Result<()> {
