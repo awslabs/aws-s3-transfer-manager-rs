@@ -67,7 +67,7 @@ type ClockFn = Arc<dyn Fn() -> Instant + Send + Sync>;
 /// addresses (if they exist).  This makes error correlation much harder (impossible really)
 /// because partial failures aren't detectable (for ex: fail to connect to ipv6 but succeed on
 /// ipv4 will not trigger any detectable way of penalizing the ipv6 address).
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum NameResolutionAddressTypes {
     /// Resolution should return one ipv4 and ipv6 address, if they exist
     #[default]
@@ -371,8 +371,20 @@ impl HostEntry {
         }
     }
 
+    fn should_cache_address(&self, address: &IpAddr) -> bool {
+        match &address {
+            IpAddr::V4(_) => self.config.address_types != NameResolutionAddressTypes::IpV6,
+            IpAddr::V6(_) => self.config.address_types != NameResolutionAddressTypes::IpV4,
+        }
+    }
+
     /// Updates the entry with a newly-resolved address
     fn on_address_resolved(&mut self, address: IpAddr) {
+        // filter if configured
+        if !self.should_cache_address(&address) {
+            return;
+        }
+
         let ttl = (self.config.clock)() + self.config.resolution_ttl;
 
         // If we already know about this address, just extend its TTL, regardless of any other
@@ -894,7 +906,7 @@ mod testing {
                 current_index: 0,
                 should_loop: true,
                 resolutions: VecDeque::new(),
-                call_count: 0
+                call_count: 0,
             }
         }
 
@@ -928,6 +940,8 @@ mod testing {
                         .push_back(Err(ResolveDnsError::new(error.to_string())));
                 }
             }
+
+            self.current_index += 1;
         }
 
         fn pop_resolution(&mut self) -> Option<ResolveDnsResult> {
@@ -1029,8 +1043,7 @@ mod testing {
 
     type MockResultTarget = Arc<Mutex<Option<ResolveDnsResult>>>;
 
-    fn create_mock_internal_request(
-    ) -> (ResolveRequestInternal, MockResultTarget) {
+    fn create_mock_internal_request() -> (ResolveRequestInternal, MockResultTarget) {
         let result = Arc::new(Mutex::new(None));
         let result_clone = result.clone();
         let request = ResolveRequestInternal {
@@ -1146,7 +1159,11 @@ mod testing {
         assert_eq!(1, context.mock_results.get_call_count());
     }
 
-    fn submit_requests(context: &mut HostEntryTestContext, count: usize, delay_millis: u64) -> Vec<MockResultTarget> {
+    fn submit_requests(
+        context: &mut HostEntryTestContext,
+        count: usize,
+        delay_millis: u64,
+    ) -> Vec<MockResultTarget> {
         let mut result_targets = Vec::new();
 
         for _ in 0..count {
@@ -1154,8 +1171,6 @@ mod testing {
             context
                 .entry
                 .handle_resolve_request(request, &context.operation_handler_context);
-
-            assert!(result_target.lock().unwrap().take().is_none());
 
             result_targets.push(result_target);
 
@@ -1198,31 +1213,23 @@ mod testing {
             .mock_results
             .add_result(Ok(vec![OTHERHOST_IPV4, OTHERHOST_IPV6]));
     }
-    fn are_results_both_host_sets(result_target1: MockResultTarget, result_target2: MockResultTarget) -> bool {
-        let final_result_option1 = result_target1.lock().unwrap().take();
-        assert!(final_result_option1.is_some());
+    fn do_results_contain_both_host_sets(result_targets: Vec<MockResultTarget>) -> bool {
+        let mut contains_local = false;
+        let mut contains_other = false;
 
-        let final_result1 = final_result_option1.unwrap();
-        assert!(final_result1.is_ok());
+        result_targets
+            .into_iter()
+            .map(|target| target.lock().unwrap().take().unwrap().unwrap())
+            .for_each(|addresses| {
+                if addresses.contains(&LOCALHOST_IPV4) && addresses.contains(&LOCALHOST_IPV6) {
+                    contains_local = true;
+                } else if addresses.contains(&OTHERHOST_IPV4) && addresses.contains(&OTHERHOST_IPV6)
+                {
+                    contains_other = true;
+                }
+            });
 
-        let final_addresses1 = final_result1.unwrap();
-        assert_eq!(2, final_addresses1.len());
-
-        let final_result_option2 = result_target2.lock().unwrap().take();
-        assert!(final_result_option2.is_some());
-
-        let final_result2 = final_result_option2.unwrap();
-        assert!(final_result2.is_ok());
-
-        let final_addresses2 = final_result2.unwrap();
-        assert_eq!(2, final_addresses2.len());
-
-        let addresses1_local = final_addresses1.contains(&LOCALHOST_IPV4) && final_addresses1.contains(&LOCALHOST_IPV6);
-        let addresses1_other = final_addresses1.contains(&OTHERHOST_IPV4) && final_addresses1.contains(&OTHERHOST_IPV6);
-        let addresses2_local = final_addresses2.contains(&LOCALHOST_IPV4) && final_addresses2.contains(&LOCALHOST_IPV6);
-        let addresses2_other = final_addresses2.contains(&OTHERHOST_IPV4) && final_addresses2.contains(&OTHERHOST_IPV6);
-
-        (addresses1_local && addresses2_other) || (addresses1_other && addresses2_local)
+        contains_local && contains_other
     }
 
     #[test]
@@ -1250,69 +1257,211 @@ mod testing {
         context.advance_time(MINIMUM_DELAY_BETWEEN_RESOLVES);
 
         let result_targets = submit_requests(&mut context, 1, 0);
-        assert_eq!(1, context.entry.pending_requests.len());
 
-        // should use the cached results, but also a resolve should be pending
+        // should have used the cached results, but also a resolve should be pending because enough
+        // time has passed
+        for result_target in result_targets {
+            assert!(is_result_localhost(result_target));
+        }
+        assert!(context.entry.pending_requests.is_empty());
+        assert!(context.entry.pending_resolution);
 
         // apply the pending resolve
+        apply_mock_result_to_context(&mut context);
 
-        // make a couple requests, we should get both address sets now
+        // make a couple requests, we should get both address sets now immediately
+        let result_targets_post = submit_requests(&mut context, 3, 100);
+        assert!(do_results_contain_both_host_sets(result_targets_post));
     }
-    
+
+    fn do_address_restricted_lookup_test(address_types: NameResolutionAddressTypes) {
+        let mut restricted_builder = SraResolverConfig::builder();
+        restricted_builder.with_address_types(address_types);
+        let mut context = HostEntryTestContext::new(restricted_builder);
+        initialize_resolution_test_context_single(&mut context);
+
+        let result_targets = submit_requests(&mut context, 3, 100);
+        assert_eq!(3, context.entry.pending_requests.len());
+
+        // apply result and verify requests not pending and resolution not pending
+        apply_mock_result_to_context(&mut context);
+
+        // all results should just be a single address of the appropriate type
+        for result_target in result_targets {
+            let addresses = result_target.lock().unwrap().take().unwrap().unwrap();
+            assert_eq!(1, addresses.len());
+
+            if address_types == NameResolutionAddressTypes::IpV4 {
+                assert_eq!(LOCALHOST_IPV4, addresses[0]);
+            } else if address_types == NameResolutionAddressTypes::IpV6 {
+                assert_eq!(LOCALHOST_IPV6, addresses[0]);
+            }
+        }
+    }
+
     #[test]
-    fn host_entry_resolve_existing_address_extends_ttl() {
-        // do what we did last test, but then resolve again and verify that the localhost
-        // addresses have their TTL extended appropriately
+    fn host_entry_lookup_ipv4_only() {
+        do_address_restricted_lookup_test(NameResolutionAddressTypes::IpV4);
+    }
+
+    #[test]
+    fn host_entry_lookup_ipv6_only() {
+        do_address_restricted_lookup_test(NameResolutionAddressTypes::IpV6);
     }
 
     #[test]
     fn host_entry_addresses_expire() {
         // resolve and then let enough time pass to expire the original addresses
-        // further resolves should pick up the second addresses in the mock results
+        let mut context = HostEntryTestContext::default();
+        initialize_resolution_test_context_single(&mut context);
+
+        let result_targets = submit_requests(&mut context, 1, 100);
+        assert_eq!(1, context.entry.pending_requests.len());
+
+        // apply result
+        apply_mock_result_to_context(&mut context);
+
+        // check ttl
+        let expected_ttl = context.mock_clock.get_current_time() + context.config.resolution_ttl;
+        let addresses = result_targets[0].lock().unwrap().take().unwrap().unwrap();
+        for address in addresses {
+            assert_eq!(
+                expected_ttl,
+                *context.entry.addresses_by_ttl.get(&address).unwrap().1
+            );
+        }
+
+        // let enough time pass, manually purge expired, and then check address state
+        context
+            .mock_clock
+            .advance_time(context.config.resolution_ttl);
+        context.entry.purge_expired();
+        assert!(context.entry.addresses_by_ttl.is_empty());
+        assert!(context.entry.ipv6_addresses.empty());
+        assert!(context.entry.ipv4_addresses.empty());
+
+        // new resolve with result
+        let result_targets = submit_requests(&mut context, 1, 100);
+        assert_eq!(1, context.entry.pending_requests.len());
+
+        // apply result
+        apply_mock_result_to_context(&mut context);
+
+        // let enough time pass for expiration, new resolve, should be pending and addresses empty
+        context.advance_time(context.config.resolution_ttl);
+        let result_targets = submit_requests(&mut context, 1, 100);
+        assert_eq!(1, context.entry.pending_requests.len());
+        assert!(context.entry.addresses_by_ttl.is_empty());
+        assert!(context.entry.ipv6_addresses.empty());
+        assert!(context.entry.ipv4_addresses.empty());
+
+        // background resolution function should have been called three times
+        assert_eq!(3, context.mock_results.get_call_count());
+    }
+
+    fn do_host_entry_fatal_host_event_bans_address(address_to_ban: IpAddr) {
+        let matching_address = if address_to_ban == LOCALHOST_IPV4 {
+            LOCALHOST_IPV6
+        } else {
+            LOCALHOST_IPV4
+        };
+
+        let expected_other_address = if address_to_ban == LOCALHOST_IPV4 {
+            OTHERHOST_IPV4
+        } else {
+            OTHERHOST_IPV6
+        };
+
+        // set up resolution with multiple address sets
+        let mut context = HostEntryTestContext::default();
+        initialize_resolution_test_context_multiple(&mut context);
+
+        // make a resolve request
+        let result_targets = submit_requests(&mut context, 1, 100);
+        assert_eq!(1, context.entry.pending_requests.len());
+        apply_mock_result_to_context(&mut context);
+
+        assert!(is_result_localhost(result_targets[0].clone()));
+
+        // mark supplied address as a fatal error, should never be seen again as long as ttl active
+        let connection_error =
+            HostEventConnectionError::builder(ConnectionErrorCategory::Fatal).build();
+        let connection_failure_event: HostEvent = HostEvent::builder(
+            &MOCK_HOST,
+            address_to_ban,
+            HostEventInformation::ConnectionError(connection_error),
+        )
+        .build();
+        context.entry.handle_host_event(connection_failure_event);
+        // still know about it
+        assert!(context.entry.addresses_by_ttl.contains(&address_to_ban));
+        // but it's not in the specific list
+        match address_to_ban {
+            IpAddr::V4(_) => {
+                assert!(context.entry.ipv4_addresses.empty());
+            }
+            IpAddr::V6(_) => {
+                assert!(context.entry.ipv6_addresses.empty());
+            }
+        }
+
+        // make a resolve request, should not see LOCALHOST_IPV4 in the cached reply
+        let result_targets = submit_requests(&mut context, 1, 100);
+        let addresses = result_targets[0].lock().unwrap().take().unwrap().unwrap();
+        assert_eq!(1, addresses.len());
+        assert!(addresses.contains(&matching_address));
+
+        // advance time enough to get a second background resolution
+        context
+            .mock_clock
+            .advance_time(MINIMUM_DELAY_BETWEEN_RESOLVES);
+
+        // make enough resolve requests to be guaranteed to see both address sets, verify
+        // address_to_ban never shows up
+        let _ = submit_requests(&mut context, 1, 100);
+        apply_mock_result_to_context(&mut context);
+
+        let result_targets = submit_requests(&mut context, 5, 100);
+        for result_target in result_targets {
+            let addresses = result_target.lock().unwrap().take().unwrap().unwrap();
+            // every response should contain otherhost for the appropriate address type
+            assert!(addresses.contains(&expected_other_address));
+            // banned address not seen
+            assert!(!addresses.contains(&address_to_ban));
+        }
+
+        // background resolution function should have been called two times
+        assert_eq!(2, context.mock_results.get_call_count());
     }
 
     #[test]
     fn host_entry_fatal_host_event_bans_ipv4_address() {
-
+        do_host_entry_fatal_host_event_bans_address(LOCALHOST_IPV4);
     }
 
     #[test]
     fn host_entry_fatal_host_event_bans_ipv6_address() {
-
+        do_host_entry_fatal_host_event_bans_address(LOCALHOST_IPV6);
     }
 
     #[test]
-    fn host_entry_reresolving_a_banned_ip_does_not_cause_it_to_be_used() {
-
-    }
+    fn host_entry_reresolving_a_banned_ip_does_not_cause_it_to_be_used() {}
 
     #[test]
-    fn host_entry_bans_expire() {
-
-    }
+    fn host_entry_bans_expire() {}
 
     #[test]
-    fn host_entry_unhealthy_address_does_not_get_used_if_alternative_exists() {
-
-    }
+    fn host_entry_unhealthy_address_does_not_get_used_if_alternative_exists() {}
 
     #[test]
-    fn host_entry_unhealthy_address_gets_used_if_no_alternative() {
-
-    }
+    fn host_entry_unhealthy_address_gets_used_if_no_alternative() {}
 
     #[test]
-    fn host_entry_unhealthy_recovers_if_enough_time_passes() {
-
-    }
+    fn host_entry_unhealthy_recovers_if_enough_time_passes() {}
 
     #[test]
-    fn host_entry_resolve_failure() {
-
-    }
+    fn host_entry_resolve_failure() {}
 
     #[test]
-    fn host_entry_resolve_multiple_with_elapsed_time_failure() {
-
-    }
+    fn host_entry_resolve_multiple_with_elapsed_time_failure() {}
 }
