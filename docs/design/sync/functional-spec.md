@@ -216,10 +216,12 @@ read, write, or delete would pass through such a link MUST get no action, and sy
 as `skipped-unknown`.
 
 When a download writes a key whose own name holds a link, dangling or not, it MUST replace the link
-and MUST NOT write through it. Delete mode removes a link as a link and leaves its target. The
-setting applies to the entries inside the local root. Sync resolves the root itself as the caller
-spelled it, even when the root is a link. A link above the root is not part of the run. FR-Root-8
-covers a key that leaves the root through its own path.
+and MUST NOT write through it. On an upload with following off, a link at a key's own name is an
+entry with nothing to send. Sync MUST report the key as `skipped-with-warning`, and delete mode MUST
+keep the destination's object (FR-Fail-7). Delete mode removes a link as a link and leaves its
+target. The setting applies to the entries inside the local root. Sync resolves the root itself as
+the caller spelled it, even when the root is a link. A link above the root is not part of the run.
+FR-Root-8 covers a key that leaves the root through its own path.
 *`[CLI]` read on 2026-10-28 at `2d52e1f`. Both listings of a sync take the same `follow_symlinks` value (`subcommands.py` → `CommandArchitecture.run`). Release 2.37.7 ([#10691](https://github.com/aws/aws-cli/pull/10691)) applied the value to download writes too. The help text says `--no-follow-symlinks` "skips any object whose destination is a symbolic link, or is located under one, starting at the destination you specified" (`subcommands.py` → `FOLLOW_SYMLINKS`). Under the default, a download follows a link on a directory above the file, and the rename "clobbers the symlink" at the file's own name ([#10691](https://github.com/aws/aws-cli/pull/10691)). `[TM]` `download_objects` and the Go `DownloadDirectory` have no symlink setting, and neither does the Java v2 `downloadDirectory`. `upload_objects`, the Java `followSymbolicLinks`, and the Go `FollowSymbolicLinks` default to not following. `[NEW]` — the root rule departs from the CLI. With `--no-follow-symlinks`, the CLI checks the destination the caller named, so a destination that is a link skips every object (`s3handler.py` → `_find_link_in_dest_path`). `[ISSUE]` [#2550](https://github.com/aws/aws-cli/issues/2550) — on Windows, following symlinks uploads each linked file as a 0-byte object.*
 
 **FR-Enum-5** When a local file's modification time falls outside the range this platform can represent,
@@ -307,8 +309,8 @@ cannot read qualify. A link whose name a filter excludes qualifies in both setti
 never resolves an excluded link. On an upload, sync MUST NOT delete a destination key under such a
 link. On a download, sync MUST NOT write a source key under it. Sync MUST report each key it holds
 back as `skipped-unknown` and MUST mark the plan incomplete, with delete mode on or off. An excluded
-link reports its keys too (FR-Filter-5), and it protects nothing it points at: delete mode may
-remove an excluded file link's target.
+link reports its keys too (FR-Filter-5), and it protects nothing it points at. Delete mode may
+remove an excluded file link's target, and the files under an excluded directory link's target.
 
 On a download, a link the walk does not resolve still counts at its own name:
 
@@ -325,8 +327,9 @@ On a download, a link the walk does not resolve still counts at its own name:
   every run holds back the keys under it.
 
 A dangling link or an endless chain in a download's destination is no failure in either setting.
-The keys under its
-name stay held, because the link may stand for a directory on an unmounted volume.
+The keys under its name stay held, because the link may stand for a directory on an unmounted
+volume. With following on, such a link above a source key holds that key on every run, and every
+run ends Warned. The hold ends once the link resolves again or the caller removes it.
 
 Take a destination holding `photos -> /mnt/nas` and a bucket holding `photos/a.jpg`. A download
 with following off and delete mode on removes the link and skips `photos/a.jpg`. The next run
@@ -339,24 +342,25 @@ downloads `photos/a.jpg` into a real directory `photos/`.
 
 - The key's path passes through a link. Removing it would remove a file inside the link's target,
   and that target can sit outside the destination.
-- Removing the key would remove the target of a followed link the walk has met, or a later link on
-  that link's chain.
+- Removing the key would remove the target of a followed link anywhere in the destination, or a
+  later link on that link's chain.
 
 So with following on, delete mode never removes what a followed link reaches, even when the bucket
 holds neither key. Sync MUST report each kept key as `skipped-unknown`. Sync MUST bound the names it
-holds for followed links (NFR-Mem-1). Past that bound, sync MUST keep every later destination-only
-key and report it the same way. With delete mode off, sync keeps nothing for followed links, and a
+holds for followed links (NFR-Mem-1). Past that bound, sync MUST keep every destination-only key
+and report it the same way. With delete mode off, sync keeps nothing for followed links, and a
 destination-only key through a link reports as destination-only.
 
-The walk meets a link only when it reads the directory holding that link. When that directory sorts
-after the link's target, as with `z/link -> ../real`, the merge can decide deletes under the target
-before the walk meets the link. With delete mode on, the plan MUST then report that it did not
-account for the target's keys. For a link to a directory, the delete and the download alternate.
-When few keys sort between the target and the link's directory, one run removes the file and the
-next run downloads it again. When the delete lands before the walk reads the link's directory, the
-same run downloads the file again. For a link to a file, the removal leaves the link dangling, and
-the next run replaces the link with the downloaded file (FR-Enum-14).
-*`[NEW]` — a strengthening. Without it, a delete through one key removes the file another key keeps. These rules hold back deletes only, so they apply only with delete mode on. With delete mode off, a tree with a directory link inside the root would otherwise end Warned on every run. rsync deletes through a link only under `--keep-dirlinks`, because only then does its delete scan enter a link to a directory (`generator.c`). rclone deletes through links under `--copy-links`. `[CLI]` read on 2026-10-28 at `2d52e1f`: `aws s3 sync --delete` follows links in the local listing by default and removes each listed path with `os.remove`, with no link check (`s3handler.py` → `LocalDeleteRequestSubmitter`). Protecting a late link's target needs every link known before the first delete. Holding deletes until then costs memory for each pending delete (NFR-Mem-1), or a temporary file past a buffer, as rsync's `--delete-delay` does.*
+The walk meets a link only when it reads the directory holding that link. That directory can sort
+after the link's target, as with `z/link -> ../real`. The second rule MUST hold there too, so sync
+MUST know every followed link in the destination before it removes a local file. Sync MUST still
+start transfers before it knows every link (NFR-Lat-1), and the deletes it waits to send MUST stay
+bounded (NFR-Mem-1).
+
+FR-Enum-15's rules cover each link that stands when sync reads its directory to find links. Another
+program can create a link later in the run, after sync has already removed a file the link names.
+When the walk follows a link sync did not find in time, sync MUST mark the plan incomplete.
+*`[NEW]` — a strengthening. Without it, a delete through one key removes the file another key keeps. These rules hold back deletes only, so they apply only with delete mode on. With delete mode off, a tree with a directory link inside the root would otherwise end Warned on every run. rsync deletes through a link only under `--keep-dirlinks`, because only then does its delete scan enter a link to a directory (`generator.c`). rclone deletes through links under `--copy-links`. `[CLI]` read on 2026-10-28 at `2d52e1f`: `aws s3 sync --delete` follows links in the local listing by default and removes each listed path with `os.remove`, with no link check (`s3handler.py` → `LocalDeleteRequestSubmitter`). Without the rule for a link that sorts after its target, the delete and the download alternate across runs: one run removes `real/x.txt`, and the next downloads it back through `z/link`. rsync's `--delete-delay` also holds deletes until its scan ends, and it keeps them in a temporary file.*
 
 ## 4. Comparison (`FR-Cmp-*`)
 
@@ -426,8 +430,7 @@ MUST keep agreeing: repeated runs over an unchanged pair MUST NOT flip between t
 **FR-Cmp-8** The same side states and the same options MUST always produce the same plan. Both sides
 arrive in key order (FR-Enum-13); beyond that, the plan MUST NOT depend on how the two interleave, or on
 the order in which earlier transfers finished. A download with following on is the one exception:
-the run's own writes and deletes through a link can change what its walk reads later (FR-Enum-4,
-FR-Enum-15).
+the run's own writes through a link can change what its walk reads later (FR-Enum-4).
 
 "The same plan" means the same decision and the same reason for every key. It does not mean the same
 sequence: FR-Exec-12 lets transfers happen in any order, so nothing downstream depends on the order
@@ -580,10 +583,8 @@ per key precisely because partial success is normal.
 
 **FR-Exec-7 (running it twice changes nothing)** Running the same sync again straight after a successful
 one, a run that ended clean (FR-Fail-5), MUST decide to do nothing at all: no transfers, no deletes.
-This MUST hold in every direction and in every comparison mode. Two cases are exceptions. The first
-is a download through a link the walk meets only after the merge passed the link's target
-(FR-Enum-15). The second is two keys that land on one local file while FR-Fail-8's policy is
-`ignore`.
+This MUST hold in every direction and in every comparison mode. One case is an exception: two keys
+that land on one local file while FR-Fail-8's policy is `ignore`.
 *`[DERIVED]` from FR-Cmp-1 plus FR-Exec-5 (the write-back is what makes the download direction stable). `[DOC]` Description: "Recursively copies new and updated files from the source directory to the destination."*
 
 **FR-Exec-8** Properties the caller supplies — user metadata, ACL and grants, encryption settings, storage
@@ -847,8 +848,8 @@ missing decisions (FR-Fail-7), and the result MUST say so.
 
 **FR-Dry-2** A dry run MUST go through the same comparison code as a real run, so the plan it prints is a
 truthful prediction of what a real run would do, given the two sides do not change in between. A
-download with following on is the one exception: a real run's own writes and deletes through a link
-can change what its walk reads later, so its plan can differ from the dry run's (FR-Cmp-8).
+download with following on is the one exception: a real run's own writes through a link can change
+what its walk reads later, so its plan can differ from the dry run's (FR-Cmp-8).
 *`[CLI]` the dry-run branch sits downstream of the comparator in the same generator chain (`subcommands.py` → `CommandArchitecture.run`), so no separate decision logic exists.*
 
 ## 9. Observability (`FR-Obs-*`)
@@ -894,7 +895,10 @@ zero per-entry requests, unless the caller opted into one of the modes FR-Cmp-5 
 *`[DERIVED]` from FR-Cmp-5 plus `[DOC]` `--page-size` (default and maximum 1000) and `utils.py` → `BucketLister.list_objects` pagination.*
 
 **NFR-Lat-1** The time until the first transfer starts MUST NOT depend on how many entries there are in
-total. A run over a million keys MUST begin transferring as promptly as a run over ten.
+total. A run over a million keys MUST begin transferring as promptly as a run over ten. A download
+with following on and delete mode on has one exception. A download that needs a local removal on
+its path waits until sync knows every followed link (FR-Enum-15). When the bounded list of removals
+waiting for that point is full, later downloads wait too.
 *`[CLI]` satisfied by the generator chain (FR-Enum-7).*
 
 **NFR-Mem-1** Peak memory MUST be bounded by what a run holds at one moment: the entries of each directory
