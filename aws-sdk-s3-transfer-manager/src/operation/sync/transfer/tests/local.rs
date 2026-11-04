@@ -501,10 +501,15 @@ async fn each_removal_on_a_path_runs_before_the_downloads_under_it() {
         "photos/2.jpg",
         "q.txt",
     ];
-    let client = a_bucket_to_download(&keys, 1_600_000_000);
-    let (t, ctx, rx) = downloading_into(&root, client, DeleteMode::On);
-
-    run_managed(&t, &ctx, rx).await;
+    // Run 1 removes the links and holds the keys under them. Run 2 downloads into real directories.
+    for _ in 0..2 {
+        let client = a_bucket_to_download(&keys, 1_600_000_000);
+        let (t, ctx, rx) = downloading_into(&root, client, DeleteMode::On);
+        run_managed(&t, &ctx, rx).await;
+        let snapshot = t.inner.state.lock().snapshot();
+        assert_eq!(snapshot.transfer_failures, 0);
+        assert_eq!(snapshot.transfers_held, 0);
+    }
 
     for key in keys {
         let path = root.join(key);
@@ -525,9 +530,6 @@ async fn each_removal_on_a_path_runs_before_the_downloads_under_it() {
         let escaped: Vec<_> = std::fs::read_dir(outside.path()).expect("reads").collect();
         assert!(escaped.is_empty(), "the run wrote outside the root");
     }
-    let snapshot = t.inner.state.lock().snapshot();
-    assert_eq!(snapshot.transfer_failures, 0);
-    assert_eq!(snapshot.transfers_held, 0);
 }
 
 #[cfg_attr(miri, ignore)]

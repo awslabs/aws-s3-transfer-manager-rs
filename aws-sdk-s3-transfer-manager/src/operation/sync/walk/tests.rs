@@ -633,14 +633,17 @@ async fn an_excluded_destination_link_waits_for_an_earlier_source_key() {
 }
 
 #[tokio::test]
-async fn an_excluded_destination_link_makes_no_pairing() {
+async fn an_excluded_destination_link_holds_back_the_keys_under_it_and_makes_no_pairing() {
     let walk = Walk::new(
         Scripted::of(&["photos/y.jpg"]),
         Scripted::from(vec![Ok(obstructed("photos", Obstruction::ExcludedLink))]),
     );
     let (seen, complete) = pair_all(walk).await;
-    assert_eq!(seen, plan(&[("photos/y.jpg", At::Here, At::Gone)]));
-    assert!(complete);
+    assert_eq!(seen, plan(&[("photos/y.jpg", At::Here, At::UnknownRange)]));
+    assert!(
+        !complete,
+        "a plan that skipped keys under an excluded link called itself complete"
+    );
 }
 
 #[tokio::test]
@@ -653,10 +656,11 @@ async fn a_source_link_with_nothing_under_it_leaves_the_plan_complete() {
     assert!(complete);
 }
 
-// A download writes through a destination link the walk left unfollowed, as `download_objects`
-// does, so that link holds nothing back.
+// A download under a destination link the walk left unfollowed would write through the link, so
+// the destination holds back every key under its name. The link itself still pairs, so delete
+// mode can remove it.
 #[tokio::test]
-async fn an_unfollowed_destination_link_holds_nothing_back() {
+async fn an_unfollowed_destination_link_holds_back_the_keys_under_it() {
     let walk = Walk::new(
         Scripted::of(&["photos/y.jpg"]),
         Scripted::from(vec![Ok(obstructed("photos", Obstruction::UnfollowedLink))]),
@@ -666,10 +670,13 @@ async fn an_unfollowed_destination_link_holds_nothing_back() {
         seen,
         plan(&[
             ("photos", At::Gone, At::Here),
-            ("photos/y.jpg", At::Here, At::Gone),
+            ("photos/y.jpg", At::Here, At::UnknownRange),
         ])
     );
-    assert!(complete);
+    assert!(
+        !complete,
+        "a plan that skipped keys under a link called itself complete"
+    );
 }
 
 // A socket cannot hold a directory, so its name holds back no keys under it.
