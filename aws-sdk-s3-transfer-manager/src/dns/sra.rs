@@ -1341,7 +1341,7 @@ mod testing {
         assert!(context.entry.ipv4_addresses.empty());
 
         // new resolve with result
-        let result_targets = submit_requests(&mut context, 1, 100);
+        let _ = submit_requests(&mut context, 1, 100);
         assert_eq!(1, context.entry.pending_requests.len());
 
         // apply result
@@ -1349,7 +1349,7 @@ mod testing {
 
         // let enough time pass for expiration, new resolve, should be pending and addresses empty
         context.advance_time(context.config.resolution_ttl);
-        let result_targets = submit_requests(&mut context, 1, 100);
+        let _ = submit_requests(&mut context, 1, 100);
         assert_eq!(1, context.entry.pending_requests.len());
         assert!(context.entry.addresses_by_ttl.is_empty());
         assert!(context.entry.ipv6_addresses.empty());
@@ -1405,7 +1405,7 @@ mod testing {
             }
         }
 
-        // make a resolve request, should not see LOCALHOST_IPV4 in the cached reply
+        // make a resolve request, should not see banned address in the cached reply
         let result_targets = submit_requests(&mut context, 1, 100);
         let addresses = result_targets[0].lock().unwrap().take().unwrap().unwrap();
         assert_eq!(1, addresses.len());
@@ -1445,23 +1445,359 @@ mod testing {
     }
 
     #[test]
-    fn host_entry_reresolving_a_banned_ip_does_not_cause_it_to_be_used() {}
+    fn host_entry_reresolving_a_banned_ip_does_not_cause_it_to_be_used() {
+        // set up resolution with single address set
+        let mut context = HostEntryTestContext::default();
+        initialize_resolution_test_context_single(&mut context);
+
+        // make a resolve request
+        let result_targets = submit_requests(&mut context, 1, 100);
+        assert_eq!(1, context.entry.pending_requests.len());
+        apply_mock_result_to_context(&mut context);
+
+        assert!(is_result_localhost(result_targets[0].clone()));
+
+        // mark LOCALHOST_IPV4 as a fatal error, should never be seen again as long as ttl active
+        let connection_error =
+            HostEventConnectionError::builder(ConnectionErrorCategory::Fatal).build();
+        let connection_failure_event: HostEvent = HostEvent::builder(
+            &MOCK_HOST,
+            LOCALHOST_IPV4,
+            HostEventInformation::ConnectionError(connection_error),
+        )
+        .build();
+        context.entry.handle_host_event(connection_failure_event);
+        // still know about it
+        assert!(context.entry.addresses_by_ttl.contains(&LOCALHOST_IPV4));
+        // but it's not in the specific list
+        assert!(context.entry.ipv4_addresses.empty());
+
+        // advance time enough to get a second background resolution
+        context
+            .mock_clock
+            .advance_time(MINIMUM_DELAY_BETWEEN_RESOLVES);
+
+        // make enough resolve requests to trigger a background resolution which will contain
+        // LOCALHOST_IPV4, then make some more requests and verify LOCALHOST_IPV4 never shows up
+        let _ = submit_requests(&mut context, 1, 100);
+        apply_mock_result_to_context(&mut context);
+
+        let result_targets = submit_requests(&mut context, 5, 100);
+        for result_target in result_targets {
+            let addresses = result_target.lock().unwrap().take().unwrap().unwrap();
+            assert_eq!(1, addresses.len());
+            assert!(addresses.contains(&LOCALHOST_IPV6));
+        }
+
+        // background resolution function should have been called two times
+        assert_eq!(2, context.mock_results.get_call_count());
+    }
 
     #[test]
-    fn host_entry_bans_expire() {}
+    fn host_entry_bans_expire() {
+        // set up resolution with single address set
+        let mut context = HostEntryTestContext::default();
+        initialize_resolution_test_context_single(&mut context);
+
+        // make a resolve request
+        let result_targets = submit_requests(&mut context, 1, 100);
+        assert_eq!(1, context.entry.pending_requests.len());
+        apply_mock_result_to_context(&mut context);
+
+        assert!(is_result_localhost(result_targets[0].clone()));
+
+        // mark LOCALHOST_IPV4 as a fatal error, should never be seen again as long as ttl active
+        let connection_error =
+            HostEventConnectionError::builder(ConnectionErrorCategory::Fatal).build();
+        let connection_failure_event: HostEvent = HostEvent::builder(
+            &MOCK_HOST,
+            LOCALHOST_IPV4,
+            HostEventInformation::ConnectionError(connection_error),
+        )
+        .build();
+        context.entry.handle_host_event(connection_failure_event);
+        // still know about it
+        assert!(context.entry.addresses_by_ttl.contains(&LOCALHOST_IPV4));
+        // but it's not in the specific list
+        assert!(context.entry.ipv4_addresses.empty());
+
+        // advance time enough to forget about the ban; because purging addresses is lazy,
+        // there's no way to verify forgetting about it unless we call an internal api
+        // (purge_expired) or re-resolve which will re-add it
+        context
+            .mock_clock
+            .advance_time(context.config.resolution_ttl);
+
+        // make a resolve requests to trigger a background resolution which will contain
+        // LOCALHOST_IPV4, then make some more requests and verify LOCALHOST_IPV4 now shows up again
+        let _ = submit_requests(&mut context, 1, 100);
+        apply_mock_result_to_context(&mut context);
+
+        let result_targets = submit_requests(&mut context, 5, 100);
+        for result_target in result_targets {
+            assert!(is_result_localhost(result_target));
+        }
+
+        // background resolution function should have been called two times
+        assert_eq!(2, context.mock_results.get_call_count());
+    }
 
     #[test]
-    fn host_entry_unhealthy_address_does_not_get_used_if_alternative_exists() {}
+    fn host_entry_unhealthy_address_does_not_get_used_if_alternative_exists() {
+        // set up resolution with multiple address sets
+        let mut context = HostEntryTestContext::default();
+        initialize_resolution_test_context_multiple(&mut context);
+
+        // make a resolve request and apply it
+        let _ = submit_requests(&mut context, 1, 100);
+        assert_eq!(1, context.entry.pending_requests.len());
+        apply_mock_result_to_context(&mut context);
+
+        // wait enough time for another background resolution to be triggerable
+        context
+            .mock_clock
+            .advance_time(MINIMUM_DELAY_BETWEEN_RESOLVES);
+
+        // make a resolve request and apply it
+        let _ = submit_requests(&mut context, 1, 100);
+        apply_mock_result_to_context(&mut context);
+
+        // mark LOCALHOST_IPV6 as unhealthy for a while
+        let penalty_duration = Duration::from_secs(5);
+        let connection_error =
+            HostEventConnectionError::builder(ConnectionErrorCategory::Standard(penalty_duration))
+                .build();
+        let connection_failure_event: HostEvent = HostEvent::builder(
+            &MOCK_HOST,
+            LOCALHOST_IPV6,
+            HostEventInformation::ConnectionError(connection_error),
+        )
+        .build();
+        context.entry.handle_host_event(connection_failure_event);
+        // still know about it
+        assert!(context.entry.addresses_by_ttl.contains(&LOCALHOST_IPV6));
+
+        // tbis is awkward
+        let v6addr: Ipv6Addr = LOCALHOST_IPV6.to_string().parse().unwrap();
+
+        // it's not healthy
+        assert!(!context
+            .entry
+            .ipv6_addresses
+            .healthy_addresses
+            .contains(&v6addr));
+        // it is unhealthy and its expiration time is expected
+        assert!(context
+            .entry
+            .ipv6_addresses
+            .unhealthy_addresses_by_expiration
+            .contains(&v6addr));
+        let expected_expiration = context.mock_clock.get_current_time() + penalty_duration;
+        assert_eq!(
+            expected_expiration,
+            context
+                .entry
+                .ipv6_addresses
+                .unhealthy_addresses_by_expiration
+                .get(&v6addr)
+                .unwrap()
+                .1
+                 .0
+        );
+
+        // do a bunch of resolves which should just cycle through the cache, but LOCALHOST_IPV6 should
+        // be skipped
+        let result_targets = submit_requests(&mut context, 5, 0);
+        for result_target in result_targets {
+            let addresses = result_target.lock().unwrap().take().unwrap().unwrap();
+            // localv6 was banned so every resolve should contain otherhostv6
+            assert_eq!(2, addresses.len());
+            assert!(addresses.contains(&OTHERHOST_IPV6));
+            assert!(addresses.contains(&LOCALHOST_IPV4) || addresses.contains(&OTHERHOST_IPV4));
+        }
+
+        // background resolution function should have been called two times
+        assert_eq!(2, context.mock_results.get_call_count());
+    }
 
     #[test]
-    fn host_entry_unhealthy_address_gets_used_if_no_alternative() {}
+    fn host_entry_unhealthy_address_gets_used_if_no_alternative() {
+        // similar to the base unhealthy test, but we only use a single address set which will force
+        // a resurrection of the unhealthy address
+
+        // set up resolution with a single address set
+        let mut context = HostEntryTestContext::default();
+        initialize_resolution_test_context_single(&mut context);
+
+        // make a resolve request and apply it
+        let _ = submit_requests(&mut context, 1, 100);
+        assert_eq!(1, context.entry.pending_requests.len());
+        apply_mock_result_to_context(&mut context);
+
+        // mark LOCALHOST_IPV6 as unhealthy for a while
+        let connection_error =
+            HostEventConnectionError::builder(ConnectionErrorCategory::Major).build();
+        let connection_failure_event: HostEvent = HostEvent::builder(
+            &MOCK_HOST,
+            LOCALHOST_IPV6,
+            HostEventInformation::ConnectionError(connection_error),
+        )
+        .build();
+        context.entry.handle_host_event(connection_failure_event);
+
+        let v6addr: Ipv6Addr = LOCALHOST_IPV6.to_string().parse().unwrap();
+        assert!(!context
+            .entry
+            .ipv6_addresses
+            .healthy_addresses
+            .contains(&v6addr));
+        assert!(context
+            .entry
+            .ipv6_addresses
+            .unhealthy_addresses_by_expiration
+            .contains(&v6addr));
+
+        // do a resolve which should resurrect the address because there's no alternative
+        let result_targets = submit_requests(&mut context, 1, 0);
+
+        // it's healthy again
+        assert!(context
+            .entry
+            .ipv6_addresses
+            .healthy_addresses
+            .contains(&v6addr));
+        assert!(!context
+            .entry
+            .ipv6_addresses
+            .unhealthy_addresses_by_expiration
+            .contains(&v6addr));
+
+        for result_target in result_targets {
+            let addresses = result_target.lock().unwrap().take().unwrap().unwrap();
+            assert_eq!(2, addresses.len());
+            assert!(addresses.contains(&LOCALHOST_IPV6));
+            assert!(addresses.contains(&LOCALHOST_IPV4));
+        }
+    }
 
     #[test]
-    fn host_entry_unhealthy_recovers_if_enough_time_passes() {}
+    fn host_entry_unhealthy_recovers_if_enough_time_passes() {
+        // similar to the base unhealthy test, but after showing it's not being used,
+        // we let enough time pass for the address to become healthy again
+        // set up resolution with multiple address sets
+        let mut context = HostEntryTestContext::default();
+        initialize_resolution_test_context_multiple(&mut context);
+
+        // make a resolve request and apply it
+        let _ = submit_requests(&mut context, 1, 100);
+        assert_eq!(1, context.entry.pending_requests.len());
+        apply_mock_result_to_context(&mut context);
+
+        // wait enough time for another background resolution to be triggerable
+        context
+            .mock_clock
+            .advance_time(MINIMUM_DELAY_BETWEEN_RESOLVES);
+
+        // make a resolve request and apply it
+        let _ = submit_requests(&mut context, 1, 100);
+        apply_mock_result_to_context(&mut context);
+
+        // mark LOCALHOST_IPV6 as unhealthy for a while
+        let penalty_duration = Duration::from_secs(5);
+        let connection_error =
+            HostEventConnectionError::builder(ConnectionErrorCategory::Standard(penalty_duration))
+                .build();
+        let connection_failure_event: HostEvent = HostEvent::builder(
+            &MOCK_HOST,
+            LOCALHOST_IPV6,
+            HostEventInformation::ConnectionError(connection_error),
+        )
+        .build();
+        context.entry.handle_host_event(connection_failure_event);
+        // still know about it
+        assert!(context.entry.addresses_by_ttl.contains(&LOCALHOST_IPV6));
+
+        let v6addr: Ipv6Addr = LOCALHOST_IPV6.to_string().parse().unwrap();
+        // it's not healthy
+        assert!(!context
+            .entry
+            .ipv6_addresses
+            .healthy_addresses
+            .contains(&v6addr));
+        // it is unhealthy and its expiration time is expected
+        assert!(context
+            .entry
+            .ipv6_addresses
+            .unhealthy_addresses_by_expiration
+            .contains(&v6addr));
+        let expected_expiration = context.mock_clock.get_current_time() + penalty_duration;
+        assert_eq!(
+            expected_expiration,
+            context
+                .entry
+                .ipv6_addresses
+                .unhealthy_addresses_by_expiration
+                .get(&v6addr)
+                .unwrap()
+                .1
+                 .0
+        );
+
+        // advance time enough for the unhealthy categorization to fall off
+        context.mock_clock.advance_time(penalty_duration);
+
+        // do a bunch of resolves which should just cycle through the cache; we should see all
+        // addresses
+        let result_targets = submit_requests(&mut context, 3, 0);
+        assert!(do_results_contain_both_host_sets(result_targets));
+    }
 
     #[test]
-    fn host_entry_resolve_failure() {}
+    fn host_entry_resolve_failure() {
+        // make the mock background resolution function return errors, verify resolves fail
+        let mut context = HostEntryTestContext::default();
+        // by not initializing any results, resolution will fail
 
-    #[test]
-    fn host_entry_resolve_multiple_with_elapsed_time_failure() {}
+        // make some resolve requests and apply the background resolve failure
+        let result_targets = submit_requests(&mut context, 3, 100);
+        assert_eq!(3, context.entry.pending_requests.len());
+        apply_mock_result_to_context(&mut context);
+
+        for result_target in result_targets {
+            let res = result_target.lock().unwrap().take().unwrap();
+            assert!(res.is_err());
+        }
+
+        // make some more resolve requests, they should fail immediately due to an empty cache
+        // and not enough time has passed to re-resolve
+        let result_targets = submit_requests(&mut context, 3, 100);
+        assert_eq!(0, context.entry.pending_requests.len());
+        assert!(!context.entry.pending_resolution);
+
+        for result_target in result_targets {
+            let res = result_target.lock().unwrap().take().unwrap();
+            assert!(res.is_err());
+        }
+
+        // advance time enough for a re-resolve (which will also fail)
+        context
+            .mock_clock
+            .advance_time(MINIMUM_DELAY_BETWEEN_RESOLVES);
+
+        // make some more resolve requests; they'll trigger a re-resolve but also ultimately
+        // fail when the background resolution fails
+        let result_targets = submit_requests(&mut context, 3, 100);
+        assert_eq!(3, context.entry.pending_requests.len());
+        assert!(context.entry.pending_resolution);
+
+        apply_mock_result_to_context(&mut context);
+
+        for result_target in result_targets {
+            let res = result_target.lock().unwrap().take().unwrap();
+            assert!(res.is_err());
+        }
+
+        // background resolution function should have been called two times
+        assert_eq!(2, context.mock_results.get_call_count());
+    }
 }
