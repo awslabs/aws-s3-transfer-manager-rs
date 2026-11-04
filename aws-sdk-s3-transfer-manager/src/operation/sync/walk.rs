@@ -527,8 +527,13 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
                 });
                 continue;
             }
+            // A destination link hides the keys under its name the same way. A write under the name
+            // would go through the link, so the destination holds those keys back.
             if order.is_ge() && self.dst.head_is(Obstruction::ExcludedLink) {
-                self.dst.take();
+                let link = self.dst.take();
+                self.dst.gap.add(Stretch {
+                    under: Some(link.key),
+                });
                 continue;
             }
             return Some(Ok(match order {
@@ -573,11 +578,6 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
     // Take the source's head entry. A source link the walk did not follow occupies its name and
     // hides whatever sits under it, so the source holds back every key under that name. A
     // destination key there then reads as unknown and not as absent.
-    //
-    // TODO(vnext): The transfer manager has no symlink policy for the local side of a download.
-    // `download_objects` writes through a link on a directory above a file, and it replaces a link
-    // at the file's own name. Sync does both, until the transfer manager settles a download-side
-    // policy.
     fn take_source(&mut self) -> Entry<S::Source> {
         let entry = self.src.take();
         if entry.meta.obstruction == Some(Obstruction::UnfollowedLink) {
@@ -638,8 +638,22 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
         }
     }
 
-    fn take_destination_only(&mut self) -> Pairing<S::Source, D::Source> {
+    // Take the destination's head entry. A destination link the walk did not follow occupies its
+    // name and hides whatever sits under it. A download under that name would write through the
+    // link, so the destination holds back every key under the name. A source key there then reads
+    // as unknown and not as absent.
+    fn take_destination(&mut self) -> Entry<D::Source> {
         let entry = self.dst.take();
+        if entry.meta.obstruction == Some(Obstruction::UnfollowedLink) {
+            self.dst.gap.add(Stretch {
+                under: Some(entry.key.clone()),
+            });
+        }
+        entry
+    }
+
+    fn take_destination_only(&mut self) -> Pairing<S::Source, D::Source> {
+        let entry = self.take_destination();
         let source = self.src.missing(&entry.key);
         self.note_unknown(&source);
         Pairing {
@@ -652,7 +666,7 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
     fn take_both(&mut self) -> Pairing<S::Source, D::Source> {
         // Neither side is missing here, so neither has anything to answer for.
         let src = self.take_source();
-        let dst = self.dst.take();
+        let dst = self.take_destination();
         Pairing {
             key: src.key.clone(),
             source: SideState::Present(src),
@@ -1726,14 +1740,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_excluded_destination_link_makes_no_pairing() {
+    async fn an_excluded_destination_link_holds_back_the_keys_under_it_and_makes_no_pairing() {
         let walk = Walk::new(
             Scripted::of(&["photos/y.jpg"]),
             Scripted::from(vec![Ok(obstructed("photos", Obstruction::ExcludedLink))]),
         );
         let (seen, complete) = pair_all(walk).await;
-        assert_eq!(seen, plan(&[("photos/y.jpg", At::Here, At::Gone)]));
-        assert!(complete);
+        assert_eq!(seen, plan(&[("photos/y.jpg", At::Here, At::UnknownRange)]));
+        assert!(
+            !complete,
+            "a plan that skipped keys under an excluded link called itself complete"
+        );
     }
 
     #[tokio::test]
@@ -1746,10 +1763,11 @@ mod tests {
         assert!(complete);
     }
 
-    // A download writes through a destination link the walk left unfollowed, as `download_objects`
-    // does, so that link holds nothing back.
+    // A download under a destination link the walk left unfollowed would write through the link, so
+    // the destination holds back every key under its name. The link itself still pairs, so delete
+    // mode can remove it.
     #[tokio::test]
-    async fn an_unfollowed_destination_link_holds_nothing_back() {
+    async fn an_unfollowed_destination_link_holds_back_the_keys_under_it() {
         let walk = Walk::new(
             Scripted::of(&["photos/y.jpg"]),
             Scripted::from(vec![Ok(obstructed("photos", Obstruction::UnfollowedLink))]),
@@ -1759,10 +1777,13 @@ mod tests {
             seen,
             plan(&[
                 ("photos", At::Gone, At::Here),
-                ("photos/y.jpg", At::Here, At::Gone),
+                ("photos/y.jpg", At::Here, At::UnknownRange),
             ])
         );
-        assert!(complete);
+        assert!(
+            !complete,
+            "a plan that skipped keys under a link called itself complete"
+        );
     }
 
     // A socket cannot hold a directory, so its name holds back no keys under it.

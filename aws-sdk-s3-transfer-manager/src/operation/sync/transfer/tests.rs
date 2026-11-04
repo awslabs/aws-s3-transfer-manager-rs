@@ -4351,12 +4351,79 @@ async fn a_download_writes_nothing_outside_the_root_through_a_link_it_deletes() 
 #[cfg(unix)]
 #[cfg_attr(miri, ignore)]
 #[tokio::test]
-async fn a_download_writes_through_a_destination_link_as_download_objects_does() {
-    let landed = through_a_destination_link(DeleteMode::Off).await;
+async fn a_download_writes_nothing_through_a_destination_link_it_keeps() {
+    let escaped = through_a_destination_link(DeleteMode::Off).await;
+    assert!(
+        escaped.is_empty(),
+        "delete mode off: wrote outside the root: {escaped:?}"
+    );
+}
+
+// More keys than one merge batch, so the merge decides some of them after the tree refused to remove
+// the link. None of them may write through it.
+#[cfg(unix)]
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn no_download_writes_through_a_link_the_run_could_not_remove() {
+    let outside = tempfile::tempdir().expect("outside");
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path().canonicalize().expect("canonical root");
+    std::os::unix::fs::symlink(outside.path(), root.join("photos")).expect("symlink");
+    let names: Vec<String> = (0..300).map(|n| format!("photos/k{n:03}.jpg")).collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let (t, ctx, rx) = downloading_into_with(
+        &root,
+        a_bucket_to_download(&refs, 1_600_000_000),
+        DeleteMode::On,
+        Arc::new(RecordDeletes::refusing_in_a_tree(1)),
+        Walker::builder().build(),
+    );
+    run_managed(&t, &ctx, rx).await;
+
+    let written_outside = std::fs::read_dir(outside.path())
+        .expect("outside reads")
+        .count();
     assert_eq!(
-        landed,
-        ["a.jpg"],
-        "delete mode off: the file did not land where the link points"
+        written_outside, 0,
+        "downloads wrote through a link the run could not remove"
+    );
+    assert!(
+        !t.is_plan_complete(),
+        "a run that held back keys under a link reported a whole plan"
+    );
+}
+
+// The same 300 keys with delete mode off. The run keeps the link, so every key stays held.
+#[cfg(unix)]
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn no_download_writes_through_a_link_the_run_keeps() {
+    let outside = tempfile::tempdir().expect("outside");
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path().canonicalize().expect("canonical root");
+    std::os::unix::fs::symlink(outside.path(), root.join("photos")).expect("symlink");
+    let names: Vec<String> = (0..300).map(|n| format!("photos/k{n:03}.jpg")).collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let (t, ctx, rx) = downloading_into(
+        &root,
+        a_bucket_to_download(&refs, 1_600_000_000),
+        DeleteMode::Off,
+    );
+    run_managed(&t, &ctx, rx).await;
+
+    let written_outside = std::fs::read_dir(outside.path())
+        .expect("outside reads")
+        .count();
+    assert_eq!(
+        written_outside, 0,
+        "downloads wrote through a link the run kept"
+    );
+    assert!(
+        std::fs::symlink_metadata(root.join("photos"))
+            .expect("photos exists")
+            .file_type()
+            .is_symlink(),
+        "delete mode off removed the link"
     );
 }
 
@@ -4394,10 +4461,15 @@ async fn each_removal_on_a_path_runs_before_the_downloads_under_it() {
         "photos/2.jpg",
         "q.txt",
     ];
-    let client = a_bucket_to_download(&keys, 1_600_000_000);
-    let (t, ctx, rx) = downloading_into(&root, client, DeleteMode::On);
-
-    run_managed(&t, &ctx, rx).await;
+    // Run 1 removes the links and holds the keys under them. Run 2 downloads into real directories.
+    for _ in 0..2 {
+        let client = a_bucket_to_download(&keys, 1_600_000_000);
+        let (t, ctx, rx) = downloading_into(&root, client, DeleteMode::On);
+        run_managed(&t, &ctx, rx).await;
+        let snapshot = t.inner.state.lock().snapshot();
+        assert_eq!(snapshot.transfer_failures, 0);
+        assert_eq!(snapshot.transfers_held, 0);
+    }
 
     for key in keys {
         let path = root.join(key);
@@ -4418,9 +4490,6 @@ async fn each_removal_on_a_path_runs_before_the_downloads_under_it() {
         let escaped: Vec<_> = std::fs::read_dir(outside.path()).expect("reads").collect();
         assert!(escaped.is_empty(), "the run wrote outside the root");
     }
-    let snapshot = t.inner.state.lock().snapshot();
-    assert_eq!(snapshot.transfer_failures, 0);
-    assert_eq!(snapshot.transfers_held, 0);
 }
 
 #[cfg_attr(miri, ignore)]
