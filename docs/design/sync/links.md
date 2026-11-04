@@ -992,10 +992,10 @@ The destination's branch mirrors the condition and adds its own stretch.
 ### Naming what a followed link reaches
 
 The link scan is a second `FsWalk` over the destination root, with the walk's follow setting and
-filter. It runs on its own blocking task and yields no entries to the merge. `FsWalk` records each
-link it follows during one `next` call. The scan turns each link into names after every call,
-including a call that returns an error. A name comes in one of two kinds, because the merge reaches
-the two at different points:
+filter. It runs as its own work item and yields no entries to the merge. `FsWalk` records each link
+it follows during one `next` call. The scan turns each link into names after every call, including a
+call that returns an error. A name comes in one of two kinds, because the merge reaches the two at
+different points:
 
 ```rust
 pub(crate) enum AliasedName {
@@ -1020,14 +1020,18 @@ that entry in the hop's resolved parent by matching the hop's identity. The link
 spell the name differently, as `Z.TXT` for a stored `z.txt` on a filesystem that ignores case. A
 hold under that spelling would miss the stored key.
 
-`Walker::downloading` takes the delete mode. With delete mode off, the run starts no scan, so a
-download with following on and delete mode off resolves no link targets (D4). The destination walk
-itself names nothing, because the scan names every link the walk could meet.
+`Walker::downloading` takes the delete mode. With delete mode off, the run starts no scan, and the
+destination walk names nothing. So a download with following on and delete mode off resolves no link
+targets (D4). With delete mode on, the destination walk names each link it follows the same way the
+scan does. The two share one `LinkNamer`. The walk needs its own names for two reasons. A link the
+walk follows while the scan still reads guards the waiting deletes too. A link the walk follows
+after the scan ended shows whether someone created it during the run (case M).
 
-The scan's result is a list of names, or a mark that the tree passed the bound (D5):
+The scan reads with `SortOrder::Native`, because it needs every link and no key order. Its result
+is a list of names, or a mark that the tree passed the bound (D5):
 
 ```rust
-pub(crate) enum LinkScan {
+pub(crate) enum LinkScanResult {
     // Every name the tree's followed links reach, at most `ALIASED_NAMES_HELD` of them.
     Names(Vec<AliasedName>),
     // The tree holds more names than the bound, so the run holds every local delete.
@@ -1035,48 +1039,48 @@ pub(crate) enum LinkScan {
 }
 ```
 
+Many links can reach one target, so the scan counts each name once before it judges the bound.
+
 ### Waiting for the scan
 
-While the scan runs, execution keeps each local delete the merge decides in `waiting`. When the
-scan ends, execution checks the waiting deletes, and the merge takes the names as holds:
+The run takes the scan from the walk when it starts. The scan leaves `State` while a work item
+reads it, as the merge does, and each item reads up to `MERGE_BATCH` entries. While the scan reads,
+`Deletes` holds every local delete in its `waiting` list, and no batch goes out. The keys still
+join `clearing`, so a download behind a waiting removal waits too (execution's D12).
+
+The walk tracks where the run stands with its scan:
 
 ```rust
-match scan {
-    LinkScan::Names(names) => {
-        for key in waiting.drain(..) {
-            if names.iter().any(|name| name.covers(&key)) {
-                // A kept key may name this file through a link (D4).
-                state.decided.skip_unknown(key);
-            } else {
-                state.deletes.queue(key);
-            }
-        }
-        for name in names {
-            walk.hold_aliased(name);
-        }
-    }
-    LinkScan::TooMany => {
-        for key in waiting.drain(..) {
-            state.decided.skip_unknown(key);
-        }
-        walk.hold_every_delete();
-    }
+enum Links {
+    // The run has no link scan. A delete goes out as soon as the merge decides it.
+    NoScan,
+    // The scan is still reading. `found` keeps each link the walk follows now.
+    Scanning { found: Vec<AliasedName> },
+    // The scan ended. `names` holds the scan's names, sorted.
+    Scanned { names: Vec<String> },
 }
 ```
 
-`Walk::hold_aliased` adds each name the merge has not passed entirely. A name the merge has passed
-covers no key still ahead of it. The check above already covered the waiting deletes behind it:
+When the scan ends and the merge is back in `State`, the run settles the scan. The walk holds the
+scan's names on the source side, and it returns the sorted union of the scan's names and the names
+in `found`. The run keeps each waiting delete the union covers, and it sends the rest:
 
 ```rust
-if passed {
-    // Nothing under the name is still ahead of the merge.
-    return;
-}
-self.src.gap.add(stretch);
+let names = walk.accept_link_scan(result);
+let (kept, sent): (Vec<String>, Vec<String>) = self
+    .deletes
+    .waiting
+    .drain(..)
+    .partition(|key| names.as_deref().is_none_or(|names| names_cover(names, key)));
 ```
 
-`AliasedName::covers` answers as the name's stretch does. Both kinds cover the name and every key
-below it. The two kinds differ only in when the merge reaches them.
+`None` stands for `TooMany`. The walk then holds every delete on the source side, and every waiting
+delete stays. The run reports each kept delete as `skipped-unknown` and marks the plan incomplete.
+A download held behind a kept key fails, as it does behind a refused removal.
+
+`names_cover` finds the key or a directory above it in the sorted names with a binary search per
+path level. After the scan, `Walk::hold_aliased` marks the plan incomplete for a name the merge
+already reached only when the scan never saw the name (case M).
 
 ### Checking a path when sync acts
 

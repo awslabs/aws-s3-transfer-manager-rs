@@ -442,10 +442,50 @@ fn at_or_under(key: &str, name: &str) -> bool {
     key.starts_with(name) && (key.len() == name.len() || key.as_bytes()[name.len()] == b'/')
 }
 
-// Followed destination links keep at most this many names held at once. Past the bound, the source
-// holds back every later delete. The value matches how many transfers may wait before the merge
-// pauses, so the held names cost about what that queue does.
+// Followed destination links keep at most this many names held at once, and the link scan records
+// at most this many names for the whole tree. Past the bound, the source holds back every later
+// delete. The value matches how many transfers may wait before the merge pauses, so the held names
+// cost about what that queue does.
 const ALIASED_NAMES_HELD: usize = 1024;
+
+// What a link scan found once it read the whole destination.
+#[derive(Debug)]
+pub(crate) enum LinkScanResult {
+    // Every name the tree's followed links reach, at most `ALIASED_NAMES_HELD` of them.
+    Names(Vec<AliasedName>),
+    // The tree holds more names than the bound, so the run holds every local delete.
+    TooMany,
+}
+
+// Where a run stands with its link scan. The merge reads this when the destination walk follows a
+// link, to decide whether a delete under the link's names may already have gone out.
+#[derive(Debug)]
+enum Links {
+    // The run has no link scan. A delete goes out as soon as the merge decides it.
+    NoScan,
+    // The scan is still reading, and every local delete waits for it. A link the walk follows now
+    // is kept here, so the waiting deletes are checked against it too.
+    Scanning { found: Vec<AliasedName> },
+    // The scan ended. These are its names, sorted. A link the walk follows from now on was either
+    // named by the scan or created after the scan read its directory.
+    Scanned { names: Vec<String> },
+}
+
+// The key an aliased name stands for, of either kind.
+fn name_of(name: &AliasedName) -> &str {
+    let (AliasedName::File(name) | AliasedName::Directory(name)) = name;
+    name
+}
+
+// Whether `names`, sorted, holds `key` or a directory above it.
+pub(crate) fn names_cover(names: &[String], key: &str) -> bool {
+    let has = |name: &str| names.binary_search_by(|n| n.as_str().cmp(name)).is_ok();
+    has(key)
+        || key
+            .bytes()
+            .enumerate()
+            .any(|(at, byte)| byte == b'/' && has(&key[..at]))
+}
 
 // Two key-ordered streams merged into one pairing per key.
 // `Progress` tells callers whether the merge can infer absence from key position.
@@ -473,6 +513,9 @@ pub(crate) struct Walk<S: KeyStream, D: KeyStream> {
     // reads as "nothing is there" — so carrying on would read every key the other side still
     // holds as absent, and delete mode would remove all of them.
     ended_by_failure: bool,
+    // The link scan this walk's run starts, until the run takes it.
+    link_scan: Option<LinkScan>,
+    links: Links,
 }
 
 impl<S: KeyStream, D: KeyStream> Walk<S, D> {
@@ -482,7 +525,41 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
             dst: Side::new(destination),
             incomplete: false,
             ended_by_failure: false,
+            link_scan: None,
+            links: Links::NoScan,
         }
+    }
+
+    // Give the run its link scan. The run reads the scan beside the merge and hands the result back
+    // through `accept_link_scan`.
+    pub(crate) fn take_link_scan(&mut self) -> Option<LinkScan> {
+        self.link_scan.take()
+    }
+
+    // Take what the link scan found. Hold its names on the source side, and return every name a
+    // waiting local delete must not touch, sorted. `None` means every waiting delete stays.
+    pub(crate) fn accept_link_scan(&mut self, result: LinkScanResult) -> Option<Vec<String>> {
+        let found = match std::mem::replace(&mut self.links, Links::NoScan) {
+            Links::Scanning { found } => found,
+            _ => Vec::new(),
+        };
+        let LinkScanResult::Names(scanned) = result else {
+            self.src.gap.add(Stretch { under: None });
+            self.links = Links::Scanned { names: Vec::new() };
+            return None;
+        };
+        let mut names: Vec<String> = Vec::with_capacity(scanned.len() + found.len());
+        for name in scanned {
+            names.push(name_of(&name).to_string());
+            self.add_alias_hold(name);
+        }
+        names.extend(found.iter().map(|name| name_of(name).to_string()));
+        names.sort_unstable();
+        names.dedup();
+        self.links = Links::Scanned {
+            names: names.clone(),
+        };
+        Some(names)
     }
 
     // The next key either side holds, or the failure that interrupted one of them.
@@ -595,30 +672,52 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
 
     // Hold back the deletes under a name a followed destination link aliases.
     //
-    // The merge may already have reached the name, and a delete under it may have gone out before
-    // the walk found the link. The merge then marks the plan incomplete. Past the bound on held
-    // names, the source holds back every later delete.
+    // The merge may already have reached the name. A delete under it then went out before the walk
+    // found the link, unless the run still holds its deletes for the link scan. While the scan
+    // reads, the name joins the ones the waiting deletes are checked against. Once the scan ended, a
+    // reached name the scan never saw marks the plan incomplete: someone created the link during the
+    // run. A run without a scan marks every reached name.
     fn hold_aliased(&mut self, name: AliasedName) {
         // No name sorts at or before the empty key, so nothing reads as reached before a pairing.
         let paired = std::cmp::max(self.src.taken.as_str(), self.dst.taken.as_str());
-        let (stretch, reached) = match name {
+        let reached = match &name {
             // The merge reaches a file when it pairs that key or a later one.
-            AliasedName::File(name) => {
-                let reached = name.as_str() <= paired;
-                (Stretch { under: Some(name) }, reached)
-            }
+            AliasedName::File(name) => name.as_str() <= paired,
             // The merge reaches a directory when it enters the subtree or passes it.
             AliasedName::Directory(name) => {
-                let stretch = Stretch { under: Some(name) };
-                let reached = stretch.covers(paired) || stretch.passed_by(paired);
-                (stretch, reached)
+                let stretch = Stretch {
+                    under: Some(name.clone()),
+                };
+                stretch.covers(paired) || stretch.passed_by(paired)
             }
         };
-        if reached {
-            self.incomplete = true;
+        match &mut self.links {
+            Links::NoScan => self.incomplete |= reached,
+            Links::Scanning { found } => {
+                if found.len() < ALIASED_NAMES_HELD {
+                    found.push(name.clone());
+                } else {
+                    // The waiting deletes can no longer be checked against every name, so the
+                    // source holds back every delete.
+                    self.src.gap.add(Stretch { under: None });
+                }
+            }
+            Links::Scanned { names } => {
+                let seen = names
+                    .binary_search_by(|n| n.as_str().cmp(name_of(&name)))
+                    .is_ok();
+                self.incomplete |= reached && !seen;
+            }
         }
+        self.add_alias_hold(name);
+    }
+
+    // Hold back the deletes under one aliased name. Past the bound on held names, the source holds
+    // back every later delete.
+    fn add_alias_hold(&mut self, name: AliasedName) {
+        let (AliasedName::File(name) | AliasedName::Directory(name)) = name;
         if self.src.gap.under.len() < ALIASED_NAMES_HELD {
-            self.src.gap.add(stretch);
+            self.src.gap.add(Stretch { under: Some(name) });
         } else {
             self.src.gap.add(Stretch { under: None });
         }
@@ -728,7 +827,9 @@ impl Walker {
     // absolute path this layer has to turn into a key.
     //
     // The names a followed link reaches exist only to stop deletes. With delete mode off, the
-    // destination names none, so a run over a tree with links holds nothing back.
+    // destination names none, so a run over a tree with links holds nothing back. With delete mode
+    // on and following on, the run also starts a link scan of the destination, and every local
+    // delete waits until the scan ends.
     pub(crate) fn downloading(
         &self,
         ctx: LocalAndBucket,
@@ -736,9 +837,20 @@ impl Walker {
     ) -> Result<Walk<S3Walk, LocalDestination>, crate::error::Error> {
         let root = ctx.local_root.clone();
         let remote = self.remote_walk(ctx.client, ctx.bucket, ctx.prefix)?;
-        let local = LocalDestination::new(self.local_walk(ctx.local_root), &root)
-            .naming_aliases(delete_mode == DeleteMode::On);
-        Ok(Walk::new(remote, local).with_roots(None, Some(root)))
+        let names = delete_mode == DeleteMode::On;
+        let local =
+            LocalDestination::new(self.local_walk(ctx.local_root), &root).naming_aliases(names);
+        let mut walk = Walk::new(remote, local).with_roots(None, Some(root.clone()));
+        if names && self.follow_symlinks {
+            walk.link_scan = Some(LinkScan {
+                walk: self.fs_walk(root.clone(), SortOrder::Native),
+                namer: LinkNamer::new(&root),
+                names: Vec::new(),
+                too_many: false,
+            });
+            walk.links = Links::Scanning { found: Vec::new() };
+        }
+        Ok(walk)
     }
 
     // The merge depends on all three of these, so this layer fixes them and a caller never
@@ -747,8 +859,14 @@ impl Walker {
     // level reports every key below it as absent. And it keeps special files, because a name that
     // is taken has to reach the comparison even though nothing can be sent for it.
     fn local_walk(&self, root: PathBuf) -> FsWalk {
+        self.fs_walk(root, SortOrder::WholeWalk)
+    }
+
+    // The link scan reads the same tree with the same rules, in whatever order the filesystem gives.
+    // It needs every link and no key order, so it skips the sort.
+    fn fs_walk(&self, root: PathBuf, sort: SortOrder) -> FsWalk {
         FsWalker::builder()
-            .sort(SortOrder::WholeWalk)
+            .sort(sort)
             .recursive(true)
             .include_special_files(true)
             .follow_symlinks(self.follow_symlinks)
@@ -887,16 +1005,11 @@ fn cost_of(err: &StreamError, root: Option<&Path>) -> Cost {
 pub(crate) struct LocalDestination {
     walk: FsWalk,
     absent: bool,
-    // The walk's paths sit under this root, as the caller spelled it.
-    root: PathBuf,
-    // A link's target takes its key under this root, with every link on the root resolved.
-    // `record_aliases` resolves the root when the walk first follows a link, so a tree without links
-    // never pays for it.
-    canonical_root: Option<PathBuf>,
+    // Names what followed links reach. `None` when the run deletes nothing, because only delete
+    // mode needs the names.
+    namer: Option<LinkNamer>,
     // The names followed links aliased wait here until the merge takes them.
     aliased: Vec<AliasedName>,
-    // Whether to name what followed links reach. Only delete mode needs the names.
-    names_aliases: bool,
 }
 
 impl LocalDestination {
@@ -907,10 +1020,8 @@ impl LocalDestination {
         Self {
             walk,
             absent: matches!(root.try_exists(), Ok(false)),
-            root: root.to_path_buf(),
-            canonical_root: None,
+            namer: Some(LinkNamer::new(root)),
             aliased: Vec::new(),
-            names_aliases: true,
         }
     }
 
@@ -918,15 +1029,41 @@ impl LocalDestination {
     // deletes nothing, so it resolves no link targets.
     #[must_use]
     fn naming_aliases(mut self, names: bool) -> Self {
-        self.names_aliases = names;
+        if !names {
+            self.namer = None;
+        }
         self
     }
 
     fn record_aliases(&mut self) {
-        if !self.names_aliases {
-            return;
+        if let Some(namer) = &mut self.namer {
+            namer.name(self.walk.followed_links(), &mut self.aliased);
         }
-        let links = self.walk.followed_links();
+    }
+}
+
+// Turns the links a walk followed into the names they reach. The destination walk and the link
+// scan share it, so both name a link the same way.
+#[derive(Debug)]
+struct LinkNamer {
+    // The walk's paths sit under this root, as the caller spelled it.
+    root: PathBuf,
+    // A link's target takes its key under this root, with every link on the root resolved. `name`
+    // resolves the root when the walk first follows a link, so a tree without links never pays for
+    // it.
+    canonical_root: Option<PathBuf>,
+}
+
+impl LinkNamer {
+    fn new(root: &Path) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            canonical_root: None,
+        }
+    }
+
+    // Append the names each of `links` reaches to `out`.
+    fn name(&mut self, links: &[FollowedLink], out: &mut Vec<AliasedName>) {
         if links.is_empty() {
             return;
         }
@@ -947,9 +1084,8 @@ impl LocalDestination {
                 // that file, so the merge holds the link's own name.
                 FollowedLink::Directory(path) => {
                     let own = key_under_root(&self.root, path);
-                    self.aliased.extend(own.map(AliasedName::Directory));
-                    self.aliased
-                        .extend(target(path).map(AliasedName::Directory));
+                    out.extend(own.map(AliasedName::Directory));
+                    out.extend(target(path).map(AliasedName::Directory));
                 }
                 // Removing a file link unlinks the link and leaves its target, so the link's own name
                 // stays deletable. Removing a later link on the chain leaves this one dangling.
@@ -957,10 +1093,61 @@ impl LocalDestination {
                     let chain = later_links(path)
                         .into_iter()
                         .filter_map(|hop| resolved(&hop));
-                    self.aliased.extend(chain.map(AliasedName::File));
-                    self.aliased.extend(target(path).map(AliasedName::File));
+                    out.extend(chain.map(AliasedName::File));
+                    out.extend(target(path).map(AliasedName::File));
                 }
             }
+        }
+    }
+}
+
+// A second walk of a download's destination that records only the links it follows. The run
+// reads it beside the merge, so the first download does not wait for it. Every local delete waits
+// until it ends, because a link anywhere in the tree can reach the file a delete removes.
+#[derive(Debug)]
+pub(crate) struct LinkScan {
+    walk: FsWalk,
+    namer: LinkNamer,
+    names: Vec<AliasedName>,
+    // Set once the tree holds more names than the bound. The scan stops there, because one more
+    // name changes nothing: the run holds every local delete either way.
+    too_many: bool,
+}
+
+impl LinkScan {
+    // Read up to `budget` entries. Return true once the scan has read the whole tree. An entry the
+    // scan cannot read costs it nothing: the destination walk cannot read that entry either, so no
+    // key reaches a file through a link behind it.
+    pub(crate) async fn advance(&mut self, budget: usize) -> bool {
+        for _ in 0..budget {
+            if self.too_many {
+                return true;
+            }
+            let next = self.walk.next().await;
+            self.namer.name(self.walk.followed_links(), &mut self.names);
+            // Many links can reach one target, so the scan counts each name once before it judges
+            // the bound.
+            if self.names.len() > ALIASED_NAMES_HELD {
+                self.names
+                    .sort_unstable_by(|a, b| name_of(a).cmp(name_of(b)));
+                self.names.dedup();
+                if self.names.len() > ALIASED_NAMES_HELD {
+                    self.too_many = true;
+                    self.names = Vec::new();
+                }
+            }
+            if next.is_none() {
+                return true;
+            }
+        }
+        false
+    }
+
+    pub(crate) fn finish(self) -> LinkScanResult {
+        if self.too_many {
+            LinkScanResult::TooMany
+        } else {
+            LinkScanResult::Names(self.names)
         }
     }
 }
@@ -3059,6 +3246,44 @@ mod tests {
             Some("photos/"),
             "a download lists the source under the same prefix"
         );
+    }
+
+    // The link scan keeps at most `ALIASED_NAMES_HELD` names for the whole tree. Many links to one
+    // target count that target once.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_link_scan_gives_up_past_its_bound() {
+        for (links, too_many) in [(ALIASED_NAMES_HELD - 1, false), (ALIASED_NAMES_HELD, true)] {
+            let dir = tempfile::tempdir().expect("a temp dir");
+            let root = dir.path().canonicalize().expect("canonical root");
+            std::fs::create_dir(root.join("real")).expect("real");
+            for n in 0..links {
+                std::os::unix::fs::symlink(root.join("real"), root.join(format!("l{n:04}")))
+                    .expect("a link");
+            }
+            let mut walk = Walker::builder()
+                .follow_symlinks(true)
+                .build()
+                .downloading(
+                    LocalAndBucket::builder()
+                        .local_root(&root)
+                        .client(a_client())
+                        .bucket("amzn-s3-demo-bucket")
+                        .build(),
+                    DeleteMode::On,
+                )
+                .expect("an ordinary bucket builds");
+            let mut scan = walk.take_link_scan().expect("the run has a link scan");
+            while !scan.advance(64).await {}
+            // Each link names itself, and all of them name `real` once.
+            let result = scan.finish();
+            assert_eq!(
+                matches!(result, LinkScanResult::TooMany),
+                too_many,
+                "{links} links name {} keys: {result:?}",
+                links + 1
+            );
+        }
     }
 
     #[tokio::test]
