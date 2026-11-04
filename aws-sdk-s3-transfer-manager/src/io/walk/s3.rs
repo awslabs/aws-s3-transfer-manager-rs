@@ -96,9 +96,7 @@ impl std::fmt::Debug for S3Walker {
 }
 
 impl Default for S3Walker {
-    /// A default walker: no prefix, no delimiter, no filter. Like every
-    /// walker, it skips 0-byte folder markers (keys ending in `/`).
-    /// Equivalent to `S3Walker::builder().build()`.
+    /// A default walker that filters out 0-byte folder markers (keys ending in '/').
     fn default() -> Self {
         S3Walker::builder().build()
     }

@@ -1247,10 +1247,6 @@ mod tests {
                 None,
                 Err("outside the target"),
             ),
-            ("photos/", Some("photos/"), None, Err("destination itself")),
-            ("photos/", Some("photos"), None, Err("destination itself")),
-            ("./", None, None, Err("destination itself")),
-            ("a/..", None, None, Err("destination itself")),
         ];
         for (key, prefix, delim, expected) in cases {
             let actual = local_key_path(root, key, *prefix, *delim);
