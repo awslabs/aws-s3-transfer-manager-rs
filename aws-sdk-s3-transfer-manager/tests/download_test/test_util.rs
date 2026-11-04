@@ -17,7 +17,7 @@ use std::time::Duration;
 
 /// Observes whether another descriptor in this process keeps a file open.
 ///
-/// Unix pins the file's identity and compares `fstat` across open descriptors,
+/// Unix pins the file's identity and compares it across open descriptors,
 /// excluding its own descriptor. Renaming or unlinking preserves the identity.
 /// Windows attempts an exclusive open, so the path must exist when probed.
 pub(super) struct OpenFileProbe {
@@ -50,8 +50,24 @@ impl OpenFileProbe {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    fn is_open(&self) -> bool {
+        use std::os::{fd::AsRawFd, unix::fs::MetadataExt};
+        let pin_path = std::path::PathBuf::from(format!("/proc/self/fd/{}", self.pin.as_raw_fd()));
+        // Path lookup observes each descriptor through procfs while its owner
+        // may close it. Paths that disappear before lookup are skipped.
+        std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path() != pin_path)
+            .any(|entry| {
+                std::fs::metadata(entry.path())
+                    .is_ok_and(|meta| (meta.dev(), meta.ino()) == self.id)
+            })
+    }
+
     // `st_dev` and `st_ino` widths differ across Unix targets.
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "linux")))]
     #[allow(clippy::unnecessary_cast)]
     fn is_open(&self) -> bool {
         use std::os::fd::AsRawFd;
