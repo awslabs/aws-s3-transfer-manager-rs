@@ -884,6 +884,7 @@ mod testing {
         current_index: usize,
         should_loop: bool,
         resolutions: VecDeque<ResolveDnsResult>,
+        call_count: usize,
     }
 
     impl HostEntryMockResolveState {
@@ -893,6 +894,7 @@ mod testing {
                 current_index: 0,
                 should_loop: true,
                 resolutions: VecDeque::new(),
+                call_count: 0
             }
         }
 
@@ -905,6 +907,8 @@ mod testing {
         }
 
         fn resolve(&mut self) {
+            self.call_count += 1;
+
             if self.current_index >= self.results.len() && self.should_loop {
                 self.current_index = 0;
             }
@@ -928,6 +932,10 @@ mod testing {
 
         fn pop_resolution(&mut self) -> Option<ResolveDnsResult> {
             self.resolutions.pop_front()
+        }
+
+        fn get_call_count(&self) -> usize {
+            self.call_count
         }
     }
 
@@ -957,6 +965,10 @@ mod testing {
 
         fn pop_resolution(&self) -> Option<ResolveDnsResult> {
             self.results.lock().unwrap().pop_resolution()
+        }
+
+        fn get_call_count(&self) -> usize {
+            self.results.lock().unwrap().get_call_count()
         }
     }
 
@@ -1005,6 +1017,8 @@ mod testing {
     const MOCK_HOST: &str = "hello.there.com";
     const LOCALHOST_IPV4: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
     const LOCALHOST_IPV6: IpAddr = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1));
+    const OTHERHOST_IPV4: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 168, 0, 1));
+    const OTHERHOST_IPV6: IpAddr = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 192, 168, 0, 1));
 
     fn initialize_resolution_test_context_single(context: &mut HostEntryTestContext) {
         context.mock_results.set_should_loop(true);
@@ -1013,8 +1027,10 @@ mod testing {
             .add_result(Ok(vec![LOCALHOST_IPV4, LOCALHOST_IPV6]));
     }
 
+    type MockResultTarget = Arc<Mutex<Option<ResolveDnsResult>>>;
+
     fn create_mock_internal_request(
-    ) -> (ResolveRequestInternal, Arc<Mutex<Option<ResolveDnsResult>>>) {
+    ) -> (ResolveRequestInternal, MockResultTarget) {
         let result = Arc::new(Mutex::new(None));
         let result_clone = result.clone();
         let request = ResolveRequestInternal {
@@ -1034,6 +1050,33 @@ mod testing {
             name: MOCK_HOST.to_string(),
             result: pending_result,
         }
+    }
+
+    fn is_result_localhost(result_target: MockResultTarget) -> bool {
+        let final_result_option = result_target.lock().unwrap().take();
+        assert!(final_result_option.is_some());
+
+        let final_result = final_result_option.unwrap();
+        assert!(final_result.is_ok());
+
+        let addresses = final_result.unwrap();
+        addresses.contains(&LOCALHOST_IPV6) && addresses.contains(&LOCALHOST_IPV6)
+    }
+
+    fn apply_mock_result_to_context(context: &mut HostEntryTestContext) {
+        // our resolve function just stuffs a result here, pull it out
+        let pending_result = context.mock_results.pop_resolution();
+        assert!(pending_result.is_some());
+
+        // apply the resolve result to the host entry and verify expected state
+        context
+            .entry
+            .handle_resolve_result(convert_pending_result_to_resolve_result(
+                pending_result.unwrap(),
+            ));
+
+        assert!(context.entry.pending_requests.is_empty());
+        assert!(!context.entry.pending_resolution);
     }
 
     #[test]
@@ -1066,27 +1109,15 @@ mod testing {
         // advance time a little
         context.advance_time(Duration::from_millis(10));
 
-        // our resolve function just stuffs a result here, pull it out
-        let pending_result = context.mock_results.pop_resolution();
-        assert!(pending_result.is_some());
+        // apply result and verify requests not pending and resolution not pending
+        apply_mock_result_to_context(&mut context);
 
-        // apply the resolve result to the host entry and verify expected state
-        context
-            .entry
-            .handle_resolve_result(convert_pending_result_to_resolve_result(
-                pending_result.unwrap(),
-            ));
-
-        // expected:
+        // additional expected:
         //   theres now an ipv4 entry in the cache
         //   theres now an ipv6 entry in the cache
-        //   the original request is no longer pending
-        //   the state no longer thinks a background resolution is running
         //   both ipv4 and ipv6 addresses have the correct ttl (now + ttl)
         assert!(!context.entry.ipv4_addresses.empty());
         assert!(!context.entry.ipv6_addresses.empty());
-        assert!(context.entry.pending_requests.is_empty());
-        assert!(!context.entry.pending_resolution);
         let expected_ttl = context.mock_clock.get_current_time() + context.config.resolution_ttl;
         assert_eq!(
             expected_ttl,
@@ -1109,14 +1140,179 @@ mod testing {
 
         // what did our request actually get resolved with?  we expect localhost for both ipv4 and
         // ipv6
-        let final_result_option = result_target.lock().unwrap().take();
-        assert!(final_result_option.is_some());
+        assert!(is_result_localhost(result_target));
 
-        let final_result = final_result_option.unwrap();
-        assert!(final_result.is_ok());
+        // background resolution function should only have been called once
+        assert_eq!(1, context.mock_results.get_call_count());
+    }
 
-        let addresses = final_result.unwrap();
-        assert!(addresses.contains(&LOCALHOST_IPV6));
-        assert!(addresses.contains(&LOCALHOST_IPV6));
+    fn submit_requests(context: &mut HostEntryTestContext, count: usize, delay_millis: u64) -> Vec<MockResultTarget> {
+        let mut result_targets = Vec::new();
+
+        for _ in 0..count {
+            let (request, result_target) = create_mock_internal_request();
+            context
+                .entry
+                .handle_resolve_request(request, &context.operation_handler_context);
+
+            assert!(result_target.lock().unwrap().take().is_none());
+
+            result_targets.push(result_target);
+
+            if delay_millis > 0 {
+                context.advance_time(Duration::from_millis(delay_millis));
+            }
+        }
+
+        result_targets
+    }
+
+    #[test]
+    fn host_entry_multiple_requests_before_resolve_finishes() {
+        // similar to previous test, but submit multiple resolve requests before handling the result
+        let mut context = HostEntryTestContext::default();
+        initialize_resolution_test_context_single(&mut context);
+
+        let result_targets = submit_requests(&mut context, 5, 100);
+        assert_eq!(5, context.entry.pending_requests.len());
+
+        // apply result and verify requests not pending and resolution not pending
+        apply_mock_result_to_context(&mut context);
+
+        // what did our requests actually get resolved with?  we expect localhost for both ipv4 and
+        // ipv6
+        for result_target in result_targets {
+            assert!(is_result_localhost(result_target));
+        }
+
+        // background resolution function should only have been called once
+        assert_eq!(1, context.mock_results.get_call_count());
+    }
+
+    fn initialize_resolution_test_context_multiple(context: &mut HostEntryTestContext) {
+        context.mock_results.set_should_loop(true);
+        context
+            .mock_results
+            .add_result(Ok(vec![LOCALHOST_IPV4, LOCALHOST_IPV6]));
+        context
+            .mock_results
+            .add_result(Ok(vec![OTHERHOST_IPV4, OTHERHOST_IPV6]));
+    }
+    fn are_results_both_host_sets(result_target1: MockResultTarget, result_target2: MockResultTarget) -> bool {
+        let final_result_option1 = result_target1.lock().unwrap().take();
+        assert!(final_result_option1.is_some());
+
+        let final_result1 = final_result_option1.unwrap();
+        assert!(final_result1.is_ok());
+
+        let final_addresses1 = final_result1.unwrap();
+        assert_eq!(2, final_addresses1.len());
+
+        let final_result_option2 = result_target2.lock().unwrap().take();
+        assert!(final_result_option2.is_some());
+
+        let final_result2 = final_result_option2.unwrap();
+        assert!(final_result2.is_ok());
+
+        let final_addresses2 = final_result2.unwrap();
+        assert_eq!(2, final_addresses2.len());
+
+        let addresses1_local = final_addresses1.contains(&LOCALHOST_IPV4) && final_addresses1.contains(&LOCALHOST_IPV6);
+        let addresses1_other = final_addresses1.contains(&OTHERHOST_IPV4) && final_addresses1.contains(&OTHERHOST_IPV6);
+        let addresses2_local = final_addresses2.contains(&LOCALHOST_IPV4) && final_addresses2.contains(&LOCALHOST_IPV6);
+        let addresses2_other = final_addresses2.contains(&OTHERHOST_IPV4) && final_addresses2.contains(&OTHERHOST_IPV6);
+
+        (addresses1_local && addresses2_other) || (addresses1_other && addresses2_local)
+    }
+
+    #[test]
+    fn host_entry_multiple_lookups_multiple_results() {
+        // in this test, we have the mock resolution alternate between two address sets, rather than
+        // one
+        //
+        // We verify that only the first set is seen until we let enough time elapse that a
+        // second background resolution attempt is done and then we should see the resolver
+        // use both sets
+        let mut context = HostEntryTestContext::default();
+        initialize_resolution_test_context_multiple(&mut context);
+
+        let result_targets_pre = submit_requests(&mut context, 2, 100);
+        assert_eq!(2, context.entry.pending_requests.len());
+
+        // apply result and verify requests not pending and resolution not pending
+        apply_mock_result_to_context(&mut context);
+
+        for result_target in result_targets_pre {
+            assert!(is_result_localhost(result_target));
+        }
+
+        // let enough time elapse that we re-resolve next request
+        context.advance_time(MINIMUM_DELAY_BETWEEN_RESOLVES);
+
+        let result_targets = submit_requests(&mut context, 1, 0);
+        assert_eq!(1, context.entry.pending_requests.len());
+
+        // should use the cached results, but also a resolve should be pending
+
+        // apply the pending resolve
+
+        // make a couple requests, we should get both address sets now
+    }
+    
+    #[test]
+    fn host_entry_resolve_existing_address_extends_ttl() {
+        // do what we did last test, but then resolve again and verify that the localhost
+        // addresses have their TTL extended appropriately
+    }
+
+    #[test]
+    fn host_entry_addresses_expire() {
+        // resolve and then let enough time pass to expire the original addresses
+        // further resolves should pick up the second addresses in the mock results
+    }
+
+    #[test]
+    fn host_entry_fatal_host_event_bans_ipv4_address() {
+
+    }
+
+    #[test]
+    fn host_entry_fatal_host_event_bans_ipv6_address() {
+
+    }
+
+    #[test]
+    fn host_entry_reresolving_a_banned_ip_does_not_cause_it_to_be_used() {
+
+    }
+
+    #[test]
+    fn host_entry_bans_expire() {
+
+    }
+
+    #[test]
+    fn host_entry_unhealthy_address_does_not_get_used_if_alternative_exists() {
+
+    }
+
+    #[test]
+    fn host_entry_unhealthy_address_gets_used_if_no_alternative() {
+
+    }
+
+    #[test]
+    fn host_entry_unhealthy_recovers_if_enough_time_passes() {
+
+    }
+
+    #[test]
+    fn host_entry_resolve_failure() {
+
+    }
+
+    #[test]
+    fn host_entry_resolve_multiple_with_elapsed_time_failure() {
+
     }
 }
