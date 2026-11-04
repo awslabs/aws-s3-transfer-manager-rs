@@ -214,6 +214,7 @@ async fn real_download(
                 .bucket(regular_bucket())
                 .prefix(prefix)
                 .build(),
+            delete_mode,
         )
         .expect("an ordinary bucket builds");
     let transfer = SyncTransfer::new(

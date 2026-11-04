@@ -11,6 +11,7 @@ use aws_sdk_s3::types::Object;
 use crate::io::key::filter::{KeyFilter, Rule};
 use crate::io::key::stream::{EntryMeta, Obstruction};
 use crate::io::walk::{FsWalkContext, FsWalker, SortOrder, WalkError, WalkErrorKind};
+use crate::operation::sync::input::DeleteMode;
 
 use super::*;
 
@@ -1862,7 +1863,10 @@ async fn a_directory_bucket_root_is_refused_in_both_directions() {
             "an upload accepted the directory bucket {bucket}, whose listing has no order"
         );
         assert!(
-            Walker::builder().build().downloading(ctx()).is_err(),
+            Walker::builder()
+                .build()
+                .downloading(ctx(), DeleteMode::Off)
+                .is_err(),
             "a download accepted the directory bucket {bucket}"
         );
     }
@@ -1936,7 +1940,7 @@ async fn the_prefix_reaches_the_listing_in_either_direction() {
     );
     let down = Walker::builder()
         .build()
-        .downloading(context())
+        .downloading(context(), DeleteMode::Off)
         .expect("an ordinary bucket builds");
     assert_eq!(
         down.src.stream.prefix(),
@@ -1960,6 +1964,7 @@ async fn a_download_walks_the_same_two_roots_the_other_way_round() {
                 .client(a_client())
                 .bucket("amzn-s3-demo-bucket")
                 .build(),
+            DeleteMode::Off,
         )
         .expect("an ordinary bucket builds");
     assert_eq!(

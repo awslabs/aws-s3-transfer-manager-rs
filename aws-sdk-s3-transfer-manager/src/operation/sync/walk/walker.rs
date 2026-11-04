@@ -16,6 +16,7 @@ use crate::io::walk::{
     FollowedLink, FsEntry, FsWalk, FsWalkContext, FsWalker, S3Walk, S3WalkContext, S3Walker,
     SortOrder, WalkErrorKind,
 };
+use crate::operation::sync::input::DeleteMode;
 
 use super::links::later_links;
 use super::Walk;
@@ -88,13 +89,18 @@ impl Walker {
     //
     // The root moves to the destination side, because that is the side whose failures name an
     // absolute path this layer has to turn into a key.
+    //
+    // The names a followed link reaches exist only to stop deletes. With delete mode off, the
+    // destination names none, so a run over a tree with links holds nothing back.
     pub(crate) fn downloading(
         &self,
         ctx: LocalAndBucket,
+        delete_mode: DeleteMode,
     ) -> Result<Walk<S3Walk, LocalDestination>, crate::error::Error> {
         let root = ctx.local_root.clone();
         let remote = self.remote_walk(ctx.client, ctx.bucket, ctx.prefix)?;
-        let local = LocalDestination::new(self.local_walk(ctx.local_root), &root);
+        let local = LocalDestination::new(self.local_walk(ctx.local_root), &root)
+            .naming_aliases(delete_mode == DeleteMode::On);
         Ok(Walk::new(remote, local).with_roots(None, Some(root)))
     }
 
@@ -181,6 +187,8 @@ pub(crate) struct LocalDestination {
     canonical_root: Option<PathBuf>,
     // The names followed links aliased wait here until the merge takes them.
     aliased: Vec<AliasedName>,
+    // Whether to name what followed links reach. Only delete mode needs the names.
+    names_aliases: bool,
 }
 
 impl LocalDestination {
@@ -194,10 +202,22 @@ impl LocalDestination {
             root: root.to_path_buf(),
             canonical_root: None,
             aliased: Vec::new(),
+            names_aliases: true,
         }
     }
 
+    // Set whether the destination names what followed links reach. A run with delete mode off
+    // deletes nothing, so it resolves no link targets.
+    #[must_use]
+    fn naming_aliases(mut self, names: bool) -> Self {
+        self.names_aliases = names;
+        self
+    }
+
     fn record_aliases(&mut self) {
+        if !self.names_aliases {
+            return;
+        }
         let links = self.walk.followed_links();
         if links.is_empty() {
             return;

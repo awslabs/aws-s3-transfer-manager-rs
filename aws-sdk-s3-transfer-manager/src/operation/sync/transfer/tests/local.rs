@@ -353,6 +353,7 @@ async fn a_download_asks_for_the_key_under_its_prefix() {
                 .bucket("amzn-s3-demo-bucket")
                 .prefix("backup/")
                 .build(),
+            DeleteMode::Off,
         )
         .expect("an ordinary bucket builds");
     let transfer = SyncTransfer::new(

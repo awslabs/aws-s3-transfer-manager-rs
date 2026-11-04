@@ -129,6 +129,7 @@ fn downloading_into_with(
                 .client(client)
                 .bucket("amzn-s3-demo-bucket")
                 .build(),
+            delete_mode,
         )
         .expect("an ordinary bucket builds");
     let transfer = SyncTransfer::new(
