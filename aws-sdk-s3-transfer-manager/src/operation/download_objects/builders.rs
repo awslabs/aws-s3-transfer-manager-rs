@@ -15,9 +15,10 @@ use super::{DownloadObjectsHandle, DownloadObjectsInputBuilder};
 
 /// Fluent builder for constructing a multiple object download.
 ///
-/// Walk behavior (prefix, filter, pagination) is configured by supplying a
-/// custom [`S3Walker`] via [`walker`](Self::walker). When not set, a default
-/// walker is used that filters out 0-byte folder markers.
+/// Walk behavior (prefix, filter, pagination) is configured by supplying an
+/// [`S3Walker`] via [`walker`](Self::walker). The walker's prefix scopes the
+/// listing and is stripped from each key to build its local path. See
+/// [`DownloadObjectsInput`](super::DownloadObjectsInput) for the full rules.
 #[derive(Debug)]
 pub struct DownloadObjectsFluentBuilder {
     handle: Arc<crate::client::Handle>,
@@ -36,7 +37,6 @@ impl DownloadObjectsFluentBuilder {
     #[tracing::instrument(skip_all, level = "debug", name = "initiate-download-objects", fields(
         bucket = self.inner.bucket.as_deref().unwrap_or_default(),
         destination = self.inner.destination.as_deref().map(|p| p.to_str().unwrap_or_default()).unwrap_or_default(),
-        key_prefix = self.inner.key_prefix.as_deref().unwrap_or_default(),
     ))]
     pub fn initiate(self) -> Result<DownloadObjectsHandle, crate::error::Error> {
         let input = self.inner.build()?;
@@ -77,23 +77,6 @@ impl DownloadObjectsFluentBuilder {
         self.inner.get_destination()
     }
 
-    /// Limit the response to keys that begin with the given prefix.
-    pub fn key_prefix(mut self, input: impl Into<String>) -> Self {
-        self.inner = self.inner.key_prefix(input);
-        self
-    }
-
-    /// Limit the response to keys that begin with the given prefix.
-    pub fn set_key_prefix(mut self, input: Option<String>) -> Self {
-        self.inner = self.inner.set_key_prefix(input);
-        self
-    }
-
-    /// The key prefix.
-    pub fn get_key_prefix(&self) -> Option<&str> {
-        self.inner.get_key_prefix()
-    }
-
     /// Character used to group keys.
     pub fn delimiter(mut self, input: impl Into<String>) -> Self {
         self.inner = self.inner.delimiter(input);
@@ -123,7 +106,11 @@ impl DownloadObjectsFluentBuilder {
         self.inner.get_failure_policy()
     }
 
-    /// Walker configuration (filter, pagination, etc.).
+    /// Walker configuration (prefix, filter, pagination, etc.).
+    ///
+    /// The walker's prefix scopes the listing and is stripped from each key
+    /// to build its local path. When not set, the default walker lists the
+    /// whole bucket.
     pub fn walker(mut self, input: S3Walker) -> Self {
         self.inner = self.inner.walker(input);
         self

@@ -137,7 +137,7 @@ async fn test_download_objects_many_small_files(rt: RuntimeConfig) {
             .download_objects()
             .bucket(bucket)
             .destination(dest.path())
-            .key_prefix(prefix)
+            .walker(S3Walker::builder().prefix(prefix).build())
             .initiate()
             .expect("initiate download_objects");
 
@@ -191,7 +191,7 @@ async fn test_download_objects_flat_content_roundtrip() {
             .download_objects()
             .bucket(bucket)
             .destination(dest.path())
-            .key_prefix(prefix)
+            .walker(S3Walker::builder().prefix(prefix).build())
             .initiate()
             .expect("initiate download_objects");
 
@@ -242,7 +242,7 @@ async fn test_download_objects_nested_prefixes() {
             .download_objects()
             .bucket(bucket)
             .destination(dest.path())
-            .key_prefix(prefix)
+            .walker(S3Walker::builder().prefix(prefix).build())
             .initiate()
             .expect("initiate download_objects");
 
@@ -293,7 +293,7 @@ async fn test_download_objects_multipart_children(rt: RuntimeConfig) {
             .download_objects()
             .bucket(bucket)
             .destination(dest.path())
-            .key_prefix(prefix)
+            .walker(S3Walker::builder().prefix(prefix).build())
             .initiate()
             .expect("initiate download_objects");
 
@@ -351,7 +351,7 @@ async fn test_download_objects_empty_prefix() {
             .download_objects()
             .bucket(bucket)
             .destination(dest.path())
-            .key_prefix("nonexistent/")
+            .walker(S3Walker::builder().prefix("nonexistent/").build())
             .initiate()
             .expect("initiate download_objects");
 
@@ -412,7 +412,7 @@ async fn test_download_objects_deep_wide_tree() {
             .download_objects()
             .bucket(bucket)
             .destination(dest.path())
-            .key_prefix(root_prefix)
+            .walker(S3Walker::builder().prefix(root_prefix).build())
             .initiate()
             .expect("initiate");
 
@@ -457,7 +457,7 @@ async fn test_download_objects_abort_terminates() {
             .download_objects()
             .bucket(bucket)
             .destination(dest.path())
-            .key_prefix(prefix)
+            .walker(S3Walker::builder().prefix(prefix).build())
             .failure_policy(FailedTransferPolicy::Abort)
             .initiate()
             .expect("initiate");
@@ -497,13 +497,12 @@ async fn test_download_objects_listing_pagination(rt: RuntimeConfig) {
 
         let dest = tempfile::tempdir().expect("tempdir");
         // Force page_size=5 so that 50 objects require 10 list pages.
-        let walker = S3Walker::builder().page_size(5).build();
+        let walker = S3Walker::builder().prefix(prefix).page_size(5).build();
         let handle = m
             .client
             .download_objects()
             .bucket(bucket)
             .destination(dest.path())
-            .key_prefix(prefix)
             .walker(walker)
             .initiate()
             .expect("initiate download_objects");
@@ -537,6 +536,132 @@ async fn test_download_objects_listing_pagination_mock_gp() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_download_objects_listing_pagination_tokio_mt() {
     test_download_objects_listing_pagination(RuntimeConfig::multi_thread_tokio()).await;
+}
+
+/// A supplied walker's prefix scopes the listing and is stripped from each
+/// key to build its local path.
+#[tokio::test]
+async fn test_download_objects_walker_prefix_scopes_listing_and_paths() {
+    timeout(TEST_TIMEOUT, async {
+        let m = mock_tm(RuntimeConfig::default()).await;
+
+        let bucket = "test-bucket";
+        let objects: &[(&str, &[u8])] = &[
+            ("other/1.txt", b"other"),
+            ("chosen/1.txt", b"chosen-1"),
+            ("chosen/sub/2.txt", b"chosen-2"),
+        ];
+        seed_objects(&m.server, bucket, objects).await;
+
+        let dest = tempfile::tempdir().expect("tempdir");
+        let handle = m
+            .client
+            .download_objects()
+            .bucket(bucket)
+            .destination(dest.path())
+            .walker(S3Walker::builder().prefix("chosen/").build())
+            .initiate()
+            .expect("initiate download_objects");
+
+        let output = handle.join().await.expect("join download_objects");
+        assert_eq!(2, output.objects_downloaded());
+        assert!(output.failed_transfers().is_empty());
+
+        let mut expected: HashMap<&str, Vec<u8>> = HashMap::new();
+        expected.insert("1.txt", b"chosen-1".to_vec());
+        expected.insert("sub/2.txt", b"chosen-2".to_vec());
+        verify_dir(dest.path(), &expected);
+
+        m.handle.shutdown().await.expect("shutdown");
+    })
+    .await
+    .expect("test_download_objects_walker_prefix_scopes_listing_and_paths timed out");
+}
+
+/// Folder markers are skipped even when the supplied walker's filter accepts
+/// every object.
+#[tokio::test]
+async fn test_download_objects_skips_folder_markers_with_supplied_walker() {
+    timeout(TEST_TIMEOUT, async {
+        let m = mock_tm(RuntimeConfig::default()).await;
+
+        let bucket = "test-bucket";
+        let objects: &[(&str, &[u8])] = &[
+            ("markers/", b""),
+            ("markers/sub/", b""),
+            ("markers/sub/file.txt", b"content"),
+        ];
+        seed_objects(&m.server, bucket, objects).await;
+
+        let dest = tempfile::tempdir().expect("tempdir");
+        let handle = m
+            .client
+            .download_objects()
+            .bucket(bucket)
+            .destination(dest.path())
+            .walker(
+                S3Walker::builder()
+                    .prefix("markers/")
+                    .filter(|_| true)
+                    .build(),
+            )
+            .initiate()
+            .expect("initiate download_objects");
+
+        let output = handle.join().await.expect("join download_objects");
+        assert_eq!(1, output.objects_downloaded());
+        assert!(output.failed_transfers().is_empty());
+
+        let mut expected: HashMap<&str, Vec<u8>> = HashMap::new();
+        expected.insert("sub/file.txt", b"content".to_vec());
+        verify_dir(dest.path(), &expected);
+
+        m.handle.shutdown().await.expect("shutdown");
+    })
+    .await
+    .expect("test_download_objects_skips_folder_markers_with_supplied_walker timed out");
+}
+
+/// A non-empty object whose key maps to the destination directory itself is
+/// reported as a failure, and the other files are untouched.
+#[tokio::test]
+async fn test_download_objects_key_mapping_to_destination_root_fails() {
+    timeout(TEST_TIMEOUT, async {
+        let m = mock_tm(RuntimeConfig::default()).await;
+
+        let bucket = "test-bucket";
+        let objects: &[(&str, &[u8])] = &[("root/", b"not-a-marker"), ("root/ok.txt", b"ok")];
+        seed_objects(&m.server, bucket, objects).await;
+
+        let dest = tempfile::tempdir().expect("tempdir");
+        let handle = m
+            .client
+            .download_objects()
+            .bucket(bucket)
+            .destination(dest.path())
+            .walker(S3Walker::builder().prefix("root/").build())
+            .failure_policy(FailedTransferPolicy::Continue)
+            .initiate()
+            .expect("initiate download_objects");
+
+        let output = handle.join().await.expect("join download_objects");
+        assert_eq!(1, output.objects_downloaded());
+        assert_eq!(1, output.failed_transfers().len());
+        let failed_key = output.failed_transfers()[0]
+            .input()
+            .key()
+            .expect("failed input should have key");
+        assert_eq!("root/", failed_key);
+
+        assert!(dest.path().is_dir(), "destination must remain a directory");
+        let mut expected: HashMap<&str, Vec<u8>> = HashMap::new();
+        expected.insert("ok.txt", b"ok".to_vec());
+        verify_dir(dest.path(), &expected);
+
+        m.handle.shutdown().await.expect("shutdown");
+    })
+    .await
+    .expect("test_download_objects_key_mapping_to_destination_root_fails timed out");
 }
 
 /// FailedTransferPolicy::Continue with one faulted key: the other objects
@@ -574,7 +699,7 @@ async fn test_download_objects_continue_policy_partial_failure() {
             .download_objects()
             .bucket(bucket)
             .destination(dest.path())
-            .key_prefix(prefix)
+            .walker(S3Walker::builder().prefix(prefix).build())
             .failure_policy(FailedTransferPolicy::Continue)
             .initiate()
             .expect("initiate download_objects");
@@ -634,7 +759,7 @@ async fn test_download_objects_key_path_safety() {
             .download_objects()
             .bucket(bucket)
             .destination(&dest_path)
-            .key_prefix(prefix)
+            .walker(S3Walker::builder().prefix(prefix).build())
             .failure_policy(FailedTransferPolicy::Continue)
             .initiate()
             .expect("initiate download_objects");
@@ -739,7 +864,7 @@ async fn test_upload_then_download_objects_roundtrip(rt: RuntimeConfig) {
             .download_objects()
             .bucket(bucket)
             .destination(dest_dir.path())
-            .key_prefix(prefix)
+            .walker(S3Walker::builder().prefix(prefix).build())
             .initiate()
             .expect("initiate download_objects");
 
