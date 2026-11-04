@@ -114,5 +114,5 @@ fn command_failure_reports_status_directory_and_captured_error() {
     assert!(stderr.contains("stdout:"));
     assert!(stderr.contains("stderr:"));
     assert!(stderr.contains("Cargo.toml"));
-    assert!(stderr.contains("error:"));
+    assert!(stderr.contains("tmdev: ERROR:"));
 }
