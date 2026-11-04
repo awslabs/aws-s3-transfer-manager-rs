@@ -147,6 +147,34 @@ async fn an_excluded_directory_link_still_holds_back_the_objects_under_its_name(
     );
 }
 
+// Two links the filter excludes. Skipping past the second must not release the hold of the first.
+#[cfg(unix)]
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn a_second_excluded_link_keeps_the_keys_under_the_first() {
+    use crate::io::key::filter::{KeyFilter, Rule};
+
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let root = dir.path().canonicalize().expect("canonical root");
+    std::fs::create_dir(root.join("real")).expect("real");
+    std::os::unix::fs::symlink(root.join("real"), root.join("photos")).expect("photos");
+    std::os::unix::fs::symlink(root.join("real"), root.join("videos")).expect("videos");
+    let (client, deleted) = listing_and_recording_deletes(&["photos/y.jpg"], 1);
+    let walker = Walker::builder()
+        .filter(Arc::new(KeyFilter::new(vec![
+            Rule::exclude("photos"),
+            Rule::exclude("videos"),
+        ])))
+        .build();
+    let (t, _ctx) = upload_run(&root, client, walker);
+    drive(&t).await;
+    let sent = deleted.lock().clone();
+    assert!(
+        sent.is_empty(),
+        "DeleteObjects was sent for a key under an excluded link: {sent:?}"
+    );
+}
+
 #[cfg(unix)]
 #[cfg_attr(miri, ignore)]
 #[tokio::test]

@@ -573,6 +573,65 @@ async fn an_excluded_source_link_holds_back_the_keys_under_it_and_makes_no_pairi
     );
 }
 
+// Skipping past `videos` passes every key before it. The destination's `photos/y.jpg` sorts
+// before `videos`, so it pairs first, while the hold on `photos` still stands.
+#[tokio::test]
+async fn a_second_excluded_link_keeps_the_hold_of_the_first() {
+    let walk = Walk::new(
+        Scripted::from(vec![
+            Ok(obstructed("photos", Obstruction::ExcludedLink)),
+            Ok(obstructed("videos", Obstruction::ExcludedLink)),
+        ]),
+        Scripted::of(&["photos/y.jpg"]),
+    );
+    let (seen, complete) = pair_all(walk).await;
+    assert_eq!(seen, plan(&[("photos/y.jpg", At::UnknownRange, At::Here)]));
+    assert!(
+        !complete,
+        "a plan that skipped keys under an excluded link called itself complete"
+    );
+}
+
+// The same rule protects a hold from a failure. Skipping past `photos` must not pass the
+// destination's `a/x.txt` before it pairs under the unreadable directory `a`.
+#[tokio::test]
+async fn an_excluded_link_keeps_the_hold_of_an_earlier_failure() {
+    let walk = Walk::new(
+        Scripted::from(vec![
+            Err(StreamError::Walk(WalkError::new(
+                Some(PathBuf::from("/root/a")),
+                WalkErrorKind::DirectoryUnreadable,
+                Box::from("permission denied"),
+            ))),
+            Ok(obstructed("photos", Obstruction::ExcludedLink)),
+        ]),
+        Scripted::of(&["a/x.txt"]),
+    )
+    .with_roots(Some(PathBuf::from("/root")), None);
+    let (seen, _) = pair_all(walk).await;
+    assert_eq!(seen, plan(&[("a/x.txt", At::UnknownRange, At::Here)]));
+}
+
+// The mirror case on the destination side. Skipping past the destination's `videos` must not
+// pass the source's `photos/y.jpg` before it pairs.
+#[tokio::test]
+async fn an_excluded_destination_link_waits_for_an_earlier_source_key() {
+    let walk = Walk::new(
+        Scripted::of(&["photos/y.jpg"]),
+        Scripted::from(vec![
+            Err(StreamError::Walk(WalkError::new(
+                Some(PathBuf::from("/root/photos")),
+                WalkErrorKind::DirectoryUnreadable,
+                Box::from("permission denied"),
+            ))),
+            Ok(obstructed("videos", Obstruction::ExcludedLink)),
+        ]),
+    )
+    .with_roots(None, Some(PathBuf::from("/root")));
+    let (seen, _) = pair_all(walk).await;
+    assert_eq!(seen, plan(&[("photos/y.jpg", At::Here, At::UnknownRange)]));
+}
+
 #[tokio::test]
 async fn an_excluded_destination_link_makes_no_pairing() {
     let walk = Walk::new(

@@ -498,37 +498,38 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
                 }
                 return Some(Err(err));
             }
-            // The filter excluded this link's own name, so the name makes no pairing. A source link
-            // still hides the keys under its name, so the source holds those keys back.
-            if self.src.head_is(Obstruction::ExcludedLink) {
+            // A key one side reached while the other has run out is absent there. A side sorting
+            // later says the same thing: reaching a key past this one settles that this one never
+            // arrives.
+            let order = match (&self.src.head, &self.dst.head) {
+                (Head::Finished, Head::Finished) => return None,
+                (Head::Entry(_), Head::Finished) => Ordering::Less,
+                (Head::Finished, Head::Entry(_)) => Ordering::Greater,
+                (Head::Entry(src), Head::Entry(dst)) => src.key.cmp(&dst.key),
+                (Head::Unread, _) | (_, Head::Unread) => {
+                    unreachable!("both heads are filled before they are compared")
+                }
+            };
+            // The filter excluded this link's own name, so the name makes no pairing. The merge
+            // skips past it only at the merge position. `take` releases every hold below the key,
+            // and the other side's head can still sort there and need one. A source link still
+            // hides the keys under its name, so the source holds those keys back.
+            if order.is_le() && self.src.head_is(Obstruction::ExcludedLink) {
                 let link = self.src.take();
                 self.src.gap.add(Stretch {
                     under: Some(link.key),
                 });
                 continue;
             }
-            if self.dst.head_is(Obstruction::ExcludedLink) {
+            if order.is_ge() && self.dst.head_is(Obstruction::ExcludedLink) {
                 self.dst.take();
                 continue;
             }
-            break;
-        }
-
-        match (&self.src.head, &self.dst.head) {
-            (Head::Finished, Head::Finished) => None,
-            // A key one side reached while the other has run out is absent there. A side
-            // sorting later says the same thing: reaching a key past this one settles
-            // that this one never arrives.
-            (Head::Entry(_), Head::Finished) => Some(Ok(self.take_source_only())),
-            (Head::Finished, Head::Entry(_)) => Some(Ok(self.take_destination_only())),
-            (Head::Entry(src), Head::Entry(dst)) => match src.key.cmp(&dst.key) {
-                Ordering::Less => Some(Ok(self.take_source_only())),
-                Ordering::Greater => Some(Ok(self.take_destination_only())),
-                Ordering::Equal => Some(Ok(self.take_both())),
-            },
-            (Head::Unread, _) | (_, Head::Unread) => {
-                unreachable!("both heads are filled before they are compared")
-            }
+            return Some(Ok(match order {
+                Ordering::Less => self.take_source_only(),
+                Ordering::Greater => self.take_destination_only(),
+                Ordering::Equal => self.take_both(),
+            }));
         }
     }
 
