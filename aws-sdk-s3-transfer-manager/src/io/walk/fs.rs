@@ -986,7 +986,7 @@ impl FsWalk {
                             // A dangling link can still stand for a directory, such as one on an
                             // unmounted volume. The key stream costs the link as its name and every
                             // key under it. The walk yields an excluded link marked, in place of a
-                            // failure.
+                            // failure. A link into an endless chain reaches nothing the same way.
                             std::io::ErrorKind::NotFound => {
                                 if rejected {
                                     self.push_excluded_link(&mut result.children, path);
@@ -1002,6 +1002,17 @@ impl FsWalk {
                             // directory would have filed a whole subtree under this name. Reported
                             // even when the filter excluded the name, because a rule on a name says
                             // nothing about the keys under it.
+                            _ if is_endless_chain(&e) => {
+                                if rejected {
+                                    self.push_excluded_link(&mut result.children, path);
+                                } else {
+                                    result.errors.push(WalkError::new(
+                                        Some(path),
+                                        WalkErrorKind::BrokenSymlink,
+                                        Box::new(e),
+                                    ));
+                                }
+                            }
                             _ => {
                                 result.errors.push(WalkError::new(
                                     Some(path),
@@ -1212,6 +1223,20 @@ impl FsWalk {
             let relative = path.strip_prefix(&self.root).unwrap_or(path);
             !f(relative)
         })
+    }
+}
+
+// Whether resolving a link failed because its chain of links never ends. The system gives up after
+// about 40 links on Linux and 32 on macOS.
+fn is_endless_chain(e: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        e.raw_os_error() == Some(libc::ELOOP)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = e;
+        false
     }
 }
 

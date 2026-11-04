@@ -4200,6 +4200,110 @@ fn stamp_hello(path: &Path, when: i64) {
         .expect("the object's time applies");
 }
 
+// A link in a download's destination that reaches nothing, with following on. It is no
+// failure. It holds the keys below its name, because it may stand for a folder on a drive that is
+// away. Its own name stays free, so a download there replaces the link.
+#[cfg(unix)]
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn a_destination_link_that_reaches_nothing_holds_only_the_keys_below_it() {
+    use std::os::unix::fs::symlink;
+    type Case = (
+        &'static str,
+        fn(&Path),
+        &'static [&'static str],
+        &'static str,
+        bool,
+        RunOutcome,
+    );
+    // Each case: the tree, the bucket, the name to look at, whether a link stays there, and the
+    // outcome.
+    let cases: &[Case] = &[
+        (
+            "dangling photos, bucket has photos/a.jpg",
+            |root| symlink(root.join("unmounted"), root.join("photos")).unwrap(),
+            &["photos/a.jpg"],
+            "photos",
+            true,
+            RunOutcome::Warned,
+        ),
+        (
+            "dangling photos, bucket has photos",
+            |root| symlink(root.join("unmounted"), root.join("photos")).unwrap(),
+            &["photos"],
+            "photos",
+            false,
+            RunOutcome::Clean,
+        ),
+        (
+            "dangling photos, bucket empty",
+            |root| symlink(root.join("unmounted"), root.join("photos")).unwrap(),
+            &[],
+            "photos",
+            true,
+            RunOutcome::Clean,
+        ),
+        (
+            "endless chain a -> b -> a, bucket has a",
+            |root| {
+                symlink(root.join("b"), root.join("a")).unwrap();
+                symlink(root.join("a"), root.join("b")).unwrap();
+            },
+            &["a"],
+            "a",
+            false,
+            RunOutcome::Clean,
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (name, build, bucket, at, link_stays, outcome) in cases {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonical root");
+        build(&root);
+        let (t, ctx, rx) = downloading_into_walking(
+            &root,
+            a_bucket_to_download(bucket, 1_600_000_000),
+            DeleteMode::On,
+            Walker::builder().follow_symlinks(true).build(),
+        );
+        run_managed(&t, &ctx, rx).await;
+        let is_link = std::fs::symlink_metadata(root.join(at))
+            .is_ok_and(|meta| meta.file_type().is_symlink());
+        if is_link != *link_stays {
+            failures.push(format!(
+                "{name}: a link at {at} is {is_link}, want {link_stays}"
+            ));
+        }
+        if t.outcome() != *outcome {
+            failures.push(format!("{name}: {:?}, want {outcome:?}", t.outcome()));
+        }
+        if t.inner.state.lock().snapshot().walk_failures != 0 {
+            failures.push(format!("{name}: the link counted as a walk failure"));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+// A loop reaches a directory, so its own name counts like a link to a directory. A download of
+// that name replaces the link, and the keys below it stay held.
+#[cfg(unix)]
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn a_download_replaces_a_destination_loop_at_its_own_name() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path().canonicalize().expect("canonical root");
+    std::os::unix::fs::symlink(&root, root.join("up")).expect("a loop");
+    let (t, ctx, rx) = downloading_into_walking(
+        &root,
+        a_bucket_to_download(&["up"], 1_600_000_000),
+        DeleteMode::On,
+        Walker::builder().follow_symlinks(true).build(),
+    );
+    run_managed(&t, &ctx, rx).await;
+    let meta = std::fs::symlink_metadata(root.join("up")).expect("up exists");
+    assert!(meta.is_file(), "the download did not replace the loop");
+}
+
 // Two aliases with the link moved after its target. The merge decides on the target before the
 // walk reads the link's directory, so only the link scan can keep the file.
 #[cfg(unix)]
