@@ -135,7 +135,9 @@ mod test {
     use crate::io::InputStream;
     use crate::metrics::unit::ByteUnit;
     use crate::operation::upload::UploadInput;
-    use crate::types::{AbortOutcome, ConcurrencyMode, PartSize, TransferStatus};
+    use crate::types::{
+        AbortOutcome, ConcurrencyMode, FailedMultipartUploadPolicy, PartSize, TransferStatus,
+    };
     use crate::RuntimeConfig;
 
     /// Polls `future` once and returns the result of that poll.
@@ -196,9 +198,15 @@ mod test {
     }
 
     /// An abort requested while CreateMultipartUpload is in flight waits for
-    /// Create's response, then aborts the upload Create returned. No part is
-    /// uploaded.
-    async fn abort_during_create_mpu(runtime_config: RuntimeConfig) {
+    /// Create's response, and no part is uploaded. Under `AbortUpload` it
+    /// aborts the upload Create returned and reports `Cancelled`; under
+    /// `Retain` it leaves the upload open and reports `Retained`. Both carry
+    /// the upload ID.
+    async fn abort_during_create_mpu(
+        runtime_config: RuntimeConfig,
+        policy: FailedMultipartUploadPolicy,
+    ) {
+        let retain = matches!(policy, FailedMultipartUploadPolicy::Retain);
         let create_started = Arc::new(Semaphore::new(0));
         let create_release = Arc::new(Semaphore::new(0));
         let abort_uris = Arc::new(Mutex::new(Vec::new()));
@@ -230,6 +238,7 @@ mod test {
             .body(InputStream::from(Bytes::from_static(
                 b"force multipart upload",
             )))
+            .failed_multipart_upload_policy(policy)
             .initiate_with(&tm)
             .unwrap();
 
@@ -251,31 +260,67 @@ mod test {
             .expect("abort hung after CreateMultipartUpload returned")
             .expect("abort failed");
 
-        assert_eq!(aborted.outcome(), AbortOutcome::Cancelled);
         assert_eq!(aborted.upload_id(), Some("test-upload-id"));
         let abort_uris = abort_uris.lock().unwrap();
-        assert_eq!(
-            abort_uris.len(),
-            1,
-            "expected one AbortMultipartUpload: {abort_uris:?}"
-        );
-        assert!(
-            abort_uris[0].contains("uploadId=test-upload-id"),
-            "AbortMultipartUpload for the wrong upload: {}",
-            abort_uris[0]
-        );
+        if retain {
+            assert_eq!(aborted.outcome(), AbortOutcome::Retained);
+            assert!(
+                abort_uris.is_empty(),
+                "unexpected AbortMultipartUpload under Retain: {abort_uris:?}"
+            );
+        } else {
+            assert_eq!(aborted.outcome(), AbortOutcome::Cancelled);
+            assert_eq!(
+                abort_uris.len(),
+                1,
+                "expected one AbortMultipartUpload: {abort_uris:?}"
+            );
+            assert!(
+                abort_uris[0].contains("uploadId=test-upload-id"),
+                "AbortMultipartUpload for the wrong upload: {}",
+                abort_uris[0]
+            );
+        }
     }
 
     #[cfg_attr(miri, ignore)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn abort_during_create_mpu_on_tokio_runtime() {
-        abort_during_create_mpu(RuntimeConfig::multi_thread_tokio()).await;
+        abort_during_create_mpu(
+            RuntimeConfig::multi_thread_tokio(),
+            FailedMultipartUploadPolicy::AbortUpload,
+        )
+        .await;
     }
 
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn abort_during_create_mpu_on_managed_runtime() {
-        abort_during_create_mpu(RuntimeConfig::default()).await;
+        abort_during_create_mpu(
+            RuntimeConfig::default(),
+            FailedMultipartUploadPolicy::AbortUpload,
+        )
+        .await;
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abort_during_create_mpu_retains_upload_on_tokio_runtime() {
+        abort_during_create_mpu(
+            RuntimeConfig::multi_thread_tokio(),
+            FailedMultipartUploadPolicy::Retain,
+        )
+        .await;
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn abort_during_create_mpu_retains_upload_on_managed_runtime() {
+        abort_during_create_mpu(
+            RuntimeConfig::default(),
+            FailedMultipartUploadPolicy::Retain,
+        )
+        .await;
     }
 
     /// How [`CompleteMpuConnector`] answers CompleteMultipartUpload.

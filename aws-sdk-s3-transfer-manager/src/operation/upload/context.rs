@@ -807,7 +807,7 @@ pub(crate) enum UploadState {
     /// PutObject is in flight.
     PutObjectInFlight,
     /// Clean up the upload in S3 when failure or user requested abort.
-    /// Based on the previous state, tracking the nesscary cleanup work here.
+    /// Based on the previous state, tracking the necessary cleanup work here.
     Aborting {
         /// S3 Multipart Upload ID to abort.
         /// `None` before CreateMultipartUpload response received.
@@ -815,7 +815,7 @@ pub(crate) enum UploadState {
         /// CreateMultipartUpload has been sent and response has not yet received.
         create_in_flight: bool,
         /// CompleteMultipartUpload has been sent and and response has not yet received.
-        /// Its response determines whether the object sotored in S3 or not.
+        /// Its response determines whether the object stored in S3 or not.
         complete_mpu_in_flight: bool,
         /// Progress of the AbortMultipartUpload request.
         abort_mpu: AbortMpuProgress,

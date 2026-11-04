@@ -182,6 +182,9 @@ pub enum AbortOutcome {
     /// S3 finished storing the object before the abort took effect. The object is not
     /// deleted; its metadata is available from [`AbortedUpload::output`].
     AlreadyCompleted,
+    /// The upload was stopped before S3 completed the object, and its multipart upload
+    /// was left open.
+    Retained,
 }
 
 impl AbortedUpload {
@@ -196,7 +199,8 @@ impl AbortedUpload {
     pub fn output(&self) -> Option<&crate::operation::upload::UploadOutput> {
         self.output.as_ref()
     }
-    /// Get the multipart upload ID that was cancelled
+    /// Get the multipart upload ID that was aborted, or that was left open when
+    /// [`outcome`](Self::outcome) is [`AbortOutcome::Retained`].
     ///
     /// Not present for uploads that did not utilize a multipart upload
     pub fn upload_id(&self) -> Option<&str> {

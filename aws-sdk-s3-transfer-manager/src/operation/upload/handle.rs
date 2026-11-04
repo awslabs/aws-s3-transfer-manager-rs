@@ -4,7 +4,7 @@
  */
 
 use crate::error::{Error, ErrorKind};
-use crate::operation::upload::transfer::UploadTransfer;
+use crate::operation::upload::transfer::{UploadResult, UploadTransfer};
 use crate::operation::upload::UploadOutput;
 use crate::transfer::StateMachineTerminalReceiver;
 use crate::types::{AbortOutcome, AbortedUpload};
@@ -115,10 +115,10 @@ impl UploadHandle {
             ));
         }
 
-        Ok(self
-            .transfer
-            .take_result()
-            .expect("result must be set on successful completion"))
+        match self.transfer.take_result() {
+            Some(UploadResult::Completed(output)) => Ok(output),
+            other => unreachable!("result must be set on successful completion instead {other:?}"),
+        }
     }
 
     /// Consume the handle and abort the upload.
@@ -143,7 +143,10 @@ impl UploadHandle {
     ///   is not deleted.
     ///
     /// AbortMultipartUpload is sent at most once, and not at all when the
-    /// failed multipart upload policy is to retain the upload.
+    /// failed multipart upload policy is to retain the upload. In that case a
+    /// multipart upload that was created is left open and this returns
+    /// [`AbortOutcome::Retained`] with its upload ID, unless S3 created the
+    /// object first.
     ///
     /// # Errors
     ///
@@ -153,6 +156,7 @@ impl UploadHandle {
     ///
     /// [`AbortOutcome::Cancelled`]: crate::types::AbortOutcome::Cancelled
     /// [`AbortOutcome::AlreadyCompleted`]: crate::types::AbortOutcome::AlreadyCompleted
+    /// [`AbortOutcome::Retained`]: crate::types::AbortOutcome::Retained
     pub async fn abort(mut self) -> Result<AbortedUpload, Error> {
         // A failure may have started the abort already. `request_abort()` is
         // idempotent, so this then changes nothing, and the wait below
@@ -171,20 +175,25 @@ impl UploadHandle {
             return Err(ctx.take_error().expect("failed transfer must have error"));
         }
 
-        // A stored result means S3 created the object, either before the
-        // abort or because Complete or PutObject committed before it took
-        // effect.
-        if let Some(output) = self.transfer.take_result() {
-            return Ok(AbortedUpload {
+        Ok(match self.transfer.take_result() {
+            // S3 created the object, either before the abort or because
+            // Complete or PutObject committed before it took effect.
+            Some(UploadResult::Completed(output)) => AbortedUpload {
                 outcome: AbortOutcome::AlreadyCompleted,
                 output: Some(output),
                 ..Default::default()
-            });
-        }
-
-        // The upload ID and request-charged value are set only when
-        // AbortMultipartUpload was sent.
-        Ok(self.transfer.take_abort_mpu_output())
+            },
+            // AbortMultipartUpload succeeded (`Cancelled`), or the policy is
+            // `Retain` and the upload was left open (`Retained`). Both carry
+            // the upload ID.
+            Some(UploadResult::Aborted(aborted)) => aborted,
+            // No multipart upload existed: the abort came before Create was
+            // sent, or stopped a PutObject.
+            None => AbortedUpload {
+                outcome: AbortOutcome::Cancelled,
+                ..Default::default()
+            },
+        })
     }
 
     /// Get the transfer ID for this upload.
