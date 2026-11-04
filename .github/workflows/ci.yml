@@ -54,6 +54,7 @@ jobs:
       - loom
       - semver
       - modeled-codegen
+      - release-tools
     steps:
       - name: Verify required results
         env:
@@ -65,6 +66,65 @@ jobs:
               <<<"$NEEDS_JSON" >&2
             exit 1
           fi
+
+  release-tools:
+    name: Release tooling
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: extractions/setup-just@v3
+      - name: Install Rust ${{ env.rust_min }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.rust_min }}
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            tools/tmdev -> target
+          prefix-key: v1-release-rust
+      - name: Format, lint, and test the locked developer tool
+        run: |
+          cargo fmt --manifest-path tools/tmdev/Cargo.toml -- --check
+          cargo clippy --locked --manifest-path tools/tmdev/Cargo.toml \
+            --target-dir tools/tmdev/target --all-targets --no-deps -- -D warnings
+          cargo test --locked --manifest-path tools/tmdev/Cargo.toml \
+            --target-dir tools/tmdev/target --all-targets
+      - name: Audit published workspace dependency requirements
+        run: just release audit
+      - name: Check developer tool lockfile
+        run: git diff --exit-code -- tools/tmdev/Cargo.lock
+      - name: Detect release preparation
+        id: changes
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if git diff --quiet "$PR_BASE_SHA" HEAD -- release.toml; then
+            echo "record=false" >> "$GITHUB_OUTPUT"
+          else
+            status=$?
+            if [[ "$status" != 1 ]]; then
+              exit "$status"
+            fi
+            echo "record=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Validate the release record
+        if: steps.changes.outputs.record == 'true'
+        run: just release check --ref HEAD
+      - name: Verify the release packages
+        if: steps.changes.outputs.record == 'true'
+        run: just release publish --ref HEAD --dry-run
+      - name: Save the release report
+        if: always() && steps.changes.outputs.record == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-preparation-plan
+          path: target/release/plan.json
+          if-no-files-found: warn
 
   modeled-codegen:
     name: Modeled API generation
