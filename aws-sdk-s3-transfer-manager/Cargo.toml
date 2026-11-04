@@ -29,6 +29,7 @@ tokio = { version = "1.43.0", features = ["rt", "io-util", "sync", "macros"] }
 tracing = "0.1"
 walkdir = "2"
 tokio-util = "0.7.13"
+crossbeam-epoch = "0.9"
 crossbeam-skiplist = "0.1.3"
 crossbeam-utils = "0.8"
 parking_lot = "0.12"

@@ -271,6 +271,7 @@ dependencies = [
  "bytes-utils",
  "clap",
  "console-subscriber",
+ "crossbeam-epoch",
  "crossbeam-skiplist",
  "crossbeam-utils",
  "dial9",

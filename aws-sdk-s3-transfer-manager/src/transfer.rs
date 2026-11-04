@@ -67,8 +67,10 @@ pub(crate) mod wake_flag {
 /// # Contracts
 ///
 /// Implementations must uphold:
-/// - **Failed lifecycle**: record the error and signal termination before returning
-///   `WorkOutcome::Failed`.
+/// - **Failed lifecycle**: record the error before returning `WorkOutcome::Failed`.
+///   Then either end the transfer and signal termination, or keep it active
+///   with a wake path so `poll_work` drives it to an end (an upload aborts
+///   its multipart upload first).
 /// - **Pending/wake obligation**: every `PollWork::Pending` must first call
 ///   `ctx.set_pending(cause)` and have a future wake path. See
 ///   [`TransferContext`] for the wake primitive protocol.
@@ -265,7 +267,9 @@ pub(crate) enum WorkOutcome {
     /// releases the execution slot but does not report a completion sample to the concurrency
     /// controller.
     Yielded,
-    /// Work failed. Transfer must have called `set_failed` + `signal_terminal` before returning.
+    /// Work failed. The transfer must have recorded the error before returning, and then
+    /// either ended (`set_failed` + `signal_terminal`) or stayed active with a wake path to
+    /// its end. See the Failed lifecycle contract on [`Transfer`].
     Failed { classification: Option<ErrorKind> },
     /// Work was skipped or aborted because the transfer is already terminal.
     Cancelled,
@@ -403,6 +407,11 @@ impl StateMachineStatus {
     #[inline]
     pub(crate) fn is_active(&self) -> bool {
         self.0.load(Ordering::Acquire) == STATUS_ACTIVE
+    }
+
+    #[inline]
+    pub(crate) fn is_completed(&self) -> bool {
+        self.0.load(Ordering::Acquire) == STATUS_COMPLETED
     }
 
     #[inline]
@@ -1083,6 +1092,12 @@ impl TransferContext {
     #[inline]
     pub(crate) fn is_active(&self) -> bool {
         self.status.is_active()
+    }
+
+    /// Check if transfer completed successfully
+    #[inline]
+    pub(crate) fn is_completed(&self) -> bool {
+        self.status.is_completed()
     }
 
     /// Signal that the transfer has reached a terminal state.
