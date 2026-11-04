@@ -56,7 +56,13 @@ fn uploading(
     )
 }
 
-async fn drive(transfer: &SyncTransfer<FsWalk, S3Walk>) -> u64 {
+async fn drive<S, D>(transfer: &SyncTransfer<S, D>) -> u64
+where
+    S: crate::io::key::stream::KeyStream + Send + 'static,
+    D: crate::io::key::stream::KeyStream + Send + 'static,
+    S::Source: Send + 'static,
+    D::Source: Send + 'static,
+{
     let run = async {
         loop {
             match transfer.poll_work() {

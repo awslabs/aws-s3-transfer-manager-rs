@@ -23,7 +23,8 @@ use crate::io::key::stream::{
 };
 use crate::io::walk::WalkErrorKind;
 
-use links::ALIASED_NAMES_HELD;
+use links::{name_of, Links, ALIASED_NAMES_HELD};
+pub(crate) use links::{names_cover, LinkScan};
 pub(crate) use walker::LocalDestination;
 #[cfg(test)]
 pub(crate) use walker::{LocalAndBucket, Walker};
@@ -440,6 +441,15 @@ fn at_or_under(key: &str, name: &str) -> bool {
     key.starts_with(name) && (key.len() == name.len() || key.as_bytes()[name.len()] == b'/')
 }
 
+// What a link scan found once it read the whole destination.
+#[derive(Debug)]
+pub(crate) enum LinkScanResult {
+    // Every name the tree's followed links reach, at most `ALIASED_NAMES_HELD` of them.
+    Names(Vec<AliasedName>),
+    // The tree holds more names than the bound, so the run holds every local delete.
+    TooMany,
+}
+
 // Two key-ordered streams merged into one pairing per key.
 // `Progress` tells callers whether the merge can infer absence from key position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -466,6 +476,9 @@ pub(crate) struct Walk<S: KeyStream, D: KeyStream> {
     // reads as "nothing is there" — so carrying on would read every key the other side still
     // holds as absent, and delete mode would remove all of them.
     ended_by_failure: bool,
+    // The link scan this walk's run starts, until the run takes it.
+    link_scan: Option<LinkScan>,
+    links: Links,
 }
 
 impl<S: KeyStream, D: KeyStream> Walk<S, D> {
@@ -475,7 +488,41 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
             dst: Side::new(destination),
             incomplete: false,
             ended_by_failure: false,
+            link_scan: None,
+            links: Links::NoScan,
         }
+    }
+
+    // Give the run its link scan. The run reads the scan beside the merge and hands the result back
+    // through `accept_link_scan`.
+    pub(crate) fn take_link_scan(&mut self) -> Option<LinkScan> {
+        self.link_scan.take()
+    }
+
+    // Take what the link scan found. Hold its names on the source side, and return every name a
+    // waiting local delete must not touch, sorted. `None` means every waiting delete stays.
+    pub(crate) fn accept_link_scan(&mut self, result: LinkScanResult) -> Option<Vec<String>> {
+        let found = match std::mem::replace(&mut self.links, Links::NoScan) {
+            Links::Scanning { found } => found,
+            _ => Vec::new(),
+        };
+        let LinkScanResult::Names(scanned) = result else {
+            self.src.gap.add(Stretch { under: None });
+            self.links = Links::Scanned { names: Vec::new() };
+            return None;
+        };
+        let mut names: Vec<String> = Vec::with_capacity(scanned.len() + found.len());
+        for name in scanned {
+            names.push(name_of(&name).to_string());
+            self.add_alias_hold(name);
+        }
+        names.extend(found.iter().map(|name| name_of(name).to_string()));
+        names.sort_unstable();
+        names.dedup();
+        self.links = Links::Scanned {
+            names: names.clone(),
+        };
+        Some(names)
     }
 
     // The next key either side holds, or the failure that interrupted one of them.
@@ -588,30 +635,52 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
 
     // Hold back the deletes under a name a followed destination link aliases.
     //
-    // The merge may already have reached the name, and a delete under it may have gone out before
-    // the walk found the link. The merge then marks the plan incomplete. Past the bound on held
-    // names, the source holds back every later delete.
+    // The merge may already have reached the name. A delete under it then went out before the walk
+    // found the link, unless the run still holds its deletes for the link scan. While the scan
+    // reads, the name joins the ones the waiting deletes are checked against. Once the scan ended, a
+    // reached name the scan never saw marks the plan incomplete: someone created the link during the
+    // run. A run without a scan marks every reached name.
     fn hold_aliased(&mut self, name: AliasedName) {
         // No name sorts at or before the empty key, so nothing reads as reached before a pairing.
         let paired = std::cmp::max(self.src.taken.as_str(), self.dst.taken.as_str());
-        let (stretch, reached) = match name {
+        let reached = match &name {
             // The merge reaches a file when it pairs that key or a later one.
-            AliasedName::File(name) => {
-                let reached = name.as_str() <= paired;
-                (Stretch { under: Some(name) }, reached)
-            }
+            AliasedName::File(name) => name.as_str() <= paired,
             // The merge reaches a directory when it enters the subtree or passes it.
             AliasedName::Directory(name) => {
-                let stretch = Stretch { under: Some(name) };
-                let reached = stretch.covers(paired) || stretch.passed_by(paired);
-                (stretch, reached)
+                let stretch = Stretch {
+                    under: Some(name.clone()),
+                };
+                stretch.covers(paired) || stretch.passed_by(paired)
             }
         };
-        if reached {
-            self.incomplete = true;
+        match &mut self.links {
+            Links::NoScan => self.incomplete |= reached,
+            Links::Scanning { found } => {
+                if found.len() < ALIASED_NAMES_HELD {
+                    found.push(name.clone());
+                } else {
+                    // The waiting deletes can no longer be checked against every name, so the
+                    // source holds back every delete.
+                    self.src.gap.add(Stretch { under: None });
+                }
+            }
+            Links::Scanned { names } => {
+                let seen = names
+                    .binary_search_by(|n| n.as_str().cmp(name_of(&name)))
+                    .is_ok();
+                self.incomplete |= reached && !seen;
+            }
         }
+        self.add_alias_hold(name);
+    }
+
+    // Hold back the deletes under one aliased name. Past the bound on held names, the source holds
+    // back every later delete.
+    fn add_alias_hold(&mut self, name: AliasedName) {
+        let (AliasedName::File(name) | AliasedName::Directory(name)) = name;
         if self.src.gap.under.len() < ALIASED_NAMES_HELD {
-            self.src.gap.add(stretch);
+            self.src.gap.add(Stretch { under: Some(name) });
         } else {
             self.src.gap.add(Stretch { under: None });
         }

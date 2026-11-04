@@ -1949,6 +1949,44 @@ async fn the_prefix_reaches_the_listing_in_either_direction() {
     );
 }
 
+// The link scan keeps at most `ALIASED_NAMES_HELD` names for the whole tree. Many links to one
+// target count that target once.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_link_scan_gives_up_past_its_bound() {
+    for (links, too_many) in [(ALIASED_NAMES_HELD - 1, false), (ALIASED_NAMES_HELD, true)] {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let root = dir.path().canonicalize().expect("canonical root");
+        std::fs::create_dir(root.join("real")).expect("real");
+        for n in 0..links {
+            std::os::unix::fs::symlink(root.join("real"), root.join(format!("l{n:04}")))
+                .expect("a link");
+        }
+        let mut walk = Walker::builder()
+            .follow_symlinks(true)
+            .build()
+            .downloading(
+                LocalAndBucket::builder()
+                    .local_root(&root)
+                    .client(a_client())
+                    .bucket("amzn-s3-demo-bucket")
+                    .build(),
+                DeleteMode::On,
+            )
+            .expect("an ordinary bucket builds");
+        let mut scan = walk.take_link_scan().expect("the run has a link scan");
+        while !scan.advance(64).await {}
+        // Each link names itself, and all of them name `real` once.
+        let result = scan.finish();
+        assert_eq!(
+            matches!(result, LinkScanResult::TooMany),
+            too_many,
+            "{links} links name {} keys: {result:?}",
+            links + 1
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_download_walks_the_same_two_roots_the_other_way_round() {
     // The same context serves both directions, so the thing worth pinning is which side is

@@ -305,6 +305,273 @@ async fn a_delete_through_a_destination_link_does_not_remove_the_file_it_aliases
 
 // A followed link makes two keys name one local file. Each row builds such a tree and names the
 // paths the run must leave resolving, and the paths it must still remove.
+#[cfg(unix)]
+fn stamp_hello(path: &Path, when: i64) {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("parent dir");
+    }
+    std::fs::write(path, b"hello").expect("file");
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .expect("file opens")
+        .set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(when as u64)),
+        )
+        .expect("the object's time applies");
+}
+
+// Two aliases with the link moved after its target. The merge decides on the target before the
+// walk reads the link's directory, so only the link scan can keep the file.
+#[cfg(unix)]
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn a_link_that_sorts_after_its_target_keeps_the_file_another_key_names() {
+    use std::os::unix::fs::symlink;
+    const WHEN: i64 = 1_600_000_000;
+    type Case = (
+        &'static str,
+        &'static [&'static str],
+        fn(&Path),
+        &'static str,
+    );
+    let cases: &[Case] = &[
+        (
+            "z/link -> ../real, bucket keeps z/link/x.txt",
+            &["z/link/x.txt"],
+            |root| {
+                stamp_hello(&root.join("real/x.txt"), WHEN);
+                std::fs::create_dir(root.join("z")).unwrap();
+                symlink("../real", root.join("z/link")).unwrap();
+            },
+            "real/x.txt",
+        ),
+        (
+            "z/y.txt -> ../a.txt, bucket keeps z/y.txt",
+            &["z/y.txt"],
+            |root| {
+                stamp_hello(&root.join("a.txt"), WHEN);
+                std::fs::create_dir(root.join("z")).unwrap();
+                symlink("../a.txt", root.join("z/y.txt")).unwrap();
+            },
+            "a.txt",
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (name, bucket, build, kept) in cases {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonical root");
+        build(&root);
+        let (t, ctx, rx) = downloading_into_walking(
+            &root,
+            a_bucket_to_download(bucket, WHEN),
+            DeleteMode::On,
+            Walker::builder().follow_symlinks(true).build(),
+        );
+        run_managed(&t, &ctx, rx).await;
+        if std::fs::metadata(root.join(kept)).is_err() {
+            failures.push(format!("{name}: {kept} no longer resolves"));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+// Without the link scan, the runs switched between deleting `real/x.txt` and writing it back
+// through `z/link`. With it, every run decides the same thing.
+#[cfg(unix)]
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn every_run_over_a_link_that_sorts_after_its_target_decides_the_same() {
+    const WHEN: i64 = 1_600_000_000;
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path().canonicalize().expect("canonical root");
+    stamp_hello(&root.join("real/x.txt"), WHEN);
+    std::fs::create_dir(root.join("z")).expect("z");
+    std::os::unix::fs::symlink("../real", root.join("z/link")).expect("symlink");
+    for run in 1..=3 {
+        let (t, ctx, rx) = downloading_into_walking(
+            &root,
+            a_bucket_to_download(&["z/link/x.txt"], WHEN),
+            DeleteMode::On,
+            Walker::builder().follow_symlinks(true).build(),
+        );
+        run_managed(&t, &ctx, rx).await;
+        assert!(
+            root.join("real/x.txt").exists(),
+            "run {run} removed the file z/link/x.txt names"
+        );
+        assert_eq!(
+            t.outcome(),
+            RunOutcome::Warned,
+            "run {run} kept a stale key and reported no warning"
+        );
+    }
+}
+
+// Run every work item but the link scan, until the run has nothing else to do. Return the scan's
+// work item, so a test can let the merge decide deletes before the scan ends.
+async fn drive_holding_the_scan(
+    t: &SyncTransfer<S3Walk, crate::operation::sync::walk::LocalDestination>,
+) -> IoRequest {
+    let mut scan = None;
+    loop {
+        match t.poll_work() {
+            PollWork::Ready { io: mut work, .. } => {
+                let is_scan = matches!(
+                    work.data_mut::<SyncWork<S3Walk, crate::operation::sync::walk::LocalDestination>>(),
+                    SyncWork::ScanLinks { .. }
+                );
+                if is_scan && scan.is_none() {
+                    scan = Some(work);
+                } else {
+                    t.execute(&mut work).await;
+                }
+            }
+            PollWork::Pending => break,
+            PollWork::Done => panic!("the run finished while its link scan never ran"),
+            PollWork::Spawned => {}
+        }
+    }
+    scan.expect("the run dispatched its link scan")
+}
+
+// Case F with the scan held back. The merge decides to delete `real/x.txt` before the scan reads
+// `z/`. The delete waits, and once the scan names `real`, it stays.
+#[cfg(unix)]
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn a_delete_the_merge_decides_before_the_scan_ends_waits_for_it() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path().canonicalize().expect("canonical root");
+    std::fs::create_dir(root.join("real")).expect("real");
+    std::fs::write(root.join("real/x.txt"), b"x").expect("x.txt");
+    std::fs::create_dir(root.join("z")).expect("z");
+    std::os::unix::fs::symlink("../real", root.join("z/link")).expect("symlink");
+    let (t, _ctx, _rx) = downloading_into_walking(
+        &root,
+        a_bucket_to_download(&[], 1_600_000_000),
+        DeleteMode::On,
+        Walker::builder().follow_symlinks(true).build(),
+    );
+    let mut scan = drive_holding_the_scan(&t).await;
+    assert!(
+        root.join("real/x.txt").exists(),
+        "a delete went out before the scan ended"
+    );
+    t.execute(&mut scan).await;
+    drive(&t).await;
+    assert!(
+        root.join("real/x.txt").exists(),
+        "the run removed the file z/link/x.txt names"
+    );
+    assert_eq!(t.outcome(), RunOutcome::Warned);
+}
+
+// Local deletes wait for the link scan. While the scan has not run, the merge decides deletes until
+// 1,024 wait, then pauses. Once the scan ends, every delete goes out.
+#[cfg(unix)]
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn the_merge_pauses_on_deletes_that_wait_for_the_link_scan() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path().canonicalize().expect("canonical root");
+    for n in 0..1100 {
+        std::fs::write(root.join(format!("f{n:04}")), b"x").expect("a local-only file");
+    }
+    let (t, _ctx, _rx) = downloading_into_walking(
+        &root,
+        a_bucket_to_download(&[], 1_600_000_000),
+        DeleteMode::On,
+        Walker::builder().follow_symlinks(true).build(),
+    );
+    let mut scan = drive_holding_the_scan(&t).await;
+    let waiting = t.inner.state.lock().snapshot();
+    assert!(
+        (1024..1024 + MERGE_BATCH).contains(&waiting.deletes_waiting),
+        "the merge did not pause at 1,024 waiting deletes: {}",
+        waiting.deletes_waiting
+    );
+    assert_eq!(
+        waiting.removed, 0,
+        "a delete went out before the scan ended"
+    );
+
+    t.execute(&mut scan).await;
+    drive(&t).await;
+    let left = std::fs::read_dir(&root).expect("root reads").count();
+    assert_eq!(left, 0, "{left} local-only files survived the run");
+    assert!(t.is_plan_complete());
+}
+
+// A link someone creates after the scan read its directory slips past the scan. The walk still
+// finds it, and the run reports that its plan may have removed a file the link names. Every key
+// compares unchanged, so the late link is the only reason the plan is not whole.
+#[cfg(unix)]
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn a_link_created_after_the_scan_read_its_directory_marks_the_plan_incomplete() {
+    const WHEN: i64 = 1_600_000_000;
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path().canonicalize().expect("canonical root");
+    stamp_hello(&root.join("real/x.txt"), WHEN);
+    std::fs::create_dir(root.join("z")).expect("z");
+    let (t, _ctx, _rx) = downloading_into_walking(
+        &root,
+        a_bucket_to_download(&["real/x.txt", "z/link/x.txt"], WHEN),
+        DeleteMode::On,
+        Walker::builder().follow_symlinks(true).build(),
+    );
+    while t.inner.state.lock().links.result.is_none() {
+        let PollWork::Ready { io: mut work, .. } = t.poll_work() else {
+            panic!("the first work a run hands out is its link scan");
+        };
+        t.execute(&mut work).await;
+    }
+    std::os::unix::fs::symlink("../real", root.join("z/link")).expect("a link made mid-run");
+    drive(&t).await;
+    assert_eq!(
+        t.inner.state.lock().snapshot().decided.transfers,
+        0,
+        "every key should compare unchanged"
+    );
+    assert!(
+        !t.is_plan_complete(),
+        "a run that followed a link its scan never saw reported a whole plan"
+    );
+}
+
+// More link names than the bound. The run cannot tell which deletes are safe, so it keeps every one
+// of them. The walk has a bound of its own for the links it follows while the scan reads. Either
+// bound keeps the file here. `the_link_scan_gives_up_past_its_bound` tests the scan's bound alone.
+#[cfg(unix)]
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn a_tree_past_the_link_bound_keeps_every_local_delete() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path().canonicalize().expect("canonical root");
+    std::fs::create_dir(root.join("real")).expect("real");
+    // Each directory link names itself and its target. 1,100 links to one target name 1,101 keys,
+    // past the bound of 1,024.
+    for n in 0..1100 {
+        std::os::unix::fs::symlink(root.join("real"), root.join(format!("l{n:04}")))
+            .expect("a link");
+    }
+    std::fs::write(root.join("old.txt"), b"x").expect("a local-only file");
+    let (t, _ctx, _rx) = downloading_into_walking(
+        &root,
+        a_bucket_to_download(&[], 1_600_000_000),
+        DeleteMode::On,
+        Walker::builder().follow_symlinks(true).build(),
+    );
+    drive(&t).await;
+    assert!(
+        root.join("old.txt").exists(),
+        "a run past the link bound removed a local file"
+    );
+    assert_eq!(t.outcome(), RunOutcome::Warned);
+}
+
 // The names a followed link reaches exist only to stop deletes. With delete mode off, the run names
 // none, so the destination-only key `link/x.txt` stays destination-only and the plan is whole. With
 // delete mode on, the same key reads as unknown.

@@ -10,15 +10,15 @@ use std::sync::Arc;
 
 use crate::io::key::filter::KeyFilter;
 use crate::io::key::stream::{
-    key_under_root, local_predicate, s3_predicate, AliasedName, Entry, KeyStream, StreamError,
+    local_predicate, s3_predicate, AliasedName, Entry, KeyStream, StreamError,
 };
 use crate::io::walk::{
-    FollowedLink, FsEntry, FsWalk, FsWalkContext, FsWalker, S3Walk, S3WalkContext, S3Walker,
-    SortOrder, WalkErrorKind,
+    FsEntry, FsWalk, FsWalkContext, FsWalker, S3Walk, S3WalkContext, S3Walker, SortOrder,
+    WalkErrorKind,
 };
 use crate::operation::sync::input::DeleteMode;
 
-use super::links::later_links;
+use super::links::{LinkNamer, LinkScan, Links};
 use super::Walk;
 
 // What a run was configured with, independent of the roots it runs against.
@@ -91,7 +91,9 @@ impl Walker {
     // absolute path this layer has to turn into a key.
     //
     // The names a followed link reaches exist only to stop deletes. With delete mode off, the
-    // destination names none, so a run over a tree with links holds nothing back.
+    // destination names none, so a run over a tree with links holds nothing back. With delete mode
+    // on and following on, the run also starts a link scan of the destination, and every local
+    // delete waits until the scan ends.
     pub(crate) fn downloading(
         &self,
         ctx: LocalAndBucket,
@@ -99,9 +101,20 @@ impl Walker {
     ) -> Result<Walk<S3Walk, LocalDestination>, crate::error::Error> {
         let root = ctx.local_root.clone();
         let remote = self.remote_walk(ctx.client, ctx.bucket, ctx.prefix)?;
-        let local = LocalDestination::new(self.local_walk(ctx.local_root), &root)
-            .naming_aliases(delete_mode == DeleteMode::On);
-        Ok(Walk::new(remote, local).with_roots(None, Some(root)))
+        let names = delete_mode == DeleteMode::On;
+        let local =
+            LocalDestination::new(self.local_walk(ctx.local_root), &root).naming_aliases(names);
+        let mut walk = Walk::new(remote, local).with_roots(None, Some(root.clone()));
+        if names && self.follow_symlinks {
+            walk.link_scan = Some(LinkScan {
+                walk: self.fs_walk(root.clone(), SortOrder::Native),
+                namer: LinkNamer::new(&root),
+                names: Vec::new(),
+                too_many: false,
+            });
+            walk.links = Links::Scanning { found: Vec::new() };
+        }
+        Ok(walk)
     }
 
     // The merge depends on all three of these, so this layer fixes them and a caller never
@@ -110,8 +123,14 @@ impl Walker {
     // level reports every key below it as absent. And it keeps special files, because a name that
     // is taken has to reach the comparison even though nothing can be sent for it.
     pub(super) fn local_walk(&self, root: PathBuf) -> FsWalk {
+        self.fs_walk(root, SortOrder::WholeWalk)
+    }
+
+    // The link scan reads the same tree with the same rules, in whatever order the filesystem gives.
+    // It needs every link and no key order, so it skips the sort.
+    fn fs_walk(&self, root: PathBuf, sort: SortOrder) -> FsWalk {
         FsWalker::builder()
-            .sort(SortOrder::WholeWalk)
+            .sort(sort)
             .recursive(true)
             .include_special_files(true)
             .follow_symlinks(self.follow_symlinks)
@@ -179,16 +198,11 @@ impl Walker {
 pub(crate) struct LocalDestination {
     walk: FsWalk,
     pub(super) absent: bool,
-    // The walk's paths sit under this root, as the caller spelled it.
-    pub(super) root: PathBuf,
-    // A link's target takes its key under this root, with every link on the root resolved.
-    // `record_aliases` resolves the root when the walk first follows a link, so a tree without links
-    // never pays for it.
-    canonical_root: Option<PathBuf>,
+    // Names what followed links reach. `None` when the run deletes nothing, because only delete
+    // mode needs the names.
+    pub(super) namer: Option<LinkNamer>,
     // The names followed links aliased wait here until the merge takes them.
     aliased: Vec<AliasedName>,
-    // Whether to name what followed links reach. Only delete mode needs the names.
-    names_aliases: bool,
 }
 
 impl LocalDestination {
@@ -199,10 +213,8 @@ impl LocalDestination {
         Self {
             walk,
             absent: matches!(root.try_exists(), Ok(false)),
-            root: root.to_path_buf(),
-            canonical_root: None,
+            namer: Some(LinkNamer::new(root)),
             aliased: Vec::new(),
-            names_aliases: true,
         }
     }
 
@@ -210,49 +222,15 @@ impl LocalDestination {
     // deletes nothing, so it resolves no link targets.
     #[must_use]
     fn naming_aliases(mut self, names: bool) -> Self {
-        self.names_aliases = names;
+        if !names {
+            self.namer = None;
+        }
         self
     }
 
     fn record_aliases(&mut self) {
-        if !self.names_aliases {
-            return;
-        }
-        let links = self.walk.followed_links();
-        if links.is_empty() {
-            return;
-        }
-        if self.canonical_root.is_none() {
-            self.canonical_root = std::fs::canonicalize(&self.root).ok();
-        }
-        // A target and a later link on a chain have resolved paths, so they take their keys under
-        // the resolved root.
-        let resolved = |path: &Path| {
-            self.canonical_root
-                .as_deref()
-                .and_then(|root| key_under_root(root, path))
-        };
-        let target = |link: &Path| std::fs::canonicalize(link).ok().and_then(|t| resolved(&t));
-        for link in links {
-            match link {
-                // Every key through the link names a file of the target. Deleting such a key removes
-                // that file, so the merge holds the link's own name.
-                FollowedLink::Directory(path) => {
-                    let own = key_under_root(&self.root, path);
-                    self.aliased.extend(own.map(AliasedName::Directory));
-                    self.aliased
-                        .extend(target(path).map(AliasedName::Directory));
-                }
-                // Removing a file link unlinks the link and leaves its target, so the link's own name
-                // stays deletable. Removing a later link on the chain leaves this one dangling.
-                FollowedLink::File(path) => {
-                    let chain = later_links(path)
-                        .into_iter()
-                        .filter_map(|hop| resolved(&hop));
-                    self.aliased.extend(chain.map(AliasedName::File));
-                    self.aliased.extend(target(path).map(AliasedName::File));
-                }
-            }
+        if let Some(namer) = &mut self.namer {
+            namer.name(self.walk.followed_links(), &mut self.aliased);
         }
     }
 }

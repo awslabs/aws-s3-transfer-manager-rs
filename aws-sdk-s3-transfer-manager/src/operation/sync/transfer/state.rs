@@ -12,7 +12,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::io::key::stream::{KeyStream, StreamError};
 use crate::operation::sync::compare::Decision;
-use crate::operation::sync::walk::{Pairing, Progress, Walk};
+use crate::operation::sync::walk::{
+    names_cover, LinkScan, LinkScanResult, Pairing, Progress, Walk,
+};
 use crate::types::FailedTransferPolicy;
 
 use super::child::SyncChild;
@@ -449,6 +451,19 @@ pub(super) struct Deletes {
     // On a tree destination, this set holds every key the run queued or sent for removal that has
     // no answer yet. A transfer under such a key waits until that key's answer arrives.
     clearing: HashSet<String>,
+    // Set while the run's link scan reads. No delete goes out until the scan ends, because a link
+    // the scan has not reached yet can make a waiting key name a file another key keeps.
+    held_for_links: bool,
+}
+
+// The run's link scan, for a download with following on and delete mode on.
+#[derive(Debug, Default)]
+pub(super) struct Links {
+    // The scan between work items. `None` while a work item reads it, and once it ended.
+    pub(super) scan: Option<LinkScan>,
+    pub(super) in_flight: bool,
+    // What the scan found, until the merge is back in state to take it.
+    pub(super) result: Option<LinkScanResult>,
 }
 
 impl Deletes {
@@ -477,9 +492,18 @@ impl Deletes {
     }
 
     // Return whether a full batch of `size` keys waits to go out. A full batch goes out at once,
-    // and a partial one waits for the merge to finish.
+    // and a partial one waits for the merge to finish. A batch held for the link scan cannot go out.
     pub(super) fn has_full_batch(&self, size: usize) -> bool {
-        self.waiting.len() >= size
+        !self.held_for_links && self.waiting.len() >= size
+    }
+
+    // Count the waiting keys the link scan holds back.
+    pub(super) fn held_for_links(&self) -> usize {
+        if self.held_for_links {
+            self.waiting.len()
+        } else {
+            0
+        }
     }
 
     // Mark these keys answered. A transfer under one of them no longer waits.
@@ -497,6 +521,9 @@ impl Deletes {
         size: usize,
         nothing_can_grow: bool,
     ) -> Option<Vec<String>> {
+        if self.held_for_links {
+            return None;
+        }
         let full = self.waiting.len() >= size;
         let last_call = nothing_can_grow && !self.waiting.is_empty();
         if !full && !last_call {
@@ -520,6 +547,7 @@ impl Deletes {
 // The scheduler locks `State` while it chooses work or records completed work.
 pub(super) struct State<S: KeyStream, D: KeyStream> {
     pub(super) merge: Merge<S, D>,
+    pub(super) links: Links,
     decided: Decided,
     pub(super) transfers: Transfers<S, D>,
     pub(super) deletes: Deletes,
@@ -531,8 +559,15 @@ pub(super) struct State<S: KeyStream, D: KeyStream> {
 }
 
 impl<S: KeyStream, D: KeyStream> State<S, D> {
-    pub(super) fn new(walk: Walk<S, D>, max_children: usize, namespace: Namespace) -> Self {
+    pub(super) fn new(mut walk: Walk<S, D>, max_children: usize, namespace: Namespace) -> Self {
+        let scan = walk.take_link_scan();
+        let held_for_links = scan.is_some();
         State {
+            links: Links {
+                scan,
+                in_flight: false,
+                result: None,
+            },
             merge: Merge {
                 walk: Some(walk),
                 in_flight: false,
@@ -556,6 +591,7 @@ impl<S: KeyStream, D: KeyStream> State<S, D> {
                 failures: Sampled::default(),
                 namespace,
                 clearing: HashSet::new(),
+                held_for_links,
             },
             failures: Sampled::default(),
             warnings: Sampled::default(),
@@ -661,7 +697,42 @@ impl<S: KeyStream, D: KeyStream> State<S, D> {
     }
 
     pub(super) fn work_outstanding(&self) -> bool {
-        self.merge.in_flight || self.deletes.in_flight > 0 || !self.transfers.running.is_idle()
+        self.merge.in_flight
+            || self.links.in_flight
+            || self.deletes.in_flight > 0
+            || !self.transfers.running.is_idle()
+    }
+
+    // Hand the link scan's result to the merge once both are in state, and release the waiting
+    // deletes. A delete under a name the scan or the walk found stays, because a kept key may name
+    // the same file through a link. The run reports each kept key as
+    // `skipped-unknown`, and it fails each download held behind one, as for a refused removal.
+    pub(super) fn settle_link_scan(&mut self) {
+        let Some(walk) = self.merge.walk.as_mut() else {
+            return;
+        };
+        let Some(result) = self.links.result.take() else {
+            return;
+        };
+        let names = walk.accept_link_scan(result);
+        let (kept, sent): (Vec<String>, Vec<String>) = self
+            .deletes
+            .waiting
+            .drain(..)
+            .partition(|key| names.as_deref().is_none_or(|names| names_cover(names, key)));
+        self.deletes.waiting = sent;
+        self.deletes.held_for_links = false;
+        if kept.is_empty() {
+            return;
+        }
+        let count = kept.len() as u64;
+        self.decided.deletes -= count;
+        self.decided.skipped.unread += count;
+        self.mark_plan_incomplete();
+        self.deletes.settle(&kept);
+        for key in &kept {
+            self.transfers.fail_held(key);
+        }
     }
 
     pub(super) fn is_execution_complete(&self) -> bool {
