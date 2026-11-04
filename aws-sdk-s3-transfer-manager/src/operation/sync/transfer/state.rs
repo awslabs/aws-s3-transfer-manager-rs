@@ -361,8 +361,9 @@ impl<S: KeyStream, D: KeyStream> Transfers<S, D> {
         }
     }
 
-    // The deleter refused `blocker`. It still stands on each held transfer's path, so each would
-    // write through it or fail on it. The run records each one as a failure.
+    // The deleter refused `blocker`. It still stands on each held transfer's path, so each would fail
+    // on it. The run records each one as a failure. A link never blocks here, because the merge
+    // holds every key under a link the walk did not follow.
     pub(super) fn fail_held(&mut self, blocker: &str) {
         for (pairing, _) in self.held.remove(blocker).unwrap_or_default() {
             let error = crate::error::Error::new(
