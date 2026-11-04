@@ -504,37 +504,38 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
                 }
                 return Some(Err(err));
             }
-            // The filter excluded this link's own name, so the name makes no pairing. A source link
-            // still hides the keys under its name, so the source holds those keys back.
-            if self.src.head_is(Obstruction::ExcludedLink) {
+            // A key one side reached while the other has run out is absent there. A side sorting
+            // later says the same thing: reaching a key past this one settles that this one never
+            // arrives.
+            let order = match (&self.src.head, &self.dst.head) {
+                (Head::Finished, Head::Finished) => return None,
+                (Head::Entry(_), Head::Finished) => Ordering::Less,
+                (Head::Finished, Head::Entry(_)) => Ordering::Greater,
+                (Head::Entry(src), Head::Entry(dst)) => src.key.cmp(&dst.key),
+                (Head::Unread, _) | (_, Head::Unread) => {
+                    unreachable!("both heads are filled before they are compared")
+                }
+            };
+            // The filter excluded this link's own name, so the name makes no pairing. The merge
+            // skips past it only at the merge position. `take` releases every hold below the key,
+            // and the other side's head can still sort there and need one. A source link still
+            // hides the keys under its name, so the source holds those keys back.
+            if order.is_le() && self.src.head_is(Obstruction::ExcludedLink) {
                 let link = self.src.take();
                 self.src.gap.add(Stretch {
                     under: Some(link.key),
                 });
                 continue;
             }
-            if self.dst.head_is(Obstruction::ExcludedLink) {
+            if order.is_ge() && self.dst.head_is(Obstruction::ExcludedLink) {
                 self.dst.take();
                 continue;
             }
-            break;
-        }
-
-        match (&self.src.head, &self.dst.head) {
-            (Head::Finished, Head::Finished) => None,
-            // A key one side reached while the other has run out is absent there. A side
-            // sorting later says the same thing: reaching a key past this one settles
-            // that this one never arrives.
-            (Head::Entry(_), Head::Finished) => Some(Ok(self.take_source_only())),
-            (Head::Finished, Head::Entry(_)) => Some(Ok(self.take_destination_only())),
-            (Head::Entry(src), Head::Entry(dst)) => match src.key.cmp(&dst.key) {
-                Ordering::Less => Some(Ok(self.take_source_only())),
-                Ordering::Greater => Some(Ok(self.take_destination_only())),
-                Ordering::Equal => Some(Ok(self.take_both())),
-            },
-            (Head::Unread, _) | (_, Head::Unread) => {
-                unreachable!("both heads are filled before they are compared")
-            }
+            return Some(Ok(match order {
+                Ordering::Less => self.take_source_only(),
+                Ordering::Greater => self.take_destination_only(),
+                Ordering::Equal => self.take_both(),
+            }));
         }
     }
 
@@ -1663,6 +1664,65 @@ mod tests {
             !complete,
             "a plan that skipped keys under an excluded link called itself complete"
         );
+    }
+
+    // Skipping past `videos` passes every key before it. The destination's `photos/y.jpg` sorts
+    // before `videos`, so it pairs first, while the hold on `photos` still stands.
+    #[tokio::test]
+    async fn a_second_excluded_link_keeps_the_hold_of_the_first() {
+        let walk = Walk::new(
+            Scripted::from(vec![
+                Ok(obstructed("photos", Obstruction::ExcludedLink)),
+                Ok(obstructed("videos", Obstruction::ExcludedLink)),
+            ]),
+            Scripted::of(&["photos/y.jpg"]),
+        );
+        let (seen, complete) = pair_all(walk).await;
+        assert_eq!(seen, plan(&[("photos/y.jpg", At::UnknownRange, At::Here)]));
+        assert!(
+            !complete,
+            "a plan that skipped keys under an excluded link called itself complete"
+        );
+    }
+
+    // The same rule protects a hold from a failure. Skipping past `photos` must not pass the
+    // destination's `a/x.txt` before it pairs under the unreadable directory `a`.
+    #[tokio::test]
+    async fn an_excluded_link_keeps_the_hold_of_an_earlier_failure() {
+        let walk = Walk::new(
+            Scripted::from(vec![
+                Err(StreamError::Walk(WalkError::new(
+                    Some(PathBuf::from("/root/a")),
+                    WalkErrorKind::DirectoryUnreadable,
+                    Box::from("permission denied"),
+                ))),
+                Ok(obstructed("photos", Obstruction::ExcludedLink)),
+            ]),
+            Scripted::of(&["a/x.txt"]),
+        )
+        .with_roots(Some(PathBuf::from("/root")), None);
+        let (seen, _) = pair_all(walk).await;
+        assert_eq!(seen, plan(&[("a/x.txt", At::UnknownRange, At::Here)]));
+    }
+
+    // The mirror case on the destination side. Skipping past the destination's `videos` must not
+    // pass the source's `photos/y.jpg` before it pairs.
+    #[tokio::test]
+    async fn an_excluded_destination_link_waits_for_an_earlier_source_key() {
+        let walk = Walk::new(
+            Scripted::of(&["photos/y.jpg"]),
+            Scripted::from(vec![
+                Err(StreamError::Walk(WalkError::new(
+                    Some(PathBuf::from("/root/photos")),
+                    WalkErrorKind::DirectoryUnreadable,
+                    Box::from("permission denied"),
+                ))),
+                Ok(obstructed("videos", Obstruction::ExcludedLink)),
+            ]),
+        )
+        .with_roots(None, Some(PathBuf::from("/root")));
+        let (seen, _) = pair_all(walk).await;
+        assert_eq!(seen, plan(&[("photos/y.jpg", At::Here, At::UnknownRange)]));
     }
 
     #[tokio::test]
