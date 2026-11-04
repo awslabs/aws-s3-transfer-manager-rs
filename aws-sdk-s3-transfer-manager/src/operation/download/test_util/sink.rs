@@ -75,9 +75,6 @@ pub(crate) struct WriteScript {
     state: Mutex<ScriptState>,
     /// Signalled when a hold starts or is released.
     changed: Condvar,
-    /// Sinks created from this script and not yet dropped. A file sink's file
-    /// closes when the sink drops.
-    open_sinks: std::sync::atomic::AtomicUsize,
 }
 
 /// Everything a [`WriteScript`] guards with its one lock, so a rule match, the
@@ -171,12 +168,6 @@ impl WriteScript {
     /// The log so far.
     pub(crate) fn events(&self) -> Vec<Event> {
         self.lock().log.clone()
-    }
-
-    /// The number of sinks created from this script that have not been
-    /// dropped.
-    pub(crate) fn open_sinks(&self) -> usize {
-        self.open_sinks.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Logs `op`, applies the first matching rule, runs `io` unless the rule
@@ -287,14 +278,10 @@ pub(crate) struct ScriptedSinkFactory(pub(crate) Arc<WriteScript>);
 
 impl SinkFactory for ScriptedSinkFactory {
     fn create(&self, file: std::fs::File, owns_file: bool) -> io::Result<Box<dyn SinkWrite>> {
-        let sink = ScriptedSink {
+        Ok(Box::new(ScriptedSink {
             inner: FileSinkFactory.create(file, owns_file)?,
             script: Arc::clone(&self.0),
-        };
-        self.0
-            .open_sinks
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Ok(Box::new(sink))
+        }))
     }
 }
 
@@ -303,14 +290,6 @@ impl SinkFactory for ScriptedSinkFactory {
 struct ScriptedSink {
     inner: Box<dyn SinkWrite>,
     script: Arc<WriteScript>,
-}
-
-impl Drop for ScriptedSink {
-    fn drop(&mut self) {
-        self.script
-            .open_sinks
-            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-    }
 }
 
 impl SinkWrite for ScriptedSink {

@@ -185,56 +185,13 @@ enum Mode {
     Stream,
     /// Positioned writes land at `chunk.offset - object_range_start` in the sink.
     Disk {
-        sink: DestinationSlot,
+        sink: Box<dyn SinkWrite>,
         /// Start of the resolved S3 byte range for this transfer.
         object_range_start: std::sync::OnceLock<u64>,
         /// Bytes the sink has accepted across every drain. Only completed run
         /// writes are counted, so this never exceeds what reached the sink.
         written: AtomicU64,
     },
-}
-
-/// The disk destination, held until [`close`](Self::close).
-///
-/// The lock is held only to clone or take the sink, never across a sink call,
-/// so closing never waits for a write in progress. Each sink call holds its own
-/// clone: the destination is released when the slot is closed and the last
-/// sink call in progress returns.
-#[derive(Debug)]
-struct DestinationSlot(std::sync::RwLock<Option<std::sync::Arc<dyn SinkWrite>>>);
-
-impl DestinationSlot {
-    fn new(sink: Box<dyn SinkWrite>) -> Self {
-        Self(std::sync::RwLock::new(Some(sink.into())))
-    }
-
-    /// Returns the destination, or `None` once the slot has been closed.
-    fn get(&self) -> Option<std::sync::Arc<dyn SinkWrite>> {
-        self.0
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-    }
-
-    /// Returns the destination, or an error once the slot has been closed.
-    fn open(&self) -> std::io::Result<std::sync::Arc<dyn SinkWrite>> {
-        self.get().ok_or_else(destination_closed)
-    }
-
-    /// Releases the slot's reference to the destination. Idempotent.
-    fn close(&self) {
-        let sink = self
-            .0
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        // Drop outside the lock: dropping the last reference closes the file.
-        drop(sink);
-    }
-}
-
-fn destination_closed() -> std::io::Error {
-    std::io::Error::other("download destination is closed")
 }
 
 /// Destination work done by one drain call.
@@ -387,9 +344,7 @@ impl BodyWriter {
     ///
     /// A run that fails to write ends the drain with a [`DrainError`] carrying
     /// the runs written before it. A filled payload before
-    /// [`prepare`](Self::prepare), or after
-    /// [`close_destination`](Self::close_destination), fails the drain with
-    /// nothing drained.
+    /// [`prepare`](Self::prepare) fails the drain with nothing drained.
     pub(crate) fn drain(&self, mode: DrainMode) -> Result<Drained, DrainError> {
         let mut drained = Drained::default();
         if let Mode::Disk {
@@ -413,22 +368,8 @@ impl BodyWriter {
                 }
                 return Ok(drained);
             };
-            loop {
-                // Obtained per run, so a close stops this drain before its next
-                // write instead of after every run it could take.
-                let Some(destination) = sink.get() else {
-                    if self.buffer.has_undrained_fills() {
-                        return Err(DrainError {
-                            drained,
-                            source: destination_closed(),
-                        });
-                    }
-                    return Ok(drained);
-                };
-                let Some(sw) = self.buffer.take_drain_run(mode) else {
-                    break;
-                };
-                let bytes = match write_run(destination.as_ref(), object_range_start, &sw) {
+            while let Some(sw) = self.buffer.take_drain_run(mode) {
+                let bytes = match write_run(sink.as_ref(), object_range_start, &sw) {
                     Ok(bytes) => bytes,
                     Err(source) => return Err(DrainError { drained, source }),
                 };
@@ -469,9 +410,7 @@ impl BodyWriter {
     /// bytes across every drain. A run claimed by a drain that has not finished
     /// writing is invisible to the terminal drain, so without this check its
     /// region would be published holding zeros or the file's previous bytes.
-    /// That error, a failed resize, and a destination already closed by
-    /// [`close_destination`](Self::close_destination) carry what the terminal
-    /// drain wrote.
+    /// That error, and a failed resize, carry what the terminal drain wrote.
     pub(crate) fn finalize(&self, expected_download_len: u64) -> Result<Drained, DrainError> {
         let drained = self.terminal_drain()?;
         if let Mode::Disk { sink, written, .. } = &*self.mode {
@@ -487,8 +426,7 @@ impl BodyWriter {
                     ),
                 });
             }
-            sink.open()
-                .and_then(|sink| sink.finalize(expected_download_len))
+            sink.finalize(expected_download_len)
                 .map_err(|source| DrainError { drained, source })?;
         }
         Ok(drained)
@@ -520,27 +458,12 @@ impl BodyWriter {
         self.buffer.set_drain_batch(batch);
     }
 
-    /// Disk mode: release the transfer's reference to the destination. Stream
-    /// mode: no-op.
-    ///
-    /// Does not wait for a write in progress on another thread; the
-    /// destination is released when that write returns. Later drains,
-    /// preparation, and finalization fail instead of writing. Idempotent.
-    pub(crate) fn close_destination(&self) {
-        if let Mode::Disk { sink, .. } = &*self.mode {
-            sink.close();
-        }
-    }
-
     /// Wake the consumer (terminal transition).
     pub(crate) fn notify_consumer(&self) {
         self.notify.notify_one();
     }
 
     /// Fix the resolved object-range origin and prepare a disk target.
-    ///
-    /// Fails if the sink's preparation fails or the destination has been
-    /// closed by [`close_destination`](Self::close_destination).
     pub(crate) fn prepare(
         &self,
         object_range_start: u64,
@@ -556,7 +479,7 @@ impl BodyWriter {
                 configured_start.set(object_range_start).is_ok(),
                 "disk destination prepared more than once"
             );
-            sink.open()?.prepare(expected_download_len)?;
+            sink.prepare(expected_download_len)?;
         }
         Ok(())
     }
@@ -641,7 +564,7 @@ pub(crate) fn new_recv_body_with_disk_mode(
         buffer,
         notify: notify.clone(),
         mode: Arc::new(Mode::Disk {
-            sink: DestinationSlot::new(sink),
+            sink,
             object_range_start: resolved_range_start,
             written: AtomicU64::new(0),
         }),
@@ -934,7 +857,7 @@ mod tests {
     };
     use crate::operation::download::sink::{SinkFactory, SinkWrite};
     use crate::operation::download::test_util::sink::{
-        Action, Event, Match, Op, ScriptedSinkFactory, WriteScript,
+        Action, Match, Op, ScriptedSinkFactory, WriteScript,
     };
     use bytes::Buf as _;
     use std::collections::BTreeMap;
@@ -1333,130 +1256,6 @@ mod tests {
             held.release();
             drain.join().unwrap().unwrap();
         });
-    }
-
-    /// A disk writer over a new file in `dir` through a sink scripted by
-    /// `script`.
-    fn scripted_writer_in(dir: &std::path::Path, script: &Arc<WriteScript>) -> Writer {
-        let file = std::fs::File::create(dir.join("out")).unwrap();
-        let sink = ScriptedSinkFactory(Arc::clone(script))
-            .create(file, false)
-            .unwrap();
-        new_recv_body_with_disk_mode(sink).0
-    }
-
-    // ref: V2429410200
-    /// Closing an idle destination releases it at once, and every later
-    /// destination operation fails without writing.
-    #[test]
-    fn close_destination_releases_an_idle_destination() {
-        let script = Arc::new(WriteScript::default());
-        let dir = tempfile::tempdir().unwrap();
-        let writer = scripted_writer_in(dir.path(), &script);
-        writer.prepare(0, 4).unwrap();
-
-        assert_eq!(script.open_sinks(), 1);
-        writer.close_destination();
-        assert_eq!(script.open_sinks(), 0);
-        writer.close_destination();
-
-        writer.claim().fill(chunk_at(0, 0, b"abcd"));
-        let error = writer
-            .drain(DrainMode::Eager)
-            .expect_err("a drain after close must not write");
-        assert_eq!(error.drained, Drained::default());
-        assert!(writer.finalize(4).is_err());
-        assert_eq!(writer.written(), 0);
-        assert!(script.events().is_empty(), "{:?}", script.events());
-    }
-
-    // ref: V2429410200
-    /// Closing the destination while a write is in progress on another thread
-    /// returns without waiting for it, and the destination is released when
-    /// that write returns.
-    ///
-    /// A close that waited for the write would deadlock a caller that must
-    /// close before it can release the writer, and would block the closing
-    /// thread for a whole write.
-    #[test]
-    fn close_destination_does_not_wait_for_a_write_in_progress() {
-        const HOLD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-        let script = Arc::new(WriteScript::default()).on(Match::NthWrite(1), Action::Hold);
-        let dir = tempfile::tempdir().unwrap();
-        let writer = scripted_writer_in(dir.path(), &script);
-        writer.prepare(0, 4).unwrap();
-        writer.claim().fill(chunk_at(0, 0, b"abcd"));
-
-        std::thread::scope(|scope| {
-            let drain = scope.spawn(|| writer.drain(DrainMode::Eager));
-            let held = script.wait_held(HOLD_TIMEOUT);
-
-            let (closed_tx, closed_rx) = std::sync::mpsc::channel();
-            let closer = &writer;
-            scope.spawn(move || {
-                closer.close_destination();
-                closed_tx.send(()).unwrap();
-            });
-            closed_rx
-                .recv_timeout(HOLD_TIMEOUT)
-                .expect("close waited for the write in progress");
-            assert_eq!(
-                script.open_sinks(),
-                1,
-                "the destination was released under a write in progress"
-            );
-
-            held.release();
-            let drained = drain.join().unwrap().unwrap();
-            assert_eq!(drained, Drained { parts: 1, bytes: 4 });
-        });
-        assert_eq!(script.open_sinks(), 0);
-        assert_eq!(std::fs::read(dir.path().join("out")).unwrap(), b"abcd");
-    }
-
-    // ref: V2429410200
-    /// A close during a drain stops that drain before its next write: only
-    /// the write already in progress reaches the destination, and the drain
-    /// fails with the runs it wrote.
-    ///
-    /// Two runs, each the head of its own receive-buffer segment, make the
-    /// drain issue two writes; the first is held while the destination is
-    /// closed.
-    #[test]
-    fn close_destination_stops_a_drain_before_its_next_write() {
-        use super::SEG_SIZE;
-        const HOLD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-        let script = Arc::new(WriteScript::default()).on(Match::NthWrite(1), Action::Hold);
-        let dir = tempfile::tempdir().unwrap();
-        let writer = scripted_writer_in(dir.path(), &script);
-        writer.prepare(0, 8).unwrap();
-        let seg = SEG_SIZE as u64;
-        for seq in 0..=seg {
-            let slot = writer.claim();
-            if seq == 0 {
-                slot.fill(chunk_at(seq, 0, b"abcd"));
-            } else if seq == seg {
-                slot.fill(chunk_at(seq, 4, b"efgh"));
-            }
-        }
-
-        std::thread::scope(|scope| {
-            let drain = scope.spawn(|| writer.drain(DrainMode::Eager));
-            let held = script.wait_held(HOLD_TIMEOUT);
-            writer.close_destination();
-            held.release();
-            let error = drain
-                .join()
-                .unwrap()
-                .expect_err("the second run must not be written after the close");
-            assert_eq!(error.drained, Drained { parts: 1, bytes: 4 });
-        });
-        let first = Op::Write { pos: 0, len: 4 };
-        assert_eq!(
-            script.events(),
-            [Event::Started(first), Event::Finished(first, Ok(()))]
-        );
-        assert_eq!(script.open_sinks(), 0);
     }
 
     #[test]

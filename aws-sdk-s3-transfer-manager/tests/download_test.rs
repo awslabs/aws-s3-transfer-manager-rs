@@ -4,6 +4,16 @@
  */
 
 mod common;
+#[cfg(any(unix, windows))]
+#[path = "download_test/test_util.rs"]
+mod test_util;
+
+#[cfg(any(unix, windows))]
+use test_util::{
+    assert_download_releases_destination, await_shutdown, drop_and_await_shutdown, Destination,
+    Ending, OpenFileProbe,
+};
+
 use aws_sdk_s3_transfer_manager::RuntimeConfig;
 use aws_sdk_s3_transfer_manager::{
     error::{BoxError, ErrorKind},
@@ -699,274 +709,6 @@ async fn test_download_write_to_path() {
     assert!(tmp_files.is_empty(), "leftover temp files: {:?}", tmp_files);
 }
 
-/// A file a test can ask whether this process still holds open.
-///
-/// Unix compares `fstat` identity across every open descriptor, so a
-/// descriptor on a renamed or unlinked file is still reported. The probe holds
-/// its own descriptor on the file, which it does not count, so the file's
-/// identity cannot be reused by a file created after it is unlinked. Windows opens
-/// the path without sharing, which fails with `ERROR_SHARING_VIOLATION` while
-/// any other handle on the file is open, so the file must still exist at that
-/// path when probed.
-#[cfg(any(unix, windows))]
-struct OpenFileProbe {
-    #[cfg(unix)]
-    id: (u64, u64),
-    #[cfg(unix)]
-    pin: std::fs::File,
-    #[cfg(windows)]
-    path: std::path::PathBuf,
-}
-
-#[cfg(any(unix, windows))]
-impl OpenFileProbe {
-    /// On Unix `path` must exist now. On Windows it must exist when
-    /// [`is_open`](Self::is_open) is called.
-    fn new(path: &std::path::Path) -> Self {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            let pin = std::fs::File::open(path).unwrap();
-            let meta = pin.metadata().unwrap();
-            Self {
-                id: (meta.dev(), meta.ino()),
-                pin,
-            }
-        }
-        #[cfg(windows)]
-        {
-            Self {
-                path: path.to_owned(),
-            }
-        }
-    }
-
-    // `st_dev` and `st_ino` widths differ across Unix targets.
-    #[cfg(unix)]
-    #[allow(clippy::unnecessary_cast)]
-    fn is_open(&self) -> bool {
-        use std::os::fd::AsRawFd;
-        let pin = self.pin.as_raw_fd();
-        let fds: Vec<i32> = std::fs::read_dir("/dev/fd")
-            .unwrap()
-            .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
-            .filter(|&fd| fd != pin)
-            .collect();
-        fds.into_iter().any(|fd| {
-            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-            // SAFETY: `fstat` only writes into `stat`, which is read only after
-            // a successful return. A descriptor closed since listing fails
-            // with EBADF and is skipped.
-            unsafe {
-                libc::fstat(fd, stat.as_mut_ptr()) == 0 && {
-                    let stat = stat.assume_init();
-                    (stat.st_dev as u64, stat.st_ino as u64) == self.id
-                }
-            }
-        })
-    }
-
-    #[cfg(windows)]
-    fn is_open(&self) -> bool {
-        use std::os::windows::fs::OpenOptionsExt;
-        const ERROR_SHARING_VIOLATION: i32 = 32;
-        match std::fs::OpenOptions::new()
-            .read(true)
-            .share_mode(0)
-            .open(&self.path)
-        {
-            Ok(_) => false,
-            Err(e) if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION) => true,
-            Err(e) => panic!("cannot probe {}: {e}", self.path.display()),
-        }
-    }
-}
-
-/// A held file is reported open, and closing it is observed. Guards the
-/// release assertions below against a probe that never matches.
-#[cfg(any(unix, windows))]
-#[test]
-fn open_file_probe_reports_a_held_file() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("held.dat");
-    std::fs::write(&path, b"held").unwrap();
-    let probe = OpenFileProbe::new(&path);
-    assert!(!probe.is_open());
-
-    let held = std::fs::File::open(&path).unwrap();
-    assert!(probe.is_open());
-    drop(held);
-    assert!(!probe.is_open());
-}
-
-/// An unlinked file whose descriptor is still held is reported open.
-#[cfg(unix)]
-#[test]
-fn open_file_probe_reports_a_held_unlinked_file() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("held.dat");
-    std::fs::write(&path, b"held").unwrap();
-    let probe = OpenFileProbe::new(&path);
-    let held = std::fs::File::open(&path).unwrap();
-    std::fs::remove_file(&path).unwrap();
-    assert!(probe.is_open());
-    drop(held);
-    assert!(!probe.is_open());
-}
-
-/// Drops `tm` and, for a managed runtime, waits until its threads have been
-/// joined.
-///
-/// A transfer the scheduler still retained would keep the client, and so its
-/// runtime, alive, and the wait would time out.
-async fn drop_and_await_shutdown(tm: aws_sdk_s3_transfer_manager::Client) {
-    let completion = tm.shutdown_completion();
-    drop(tm);
-    if let Some(completion) = completion {
-        tokio::time::timeout(Duration::from_secs(5), completion.wait())
-            .await
-            .expect("the client's runtime did not shut down")
-            .expect("managed runtime shutdown failed");
-    }
-}
-
-/// The destination a single-object download writes through.
-#[derive(Clone, Copy, Debug)]
-enum Destination {
-    /// `write_to_path`: a temporary file beside the path, renamed on success.
-    Path,
-    /// `write_to_file`: a file the caller opened and moved in.
-    File,
-}
-
-/// How a single-object download ends.
-#[derive(Clone, Copy, Debug)]
-enum Ending {
-    /// `join` succeeds.
-    Success,
-    /// A part request fails after discovery, so `join` fails.
-    BodyFailure,
-    /// `abort` returns.
-    Abort,
-    /// The handle is dropped without `join`.
-    DropHandle,
-}
-
-/// Once a download has ended, the transfer manager holds no descriptor on the
-/// file it wrote, whether or not the client is still alive.
-///
-/// The download has ended when `join` or `abort` returns or the handle has
-/// been dropped. A descriptor retained past that point keeps an unlinked
-/// file's storage allocated and, on Windows, blocks deleting or replacing it.
-/// The probe runs with the client alive because a long-lived client must not
-/// accumulate descriptors.
-///
-/// A dropped handle may leave a write that was already executing on another
-/// thread to finish, and the file closes when that write returns, so that
-/// ending is probed until a bounded deadline rather than once.
-#[cfg(any(unix, windows))]
-async fn assert_download_releases_destination(
-    destination: Destination,
-    ending: Ending,
-    runtime_config: RuntimeConfig,
-) {
-    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
-    let data = rand_data(2 * part_size);
-    let http_client = match ending {
-        // Discovery returns the first part; the second part request fails.
-        Ending::BodyFailure => StaticReplayClient::new(vec![
-            ReplayEvent::new(
-                dummy_expected_request(),
-                http::Response::builder()
-                    .status(200)
-                    .header("Content-Length", format!("{part_size}"))
-                    .header(
-                        "Content-Range",
-                        format!("bytes 0-{}/{}", part_size - 1, data.len()),
-                    )
-                    .header("ETag", "my-etag")
-                    .body(SdkBody::from(data.slice(0..part_size)))
-                    .unwrap(),
-            ),
-            ReplayEvent::new(
-                dummy_expected_request(),
-                http::Response::builder()
-                    .status(412)
-                    .body(SdkBody::from(
-                        r#"<?xml version="1.0" encoding="UTF-8"?><Error><Code>PreconditionFailed</Code></Error>"#,
-                    ))
-                    .unwrap(),
-            ),
-        ]),
-        _ => simple_object_connector(&data, part_size),
-    };
-    let config = aws_sdk_s3_transfer_manager::Config::builder()
-        .s3_config(common::s3_config(http_client))
-        .part_size(PartSize::Target(part_size as u64))
-        .concurrency(ConcurrencyMode::Explicit(1))
-        .runtime_config(runtime_config)
-        .build();
-    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
-
-    let dir = tempfile::tempdir().unwrap();
-    let dest_path = dir.path().join("output.dat");
-    let download = tm.download().bucket("test-bucket").key("test-object");
-    let handle = match destination {
-        Destination::Path => download.write_to_path(&dest_path).await.unwrap(),
-        Destination::File => {
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(true)
-                .write(true)
-                .open(&dest_path)
-                .unwrap();
-            download.write_to_file(file).unwrap()
-        }
-    };
-    // Unix identifies the written file by inode, which a `write_to_path`
-    // rename preserves, so the temporary file is probed before the download
-    // ends. Windows probes by path, so it probes the path that exists after.
-    let written = match destination {
-        Destination::Path if cfg!(unix) => {
-            let temps: Vec<_> = std::fs::read_dir(dir.path())
-                .unwrap()
-                .map(|entry| entry.unwrap().path())
-                .filter(|path| path.to_string_lossy().contains(".s3tmp"))
-                .collect();
-            assert_eq!(temps.len(), 1, "temporary files: {temps:?}");
-            temps[0].clone()
-        }
-        _ => dest_path.clone(),
-    };
-    let probe = OpenFileProbe::new(&written);
-
-    match ending {
-        Ending::Success => {
-            handle.join().await.unwrap();
-            assert_eq!(std::fs::read(&dest_path).unwrap(), data.as_ref());
-        }
-        Ending::BodyFailure => {
-            handle.join().await.unwrap_err();
-        }
-        Ending::Abort => handle.abort().await,
-        Ending::DropHandle => drop(handle),
-    }
-    let mut open = probe.is_open();
-    if matches!(ending, Ending::DropHandle) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(1);
-        while open && std::time::Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-            open = probe.is_open();
-        }
-    }
-    assert!(
-        !open,
-        "{destination:?} download ending in {ending:?} left {} open",
-        written.display()
-    );
-    drop_and_await_shutdown(tm).await;
-}
-
 macro_rules! download_releases_destination_tests {
     ($($(#[$attr:meta])* $name:ident: $destination:ident, $ending:ident, $runtime:expr;)*) => {$(
         $(#[$attr])*
@@ -982,7 +724,7 @@ macro_rules! download_releases_destination_tests {
     )*};
 }
 
-// ref: V2429410200
+// ref: awslabs/aws-s3-transfer-manager-rs#228, V2429410200
 // Windows probes by path, so `write_to_path` endings that remove the
 // temporary file are covered on Unix only.
 download_releases_destination_tests! {
@@ -1007,8 +749,8 @@ download_releases_destination_tests! {
 }
 
 // ref: V2429410200
-/// Once `download_objects` joins, the transfer manager holds no descriptor on
-/// any file it wrote, with the client still alive.
+/// Completed `download_objects` children release their destination files
+/// through ordinary retirement, with the client still alive.
 #[cfg(any(unix, windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn download_objects_releases_destination_files() {
@@ -1060,12 +802,53 @@ async fn download_objects_releases_destination_files() {
     assert_eq!(output.objects_downloaded(), 1);
     let path = dir.path().join("key1");
     assert_eq!(std::fs::read(&path).unwrap(), data.as_ref());
-    assert!(
-        !OpenFileProbe::new(&path).is_open(),
-        "{} left open",
-        path.display()
-    );
+    OpenFileProbe::new(&path).assert_released().await;
     drop_and_await_shutdown(tm).await;
+}
+
+// ref: V2429410200
+/// A completed download releases its destination after both clients are
+/// dropped and the destination is unlinked.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn write_to_path_drop_clients_then_unlink_releases_destination() {
+    let data = Bytes::from_static(b"snapshot");
+    let response = ReplayEvent::new(
+        dummy_expected_request(),
+        http::Response::builder()
+            .status(200)
+            .header("Content-Length", data.len().to_string())
+            .body(SdkBody::from(data.clone()))
+            .unwrap(),
+    );
+    let shared = common::shared_config(StaticReplayClient::new(vec![response]));
+    let s3 = aws_sdk_s3::Client::new(&shared);
+    let tm = aws_sdk_s3_transfer_manager::Client::new(
+        aws_sdk_s3_transfer_manager::Config::builder()
+            .s3_config(&shared)
+            .build(),
+    );
+    let completion = tm.shutdown_completion();
+    let dir = tempfile::tempdir().unwrap();
+    let destination = dir.path().join("snapshot.bin");
+    tm.download()
+        .bucket("bucket")
+        .key("key")
+        .write_to_path(&destination)
+        .await
+        .unwrap()
+        .join()
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(&destination).unwrap(), data.as_ref());
+    let probe = OpenFileProbe::new(&destination);
+    drop(tm);
+    drop(s3);
+    drop(shared);
+    std::fs::remove_file(&destination).unwrap();
+    assert!(!destination.exists());
+    probe.assert_released().await;
+    await_shutdown(completion).await;
 }
 
 /// A file already at the temporary name `write_to_path` draws is left

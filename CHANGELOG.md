@@ -58,13 +58,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ([#226](https://github.com/awslabs/aws-s3-transfer-manager-rs/issues/226))
 - A finished transfer could be retained for the life of the process, and the client with it:
   dropping the `Client` did not shut down its runtime. A download to disk (`write_to_path`,
-  `write_to_file`, or `download_objects`) kept its file open after `join` or `abort` returned or its
-  handle was dropped. On Windows, other opens of the file that deny write sharing failed with a
-  sharing violation; on every platform, a deleted file's storage stayed allocated and each download
-  held a file descriptor. A finished transfer is now released once the scheduler retires it, and the
-  transfer manager holds no handle on the file once `join` or `abort` has returned or the handle's
-  drop has returned, unless a write to the file is still executing on another thread at that point;
-  the file then closes when that write returns.
+  `write_to_file`, or `download_objects`) kept its file open, preventing opens that deny write
+  sharing on Windows and keeping deleted files' storage allocated. Ready-set entries now hold weak
+  descriptors, so transfers and their resources are released when the registry and remaining
+  transient owners retire, without waiting for epoch reclamation. The last worker reference can
+  retire after `join` or `abort` returns.
 
 ## [0.3.1] - 2026-10-09
 
