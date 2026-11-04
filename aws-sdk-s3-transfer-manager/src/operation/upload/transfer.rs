@@ -1988,6 +1988,8 @@ mod tests {
         ready: Arc<std::sync::atomic::AtomicBool>,
         source_waker: Arc<Mutex<Option<std::task::Waker>>>,
         yielded: bool,
+        /// Dropped with the stream, so a `Weak` to it reports whether the stream is still owned.
+        _probe: Option<Arc<()>>,
     }
 
     impl crate::io::PartStream for BlockingPartStream {
@@ -2193,6 +2195,7 @@ mod tests {
             ready: Arc::clone(&ready),
             source_waker: Arc::clone(&source_waker),
             yielded: false,
+            _probe: None,
         };
         let transfer = create_test_transfer_with_stream(
             mock_s3_client_for_mpu(),
@@ -3245,5 +3248,180 @@ mod tests {
         transfer.execute(&mut work).await;
 
         assert!(transfer.take_result().is_some());
+    }
+
+    /// Returns an upload body over a [`BlockingPartStream`], and a probe that reports whether
+    /// anything still owns that stream.
+    ///
+    /// - The `InputStream` is the body to pass to the transfer under test.
+    /// - The `Weak<()>` is the probe. The stream holds the only strong reference, so
+    ///   `probe.upgrade().is_none()` once the stream has been dropped, and `is_some()` while the
+    ///   transfer or one of its reads still owns it.
+    ///
+    /// With `ready`, the stream yields one five-byte part, then end of stream. Without it, the
+    /// stream stays pending, as a producer waiting for the upload to take its next part does;
+    /// nothing makes it ready.
+    fn probed_stream(ready: bool) -> (InputStream, std::sync::Weak<()>) {
+        let probe = Arc::new(());
+        let weak = Arc::downgrade(&probe);
+        let stream = BlockingPartStream {
+            ready: Arc::new(std::sync::atomic::AtomicBool::new(ready)),
+            source_waker: Arc::new(Mutex::new(None)),
+            yielded: false,
+            _probe: Some(probe),
+        };
+        (InputStream::from_part_stream(stream), weak)
+    }
+
+    /// Creates the multipart upload, then executes one source read that parks on the pending
+    /// source.
+    async fn park_one_source_read(transfer: &UploadTransfer) {
+        let mut create = assert_ready(transfer.poll_work());
+        assert!(matches!(
+            transfer.execute(&mut create).await,
+            WorkOutcome::Success { .. }
+        ));
+        let mut read = assert_ready(transfer.poll_work());
+        assert!(matches!(
+            transfer.execute(&mut read).await,
+            WorkOutcome::Yielded
+        ));
+        let state = transfer.inner.state.lock().expect("lock poisoned");
+        assert_eq!(snapshot_state(&state).pending_reads, 1);
+    }
+
+    // ref: awslabs/aws-s3-transfer-manager-rs#226
+    /// A source read parked on a pending source is released when another work item fails the
+    /// upload, rather than retained for as long as the transfer lives.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn failure_releases_parked_source_read() {
+        let (stream, probe) = probed_stream(false);
+        let transfer = create_test_transfer_with_stream(mock_s3_client_for_mpu(), stream);
+        park_one_source_read(&transfer).await;
+
+        assert!(matches!(
+            transfer.fail(
+                transfer.inner.state.lock().expect("lock poisoned"),
+                Error::new(ErrorKind::RuntimeError, "sibling failure"),
+                FailedRequest::Other,
+            ),
+            WorkOutcome::Failed { .. }
+        ));
+
+        assert!(
+            probe.upgrade().is_none(),
+            "failed upload retained its parked source read"
+        );
+    }
+
+    // ref: awslabs/aws-s3-transfer-manager-rs#226
+    /// A failed UploadPart releases a source that no read holds. Between reads the stream waits
+    /// in the part reader, so the failure must release the reader, not only the parked reads.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn upload_part_failure_releases_idle_source() {
+        let create_mpu = mock!(aws_sdk_s3::Client::create_multipart_upload).then_output(|| {
+            CreateMultipartUploadOutput::builder()
+                .upload_id("test-upload-id")
+                .build()
+        });
+        let upload_part =
+            mock!(aws_sdk_s3::Client::upload_part).then_http_response(service_error_response);
+        let (stream, probe) = probed_stream(true);
+        let transfer = create_test_transfer_with_stream(
+            mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[create_mpu, upload_part]),
+            stream,
+        );
+
+        let mut create = assert_ready(transfer.poll_work());
+        assert!(matches!(
+            transfer.execute(&mut create).await,
+            WorkOutcome::Success { .. }
+        ));
+        let mut part = assert_ready(transfer.poll_work());
+        assert!(matches!(
+            transfer.execute(&mut part).await,
+            WorkOutcome::Failed { .. }
+        ));
+
+        assert!(
+            probe.upgrade().is_none(),
+            "failed upload retained its idle source"
+        );
+    }
+
+    /// A custom source whose first poll fails the upload, as another work item failing while this
+    /// read runs would, and then reports `Pending`.
+    #[derive(Debug)]
+    struct FailsUploadWhilePolledStream {
+        /// Taken on the first poll, which also breaks the transfer-to-stream cycle.
+        transfer: Arc<Mutex<Option<UploadTransfer>>>,
+        _probe: Arc<()>,
+    }
+
+    impl crate::io::PartStream for FailsUploadWhilePolledStream {
+        fn poll_part(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _stream_cx: &crate::io::StreamContext,
+        ) -> std::task::Poll<Option<std::io::Result<PartData>>> {
+            let transfer = self.transfer.lock().expect("transfer slot poisoned").take();
+            if let Some(transfer) = transfer {
+                assert!(matches!(
+                    transfer.fail(
+                        transfer.inner.state.lock().expect("lock poisoned"),
+                        Error::new(ErrorKind::RuntimeError, "sibling failure"),
+                        FailedRequest::Other,
+                    ),
+                    WorkOutcome::Failed { .. }
+                ));
+            }
+            std::task::Poll::Pending
+        }
+
+        fn size_hint(&self) -> crate::io::SizeHint {
+            crate::io::SizeHint::default()
+        }
+    }
+
+    // ref: awslabs/aws-s3-transfer-manager-rs#226
+    /// A read whose source returns `Pending` after another work item failed the upload is not
+    /// parked: the read reports `Cancelled`, and its stream is dropped with the part reader rather
+    /// than retained.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn read_pending_after_failure_is_not_parked() {
+        let probe = Arc::new(());
+        let weak = Arc::downgrade(&probe);
+        let slot = Arc::new(Mutex::new(None));
+        let stream = FailsUploadWhilePolledStream {
+            transfer: Arc::clone(&slot),
+            _probe: probe,
+        };
+        let transfer = create_test_transfer_with_stream(
+            mock_s3_client_for_mpu(),
+            InputStream::from_part_stream(stream),
+        );
+        *slot.lock().expect("transfer slot poisoned") = Some(transfer.clone());
+
+        let mut create = assert_ready(transfer.poll_work());
+        assert!(matches!(
+            transfer.execute(&mut create).await,
+            WorkOutcome::Success { .. }
+        ));
+        let mut read = assert_ready(transfer.poll_work());
+        assert!(matches!(
+            transfer.execute(&mut read).await,
+            WorkOutcome::Cancelled
+        ));
+
+        let state = transfer.inner.state.lock().expect("lock poisoned");
+        assert_eq!(snapshot_state(&state).pending_reads, 0);
+        drop(state);
+        assert!(
+            weak.upgrade().is_none(),
+            "a read pending after the failure retained its source"
+        );
     }
 }
