@@ -126,18 +126,18 @@ fn a_file_that_went_away_holds_nothing_back() {
         Box::from("not there any more"),
     ));
     assert!(matches!(
-        cost_of(&gone, Some(Path::new("/root"))),
+        cost_of(&gone, Some(Path::new("/root")), false),
         Cost::Nothing
     ));
     // With no root to name the key against, the answer is the same: there is no key to hold.
-    assert!(matches!(cost_of(&gone, None), Cost::Nothing));
+    assert!(matches!(cost_of(&gone, None, false), Cost::Nothing));
     // A file that is there and could not be read still holds its own key.
     let denied = StreamError::Walk(WalkError::new(
         Some(std::path::PathBuf::from("/root/b.txt")),
         WalkErrorKind::PermissionDenied,
         Box::from("denied"),
     ));
-    match cost_of(&denied, Some(Path::new("/root"))) {
+    match cost_of(&denied, Some(Path::new("/root")), false) {
         Cost::Key(key) => assert_eq!(key, "b.txt"),
         other => panic!("a file that is there should hold its own key, got {other:?}"),
     }
@@ -572,6 +572,45 @@ async fn an_excluded_source_link_holds_back_the_keys_under_it_and_makes_no_pairi
         !complete,
         "a plan that skipped keys under an excluded link called itself complete"
     );
+}
+
+// A loop reaches a directory, so its own name counts as a directory on either side. Only
+// the keys below it are unknown. A dangling link holds its own name on the source, because the
+// source has nothing to send there.
+#[tokio::test]
+async fn a_loop_holds_only_the_keys_below_its_name() {
+    let fail = |kind| {
+        Err(StreamError::Walk(WalkError::new(
+            Some(PathBuf::from("/root/up")),
+            kind,
+            Box::from("a link"),
+        )))
+    };
+    let cases = [
+        (
+            WalkErrorKind::SymlinkCycle,
+            plan(&[
+                ("up", At::Gone, At::Here),
+                ("up/x", At::UnknownRange, At::Here),
+            ]),
+        ),
+        (
+            WalkErrorKind::BrokenSymlink,
+            plan(&[
+                ("up", At::UnknownRange, At::Here),
+                ("up/x", At::UnknownRange, At::Here),
+            ]),
+        ),
+    ];
+    for (kind, want) in cases {
+        let walk = Walk::new(
+            Scripted::from(vec![fail(kind)]),
+            Scripted::of(&["up", "up/x"]),
+        )
+        .with_roots(Some(PathBuf::from("/root")), None);
+        let (seen, _) = pair_all(walk).await;
+        assert_eq!(seen, want, "{kind:?} on the source");
+    }
 }
 
 // Skipping past `videos` passes every key before it. The destination's `photos/y.jpg` sorts

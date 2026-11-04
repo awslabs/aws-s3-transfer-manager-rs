@@ -168,6 +168,9 @@ struct Side<K: KeyStream> {
     // first. `take` clones that key anyway to release what the merge passed, so keeping it adds no
     // copy. The later of the two sides' keys shows how far the merge has paired.
     taken: String,
+    // Whether this side is where entries land. A link that reaches nothing there leaves its own
+    // name free, because a download can replace the link.
+    destination: bool,
 }
 
 impl<K: KeyStream> Side<K> {
@@ -181,6 +184,7 @@ impl<K: KeyStream> Side<K> {
             lost_unnamed: false,
             root: None,
             taken: String::new(),
+            destination: false,
         }
     }
 
@@ -218,12 +222,15 @@ impl<K: KeyStream> Side<K> {
             // beside the walk's own, and the two could drift apart.
             Some(Err(err)) => {
                 if !self.stream.is_done() {
-                    match cost_of(&err, self.root.as_deref()) {
+                    match cost_of(&err, self.root.as_deref(), self.destination) {
                         Cost::Key(key) => {
                             self.lost.insert(key);
                         }
                         Cost::UnnamedKey => self.lost_unnamed = true,
                         Cost::Stretch(stretch) => self.gap.add(stretch),
+                        Cost::Below(name) => {
+                            self.gap.below.insert(name);
+                        }
                         Cost::Nothing => {}
                     }
                 }
@@ -352,6 +359,9 @@ struct Stretches {
     // key or once per failure, and a scan makes each of them cost what the whole run has held. With N
     // unreadable directories ahead of M keys, a list costs N² to fill and N·M to consult.
     under: BTreeSet<String>,
+    // Names whose keys below are held, while the name itself stays free. A link that reaches
+    // nothing, or that loops back, leaves nothing at its own name, but it may stand for a directory.
+    below: BTreeSet<String>,
     // A stretch bounding nothing covers every later key and is never passed, so it needs no name and
     // no ordering — only to be remembered.
     everything: bool,
@@ -378,29 +388,38 @@ impl Stretches {
         if self.under.contains(key) {
             return true;
         }
-        key.bytes()
-            .enumerate()
-            .any(|(at, byte)| byte == b'/' && self.under.contains(&key[..at]))
+        key.bytes().enumerate().any(|(at, byte)| {
+            byte == b'/' && (self.under.contains(&key[..at]) || self.below.contains(&key[..at]))
+        })
     }
 
     // Drop every stretch the merge has passed.
     fn release_passed(&mut self, key: &str) {
-        // Everything sorting before the key is behind the merge, with one exception: a name the key
-        // extends without entering its subtree — `link` against `link.txt`, where `.` sorts below `/`
-        // — is neither covered nor passed, because the whole subtree is still ahead. Those are put
-        // back, and there are at most as many as the key is long.
-        let at_or_after = self.under.split_off(key);
-        let held: Vec<String> = key
-            .bytes()
-            .enumerate()
-            .filter(|(_, byte)| *byte <= b'/')
-            .map(|(at, _)| &key[..at])
-            .filter(|prefix| self.under.contains(*prefix))
-            .map(str::to_string)
-            .collect();
-        self.under = at_or_after;
-        self.under.extend(held);
+        release_passed_in(&mut self.under, key);
+        release_passed_in(&mut self.below, key);
     }
+}
+
+// Drop every name in `names` the merge has passed at `key`.
+fn release_passed_in(names: &mut BTreeSet<String>, key: &str) {
+    if names.is_empty() {
+        return;
+    }
+    // Everything sorting before the key is behind the merge, with one exception: a name the key
+    // extends without entering its subtree — `link` against `link.txt`, where `.` sorts below `/` —
+    // is neither covered nor passed, because the whole subtree is still ahead. Those are put back,
+    // and there are at most as many as the key is long.
+    let at_or_after = names.split_off(key);
+    let held: Vec<String> = key
+        .bytes()
+        .enumerate()
+        .filter(|(_, byte)| *byte <= b'/')
+        .map(|(at, _)| &key[..at])
+        .filter(|prefix| names.contains(*prefix))
+        .map(str::to_string)
+        .collect();
+    *names = at_or_after;
+    names.extend(held);
 }
 
 impl Stretch {
@@ -483,9 +502,11 @@ pub(crate) struct Walk<S: KeyStream, D: KeyStream> {
 
 impl<S: KeyStream, D: KeyStream> Walk<S, D> {
     pub(crate) fn new(source: S, destination: D) -> Self {
+        let mut dst = Side::new(destination);
+        dst.destination = true;
         Self {
             src: Side::new(source),
-            dst: Side::new(destination),
+            dst,
             incomplete: false,
             ended_by_failure: false,
             link_scan: None,
@@ -552,6 +573,11 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
             // deletes under every name the link aliases, including when the read also failed.
             for name in self.dst.stream.take_aliased_names() {
                 self.hold_aliased(name);
+            }
+            // A link in the destination that reaches nothing is no failure. It holds the keys
+            // below its name, and a download can still land at the name itself.
+            if failure.as_ref().is_some_and(reaches_nothing) {
+                continue;
             }
             if let Some(err) = failure {
                 if err.keys_lost() != KeysLost::Nothing {
@@ -735,6 +761,8 @@ enum Cost {
     UnnamedKey,
     // Every key the failure hid, under the prefix it names where one could be worked out.
     Stretch(Stretch),
+    // Every key below this name, and not the name itself.
+    Below(String),
     // Nothing for the merge to answer for. The name produced no key on this side, so no pairing will
     // ever ask about it, and holding anything back would hold back a key chosen at random.
     Nothing,
@@ -743,8 +771,24 @@ enum Cost {
 // A listing says which key it dropped. A walk says which path it could not read, and a path is not
 // a key: turning one into the other needs the walk root, which lives a layer up from the stream
 // that reported it.
-fn cost_of(err: &StreamError, root: Option<&Path>) -> Cost {
+fn cost_of(err: &StreamError, root: Option<&Path>, destination: bool) -> Cost {
+    let key_of = |walk: &crate::io::walk::WalkError| {
+        root.and_then(|root| walk.path().and_then(|p| key_under_root(root, p)))
+    };
     match err {
+        // A loop reaches a directory, so its own name counts as a directory, and only the keys
+        // below it are unknown. In the destination, a link that reaches nothing leaves its
+        // name free the same way, because a download can replace the link. In the source, that
+        // link has nothing to send at its name, so the name stays held too.
+        StreamError::Walk(walk)
+            if walk.kind() == WalkErrorKind::SymlinkCycle
+                || (destination && walk.kind() == WalkErrorKind::BrokenSymlink) =>
+        {
+            match key_of(walk) {
+                Some(name) => Cost::Below(name),
+                None => Cost::Stretch(Stretch { under: None }),
+            }
+        }
         // A listing names the key it dropped, already taken relative to the root.
         StreamError::MalformedListing { key: Some(key), .. } => Cost::Key(key.clone()),
         // A name no key can carry takes no part in the comparison, so there is no key here to
@@ -762,19 +806,17 @@ fn cost_of(err: &StreamError, root: Option<&Path>) -> Cost {
         // the walk disagree about the path's form — a root left uncanonicalized against a walk
         // that resolved it, say. Each one drops back to holding the side's whole account open,
         // which is safe and much coarser, so it says so.
-        StreamError::Walk(walk) if err.keys_lost() == KeysLost::OneKey => {
-            match root.and_then(|root| walk.path().and_then(|p| key_under_root(root, p))) {
-                Some(key) => Cost::Key(key),
-                None => {
-                    tracing::warn!(
-                        path = ?walk.path(),
-                        root = ?root,
-                        "could not name the lost key, so this side's account stays open for the run"
-                    );
-                    Cost::UnnamedKey
-                }
+        StreamError::Walk(walk) if err.keys_lost() == KeysLost::OneKey => match key_of(walk) {
+            Some(key) => Cost::Key(key),
+            None => {
+                tracing::warn!(
+                    path = ?walk.path(),
+                    root = ?root,
+                    "could not name the lost key, so this side's account stays open for the run"
+                );
+                Cost::UnnamedKey
             }
-        }
+        },
         _ if err.keys_lost() == KeysLost::OneKey => Cost::UnnamedKey,
         // A stretch, bounded by the name it cost where the failure named a path and the root is
         // known. The bound is the name itself, which `covers` reads as that name and everything
@@ -782,13 +824,17 @@ fn cost_of(err: &StreamError, root: Option<&Path>) -> Cost {
         // reported before the keys it hid says nothing about where they stop.
         _ => Cost::Stretch(Stretch {
             under: match err {
-                StreamError::Walk(walk) => {
-                    root.and_then(|root| walk.path().and_then(|p| key_under_root(root, p)))
-                }
+                StreamError::Walk(walk) => key_of(walk),
                 _ => None,
             },
         }),
     }
+}
+
+// Whether a failure is a link that reaches nothing: a dangling link or an endless chain. In a
+// download's destination that is no failure.
+fn reaches_nothing(err: &StreamError) -> bool {
+    matches!(err, StreamError::Walk(walk) if walk.kind() == WalkErrorKind::BrokenSymlink)
 }
 
 mod links;
