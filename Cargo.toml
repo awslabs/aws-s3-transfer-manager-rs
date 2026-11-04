@@ -13,7 +13,7 @@ members = [
     "integration-tests",
     "wasm32-wasi-tests",
 ]
-exclude = ["fuzz"]
+exclude = ["fuzz", "tools/tmdev"]
 
 [workspace.package]
 rust-version = "1.94.1"

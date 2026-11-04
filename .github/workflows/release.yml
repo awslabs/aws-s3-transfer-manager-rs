@@ -38,15 +38,17 @@ jobs:
         with:
           ref: ${{ inputs.ref }}
           fetch-depth: 0
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
       - uses: extractions/setup-just@v3
       - name: Install Rust ${{ env.rust_min }}
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ env.rust_min }}
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            tools/tmdev -> target
+          prefix-key: v1-release-rust
       - name: Validate the source and release record
         id: plan
         env:

@@ -24,7 +24,13 @@ install-model *args:
 diff-model old new:
     tools/codegen/s3-tm-model-codegen/gradlew --project-dir tools/codegen/s3-tm-model-codegen diffModels -PoldModel={{quote(old)}} -PnewModel={{quote(new)}}
 
-# Prepare, check, or publish the recorded workspace release.
+# Check build freshness, then run the locked developer tool.
+[positional-arguments]
+tmdev *args:
+    cargo build --quiet --locked --manifest-path tools/tmdev/Cargo.toml --target-dir tools/tmdev/target
+    tools/tmdev/target/debug/tmdev "$@"
+
+# Prepare, audit, check, tag, or publish workspace releases.
 [positional-arguments]
 release *args:
-    python3 tools/release.py "$@"
+    @just tmdev release "$@"

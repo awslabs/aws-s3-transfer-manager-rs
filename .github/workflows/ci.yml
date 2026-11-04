@@ -75,11 +75,29 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: actions/setup-python@v5
+      - uses: extractions/setup-just@v3
+      - name: Install Rust ${{ env.rust_min }}
+        uses: dtolnay/rust-toolchain@stable
         with:
-          python-version: '3.12'
-      - name: Test release records and publication selection
-        run: python3 -m unittest discover -s tools/tests -v
+          toolchain: ${{ env.rust_min }}
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            tools/tmdev -> target
+          prefix-key: v1-release-rust
+      - name: Format, lint, and test the locked developer tool
+        run: |
+          cargo fmt --manifest-path tools/tmdev/Cargo.toml -- --check
+          cargo clippy --locked --manifest-path tools/tmdev/Cargo.toml \
+            --target-dir tools/tmdev/target --all-targets --no-deps -- -D warnings
+          cargo test --locked --manifest-path tools/tmdev/Cargo.toml \
+            --target-dir tools/tmdev/target --all-targets
+      - name: Audit published workspace dependency requirements
+        run: just release audit
+      - name: Check developer tool lockfile
+        run: git diff --exit-code -- tools/tmdev/Cargo.lock
       - name: Detect release preparation
         id: changes
         env:
@@ -94,15 +112,6 @@ jobs:
             fi
             echo "record=true" >> "$GITHUB_OUTPUT"
           fi
-      - uses: extractions/setup-just@v3
-        if: steps.changes.outputs.record == 'true'
-      - name: Install Rust ${{ env.rust_min }}
-        if: steps.changes.outputs.record == 'true'
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: ${{ env.rust_min }}
-      - uses: Swatinem/rust-cache@v2
-        if: steps.changes.outputs.record == 'true'
       - name: Validate the release record
         if: steps.changes.outputs.record == 'true'
         run: just release check --ref HEAD
