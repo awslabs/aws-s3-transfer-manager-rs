@@ -337,6 +337,7 @@ fn downloading_into_with(
                 .client(client)
                 .bucket("amzn-s3-demo-bucket")
                 .build(),
+            delete_mode,
         )
         .expect("an ordinary bucket builds");
     let transfer = SyncTransfer::new(
@@ -718,6 +719,7 @@ async fn a_download_asks_for_the_key_under_its_prefix() {
                 .bucket("amzn-s3-demo-bucket")
                 .prefix("backup/")
                 .build(),
+            DeleteMode::Off,
         )
         .expect("an ordinary bucket builds");
     let transfer = SyncTransfer::new(
@@ -4175,6 +4177,38 @@ async fn a_delete_through_a_destination_link_does_not_remove_the_file_it_aliases
 
 // A followed link makes two keys name one local file. Each row builds such a tree and names the
 // paths the run must leave resolving, and the paths it must still remove.
+// The names a followed link reaches exist only to stop deletes. With delete mode off, the run names
+// none, so the destination-only key `link/x.txt` stays destination-only and the plan is whole. With
+// delete mode on, the same key reads as unknown.
+#[cfg(unix)]
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn a_download_names_link_targets_only_with_delete_mode_on() {
+    for (delete_mode, whole) in [(DeleteMode::Off, true), (DeleteMode::On, false)] {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonical root");
+        std::fs::create_dir(root.join("real")).expect("real");
+        std::fs::write(root.join("real/x.txt"), b"hello").expect("x.txt");
+        std::os::unix::fs::symlink(root.join("real"), root.join("link")).expect("symlink");
+        let (t, ctx, rx) = downloading_into_walking(
+            &root,
+            a_bucket_to_download(&["real/x.txt"], 1_600_000_000),
+            delete_mode,
+            Walker::builder().follow_symlinks(true).build(),
+        );
+        run_managed(&t, &ctx, rx).await;
+        assert_eq!(
+            t.is_plan_complete(),
+            whole,
+            "delete mode {delete_mode:?}: the plan's completeness was wrong"
+        );
+        assert!(
+            root.join("real/x.txt").exists(),
+            "delete mode {delete_mode:?}: the run removed the file a kept key names"
+        );
+    }
+}
+
 #[cfg(unix)]
 #[cfg_attr(miri, ignore)]
 #[tokio::test]
@@ -4799,6 +4833,7 @@ mod real_bucket {
                     .bucket(regular_bucket())
                     .prefix(prefix)
                     .build(),
+                delete_mode,
             )
             .expect("an ordinary bucket builds");
         let transfer = SyncTransfer::new(
