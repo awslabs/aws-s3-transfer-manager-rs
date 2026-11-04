@@ -14,7 +14,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use aws_sdk_s3_transfer_manager::io::walk::FsWalker;
+use aws_sdk_s3_transfer_manager::io::walk::{FsWalker, S3Walker};
 use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
 use aws_sdk_s3_transfer_manager::RuntimeConfig;
 use s3_mock_server::S3MockServer;
@@ -711,7 +711,7 @@ async fn download_objects_transient_throttle_storm_recovers() {
             .client
             .download_objects()
             .bucket(bucket)
-            .key_prefix(prefix)
+            .walker(S3Walker::builder().prefix(prefix).build())
             .destination(dest.path())
             .initiate()
             .expect("initiate download_objects");

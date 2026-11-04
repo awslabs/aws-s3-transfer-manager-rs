@@ -429,7 +429,6 @@ async fn test_objects_transfer() {
     let download_handle = tm
         .download_objects()
         .bucket(bucket_name.as_str())
-        .key_prefix("pre-existing")
         .walker(
             aws_sdk_s3_transfer_manager::io::walk::S3Walker::builder()
                 .filter(sse_c_filter)

@@ -277,7 +277,7 @@ impl DownloadObjectsTransfer {
     ) -> Self {
         let bucket = input.bucket().unwrap().to_string();
         let destination = input.destination().unwrap().to_path_buf();
-        let key_prefix = input.key_prefix().map(|s| s.to_string());
+        let key_prefix = walk.prefix().map(str::to_owned);
         let delimiter = input.delimiter().map(|s| s.to_string());
         let failure_policy = input.failure_policy().clone();
 
@@ -1488,7 +1488,6 @@ mod tests {
         let input = crate::operation::download_objects::DownloadObjectsInput::builder()
             .bucket("test-bucket")
             .destination(dir.path())
-            .key_prefix("backup/2023/")
             .failure_policy(FailedTransferPolicy::Continue)
             .build()
             .unwrap();

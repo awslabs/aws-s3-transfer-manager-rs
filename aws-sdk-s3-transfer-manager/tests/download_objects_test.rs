@@ -12,7 +12,9 @@ use aws_sdk_s3::{
     },
     primitives::ByteStream,
 };
-use aws_sdk_s3_transfer_manager::{error::ErrorKind, types::FailedTransferPolicy};
+use aws_sdk_s3_transfer_manager::{
+    error::ErrorKind, io::walk::S3Walker, types::FailedTransferPolicy,
+};
 use aws_smithy_mocks::{mock, mock_client, Rule, RuleMode};
 use aws_smithy_runtime_api::{client::orchestrator::HttpResponse, http::StatusCode};
 use bytes::Bytes;
@@ -206,7 +208,7 @@ async fn test_strip_prefix_in_destination_path() {
         let handle = tm
             .download_objects()
             .bucket("test-bucket")
-            .key_prefix("abc/def/")
+            .walker(S3Walker::builder().prefix("abc/def/").build())
             .destination(dest.path())
             .initiate()
             .unwrap();
@@ -249,7 +251,7 @@ async fn test_object_with_prefix_included() {
     let handle = tm
         .download_objects()
         .bucket("test-bucket")
-        .key_prefix("abc")
+        .walker(S3Walker::builder().prefix("abc").build())
         .destination(dest.path())
         .initiate()
         .unwrap();

@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use aws_sdk_s3_transfer_manager::error::ErrorKind;
-use aws_sdk_s3_transfer_manager::io::walk::FsWalker;
+use aws_sdk_s3_transfer_manager::io::walk::{FsWalker, S3Walker};
 use aws_sdk_s3_transfer_manager::io::InputStream;
 use aws_sdk_s3_transfer_manager::types::FailedTransferPolicy;
 use aws_sdk_s3_transfer_manager::Client;
@@ -417,7 +417,7 @@ async fn directory_round_trip(store: Store, work: &Path) -> Result<String, Strin
     let downloaded = client
         .download_objects()
         .bucket("bucket")
-        .key_prefix("tree/")
+        .walker(S3Walker::builder().prefix("tree/").build())
         .destination(&destination)
         .initiate()
         .map_err(|e| error("initiate download_objects", e))?
@@ -509,7 +509,7 @@ async fn many_files(store: Store, work: &Path) -> Result<String, String> {
     let downloaded = client
         .download_objects()
         .bucket("bucket")
-        .key_prefix("many/")
+        .walker(S3Walker::builder().prefix("many/").build())
         .destination(&destination)
         .initiate()
         .map_err(|e| error("initiate download_objects", e))?
