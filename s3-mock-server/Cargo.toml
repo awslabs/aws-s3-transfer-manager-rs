@@ -9,8 +9,8 @@ description = "A mock S3 server for testing and benchmarking the AWS S3 Transfer
 
 [dependencies]
 async-trait = "0.1.83"
-aws-config = { workspace = true }
-aws-sdk-s3 = { workspace = true }
+aws-config = { workspace = true, features = ["default"] }
+aws-sdk-s3 = { workspace = true, features = ["default-https-client"] }
 aws-smithy-checksums = { workspace = true }
 base64 = "0.22.1"
 bytes = "1"

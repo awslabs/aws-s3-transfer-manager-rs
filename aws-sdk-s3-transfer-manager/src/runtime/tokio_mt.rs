@@ -24,6 +24,8 @@ use worker_pool::WorkerPool;
 ///
 /// Assumes it is running within an existing tokio multi-threaded runtime context.
 /// Workers are spawned via `tokio::spawn` and pull work from a shared queue.
+/// On wasm targets it runs file I/O inline and also accepts a current-thread
+/// runtime.
 #[derive(Debug)]
 pub(crate) struct TokioMultiThreadRuntime {
     pool: Arc<WorkerPool>,
@@ -34,11 +36,17 @@ pub(crate) struct TokioMultiThreadRuntime {
 
 impl TokioMultiThreadRuntime {
     pub(crate) fn new(handle: Weak<crate::client::Handle>) -> Self {
+        // wasm targets have no blocking pool, so file I/O runs inline.
+        let components = if cfg!(target_family = "wasm") {
+            RuntimeComponents::inline_io()
+        } else {
+            RuntimeComponents::default()
+        };
         Self {
             pool: Arc::new(WorkerPool::new()),
             handle,
             worker_count: AtomicUsize::new(0),
-            components: RuntimeComponents::default(),
+            components,
         }
     }
 
@@ -59,11 +67,15 @@ impl TokioMultiThreadRuntime {
 
             // Emit the current-thread guardrail warning once, at the site where
             // workers actually execute (not at Client::new, which may observe a
-            // different runtime).
-            if matches!(
-                tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()),
-                Ok(tokio::runtime::RuntimeFlavor::CurrentThread)
-            ) {
+            // different runtime). wasm targets are exempt: their threads are
+            // unavailable or cooperative, so no runtime choice avoids
+            // serialization.
+            if !cfg!(target_family = "wasm")
+                && matches!(
+                    tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()),
+                    Ok(tokio::runtime::RuntimeFlavor::CurrentThread)
+                )
+            {
                 tracing::warn!(
                     target: crate::telemetry::TARGET_SCHEDULING,
                     "Caller Tokio execution selected on a current-thread runtime; \

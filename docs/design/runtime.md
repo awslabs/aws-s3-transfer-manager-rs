@@ -99,3 +99,16 @@ reads on the managed polling thread, including for borrowed connections.
 Both file-body paths preserve the same open file identity, memory pool,
 chunk bounds, cancellation behavior, and retry reconstruction. Transport choice
 does not alter pool accounting or immutable byte ownership.
+
+## wasm targets
+
+wasm targets cannot run managed threads or a blocking pool: wasip1 and wasip2
+cannot spawn threads, and wasip3's cooperative threads run one at a time.
+`Managed` configuration therefore runs on the caller's Tokio runtime, as
+`RuntimeConfig::multi_thread_tokio()` does, and a current-thread runtime is
+supported. No managed owner exists, so `Client::shutdown_completion` returns
+`None`, and `__unstable_ext` does not compile.
+
+TM builds no transport; the S3 configuration must supply HTTP. Transfer tasks
+and file-backed request bodies both read and write directly on the polling
+thread, because offloading cannot move the work elsewhere.

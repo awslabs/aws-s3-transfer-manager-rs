@@ -11,13 +11,20 @@ use std::{error::Error, fmt};
 ///
 /// Obtain this value from [`crate::Client::shutdown_completion`] before releasing
 /// the client. Clones and repeated waits observe the same shutdown outcome.
+/// wasm targets have no managed runtime, so no value of this type exists there.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct ShutdownCompletion {
-    inner: aws_smithy_execution::ShutdownCompletion,
+    inner: Inner,
 }
 
+#[cfg(not(target_family = "wasm"))]
+type Inner = aws_smithy_execution::ShutdownCompletion;
+#[cfg(target_family = "wasm")]
+type Inner = std::convert::Infallible;
+
 impl ShutdownCompletion {
+    #[cfg(not(target_family = "wasm"))]
     pub(crate) fn new(inner: aws_smithy_execution::ShutdownCompletion) -> Self {
         Self { inner }
     }
@@ -39,10 +46,14 @@ impl ShutdownCompletion {
     /// Rejects waiting from this managed runtime's own threads. Also reports
     /// joiner startup failure, lost completion, and managed-thread panics.
     pub async fn wait(&self) -> Result<(), ShutdownError> {
-        self.inner
+        #[cfg(not(target_family = "wasm"))]
+        return self
+            .inner
             .wait()
             .await
-            .map_err(ShutdownError::from_execution)
+            .map_err(ShutdownError::from_execution);
+        #[cfg(target_family = "wasm")]
+        match self.inner {}
     }
 }
 
@@ -78,6 +89,7 @@ impl ShutdownError {
 }
 
 impl ShutdownError {
+    #[cfg(not(target_family = "wasm"))]
     fn from_execution(source: aws_smithy_execution::ShutdownError) -> Self {
         use aws_smithy_execution::ShutdownErrorKind as Kind;
         let kind = match source.kind() {
