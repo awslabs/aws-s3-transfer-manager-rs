@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use crate::io::key::stream::{KeyStream, StreamError};
 use crate::operation::sync::compare::Decision;
 use crate::operation::sync::walk::{
-    names_cover, LinkScan, LinkScanResult, Pairing, Progress, Walk,
+    names_cover, LinkScan, LinkScanResult, Pairing, Progress, Walk, ALIASED_NAMES_HELD,
 };
 use crate::types::FailedTransferPolicy;
 
@@ -455,6 +455,9 @@ pub(super) struct Deletes {
     // Set while the run's link scan reads. No delete goes out until the scan ends, because a link
     // the scan has not reached yet can make a waiting key name a file another key keeps.
     held_for_links: bool,
+    // Set when the tree held more link names than the bound, so the run kept every local delete.
+    // The run says so, so a caller can tell why delete mode removed nothing.
+    past_link_bound: bool,
 }
 
 // The run's link scan, for a download with following on and delete mode on.
@@ -593,6 +596,7 @@ impl<S: KeyStream, D: KeyStream> State<S, D> {
                 namespace,
                 clearing: HashSet::new(),
                 held_for_links,
+                past_link_bound: false,
             },
             failures: Sampled::default(),
             warnings: Sampled::default(),
@@ -716,6 +720,15 @@ impl<S: KeyStream, D: KeyStream> State<S, D> {
             return;
         };
         let names = walk.accept_link_scan(result);
+        if names.is_none() {
+            self.deletes.past_link_bound = true;
+            tracing::warn!(
+                bound = ALIASED_NAMES_HELD,
+                "the destination holds more link names than the run can track, so the run removes \
+                 no local file; turn off following links, or exclude the folders that hold many \
+                 links"
+            );
+        }
         let (kept, sent): (Vec<String>, Vec<String>) = self
             .deletes
             .waiting
@@ -830,6 +843,7 @@ pub(super) struct RunSnapshot {
     pub(super) plan_incomplete: bool,
     pub(super) walk_plan_incomplete: bool,
     pub(super) stopped: bool,
+    pub(super) past_link_bound: bool,
 }
 
 #[cfg(test)]
@@ -860,6 +874,7 @@ impl<S: KeyStream, D: KeyStream> State<S, D> {
             plan_incomplete: self.plan_incomplete,
             walk_plan_incomplete: self.walk_plan_incomplete,
             stopped: self.stopped_by.is_some(),
+            past_link_bound: self.deletes.past_link_bound,
         }
     }
 

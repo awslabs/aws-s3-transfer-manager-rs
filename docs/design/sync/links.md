@@ -41,6 +41,7 @@ Each case is one way a link could make sync delete or write the wrong file.
 | K | download | on | on or off | sync replaces a link to a drive that is away |
 | L | download | on | on | nobody says whether the filter protects the target |
 | M | download | on | on | sync deletes a file a new link names |
+| N | download | on | on | a caller cannot tell why sync deleted nothing |
 
 ### A. Upload: a link the walk does not look inside
 
@@ -686,6 +687,43 @@ it follows. When the walk follows a link the scan never named, sync marks the pl
 the run ends `Warned` (D6). The next run's scan finds `z/link`, holds `real`, and keeps
 `real/x.txt`. A link removed during the run only leaves an extra hold, and that costs nothing.
 
+### N. Download: a tree with more link names than the bound
+
+```
+   local folder (destination)
+   ┌──────────────────────────────┐
+   │ node_modules/                │   thousands of links, as pnpm builds it
+   │   a ──► .pnpm/a@1/...        │
+   │   b ──► .pnpm/b@2/...        │
+   │ old.txt                      │   the bucket lacks it
+   └──────────────────────────────┘
+```
+
+**Setup.** This is a download with following on and delete mode on. The local folder holds more
+than 1,024 followed links, as a JavaScript project installed with pnpm does. It also holds
+`old.txt`, and the bucket lacks that key.
+
+**What each side yields.** The link scan names each link and each target. Past 1,024 names it stops
+recording (D5).
+
+**The risk.** Sync cannot tell which local deletes are safe, so it keeps every one. Delete mode then
+removes nothing anywhere in the folder, even in folders with no links. A run that reports only
+`Warned` and a long list of `skipped-unknown` keys leaves the caller guessing why.
+
+| Step | What happens |
+|---|---|
+| 1 | the scan passes 1,024 names and stops recording |
+| 2 | the scan returns `TooMany` |
+| 3 | sync keeps every local delete in the run |
+| 4 | each kept key reports `skipped-unknown` |
+| 5 | the run ends `Warned`, and it records that it passed the bound |
+
+**What sync does.** The run records that the tree passed the bound, and it logs a warning that names
+the bound and two ways out: turn off following links, or exclude the folders that hold many links.
+The walk keeps its own bound while the scan reads. When the walk finds more names than the bound,
+every waiting delete stays, whatever the scan found. The tree alone decides whether a run passes
+the bound, so every run over the tree ends the same way.
+
 ## 1. Scope, and why it is this
 
 This design covers the local tree in both directions. A bucket has no links, and a delete there
@@ -778,7 +816,8 @@ tree like `current -> releases/v3` ends `Clean`.
 **D5. The link scan keeps at most 1,024 names.** A tree with one link per directory would give the
 scan one name per directory. **NFR-Mem-1** rules out memory that grows with the tree. Past 1,024
 names, the scan stops recording, and the run holds every local delete. Each held key reports as
-`skipped-unknown`, and the run ends `Warned`. The bound counts every name in the tree, wherever the
+`skipped-unknown`, and the run ends `Warned`. The run also records that it passed the bound, and it
+logs a warning that says so (case N). The bound counts every name in the tree, wherever the
 merge stands. So the tree alone decides whether a run passes the bound, and two runs over one tree
 decide the same deletes. The bound matches the 1,024 transfers that may wait before the merge
 pauses (execution's D11), so the names cost about what that queue costs.

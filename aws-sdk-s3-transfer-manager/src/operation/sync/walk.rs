@@ -465,7 +465,7 @@ fn at_or_under(key: &str, name: &str) -> bool {
 // at most this many names for the whole tree. Past the bound, the source holds back every later
 // delete. The value matches how many transfers may wait before the merge pauses, so the held names
 // cost about what that queue does.
-const ALIASED_NAMES_HELD: usize = 1024;
+pub(crate) const ALIASED_NAMES_HELD: usize = 1024;
 
 // What a link scan found once it read the whole destination.
 #[derive(Debug)]
@@ -484,10 +484,16 @@ enum Links {
     NoScan,
     // The scan is still reading, and every local delete waits for it. A link the walk follows now
     // is kept here, so the waiting deletes are checked against it too.
-    Scanning { found: Vec<AliasedName> },
+    // `overflow` is set once the walk found more names than the bound, so `found` lacks some.
+    Scanning {
+        found: Vec<AliasedName>,
+        overflow: bool,
+    },
     // The scan ended. These are its names, sorted. A link the walk follows from now on was either
     // named by the scan or created after the scan read its directory.
-    Scanned { names: Vec<String> },
+    Scanned {
+        names: Vec<String>,
+    },
 }
 
 // Whether a link stands among a key's parent directories below the root. A read, a write, or
@@ -596,7 +602,13 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
     // waiting local delete must not touch, sorted. `None` means every waiting delete stays.
     pub(crate) fn accept_link_scan(&mut self, result: LinkScanResult) -> Option<Vec<String>> {
         let found = match std::mem::replace(&mut self.links, Links::NoScan) {
-            Links::Scanning { found } => found,
+            Links::Scanning { found, overflow } => {
+                if overflow {
+                    self.links = Links::Scanned { names: Vec::new() };
+                    return None;
+                }
+                found
+            }
             _ => Vec::new(),
         };
         let LinkScanResult::Names(scanned) = result else {
@@ -769,10 +781,13 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
         };
         match &mut self.links {
             Links::NoScan => self.incomplete |= reached,
-            Links::Scanning { found } => {
+            Links::Scanning { found, overflow } => {
                 if found.len() < ALIASED_NAMES_HELD {
                     found.push(name.clone());
                 } else {
+                    // A waiting delete under a name `found` lacks would go out, so every waiting
+                    // delete stays when the scan ends.
+                    *overflow = true;
                     // The waiting deletes can no longer be checked against every name, so the
                     // source holds back every delete.
                     self.src.gap.add(Stretch { under: None });
@@ -927,7 +942,10 @@ impl Walker {
                 names: Vec::new(),
                 too_many: false,
             });
-            walk.links = Links::Scanning { found: Vec::new() };
+            walk.links = Links::Scanning {
+                found: Vec::new(),
+                overflow: false,
+            };
         }
         Ok(walk)
     }
@@ -3384,6 +3402,25 @@ mod tests {
             down.src.stream.prefix(),
             Some("photos/"),
             "a download lists the source under the same prefix"
+        );
+    }
+
+    // While the scan reads, the walk keeps each name it finds for the waiting deletes. Past the
+    // bound it cannot keep them all, so every waiting delete stays, whatever the scan found.
+    #[tokio::test]
+    async fn names_the_walk_finds_past_the_bound_keep_every_waiting_delete() {
+        let mut walk = Walk::new(Scripted::of(&[]), Scripted::of(&[]));
+        walk.links = Links::Scanning {
+            found: Vec::new(),
+            overflow: false,
+        };
+        for n in 0..=ALIASED_NAMES_HELD {
+            walk.hold_aliased(AliasedName::Directory(format!("l{n:04}")));
+        }
+        assert_eq!(
+            walk.accept_link_scan(LinkScanResult::Names(Vec::new())),
+            None,
+            "a waiting delete under a dropped name could go out"
         );
     }
 
