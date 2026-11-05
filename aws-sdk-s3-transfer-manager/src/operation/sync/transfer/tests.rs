@@ -113,7 +113,8 @@ async fn an_archived_object_and_a_restoring_one_are_counted_apart() {
             },
             Obstruction::NothingToRead
             | Obstruction::UnfollowedLink
-            | Obstruction::ExcludedLink => {
+            | Obstruction::ExcludedLink
+            | Obstruction::LinkToDirectory => {
                 unreachable!("not under test here")
             }
         };
@@ -4282,6 +4283,132 @@ async fn a_destination_link_that_reaches_nothing_holds_only_the_keys_below_it() 
         }
     }
     assert!(failures.is_empty(), "{failures:#?}");
+}
+
+// A download with following on into `root`, comparing with `mode`.
+fn downloading_in_mode(
+    root: &Path,
+    client: aws_sdk_s3::Client,
+    mode: Mode,
+    delete_mode: DeleteMode,
+) -> (
+    SyncTransfer<S3Walk, crate::operation::sync::walk::LocalDestination>,
+    TransferContext,
+    crate::transfer::StateMachineTerminalReceiver,
+) {
+    let config = crate::Config::builder().client(client.clone()).build();
+    let handle = crate::client::Handle::test_handle_managed(config);
+    let (ctx, rx) = TransferContext::new(handle);
+    let walk = Walker::builder()
+        .follow_symlinks(true)
+        .build()
+        .downloading(
+            LocalAndBucket::builder()
+                .local_root(root)
+                .client(client)
+                .bucket("amzn-s3-demo-bucket")
+                .build(),
+            delete_mode,
+        )
+        .expect("an ordinary bucket builds");
+    let transfer = SyncTransfer::new(
+        ctx.clone(),
+        walk,
+        mode.downloading(),
+        Arc::new(SpawnDownload::new(
+            ctx.handle.clone(),
+            "amzn-s3-demo-bucket",
+            None,
+            root,
+        )),
+        Arc::new(DeleteFromLocalTree::new(root)),
+        RunSettings {
+            max_children: 4,
+            delete_mode,
+            failure_policy: FailedTransferPolicy::Continue,
+        },
+    );
+    (transfer, ctx, rx)
+}
+
+// A followed link to a directory sits at a key's own name. The walk descends into it,
+// and it still reports the name as taken. No-overwrite keeps the link, and the default modes replace
+// it.
+#[cfg(unix)]
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn no_overwrite_keeps_a_link_to_a_directory_at_a_keys_name() {
+    for (mode, link_stays) in [(Mode::NoOverwrite, true), (Mode::SizeAndTime, false)] {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonical root");
+        std::fs::create_dir(root.join("real")).expect("real");
+        std::os::unix::fs::symlink(root.join("real"), root.join("y.txt")).expect("symlink");
+        let (t, ctx, rx) = downloading_in_mode(
+            &root,
+            a_bucket_to_download(&["y.txt"], 1_600_000_000),
+            mode,
+            DeleteMode::Off,
+        );
+        run_managed(&t, &ctx, rx).await;
+        let is_link = std::fs::symlink_metadata(root.join("y.txt"))
+            .expect("y.txt exists")
+            .file_type()
+            .is_symlink();
+        assert_eq!(is_link, link_stays, "{mode:?}");
+        assert!(
+            root.join("real").is_dir(),
+            "{mode:?} touched the link's target"
+        );
+    }
+}
+
+// The link's own name pairs only with the same source key. Here the bucket has every file through
+// the link and no key `y.txt`, so delete mode leaves the link, and the run is clean.
+#[cfg(unix)]
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn delete_mode_keeps_a_followed_link_to_a_directory() {
+    const WHEN: i64 = 1_600_000_000;
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path().canonicalize().expect("canonical root");
+    stamp_hello(&root.join("real/a"), WHEN);
+    std::os::unix::fs::symlink(root.join("real"), root.join("y.txt")).expect("symlink");
+    let (t, ctx, rx) = downloading_in_mode(
+        &root,
+        a_bucket_to_download(&["real/a", "y.txt/a"], WHEN),
+        Mode::SizeAndTime,
+        DeleteMode::On,
+    );
+    run_managed(&t, &ctx, rx).await;
+    assert!(
+        std::fs::symlink_metadata(root.join("y.txt"))
+            .expect("y.txt exists")
+            .file_type()
+            .is_symlink(),
+        "delete mode removed the link"
+    );
+    assert_eq!(t.outcome(), RunOutcome::Clean);
+}
+
+// On an upload, a link the walk followed into a directory has nothing to send at its own name. An
+// object at that name is destination-only, as for a real directory, and delete mode
+// removes it.
+#[cfg(unix)]
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn an_upload_deletes_the_object_at_a_followed_directory_links_name() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path().canonicalize().expect("canonical root");
+    std::fs::create_dir(root.join("real")).expect("real");
+    std::os::unix::fs::symlink(root.join("real"), root.join("y.txt")).expect("symlink");
+    let (client, deleted) = listing_and_recording_deletes(&["y.txt"], 1);
+    let (t, _ctx) = upload_run(
+        &root,
+        client,
+        Walker::builder().follow_symlinks(true).build(),
+    );
+    drive(&t).await;
+    assert_eq!(deleted.lock().clone(), vec!["y.txt".to_string()]);
 }
 
 // A loop reaches a directory, so its own name counts like a link to a directory. A download of

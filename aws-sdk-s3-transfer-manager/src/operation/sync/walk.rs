@@ -649,6 +649,21 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
                 self.dst.take_holding();
                 continue;
             }
+            // A link the walk followed into a directory stands only for its own name. The
+            // keys under the name come from the directory. On the source the name has nothing to
+            // send, so the merge skips past it, and a bucket key at the name pairs as
+            // destination-only, as for a real directory. On the destination the name pairs only
+            // with the same source key, so no-overwrite sees something there and keeps the link.
+            // A destination link with no source key at its name is skipped, so delete mode never
+            // removes it.
+            if order.is_le() && self.src.head_is(Obstruction::LinkToDirectory) {
+                self.src.take();
+                continue;
+            }
+            if order.is_gt() && self.dst.head_is(Obstruction::LinkToDirectory) {
+                self.dst.take();
+                continue;
+            }
             return Some(Ok(match order {
                 Ordering::Less => self.take_source_only(),
                 Ordering::Greater => self.take_destination_only(),

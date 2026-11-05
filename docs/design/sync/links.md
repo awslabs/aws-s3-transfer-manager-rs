@@ -398,7 +398,7 @@ follow setting.
 | off | anything | the link, with no size and no time |
 | on | missing | nothing |
 | on | a file | the target file's size and time |
-| on | a directory | nothing, because the walk lists the keys inside it under `y.txt/` |
+| on | a directory | a marker with no size or time, then the keys under `y.txt/` |
 | on | a socket | a socket, a kind of file sync cannot write |
 
 **The risk.** A download writes a temporary file, then renames it to `y.txt`. A rename replaces the
@@ -425,9 +425,9 @@ Each row has a reason:
 - **A missing target.** Nothing sits at `y.txt`, so every mode downloads.
 - **A file target.** The link counts as that file. When the comparison finds a difference, the
   rename replaces the link, and the target stays as it was.
-- **A directory target.** The walk yields nothing at `y.txt`, so the default modes download. A
-  no-overwrite download checks the final name just before the rename. The name reaches a
-  directory, so it skips the key.
+- **A directory target.** The walk yields the link's own name, with no size or time, and then
+  the keys inside it under `y.txt/`. The default modes download, and the rename replaces the
+  link. No-overwrite sees an entry at `y.txt` and keeps the link.
 - **A socket target.** Sync cannot write a socket, so every mode skips the key, as for a real
   socket.
 
@@ -543,7 +543,7 @@ follow setting.
 | off | anything | the link, with nothing to send |
 | on | a file | the target file |
 | on | missing | an error for `y.txt` |
-| on | a directory | nothing, because the walk lists the keys inside it under `y.txt/` |
+| on | a directory | a marker the merge skips, then the keys under `y.txt/` |
 
 **The risk.** The AWS CLI with `--no-follow-symlinks` leaves the link out of its listing. The merge
 then reads `y.txt` as missing from the local folder, and delete mode removes the object. The link
@@ -567,8 +567,9 @@ Each row has a reason:
   other file.
 - **A missing target.** The source has a key it cannot read. The key fails, and the merge answers
   "unknown" for it, so the object stays.
-- **A directory target.** The walk yields nothing at `y.txt`, so the bucket's `y.txt` is
-  destination-only. Delete mode removes it, as for a real directory named `y.txt`.
+- **A directory target.** The merge skips past the marker at `y.txt`, because the link has
+  nothing to send there. The bucket's `y.txt` is destination-only, and delete mode removes it, as
+  for a real directory named `y.txt`.
 
 ### K. Download: a broken link above a kept key, with following on
 
@@ -848,10 +849,13 @@ With following on, a link at a key's own name counts as what it reaches:
   replaces the link and leaves the target alone.
 - A link to a socket, FIFO, or device reads as that file, and every mode skips the key as
   obstructed.
-- A link to a directory leaves no entry at its name, because the walk descends into it. The default
-  modes download and replace the link, as **FR-Enum-4** says. No-overwrite keeps it. Just before
-  the rename, a no-overwrite download checks the final name with links resolved. When the name
-  reaches anything, the download skips the key and reports it as already at the destination.
+- A link to a directory takes its own name, and the walk also descends into it. The walk yields
+  the name as an entry marked `LinkToDirectory`, with no size or time. That entry pairs only with
+  the same key on the other side. In a download's destination, the default modes download and
+  replace the link, as **FR-Enum-4** says. No-overwrite sees an entry there, so it keeps the link
+  and reports the key as already at the destination. With no source key at the name, the merge
+  skips past the entry, so delete mode never removes the link. In an upload's source, the name has
+  nothing to send, so the merge skips past it, and a bucket key at the name is destination-only.
 - A loop reaches a directory too. The walk stops at the loop, and only the keys below its name stay
   held, so its own name counts like a link to a directory.
 - A link whose target the walk cannot read stays unknown at its own name as well. Its name and the

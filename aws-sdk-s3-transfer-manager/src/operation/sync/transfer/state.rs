@@ -166,8 +166,9 @@ impl Obstructed {
             // reads only regular files.
             Obstruction::NothingToRead | Obstruction::UnfollowedLink => self.nothing_to_read += 1,
             Obstruction::Archived => self.archived += 1,
-            // The merge drops an excluded link before any decision reaches this count.
-            Obstruction::ExcludedLink => {}
+            // The merge drops an excluded link before any decision reaches this count. A link to a
+            // directory never blocks a write, and the merge drops it on the source side.
+            Obstruction::ExcludedLink | Obstruction::LinkToDirectory => {}
             Obstruction::BeingRestored => self.restoring += 1,
         }
     }
