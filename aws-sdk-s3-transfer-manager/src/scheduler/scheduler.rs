@@ -27,12 +27,6 @@
 //!                  └──────────── on_completion() ◄──────────────────┘
 //! ```
 //!
-//! The registry owns each descriptor. Ready set entries do not keep a
-//! descriptor alive, so the scheduler releases its reference to a transfer
-//! once the transfer has left the registry and no transient holder, such as
-//! an in-progress poll, a dispatched work item, or a canceller waiting for
-//! it to go idle, still holds its descriptor.
-//!
 //! # Fair Scheduling (CFS)
 //!
 //! When multiple transfers are ready, the scheduler uses Completely Fair Scheduling.
@@ -147,9 +141,7 @@ use super::gate::GenerateWorkGate;
 pub(crate) struct Scheduler(Arc<SchedulerInner>);
 
 struct SchedulerInner {
-    /// Live transfers. The only owner of a descriptor apart from transient
-    /// holders, such as an in-progress poll, a dispatched work item, and a
-    /// canceller waiting for the transfer to go idle.
+    /// Transfers registered for scheduling.
     transfers: RwLock<HashMap<TransferId, TransferDescriptor>>,
     ready_set: ReadySet,
     handle: Weak<crate::client::Handle>,
