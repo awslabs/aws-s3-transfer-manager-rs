@@ -346,14 +346,14 @@ impl<T> ResolverProcess<T> {
     fn new(
         state: T,
         internal_resolver: SharedDnsResolver,
-        sender: mpsc::UnboundedSender<ResolverOperation>,
+        sender: Arc<mpsc::UnboundedSender<ResolverOperation>>,
         receiver: mpsc::UnboundedReceiver<ResolverOperation>,
     ) -> Self {
         // build the resolver function that runs resolution as a background task on the tokio
         // runtime and then takes the result and sends it back to the resolver process via
         // the operation input channel
         let resolver = internal_resolver.clone();
-        let operation_channel = sender.clone();
+        let operation_channel = sender.downgrade();
         let resolution_function: ResolutionFunction = Box::new(move |name| {
             let handle = tokio::runtime::Handle::current();
             let internal_name = name.to_string();
@@ -365,7 +365,10 @@ impl<T> ResolverProcess<T> {
                     name: internal_name,
                     result,
                 });
-                let _ = internal_channel.send(caching_result);
+                let strong_channel_option = internal_channel.upgrade();
+                if let Some(strong_channel) = strong_channel_option {
+                    let _ = strong_channel.send(caching_result);
+                }
             });
         });
 
@@ -430,9 +433,7 @@ pub trait Resolver: Debug + Send + Sync {
 /// resolution requests
 #[derive(Debug)]
 pub struct ResolverImpl {
-    // if we create our own runtime, we need to hold onto it here, since no one else will
-    self_created_runtime: Option<tokio::runtime::Runtime>,
-    operation_channel: mpsc::UnboundedSender<ResolverOperation>,
+    operation_channel: Arc<mpsc::UnboundedSender<ResolverOperation>>,
 }
 
 const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(60);
@@ -464,16 +465,17 @@ impl ResolverImpl {
             mpsc::UnboundedReceiver<ResolverOperation>,
         ) = mpsc::unbounded_channel();
 
-        let mut caching_resolver = ResolverImpl {
-            self_created_runtime: None,
-            operation_channel: tx.clone(),
+        let atx = Arc::new(tx);
+
+        let caching_resolver = ResolverImpl {
+            operation_channel: atx.clone(),
         };
 
         // Config resolver || basic getaddrinfo resolver
         let internal_resolver = config.internal_resolver.unwrap_or(SharedDnsResolver::new(
             aws_smithy_runtime::client::dns::TokioDnsResolver::new(),
         ));
-        let mut resolver_impl = ResolverProcess::<T>::new(state, internal_resolver, tx, rx);
+        let mut resolver_impl = ResolverProcess::<T>::new(state, internal_resolver, atx, rx);
 
         // Config runtime || create a new runtime
         if let Some(config_runtime) = config.runtime {
@@ -481,18 +483,17 @@ impl ResolverImpl {
                 resolver_impl.run(operation_handler).await;
             });
         } else {
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .thread_name("caching-resolver-fallback-rt")
-                .build()
-                .unwrap();
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .thread_name("caching-resolver-fallback-rt")
+                    .build()
+                    .unwrap();
 
-            runtime.spawn(async move {
-                resolver_impl.run(operation_handler).await;
+                runtime.block_on(async move {
+                    resolver_impl.run(operation_handler).await;
+                });
             });
-
-            // need to keep this alive, a handle is insufficient
-            caching_resolver.self_created_runtime = Some(runtime);
         }
 
         caching_resolver
