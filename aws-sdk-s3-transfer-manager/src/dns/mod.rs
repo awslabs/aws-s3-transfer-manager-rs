@@ -438,6 +438,44 @@ pub struct ResolverImpl {
 
 const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(60);
 
+#[cfg(not(target_family = "wasm"))]
+fn spawn_resolution_runtime<T>(
+    mut resolver_process: ResolverProcess<T>,
+    operation_handler: ResolverOperationHandlerFn<T>,
+) where
+    T: Send + 'static,
+{
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("caching-resolver-fallback-rt")
+            .build()
+            .unwrap();
+
+        runtime.block_on(async move {
+            resolver_process.run(operation_handler).await;
+        });
+    });
+}
+
+#[cfg(target_family = "wasm")]
+fn spawn_resolution_runtime<T>(
+    mut resolver_process: ResolverProcess<T>,
+    operation_handler: ResolverOperationHandlerFn<T>,
+) where
+    T: Send + 'static,
+{
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async move {
+            resolver_process.run(operation_handler).await;
+        });
+    });
+}
+
 impl ResolverImpl {
     /// Creates a new resolver implementation using the default constructor for the bookkeeping
     /// state
@@ -475,25 +513,15 @@ impl ResolverImpl {
         let internal_resolver = config.internal_resolver.unwrap_or(SharedDnsResolver::new(
             aws_smithy_runtime::client::dns::TokioDnsResolver::new(),
         ));
-        let mut resolver_impl = ResolverProcess::<T>::new(state, internal_resolver, atx, rx);
+        let mut resolver_process = ResolverProcess::<T>::new(state, internal_resolver, atx, rx);
 
         // Config runtime || create a new runtime
         if let Some(config_runtime) = config.runtime {
             config_runtime.spawn(async move {
-                resolver_impl.run(operation_handler).await;
+                resolver_process.run(operation_handler).await;
             });
         } else {
-            std::thread::spawn(move || {
-                let runtime = tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(2)
-                    .thread_name("caching-resolver-fallback-rt")
-                    .build()
-                    .unwrap();
-
-                runtime.block_on(async move {
-                    resolver_impl.run(operation_handler).await;
-                });
-            });
+            spawn_resolution_runtime(resolver_process, operation_handler);
         }
 
         caching_resolver
