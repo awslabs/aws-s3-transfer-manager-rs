@@ -244,8 +244,8 @@ fn walk_sync_link_scan_cost(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("walk_sync_link_scan");
     for (label, dir, count) in [
-        ("balanced_1110files", &plain, plain_count),
-        ("balanced_1110files_100links", &linked, linked_count),
+        ("balanced_f10_d3_10each", &plain, plain_count),
+        ("balanced_f10_d3_10each_100links", &linked, linked_count),
     ] {
         group.throughput(Throughput::Elements(count as u64));
         group.bench_function(BenchmarkId::new(label, "walk"), |b| {

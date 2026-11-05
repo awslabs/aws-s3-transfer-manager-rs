@@ -847,11 +847,13 @@ removal (execution's D12) waits for the scan too. In those two cases a transfer 
 and in no other.
 
 The scan costs one `readdir` for each directory and one `stat` for each link. On Linux and macOS
-`readdir` reports each entry's type, so the scan never stats a regular file. The walk itself calls
-`stat` on every file, so the scan costs less than the walk. On the walk benchmark's tree of 1,110
-files in 1,111 directories, the walk takes 75 ms and the scan 57 ms. Both read the tree at warm
-cache on an APFS SSD, and `readdir` alone takes 58 ms there. The scan and the walk run at the same
-time. A run with fewer than 1,024 deletes waiting never pauses the merge for the scan.
+`readdir` reports each entry's type, so the scan never stats a regular file. The walk calls `stat`
+on every file, so the scan costs less than the walk. The `walk_sync_link_scan` group in
+`benches/walk.rs` measures both on a balanced tree. There the scan costs about three quarters of the
+walk, and the walk and the scan together cost less than twice the walk. The benchmark reads a tree
+held in the page cache, so it shows how the two reads compare, and not what a cold disk adds. The
+scan and the walk run at the same time. A run with fewer than 1,024 deletes waiting never pauses the
+merge for the scan.
 
 The tree alone decides each delete, so every run over one tree decides the same deletes. With
 delete mode off, nothing deletes, so the run starts no scan.
