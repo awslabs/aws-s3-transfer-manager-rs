@@ -245,33 +245,25 @@ impl PollWork {
     }
 }
 
-/// Result of executing a work item.
-///
-/// Contract between transfer state machines and the scheduler:
-/// - `Success`: Work completed. Scheduler continues polling the transfer for more work.
-/// - `Yielded`: Dispatched execution retired without completing a reportable I/O operation or
-///   reporting a failure. Transfer state has retained any continuation or has retracted or retired
-///   the speculative operation. The scheduler releases the execution slot without producing a
-///   concurrency-controller sample.
-/// - `Failed`: Transfer has already transitioned itself to terminal state (via `set_failed` +
-///   `signal_terminal`). Scheduler will not poll it again and will remove it once idle.
-/// - `Cancelled`: Transfer is already terminal (failed or cancelled by another work item).
-///   Same cleanup as `Failed`.
+/// How a work item's execution ended. Each variant states what the transfer guarantees in
+/// returning it.
 pub(crate) enum WorkOutcome {
     /// Work completed successfully.
     Success { data: Option<Box<dyn WorkData>> },
-    /// Dispatched execution retired without completing an I/O operation or reporting a failure.
-    ///
-    /// Before returning, transfer state must reconcile the work exactly once. If it retains a
-    /// continuation, that continuation must retain its progress and future wake path. The scheduler
-    /// releases the execution slot but does not report a completion sample to the concurrency
+    /// The work ended without completing an I/O operation or reporting a failure, and the
+    /// transfer continues. Unlike every other outcome, it is not a completion for the concurrency
     /// controller.
+    ///
+    /// The transfer has reconciled the work exactly once. A continuation it kept retains the
+    /// work's progress and a future wake path; otherwise the operation was retracted or retired.
     Yielded,
-    /// Work failed. The transfer must have recorded the error before returning, and then
-    /// either ended (`set_failed` + `signal_terminal`) or stayed active with a wake path to
-    /// its end. See the Failed lifecycle contract on [`Transfer`].
+    /// The work failed, and the transfer recorded the error.
+    ///
+    /// The transfer has ended, or stays active with a wake path to its end; see the Failed
+    /// lifecycle contract on [`Transfer`]. `classification` is the error's kind, if it has one.
     Failed { classification: Option<ErrorKind> },
-    /// Work was skipped or aborted because the transfer is already terminal.
+    /// The work was skipped, or stood down without an error of its own, because the transfer is
+    /// ending or has ended.
     Cancelled,
 }
 
