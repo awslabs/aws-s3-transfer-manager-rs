@@ -6,7 +6,7 @@
 //! State machine for plural upload (`upload_objects`).
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{hash_map::Entry, BTreeMap, HashMap, VecDeque};
 use std::fmt;
 use std::future::Future;
 use std::path::{PathBuf, MAIN_SEPARATOR, MAIN_SEPARATOR_STR};
@@ -376,6 +376,8 @@ struct State {
     reaping_in_flight: usize,
     failed: Vec<FailedUpload>,
     successful_uploads: u64,
+    /// Keys already derived, mapped to the file that derived each one.
+    derived_keys: HashMap<String, PathBuf>,
 }
 
 impl State {
@@ -440,6 +442,7 @@ impl UploadObjectsTransfer {
                 children_reserved: 0,
                 reaping_in_flight: 0,
                 failed: Vec::new(),
+                derived_keys: HashMap::new(),
                 successful_uploads: 0,
             }),
         });
@@ -680,22 +683,24 @@ impl UploadObjectsTransfer {
         // Loop until one spawnable entry is claimed or the queue is exhausted.
         while let Some(entry) = state.pending_entries.pop_front() {
             let relative = entry.relative_path().to_string_lossy().to_string();
-            let key =
-                match derive_object_key(&relative, key_prefix.as_deref(), delimiter.as_deref()) {
-                    Ok(k) => k.into_owned(),
-                    Err(e) => {
-                        state.failed.push(FailedUpload {
-                            input: None,
-                            error: e,
-                            source_path: Some(entry.path().to_path_buf()),
-                        });
-                        if *self.failure_policy() == FailedTransferPolicy::Abort {
-                            self.abort(state, "key derivation failure");
-                            return SpawnDecision::Abort;
-                        }
-                        continue;
+            let key = derive_object_key(&relative, key_prefix.as_deref(), delimiter.as_deref())
+                .map(Cow::into_owned)
+                .and_then(|k| claim_key(&mut state.derived_keys, k, entry.path()));
+            let key = match key {
+                Ok(k) => k,
+                Err(e) => {
+                    state.failed.push(FailedUpload {
+                        input: None,
+                        error: e,
+                        source_path: Some(entry.path().to_path_buf()),
+                    });
+                    if *self.failure_policy() == FailedTransferPolicy::Abort {
+                        self.abort(state, "key derivation failure");
+                        return SpawnDecision::Abort;
                     }
-                };
+                    continue;
+                }
+            };
 
             let stream = match InputStream::read_from()
                 .path(entry.path())
@@ -1252,6 +1257,27 @@ impl Transfer for UploadObjectsTransfer {
     fn on_terminal(&self) {}
 }
 
+/// Record that `path` derived `key`, failing when another file already derived it.
+fn claim_key(
+    derived_keys: &mut HashMap<String, PathBuf>,
+    key: String,
+    path: &std::path::Path,
+) -> Result<String, error::Error> {
+    match derived_keys.entry(key) {
+        Entry::Occupied(e) => Err(error::invalid_input(format!(
+            "`{}` derives key `{}`, already derived from `{}`",
+            path.display(),
+            e.key(),
+            e.get().display()
+        ))),
+        Entry::Vacant(e) => {
+            let key = e.key().clone();
+            e.insert(path.to_path_buf());
+            Ok(key)
+        }
+    }
+}
+
 /// Derive the S3 object key for a file at `relative_filename` inside the walk root.
 ///
 /// The key is formed by optionally prepending a prefix and substituting the
@@ -1572,11 +1598,11 @@ mod tests {
         );
     }
 
-    /// Two files that derive one key both upload to it and both count as uploaded.
+    /// Of two files that derive one key, the second fails without uploading.
     #[cfg(unix)]
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
-    async fn test_files_deriving_one_key_both_upload() {
+    async fn test_files_deriving_one_key_upload_once() {
         use std::os::unix::ffi::OsStrExt;
         // (file names, delimiter, key both derive)
         type Case = ([&'static [u8]; 2], Option<&'static str>, &'static str);
@@ -1636,8 +1662,14 @@ mod tests {
             .await
             .expect("transfer should complete within timeout");
 
-            assert_eq!(transfer.successful_uploads(), 2, "key={key:?}");
-            assert_eq!(*captured.lock().unwrap(), [key; 2], "key={key:?}");
+            assert_eq!(transfer.successful_uploads(), 1, "key={key:?}");
+            assert_eq!(*captured.lock().unwrap(), [key], "key={key:?}");
+            let failed = transfer.take_failed();
+            assert_eq!(failed.len(), 1, "key={key:?}");
+            assert_eq!(
+                failed[0].error().kind(),
+                &crate::error::ErrorKind::InputInvalid
+            );
         }
     }
 
