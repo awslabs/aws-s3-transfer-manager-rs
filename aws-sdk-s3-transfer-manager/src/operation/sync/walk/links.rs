@@ -151,32 +151,28 @@ pub(crate) struct LinkScan {
 }
 
 impl LinkScan {
-    // Read up to `budget` entries. Return true once the scan has read the whole tree. An entry the
-    // scan cannot read costs it nothing: the destination walk cannot read that entry either, so no
-    // key reaches a file through a link behind it.
+    // Read up to `budget` directories. Return true once the scan has read the whole tree. A
+    // directory the scan cannot read costs it nothing: the destination walk cannot read that
+    // directory either, so no key reaches a file through a link inside it.
     pub(crate) async fn advance(&mut self, budget: usize) -> bool {
-        for _ in 0..budget {
-            if self.too_many {
-                return true;
-            }
-            let next = self.walk.next().await;
-            self.namer.name(self.walk.followed_links(), &mut self.names);
-            // Many links can reach one target, so the scan counts each name once before it judges
-            // the bound.
+        if self.too_many {
+            return true;
+        }
+        let done = self.walk.read_dirs(budget);
+        self.namer.name(self.walk.followed_links(), &mut self.names);
+        // Many links can reach one target, so the scan counts each name once before it judges the
+        // bound.
+        if self.names.len() > ALIASED_NAMES_HELD {
+            self.names
+                .sort_unstable_by(|a, b| name_of(a).cmp(name_of(b)));
+            self.names.dedup();
             if self.names.len() > ALIASED_NAMES_HELD {
-                self.names
-                    .sort_unstable_by(|a, b| name_of(a).cmp(name_of(b)));
-                self.names.dedup();
-                if self.names.len() > ALIASED_NAMES_HELD {
-                    self.too_many = true;
-                    self.names = Vec::new();
-                }
-            }
-            if next.is_none() {
+                self.too_many = true;
+                self.names = Vec::new();
                 return true;
             }
         }
-        false
+        done
     }
 
     pub(crate) fn finish(self) -> LinkScanResult {

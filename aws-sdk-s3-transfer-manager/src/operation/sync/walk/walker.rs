@@ -110,7 +110,7 @@ impl Walker {
         walk.checks_transfers = !self.follow_symlinks;
         if names && self.follow_symlinks {
             walk.link_scan = Some(LinkScan {
-                walk: self.fs_walk(root.clone(), SortOrder::Native),
+                walk: self.fs_walk(root.clone(), SortOrder::Native, true),
                 namer: LinkNamer::new(&root),
                 names: Vec::new(),
                 too_many: false,
@@ -129,14 +129,16 @@ impl Walker {
     // level reports every key below it as absent. And it keeps special files, because a name that
     // is taken has to reach the comparison even though nothing can be sent for it.
     pub(super) fn local_walk(&self, root: PathBuf) -> FsWalk {
-        self.fs_walk(root, SortOrder::WholeWalk)
+        self.fs_walk(root, SortOrder::WholeWalk, false)
     }
 
     // The link scan reads the same tree with the same rules, in whatever order the filesystem gives.
-    // It needs every link and no key order, so it skips the sort.
-    fn fs_walk(&self, root: PathBuf, sort: SortOrder) -> FsWalk {
+    // It needs every link and no key order, so it skips the sort, and `links_only` skips each file's
+    // metadata.
+    fn fs_walk(&self, root: PathBuf, sort: SortOrder, links_only: bool) -> FsWalk {
         FsWalker::builder()
             .root_as_named(true)
+            .links_only(links_only)
             .sort(sort)
             .recursive(true)
             .include_special_files(true)
