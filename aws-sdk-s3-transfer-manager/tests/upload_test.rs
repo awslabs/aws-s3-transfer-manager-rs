@@ -26,14 +26,17 @@ use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
 use aws_sdk_s3_transfer_manager::operation::upload::ChecksumStrategy;
 use aws_smithy_mocks::{mock, mock_client, Rule, RuleMode};
 use aws_smithy_runtime::test_util::capture_test_logs::capture_test_logs;
-use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
+use aws_smithy_runtime_api::client::http::{
+    http_client_fn, HttpConnector, HttpConnectorFuture, SharedHttpConnector,
+};
+use aws_smithy_runtime_api::client::orchestrator::{HttpRequest, HttpResponse};
 use aws_smithy_runtime_api::client::result::SdkError;
 use aws_smithy_runtime_api::http::StatusCode;
 use aws_smithy_types::body::SdkBody;
 use bytes::{BufMut, Bytes};
 use pin_project_lite::pin_project;
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 
 /// number of simultaneous uploads to create
 const MANY_ASYNC_UPLOADS_CNT: usize = 200;
@@ -1910,14 +1913,13 @@ fn precondition_failed() -> HttpResponse {
 /// part is a producer applying backpressure: a second `send` waits until the upload takes the
 /// first part.
 fn upload_from_channel(
-    mock: &MultipartMock,
+    tm: &aws_sdk_s3_transfer_manager::Client,
 ) -> (
     mpsc::Sender<Bytes>,
     aws_sdk_s3_transfer_manager::operation::upload::UploadHandle,
 ) {
     let (tx, rx) = mpsc::channel(1);
-    let handle = mock
-        .tm()
+    let handle = tm
         .upload()
         .bucket("test-bucket")
         .key("test-key")
@@ -1956,7 +1958,7 @@ async fn test_upload_part_failure_releases_stream_while_handle_held() {
     let upload_part =
         mock!(aws_sdk_s3::Client::upload_part).then_http_response(precondition_failed);
     let mock = MultipartMock::new().with_override(&upload_part);
-    let (tx, handle) = upload_from_channel(&mock);
+    let (tx, handle) = upload_from_channel(&mock.tm());
 
     tx.send(Bytes::from_static(b"part one")).await.unwrap();
     assert_failure_releases_stream(&tx, &handle).await;
@@ -1976,7 +1978,7 @@ async fn test_create_multipart_failure_releases_stream_while_handle_held() {
     let create_mpu =
         mock!(aws_sdk_s3::Client::create_multipart_upload).then_http_response(precondition_failed);
     let mock = MultipartMock::new().with_override(&create_mpu);
-    let (tx, handle) = upload_from_channel(&mock);
+    let (tx, handle) = upload_from_channel(&mock.tm());
 
     assert_failure_releases_stream(&tx, &handle).await;
 
@@ -1985,4 +1987,176 @@ async fn test_create_multipart_failure_releases_stream_while_handle_held() {
         .await
         .expect_err("CreateMultipartUpload failed");
     assert_eq!(0, mock.record().upload_part_calls());
+}
+
+// ref: awslabs/aws-s3-transfer-manager-rs#226
+/// A worker panic fails the upload from outside its state machine. The custom stream is still
+/// released while the caller holds the handle.
+#[tokio::test]
+async fn test_worker_panic_releases_stream_while_handle_held() {
+    let upload_part = mock!(aws_sdk_s3::Client::upload_part)
+        .then_output(|| -> UploadPartOutput { panic!("UploadPart panicked") });
+    let mock = MultipartMock::new().with_override(&upload_part);
+    let (tx, handle) = upload_from_channel(&mock.tm());
+
+    tx.send(Bytes::from_static(b"part one")).await.unwrap();
+    assert_failure_releases_stream(&tx, &handle).await;
+
+    let err = handle.join().await.expect_err("a worker panicked");
+    assert_eq!(err.kind(), &ErrorKind::RuntimeError);
+}
+
+/// Answers CreateMultipartUpload, holds part 1's UploadPart forever, adding a permit to
+/// `part_one_sent` when it arrives, and panics on part 2's.
+#[derive(Debug)]
+struct HeldPartThenPanicConnector {
+    part_one_sent: Arc<Semaphore>,
+}
+
+impl HttpConnector for HeldPartThenPanicConnector {
+    fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
+        let uri = request.uri().to_string();
+        if uri.contains("partNumber=1") {
+            self.part_one_sent.add_permits(1);
+            return HttpConnectorFuture::new(std::future::pending());
+        }
+        if uri.contains("partNumber=2") {
+            panic!("UploadPart panicked");
+        }
+        assert!(
+            request.method() == "POST" && uri.contains("uploads"),
+            "unexpected request: {} {uri}",
+            request.method()
+        );
+        HttpConnectorFuture::ready(Ok(HttpResponse::new(
+            200.try_into().unwrap(),
+            SdkBody::from(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+                    <InitiateMultipartUploadResult>
+                        <Bucket>test-bucket</Bucket>
+                        <Key>test-key</Key>
+                        <UploadId>test-upload-id</UploadId>
+                    </InitiateMultipartUploadResult>"#,
+            ),
+        )))
+    }
+}
+
+// ref: awslabs/aws-s3-transfer-manager-rs#226
+/// A worker panic interrupts a part whose request has not returned, so the custom stream that
+/// part's reader holds is released while the caller holds the handle.
+#[tokio::test]
+async fn test_worker_panic_releases_stream_held_by_a_hung_part() {
+    let part_one_sent = Arc::new(Semaphore::new(0));
+    let connector = SharedHttpConnector::new(HeldPartThenPanicConnector {
+        part_one_sent: part_one_sent.clone(),
+    });
+    let client = aws_sdk_s3::Client::from_conf(
+        aws_sdk_s3::config::Config::builder()
+            .http_client(http_client_fn(move |_, _| connector.clone()))
+            .region(aws_sdk_s3::config::Region::new("us-west-2"))
+            .with_test_defaults()
+            .build(),
+    );
+    let tm = aws_sdk_s3_transfer_manager::Client::new(
+        aws_sdk_s3_transfer_manager::Config::builder()
+            .s3_config(test_common::s3_config_with_test_http(
+                client.config().to_builder(),
+            ))
+            .concurrency(aws_sdk_s3_transfer_manager::types::ConcurrencyMode::Explicit(4))
+            .build(),
+    );
+    let (tx, handle) = upload_from_channel(&tm);
+
+    tx.send(Bytes::from_static(b"part one")).await.unwrap();
+    tokio::time::timeout(SOURCE_RELEASE_TIMEOUT, part_one_sent.acquire())
+        .await
+        .expect("part 1 was not sent")
+        .expect("semaphore closed")
+        .forget();
+    tx.send(Bytes::from_static(b"part two")).await.unwrap();
+    assert_failure_releases_stream(&tx, &handle).await;
+}
+
+/// A custom stream whose `full_object_checksum` signals `entered` and then blocks its thread
+/// until `release`, standing in for a slow checksum computation.
+#[derive(Debug)]
+struct SlowChecksumStream {
+    inner: TestStream,
+    entered: Arc<Semaphore>,
+    release: Arc<std::sync::Barrier>,
+    dropped: Arc<Semaphore>,
+}
+
+impl Drop for SlowChecksumStream {
+    fn drop(&mut self) {
+        self.dropped.add_permits(1);
+    }
+}
+
+impl PartStream for SlowChecksumStream {
+    fn poll_part(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        stream_cx: &StreamContext,
+    ) -> Poll<Option<std::io::Result<PartData>>> {
+        std::pin::Pin::new(&mut self.inner).poll_part(cx, stream_cx)
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::default()
+    }
+
+    fn full_object_checksum(&self) -> Option<String> {
+        self.entered.add_permits(1);
+        self.release.wait();
+        None
+    }
+}
+
+// ref: awslabs/aws-s3-transfer-manager-rs#226
+/// An upload whose handle is dropped while CompleteMultipartUpload prepares its request, here
+/// while the caller's stream computes the full-object checksum, never sends it.
+#[tokio::test]
+async fn test_complete_not_sent_when_upload_ends_during_checksum() {
+    let complete = mock!(aws_sdk_s3::Client::complete_multipart_upload)
+        .then_output(|| CompleteMultipartUploadOutput::builder().build());
+    let mock = MultipartMock::new().with_override(&complete);
+    let tm = mock.tm();
+    let entered = Arc::new(Semaphore::new(0));
+    let dropped = Arc::new(Semaphore::new(0));
+    let release = Arc::new(std::sync::Barrier::new(2));
+    let (tx, rx) = mpsc::channel(1);
+    let stream = SlowChecksumStream {
+        inner: TestStream::unknown_length(rx),
+        entered: entered.clone(),
+        release: release.clone(),
+        dropped: dropped.clone(),
+    };
+    let handle = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .checksum_strategy(ChecksumStrategy::with_calculated_crc32())
+        .body(InputStream::from_part_stream(stream))
+        .initiate()
+        .unwrap();
+    tx.send(Bytes::from_static(b"part one")).await.unwrap();
+    drop(tx);
+    tokio::time::timeout(SOURCE_RELEASE_TIMEOUT, entered.acquire())
+        .await
+        .expect("CompleteMultipartUpload did not request the checksum")
+        .expect("semaphore closed")
+        .forget();
+    assert_eq!(complete.num_calls(), 0);
+
+    drop(handle);
+    release.wait();
+    drop(tm);
+    tokio::time::timeout(SOURCE_RELEASE_TIMEOUT, dropped.acquire())
+        .await
+        .expect("the stream was not dropped")
+        .expect("semaphore closed")
+        .forget();
+    assert_eq!(complete.num_calls(), 0);
 }
