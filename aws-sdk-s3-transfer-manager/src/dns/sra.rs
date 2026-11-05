@@ -713,9 +713,10 @@ mod testing {
         address_set.add_address(local);
 
         let now = Instant::now();
-        let mut acquired_addresses: Vec<Ipv4Addr> = Vec::new();
-        acquired_addresses.push(address_set.acquire_address(now).unwrap());
-        acquired_addresses.push(address_set.acquire_address(now).unwrap());
+        let acquired_addresses: Vec<Ipv4Addr> = vec![
+            address_set.acquire_address(now).unwrap(),
+            address_set.acquire_address(now).unwrap(),
+        ];
 
         assert!(acquired_addresses.contains(&loopback));
         assert!(acquired_addresses.contains(&local));
@@ -730,10 +731,11 @@ mod testing {
         address_set.add_address(loopback);
 
         let now = Instant::now();
-        let mut acquired_addresses: Vec<Ipv4Addr> = Vec::new();
-        acquired_addresses.push(address_set.acquire_address(now).unwrap());
-        acquired_addresses.push(address_set.acquire_address(now).unwrap());
-        acquired_addresses.push(address_set.acquire_address(now).unwrap());
+        let acquired_addresses: Vec<Ipv4Addr> = vec![
+            address_set.acquire_address(now).unwrap(),
+            address_set.acquire_address(now).unwrap(),
+            address_set.acquire_address(now).unwrap(),
+        ];
 
         for address in &acquired_addresses {
             assert_eq!(loopback, *address);
@@ -752,13 +754,14 @@ mod testing {
         address_set.add_address(local);
 
         let now = Instant::now();
-        let mut acquired_addresses: Vec<Ipv4Addr> = Vec::new();
-        acquired_addresses.push(address_set.acquire_address(now).unwrap());
-        acquired_addresses.push(address_set.acquire_address(now).unwrap());
-        acquired_addresses.push(address_set.acquire_address(now).unwrap());
-        acquired_addresses.push(address_set.acquire_address(now).unwrap());
-        acquired_addresses.push(address_set.acquire_address(now).unwrap());
-        acquired_addresses.push(address_set.acquire_address(now).unwrap());
+        let acquired_addresses: Vec<Ipv4Addr> = vec![
+            address_set.acquire_address(now).unwrap(),
+            address_set.acquire_address(now).unwrap(),
+            address_set.acquire_address(now).unwrap(),
+            address_set.acquire_address(now).unwrap(),
+            address_set.acquire_address(now).unwrap(),
+            address_set.acquire_address(now).unwrap(),
+        ];
 
         for idx in 0..3 {
             let start_index = idx * 2;
@@ -1387,7 +1390,7 @@ mod testing {
         let connection_error =
             HostEventConnectionError::builder(ConnectionErrorCategory::Fatal).build();
         let connection_failure_event: HostEvent = HostEvent::builder(
-            &MOCK_HOST,
+            MOCK_HOST,
             address_to_ban,
             HostEventInformation::ConnectionError(connection_error),
         )
@@ -1461,7 +1464,7 @@ mod testing {
         let connection_error =
             HostEventConnectionError::builder(ConnectionErrorCategory::Fatal).build();
         let connection_failure_event: HostEvent = HostEvent::builder(
-            &MOCK_HOST,
+            MOCK_HOST,
             LOCALHOST_IPV4,
             HostEventInformation::ConnectionError(connection_error),
         )
@@ -1510,7 +1513,7 @@ mod testing {
         let connection_error =
             HostEventConnectionError::builder(ConnectionErrorCategory::Fatal).build();
         let connection_failure_event: HostEvent = HostEvent::builder(
-            &MOCK_HOST,
+            MOCK_HOST,
             LOCALHOST_IPV4,
             HostEventInformation::ConnectionError(connection_error),
         )
@@ -1568,7 +1571,7 @@ mod testing {
             HostEventConnectionError::builder(ConnectionErrorCategory::Standard(penalty_duration))
                 .build();
         let connection_failure_event: HostEvent = HostEvent::builder(
-            &MOCK_HOST,
+            MOCK_HOST,
             LOCALHOST_IPV6,
             HostEventInformation::ConnectionError(connection_error),
         )
@@ -1638,7 +1641,7 @@ mod testing {
         let connection_error =
             HostEventConnectionError::builder(ConnectionErrorCategory::Major).build();
         let connection_failure_event: HostEvent = HostEvent::builder(
-            &MOCK_HOST,
+            MOCK_HOST,
             LOCALHOST_IPV6,
             HostEventInformation::ConnectionError(connection_error),
         )
@@ -1708,7 +1711,7 @@ mod testing {
             HostEventConnectionError::builder(ConnectionErrorCategory::Standard(penalty_duration))
                 .build();
         let connection_failure_event: HostEvent = HostEvent::builder(
-            &MOCK_HOST,
+            MOCK_HOST,
             LOCALHOST_IPV6,
             HostEventInformation::ConnectionError(connection_error),
         )
