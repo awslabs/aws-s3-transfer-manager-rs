@@ -1572,6 +1572,75 @@ mod tests {
         );
     }
 
+    /// Two files that derive one key both upload to it and both count as uploaded.
+    #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_files_deriving_one_key_both_upload() {
+        use std::os::unix::ffi::OsStrExt;
+        // (file names, delimiter, key both derive)
+        type Case = ([&'static [u8]; 2], Option<&'static str>, &'static str);
+        let cases: [Case; 2] = [
+            ([b"a-/b", b"a/-b"], Some("--"), "a---b"),
+            ([b"caf\xe9", b"caf\xe8"], None, "caf\u{fffd}"),
+        ];
+        for (names, delimiter, key) in cases {
+            let dir = tempdir().unwrap();
+            for name in names {
+                let path = dir.path().join(std::ffi::OsStr::from_bytes(name));
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, "x").unwrap();
+            }
+
+            let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let captured_cl = captured.clone();
+            let put = mock!(aws_sdk_s3::Client::put_object)
+                .match_requests(move |req| {
+                    captured_cl
+                        .lock()
+                        .unwrap()
+                        .push(req.key().unwrap().to_string());
+                    true
+                })
+                .then_output(|| PutObjectOutput::builder().e_tag("test-etag").build());
+            let s3_client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[put]);
+            let handle = crate::client::Handle::test_handle_tokio(
+                crate::Config::builder().sdk_client(s3_client).build(),
+            );
+
+            let input = super::super::UploadObjectsInputBuilder::default()
+                .bucket("test-bucket")
+                .source(dir.path())
+                .failure_policy(FailedTransferPolicy::Continue)
+                .set_delimiter(delimiter.map(str::to_string))
+                .build()
+                .unwrap();
+            let walker = FsWalker::builder()
+                .recursive(true)
+                .build()
+                .walk(FsWalkContext::builder().root(dir.path()).build());
+
+            let (ctx, completion_rx) = TransferContext::new(handle);
+            let transfer = UploadObjectsTransfer::new(ctx, input, walker);
+            transfer
+                .inner
+                .ctx
+                .handle
+                .scheduler
+                .register_empty_group_for_test(transfer.inner.ctx.id.id);
+
+            timeout(Duration::from_secs(5), async {
+                drive_transfer(&transfer).await;
+                let _ = completion_rx.await;
+            })
+            .await
+            .expect("transfer should complete within timeout");
+
+            assert_eq!(transfer.successful_uploads(), 2, "key={key:?}");
+            assert_eq!(*captured.lock().unwrap(), [key; 2], "key={key:?}");
+        }
+    }
+
     #[cfg(unix)]
     #[cfg_attr(miri, ignore)]
     #[tokio::test]

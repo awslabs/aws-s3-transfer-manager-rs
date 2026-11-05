@@ -1449,6 +1449,56 @@ mod tests {
         assert!(dir.path().join("docs/readme.txt").exists());
     }
 
+    /// Two keys that normalize to one local path both download to it and both count as
+    /// downloaded; the file holds only one object's bytes.
+    #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_keys_normalizing_to_one_path_both_download() {
+        let dir = tempdir().unwrap();
+
+        let list = mock!(aws_sdk_s3::Client::list_objects_v2).then_output(|| {
+            ListObjectsV2Output::builder()
+                .set_contents(Some(vec![
+                    Object::builder().key("a//b").size(5).build(),
+                    Object::builder().key("a/b").size(5).build(),
+                ]))
+                .build()
+        });
+        let get = |key: &'static str, body: &'static [u8]| {
+            mock!(aws_sdk_s3::Client::get_object)
+                .match_requests(move |req| req.key() == Some(key))
+                .then_output(move || {
+                    GetObjectOutput::builder()
+                        .content_length(5)
+                        .body(aws_sdk_s3::primitives::ByteStream::from_static(body))
+                        .build()
+                })
+        };
+        let client = mock_client!(
+            aws_sdk_s3,
+            RuleMode::MatchAny,
+            &[list, get("a//b", b"first"), get("a/b", b"other")]
+        );
+
+        let (transfer, completion_rx) = setup(dir.path(), FailedTransferPolicy::Continue, client);
+
+        timeout(Duration::from_secs(10), async {
+            drive_transfer(&transfer).await;
+            let _ = completion_rx.await;
+        })
+        .await
+        .expect("transfer should complete within timeout");
+
+        assert_eq!(transfer.successful_downloads(), 2);
+        assert!(transfer.take_failed().is_none());
+        let files: Vec<_> = std::fs::read_dir(dir.path().join("a"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(files, ["b"]);
+    }
+
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_prefix_stripping() {
