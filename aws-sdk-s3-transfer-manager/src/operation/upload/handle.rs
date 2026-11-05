@@ -30,6 +30,16 @@ use crate::types::{AbortOutcome, AbortedUpload};
 /// let output = handle.join().await?;
 /// ```
 ///
+/// # Custom stream bodies
+///
+/// When the upload fails or is cancelled, it drops a body created with
+/// [`InputStream::from_part_stream`](crate::io::InputStream::from_part_stream) without waiting for
+/// this handle to be dropped. A producer feeding the stream can therefore observe the end of the
+/// upload through the stream's own drop, for example a channel's sender returning an error, while
+/// the caller keeps the handle to learn the outcome from [`join`](Self::join). Work already holding
+/// the stream at that moment, such as a poll in progress, drops it when that work stops. On
+/// success, the stream is dropped after the upload completes.
+///
 /// # Cancellation
 ///
 /// The operation can be cancelled either by dropping this handle or by calling
@@ -42,6 +52,7 @@ use crate::types::{AbortOutcome, AbortedUpload};
 /// - Queued work is purged from the scheduler
 /// - In-flight work is interrupted at its next await point
 /// - `AbortMultipartUpload` is **not** called (multipart uploads may be left incomplete)
+/// - The ID of a multipart upload left open is logged at `WARN`
 /// - Drop returns immediately without waiting for in-flight work
 ///
 /// **Warning:** Dropping a handle for a multipart upload without calling `abort()` may

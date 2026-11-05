@@ -777,7 +777,7 @@ pub(crate) struct MultipartCompletion {
 ///
 /// A multipart upload ID is held from `Transferring` through `CompleteInFlight`
 /// (or `Aborting`) and leaves the state only when CompleteMultipartUpload
-/// succeeds or the abort ends the transfer.
+/// succeeds or the transfer ends.
 #[derive(Debug)]
 pub(crate) enum UploadState {
     /// Waiting to start CreateMPU or PutObject.
@@ -823,7 +823,9 @@ pub(crate) enum UploadState {
         /// set, the transfer ends as failed with it instead of as cancelled.
         failure: Option<UploadFailure>,
     },
-    /// S3 has committed the object; no multipart upload remains open.
+    /// The upload has ended: S3 committed the object, the abort finished, or
+    /// the transfer was ended from outside. The body and part state have been
+    /// dropped.
     Done,
 }
 
