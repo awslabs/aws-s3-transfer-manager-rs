@@ -135,12 +135,13 @@ fn walker_with(order: SortOrder, follow_symlinks: bool) -> FsWalker {
 fn drain_follow(
     rt: &tokio::runtime::Runtime,
     root: &Path,
+    order: SortOrder,
     follow_symlinks: bool,
     expected: usize,
 ) -> usize {
     rt.block_on(async {
         let ctx = FsWalkContext::builder().root(root).build();
-        let mut walk = walker_with(SortOrder::WithinDirectory, follow_symlinks).walk(ctx);
+        let mut walk = walker_with(order, follow_symlinks).walk(ctx);
         let mut n = 0;
         while let Some(result) = walk.next().await {
             if result.is_ok() {
@@ -170,7 +171,89 @@ fn walk_cycle_detection_cost(c: &mut Criterion) {
     group.throughput(Throughput::Elements(count as u64));
     for (label, follow) in [("no_follow", false), ("follow_symlinks", true)] {
         group.bench_function(BenchmarkId::new("balanced_1110dirs", label), |b| {
-            b.iter(|| black_box(drain_follow(&rt, dir.path(), follow, count)));
+            b.iter(|| {
+                black_box(drain_follow(
+                    &rt,
+                    dir.path(),
+                    SortOrder::WithinDirectory,
+                    follow,
+                    count,
+                ))
+            });
+        });
+    }
+    group.finish();
+}
+
+// A balanced tree with `links` file links in the root, each to a file of the tree. With following
+// on, the walk yields each link as the file it reaches, so the count includes the links.
+fn build_balanced_with_links(root: &Path, links: usize) -> usize {
+    let count = build_balanced(root, 10, 3, 10);
+    for i in 0..links {
+        let target = root.join(format!("d{:04}", i % 10)).join("f0000.dat");
+        symlink_file(&target, &root.join(format!("l{i:04}.dat")));
+    }
+    count + links
+}
+
+#[cfg(unix)]
+fn symlink_file(target: &Path, link: &Path) {
+    std::os::unix::fs::symlink(target, link).unwrap();
+}
+
+#[cfg(windows)]
+fn symlink_file(target: &Path, link: &Path) {
+    std::os::windows::fs::symlink_file(target, link).unwrap();
+}
+
+// A sync download with following on and delete mode on reads the destination twice: the walk in key
+// order, and a link scan in native order that records only links. The two run beside
+// each other in a sync run. Here they run one after the other on one thread, so `walk_and_scan`
+// is the most the second read can add. The scan's link naming is crate-private and not timed.
+fn walk_sync_link_scan_cost(c: &mut Criterion) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let plain = TempDir::new().unwrap();
+    let plain_count = build_balanced(plain.path(), 10, 3, 10);
+    let linked = TempDir::new().unwrap();
+    let linked_count = build_balanced_with_links(linked.path(), 100);
+
+    let mut group = c.benchmark_group("walk_sync_link_scan");
+    for (label, dir, count) in [
+        ("balanced_1110files", &plain, plain_count),
+        ("balanced_1110files_100links", &linked, linked_count),
+    ] {
+        group.throughput(Throughput::Elements(count as u64));
+        group.bench_function(BenchmarkId::new(label, "walk"), |b| {
+            b.iter(|| {
+                black_box(drain_follow(
+                    &rt,
+                    dir.path(),
+                    SortOrder::WholeWalk,
+                    true,
+                    count,
+                ))
+            });
+        });
+        group.bench_function(BenchmarkId::new(label, "scan"), |b| {
+            b.iter(|| {
+                black_box(drain_follow(
+                    &rt,
+                    dir.path(),
+                    SortOrder::Native,
+                    true,
+                    count,
+                ))
+            });
+        });
+        group.bench_function(BenchmarkId::new(label, "walk_and_scan"), |b| {
+            b.iter(|| {
+                let walked = drain_follow(&rt, dir.path(), SortOrder::WholeWalk, true, count);
+                let scanned = drain_follow(&rt, dir.path(), SortOrder::Native, true, count);
+                black_box(walked + scanned)
+            });
         });
     }
     group.finish();
@@ -362,7 +445,8 @@ criterion_group!(
     walk_throughput,
     walk_first_entry_latency,
     walk_first_entry_scaling,
-    walk_cycle_detection_cost
+    walk_cycle_detection_cost,
+    walk_sync_link_scan_cost
 );
 
 fn main() {
