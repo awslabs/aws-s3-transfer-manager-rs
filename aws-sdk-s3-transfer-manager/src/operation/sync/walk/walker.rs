@@ -130,6 +130,7 @@ impl Walker {
     // It needs every link and no key order, so it skips the sort.
     fn fs_walk(&self, root: PathBuf, sort: SortOrder) -> FsWalk {
         FsWalker::builder()
+            .root_as_named(true)
             .sort(sort)
             .recursive(true)
             .include_special_files(true)

@@ -875,9 +875,12 @@ root as a directory nobody has created yet.
 
 A link to a directory that contains the root is a loop, and the walk stops at the link. The check
 covers the directories above the root as spelled and above the resolved root, because a link can
-reach either chain. It identifies each directory by the device and inode that `stat` returns. `stat`
-needs only search permission, so a directory the run can enter and cannot list still counts. The
-check costs one `stat` for each directory above the root, once per run, and only with following on.
+reach either chain. The walk already keeps a handle for each directory on its descent path, and it
+compares a link's target against the handles on that path. So the directories above the root join
+the path when the walk starts. Opening a directory for its handle needs read permission. A directory
+above the root that the run cannot open stays out of the chain, and a link to it fails the same way:
+the walk cannot read that directory either, so it reports the link's subtree as unreadable. The
+check costs one open for each directory above the root, once per run, and only with following on.
 
 **D9. Sync checks a path again when it acts.** The holds come from the walk, and two things slip
 past them (case I). The filesystem can match a key's name to a link's name without regard to case or
