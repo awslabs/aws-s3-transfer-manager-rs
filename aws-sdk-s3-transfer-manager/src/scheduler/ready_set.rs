@@ -624,7 +624,7 @@ impl ReadySet {
 }
 
 /// Marker error returned from [`ReadySet::insert`] when a child's parent group
-/// does not exist. The error does not cancel or unregister the orphaned child.
+/// does not exist. The orphaned child must be cancelled and unregistered.
 #[derive(Debug)]
 pub(super) struct OrphanedChild;
 
@@ -1174,19 +1174,20 @@ mod loom_tests {
         });
     }
 
-    /// Models queued members whose liveness can change concurrently.
+    /// Models member publication, counting, and root coordination.
     ///
     /// Uses production `GroupState` atomics with separate insert/pop control
-    /// flow, mutex-backed storage, and liveness flags. Does not execute
-    /// `ReadySet` or model weak-reference ownership.
-    struct LoomWeakGroup {
+    /// flow and mutex-backed storage. Does not execute `ReadySet` or model
+    /// weak-reference ownership.
+    struct LoomMemberGroup {
         group: LoomGroup,
-        members: loom::sync::Mutex<std::collections::VecDeque<Arc<loom::sync::atomic::AtomicBool>>>,
+        members: loom::sync::Mutex<std::collections::VecDeque<usize>>,
     }
 
-    impl LoomWeakGroup {
-        fn insert(&self, alive: Arc<loom::sync::atomic::AtomicBool>) {
-            self.members.lock().unwrap().push_back(alive);
+    impl LoomMemberGroup {
+        fn insert(&self, member: usize) {
+            // A lower-vruntime arrival can be selected before its count update.
+            self.members.lock().unwrap().push_front(member);
             let prev = self.group.state.enqueue();
             if prev == 0 && self.group.state.try_enter_root() {
                 self.group.state.set_group_vruntime(0);
@@ -1194,60 +1195,60 @@ mod loom_tests {
             }
         }
 
-        /// Pops one member and returns whether it was live.
-        fn pop(&self) -> bool {
+        /// Removes at most one member per root selection, then coordinates re-entry.
+        fn pop(&self) -> Option<usize> {
             self.group.root_entries.fetch_sub(1, Ordering::SeqCst);
-            let found = match self.members.lock().unwrap().pop_front() {
-                Some(member) => {
-                    self.group.state.dequeue();
-                    member.load(Ordering::SeqCst)
-                }
-                None => false,
-            };
+            let member = self.members.lock().unwrap().pop_front();
+            if member.is_some() {
+                assert!(self.group.state.dequeue() > 0, "nr_queued underflow");
+            }
             self.group.state.exit_root();
             if self.group.state.nr_queued() > 0 && self.group.state.try_enter_root() {
                 self.group.root_entries.fetch_add(1, Ordering::SeqCst);
             }
-            found
+            member
         }
     }
 
     // ref: V2429410200
-    /// A modeled pop racing insertion and liveness loss removes one member.
-    /// The model's count matches its storage and root presence.
-    ///
-    /// The liveness result is not asserted. The oracle checks publication,
-    /// member counting, and root presence, not dead-entry retry.
+    /// A modeled pop racing member publication removes exactly one entry.
+    /// After insertion completes, the remaining member is counted and reachable.
     ///
     /// Removing more than one entry per root-tree pop can wrap the count: the
-    /// second removal can take the racing insert's entry before its
-    /// `enqueue`, wrapping `nr_queued`.
+    /// racing insert publishes its entry before incrementing `nr_queued`.
     #[test]
-    fn pop_skipping_a_released_member_concurrent_with_insert() {
+    fn pop_concurrent_with_member_publication_preserves_group_membership() {
         loom::model(|| {
-            let first = Arc::new(loom::sync::atomic::AtomicBool::new(true));
-            let group = Arc::new(LoomWeakGroup {
+            const FIRST: usize = 1;
+            const SECOND: usize = 2;
+            let group = Arc::new(LoomMemberGroup {
                 group: LoomGroup::new(1),
-                members: loom::sync::Mutex::new([Arc::clone(&first)].into_iter().collect()),
+                members: loom::sync::Mutex::new([FIRST].into_iter().collect()),
             });
 
-            let release = thread::spawn(move || first.store(false, Ordering::SeqCst));
             let g = Arc::clone(&group);
-            let insert = thread::spawn(move || {
-                g.insert(Arc::new(loom::sync::atomic::AtomicBool::new(true)))
-            });
-            let _live = group.pop();
-            release.join().unwrap();
+            let insert = thread::spawn(move || g.insert(SECOND));
+            let popped = group.pop().expect("the initial member is available");
+            let remaining = match popped {
+                FIRST => SECOND,
+                SECOND => FIRST,
+                member => panic!("unexpected member {member}"),
+            };
             insert.join().unwrap();
 
-            let queued = group.members.lock().unwrap().len();
-            assert_eq!(queued, 1, "one root pop removes exactly one entry");
-            assert_eq!(group.group.count(), queued, "nr_queued drifted");
             assert_eq!(
-                group.group.is_in_root(),
-                queued > 0,
-                "root membership wrong"
+                *group.members.lock().unwrap(),
+                [remaining],
+                "one root pop removes exactly one entry"
             );
+            assert_eq!(group.group.count(), 1, "nr_queued drifted");
+            assert!(group.group.is_in_root(), "remaining member is unreachable");
+            assert!(group.group.root_entries_valid(), "duplicate root entry");
+
+            assert_eq!(group.pop(), Some(remaining));
+            assert!(group.members.lock().unwrap().is_empty());
+            assert_eq!(group.group.count(), 0);
+            assert!(!group.group.is_in_root());
             assert!(group.group.root_entries_valid(), "duplicate root entry");
         });
     }

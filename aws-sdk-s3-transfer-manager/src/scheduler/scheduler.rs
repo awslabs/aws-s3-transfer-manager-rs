@@ -27,6 +27,12 @@
 //!                  └──────────── on_completion() ◄──────────────────┘
 //! ```
 //!
+//! The registry owns each descriptor. Ready set entries do not keep a
+//! descriptor alive, so the scheduler releases its reference to a transfer
+//! once the transfer has left the registry and no transient holder, such as
+//! an in-progress poll, a dispatched work item, or a canceller waiting for
+//! it to go idle, still holds its descriptor.
+//!
 //! # Fair Scheduling (CFS)
 //!
 //! When multiple transfers are ready, the scheduler uses Completely Fair Scheduling.
@@ -73,11 +79,6 @@
 //! - **Ready set entries are unique per transfer id.** Duplicates re-open the
 //!   single-poll invariant and produce lock-contention storms under burst
 //!   completions.
-//! - **The registry owns each descriptor.** Ready set entries do not keep a
-//!   descriptor alive, so the scheduler releases its reference to a transfer
-//!   once the transfer has left the registry and no transient holder, such as
-//!   an in-progress poll, a dispatched work item, or a canceller waiting for
-//!   it to go idle, still holds its descriptor.
 //! - **Composite transfers pay their own per-call cost.** A composite's
 //!   `poll_work` may recursively call [`Scheduler::enqueue_transfer`] to spawn
 //!   children. The per-call fan-out must be bounded - cost is

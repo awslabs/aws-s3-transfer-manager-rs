@@ -822,6 +822,7 @@ async fn write_to_path_drop_clients_then_unlink_releases_destination() {
             .unwrap(),
     );
     let shared = common::shared_config(StaticReplayClient::new(vec![response]));
+    // Reproduce the reported drop sequence with both clients sharing SDK configuration.
     let s3 = aws_sdk_s3::Client::new(&shared);
     let tm = aws_sdk_s3_transfer_manager::Client::new(
         aws_sdk_s3_transfer_manager::Config::builder()
