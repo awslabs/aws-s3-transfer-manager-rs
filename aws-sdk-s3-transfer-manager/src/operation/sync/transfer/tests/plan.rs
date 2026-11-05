@@ -37,7 +37,8 @@ async fn an_archived_object_and_a_restoring_one_are_counted_apart() {
             },
             Obstruction::NothingToRead
             | Obstruction::UnfollowedLink
-            | Obstruction::ExcludedLink => {
+            | Obstruction::ExcludedLink
+            | Obstruction::LinkToDirectory => {
                 unreachable!("not under test here")
             }
         };

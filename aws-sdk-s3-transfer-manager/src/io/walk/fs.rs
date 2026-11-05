@@ -167,7 +167,8 @@ pub struct FsEntry {
     file_type: FileType,
     // True when the walk arrived here through a symlink it resolved, so this describes what the
     // link points at. False for a path reached directly, and for a link left alone — which
-    // `file_type` reports as `Symlink`.
+    // `file_type` reports as `Symlink`. A `Symlink` entry with this set is a link the walk followed
+    // into a directory: the walk yields the link's own name, and descends into it as well.
     followed_symlink: bool,
     path_filtered: PathFiltered,
     // The walk root, shared by every entry it produces. `relative_path` is a suffix of
@@ -1039,6 +1040,18 @@ impl FsWalk {
                                 continue;
                             }
                             if depth < self.config.max_depth {
+                                // The link's own name is taken, even though no file sits there. A
+                                // consumer that reads absence from the stream hears about it, as it
+                                // hears about a special file.
+                                if self.config.include_special_files && !rejected {
+                                    self.push_entry(
+                                        &mut result.children,
+                                        path.clone(),
+                                        None,
+                                        FileType::Symlink,
+                                        true,
+                                    );
+                                }
                                 result.followed.push(FollowedLink::Directory(path.clone()));
                                 result.children.push(Child::Dir(PendingDir {
                                     path,

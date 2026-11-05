@@ -75,6 +75,10 @@ pub(crate) enum Obstruction {
     // still hides the keys under the name, so the merge drops this entry and holds back those
     // keys.
     ExcludedLink,
+    // The item is a link the walk followed into a directory. The keys under its name come from the
+    // directory, so this entry stands only for the name itself. It pairs only with the same key on
+    // the other side: a download there replaces the link, and no-overwrite keeps it.
+    LinkToDirectory,
     // An object whose bytes sit in an archive with no restored copy to read.
     Archived,
     // A restore is under way. The bytes arrive when it finishes, so a later run gets them.
@@ -91,6 +95,8 @@ impl Obstruction {
             Self::NothingToRead => true,
             // The merge drops an excluded link before any comparison reads this answer.
             Self::ExcludedLink => true,
+            // The rename replaces the link and leaves the directory it points at alone.
+            Self::LinkToDirectory => false,
             // A download renames its file onto the destination name, and the rename replaces a
             // link at that name. `download_objects` replaces the link the same way.
             Self::UnfollowedLink => false,
@@ -494,7 +500,13 @@ impl KeyStream for FsWalk {
                     obstruction: match (entry.path_filtered(), entry.file_type()) {
                         (PathFiltered::Excluded, _) => Some(Obstruction::ExcludedLink),
                         (PathFiltered::Kept, FileType::Regular) => None,
-                        // The walk reports a link as a link when it left the link unfollowed.
+                        // The walk followed this link into a directory. It went inside, and it
+                        // also reports the link's own name here.
+                        (PathFiltered::Kept, FileType::Symlink) if entry.followed_symlink() => {
+                            Some(Obstruction::LinkToDirectory)
+                        }
+                        // The walk did not follow this link. The entry is the link itself, and the
+                        // walk read nothing behind it.
                         (PathFiltered::Kept, FileType::Symlink) => {
                             Some(Obstruction::UnfollowedLink)
                         }
