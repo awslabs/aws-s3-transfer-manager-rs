@@ -4331,6 +4331,133 @@ fn downloading_in_mode(
     (transfer, ctx, rx)
 }
 
+// Execute the run's first work item, the merge. The merge then has decided every key of a small
+// tree, and nothing has acted on them yet.
+async fn decide_without_acting<S, D>(t: &SyncTransfer<S, D>)
+where
+    S: crate::io::key::stream::KeyStream + Send + 'static,
+    D: crate::io::key::stream::KeyStream + Send + 'static,
+    S::Source: Send + 'static,
+    D::Source: Send + 'static,
+{
+    let PollWork::Ready { io: mut work, .. } = t.poll_work() else {
+        panic!("the first work a run hands out is its merge");
+    };
+    t.execute(&mut work).await;
+}
+
+// Swap the directory `dir` for a link to `target`, as another program might during a run.
+#[cfg(unix)]
+fn swap_for_a_link(dir: &Path, target: &Path) {
+    std::fs::remove_dir_all(dir).expect("the directory goes");
+    std::os::unix::fs::symlink(target, dir).expect("a link in its place");
+}
+
+// A link that appears after the walk read its directory slips past every hold. With
+// following off, the download checks the path just before it writes, and it skips the key. With
+// following on, a write through a link above the file is allowed on purpose.
+#[cfg(unix)]
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn a_download_checks_its_path_for_a_link_just_before_it_writes() {
+    for (follow, writes_through) in [(false, false), (true, true)] {
+        let outside = tempfile::tempdir().expect("outside");
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonical root");
+        std::fs::create_dir(root.join("d")).expect("d");
+        let (t, ctx, rx) = downloading_into_walking(
+            &root,
+            a_bucket_to_download(&["d/a.txt"], 1_600_000_000),
+            DeleteMode::Off,
+            Walker::builder().follow_symlinks(follow).build(),
+        );
+        decide_without_acting(&t).await;
+        swap_for_a_link(&root.join("d"), outside.path());
+        run_managed(&t, &ctx, rx).await;
+        let wrote = outside.path().join("a.txt").exists();
+        assert_eq!(wrote, writes_through, "following {follow}");
+        assert_eq!(t.is_plan_complete(), follow, "following {follow}");
+    }
+}
+
+// A local delete checks its path for a link in either follow setting. A link that appeared
+// after the walk read its directory would make the delete remove a file outside the root.
+#[cfg(unix)]
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn a_local_delete_checks_its_path_for_a_link_just_before_it_acts() {
+    let outside = tempfile::tempdir().expect("outside");
+    std::fs::write(outside.path().join("x.txt"), b"keep me").expect("x.txt outside");
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path().canonicalize().expect("canonical root");
+    std::fs::create_dir(root.join("d")).expect("d");
+    std::fs::write(root.join("d/x.txt"), b"x").expect("d/x.txt");
+    let (t, ctx, rx) = downloading_into_walking(
+        &root,
+        a_bucket_to_download(&[], 1_600_000_000),
+        DeleteMode::On,
+        Walker::builder().build(),
+    );
+    decide_without_acting(&t).await;
+    swap_for_a_link(&root.join("d"), outside.path());
+    run_managed(&t, &ctx, rx).await;
+    assert!(
+        outside.path().join("x.txt").exists(),
+        "the delete went through a link to a file outside the root"
+    );
+    assert!(!t.is_plan_complete());
+}
+
+// With following off, an upload checks the path just before it reads.
+#[cfg(unix)]
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn an_upload_checks_its_path_for_a_link_just_before_it_reads() {
+    let outside = tempfile::tempdir().expect("outside");
+    std::fs::write(outside.path().join("a.txt"), b"not yours").expect("a.txt outside");
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path().canonicalize().expect("canonical root");
+    std::fs::create_dir(root.join("d")).expect("d");
+    std::fs::write(root.join("d/a.txt"), b"x").expect("d/a.txt");
+    let (client, _deleted) = listing_and_recording_deletes(&[], 1);
+    let (t, _ctx) = upload_run(&root, client, Walker::builder().build());
+    decide_without_acting(&t).await;
+    swap_for_a_link(&root.join("d"), outside.path());
+    drive(&t).await;
+    let snapshot = t.inner.state.lock().snapshot();
+    assert_eq!(
+        snapshot.decided.transfers, 0,
+        "the upload read through the link"
+    );
+    assert_eq!(snapshot.decided.skipped.unread, 1);
+    assert!(!t.is_plan_complete());
+}
+
+// On a disk that ignores case, the key `photos/a.jpg` reaches the link `Photos`. The
+// merge compares names byte for byte, so its hold on `Photos` misses the key. The check asks the
+// disk, and the disk finds the link. On a disk that respects case, the download lands in a new
+// `photos/`, and nothing reaches the link either.
+#[cfg(unix)]
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn a_download_never_writes_through_a_link_that_matches_only_by_case() {
+    let outside = tempfile::tempdir().expect("outside");
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path().canonicalize().expect("canonical root");
+    std::os::unix::fs::symlink(outside.path(), root.join("Photos")).expect("symlink");
+    let (t, ctx, rx) = downloading_into(
+        &root,
+        a_bucket_to_download(&["photos/a.jpg"], 1_600_000_000),
+        DeleteMode::Off,
+    );
+    run_managed(&t, &ctx, rx).await;
+    let escaped: Vec<_> = std::fs::read_dir(outside.path()).expect("reads").collect();
+    assert!(
+        escaped.is_empty(),
+        "a download wrote through a link it matched by case"
+    );
+}
+
 // The run starts at the root the caller named, even when the root is a link. The
 // follow setting covers the entries inside the root.
 #[cfg(unix)]

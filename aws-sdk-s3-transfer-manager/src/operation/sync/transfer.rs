@@ -12,7 +12,7 @@ use std::sync::Arc;
 use crate::io::key::stream::{KeyStream, StreamError};
 use crate::operation::sync::compare::{Compare, Decision, Verdict};
 use crate::operation::sync::input::{DeleteMode, RunSettings};
-use crate::operation::sync::walk::{LinkScan, Progress, Walk};
+use crate::operation::sync::walk::{link_on_path, LinkScan, Progress, Walk};
 use crate::transfer::{IoRequest, PollWork, Transfer, TransferContext, WorkOutcome};
 use crate::types::FailedTransferPolicy;
 
@@ -139,6 +139,10 @@ where
     failure_policy: FailedTransferPolicy,
     // Allow sync to remove destination-only keys. Delete mode requires caller opt-in.
     delete_mode: DeleteMode,
+    // The local root, when the run checks a path for a link just before it acts.
+    check_root: Option<std::path::PathBuf>,
+    // Whether the check also runs before each read and write. Local deletes are always checked.
+    check_transfers: bool,
 }
 
 impl<S, D> SyncTransfer<S, D>
@@ -157,6 +161,10 @@ where
         settings: RunSettings,
     ) -> Self {
         let namespace = deleter.namespace();
+        let (check_root, check_transfers) = match walk.link_check() {
+            Some((root, transfers)) => (Some(root.to_path_buf()), transfers),
+            None => (None, false),
+        };
         Self {
             inner: Arc::new(Inner {
                 ctx,
@@ -165,6 +173,8 @@ where
                 deleter,
                 delete_mode: settings.delete_mode,
                 failure_policy: settings.failure_policy,
+                check_root,
+                check_transfers,
                 state: Mutex::new(State::new(walk, settings.max_children, namespace)),
             }),
         }
@@ -197,6 +207,13 @@ where
                 // Spawn without the state lock. The reservation holds the slot until the child
                 // starts.
                 drop(state);
+                // A link that appeared after the walk read its directory, or that the walk matched
+                // to the key only by case, can stand on the path. The slot goes back when the
+                // reservation drops.
+                if self.link_on_path_of(pairing.key(), self.inner.check_transfers) {
+                    self.inner.state.lock().skip_transfer();
+                    return PollWork::Spawned;
+                }
                 let spawned = match pairing.source().entry() {
                     Some(entry) => {
                         self.inner
@@ -251,6 +268,15 @@ where
         // transfer.
         self.inner.ctx.set_pending();
         PollWork::Pending
+    }
+
+    // Whether a link stands on the path of `key` below the local root, when `checked` asks for the
+    // check.
+    fn link_on_path_of(&self, key: &str, checked: bool) -> bool {
+        match &self.inner.check_root {
+            Some(root) if checked => link_on_path(root, key),
+            _ => false,
+        }
     }
 
     // Return true after cancellation or an aborting failure. The transfer stays active until
@@ -483,6 +509,18 @@ where
                 self.inner.ctx.try_wake();
                 return WorkOutcome::Cancelled;
             }
+        }
+
+        // Each local delete checks its path for a link first. A delete through a link would
+        // remove a file outside the place the merge decided about.
+        let tree = self.inner.deleter.namespace() == delete::Namespace::Tree;
+        let (kept, keys): (Vec<String>, Vec<String>) = keys
+            .into_iter()
+            .partition(|key| self.link_on_path_of(key, tree));
+        if !kept.is_empty() {
+            let mut state = self.inner.state.lock();
+            state.deletes.record_response(kept.len(), 0);
+            state.keep_deletes(&kept);
         }
 
         let sent = keys.len();

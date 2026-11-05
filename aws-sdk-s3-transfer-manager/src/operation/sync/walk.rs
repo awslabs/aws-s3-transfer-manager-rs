@@ -490,6 +490,29 @@ enum Links {
     Scanned { names: Vec<String> },
 }
 
+// Whether a link stands among a key's parent directories below the root. A read, a write, or
+// a delete through that link would act on the link's target. The key's own name stays out of the
+// check, because delete mode removes a link as a link and a download's rename replaces one.
+//
+// The check goes through the filesystem's own name lookup, so on a disk that ignores case, asking
+// about `photos` finds the link `Photos`. An absent component holds no link below it, and an
+// unreadable one fails the action itself, so neither counts.
+pub(crate) fn link_on_path(root: &Path, key: &str) -> bool {
+    let Some((parents, _own_name)) = key.rsplit_once('/') else {
+        return false;
+    };
+    let mut at = root.to_path_buf();
+    for part in parents.split('/') {
+        at.push(part);
+        match std::fs::symlink_metadata(&at) {
+            Ok(meta) if meta.file_type().is_symlink() => return true,
+            Ok(_) => {}
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
 // The key an aliased name stands for, of either kind.
 fn name_of(name: &AliasedName) -> &str {
     let (AliasedName::File(name) | AliasedName::Directory(name)) = name;
@@ -535,6 +558,10 @@ pub(crate) struct Walk<S: KeyStream, D: KeyStream> {
     // The link scan this walk's run starts, until the run takes it.
     link_scan: Option<LinkScan>,
     links: Links,
+    // Whether the run checks the path for a link before each read and write, as well as before each
+    // local delete. True with following off. With following on, a read or a write passes
+    // through a link above the file on purpose.
+    checks_transfers: bool,
 }
 
 impl<S: KeyStream, D: KeyStream> Walk<S, D> {
@@ -548,7 +575,15 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
             ended_by_failure: false,
             link_scan: None,
             links: Links::NoScan,
+            checks_transfers: false,
         }
+    }
+
+    // The local root, and whether the run checks reads and writes as well as deletes for a link on
+    // the path. `None` when neither side walks a filesystem.
+    pub(crate) fn link_check(&self) -> Option<(&Path, bool)> {
+        let root = self.src.root.as_deref().or(self.dst.root.as_deref())?;
+        Some((root, self.checks_transfers))
     }
 
     // Give the run its link scan. The run reads the scan beside the merge and hands the result back
@@ -858,7 +893,9 @@ impl Walker {
         let local = self.local_walk(ctx.local_root);
         let remote = self.remote_walk(ctx.client, ctx.bucket, ctx.prefix)?;
         // Only the source walks a filesystem; a listing names its own lost keys.
-        Ok(Walk::new(local, remote).with_roots(Some(root), None))
+        let mut walk = Walk::new(local, remote).with_roots(Some(root), None);
+        walk.checks_transfers = !self.follow_symlinks;
+        Ok(walk)
     }
 
     // The same two roots the other way round: the listing is the source and the local tree is
@@ -882,6 +919,7 @@ impl Walker {
         let local =
             LocalDestination::new(self.local_walk(ctx.local_root), &root).naming_aliases(names);
         let mut walk = Walk::new(remote, local).with_roots(None, Some(root.clone()));
+        walk.checks_transfers = !self.follow_symlinks;
         if names && self.follow_symlinks {
             walk.link_scan = Some(LinkScan {
                 walk: self.fs_walk(root.clone(), SortOrder::Native),

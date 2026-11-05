@@ -726,14 +726,32 @@ impl<S: KeyStream, D: KeyStream> State<S, D> {
         if kept.is_empty() {
             return;
         }
+        self.keep_deletes(&kept);
+    }
+
+    // Keep these decided deletes, because a link may stand where the delete would act. The run
+    // reports each kept key as `skipped-unknown`, and it fails each download held behind one, as for
+    // a refused removal.
+    pub(super) fn keep_deletes(&mut self, kept: &[String]) {
+        if kept.is_empty() {
+            return;
+        }
         let count = kept.len() as u64;
         self.decided.deletes -= count;
         self.decided.skipped.unread += count;
         self.mark_plan_incomplete();
-        self.deletes.settle(&kept);
-        for key in &kept {
+        self.deletes.settle(kept);
+        for key in kept {
             self.transfers.fail_held(key);
         }
+    }
+
+    // Skip one decided transfer, because a link stands on the path it would read or write. The run
+    // reports the key as `skipped-unknown`.
+    pub(super) fn skip_transfer(&mut self) {
+        self.decided.transfers -= 1;
+        self.decided.skipped.unread += 1;
+        self.mark_plan_incomplete();
     }
 
     pub(super) fn is_execution_complete(&self) -> bool {

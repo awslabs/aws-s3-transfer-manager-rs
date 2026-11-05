@@ -1091,31 +1091,38 @@ already reached only when the scan never saw the name (case M).
 
 ### Checking a path when sync acts
 
-Execution runs the D9 check before each local delete, and with following off before each upload read
-and each download write. The check walks the key's parent components below the root:
+The walk records whether the run checks reads and writes, and execution reads that from the walk
+when the run starts. A local delete always gets the check. With following off, each upload read and
+each download write get it too. The check walks the key's parent components below the root:
 
 ```rust
-// The first link among a key's parent components below the root. A delete or a write through that
-// link would act on the link's target.
-fn link_on_path(root: &Path, key: &str) -> Option<PathBuf> {
-    let (parents, _own_name) = key.rsplit_once('/')?;
+pub(crate) fn link_on_path(root: &Path, key: &str) -> bool {
+    let Some((parents, _own_name)) = key.rsplit_once('/') else {
+        return false;
+    };
     let mut at = root.to_path_buf();
     for part in parents.split('/') {
         at.push(part);
         match std::fs::symlink_metadata(&at) {
-            Ok(meta) if meta.file_type().is_symlink() => return Some(at),
+            Ok(meta) if meta.file_type().is_symlink() => return true,
             Ok(_) => {}
             // Nothing below an absent component can be a link, and an unreadable component fails
             // the action itself.
-            Err(_) => return None,
+            Err(_) => return false,
         }
     }
-    None
+    false
 }
 ```
 
 `symlink_metadata` goes through the filesystem's own name lookup. On a filesystem that ignores case,
 `photos` therefore finds the link `Photos` (case I).
+
+Execution checks a transfer in `poll_work` after it claims a slot, just before the spawn. A key with
+a link on its path gives the slot back and reports `skipped-unknown`. Execution checks a local
+delete in the delete work item, just before the removal. A kept delete reports `skipped-unknown`,
+and each download held behind it fails, as behind a refused removal. Both paths mark the plan
+incomplete.
 
 ### What this design does not decide
 
