@@ -624,7 +624,7 @@ impl ReadySet {
 }
 
 /// Marker error returned from [`ReadySet::insert`] when a child's parent group
-/// does not exist. The orphaned child must be cancelled and unregistered.
+/// does not exist. The child is not queued, and its ready-set claim is released.
 #[derive(Debug)]
 pub(super) struct OrphanedChild;
 
