@@ -8,10 +8,12 @@ mod common;
 #[path = "download_test/test_util.rs"]
 mod test_util;
 
+#[cfg(unix)]
+use test_util::await_shutdown;
 #[cfg(any(unix, windows))]
 use test_util::{
-    assert_download_releases_destination, await_shutdown, drop_and_await_shutdown, Destination,
-    Ending, OpenFileProbe,
+    assert_download_releases_destination, drop_and_await_shutdown, Destination, Ending,
+    OpenFileProbe,
 };
 
 use aws_sdk_s3_transfer_manager::RuntimeConfig;

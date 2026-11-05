@@ -225,18 +225,26 @@ pub(super) async fn assert_download_releases_destination(
             download.write_to_file(file).unwrap()
         }
     };
-    // Unix identifies the written file by inode, which a `write_to_path`
-    // rename preserves, so the temporary file is probed before the download
-    // ends. Windows probes by path, so it probes the path that exists after.
+    // The temporary path can be renamed or removed. Unix probes pin its
+    // identity; Windows probes keep a hard link for an exclusive open.
     let written = match destination {
-        Destination::Path if cfg!(unix) => {
+        Destination::Path => {
             let temps: Vec<_> = std::fs::read_dir(dir.path())
                 .unwrap()
                 .map(|entry| entry.unwrap().path())
                 .filter(|path| path.to_string_lossy().contains(".s3tmp"))
                 .collect();
             assert_eq!(temps.len(), 1, "temporary files: {temps:?}");
-            temps[0].clone()
+            #[cfg(unix)]
+            {
+                temps[0].clone()
+            }
+            #[cfg(windows)]
+            {
+                let probe_path = dir.path().join("probe.dat");
+                std::fs::hard_link(&temps[0], &probe_path).unwrap();
+                probe_path
+            }
         }
         _ => dest_path.clone(),
     };
@@ -271,6 +279,27 @@ mod tests {
         assert!(!probe.is_open());
 
         let held = std::fs::File::open(&path).unwrap();
+        assert!(probe.is_open());
+        drop(held);
+        assert!(!probe.is_open());
+    }
+
+    /// A hard link preserves the probe across a rename and unlink of the opened path.
+    #[test]
+    fn open_file_probe_reports_a_held_file_through_a_hard_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("held.dat");
+        let probe_path = dir.path().join("probe.dat");
+        let renamed = dir.path().join("renamed.dat");
+        std::fs::write(&path, b"held").unwrap();
+        std::fs::hard_link(&path, &probe_path).unwrap();
+        let probe = OpenFileProbe::new(&probe_path);
+        assert!(!probe.is_open());
+
+        let held = std::fs::File::open(&path).unwrap();
+        std::fs::rename(&path, &renamed).unwrap();
+        assert!(probe.is_open());
+        std::fs::remove_file(&renamed).unwrap();
         assert!(probe.is_open());
         drop(held);
         assert!(!probe.is_open());
