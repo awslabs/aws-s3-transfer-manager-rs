@@ -699,7 +699,7 @@ impl DownloadTransfer {
                 )
                 .await
             }
-            DownloadWork::DrainResident => self.execute_drain_resident(),
+            DownloadWork::DrainResident => self.execute_drain_resident().await,
         }
     }
 
@@ -724,7 +724,7 @@ impl DownloadTransfer {
     /// `ChunkOutput`s returns their carrier charges, which memory admission
     /// re-grants FIFO; the `on_completion -> generate_work` after this returns
     /// re-polls this transfer.
-    fn execute_drain_resident(&self) -> WorkOutcome {
+    async fn execute_drain_resident(&self) -> WorkOutcome {
         // Equivalent to checking the state for `Transferring`, without the
         // state lock. Failure and cancellation move the status off `Active`
         // before the state enters `Terminal`. The only point at which the state
@@ -737,28 +737,29 @@ impl DownloadTransfer {
             return WorkOutcome::Cancelled;
         }
 
-        let flushed = self.inner.writer.flush_resident();
+        let flushed = self.inner.writer.flush_resident().await;
         self.record_disk_write(bytes_drained(&flushed));
 
-        let mut work = self.inner.state.lock().unwrap();
-        if let DownloadState::Transferring {
-            drains_in_flight, ..
-        } = &mut *work
-        {
-            *drains_in_flight -= 1;
-        }
-        let drained = match flushed {
-            Ok(drained) => drained,
-            Err(e) => {
-                return self.fail(work, error::Error::new(error::ErrorKind::IOError, e.source))
+        let (drained, snapshot, completion) = {
+            let mut work = self.inner.state.lock().unwrap();
+            if let DownloadState::Transferring {
+                drains_in_flight, ..
+            } = &mut *work
+            {
+                *drains_in_flight -= 1;
             }
+            let drained = match flushed {
+                Ok(drained) => drained,
+                Err(e) => {
+                    return self.fail(work, error::Error::new(error::ErrorKind::IOError, e.source))
+                }
+            };
+            if let DownloadState::Transferring { gate, .. } = &mut *work {
+                gate.release(drained.parts);
+            }
+            let snapshot = self.snapshot(&work);
+            (drained, snapshot, work.try_claim_completion())
         };
-        if let DownloadState::Transferring { gate, .. } = &mut *work {
-            gate.release(drained.parts);
-        }
-        let snapshot = self.snapshot(&work);
-        let completion = work.try_claim_completion();
-        drop(work);
 
         self.inner
             .observability
@@ -769,7 +770,7 @@ impl DownloadTransfer {
             snapshot,
         );
         if let Some(claim) = completion {
-            return self.finalize_completion(claim);
+            return self.finalize_completion(claim).await;
         }
         self.inner.ctx.try_wake();
         WorkOutcome::Success { data: None }
@@ -837,6 +838,7 @@ impl DownloadTransfer {
             .inner
             .writer
             .prepare(object_range_start, expected_download_len)
+            .await
         {
             let guard = self.inner.state.lock().unwrap();
             return self.fail(
@@ -938,7 +940,7 @@ impl DownloadTransfer {
         }
 
         if let Some(claim) = completion {
-            return self.finalize_completion(claim);
+            return self.finalize_completion(claim).await;
         }
 
         // State changed from DiscoveryInFlight - try to wake
@@ -1091,7 +1093,7 @@ impl DownloadTransfer {
         // occupancy this drain released, accounted under the lock in decrement_in_flight.
         let mut freed = 0u64;
         if slot.fill(chunk) == FillOutcome::DrainReady {
-            let drain = self.inner.writer.drain(DrainMode::Batched);
+            let drain = self.inner.writer.drain(DrainMode::Batched).await;
             self.record_disk_write(bytes_drained(&drain));
             match drain {
                 Ok(drained) => freed = drained.parts,
@@ -1114,7 +1116,7 @@ impl DownloadTransfer {
         });
 
         if let Some(claim) = self.decrement_in_flight(freed) {
-            return self.finalize_completion(claim);
+            return self.finalize_completion(claim).await;
         }
 
         WorkOutcome::Success { data: None }
@@ -1235,7 +1237,7 @@ impl DownloadTransfer {
         // decrement_in_flight.
         let mut freed = 0u64;
         if slot.fill(chunk) == FillOutcome::DrainReady {
-            let drain = self.inner.writer.drain(DrainMode::Batched);
+            let drain = self.inner.writer.drain(DrainMode::Batched).await;
             self.record_disk_write(bytes_drained(&drain));
             match drain {
                 Ok(drained) => freed = drained.parts,
@@ -1258,7 +1260,7 @@ impl DownloadTransfer {
         });
 
         if let Some(claim) = self.decrement_in_flight(freed) {
-            return self.finalize_completion(claim);
+            return self.finalize_completion(claim).await;
         }
 
         tracing::trace!(
@@ -1339,13 +1341,13 @@ impl DownloadTransfer {
     /// The state is already `Terminal`, entered when the claim was taken; this runs after
     /// the state lock is released so disk IO never happens under it. Symmetric with
     /// `fail`, which error paths call from `execute`.
-    fn finalize_completion(&self, _claim: CompletionClaim) -> WorkOutcome {
+    async fn finalize_completion(&self, _claim: CompletionClaim) -> WorkOutcome {
         let expected_len = *self
             .inner
             .expected_download_len
             .get()
             .expect("completed download must have a discovered length");
-        let finalization = self.finalize_destination(expected_len);
+        let finalization = self.finalize_destination(expected_len).await;
         if let Err(e) = finalization {
             // Finalize failed: transition to failed. The state is already Terminal; `fail`
             // calls `enter_terminal` which is idempotent on Terminal (returns None).
@@ -1444,8 +1446,8 @@ impl DownloadTransfer {
 
     /// Finalizes the destination for a successful transfer, then records the
     /// bytes written, whether or not finalization succeeded, and its outcome.
-    fn finalize_destination(&self, expected_len: u64) -> Result<(), std::io::Error> {
-        let finalization = self.inner.writer.finalize(expected_len);
+    async fn finalize_destination(&self, expected_len: u64) -> Result<(), std::io::Error> {
+        let finalization = self.inner.writer.finalize(expected_len).await;
         self.record_disk_write(bytes_drained(&finalization));
         let finalization = finalization
             .map(|drained| drained.parts)
@@ -1730,6 +1732,7 @@ fn build_integrity_checks(
 
 #[cfg(test)]
 mod tests {
+    use crate::operation::download::test_util::now;
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3337,7 +3340,7 @@ mod tests {
         let (transfer, _consumer, dir) =
             disk_transfer(handle, &ScriptedSinkFactory(Arc::clone(&script)));
         let writer = transfer.writer();
-        writer.prepare(0, 3 * RUN_LEN).unwrap();
+        now(writer.prepare(0, 3 * RUN_LEN)).unwrap();
 
         // Fill only the first slot of each segment, so an eager drain takes three
         // separate runs, in order.
@@ -3411,7 +3414,7 @@ mod tests {
 
         assert_discovery_succeeds(&transfer).await;
         let writer = transfer.writer().clone();
-        let untracked = std::thread::spawn(move || writer.drain(DrainMode::Eager));
+        let untracked = std::thread::spawn(move || now(writer.drain(DrainMode::Eager)));
         let held = script.wait_held(TIMEOUT);
         assert_eq!(
             held.op(),

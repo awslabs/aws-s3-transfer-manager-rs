@@ -779,6 +779,10 @@ pub(crate) struct MultipartCompletion {
 /// and leaves the state only when CompleteMultipartUpload succeeds.
 #[derive(Debug)]
 pub(crate) enum UploadState {
+    /// Opening the source file through the client's filesystem, and reading
+    /// its length when unknown, before CreateMPU or PutObject is chosen.
+    /// `stream` is `None` while the resolution work item is in flight.
+    ResolvingSource { stream: Option<InputStream> },
     /// Waiting to start CreateMPU or PutObject.
     PendingInit {
         stream: Option<InputStream>,

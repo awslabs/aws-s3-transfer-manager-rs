@@ -3,7 +3,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use std::{fs::Metadata, path::Path};
+use std::path::Path;
+
+use crate::io::fs::Metadata;
 
 use crate::error;
 

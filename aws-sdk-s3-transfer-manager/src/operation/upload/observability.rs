@@ -560,6 +560,14 @@ impl UploadObservability {
         }))
     }
 
+    /// Records the source's size bounds once resolution has determined them.
+    pub(crate) fn source_resolved(&self, size_hint: SizeHint) {
+        if let Self::Enabled(enabled) = self {
+            enabled.state.lock().expect("lock poisoned").length_kind =
+                UploadLengthKind::from_size_hint(size_hint);
+        }
+    }
+
     /// Selects the request strategy used by this upload.
     pub(crate) fn select_mode(&self, mode: UploadMode) {
         if let Self::Enabled(enabled) = self {

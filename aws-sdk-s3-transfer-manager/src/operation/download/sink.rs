@@ -11,7 +11,24 @@
 //! a file, and a [`SinkFactory`](crate::operation::download::sink::SinkFactory)
 //! builds the sink for one download over its already-open destination file.
 
+use std::io;
+
+use futures_util::future::{BoxFuture, Either, Ready};
+
 use super::body::DiskWriteCursor;
+use crate::io::fs::OpenFile;
+
+/// The completion of one sink operation.
+///
+/// A sink whose operations complete when they are started returns
+/// [`Either::Left`], a ready future. A sink whose operations complete later
+/// returns [`Either::Right`].
+pub(crate) type SinkFuture<'a> = Either<Ready<io::Result<()>>, BoxFuture<'a, io::Result<()>>>;
+
+/// Returns a sink operation that has already completed with `result`.
+pub(crate) fn completed(result: io::Result<()>) -> SinkFuture<'static> {
+    Either::Left(futures_util::future::ready(result))
+}
 
 /// Positioned-write target for download-to-file. Abstracts the file so the drain
 /// orchestration (run coalescing, offset translation) can be exercised against an
@@ -22,18 +39,28 @@ use super::body::DiskWriteCursor;
 /// `prepare` may reserve storage before writes begin, while `finalize` establishes
 /// the destination layout after every payload write succeeds. Implementations are
 /// shared across the issuer and the drain task, hence `Send + Sync`.
+///
+/// Each operation returns a [`SinkFuture`]. The run's payloads stay owned until
+/// the write's future completes or is dropped. A sink that reports
+/// [`completes_inline`](Self::completes_inline) returns only ready futures.
 pub(crate) trait SinkWrite: Send + Sync + std::fmt::Debug {
-    /// Write the entire buffer at `pos` bytes from the payload's destination start.
-    fn write_all_at(&self, buf: &mut DiskWriteCursor<'_>, pos: u64) -> std::io::Result<()>;
+    /// Write the entire run `buf` at `pos` bytes from the payload's destination
+    /// start.
+    fn write_all_at<'a>(&'a self, buf: DiskWriteCursor<'a>, pos: u64) -> SinkFuture<'a>;
 
     /// Prepare a target for an expected download of `expected_download_len` bytes.
-    fn prepare(&self, _expected_download_len: u64) -> std::io::Result<()> {
-        Ok(())
+    fn prepare(&self, _expected_download_len: u64) -> SinkFuture<'_> {
+        completed(Ok(()))
     }
 
     /// Establish the target's successful layout for the complete payload.
-    fn finalize(&self, _expected_download_len: u64) -> std::io::Result<()> {
-        Ok(())
+    fn finalize(&self, _expected_download_len: u64) -> SinkFuture<'_> {
+        completed(Ok(()))
+    }
+
+    /// Returns whether every operation completes when it is started.
+    fn completes_inline(&self) -> bool {
+        true
     }
 }
 
@@ -43,8 +70,11 @@ pub(crate) trait SinkWrite: Send + Sync + std::fmt::Debug {
 /// finalization truncates the file to the payload length. A future append or
 /// write-at policy belongs here: it can translate the relative positions and
 /// final length without changing transfer scheduling or object-range arithmetic.
+///
+/// An operating-system file completes each operation on the calling thread. A
+/// host file on `wasm32-unknown-unknown` completes them asynchronously.
 pub(crate) struct FileSink {
-    file: std::fs::File,
+    file: OpenFile,
     /// Whether the transfer manager created this file (vs caller-provided). Only an
     /// owned file is preallocated.
     owns_file: bool,
@@ -53,7 +83,7 @@ pub(crate) struct FileSink {
 impl FileSink {
     /// Wraps `file`. `owns_file` is true when the transfer manager created the
     /// file, which permits preallocating it.
-    pub(crate) fn new(file: std::fs::File, owns_file: bool) -> Self {
+    pub(crate) fn new(file: OpenFile, owns_file: bool) -> Self {
         Self { file, owns_file }
     }
 }
@@ -70,7 +100,7 @@ impl std::fmt::Debug for FileSink {
 /// positioned writes may still succeed. Linux storage and quota exhaustion
 /// cannot recover without external intervention and should fail before the
 /// transfer spends network and memory resources on the object body.
-fn preallocation_failure_is_fatal(error: &std::io::Error) -> bool {
+fn preallocation_failure_is_fatal(error: &io::Error) -> bool {
     #[cfg(target_os = "linux")]
     {
         matches!(
@@ -85,25 +115,67 @@ fn preallocation_failure_is_fatal(error: &std::io::Error) -> bool {
     }
 }
 
-impl SinkWrite for FileSink {
-    fn write_all_at(&self, buf: &mut DiskWriteCursor<'_>, pos: u64) -> std::io::Result<()> {
-        crate::io::fs::write_all_at(&self.file, buf, pos)
-    }
-
-    fn prepare(&self, expected_download_len: u64) -> std::io::Result<()> {
-        if self.owns_file {
-            if let Err(e) = crate::io::fs::preallocate(&self.file, expected_download_len) {
-                if preallocation_failure_is_fatal(&e) {
-                    return Err(e);
-                }
-                tracing::warn!(error = %e, "failed to preallocate file space");
-            }
+/// Applies the preallocation failure policy: a fatal failure is returned, and
+/// any other failure is logged and ignored.
+fn preallocation_outcome(result: io::Result<()>) -> io::Result<()> {
+    match result {
+        Err(e) if preallocation_failure_is_fatal(&e) => Err(e),
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to preallocate file space");
+            Ok(())
         }
-        Ok(())
+        Ok(()) => Ok(()),
+    }
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+impl SinkWrite for FileSink {
+    fn write_all_at<'a>(&'a self, mut buf: DiskWriteCursor<'a>, pos: u64) -> SinkFuture<'a> {
+        completed(crate::io::fs::write_all_at(&self.file, &mut buf, pos))
     }
 
-    fn finalize(&self, expected_download_len: u64) -> std::io::Result<()> {
-        self.file.set_len(expected_download_len)
+    fn prepare(&self, expected_download_len: u64) -> SinkFuture<'_> {
+        if !self.owns_file {
+            return completed(Ok(()));
+        }
+        completed(preallocation_outcome(crate::io::fs::preallocate(
+            &self.file,
+            expected_download_len,
+        )))
+    }
+
+    fn finalize(&self, expected_download_len: u64) -> SinkFuture<'_> {
+        completed(self.file.set_len(expected_download_len))
+    }
+}
+
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+impl SinkWrite for FileSink {
+    /// Sends the run's payloads to the host without copying them. The returned
+    /// future retains them until the host confirms the complete write.
+    fn write_all_at<'a>(&'a self, buf: DiskWriteCursor<'a>, pos: u64) -> SinkFuture<'a> {
+        use crate::wasm::WasmFile;
+        Either::Right(self.file.write_all_at(pos, buf.to_segmented()))
+    }
+
+    fn prepare(&self, expected_download_len: u64) -> SinkFuture<'_> {
+        use crate::wasm::WasmFile;
+        if !self.owns_file {
+            return completed(Ok(()));
+        }
+        let preallocation = self.file.preallocate(expected_download_len);
+        Either::Right(Box::pin(async move {
+            preallocation_outcome(preallocation.await)
+        }))
+    }
+
+    fn finalize(&self, expected_download_len: u64) -> SinkFuture<'_> {
+        use crate::wasm::WasmFile;
+        Either::Right(self.file.set_len(expected_download_len))
+    }
+
+    fn completes_inline(&self) -> bool {
+        false
     }
 }
 
@@ -121,7 +193,7 @@ pub(crate) trait SinkFactory: Send + Sync + std::fmt::Debug {
     /// factory's destination or its handle cannot be inspected. An
     /// [`InvalidInput`](std::io::ErrorKind::InvalidInput) error means the
     /// caller supplied a destination the sink does not support.
-    fn create(&self, file: std::fs::File, owns_file: bool) -> std::io::Result<Box<dyn SinkWrite>>;
+    fn create(&self, file: OpenFile, owns_file: bool) -> io::Result<Box<dyn SinkWrite>>;
 }
 
 /// [`SinkFactory`] whose sinks write directly to the destination file.
@@ -134,10 +206,10 @@ impl SinkFactory for FileSinkFactory {
     /// ([`is_append_only`](crate::io::fs::is_append_only)), since positioned
     /// writes through it would not land at their offsets. An error reading the
     /// handle's mode is returned as is.
-    fn create(&self, file: std::fs::File, owns_file: bool) -> std::io::Result<Box<dyn SinkWrite>> {
+    fn create(&self, file: OpenFile, owns_file: bool) -> io::Result<Box<dyn SinkWrite>> {
         if crate::io::fs::is_append_only(&file)? {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
                 "destination file is open in append mode, which downloads to a file do not support",
             ));
         }

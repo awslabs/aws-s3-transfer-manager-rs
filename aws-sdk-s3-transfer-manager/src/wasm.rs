@@ -29,6 +29,23 @@
 //! target. It does not drive the host's event loop: the host must keep polling
 //! spawned futures while transfers are active.
 //!
+//! # Filesystem
+//!
+//! The target has no filesystem of its own. A client reaches files only
+//! through the [`WasmFileSystem`] set with
+//! [`Builder::wasm_filesystem`](crate::config::Builder::wasm_filesystem).
+//! Without one, uploads from memory or a custom stream and downloads read
+//! from [`DownloadHandle::body_mut`](crate::operation::download::DownloadHandle::body_mut)
+//! work, and every path operation fails with
+//! [`ErrorKind::IOError`](crate::error::ErrorKind::IOError) whose source has
+//! [`std::io::ErrorKind::Unsupported`]. A path upload fails that way before
+//! it sends a request.
+//!
+//! A path given to [`InputStream::from_path`](crate::io::InputStream::from_path)
+//! is opened by the client that uploads it, when the upload starts, and that
+//! open file serves every read and retry. Opening or reading the path's
+//! length therefore fails the upload rather than the stream's construction.
+//!
 //! # Examples
 //!
 //! A runtime that forwards to an embedding host's clock and executor, used by
@@ -85,7 +102,13 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+mod fs;
 pub(crate) mod instant;
+
+pub use fs::{
+    DirectoryEntry, FileIdentity, FileMetadata, FileSystemFuture, FileType, OpenMode,
+    SharedWasmFile, SharedWasmFileSystem, WasmFile, WasmFileSystem,
+};
 
 /// A transfer-manager future submitted to [`WasmRuntime::spawn`].
 pub type BoxFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;

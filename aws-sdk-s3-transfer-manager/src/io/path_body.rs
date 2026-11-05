@@ -3,10 +3,13 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use crate::io::error::{Error, ErrorKind};
-use crate::io::stream::{InputStream, RawInputStream};
-use std::fs;
+use std::io;
 use std::path::PathBuf;
+use std::sync::Arc;
+
+use crate::io::error::{Error, ErrorKind};
+use crate::io::fs::{self, FileSystem, Metadata, OpenFile};
+use crate::io::stream::{InputStream, RawInputStream};
 
 /// Input stream designed to wrap file based input.
 #[derive(Debug)]
@@ -17,6 +20,92 @@ pub(super) struct PathBody {
     pub(super) length: u64,
     // The byte-offset to start reading from
     pub(super) offset: u64,
+    // How the file is opened
+    pub(super) source: PathSource,
+}
+
+/// How a [`PathBody`] obtains its open file.
+#[derive(Debug)]
+pub(super) enum PathSource {
+    /// The reader opens the path on the calling thread when it is created.
+    Path,
+    /// The uploading transfer opens the path through its client's filesystem
+    /// before choosing how to send it. `length` is meaningful only when
+    /// `length_known` is true; otherwise it is read from the open file.
+    Unresolved { length_known: bool },
+    /// The file the uploading transfer opened. Every read and retry uses it.
+    Open(Arc<OpenFile>),
+}
+
+impl PathBody {
+    /// Returns whether the uploading transfer must open the file before
+    /// choosing how to send it.
+    pub(super) fn needs_resolution(&self) -> bool {
+        matches!(self.source, PathSource::Unresolved { .. })
+    }
+
+    /// Returns whether `length` is the number of bytes to read.
+    pub(super) fn length_known(&self) -> bool {
+        !matches!(
+            self.source,
+            PathSource::Unresolved {
+                length_known: false
+            }
+        )
+    }
+
+    /// Opens the path through `filesystem`, and reads the remaining length
+    /// from the open file when it is not known.
+    ///
+    /// Returns the body with an open file and a known length. Fails with
+    /// [`ErrorKind::OffsetGreaterThanFileSize`] when the offset is past the end
+    /// of the file, and with the filesystem's error when the path cannot be
+    /// opened or inspected. A body that does not need resolution is returned
+    /// unchanged.
+    pub(super) async fn resolve(mut self, filesystem: &FileSystem) -> Result<Self, Error> {
+        let PathSource::Unresolved { length_known } = self.source else {
+            return Ok(self);
+        };
+        let file = filesystem
+            .open_read(&self.path)
+            .await
+            .map_err(|e| open_error(&self.path, e))?;
+        if !length_known {
+            let metadata = filesystem.file_metadata(&file).await?;
+            self.length = remaining_length(&metadata, self.offset)?;
+        }
+        self.source = PathSource::Open(Arc::new(file));
+        Ok(self)
+    }
+
+    /// Returns the open file, opening the path on the calling thread when the
+    /// body has not been resolved.
+    pub(super) fn open(&self) -> io::Result<Arc<OpenFile>> {
+        match &self.source {
+            PathSource::Open(file) => Ok(Arc::clone(file)),
+            PathSource::Path | PathSource::Unresolved { .. } => fs::open_read_blocking(&self.path)
+                .map(Arc::new)
+                .map_err(|e| open_error(&self.path, e)),
+        }
+    }
+}
+
+/// Adds the path to an error from opening it.
+fn open_error(path: &std::path::Path, error: io::Error) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        format!("failed to open {}: {error}", path.display()),
+    )
+}
+
+/// Returns the bytes from `offset` to the end of the file `metadata`
+/// describes, or [`ErrorKind::OffsetGreaterThanFileSize`].
+fn remaining_length(metadata: &Metadata, offset: u64) -> Result<u64, Error> {
+    let file_size = metadata.len();
+    if offset > file_size {
+        return Err(ErrorKind::OffsetGreaterThanFileSize.into());
+    }
+    Ok(file_size - offset)
 }
 
 /// Builder for creating [`InputStream`] from a file/path.
@@ -37,12 +126,16 @@ pub(super) struct PathBody {
 /// }
 /// # }
 /// ```
+///
+/// On `wasm32-unknown-unknown`, [`build`](Self::build) does not access the
+/// filesystem. The client that uploads the stream opens the path, and reads
+/// its length when none was set, before sending a request.
 #[derive(Debug, Default)]
 pub struct PathBodyBuilder {
     path: Option<PathBuf>,
     length: Option<u64>,
     offset: Option<u64>,
-    metadata: Option<fs::Metadata>,
+    metadata: Option<Metadata>,
 }
 
 impl PathBodyBuilder {
@@ -84,7 +177,7 @@ impl PathBodyBuilder {
     }
 
     /// Provide `metadata` for `self.path`, potentially reducing system calls during `build` if pre-set.
-    pub(crate) fn metadata(mut self, metadata: fs::Metadata) -> Self {
+    pub(crate) fn metadata(mut self, metadata: Metadata) -> Self {
         self.metadata = Some(metadata);
         self
     }
@@ -94,25 +187,28 @@ impl PathBodyBuilder {
         let path = self.path.expect("path set");
         let offset = self.offset.unwrap_or_default();
 
-        let length = match self.length {
-            None => {
-                // TODO(aws-sdk-rust#1159, design) - evaluate if we want build() to be async and to use tokio for stat() call (bytestream FsBuilder::build() is async)
-                let metadata = self.metadata.unwrap_or(fs::metadata(path.clone())?);
-                let file_size = metadata.len();
-
-                if offset > file_size {
-                    return Err(ErrorKind::OffsetGreaterThanFileSize.into());
-                }
-
-                file_size - offset
-            }
-            Some(explicit) => explicit,
+        let (length, length_known) = match (self.length, self.metadata) {
+            (Some(explicit), _) => (explicit, true),
+            (None, Some(metadata)) => (remaining_length(&metadata, offset)?, true),
+            // A host filesystem reads the length when the upload opens the file.
+            (None, None) if !fs::COMPLETES_INLINE => (0, false),
+            // TODO(aws-sdk-rust#1159, design) - evaluate if we want build() to be async and to use tokio for stat() call (bytestream FsBuilder::build() is async)
+            (None, None) => (
+                remaining_length(&fs::metadata_blocking(&path)?, offset)?,
+                true,
+            ),
+        };
+        let source = if fs::COMPLETES_INLINE {
+            PathSource::Path
+        } else {
+            PathSource::Unresolved { length_known }
         };
 
         let body = PathBody {
             path,
             length,
             offset,
+            source,
         };
 
         let stream = InputStream {

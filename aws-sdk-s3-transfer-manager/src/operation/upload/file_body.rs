@@ -15,10 +15,8 @@
 //! owner-backed `Bytes` frames from pooled chunks and reacquire storage for each
 //! retry attempt.
 
-use std::fs::File;
 use std::future::poll_fn;
 use std::io;
-use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -27,7 +25,7 @@ use bytes::Bytes;
 use http_body_1x::{Body, Frame, SizeHint};
 use tokio::sync::mpsc;
 
-use crate::io::fs::read_exact_at;
+use crate::io::fs::{read_exact_at, OpenFile, ReadAt};
 use crate::io::PartBuffer;
 use crate::memory::{BufferPool, SegmentedBytes};
 
@@ -47,23 +45,15 @@ const FILE_BODY_READAHEAD: usize = 4;
 /// Stable file identity and memory domain shared by all body attempts.
 #[derive(Clone, Debug)]
 pub(crate) struct FileBodySource {
-    file: Arc<File>,
+    file: Arc<OpenFile>,
     pool: BufferPool,
 }
 
 impl FileBodySource {
-    /// Opens `path` once for use by every SDK and transfer-manager retry.
-    pub(crate) fn open(path: &Path, pool: BufferPool) -> io::Result<Self> {
-        let file = File::open(path).map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!("failed to open {}: {error}", path.display()),
-            )
-        })?;
-        Ok(Self {
-            file: Arc::new(file),
-            pool,
-        })
+    /// Returns the source for `file`, which every SDK and transfer-manager
+    /// retry reads.
+    pub(crate) fn new(file: Arc<OpenFile>, pool: BufferPool) -> Self {
+        Self { file, pool }
     }
 }
 
@@ -136,8 +126,10 @@ impl FileBodyProgress {
 /// File-backed HTTP body for callers on a managed thread with direct I/O.
 ///
 /// Pool admission may return `Poll::Pending`. Once storage is available,
-/// `poll_frame` reads the next chunk synchronously. This body is valid only
-/// when the transfer manager owns the polling thread.
+/// `poll_frame` reads the next chunk through [`ReadAt`]: synchronously from
+/// an operating-system file, or as a host request that may return
+/// `Poll::Pending` on `wasm32-unknown-unknown`. This body is valid only when
+/// the transfer manager owns the polling thread or the file is a host file.
 ///
 /// Each retry starts at `offset` but retains the same [`FileBodySource`].
 #[derive(Debug)]
@@ -151,6 +143,8 @@ pub(crate) struct DirectFileBody {
     progress: FileBodyProgress,
     /// Admission or mutable storage for the next chunk.
     buffer: Option<PartBuffer>,
+    /// The read filling `buffer`, retained across `Poll::Pending`.
+    read: ReadAt,
 }
 
 impl DirectFileBody {
@@ -161,6 +155,7 @@ impl DirectFileBody {
             unread: length,
             progress: FileBodyProgress::new(length),
             buffer: None,
+            read: ReadAt::new(),
         }
     }
 }
@@ -204,11 +199,18 @@ impl Body for DirectFileBody {
                 }
             }
 
-            if let Err(error) = read_exact_at(&this.source.file, buffer, this.offset) {
-                this.unread = 0;
-                this.progress.terminate();
-                this.buffer = None;
-                return Poll::Ready(Some(Err(error)));
+            match this
+                .read
+                .poll_read(cx, &this.source.file, buffer, this.offset)
+            {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(error)) => {
+                    this.unread = 0;
+                    this.progress.terminate();
+                    this.buffer = None;
+                    return Poll::Ready(Some(Err(error)));
+                }
             }
 
             let data = this
@@ -458,8 +460,8 @@ mod tests {
             .unwrap()
     }
 
-    fn source(path: &Path, pool: &BufferPool) -> FileBodySource {
-        FileBodySource::open(path, pool.clone()).unwrap()
+    fn source(path: &std::path::Path, pool: &BufferPool) -> FileBodySource {
+        FileBodySource::new(Arc::new(std::fs::File::open(path).unwrap()), pool.clone())
     }
 
     fn poll_body_once<B>(body: &mut B) -> Poll<Option<Result<Frame<Bytes>, B::Error>>>

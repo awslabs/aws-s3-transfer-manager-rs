@@ -4,9 +4,7 @@
  */
 use std::sync::Arc;
 
-#[cfg(any(unix, windows, target_os = "wasi"))]
-use super::ManagedDownloadHandle;
-use super::{DownloadHandle, DownloadInputBuilder};
+use super::{DownloadHandle, DownloadInputBuilder, ManagedDownloadHandle};
 
 /// Fluent builder for constructing a single object download transfer.
 #[derive(Debug)]
@@ -44,7 +42,13 @@ impl DownloadFluentBuilder {
     /// system and the temporary file was renamed. It does not call `sync_data`,
     /// `sync_all`, or synchronize the parent directory, and therefore does not
     /// promise persistence across a system crash or power loss.
-    #[cfg(any(unix, windows, target_os = "wasi"))]
+    ///
+    /// On `wasm32-unknown-unknown`, the client's
+    /// [`WasmFileSystem`](crate::wasm::WasmFileSystem) creates, writes,
+    /// renames, and removes the files, and success means it accepted every
+    /// byte and completed the rename. A filesystem that cannot create a file
+    /// atomically or rename one fails the download; the destination is never
+    /// written in place.
     pub async fn write_to_path(
         self,
         path: impl Into<std::path::PathBuf>,
@@ -82,10 +86,37 @@ impl DownloadFluentBuilder {
     /// Successful completion does not synchronize file data or metadata. Call
     /// the appropriate synchronization method on another handle when crash
     /// persistence is required.
-    #[cfg(any(unix, windows, target_os = "wasi"))]
+    #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
     pub fn write_to_file(
         self,
         file: std::fs::File,
+    ) -> Result<ManagedDownloadHandle, crate::error::Error> {
+        let input = self.inner.build()?;
+        crate::operation::download::Download::orchestrate_to_file(
+            self.handle,
+            input,
+            file,
+            &crate::operation::download::sink::FileSinkFactory,
+        )
+    }
+
+    /// Download the object and write it to the given open host file.
+    ///
+    /// The caller is responsible for the file lifecycle (creation, cleanup).
+    /// The transfer manager writes to the file using positioned writes at
+    /// offsets starting from 0 and resizes it to the exact downloaded length,
+    /// removing any previous tail. `file` may come from any
+    /// [`WasmFileSystem`](crate::wasm::WasmFileSystem), including one other
+    /// than the client's.
+    ///
+    /// On failure or cancellation, the file may contain a noncontiguous mixture
+    /// of downloaded and previous data, and positioned writes may have extended
+    /// it. Treat its contents as invalid unless [`ManagedDownloadHandle::join`]
+    /// succeeds.
+    #[cfg(all(target_family = "wasm", target_os = "unknown"))]
+    pub fn write_to_file(
+        self,
+        file: crate::wasm::SharedWasmFile,
     ) -> Result<ManagedDownloadHandle, crate::error::Error> {
         let input = self.inner.build()?;
         crate::operation::download::Download::orchestrate_to_file(

@@ -42,7 +42,7 @@ use tracing::Instrument;
 
 use crate::error::{Error, ErrorKind};
 use crate::io::part_reader::{Builder as PartReaderBuilder, PartReadStart};
-use crate::io::{InputStream, PartData};
+use crate::io::{InputStream, PartData, SizeHint};
 use crate::operation::upload::context::{
     apply_content_length, validate_distinct_part_numbers, validate_part_number, validate_size_hint,
     MultipartCompletion, PartPlan, PartReadWake, PartTransferState, PendingPartRead,
@@ -65,6 +65,7 @@ use crate::types::BucketType;
 /// Upload-specific work data.
 #[derive(Debug)]
 pub(crate) enum UploadWork {
+    ResolveSource { stream: InputStream },
     CreateMPU,
     UploadPart(UploadPartWork),
     CompleteMPU(Box<CompleteMpuWork>),
@@ -122,31 +123,35 @@ impl UploadTransfer {
         request: UploadInput,
         stream: InputStream,
     ) -> Result<Self, Error> {
-        let size_hint = stream.size_hint();
-        validate_size_hint(size_hint).map_err(crate::error::invalid_input)?;
-        // A declared content length replaces the body's bounds, so the size checks while reading
-        // and at completion hold the body to exactly that many bytes.
-        let size_hint = apply_content_length(size_hint, request.content_length())
-            .map_err(crate::error::invalid_input)?;
+        // A source that must be opened first is sized once it is resolved.
+        let resolve = stream.needs_resolution();
+        let size_hint = if resolve {
+            SizeHint::default()
+        } else {
+            source_size_hint(&stream, &request)?
+        };
         let observability = UploadObservability::new(
             ctx.handle.config.diagnostics().transfer(),
             size_hint,
             ctx.handle.timer.clock(),
         );
 
-        // Only equal bounds are a known total. A bounded stream reports no total while in progress;
-        // its actual size is published after EOF.
-        if size_hint.upper() == Some(size_hint.lower()) {
-            ctx.set_total_bytes(size_hint.lower());
-        }
-
-        let inner = Arc::new(UploadTransferInner {
-            ctx,
-            state: Mutex::new(UploadState::PendingInit {
+        let state = if resolve {
+            UploadState::ResolvingSource {
+                stream: Some(stream),
+            }
+        } else {
+            publish_total_bytes(&ctx, size_hint);
+            UploadState::PendingInit {
                 stream: Some(stream),
                 size_hint,
                 init_in_flight: false,
-            }),
+            }
+        };
+
+        let inner = Arc::new(UploadTransferInner {
+            ctx,
+            state: Mutex::new(state),
             observability,
             request: Arc::new(request),
             bucket_type,
@@ -212,7 +217,8 @@ impl UploadTransfer {
             UploadState::Transferring { upload_id, .. }
             | UploadState::Completing { upload_id, .. }
             | UploadState::CompleteInFlight { upload_id } => Some(upload_id.clone()),
-            UploadState::PendingInit { .. }
+            UploadState::ResolvingSource { .. }
+            | UploadState::PendingInit { .. }
             | UploadState::PutObjectInFlight
             | UploadState::Done => None,
         }
@@ -238,6 +244,19 @@ impl UploadTransfer {
 
         loop {
             match &mut *state {
+                UploadState::ResolvingSource { stream } => {
+                    return match stream.take() {
+                        Some(stream) => PollWork::ready(IoRequest {
+                            data: Some(Box::new(UploadWork::ResolveSource { stream })),
+                        }),
+                        None => {
+                            self.inner
+                                .ctx
+                                .set_pending(PendingCause::in_flight_work("resolve_source"));
+                            PollWork::Pending
+                        }
+                    };
+                }
                 UploadState::PendingInit {
                     init_in_flight,
                     size_hint,
@@ -363,11 +382,38 @@ impl UploadTransfer {
     pub(crate) async fn execute(&self, work: &mut IoRequest) -> WorkOutcome {
         // A work item executes once, so execute takes its payload by value.
         match work.take_data::<UploadWork>() {
+            UploadWork::ResolveSource { stream } => self.execute_resolve_source(stream).await,
             UploadWork::CreateMPU => self.execute_create_mpu().await,
             UploadWork::UploadPart(part) => self.execute_upload_part(part).await,
             UploadWork::CompleteMPU(completion) => self.execute_complete_mpu(*completion).await,
             UploadWork::PutObject { stream } => self.execute_put_object(stream).await,
         }
+    }
+
+    /// Opens the source file through the client's filesystem, reads its length
+    /// when unknown, and moves to `PendingInit` with the resolved size bounds.
+    ///
+    /// No request has been sent, so a failure fails the transfer without
+    /// further cleanup.
+    async fn execute_resolve_source(&self, stream: InputStream) -> WorkOutcome {
+        let filesystem = self.inner.ctx.handle.config.filesystem();
+        let resolved = match stream.resolve(&filesystem).await {
+            Ok(stream) => stream,
+            Err(error) => return self.fail(error.into()),
+        };
+        let size_hint = match source_size_hint(&resolved, &self.inner.request) {
+            Ok(size_hint) => size_hint,
+            Err(error) => return self.fail(error),
+        };
+        self.inner.observability.source_resolved(size_hint);
+        publish_total_bytes(&self.inner.ctx, size_hint);
+        *self.inner.state.lock().expect("lock poisoned") = UploadState::PendingInit {
+            stream: Some(resolved),
+            size_hint,
+            init_in_flight: false,
+        };
+        self.inner.ctx.try_wake();
+        WorkOutcome::Success { data: None }
     }
 
     async fn execute_create_mpu(&self) -> WorkOutcome {
@@ -1092,9 +1138,32 @@ impl UploadTransfer {
     }
 }
 
+/// Returns the bounds on `stream`'s length that the upload holds it to.
+///
+/// A declared content length replaces the body's bounds, so the size checks while reading and at
+/// completion hold the body to exactly that many bytes. Contradictory bounds are invalid input.
+fn source_size_hint(stream: &InputStream, request: &UploadInput) -> Result<SizeHint, Error> {
+    let size_hint = stream.size_hint();
+    validate_size_hint(size_hint).map_err(crate::error::invalid_input)?;
+    apply_content_length(size_hint, request.content_length()).map_err(crate::error::invalid_input)
+}
+
+/// Publishes the transfer's total bytes when `size_hint` is exact.
+///
+/// Only equal bounds are a known total. A bounded stream reports no total while in progress; its
+/// actual size is published after EOF.
+fn publish_total_bytes(ctx: &TransferContext, size_hint: SizeHint) {
+    if size_hint.upper() == Some(size_hint.lower()) {
+        ctx.set_total_bytes(size_hint.lower());
+    }
+}
+
 /// Returns a copyable view of upload execution while the state lock is held.
 fn snapshot_state(state: &UploadState) -> UploadStateSnapshot {
     match state {
+        UploadState::ResolvingSource { .. } => {
+            UploadStateSnapshot::inactive(UploadExecutionState::PendingInitialization)
+        }
         UploadState::PendingInit {
             init_in_flight: false,
             ..

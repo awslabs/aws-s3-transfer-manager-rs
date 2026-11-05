@@ -4,12 +4,11 @@
  */
 
 use std::collections::VecDeque;
-use std::fs::Metadata;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::error::{WalkError, WalkErrorKind};
-use crate::io::fs::Handle;
+use crate::io::fs::{FileSystem, Handle, Metadata};
 
 /// A directory queued for traversal, carrying the chain of ancestor directory
 /// handles needed for per-path symlink cycle detection.
@@ -68,7 +67,9 @@ impl DirEntry {
     /// File metadata.
     ///
     /// When the entry was produced by following a symlink, this is the
-    /// metadata of the symlink target (not the symlink itself).
+    /// metadata of the symlink target (not the symlink itself). On
+    /// `wasm32-unknown-unknown`, this is the host filesystem's
+    /// `wasm::FileMetadata`; on other targets, [`std::fs::Metadata`].
     pub fn metadata(&self) -> &Metadata {
         &self.metadata
     }
@@ -156,69 +157,27 @@ impl FsWalker {
     /// Returns an [`FsWalk`] that yields file entries via
     /// [`next`](FsWalk::next). The walk begins by validating the root
     /// directory from the context; invalid roots produce a fatal error
-    /// on the first call to `next`.
+    /// on the first call to `next`. The walk reads through the context's
+    /// filesystem only when `next` is called.
     #[must_use]
     pub fn walk(self, ctx: FsWalkContext) -> FsWalk {
-        let mut root = ctx.root;
-        let mut pending_errors = VecDeque::new();
-        let mut done = false;
-        let mut pending_dirs = VecDeque::new();
-
-        if self.canonicalize_root {
-            match std::fs::canonicalize(&root) {
-                Ok(canonical) => root = canonical,
-                Err(e) => {
-                    pending_errors.push_back(WalkError::new(
-                        Some(root.clone()),
-                        WalkErrorKind::SourceUnreadable,
-                        Box::new(e),
-                    ));
-                    done = true;
-                }
-            }
-        } else if !self.follow_symlinks {
-            match std::fs::symlink_metadata(&root) {
-                Ok(md) if md.file_type().is_symlink() => {
-                    pending_errors.push_back(WalkError::new(
-                        Some(root.clone()),
-                        WalkErrorKind::NotADirectory,
-                        Box::from("source root is a symlink; enable follow_symlinks or canonicalize_root to walk through it"),
-                    ));
-                    done = true;
-                }
-                Ok(_) => {}
-                Err(_) => {
-                    // Root doesn't exist / isn't accessible; let the first
-                    // directory read report the fatal error.
-                }
-            }
-        }
-
-        if !done {
-            pending_dirs.push_back(PendingDir {
-                path: root.clone(),
-                depth: 0,
-                ancestor_handles: Vec::new(),
-            });
-        }
-
         tracing::debug!(
-            ?root,
+            root = ?ctx.root,
             follow_symlinks = self.follow_symlinks,
             max_depth = self.max_depth,
             sort = self.sort,
             "fs walk started",
         );
 
-        let root: Arc<Path> = root.into();
-
         FsWalk {
             config: Arc::new(self),
-            root,
-            pending_dirs,
+            root: ctx.root.into(),
+            filesystem: ctx.filesystem,
+            root_checked: false,
+            pending_dirs: VecDeque::new(),
             ready_files: VecDeque::new(),
-            pending_errors,
-            done,
+            pending_errors: VecDeque::new(),
+            done: false,
         }
     }
 }

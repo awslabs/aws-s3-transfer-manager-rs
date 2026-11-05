@@ -97,6 +97,38 @@ impl InputStream {
         matches!(self.inner, RawInputStream::Fs(_))
     }
 
+    /// Returns `true` when the uploading transfer must open this stream's file
+    /// through its client's filesystem before choosing how to send it.
+    ///
+    /// Only file streams built on `wasm32-unknown-unknown` need this. The size
+    /// hint of such a stream is unknown until resolution when the builder had
+    /// no length.
+    pub(crate) fn needs_resolution(&self) -> bool {
+        matches!(&self.inner, RawInputStream::Fs(body) if body.needs_resolution())
+    }
+
+    /// Opens this stream's file through `filesystem` when it
+    /// [needs resolution](Self::needs_resolution), and reads its length when
+    /// the length is unknown. The resolved stream reads every byte and retry
+    /// from that open file.
+    ///
+    /// Other streams are returned unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file cannot be opened or inspected, or when
+    /// the stream's offset is past the end of the file.
+    pub(crate) async fn resolve(
+        self,
+        filesystem: &crate::io::fs::FileSystem,
+    ) -> Result<Self, crate::io::error::Error> {
+        let inner = match self.inner {
+            RawInputStream::Fs(body) => RawInputStream::Fs(body.resolve(filesystem).await?),
+            inner => inner,
+        };
+        Ok(Self { inner })
+    }
+
     /// Convert this input stream into an [`SdkBody`] suitable for a top-level
     /// retryable SDK call (e.g. `PutObject`). The returned body is retryable at
     /// the SDK layer:
@@ -105,7 +137,8 @@ impl InputStream {
     ///   path is a cheap `Bytes` clone. Keeping the native in-memory body (rather
     ///   than a custom wrapper) is what lets the SDK take its inline-checksum
     ///   path; wrapping would force aws-chunked trailer encoding.
-    /// * File-backed (`Fs`) streams open the file once, then go through
+    /// * File-backed (`Fs`) streams open the file once, unless resolution
+    ///   already opened it, then go through
     ///   [`SdkBody::retryable`]. Each retry constructs a fresh
     ///   [`DirectFileBody`] or [`OffloadedFileBody`] with an independent cursor
     ///   over the same open file identity.
@@ -144,7 +177,7 @@ impl InputStream {
         match self.inner {
             RawInputStream::Buf(bytes) => Ok(SdkBody::from(bytes)),
             RawInputStream::Fs(path_body) => {
-                let source = FileBodySource::open(&path_body.path, buffer_pool)?;
+                let source = FileBodySource::new(path_body.open()?, buffer_pool);
                 let offset = path_body.offset;
                 let length = path_body.length;
                 if direct_io {
@@ -481,7 +514,10 @@ impl RawInputStream {
     pub(super) fn size_hint(&self) -> SizeHint {
         match self {
             RawInputStream::Buf(bytes) => SizeHint::exact(bytes.remaining() as u64),
-            RawInputStream::Fs(path_body) => SizeHint::exact(path_body.length),
+            RawInputStream::Fs(path_body) if path_body.length_known() => {
+                SizeHint::exact(path_body.length)
+            }
+            RawInputStream::Fs(_) => SizeHint::default(),
             RawInputStream::Dyn(box_body) => box_body.inner.size_hint(),
         }
     }

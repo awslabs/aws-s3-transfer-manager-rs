@@ -67,6 +67,13 @@ pub(crate) enum DownloadObjectsWork {
     AdvanceWalker { walk: Option<Box<S3Walk>> },
     /// Join a batch of terminal child downloads.
     JoinChildren { batch: Option<ReapingBatch> },
+    /// Create one claimed object's parent directories and temporary file, and
+    /// start its child download, through a filesystem that completes
+    /// asynchronously. Owns the claim's reservation until the child is merged.
+    PrepareChild {
+        entry: Option<Object>,
+        reservation: Option<Reservation>,
+    },
 }
 
 impl std::fmt::Debug for DownloadObjectsWork {
@@ -77,6 +84,10 @@ impl std::fmt::Debug for DownloadObjectsWork {
                 .debug_struct("JoinChildren")
                 .field("count", &batch.as_ref().map(|b| b.count))
                 .finish(),
+            Self::PrepareChild { entry, .. } => f
+                .debug_struct("PrepareChild")
+                .field("key", &entry.as_ref().and_then(|entry| entry.key()))
+                .finish_non_exhaustive(),
         }
     }
 }
@@ -95,7 +106,7 @@ pub(crate) struct ChildTransfer {
 /// The type makes the counter pairing structural: `merge_spawned`'s signature
 /// requires the token, so a caller cannot forget to release the reservation,
 /// and the count released always matches the count reserved.
-struct Reservation {
+pub(crate) struct Reservation {
     transfer: Arc<DownloadObjectsTransferInner>,
     count: usize,
     consumed: bool,
@@ -263,8 +274,11 @@ struct DownloadObjectsTransferInner {
     delimiter: Option<String>,
     failure_policy: FailedTransferPolicy,
     pipeline_depth: usize,
+    /// The client's filesystem, which receives every destination operation.
+    filesystem: crate::io::fs::FileSystem,
     /// Directories already created (dedup `create_dir_all` across children
     /// that share a prefix; objects in the same S3 "folder" map to one dir).
+    /// A directory is recorded only after its creation succeeds.
     created_dirs: Mutex<HashSet<PathBuf>>,
 }
 
@@ -280,6 +294,7 @@ impl DownloadObjectsTransfer {
         let key_prefix = input.key_prefix().map(|s| s.to_string());
         let delimiter = input.delimiter().map(|s| s.to_string());
         let failure_policy = input.failure_policy().clone();
+        let filesystem = ctx.handle.config.filesystem();
 
         Self {
             inner: Arc::new(DownloadObjectsTransferInner {
@@ -301,6 +316,7 @@ impl DownloadObjectsTransfer {
                 delimiter,
                 failure_policy,
                 pipeline_depth,
+                filesystem,
                 created_dirs: Mutex::new(HashSet::new()),
             }),
         }
@@ -329,7 +345,9 @@ impl DownloadObjectsTransfer {
     ///
     /// 1. Walk (refill): if the walker can dispatch, return its `AdvanceWalker`
     ///    item. A walk poll is the whole poll (neither spawns nor reaps).
-    /// 2. Spawn one child (lock released around orchestration).
+    /// 2. Spawn one child (lock released around orchestration). With a
+    ///    filesystem that completes asynchronously, return a `PrepareChild` item
+    ///    for the claimed entry instead; that poll neither spawns nor reaps.
     /// 3. Reap any terminal children (up to MAX_REAP_PER_POLL this poll).
     /// 4. Fuse: a reap returns `Ready { io: JoinChildren, spawned }`; with no
     ///    reap, `Spawned` if an entry was claimed, else `check_terminal` /
@@ -365,7 +383,16 @@ impl DownloadObjectsTransfer {
         let mut attempted = false;
         let mut materialized = false;
         if self.inner.ctx.is_active() {
-            let (to_spawn, reservation) = self.claim_one(&mut state);
+            let (mut to_spawn, reservation) = self.claim_one(&mut state);
+            if !to_spawn.is_empty() && !self.inner.filesystem.completes_inline() {
+                // `poll_work` performs no filesystem operation that can wait.
+                return PollWork::ready(IoRequest {
+                    data: Some(Box::new(DownloadObjectsWork::PrepareChild {
+                        entry: to_spawn.pop(),
+                        reservation: Some(reservation),
+                    })),
+                });
+            }
             if !to_spawn.is_empty() {
                 attempted = true;
                 drop(state);
@@ -497,13 +524,72 @@ impl DownloadObjectsTransfer {
             .collect()
     }
 
-    /// Stat the destination and confirm it is a directory. Blocking; called
-    /// once from the first walker advance, during work-item execution rather
-    /// than on the caller's `initiate` thread.
-    fn validate_destination(&self) -> Result<(), Error> {
+    /// Stat the destination and confirm it is a directory. Called once from the
+    /// first walker advance, during work-item execution rather than on the
+    /// caller's `initiate` thread. Blocking on the operating system's
+    /// filesystem.
+    async fn validate_destination(&self) -> Result<(), Error> {
         let dest = &self.inner.destination;
-        let metadata = std::fs::metadata(dest)?;
+        let metadata = self.inner.filesystem.metadata(dest).await?;
         crate::operation::validate_target_is_dir(&metadata, dest)
+    }
+
+    /// Prepares the destination for `key` and starts its child download
+    /// through a filesystem that completes asynchronously.
+    ///
+    /// Creates the parent directories unless an earlier child created them,
+    /// then creates the temporary file and the child download. Children that
+    /// share an uncreated directory may each request it, since creating an
+    /// existing directory succeeds.
+    async fn prepare_child(
+        &self,
+        handle: &Arc<crate::client::Handle>,
+        key: &str,
+        parent_id: u64,
+    ) -> Result<ManagedDownloadHandle, Error> {
+        let dest_path = local_key_path(
+            &self.inner.destination,
+            key,
+            self.inner.key_prefix.as_deref(),
+            self.inner.delimiter.as_deref(),
+        )?;
+
+        if let Some(parent) = dest_path.parent() {
+            let known = self.inner.created_dirs.lock().contains(parent);
+            if !known {
+                self.inner
+                    .filesystem
+                    .create_dir_all(parent)
+                    .await
+                    .map_err(|e| {
+                        error::Error::new(
+                            ErrorKind::IOError,
+                            format!("failed to create directory for key '{key}': {e}"),
+                        )
+                    })?;
+                self.inner.created_dirs.lock().insert(parent.to_path_buf());
+            }
+        }
+
+        let input = DownloadInput::builder()
+            .bucket(&self.inner.bucket)
+            .key(key)
+            .build()
+            .expect("bucket and key are set");
+        Download::orchestrate_to_path(
+            handle.clone(),
+            input,
+            dest_path,
+            Some(parent_id),
+            &FileSinkFactory,
+        )
+        .await
+        .map_err(|e| {
+            error::Error::new(
+                ErrorKind::IOError,
+                format!("failed to create temp file for key '{key}': {e}"),
+            )
+        })
     }
 
     fn spawn_single_child(
@@ -532,7 +618,7 @@ impl DownloadObjectsTransfer {
         if let Some(parent) = dest_path.parent() {
             let known = self.inner.created_dirs.lock().contains(parent);
             if !known {
-                std::fs::create_dir_all(parent).map_err(|e| {
+                self.inner.filesystem.create_dir_all_blocking(parent).map_err(|e| {
                     error::Error::new(
                         ErrorKind::IOError,
                         format!("failed to create directory for key '{key}': {e}"),
@@ -551,8 +637,10 @@ impl DownloadObjectsTransfer {
         // Create temp file synchronously (we're in poll_work, not async).
         // orchestrate_to_path is async; for child spawning we use the
         // synchronous helper + orchestrate_with_sink directly.
-        let (file, temp_path) =
-            crate::io::fs::create_first_new(crate::operation::download::temp_file_candidates(
+        let (file, temp_path) = self
+            .inner
+            .filesystem
+            .create_first_new_blocking(crate::operation::download::temp_file_candidates(
                 &dest_path,
                 std::iter::repeat_with(|| fastrand::u32(..)),
             ))
@@ -564,7 +652,7 @@ impl DownloadObjectsTransfer {
             })?;
         let sink = FileSinkFactory.create(file, true).map_err(|e| {
             // No handle owns the temp file yet, so remove it here.
-            let _ = std::fs::remove_file(&temp_path);
+            let _ = self.inner.filesystem.remove_file_blocking(&temp_path);
             error::Error::new(
                 ErrorKind::IOError,
                 format!("failed to create destination sink for key '{key}': {e}"),
@@ -735,7 +823,50 @@ impl DownloadObjectsTransfer {
                 let batch = batch.take().expect("batch already taken");
                 self.execute_join_children(batch).await
             }
+            DownloadObjectsWork::PrepareChild { entry, reservation } => {
+                let entry = entry.take().expect("entry already taken");
+                let reservation = reservation.take().expect("reservation already taken");
+                self.execute_prepare_child(entry, reservation).await
+            }
         }
+    }
+
+    /// Prepares one claimed entry's child download and merges it, or its
+    /// failure, into state, releasing the claim's reservation under the same
+    /// lock. A transfer that is no longer active releases the reservation
+    /// without touching the filesystem.
+    async fn execute_prepare_child(&self, obj: Object, reservation: Reservation) -> WorkOutcome {
+        if !self.inner.ctx.is_active() {
+            let mut state = self.inner.state.lock();
+            reservation.consume(&mut state);
+            if self.check_terminal(&state).is_none() {
+                drop(state);
+                self.inner.ctx.try_wake();
+            }
+            return WorkOutcome::Cancelled;
+        }
+
+        let key = obj
+            .key()
+            .expect("S3Walk yields objects with keys")
+            .to_string();
+        let result = self
+            .prepare_child(&self.inner.ctx.handle, &key, self.inner.ctx.id.id)
+            .await
+            .map(|handle| ChildTransfer { handle, key });
+
+        let mut state = self.inner.state.lock();
+        self.merge_spawned(&mut state, vec![(obj, result)], reservation);
+        // An execute callback that drains the last in-flight work owns the
+        // terminal transition.
+        if self.check_terminal(&state).is_some() {
+            return WorkOutcome::Success { data: None };
+        }
+        drop(state);
+        // Wake: the new child, or the freed reservation, changes what poll_work
+        // can do next.
+        self.inner.ctx.try_wake();
+        WorkOutcome::Success { data: None }
     }
 
     async fn execute_advance_walker(&self, mut walk: S3Walk) -> WorkOutcome {
@@ -750,7 +881,7 @@ impl DownloadObjectsTransfer {
             first
         };
         if needs_validation {
-            if let Err(err) = self.validate_destination() {
+            if let Err(err) = self.validate_destination().await {
                 let mut state = self.inner.state.lock();
                 state.walk_in_flight = false;
                 // set_failed alone: check_terminal arbitrates the terminal signal once in-flight work (children/walks/reaps) drains.

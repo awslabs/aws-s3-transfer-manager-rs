@@ -18,7 +18,9 @@ use std::time::{Duration, Instant};
 use bytes::Buf;
 
 use crate::operation::download::body::DiskWriteCursor;
-use crate::operation::download::sink::{FileSinkFactory, SinkFactory, SinkWrite};
+use crate::operation::download::sink::{
+    completed, FileSinkFactory, SinkFactory, SinkFuture, SinkWrite,
+};
 
 /// Which destination operation a rule applies to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -293,24 +295,29 @@ struct ScriptedSink {
 }
 
 impl SinkWrite for ScriptedSink {
-    fn write_all_at(&self, buf: &mut DiskWriteCursor<'_>, pos: u64) -> io::Result<()> {
+    fn write_all_at<'a>(&'a self, buf: DiskWriteCursor<'a>, pos: u64) -> SinkFuture<'a> {
         let op = Op::Write {
             pos,
             len: buf.remaining(),
         };
-        self.script.run(op, || self.inner.write_all_at(buf, pos))
+        completed(
+            self.script
+                .run(op, || super::now(self.inner.write_all_at(buf, pos))),
+        )
     }
 
-    fn prepare(&self, expected_download_len: u64) -> io::Result<()> {
+    fn prepare(&self, expected_download_len: u64) -> SinkFuture<'_> {
         self.inner.prepare(expected_download_len)
     }
 
-    fn finalize(&self, expected_download_len: u64) -> io::Result<()> {
+    fn finalize(&self, expected_download_len: u64) -> SinkFuture<'_> {
         let op = Op::Finalize {
             len: expected_download_len,
         };
-        self.script
-            .run(op, || self.inner.finalize(expected_download_len))
+        completed(
+            self.script
+                .run(op, || super::now(self.inner.finalize(expected_download_len))),
+        )
     }
 }
 
@@ -324,6 +331,7 @@ mod tests {
     use bytes::Bytes;
 
     use super::{Action, Event, Match, Op, ScriptedSinkFactory, WriteScript};
+    use crate::operation::download::test_util::now;
     use crate::memory::SegmentedBytes;
     use crate::operation::download::body::{new_recv_body_with_disk_mode, BodyWriter, ChunkOutput};
     use crate::operation::download::recv_buffer::DrainMode;
@@ -346,7 +354,7 @@ mod tests {
             .create(file, false)
             .unwrap();
         let (writer, _consumer) = new_recv_body_with_disk_mode(sink);
-        writer.prepare(0, expected_len).unwrap();
+        now(writer.prepare(0, expected_len)).unwrap();
         writer
     }
 
@@ -374,7 +382,7 @@ mod tests {
         fill(&writer, 0, b"abcd");
 
         std::thread::scope(|scope| {
-            let drain = scope.spawn(|| writer.drain(DrainMode::Eager));
+            let drain = scope.spawn(|| now(writer.drain(DrainMode::Eager)));
             let held = script.wait_held(HOLD_TIMEOUT);
             assert_eq!(held.op(), Op::Write { pos: 0, len: 4 });
             assert!(
@@ -408,7 +416,7 @@ mod tests {
         fill(&writer, 0, b"abcd");
 
         let error = std::thread::scope(|scope| {
-            let drain = scope.spawn(|| writer.drain(DrainMode::Eager));
+            let drain = scope.spawn(|| now(writer.drain(DrainMode::Eager)));
             script
                 .wait_held(HOLD_TIMEOUT)
                 .release_err(io::ErrorKind::StorageFull);
@@ -432,14 +440,14 @@ mod tests {
         let writer = scripted_writer(&script, std::fs::File::create(&path).unwrap(), 6);
 
         fill(&writer, 0, b"ab");
-        writer.drain(DrainMode::Eager).unwrap();
+        now(writer.drain(DrainMode::Eager)).unwrap();
         fill(&writer, 2, b"cd");
-        let error = writer
-            .drain(DrainMode::Eager)
+        let error = now(writer
+            .drain(DrainMode::Eager))
             .expect_err("the write at offset 2 is scripted to fail");
         assert_eq!(error.source.kind(), io::ErrorKind::StorageFull);
         fill(&writer, 4, b"ef");
-        writer.drain(DrainMode::Eager).unwrap();
+        now(writer.drain(DrainMode::Eager)).unwrap();
 
         let contents = std::fs::read(&path).unwrap();
         assert_eq!(&contents[..2], b"ab");
@@ -470,8 +478,8 @@ mod tests {
         let writer = scripted_writer(&script, file, 3);
         fill(&writer, 0, b"new");
 
-        let error = writer
-            .finalize(3)
+        let error = now(writer
+            .finalize(3))
             .expect_err("finalize is scripted to fail");
         assert_eq!(error.source.kind(), io::ErrorKind::PermissionDenied);
         assert_eq!(std::fs::read(&path).unwrap(), b"newle contents");
@@ -553,10 +561,10 @@ mod tests {
 
         script.mark("start");
         fill(&writer, 0, b"ab");
-        writer.drain(DrainMode::Eager).unwrap();
+        now(writer.drain(DrainMode::Eager)).unwrap();
         script.mark("between");
         fill(&writer, 2, b"cd");
-        writer.finalize(4).unwrap();
+        now(writer.finalize(4)).unwrap();
         script.mark("end");
 
         let first = Op::Write { pos: 0, len: 2 };

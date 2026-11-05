@@ -161,6 +161,8 @@ pub struct Config {
     /// `Client::new` hot path. `None` when the config was built directly
     /// (bypassing the loader); consumers then fall back to cheap local detection.
     machine_profile: Option<crate::runtime::platform::MachineProfile>,
+    #[cfg(all(target_family = "wasm", target_os = "unknown"))]
+    wasm_filesystem: Option<crate::wasm::SharedWasmFileSystem>,
     #[cfg(feature = "dial9")]
     pub(crate) dial9_handle: Option<dial9::Dial9Handle>,
 }
@@ -214,6 +216,14 @@ impl Config {
     /// Returns the diagnostic policy fixed when this configuration was built.
     pub(crate) fn diagnostics(&self) -> DiagnosticsConfig {
         self.diagnostics
+    }
+
+    /// Returns the filesystem that this client's path operations use.
+    pub(crate) fn filesystem(&self) -> crate::io::fs::FileSystem {
+        #[cfg(all(target_family = "wasm", target_os = "unknown"))]
+        return crate::io::fs::FileSystem::host(self.wasm_filesystem.clone());
+        #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+        return crate::io::fs::FileSystem::os();
     }
 
     /// Machine facts detected by the async config loader, if this config was
@@ -281,6 +291,8 @@ pub struct Builder {
     client: Option<aws_sdk_s3::Client>,
     s3_client_config: Option<S3ClientConfig>,
     machine_profile: Option<crate::runtime::platform::MachineProfile>,
+    #[cfg(all(target_family = "wasm", target_os = "unknown"))]
+    wasm_filesystem: Option<crate::wasm::SharedWasmFileSystem>,
     #[cfg(feature = "dial9")]
     dial9_handle: Option<dial9::Dial9Handle>,
 }
@@ -383,6 +395,19 @@ impl Builder {
         self
     }
 
+    /// Sets the filesystem that this client's path operations use.
+    ///
+    /// Uploads from a path, downloads to a path or an open file, and both
+    /// directory operations go through `filesystem`. Without one, those
+    /// operations fail with [`ErrorKind::IOError`](crate::error::ErrorKind::IOError)
+    /// whose source has [`std::io::ErrorKind::Unsupported`]. Other transfers
+    /// do not use it. Clients may share one filesystem or use separate ones.
+    #[cfg(all(target_family = "wasm", target_os = "unknown"))]
+    pub fn wasm_filesystem(mut self, filesystem: impl crate::wasm::WasmFileSystem) -> Self {
+        self.wasm_filesystem = Some(crate::wasm::SharedWasmFileSystem::new(filesystem));
+        self
+    }
+
     /// Installs deterministic diagnostics for internal tests.
     #[cfg(test)]
     pub(crate) fn diagnostics_for_test(
@@ -466,6 +491,8 @@ impl Builder {
             framework_metadata: self.framework_metadata,
             s3_client_source: Some(s3_client_source),
             machine_profile: self.machine_profile,
+            #[cfg(all(target_family = "wasm", target_os = "unknown"))]
+            wasm_filesystem: self.wasm_filesystem,
             #[cfg(feature = "dial9")]
             dial9_handle: self.dial9_handle,
         }

@@ -6,6 +6,7 @@
 use std::io::IoSlice;
 
 use bytes::Buf;
+use futures_util::FutureExt;
 
 use crate::runtime::buffer_pool::{Reservation, SegmentedBytes};
 use crate::runtime::sync::sync::atomic::{AtomicU64, Ordering};
@@ -124,6 +125,27 @@ impl<'a> DiskWriteCursor<'a> {
             .get()
             .map(|chunk| &chunk.data)
             .expect("validated disk-write payload disappeared")
+    }
+
+    /// Returns the remaining bytes of the run as one value that shares the
+    /// payloads' owners, without copying payload bytes.
+    #[cfg(all(target_family = "wasm", target_os = "unknown"))]
+    pub(crate) fn to_segmented(&self) -> SegmentedBytes {
+        let mut run = SegmentedBytes::from(bytes::Bytes::new());
+        for (index, slot) in self.write.payloads()[self.payload_index..]
+            .iter()
+            .enumerate()
+        {
+            let mut data = slot
+                .get()
+                .map(|chunk| chunk.data.clone())
+                .expect("validated disk-write payload disappeared");
+            if index == 0 {
+                data.advance(self.payload_offset);
+            }
+            run.append(data);
+        }
+        run
     }
 }
 
@@ -345,7 +367,11 @@ impl BodyWriter {
     /// A run that fails to write ends the drain with a [`DrainError`] carrying
     /// the runs written before it. A filled payload before
     /// [`prepare`](Self::prepare) fails the drain with nothing drained.
-    pub(crate) fn drain(&self, mode: DrainMode) -> Result<Drained, DrainError> {
+    ///
+    /// Each claimed run stays owned while the sink writes it, including across
+    /// `Poll::Pending`, and is freed only after the write's terminal result.
+    /// With a sink that completes inline, the drain completes on its first poll.
+    pub(crate) async fn drain(&self, mode: DrainMode) -> Result<Drained, DrainError> {
         let mut drained = Drained::default();
         if let Mode::Disk {
             sink,
@@ -369,7 +395,7 @@ impl BodyWriter {
                 return Ok(drained);
             };
             while let Some(sw) = self.buffer.take_drain_run(mode) {
-                let bytes = match write_run(sink.as_ref(), object_range_start, &sw) {
+                let bytes = match write_run(sink.as_ref(), object_range_start, &sw).await {
                     Ok(bytes) => bytes,
                     Err(source) => return Err(DrainError { drained, source }),
                 };
@@ -384,14 +410,29 @@ impl BodyWriter {
     /// Flush every remaining filled run at a terminal transition, including a partial
     /// final segment below the drain batch.
     ///
-    /// Success, failure, and cancellation all use this operation to release resident
-    /// payload ownership. It does not establish the target's successful final shape.
+    /// Failure and cancellation use this operation to release resident payload
+    /// ownership. It does not establish the target's successful final shape.
     /// Fails as [`drain`](Self::drain) does.
+    ///
+    /// A sink that completes inline receives every remaining run. A sink that
+    /// completes asynchronously cannot be awaited here, so the remaining runs
+    /// are freed without being written and nothing is reported as drained.
+    /// The destination of a failed or cancelled download is not valid in
+    /// either case.
     pub(crate) fn terminal_drain(&self) -> Result<Drained, DrainError> {
-        if !matches!(&*self.mode, Mode::Disk { .. }) {
+        let Mode::Disk { sink, .. } = &*self.mode else {
+            return Ok(Drained::default());
+        };
+        if !sink.completes_inline() {
+            while let Some(run) = self.buffer.take_drain_run(DrainMode::Eager) {
+                drop(run);
+            }
             return Ok(Drained::default());
         }
-        let drained = self.drain(DrainMode::Eager)?;
+        let drained = self
+            .drain(DrainMode::Eager)
+            .now_or_never()
+            .expect("a sink that completes inline completes every drain on its first poll")?;
         tracing::debug!(
             target: crate::telemetry::TARGET_TRANSFER,
             terminal_parts = drained.parts,
@@ -401,34 +442,41 @@ impl BodyWriter {
         Ok(drained)
     }
 
-    /// Flush terminal payloads and establish the successful disk target length.
+    /// Write every remaining filled run, including a partial final segment
+    /// below the drain batch, and establish the successful disk target length.
     ///
-    /// Returns what the terminal drain wrote. A failed terminal drain returns its
+    /// Returns what that final drain wrote. A failed final drain returns its
     /// [`DrainError`]. Fails with
     /// [`UnexpectedEof`](std::io::ErrorKind::UnexpectedEof), before the target
     /// is resized, if the sink has not accepted exactly `expected_download_len`
     /// bytes across every drain. A run claimed by a drain that has not finished
-    /// writing is invisible to the terminal drain, so without this check its
+    /// writing is invisible to the final drain, so without this check its
     /// region would be published holding zeros or the file's previous bytes.
-    /// That error, and a failed resize, carry what the terminal drain wrote.
-    pub(crate) fn finalize(&self, expected_download_len: u64) -> Result<Drained, DrainError> {
-        let drained = self.terminal_drain()?;
-        if let Mode::Disk { sink, written, .. } = &*self.mode {
-            let written = written.load(Ordering::Acquire);
-            if written != expected_download_len {
-                return Err(DrainError {
-                    drained,
-                    source: std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        format!(
-                            "destination accepted {written} of {expected_download_len} expected bytes"
-                        ),
-                    ),
-                });
-            }
-            sink.finalize(expected_download_len)
-                .map_err(|source| DrainError { drained, source })?;
+    /// That error, and a failed resize, carry what the final drain wrote.
+    pub(crate) async fn finalize(&self, expected_download_len: u64) -> Result<Drained, DrainError> {
+        let Mode::Disk { sink, written, .. } = &*self.mode else {
+            return Ok(Drained::default());
+        };
+        let drained = self.drain(DrainMode::Eager).await?;
+        tracing::debug!(
+            target: crate::telemetry::TARGET_TRANSFER,
+            terminal_parts = drained.parts,
+            terminal_bytes = drained.bytes,
+            "terminal drain complete; tail flushed to disk",
+        );
+        let written = written.load(Ordering::Acquire);
+        if written != expected_download_len {
+            return Err(DrainError {
+                drained,
+                source: std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!("destination accepted {written} of {expected_download_len} expected bytes"),
+                ),
+            });
         }
+        sink.finalize(expected_download_len)
+            .await
+            .map_err(|source| DrainError { drained, source })?;
         Ok(drained)
     }
 
@@ -445,8 +493,8 @@ impl BodyWriter {
     /// the same eager take. Returns the parts freed, so the caller releases their
     /// read-ahead occupancy, and the bytes written. Not terminal: the transfer
     /// keeps issuing after this. Fails as [`drain`](Self::drain) does.
-    pub(crate) fn flush_resident(&self) -> Result<Drained, DrainError> {
-        self.drain(DrainMode::Eager)
+    pub(crate) async fn flush_resident(&self) -> Result<Drained, DrainError> {
+        self.drain(DrainMode::Eager).await
     }
 
     /// Couple the drain batch to the read-ahead window: a window narrower than a
@@ -464,7 +512,7 @@ impl BodyWriter {
     }
 
     /// Fix the resolved object-range origin and prepare a disk target.
-    pub(crate) fn prepare(
+    pub(crate) async fn prepare(
         &self,
         object_range_start: u64,
         expected_download_len: u64,
@@ -479,7 +527,7 @@ impl BodyWriter {
                 configured_start.set(object_range_start).is_ok(),
                 "disk destination prepared more than once"
             );
-            sink.prepare(expected_download_len)?;
+            sink.prepare(expected_download_len).await?;
         }
         Ok(())
     }
@@ -490,12 +538,12 @@ impl BodyWriter {
 ///
 /// The cursor borrows payloads in place. `complete()` (called by the caller
 /// after this returns) frees their owners.
-fn write_run(
+async fn write_run(
     sink: &dyn SinkWrite,
     object_range_start: u64,
     sw: &SegmentWrite<ChunkOutput>,
 ) -> std::io::Result<u64> {
-    let (object_offset, mut cursor) = DiskWriteCursor::new(sw)?;
+    let (object_offset, cursor) = DiskWriteCursor::new(sw)?;
     let len = cursor.remaining() as u64;
     let file_pos = object_offset
         .checked_sub(object_range_start)
@@ -505,7 +553,7 @@ fn write_run(
                 "disk-write payload begins before the requested object range",
             )
         })?;
-    sink.write_all_at(&mut cursor, file_pos)?;
+    sink.write_all_at(cursor, file_pos).await?;
     Ok(len)
 }
 
@@ -855,7 +903,8 @@ mod tests {
         new_recv_body_with_disk_mode, new_recv_body_with_sink, BodyWriter as Writer,
         DiskWriteCursor, DrainMode, Drained, RecvBodyConsumer, Reservation,
     };
-    use crate::operation::download::sink::{SinkFactory, SinkWrite};
+    use crate::operation::download::sink::{completed, SinkFactory, SinkFuture, SinkWrite};
+    use crate::operation::download::test_util::now;
     use crate::operation::download::test_util::sink::{
         Action, Match, Op, ScriptedSinkFactory, WriteScript,
     };
@@ -928,11 +977,11 @@ mod tests {
     }
 
     impl SinkWrite for CaptureSink {
-        fn write_all_at(&self, buf: &mut DiskWriteCursor<'_>, pos: u64) -> std::io::Result<()> {
+        fn write_all_at<'a>(&'a self, mut buf: DiskWriteCursor<'a>, pos: u64) -> SinkFuture<'a> {
             let mut bytes = vec![0u8; buf.remaining()];
             buf.copy_to_slice(&mut bytes);
             self.writes.lock().unwrap().insert(pos, bytes);
-            Ok(())
+            completed(Ok(()))
         }
     }
 
@@ -945,12 +994,12 @@ mod tests {
         #[derive(Debug)]
         struct Shared(Arc<CaptureSink>);
         impl SinkWrite for Shared {
-            fn write_all_at(&self, buf: &mut DiskWriteCursor<'_>, pos: u64) -> std::io::Result<()> {
+            fn write_all_at<'a>(&'a self, buf: DiskWriteCursor<'a>, pos: u64) -> SinkFuture<'a> {
                 self.0.write_all_at(buf, pos)
             }
         }
         let (writer, consumer) = new_recv_body_with_disk_mode(Box::new(Shared(sink.clone())));
-        writer.prepare(object_range_start, 0).unwrap();
+        now(writer.prepare(object_range_start, 0)).unwrap();
         (writer, consumer, sink)
     }
 
@@ -959,7 +1008,7 @@ mod tests {
         object_range_start: u64,
     ) -> (Writer, RecvBodyConsumer) {
         let (writer, consumer) = new_recv_body_with_sink(file, false);
-        writer.prepare(object_range_start, 0).unwrap();
+        now(writer.prepare(object_range_start, 0)).unwrap();
         (writer, consumer)
     }
 
@@ -1072,7 +1121,7 @@ mod tests {
             slot.fill(chunk_at(i, offset, &data));
         }
 
-        writer.drain(DrainMode::Batched).unwrap();
+        now(writer.drain(DrainMode::Batched)).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), expected);
     }
 
@@ -1095,7 +1144,7 @@ mod tests {
             slot.fill(chunk_at(i, offset, &data));
         }
 
-        writer.finalize(expected.len() as u64).unwrap();
+        now(writer.finalize(expected.len() as u64)).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), expected);
     }
 
@@ -1111,7 +1160,7 @@ mod tests {
             .open(&path)
             .unwrap();
         let (writer, _consumer) = new_recv_body_with_sink(file, false);
-        writer.prepare(0, 3).unwrap();
+        now(writer.prepare(0, 3)).unwrap();
         assert_eq!(
             std::fs::metadata(&path).unwrap().len(),
             ORIGINAL.len() as u64,
@@ -1126,7 +1175,7 @@ mod tests {
             "terminal cleanup must not establish the successful length"
         );
 
-        writer.finalize(3).unwrap();
+        now(writer.finalize(3)).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"new");
     }
 
@@ -1163,7 +1212,7 @@ mod tests {
         let path = dir.path().join("out");
         std::fs::File::create(&path).unwrap();
         let (writer, _consumer) = scripted_writer_over(&path, &script);
-        writer.prepare(0, 3 * RUN_LEN).unwrap();
+        now(writer.prepare(0, 3 * RUN_LEN)).unwrap();
 
         // Fill only the first slot of each segment, so the drain takes three
         // separate runs, in order.
@@ -1180,8 +1229,8 @@ mod tests {
             }
         }
 
-        let error = writer
-            .drain(DrainMode::Eager)
+        let error = now(writer
+            .drain(DrainMode::Eager))
             .expect_err("the third write is scripted to fail");
         assert_eq!(error.source.kind(), std::io::ErrorKind::StorageFull);
         assert_eq!(error.drained, Drained { parts: 2, bytes: 8 });
@@ -1200,13 +1249,13 @@ mod tests {
         let path = dir.path().join("out");
         std::fs::write(&path, b"existing").unwrap();
         let (writer, _consumer) = scripted_writer_over(&path, &script);
-        writer.prepare(0, 3).unwrap();
+        now(writer.prepare(0, 3)).unwrap();
         writer.claim().fill(chunk_at(0, 0, b"new"));
-        writer.drain(DrainMode::Eager).unwrap();
+        now(writer.drain(DrainMode::Eager)).unwrap();
         assert_eq!(writer.written(), 3, "the whole object was written");
 
-        let error = writer
-            .finalize(3)
+        let error = now(writer
+            .finalize(3))
             .expect_err("the resize is scripted to fail");
         assert_eq!(error.source.kind(), std::io::ErrorKind::PermissionDenied);
         let contents = std::fs::read(&path).unwrap();
@@ -1227,17 +1276,17 @@ mod tests {
         let path = dir.path().join("out");
         std::fs::write(&path, ORIGINAL).unwrap();
         let (writer, _consumer) = scripted_writer_over(&path, &script);
-        writer.prepare(0, 4).unwrap();
+        now(writer.prepare(0, 4)).unwrap();
         writer.claim().fill(chunk_at(0, 0, b"ab"));
 
         std::thread::scope(|scope| {
-            let drain = scope.spawn(|| writer.drain(DrainMode::Eager));
+            let drain = scope.spawn(|| now(writer.drain(DrainMode::Eager)));
             let held = script.wait_held(HOLD_TIMEOUT);
             assert_eq!(held.op(), Op::Write { pos: 0, len: 2 });
 
             writer.claim().fill(chunk_at(1, 2, b"cd"));
-            let error = writer
-                .finalize(4)
+            let error = now(writer
+                .finalize(4))
                 .expect_err("two of four bytes reached the destination");
             assert_eq!(error.source.kind(), std::io::ErrorKind::UnexpectedEof);
             assert!(
@@ -1269,10 +1318,10 @@ mod tests {
             .open(&path)
             .unwrap();
         let (writer, _consumer) = new_recv_body_with_sink(file, false);
-        writer.prepare(0, 0).unwrap();
+        now(writer.prepare(0, 0)).unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 8);
 
-        writer.finalize(0).unwrap();
+        now(writer.finalize(0)).unwrap();
         assert!(std::fs::read(&path).unwrap().is_empty());
     }
 
@@ -1295,7 +1344,7 @@ mod tests {
             slot.fill(chunk_at(i, offset, &data));
         }
 
-        writer.finalize(expected.len() as u64).unwrap();
+        now(writer.finalize(expected.len() as u64)).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), expected);
     }
 
@@ -1318,7 +1367,7 @@ mod tests {
             slot.fill(chunk_at(i, offset, &data));
         }
 
-        writer.drain(DrainMode::Batched).unwrap();
+        now(writer.drain(DrainMode::Batched)).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), expected);
     }
 
@@ -1349,7 +1398,7 @@ mod tests {
             h.await.unwrap();
         }
 
-        writer.finalize((n * CHUNK_LEN) as u64).unwrap();
+        now(writer.finalize((n * CHUNK_LEN) as u64)).unwrap();
 
         let contents = std::fs::read(&path).unwrap();
         for seq in 0..n as u64 {
@@ -1388,7 +1437,7 @@ mod tests {
             let outcome = slot.fill(chunk_at(i, i, &[i as u8]));
             // Drain on the batch edge, as execute_get_range does.
             if outcome == super::FillOutcome::DrainReady {
-                freed_total += writer.drain(DrainMode::Batched).unwrap().parts;
+                freed_total += now(writer.drain(DrainMode::Batched)).unwrap().parts;
             }
         }
         // A terminal drain flushes any sub-batch tail so the total accounts for every part.
@@ -1474,7 +1523,7 @@ mod tests {
                         let outcome = slot.fill(chunk_at(seq as u64, offset, &part_bytes(seq)));
                         // Mirror execute_get_range: drain on the batch edge.
                         if outcome == super::FillOutcome::DrainReady {
-                            let freed = writer.drain(DrainMode::Batched).unwrap().parts;
+                            let freed = now(writer.drain(DrainMode::Batched)).unwrap().parts;
                             freed_total.fetch_add(freed, std::sync::atomic::Ordering::Relaxed);
                         }
                     }

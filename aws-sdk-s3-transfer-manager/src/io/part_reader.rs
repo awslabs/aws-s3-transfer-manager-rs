@@ -3,7 +3,6 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 use std::cmp;
-use std::fs::File;
 use std::future::{poll_fn, Future};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -13,7 +12,7 @@ use bytes::{Buf, Bytes};
 use tokio::sync::Notify;
 
 use crate::io::error::Error;
-use crate::io::fs::read_exact_at;
+use crate::io::fs::{read_exact_at, OpenFile, ReadAt};
 use crate::io::path_body::PathBody;
 use crate::io::stream::RawInputStream;
 use crate::io::InputStream;
@@ -361,7 +360,7 @@ impl BytesPartReader {
 struct PathBodyPartReader {
     body: PathBody,
     state: Mutex<PartReaderState>, // std Mutex
-    file: Arc<File>,
+    file: Arc<OpenFile>,
 }
 
 impl PathBodyPartReader {
@@ -371,12 +370,7 @@ impl PathBodyPartReader {
         // order is sequential so kernel readahead would help, but concurrent execution creates
         // some scatter. Benchmark before adding.
         // TODO(vnext): does this need to be async now?
-        let file = Arc::new(File::open(&body.path).map_err(|e| {
-            Error::from(std::io::Error::new(
-                e.kind(),
-                format!("failed to open {}: {e}", body.path.display()),
-            ))
-        })?);
+        let file = body.open().map_err(Error::from)?;
         let offset = body.offset;
         let content_length = body.length;
         Ok(Self {
@@ -407,8 +401,10 @@ impl PathBodyPartReader {
         poll_fn(|cx| dst.poll_acquire(cx, part_size)).await?;
 
         if stream_cx.direct_io() {
-            // Managed threads: read directly, no thread pool hop.
-            read_exact_at(&self.file, &mut dst, offset)?;
+            // Managed threads: read directly, no thread pool hop. A host file
+            // read completes asynchronously on the same task.
+            let mut read = ReadAt::new();
+            poll_fn(|cx| read.poll_read(cx, &self.file, &mut dst, offset)).await?;
         } else {
             // Shared runtime: offload to blocking thread pool.
             let fd = Arc::clone(&self.file);
@@ -685,7 +681,7 @@ mod test {
     use crate::io::part_reader::{
         Builder, BytesPartReader, PartData, PartReadStart, PartReader, PathBodyPartReader,
     };
-    use crate::io::path_body::PathBody;
+    use crate::io::path_body::{PathBody, PathSource};
     use crate::io::stream::{PartStream, StreamContext};
     use crate::io::InputStream;
     use crate::memory::BufferPool;
@@ -1280,6 +1276,7 @@ mod test {
             path: tmp.path().to_path_buf(),
             offset: 10,
             length: 20,
+            source: PathSource::Path,
         };
         let reader = PathBodyPartReader::new(path_body).unwrap();
         let stream_cx = test_stream_cx(5);
@@ -1318,6 +1315,7 @@ mod test {
             path: tmp.path().to_path_buf(),
             offset: 0,
             length: 3,
+            source: PathSource::Path,
         };
         let reader = PathBodyPartReader::new(path_body).unwrap();
         let stream_cx = test_stream_cx(10);

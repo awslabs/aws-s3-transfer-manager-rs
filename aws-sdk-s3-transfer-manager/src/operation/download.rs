@@ -131,7 +131,8 @@ impl Download {
     ///
     /// When `parent_id` is `Some`, the transfer is linked as a child of the
     /// given composite transfer via [`TransferContext::new_child`](crate::transfer::TransferContext::new_child).
-    #[cfg(any(unix, windows, target_os = "wasi"))]
+    ///
+    /// The client's filesystem creates and, on failure, removes the temp file.
     pub(crate) async fn orchestrate_to_path(
         handle: Arc<crate::client::Handle>,
         input: DownloadInput,
@@ -139,10 +140,12 @@ impl Download {
         parent_id: Option<u64>,
         sinks: &dyn sink::SinkFactory,
     ) -> Result<ManagedDownloadHandle, error::Error> {
+        let filesystem = handle.config.filesystem();
         // Generate temp file in the same directory as destination
         let candidates =
             temp_file_candidates(&dest_path, std::iter::repeat_with(|| fastrand::u32(..)));
-        let (file, temp_path) = crate::io::fs::create_first_new_async(candidates)
+        let (file, temp_path) = filesystem
+            .create_first_new(candidates)
             .await
             .map_err(|e| error::from_kind(error::ErrorKind::IOError)(e))?;
 
@@ -150,7 +153,7 @@ impl Download {
             Ok(sink) => sink,
             Err(e) => {
                 // No handle owns the temp file yet, so remove it here.
-                let _ = crate::io::fs::remove_file_async(&temp_path).await;
+                let _ = filesystem.remove_file(&temp_path).await;
                 return Err(error::from_kind(error::ErrorKind::IOError)(e));
             }
         };
@@ -168,11 +171,10 @@ impl Download {
     /// and [`ErrorKind::IOError`](error::ErrorKind::IOError) for any other
     /// failure to create the sink. Either happens before the transfer is
     /// scheduled, so no request is sent and `file` is not written.
-    #[cfg(any(unix, windows, target_os = "wasi"))]
     pub(crate) fn orchestrate_to_file(
         handle: Arc<crate::client::Handle>,
         input: DownloadInput,
-        file: std::fs::File,
+        file: crate::io::fs::OpenFile,
         sinks: &dyn sink::SinkFactory,
     ) -> Result<ManagedDownloadHandle, error::Error> {
         let sink = sinks.create(file, false).map_err(|e| {

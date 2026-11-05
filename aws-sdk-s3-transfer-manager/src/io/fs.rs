@@ -13,7 +13,7 @@
 //! flush data or provide a durability boundary.
 //!
 //! [`is_append_only`] reports whether a handle's positioned writes would land
-//! at their offsets, and [`create_first_new`] creates the first of several
+//! at their offsets, and `create_first_new` creates the first of several
 //! candidate paths that does not exist yet, without opening any existing entry.
 //! [`Handle`] identifies the file a path names, so that two paths can be
 //! compared.
@@ -21,13 +21,42 @@
 //! The `_async` helpers keep blocking filesystem calls off async worker
 //! threads: natively through `tokio::fs` or tokio's blocking pool, and inline
 //! on wasm targets, which have no blocking pool.
+//!
+//! [`FileSystem`] is the filesystem one client's path operations use, with
+//! [`OpenFile`], [`Metadata`], [`ReadDir`], and [`ReadAt`] as its file, entry
+//! metadata, directory listing, and positioned-read types. On
+//! `wasm32-unknown-unknown` it forwards to the host application's
+//! filesystem, whose operations complete asynchronously, and the synchronous
+//! positioned read fails with [`io::ErrorKind::Unsupported`]. On every other
+//! target it is the operating system's filesystem, which completes each
+//! operation when it is called.
 
-use bytes::{Buf, BufMut};
+use bytes::BufMut;
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+use bytes::Buf;
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 use std::fs::File;
 use std::io;
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 use std::path::{Path, PathBuf};
 
 use crate::io::PartBuffer;
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+mod os;
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+pub(crate) use os::{
+    metadata_blocking, open_read_blocking, FileSystem, Metadata, OpenFile, ReadAt, ReadDir,
+    COMPLETES_INLINE,
+};
+
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+mod host;
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+pub(crate) use host::{
+    metadata_blocking, open_read_blocking, FileSystem, Handle, Metadata, OpenFile, ReadAt,
+    ReadDir, COMPLETES_INLINE,
+};
 
 /// Repeats positioned reads until `dst` is full.
 ///
@@ -144,7 +173,11 @@ fn validate_off_t_range(offset: u64, len: usize) -> io::Result<()> {
 ///
 /// Returns [`io::ErrorKind::UnexpectedEof`] when the requested range extends
 /// beyond the file and an error when the range offset cannot be represented.
-pub(crate) fn read_exact_at(file: &File, dst: &mut PartBuffer, mut offset: u64) -> io::Result<()> {
+pub(crate) fn read_exact_at(
+    file: &OpenFile,
+    dst: &mut PartBuffer,
+    mut offset: u64,
+) -> io::Result<()> {
     while dst.remaining_mut() != 0 {
         // SAFETY: the returned slice remains `MaybeUninit<u8>` until the
         // positioned read initializes the complete range.
@@ -185,8 +218,8 @@ pub(crate) fn read_exact_at(file: &File, dst: &mut PartBuffer, mut offset: u64) 
 /// after the bytes already written so the caller can observe partial progress.
 ///
 /// Unix uses vectored positioned writes to preserve segment boundaries.
-/// Windows and WASI write one segment per call. Platforms without
-/// positioned-write support return [`io::ErrorKind::Unsupported`].
+/// Windows and WASI write one segment per call.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 pub(crate) fn write_all_at(file: &File, buf: &mut impl Buf, offset: u64) -> io::Result<()> {
     sys::write_all_at(file, buf, offset)
 }
@@ -196,10 +229,11 @@ pub(crate) fn write_all_at(file: &File, buf: &mut impl Buf, offset: u64) -> io::
 /// Linux reserves the range with `posix_fallocate`, allowing allocation
 /// failures to surface before transfer writes begin. Other Unix systems,
 /// Windows, and WASI set the logical file length without guaranteeing physical
-/// space; unsupported platforms treat the request as a no-op.
+/// space.
 ///
 /// This operation does not flush file data or metadata. Successful return is
 /// not a durability guarantee.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 pub(crate) fn preallocate(file: &File, len: u64) -> io::Result<()> {
     sys::preallocate(file, len)
 }
@@ -216,12 +250,13 @@ pub(crate) fn preallocate(file: &File, len: u64) -> io::Result<()> {
 ///   regardless of its offset.
 /// - On WASI, true when wasi-libc reports `O_APPEND` in the descriptor's status
 ///   flags.
-/// - Under Miri, and on other targets, the handle is not inspected and the
-///   result is `Ok(false)`.
+/// - Under Miri, and on `wasm32-unknown-unknown`, whose host files take
+///   positioned writes, the handle is not inspected and the result is
+///   `Ok(false)`.
 ///
 /// The result describes the handle at the time of the call. An error means
 /// the handle's mode could not be read.
-pub(crate) fn is_append_only(file: &File) -> io::Result<bool> {
+pub(crate) fn is_append_only(file: &OpenFile) -> io::Result<bool> {
     sys::is_append_only(file)
 }
 
@@ -238,6 +273,7 @@ pub(crate) fn is_append_only(file: &File) -> io::Result<bool> {
 /// [`io::ErrorKind::AlreadyExists`] when every candidate named an existing
 /// entry, or there were none. Any other error from opening a candidate is
 /// returned at once.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 pub(crate) fn create_first_new(
     candidates: impl IntoIterator<Item = PathBuf>,
 ) -> io::Result<(File, PathBuf)> {
@@ -261,7 +297,7 @@ pub(crate) fn create_first_new(
 ///
 /// Returns its result, or an error if the blocking task panics or is
 /// cancelled.
-#[cfg(any(unix, windows, target_os = "wasi"))]
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 pub(crate) async fn create_first_new_async(
     candidates: Vec<PathBuf>,
 ) -> io::Result<(File, PathBuf)> {
@@ -283,7 +319,7 @@ pub(crate) async fn rename_async(from: &Path, to: &Path) -> io::Result<()> {
 /// Uses `tokio::fs::rename`, or [`std::fs::rename`] on the calling thread on
 /// wasm targets, where tokio's blocking pool is unavailable. Returns the
 /// rename's result.
-#[cfg(target_family = "wasm")]
+#[cfg(all(target_family = "wasm", not(target_os = "unknown")))]
 pub(crate) async fn rename_async(from: &Path, to: &Path) -> io::Result<()> {
     std::fs::rename(from, to)
 }
@@ -303,7 +339,7 @@ pub(crate) async fn remove_file_async(path: &Path) -> io::Result<()> {
 /// Uses `tokio::fs::remove_file`, or [`std::fs::remove_file`] on the calling
 /// thread on wasm targets, where tokio's blocking pool is unavailable. Returns
 /// the removal's result.
-#[cfg(target_family = "wasm")]
+#[cfg(all(target_family = "wasm", not(target_os = "unknown")))]
 pub(crate) async fn remove_file_async(path: &Path) -> io::Result<()> {
     std::fs::remove_file(path)
 }
@@ -328,7 +364,10 @@ async fn run_blocking<T>(operation: impl FnOnce() -> io::Result<T>) -> io::Resul
     operation()
 }
 
-#[cfg(not(target_os = "wasi"))]
+#[cfg(not(any(
+    target_os = "wasi",
+    all(target_family = "wasm", target_os = "unknown")
+)))]
 pub(crate) use same_file::Handle;
 #[cfg(target_os = "wasi")]
 pub(crate) use sys::Handle;
@@ -584,34 +623,28 @@ mod sys {
     }
 }
 
-#[cfg(not(any(unix, windows, target_os = "wasi")))]
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 mod sys {
-    //! Fallbacks for platforms without positioned filesystem operations.
+    //! Synchronous positioned I/O on `wasm32-unknown-unknown`.
+    //!
+    //! Host files complete reads asynchronously through
+    //! [`ReadAt`](super::ReadAt), so a synchronous read is unsupported.
 
-    use bytes::Buf;
-    use std::fs::File;
     use std::io;
 
-    pub(super) fn read_exact_at(_file: &File, _dst: &mut [u8], _offset: u64) -> io::Result<()> {
+    pub(super) fn read_exact_at(
+        _file: &super::OpenFile,
+        _dst: &mut [u8],
+        _offset: u64,
+    ) -> io::Result<()> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "positioned reads not supported on this platform",
+            "host files complete positioned reads asynchronously",
         ))
-    }
-
-    pub(super) fn write_all_at(_file: &File, _buf: &mut impl Buf, _offset: u64) -> io::Result<()> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "positioned writes not supported on this platform",
-        ))
-    }
-
-    pub(super) fn preallocate(_file: &File, _len: u64) -> io::Result<()> {
-        Ok(())
     }
 
     /// Does not inspect the handle: always `Ok(false)`.
-    pub(super) fn is_append_only(_file: &File) -> io::Result<bool> {
+    pub(super) fn is_append_only(_file: &super::OpenFile) -> io::Result<bool> {
         Ok(false)
     }
 }

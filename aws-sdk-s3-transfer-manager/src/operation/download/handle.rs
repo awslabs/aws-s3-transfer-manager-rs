@@ -374,7 +374,6 @@ impl ManagedDownloadHandle {
         }
     }
 
-    #[cfg(any(unix, windows, target_os = "wasi"))]
     pub(crate) fn new_unmanaged(inner: DownloadHandleInner) -> Self {
         Self {
             inner,
@@ -462,8 +461,9 @@ impl ManagedDownloadHandle {
             // path downloads would sync file data before rename and the parent
             // directory after rename where supported. The latency and cross-platform
             // semantics make this a client/API policy rather than the default.
-            if let Err(e) = crate::io::fs::rename_async(&temp, dest).await {
-                let _ = crate::io::fs::remove_file_async(&temp).await;
+            let filesystem = self.inner.transfer.ctx().handle.config.filesystem();
+            if let Err(e) = filesystem.rename(&temp, dest).await {
+                let _ = filesystem.remove_file(&temp).await;
                 return Err(e);
             }
         }
@@ -476,7 +476,8 @@ impl ManagedDownloadHandle {
     /// that name again.
     async fn cleanup(&mut self) {
         if let Some(temp) = self.temp_path.take() {
-            let _ = crate::io::fs::remove_file_async(&temp).await;
+            let filesystem = self.inner.transfer.ctx().handle.config.filesystem();
+            let _ = filesystem.remove_file(&temp).await;
         }
     }
 }
@@ -492,7 +493,7 @@ impl Drop for ManagedDownloadHandle {
                 .cancel_transfer(self.inner.transfer.id());
         }
         if let Some(temp) = &self.temp_path {
-            let _ = std::fs::remove_file(temp);
+            ctx.handle.config.filesystem().remove_file_detached(temp);
         }
     }
 }
