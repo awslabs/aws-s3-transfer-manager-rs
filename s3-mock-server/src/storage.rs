@@ -115,8 +115,74 @@ pub(crate) fn etag_condition_holds(condition: &s3s::dto::ETagCondition, etag: &s
     }
 }
 
+/// Request for appending to an object (PutObject with `x-amz-write-offset-bytes`).
+pub(crate) struct AppendObjectRequest {
+    /// Where the appended data must start: the current size of the object.
+    pub offset: u64,
+    /// The data to append. Its checksums have been validated against the request's.
+    pub content: Bytes,
+    /// `If-Match` (the ETag the object must have) or `If-None-Match: *` (the key must not exist).
+    pub precondition: WritePrecondition,
+    /// The algorithm of the request's checksum, if it has one.
+    pub checksum_algorithm: Option<aws_smithy_checksums::ChecksumAlgorithm>,
+    /// The PutObject the append was sent as. When the key does not exist and `offset` is 0, the
+    /// object is created from it, with `content` as its body; otherwise only its bucket and key
+    /// are used.
+    pub put_object: StoreObjectRequest,
+}
+
 /// An in-place change to the stored metadata of an object.
 pub(crate) type MetadataUpdate = Box<dyn FnOnce(&mut ObjectMetadata) + Send>;
+
+/// Conditions on a RenameObject request.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RenamePreconditions {
+    /// `If-Match` on the destination.
+    pub if_match: Option<String>,
+    /// `If-None-Match: *` on the destination.
+    pub if_none_match_any: bool,
+    /// `x-amz-rename-source-if-match` on the source.
+    pub source_if_match: Option<String>,
+}
+
+/// Request for renaming an object (RenameObject).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RenameRequest {
+    pub src_key: String,
+    pub dst_key: String,
+    pub preconditions: RenamePreconditions,
+    /// The `x-amz-client-token` that makes a retry of the rename idempotent.
+    pub client_token: Option<String>,
+}
+
+impl RenamePreconditions {
+    /// Check the conditions against the current source and destination. A missing source fails
+    /// with `NoSuchKey` before any condition is evaluated. The ETag matches are checked next, the
+    /// destination's `If-Match` and then the source's `x-amz-rename-source-if-match`, both
+    /// reported as `If-Match` as S3 reports them, and `If-None-Match` last. `If-Match` fails on a
+    /// missing destination.
+    pub(crate) fn check(
+        &self,
+        source: Option<&ObjectMetadata>,
+        destination: Option<&ObjectMetadata>,
+    ) -> Result<()> {
+        let source = source.ok_or(crate::Error::NoSuchKey)?;
+        if let Some(etag) = &self.if_match {
+            if !destination.is_some_and(|destination| etags_match(etag, &destination.etag)) {
+                return Err(crate::Error::RenamePreconditionFailed("If-Match"));
+            }
+        }
+        if let Some(etag) = &self.source_if_match {
+            if !etags_match(etag, &source.etag) {
+                return Err(crate::Error::RenamePreconditionFailed("If-Match"));
+            }
+        }
+        if self.if_none_match_any && destination.is_some() {
+            return Err(crate::Error::RenamePreconditionFailed("If-None-Match"));
+        }
+        Ok(())
+    }
+}
 
 /// Request for retrieving an object.
 pub(crate) struct GetObjectRequest<'a> {
@@ -177,6 +243,8 @@ pub(crate) struct UploadPartRequest<'a> {
     pub upload_id: &'a str,
     pub part_number: i32,
     pub content: Bytes,
+    /// Whether the request carried a checksum of the part.
+    pub client_checksum: bool,
 }
 
 /// Response for uploading a part.
@@ -416,6 +484,28 @@ pub(crate) trait StorageBackend: Send + Sync + Debug {
     /// Abort a multipart upload and clean up all associated data.
     async fn abort_multipart_upload(&self, upload_id: &str) -> Result<()>;
 
+    /// Append to an object, or create it when the key does not exist and the offset is 0.
+    ///
+    /// Fails with `NoSuchKey` for a missing key at a non-zero offset or with `If-Match`,
+    /// `PreconditionFailed` when `If-Match` does not hold or the key exists with
+    /// `If-None-Match: *`, `InvalidArgument` for an empty append to a non-empty object,
+    /// `InvalidWriteOffset` when the offset is not the object's size, and `ChecksumTypeMismatch`
+    /// when the object stores checksums but none of the request's algorithm, CRC64NVME if the
+    /// request has none.
+    async fn append_object(&self, _request: AppendObjectRequest) -> Result<StoredObjectMetadata> {
+        Err(crate::Error::NotImplemented)
+    }
+
+    /// Move an object to a new key in the same bucket, replacing any object at the destination.
+    ///
+    /// A request with the client token of a rename that succeeded succeeds without renaming again
+    /// if it is the same request, and fails with `IdempotentParameterMismatch` otherwise. Fails
+    /// with `NoSuchKey` when the source does not exist, and with `RenamePreconditionFailed`,
+    /// naming the condition header S3 reports, when a condition does not hold.
+    async fn rename_object(&self, _bucket: &str, _request: RenameRequest) -> Result<()> {
+        Err(crate::Error::NotImplemented)
+    }
+
     /// The multipart uploads in progress in `bucket`, ordered by key and then upload id.
     async fn list_multipart_uploads(&self, bucket: &str) -> Result<Vec<MultipartUploadInfo>>;
 
@@ -507,6 +597,14 @@ impl StorageBackend for std::sync::Arc<dyn StorageBackend + '_> {
 
     async fn abort_multipart_upload(&self, upload_id: &str) -> Result<()> {
         (**self).abort_multipart_upload(upload_id).await
+    }
+
+    async fn append_object(&self, request: AppendObjectRequest) -> Result<StoredObjectMetadata> {
+        (**self).append_object(request).await
+    }
+
+    async fn rename_object(&self, bucket: &str, request: RenameRequest) -> Result<()> {
+        (**self).rename_object(bucket, request).await
     }
 
     async fn list_multipart_uploads(&self, bucket: &str) -> Result<Vec<MultipartUploadInfo>> {

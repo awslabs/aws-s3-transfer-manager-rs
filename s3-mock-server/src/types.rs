@@ -287,10 +287,17 @@ pub fn composite_checksum(
     part_checksums: &[String],
     algorithm: aws_sdk_s3::types::ChecksumAlgorithm,
 ) -> String {
-    use base64::Engine;
-
     let smithy_algorithm = aws_smithy_checksums::ChecksumAlgorithm::from_str(algorithm.as_str())
         .expect("unsupported checksum algorithm");
+    composite_of(part_checksums, smithy_algorithm)
+}
+
+/// [`composite_checksum`] with the checksum algorithm as `aws_smithy_checksums` names it.
+pub(crate) fn composite_of(
+    part_checksums: &[String],
+    smithy_algorithm: aws_smithy_checksums::ChecksumAlgorithm,
+) -> String {
+    use base64::Engine;
 
     let raw: Vec<u8> = part_checksums
         .iter()

@@ -38,6 +38,8 @@ struct MultipartState {
 struct BucketState {
     created_at: SystemTime,
     objects: HashMap<String, (Bytes, ObjectMetadata)>,
+    /// The renames that succeeded with a client token, by token.
+    renames: HashMap<String, crate::storage::RenameRequest>,
 }
 
 impl BucketState {
@@ -45,6 +47,7 @@ impl BucketState {
         Self {
             created_at: SystemTime::now(),
             objects: HashMap::new(),
+            renames: HashMap::new(),
         }
     }
 }
@@ -124,6 +127,7 @@ impl StorageBackend for InMemoryStorage {
             content_disposition: request.content_disposition,
             content_language: request.content_language,
             parts: Vec::new(),
+            append_segments: Vec::new(),
             restore_status: request.restore_status,
         };
 
@@ -331,6 +335,7 @@ impl StorageBackend for InMemoryStorage {
         let mut part_metadata = PartMetadata {
             etag: etag.clone(),
             size: request.content.len() as u64,
+            client_checksum: request.client_checksum,
             ..Default::default()
         };
 
@@ -464,6 +469,7 @@ impl StorageBackend for InMemoryStorage {
                 total_size += part_metadata.size;
                 final_metadata.parts.push(ObjectPart {
                     size: part_metadata.size,
+                    client_checksum: part_metadata.client_checksum,
                     crc32: part_metadata.crc32.clone(),
                     crc32c: part_metadata.crc32c.clone(),
                     crc64nvme: part_metadata.crc64nvme.clone(),
@@ -649,6 +655,174 @@ impl StorageBackend for InMemoryStorage {
         }
         multipart.parts.remove(upload_id);
 
+        Ok(())
+    }
+
+    async fn append_object(
+        &self,
+        request: crate::storage::AppendObjectRequest,
+    ) -> Result<StoredObjectMetadata> {
+        let mut buckets = self.buckets.write().await;
+        let bucket_state = buckets
+            .get_mut(&request.put_object.bucket)
+            .ok_or(Error::NoSuchBucket)?;
+
+        let Some((data, metadata)) = bucket_state.objects.get(&request.put_object.key) else {
+            // As in S3, an append with `If-Match` does not create the object.
+            if request.offset != 0
+                || matches!(
+                    request.precondition,
+                    crate::storage::WritePrecondition::IfMatch(_)
+                )
+            {
+                return Err(Error::NoSuchKey);
+            }
+            let if_none_match =
+                request.precondition == crate::storage::WritePrecondition::IfNoneMatchAny;
+            // Create the object as a PutObject of the appended data would. The lock is released
+            // first because `put_object` takes it; the key must still be missing when the write
+            // lands, so of two racing creating appends one fails.
+            drop(buckets);
+            let mut put_object = request.put_object;
+            let content = request.content;
+            put_object.body = Box::pin(futures::stream::once(async move { Ok(content) }));
+            put_object.precondition = crate::storage::WritePrecondition::IfNoneMatchAny;
+            // A creating append that lost the race fails as an append at the wrong offset, unless
+            // it asked for the key not to exist.
+            return self
+                .put_object(put_object)
+                .await
+                .map_err(|error| match error {
+                    Error::PreconditionFailed if !if_none_match => Error::InvalidWriteOffset,
+                    error => error,
+                });
+        };
+
+        request.precondition.check(Some(metadata))?;
+        if request.content.is_empty() && metadata.content_length > 0 {
+            return Err(Error::InvalidArgument(
+                "Request body cannot be empty when 'write offset' is specified",
+            ));
+        }
+        if metadata.content_length != request.offset {
+            return Err(Error::InvalidWriteOffset);
+        }
+        let algorithms = metadata.checksum_algorithms();
+        // An append without a checksum is checked as a CRC64NVME one, S3's default.
+        let algorithm = request
+            .checksum_algorithm
+            .unwrap_or(aws_smithy_checksums::ChecksumAlgorithm::Crc64Nvme);
+        if !algorithms.is_empty() && !algorithms.contains(&algorithm) {
+            return Err(Error::ChecksumTypeMismatch {
+                expected: algorithms
+                    .iter()
+                    .map(|a| a.as_str())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                actual: algorithm.as_str().to_owned(),
+            });
+        }
+
+        // The ETag and the full-object checksums cover the combined content.
+        let mut checks = crate::types::ObjectIntegrityChecks::new().with_md5();
+        for algorithm in &algorithms {
+            checks = checks.with_checksum_algorithm(*algorithm);
+        }
+        let mut content = BytesMut::with_capacity(data.len() + request.content.len());
+        content.extend_from_slice(data);
+        content.extend_from_slice(&request.content);
+        let content = content.freeze();
+        checks.update(&content);
+        let mut object_integrity = checks.finalize();
+
+        // S3 does not extend a SHA-1 or SHA-256 checksum: an appended object's is the composite of
+        // the checksums of its segments.
+        let mut append_segments = Vec::new();
+        if let Some(algorithm) = algorithms.iter().copied().find(|algorithm| {
+            matches!(
+                algorithm,
+                aws_smithy_checksums::ChecksumAlgorithm::Sha1
+                    | aws_smithy_checksums::ChecksumAlgorithm::Sha256
+            )
+        }) {
+            let sha256 = algorithm == aws_smithy_checksums::ChecksumAlgorithm::Sha256;
+            let checksum_of = |sha1: &Option<String>, sha256_value: &Option<String>| {
+                if sha256 {
+                    sha256_value.clone()
+                } else {
+                    sha1.clone()
+                }
+            };
+            append_segments = if !metadata.append_segments.is_empty() {
+                metadata.append_segments.clone()
+            } else if !metadata.parts.is_empty() {
+                metadata
+                    .parts
+                    .iter()
+                    .filter_map(|part| checksum_of(&part.sha1, &part.sha256))
+                    .collect()
+            } else {
+                checksum_of(&metadata.sha1, &metadata.sha256)
+                    .into_iter()
+                    .collect()
+            };
+            let mut appended =
+                crate::types::ObjectIntegrityChecks::new().with_checksum_algorithm(algorithm);
+            appended.update(&request.content);
+            let appended = appended.finalize();
+            append_segments.extend(checksum_of(&appended.sha1, &appended.sha256));
+            let composite = Some(crate::types::composite_of(&append_segments, algorithm));
+            if sha256 {
+                object_integrity.sha256 = composite;
+            } else {
+                object_integrity.sha1 = composite;
+            }
+        }
+
+        let mut metadata = metadata.clone();
+        metadata.content_length = content.len() as u64;
+        metadata.etag = object_integrity.etag().unwrap_or_default();
+        metadata.last_modified = SystemTime::now();
+        metadata.crc32 = object_integrity.crc32.clone();
+        metadata.crc32c = object_integrity.crc32c.clone();
+        metadata.crc64nvme = object_integrity.crc64nvme.clone();
+        metadata.sha1 = object_integrity.sha1.clone();
+        metadata.sha256 = object_integrity.sha256.clone();
+        // An appended object has no part layout to report.
+        metadata.parts = Vec::new();
+        metadata.append_segments = append_segments;
+        bucket_state
+            .objects
+            .insert(request.put_object.key, (content, metadata));
+        Ok(StoredObjectMetadata { object_integrity })
+    }
+
+    async fn rename_object(
+        &self,
+        bucket: &str,
+        request: crate::storage::RenameRequest,
+    ) -> Result<()> {
+        let mut buckets = self.buckets.write().await;
+        let bucket_state = buckets.get_mut(bucket).ok_or(Error::NoSuchBucket)?;
+        if let Some(token) = &request.client_token {
+            match bucket_state.renames.get(token) {
+                Some(previous) if *previous == request => return Ok(()),
+                Some(_) => return Err(Error::IdempotentParameterMismatch),
+                None => {}
+            }
+        }
+        request.preconditions.check(
+            bucket_state.objects.get(&request.src_key).map(|(_, m)| m),
+            bucket_state.objects.get(&request.dst_key).map(|(_, m)| m),
+        )?;
+        let object = bucket_state
+            .objects
+            .remove(&request.src_key)
+            .expect("the preconditions check that the source exists");
+        bucket_state.objects.insert(request.dst_key.clone(), object);
+        if let Some(token) = request.client_token.clone() {
+            bucket_state.renames.insert(token, request);
+        }
         Ok(())
     }
 
@@ -906,12 +1080,14 @@ mod tests {
             upload_id,
             part_number: 1,
             content: part1.clone(),
+            client_checksum: false,
         };
         let etag1 = storage.upload_part(request1).await.unwrap();
         let request2 = crate::storage::UploadPartRequest {
             upload_id,
             part_number: 2,
             content: part2.clone(),
+            client_checksum: false,
         };
         let etag2 = storage.upload_part(request2).await.unwrap();
 
@@ -995,6 +1171,7 @@ mod tests {
                         upload_id: &upload_id,
                         part_number: 1,
                         content: Bytes::from_static(b"part"),
+                        client_checksum: false,
                     })
                     .await
                     .map(|_| ())
@@ -1033,6 +1210,7 @@ mod tests {
             upload_id,
             part_number: 1,
             content: part1,
+            client_checksum: false,
         };
         let etag1 = storage.upload_part(request).await.unwrap();
 
@@ -1091,6 +1269,7 @@ mod tests {
                 upload_id,
                 part_number: 1,
                 content: Bytes::from_static(b"part1"),
+                client_checksum: false,
             })
             .await
             .unwrap()
@@ -1157,6 +1336,7 @@ mod tests {
             upload_id,
             part_number: 1,
             content: part1,
+            client_checksum: false,
         };
         storage.upload_part(request).await.unwrap();
 

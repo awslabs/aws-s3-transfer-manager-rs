@@ -76,8 +76,8 @@ pub enum FaultType {
     /// headers. An upload body is fully consumed and stored first. The connection
     /// stays open with no reset and no EOF, so the client waits for a response
     /// that never arrives. Unlike [`StallRequestRead`](Self::StallRequestRead),
-    /// the request body is never stalled. Applies to GetObject, PutObject and
-    /// UploadPart.
+    /// the request body is never stalled. Applies to GetObject, PutObject,
+    /// UploadPart and RenameObject.
     WithholdResponseHeaders,
 }
 

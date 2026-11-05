@@ -67,6 +67,7 @@ async fn test_multipart_streaming_comprehensive<S: StorageBackend>(storage: &S) 
         upload_id,
         part_number: 1,
         content: part1.clone(),
+        client_checksum: false,
     };
     let etag1 = storage.upload_part(request1).await.unwrap().etag;
 
@@ -74,6 +75,7 @@ async fn test_multipart_streaming_comprehensive<S: StorageBackend>(storage: &S) 
         upload_id,
         part_number: 2,
         content: part2.clone(),
+        client_checksum: false,
     };
     let etag2 = storage.upload_part(request2).await.unwrap().etag;
 
@@ -81,6 +83,7 @@ async fn test_multipart_streaming_comprehensive<S: StorageBackend>(storage: &S) 
         upload_id,
         part_number: 3,
         content: part3.clone(),
+        client_checksum: false,
     };
     let etag3 = storage.upload_part(request3).await.unwrap().etag;
 
@@ -439,6 +442,107 @@ async fn test_write_preconditions<S: StorageBackend>(storage: &S) {
         .is_none());
 }
 
+/// A rename moves the data and the metadata to the destination, replacing it, and fails with
+/// `NoSuchKey` for a missing source or `RenamePreconditionFailed` for a failed condition without
+/// moving anything. A retry with the client token of a rename that succeeded succeeds without
+/// renaming again, and another request with the token fails with `IdempotentParameterMismatch`.
+async fn test_rename<S: StorageBackend>(storage: &S) {
+    use crate::storage::{RenamePreconditions, RenameRequest};
+    let request = |src: &str, dst: &str, preconditions, client_token: Option<&str>| RenameRequest {
+        src_key: src.to_owned(),
+        dst_key: dst.to_owned(),
+        preconditions,
+        client_token: client_token.map(str::to_owned),
+    };
+    storage.create_bucket(TEST_BUCKET).await.unwrap();
+    let etag = storage
+        .put_object(store_request("dir/source", b"content"))
+        .await
+        .unwrap()
+        .object_integrity
+        .etag()
+        .unwrap();
+    storage
+        .put_object(store_request("destination", b"old"))
+        .await
+        .unwrap();
+
+    let conditions = RenamePreconditions {
+        if_none_match_any: true,
+        ..Default::default()
+    };
+    let result = storage
+        .rename_object(
+            TEST_BUCKET,
+            request("dir/source", "destination", conditions, None),
+        )
+        .await;
+    assert!(
+        matches!(
+            result,
+            Err(crate::Error::RenamePreconditionFailed("If-None-Match"))
+        ),
+        "{result:?}"
+    );
+    assert_eq!(content_of(storage, "destination").await.unwrap(), "old");
+
+    let conditions = RenamePreconditions {
+        source_if_match: Some(etag.clone()),
+        ..Default::default()
+    };
+    let with_token = || {
+        request(
+            "dir/source",
+            "other/destination",
+            conditions.clone(),
+            Some("t"),
+        )
+    };
+    storage
+        .rename_object(TEST_BUCKET, with_token())
+        .await
+        .unwrap();
+    // A retry with the token succeeds without renaming again; another request with it fails.
+    storage
+        .rename_object(TEST_BUCKET, with_token())
+        .await
+        .unwrap();
+    let result = storage
+        .rename_object(
+            TEST_BUCKET,
+            request("dir/source", "elsewhere", Default::default(), Some("t")),
+        )
+        .await;
+    assert!(
+        matches!(result, Err(crate::Error::IdempotentParameterMismatch)),
+        "{result:?}"
+    );
+    storage
+        .rename_object(
+            TEST_BUCKET,
+            request("other/destination", "destination", Default::default(), None),
+        )
+        .await
+        .unwrap();
+    assert!(content_of(storage, "dir/source").await.is_none());
+    assert!(content_of(storage, "other/destination").await.is_none());
+    assert_eq!(content_of(storage, "destination").await.unwrap(), "content");
+    let metadata = storage
+        .head_object(TEST_BUCKET, "destination")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(metadata.etag, etag);
+
+    let result = storage
+        .rename_object(
+            TEST_BUCKET,
+            request("missing", "destination", Default::default(), None),
+        )
+        .await;
+    assert!(matches!(result, Err(crate::Error::NoSuchKey)), "{result:?}");
+}
+
 /// `delete_object_if_match` deletes the object only when its ETag matches, quoted or not, or the
 /// condition is `*`, fails with `PreconditionFailed` otherwise, and with `NoSuchKey` for a
 /// missing key.
@@ -497,6 +601,11 @@ async fn test_filesystem_write_preconditions() {
     let dir = tempdir().unwrap();
     test_write_preconditions(&FilesystemStorage::new(dir.path().join("a")).await.unwrap()).await;
     test_delete_object_if_match(&FilesystemStorage::new(dir.path().join("b")).await.unwrap()).await;
+}
+
+#[tokio::test]
+async fn test_in_memory_rename() {
+    test_rename(&InMemoryStorage::new()).await;
 }
 
 /// `update_metadata` changes the stored metadata and leaves the data alone, and fails with

@@ -104,6 +104,8 @@ pub(crate) struct ServerState {
     pub(crate) throttle: std::sync::Mutex<Option<std::sync::Arc<crate::throttle::RateThrottle>>>,
     /// Requests received per operation.
     pub(crate) requests: crate::operation::RequestCounters,
+    /// S3 Express sessions created with CreateSession.
+    pub(crate) sessions: crate::express::Sessions,
 }
 
 impl ServerState {
@@ -164,6 +166,75 @@ impl<S: StorageBackend + 'static> Inner<S> {
     /// Create a new Inner sharing the state of an owning server.
     pub(crate) fn with_state(storage: S, state: std::sync::Arc<ServerState>) -> Self {
         Self { storage, state }
+    }
+
+    /// Serve a PutObject with `x-amz-write-offset-bytes`: append the body to the object at
+    /// `offset`, or create the object when it does not exist and `offset` is 0.
+    ///
+    /// The body is read in full and checked against the request's checksums before the object
+    /// changes, so a `BadDigest` append leaves the object as it was.
+    async fn append_object(
+        &self,
+        mut request: crate::storage::StoreObjectRequest,
+        offset: i64,
+    ) -> S3Result<S3Response<s3s::dto::PutObjectOutput>> {
+        let offset =
+            u64::try_from(offset).map_err(|_| Error::InvalidArgument("Invalid write offset"))?;
+        let client_checksums = request
+            .client_checksums
+            .take()
+            .expect("PutObject requests carry the client's checksums");
+        let checksum_algorithm = [
+            (client_checksums.crc32.is_some(), ChecksumAlgorithm::Crc32),
+            (client_checksums.crc32c.is_some(), ChecksumAlgorithm::Crc32c),
+            (
+                client_checksums.crc64nvme.is_some(),
+                ChecksumAlgorithm::Crc64Nvme,
+            ),
+            (client_checksums.sha1.is_some(), ChecksumAlgorithm::Sha1),
+            (client_checksums.sha256.is_some(), ChecksumAlgorithm::Sha256),
+        ]
+        .into_iter()
+        .find_map(|(present, algorithm)| present.then_some(algorithm));
+        let precondition = std::mem::take(&mut request.precondition);
+
+        let mut content = BytesMut::new();
+        while let Some(chunk) = request.body.next().await {
+            let chunk = chunk.map_err(|e| Error::Internal(format!("Stream error: {}", e)))?;
+            content.extend_from_slice(&chunk);
+        }
+        let content = content.freeze();
+        let mut checks = crate::types::ObjectIntegrityChecks::from(&client_checksums);
+        checks.update(&content);
+        if let Err(algorithm) = checks.finalize().validate(&client_checksums) {
+            return Err(Error::BadDigest {
+                algorithm,
+                completion: false,
+            }
+            .into());
+        }
+
+        let stored = self
+            .storage
+            .append_object(crate::storage::AppendObjectRequest {
+                offset,
+                content,
+                precondition,
+                checksum_algorithm,
+                put_object: request,
+            })
+            .await?;
+        let output = s3s::dto::PutObjectOutput {
+            e_tag: opt_etag_from_quoted(stored.object_integrity.etag()),
+            checksum_type: integrity_checksum_type(&stored.object_integrity),
+            checksum_crc32: stored.object_integrity.crc32,
+            checksum_crc32c: stored.object_integrity.crc32c,
+            checksum_sha1: stored.object_integrity.sha1,
+            checksum_sha256: stored.object_integrity.sha256,
+            checksum_crc64nvme: stored.object_integrity.crc64nvme,
+            ..Default::default()
+        };
+        Ok(S3Response::new(output))
     }
 
     /// Apply the fault drawn for a GET request to its response. Effects are
@@ -419,7 +490,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         if let Some(part_number) = input.part_number {
             stream_metadata.apply_part_checksums(part_number);
         }
-        if omits_part_checksums(&metadata, input.part_number, range.as_ref()) {
+        if omits_part_checksums(bucket, &metadata, input.part_number, range.as_ref()) {
             stream_metadata.clear_checksums();
         }
 
@@ -467,7 +538,8 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         }
 
         // Return stored HTTP headers
-        output.storage_class = storage_class_header(stream_metadata.storage_class);
+        output.storage_class =
+            BucketType::of(bucket).storage_class_header(stream_metadata.storage_class);
         output.cache_control = stream_metadata.cache_control.map(|s| s.parse().unwrap());
         output.content_encoding = stream_metadata.content_encoding.map(|s| s.parse().unwrap());
         output.content_disposition = stream_metadata
@@ -539,7 +611,8 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             .as_ref()
             .map(|r| content_range_header(r, metadata.content_length));
         let checksum_type = stored_checksum_type(&metadata);
-        let omit_checksums = omits_part_checksums(&metadata, input.part_number, range.as_ref());
+        let omit_checksums =
+            omits_part_checksums(bucket, &metadata, input.part_number, range.as_ref());
         match (input.part_number, range.as_ref()) {
             (Some(part_number), _) => metadata.apply_part_checksums(part_number),
             (None, Some(r)) => metadata.apply_range_checksums(r.start, r.end),
@@ -573,7 +646,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         output.checksum_crc64nvme = metadata.crc64nvme;
 
         // Return stored HTTP headers
-        output.storage_class = storage_class_header(metadata.storage_class);
+        output.storage_class = BucketType::of(bucket).storage_class_header(metadata.storage_class);
         output.cache_control = metadata.cache_control.map(|s| s.parse().unwrap());
         output.content_encoding = metadata.content_encoding.map(|s| s.parse().unwrap());
         output.content_disposition = metadata.content_disposition.map(|s| s.parse().unwrap());
@@ -616,8 +689,17 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             );
         }
 
+        let bucket_type = BucketType::of(&input.bucket);
+        // As in S3, only directory buckets serve appends.
+        if input.write_offset_bytes.is_some() && bucket_type == BucketType::GeneralPurpose {
+            return Err(Error::NotImplemented.into());
+        }
+        bucket_type
+            .check_storage_class(input.storage_class.as_ref().map(|class| class.as_str()))?;
+        bucket_type.check_content_md5(input.content_md5.as_deref())?;
         let client_checksums = crate::types::ClientChecksums::from(&input);
         validate_digest_headers(&client_checksums)?;
+        let write_offset = input.write_offset_bytes;
         let integrity_checks = crate::types::ObjectIntegrityChecks::from(&client_checksums);
 
         // Create storage request with configured checksums
@@ -655,6 +737,16 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             request.body = Box::pin(stalled);
         }
 
+        if let Some(offset) = write_offset {
+            let response = self.append_object(request, offset).await?;
+            // WithholdResponseHeaders: the append is applied; never respond.
+            if let Some(crate::faults::FaultType::WithholdResponseHeaders) = fault {
+                std::future::pending::<()>().await;
+                unreachable!("pending future never resolves");
+            }
+            return Ok(response);
+        }
+
         let stored_meta = self.storage.put_object(request).await?;
 
         // WithholdResponseHeaders: body is consumed and stored; never respond.
@@ -689,6 +781,8 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         let input = req.input;
         tracing::trace!(bucket = %input.bucket, key = %input.key, "CreateMultipartUpload");
         check_bucket(&self.storage, &input.bucket).await?;
+        BucketType::of(&input.bucket)
+            .check_storage_class(input.storage_class.as_ref().map(|class| class.as_str()))?;
         let key = &input.key;
 
         // Extract checksum algorithm if provided, default to CRC64NVME
@@ -789,12 +883,15 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             Some(&req.input.bucket),
             Some(&req.input.key),
         )?;
+        // s3s keeps a trailing checksum out of the input; the request declares it.
+        let trailing_checksum = req.headers.contains_key("x-amz-trailer");
         let input = req.input;
         let upload_id = &input.upload_id;
         let part_number = input.part_number;
         tracing::trace!(%upload_id, part_number, "UploadPart");
         check_bucket(&self.storage, &input.bucket).await?;
 
+        BucketType::of(&input.bucket).check_content_md5(input.content_md5.as_deref())?;
         let client_checksums = crate::types::ClientChecksums::from(&input);
         validate_digest_headers(&client_checksums)?;
         let mut integrity_checks = crate::types::ObjectIntegrityChecks::from(&client_checksums);
@@ -854,6 +951,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             upload_id,
             part_number,
             content,
+            client_checksum: client_checksums.has_any() || trailing_checksum,
         };
         let response = self.storage.upload_part(request).await?;
 
@@ -1020,7 +1118,8 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         check_bucket(&self.storage, &input.bucket).await?;
 
         let prefix = input.prefix.as_deref().unwrap_or("");
-        BucketType::of(&input.bucket).check_listing(
+        let bucket_type = BucketType::of(&input.bucket);
+        bucket_type.check_listing(
             prefix,
             input.delimiter.as_deref(),
             input.start_after.is_some(),
@@ -1036,6 +1135,10 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             prefix: Some(prefix),
         };
         let objects = self.storage.list_objects(request).await?.objects;
+        let order = match bucket_type {
+            BucketType::GeneralPurpose => crate::list::ListOrder::Lexicographic,
+            BucketType::Directory => crate::list::ListOrder::Unordered,
+        };
         let list_request = crate::list::ListRequest {
             prefix,
             delimiter: input.delimiter.as_deref(),
@@ -1043,16 +1146,17 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             continuation_token: input.continuation_token.as_deref(),
             start_after: input.start_after.as_deref(),
         };
-        let page = crate::list::list_page(objects, &list_request).map_err(|error| match error {
-            crate::list::ListError::InvalidContinuationToken => {
-                Error::InvalidArgument("The continuation token provided is incorrect")
-            }
-        })?;
+        let page =
+            crate::list::list_page(objects, &list_request, order).map_err(|error| match error {
+                crate::list::ListError::InvalidContinuationToken => {
+                    Error::InvalidArgument("The continuation token provided is incorrect")
+                }
+            })?;
 
         let contents: Vec<s3s::dto::Object> = page
             .objects
             .into_iter()
-            .map(|obj| list_entry(obj, include_restore_status))
+            .map(|obj| list_entry(obj, bucket_type, include_restore_status))
             .collect();
         let common_prefixes: Vec<s3s::dto::CommonPrefix> = page
             .common_prefixes
@@ -1232,23 +1336,31 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
 pub(crate) async fn check_bucket(
     storage: &(impl StorageBackend + ?Sized),
     bucket: &str,
-) -> S3Result<()> {
+) -> crate::Result<()> {
     if storage.head_bucket(bucket).await? {
         Ok(())
     } else {
-        Err(Error::NoSuchBucket.into())
+        Err(Error::NoSuchBucket)
     }
 }
 
 /// The ListObjectsV2 entry of an object. The restore status is included only when requested, as
 /// in S3.
-fn list_entry(obj: crate::storage::ObjectInfo, include_restore_status: bool) -> s3s::dto::Object {
+fn list_entry(
+    obj: crate::storage::ObjectInfo,
+    bucket_type: BucketType,
+    include_restore_status: bool,
+) -> s3s::dto::Object {
     let algorithms = obj.metadata.checksum_algorithms();
     s3s::dto::Object {
         size: Some(obj.metadata.content_length as i64),
         e_tag: Some(etag_from_quoted(&obj.metadata.etag)),
         last_modified: Some(Timestamp::from(obj.metadata.last_modified)),
-        storage_class: Some(listed_storage_class(&obj.metadata.storage_class).into()),
+        storage_class: Some(
+            bucket_type
+                .listed_storage_class(&obj.metadata.storage_class)
+                .into(),
+        ),
         checksum_algorithm: (!algorithms.is_empty()).then(|| {
             algorithms
                 .iter()
@@ -1308,19 +1420,24 @@ fn part_number_range(
 }
 
 /// Whether a GetObject or HeadObject of part of `metadata`'s object (a `part_number`, or a
-/// `range` other than the whole object) returns no checksum: S3 returns none for the parts of a
-/// multipart object with a full-object checksum.
+/// `range` other than the whole object) returns no checksum, as in S3: for the parts of a
+/// multipart object uploaded without part checksums, and, in general purpose buckets, for those
+/// of a multipart object with a full-object checksum.
 fn omits_part_checksums(
+    bucket: &str,
     metadata: &ObjectMetadata,
     part_number: Option<i32>,
     range: Option<&std::ops::Range<u64>>,
 ) -> bool {
     let partial = part_number.is_some()
         || range.is_some_and(|range| range.start != 0 || range.end != metadata.content_length);
+    let full_object_in_general_purpose = BucketType::of(bucket) == BucketType::GeneralPurpose
+        && stored_checksum_type(metadata)
+            .is_some_and(|t| t.as_str() == s3s::dto::ChecksumType::FULL_OBJECT);
     partial
         && !metadata.parts.is_empty()
-        && stored_checksum_type(metadata)
-            .is_some_and(|t| t.as_str() == s3s::dto::ChecksumType::FULL_OBJECT)
+        && (full_object_in_general_purpose
+            || metadata.parts.iter().any(|part| !part.client_checksum))
 }
 
 /// Fail a request whose digest headers are malformed before its body is read, as S3 does: a
@@ -1417,22 +1534,6 @@ fn checksum_type_of<'a>(
             s3s::dto::ChecksumType::FULL_OBJECT
         },
     ))
-}
-
-/// The `x-amz-storage-class` header of a GetObject or HeadObject response: S3 omits it for
-/// `STANDARD` objects, also when `STANDARD` was requested explicitly.
-fn storage_class_header(storage_class: Option<String>) -> Option<s3s::dto::StorageClass> {
-    storage_class
-        .filter(|class| class != s3s::dto::StorageClass::STANDARD)
-        .map(s3s::dto::StorageClass::from)
-}
-
-/// The storage class of an object in ListObjectsV2 entries, which S3 always reports: `STANDARD`
-/// when none was set.
-fn listed_storage_class(storage_class: &Option<String>) -> String {
-    storage_class
-        .clone()
-        .unwrap_or_else(|| s3s::dto::StorageClass::STANDARD.to_owned())
 }
 
 /// Whether a request set `x-amz-checksum-mode: ENABLED`.
@@ -2000,9 +2101,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_directory_bucket_requires_contiguous_parts() {
-        // Drive the handler directly: the AWS SDK client rejects `--x-s3` names
-        // client-side (InvalidBucketName) before a request can reach the server,
-        // so a directory-bucket gap can only be exercised at the handler level.
+        // A directory bucket rejects a gap in the part numbers (1, 3).
         let bucket = "test-dir-bucket--usw2-az1--x-s3";
         let key = "dir-gap-key";
 
