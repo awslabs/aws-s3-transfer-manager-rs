@@ -4331,6 +4331,82 @@ fn downloading_in_mode(
     (transfer, ctx, rx)
 }
 
+// The run starts at the root the caller named, even when the root is a link. The
+// follow setting covers the entries inside the root.
+#[cfg(unix)]
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn an_upload_starts_at_a_root_that_is_a_link() {
+    for follow in [false, true] {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let data = dir.path().canonicalize().expect("canonical dir");
+        std::fs::create_dir(data.join("dest")).expect("dest");
+        std::fs::write(data.join("dest/a.txt"), b"x").expect("a.txt");
+        std::os::unix::fs::symlink(data.join("dest"), data.join("current")).expect("symlink");
+        let (client, _deleted) = listing_and_recording_deletes(&[], 1);
+        let (t, _ctx) = upload_run(
+            &data.join("current"),
+            client,
+            Walker::builder().follow_symlinks(follow).build(),
+        );
+        drive(&t).await;
+        let snapshot = t.inner.state.lock().snapshot();
+        assert_eq!(
+            snapshot.walk_failures, 0,
+            "following {follow}: the root failed"
+        );
+        assert_eq!(snapshot.decided.transfers, 1, "following {follow}");
+    }
+}
+
+// A link to a directory that holds the root is a loop. Following it would send the
+// files beside the root, and the root's own files a second time.
+#[cfg(unix)]
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn an_upload_never_climbs_above_the_root_through_a_link() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let data = dir.path().canonicalize().expect("canonical dir");
+    std::fs::create_dir_all(data.join("sibling")).expect("sibling");
+    std::fs::write(data.join("sibling/s.txt"), b"x").expect("s.txt");
+    std::fs::create_dir(data.join("dest")).expect("dest");
+    std::fs::write(data.join("dest/a.txt"), b"x").expect("a.txt");
+    std::os::unix::fs::symlink("..", data.join("dest/up")).expect("up -> ..");
+    let (client, _deleted) = listing_and_recording_deletes(&[], 1);
+    let (t, _ctx) = upload_run(
+        &data.join("dest"),
+        client,
+        Walker::builder().follow_symlinks(true).build(),
+    );
+    drive(&t).await;
+    assert_eq!(
+        t.inner.state.lock().snapshot().decided.transfers,
+        1,
+        "the run sent files from above the root"
+    );
+}
+
+// A root that is a link to nothing exists, and it is no directory. A download into it ends
+// before any work, and it never reads the root as a directory nobody has created yet.
+#[cfg(unix)]
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn a_download_into_a_root_that_links_to_nothing_ends_before_any_work() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let base = dir.path().canonicalize().expect("canonical dir");
+    let root = base.join("current");
+    std::os::unix::fs::symlink(base.join("gone"), &root).expect("a dangling root");
+    let (t, ctx, rx) = downloading_into_walking(
+        &root,
+        a_bucket_to_download(&["a.txt"], 1_600_000_000),
+        DeleteMode::Off,
+        Walker::builder().follow_symlinks(true).build(),
+    );
+    run_managed(&t, &ctx, rx).await;
+    assert_eq!(t.inner.state.lock().snapshot().decided.transfers, 0);
+    assert_eq!(t.outcome(), RunOutcome::Failed);
+}
+
 // A followed link to a directory sits at a key's own name. The walk descends into it,
 // and it still reports the name as taken. No-overwrite keeps the link, and the default modes replace
 // it.

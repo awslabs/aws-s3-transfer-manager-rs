@@ -315,6 +315,7 @@ pub struct FsWalker {
     sort_order: SortOrder,
     include_special_files: bool,
     canonicalize_root: bool,
+    root_as_named: bool,
     filter: Option<FilterFn>,
     path_filter: Option<PathFilterFn>,
 }
@@ -361,6 +362,21 @@ impl FsWalker {
                     done = true;
                 }
             }
+        } else if self.root_as_named {
+            // A root that is a link to nothing exists, and it is no directory. Asking with
+            // `lstat` keeps it from reading as a directory nobody has created yet.
+            let is_link =
+                std::fs::symlink_metadata(&root).is_ok_and(|md| md.file_type().is_symlink());
+            if is_link
+                && std::fs::metadata(&root).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+            {
+                pending_errors.push_back(WalkError::new(
+                    Some(root.clone()),
+                    WalkErrorKind::NotADirectory,
+                    Box::from("the root is a link that points at nothing"),
+                ));
+                done = true;
+            }
         } else if !self.follow_symlinks {
             match std::fs::symlink_metadata(&root) {
                 Ok(md) if md.file_type().is_symlink() => {
@@ -379,10 +395,17 @@ impl FsWalker {
             }
         }
 
+        // A link to a directory that holds the root would walk the root again, and the files beside
+        // it too. The loop check reads the descent path, so the directories above the root join it.
+        let ancestor_handles = if self.root_as_named && self.follow_symlinks && !done {
+            above_root(&root)
+        } else {
+            Vec::new()
+        };
         let root_dir = PendingDir {
             path: root.clone(),
             depth: 0,
-            ancestor_handles: Vec::new(),
+            ancestor_handles,
         };
         // Matched over every order rather than tested against one, so an order added later has to
         // say which traversal it needs instead of silently taking the breadth-first one.
@@ -443,6 +466,7 @@ pub struct FsWalkerBuilder {
     sort_order: SortOrder,
     include_special_files: bool,
     canonicalize_root: bool,
+    root_as_named: bool,
     filter: Option<FilterFn>,
     path_filter: Option<PathFilterFn>,
 }
@@ -529,6 +553,14 @@ impl FsWalkerBuilder {
         self
     }
 
+    // Start at the root the caller named, even when the root is a link and links are not followed.
+    // The follow setting covers the entries inside the root. With following on, a link to a
+    // directory that holds the root counts as a loop, so the walk never climbs above the root.
+    pub(crate) fn root_as_named(mut self, as_named: bool) -> Self {
+        self.root_as_named = as_named;
+        self
+    }
+
     /// Resolve the walk root via `std::fs::canonicalize` before walking.
     ///
     /// When `true`, the root path is canonicalized (symlinks resolved,
@@ -590,6 +622,7 @@ impl FsWalkerBuilder {
             sort_order: self.sort_order,
             include_special_files: self.include_special_files,
             canonicalize_root: self.canonicalize_root,
+            root_as_named: self.root_as_named,
             filter: self.filter,
             path_filter: self.path_filter,
         }
@@ -1237,6 +1270,24 @@ impl FsWalk {
             !f(relative)
         })
     }
+}
+
+// Handles for every directory above the root, both as the caller spelled it and with its links
+// resolved, because a link can reach either chain. A directory the walk cannot open is left out.
+fn above_root(root: &Path) -> Vec<Arc<Handle>> {
+    let spelled = std::path::absolute(root).ok();
+    let resolved = std::fs::canonicalize(root).ok();
+    let mut handles: Vec<Arc<Handle>> = Vec::new();
+    for start in [spelled, resolved].into_iter().flatten() {
+        for dir in start.ancestors().skip(1) {
+            if let Ok(handle) = Handle::from_path(dir) {
+                if !handles.iter().any(|known| **known == handle) {
+                    handles.push(Arc::new(handle));
+                }
+            }
+        }
+    }
+    handles
 }
 
 // Whether resolving a link failed because its chain of links never ends. The system gives up after
