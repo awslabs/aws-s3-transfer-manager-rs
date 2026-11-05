@@ -23,8 +23,8 @@ use crate::io::key::stream::{
 };
 use crate::io::walk::WalkErrorKind;
 
-pub(crate) use links::{link_on_path, names_cover, LinkScan};
-use links::{name_of, Links, ALIASED_NAMES_HELD};
+pub(crate) use links::{link_on_path, names_cover, LinkScan, ALIASED_NAMES_HELD};
+use links::{name_of, Links};
 pub(crate) use walker::LocalDestination;
 #[cfg(test)]
 pub(crate) use walker::{LocalAndBucket, Walker};
@@ -536,7 +536,13 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
     // waiting local delete must not touch, sorted. `None` means every waiting delete stays.
     pub(crate) fn accept_link_scan(&mut self, result: LinkScanResult) -> Option<Vec<String>> {
         let found = match std::mem::replace(&mut self.links, Links::NoScan) {
-            Links::Scanning { found } => found,
+            Links::Scanning { found, overflow } => {
+                if overflow {
+                    self.links = Links::Scanned { names: Vec::new() };
+                    return None;
+                }
+                found
+            }
             _ => Vec::new(),
         };
         let LinkScanResult::Names(scanned) = result else {
@@ -709,10 +715,13 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
         };
         match &mut self.links {
             Links::NoScan => self.incomplete |= reached,
-            Links::Scanning { found } => {
+            Links::Scanning { found, overflow } => {
                 if found.len() < ALIASED_NAMES_HELD {
                     found.push(name.clone());
                 } else {
+                    // A waiting delete under a name `found` lacks would go out, so every waiting
+                    // delete stays when the scan ends.
+                    *overflow = true;
                     // The waiting deletes can no longer be checked against every name, so the
                     // source holds back every delete.
                     self.src.gap.add(Stretch { under: None });

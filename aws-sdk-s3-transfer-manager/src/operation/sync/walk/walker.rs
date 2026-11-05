@@ -115,7 +115,10 @@ impl Walker {
                 names: Vec::new(),
                 too_many: false,
             });
-            walk.links = Links::Scanning { found: Vec::new() };
+            walk.links = Links::Scanning {
+                found: Vec::new(),
+                overflow: false,
+            };
         }
         Ok(walk)
     }

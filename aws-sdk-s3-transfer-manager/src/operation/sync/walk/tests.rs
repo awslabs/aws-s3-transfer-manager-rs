@@ -1988,6 +1988,25 @@ async fn the_prefix_reaches_the_listing_in_either_direction() {
     );
 }
 
+// While the scan reads, the walk keeps each name it finds for the waiting deletes. Past the
+// bound it cannot keep them all, so every waiting delete stays, whatever the scan found.
+#[tokio::test]
+async fn names_the_walk_finds_past_the_bound_keep_every_waiting_delete() {
+    let mut walk = Walk::new(Scripted::of(&[]), Scripted::of(&[]));
+    walk.links = Links::Scanning {
+        found: Vec::new(),
+        overflow: false,
+    };
+    for n in 0..=ALIASED_NAMES_HELD {
+        walk.hold_aliased(AliasedName::Directory(format!("l{n:04}")));
+    }
+    assert_eq!(
+        walk.accept_link_scan(LinkScanResult::Names(Vec::new())),
+        None,
+        "a waiting delete under a dropped name could go out"
+    );
+}
+
 // The link scan keeps at most `ALIASED_NAMES_HELD` names for the whole tree. Many links to one
 // target count that target once.
 #[cfg(unix)]

@@ -17,7 +17,7 @@ use super::LinkScanResult;
 // at most this many names for the whole tree. Past the bound, the source holds back every later
 // delete. The value matches how many transfers may wait before the merge pauses, so the held names
 // cost about what that queue does.
-pub(super) const ALIASED_NAMES_HELD: usize = 1024;
+pub(crate) const ALIASED_NAMES_HELD: usize = 1024;
 
 // Where a run stands with its link scan. The merge reads this when the destination walk follows a
 // link, to decide whether a delete under the link's names may already have gone out.
@@ -27,10 +27,16 @@ pub(super) enum Links {
     NoScan,
     // The scan is still reading, and every local delete waits for it. A link the walk follows now
     // is kept here, so the waiting deletes are checked against it too.
-    Scanning { found: Vec<AliasedName> },
+    // `overflow` is set once the walk found more names than the bound, so `found` lacks some.
+    Scanning {
+        found: Vec<AliasedName>,
+        overflow: bool,
+    },
     // The scan ended. These are its names, sorted. A link the walk follows from now on was either
     // named by the scan or created after the scan read its directory.
-    Scanned { names: Vec<String> },
+    Scanned {
+        names: Vec<String>,
+    },
 }
 
 // Whether a link stands among a key's parent directories below the root. A read, a write, or

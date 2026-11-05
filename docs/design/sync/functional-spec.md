@@ -347,8 +347,9 @@ downloads `photos/a.jpg` into a real directory `photos/`.
 
 So with following on, delete mode never removes what a followed link reaches, even when the bucket
 holds neither key. Sync MUST report each kept key as `skipped-unknown`. Sync MUST bound the names it
-holds for followed links (NFR-Mem-1). Past that bound, sync MUST keep every destination-only key
-and report it the same way. With delete mode off, sync keeps nothing for followed links, and a
+holds for followed links (NFR-Mem-1). Past that bound, sync MUST keep every destination-only key and
+report it the same way. Sync MUST also report that the tree passed the bound, so a caller can tell
+why delete mode removed nothing. With delete mode off, sync keeps nothing for followed links, and a
 destination-only key through a link reports as destination-only.
 
 The walk meets a link only when it reads the directory holding that link. That directory can sort

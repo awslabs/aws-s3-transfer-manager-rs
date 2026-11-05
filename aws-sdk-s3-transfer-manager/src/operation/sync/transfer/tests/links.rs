@@ -1003,6 +1003,10 @@ async fn a_tree_past_the_link_bound_keeps_every_local_delete() {
         "a run past the link bound removed a local file"
     );
     assert_eq!(t.outcome(), RunOutcome::Warned);
+    assert!(
+        t.inner.state.lock().snapshot().past_link_bound,
+        "the run kept every delete and did not record why"
+    );
 }
 
 // The names a followed link reaches exist only to stop deletes. With delete mode off, the run names
