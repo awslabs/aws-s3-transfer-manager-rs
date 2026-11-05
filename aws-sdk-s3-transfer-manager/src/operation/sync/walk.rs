@@ -937,7 +937,7 @@ impl Walker {
         walk.checks_transfers = !self.follow_symlinks;
         if names && self.follow_symlinks {
             walk.link_scan = Some(LinkScan {
-                walk: self.fs_walk(root.clone(), SortOrder::Native),
+                walk: self.fs_walk(root.clone(), SortOrder::Native, true),
                 namer: LinkNamer::new(&root),
                 names: Vec::new(),
                 too_many: false,
@@ -956,14 +956,16 @@ impl Walker {
     // level reports every key below it as absent. And it keeps special files, because a name that
     // is taken has to reach the comparison even though nothing can be sent for it.
     fn local_walk(&self, root: PathBuf) -> FsWalk {
-        self.fs_walk(root, SortOrder::WholeWalk)
+        self.fs_walk(root, SortOrder::WholeWalk, false)
     }
 
     // The link scan reads the same tree with the same rules, in whatever order the filesystem gives.
-    // It needs every link and no key order, so it skips the sort.
-    fn fs_walk(&self, root: PathBuf, sort: SortOrder) -> FsWalk {
+    // It needs every link and no key order, so it skips the sort, and `links_only` skips each file's
+    // metadata.
+    fn fs_walk(&self, root: PathBuf, sort: SortOrder, links_only: bool) -> FsWalk {
         FsWalker::builder()
             .root_as_named(true)
+            .links_only(links_only)
             .sort(sort)
             .recursive(true)
             .include_special_files(true)
@@ -1233,32 +1235,28 @@ pub(crate) struct LinkScan {
 }
 
 impl LinkScan {
-    // Read up to `budget` entries. Return true once the scan has read the whole tree. An entry the
-    // scan cannot read costs it nothing: the destination walk cannot read that entry either, so no
-    // key reaches a file through a link behind it.
+    // Read up to `budget` directories. Return true once the scan has read the whole tree. A
+    // directory the scan cannot read costs it nothing: the destination walk cannot read that
+    // directory either, so no key reaches a file through a link inside it.
     pub(crate) async fn advance(&mut self, budget: usize) -> bool {
-        for _ in 0..budget {
-            if self.too_many {
-                return true;
-            }
-            let next = self.walk.next().await;
-            self.namer.name(self.walk.followed_links(), &mut self.names);
-            // Many links can reach one target, so the scan counts each name once before it judges
-            // the bound.
+        if self.too_many {
+            return true;
+        }
+        let done = self.walk.read_dirs(budget);
+        self.namer.name(self.walk.followed_links(), &mut self.names);
+        // Many links can reach one target, so the scan counts each name once before it judges the
+        // bound.
+        if self.names.len() > ALIASED_NAMES_HELD {
+            self.names
+                .sort_unstable_by(|a, b| name_of(a).cmp(name_of(b)));
+            self.names.dedup();
             if self.names.len() > ALIASED_NAMES_HELD {
-                self.names
-                    .sort_unstable_by(|a, b| name_of(a).cmp(name_of(b)));
-                self.names.dedup();
-                if self.names.len() > ALIASED_NAMES_HELD {
-                    self.too_many = true;
-                    self.names = Vec::new();
-                }
-            }
-            if next.is_none() {
+                self.too_many = true;
+                self.names = Vec::new();
                 return true;
             }
         }
-        false
+        done
     }
 
     pub(crate) fn finish(self) -> LinkScanResult {

@@ -848,8 +848,10 @@ and in no other.
 
 The scan costs one `readdir` for each directory and one `stat` for each link. On Linux and macOS
 `readdir` reports each entry's type, so the scan never stats a regular file. The walk itself calls
-`lstat` on every entry, so the scan costs less than the walk. The scan and the walk run at the
-same time. A run with fewer than 1,024 deletes waiting never pauses the merge for the scan.
+`stat` on every file, so the scan costs less than the walk. On the walk benchmark's tree of 1,110
+files in 1,111 directories, the walk takes 75 ms and the scan 57 ms. Both read the tree at warm
+cache on an APFS SSD, and `readdir` alone takes 58 ms there. The scan and the walk run at the same
+time. A run with fewer than 1,024 deletes waiting never pauses the merge for the scan.
 
 The tree alone decides each delete, so every run over one tree decides the same deletes. With
 delete mode off, nothing deletes, so the run starts no scan.
@@ -914,12 +916,12 @@ root as a directory nobody has created yet.
 
 A link to a directory that contains the root is a loop, and the walk stops at the link. The check
 covers the directories above the root as spelled and above the resolved root, because a link can
-reach either chain. The walk already keeps a handle for each directory on its descent path, and it
-compares a link's target against the handles on that path. So the directories above the root join
-the path when the walk starts. Opening a directory for its handle needs read permission. A directory
-above the root that the run cannot open stays out of the chain, and a link to it fails the same way:
-the walk cannot read that directory either, so it reports the link's subtree as unreadable. The
-check costs one open for each directory above the root, once per run, and only with following on.
+reach either chain. The walk keeps the directories on its descent path, and it compares a link's
+target against them. So the directories above the root join the path when the walk starts. The walk
+opens a directory's handle only when a link to a directory first asks for it, and children share the
+handle. A tree without such links opens none. Opening a handle needs read permission. A directory
+above the root that the run cannot open matches nothing, and a link to it fails the same way: the
+walk cannot read that directory either, so it reports the link's subtree as unreadable.
 
 **D9. Sync checks a path again when it acts.** The holds come from the walk, and two things slip
 past them (case I). The filesystem can match a key's name to a link's name without regard to case or
@@ -1089,10 +1091,11 @@ Many links can reach one target, so the scan counts each name once before it jud
 
 ### Waiting for the scan
 
-The run takes the scan from the walk when it starts. The scan leaves `State` while a work item
-reads it, as the merge does, and each item reads up to `MERGE_BATCH` entries. While the scan reads,
-`Deletes` holds every local delete in its `waiting` list, and no batch goes out. The keys still
-join `clearing`, so a download behind a waiting removal waits too (execution's D12).
+The run takes the scan from the walk when it starts. The scan leaves `State` while a work item reads
+it, as the merge does, and each item reads up to `MERGE_BATCH` directories. The item does not yield
+between directories, because the batch already bounds it. While the scan reads, `Deletes` holds
+every local delete in its `waiting` list, and no batch goes out. The keys still join `clearing`, so
+a download behind a waiting removal waits too (execution's D12).
 
 The walk tracks where the run stands with its scan:
 

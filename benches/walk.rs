@@ -206,6 +206,28 @@ fn symlink_file(target: &Path, link: &Path) {
     std::os::windows::fs::symlink_file(target, link).unwrap();
 }
 
+// The link scan reads like sync's: native order, following links, links only, and 64 directories
+// per batch. It reads no file's metadata and yields no entry.
+fn drain_links_only(rt: &tokio::runtime::Runtime, root: &Path) -> usize {
+    rt.block_on(async {
+        let ctx = FsWalkContext::builder().root(root).build();
+        let mut walk = FsWalker::builder()
+            .recursive(true)
+            .sort(SortOrder::Native)
+            .follow_symlinks(true)
+            .links_only(true)
+            .build()
+            .walk(ctx);
+        // Sync's scan reads 64 directories per work item, and so does this loop.
+        let mut batches = 0;
+        while !walk.read_dirs(64) {
+            batches += 1;
+        }
+        assert!(walk.is_done(), "the scan stopped before it read the tree");
+        batches
+    })
+}
+
 // A sync download with following on and delete mode on reads the destination twice: the walk in key
 // order, and a link scan in native order that records only links. The two run beside
 // each other in a sync run. Here they run one after the other on one thread, so `walk_and_scan`
@@ -238,20 +260,12 @@ fn walk_sync_link_scan_cost(c: &mut Criterion) {
             });
         });
         group.bench_function(BenchmarkId::new(label, "scan"), |b| {
-            b.iter(|| {
-                black_box(drain_follow(
-                    &rt,
-                    dir.path(),
-                    SortOrder::Native,
-                    true,
-                    count,
-                ))
-            });
+            b.iter(|| black_box(drain_links_only(&rt, dir.path())));
         });
         group.bench_function(BenchmarkId::new(label, "walk_and_scan"), |b| {
             b.iter(|| {
                 let walked = drain_follow(&rt, dir.path(), SortOrder::WholeWalk, true, count);
-                let scanned = drain_follow(&rt, dir.path(), SortOrder::Native, true, count);
+                let scanned = drain_links_only(&rt, dir.path());
                 black_box(walked + scanned)
             });
         });
