@@ -369,16 +369,17 @@ The scheduler checks the terminal flag before polling and removes terminal trans
 registry and ready set. Queued work belonging to the cancelled transfer is purged from the
 execution queue. In-flight work completes naturally; the execution layer checks the terminal flag
 at execution start and cooperatively cancels. `wait_for_idle()` blocks until the transfer's
-outstanding count (queued + executing) reaches zero, guaranteeing all resources are released
-before returning.
+outstanding count (queued + executing) reaches zero. A transient descriptor can outlive this wait;
+resource release follows the ownership described in [The registry owns the descriptor](#the-registry-owns-the-descriptor).
 
 ### State Machine Contracts
 
 A Transfer implementation must uphold several contracts:
 
-**Failed lifecycle.** When execution fails, the transfer must record the error and signal
-termination before returning the failure outcome. The scheduler relies on the terminal signal to
-stop generating work and clean up.
+**Failed lifecycle.** Before returning `WorkOutcome::Failed`, the transfer must record the error.
+It must either end the transfer and signal termination, or remain active with a wake path until
+`poll_work` ends it. A multipart upload can use this active phase to abort its multipart upload
+before signalling termination.
 
 **Poll-time pending/wake obligation.** Every `PollWork::Pending` return must have a corresponding
 future wake path. If a transfer returns `PollWork::Pending` and nothing ever wakes it, that transfer
