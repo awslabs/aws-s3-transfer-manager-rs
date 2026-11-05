@@ -65,6 +65,23 @@ pub(crate) enum Namespace {
     Tree,
 }
 
+// Remove one entry from a local tree, as itself. A link goes as a link, and its target stays. On
+// Windows, `remove_file` refuses a link to a directory or a junction, so such a link goes with
+// `remove_dir`. `remove_dir` removes the link and never the directory behind it.
+async fn remove_entry(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileTypeExt;
+        let is_dir_link = tokio::fs::symlink_metadata(path)
+            .await
+            .is_ok_and(|meta| meta.file_type().is_symlink_dir());
+        if is_dir_link {
+            return tokio::fs::remove_dir(path).await;
+        }
+    }
+    tokio::fs::remove_file(path).await
+}
+
 // Remove files from a local tree. Directories stay in place. Sync may not own a directory that
 // becomes empty.
 #[derive(Debug)]
@@ -98,7 +115,7 @@ impl DeleteFromLocalTree {
                     continue;
                 }
             };
-            match tokio::fs::remove_file(&path).await {
+            match remove_entry(&path).await {
                 Ok(()) => outcomes.push(Ok(key)),
                 // A missing file already has the delete result the run wanted. A second run reports
                 // the same outcome.
@@ -326,5 +343,53 @@ impl DeleteKeys for DeleteFromBucket {
         stopped: StopCheck<'a>,
     ) -> Pin<Box<dyn Future<Output = Vec<KeyOutcome>> + Send + 'a>> {
         Box::pin(DeleteFromBucket::delete(self, keys, stopped))
+    }
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::*;
+
+    // Create a link to a directory. Windows allows this only with developer mode or an elevated
+    // shell, so the test there stops early without one.
+    fn dir_link(target: &std::path::Path, link: &std::path::Path) -> bool {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link).expect("a link");
+            true
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_dir(target, link).is_ok()
+        }
+    }
+
+    // Delete mode removes a link to a directory as a link, on every platform. The directory
+    // behind it and its files stay.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn a_local_delete_removes_a_directory_link_and_keeps_its_target() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonical root");
+        std::fs::create_dir(root.join("real")).expect("real");
+        std::fs::write(root.join("real/x.txt"), b"x").expect("x.txt");
+        if !dir_link(&root.join("real"), &root.join("photos")) {
+            return;
+        }
+        let outcomes = DeleteFromLocalTree::new(&root)
+            .delete(vec!["photos".to_string()])
+            .await;
+        assert!(
+            matches!(outcomes.as_slice(), [Ok(key)] if key == "photos"),
+            "{outcomes:?}"
+        );
+        assert!(
+            std::fs::symlink_metadata(root.join("photos")).is_err(),
+            "the link stayed"
+        );
+        assert!(
+            root.join("real/x.txt").exists(),
+            "the delete reached the target"
+        );
     }
 }
