@@ -846,8 +846,8 @@ mod tests {
                     assert!(observed.iter().all(|id| id.runtime_id() == execution.id()));
                 }
                 tokio::time::timeout(Duration::from_secs(5), async {
-                    // The last work item drops its handle on its worker after
-                    // `join` has returned.
+                    // Terminal notification can precede the last work item's
+                    // retirement.
                     while weak.upgrade().is_some() {
                         tokio::task::yield_now().await;
                     }

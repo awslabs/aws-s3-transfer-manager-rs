@@ -369,8 +369,8 @@ The scheduler checks the terminal flag before polling and removes terminal trans
 registry and ready set. Queued work belonging to the cancelled transfer is purged from the
 execution queue. In-flight work completes naturally; the execution layer checks the terminal flag
 at execution start and cooperatively cancels. `wait_for_idle()` blocks until the transfer's
-outstanding count (queued + executing) reaches zero. A transient descriptor can outlive this wait;
-resource release follows the ownership described in [The registry owns the descriptor](#the-registry-owns-the-descriptor).
+outstanding count (queued + executing) reaches zero. This wait does not imply that all descriptor
+references have dropped.
 
 ### State Machine Contracts
 
@@ -611,36 +611,6 @@ pop / `poll_work` / reinsert cycles, released only when `poll_work` returns
 `Pending` or `Done`. Callers that need to re-insert after `PollWork::Ready`
 use `ReadySet::reinsert_under_claim`, which bypasses the CAS because the
 caller still owns the claim.
-
-### The registry owns the descriptor
-
-**Invariant.** Apart from transient holders, such as an in-progress poll, a
-dispatched work item, and a canceller waiting for the transfer to go idle, the
-scheduler's registry is the only owner of a transfer's descriptor. Ready set
-entries do not keep a descriptor alive. The scheduler releases its reference to
-a transfer once the transfer has left the registry and no transient holder
-still holds its descriptor; the transfer is dropped when its other owners, such
-as the caller's handle, have dropped too.
-
-**What it rules out.** The ready set's skip lists free a removed node only
-after epoch-based reclamation, which has no bound on when it runs. An entry
-that owned its descriptor would keep a retired transfer alive, with everything
-the transfer owns: a download's destination file and the client handle. The
-handle owns the scheduler, so the retained transfer would also keep the
-client's runtime from shutting down after the caller drops the client.
-
-**Mechanism.** Group members are stored as weak references. A pop that finds
-a dropped descriptor discards the entry and continues from the root tree. Each
-root-tree pop removes exactly one member entry: an insert publishes its entry
-before counting it, so a second removal in the same pop could take an entry
-whose count has not been added and wrap the group's count. The Loom model
-`pop_skipping_a_released_member_concurrent_with_insert` checks the count and
-root-tree membership under that race. Because an entry does not keep its
-descriptor alive, the caller's descriptor can be the last owner when an insert
-returns; the insert drops it only after releasing the ready set's locks, since
-a transfer's drop can re-enter the scheduler. A work-generation pass holds the
-client handle for its duration for the same reason: retiring a transfer can
-drop the last other owner of the handle.
 
 ### Bounded per-call cost
 

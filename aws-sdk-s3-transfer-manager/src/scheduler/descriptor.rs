@@ -157,9 +157,8 @@ pub(super) fn vruntime_delta_for_cost(cost: u64, priority: u8) -> u64 {
 /// - The transfer itself for polling work
 ///
 /// The transfer is dropped when the last clone drops.
-// `std::sync::Arc` rather than the loom compat `Arc`, which has no `Weak`. The
-// descriptor's cross-thread protocol is in `Inner`'s atomics, which stay
-// loom-aware; the reference count orders only the final drop.
+// Weak references require std::sync::Arc; Loom's Arc has no Weak.
+// Descriptor atomics remain Loom-instrumented; reference counts do not.
 #[derive(Clone)]
 pub(crate) struct TransferDescriptor(std::sync::Arc<Inner>);
 

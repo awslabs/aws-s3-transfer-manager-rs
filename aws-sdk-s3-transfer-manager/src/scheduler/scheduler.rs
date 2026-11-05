@@ -1411,10 +1411,10 @@ mod tests {
     ///
     /// The mock's state machine is owned only by the transfer, so its weak
     /// reference dies exactly when the scheduler drops the transfer. The
-    /// final drop happens on a worker after the transfer leaves the registry,
-    /// so the check waits a bounded time. A transfer retained by scheduler
-    /// structures past removal keeps its resources, such as a destination
-    /// file and the client handle, alive for the life of the process.
+    /// final worker reference can outlive registry removal, so the check
+    /// waits a bounded time without forcing epoch collection.
+    /// A transfer retained by scheduler structures past removal keeps its
+    /// resources, such as a destination file and the client handle, alive.
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn completed_transfer_is_dropped_while_the_client_is_alive() {
