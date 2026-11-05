@@ -81,7 +81,9 @@ impl Walker {
         let local = self.local_walk(ctx.local_root);
         let remote = self.remote_walk(ctx.client, ctx.bucket, ctx.prefix)?;
         // Only the source walks a filesystem; a listing names its own lost keys.
-        Ok(Walk::new(local, remote).with_roots(Some(root), None))
+        let mut walk = Walk::new(local, remote).with_roots(Some(root), None);
+        walk.checks_transfers = !self.follow_symlinks;
+        Ok(walk)
     }
 
     // The same two roots the other way round: the listing is the source and the local tree is
@@ -105,6 +107,7 @@ impl Walker {
         let local =
             LocalDestination::new(self.local_walk(ctx.local_root), &root).naming_aliases(names);
         let mut walk = Walk::new(remote, local).with_roots(None, Some(root.clone()));
+        walk.checks_transfers = !self.follow_symlinks;
         if names && self.follow_symlinks {
             walk.link_scan = Some(LinkScan {
                 walk: self.fs_walk(root.clone(), SortOrder::Native),

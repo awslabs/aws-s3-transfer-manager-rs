@@ -33,6 +33,29 @@ pub(super) enum Links {
     Scanned { names: Vec<String> },
 }
 
+// Whether a link stands among a key's parent directories below the root. A read, a write, or
+// a delete through that link would act on the link's target. The key's own name stays out of the
+// check, because delete mode removes a link as a link and a download's rename replaces one.
+//
+// The check goes through the filesystem's own name lookup, so on a disk that ignores case, asking
+// about `photos` finds the link `Photos`. An absent component holds no link below it, and an
+// unreadable one fails the action itself, so neither counts.
+pub(crate) fn link_on_path(root: &Path, key: &str) -> bool {
+    let Some((parents, _own_name)) = key.rsplit_once('/') else {
+        return false;
+    };
+    let mut at = root.to_path_buf();
+    for part in parents.split('/') {
+        at.push(part);
+        match std::fs::symlink_metadata(&at) {
+            Ok(meta) if meta.file_type().is_symlink() => return true,
+            Ok(_) => {}
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
 // The key an aliased name stands for, of either kind.
 pub(super) fn name_of(name: &AliasedName) -> &str {
     let (AliasedName::File(name) | AliasedName::Directory(name)) = name;

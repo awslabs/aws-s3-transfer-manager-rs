@@ -23,8 +23,8 @@ use crate::io::key::stream::{
 };
 use crate::io::walk::WalkErrorKind;
 
+pub(crate) use links::{link_on_path, names_cover, LinkScan};
 use links::{name_of, Links, ALIASED_NAMES_HELD};
-pub(crate) use links::{names_cover, LinkScan};
 pub(crate) use walker::LocalDestination;
 #[cfg(test)]
 pub(crate) use walker::{LocalAndBucket, Walker};
@@ -498,6 +498,10 @@ pub(crate) struct Walk<S: KeyStream, D: KeyStream> {
     // The link scan this walk's run starts, until the run takes it.
     link_scan: Option<LinkScan>,
     links: Links,
+    // Whether the run checks the path for a link before each read and write, as well as before each
+    // local delete. True with following off. With following on, a read or a write passes
+    // through a link above the file on purpose.
+    checks_transfers: bool,
 }
 
 impl<S: KeyStream, D: KeyStream> Walk<S, D> {
@@ -511,7 +515,15 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
             ended_by_failure: false,
             link_scan: None,
             links: Links::NoScan,
+            checks_transfers: false,
         }
+    }
+
+    // The local root, and whether the run checks reads and writes as well as deletes for a link on
+    // the path. `None` when neither side walks a filesystem.
+    pub(crate) fn link_check(&self) -> Option<(&Path, bool)> {
+        let root = self.src.root.as_deref().or(self.dst.root.as_deref())?;
+        Some((root, self.checks_transfers))
     }
 
     // Give the run its link scan. The run reads the scan beside the merge and hands the result back
