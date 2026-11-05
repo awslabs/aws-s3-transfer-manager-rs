@@ -6,6 +6,14 @@
 use crate::metrics::{unit::ByteUnit, Throughput};
 use crate::runtime::buffer_pool::BufferPool;
 
+pub use crate::model::builders;
+pub use crate::model::{
+    ArchiveStatus, ChecksumAlgorithm, ChecksumMode, ChecksumType, ChunkMetadata, DownloadInput,
+    Object, ObjectCannedAcl, ObjectLockLegalHoldStatus, ObjectLockMode, ObjectMetadata,
+    ObjectStorageClass, Owner, ReplicationStatus, RequestCharged, RequestPayer, RestoreStatus,
+    ServerSideEncryption, StorageClass, UploadInput, UploadOutput,
+};
+
 /// The target part size for an upload or download request.
 #[non_exhaustive]
 #[derive(Debug, Clone, Default)]
@@ -69,29 +77,6 @@ pub enum MemoryConfig {
     /// Every client or component using a clone of this pool shares one
     /// admission ceiling, prepared-storage cache, and metrics domain.
     Explicit(BufferPool),
-}
-
-/// Selects the execution runtime the transfer manager runs on.
-#[non_exhaustive]
-#[derive(Debug, Clone, Default)]
-pub enum RuntimeMode {
-    /// Managed OS threads owned by the transfer manager (default, recommended).
-    ///
-    /// Spawns and owns its own worker threads; the performance path.
-    #[default]
-    Managed,
-    /// Run on the caller's tokio multi-threaded runtime instead of spawning
-    /// dedicated threads.
-    ///
-    /// An escape hatch for embedding the transfer manager where it must not
-    /// spawn its own OS threads. This is not a performance tuning knob —
-    /// `Managed` is faster by design; prefer it unless you specifically need
-    /// the transfer manager to run on your existing runtime.
-    ///
-    /// Requires a multi-threaded runtime: transfer workers run via
-    /// `tokio::spawn`, so on a current-thread runtime they serialize onto one
-    /// thread and throughput collapses.
-    MultiThreadTokio,
 }
 
 /// The concurrency mode the client should use for executing requests.
@@ -182,11 +167,40 @@ pub enum FailedMultipartUploadPolicy {
 #[derive(Debug, Default)]
 pub struct AbortedUpload {
     pub(crate) upload_id: Option<String>,
-    pub(crate) request_charged: Option<aws_sdk_s3::types::RequestCharged>,
+    pub(crate) request_charged: Option<crate::model::RequestCharged>,
+    pub(crate) outcome: AbortOutcome,
+    pub(crate) output: Option<crate::operation::upload::UploadOutput>,
+}
+
+/// What an abort established about the object.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AbortOutcome {
+    /// The upload was stopped before S3 completes the object.
+    #[default]
+    Cancelled,
+    /// S3 finished storing the object before the abort took effect. The object is not
+    /// deleted; its metadata is available from [`AbortedUpload::output`].
+    AlreadyCompleted,
+    /// The upload was stopped before S3 completed the object, and its multipart upload
+    /// was left open.
+    Retained,
 }
 
 impl AbortedUpload {
-    /// Get the multipart upload ID that was cancelled
+    /// Returns whether the abort stopped the upload or the object already
+    /// exists.
+    pub fn outcome(&self) -> AbortOutcome {
+        self.outcome
+    }
+
+    /// Returns the upload's output when [`outcome`](Self::outcome) is
+    /// [`AbortOutcome::AlreadyCompleted`], and `None` otherwise.
+    pub fn output(&self) -> Option<&crate::operation::upload::UploadOutput> {
+        self.output.as_ref()
+    }
+    /// Get the multipart upload ID that was aborted, or that was left open when
+    /// [`outcome`](Self::outcome) is [`AbortOutcome::Retained`].
     ///
     /// Not present for uploads that did not utilize a multipart upload
     pub fn upload_id(&self) -> Option<&str> {
@@ -197,7 +211,7 @@ impl AbortedUpload {
     ///
     /// This functionality is not supported for directory buckets and is
     /// not present for uploads that did not utilize a multipart upload
-    pub fn request_charged(&self) -> &Option<aws_sdk_s3::types::RequestCharged> {
+    pub fn request_charged(&self) -> &Option<crate::model::RequestCharged> {
         &self.request_charged
     }
 }
@@ -367,7 +381,7 @@ pub struct IntegrityChecks {
     checksum_crc64_nvme: Option<String>,
     checksum_sha1: Option<String>,
     checksum_sha256: Option<String>,
-    checksum_type: Option<aws_sdk_s3::types::ChecksumType>,
+    checksum_type: Option<crate::model::ChecksumType>,
     checksum_validation: ChecksumValidation,
 }
 
@@ -403,7 +417,7 @@ impl IntegrityChecks {
     }
 
     /// The object's checksum type (full-object vs composite), if reported.
-    pub fn checksum_type(&self) -> Option<&aws_sdk_s3::types::ChecksumType> {
+    pub fn checksum_type(&self) -> Option<&crate::model::ChecksumType> {
         self.checksum_type.as_ref()
     }
 }
@@ -420,7 +434,7 @@ pub enum ChecksumValidation {
     #[non_exhaustive]
     Validated {
         /// The algorithm used to validate.
-        algorithm: aws_sdk_s3::types::ChecksumAlgorithm,
+        algorithm: crate::model::ChecksumAlgorithm,
     },
     /// No whole-object validation occurred. `reason` explains why.
     #[non_exhaustive]
@@ -455,7 +469,7 @@ impl IntegrityChecks {
         checksum_crc64_nvme: Option<String>,
         checksum_sha1: Option<String>,
         checksum_sha256: Option<String>,
-        checksum_type: Option<aws_sdk_s3::types::ChecksumType>,
+        checksum_type: Option<crate::model::ChecksumType>,
         checksum_validation: ChecksumValidation,
     ) -> Self {
         Self {

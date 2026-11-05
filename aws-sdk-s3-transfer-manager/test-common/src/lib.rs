@@ -8,6 +8,16 @@ use bytes::{BufMut, Bytes, BytesMut};
 use std::sync::OnceLock;
 use uuid::Uuid;
 
+/// Converts fixture configuration while retaining its HTTP client and interceptors.
+///
+/// SDK-backed fixtures pass their client's `config().to_builder()` with
+/// `sdk-v1` enabled; shared-configuration fixtures can pass `&SdkConfig`.
+pub fn s3_config_with_test_http(
+    config: impl Into<aws_sdk_s3_transfer_manager::config::S3ClientConfig>,
+) -> aws_sdk_s3_transfer_manager::config::S3ClientConfig {
+    config.into()
+}
+
 /// Create a directory structure rooted at `recursion_root`, containing files with sizes
 /// specified in `files`
 ///

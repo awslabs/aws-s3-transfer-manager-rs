@@ -56,10 +56,12 @@ async fn setup_test(
         .unwrap();
 
     let handle = mock_server.start().await.unwrap();
-    let s3_client = handle.client().await;
+    let shared_config = handle.shared_config().await;
 
     let tm_config = aws_sdk_s3_transfer_manager::Config::builder()
-        .client(s3_client)
+        .s3_config(aws_sdk_s3_transfer_manager::config::S3ClientConfig::new(
+            &shared_config,
+        ))
         .build();
     let tm = aws_sdk_s3_transfer_manager::Client::new(tm_config);
 

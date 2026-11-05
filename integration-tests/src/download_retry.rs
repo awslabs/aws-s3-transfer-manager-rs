@@ -43,12 +43,13 @@
 
 use crate::assertions::{assert_integrity_error, assert_io_error, assert_same_content};
 use crate::harness::Target;
-use aws_sdk_s3::types::ChecksumMode;
 use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
 use aws_sdk_s3_transfer_manager::operation::upload::ChecksumStrategy;
+use aws_sdk_s3_transfer_manager::types::ChecksumMode;
 use aws_sdk_s3_transfer_manager::types::PartSize;
 use aws_sdk_s3_transfer_manager::Client as TmClient;
-use s3_mock_server::{BodyCadence, FaultType, Occurrence, S3MockServer};
+use s3_mock_server::S3MockServer;
+use s3_mock_server::{BodyCadence, FaultType, Occurrence};
 
 /// Part size pinned equally for upload and download so multipart download ranges
 /// align to the uploaded part boundaries (the precondition for per-part
@@ -373,8 +374,12 @@ async fn slow_progressing_body_download_completes() {
 async fn corrupt_body_always_fails() {
     let t = Target::mock_gp().connect_with(Some(PART_SIZE)).await;
     let data = multipart_data();
-    t.put("obj", data, ChecksumStrategy::with_calculated_crc32())
-        .await;
+    t.put(
+        "obj",
+        data,
+        ChecksumStrategy::with_calculated_crc32_composite_if_multipart(),
+    )
+    .await;
 
     let mock = t.mock().expect("requires the mock backend");
     mock.insert_fault(
@@ -400,8 +405,12 @@ async fn corrupt_body_always_fails() {
 async fn corrupt_body_once_is_not_retried() {
     let t = Target::mock_gp().connect_with(Some(PART_SIZE)).await;
     let data = multipart_data();
-    t.put("obj", data, ChecksumStrategy::with_calculated_crc32())
-        .await;
+    t.put(
+        "obj",
+        data,
+        ChecksumStrategy::with_calculated_crc32_composite_if_multipart(),
+    )
+    .await;
 
     let mock = t.mock().expect("requires the mock backend");
     mock.insert_fault(
@@ -638,7 +647,9 @@ async fn requests_carry_per_bucket_retry_partition() {
     };
     let tm = TmClient::new(
         aws_sdk_s3_transfer_manager::Config::builder()
-            .client(s3)
+            .s3_config(aws_sdk_s3_transfer_manager::config::S3ClientConfig::new(
+                s3.config().to_builder(),
+            ))
             .part_size(PART_SIZE)
             .build(),
     );
@@ -725,7 +736,7 @@ async fn discovery_service_error_surfaces_underlying_cause() {
     mock.insert_fault(
         t.bucket(),
         &t.key("obj"),
-        FaultType::ServiceError { status: 503 },
+        FaultType::slow_down(),
         0,
         Occurrence::Always,
     );
@@ -764,7 +775,7 @@ async fn discovery_single_service_error_recovers() {
     mock.insert_fault(
         t.bucket(),
         &t.key("obj"),
-        FaultType::ServiceError { status: 503 },
+        FaultType::slow_down(),
         0,
         Occurrence::Once,
     );

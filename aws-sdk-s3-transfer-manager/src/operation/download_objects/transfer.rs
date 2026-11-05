@@ -9,7 +9,6 @@
 //! discovers objects, the parent spawns child downloads (via
 //! [`Download::orchestrate_with_sink`]), and reaps them as they complete.
 
-use aws_sdk_s3::types::Object;
 use parking_lot::Mutex;
 use path_clean::PathClean;
 use std::borrow::Cow;
@@ -21,6 +20,7 @@ use std::sync::Arc;
 
 use crate::error::{self, Error, ErrorKind};
 use crate::io::walk::S3Walk;
+use crate::model::Object;
 use crate::operation::download::sink::{FileSinkFactory, SinkFactory};
 use crate::operation::download::{Download, DownloadInput, ManagedDownloadHandle};
 use crate::transfer::{
@@ -277,7 +277,7 @@ impl DownloadObjectsTransfer {
     ) -> Self {
         let bucket = input.bucket().unwrap().to_string();
         let destination = input.destination().unwrap().to_path_buf();
-        let key_prefix = input.key_prefix().map(|s| s.to_string());
+        let key_prefix = walk.prefix().map(str::to_owned);
         let delimiter = input.delimiter().map(|s| s.to_string());
         let failure_policy = input.failure_policy().clone();
 
@@ -1064,12 +1064,14 @@ mod tests {
         DownloadObjectsTransfer,
         crate::transfer::StateMachineTerminalReceiver,
     ) {
-        let config = crate::Config::builder().client(s3_client.clone()).build();
+        let config = crate::Config::builder()
+            .sdk_client(s3_client.clone())
+            .build();
         let handle = crate::client::Handle::test_handle_tokio(config);
 
         let walk = S3Walker::builder().build().walk(
             S3WalkContext::builder()
-                .client(s3_client)
+                .sdk_client(s3_client)
                 .bucket("test-bucket")
                 .build(),
         );
@@ -1117,7 +1119,7 @@ mod tests {
     ) {
         let walk = S3Walker::builder().build().walk(
             S3WalkContext::builder()
-                .client(s3_client)
+                .sdk_client(s3_client)
                 .bucket("test-bucket")
                 .build(),
         );
@@ -1468,12 +1470,12 @@ mod tests {
         });
         let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[list, get]);
 
-        let config = crate::Config::builder().client(client.clone()).build();
+        let config = crate::Config::builder().sdk_client(client.clone()).build();
         let handle = crate::client::Handle::test_handle_tokio(config);
 
         let walk = S3Walker::builder().prefix("backup/2023/").build().walk(
             S3WalkContext::builder()
-                .client(client)
+                .sdk_client(client)
                 .bucket("test-bucket")
                 .build(),
         );
@@ -1486,7 +1488,6 @@ mod tests {
         let input = crate::operation::download_objects::DownloadObjectsInput::builder()
             .bucket("test-bucket")
             .destination(dir.path())
-            .key_prefix("backup/2023/")
             .failure_policy(FailedTransferPolicy::Continue)
             .build()
             .unwrap();
@@ -1615,7 +1616,9 @@ mod tests {
     #[tokio::test]
     async fn test_happy_path_managed_runtime() {
         let dir = tempdir().unwrap();
-        let config = crate::Config::builder().client(mock_s3_success()).build();
+        let config = crate::Config::builder()
+            .sdk_client(mock_s3_success())
+            .build();
         let handle = crate::client::Handle::test_handle_managed(config);
 
         let (transfer, completion_rx) = setup_enqueued(
@@ -1635,6 +1638,8 @@ mod tests {
         assert!(dir.path().join("a.txt").exists());
         assert!(dir.path().join("b.txt").exists());
         assert!(dir.path().join("c.txt").exists());
+
+        crate::runtime::test_util::shutdown(&transfer.ctx().handle).await;
     }
 
     #[cfg_attr(miri, ignore)]
@@ -1663,7 +1668,9 @@ mod tests {
         });
         let s3_client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[list, get]);
 
-        let config = crate::Config::builder().client(s3_client.clone()).build();
+        let config = crate::Config::builder()
+            .sdk_client(s3_client.clone())
+            .build();
         let handle = crate::client::Handle::test_handle_managed(config);
 
         let (transfer, completion_rx) = setup_enqueued(
@@ -1702,6 +1709,8 @@ mod tests {
             m.disk_write, 40,
             "child disk_write must aggregate to parent"
         );
+
+        crate::runtime::test_util::shutdown(&transfer.ctx().handle).await;
     }
 
     /// Under `Abort`, a child failure sets the parent failed in an execute
@@ -1739,7 +1748,9 @@ mod tests {
         });
         let s3_client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[list, get]);
 
-        let config = crate::Config::builder().client(s3_client.clone()).build();
+        let config = crate::Config::builder()
+            .sdk_client(s3_client.clone())
+            .build();
         let handle = crate::client::Handle::test_handle_managed(config);
 
         let (transfer, completion_rx) =
@@ -1754,6 +1765,16 @@ mod tests {
         .expect("Abort failure must signal parent terminal, not strand join()");
 
         assert!(transfer.ctx().is_failed());
+
+        let ctx = transfer.ctx();
+        timeout(
+            Duration::from_secs(10),
+            ctx.handle.scheduler.cancel_transfer(ctx.id).wait_for_idle(),
+        )
+        .await
+        .expect("failed parent and child work did not drain");
+
+        crate::runtime::test_util::shutdown(&ctx.handle).await;
     }
 
     /// Regression (real scheduler): two claimed-but-failed spawns under Continue
@@ -1789,7 +1810,9 @@ mod tests {
         });
         let s3_client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[list, get]);
 
-        let config = crate::Config::builder().client(s3_client.clone()).build();
+        let config = crate::Config::builder()
+            .sdk_client(s3_client.clone())
+            .build();
         let handle = crate::client::Handle::test_handle_managed(config);
 
         let (transfer, completion_rx) = setup_enqueued(
@@ -1811,6 +1834,8 @@ mod tests {
             2,
             "both failed entries must be recorded"
         );
+
+        crate::runtime::test_util::shutdown(&transfer.ctx().handle).await;
     }
 
     #[cfg_attr(miri, ignore)]
@@ -1819,7 +1844,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let s3_client = mock_s3_list_failure();
 
-        let config = crate::Config::builder().client(s3_client.clone()).build();
+        let config = crate::Config::builder()
+            .sdk_client(s3_client.clone())
+            .build();
         let handle = crate::client::Handle::test_handle_managed(config);
 
         let (transfer, completion_rx) = setup_enqueued(
@@ -1837,6 +1864,8 @@ mod tests {
 
         assert_eq!(transfer.successful_downloads(), 0);
         assert!(transfer.ctx().is_failed());
+
+        crate::runtime::test_util::shutdown(&transfer.ctx().handle).await;
     }
 
     // --- RAII counter guard tests (mirror upload_objects) ---
@@ -2064,7 +2093,7 @@ mod tests {
         });
         let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[list, get]);
 
-        let config = crate::Config::builder().client(client.clone()).build();
+        let config = crate::Config::builder().sdk_client(client.clone()).build();
         let handle = crate::client::Handle::test_handle_managed(config);
 
         let (transfer, completion_rx) =
@@ -2083,6 +2112,8 @@ mod tests {
                 "object {i} must be present on disk"
             );
         }
+
+        crate::runtime::test_util::shutdown(&transfer.ctx().handle).await;
     }
 
     /// Backstop test: with a small max_concurrent set via pipeline_depth,
@@ -2114,12 +2145,12 @@ mod tests {
         });
         let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[list, get]);
 
-        let config = crate::Config::builder().client(client.clone()).build();
+        let config = crate::Config::builder().sdk_client(client.clone()).build();
         let handle = crate::client::Handle::test_handle_tokio(config);
 
         let walk = S3Walker::builder().build().walk(
             S3WalkContext::builder()
-                .client(client)
+                .sdk_client(client)
                 .bucket("test-bucket")
                 .build(),
         );
@@ -2307,9 +2338,12 @@ mod tests {
             );
             let mut state = transfer.inner.state.lock();
             for i in 0..WALK_LOW_WATER {
-                state
-                    .pending_entries
-                    .push_back(Object::builder().key(format!("k{i}")).size(1).build());
+                state.pending_entries.push_back(
+                    crate::model::Object::builder()
+                        .key(format!("k{i}"))
+                        .size(1)
+                        .build(),
+                );
             }
             assert!(
                 transfer.dispatch_walk(&mut state).is_none(),

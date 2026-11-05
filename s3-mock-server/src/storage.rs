@@ -47,7 +47,76 @@ pub struct StoreObjectRequest {
     pub content_encoding: Option<String>,
     pub content_disposition: Option<String>,
     pub content_language: Option<String>,
+    /// Checksums the client sent with the body. A body that does not match them fails with
+    /// [`Error::BadDigest`](crate::Error::BadDigest), and the key is left
+    /// unchanged.
+    pub client_checksums: Option<ClientChecksums>,
+    /// Condition on the current state of the key, checked atomically with the write by
+    /// backends that support it.
+    pub precondition: WritePrecondition,
+    /// When set, the quoted ETag stored instead of the MD5 of the body.
+    pub etag: Option<String>,
+    /// Restore status to store, for an object in an archival storage class.
+    pub restore_status: Option<crate::storage::models::RestoreStatus>,
 }
+
+/// Condition on the current state of a key for a write to succeed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum WritePrecondition {
+    /// Unconditional write.
+    #[default]
+    None,
+    /// `If-Match`: the key must exist with this ETag, compared without quotes. A missing key
+    /// fails with [`Error::NoSuchKey`](crate::Error::NoSuchKey).
+    IfMatch(String),
+    /// `If-None-Match: *`: the key must not exist.
+    IfNoneMatchAny,
+}
+
+impl WritePrecondition {
+    /// Check the precondition against the current metadata of the key.
+    pub(crate) fn check(&self, current: Option<&ObjectMetadata>) -> Result<()> {
+        match (self, current) {
+            (WritePrecondition::None, _) | (WritePrecondition::IfNoneMatchAny, None) => Ok(()),
+            (WritePrecondition::IfMatch(_), None) => Err(crate::Error::NoSuchKey),
+            (WritePrecondition::IfMatch(etag), Some(metadata))
+                if etags_match(etag, &metadata.etag) =>
+            {
+                Ok(())
+            }
+            (WritePrecondition::IfMatch(_), Some(_))
+            | (WritePrecondition::IfNoneMatchAny, Some(_)) => Err(crate::Error::PreconditionFailed),
+        }
+    }
+}
+
+/// Check DeleteObject's `If-Match` against the current metadata of the key.
+pub(crate) fn check_delete_if_match(
+    if_match: &s3s::dto::ETagCondition,
+    current: Option<&ObjectMetadata>,
+) -> Result<()> {
+    match current {
+        None => Err(crate::Error::NoSuchKey),
+        Some(metadata) if etag_condition_holds(if_match, &metadata.etag) => Ok(()),
+        Some(_) => Err(crate::Error::PreconditionFailed),
+    }
+}
+
+/// Whether two ETags are equal, ignoring surrounding quotes.
+pub(crate) fn etags_match(a: &str, b: &str) -> bool {
+    a.trim_matches('"') == b.trim_matches('"')
+}
+
+/// Whether an `If-Match` condition holds for an object with `etag`: `*` matches any object.
+pub(crate) fn etag_condition_holds(condition: &s3s::dto::ETagCondition, etag: &str) -> bool {
+    match condition {
+        s3s::dto::ETagCondition::ETag(expected) => etags_match(expected.value(), etag),
+        s3s::dto::ETagCondition::Any => true,
+    }
+}
+
+/// An in-place change to the stored metadata of an object.
+pub(crate) type MetadataUpdate = Box<dyn FnOnce(&mut ObjectMetadata) + Send>;
 
 /// Request for retrieving an object.
 pub(crate) struct GetObjectRequest<'a> {
@@ -75,9 +144,17 @@ pub(crate) struct ListObjectsResponse {
 }
 
 /// Information about an object.
+#[derive(Debug)]
 pub(crate) struct ObjectInfo {
     pub key: String,
     pub metadata: ObjectMetadata,
+}
+
+/// An in-progress multipart upload.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct MultipartUploadInfo {
+    pub key: String,
+    pub upload_id: String,
 }
 
 /// Information about a bucket.
@@ -152,6 +229,10 @@ impl StoreObjectRequest {
             content_encoding: None,
             content_disposition: None,
             content_language: None,
+            client_checksums: None,
+            precondition: WritePrecondition::None,
+            etag: None,
+            restore_status: None,
         }
     }
 
@@ -163,6 +244,15 @@ impl StoreObjectRequest {
 
 impl From<s3s::dto::PutObjectInput> for StoreObjectRequest {
     fn from(input: s3s::dto::PutObjectInput) -> Self {
+        // S3 supports only `If-Match` with an ETag and `If-None-Match: *` on writes; other
+        // conditions are ignored.
+        let precondition = match (&input.if_match, &input.if_none_match) {
+            (Some(s3s::dto::ETagCondition::ETag(etag)), None) => {
+                WritePrecondition::IfMatch(etag.value().to_owned())
+            }
+            (None, Some(s3s::dto::ETagCondition::Any)) => WritePrecondition::IfNoneMatchAny,
+            _ => WritePrecondition::None,
+        };
         let stream = input
             .body
             .unwrap_or_else(|| {
@@ -199,6 +289,10 @@ impl From<s3s::dto::PutObjectInput> for StoreObjectRequest {
             content_language: input
                 .content_language
                 .map(|s| Cow::<str>::from(s).into_owned()),
+            client_checksums: None,
+            precondition,
+            etag: None,
+            restore_status: None,
         }
     }
 }
@@ -256,6 +350,20 @@ pub(crate) trait StorageBackend: Send + Sync + Debug {
     /// Delete an object and its metadata.
     async fn delete_object(&self, bucket: &str, key: &str) -> Result<()>;
 
+    /// Delete an object only if its ETag matches `if_match`, compared without quotes, or
+    /// `if_match` is `*` (DeleteObject with `If-Match`). Fails with `NoSuchKey` for a missing key and
+    /// `PreconditionFailed` for a different ETag, deleting nothing. The default implementation
+    /// checks the ETag and then deletes, which is not atomic.
+    async fn delete_object_if_match(
+        &self,
+        bucket: &str,
+        key: &str,
+        if_match: &s3s::dto::ETagCondition,
+    ) -> Result<()> {
+        check_delete_if_match(if_match, self.head_object(bucket, key).await?.as_ref())?;
+        self.delete_object(bucket, key).await
+    }
+
     /// List all objects with a given prefix.
     async fn list_objects(&self, request: ListObjectsRequest<'_>) -> Result<ListObjectsResponse>;
 
@@ -267,7 +375,8 @@ pub(crate) trait StorageBackend: Send + Sync + Debug {
     /// Create a new bucket.
     async fn create_bucket(&self, bucket: &str) -> Result<()>;
 
-    /// Delete a bucket. Fails if the bucket is non-empty.
+    /// Delete a bucket. Fails with [`Error::BucketNotEmpty`](crate::Error::BucketNotEmpty) if the
+    /// bucket has objects.
     async fn delete_bucket(&self, bucket: &str) -> Result<()>;
 
     /// Check if a bucket exists.
@@ -291,6 +400,13 @@ pub(crate) trait StorageBackend: Send + Sync + Debug {
     #[allow(dead_code)]
     async fn list_parts(&self, upload_id: &str) -> Result<Vec<PartInfo>>;
 
+    /// Return the checksum type (FULL_OBJECT vs COMPOSITE) recorded when the
+    /// multipart upload was created, or `Error::NoSuchUpload` if it does not exist.
+    async fn multipart_checksum_type(
+        &self,
+        upload_id: &str,
+    ) -> Result<Option<aws_sdk_s3::types::ChecksumType>>;
+
     /// Complete a multipart upload by combining parts into a final object.
     async fn complete_multipart_upload(
         &self,
@@ -299,6 +415,14 @@ pub(crate) trait StorageBackend: Send + Sync + Debug {
 
     /// Abort a multipart upload and clean up all associated data.
     async fn abort_multipart_upload(&self, upload_id: &str) -> Result<()>;
+
+    /// The multipart uploads in progress in `bucket`, ordered by key and then upload id.
+    async fn list_multipart_uploads(&self, bucket: &str) -> Result<Vec<MultipartUploadInfo>>;
+
+    /// Change the stored metadata of an object in place, leaving its data unchanged.
+    ///
+    /// Fails with `NoSuchBucket` or `NoSuchKey` when the object does not exist.
+    async fn update_metadata(&self, bucket: &str, key: &str, update: MetadataUpdate) -> Result<()>;
 
     /// Reset all state, removing all buckets, objects, and in-flight uploads.
     async fn reset(&self) -> Result<()>;
@@ -317,6 +441,15 @@ impl StorageBackend for std::sync::Arc<dyn StorageBackend + '_> {
 
     async fn delete_object(&self, bucket: &str, key: &str) -> Result<()> {
         (**self).delete_object(bucket, key).await
+    }
+
+    async fn delete_object_if_match(
+        &self,
+        bucket: &str,
+        key: &str,
+        if_match: &s3s::dto::ETagCondition,
+    ) -> Result<()> {
+        (**self).delete_object_if_match(bucket, key, if_match).await
     }
 
     async fn list_objects(&self, request: ListObjectsRequest<'_>) -> Result<ListObjectsResponse> {
@@ -358,6 +491,13 @@ impl StorageBackend for std::sync::Arc<dyn StorageBackend + '_> {
         (**self).list_parts(upload_id).await
     }
 
+    async fn multipart_checksum_type(
+        &self,
+        upload_id: &str,
+    ) -> Result<Option<aws_sdk_s3::types::ChecksumType>> {
+        (**self).multipart_checksum_type(upload_id).await
+    }
+
     async fn complete_multipart_upload(
         &self,
         request: CompleteMultipartUploadRequest<'_>,
@@ -367,6 +507,14 @@ impl StorageBackend for std::sync::Arc<dyn StorageBackend + '_> {
 
     async fn abort_multipart_upload(&self, upload_id: &str) -> Result<()> {
         (**self).abort_multipart_upload(upload_id).await
+    }
+
+    async fn list_multipart_uploads(&self, bucket: &str) -> Result<Vec<MultipartUploadInfo>> {
+        (**self).list_multipart_uploads(bucket).await
+    }
+
+    async fn update_metadata(&self, bucket: &str, key: &str, update: MetadataUpdate) -> Result<()> {
+        (**self).update_metadata(bucket, key, update).await
     }
 
     async fn reset(&self) -> Result<()> {

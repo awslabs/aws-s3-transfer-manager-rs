@@ -115,7 +115,7 @@ pub(crate) struct FilesystemStorage {
 
 impl FilesystemStorage {
     /// Create a new filesystem storage backend.
-    pub(crate) async fn new(root_dir: impl AsRef<Path>) -> Result<Self> {
+    pub(crate) async fn new(root_dir: impl AsRef<Path>) -> std::io::Result<Self> {
         let root_dir = root_dir.as_ref().to_path_buf();
         fs::create_dir_all(&root_dir).await?;
         Ok(Self { root_dir })
@@ -125,11 +125,20 @@ impl FilesystemStorage {
         self.root_dir.join(bucket).join("objects")
     }
 
-    /// Ensure bucket directories exist (auto-create for backward compat).
+    /// Create the bucket's directories, and the uploads directory the server's writes use.
     async fn ensure_bucket(&self, bucket: &str) -> Result<()> {
         fs::create_dir_all(self.objects_dir(bucket)).await?;
         fs::create_dir_all(self.root_dir.join("uploads")).await?;
         Ok(())
+    }
+
+    /// Fail with `NoSuchBucket` if the bucket has not been created.
+    async fn require_bucket(&self, bucket: &str) -> Result<()> {
+        if self.objects_dir(bucket).is_dir() {
+            Ok(())
+        } else {
+            Err(Error::NoSuchBucket)
+        }
     }
 
     fn get_object_path(&self, bucket: &str, key: &str) -> PathBuf {
@@ -173,7 +182,7 @@ impl FilesystemStorage {
 
         // Serialize and write metadata
         let json =
-            serde_json::to_string(metadata).map_err(|e| Error::Io(std::io::Error::other(e)))?;
+            serde_json::to_string(metadata).map_err(|e| Error::from(std::io::Error::other(e)))?;
         fs::write(path, json).await?;
         Ok(())
     }
@@ -182,12 +191,12 @@ impl FilesystemStorage {
     async fn load_metadata<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>> {
         match fs::read_to_string(path).await {
             Ok(json) => {
-                let metadata =
-                    serde_json::from_str(&json).map_err(|e| Error::Io(std::io::Error::other(e)))?;
+                let metadata = serde_json::from_str(&json)
+                    .map_err(|e| Error::from(std::io::Error::other(e)))?;
                 Ok(Some(metadata))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(Error::Io(e)),
+            Err(e) => Err(Error::from(e)),
         }
     }
 
@@ -252,8 +261,7 @@ impl StorageBackend for FilesystemStorage {
         &self,
         request: crate::storage::StoreObjectRequest,
     ) -> Result<StoredObjectMetadata> {
-        // Auto-create bucket directories
-        self.ensure_bucket(&request.bucket).await?;
+        self.require_bucket(&request.bucket).await?;
 
         let mut body = request.body;
         let mut integrity_checks = request.integrity_checks;
@@ -262,24 +270,50 @@ impl StorageBackend for FilesystemStorage {
             fs::create_dir_all(parent).await?;
         }
 
-        let mut file = fs::File::create(&path).await?;
+        // The body goes to a temporary file outside the bucket's objects directory, so a body
+        // that fails its checksum or ends in a stream error leaves the existing object intact
+        // and never shows up in listings.
+        let temp_path = tempfile::Builder::new()
+            .prefix("put-")
+            .tempfile_in(self.root_dir.join("uploads"))?
+            .into_temp_path();
         let mut content_length = 0u64;
-
-        while let Some(chunk) = body.next().await {
-            let chunk = chunk.map_err(|e| Error::Internal(format!("Stream error: {}", e)))?;
-            integrity_checks.update(&chunk);
-            content_length += chunk.len() as u64;
-            file.write_all(&chunk).await?;
+        {
+            // Closed at the end of the block, before the rename.
+            let mut file = fs::OpenOptions::new().write(true).open(&temp_path).await?;
+            while let Some(chunk) = body.next().await {
+                let chunk = chunk.map_err(|e| Error::Internal(format!("Stream error: {}", e)))?;
+                integrity_checks.update(&chunk);
+                content_length += chunk.len() as u64;
+                file.write_all(&chunk).await?;
+            }
+            file.flush().await?;
         }
-        file.flush().await?;
-
         let object_integrity = integrity_checks.finalize();
+        if let Some(client_checksums) = &request.client_checksums {
+            object_integrity
+                .validate(client_checksums)
+                .map_err(|algorithm| Error::BadDigest {
+                    algorithm,
+                    completion: false,
+                })?;
+        }
+        // Checked just before the object is replaced, but not atomically with it: a concurrent
+        // write to the same key can land in between.
+        if request.precondition != crate::storage::WritePrecondition::None {
+            let current = self.head_object(&request.bucket, &request.key).await?;
+            request.precondition.check(current.as_ref())?;
+        }
+        temp_path.persist(&path).map_err(|e| e.error)?;
         let last_modified = request.last_modified.unwrap_or_else(SystemTime::now);
 
         let metadata = ObjectMetadata {
             content_type: request.content_type,
             content_length,
-            etag: object_integrity.etag().unwrap_or_default(),
+            etag: request
+                .etag
+                .clone()
+                .unwrap_or_else(|| object_integrity.etag().unwrap_or_default()),
             last_modified,
             user_metadata: request.user_metadata,
             checksum_algorithm: None,
@@ -295,6 +329,7 @@ impl StorageBackend for FilesystemStorage {
             content_disposition: request.content_disposition,
             content_language: request.content_language,
             parts: Vec::new(),
+            restore_status: request.restore_status,
         };
         let metadata_path = self.get_object_metadata_path(&request.bucket, &request.key);
         Self::save_metadata(&metadata_path, &metadata).await?;
@@ -319,7 +354,7 @@ impl StorageBackend for FilesystemStorage {
         let mut file = match fs::File::open(&path).await {
             Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(Error::Io(e)),
+            Err(e) => return Err(Error::from(e)),
         };
 
         // Handle range request
@@ -372,7 +407,7 @@ impl StorageBackend for FilesystemStorage {
         match fs::remove_file(&path).await {
             Ok(()) => (),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(Error::Io(e)),
+            Err(e) => return Err(Error::from(e)),
         }
 
         // Try to delete metadata, but don't error if it's already gone
@@ -410,7 +445,7 @@ impl StorageBackend for FilesystemStorage {
         &self,
         request: crate::storage::CreateMultipartUploadRequest<'_>,
     ) -> Result<()> {
-        self.ensure_bucket(request.bucket).await?;
+        self.require_bucket(request.bucket).await?;
         let upload_dir = self.get_upload_dir(request.upload_id);
         fs::create_dir_all(&upload_dir).await?;
 
@@ -518,6 +553,17 @@ impl StorageBackend for FilesystemStorage {
         Ok(result)
     }
 
+    async fn multipart_checksum_type(
+        &self,
+        upload_id: &str,
+    ) -> Result<Option<aws_sdk_s3::types::ChecksumType>> {
+        let metadata_path = self.get_upload_metadata_path(upload_id);
+        let upload_metadata: MultipartUploadMetadata = Self::load_metadata(&metadata_path)
+            .await?
+            .ok_or(Error::NoSuchUpload)?;
+        Ok(upload_metadata.checksum_type)
+    }
+
     async fn complete_multipart_upload(
         &self,
         request: crate::storage::CompleteMultipartUploadRequest<'_>,
@@ -529,6 +575,7 @@ impl StorageBackend for FilesystemStorage {
             .ok_or(Error::NoSuchUpload)?;
 
         let bucket = upload_metadata.bucket.as_deref().unwrap_or(request.bucket);
+        self.require_bucket(bucket).await?;
         let checksum_algorithm = upload_metadata.metadata.checksum_algorithm;
         let checksum_type = upload_metadata.checksum_type;
 
@@ -541,7 +588,7 @@ impl StorageBackend for FilesystemStorage {
             let part_metadata_path = self.get_part_metadata_path(request.upload_id, *part_number);
             let part_metadata: PartMetadata = Self::load_metadata(&part_metadata_path)
                 .await?
-                .ok_or(Error::NoSuchPart)?;
+                .ok_or(Error::InvalidPart)?;
 
             if part_metadata.etag != *expected_etag {
                 return Err(Error::InvalidPart);
@@ -640,8 +687,11 @@ impl StorageBackend for FilesystemStorage {
 
         // Validate against client-provided checksum if present
         if let Some(client_checksums) = request.client_checksums {
-            if let Err(error_msg) = object_integrity.validate(client_checksums) {
-                return Err(Error::ChecksumMismatch(error_msg.to_string()));
+            if let Err(algorithm) = object_integrity.validate(client_checksums) {
+                return Err(Error::BadDigest {
+                    algorithm,
+                    completion: true,
+                });
             }
         }
 
@@ -714,7 +764,7 @@ impl StorageBackend for FilesystemStorage {
         if objects_dir.exists() {
             let mut rd = fs::read_dir(&objects_dir).await?;
             if rd.next_entry().await?.is_some() {
-                return Err(Error::Internal("bucket is not empty".to_string()));
+                return Err(Error::BucketNotEmpty);
             }
         }
         fs::remove_dir_all(&bucket_dir).await?;
@@ -762,6 +812,52 @@ impl StorageBackend for FilesystemStorage {
         fs::remove_dir_all(upload_dir).await?;
 
         Ok(())
+    }
+
+    async fn list_multipart_uploads(
+        &self,
+        bucket: &str,
+    ) -> Result<Vec<crate::storage::MultipartUploadInfo>> {
+        let mut uploads = Vec::new();
+        let mut entries = match fs::read_dir(self.root_dir.join("uploads")).await {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(uploads),
+            Err(e) => return Err(e.into()),
+        };
+        while let Some(entry) = entries.next_entry().await? {
+            if !entry.file_type().await?.is_dir() {
+                continue;
+            }
+            let metadata_path = entry.path().join("metadata.json");
+            let Some(upload) =
+                Self::load_metadata::<MultipartUploadMetadata>(&metadata_path).await?
+            else {
+                continue;
+            };
+            if upload.bucket.as_deref() == Some(bucket) {
+                uploads.push(crate::storage::MultipartUploadInfo {
+                    key: upload.key,
+                    upload_id: upload.upload_id,
+                });
+            }
+        }
+        uploads.sort();
+        Ok(uploads)
+    }
+
+    async fn update_metadata(
+        &self,
+        bucket: &str,
+        key: &str,
+        update: crate::storage::MetadataUpdate,
+    ) -> Result<()> {
+        // Not atomic with concurrent writes to the same key.
+        let metadata_path = self.get_object_metadata_path(bucket, key);
+        let mut metadata: ObjectMetadata = Self::load_metadata(&metadata_path)
+            .await?
+            .ok_or(Error::NoSuchKey)?;
+        update(&mut metadata);
+        Self::save_metadata(&metadata_path, &metadata).await
     }
 
     async fn reset(&self) -> Result<()> {
@@ -818,6 +914,7 @@ mod tests {
     async fn test_put_and_get_object() {
         let temp_dir = tempdir().unwrap();
         let storage = FilesystemStorage::new(temp_dir.path()).await.unwrap();
+        storage.create_bucket(TEST_BUCKET).await.unwrap();
         let key = "test-key";
         let content = Bytes::from("test content");
         let integrity_checks = ObjectIntegrityChecks::new().with_md5();
@@ -851,6 +948,7 @@ mod tests {
     async fn test_get_object_with_range() {
         let temp_dir = tempdir().unwrap();
         let storage = FilesystemStorage::new(temp_dir.path()).await.unwrap();
+        storage.create_bucket(TEST_BUCKET).await.unwrap();
         let key = "test-key";
         let content = Bytes::from("0123456789");
         let integrity_checks = ObjectIntegrityChecks::new().with_md5();
@@ -882,6 +980,7 @@ mod tests {
     async fn test_delete_object() {
         let temp_dir = tempdir().unwrap();
         let storage = FilesystemStorage::new(temp_dir.path()).await.unwrap();
+        storage.create_bucket(TEST_BUCKET).await.unwrap();
         let key = "test-key";
         let content = Bytes::from("test content");
         let integrity_checks = ObjectIntegrityChecks::new().with_md5();
@@ -920,6 +1019,7 @@ mod tests {
     async fn test_list_objects() {
         let temp_dir = tempdir().unwrap();
         let storage = FilesystemStorage::new(temp_dir.path()).await.unwrap();
+        storage.create_bucket(TEST_BUCKET).await.unwrap();
         let content = Bytes::from("test content");
 
         for i in 0..3 {
@@ -957,6 +1057,7 @@ mod tests {
     async fn test_multipart_upload() {
         let temp_dir = tempdir().unwrap();
         let storage = FilesystemStorage::new(temp_dir.path()).await.unwrap();
+        storage.create_bucket(TEST_BUCKET).await.unwrap();
         let upload_id = "test-upload-123";
         let key = "test-multipart-key";
         let metadata = create_test_metadata(0);
@@ -1021,6 +1122,7 @@ mod tests {
     async fn test_multipart_upload_missing_part() {
         let temp_dir = tempdir().unwrap();
         let storage = FilesystemStorage::new(temp_dir.path()).await.unwrap();
+        storage.create_bucket(TEST_BUCKET).await.unwrap();
         let upload_id = "test-upload-123";
         let key = "test-multipart-key";
         let metadata = create_test_metadata(0);
@@ -1057,6 +1159,7 @@ mod tests {
     async fn test_abort_multipart_upload() {
         let temp_dir = tempdir().unwrap();
         let storage = FilesystemStorage::new(temp_dir.path()).await.unwrap();
+        storage.create_bucket(TEST_BUCKET).await.unwrap();
         let upload_id = "test-upload-123";
         let key = "test-multipart-key";
         let metadata = create_test_metadata(0);
@@ -1088,6 +1191,7 @@ mod tests {
     async fn test_nested_object_keys() {
         let temp_dir = tempdir().unwrap();
         let storage = FilesystemStorage::new(temp_dir.path()).await.unwrap();
+        storage.create_bucket(TEST_BUCKET).await.unwrap();
         let key = "nested/path/to/test-key";
         let content = Bytes::from("test content");
         let integrity_checks = ObjectIntegrityChecks::new().with_md5();
@@ -1127,6 +1231,7 @@ mod tests {
     async fn test_empty_key() {
         let temp_dir = tempdir().unwrap();
         let storage = FilesystemStorage::new(temp_dir.path()).await.unwrap();
+        storage.create_bucket(TEST_BUCKET).await.unwrap();
         let key = "";
         let content = Bytes::from("test content");
         let integrity_checks = ObjectIntegrityChecks::new().with_md5();

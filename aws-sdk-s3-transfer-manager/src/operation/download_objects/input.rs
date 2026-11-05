@@ -14,9 +14,20 @@ use std::{
 
 /// Input type for downloading multiple objects from Amazon S3.
 ///
-/// Walk behavior (prefix, delimiter, filter, pagination) is configured by
-/// supplying a custom [`S3Walker`] via [`walker`](DownloadObjectsInputBuilder::walker).
-/// When not set, a default walker is used that filters out 0-byte folder markers.
+/// Walk behavior (prefix, filter, pagination) is configured by supplying an
+/// [`S3Walker`] via [`walker`](DownloadObjectsInputBuilder::walker). When not
+/// set, the default walker lists the whole bucket.
+///
+/// The walker's prefix, set with
+/// [`S3WalkerBuilder::prefix`](crate::io::walk::S3WalkerBuilder::prefix),
+/// scopes the listing and is stripped from each key to build its path under
+/// [`destination`](Self::destination). Without a prefix, the full key is
+/// used.
+///
+/// 0-byte objects whose key ends in `/` (folder markers) are skipped. A key
+/// whose local path resolves outside the destination, or to the destination
+/// directory itself, is not downloaded. It is reported as a failure and
+/// handled by the [`failure_policy`](Self::failure_policy).
 #[non_exhaustive]
 #[derive(Clone)]
 pub struct DownloadObjectsInput {
@@ -25,9 +36,6 @@ pub struct DownloadObjectsInput {
 
     /// The destination directory to which files should be downloaded.
     pub destination: Option<PathBuf>,
-
-    /// Limit the response to keys that begin with the given prefix.
-    pub key_prefix: Option<String>,
 
     /// Character used to group keys.
     pub delimiter: Option<String>,
@@ -64,11 +72,6 @@ impl DownloadObjectsInput {
         self.destination.as_deref()
     }
 
-    /// Limit the response to keys that begin with the given prefix.
-    pub fn key_prefix(&self) -> Option<&str> {
-        self.key_prefix.as_deref()
-    }
-
     /// Character used to group keys.
     pub fn delimiter(&self) -> Option<&str> {
         self.delimiter.as_deref()
@@ -95,7 +98,6 @@ impl fmt::Debug for DownloadObjectsInput {
         f.debug_struct("DownloadObjectsInput")
             .field("bucket", &self.bucket)
             .field("destination", &self.destination)
-            .field("key_prefix", &self.key_prefix)
             .field("delimiter", &self.delimiter)
             .field("failure_policy", &self.failure_policy)
             .field("walker", &self.walker.is_some())
@@ -110,7 +112,6 @@ impl fmt::Debug for DownloadObjectsInput {
 pub struct DownloadObjectsInputBuilder {
     pub(crate) bucket: Option<String>,
     pub(crate) destination: Option<PathBuf>,
-    pub(crate) key_prefix: Option<String>,
     pub(crate) delimiter: Option<String>,
     pub(crate) failure_policy: FailedTransferPolicy,
     pub(crate) walker: Option<S3Walker>,
@@ -152,23 +153,6 @@ impl DownloadObjectsInputBuilder {
         self.destination.as_deref()
     }
 
-    /// Limit the response to keys that begin with the given prefix.
-    pub fn key_prefix(mut self, input: impl Into<String>) -> Self {
-        self.key_prefix = Some(input.into());
-        self
-    }
-
-    /// Limit the response to keys that begin with the given prefix.
-    pub fn set_key_prefix(mut self, input: Option<String>) -> Self {
-        self.key_prefix = input;
-        self
-    }
-
-    /// The key prefix.
-    pub fn get_key_prefix(&self) -> Option<&str> {
-        self.key_prefix.as_deref()
-    }
-
     /// Character used to group keys.
     pub fn delimiter(mut self, input: impl Into<String>) -> Self {
         self.delimiter = Some(input.into());
@@ -201,8 +185,9 @@ impl DownloadObjectsInputBuilder {
     /// Walker configuration (prefix, filter, pagination, etc.).
     ///
     /// Pass an [`S3Walker`] built via [`S3Walker::builder`] to customize the
-    /// listing. When not set, a default walker is used that filters out
-    /// 0-byte folder markers.
+    /// listing. Its prefix scopes the listing and is stripped from each key
+    /// to build its local path. When not set, a default walker is used that
+    /// filters out 0-byte folder markers.
     pub fn walker(mut self, input: S3Walker) -> Self {
         self.walker = Some(input);
         self
@@ -248,11 +233,9 @@ impl DownloadObjectsInputBuilder {
                 "Destination directory is required",
             ));
         }
-
         Ok(DownloadObjectsInput {
             bucket: self.bucket,
             destination: self.destination,
-            key_prefix: self.key_prefix,
             delimiter: self.delimiter,
             failure_policy: self.failure_policy,
             walker: self.walker,
@@ -266,7 +249,6 @@ impl fmt::Debug for DownloadObjectsInputBuilder {
         f.debug_struct("DownloadObjectsInputBuilder")
             .field("bucket", &self.bucket)
             .field("destination", &self.destination)
-            .field("key_prefix", &self.key_prefix)
             .field("delimiter", &self.delimiter)
             .field("failure_policy", &self.failure_policy)
             .field("walker", &self.walker.is_some())

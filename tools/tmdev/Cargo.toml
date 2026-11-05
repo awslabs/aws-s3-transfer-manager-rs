@@ -1,0 +1,29 @@
+[package]
+name = "tmdev"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94.1"
+authors = ["AWS Rust SDK Team <aws-sdk-rust@amazon.com>"]
+license = "Apache-2.0"
+description = "Transfer Manager developer commands"
+publish = false
+
+[workspace]
+resolver = "3"
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", default-features = false, features = ["derive", "std", "help", "usage", "error-context"] }
+flate2 = "1.1.10"
+log = "0.4.35"
+semver = { version = "1.0.28", features = ["serde"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+tar = { version = "0.4.46", default-features = false }
+time = { version = "0.3.55", features = ["parsing", "formatting"] }
+toml = "1.2.0"
+ureq = { version = "3.5.1", default-features = false, features = ["rustls"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"

@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::task::ready;
 use std::{task::Poll, time::Duration};
 
+use aws_sdk_s3::operation::abort_multipart_upload::AbortMultipartUploadOutput;
 use aws_sdk_s3::operation::complete_multipart_upload::{
     CompleteMultipartUploadError, CompleteMultipartUploadInput, CompleteMultipartUploadOutput,
 };
@@ -46,29 +47,64 @@ const SEND_DATA_TIMEOUT_S: u64 = 10;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 pin_project! {
+    /// The TestStream that emits each `Bytes` as the next sequential part, numbering parts from 1.
+    /// Closing the sender ends the stream.
+    ///
+    /// - `size_hint` is returned verbatim from `size_hint()`
+    /// - `full_object_checksum` is the optional checksum taken, when set, returned from `full_object_checksum()`.
+    /// - `observed_part_size` records the most recent `StreamContext::part_size()` seen in
+    ///   `poll_part`, so a test can read back the runtime-chosen part size.
     #[derive(Debug)]
     struct TestStream {
         next_part_num: u64,
         rx: mpsc::Receiver<Bytes>,
         size_hint: SizeHint,
+        full_object_checksum: Option<String>,
         observed_part_size: Arc<AtomicUsize>,
     }
 }
 
 impl TestStream {
-    fn exact(rx: mpsc::Receiver<Bytes>, size: u64) -> Self {
-        Self::with_size_hint(rx, SizeHint::exact(size))
-    }
-
-    fn with_size_hint(rx: mpsc::Receiver<Bytes>, size_hint: SizeHint) -> Self {
+    /// The general constructor. Other constructor builds on this one.
+    ///
+    /// - `size_hint` defaults to `SizeHint::default()` when `None`.
+    fn new(
+        rx: mpsc::Receiver<Bytes>,
+        size_hint: Option<SizeHint>,
+        full_object_checksum: Option<String>,
+    ) -> Self {
         Self {
             next_part_num: 1,
             rx,
-            size_hint,
+            size_hint: size_hint.unwrap_or_default(),
+            full_object_checksum,
             observed_part_size: Arc::new(AtomicUsize::new(0)),
         }
     }
 
+    fn with_size_hint(rx: mpsc::Receiver<Bytes>, size_hint: SizeHint) -> Self {
+        Self::new(rx, Some(size_hint), None)
+    }
+
+    /// Declares an exact size of `size` bytes, driving the known-length path.
+    fn exact(rx: mpsc::Receiver<Bytes>, size: u64) -> Self {
+        Self::new(rx, Some(SizeHint::exact(size)), None)
+    }
+
+    /// Reports no upper bound, driving the unknown-length path.
+    fn unknown_length(rx: mpsc::Receiver<Bytes>) -> Self {
+        Self::new(rx, None, None)
+    }
+
+    /// Unknown length with `full_object_checksum`.
+    fn unknown_length_with_checksum(
+        rx: mpsc::Receiver<Bytes>,
+        full_object_checksum: String,
+    ) -> Self {
+        Self::new(rx, None, Some(full_object_checksum))
+    }
+
+    /// Returns the handle holding the latest `part_size()` recorded by `poll_part`.
     fn observed_part_size(&self) -> Arc<AtomicUsize> {
         Arc::clone(&self.observed_part_size)
     }
@@ -95,48 +131,9 @@ impl PartStream for TestStream {
     fn size_hint(&self) -> SizeHint {
         self.size_hint
     }
-}
 
-pin_project! {
-    /// A `PartStream` whose total size is not known up front: `size_hint` has no upper bound.
-    ///
-    /// Mirrors a caller like Mountpoint, which writes an object whose final size is only known once
-    /// the writer closes. Parts arrive over a channel; closing the sender is end-of-stream.
-    #[derive(Debug)]
-    struct UnknownLengthStream {
-        next_part_num: u64,
-        rx: mpsc::Receiver<Bytes>,
-    }
-}
-
-impl UnknownLengthStream {
-    fn new(rx: mpsc::Receiver<Bytes>) -> Self {
-        Self {
-            next_part_num: 1,
-            rx,
-        }
-    }
-}
-
-impl PartStream for UnknownLengthStream {
-    fn poll_part(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        _stream_cx: &StreamContext,
-    ) -> Poll<Option<std::io::Result<PartData>>> {
-        let this = self.project();
-        let data = ready!(this.rx.poll_recv(cx));
-        let part = data.map(|b| {
-            let part_num = *this.next_part_num;
-            *this.next_part_num += 1;
-            Ok(PartData::new(part_num, b))
-        });
-        Poll::Ready(part)
-    }
-
-    /// No upper bound — this is what routes the upload down the unknown-length path.
-    fn size_hint(&self) -> SizeHint {
-        SizeHint::default()
+    fn full_object_checksum(&self) -> Option<String> {
+        self.full_object_checksum.clone()
     }
 }
 
@@ -234,10 +231,104 @@ impl PartStream for WakeBeforePendingStream {
     }
 }
 
-#[derive(Debug)]
-struct SegmentedPartStream {
-    part: Option<PartData>,
-    size: u64,
+/// The producer a [`ScriptedPartStream`] drives: each call yields the next poll result, given the
+/// [`StreamContext`] so a script can size a part to the runtime-chosen `part_size()`.
+type PartScript =
+    Box<dyn FnMut(&StreamContext) -> Poll<Option<std::io::Result<PartData>>> + Send + Sync>;
+
+/// A PartStream with a part-producing script
+struct ScriptedPartStream {
+    script: PartScript,
+    size_hint: SizeHint,
+}
+
+impl std::fmt::Debug for ScriptedPartStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScriptedPartStream")
+            .field("size_hint", &self.size_hint)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ScriptedPartStream {
+    fn new(
+        size_hint: SizeHint,
+        script: impl FnMut(&StreamContext) -> Poll<Option<std::io::Result<PartData>>>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        Self {
+            script: Box::new(script),
+            size_hint,
+        }
+    }
+
+    /// Yields `part` once, then end-of-stream. Declares `size` exactly.
+    fn segmented(part: PartData, size: u64) -> Self {
+        let mut part = Some(part);
+        Self::new(SizeHint::exact(size), move |_stream_cx| {
+            Poll::Ready(part.take().map(Ok))
+        })
+    }
+
+    /// Yields one part per entry in `part_numbers`, the part at position `i` holding `i + 1` bytes,
+    /// then end-of-stream. The body length identifies which scripted part a recorded UploadPart
+    /// carried.
+    fn numbered(part_numbers: &[u64]) -> Self {
+        let mut remaining: std::collections::VecDeque<u64> = part_numbers.iter().copied().collect();
+        let mut yielded = 0usize;
+        Self::new(SizeHint::default(), move |_stream_cx| {
+            let Some(part_number) = remaining.pop_front() else {
+                return Poll::Ready(None);
+            };
+            yielded += 1;
+            Poll::Ready(Some(Ok(PartData::new(part_number, vec![0u8; yielded]))))
+        })
+    }
+
+    /// Yields one-byte parts numbered from `next_part_num` up to and including `total`, then
+    /// end-of-stream.
+    fn counting(mut next_part_num: u64, total: u64) -> Self {
+        Self::new(SizeHint::default(), move |_stream_cx| {
+            if next_part_num > total {
+                return Poll::Ready(None);
+            }
+            let part_number = next_part_num;
+            next_part_num += 1;
+            Poll::Ready(Some(Ok(PartData::new(
+                part_number,
+                Bytes::from_static(b"x"),
+            ))))
+        })
+    }
+
+    /// Yields one part sized to the context's `part_size()`, then a reader error.
+    fn failing_after_one_part() -> Self {
+        let mut yielded = false;
+        Self::new(SizeHint::default(), move |stream_cx| {
+            if yielded {
+                return Poll::Ready(Some(Err(std::io::Error::other("simulated reader failure"))));
+            }
+            yielded = true;
+            let data = vec![0u8; stream_cx.part_size()];
+            Poll::Ready(Some(Ok(PartData::new(1, data))))
+        })
+    }
+}
+
+impl PartStream for ScriptedPartStream {
+    fn poll_part(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        stream_cx: &StreamContext,
+    ) -> Poll<Option<std::io::Result<PartData>>> {
+        (self.get_mut().script)(stream_cx)
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.size_hint
+    }
 }
 
 #[derive(Debug)]
@@ -280,25 +371,13 @@ impl PartStream for PooledPartStream {
     }
 }
 
-impl PartStream for SegmentedPartStream {
-    fn poll_part(
-        mut self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-        _stream_cx: &StreamContext,
-    ) -> Poll<Option<std::io::Result<PartData>>> {
-        Poll::Ready(self.part.take().map(Ok))
-    }
-
-    fn size_hint(&self) -> SizeHint {
-        SizeHint::exact(self.size)
-    }
-}
-
 /// Builds a transfer manager with default config that sends its S3 requests to `client`.
 fn tm_with(client: aws_sdk_s3::Client) -> aws_sdk_s3_transfer_manager::Client {
     aws_sdk_s3_transfer_manager::Client::new(
         aws_sdk_s3_transfer_manager::Config::builder()
-            .client(client)
+            .s3_config(test_common::s3_config_with_test_http(
+                client.config().to_builder(),
+            ))
             .build(),
     )
 }
@@ -315,6 +394,8 @@ struct MultipartRecord {
     upload_parts: Mutex<Vec<(i32, i64)>>,
     /// Each CompleteMultipartUpload request, as received.
     completions: Mutex<Vec<CompleteMultipartUploadInput>>,
+    /// How many AbortMultipartUpload requests were answered.
+    aborts: AtomicUsize,
 }
 
 impl MultipartRecord {
@@ -336,6 +417,11 @@ impl MultipartRecord {
     /// How many CompleteMultipartUpload requests were recorded.
     fn complete_calls(&self) -> usize {
         self.completions.lock().unwrap().len()
+    }
+
+    /// How many AbortMultipartUpload requests were recorded.
+    fn abort_calls(&self) -> usize {
+        self.aborts.load(Ordering::SeqCst)
     }
 
     /// The part numbers each recorded CompleteMultipartUpload listed, in the order it listed them.
@@ -366,11 +452,13 @@ impl MultipartRecord {
     }
 }
 
-/// A mock multipart service. CreateMultipartUpload, UploadPart and CompleteMultipartUpload succeed
-/// and are recorded in a [`MultipartRecord`], unless a test overrides one with its own rule.
+/// A mock multipart service. CreateMultipartUpload, UploadPart, CompleteMultipartUpload and
+/// AbortMultipartUpload succeed and are recorded in a [`MultipartRecord`], unless a test overrides
+/// one with its own rule. A failed upload sends AbortMultipartUpload.
 ///
-/// CreateMultipartUpload returns [`MOCK_UPLOAD_ID`]. The default UploadPart and
-/// CompleteMultipartUpload rules match only requests carrying that upload ID, so a request carrying
+/// CreateMultipartUpload returns [`MOCK_UPLOAD_ID`]. The default UploadPart,
+/// CompleteMultipartUpload and AbortMultipartUpload rules match only requests carrying that upload
+/// ID, so a request carrying
 /// any other ID matches no rule and the mock panics. The default UploadPart answer carries the ETag
 /// `etag-{part number}`.
 struct MultipartMock {
@@ -436,11 +524,21 @@ impl MultipartMock {
                 }
             });
 
+        let abort_mpu = mock!(aws_sdk_s3::Client::abort_multipart_upload)
+            .match_requests(|req| req.upload_id() == Some(MOCK_UPLOAD_ID))
+            .then_compute_output({
+                let record = Arc::clone(&self.record);
+                move |_| {
+                    record.aborts.fetch_add(1, Ordering::SeqCst);
+                    AbortMultipartUploadOutput::builder().build()
+                }
+            });
+
         let rules: Vec<Rule> = self
             .overrides
             .iter()
             .cloned()
-            .chain([create_mpu, upload_part, complete_mpu])
+            .chain([create_mpu, upload_part, complete_mpu, abort_mpu])
             .collect();
         mock_client!(aws_sdk_s3, RuleMode::MatchAny, &rules)
     }
@@ -456,47 +554,8 @@ impl MultipartMock {
     }
 }
 
-/// A `PartStream` that yields one part per scripted part number, in script order, then
-/// end-of-stream.
-///
-/// The part at script position `i` holds `i + 1` bytes, so a recorded UploadPart's content length
-/// identifies which scripted part it carried.
-#[derive(Debug)]
-struct NumberedPartStream {
-    part_numbers: std::collections::VecDeque<u64>,
-    yielded: usize,
-}
-
-impl NumberedPartStream {
-    fn new(part_numbers: &[u64]) -> Self {
-        Self {
-            part_numbers: part_numbers.iter().copied().collect(),
-            yielded: 0,
-        }
-    }
-}
-
-impl PartStream for NumberedPartStream {
-    fn poll_part(
-        mut self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-        _stream_cx: &StreamContext,
-    ) -> Poll<Option<std::io::Result<PartData>>> {
-        let Some(part_number) = self.part_numbers.pop_front() else {
-            return Poll::Ready(None);
-        };
-        self.yielded += 1;
-        let data = vec![0u8; self.yielded];
-        Poll::Ready(Some(Ok(PartData::new(part_number, data))))
-    }
-
-    fn size_hint(&self) -> SizeHint {
-        SizeHint::default()
-    }
-}
-
-/// Uploads a `NumberedPartStream` for `part_numbers` and returns the outcome with the mock it ran
-/// against.
+/// Uploads a numbered scripted stream for `part_numbers` and returns the outcome with the mock it
+/// ran against.
 async fn upload_numbered_parts(part_numbers: &[u64]) -> (Result<(), Error>, MultipartMock) {
     let mock = MultipartMock::new();
     let tm = mock.tm();
@@ -504,7 +563,7 @@ async fn upload_numbered_parts(part_numbers: &[u64]) -> (Result<(), Error>, Mult
         .upload()
         .bucket("test-bucket")
         .key("test-key")
-        .body(InputStream::from_part_stream(NumberedPartStream::new(
+        .body(InputStream::from_part_stream(ScriptedPartStream::numbered(
             part_numbers,
         )))
         .initiate()
@@ -570,10 +629,7 @@ async fn test_custom_stream_uploads_segmented_part_data() {
     let mut data = SegmentedBytes::from(Bytes::from_static(b"left"));
     data.append(SegmentedBytes::from(Bytes::from_static(b"-right")));
     let size = data.len() as u64;
-    let stream = SegmentedPartStream {
-        part: Some(PartData::from_segmented(1, data)),
-        size,
-    };
+    let stream = ScriptedPartStream::segmented(PartData::from_segmented(1, data), size);
     let tm = MultipartMock::new().tm();
 
     let handle = tm
@@ -599,7 +655,9 @@ async fn test_custom_stream_resumes_after_part_buffer_admission() {
     let held = pool.acquire(&holder, CAPACITY).unwrap();
 
     let config = aws_sdk_s3_transfer_manager::Config::builder()
-        .client(MultipartMock::new().client())
+        .s3_config(test_common::s3_config_with_test_http(
+            MultipartMock::new().client().config().to_builder(),
+        ))
         .memory(MemoryConfig::Explicit(pool.clone()))
         .build();
     let tm = aws_sdk_s3_transfer_manager::Client::new(config);
@@ -795,33 +853,6 @@ async fn test_complete_mpu_sends_mpu_object_size() {
 // these all exercise the multipart path. Termination comes from the reader
 // reporting end-of-stream rather than from a part count.
 
-/// A stream with no declared length uploads via multipart and completes.
-#[tokio::test]
-async fn test_unknown_length_multipart_upload() {
-    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
-    let tm = MultipartMock::new().tm();
-
-    let (tx, rx) = mpsc::channel(2);
-    let handle = tm
-        .upload()
-        .bucket("test-bucket")
-        .key("test-key")
-        .body(InputStream::from_part_stream(UnknownLengthStream::new(rx)))
-        .initiate()
-        .unwrap();
-
-    // Two full parts, then end-of-stream by dropping the sender.
-    for _ in 0..2 {
-        tx.send(Bytes::from(vec![0u8; part_size])).await.unwrap();
-    }
-    drop(tx);
-
-    handle
-        .join()
-        .await
-        .expect("an unknown-length stream must upload, not panic");
-}
-
 /// An empty stream with no declared bounds must complete as a normal 0-byte object.
 ///
 /// S3 rejects a CompleteMultipartUpload that lists no parts, so "no bytes" cannot
@@ -831,9 +862,9 @@ async fn test_unknown_length_multipart_upload() {
 async fn test_unknown_length_empty_stream() {
     let (tx, rx) = mpsc::channel(1);
     drop(tx);
-    assert_single_empty_multipart_upload(InputStream::from_part_stream(UnknownLengthStream::new(
-        rx,
-    )))
+    assert_single_empty_multipart_upload(InputStream::from_part_stream(
+        TestStream::unknown_length(rx),
+    ))
     .await;
 }
 
@@ -860,10 +891,7 @@ async fn test_exact_zero_hint_allows_empty_stream() {
 /// duplicate after observing EOF.
 #[tokio::test]
 async fn test_explicit_zero_byte_part_is_not_duplicated() {
-    let stream = SegmentedPartStream {
-        part: Some(PartData::new(1, Bytes::new())),
-        size: 0,
-    };
+    let stream = ScriptedPartStream::segmented(PartData::new(1, Bytes::new()), 0);
     assert_single_empty_multipart_upload(InputStream::from_part_stream(stream)).await;
 }
 
@@ -884,7 +912,9 @@ async fn test_unknown_length_mpu_object_size_is_running_sum() {
         .upload()
         .bucket("test-bucket")
         .key("test-key")
-        .body(InputStream::from_part_stream(UnknownLengthStream::new(rx)))
+        .body(InputStream::from_part_stream(TestStream::unknown_length(
+            rx,
+        )))
         .initiate()
         .unwrap();
 
@@ -1142,7 +1172,9 @@ async fn test_unknown_length_with_data_never_sends_empty_part() {
         .upload()
         .bucket("test-bucket")
         .key("test-key")
-        .body(InputStream::from_part_stream(UnknownLengthStream::new(rx)))
+        .body(InputStream::from_part_stream(TestStream::unknown_length(
+            rx,
+        )))
         .initiate()
         .unwrap();
 
@@ -1170,56 +1202,6 @@ async fn test_unknown_length_with_data_never_sends_empty_part() {
     );
 }
 
-pin_project! {
-    /// An unknown-length `PartStream` that also supplies a full-object checksum.
-    ///
-    /// `full_object_checksum` is consulted once, after the final part, and only when the
-    /// upload uses a `FullObject` checksum strategy without a value set up front. Pairing
-    /// it with an unknown length is the combination the design flagged as needing
-    /// coverage: the size is not known when the strategy is chosen.
-    #[derive(Debug)]
-    struct UnknownLengthChecksumStream {
-        next_part_num: u64,
-        rx: mpsc::Receiver<Bytes>,
-        full_object_checksum: Option<String>,
-    }
-}
-
-impl UnknownLengthChecksumStream {
-    fn new(rx: mpsc::Receiver<Bytes>, full_object_checksum: Option<String>) -> Self {
-        Self {
-            next_part_num: 1,
-            rx,
-            full_object_checksum,
-        }
-    }
-}
-
-impl PartStream for UnknownLengthChecksumStream {
-    fn poll_part(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        _stream_cx: &StreamContext,
-    ) -> Poll<Option<std::io::Result<PartData>>> {
-        let this = self.project();
-        let data = ready!(this.rx.poll_recv(cx));
-        let part = data.map(|b| {
-            let part_num = *this.next_part_num;
-            *this.next_part_num += 1;
-            Ok(PartData::new(part_num, b))
-        });
-        Poll::Ready(part)
-    }
-
-    fn size_hint(&self) -> SizeHint {
-        SizeHint::default()
-    }
-
-    fn full_object_checksum(&self) -> Option<String> {
-        self.full_object_checksum.clone()
-    }
-}
-
 /// A full-object checksum supplied by the stream must reach CompleteMultipartUpload even
 /// though the length was never declared.
 ///
@@ -1236,7 +1218,7 @@ async fn test_unknown_length_forwards_full_object_checksum() {
     let tm = mock.tm();
 
     let (tx, rx) = mpsc::channel(1);
-    let stream = UnknownLengthChecksumStream::new(rx, Some(expected_checksum.to_owned()));
+    let stream = TestStream::unknown_length_with_checksum(rx, expected_checksum.to_owned());
     let handle = tm
         .upload()
         .bucket("test-bucket")
@@ -1281,7 +1263,9 @@ async fn test_unknown_length_reports_total_bytes_after_completion() {
         .upload()
         .bucket("test-bucket")
         .key("test-key")
-        .body(InputStream::from_part_stream(UnknownLengthStream::new(rx)))
+        .body(InputStream::from_part_stream(TestStream::unknown_length(
+            rx,
+        )))
         .initiate()
         .unwrap();
 
@@ -1322,9 +1306,9 @@ async fn test_unknown_length_reader_error_fails_transfer() {
         .upload()
         .bucket("test-bucket")
         .key("test-key")
-        .body(InputStream::from_part_stream(FailingUnknownLengthStream {
-            yielded: false,
-        }))
+        .body(InputStream::from_part_stream(
+            ScriptedPartStream::failing_after_one_part(),
+        ))
         .initiate()
         .unwrap();
 
@@ -1337,31 +1321,6 @@ async fn test_unknown_length_reader_error_fails_transfer() {
         "expected an IO error, got {:?}",
         err.kind()
     );
-}
-
-/// Yields one part, then errors — never reports end-of-stream.
-#[derive(Debug)]
-struct FailingUnknownLengthStream {
-    yielded: bool,
-}
-
-impl PartStream for FailingUnknownLengthStream {
-    fn poll_part(
-        mut self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-        stream_cx: &StreamContext,
-    ) -> Poll<Option<std::io::Result<PartData>>> {
-        if self.yielded {
-            return Poll::Ready(Some(Err(std::io::Error::other("simulated reader failure"))));
-        }
-        self.yielded = true;
-        let data = vec![0u8; stream_cx.part_size()];
-        Poll::Ready(Some(Ok(PartData::new(1, data))))
-    }
-
-    fn size_hint(&self) -> SizeHint {
-        SizeHint::default()
-    }
 }
 
 /// A stream that yields more parts than the unknown-length default capacity must still
@@ -1385,7 +1344,9 @@ async fn test_unknown_length_many_parts_grows_part_list() {
         .upload()
         .bucket("test-bucket")
         .key("test-key")
-        .body(InputStream::from_part_stream(UnknownLengthStream::new(rx)))
+        .body(InputStream::from_part_stream(TestStream::unknown_length(
+            rx,
+        )))
         .initiate()
         .unwrap();
 
@@ -1415,41 +1376,6 @@ async fn test_unknown_length_many_parts_grows_part_list() {
     );
 }
 
-pin_project! {
-    /// An unknown-length `PartStream` that yields `total` one-byte parts, then end-of-stream.
-    ///
-    /// Parts are produced without waiting on a channel, so a test can drive the part count past a
-    /// limit without also taking on caller-data backpressure.
-    #[derive(Debug)]
-    struct CountingUnknownLengthStream {
-        next_part_num: u64,
-        total: u64,
-    }
-}
-
-impl PartStream for CountingUnknownLengthStream {
-    fn poll_part(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-        _stream_cx: &StreamContext,
-    ) -> Poll<Option<std::io::Result<PartData>>> {
-        let this = self.project();
-        if *this.next_part_num > *this.total {
-            return Poll::Ready(None);
-        }
-        let part_number = *this.next_part_num;
-        *this.next_part_num += 1;
-        Poll::Ready(Some(Ok(PartData::new(
-            part_number,
-            Bytes::from_static(b"x"),
-        ))))
-    }
-
-    fn size_hint(&self) -> SizeHint {
-        SizeHint::default()
-    }
-}
-
 /// A stream exceeding the S3 part limit fails with a message naming the remedy.
 ///
 /// The guard keys on parts the reader actually yielded, so an exactly-`MAX_PARTS` stream must still
@@ -1465,10 +1391,10 @@ async fn test_unknown_length_exceeding_part_limit_fails() {
         .upload()
         .bucket("test-bucket")
         .key("test-key")
-        .body(InputStream::from_part_stream(CountingUnknownLengthStream {
-            next_part_num: 1,
-            total: MAX_PARTS + 1,
-        }))
+        .body(InputStream::from_part_stream(ScriptedPartStream::counting(
+            1,
+            MAX_PARTS + 1,
+        )))
         .initiate()
         .unwrap();
 
@@ -1502,10 +1428,9 @@ async fn test_unknown_length_exactly_max_parts_succeeds() {
         .upload()
         .bucket("test-bucket")
         .key("test-key")
-        .body(InputStream::from_part_stream(CountingUnknownLengthStream {
-            next_part_num: 1,
-            total: MAX_PARTS,
-        }))
+        .body(InputStream::from_part_stream(ScriptedPartStream::counting(
+            1, MAX_PARTS,
+        )))
         .initiate()
         .unwrap();
 
@@ -1656,9 +1581,9 @@ async fn upload_failing_on_part_two(part_two: Rule) -> Error {
         .upload()
         .bucket("test-bucket")
         .key("test-key")
-        .body(InputStream::from_part_stream(NumberedPartStream::new(&[
-            1, 2, 3,
-        ])))
+        .body(InputStream::from_part_stream(ScriptedPartStream::numbered(
+            &[1, 2, 3],
+        )))
         .initiate()
         .unwrap()
         .join()
@@ -1676,6 +1601,11 @@ async fn upload_failing_on_part_two(part_two: Rule) -> Error {
     );
     assert_eq!(1, part_two.num_calls(), "part 2 must not be re-sent");
     assert_eq!(0, mock.record().complete_calls());
+    assert_eq!(
+        1,
+        mock.record().abort_calls(),
+        "the failed upload must be aborted"
+    );
     error
 }
 

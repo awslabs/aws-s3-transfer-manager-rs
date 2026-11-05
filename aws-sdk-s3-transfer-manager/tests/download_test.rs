@@ -3,11 +3,12 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use aws_config::Region;
+mod common;
+use aws_sdk_s3_transfer_manager::RuntimeConfig;
 use aws_sdk_s3_transfer_manager::{
     error::{BoxError, ErrorKind},
     metrics::unit::ByteUnit,
-    types::{ConcurrencyMode, PartSize, RuntimeMode, TransferStatus},
+    types::{ConcurrencyMode, PartSize, TransferStatus},
 };
 use aws_smithy_runtime_api::client::http::{
     http_client_fn, HttpConnector, HttpConnectorFuture, SharedHttpConnector,
@@ -105,16 +106,8 @@ fn test_tm(
     http_client: StaticReplayClient,
     part_size: usize,
 ) -> aws_sdk_s3_transfer_manager::Client {
-    let s3_client = aws_sdk_s3::Client::from_conf(
-        aws_sdk_s3::config::Config::builder()
-            .http_client(http_client)
-            .region(Region::from_static("us-west-2"))
-            .with_test_defaults()
-            .build(),
-    );
-
     let config = aws_sdk_s3_transfer_manager::Config::builder()
-        .client(s3_client)
+        .s3_config(common::s3_config(http_client))
         .part_size(PartSize::Target(part_size as u64))
         .concurrency(ConcurrencyMode::Explicit(1))
         .build();
@@ -291,7 +284,7 @@ impl HttpConnector for ParkAfterDiscoveryConnector {
 /// without waiting for those requests to complete on their own.
 ///
 /// The body is never consumed.
-async fn abort_download_with_executing_gets(runtime_mode: RuntimeMode) {
+async fn abort_download_with_executing_gets(runtime_config: RuntimeConfig) {
     let total = 25 * ByteUnit::Mebibyte.as_bytes_usize();
     let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
     let requests = Arc::new(AtomicUsize::new(0));
@@ -301,18 +294,13 @@ async fn abort_download_with_executing_gets(runtime_mode: RuntimeMode) {
         requests: requests.clone(),
         parked_started: parked_started.clone(),
     });
-    let s3_client = aws_sdk_s3::Client::from_conf(
-        aws_sdk_s3::config::Config::builder()
-            .http_client(http_client_fn(move |_, _| connector.clone()))
-            .region(Region::from_static("us-west-2"))
-            .with_test_defaults()
-            .build(),
-    );
     let config = aws_sdk_s3_transfer_manager::Config::builder()
-        .client(s3_client)
+        .s3_config(common::s3_config(http_client_fn(move |_, _| {
+            connector.clone()
+        })))
         .part_size(PartSize::Target(part_size as u64))
         .concurrency(ConcurrencyMode::Explicit(2))
-        .runtime_mode(runtime_mode)
+        .runtime_config(runtime_config)
         .build();
     let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
@@ -342,12 +330,12 @@ async fn abort_download_with_executing_gets(runtime_mode: RuntimeMode) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_abort_download_on_tokio_runtime() {
-    abort_download_with_executing_gets(RuntimeMode::MultiThreadTokio).await;
+    abort_download_with_executing_gets(RuntimeConfig::multi_thread_tokio()).await;
 }
 
 #[tokio::test]
 async fn test_abort_download_on_managed_runtime() {
-    abort_download_with_executing_gets(RuntimeMode::Managed).await;
+    abort_download_with_executing_gets(RuntimeConfig::default()).await;
 }
 
 pin_project! {
@@ -971,18 +959,16 @@ async fn test_integrity_checks_disabled_when_validation_when_required() {
     let data = Bytes::from_static(HELLO);
     let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
     let http_client = single_part_connector(&data, Some(HELLO_CRC32));
-    let s3_client = aws_sdk_s3::Client::from_conf(
-        aws_sdk_s3::config::Config::builder()
-            .http_client(http_client)
-            .region(Region::from_static("us-west-2"))
-            .response_checksum_validation(
-                aws_sdk_s3::config::ResponseChecksumValidation::WhenRequired,
-            )
-            .with_test_defaults()
-            .build(),
-    );
+    let shared = common::shared_config(http_client)
+        .into_builder()
+        .response_checksum_validation(
+            aws_smithy_types::checksum_config::ResponseChecksumValidation::WhenRequired,
+        )
+        .build();
     let config = aws_sdk_s3_transfer_manager::Config::builder()
-        .client(s3_client)
+        .s3_config(aws_sdk_s3_transfer_manager::config::S3ClientConfig::new(
+            &shared,
+        ))
         .part_size(PartSize::Target(part_size as u64))
         .concurrency(ConcurrencyMode::Explicit(1))
         .build();
@@ -1020,7 +1006,7 @@ async fn test_integrity_checks_enabled_not_falsely_validated() {
         .download()
         .bucket("test-bucket")
         .key("test-object")
-        .checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled)
+        .checksum_mode(aws_sdk_s3_transfer_manager::types::ChecksumMode::Enabled)
         .initiate()
         .unwrap();
     let _ = drain(&mut handle).await.unwrap();

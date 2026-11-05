@@ -7,6 +7,7 @@
 
 mod pending;
 
+use crate::config::user_agent::OperationFeatures;
 use crate::error;
 use crate::scheduler::concurrency::ErrorKind;
 use std::any::Any;
@@ -66,8 +67,10 @@ pub(crate) mod wake_flag {
 /// # Contracts
 ///
 /// Implementations must uphold:
-/// - **Failed lifecycle**: record the error and signal termination before returning
-///   `WorkOutcome::Failed`.
+/// - **Failed lifecycle**: record the error before returning `WorkOutcome::Failed`.
+///   Then either end the transfer and signal termination, or keep it active
+///   with a wake path so `poll_work` drives it to an end (an upload aborts
+///   its multipart upload first).
 /// - **Pending/wake obligation**: every `PollWork::Pending` must first call
 ///   `ctx.set_pending(cause)` and have a future wake path. See
 ///   [`TransferContext`] for the wake primitive protocol.
@@ -264,7 +267,9 @@ pub(crate) enum WorkOutcome {
     /// releases the execution slot but does not report a completion sample to the concurrency
     /// controller.
     Yielded,
-    /// Work failed. Transfer must have called `set_failed` + `signal_terminal` before returning.
+    /// Work failed. The transfer must have recorded the error before returning, and then
+    /// either ended (`set_failed` + `signal_terminal`) or stayed active with a wake path to
+    /// its end. See the Failed lifecycle contract on [`Transfer`].
     Failed { classification: Option<ErrorKind> },
     /// Work was skipped or aborted because the transfer is already terminal.
     Cancelled,
@@ -402,6 +407,11 @@ impl StateMachineStatus {
     #[inline]
     pub(crate) fn is_active(&self) -> bool {
         self.0.load(Ordering::Acquire) == STATUS_ACTIVE
+    }
+
+    #[inline]
+    pub(crate) fn is_completed(&self) -> bool {
+        self.0.load(Ordering::Acquire) == STATUS_COMPLETED
     }
 
     #[inline]
@@ -558,6 +568,8 @@ pub(crate) struct TransferContext {
     pending_state: Option<Arc<TransferPendingState>>,
     /// Per-transfer metrics backing store
     pub(crate) metrics: Arc<MetricsState>,
+    /// User agent features of the operation this transfer belongs to
+    features: OperationFeatures,
 }
 
 /// In-progress measurement for one logical transfer-manager request.
@@ -820,8 +832,41 @@ impl TransferContext {
             completion_tx: Arc::new(Mutex::new(Some(completion_tx))),
             wake_flag: Arc::new(wake_flag::WakeFlag::new()),
             pending_state,
+            features: OperationFeatures::default(),
         };
         (ctx, completion_rx)
+    }
+
+    /// Marks every request this transfer issues with `features`.
+    pub(crate) fn with_features(mut self, features: OperationFeatures) -> Self {
+        self.features = features;
+        self
+    }
+
+    /// [`Handle::bucket_partition_override`](crate::client::Handle::bucket_partition_override)
+    /// carrying this transfer's user agent features.
+    pub(crate) fn bucket_partition_override(
+        &self,
+        bucket: Option<&str>,
+    ) -> aws_sdk_s3::config::Builder {
+        self.features
+            .apply(self.handle.bucket_partition_override(bucket))
+    }
+
+    /// [`Handle::download_get_override`](crate::client::Handle::download_get_override)
+    /// carrying this transfer's user agent features.
+    pub(crate) fn download_get_override(
+        &self,
+        bucket: Option<&str>,
+    ) -> aws_sdk_s3::config::Builder {
+        self.features
+            .apply(self.handle.download_get_override(bucket))
+    }
+
+    /// [`Handle::upload_override`](crate::client::Handle::upload_override) carrying this
+    /// transfer's user agent features.
+    pub(crate) fn upload_override(&self, bucket: Option<&str>) -> aws_sdk_s3::config::Builder {
+        self.features.apply(self.handle.upload_override(bucket))
     }
 
     /// Create a new transfer context with a specific ID (for testing).
@@ -1047,6 +1092,12 @@ impl TransferContext {
     #[inline]
     pub(crate) fn is_active(&self) -> bool {
         self.status.is_active()
+    }
+
+    /// Check if transfer completed successfully
+    #[inline]
+    pub(crate) fn is_completed(&self) -> bool {
+        self.status.is_completed()
     }
 
     /// Signal that the transfer has reached a terminal state.
@@ -1289,14 +1340,14 @@ mod tests {
 
         fn test_handle() -> Arc<crate::client::Handle> {
             let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
-            let config = crate::Config::builder().client(s3_client).build();
+            let config = crate::Config::builder().sdk_client(s3_client).build();
             crate::client::Handle::new_for_test(config, 4)
         }
 
         fn test_handle_with_diagnostics(detail: u64) -> Arc<crate::client::Handle> {
             let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
             let config = crate::Config::builder()
-                .client(s3_client)
+                .sdk_client(s3_client)
                 .diagnostics_for_test(crate::config::MemoryDiagnosticsConfig::default(), detail)
                 .build();
             crate::client::Handle::new_for_test(config, 4)

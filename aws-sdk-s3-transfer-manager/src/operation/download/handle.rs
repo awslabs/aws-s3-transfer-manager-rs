@@ -5,9 +5,9 @@
 
 use crate::error::{self, ErrorKind};
 use crate::operation::download::body::{Body, RecvBodyConsumer};
-use crate::operation::download::object_meta::ObjectMetadata;
 use crate::operation::download::output::DownloadOutput;
 use crate::operation::download::transfer::DownloadTransfer;
+use crate::operation::download::ObjectMetadata;
 use crate::transfer::{StateMachineTerminalReceiver, TransferId};
 
 /// Shared core logic for download handles.
@@ -390,9 +390,7 @@ impl ManagedDownloadHandle {
     /// Object metadata.
     ///
     /// Waits for discovery to complete if metadata is not yet available.
-    pub async fn object_meta(
-        &self,
-    ) -> Result<&crate::operation::download::object_meta::ObjectMetadata, error::Error> {
+    pub async fn object_meta(&self) -> Result<&ObjectMetadata, error::Error> {
         self.inner.object_meta().await
     }
 
@@ -463,8 +461,8 @@ impl ManagedDownloadHandle {
             // path downloads would sync file data before rename and the parent
             // directory after rename where supported. The latency and cross-platform
             // semantics make this a client/API policy rather than the default.
-            if let Err(e) = tokio::fs::rename(&temp, dest).await {
-                let _ = tokio::fs::remove_file(&temp).await;
+            if let Err(e) = crate::io::fs::rename_async(&temp, dest).await {
+                let _ = crate::io::fs::remove_file_async(&temp).await;
                 return Err(e);
             }
         }
@@ -477,7 +475,7 @@ impl ManagedDownloadHandle {
     /// that name again.
     async fn cleanup(&mut self) {
         if let Some(temp) = self.temp_path.take() {
-            let _ = tokio::fs::remove_file(&temp).await;
+            let _ = crate::io::fs::remove_file_async(&temp).await;
         }
     }
 }
@@ -526,7 +524,7 @@ mod tests {
     fn make_cancelled_download_inner() -> (DownloadHandleInner, RecvBodyConsumer) {
         let handle = crate::client::Handle::test_handle_tokio(
             crate::Config::builder()
-                .client(aws_smithy_mocks::mock_client!(
+                .sdk_client(aws_smithy_mocks::mock_client!(
                     aws_sdk_s3,
                     aws_smithy_mocks::RuleMode::MatchAny,
                     &[]

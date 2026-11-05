@@ -1,0 +1,36 @@
+{
+  "version": "1.0",
+  "projections": {
+    "s3-tm-dataplane": {
+      "transforms": [
+        {
+          "name": "includeServices",
+          "args": {
+            "services": ["com.amazonaws.s3#AmazonS3"]
+          }
+        },
+        {
+          "name": "excludeTraits",
+          "args": {
+            "traits": ["smithy.rules#endpointTests"]
+          }
+        },
+        {
+          "name": "excludeShapesBySelector",
+          "args": {
+            "selector": "operation :not([id|name = PutObject, CreateMultipartUpload, UploadPart, CompleteMultipartUpload, AbortMultipartUpload, GetObject, HeadObject, ListObjectsV2])"
+          }
+        },
+        {
+          "name": "includeShapesBySelector",
+          "args": {
+            "selector": ":is(service [id = 'com.amazonaws.s3#AmazonS3'], service [id = 'com.amazonaws.s3#AmazonS3'] ~>, [trait|trait], [trait|trait] ~>, [trait|mixin], [trait|mixin] ~>)"
+          }
+        }
+      ],
+      "plugins": {
+        "model": {}
+      }
+    }
+  }
+}

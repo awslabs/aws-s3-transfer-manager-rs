@@ -7,7 +7,8 @@ use aws_config::BehaviorVersion;
 use aws_runtime::user_agent::FrameworkMetadata;
 
 use crate::config::{Builder, Config, S3ClientConfig};
-use crate::types::{ConcurrencyMode, MemoryConfig, PartSize, RuntimeMode};
+use crate::types::{ConcurrencyMode, MemoryConfig, PartSize};
+use crate::RuntimeConfig;
 
 /// Load transfer manager [`Config`] from the environment.
 #[derive(Default, Debug)]
@@ -54,9 +55,9 @@ impl ConfigLoader {
 
     /// Set the execution runtime this client should use.
     ///
-    /// Default is [RuntimeMode::Managed].
-    pub fn runtime_mode(mut self, mode: RuntimeMode) -> Self {
-        self.builder = self.builder.runtime_mode(mode);
+    /// Defaults to owned managed execution.
+    pub fn runtime_config(mut self, mode: RuntimeConfig) -> Self {
+        self.builder = self.builder.runtime_config(mode);
         self
     }
 
@@ -140,9 +141,7 @@ impl ConfigLoader {
         // construction stays free of blocking DMI reads and network IMDS calls.
         let profile = detect_machine_profile().await;
 
-        let sdk_client_builder = aws_sdk_s3::config::Builder::from(&shared_config);
-
-        let mut s3_config = S3ClientConfig::new(sdk_client_builder);
+        let mut s3_config = S3ClientConfig::new(&shared_config);
         s3_config.network_interfaces = self.network_interfaces;
         let builder = self
             .builder
@@ -348,7 +347,7 @@ mod tests {
             .build();
 
         let capture_request_config = crate::Config::builder()
-            .client(aws_sdk_s3::Client::from_conf(sdk_s3_config))
+            .sdk_client(aws_sdk_s3::Client::from_conf(sdk_s3_config))
             .part_size(PartSize::Target(8))
             .build();
 

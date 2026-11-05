@@ -21,8 +21,10 @@ use transfer::DownloadObjectsTransfer;
 
 use std::sync::Arc;
 
-use crate::io::walk::{S3WalkContext, S3Walker};
+use crate::config::user_agent::OperationFeatures;
+use crate::io::walk::S3WalkContext;
 use crate::transfer::TransferContext;
+use aws_runtime::sdk_feature::AwsSdkFeature;
 
 /// Operation struct for downloading multiple objects from Amazon S3
 #[derive(Clone, Default, Debug)]
@@ -56,18 +58,12 @@ impl DownloadObjects {
             .map(|n| n.max(1))
             .unwrap_or(super::DEFAULT_MAX_CONCURRENT_CHILDREN);
 
-        let walker = input.walker().cloned().unwrap_or_else(|| {
-            let mut builder =
-                S3Walker::builder().filter(crate::io::walk::exclude_s3_folder_markers);
-            if let Some(prefix) = input.key_prefix() {
-                builder = builder.prefix(prefix);
-            }
-            builder.build()
-        });
+        let walker = input.walker().cloned().unwrap_or_default();
 
-        let s3_client = handle.s3_client.clone();
+        let features = OperationFeatures::new([AwsSdkFeature::S3TransferDownloadDirectory]);
+        let s3_client = features.apply_to_client(&handle.s3_client);
         let walk_ctx = S3WalkContext::builder()
-            .client(s3_client)
+            .sdk_client(s3_client)
             .bucket(&bucket)
             .build();
         let walk = walker.walk(walk_ctx);

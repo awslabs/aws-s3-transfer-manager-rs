@@ -48,7 +48,7 @@ impl MockTransfer {
         state_machine: Arc<S>,
     ) -> Self {
         let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
-        let config = crate::Config::builder().client(s3_client).build();
+        let config = crate::Config::builder().sdk_client(s3_client).build();
         let handle = crate::client::Handle::new_for_test(config, 1);
 
         let (ctx, _completion_rx) = TransferContext::with_id(id, handle);

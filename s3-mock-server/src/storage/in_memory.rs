@@ -92,12 +92,23 @@ impl StorageBackend for InMemoryStorage {
         let content = content.freeze();
         let content_length = content.len() as u64;
         let object_integrity = integrity_checks.finalize();
+        if let Some(client_checksums) = &request.client_checksums {
+            if let Err(algorithm) = object_integrity.validate(client_checksums) {
+                return Err(Error::BadDigest {
+                    algorithm,
+                    completion: false,
+                });
+            }
+        }
         let last_modified = request.last_modified.unwrap_or_else(SystemTime::now);
 
         let metadata = ObjectMetadata {
             content_type: request.content_type,
             content_length,
-            etag: object_integrity.etag().unwrap_or_default(),
+            etag: request
+                .etag
+                .clone()
+                .unwrap_or_else(|| object_integrity.etag().unwrap_or_default()),
             last_modified,
             user_metadata: request.user_metadata,
             checksum_algorithm: None,
@@ -113,13 +124,17 @@ impl StorageBackend for InMemoryStorage {
             content_disposition: request.content_disposition,
             content_language: request.content_language,
             parts: Vec::new(),
+            restore_status: request.restore_status,
         };
 
         let mut buckets = self.buckets.write().await;
-        // Auto-create bucket if it doesn't exist (backward compatibility)
         let bucket_state = buckets
-            .entry(request.bucket)
-            .or_insert_with(BucketState::new);
+            .get_mut(&request.bucket)
+            .ok_or(Error::NoSuchBucket)?;
+        // Checked under the write lock, so the condition holds at the moment of the write.
+        request
+            .precondition
+            .check(bucket_state.objects.get(&request.key).map(|(_, m)| m))?;
         bucket_state
             .objects
             .insert(request.key.clone(), (content, metadata));
@@ -168,6 +183,22 @@ impl StorageBackend for InMemoryStorage {
         let mut buckets = self.buckets.write().await;
         let bucket_state = buckets.get_mut(bucket).ok_or(Error::NoSuchBucket)?;
         // DeleteObject is idempotent: deleting a non-existent key is not an error.
+        bucket_state.objects.remove(key);
+        Ok(())
+    }
+
+    async fn delete_object_if_match(
+        &self,
+        bucket: &str,
+        key: &str,
+        if_match: &s3s::dto::ETagCondition,
+    ) -> Result<()> {
+        let mut buckets = self.buckets.write().await;
+        let bucket_state = buckets.get_mut(bucket).ok_or(Error::NoSuchBucket)?;
+        crate::storage::check_delete_if_match(
+            if_match,
+            bucket_state.objects.get(key).map(|(_, metadata)| metadata),
+        )?;
         bucket_state.objects.remove(key);
         Ok(())
     }
@@ -229,9 +260,7 @@ impl StorageBackend for InMemoryStorage {
     async fn delete_bucket(&self, bucket: &str) -> Result<()> {
         let mut buckets = self.buckets.write().await;
         match buckets.get(bucket) {
-            Some(state) if !state.objects.is_empty() => {
-                Err(Error::Internal("bucket is not empty".to_string()))
-            }
+            Some(state) if !state.objects.is_empty() => Err(Error::BucketNotEmpty),
             Some(_) => {
                 buckets.remove(bucket);
                 Ok(())
@@ -373,6 +402,18 @@ impl StorageBackend for InMemoryStorage {
         Ok(result)
     }
 
+    async fn multipart_checksum_type(
+        &self,
+        upload_id: &str,
+    ) -> Result<Option<aws_sdk_s3::types::ChecksumType>> {
+        let multipart = self.multipart.read().await;
+        let upload = multipart
+            .uploads
+            .get(upload_id)
+            .ok_or(Error::NoSuchUpload)?;
+        Ok(upload.checksum_type.clone())
+    }
+
     async fn complete_multipart_upload(
         &self,
         request: crate::storage::CompleteMultipartUploadRequest<'_>,
@@ -407,7 +448,7 @@ impl StorageBackend for InMemoryStorage {
                         return Err(Error::InvalidPart);
                     }
                 }
-                None => return Err(Error::NoSuchPart),
+                None => return Err(Error::InvalidPart),
             }
         }
 
@@ -551,8 +592,11 @@ impl StorageBackend for InMemoryStorage {
 
         // Validate against client-provided checksum if present
         if let Some(client_checksums) = request.client_checksums {
-            if let Err(error_msg) = object_integrity.validate(client_checksums) {
-                return Err(Error::ChecksumMismatch(error_msg.to_string()));
+            if let Err(algorithm) = object_integrity.validate(client_checksums) {
+                return Err(Error::BadDigest {
+                    algorithm,
+                    completion: true,
+                });
             }
         }
 
@@ -570,6 +614,9 @@ impl StorageBackend for InMemoryStorage {
 
         // Completion errors leave the upload and its parts available for retry. Remove both only
         // after every request and checksum validation has succeeded.
+        if !self.buckets.read().await.contains_key(&bucket) {
+            return Err(Error::NoSuchBucket);
+        }
         {
             let mut multipart = self.multipart.write().await;
             if multipart.uploads.remove(request.upload_id).is_none() {
@@ -583,8 +630,7 @@ impl StorageBackend for InMemoryStorage {
         // Store the final object
         let combined_data = combined.freeze();
         let mut buckets = self.buckets.write().await;
-        // Auto-create bucket if it doesn't exist
-        let bucket_state = buckets.entry(bucket).or_insert_with(BucketState::new);
+        let bucket_state = buckets.get_mut(&bucket).ok_or(Error::NoSuchBucket)?;
         bucket_state
             .objects
             .insert(key.clone(), (combined_data, final_metadata.clone()));
@@ -603,6 +649,41 @@ impl StorageBackend for InMemoryStorage {
         }
         multipart.parts.remove(upload_id);
 
+        Ok(())
+    }
+
+    async fn list_multipart_uploads(
+        &self,
+        bucket: &str,
+    ) -> Result<Vec<crate::storage::MultipartUploadInfo>> {
+        let multipart = self.multipart.read().await;
+        let mut uploads: Vec<_> = multipart
+            .uploads
+            .values()
+            .filter(|upload| upload.bucket.as_deref() == Some(bucket))
+            .map(|upload| crate::storage::MultipartUploadInfo {
+                key: upload.key.clone(),
+                upload_id: upload.upload_id.clone(),
+            })
+            .collect();
+        uploads.sort();
+        Ok(uploads)
+    }
+
+    async fn update_metadata(
+        &self,
+        bucket: &str,
+        key: &str,
+        update: crate::storage::MetadataUpdate,
+    ) -> Result<()> {
+        let mut buckets = self.buckets.write().await;
+        let (_, metadata) = buckets
+            .get_mut(bucket)
+            .ok_or(Error::NoSuchBucket)?
+            .objects
+            .get_mut(key)
+            .ok_or(Error::NoSuchKey)?;
+        update(metadata);
         Ok(())
     }
 
@@ -663,6 +744,7 @@ mod tests {
     #[tokio::test]
     async fn test_put_and_get_object() {
         let storage = InMemoryStorage::new();
+        storage.create_bucket(TEST_BUCKET).await.unwrap();
         let key = "test-key";
         let content = Bytes::from("test content");
         let integrity_checks = ObjectIntegrityChecks::new().with_md5();
@@ -697,6 +779,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_object_with_range() {
         let storage = InMemoryStorage::new();
+        storage.create_bucket(TEST_BUCKET).await.unwrap();
         let key = "test-key";
         let content = Bytes::from("0123456789");
         let integrity_checks = ObjectIntegrityChecks::new().with_md5();
@@ -727,6 +810,7 @@ mod tests {
     #[tokio::test]
     async fn test_delete_object() {
         let storage = InMemoryStorage::new();
+        storage.create_bucket(TEST_BUCKET).await.unwrap();
         let key = "test-key";
         let content = Bytes::from("test content");
         let integrity_checks = ObjectIntegrityChecks::new().with_md5();
@@ -764,6 +848,7 @@ mod tests {
     #[tokio::test]
     async fn test_list_objects() {
         let storage = InMemoryStorage::new();
+        storage.create_bucket(TEST_BUCKET).await.unwrap();
         let content = Bytes::from("test content");
 
         for i in 0..3 {
@@ -800,6 +885,7 @@ mod tests {
     #[tokio::test]
     async fn test_multipart_upload() {
         let storage = InMemoryStorage::new();
+        storage.create_bucket(TEST_BUCKET).await.unwrap();
         let upload_id = "test-upload-123";
         let key = "test-multipart-key";
         let metadata = create_test_metadata(0);
@@ -928,6 +1014,7 @@ mod tests {
     #[tokio::test]
     async fn test_rejected_multipart_completion_retains_upload() {
         let storage = InMemoryStorage::new();
+        storage.create_bucket(TEST_BUCKET).await.unwrap();
         let upload_id = "test-upload-123";
         let key = "test-multipart-key";
         let metadata = create_test_metadata(0);
@@ -982,6 +1069,7 @@ mod tests {
     #[tokio::test]
     async fn test_checksum_rejection_retains_multipart_upload() {
         let storage = InMemoryStorage::new();
+        storage.create_bucket(TEST_BUCKET).await.unwrap();
         let upload_id = "test-upload-checksum";
         let key = "test-multipart-checksum-key";
         let mut metadata = create_test_metadata(0);
@@ -1013,6 +1101,7 @@ mod tests {
             sha1: None,
             sha256: None,
             crc64nvme: None,
+            md5: None,
         };
 
         let result = storage
@@ -1023,7 +1112,13 @@ mod tests {
                 client_checksums: Some(&invalid_checksum),
             })
             .await;
-        assert!(matches!(result, Err(Error::ChecksumMismatch(_))));
+        assert!(matches!(
+            result,
+            Err(Error::BadDigest {
+                completion: true,
+                ..
+            })
+        ));
         assert_eq!(
             storage.list_parts(upload_id).await.unwrap().len(),
             1,

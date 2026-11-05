@@ -37,6 +37,7 @@ async fn collect_stream_data(
 
 /// Test multipart upload with range requests to ensure no blocking issues
 async fn test_multipart_streaming_comprehensive<S: StorageBackend>(storage: &S) {
+    storage.create_bucket(TEST_BUCKET).await.unwrap();
     let key = "test-multipart-streaming";
     let upload_id = "test-upload-streaming";
     let metadata = ObjectMetadata {
@@ -185,6 +186,10 @@ async fn test_concurrent_operations<S: StorageBackend>(storage: &S) {
             content_encoding: None,
             content_disposition: None,
             content_language: None,
+            client_checksums: None,
+            precondition: Default::default(),
+            etag: None,
+            restore_status: None,
         };
 
         storage.put_object(request).await.unwrap();
@@ -233,6 +238,7 @@ async fn test_storage_backend_consistency() {
         &fs_storage as &dyn StorageBackend,
         &mem_storage as &dyn StorageBackend,
     ] {
+        storage.create_bucket(TEST_BUCKET).await.unwrap();
         let content_for_stream = content.clone();
         let stream = futures::stream::once(async move { Ok(content_for_stream) });
         let request = StoreObjectRequest {
@@ -249,6 +255,10 @@ async fn test_storage_backend_consistency() {
             content_encoding: None,
             content_disposition: None,
             content_language: None,
+            client_checksums: None,
+            precondition: Default::default(),
+            etag: None,
+            restore_status: None,
         };
         let stored_metadata = storage.put_object(request).await.unwrap();
 
@@ -280,6 +290,7 @@ async fn test_checksum_storage_and_retrieval() {
 }
 
 async fn test_checksum_storage_backend<S: StorageBackend + ?Sized>(storage: &S) {
+    storage.create_bucket(TEST_BUCKET).await.unwrap();
     let key = "test-checksum-object";
     let test_data = Bytes::from("Hello, checksum world!");
 
@@ -309,4 +320,272 @@ async fn test_checksum_storage_backend<S: StorageBackend + ?Sized>(storage: &S) 
         retrieved_meta.etag,
         stored_meta.object_integrity.etag().unwrap()
     );
+}
+
+/// A PutObject whose body stream fails leaves the existing object, and nothing else, in
+/// storage.
+async fn test_failed_body_keeps_existing_object<S: StorageBackend>(storage: &S) {
+    storage.create_bucket(TEST_BUCKET).await.unwrap();
+    let original = StoreObjectRequest::new(
+        TEST_BUCKET,
+        "object",
+        Box::pin(futures::stream::once(async {
+            Ok(Bytes::from_static(b"original"))
+        })),
+        ObjectIntegrityChecks::new().with_md5(),
+    );
+    storage.put_object(original).await.unwrap();
+
+    let failing = StoreObjectRequest::new(
+        TEST_BUCKET,
+        "object",
+        Box::pin(futures::stream::iter([
+            Ok(Bytes::from_static(b"repl")),
+            Err(std::io::Error::other("client went away")),
+        ])),
+        ObjectIntegrityChecks::new().with_md5(),
+    );
+    assert!(storage.put_object(failing).await.is_err());
+
+    let request = GetObjectRequest {
+        bucket: TEST_BUCKET,
+        key: "object",
+        range: None,
+    };
+    let response = storage.get_object(request).await.unwrap().unwrap();
+    assert_eq!(
+        collect_stream_data(response.stream).await.unwrap(),
+        "original"
+    );
+}
+
+#[tokio::test]
+async fn test_in_memory_failed_body_keeps_existing_object() {
+    test_failed_body_keeps_existing_object(&InMemoryStorage::new()).await;
+}
+
+#[tokio::test]
+async fn test_filesystem_failed_body_keeps_existing_object() {
+    let dir = tempdir().unwrap();
+    let storage = FilesystemStorage::new(dir.path()).await.unwrap();
+    test_failed_body_keeps_existing_object(&storage).await;
+    // The temporary file of the failed write is gone.
+    let mut uploads = std::fs::read_dir(dir.path().join("uploads")).unwrap();
+    assert!(uploads.next().is_none());
+}
+
+fn store_request(key: &str, content: &'static [u8]) -> StoreObjectRequest {
+    StoreObjectRequest::new(
+        TEST_BUCKET,
+        key,
+        Box::pin(futures::stream::once(async move {
+            Ok(Bytes::from_static(content))
+        })),
+        ObjectIntegrityChecks::new().with_md5(),
+    )
+}
+
+async fn content_of<S: StorageBackend>(storage: &S, key: &str) -> Option<Bytes> {
+    let request = GetObjectRequest {
+        bucket: TEST_BUCKET,
+        key,
+        range: None,
+    };
+    let response = storage.get_object(request).await.unwrap()?;
+    Some(collect_stream_data(response.stream).await.unwrap())
+}
+
+/// `If-Match` and `If-None-Match: *` writes succeed only when their condition holds, and leave the
+/// key unchanged when it does not.
+async fn test_write_preconditions<S: StorageBackend>(storage: &S) {
+    use crate::storage::WritePrecondition;
+    storage.create_bucket(TEST_BUCKET).await.unwrap();
+
+    let mut create = store_request("conditional", b"v1");
+    create.precondition = WritePrecondition::IfNoneMatchAny;
+    let stored = storage.put_object(create).await.unwrap();
+    let etag = stored.object_integrity.etag().unwrap();
+
+    let mut overwrite = store_request("conditional", b"v2");
+    overwrite.precondition = WritePrecondition::IfNoneMatchAny;
+    let result = storage.put_object(overwrite).await;
+    assert!(
+        matches!(result, Err(crate::Error::PreconditionFailed)),
+        "{result:?}"
+    );
+
+    let mut stale = store_request("conditional", b"v2");
+    stale.precondition = WritePrecondition::IfMatch("\"stale\"".to_owned());
+    let result = storage.put_object(stale).await;
+    assert!(
+        matches!(result, Err(crate::Error::PreconditionFailed)),
+        "{result:?}"
+    );
+    assert_eq!(content_of(storage, "conditional").await.unwrap(), "v1");
+
+    let mut matching = store_request("conditional", b"v2");
+    matching.precondition = WritePrecondition::IfMatch(etag.trim_matches('"').to_owned());
+    storage.put_object(matching).await.unwrap();
+    assert_eq!(content_of(storage, "conditional").await.unwrap(), "v2");
+
+    let mut missing = store_request("missing", b"v1");
+    missing.precondition = WritePrecondition::IfMatch(etag);
+    let result = storage.put_object(missing).await;
+    assert!(matches!(result, Err(crate::Error::NoSuchKey)), "{result:?}");
+    assert!(storage
+        .head_object(TEST_BUCKET, "missing")
+        .await
+        .unwrap()
+        .is_none());
+}
+
+/// `delete_object_if_match` deletes the object only when its ETag matches, quoted or not, or the
+/// condition is `*`, fails with `PreconditionFailed` otherwise, and with `NoSuchKey` for a
+/// missing key.
+async fn test_delete_object_if_match<S: StorageBackend>(storage: &S) {
+    use s3s::dto::{ETag, ETagCondition};
+    let matching = |etag: &str| ETagCondition::ETag(ETag::Strong(etag.to_owned()));
+    storage.create_bucket(TEST_BUCKET).await.unwrap();
+    let etag = storage
+        .put_object(store_request("object", b"content"))
+        .await
+        .unwrap()
+        .object_integrity
+        .etag()
+        .unwrap();
+    let result = storage
+        .delete_object_if_match(TEST_BUCKET, "object", &matching("other"))
+        .await;
+    assert!(
+        matches!(result, Err(crate::Error::PreconditionFailed)),
+        "{result:?}"
+    );
+    assert_eq!(content_of(storage, "object").await.unwrap(), "content");
+    storage
+        .delete_object_if_match(TEST_BUCKET, "object", &matching(etag.trim_matches('"')))
+        .await
+        .unwrap();
+    assert!(content_of(storage, "object").await.is_none());
+    let result = storage
+        .delete_object_if_match(TEST_BUCKET, "object", &matching(&etag))
+        .await;
+    assert!(matches!(result, Err(crate::Error::NoSuchKey)), "{result:?}");
+    // `*` matches any existing object.
+    storage
+        .put_object(store_request("object", b"content"))
+        .await
+        .unwrap();
+    storage
+        .delete_object_if_match(TEST_BUCKET, "object", &ETagCondition::Any)
+        .await
+        .unwrap();
+    assert!(content_of(storage, "object").await.is_none());
+    let result = storage
+        .delete_object_if_match(TEST_BUCKET, "object", &ETagCondition::Any)
+        .await;
+    assert!(matches!(result, Err(crate::Error::NoSuchKey)), "{result:?}");
+}
+
+#[tokio::test]
+async fn test_in_memory_write_preconditions() {
+    test_write_preconditions(&InMemoryStorage::new()).await;
+    test_delete_object_if_match(&InMemoryStorage::new()).await;
+}
+
+#[tokio::test]
+async fn test_filesystem_write_preconditions() {
+    let dir = tempdir().unwrap();
+    test_write_preconditions(&FilesystemStorage::new(dir.path().join("a")).await.unwrap()).await;
+    test_delete_object_if_match(&FilesystemStorage::new(dir.path().join("b")).await.unwrap()).await;
+}
+
+/// `update_metadata` changes the stored metadata and leaves the data alone, and fails with
+/// `NoSuchKey` for a missing key.
+async fn test_update_metadata<S: StorageBackend>(storage: &S) {
+    storage.create_bucket(TEST_BUCKET).await.unwrap();
+    storage
+        .put_object(store_request("object", b"content"))
+        .await
+        .unwrap();
+    storage
+        .update_metadata(
+            TEST_BUCKET,
+            "object",
+            Box::new(|metadata| metadata.storage_class = Some("GLACIER".to_owned())),
+        )
+        .await
+        .unwrap();
+    let metadata = storage
+        .head_object(TEST_BUCKET, "object")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(metadata.storage_class.as_deref(), Some("GLACIER"));
+    assert_eq!(content_of(storage, "object").await.unwrap(), "content");
+
+    let result = storage
+        .update_metadata(TEST_BUCKET, "missing", Box::new(|_| {}))
+        .await;
+    assert!(matches!(result, Err(crate::Error::NoSuchKey)), "{result:?}");
+}
+
+#[tokio::test]
+async fn test_in_memory_update_metadata() {
+    test_update_metadata(&InMemoryStorage::new()).await;
+}
+
+#[tokio::test]
+async fn test_filesystem_update_metadata() {
+    let dir = tempdir().unwrap();
+    test_update_metadata(&FilesystemStorage::new(dir.path()).await.unwrap()).await;
+}
+
+/// `list_multipart_uploads` reports the uploads in progress in one bucket, ordered by key, and
+/// drops an upload once it is aborted.
+async fn test_list_multipart_uploads<S: StorageBackend>(storage: &S) {
+    storage.create_bucket(TEST_BUCKET).await.unwrap();
+    storage.create_bucket("other-bucket").await.unwrap();
+    for (bucket, key, upload_id) in [
+        (TEST_BUCKET, "b", "upload-1"),
+        (TEST_BUCKET, "a", "upload-2"),
+        ("other-bucket", "c", "upload-3"),
+    ] {
+        let request = CreateMultipartUploadRequest {
+            bucket,
+            key,
+            upload_id,
+            metadata: ObjectMetadata::default(),
+            checksum_type: aws_sdk_s3::types::ChecksumType::Composite,
+        };
+        storage.create_multipart_upload(request).await.unwrap();
+    }
+    let listed = |uploads: Vec<crate::storage::MultipartUploadInfo>| -> Vec<(String, String)> {
+        uploads
+            .into_iter()
+            .map(|upload| (upload.key, upload.upload_id))
+            .collect()
+    };
+    assert_eq!(
+        listed(storage.list_multipart_uploads(TEST_BUCKET).await.unwrap()),
+        [
+            ("a".to_owned(), "upload-2".to_owned()),
+            ("b".to_owned(), "upload-1".to_owned())
+        ]
+    );
+    storage.abort_multipart_upload("upload-2").await.unwrap();
+    assert_eq!(
+        listed(storage.list_multipart_uploads(TEST_BUCKET).await.unwrap()),
+        [("b".to_owned(), "upload-1".to_owned())]
+    );
+}
+
+#[tokio::test]
+async fn test_in_memory_list_multipart_uploads() {
+    test_list_multipart_uploads(&InMemoryStorage::new()).await;
+}
+
+#[tokio::test]
+async fn test_filesystem_list_multipart_uploads() {
+    let dir = tempdir().unwrap();
+    test_list_multipart_uploads(&FilesystemStorage::new(dir.path()).await.unwrap()).await;
 }

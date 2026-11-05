@@ -20,18 +20,33 @@ fi
 test_binary=$1
 shift
 
+# Maximum seconds any single setup/teardown adb invocation may run.
+adb_timeout_seconds=${ADB_TIMEOUT_SECONDS:-60}
+
+# Grace period after the adb timeout fires: the call is first sent SIGTERM so a
+# wedged adb client can disconnect cleanly, then SIGKILL after this many seconds
+# if it has not exited.
+adb_kill_after_seconds=${ADB_KILL_AFTER_SECONDS:-5}
+
+# Run an adb command under a hard timeout so a hung device cannot stall the
+# script. At the timeout adb is sent SIGTERM, then SIGKILL after the kill-after
+# grace period. Returns the command's own status, or 124 if the timeout fired.
+adb_bounded() {
+    timeout --signal=TERM --kill-after="$adb_kill_after_seconds" "$adb_timeout_seconds" adb "$@"
+}
+
 device_path="/data/local/tmp/$(basename "$test_binary")"
 
 cleanup() {
     local status=$?
     trap - EXIT
-    adb -s "$CARGO_NDK_ADB_SERIAL" shell rm -f "$device_path" >/dev/null 2>&1 || true
+    adb_bounded -s "$CARGO_NDK_ADB_SERIAL" shell rm -f "$device_path" >/dev/null 2>&1 || true
     exit "$status"
 }
 trap cleanup EXIT
 
-adb -s "$CARGO_NDK_ADB_SERIAL" push "$test_binary" "$device_path" >/dev/null
-adb -s "$CARGO_NDK_ADB_SERIAL" shell chmod 755 "$device_path"
+adb_bounded -s "$CARGO_NDK_ADB_SERIAL" push "$test_binary" "$device_path" >/dev/null
+adb_bounded -s "$CARGO_NDK_ADB_SERIAL" shell chmod 755 "$device_path"
 echo "Running Android tests through repository runner"
 adb -s "$CARGO_NDK_ADB_SERIAL" shell \
     env \

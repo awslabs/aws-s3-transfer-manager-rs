@@ -1,0 +1,9 @@
+[release]
+tag = "release-2026-11-03"
+
+[release.crates]
+aws-sdk-s3-transfer-manager = "0.4.0"
+aws-sdk-s3-transfer-manager-ext = "0.1.0"
+aws-smithy-execution = "0.1.0"
+aws-smithy-managed-http = "0.1.0"
+aws-smithy-topology = "0.1.0"

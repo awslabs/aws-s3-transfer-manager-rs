@@ -3,10 +3,21 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-mod input;
+//! Download a single S3 object using modeled request and response metadata.
+//!
+//! [`DownloadInput`](crate::operation::download::DownloadInput) and the metadata
+//! types are re-exported from [`crate::types`].
+//! Object metadata describes the discovery response (GET or HEAD), while each
+//! [`ChunkOutput`](crate::operation::download::ChunkOutput) carries metadata from
+//! its own GET response. Optional service
+//! values remain absent when the corresponding response does not include them.
+//! Reported checksum fields alone do not mean that the downloaded bytes were
+//! validated; use
+//! [`DownloadOutput::integrity_checks`](crate::operation::download::DownloadOutput::integrity_checks)
+//! for that result.
 
-/// Request type for downloading a single object from Amazon S3
-pub use input::{DownloadInput, DownloadInputBuilder};
+pub use crate::model::builders::DownloadInputBuilder;
+pub use crate::model::{ChunkMetadata, DownloadInput, ObjectMetadata};
 
 /// Operation builders
 pub mod builders;
@@ -44,17 +55,13 @@ pub use output::DownloadOutput;
 pub(crate) mod transfer;
 pub(crate) use transfer::DownloadTransfer;
 
-/// Provides metadata for each chunk during an object download.
-mod chunk_meta;
-pub use chunk_meta::ChunkMetadata;
-
-/// Provides metadata for a single S3 object during download.
 mod object_meta;
-pub use object_meta::ObjectMetadata;
 
+use crate::config::user_agent::OperationFeatures;
 use crate::error;
 use crate::operation::download::body::new_recv_body;
 use crate::types::BucketType;
+use aws_runtime::sdk_feature::AwsSdkFeature;
 use std::sync::Arc;
 
 /// Most names tried for the temporary file of one path download.
@@ -126,7 +133,7 @@ impl Download {
     ///
     /// When `parent_id` is `Some`, the transfer is linked as a child of the
     /// given composite transfer via [`TransferContext::new_child`](crate::transfer::TransferContext::new_child).
-    #[cfg(any(unix, windows))]
+    #[cfg(any(unix, windows, target_os = "wasi"))]
     pub(crate) async fn orchestrate_to_path(
         handle: Arc<crate::client::Handle>,
         input: DownloadInput,
@@ -145,7 +152,7 @@ impl Download {
             Ok(sink) => sink,
             Err(e) => {
                 // No handle owns the temp file yet, so remove it here.
-                let _ = tokio::fs::remove_file(&temp_path).await;
+                let _ = crate::io::fs::remove_file_async(&temp_path).await;
                 return Err(error::from_kind(error::ErrorKind::IOError)(e));
             }
         };
@@ -163,7 +170,7 @@ impl Download {
     /// and [`ErrorKind::IOError`](error::ErrorKind::IOError) for any other
     /// failure to create the sink. Either happens before the transfer is
     /// scheduled, so no request is sent and `file` is not written.
-    #[cfg(any(unix, windows))]
+    #[cfg(any(unix, windows, target_os = "wasi"))]
     pub(crate) fn orchestrate_to_file(
         handle: Arc<crate::client::Handle>,
         input: DownloadInput,
@@ -187,7 +194,6 @@ impl Download {
     ///
     /// When `parent_id` is `Some`, the transfer is linked as a child of the
     /// given composite transfer via [`TransferContext::new_child`](crate::transfer::TransferContext::new_child).
-    #[cfg(any(unix, windows))]
     pub(crate) fn orchestrate_with_sink(
         handle: Arc<crate::client::Handle>,
         input: DownloadInput,
@@ -210,6 +216,13 @@ impl Download {
             None => TransferContext::new(handle.clone()),
         };
 
+        let features = OperationFeatures::new(
+            parent_id
+                .map(|_| AwsSdkFeature::S3TransferDownloadDirectory)
+                .into_iter()
+                .chain([AwsSdkFeature::S3FilePath]),
+        );
+        let ctx = ctx.with_features(features);
         let transfer = DownloadTransfer::new(ctx.clone(), bucket_type, input, writer);
         handle
             .scheduler
