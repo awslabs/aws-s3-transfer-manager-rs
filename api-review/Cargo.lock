@@ -3783,6 +3783,7 @@ dependencies = [
  "aws-sdk-s3-transfer-manager-ext",
  "aws-smithy-execution",
  "aws-smithy-http-client",
+ "aws-smithy-managed-http",
  "bytes",
  "dial9",
  "s3-mock-server",

@@ -15,7 +15,7 @@ resolver = "3"
 # Scenarios that need the transfer manager's AWS SDK for Rust S3 interoperability.
 sdk-v1 = ["aws-sdk-s3-transfer-manager/sdk-v1"]
 # Scenarios that adopt a caller-built managed runtime through the extension crate.
-ext = ["dep:aws-sdk-s3-transfer-manager-ext", "dep:aws-smithy-execution"]
+ext = ["dep:aws-sdk-s3-transfer-manager-ext", "dep:aws-smithy-execution", "dep:aws-smithy-managed-http"]
 # Scenarios that record runtime traces with dial9.
 dial9 = ["aws-sdk-s3-transfer-manager/dial9", "dep:dial9"]
 
@@ -25,6 +25,7 @@ aws-sdk-s3 = "1.154.0"
 aws-smithy-http-client = { version = "1.5.2", features = ["rustls-aws-lc"] }
 aws-sdk-s3-transfer-manager-ext = { path = "../crates/aws-sdk-s3-transfer-manager-ext", optional = true }
 aws-smithy-execution = { path = "../crates/aws-smithy-execution", optional = true }
+aws-smithy-managed-http = { path = "../crates/aws-smithy-managed-http", features = ["client"], optional = true }
 dial9 = { version = "0.5", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 aws-config = { version = "1.13.0", features = ["behavior-version-latest"] }
