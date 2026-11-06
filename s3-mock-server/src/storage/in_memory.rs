@@ -670,39 +670,12 @@ impl StorageBackend for InMemoryStorage {
     ) -> Result<StoredObjectMetadata> {
         let mut buckets = self.buckets.write().await;
         let bucket_state = buckets
-            .get_mut(&request.put_object.bucket)
+            .get_mut(&request.bucket)
             .ok_or(Error::NoSuchBucket)?;
-
-        let Some((data, metadata)) = bucket_state.objects.get(&request.put_object.key) else {
-            // As in S3, an append with `If-Match` does not create the object.
-            if request.offset != 0
-                || matches!(
-                    request.precondition,
-                    crate::storage::WritePrecondition::IfMatch(_)
-                )
-            {
-                return Err(Error::NoSuchKey);
-            }
-            let if_none_match =
-                request.precondition == crate::storage::WritePrecondition::IfNoneMatchAny;
-            // Create the object as a PutObject of the appended data would. The lock is released
-            // first because `put_object` takes it; the key must still be missing when the write
-            // lands, so of two racing creating appends one fails.
-            drop(buckets);
-            let mut put_object = request.put_object;
-            let content = request.content;
-            put_object.body = Box::pin(futures::stream::once(async move { Ok(content) }));
-            put_object.precondition = crate::storage::WritePrecondition::IfNoneMatchAny;
-            // A creating append that lost the race fails as an append at the wrong offset, unless
-            // it asked for the key not to exist.
-            return self
-                .put_object(put_object)
-                .await
-                .map_err(|error| match error {
-                    Error::PreconditionFailed if !if_none_match => Error::InvalidWriteOffset,
-                    error => error,
-                });
-        };
+        let (data, metadata) = bucket_state
+            .objects
+            .get(&request.key)
+            .ok_or(Error::NoSuchKey)?;
 
         request.precondition.check(Some(metadata))?;
         if request.content.is_empty() && metadata.content_length > 0 {
@@ -810,7 +783,7 @@ impl StorageBackend for InMemoryStorage {
         metadata.append_parts = parts + 1;
         bucket_state
             .objects
-            .insert(request.put_object.key, (content, metadata));
+            .insert(request.key, (content, metadata));
         Ok(StoredObjectMetadata { object_integrity })
     }
 

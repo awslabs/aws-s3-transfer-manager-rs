@@ -741,16 +741,12 @@ async fn test_in_memory_append_part_limit_counts_multipart_parts() {
         .await
         .unwrap();
     let append = |offset: u64| crate::storage::AppendObjectRequest {
+        bucket: TEST_BUCKET.to_owned(),
+        key: key.to_owned(),
         offset,
         content: Bytes::from_static(b"x"),
         precondition: crate::storage::WritePrecondition::None,
         checksum_algorithm: None,
-        put_object: StoreObjectRequest::new(
-            TEST_BUCKET,
-            key,
-            Box::pin(futures::stream::empty()),
-            ObjectIntegrityChecks::new(),
-        ),
     };
     for offset in 3..10_000 {
         storage.append_object(append(offset)).await.unwrap();

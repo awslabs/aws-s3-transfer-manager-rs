@@ -169,7 +169,8 @@ impl<S: StorageBackend + 'static> Inner<S> {
     }
 
     /// Serve a PutObject with `x-amz-write-offset-bytes`: append the body to the object at
-    /// `offset`, or create the object when it does not exist and `offset` is 0.
+    /// `offset`. If the key does not exist, `offset` is 0 and the request has no `If-Match`, create
+    /// the object as a PutObject of the body would.
     ///
     /// The body is read in full and checked against the request's checksums before the object
     /// changes, so a `BadDigest` append leaves the object as it was.
@@ -203,16 +204,36 @@ impl<S: StorageBackend + 'static> Inner<S> {
             .into());
         }
 
-        let stored = self
-            .storage
-            .append_object(crate::storage::AppendObjectRequest {
-                offset,
-                content,
-                precondition,
-                checksum_algorithm,
-                put_object: request,
-            })
-            .await?;
+        let append = crate::storage::AppendObjectRequest {
+            bucket: request.bucket.clone(),
+            key: request.key.clone(),
+            offset,
+            content: content.clone(),
+            precondition: precondition.clone(),
+            checksum_algorithm,
+        };
+        let stored = match self.storage.append_object(append).await {
+            Err(Error::NoSuchKey)
+                if offset == 0
+                    && !matches!(precondition, crate::storage::WritePrecondition::IfMatch(_)) =>
+            {
+                // The key must still be missing when the object is written. Of two concurrent
+                // appends that create it, one fails, with InvalidWriteOffset, or PreconditionFailed
+                // if it has `If-None-Match: *`.
+                request.body = Box::pin(futures::stream::once(async move { Ok(content) }));
+                request.precondition = crate::storage::WritePrecondition::IfNoneMatchAny;
+                let if_none_match =
+                    precondition == crate::storage::WritePrecondition::IfNoneMatchAny;
+                self.storage
+                    .put_object(request)
+                    .await
+                    .map_err(|error| match error {
+                        Error::PreconditionFailed if !if_none_match => Error::InvalidWriteOffset,
+                        error => error,
+                    })?
+            }
+            result => result?,
+        };
         let output = s3s::dto::PutObjectOutput {
             e_tag: opt_etag_from_quoted(stored.object_integrity.etag()),
             checksum_type: integrity_checksum_type(&stored.object_integrity),

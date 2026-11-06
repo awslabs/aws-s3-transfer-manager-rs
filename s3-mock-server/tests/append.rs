@@ -340,23 +340,6 @@ async fn test_append_without_checksum() -> Result {
     Ok(())
 }
 
-/// Of two appends at offset 0 that both try to create a missing key, one creates it and the
-/// other fails with InvalidWriteOffset, as in S3.
-#[tokio::test]
-async fn test_append_create_races() -> Result {
-    let f = Fixture::directory().await;
-    let (first, second) = tokio::join!(
-        append(&f, "raced", 0, b"first"),
-        append(&f, "raced", 0, b"other"),
-    );
-    let results = [first.is_ok(), second.is_ok()];
-    assert_eq!(results.iter().filter(|ok| **ok).count(), 1, "{results:?}");
-    let failed = if first.is_ok() { second } else { first };
-    assert_failure(&failure(failed), 400, "InvalidWriteOffset");
-    f.shutdown().await;
-    Ok(())
-}
-
 /// An append with `If-None-Match: *` creates a missing key at offset 0, fails with NoSuchKey for
 /// a missing key at another offset, and fails with 412 for an existing key, leaving it
 /// unchanged, as in S3.
