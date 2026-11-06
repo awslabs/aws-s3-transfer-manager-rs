@@ -5,11 +5,11 @@
 
 //! ListObjectsV2 pagination.
 //!
-//! A page holds up to `max_keys` entries, where an entry is an object or a common prefix: all
-//! the keys that roll up into one common prefix count as one entry. In key order, as in general
-//! purpose buckets, a common prefix is never split across pages or repeated on a later page.
-//! [`ListOrder::Unordered`] lists the entries in a fixed pseudo-random order instead, as directory
-//! buckets do, with each common prefix as one entry in that order.
+//! A page holds up to `max_keys` entries, where an entry is an object or a common prefix: all the
+//! keys that roll up into one common prefix count as one entry. In key order (general purpose
+//! buckets), a common prefix is never split across pages or repeated on a later page.
+//! [`ListOrder::Unordered`] (directory buckets) lists the entries, keys and common prefixes, in a
+//! fixed pseudo-random order.
 
 use base64::Engine;
 

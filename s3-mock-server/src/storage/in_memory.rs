@@ -695,7 +695,7 @@ impl StorageBackend for InMemoryStorage {
             return Err(Error::TooManyParts);
         }
         let algorithms = metadata.checksum_algorithms();
-        // An append without a checksum is checked as a CRC64NVME one, S3's default.
+        // An append without a checksum is checked as a CRC64NVME one, the default algorithm.
         let algorithm = request
             .checksum_algorithm
             .unwrap_or(aws_smithy_checksums::ChecksumAlgorithm::Crc64Nvme);
@@ -724,8 +724,8 @@ impl StorageBackend for InMemoryStorage {
         checks.update(&content);
         let mut object_integrity = checks.finalize();
 
-        // S3 does not extend a SHA-1 or SHA-256 checksum: an appended object's is the composite of
-        // the checksums of its segments.
+        // A SHA-1 or SHA-256 checksum is not extended: an appended object's is the composite of the
+        // checksums of its segments.
         let mut append_segments = Vec::new();
         if let Some(algorithm) = algorithms.iter().copied().find(|algorithm| {
             matches!(

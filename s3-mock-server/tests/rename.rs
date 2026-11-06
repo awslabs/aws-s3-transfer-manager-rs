@@ -27,8 +27,8 @@ async fn rename(
         .await
 }
 
-/// A rename in a general purpose bucket fails with 501 NotImplemented, as in S3, and changes
-/// nothing; the request is still counted.
+/// A rename in a general purpose bucket fails with 501 NotImplemented and changes nothing; the
+/// request is still counted.
 #[tokio::test]
 async fn test_rename_not_implemented_in_general_purpose_buckets() -> Result {
     let f = Fixture::new().await;
@@ -166,8 +166,7 @@ async fn test_rename() -> Result {
             .await?;
     assert_eq!(head.e_tag.as_deref(), Some(etag.as_str()));
 
-    // As in S3, `/bucket/key` names the key `/bucket/key`, and percent-encoded sources are
-    // decoded.
+    // `/bucket/key` names the key `/bucket/key`, and percent-encoded sources are decoded.
     let fail = failure(rename(&f, &format!("/{}/other/b", f.bucket), "c d").await);
     assert_failure(&fail, 404, "NoSuchKey");
     rename(&f, "other/b", "c d").await?;
@@ -255,9 +254,9 @@ async fn test_rename_preconditions() -> Result {
 }
 
 /// A failed rename condition is named in the error's `Condition` element, which clients parse:
-/// `If-None-Match` for an existing destination, `If-Match` for a destination or source ETag that
-/// does not match, and `If-Match` when an ETag condition and `If-None-Match` both fail, as S3
-/// names them.
+/// - `If-None-Match` for an existing destination;
+/// - `If-Match` for a destination or source ETag that does not match;
+/// - `If-Match` when an ETag condition and `If-None-Match` both fail.
 #[tokio::test]
 async fn test_rename_precondition_failure_reports_condition() -> Result {
     let f = Fixture::directory().await;
@@ -305,7 +304,7 @@ async fn test_rename_precondition_failure_reports_condition() -> Result {
 }
 
 /// A missing source fails with NoSuchKey before any destination condition is evaluated, and
-/// `If-Match` on a missing destination fails with 412 naming `If-Match`, as in S3.
+/// `If-Match` on a missing destination fails with 412 naming `If-Match`.
 #[tokio::test]
 async fn test_rename_precondition_order() -> Result {
     let f = Fixture::directory().await;
@@ -399,8 +398,8 @@ async fn test_rename_unsupported_conditions_and_unicode_source() -> Result {
 }
 
 /// A missing source fails with NoSuchKey. A destination key over 1,024 bytes fails with 400
-/// `KeyTooLongError` reporting the key's size and the limit, as S3 answers it, and is still
-/// counted and subject to faults; a 1,024-byte key is accepted.
+/// `KeyTooLongError` reporting the key's size and the limit, and is still counted and subject to
+/// faults; a 1,024-byte key is accepted.
 #[tokio::test]
 async fn test_rename_errors() -> Result {
     let f = Fixture::directory().await;

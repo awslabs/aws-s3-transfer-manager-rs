@@ -34,8 +34,8 @@ async fn append(
         .await
 }
 
-/// An append to a general purpose bucket fails with 501 NotImplemented, as in S3, and changes
-/// nothing; the request is still counted.
+/// An append to a general purpose bucket fails with 501 NotImplemented and changes nothing; the
+/// request is still counted.
 #[tokio::test]
 async fn test_append_not_implemented_in_general_purpose_buckets() -> Result {
     let f = Fixture::new().await;
@@ -170,8 +170,8 @@ async fn test_append_withhold_response_headers() -> Result {
     Ok(())
 }
 
-/// An empty append to a non-empty object fails with InvalidArgument and S3's message; an empty
-/// append at offset 0 creates an empty object.
+/// An empty append to a non-empty object fails with InvalidArgument; an empty append at offset 0
+/// creates an empty object.
 #[tokio::test]
 async fn test_append_empty_body() -> Result {
     let f = Fixture::directory().await;
@@ -242,8 +242,8 @@ async fn test_append_checksum_algorithm_mismatch() -> Result {
     Ok(())
 }
 
-/// An append with `If-Match` extends the object only while its ETag matches, and on a missing
-/// key fails with NoSuchKey without creating it, as in S3.
+/// An append with `If-Match` extends the object only while its ETag matches, and on a missing key
+/// fails with NoSuchKey without creating it.
 #[tokio::test]
 async fn test_append_if_match() -> Result {
     let f = Fixture::directory().await;
@@ -288,9 +288,9 @@ async fn test_append_if_match() -> Result {
     Ok(())
 }
 
-/// An append without a checksum is checked as a CRC64NVME one, S3's default: it fails with the
-/// checksum type mismatch, in S3's words, on an object that stores another algorithm, and extends
-/// an object that stores CRC64NVME.
+/// An append without a checksum is checked as a CRC64NVME one, the default algorithm: on an object
+/// that stores another algorithm it fails with a checksum type mismatch, and it extends an object
+/// that stores CRC64NVME.
 #[tokio::test]
 async fn test_append_without_checksum() -> Result {
     let f = Fixture::directory().await;
@@ -340,9 +340,8 @@ async fn test_append_without_checksum() -> Result {
     Ok(())
 }
 
-/// An append with `If-None-Match: *` creates a missing key at offset 0, fails with NoSuchKey for
-/// a missing key at another offset, and fails with 412 for an existing key, leaving it
-/// unchanged, as in S3.
+/// An append with `If-None-Match: *` creates a missing key at offset 0, fails with NoSuchKey for a
+/// missing key at another offset, and fails with 412 for an existing key, leaving it unchanged.
 #[tokio::test]
 async fn test_append_if_none_match() -> Result {
     let f = Fixture::directory().await;
@@ -424,12 +423,11 @@ async fn multipart(
     Ok(())
 }
 
-/// After an append, an object has no parts (part 1 is the whole object) and reports the checksum
-/// S3 reports: a full-object CRC
-/// of the combined content, also for a multipart object with a composite CRC, and for SHA-1 and
-/// SHA-256 the composite of the checksums of the object's segments (its parts or the data it was
-/// created with, then each append). The expected values are those S3 returned for the same
-/// requests.
+/// After an append, an object has no parts (part 1 is the whole object). Its checksum is a
+/// full-object CRC of the combined content, also for a multipart object with a composite CRC; for
+/// SHA-1 and SHA-256, the composite of the checksums of the object's segments (its parts or the
+/// data it was created with, then each append). The expected values are those S3 returned for the
+/// same requests.
 #[tokio::test]
 async fn test_append_checksums() -> Result {
     let f = Fixture::directory().await;

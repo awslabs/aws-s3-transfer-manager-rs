@@ -43,7 +43,7 @@ async fn put(s3: &Client, bucket: &str, key: &str) {
 
 /// Objects in a directory bucket are EXPRESS_ONEZONE: GetObject and HeadObject report it, as do
 /// listings. Other storage classes fail with 400 InvalidStorageClass in directory buckets, and
-/// EXPRESS_ONEZONE does in general purpose buckets, as in S3.
+/// EXPRESS_ONEZONE does in general purpose buckets.
 #[tokio::test]
 async fn test_storage_classes() -> Result {
     let (_server, _handle, s3) = setup(S3MockServer::builder()).await;
@@ -101,7 +101,7 @@ async fn test_storage_classes() -> Result {
 }
 
 /// Directory buckets do not support Content-MD5: PutObject and UploadPart with it fail with 501
-/// NotImplemented, as in S3, and store nothing.
+/// NotImplemented and store nothing.
 #[tokio::test]
 async fn test_content_md5_not_implemented() -> Result {
     use base64::Engine;
@@ -204,9 +204,9 @@ async fn test_invalid_part_order_message() -> Result {
     Ok(())
 }
 
-/// ListObjectsV2 in a directory bucket lists every key, in no particular order, and fails as S3
-/// does for the parameters directory buckets do not support: a delimiter other than `/` or a
-/// prefix that does not end in `/` with 400 InvalidRequest, `start-after` with 501 NotSupported.
+/// ListObjectsV2 in a directory bucket lists every key, in no particular order. It fails for the
+/// parameters directory buckets do not support: with 400 InvalidRequest for a delimiter other than
+/// `/` or a prefix that does not end in `/`, and with 501 NotSupported for `start-after`.
 #[tokio::test]
 async fn test_listing() -> Result {
     let (server, _handle, s3) = setup(S3MockServer::builder()).await;

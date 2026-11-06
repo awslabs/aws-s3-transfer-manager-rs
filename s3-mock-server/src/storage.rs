@@ -158,11 +158,11 @@ pub(crate) struct RenameRequest {
 }
 
 impl RenamePreconditions {
-    /// Check the conditions against the current source and destination. A missing source fails
-    /// with `NoSuchKey` before any condition is evaluated. The ETag matches are checked next, the
-    /// destination's `If-Match` and then the source's `x-amz-rename-source-if-match`, both
-    /// reported as `If-Match` as S3 reports them, and `If-None-Match` last. `If-Match` fails on a
-    /// missing destination.
+    /// Check the conditions against the current source and destination, in this order:
+    /// - a missing source fails with `NoSuchKey`;
+    /// - the destination's `If-Match`, then the source's `x-amz-rename-source-if-match`, both
+    ///   reported as `If-Match`; `If-Match` fails on a missing destination;
+    /// - `If-None-Match`.
     pub(crate) fn check(
         &self,
         source: Option<&ObjectMetadata>,
@@ -578,8 +578,8 @@ pub(crate) trait StorageBackend: Send + Sync + Debug {
     ///
     /// A request with the client token of a rename that succeeded succeeds without renaming again
     /// if it is the same request, and fails with `IdempotentParameterMismatch` otherwise. Fails
-    /// with `NoSuchKey` when the source does not exist, and with `RenamePreconditionFailed`,
-    /// naming the condition header S3 reports, when a condition does not hold.
+    /// with `NoSuchKey` when the source does not exist, and with `RenamePreconditionFailed`, naming
+    /// the failed condition's header, when a condition does not hold.
     async fn rename_object(&self, _bucket: &str, _request: RenameRequest) -> Result<()> {
         Err(crate::Error::NotImplemented)
     }

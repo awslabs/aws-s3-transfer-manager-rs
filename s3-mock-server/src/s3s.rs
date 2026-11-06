@@ -707,7 +707,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         }
 
         let bucket_type = BucketType::of(&input.bucket);
-        // As in S3, only directory buckets serve appends.
+        // Only directory buckets serve appends.
         if input.write_offset_bytes.is_some() && bucket_type == BucketType::GeneralPurpose {
             return Err(Error::NotImplemented.into());
         }

@@ -36,7 +36,7 @@ impl BucketType {
         }
     }
 
-    /// The storage class an object stored without one has: STANDARD or EXPRESS_ONEZONE.
+    /// The storage class of an object stored without one: STANDARD or EXPRESS_ONEZONE.
     pub(crate) fn default_storage_class(self) -> &'static str {
         match self {
             Self::GeneralPurpose => s3s::dto::StorageClass::STANDARD,
@@ -44,9 +44,8 @@ impl BucketType {
         }
     }
 
-    /// Fail with 400 InvalidStorageClass when a request sets a storage class that buckets of
-    /// this type do not have: EXPRESS_ONEZONE in general purpose buckets, any other class in
-    /// directory buckets.
+    /// Check the storage class a request sets. Fails with 400 InvalidStorageClass for
+    /// EXPRESS_ONEZONE in a general purpose bucket, and for any other class in a directory bucket.
     pub(crate) fn check_storage_class(self, storage_class: Option<&str>) -> crate::Result<()> {
         match (self, storage_class) {
             (Self::GeneralPurpose, Some(EXPRESS_ONEZONE)) => Err(Error::InvalidStorageClass),
@@ -57,8 +56,8 @@ impl BucketType {
         }
     }
 
-    /// Fail with 501 NotImplemented when a request sets `Content-MD5` in a directory bucket,
-    /// which does not support it.
+    /// Check that a request to a directory bucket does not set `Content-MD5`, which directory
+    /// buckets do not support. Fails with 501 NotImplemented.
     pub(crate) fn check_content_md5(self, content_md5: Option<&str>) -> crate::Result<()> {
         if self == Self::Directory && content_md5.is_some() {
             return Err(Error::ContentMd5NotImplemented);
@@ -112,7 +111,7 @@ impl BucketType {
         }
     }
 
-    /// The storage class of an object in ListObjectsV2 entries, which S3 always reports.
+    /// The storage class of an object in ListObjectsV2 entries, which always report one.
     pub(crate) fn listed_storage_class(self, storage_class: &Option<String>) -> String {
         storage_class
             .clone()

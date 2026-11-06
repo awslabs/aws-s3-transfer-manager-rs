@@ -150,18 +150,11 @@ async fn test_filesystem_storage() -> Result<(), Box<dyn std::error::Error>> {
   ETag and `If-None-Match: *`. The server ignores other conditions. The in-memory store checks a
   write's or a delete's condition atomically with it.
 - PutObject with `x-amz-write-offset-bytes` appends to an object in directory buckets (in-memory
-  store only), and fails with 501 NotImplemented in general purpose buckets, as in S3. Appends
-  honor `If-Match` and `If-None-Match: *` as PutObject does; their 412 does not name the failed
-  condition in a `Condition` element, as S3's does. As in S3, an append carries a checksum of the
-  object's algorithm (CRC64NVME if it has none), and the appended object has no parts and a CRC of
-  the combined content, or for SHA-1 and SHA-256 a composite checksum of its segments: its parts or
-  the data it was created with, then each append.
-- RenameObject is served in directory buckets (in-memory store only), and fails with 501
-  NotImplemented in general purpose buckets, as in S3. `x-amz-rename-source` is the source key
-  in the same bucket, percent-decoded, as S3 reads it. Conditions other than `If-Match`,
-  `If-None-Match: *` and `x-amz-rename-source-if-match` fail with 501. A rename retried with the
-  `x-amz-client-token` of a rename that succeeded succeeds without renaming again, and fails with
-  400 IdempotentParameterMismatch if its source, destination or conditions differ.
+  store only), honoring `If-Match` and `If-None-Match: *`. Unlike S3's, an append's 412 does not
+  name the failed condition in a `Condition` element.
+- RenameObject is served in directory buckets (in-memory store only), honoring `If-Match`,
+  `If-None-Match: *`, `x-amz-rename-source-if-match` and `x-amz-client-token`. Other conditions
+  fail with 501 NotImplemented.
 
 ### Archived Objects
 
@@ -200,13 +193,12 @@ GetObject and HeadObject omit `x-amz-storage-class` for `STANDARD` objects; List
 ListObjectsV2 pages hold at most `max-keys` entries, counting each common prefix once. Listed
 objects report their checksum algorithms, storage class and, when requested, restore status.
 General purpose buckets list keys in lexicographic order and never split a common prefix across
-pages; directory buckets list them in a fixed pseudo-random order, as S3 directory buckets may.
+pages; directory buckets list them in a fixed pseudo-random order.
 
 ### Directory Buckets
 
 Buckets whose names end in `--x-s3`, such as `amzn-s3-demo-bucket--usw2-az1--x-s3`, are directory
-buckets (S3 Express One Zone). The server authenticates requests to them with S3 Express sessions
-and, where directory buckets differ from general purpose buckets, answers as S3 does.
+buckets (S3 Express One Zone), with S3 Express sessions and the behavior of directory buckets.
 
 **Sessions.** The server serves CreateSession (`GET /{bucket}?session`), which returns credentials
 valid for five minutes, in `ReadWrite` or `ReadOnly` mode. A directory bucket accepts requests
@@ -239,17 +231,13 @@ checksums of a chunked body that declares them in `x-amz-trailer` are checked as
 are, once the body has been read; a PutObject with such a body is read in full before it is stored.
 
 **Creating and deleting directory buckets.** Create them with `S3MockServer::create_bucket`, and
-remove them with `S3MockServer::reset`. S3 serves CreateBucket and DeleteBucket for directory
-buckets at a separate regional endpoint, which the SDK signs with the caller's credentials. Against
-a custom endpoint such as the server's, the SDK signs them with a session instead: a CreateBucket
-first sends a CreateSession for the bucket, which fails with NoSuchBucket because the bucket does
-not exist yet, as it would in S3, and a DeleteBucket fails with 403 AccessDenied, as a bucket-level
-write signed with a session.
+remove them with `S3MockServer::reset`. The SDK's CreateBucket and DeleteBucket for a directory
+bucket fail against the server.
 
 **Differences from general purpose buckets.**
 
-- Objects are EXPRESS_ONEZONE. Any other storage class fails with 400 InvalidStorageClass,
-  as EXPRESS_ONEZONE does in general purpose buckets.
+- Objects are EXPRESS_ONEZONE. Any other storage class fails with 400 InvalidStorageClass, and
+  EXPRESS_ONEZONE does in general purpose buckets.
 - `Content-MD5` fails with 501 NotImplemented.
 - ListObjectsV2 lists keys in a fixed pseudo-random order (see *Listing*). It fails with 400
   InvalidRequest for a delimiter other than `/` or a prefix that does not end in `/`, and with
@@ -295,9 +283,9 @@ key. Counts and faults apply per HTTP request, so each retry and each part reque
 `FaultType::Error(Error::Custom { code, status, message })` answers with an error the server does
 not otherwise send, such as 400 RequestTimeout.
 
-In directory buckets, a request draws its fault once it is authenticated and, for a chunked body,
-once the body has been read (see *Directory Buckets*). CreateSession is affected only by faults
-that fail the request (`FaultType::Error`).
+A request draws its fault once its signature has been verified. CreateSession is affected only by
+faults that fail the request (`FaultType::Error`). A PutObject whose chunked body declares trailing
+checksums is read in full before it is stored.
 
 ## License
 

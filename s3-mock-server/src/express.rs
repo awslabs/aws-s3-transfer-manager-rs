@@ -24,7 +24,7 @@ use crate::bucket::BucketType;
 use crate::error::Error;
 use crate::s3s::ServerState;
 
-/// How long a session's credentials are valid, as in S3.
+/// How long a session's credentials are valid.
 const SESSION_DURATION: Duration = Duration::from_secs(5 * 60);
 
 /// How long an expired session is remembered. A request signed with an expired session fails with
@@ -311,8 +311,8 @@ const CHECKSUM_HEADERS: [&str; 5] = [
     "x-amz-checksum-sha256",
 ];
 
-/// Fail, as S3 does, a request with `x-amz-sdk-checksum-algorithm` but no checksum header or
-/// trailer for it.
+/// Check that a request with `x-amz-sdk-checksum-algorithm` carries a checksum header or trailer.
+/// Fails with 400 InvalidRequest otherwise.
 fn check_checksum_headers(headers: &HeaderMap) -> crate::Result<()> {
     let has_checksum = CHECKSUM_HEADERS
         .iter()

@@ -10,8 +10,8 @@ use aws_sdk_s3::types::{ChecksumAlgorithm, ChecksumType, CompletedMultipartUploa
 use common::{assert_failure, failure, no_retry, Fixture, Result};
 use s3_mock_server::S3MockServer;
 
-/// NoSuchKey, NoSuchBucket, NoSuchUpload, InvalidRange, PreconditionFailed and NotImplemented
-/// carry S3's messages.
+/// NoSuchKey, NoSuchBucket, NoSuchUpload, InvalidRange, PreconditionFailed and NotImplemented carry
+/// the messages S3 sends.
 #[tokio::test]
 async fn test_common_error_messages() -> Result {
     let f = Fixture::new().await;

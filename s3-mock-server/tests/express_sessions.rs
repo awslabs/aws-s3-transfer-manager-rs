@@ -692,8 +692,8 @@ async fn test_session_without_bucket() -> Result {
     Ok(())
 }
 
-/// PutObject and UploadPart with streaming bodies, which the SDK sends chunked with the checksum
-/// in a trailer, store the data and the trailing checksum.
+/// PutObject and UploadPart with streaming bodies, which the SDK sends chunked with the checksum in
+/// a trailer, store the data; PutObject also stores the trailing checksum.
 #[tokio::test]
 async fn test_streaming_uploads() -> Result {
     use aws_sdk_s3::types::{

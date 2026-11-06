@@ -3,7 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! RenameObject, which s3s does not model, served as a custom s3s route.
+//! RenameObject: `PUT /{bucket}/{key}?renameObject`, with the source key in `x-amz-rename-source`.
+//! Only path-style requests are supported.
 //!
 //! [`RenameRoute`] serves renames as an s3s custom route, once s3s has verified their signature.
 //! Renames to keys longer than 1,024 bytes fail with KeyTooLongError.
@@ -25,10 +26,10 @@ const RENAME_QUERY_PARAM: &str = "renameObject";
 const RENAME_SOURCE_HEADER: &str = "x-amz-rename-source";
 const RENAME_SOURCE_IF_MATCH_HEADER: &str = "x-amz-rename-source-if-match";
 const CLIENT_TOKEN_HEADER: &str = "x-amz-client-token";
-/// The longest client token S3 accepts, in characters.
+/// The longest client token, in characters.
 const MAX_CLIENT_TOKEN_LENGTH: usize = 64;
-/// Rename conditions S3 evaluates and the server does not; a rename with any of them fails with
-/// NotImplemented rather than ignoring it.
+/// Rename conditions the server does not evaluate. A rename with any of them fails with
+/// NotImplemented.
 const UNSUPPORTED_CONDITION_HEADERS: &[&str] = &[
     "if-modified-since",
     "if-unmodified-since",
@@ -36,7 +37,7 @@ const UNSUPPORTED_CONDITION_HEADERS: &[&str] = &[
     "x-amz-rename-source-if-modified-since",
     "x-amz-rename-source-if-unmodified-since",
 ];
-/// The longest key S3 accepts, in bytes of UTF-8.
+/// The longest key, in bytes of UTF-8.
 pub(crate) const MAX_KEY_LENGTH: usize = 1024;
 
 /// Serves authenticated RenameObject requests.
@@ -104,13 +105,13 @@ impl S3Route for RenameRoute {
                 return Err(Error::NotImplemented.into());
             }
         }
-        // S3 accepts an empty token, as no token.
+        // An empty token is no token.
         let client_token = client_token(&req.headers)?;
         let if_none_match = header("if-none-match");
         if if_none_match.as_deref().is_some_and(|value| value != "*") {
             return Err(Error::NotImplemented.into());
         }
-        // S3 percent-decodes the source key, which may also be sent unencoded, so it need not be
+        // The source key is percent-decoded, and may also be sent unencoded, so it need not be
         // ASCII.
         let src_key = req
             .headers
@@ -118,7 +119,7 @@ impl S3Route for RenameRoute {
             .ok_or(Error::InvalidRequest("Missing x-amz-rename-source"))?;
         let src_key = std::str::from_utf8(src_key.as_bytes())
             .map_err(|_| Error::InvalidArgument("x-amz-rename-source is not UTF-8"))?;
-        // The source is the key itself: S3 resolves `/{bucket}/{key}` to that literal key.
+        // The source is the key as given: `/{bucket}/{key}` is a key, not a bucket and a key.
         let src_key = percent_decode(src_key)?;
         tracing::trace!(%bucket, %src_key, %dst_key, "RenameObject");
         crate::s3s::check_bucket(self.storage.as_ref(), &bucket).await?;
@@ -142,17 +143,16 @@ impl S3Route for RenameRoute {
                 }
                 Ok(S3Response::new(Body::empty()))
             }
-            // S3 names the failed condition in a `Condition` element, which an s3s error
-            // cannot carry, so the route answers with the error response.
+            // The error names the failed condition in a `Condition` element, which an s3s error
+            // cannot carry, so the route builds the response.
             Err(error @ Error::RenamePreconditionFailed(_)) => Ok(error_response(error)),
             Err(error) => Err(error.into()),
         }
     }
 }
 
-/// The request's `x-amz-client-token`, if it has a non-empty one. Fails, as S3 does, with 400
-/// InvalidRequest for a token longer than 64 characters or with characters outside ASCII 33 to
-/// 126.
+/// The request's `x-amz-client-token`, if it has a non-empty one. Fails with 400 InvalidRequest for
+/// a token longer than 64 characters or with characters outside ASCII 33 to 126.
 fn client_token(headers: &HeaderMap) -> crate::Result<Option<String>> {
     let Some(token) = headers
         .get(CLIENT_TOKEN_HEADER)

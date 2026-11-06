@@ -4,9 +4,9 @@
  */
 //! Error types for the S3 Mock Server.
 //!
-//! Handlers, routes and storage fail with an [`Error`](enum@Error), whose conversion into an
-//! `s3s::S3Error` is the only place the server builds an S3 error response. `Error::into_response`
-//! writes that response for the requests the server answers without s3s.
+//! Handlers, routes and storage fail with an [`Error`](enum@Error). Its conversion into an
+//! `s3s::S3Error` builds every S3 error response, and [`Error::into_response`] writes the response
+//! with the elements an `S3Error` cannot carry.
 
 use std::borrow::Cow;
 use std::io;
@@ -73,7 +73,7 @@ pub enum Error {
     #[error("invalid storage class")]
     InvalidStorageClass,
 
-    /// The request uses functionality that S3, or the server, does not implement.
+    /// The request uses functionality the server does not implement.
     #[error("not implemented")]
     NotImplemented,
 
@@ -81,8 +81,8 @@ pub enum Error {
     #[error("Content-MD5 not implemented")]
     ContentMd5NotImplemented,
 
-    /// A key is longer than S3 allows. Carries its length in bytes, which S3 reports in the
-    /// error's `Size` element.
+    /// A key is longer than 1,024 bytes. Carries its length in bytes, reported in the error's
+    /// `Size` element.
     #[error("key too long: {size} bytes")]
     KeyTooLong {
         /// The length of the key in bytes.
@@ -105,8 +105,8 @@ pub enum Error {
     #[error("precondition failed")]
     PreconditionFailed,
 
-    /// A RenameObject condition did not hold. Carries the name of the condition header that S3
-    /// reports in the error's `Condition` element.
+    /// A RenameObject condition did not hold. Carries the name of the condition's header, reported
+    /// in the error's `Condition` element.
     #[error("rename precondition failed: {0}")]
     RenamePreconditionFailed(&'static str),
 
@@ -177,7 +177,8 @@ pub enum Error {
     #[error("access denied")]
     AccessDenied,
 
-    /// An S3 Express request names credentials the server does not have.
+    /// A request names credentials the server does not have, or a session's credentials where the
+    /// session is not valid.
     #[error("invalid access key ID")]
     InvalidAccessKeyId,
 
@@ -225,11 +226,9 @@ impl From<io::Error> for Error {
 const INTERNAL_ERROR_MESSAGE: &str = "We encountered an internal error. Please try again.";
 
 impl Error {
-    /// The HTTP response to a request that fails with this error, for the requests the server
-    /// answers without s3s: the error document of the `S3Error` the error converts into, with the
-    /// elements S3 adds to some error documents and an `S3Error` cannot carry, the `Condition` of
-    /// a failed RenameObject condition and the `Size` and `MaxSizeAllowed` of a key that is too
-    /// long.
+    /// The HTTP response for this error: the status, headers and XML error document of the
+    /// `S3Error` it converts into, with the elements an `S3Error` cannot carry: `Condition` for a
+    /// failed RenameObject condition, and `Size` and `MaxSizeAllowed` for a key that is too long.
     pub(crate) fn into_response(self) -> http::Response<s3s::Body> {
         let condition = match &self {
             Error::RenamePreconditionFailed(condition) => Some(*condition),
