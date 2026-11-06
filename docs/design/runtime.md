@@ -99,13 +99,17 @@ downloads. The pass also reports the largest concurrency the ceiling funds, so a
 later adaptive layer reads its own upper bound instead of discovering it through
 admission stalls.
 
-The connection cap is the smaller of the descriptor-derived cap and the
-concurrency target, since a connection beyond the target carries no work. The
-descriptor budget is in turn the smaller of a fraction of the soft limit and
-that limit less a fixed reserve, because the descriptors a process holds besides
-its connections are closer to a fixed count than to a share of the limit. A
-floor applies underneath both, so a soft limit below the reserve still yields a
-cap the client can attempt a transfer with.
+The connection cap is the descriptor-derived cap, not narrowed to the
+concurrency target. It is a bound that keeps the process within its descriptor
+limit, and connections open lazily, so headroom above the target costs nothing
+until used. That headroom keeps connections local to the partition that opened
+them instead of borrowed or reclaimed across partitions at the cap, and leaves
+room for requests outside the scheduler, such as listing and S3 Express session
+creation. The descriptor budget is the smaller of a fraction of the soft limit
+and that limit less a fixed reserve, because the descriptors a process holds
+besides its connections are closer to a fixed count than to a share of the
+limit. A floor applies underneath both, so a soft limit below the reserve still
+yields a cap the client can attempt a transfer with.
 
 Sizing resolves before the managed execution owner is constructed, so an adopted
 runtime's own topology is not visible to it and the vCPU count comes from the

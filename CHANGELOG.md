@@ -10,21 +10,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - `config::Builder::throughput_target_gbps` and `ConfigLoader::throughput_target_gbps` take the
   network throughput, in Gbps, the client should size itself for. It drives the automatic
-  concurrency target and, through it, the per-host connection cap. A configured concurrency
-  target takes precedence. A value that is not finite and positive is ignored with a warning.
+  concurrency target. A configured concurrency target takes precedence. A value that is not
+  finite and positive is ignored with a warning.
 - Client construction logs one `INFO` record of the resolved sizing (concurrency target and the
-  signal it came from and was bounded by, memory ceiling, part size, connection caps) and a
+  signal it came from and was bounded by, memory ceiling, part size, connection cap) and a
   `WARN` for each configured value the host cannot fund.
 
 ### Changed
-- The concurrency target, payload-memory ceiling, part size, and per-host connection cap are
-  resolved together. A derived concurrency target is lowered to what the descriptor-derived
-  connection cap and the memory ceiling can sustain at the resolved part size. Configured values
-  are used as given.
+- The concurrency target, payload-memory ceiling, and part size are resolved together. A
+  derived concurrency target is lowered to what the descriptor-derived connection cap and the
+  memory ceiling can sustain at the resolved part size. Configured values are used as given.
 - The automatic part size is 8 MiB for both uploads and downloads. Downloads previously used
   5 MiB, so objects between 5 and 8 MiB now download with a single GET.
-- The per-host connection cap is at most the concurrency target. The descriptor budget is the
-  smaller of half the soft `RLIMIT_NOFILE` and the soft limit less 64 descriptors.
+- The per-host connection cap's descriptor budget is the smaller of half the soft
+  `RLIMIT_NOFILE` and the soft limit less 64 descriptors, so it binds only below a soft limit
+  of 128.
 - The automatic memory ceiling for a client is at least 256 MiB, limited to half of detected
   memory. `BufferPool` built with `MemoryBudgetConfig::Auto` directly is unchanged.
 

@@ -370,13 +370,12 @@ impl Builder {
     /// Set the network throughput, in gigabits per second, the client should
     /// size itself for.
     ///
-    /// One figure drives the automatic concurrency target, and through it the
-    /// per-host connection cap, so a caller who knows what the host's network
-    /// sustains need not set those individually. A concurrency target set
-    /// directly takes precedence over the one derived from this value. The
-    /// payload-memory ceiling is not derived from throughput; it is a bound
-    /// against exhausting host memory and comes from detected memory or
-    /// [`Builder::memory`].
+    /// One figure drives the automatic concurrency target, so a caller who
+    /// knows what the host's network sustains need not set it individually. A
+    /// concurrency target set directly takes precedence over the one derived
+    /// from this value. The payload-memory ceiling is not derived from
+    /// throughput; it is a bound against exhausting host memory and comes from
+    /// detected memory or [`Builder::memory`].
     ///
     /// A value that is not finite and positive is ignored with a warning at
     /// client construction, leaving throughput to be estimated from the

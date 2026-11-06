@@ -159,7 +159,13 @@ pub(crate) struct Sizing {
     pub(crate) concurrency: usize,
     /// Part size for uploads and downloads.
     pub(crate) part_size: u64,
-    /// Maximum connections to one origin.
+    /// Maximum connections to one origin: the descriptor-derived cap.
+    ///
+    /// Not narrowed to the concurrency target. The cap is a descriptor safety
+    /// bound, and connections open lazily, so headroom above the target costs
+    /// nothing until used. It keeps connections partition-local rather than
+    /// borrowed or reclaimed across partitions at the cap, and leaves room for
+    /// requests outside the scheduler, such as listing and session creation.
     pub(crate) connection_cap: usize,
     /// Largest concurrency the ceiling funds at `part_size`.
     ///
@@ -226,8 +232,7 @@ pub(crate) fn resolve(signals: Signals<'_>) -> Sizing {
         ceiling_bytes,
         concurrency,
         part_size,
-        // A connection beyond the concurrency target has no work to carry.
-        connection_cap: signals.descriptor_cap.min(concurrency).max(1),
+        connection_cap: signals.descriptor_cap.max(1),
         max_funded_concurrency: memory_bound,
         throughput_gbps,
         concurrency_source: if signals.explicit_concurrency.is_some() {
@@ -596,14 +601,16 @@ mod tests {
     }
 
     #[test]
-    fn connection_cap_never_exceeds_the_concurrency_target() {
-        // Connections beyond the target have no work to carry.
+    fn connection_cap_is_not_narrowed_to_the_concurrency_target() {
+        // The cap is a descriptor safety bound. A small target leaves it intact
+        // so partitions keep their own connections and unscheduled requests
+        // have room.
         let mut s = signals(Some(8 * GIB as usize), 4);
         s.explicit_concurrency = Some(12);
         let sizing = resolve(s);
 
         assert_eq!(sizing.concurrency, 12);
-        assert_eq!(sizing.connection_cap, 12);
+        assert_eq!(sizing.connection_cap, 4096);
     }
 
     #[test]
@@ -654,8 +661,7 @@ mod tests {
 
                         assert!(sizing.concurrency >= 1);
                         assert!(sizing.ceiling_bytes > 0);
-                        assert!(sizing.connection_cap >= 1);
-                        assert!(sizing.connection_cap <= sizing.concurrency);
+                        assert_eq!(sizing.connection_cap, descriptor_cap);
                         assert!(sizing.max_funded_concurrency >= 1);
                         assert_eq!(sizing.part_size, part.unwrap_or(DEFAULT_PART_SIZE));
                     }

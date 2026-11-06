@@ -600,7 +600,6 @@ fn log_resource_sizing(
         part_size_bytes = sizing.part_size,
         max_connections_per_host = sizing.connection_cap,
         connection_cap_installed,
-        descriptor_connection_cap = cap.max_per_host,
         max_funded_concurrency = sizing.max_funded_concurrency,
         soft_descriptor_limit = ?soft,
         hard_descriptor_limit = ?hard,
