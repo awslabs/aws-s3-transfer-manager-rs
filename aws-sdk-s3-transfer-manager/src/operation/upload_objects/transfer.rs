@@ -1612,14 +1612,14 @@ mod tests {
     #[tokio::test]
     async fn test_files_deriving_one_key_upload_once() {
         // (file names, delimiter, key both derive, policy)
-        type Case = (
-            [&'static std::path::Path; 2],
-            Option<&'static str>,
-            &'static str,
-            FailedTransferPolicy,
-        );
         let delimited = [std::path::Path::new("a-/b"), std::path::Path::new("a/-b")];
-        let mut cases: Vec<Case> = vec![
+        // APFS rejects file names that are not valid UTF-8.
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let lossy = |b: &'static [u8]| {
+            use std::os::unix::ffi::OsStrExt;
+            std::path::Path::new(std::ffi::OsStr::from_bytes(b))
+        };
+        let cases = [
             (
                 delimited,
                 Some("--"),
@@ -1627,19 +1627,14 @@ mod tests {
                 FailedTransferPolicy::Continue,
             ),
             (delimited, Some("--"), "a---b", FailedTransferPolicy::Abort),
-        ];
-        // APFS rejects file names that are not valid UTF-8.
-        #[cfg(all(unix, not(target_os = "macos")))]
-        {
-            use std::os::unix::ffi::OsStrExt;
-            let lossy = |b: &'static [u8]| std::path::Path::new(std::ffi::OsStr::from_bytes(b));
-            cases.push((
+            #[cfg(all(unix, not(target_os = "macos")))]
+            (
                 [lossy(b"caf\xe9"), lossy(b"caf\xe8")],
                 None,
                 "caf\u{fffd}",
                 FailedTransferPolicy::Continue,
-            ));
-        }
+            ),
+        ];
         for (names, delimiter, key, policy) in cases {
             let dir = tempdir().unwrap();
             for name in names {
