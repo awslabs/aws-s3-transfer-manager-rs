@@ -21,11 +21,12 @@ use std::sync::Arc;
 
 use crate::io::key::filter::KeyFilter;
 use crate::io::key::stream::{
-    key_under_root, local_predicate, s3_predicate, Entry, KeyStream, KeysLost, StreamError,
+    key_under_root, local_predicate, s3_predicate, AliasedName, Entry, KeyStream, KeysLost,
+    Obstruction, StreamError,
 };
 use crate::io::walk::{
-    FsEntry, FsWalk, FsWalkContext, FsWalker, S3Walk, S3WalkContext, S3Walker, SortOrder,
-    WalkErrorKind,
+    FollowedLink, FsEntry, FsWalk, FsWalkContext, FsWalker, S3Walk, S3WalkContext, S3Walker,
+    SortOrder, WalkErrorKind,
 };
 
 // What one side holds at the key the merge has reached.
@@ -163,6 +164,10 @@ struct Side<K: KeyStream> {
     // which never says what its root is, so the answer comes from here — which is what makes one
     // lost key nameable here, where a layer down has no root to name it against.
     root: Option<PathBuf>,
+    // `take` keeps here the key of the entry it handed over last. The string is empty before the
+    // first. `take` clones that key anyway to release what the merge passed, so keeping it adds no
+    // copy. The later of the two sides' keys shows how far the merge has paired.
+    taken: String,
 }
 
 impl<K: KeyStream> Side<K> {
@@ -175,6 +180,7 @@ impl<K: KeyStream> Side<K> {
             lost: BTreeSet::new(),
             lost_unnamed: false,
             root: None,
+            taken: String::new(),
         }
     }
 
@@ -238,6 +244,13 @@ impl<K: KeyStream> Side<K> {
         matches!(self.head, Head::Finished)
     }
 
+    // Return whether the head entry carries `obstruction`.
+    fn head_is(&self, obstruction: Obstruction) -> bool {
+        self.head
+            .entry()
+            .is_some_and(|entry| entry.meta.obstruction == Some(obstruction))
+    }
+
     // Take the entry at the head, releasing every stretch the merge has now passed.
     //
     // A key inside a stretch, or one sorting before it, releases nothing: the failure was heard
@@ -251,6 +264,7 @@ impl<K: KeyStream> Side<K> {
             // for the length of the run instead of keeping it inside what the directories currently
             // open are holding.
             self.release_before(&key);
+            self.taken = key;
         }
         match std::mem::replace(&mut self.head, Head::Unread) {
             Head::Entry(entry) => entry,
@@ -410,7 +424,23 @@ fn at_or_under(key: &str, name: &str) -> bool {
     key.starts_with(name) && (key.len() == name.len() || key.as_bytes()[name.len()] == b'/')
 }
 
+// Followed destination links keep at most this many names held at once. Past the bound, the source
+// holds back every later delete. The value matches how many transfers may wait before the merge
+// pauses, so the held names cost about what that queue does.
+const ALIASED_NAMES_HELD: usize = 1024;
+
 // Two key-ordered streams merged into one pairing per key.
+// `Progress` tells callers whether the merge can infer absence from key position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Progress {
+    // The merge has not finished. It may produce more pairings.
+    Pairing,
+    // Both streams finished. Every produced key has a pairing.
+    Accounted,
+    // A terminal failure stopped the merge. Later keys cannot read absence from position.
+    Stopped,
+}
+
 pub(crate) struct Walk<S: KeyStream, D: KeyStream> {
     src: Side<S>,
     dst: Side<D>,
@@ -448,19 +478,46 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
         if self.ended_by_failure {
             return None;
         }
-        if let Some(err) = self.src.fill().await {
-            self.incomplete = true;
-            if self.src.is_done() {
-                self.ended_by_failure = true;
+        loop {
+            // A failure that lost no key, such as a file that vanished, leaves the plan whole.
+            if let Some(err) = self.src.fill().await {
+                if err.keys_lost() != KeysLost::Nothing {
+                    self.incomplete = true;
+                }
+                if self.src.is_done() {
+                    self.ended_by_failure = true;
+                }
+                return Some(Err(err));
             }
-            return Some(Err(err));
-        }
-        if let Some(err) = self.dst.fill().await {
-            self.incomplete = true;
-            if self.dst.is_done() {
-                self.ended_by_failure = true;
+            let failure = self.dst.fill().await;
+            // A followed destination link makes two keys name one file. The source holds back the
+            // deletes under every name the link aliases, including when the read also failed.
+            for name in self.dst.stream.take_aliased_names() {
+                self.hold_aliased(name);
             }
-            return Some(Err(err));
+            if let Some(err) = failure {
+                if err.keys_lost() != KeysLost::Nothing {
+                    self.incomplete = true;
+                }
+                if self.dst.is_done() {
+                    self.ended_by_failure = true;
+                }
+                return Some(Err(err));
+            }
+            // The filter excluded this link's own name, so the name makes no pairing. A source link
+            // still hides the keys under its name, so the source holds those keys back.
+            if self.src.head_is(Obstruction::ExcludedLink) {
+                let link = self.src.take();
+                self.src.gap.add(Stretch {
+                    under: Some(link.key),
+                });
+                continue;
+            }
+            if self.dst.head_is(Obstruction::ExcludedLink) {
+                self.dst.take();
+                continue;
+            }
+            break;
         }
 
         match (&self.src.head, &self.dst.head) {
@@ -501,17 +558,78 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
         !self.incomplete
     }
 
-    // Whether anything further will be paired.
+    // Report whether the merge can continue pairing, accounted for every key, or stopped.
+    pub(crate) fn progress(&self) -> Progress {
+        if self.ended_by_failure {
+            Progress::Stopped
+        } else if self.src.is_finished() && self.dst.is_finished() {
+            Progress::Accounted
+        } else {
+            Progress::Pairing
+        }
+    }
+
+    // Take the source's head entry. A source link the walk did not follow occupies its name and
+    // hides whatever sits under it, so the source holds back every key under that name. A
+    // destination key there then reads as unknown and not as absent.
     //
-    // A walk that has not been advanced answers `false`, since neither side has said yet
-    // whether it holds anything. That matches what the two walkers underneath do.
-    pub(crate) fn is_done(&self) -> bool {
-        self.ended_by_failure || (self.src.is_finished() && self.dst.is_finished())
+    // TODO(vnext): The transfer manager has no symlink policy for the local side of a download.
+    // `download_objects` writes through a link on a directory above a file, and it replaces a link
+    // at the file's own name. Sync does both, until the transfer manager settles a download-side
+    // policy.
+    fn take_source(&mut self) -> Entry<S::Source> {
+        let entry = self.src.take();
+        if entry.meta.obstruction == Some(Obstruction::UnfollowedLink) {
+            self.src.gap.add(Stretch {
+                under: Some(entry.key.clone()),
+            });
+        }
+        entry
+    }
+
+    // A key one side could not account for leaves a hole in the plan, whether a failure or an
+    // unfollowed link hid it.
+    fn note_unknown<T>(&mut self, side: &SideState<T>) {
+        if matches!(side, SideState::Unknown(_)) {
+            self.incomplete = true;
+        }
+    }
+
+    // Hold back the deletes under a name a followed destination link aliases.
+    //
+    // The merge may already have reached the name, and a delete under it may have gone out before
+    // the walk found the link. The merge then marks the plan incomplete. Past the bound on held
+    // names, the source holds back every later delete.
+    fn hold_aliased(&mut self, name: AliasedName) {
+        // No name sorts at or before the empty key, so nothing reads as reached before a pairing.
+        let paired = std::cmp::max(self.src.taken.as_str(), self.dst.taken.as_str());
+        let (stretch, reached) = match name {
+            // The merge reaches a file when it pairs that key or a later one.
+            AliasedName::File(name) => {
+                let reached = name.as_str() <= paired;
+                (Stretch { under: Some(name) }, reached)
+            }
+            // The merge reaches a directory when it enters the subtree or passes it.
+            AliasedName::Directory(name) => {
+                let stretch = Stretch { under: Some(name) };
+                let reached = stretch.covers(paired) || stretch.passed_by(paired);
+                (stretch, reached)
+            }
+        };
+        if reached {
+            self.incomplete = true;
+        }
+        if self.src.gap.under.len() < ALIASED_NAMES_HELD {
+            self.src.gap.add(stretch);
+        } else {
+            self.src.gap.add(Stretch { under: None });
+        }
     }
 
     fn take_source_only(&mut self) -> Pairing<S::Source, D::Source> {
-        let entry = self.src.take();
+        let entry = self.take_source();
         let destination = self.dst.missing(&entry.key);
+        self.note_unknown(&destination);
         Pairing {
             key: entry.key.clone(),
             source: SideState::Present(entry),
@@ -522,6 +640,7 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
     fn take_destination_only(&mut self) -> Pairing<S::Source, D::Source> {
         let entry = self.dst.take();
         let source = self.src.missing(&entry.key);
+        self.note_unknown(&source);
         Pairing {
             key: entry.key.clone(),
             source,
@@ -531,7 +650,7 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
 
     fn take_both(&mut self) -> Pairing<S::Source, D::Source> {
         // Neither side is missing here, so neither has anything to answer for.
-        let src = self.src.take();
+        let src = self.take_source();
         let dst = self.dst.take();
         Pairing {
             key: src.key.clone(),
@@ -761,9 +880,18 @@ fn cost_of(err: &StreamError, root: Option<&Path>) -> Cost {
 // Only an absent root is swallowed. A root that exists and is not a directory still ends the run,
 // because nothing can be written into it either, and a root that could not be read is a permission
 // problem the caller has to hear about.
+#[derive(Debug)]
 pub(crate) struct LocalDestination {
     walk: FsWalk,
     absent: bool,
+    // The walk's paths sit under this root, as the caller spelled it.
+    root: PathBuf,
+    // A link's target takes its key under this root, with every link on the root resolved.
+    // `record_aliases` resolves the root when the walk first follows a link, so a tree without links
+    // never pays for it.
+    canonical_root: Option<PathBuf>,
+    // The names followed links aliased wait here until the merge takes them.
+    aliased: Vec<AliasedName>,
 }
 
 impl LocalDestination {
@@ -774,8 +902,82 @@ impl LocalDestination {
         Self {
             walk,
             absent: matches!(root.try_exists(), Ok(false)),
+            root: root.to_path_buf(),
+            canonical_root: None,
+            aliased: Vec::new(),
         }
     }
+
+    fn record_aliases(&mut self) {
+        let links = self.walk.followed_links();
+        if links.is_empty() {
+            return;
+        }
+        if self.canonical_root.is_none() {
+            self.canonical_root = std::fs::canonicalize(&self.root).ok();
+        }
+        // A target and a later link on a chain have resolved paths, so they take their keys under
+        // the resolved root.
+        let resolved = |path: &Path| {
+            self.canonical_root
+                .as_deref()
+                .and_then(|root| key_under_root(root, path))
+        };
+        let target = |link: &Path| std::fs::canonicalize(link).ok().and_then(|t| resolved(&t));
+        for link in links {
+            match link {
+                // Every key through the link names a file of the target. Deleting such a key removes
+                // that file, so the merge holds the link's own name.
+                FollowedLink::Directory(path) => {
+                    let own = key_under_root(&self.root, path);
+                    self.aliased.extend(own.map(AliasedName::Directory));
+                    self.aliased
+                        .extend(target(path).map(AliasedName::Directory));
+                }
+                // Removing a file link unlinks the link and leaves its target, so the link's own name
+                // stays deletable. Removing a later link on the chain leaves this one dangling.
+                FollowedLink::File(path) => {
+                    let chain = later_links(path)
+                        .into_iter()
+                        .filter_map(|hop| resolved(&hop));
+                    self.aliased.extend(chain.map(AliasedName::File));
+                    self.aliased.extend(target(path).map(AliasedName::File));
+                }
+            }
+        }
+    }
+}
+
+// Return the links a chain passes through after its first. Each path joins a resolved parent
+// directory and the link's own name, because resolving the whole path would name the file at the
+// end of the chain.
+//
+// The walk resolved this chain already, and one path passes through at most 40 links on Linux and
+// 32 on macOS. The bound stops a chain that became a loop since.
+fn later_links(link: &Path) -> Vec<PathBuf> {
+    const MOST_LINKS: usize = 40;
+    let mut later = Vec::new();
+    let mut at = link.to_path_buf();
+    while later.len() < MOST_LINKS {
+        let Ok(target) = std::fs::read_link(&at) else {
+            break;
+        };
+        let next = at.parent().unwrap_or(Path::new("")).join(target);
+        let (Some(dir), Some(name)) = (next.parent(), next.file_name()) else {
+            break;
+        };
+        let is_link = std::fs::symlink_metadata(dir.join(name))
+            .is_ok_and(|meta| meta.file_type().is_symlink());
+        if !is_link {
+            break;
+        }
+        let Ok(dir) = std::fs::canonicalize(dir) else {
+            break;
+        };
+        at = dir.join(name);
+        later.push(at.clone());
+    }
+    later
 }
 
 impl KeyStream for LocalDestination {
@@ -786,7 +988,11 @@ impl KeyStream for LocalDestination {
     }
 
     async fn next_entry(&mut self) -> Option<Result<Entry<FsEntry>, StreamError>> {
-        match self.walk.next_entry().await {
+        let next = self.walk.next_entry().await;
+        // Record the links on every outcome, because a call that returns a failure can also follow a
+        // link.
+        self.record_aliases();
+        match next {
             Some(Err(StreamError::Walk(err)))
                 if self.absent
                     && err.kind() == WalkErrorKind::SourceUnreadable
@@ -796,6 +1002,10 @@ impl KeyStream for LocalDestination {
             }
             other => other,
         }
+    }
+
+    fn take_aliased_names(&mut self) -> Vec<AliasedName> {
+        std::mem::take(&mut self.aliased)
     }
 }
 
@@ -1047,8 +1257,9 @@ mod tests {
                 at(pairing.destination()),
             ));
         }
-        assert!(
-            walk.is_done(),
+        assert_eq!(
+            walk.progress(),
+            Progress::Accounted,
             "the merge ends only when both sides are done"
         );
         plan
@@ -1381,6 +1592,135 @@ mod tests {
             key: Some(key.to_string()),
             what: "size",
         }
+    }
+
+    fn obstructed(key: &str, why: Obstruction) -> Entry<()> {
+        let mut entry = entry(key);
+        entry.meta.obstruction = Some(why);
+        entry
+    }
+
+    // Pair every key and report whether the walk called its plan complete.
+    async fn pair_all(mut walk: Walk<Scripted, Scripted>) -> (Vec<(String, At, At)>, bool) {
+        let mut seen = Vec::new();
+        while let Some(next) = walk.next().await {
+            if let Ok(pairing) = next {
+                seen.push((
+                    pairing.key().to_string(),
+                    at(pairing.source()),
+                    at(pairing.destination()),
+                ));
+            }
+        }
+        (seen, walk.is_plan_complete())
+    }
+
+    #[tokio::test]
+    async fn a_source_link_the_walk_did_not_follow_holds_back_the_keys_under_it() {
+        let walk = Walk::new(
+            Scripted::from(vec![
+                Ok(entry("a.txt")),
+                Ok(obstructed("photos", Obstruction::UnfollowedLink)),
+            ]),
+            Scripted::of(&["photos", "photos/2019/x.jpg", "photos/y.jpg", "q.txt"]),
+        );
+        let (seen, complete) = pair_all(walk).await;
+        assert_eq!(
+            seen,
+            plan(&[
+                ("a.txt", At::Here, At::Gone),
+                ("photos", At::Here, At::Here),
+                ("photos/2019/x.jpg", At::UnknownRange, At::Here),
+                ("photos/y.jpg", At::UnknownRange, At::Here),
+                ("q.txt", At::Gone, At::Here),
+            ])
+        );
+        assert!(
+            !complete,
+            "a plan that skipped keys under a link called itself complete"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_excluded_source_link_holds_back_the_keys_under_it_and_makes_no_pairing() {
+        let walk = Walk::new(
+            Scripted::from(vec![
+                Ok(entry("a.txt")),
+                Ok(obstructed("photos", Obstruction::ExcludedLink)),
+            ]),
+            Scripted::of(&["photos/y.jpg", "q.txt"]),
+        );
+        let (seen, complete) = pair_all(walk).await;
+        assert_eq!(
+            seen,
+            plan(&[
+                ("a.txt", At::Here, At::Gone),
+                ("photos/y.jpg", At::UnknownRange, At::Here),
+                ("q.txt", At::Gone, At::Here),
+            ])
+        );
+        assert!(
+            !complete,
+            "a plan that skipped keys under an excluded link called itself complete"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_excluded_destination_link_makes_no_pairing() {
+        let walk = Walk::new(
+            Scripted::of(&["photos/y.jpg"]),
+            Scripted::from(vec![Ok(obstructed("photos", Obstruction::ExcludedLink))]),
+        );
+        let (seen, complete) = pair_all(walk).await;
+        assert_eq!(seen, plan(&[("photos/y.jpg", At::Here, At::Gone)]));
+        assert!(complete);
+    }
+
+    #[tokio::test]
+    async fn a_source_link_with_nothing_under_it_leaves_the_plan_complete() {
+        let walk = Walk::new(
+            Scripted::from(vec![Ok(obstructed("photos", Obstruction::UnfollowedLink))]),
+            Scripted::of(&["photos", "q.txt"]),
+        );
+        let (_, complete) = pair_all(walk).await;
+        assert!(complete);
+    }
+
+    // A download writes through a destination link the walk left unfollowed, as `download_objects`
+    // does, so that link holds nothing back.
+    #[tokio::test]
+    async fn an_unfollowed_destination_link_holds_nothing_back() {
+        let walk = Walk::new(
+            Scripted::of(&["photos/y.jpg"]),
+            Scripted::from(vec![Ok(obstructed("photos", Obstruction::UnfollowedLink))]),
+        );
+        let (seen, complete) = pair_all(walk).await;
+        assert_eq!(
+            seen,
+            plan(&[
+                ("photos", At::Gone, At::Here),
+                ("photos/y.jpg", At::Here, At::Gone),
+            ])
+        );
+        assert!(complete);
+    }
+
+    // A socket cannot hold a directory, so its name holds back no keys under it.
+    #[tokio::test]
+    async fn a_source_socket_holds_nothing_back() {
+        let walk = Walk::new(
+            Scripted::from(vec![Ok(obstructed("sock", Obstruction::NothingToRead))]),
+            Scripted::of(&["sock/x.txt"]),
+        );
+        let (seen, complete) = pair_all(walk).await;
+        assert_eq!(
+            seen,
+            plan(&[
+                ("sock", At::Here, At::Gone),
+                ("sock/x.txt", At::Gone, At::Here),
+            ])
+        );
+        assert!(complete);
     }
 
     async fn drain(mut walk: Walk<Scripted, Scripted>) -> Vec<(String, At, At)> {
@@ -1928,7 +2268,7 @@ mod tests {
             Scripted::of(&["a.txt", "b.txt", "c.txt"]),
         );
         while walk.next().await.is_some() {}
-        assert!(walk.is_done());
+        assert_eq!(walk.progress(), Progress::Stopped);
         assert!(!walk.is_plan_complete());
     }
 
@@ -1937,6 +2277,30 @@ mod tests {
         let mut walk = Walk::new(Scripted::of(&["a.txt"]), Scripted::of(&["a.txt"]));
         while walk.next().await.is_some() {}
         assert!(walk.is_plan_complete());
+    }
+
+    #[tokio::test]
+    async fn a_file_that_went_away_leaves_the_plan_whole() {
+        // A file that vanished mid-walk is an answer: the file is gone. The walk lost no key, so
+        // an active tree keeps a whole plan.
+        let gone = StreamError::Walk(WalkError::new(
+            Some(PathBuf::from("/root/b.txt")),
+            WalkErrorKind::Vanished,
+            Box::from("not there any more"),
+        ));
+        let mut walk = Walk::new(
+            Scripted::from(vec![Ok(entry("a.txt")), Err(gone), Ok(entry("c.txt"))]),
+            Scripted::of(&["a.txt", "c.txt"]),
+        );
+        let mut errors = 0;
+        while let Some(next) = walk.next().await {
+            errors += usize::from(next.is_err());
+        }
+        assert_eq!(errors, 1, "the walk did not report the vanished file");
+        assert!(
+            walk.is_plan_complete(),
+            "a file that went away marked the plan incomplete"
+        );
     }
 
     #[tokio::test]
@@ -1964,7 +2328,7 @@ mod tests {
             walk.next().await.is_none(),
             "a side that has stopped cannot say a key is absent, so nothing more is paired"
         );
-        assert!(walk.is_done());
+        assert_eq!(walk.progress(), Progress::Stopped);
     }
 
     #[tokio::test]
@@ -1979,7 +2343,7 @@ mod tests {
             walk.next().await.is_none(),
             "nothing may be written to or removed from a side nobody could read"
         );
-        assert!(walk.is_done());
+        assert_eq!(walk.progress(), Progress::Stopped);
     }
 
     #[tokio::test]
@@ -2171,10 +2535,9 @@ mod tests {
         let root = dir.path().join("appeared");
         std::fs::write(&root, b"x").expect("write the file");
         let walker = Walker::builder().build();
-        let local = LocalDestination {
-            walk: walker.local_walk(root.clone()),
-            absent: true,
-        };
+        let mut local = LocalDestination::new(walker.local_walk(root.clone()), &root);
+        // The check ran before the file appeared.
+        local.absent = true;
         let mut walk = Walk::new(Scripted::of(&["a.txt"]), local).with_roots(None, Some(root));
         let mut errors = 0;
         while let Some(next) = walk.next().await {
@@ -2187,6 +2550,120 @@ mod tests {
             (1, false),
             "only a root that is genuinely missing is treated as holding no keys"
         );
+    }
+
+    // The merge holds a bounded number of names for followed links, and past the bound it holds
+    // every later delete. A name the merge has passed stops counting toward the bound.
+    #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn the_names_followed_links_hold_stay_bounded() {
+        use std::os::unix::fs::symlink;
+
+        // The root contains more links than the bound allows names for. Each link holds its own
+        // name and a target the merge reaches only after `0.txt`.
+        fn forward(root: &Path) {
+            for n in 0..=ALIASED_NAMES_HELD / 2 {
+                let target = root.join(format!("z/t{n:04}"));
+                std::fs::create_dir_all(&target).expect("a target");
+                symlink(&target, root.join(format!("a{n:04}"))).expect("a link");
+            }
+        }
+        // The same number of links sit one per directory. The merge passes each link's names before
+        // the walk reads the next directory.
+        fn passed(root: &Path) {
+            for n in 0..=ALIASED_NAMES_HELD / 2 {
+                let dir = root.join(format!("d{n:04}"));
+                std::fs::create_dir_all(dir.join("real")).expect("a target");
+                std::fs::write(dir.join("real/x.txt"), b"x").expect("a file");
+                symlink("real", dir.join("link")).expect("a link");
+            }
+        }
+
+        type Case = (&'static str, fn(&Path), At);
+        let cases: [Case; 2] = [
+            ("forward links", forward, At::UnknownRange),
+            ("passed links", passed, At::Gone),
+        ];
+        for (name, build, expected) in cases {
+            let dir = tempfile::tempdir().expect("a temp dir");
+            let root = dir.path().to_path_buf();
+            build(&root);
+            std::fs::write(root.join("0.txt"), b"stale").expect("a stale file");
+            std::fs::write(root.join("zz.txt"), b"stale").expect("a stale file");
+
+            let walker = Walker::builder().follow_symlinks(true).build();
+            let local = LocalDestination::new(walker.local_walk(root.clone()), &root);
+            let mut walk = Walk::new(Scripted::of(&[]), local).with_roots(None, Some(root));
+            let mut most = 0;
+            let mut stale = Vec::new();
+            while let Some(next) = walk.next().await {
+                most = most.max(walk.src.gap.under.len());
+                let pairing = next.expect("the walk does not fail");
+                if pairing.key().ends_with(".txt") && !pairing.key().contains('/') {
+                    stale.push((pairing.key().to_string(), at(pairing.source())));
+                }
+            }
+            assert!(
+                most <= ALIASED_NAMES_HELD,
+                "{name}: {most} names held at once"
+            );
+            assert_eq!(
+                stale,
+                [
+                    ("0.txt".to_string(), expected),
+                    ("zz.txt".to_string(), expected)
+                ],
+                "{name}"
+            );
+        }
+    }
+
+    // A link the walk finds only after the merge reached its target leaves the plan incomplete,
+    // because a delete under the target may already have gone out. A key the target's name only
+    // extends, such as `link.txt` beside `link`, does not reach the target.
+    #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn a_link_found_after_the_merge_reached_its_target_leaves_the_plan_incomplete() {
+        use std::os::unix::fs::symlink;
+
+        fn late(root: &Path) {
+            std::fs::create_dir_all(root.join("real")).expect("a target");
+            std::fs::write(root.join("real/x.txt"), b"x").expect("a file");
+            std::fs::create_dir(root.join("z")).expect("a directory");
+            symlink("../real", root.join("z/link")).expect("a link");
+        }
+        fn beside(root: &Path) {
+            std::fs::create_dir_all(root.join("link")).expect("a target");
+            std::fs::write(root.join("link/x.txt"), b"x").expect("a file");
+            std::fs::write(root.join("link.txt"), b"x").expect("a file");
+            std::fs::create_dir(root.join("link.v2")).expect("a directory");
+            symlink("../link", root.join("link.v2/alias")).expect("a link");
+        }
+
+        type Case = (&'static str, fn(&Path), &'static [&'static str], bool);
+        let cases: [Case; 2] = [
+            ("z/link -> ../real", late, &["z/link/x.txt"], false),
+            (
+                "link.v2/alias -> ../link beside link.txt",
+                beside,
+                &["link.txt", "link.v2/alias/x.txt", "link/x.txt"],
+                true,
+            ),
+        ];
+        for (name, build, source, complete) in cases {
+            let dir = tempfile::tempdir().expect("a temp dir");
+            let root = dir.path().to_path_buf();
+            build(&root);
+            let walker = Walker::builder().follow_symlinks(true).build();
+            let local = LocalDestination::new(walker.local_walk(root.clone()), &root);
+            let mut walk = Walk::new(Scripted::of(source), local).with_roots(None, Some(root));
+            while let Some(next) = walk.next().await {
+                next.expect("the walk does not fail");
+            }
+            assert_eq!(walk.is_plan_complete(), complete, "{name}");
+        }
     }
 
     // A destination that exists and is not a directory is still fatal: nothing can be written
@@ -2446,8 +2923,9 @@ mod tests {
                     .build(),
             )
             .expect("an ordinary bucket builds");
-        assert!(
-            !walk.is_done(),
+        assert_eq!(
+            walk.progress(),
+            Progress::Pairing,
             "a walk that has read nothing has not finished"
         );
         // Without this the local side cannot turn a failure's path into a key, and one

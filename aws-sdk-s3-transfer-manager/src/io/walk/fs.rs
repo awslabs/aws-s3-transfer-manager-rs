@@ -33,6 +33,8 @@ struct ReadDirResult {
     children: Vec<Child>,
     // Non-fatal errors encountered reading individual entries.
     errors: Vec<WalkError>,
+    // The read records every link it followed to a directory or a regular file.
+    followed: Vec<FollowedLink>,
 }
 
 // How the walk is positioned. Which traversal a walk uses follows from its `SortOrder`: ordering
@@ -134,6 +136,23 @@ fn cmp_key_form(a: &Child, b: &Child) -> Ordering {
     }
 }
 
+// `PathFiltered` records what the path filter did to an entry's own name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PathFiltered {
+    Kept,
+    // The walk yields an excluded entry for a link only. A consumer that reads absence from the
+    // stream then learns that the link hides the keys under its name.
+    Excluded,
+}
+
+// `FollowedLink` records a symlink the walk followed, by what the link points at. When the target
+// sits inside the root, each file the link reaches arrives under two paths.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum FollowedLink {
+    Directory(PathBuf),
+    File(PathBuf),
+}
+
 /// One thing a filesystem walk found.
 ///
 /// Carries the absolute path, the path relative to the walk root, what the filesystem said is
@@ -150,6 +169,7 @@ pub struct FsEntry {
     // link points at. False for a path reached directly, and for a link left alone — which
     // `file_type` reports as `Symlink`.
     followed_symlink: bool,
+    path_filtered: PathFiltered,
     // The walk root, shared by every entry it produces. `relative_path` is a suffix of
     // `path`, so storing it separately would put a second copy of the whole path in
     // memory for every entry held — and a key-ordered walk holds the unconsumed
@@ -159,6 +179,10 @@ pub struct FsEntry {
 }
 
 impl FsEntry {
+    pub(crate) fn path_filtered(&self) -> PathFiltered {
+        self.path_filtered
+    }
+
     /// Absolute path to the file on the local filesystem.
     pub fn path(&self) -> &Path {
         &self.path
@@ -402,6 +426,7 @@ impl FsWalker {
             cursor,
             pending_errors,
             done,
+            followed: Vec::new(),
         }
     }
 }
@@ -547,6 +572,9 @@ impl FsWalkerBuilder {
     // Directories are not offered to it: skipping one would skip everything beneath,
     // and a rule written for a file's key says nothing about the keys under a folder
     // of a similar name.
+    //
+    // The filter judges each name on its own, so a link it rejects can still hide keys under its
+    // name. The walk yields such a link marked `PathFiltered::Excluded`, with no metadata.
     pub(crate) fn path_filter(mut self, f: impl Fn(&Path) -> bool + Send + Sync + 'static) -> Self {
         self.path_filter = Some(Arc::new(f));
         self
@@ -637,6 +665,10 @@ pub struct FsWalk {
     cursor: Cursor,
     pending_errors: VecDeque<WalkError>,
     done: bool,
+    // A `next` call records here every link it follows to a directory or a regular file, whether it
+    // returns an entry or an error. The call clears the record first, so a walk holds one call's
+    // links at most.
+    followed: Vec<FollowedLink>,
 }
 
 impl std::fmt::Debug for FsWalk {
@@ -658,6 +690,7 @@ impl FsWalk {
     ///   followed by more results as the walk continues.
     /// - `None` when the walk is complete.
     pub async fn next(&mut self) -> Option<Result<FsEntry, WalkError>> {
+        self.followed.clear();
         let mut read_a_directory = false;
         loop {
             if let Some(err) = self.pending_errors.pop_front() {
@@ -722,6 +755,7 @@ impl FsWalk {
             match self.read_dir(&dir.path, dir.depth, &dir.ancestor_handles) {
                 Ok(result) => {
                     self.pending_errors.extend(result.errors);
+                    self.followed.extend(result.followed);
                     match &mut self.cursor {
                         Cursor::Breadth {
                             pending_dirs,
@@ -810,6 +844,7 @@ impl FsWalk {
             },
             pending_errors: VecDeque::new(),
             done: false,
+            followed: Vec::new(),
         })
     }
 
@@ -856,6 +891,10 @@ impl FsWalk {
         }
     }
 
+    pub(crate) fn followed_links(&self) -> &[FollowedLink] {
+        &self.followed
+    }
+
     fn read_dir(
         &self,
         dir: &Path,
@@ -885,6 +924,7 @@ impl FsWalk {
         let mut result = ReadDirResult {
             children: Vec::new(),
             errors: Vec::new(),
+            followed: Vec::new(),
         };
 
         for entry in entries {
@@ -930,16 +970,12 @@ impl FsWalk {
 
             if file_type.is_symlink() {
                 if !self.config.follow_symlinks {
-                    if !rejected && self.config.include_special_files {
-                        // Nothing here describes what the link points at, because the walk did
-                        // not look. The metadata is the link's own, which is what `lstat` gave.
-                        self.push_entry(
-                            &mut result.children,
-                            path,
-                            entry.metadata().ok(),
-                            FileType::Symlink,
-                            false,
-                        );
+                    if rejected {
+                        self.push_excluded_link(&mut result.children, path);
+                    } else if self.config.include_special_files {
+                        // `DirEntry::metadata` would describe the link itself, so this entry carries
+                        // no target metadata.
+                        self.push_entry(&mut result.children, path, None, FileType::Symlink, false);
                     }
                     continue;
                 }
@@ -947,10 +983,14 @@ impl FsWalk {
                     Ok(m) => m,
                     Err(e) => {
                         match e.kind() {
-                            // A link pointing at nothing has no subtree to lose, so it is one
-                            // entry, and an excluded entry stays silent.
+                            // A dangling link can still stand for a directory, such as one on an
+                            // unmounted volume. The key stream costs the link as its name and every
+                            // key under it. The walk yields an excluded link marked, in place of a
+                            // failure.
                             std::io::ErrorKind::NotFound => {
-                                if !rejected {
+                                if rejected {
+                                    self.push_excluded_link(&mut result.children, path);
+                                } else {
                                     result.errors.push(WalkError::new(
                                         Some(path),
                                         WalkErrorKind::BrokenSymlink,
@@ -988,6 +1028,7 @@ impl FsWalk {
                                 continue;
                             }
                             if depth < self.config.max_depth {
+                                result.followed.push(FollowedLink::Directory(path.clone()));
                                 result.children.push(Child::Dir(PendingDir {
                                     path,
                                     depth: depth + 1,
@@ -1012,6 +1053,7 @@ impl FsWalk {
                     if rejected {
                         continue;
                     }
+                    result.followed.push(FollowedLink::File(path.clone()));
                     self.push_entry(
                         &mut result.children,
                         path,
@@ -1139,12 +1181,27 @@ impl FsWalk {
             path,
             file_type,
             followed_symlink,
+            path_filtered: PathFiltered::Kept,
             root: Arc::clone(&self.root),
             metadata,
         };
         if self.config.filter.as_ref().is_none_or(|f| f(&entry)) {
             children.push(Child::File(entry));
         }
+    }
+
+    // Yield a link whose own name the path filter excluded. The entry skips the entry filter,
+    // because the consumer drops the link before it acts on any entry. The walk skips the
+    // metadata read, so a rejected name still costs zero `stat` calls.
+    fn push_excluded_link(&self, children: &mut Vec<Child>, path: PathBuf) {
+        children.push(Child::File(FsEntry {
+            path,
+            file_type: FileType::Symlink,
+            followed_symlink: false,
+            path_filtered: PathFiltered::Excluded,
+            root: Arc::clone(&self.root),
+            metadata: None,
+        }));
     }
 
     // Whether the path filter rejects this entry. `push_file` is where rejection is
@@ -1398,6 +1455,51 @@ mod tests {
                 (PathBuf::from("real.txt"), FileType::Regular),
             ]
         );
+    }
+
+    #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn a_link_the_path_filter_excludes_arrives_marked() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join("real")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("real"), dir.path().join("photos")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("gone"), dir.path().join("dangling")).unwrap();
+        let excluding = |p: &Path| p != Path::new("photos") && p != Path::new("dangling");
+
+        for follow in [false, true] {
+            let marked = walker()
+                .follow_symlinks(follow)
+                .include_special_files(true)
+                .path_filter(excluding)
+                .build()
+                .walk(ctx(dir.path()));
+            let (entries, errors) = collect_entries(marked).await;
+            assert!(
+                errors.is_empty(),
+                "an excluded link reported a failure: {errors:?}"
+            );
+            assert!(
+                entries.iter().all(|e| e.metadata().is_none()),
+                "the walk read metadata for a name its path filter rejected"
+            );
+            let mut seen: Vec<_> = entries
+                .iter()
+                .map(|e| (norm(e.relative_path()), e.path_filtered()))
+                .collect();
+            seen.sort_by(|a, b| a.0.cmp(&b.0));
+            // With following on, the walk descends into the link to a real directory, so only the
+            // dangling link stands as a link. With following off, both links stand as links.
+            let expected: Vec<(String, PathFiltered)> = if follow {
+                vec![("dangling".to_string(), PathFiltered::Excluded)]
+            } else {
+                vec![
+                    ("dangling".to_string(), PathFiltered::Excluded),
+                    ("photos".to_string(), PathFiltered::Excluded),
+                ]
+            };
+            assert_eq!(seen, expected, "follow_symlinks({follow})");
+        }
     }
 
     #[cfg(unix)]
@@ -2260,6 +2362,62 @@ mod tests {
             errors.is_empty(),
             "non-cyclic duplicate should not produce errors"
         );
+    }
+
+    // A call records every link it follows to a directory or a file, across every directory it
+    // reads. A call that returns an error keeps its record. The walk records no cycle and no link the
+    // path filter excludes. The next call starts a new record.
+    #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn each_call_records_the_links_it_followed() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("root");
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(root.join("a/b")).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(root.join("a/b/x.txt"), "x").unwrap();
+        let link = |target: &Path, name: &str| {
+            std::os::unix::fs::symlink(target, root.join(name)).unwrap();
+        };
+        link(&outside, "l0");
+        link(&outside, "a/l1");
+        link(&outside, "a/b/l2");
+        link(&root.join("a/b/x.txt"), "y.txt");
+        link(&root.join("a/b/x.txt"), "z.txt");
+        link(&root, "self");
+
+        let mut walk = walker()
+            .recursive(true)
+            .sort(SortOrder::WholeWalk)
+            .follow_symlinks(true)
+            .path_filter(|p| p != Path::new("z.txt"))
+            .build()
+            .walk(ctx(&root));
+        let recorded = |walk: &FsWalk| {
+            let mut names: Vec<String> = walk
+                .followed_links()
+                .iter()
+                .map(|link| match link {
+                    FollowedLink::Directory(p) => {
+                        format!("{}/", norm(p.strip_prefix(&root).unwrap()))
+                    }
+                    FollowedLink::File(p) => norm(p.strip_prefix(&root).unwrap()),
+                })
+                .collect();
+            names.sort();
+            names
+        };
+
+        // The first call reads the root and returns the cycle that `self` makes.
+        let first = walk.next().await.unwrap();
+        assert_eq!(first.unwrap_err().kind(), WalkErrorKind::SymlinkCycle);
+        assert_eq!(recorded(&walk), ["l0/", "y.txt"]);
+
+        // The second call reads `a`, `a/b`, and the target of `a/b/l2` before it returns a file.
+        let second = walk.next().await.unwrap().unwrap();
+        assert_eq!(norm(second.relative_path()), "a/b/x.txt");
+        assert_eq!(recorded(&walk), ["a/b/l2/", "a/l1/"]);
     }
 
     #[cfg(unix)]

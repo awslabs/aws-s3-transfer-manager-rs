@@ -58,6 +58,35 @@ pub(crate) fn write_all_at(file: &File, buf: &mut impl Buf, offset: u64) -> io::
     sys::write_all_at(file, buf, offset)
 }
 
+/// Set the modification time of the file at `path` to `at`. The call blocks on `std::fs`, so the
+/// caller picks a thread that may block.
+pub(crate) fn set_modified_time(
+    path: &std::path::Path,
+    at: aws_smithy_types::DateTime,
+) -> io::Result<()> {
+    let secs = at.secs();
+    let nanos = at.subsec_nanos();
+    // `DateTime` can be before the epoch, so the function picks addition or subtraction before it
+    // builds the `SystemTime`.
+    let when = if secs >= 0 {
+        std::time::SystemTime::UNIX_EPOCH.checked_add(std::time::Duration::new(secs as u64, nanos))
+    } else {
+        std::time::SystemTime::UNIX_EPOCH
+            .checked_sub(std::time::Duration::new(secs.unsigned_abs(), 0))
+            .and_then(|t| t.checked_add(std::time::Duration::new(0, nanos)))
+    };
+    let Some(when) = when else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the time is outside what this platform can represent",
+        ));
+    };
+    File::options()
+        .write(true)
+        .open(path)?
+        .set_times(std::fs::FileTimes::new().set_modified(when))
+}
+
 /// Pre-allocate disk space for `file` so that at least `len` bytes can be
 /// written without triggering per-write metadata updates or late ENOSPC.
 ///
@@ -179,6 +208,25 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use bytes_utils::SegmentedBuf;
+
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn a_file_takes_the_modification_time_it_is_given() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("stamped.txt");
+        std::fs::write(&path, "x").expect("the file is written");
+
+        set_modified_time(&path, aws_smithy_types::DateTime::from_secs(1_600_000_000))
+            .expect("the time is set");
+
+        let modified = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .expect("the time reads back");
+        assert_eq!(
+            modified,
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000)
+        );
+    }
 
     #[test]
     fn write_all_at_single_segment() {

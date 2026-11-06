@@ -95,8 +95,13 @@ the first listing goes out and at the earliest point that knows the bucket's nam
 still serves a directory bucket, because an operation reading every key handed to it needs no
 order. **FR-Exec-5** wants a
 download to stamp the file with the object's time, and one of the comparisons below,
-`ExactTimestamps`, is only correct once something does. Nothing stamps it today, so on a download
-that comparison never reaches an equal pair and sends every key on every run. **FR-Fail-6** ends a
+`ExactTimestamps`, is only correct once something does.
+
+Comparison does not stamp a downloaded file. An unstamped file never matches its
+object, so each later run downloads it again. Execution stamps the temporary file
+before it renames the file. That lets a download reach an equal pair.
+
+**FR-Fail-6** ends a
 run when a root cannot be listed, and a download destination that does not exist yet is the one
 thing that looks like that case without being it: nothing was listed there because nothing is
 there, so every key the source holds is missing and the plan is whole. **FR-Dry-2** wants a dry

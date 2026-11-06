@@ -290,8 +290,17 @@ pub(crate) fn classify_upload_part_retry(ge: &GuardError<Error>) -> RetryDecisio
 /// inner retry only. The set mirrors the scheduler's throttle classifier
 /// (`scheduler::concurrency`).
 fn is_throttle(e: &Error) -> bool {
+    is_throttle_code(e.code())
+}
+
+/// Whether a service error code denotes throttling.
+///
+/// Split out from [`is_throttle`] for a caller holding a code without an [`Error`] around it:
+/// `DeleteObjects` reports a refusal per key inside a successful response, so the code arrives as a
+/// field rather than as a failed send. Sharing the set keeps one answer to what throttling is.
+pub(crate) fn is_throttle_code(code: Option<&str>) -> bool {
     matches!(
-        e.code(),
+        code,
         Some(
             "SlowDown"
                 | "Throttling"

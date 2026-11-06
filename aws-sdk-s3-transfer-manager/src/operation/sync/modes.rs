@@ -42,18 +42,7 @@ pub(crate) struct SizeAndTime;
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct SizeOnly;
 
-// Like `SizeAndTime`, except a download leaves a key alone only when the two times are exactly
-// equal, so an object written at any other second comes down. Uploads and copies keep
-// `SizeAndTime`'s rule.
-//
-// This mode cannot be used for downloads today, and choosing it costs a full re-transfer of
-// every key on every run. Equality becomes reachable once a download stamps the object's
-// last-modified time onto the file it writes.
-// Nothing here does that, so a downloaded file carries the time it was written, the two sides
-// never match, and every key is sent on every run — the case this mode is meant to cure.
-//
-// Uploading and copying can never reach it at all: S3 stamps its own time when it stores an
-// object and never carries the source's across. That is why those two keep the default rule.
+// Downloads require equal sizes and timestamps. Uploads and copies use `SizeAndTime`.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct ExactTimestamps;
 
@@ -95,6 +84,9 @@ macro_rules! picker {
     ($picker:ident, $source:ty, $destination:ty, $doc:literal) => {
         impl Mode {
             #[doc = $doc]
+            // `Send + Sync` because a comparison is held by a transfer, and the scheduler requires
+            // a transfer to be both. Every mode here is a unit struct, so this states what they
+            // already are.
             pub(crate) fn $picker(
                 &self,
             ) -> &'static (dyn Compare<$source, $destination> + Send + Sync) {
@@ -700,8 +692,6 @@ mod tests {
 
     #[tokio::test]
     async fn exact_timestamps_leaves_an_upload_the_default_rule_leaves() {
-        // This mode's upload impl, which no other test reaches. It delegates, so what it must show
-        // is that the delegation is wired: a newer object is left alone, as the default rule says.
         let (_dir, fs) = a_local_entry().await;
         assert_eq!(
             ExactTimestamps.compare(&uploading(local(1, 50, fs), object(1, 100))),

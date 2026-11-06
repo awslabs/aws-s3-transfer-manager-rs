@@ -528,10 +528,22 @@ impl S3Walk {
             req = req.max_keys(page_size);
         }
 
-        let output = req
-            .send()
-            .await
-            .map_err(|e| WalkError::new(None, WalkErrorKind::Service, Box::new(e)))?;
+        // Retried on throttling and transient transport failure. A service error here is fatal to the
+        // walk, so one dropped page costs every key after it — and a caller that consumed those keys
+        // as absent would be reading a hole as an answer.
+        let output = crate::retry::retry(crate::retry::classify_discovery_retry, |_| {
+            let req = req.clone();
+            async move {
+                // `Error::from` rather than wrapping by kind: only the conversion carries the
+                // service metadata across, and the classifier reads the service code to tell a
+                // throttle from a refusal.
+                req.send()
+                    .await
+                    .map_err(|e| crate::retry::GuardError::Inner(crate::error::Error::from(e)))
+            }
+        })
+        .await
+        .map_err(|e| WalkError::new(None, WalkErrorKind::Service, Box::new(e)))?;
 
         let mut objects: Vec<Object> = output.contents.unwrap_or_default();
         if let Some(ref filter) = self.config.filter {
@@ -620,6 +632,39 @@ mod tests {
             walk.next_token.as_deref(),
             Some("tok"),
             "the walk lost its position, so the next call would re-list the prefix"
+        );
+    }
+
+    // A throttled page is retried rather than ending the walk. A service error here is fatal, so a
+    // dropped page would cost every key after it, and a consumer reading position for absence would
+    // take that hole for an answer.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn a_throttled_page_is_asked_for_again() {
+        let throttled = mock!(aws_sdk_s3::Client::list_objects_v2).then_error(|| {
+            aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Error::generic(
+                aws_sdk_s3::error::ErrorMetadata::builder()
+                    .code("SlowDown")
+                    .message("slow down")
+                    .build(),
+            )
+        });
+        let answered = mock!(aws_sdk_s3::Client::list_objects_v2).then_output(|| {
+            ListObjectsV2Output::builder()
+                .set_contents(Some(vec![Object::builder().key("a.txt").build()]))
+                .build()
+        });
+        let client = mock_client!(aws_sdk_s3, RuleMode::Sequential, &[&throttled, &answered]);
+
+        let mut walk = walker().build().walk(s3ctx(client, "test-bucket"));
+        let mut keys = Vec::new();
+        while let Some(result) = walk.next().await {
+            keys.push(result.expect("the throttle ended the walk").key.unwrap());
+        }
+        assert_eq!(
+            keys,
+            vec!["a.txt"],
+            "the walk gave up on the first throttle instead of asking again"
         );
     }
 

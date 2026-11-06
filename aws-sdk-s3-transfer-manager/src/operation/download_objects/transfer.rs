@@ -11,15 +11,13 @@
 
 use aws_sdk_s3::types::Object;
 use parking_lot::Mutex;
-use path_clean::PathClean;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::error::{self, Error, ErrorKind};
-use crate::io::key::{replace_delim, strip_key_prefix};
 use crate::io::walk::S3Walk;
 use crate::operation::download::{Download, DownloadInput, ManagedDownloadHandle};
 use crate::transfer::{IoRequest, PollWork, Transfer, TransferContext, TransferId, WorkOutcome};
@@ -504,7 +502,7 @@ impl DownloadObjectsTransfer {
         key: &str,
         parent_id: u64,
     ) -> Result<ManagedDownloadHandle, Error> {
-        let dest_path = local_key_path(
+        let dest_path = crate::io::key::local_key_path(
             &self.inner.destination,
             key,
             self.inner.key_prefix.as_deref(),
@@ -929,49 +927,6 @@ impl Transfer for DownloadObjectsTransfer {
     fn on_terminal(&self) {}
 }
 
-/// Derive the local filesystem path for a given S3 key.
-///
-// TODO(vnext): two keys can end up as the same local file. `path_clean` sends `a//b`, `a/./b` and
-// `a/b` to one path, and a case-insensitive filesystem folds `Photos/x` onto `photos/x`, leaving a
-// download to write one file and report a success for each key. S3 GetObject keeps the keys apart
-// and serves each one by name, but preserving them as they are in a filename may not be allowed by
-// the OS, which collapses `//` to `/`. Currently the transfer manager preemptively normalizes them
-// to avoid a collision, but that shouldn't happen. If there is a collision, it is a write failure
-// and should follow the failure policy. `derive_object_key` breaks the same way in the other
-// direction, turning two local names into one key.
-// See https://github.com/awslabs/aws-s3-transfer-manager-rs/pull/184#discussion_r4149427294
-///
-/// Strips the configured prefix, replaces the delimiter with the OS path
-/// separator, joins with the destination root, normalizes via `path_clean`,
-/// and validates the result stays within the root (path traversal guard).
-pub(crate) fn local_key_path(
-    root_dir: &Path,
-    key: &str,
-    prefix: Option<&str>,
-    delimiter: Option<&str>,
-) -> Result<PathBuf, Error> {
-    let stripped = strip_key_prefix(key, prefix, delimiter);
-    let relative_path = replace_delim(stripped, delimiter, std::path::MAIN_SEPARATOR_STR);
-
-    let local_path = root_dir.join(relative_path.as_ref()).clean();
-    validate_path(root_dir, &local_path, key)?;
-
-    Ok(local_path)
-}
-
-fn validate_path(root_dir: &Path, local_path: &Path, key: &str) -> Result<(), Error> {
-    if !local_path.starts_with(root_dir) {
-        return Err(Error::new(
-            ErrorKind::InputInvalid,
-            format!(
-                "Unable to download key: '{key}', its relative path resolves \
-                 outside the target destination directory"
-            ),
-        ));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -981,6 +936,7 @@ mod tests {
     use aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output;
     use aws_sdk_s3::types::Object;
     use aws_smithy_mocks::{mock, mock_client, RuleMode};
+    use std::path::Path;
     use std::time::Duration;
     use tempfile::tempdir;
     use tokio::time::timeout;
@@ -1157,7 +1113,7 @@ mod tests {
             ),
         ];
         for (key, prefix, delim, expected) in cases {
-            let actual = local_key_path(root, key, *prefix, *delim);
+            let actual = crate::io::key::local_key_path(root, key, *prefix, *delim);
             match expected {
                 Ok(path) => {
                     let actual =
