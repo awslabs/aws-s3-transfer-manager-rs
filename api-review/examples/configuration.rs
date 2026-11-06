@@ -3,7 +3,7 @@
 //! Each function builds a client the way a customer would for one situation. `main` builds them all
 //! without sending requests.
 
-use aws_config::{BehaviorVersion, FrameworkMetadata, Region};
+use aws_config::{BehaviorVersion, FrameworkMetadata, Region, SdkConfig};
 use aws_sdk_s3::config::Credentials;
 use aws_sdk_s3_transfer_manager::types::{ConcurrencyMode, PartSize, ReadAhead};
 use aws_sdk_s3_transfer_manager::{Client, Config};
@@ -24,6 +24,28 @@ async fn tuned() -> Client {
         .concurrency(ConcurrencyMode::Explicit(64))
         .load()
         .await;
+    Client::new(config)
+}
+
+/// Organization-wide AWS settings, as an `aws-config` loader that callers extend.
+fn org_aws_config() -> aws_config::ConfigLoader {
+    aws_config::defaults(BehaviorVersion::latest()).region(Region::new("us-west-2"))
+}
+
+/// Organization-wide transfer tuning on top of whatever AWS configuration the caller loaded.
+fn org_transfer_config(sdk_config: &SdkConfig) -> aws_sdk_s3_transfer_manager::config::Builder {
+    Config::builder()
+        .s3_config(sdk_config)
+        .part_size(PartSize::Target(16 * MIB))
+        .concurrency(ConcurrencyMode::Explicit(64))
+}
+
+/// A team extends both organization defaults.
+async fn team_client() -> Client {
+    let sdk_config = org_aws_config().profile_name("team-a").load().await;
+    let config = org_transfer_config(&sdk_config)
+        .multipart_threshold(PartSize::Target(64 * MIB))
+        .build();
     Client::new(config)
 }
 
@@ -124,6 +146,7 @@ async fn lifecycle(client: Client) {
 async fn main() {
     lifecycle(defaults().await).await;
     lifecycle(tuned().await).await;
+    lifecycle(team_client().await).await;
     lifecycle(client_read_ahead_default().await).await;
     lifecycle(region_profile_credentials().await).await;
     let (s3, tm) = shared_with_sdk_client().await;
