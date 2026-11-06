@@ -12,7 +12,7 @@
 use parking_lot::Mutex;
 use path_clean::PathClean;
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{hash_map::Entry, HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -266,6 +266,9 @@ struct DownloadObjectsTransferInner {
     /// Directories already created (dedup `create_dir_all` across children
     /// that share a prefix; objects in the same S3 "folder" map to one dir).
     created_dirs: Mutex<HashSet<PathBuf>>,
+    /// Destination paths already claimed, relative to `destination` and keyed by
+    /// `path_identity`, mapped to the key that claimed each one.
+    claimed_paths: Mutex<HashMap<PathBuf, String>>,
 }
 
 impl DownloadObjectsTransfer {
@@ -302,6 +305,7 @@ impl DownloadObjectsTransfer {
                 failure_policy,
                 pipeline_depth,
                 created_dirs: Mutex::new(HashSet::new()),
+                claimed_paths: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -518,6 +522,24 @@ impl DownloadObjectsTransfer {
             self.inner.key_prefix.as_deref(),
             self.inner.delimiter.as_deref(),
         )?;
+        match self.inner.claimed_paths.lock().entry(path_identity(
+            dest_path
+                .strip_prefix(&self.inner.destination)
+                .expect("local_key_path validated containment"),
+        )) {
+            Entry::Occupied(e) => {
+                return Err(Error::new(
+                    ErrorKind::InputInvalid,
+                    format!(
+                        "Unable to download key: '{key}', it maps to the same local path as key '{}'",
+                        e.get()
+                    ),
+                ));
+            }
+            Entry::Vacant(e) => {
+                e.insert(key.to_string());
+            }
+        }
 
         // Create parent directories, deduped via created_dirs so we don't
         // re-stat the whole ancestor chain for every object sharing a prefix
@@ -980,6 +1002,16 @@ pub(crate) fn local_key_path(
     validate_path(root_dir, &local_path, key)?;
 
     Ok(local_path)
+}
+
+/// The identity of `path` on the destination filesystem: case-folded on platforms whose
+/// default filesystems are case-insensitive.
+fn path_identity(path: &Path) -> PathBuf {
+    if cfg!(any(target_os = "macos", target_os = "windows")) {
+        PathBuf::from(path.to_string_lossy().to_lowercase())
+    } else {
+        path.to_path_buf()
+    }
 }
 
 fn validate_path(root_dir: &Path, local_path: &Path, key: &str) -> Result<(), Error> {
@@ -1447,6 +1479,67 @@ mod tests {
         assert_eq!(transfer.successful_downloads(), 2);
         assert!(dir.path().join("photos/2023/jan/img.jpg").exists());
         assert!(dir.path().join("docs/readme.txt").exists());
+    }
+
+    /// Of two keys that map to one local path, the second fails and the first's bytes are
+    /// published.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_keys_mapping_to_one_path_download_once() {
+        let cases = [
+            ["a//b", "a/b"],
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            ["a/B", "a/b"],
+        ];
+        for [first, second] in cases {
+            let dir = tempdir().unwrap();
+            let list = mock!(aws_sdk_s3::Client::list_objects_v2).then_output(move || {
+                ListObjectsV2Output::builder()
+                    .set_contents(Some(vec![
+                        Object::builder().key(first).size(5).build(),
+                        Object::builder().key(second).size(5).build(),
+                    ]))
+                    .build()
+            });
+            let get = |key: &'static str, body: &'static [u8]| {
+                mock!(aws_sdk_s3::Client::get_object)
+                    .match_requests(move |req| req.key() == Some(key))
+                    .then_output(move || {
+                        GetObjectOutput::builder()
+                            .content_length(5)
+                            .body(aws_sdk_s3::primitives::ByteStream::from_static(body))
+                            .build()
+                    })
+            };
+            let client = mock_client!(
+                aws_sdk_s3,
+                RuleMode::MatchAny,
+                &[list, get(first, b"first"), get(second, b"other")]
+            );
+
+            let (transfer, completion_rx) =
+                setup(dir.path(), FailedTransferPolicy::Continue, client);
+
+            timeout(Duration::from_secs(10), async {
+                drive_transfer(&transfer).await;
+                let _ = completion_rx.await;
+            })
+            .await
+            .expect("transfer should complete within timeout");
+
+            assert_eq!(transfer.successful_downloads(), 1, "key={second:?}");
+            let failed = transfer.take_failed().unwrap();
+            assert_eq!(failed.len(), 1, "key={second:?}");
+            assert_eq!(failed[0].input().key(), Some(second));
+            assert_eq!(failed[0].error().kind(), &ErrorKind::InputInvalid);
+            let message = std::error::Error::source(failed[0].error())
+                .unwrap()
+                .to_string();
+            assert!(message.contains(&format!("'{first}'")), "{message}");
+            let published = dir.path().join(first.replace("//", "/"));
+            assert_eq!(std::fs::read(published).unwrap(), b"first");
+            assert_eq!(std::fs::read_dir(dir.path().join("a")).unwrap().count(), 1);
+        }
     }
 
     #[cfg_attr(miri, ignore)]

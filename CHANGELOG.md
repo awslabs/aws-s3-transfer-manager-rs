@@ -5,6 +5,17 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [vNext] - Unreleased
+
+### Fixed
+- `upload_objects` and `download_objects` could map two inputs to one output and report both as
+  uploaded or downloaded while the later write replaced the earlier one. `upload_objects` now fails a
+  file whose key another file already derived, such as names that aren't valid Unicode and differ
+  only in those bytes, or `a-/b` and `a/-b` with the delimiter `--`. `download_objects` now fails a
+  key whose local path another key already claimed, such as `a//b` and `a/b`, or keys that differ
+  only by case on macOS and Windows. The failure has `ErrorKind::InputInvalid`, names the other
+  input, and follows the `FailedTransferPolicy`.
+
 ## [release-2026-11-05]
 
 ### Added

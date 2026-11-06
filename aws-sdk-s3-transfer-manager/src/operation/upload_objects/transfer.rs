@@ -6,7 +6,7 @@
 //! State machine for plural upload (`upload_objects`).
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{hash_map::Entry, BTreeMap, HashMap, VecDeque};
 use std::fmt;
 use std::future::Future;
 use std::path::{PathBuf, MAIN_SEPARATOR, MAIN_SEPARATOR_STR};
@@ -376,6 +376,8 @@ struct State {
     reaping_in_flight: usize,
     failed: Vec<FailedUpload>,
     successful_uploads: u64,
+    /// Keys already derived, mapped to the file that derived each one.
+    derived_keys: HashMap<String, PathBuf>,
 }
 
 impl State {
@@ -440,6 +442,7 @@ impl UploadObjectsTransfer {
                 children_reserved: 0,
                 reaping_in_flight: 0,
                 failed: Vec::new(),
+                derived_keys: HashMap::new(),
                 successful_uploads: 0,
             }),
         });
@@ -716,6 +719,19 @@ impl UploadObjectsTransfer {
                     continue;
                 }
             };
+
+            if let Err(e) = claim_key(&mut state.derived_keys, &key, entry.path()) {
+                state.failed.push(FailedUpload {
+                    input: None,
+                    error: e,
+                    source_path: Some(entry.path().to_path_buf()),
+                });
+                if *self.failure_policy() == FailedTransferPolicy::Abort {
+                    self.abort(state, "key conflict");
+                    return SpawnDecision::Abort;
+                }
+                continue;
+            }
 
             let input = UploadInput::builder()
                 .bucket(bucket)
@@ -1252,6 +1268,25 @@ impl Transfer for UploadObjectsTransfer {
     fn on_terminal(&self) {}
 }
 
+/// Record that `path` derived `key`, failing when another file already derived it.
+fn claim_key(
+    derived_keys: &mut HashMap<String, PathBuf>,
+    key: &str,
+    path: &std::path::Path,
+) -> Result<(), error::Error> {
+    match derived_keys.entry(key.to_owned()) {
+        Entry::Occupied(e) => Err(error::invalid_input(format!(
+            "`{}` derives key `{key}`, already derived from `{}`",
+            path.display(),
+            e.get().display()
+        ))),
+        Entry::Vacant(e) => {
+            e.insert(path.to_path_buf());
+            Ok(())
+        }
+    }
+}
+
 /// Derive the S3 object key for a file at `relative_filename` inside the walk root.
 ///
 /// The key is formed by optionally prepending a prefix and substituting the
@@ -1570,6 +1605,111 @@ mod tests {
                 "photos/2024/top.txt".to_string(),
             ]
         );
+    }
+
+    /// Of two files that derive one key, the second fails without uploading.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_files_deriving_one_key_upload_once() {
+        // (file names, delimiter, key both derive, policy)
+        let delimited = [std::path::Path::new("a-/b"), std::path::Path::new("a/-b")];
+        // APFS rejects file names that are not valid UTF-8.
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let lossy = |b: &'static [u8]| {
+            use std::os::unix::ffi::OsStrExt;
+            std::path::Path::new(std::ffi::OsStr::from_bytes(b))
+        };
+        let cases = [
+            (
+                delimited,
+                Some("--"),
+                "a---b",
+                FailedTransferPolicy::Continue,
+            ),
+            (delimited, Some("--"), "a---b", FailedTransferPolicy::Abort),
+            #[cfg(all(unix, not(target_os = "macos")))]
+            (
+                [lossy(b"caf\xe9"), lossy(b"caf\xe8")],
+                None,
+                "caf\u{fffd}",
+                FailedTransferPolicy::Continue,
+            ),
+        ];
+        for (names, delimiter, key, policy) in cases {
+            let dir = tempdir().unwrap();
+            for name in names {
+                let path = dir.path().join(name);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, "x").unwrap();
+            }
+
+            let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let captured_cl = captured.clone();
+            let put = mock!(aws_sdk_s3::Client::put_object)
+                .match_requests(move |req| {
+                    captured_cl
+                        .lock()
+                        .unwrap()
+                        .push(req.key().unwrap().to_string());
+                    true
+                })
+                .then_output(|| PutObjectOutput::builder().e_tag("test-etag").build());
+            let s3_client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[put]);
+            let handle = crate::client::Handle::test_handle_tokio(
+                crate::Config::builder().sdk_client(s3_client).build(),
+            );
+
+            let input = super::super::UploadObjectsInputBuilder::default()
+                .bucket("test-bucket")
+                .source(dir.path())
+                .failure_policy(policy.clone())
+                .set_delimiter(delimiter.map(str::to_string))
+                .build()
+                .unwrap();
+            let walker = FsWalker::builder()
+                .recursive(true)
+                .build()
+                .walk(FsWalkContext::builder().root(dir.path()).build());
+
+            let (ctx, completion_rx) = TransferContext::new(handle);
+            let transfer = UploadObjectsTransfer::new(ctx, input, walker);
+            transfer
+                .inner
+                .ctx
+                .handle
+                .scheduler
+                .register_empty_group_for_test(transfer.inner.ctx.id.id);
+
+            timeout(Duration::from_secs(5), async {
+                drive_transfer(&transfer).await;
+                let _ = completion_rx.await;
+            })
+            .await
+            .expect("transfer should complete within timeout");
+
+            let abort = policy == FailedTransferPolicy::Abort;
+            assert_eq!(transfer.ctx().is_failed(), abort, "key={key:?}");
+            let failed = transfer.take_failed();
+            assert_eq!(failed.len(), 1, "key={key:?}");
+            assert_eq!(
+                failed[0].error().kind(),
+                &crate::error::ErrorKind::InputInvalid
+            );
+            let message = std::error::Error::source(failed[0].error())
+                .unwrap()
+                .to_string();
+            let failed_path = failed[0].source_path().unwrap();
+            let other = names
+                .iter()
+                .map(|n| dir.path().join(n).components().collect::<PathBuf>())
+                .find(|p| p != failed_path)
+                .unwrap();
+            assert!(message.contains(&other.display().to_string()), "{message}");
+            if !abort {
+                assert_eq!(transfer.successful_uploads(), 1, "key={key:?}");
+                assert_eq!(*captured.lock().unwrap(), [key], "key={key:?}");
+            }
+        }
     }
 
     #[cfg(unix)]
