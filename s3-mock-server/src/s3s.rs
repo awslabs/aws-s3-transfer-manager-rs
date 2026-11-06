@@ -184,18 +184,7 @@ impl<S: StorageBackend + 'static> Inner<S> {
             .client_checksums
             .take()
             .expect("PutObject requests carry the client's checksums");
-        let checksum_algorithm = [
-            (client_checksums.crc32.is_some(), ChecksumAlgorithm::Crc32),
-            (client_checksums.crc32c.is_some(), ChecksumAlgorithm::Crc32c),
-            (
-                client_checksums.crc64nvme.is_some(),
-                ChecksumAlgorithm::Crc64Nvme,
-            ),
-            (client_checksums.sha1.is_some(), ChecksumAlgorithm::Sha1),
-            (client_checksums.sha256.is_some(), ChecksumAlgorithm::Sha256),
-        ]
-        .into_iter()
-        .find_map(|(present, algorithm)| present.then_some(algorithm));
+        let checksum_algorithm = client_checksums.algorithms().first().copied();
         let precondition = std::mem::take(&mut request.precondition);
 
         let mut content = BytesMut::new();
@@ -487,7 +476,10 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         // The object can be replaced between the lookup above and this read: the condition must
         // also hold for the object whose data is returned.
         check_if_match(input.if_match.as_ref(), &stream_metadata)?;
-        if let Some(part_number) = input.part_number {
+        if let Some(part_number) = input
+            .part_number
+            .filter(|_| !reports_object_checksum(bucket, &metadata, range.as_ref()))
+        {
             stream_metadata.apply_part_checksums(part_number);
         }
         if omits_part_checksums(bucket, &metadata, input.part_number, range.as_ref()) {
@@ -613,7 +605,9 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         let checksum_type = stored_checksum_type(&metadata);
         let omit_checksums =
             omits_part_checksums(bucket, &metadata, input.part_number, range.as_ref());
+        let object_checksum = reports_object_checksum(bucket, &metadata, range.as_ref());
         match (input.part_number, range.as_ref()) {
+            (Some(_), _) if object_checksum => {}
             (Some(part_number), _) => metadata.apply_part_checksums(part_number),
             (None, Some(r)) => metadata.apply_range_checksums(r.start, r.end),
             (None, None) => {}
@@ -859,6 +853,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             user_metadata,
             storage_class,
             checksum_algorithm: Some(checksum_algorithm),
+            part_checksums: input.checksum_algorithm.is_some(),
             ..Default::default()
         };
         let request = crate::storage::CreateMultipartUploadRequest {
@@ -963,7 +958,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             upload_id,
             part_number,
             content,
-            client_checksum: client_checksums.has_any(),
+            client_checksum_algorithms: client_checksums.algorithms(),
         };
         let response = self.storage.upload_part(request).await?;
 
@@ -973,14 +968,41 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             unreachable!("pending future never resolves");
         }
 
-        // Build response with checksums
+        // The response reports the part's checksum in the algorithm of its upload, if the upload
+        // was created with one, and, in a general purpose bucket, the checksums the request
+        // carried.
+        let stored = response.checksums.unwrap_or_default();
+        let echo = BucketType::of(&input.bucket) == BucketType::GeneralPurpose;
+        let reported = |stored: Option<String>, sent: bool, calculated: Option<String>| {
+            stored.or(calculated.filter(|_| echo && sent))
+        };
         let output = s3s::dto::UploadPartOutput {
             e_tag: Some(etag_from_quoted(&response.etag)),
-            checksum_crc32: calculated_integrity.crc32,
-            checksum_crc32c: calculated_integrity.crc32c,
-            checksum_sha1: calculated_integrity.sha1,
-            checksum_sha256: calculated_integrity.sha256,
-            checksum_crc64nvme: calculated_integrity.crc64nvme,
+            checksum_crc32: reported(
+                stored.crc32,
+                client_checksums.crc32.is_some(),
+                calculated_integrity.crc32,
+            ),
+            checksum_crc32c: reported(
+                stored.crc32c,
+                client_checksums.crc32c.is_some(),
+                calculated_integrity.crc32c,
+            ),
+            checksum_sha1: reported(
+                stored.sha1,
+                client_checksums.sha1.is_some(),
+                calculated_integrity.sha1,
+            ),
+            checksum_sha256: reported(
+                stored.sha256,
+                client_checksums.sha256.is_some(),
+                calculated_integrity.sha256,
+            ),
+            checksum_crc64nvme: reported(
+                stored.crc64nvme,
+                client_checksums.crc64nvme.is_some(),
+                calculated_integrity.crc64nvme,
+            ),
             ..Default::default()
         };
 
@@ -1007,8 +1029,18 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
 
         // Extract part information
         let mut parts = Vec::new();
+        let mut listed_part_checksum = None;
         if let Some(completed_parts) = input.multipart_upload.and_then(|u| u.parts) {
             for part in completed_parts {
+                listed_part_checksum = listed_part_checksum.or([
+                    ("crc32", part.checksum_crc32.is_some()),
+                    ("crc32c", part.checksum_crc32c.is_some()),
+                    ("crc64nvme", part.checksum_crc64nvme.is_some()),
+                    ("sha1", part.checksum_sha1.is_some()),
+                    ("sha256", part.checksum_sha256.is_some()),
+                ]
+                .into_iter()
+                .find_map(|(algorithm, listed)| listed.then_some(algorithm)));
                 let part_number = part.part_number.ok_or(Error::MalformedXml)?;
                 let etag = part.e_tag.ok_or(Error::MalformedXml)?;
                 parts.push((part_number, format!("\"{}\"", etag.value())));
@@ -1074,6 +1106,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             } else {
                 None
             },
+            listed_part_checksum,
         };
         let response = self.storage.complete_multipart_upload(request).await?;
 
@@ -1464,10 +1497,15 @@ fn part_number_range(
     }
 }
 
-/// Whether a GetObject or HeadObject of part of `metadata`'s object (a `part_number`, or a
-/// `range` other than the whole object) returns no checksum, as in S3: for the parts of a
-/// multipart object uploaded without part checksums, and, in general purpose buckets, for those
-/// of a multipart object with a full-object checksum.
+/// Whether a GetObject or HeadObject of part of `metadata`'s object (by `part_number`, or by a
+/// `range` other than the whole object) returns no checksum. It returns none for a part of a
+/// multipart object:
+/// - whose upload was created without a checksum algorithm, even if its parts were uploaded with
+///   checksums;
+/// - with a full-object checksum, in a general purpose bucket.
+///
+/// In a general purpose bucket, a part that is the whole object of an object with a full-object
+/// checksum reports the object's checksum in both cases ([`reports_object_checksum`]).
 fn omits_part_checksums(
     bucket: &str,
     metadata: &ObjectMetadata,
@@ -1476,13 +1514,31 @@ fn omits_part_checksums(
 ) -> bool {
     let partial = part_number.is_some()
         || range.is_some_and(|range| range.start != 0 || range.end != metadata.content_length);
-    let full_object_in_general_purpose = BucketType::of(bucket) == BucketType::GeneralPurpose
-        && stored_checksum_type(metadata)
-            .is_some_and(|t| t.as_str() == s3s::dto::ChecksumType::FULL_OBJECT);
     partial
         && !metadata.parts.is_empty()
-        && (full_object_in_general_purpose
-            || metadata.parts.iter().any(|part| !part.client_checksum))
+        && (full_object_in_general_purpose(bucket, metadata) || !metadata.part_checksums)
+        && !reports_object_checksum(bucket, metadata, range)
+}
+
+/// Whether a partNumber read of `range` of `metadata`'s object reports the object's checksum: in a
+/// general purpose bucket, when the object is a multipart object with a full-object checksum and
+/// the part is the whole object, as part 1 of a one-part object is.
+fn reports_object_checksum(
+    bucket: &str,
+    metadata: &ObjectMetadata,
+    range: Option<&std::ops::Range<u64>>,
+) -> bool {
+    !metadata.parts.is_empty()
+        && full_object_in_general_purpose(bucket, metadata)
+        && range.is_some_and(|range| range.start == 0 && range.end == metadata.content_length)
+}
+
+/// Whether `metadata`'s object, in `bucket`, is in a general purpose bucket and has a full-object
+/// checksum.
+fn full_object_in_general_purpose(bucket: &str, metadata: &ObjectMetadata) -> bool {
+    BucketType::of(bucket) == BucketType::GeneralPurpose
+        && stored_checksum_type(metadata)
+            .is_some_and(|t| t.as_str() == s3s::dto::ChecksumType::FULL_OBJECT)
 }
 
 /// Add the checksums in the trailer of an `aws-chunked` body to `checksums`: s3s keeps them out of

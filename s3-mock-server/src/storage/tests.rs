@@ -67,7 +67,7 @@ async fn test_multipart_streaming_comprehensive<S: StorageBackend>(storage: &S) 
         upload_id,
         part_number: 1,
         content: part1.clone(),
-        client_checksum: false,
+        client_checksum_algorithms: vec![],
     };
     let etag1 = storage.upload_part(request1).await.unwrap().etag;
 
@@ -75,7 +75,7 @@ async fn test_multipart_streaming_comprehensive<S: StorageBackend>(storage: &S) 
         upload_id,
         part_number: 2,
         content: part2.clone(),
-        client_checksum: false,
+        client_checksum_algorithms: vec![],
     };
     let etag2 = storage.upload_part(request2).await.unwrap().etag;
 
@@ -83,7 +83,7 @@ async fn test_multipart_streaming_comprehensive<S: StorageBackend>(storage: &S) 
         upload_id,
         part_number: 3,
         content: part3.clone(),
-        client_checksum: false,
+        client_checksum_algorithms: vec![],
     };
     let etag3 = storage.upload_part(request3).await.unwrap().etag;
 
@@ -93,6 +93,7 @@ async fn test_multipart_streaming_comprehensive<S: StorageBackend>(storage: &S) 
         upload_id,
         parts: vec![(1, etag1), (2, etag2), (3, etag3)],
         client_checksums: None,
+        listed_part_checksum: None,
     };
     storage
         .complete_multipart_upload(complete_request)
@@ -722,7 +723,7 @@ async fn test_in_memory_append_part_limit_counts_multipart_parts() {
             upload_id,
             part_number,
             content: Bytes::from_static(b"p"),
-            client_checksum: false,
+            client_checksum_algorithms: vec![],
         };
         parts.push((
             part_number,
@@ -735,6 +736,7 @@ async fn test_in_memory_append_part_limit_counts_multipart_parts() {
             upload_id,
             parts,
             client_checksums: None,
+            listed_part_checksum: None,
         })
         .await
         .unwrap();

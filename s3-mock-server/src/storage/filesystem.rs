@@ -331,6 +331,7 @@ impl StorageBackend for FilesystemStorage {
             parts: Vec::new(),
             append_segments: Vec::new(),
             append_parts: 0,
+            part_checksums: false,
             restore_status: request.restore_status,
         };
         let metadata_path = self.get_object_metadata_path(&request.bucket, &request.key);
@@ -474,6 +475,7 @@ impl StorageBackend for FilesystemStorage {
         let mut upload_metadata: MultipartUploadMetadata = Self::load_metadata(&metadata_path)
             .await?
             .ok_or(Error::NoSuchUpload)?;
+        request.check_checksum(&upload_metadata)?;
 
         let checksum_algorithm = upload_metadata.metadata.checksum_algorithm;
 
@@ -484,7 +486,6 @@ impl StorageBackend for FilesystemStorage {
         let mut part_metadata = PartMetadata {
             etag: etag.clone(),
             size: request.content.len() as u64,
-            client_checksum: request.client_checksum,
             ..Default::default()
         };
 
@@ -531,12 +532,16 @@ impl StorageBackend for FilesystemStorage {
         Self::save_metadata(&part_metadata_path, &part_metadata).await?;
 
         // Update the upload metadata
+        let checksums = upload_metadata
+            .metadata
+            .part_checksums
+            .then(|| part_metadata.clone());
         upload_metadata
             .parts
             .insert(request.part_number, part_metadata);
         Self::save_metadata(&metadata_path, &upload_metadata).await?;
 
-        Ok(crate::storage::UploadPartResponse { etag })
+        Ok(crate::storage::UploadPartResponse { etag, checksums })
     }
 
     async fn list_parts(&self, upload_id: &str) -> Result<Vec<crate::storage::PartInfo>> {
@@ -576,6 +581,7 @@ impl StorageBackend for FilesystemStorage {
         let upload_metadata: MultipartUploadMetadata = Self::load_metadata(&metadata_path)
             .await?
             .ok_or(Error::NoSuchUpload)?;
+        request.check_listed_part_checksums(&upload_metadata)?;
 
         let bucket = upload_metadata.bucket.as_deref().unwrap_or(request.bucket);
         self.require_bucket(bucket).await?;
@@ -707,7 +713,6 @@ impl StorageBackend for FilesystemStorage {
             .iter()
             .map(|(_, pm)| ObjectPart {
                 size: pm.size,
-                client_checksum: pm.client_checksum,
                 crc32: pm.crc32.clone(),
                 crc32c: pm.crc32c.clone(),
                 crc64nvme: pm.crc64nvme.clone(),
@@ -1082,14 +1087,14 @@ mod tests {
             upload_id,
             part_number: 1,
             content: part1.clone(),
-            client_checksum: false,
+            client_checksum_algorithms: vec![],
         };
         let etag1 = storage.upload_part(request1).await.unwrap();
         let request2 = crate::storage::UploadPartRequest {
             upload_id,
             part_number: 2,
             content: part2.clone(),
-            client_checksum: false,
+            client_checksum_algorithms: vec![],
         };
         let etag2 = storage.upload_part(request2).await.unwrap();
 
@@ -1103,6 +1108,7 @@ mod tests {
             upload_id,
             parts: parts_to_complete,
             client_checksums: None,
+            listed_part_checksum: None,
         };
         let response = storage.complete_multipart_upload(request).await.unwrap();
 
@@ -1147,7 +1153,7 @@ mod tests {
             upload_id,
             part_number: 1,
             content: part1,
-            client_checksum: false,
+            client_checksum_algorithms: vec![],
         };
         let etag1 = storage.upload_part(request).await.unwrap();
 
@@ -1157,6 +1163,7 @@ mod tests {
             upload_id,
             parts: parts_to_complete,
             client_checksums: None,
+            listed_part_checksum: None,
         };
         let result = storage.complete_multipart_upload(request).await;
         assert!(result.is_err());
@@ -1185,7 +1192,7 @@ mod tests {
             upload_id,
             part_number: 1,
             content: part1,
-            client_checksum: false,
+            client_checksum_algorithms: vec![],
         };
         storage.upload_part(request).await.unwrap();
 

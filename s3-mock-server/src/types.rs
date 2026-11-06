@@ -37,6 +37,21 @@ pub struct ClientChecksums {
 }
 
 impl ClientChecksums {
+    /// The algorithms of the checksums the request carries.
+    pub fn algorithms(&self) -> Vec<aws_smithy_checksums::ChecksumAlgorithm> {
+        use aws_smithy_checksums::ChecksumAlgorithm;
+        [
+            (&self.crc32, ChecksumAlgorithm::Crc32),
+            (&self.crc32c, ChecksumAlgorithm::Crc32c),
+            (&self.crc64nvme, ChecksumAlgorithm::Crc64Nvme),
+            (&self.sha1, ChecksumAlgorithm::Sha1),
+            (&self.sha256, ChecksumAlgorithm::Sha256),
+        ]
+        .into_iter()
+        .filter_map(|(value, algorithm)| value.is_some().then_some(algorithm))
+        .collect()
+    }
+
     pub fn has_any(&self) -> bool {
         self.crc32.is_some()
             || self.crc32c.is_some()

@@ -278,9 +278,9 @@ async fn test_listing() -> Result {
     Ok(())
 }
 
-/// A range or partNumber read of part of a multipart object with a full-object checksum, uploaded
-/// with part checksums, returns the part's checksum in a directory bucket, as S3 does (general
-/// purpose buckets return none); a read of the whole object returns the object's checksum.
+/// In a directory bucket, a range or partNumber read of part of a multipart object with a
+/// full-object checksum, whose upload was created with a checksum algorithm, returns the part's
+/// checksum. A read of the whole object returns the object's checksum.
 #[tokio::test]
 async fn test_part_checksums_of_full_object_multipart_objects() -> Result {
     use aws_sdk_s3::types::{
@@ -357,14 +357,18 @@ async fn test_part_checksums_of_full_object_multipart_objects() -> Result {
     Ok(())
 }
 
-/// A read of part of a multipart object whose parts were uploaded without checksums returns no
-/// checksum, as in S3, although the object has a full-object checksum.
-#[tokio::test]
-async fn test_no_part_checksums_for_parts_uploaded_without_them() -> Result {
+/// Upload `parts` to `key` of `bucket` in a multipart upload created with `algorithm` (none if
+/// `None`), each part with a CRC64NVME checksum if its flag is set.
+async fn upload_mixed(
+    s3: &Client,
+    bucket: &str,
+    key: &str,
+    algorithm: Option<aws_sdk_s3::types::ChecksumAlgorithm>,
+    parts: &[(&'static [u8], bool)],
+) -> Result {
     use aws_sdk_s3::config::RequestChecksumCalculation;
-    use aws_sdk_s3::types::{ChecksumMode, CompletedMultipartUpload, CompletedPart};
-    let (_server, _handle, s3) = setup(S3MockServer::builder()).await;
-    let s3 = aws_sdk_s3::Client::from_conf(
+    use aws_sdk_s3::types::ChecksumAlgorithm;
+    let unchecked = Client::from_conf(
         s3.config()
             .to_builder()
             .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
@@ -372,18 +376,24 @@ async fn test_no_part_checksums_for_parts_uploaded_without_them() -> Result {
     );
     let upload_id = s3
         .create_multipart_upload()
-        .bucket(DIRECTORY)
-        .key("mpu")
+        .bucket(bucket)
+        .key(key)
+        .set_checksum_algorithm(algorithm)
         .send()
         .await?
         .upload_id
         .unwrap();
     let mut completed = Vec::new();
-    for (i, part) in [&b"first part"[..], b"second"].into_iter().enumerate() {
-        let out = s3
-            .upload_part()
-            .bucket(DIRECTORY)
-            .key("mpu")
+    for (i, (part, with_checksum)) in parts.iter().enumerate() {
+        let request = if *with_checksum {
+            s3.upload_part()
+                .checksum_algorithm(ChecksumAlgorithm::Crc64Nvme)
+        } else {
+            unchecked.upload_part()
+        };
+        let out = request
+            .bucket(bucket)
+            .key(key)
             .upload_id(&upload_id)
             .part_number(i as i32 + 1)
             .body(ByteStream::from_static(part))
@@ -393,12 +403,13 @@ async fn test_no_part_checksums_for_parts_uploaded_without_them() -> Result {
             CompletedPart::builder()
                 .part_number(i as i32 + 1)
                 .e_tag(out.e_tag.unwrap())
+                .set_checksum_crc64_nvme(out.checksum_crc64_nvme)
                 .build(),
         );
     }
     s3.complete_multipart_upload()
-        .bucket(DIRECTORY)
-        .key("mpu")
+        .bucket(bucket)
+        .key(key)
         .upload_id(&upload_id)
         .multipart_upload(
             CompletedMultipartUpload::builder()
@@ -407,15 +418,339 @@ async fn test_no_part_checksums_for_parts_uploaded_without_them() -> Result {
         )
         .send()
         .await?;
-    let head = |part_number: Option<i32>| {
-        s3.head_object()
+    Ok(())
+}
+
+/// In a directory bucket, an UploadPart without a checksum to an upload created with a checksum
+/// algorithm fails with 400 InvalidRequest, so the parts of such an object all have checksums.
+/// General purpose buckets accept the part.
+#[tokio::test]
+async fn test_part_without_checksum_fails_in_upload_with_algorithm() -> Result {
+    use aws_sdk_s3::types::ChecksumAlgorithm;
+    let (_server, _handle, s3) = setup(S3MockServer::builder()).await;
+    let parts: [(&'static [u8], bool); 2] = [(b"first part", true), (b"second", false)];
+    let result = upload_mixed(
+        &s3,
+        DIRECTORY,
+        "mpu",
+        Some(ChecksumAlgorithm::Crc64Nvme),
+        &parts,
+    )
+    .await;
+    let error = result.expect_err("the part without a checksum should fail");
+    let error = error
+        .downcast::<aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::upload_part::UploadPartError>>()
+        .expect("UploadPart fails");
+    let fail = failure::<(), _>(Err(*error));
+    assert_failure(&fail, 400, "InvalidRequest");
+    assert_eq!(
+        fail.message.as_deref(),
+        Some(
+            "Checksum Type mismatch occurred, expected checksum Type: crc64nvme, actual checksum \
+             Type: None."
+        )
+    );
+    upload_mixed(
+        &s3,
+        GENERAL_PURPOSE,
+        "mpu",
+        Some(ChecksumAlgorithm::Crc64Nvme),
+        &parts,
+    )
+    .await?;
+    Ok(())
+}
+
+/// A read of part of a multipart object whose upload was created without a checksum algorithm
+/// returns no checksum, also when its parts were uploaded with checksums.
+#[tokio::test]
+async fn test_no_part_checksums_without_upload_algorithm() -> Result {
+    use aws_sdk_s3::types::ChecksumMode;
+    let (_server, _handle, s3) = setup(S3MockServer::builder()).await;
+    upload_mixed(
+        &s3,
+        DIRECTORY,
+        "mpu",
+        None,
+        &[(b"first part", true), (b"second", true)],
+    )
+    .await?;
+    for part_number in [1, 2] {
+        let head = s3
+            .head_object()
             .bucket(DIRECTORY)
             .key("mpu")
-            .set_part_number(part_number)
+            .part_number(part_number)
             .checksum_mode(ChecksumMode::Enabled)
             .send()
-    };
-    assert_eq!(head(Some(1)).await?.checksum_crc64_nvme, None);
-    assert!(head(None).await?.checksum_crc64_nvme.is_some());
+            .await?;
+        assert_eq!(head.checksum_crc64_nvme, None, "part {part_number}");
+    }
+    Ok(())
+}
+
+/// A client like `s3` that sends a checksum only when a request asks for one.
+fn without_default_checksums(s3: &Client) -> Client {
+    use aws_sdk_s3::config::RequestChecksumCalculation;
+    Client::from_conf(
+        s3.config()
+            .to_builder()
+            .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
+            .build(),
+    )
+}
+
+/// Create a multipart upload of `key` in `bucket` with `algorithm` and `checksum_type` (none if
+/// `None`), and return its upload ID.
+async fn create_upload(
+    s3: &Client,
+    bucket: &str,
+    key: &str,
+    algorithm: Option<aws_sdk_s3::types::ChecksumAlgorithm>,
+    checksum_type: Option<aws_sdk_s3::types::ChecksumType>,
+) -> Result<String> {
+    Ok(s3
+        .create_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .set_checksum_algorithm(algorithm)
+        .set_checksum_type(checksum_type)
+        .send()
+        .await?
+        .upload_id
+        .unwrap())
+}
+
+/// UploadPart reports:
+/// - the part's checksum in the algorithm its upload was created with, computed if the part carried
+///   none;
+/// - in a general purpose bucket only, a checksum the part carried to an upload created without an
+///   algorithm.
+///
+/// A part without a checksum to an upload created without an algorithm reports none.
+#[tokio::test]
+async fn test_upload_part_reported_checksums() -> Result {
+    use aws_sdk_s3::types::{ChecksumAlgorithm, ChecksumType};
+    let (_server, _handle, s3) = setup(S3MockServer::builder()).await;
+    let s3 = without_default_checksums(&s3);
+    // CRC32 of "data", base64.
+    let crc32 = "rfPzYw==";
+    for bucket in [GENERAL_PURPOSE, DIRECTORY] {
+        let upload_id = create_upload(&s3, bucket, "mpu", None, None).await?;
+        let part = |number: i32| {
+            s3.upload_part()
+                .bucket(bucket)
+                .key("mpu")
+                .upload_id(&upload_id)
+                .part_number(number)
+                .body(ByteStream::from_static(b"data"))
+        };
+        let sent = part(1).checksum_crc32(crc32).send().await?;
+        let echoed = (bucket == GENERAL_PURPOSE).then_some(crc32);
+        assert_eq!(sent.checksum_crc32.as_deref(), echoed, "{bucket}");
+        let plain = part(2).send().await?;
+        assert_eq!(plain.checksum_crc32, None, "{bucket}");
+        assert_eq!(plain.checksum_crc64_nvme, None, "{bucket}");
+    }
+    let upload_id = create_upload(
+        &s3,
+        GENERAL_PURPOSE,
+        "full",
+        Some(ChecksumAlgorithm::Crc32),
+        Some(ChecksumType::FullObject),
+    )
+    .await?;
+    let part = s3
+        .upload_part()
+        .bucket(GENERAL_PURPOSE)
+        .key("full")
+        .upload_id(&upload_id)
+        .part_number(1)
+        .body(ByteStream::from_static(b"data"))
+        .send()
+        .await?;
+    assert_eq!(part.checksum_crc32.as_deref(), Some(crc32));
+    assert_eq!(part.checksum_crc64_nvme, None);
+    Ok(())
+}
+
+/// In a general purpose bucket, an UploadPart without a checksum to an upload created with a
+/// checksum algorithm and the COMPOSITE checksum type fails with 400 InvalidRequest.
+#[tokio::test]
+async fn test_part_without_checksum_fails_in_composite_upload() -> Result {
+    use aws_sdk_s3::types::{ChecksumAlgorithm, ChecksumType};
+    let (_server, _handle, s3) = setup(S3MockServer::builder()).await;
+    let s3 = without_default_checksums(&s3);
+    let upload_id = create_upload(
+        &s3,
+        GENERAL_PURPOSE,
+        "mpu",
+        Some(ChecksumAlgorithm::Crc32),
+        Some(ChecksumType::Composite),
+    )
+    .await?;
+    let result = s3
+        .upload_part()
+        .bucket(GENERAL_PURPOSE)
+        .key("mpu")
+        .upload_id(&upload_id)
+        .part_number(1)
+        .body(ByteStream::from_static(b"data"))
+        .send()
+        .await;
+    let fail = failure(result);
+    assert_failure(&fail, 400, "InvalidRequest");
+    assert_eq!(
+        fail.message.as_deref(),
+        Some(
+            "Checksum Type mismatch occurred, expected checksum Type: crc32, actual checksum \
+             Type: null"
+        )
+    );
+    Ok(())
+}
+
+/// A CompleteMultipartUpload that lists a part checksum for an upload created without a checksum
+/// algorithm fails with 400 InvalidPart in a general purpose bucket, and with 400 InvalidRequest in
+/// a directory bucket. Listed without it, the part completes the upload.
+#[tokio::test]
+async fn test_complete_lists_part_checksum_of_upload_without_algorithm() -> Result {
+    let (_server, _handle, s3) = setup(S3MockServer::builder()).await;
+    let s3 = without_default_checksums(&s3);
+    for bucket in [GENERAL_PURPOSE, DIRECTORY] {
+        let upload_id = create_upload(&s3, bucket, "mpu", None, None).await?;
+        let part = s3
+            .upload_part()
+            .bucket(bucket)
+            .key("mpu")
+            .upload_id(&upload_id)
+            .part_number(1)
+            .body(ByteStream::from_static(b"data"))
+            .checksum_crc32("rfPzYw==")
+            .send()
+            .await?;
+        let complete = |checksum: Option<&str>| {
+            let part = CompletedPart::builder()
+                .part_number(1)
+                .e_tag(part.e_tag.clone().unwrap())
+                .set_checksum_crc32(checksum.map(str::to_owned))
+                .build();
+            s3.complete_multipart_upload()
+                .bucket(bucket)
+                .key("mpu")
+                .upload_id(&upload_id)
+                .multipart_upload(CompletedMultipartUpload::builder().parts(part).build())
+                .send()
+        };
+        let fail = failure(complete(Some("rfPzYw==")).await);
+        if bucket == GENERAL_PURPOSE {
+            assert_failure(&fail, 400, "InvalidPart");
+        } else {
+            assert_failure(&fail, 400, "InvalidRequest");
+            assert_eq!(
+                fail.message.as_deref(),
+                Some(
+                    "Checksum Type mismatch occurred, expected checksum Type: None, actual \
+                     checksum Type: crc32."
+                )
+            );
+        }
+        complete(None).await?;
+    }
+    Ok(())
+}
+
+/// In a general purpose bucket, a partNumber=1 read of a one-part multipart object with a
+/// full-object checksum reports the object's checksum. A directory bucket reports none for an
+/// upload created without a checksum algorithm.
+#[tokio::test]
+async fn test_part_number_read_of_one_part_object() -> Result {
+    use aws_sdk_s3::types::{ChecksumMode, ChecksumType};
+    let (_server, _handle, s3) = setup(S3MockServer::builder()).await;
+    let s3 = without_default_checksums(&s3);
+    for bucket in [GENERAL_PURPOSE, DIRECTORY] {
+        let upload_id = create_upload(&s3, bucket, "mpu", None, None).await?;
+        let part = s3
+            .upload_part()
+            .bucket(bucket)
+            .key("mpu")
+            .upload_id(&upload_id)
+            .part_number(1)
+            .body(ByteStream::from_static(b"data"))
+            .send()
+            .await?;
+        let completed = CompletedPart::builder()
+            .part_number(1)
+            .e_tag(part.e_tag.unwrap())
+            .build();
+        let object = s3
+            .complete_multipart_upload()
+            .bucket(bucket)
+            .key("mpu")
+            .upload_id(&upload_id)
+            .multipart_upload(CompletedMultipartUpload::builder().parts(completed).build())
+            .send()
+            .await?;
+        let expected =
+            (bucket == GENERAL_PURPOSE).then(|| object.checksum_crc64_nvme.clone().unwrap());
+        let head = s3
+            .head_object()
+            .bucket(bucket)
+            .key("mpu")
+            .part_number(1)
+            .checksum_mode(ChecksumMode::Enabled)
+            .send()
+            .await?;
+        assert_eq!(head.checksum_crc64_nvme, expected, "{bucket}");
+        let get = s3
+            .get_object()
+            .bucket(bucket)
+            .key("mpu")
+            .part_number(1)
+            .checksum_mode(ChecksumMode::Enabled)
+            .send()
+            .await?;
+        assert_eq!(get.checksum_crc64_nvme, expected, "{bucket}");
+        if bucket == GENERAL_PURPOSE {
+            assert_eq!(get.checksum_type, Some(ChecksumType::FullObject));
+        }
+    }
+    Ok(())
+}
+
+/// An UploadPart to an upload created with a checksum algorithm, with a checksum of another
+/// algorithm only, fails with 400 InvalidRequest in either bucket type.
+#[tokio::test]
+async fn test_part_with_another_algorithm_fails() -> Result {
+    use aws_sdk_s3::types::{ChecksumAlgorithm, ChecksumType};
+    let (_server, _handle, s3) = setup(S3MockServer::builder()).await;
+    let s3 = without_default_checksums(&s3);
+    for (bucket, period) in [(GENERAL_PURPOSE, ""), (DIRECTORY, ".")] {
+        let upload_id = create_upload(
+            &s3,
+            bucket,
+            "mpu",
+            Some(ChecksumAlgorithm::Crc64Nvme),
+            Some(ChecksumType::FullObject),
+        )
+        .await?;
+        let result = s3
+            .upload_part()
+            .bucket(bucket)
+            .key("mpu")
+            .upload_id(&upload_id)
+            .part_number(1)
+            .body(ByteStream::from_static(b"data"))
+            .checksum_crc32("rfPzYw==")
+            .send()
+            .await;
+        let fail = failure(result);
+        assert_failure(&fail, 400, "InvalidRequest");
+        let message = format!(
+            "Checksum Type mismatch occurred, expected checksum Type: crc64nvme, actual checksum \
+             Type: crc32{period}"
+        );
+        assert_eq!(fail.message.as_deref(), Some(message.as_str()), "{bucket}");
+    }
     Ok(())
 }

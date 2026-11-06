@@ -191,8 +191,9 @@ GetObject and HeadObject omit `x-amz-storage-class` for `STANDARD` objects; List
   `Content-Range`; an object uploaded in one request is a single part. A HeadObject with a `Range`
   describes the range. HeadObject is always answered 200, where S3 answers 206 for a part or a
   range.
-- A GetObject or HeadObject of part of a multipart object with a full-object checksum, by
-  `partNumber` or by a range, returns no checksum, as S3 general purpose buckets do.
+- UploadPart, CompleteMultipartUpload and reads of a part (by `partNumber` or by a range) report
+  and check part checksums according to the checksum algorithm and type the multipart upload was
+  created with.
 
 ### Listing
 
@@ -249,12 +250,10 @@ write signed with a session.
 - Objects are EXPRESS_ONEZONE. Any other storage class fails with 400 InvalidStorageClass,
   as EXPRESS_ONEZONE does in general purpose buckets.
 - `Content-MD5` fails with 501 NotImplemented.
-- ListObjectsV2 lists keys in no particular order, with each common prefix as one entry. It
-  fails with 400 InvalidRequest for a delimiter other than `/` or a prefix that does not end in
-  `/`, and with 501 NotSupported for `start-after`.
-- A range or `partNumber` read of part of a multipart object with a full-object checksum
-  returns the part's checksum if the part was uploaded with one; general purpose buckets
-  return none.
+- ListObjectsV2 lists keys in a fixed pseudo-random order (see *Listing*). It fails with 400
+  InvalidRequest for a delimiter other than `/` or a prefix that does not end in `/`, and with
+  501 NotSupported for `start-after`.
+- Part checksums: every part of an upload created with a checksum algorithm must carry a checksum.
 - Appends and RenameObject are served; general purpose buckets fail them with 501
   NotImplemented.
 

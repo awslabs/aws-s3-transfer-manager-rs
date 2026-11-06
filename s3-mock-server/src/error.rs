@@ -130,13 +130,17 @@ pub enum Error {
     #[error("too many parts")]
     TooManyParts,
 
-    /// An append carries a checksum of an algorithm the object does not store.
+    /// A write does not carry a checksum of the required algorithm: an append, of an algorithm the
+    /// object stores; an UploadPart, of the algorithm its upload was created with.
     #[error("checksum type mismatch: expected {expected}, got {actual}")]
     ChecksumTypeMismatch {
-        /// Lowercase names of the algorithms the object stores.
+        /// Lowercase names of the algorithms required.
         expected: String,
-        /// Lowercase name of the algorithm of the request's checksum.
+        /// Lowercase name of the algorithm of the request's checksum. If it has none: `None`, or
+        /// `null` in a general purpose bucket.
         actual: String,
+        /// The type of the bucket. The message ends with a period only in a directory bucket.
+        bucket_type: crate::BucketType,
     },
 
     /// The object's storage class does not allow the operation: a read of an archived object
@@ -432,12 +436,21 @@ impl From<Error> for s3s::S3Error {
                 "The write offset value that you specified does not match the current object size."
                     .into(),
             ),
-            Error::ChecksumTypeMismatch { expected, actual } => (
+            Error::ChecksumTypeMismatch {
+                expected,
+                actual,
+                bucket_type,
+            } => (
                 S3ErrorCode::InvalidRequest,
                 StatusCode::BAD_REQUEST,
                 format!(
                     "Checksum Type mismatch occurred, expected checksum Type: {expected}, actual \
-                     checksum Type: {actual}."
+                     checksum Type: {actual}{}",
+                    if *bucket_type == crate::BucketType::Directory {
+                        "."
+                    } else {
+                        ""
+                    }
                 )
                 .into(),
             ),

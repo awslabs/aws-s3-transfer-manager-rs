@@ -19,7 +19,8 @@ use std::ops::Range;
 use std::pin::Pin;
 use std::time::SystemTime;
 
-use crate::storage::models::ObjectMetadata;
+use crate::bucket::BucketType;
+use crate::storage::models::{MultipartUploadMetadata, ObjectMetadata, PartMetadata};
 use crate::types::{ClientChecksums, ObjectIntegrity, ObjectIntegrityChecks, StoredObjectMetadata};
 use crate::Result;
 
@@ -246,14 +247,60 @@ pub(crate) struct UploadPartRequest<'a> {
     pub upload_id: &'a str,
     pub part_number: i32,
     pub content: Bytes,
-    /// Whether the request carried a checksum of the part.
-    pub client_checksum: bool,
+    /// The algorithms of the checksums the request carried.
+    pub client_checksum_algorithms: Vec<aws_smithy_checksums::ChecksumAlgorithm>,
+}
+
+impl UploadPartRequest<'_> {
+    /// Check that an UploadPart to an upload created with a checksum algorithm carries a checksum
+    /// of that algorithm. It fails with 400 InvalidRequest:
+    /// - with a checksum of another algorithm only, in either bucket type;
+    /// - without a checksum, in a directory bucket, and in a general purpose bucket for the
+    ///   COMPOSITE checksum type.
+    pub(crate) fn check_checksum(&self, upload: &MultipartUploadMetadata) -> Result<()> {
+        let Some(algorithm) = upload
+            .metadata
+            .checksum_algorithm
+            .filter(|_| upload.metadata.part_checksums)
+        else {
+            return Ok(());
+        };
+        let directory = upload_in_directory_bucket(upload);
+        let composite = upload.checksum_type == Some(aws_sdk_s3::types::ChecksumType::Composite);
+        let actual = match self.client_checksum_algorithms.first() {
+            _ if self.client_checksum_algorithms.contains(&algorithm) => return Ok(()),
+            Some(other) => other.as_str(),
+            None if directory => "None",
+            None if composite => "null",
+            None => return Ok(()),
+        };
+        Err(crate::Error::ChecksumTypeMismatch {
+            expected: algorithm.as_str().to_owned(),
+            actual: actual.to_owned(),
+            bucket_type: if directory {
+                BucketType::Directory
+            } else {
+                BucketType::GeneralPurpose
+            },
+        })
+    }
+}
+
+/// Whether `upload` is to a directory bucket.
+fn upload_in_directory_bucket(upload: &MultipartUploadMetadata) -> bool {
+    upload
+        .bucket
+        .as_deref()
+        .is_some_and(|bucket| BucketType::of(bucket) == BucketType::Directory)
 }
 
 /// Response for uploading a part.
 #[derive(Debug)]
 pub(crate) struct UploadPartResponse {
     pub etag: String,
+    /// The part as stored, with its checksum in the algorithm of its upload, if the upload was
+    /// created with a checksum algorithm.
+    pub checksums: Option<PartMetadata>,
 }
 
 /// Information about a part.
@@ -269,6 +316,34 @@ pub(crate) struct CompleteMultipartUploadRequest<'a> {
     pub upload_id: &'a str,
     pub parts: Vec<(i32, String)>,
     pub client_checksums: Option<&'a ClientChecksums>,
+    /// Lowercase name of the algorithm of the first part checksum the request lists, if it lists
+    /// any.
+    pub listed_part_checksum: Option<&'static str>,
+}
+
+impl CompleteMultipartUploadRequest<'_> {
+    /// Check the part checksums a CompleteMultipartUpload lists. Listing one for an upload created
+    /// without a checksum algorithm fails with 400 InvalidRequest in a directory bucket, and with
+    /// 400 InvalidPart in a general purpose bucket.
+    pub(crate) fn check_listed_part_checksums(
+        &self,
+        upload: &MultipartUploadMetadata,
+    ) -> Result<()> {
+        match self.listed_part_checksum {
+            Some(algorithm) if !upload.metadata.part_checksums => {
+                if upload_in_directory_bucket(upload) {
+                    Err(crate::Error::ChecksumTypeMismatch {
+                        expected: "None".to_owned(),
+                        actual: algorithm.to_owned(),
+                        bucket_type: BucketType::Directory,
+                    })
+                } else {
+                    Err(crate::Error::InvalidPart)
+                }
+            }
+            _ => Ok(()),
+        }
+    }
 }
 
 /// Response for completing a multipart upload.

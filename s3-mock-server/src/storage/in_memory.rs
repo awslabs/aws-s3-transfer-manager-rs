@@ -129,6 +129,7 @@ impl StorageBackend for InMemoryStorage {
             parts: Vec::new(),
             append_segments: Vec::new(),
             append_parts: 0,
+            part_checksums: false,
             restore_status: request.restore_status,
         };
 
@@ -320,13 +321,17 @@ impl StorageBackend for InMemoryStorage {
         request: crate::storage::UploadPartRequest<'_>,
     ) -> Result<crate::storage::UploadPartResponse> {
         // Get upload metadata to determine checksum algorithm
-        let checksum_algorithm = {
+        let (checksum_algorithm, part_checksums) = {
             let multipart = self.multipart.read().await;
             let upload = multipart
                 .uploads
                 .get(request.upload_id)
                 .ok_or(Error::NoSuchUpload)?;
-            upload.metadata.checksum_algorithm
+            request.check_checksum(upload)?;
+            (
+                upload.metadata.checksum_algorithm,
+                upload.metadata.part_checksums,
+            )
         };
 
         // Calculate ETag (MD5 hash)
@@ -336,7 +341,6 @@ impl StorageBackend for InMemoryStorage {
         let mut part_metadata = PartMetadata {
             etag: etag.clone(),
             size: request.content.len() as u64,
-            client_checksum: request.client_checksum,
             ..Default::default()
         };
 
@@ -384,9 +388,10 @@ impl StorageBackend for InMemoryStorage {
             request.part_number,
             (request.content.clone(), part_metadata.clone()),
         );
+        let checksums = part_checksums.then(|| part_metadata.clone());
         upload.parts.insert(request.part_number, part_metadata);
 
-        Ok(crate::storage::UploadPartResponse { etag })
+        Ok(crate::storage::UploadPartResponse { etag, checksums })
     }
 
     async fn list_parts(&self, upload_id: &str) -> Result<Vec<crate::storage::PartInfo>> {
@@ -431,6 +436,7 @@ impl StorageBackend for InMemoryStorage {
                 .get(request.upload_id)
                 .cloned()
                 .ok_or(Error::NoSuchUpload)?;
+            request.check_listed_part_checksums(&upload)?;
             let upload_parts = multipart
                 .parts
                 .get(request.upload_id)
@@ -470,7 +476,6 @@ impl StorageBackend for InMemoryStorage {
                 total_size += part_metadata.size;
                 final_metadata.parts.push(ObjectPart {
                     size: part_metadata.size,
-                    client_checksum: part_metadata.client_checksum,
                     crc32: part_metadata.crc32.clone(),
                     crc32c: part_metadata.crc32c.clone(),
                     crc64nvme: part_metadata.crc64nvme.clone(),
@@ -729,6 +734,8 @@ impl StorageBackend for InMemoryStorage {
                     .collect::<Vec<_>>()
                     .join(","),
                 actual: algorithm.as_str().to_owned(),
+                // Only directory buckets serve appends.
+                bucket_type: crate::BucketType::Directory,
             });
         }
 
@@ -1090,14 +1097,14 @@ mod tests {
             upload_id,
             part_number: 1,
             content: part1.clone(),
-            client_checksum: false,
+            client_checksum_algorithms: vec![],
         };
         let etag1 = storage.upload_part(request1).await.unwrap();
         let request2 = crate::storage::UploadPartRequest {
             upload_id,
             part_number: 2,
             content: part2.clone(),
-            client_checksum: false,
+            client_checksum_algorithms: vec![],
         };
         let etag2 = storage.upload_part(request2).await.unwrap();
 
@@ -1111,6 +1118,7 @@ mod tests {
             upload_id,
             parts: parts_to_complete,
             client_checksums: None,
+            listed_part_checksum: None,
         };
         let response = storage.complete_multipart_upload(request).await.unwrap();
 
@@ -1181,7 +1189,7 @@ mod tests {
                         upload_id: &upload_id,
                         part_number: 1,
                         content: Bytes::from_static(b"part"),
-                        client_checksum: false,
+                        client_checksum_algorithms: vec![],
                     })
                     .await
                     .map(|_| ())
@@ -1220,7 +1228,7 @@ mod tests {
             upload_id,
             part_number: 1,
             content: part1,
-            client_checksum: false,
+            client_checksum_algorithms: vec![],
         };
         let etag1 = storage.upload_part(request).await.unwrap();
 
@@ -1231,6 +1239,7 @@ mod tests {
             upload_id,
             parts: parts_to_complete,
             client_checksums: None,
+            listed_part_checksum: None,
         };
         let result = storage.complete_multipart_upload(request).await;
         assert!(result.is_err());
@@ -1247,6 +1256,7 @@ mod tests {
             upload_id,
             parts: vec![(1, valid_etag)],
             client_checksums: None,
+            listed_part_checksum: None,
         };
         storage
             .complete_multipart_upload(request)
@@ -1279,7 +1289,7 @@ mod tests {
                 upload_id,
                 part_number: 1,
                 content: Bytes::from_static(b"part1"),
-                client_checksum: false,
+                client_checksum_algorithms: vec![],
             })
             .await
             .unwrap()
@@ -1299,6 +1309,7 @@ mod tests {
                 upload_id,
                 parts: vec![(1, etag.clone())],
                 client_checksums: Some(&invalid_checksum),
+                listed_part_checksum: None,
             })
             .await;
         assert!(matches!(
@@ -1320,6 +1331,7 @@ mod tests {
                 upload_id,
                 parts: vec![(1, etag)],
                 client_checksums: None,
+                listed_part_checksum: None,
             })
             .await
             .expect("completion must remain retryable after checksum rejection");
@@ -1346,7 +1358,7 @@ mod tests {
             upload_id,
             part_number: 1,
             content: part1,
-            client_checksum: false,
+            client_checksum_algorithms: vec![],
         };
         storage.upload_part(request).await.unwrap();
 

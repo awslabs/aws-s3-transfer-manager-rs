@@ -128,6 +128,12 @@ pub(crate) struct ObjectMetadata {
     #[serde(default)]
     pub append_parts: u32,
 
+    /// Whether the object's multipart upload was created with a checksum algorithm. Reads of a part
+    /// report its checksum only for such an object, and in a directory bucket every part of such an
+    /// upload carries a checksum.
+    #[serde(default)]
+    pub part_checksums: bool,
+
     /// Restore status of an object in an archival storage class, reported in the
     /// `x-amz-restore` header.
     #[serde(default)]
@@ -150,9 +156,6 @@ pub enum RestoreStatus {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct ObjectPart {
     pub size: u64,
-    /// Whether the part was uploaded with a checksum. S3 reports a part's checksum only then.
-    #[serde(default)]
-    pub client_checksum: bool,
     pub crc32: Option<String>,
     pub crc32c: Option<String>,
     pub crc64nvme: Option<String>,
@@ -293,6 +296,7 @@ impl Default for ObjectMetadata {
             parts: Vec::new(),
             append_segments: Vec::new(),
             append_parts: 0,
+            part_checksums: false,
             restore_status: None,
         }
     }
@@ -313,10 +317,6 @@ pub(crate) struct PartMetadata {
     pub crc64nvme: Option<String>,
     pub sha1: Option<String>,
     pub sha256: Option<String>,
-
-    /// Whether the part was uploaded with a checksum.
-    #[serde(default)]
-    pub client_checksum: bool,
 }
 
 /// Metadata for a multipart upload.
