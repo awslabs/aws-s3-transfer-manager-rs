@@ -266,8 +266,8 @@ struct DownloadObjectsTransferInner {
     /// Directories already created (dedup `create_dir_all` across children
     /// that share a prefix; objects in the same S3 "folder" map to one dir).
     created_dirs: Mutex<HashSet<PathBuf>>,
-    /// Destination paths already claimed, keyed by `path_identity` and mapped to
-    /// the key that claimed each one.
+    /// Destination paths already claimed, relative to `destination` and keyed by
+    /// `path_identity`, mapped to the key that claimed each one.
     claimed_paths: Mutex<HashMap<PathBuf, String>>,
 }
 
@@ -522,12 +522,11 @@ impl DownloadObjectsTransfer {
             self.inner.key_prefix.as_deref(),
             self.inner.delimiter.as_deref(),
         )?;
-        match self
-            .inner
-            .claimed_paths
-            .lock()
-            .entry(path_identity(&dest_path))
-        {
+        match self.inner.claimed_paths.lock().entry(path_identity(
+            dest_path
+                .strip_prefix(&self.inner.destination)
+                .expect("local_key_path validated containment"),
+        )) {
             Entry::Occupied(e) => {
                 return Err(Error::new(
                     ErrorKind::InputInvalid,

@@ -683,24 +683,22 @@ impl UploadObjectsTransfer {
         // Loop until one spawnable entry is claimed or the queue is exhausted.
         while let Some(entry) = state.pending_entries.pop_front() {
             let relative = entry.relative_path().to_string_lossy().to_string();
-            let key = derive_object_key(&relative, key_prefix.as_deref(), delimiter.as_deref())
-                .map(Cow::into_owned)
-                .and_then(|k| claim_key(&mut state.derived_keys, k, entry.path()));
-            let key = match key {
-                Ok(k) => k,
-                Err(e) => {
-                    state.failed.push(FailedUpload {
-                        input: None,
-                        error: e,
-                        source_path: Some(entry.path().to_path_buf()),
-                    });
-                    if *self.failure_policy() == FailedTransferPolicy::Abort {
-                        self.abort(state, "key derivation failure");
-                        return SpawnDecision::Abort;
+            let key =
+                match derive_object_key(&relative, key_prefix.as_deref(), delimiter.as_deref()) {
+                    Ok(k) => k.into_owned(),
+                    Err(e) => {
+                        state.failed.push(FailedUpload {
+                            input: None,
+                            error: e,
+                            source_path: Some(entry.path().to_path_buf()),
+                        });
+                        if *self.failure_policy() == FailedTransferPolicy::Abort {
+                            self.abort(state, "key derivation failure");
+                            return SpawnDecision::Abort;
+                        }
+                        continue;
                     }
-                    continue;
-                }
-            };
+                };
 
             let stream = match InputStream::read_from()
                 .path(entry.path())
@@ -721,6 +719,19 @@ impl UploadObjectsTransfer {
                     continue;
                 }
             };
+
+            if let Err(e) = claim_key(&mut state.derived_keys, &key, entry.path()) {
+                state.failed.push(FailedUpload {
+                    input: None,
+                    error: e,
+                    source_path: Some(entry.path().to_path_buf()),
+                });
+                if *self.failure_policy() == FailedTransferPolicy::Abort {
+                    self.abort(state, "key conflict");
+                    return SpawnDecision::Abort;
+                }
+                continue;
+            }
 
             let input = UploadInput::builder()
                 .bucket(bucket)
@@ -1260,20 +1271,18 @@ impl Transfer for UploadObjectsTransfer {
 /// Record that `path` derived `key`, failing when another file already derived it.
 fn claim_key(
     derived_keys: &mut HashMap<String, PathBuf>,
-    key: String,
+    key: &str,
     path: &std::path::Path,
-) -> Result<String, error::Error> {
-    match derived_keys.entry(key) {
+) -> Result<(), error::Error> {
+    match derived_keys.entry(key.to_owned()) {
         Entry::Occupied(e) => Err(error::invalid_input(format!(
-            "`{}` derives key `{}`, already derived from `{}`",
+            "`{}` derives key `{key}`, already derived from `{}`",
             path.display(),
-            e.key(),
             e.get().display()
         ))),
         Entry::Vacant(e) => {
-            let key = e.key().clone();
             e.insert(path.to_path_buf());
-            Ok(key)
+            Ok(())
         }
     }
 }
@@ -1606,10 +1615,10 @@ mod tests {
         use std::os::unix::ffi::OsStrExt;
         // (file names, delimiter, key both derive)
         type Case = ([&'static [u8]; 2], Option<&'static str>, &'static str);
-        let cases: [Case; 2] = [
-            ([b"a-/b", b"a/-b"], Some("--"), "a---b"),
-            ([b"caf\xe9", b"caf\xe8"], None, "caf\u{fffd}"),
-        ];
+        let mut cases: Vec<Case> = vec![([b"a-/b", b"a/-b"], Some("--"), "a---b")];
+        // APFS rejects file names that are not valid UTF-8.
+        #[cfg(target_os = "linux")]
+        cases.push(([b"caf\xe9", b"caf\xe8"], None, "caf\u{fffd}"));
         for (names, delimiter, key) in cases {
             let dir = tempdir().unwrap();
             for name in names {
