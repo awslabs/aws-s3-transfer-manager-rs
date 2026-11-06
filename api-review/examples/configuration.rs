@@ -3,7 +3,7 @@
 //! Each function builds a client the way a customer would for one situation. `main` builds them all
 //! without sending requests.
 
-use aws_config::{BehaviorVersion, Region};
+use aws_config::{BehaviorVersion, FrameworkMetadata, Region};
 use aws_sdk_s3::config::Credentials;
 use aws_sdk_s3_transfer_manager::types::{ConcurrencyMode, PartSize, ReadAhead};
 use aws_sdk_s3_transfer_manager::{Client, Config};
@@ -27,8 +27,9 @@ async fn tuned() -> Client {
     Client::new(config)
 }
 
-/// `read_ahead` is only on the builder, so tuning it means leaving the loader.
-async fn tuned_read_ahead() -> Client {
+/// Set the client-wide read-ahead default. The setter is on the builder, not the loader. Downloads can
+/// also override it per request or while running; see the download scenario.
+async fn client_read_ahead_default() -> Client {
     let sdk_config = aws_config::load_defaults(BehaviorVersion::latest()).await;
     let config = Config::builder()
         .s3_config(&sdk_config)
@@ -59,6 +60,26 @@ async fn shared_with_sdk_client() -> (aws_sdk_s3::Client, Client) {
     let s3 = aws_sdk_s3::Client::new(&sdk_config);
     let tm = Client::new(Config::builder().s3_config(&sdk_config).build());
     (s3, tm)
+}
+
+/// Start from an S3 client the application already has, keeping its configuration. Needs the
+/// transfer manager's `sdk-v1` feature.
+#[cfg(feature = "sdk-v1")]
+async fn from_existing_sdk_client(s3: &aws_sdk_s3::Client) -> Client {
+    let config = Config::builder().s3_config(s3.config().to_builder()).build();
+    Client::new(config)
+}
+
+/// Identify a framework built on the transfer manager in the user agent, through shared AWS
+/// configuration.
+async fn framework_attribution() -> Client {
+    let sdk_config = aws_config::defaults(BehaviorVersion::latest())
+        .framework_metadata(
+            FrameworkMetadata::new("my-framework", Some("2.1")).expect("valid framework metadata"),
+        )
+        .load()
+        .await;
+    Client::new(Config::builder().s3_config(&sdk_config).build())
 }
 
 /// A custom endpoint, set on the shared AWS configuration.
@@ -103,10 +124,14 @@ async fn lifecycle(client: Client) {
 async fn main() {
     lifecycle(defaults().await).await;
     lifecycle(tuned().await).await;
-    lifecycle(tuned_read_ahead().await).await;
+    lifecycle(client_read_ahead_default().await).await;
     lifecycle(region_profile_credentials().await).await;
-    let (_s3, tm) = shared_with_sdk_client().await;
+    let (s3, tm) = shared_with_sdk_client().await;
     lifecycle(tm).await;
+    #[cfg(feature = "sdk-v1")]
+    lifecycle(from_existing_sdk_client(&s3).await).await;
+    drop(s3);
+    lifecycle(framework_attribution().await).await;
     lifecycle(custom_endpoint().await).await;
     #[cfg(feature = "sdk-v1")]
     lifecycle(path_style_endpoint().await).await;
