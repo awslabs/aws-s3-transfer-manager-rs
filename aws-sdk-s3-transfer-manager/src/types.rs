@@ -61,6 +61,7 @@ pub enum MemoryBudgetConfig {
     ///
     /// [`MemoryMetrics::configured_capacity_bytes`]:
     ///     crate::metrics::MemoryMetrics::configured_capacity_bytes
+    /// [`ByteUnit`]: crate::metrics::unit::ByteUnit
     Limit(usize),
 }
 
