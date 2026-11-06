@@ -20,7 +20,10 @@ aws-sdk-s3-transfer-manager = { path = "../aws-sdk-s3-transfer-manager" }
 aws-sdk-s3 = "1.154.0"
 aws-config = { version = "1.13.0", features = ["behavior-version-latest"] }
 tokio = { version = "1", features = ["full"] }
+bytes = "1"
 
 [dev-dependencies]
 # Captures outgoing requests so scenarios can show what reaches the wire.
 aws-smithy-http-client = { version = "1.5.2", features = ["test-util"] }
+# Local S3 endpoint so transfer scenarios run end to end.
+s3-mock-server = { path = "../s3-mock-server" }
