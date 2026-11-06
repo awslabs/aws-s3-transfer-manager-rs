@@ -1486,12 +1486,11 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_keys_mapping_to_one_path_download_once() {
-        let mut cases: Vec<[&'static str; 2]> = Vec::new();
-        #[cfg(unix)]
-        cases.push(["a//b", "a/b"]);
-        #[cfg(any(target_os = "macos", target_os = "windows"))]
-        cases.push(["a/B", "a/b"]);
-
+        let cases = [
+            ["a//b", "a/b"],
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            ["a/B", "a/b"],
+        ];
         for [first, second] in cases {
             let dir = tempdir().unwrap();
             let list = mock!(aws_sdk_s3::Client::list_objects_v2).then_output(move || {

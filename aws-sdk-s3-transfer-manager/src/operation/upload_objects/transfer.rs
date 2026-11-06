@@ -1608,21 +1608,42 @@ mod tests {
     }
 
     /// Of two files that derive one key, the second fails without uploading.
-    #[cfg(unix)]
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_files_deriving_one_key_upload_once() {
-        use std::os::unix::ffi::OsStrExt;
-        // (file names, delimiter, key both derive)
-        type Case = ([&'static [u8]; 2], Option<&'static str>, &'static str);
-        let mut cases: Vec<Case> = vec![([b"a-/b", b"a/-b"], Some("--"), "a---b")];
+        // (file names, delimiter, key both derive, policy)
+        type Case = (
+            [&'static std::path::Path; 2],
+            Option<&'static str>,
+            &'static str,
+            FailedTransferPolicy,
+        );
+        let delimited = [std::path::Path::new("a-/b"), std::path::Path::new("a/-b")];
+        let mut cases: Vec<Case> = vec![
+            (
+                delimited,
+                Some("--"),
+                "a---b",
+                FailedTransferPolicy::Continue,
+            ),
+            (delimited, Some("--"), "a---b", FailedTransferPolicy::Abort),
+        ];
         // APFS rejects file names that are not valid UTF-8.
-        #[cfg(target_os = "linux")]
-        cases.push(([b"caf\xe9", b"caf\xe8"], None, "caf\u{fffd}"));
-        for (names, delimiter, key) in cases {
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let lossy = |b: &'static [u8]| std::path::Path::new(std::ffi::OsStr::from_bytes(b));
+            cases.push((
+                [lossy(b"caf\xe9"), lossy(b"caf\xe8")],
+                None,
+                "caf\u{fffd}",
+                FailedTransferPolicy::Continue,
+            ));
+        }
+        for (names, delimiter, key, policy) in cases {
             let dir = tempdir().unwrap();
             for name in names {
-                let path = dir.path().join(std::ffi::OsStr::from_bytes(name));
+                let path = dir.path().join(name);
                 fs::create_dir_all(path.parent().unwrap()).unwrap();
                 fs::write(path, "x").unwrap();
             }
@@ -1646,7 +1667,7 @@ mod tests {
             let input = super::super::UploadObjectsInputBuilder::default()
                 .bucket("test-bucket")
                 .source(dir.path())
-                .failure_policy(FailedTransferPolicy::Continue)
+                .failure_policy(policy.clone())
                 .set_delimiter(delimiter.map(str::to_string))
                 .build()
                 .unwrap();
@@ -1671,14 +1692,18 @@ mod tests {
             .await
             .expect("transfer should complete within timeout");
 
-            assert_eq!(transfer.successful_uploads(), 1, "key={key:?}");
-            assert_eq!(*captured.lock().unwrap(), [key], "key={key:?}");
+            let abort = policy == FailedTransferPolicy::Abort;
+            assert_eq!(transfer.ctx().is_failed(), abort, "key={key:?}");
             let failed = transfer.take_failed();
             assert_eq!(failed.len(), 1, "key={key:?}");
             assert_eq!(
                 failed[0].error().kind(),
                 &crate::error::ErrorKind::InputInvalid
             );
+            if !abort {
+                assert_eq!(transfer.successful_uploads(), 1, "key={key:?}");
+                assert_eq!(*captured.lock().unwrap(), [key], "key={key:?}");
+            }
         }
     }
 
