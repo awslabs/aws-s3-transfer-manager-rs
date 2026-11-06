@@ -28,13 +28,13 @@ const DEFAULT_BLOCK_BYTES: usize = 128 * 1024 * 1024;
 const DEFAULT_OPTIMISTIC_SCAN_BYTES: usize = 32 * 1024 * 1024;
 
 /// Denominator of the detected-memory share selected by automatic capacity.
-const AUTO_MEMORY_SHARE_DENOMINATOR: usize = 4;
+pub(crate) const AUTO_MEMORY_SHARE_DENOMINATOR: usize = 4;
 
 /// Maximum automatic capacity in bytes.
-const AUTO_CAPACITY_MAX_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+pub(crate) const AUTO_CAPACITY_MAX_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 
 /// Automatic capacity when effective memory cannot be detected.
-const AUTO_CAPACITY_FALLBACK_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+pub(crate) const AUTO_CAPACITY_FALLBACK_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Explicit fraction bits stored by an IEEE 754 binary64 value.
 const F64_FRACTION_BITS: u32 = 52;

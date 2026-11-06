@@ -33,7 +33,9 @@ pub(crate) fn client_features(config: &Config, profile: &MachineProfile) -> Vec<
     if matches!(config.part_size(), PartSize::Target(_)) {
         features.push(AwsSdkFeature::S3CustomPartSize);
     }
-    if !matches!(config.concurrency(), ConcurrencyMode::Auto) {
+    if !matches!(config.concurrency(), ConcurrencyMode::Auto)
+        || config.throughput_target_gbps().is_some()
+    {
         features.push(AwsSdkFeature::S3CustomThroughput);
     }
     if matches!(config.memory(), MemoryConfig::Explicit(_)) {
@@ -723,6 +725,16 @@ mod tests {
                 "concurrency",
                 off_ec2().concurrency(ConcurrencyMode::Explicit(4)),
                 vec![BusinessMetric::S3CustomThroughput],
+            ),
+            (
+                "throughput target",
+                off_ec2().throughput_target_gbps(25.0),
+                vec![BusinessMetric::S3CustomThroughput],
+            ),
+            (
+                "ignored throughput target",
+                off_ec2().throughput_target_gbps(f64::NAN),
+                vec![],
             ),
             (
                 "memory",

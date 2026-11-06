@@ -3,7 +3,6 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use crate::metrics::{unit::ByteUnit, Throughput};
 use crate::runtime::buffer_pool::BufferPool;
 
 pub use crate::model::builders;
@@ -62,6 +61,7 @@ pub enum MemoryBudgetConfig {
     ///
     /// [`MemoryMetrics::configured_capacity_bytes`]:
     ///     crate::metrics::MemoryMetrics::configured_capacity_bytes
+    /// [`ByteUnit`]: crate::metrics::unit::ByteUnit
     Limit(usize),
 }
 
@@ -70,6 +70,10 @@ pub enum MemoryBudgetConfig {
 #[derive(Debug, Clone, Default)]
 pub enum MemoryConfig {
     /// Construct an automatically sized pool when the client is created.
+    ///
+    /// The ceiling follows [`MemoryBudgetConfig::Auto`], except that on a small
+    /// host it is raised to at most 256 MiB so the pool funds the minimum
+    /// concurrency target, and never above half of detected memory.
     #[default]
     Auto,
     /// Use an existing pool.
@@ -86,11 +90,6 @@ pub enum ConcurrencyMode {
     /// Automatically configured concurrency based on the execution environment.
     #[default]
     Auto,
-
-    /// Explicitly configured throughput setting the client should aim for.
-    ///
-    /// In this mode, concurrency is limited by attempting to hit a throughput target.
-    TargetThroughput(TargetThroughput),
 
     /// Explicit concurrency control
     Explicit(usize),
@@ -111,43 +110,6 @@ pub enum ReadAhead {
     /// Read ahead at most `n` parts beyond the consumer's position. `0` fetches only
     /// the part the consumer is waiting on (no speculation). Still bounded by memory.
     Parts(usize),
-}
-
-/// Throughput target(s)
-#[derive(Debug, Clone)]
-pub struct TargetThroughput {
-    download: Throughput,
-    upload: Throughput,
-}
-
-impl TargetThroughput {
-    /// Create a new target throughput in Gigabits/sec that is
-    /// the same for both uploads and downloads.
-    pub fn new_gigabits_per_sec(gbps: u64) -> Self {
-        let target = Throughput::new_bytes_per_sec(gbps * ByteUnit::Gigabit.as_bytes_u64());
-        Self::new(target, target)
-    }
-
-    // TODO: we don't actually support limiting throughput by upload/download independently (yet), it will require updates to scheduler.
-
-    /// Create a new target throughput using the given upload and download
-    /// throughputs.
-    fn new(download_target: Throughput, upload_target: Throughput) -> Self {
-        Self {
-            download: download_target,
-            upload: upload_target,
-        }
-    }
-
-    /// Get the target throughput for uploads
-    pub fn upload(&self) -> &Throughput {
-        &self.upload
-    }
-
-    /// Get the target throughput for downloads
-    pub fn download(&self) -> &Throughput {
-        &self.download
-    }
 }
 
 /// Policy for how to handle a failed multipart upload

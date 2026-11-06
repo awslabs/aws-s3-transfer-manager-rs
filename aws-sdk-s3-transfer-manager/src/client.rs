@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::memory::BufferPool;
+use crate::runtime::sizing::{self, ConcurrencyBound, Signals, Sizing};
 use crate::runtime::ExecutionRuntime;
 
 /// Transfer manager client for Amazon Simple Storage Service.
@@ -34,6 +35,8 @@ pub(crate) struct Handle {
     pub(crate) controller: Arc<dyn ConcurrencyController>,
     pub(crate) telemetry: Arc<Telemetry>,
     pub(crate) buffer_pool: BufferPool,
+    /// Resource sizing resolved when the client was constructed.
+    pub(crate) sizing: Sizing,
     /// Per-bucket retry token bucket, cached so all operations and retries to a
     /// given bucket share one live token bucket. The SDK does not share a bucket
     /// across custom retry partitions, and a partition built per operation would
@@ -75,20 +78,12 @@ impl Handle {
         }
     }
 
-    /// Get the concrete target part size to use for uploads
-    pub(crate) fn upload_part_size_bytes(&self) -> u64 {
-        match self.config.part_size() {
-            PartSize::Auto => 8 * ByteUnit::Mebibyte.as_bytes_u64(),
-            PartSize::Target(explicit) => *explicit,
-        }
-    }
-
-    /// Get the concrete target part size to use for downloads
-    pub(crate) fn download_part_size_bytes(&self) -> u64 {
-        match self.config.part_size() {
-            PartSize::Auto => 5 * ByteUnit::Mebibyte.as_bytes_u64(),
-            PartSize::Target(explicit) => *explicit,
-        }
+    /// Get the concrete target part size to use for transfer operations.
+    ///
+    /// Uploads and downloads share one size: the configured size when set, and
+    /// a fixed default otherwise.
+    pub(crate) fn part_size_bytes(&self) -> u64 {
+        self.sizing.part_size
     }
 
     /// Whether the user pinned an explicit part size (vs leaving it `Auto`).
@@ -218,6 +213,24 @@ impl Handle {
             .expect("test buffer-pool configuration must be valid"),
             MemoryConfig::Explicit(pool) => pool.clone(),
         };
+        // Resolve sizing against the pool this handle actually uses, so the
+        // part size agrees with the ceiling the test is running under.
+        let sizing = sizing::resolve(Signals {
+            throughput_gbps: config.throughput_target_gbps(),
+            instance_type: None,
+            vcpus: 1,
+            ram_bytes: None,
+            descriptor_cap: crate::runtime::platform::MAX_CONNECTIONS_PER_HOST,
+            explicit_concurrency: Some(controller.target()),
+            explicit_part_size: match config.part_size() {
+                PartSize::Target(n) => Some(*n),
+                PartSize::Auto => None,
+            },
+            ceiling_override_bytes: Some(
+                usize::try_from(buffer_pool.metrics().configured_capacity_bytes())
+                    .unwrap_or(usize::MAX),
+            ),
+        });
         Arc::new_cyclic(|weak| {
             let scheduler = Scheduler::new(weak.clone());
             let runtime = runtime_factory(weak.clone());
@@ -235,6 +248,7 @@ impl Handle {
                 controller,
                 telemetry: Arc::new(Telemetry::new(std::time::Duration::from_millis(500))),
                 buffer_pool,
+                sizing,
                 retry_partitions: std::sync::Mutex::new(std::collections::HashMap::new()),
             }
         })
@@ -271,18 +285,37 @@ impl Client {
 
         let client_features = crate::config::user_agent::client_features(&config, &profile);
 
-        // 1. Create concurrency controller and telemetry
-        let (controller, telemetry): (Arc<dyn ConcurrencyController>, _) = {
-            // Resolve the concurrency target once, at construction. The preview
-            // ships a fixed instance-aware seed rather than the adaptive
-            // controller (which is left in the tree for a later release); see
-            // `runtime::platform` concurrency seeding.
-            let target = resolve_concurrency_target(config.concurrency(), &profile);
-            (
-                Arc::new(FixedConcurrency::new(target)),
-                Arc::new(Telemetry::new(Duration::from_millis(500))),
-            )
+        // Resolve every sized resource from one pass over the available
+        // signals, so the concurrency target, payload-memory ceiling, part
+        // size, and connection cap agree on what the host can sustain.
+        let connection_cap = crate::runtime::platform::ConnectionCap::detect();
+        let explicit_pool_ceiling = match config.memory() {
+            MemoryConfig::Explicit(pool) => Some(
+                usize::try_from(pool.metrics().configured_capacity_bytes()).unwrap_or(usize::MAX),
+            ),
+            MemoryConfig::Auto => None,
         };
+        let sizing = sizing::resolve(Signals {
+            throughput_gbps: config.throughput_target_gbps(),
+            instance_type: profile.instance_type.as_deref(),
+            vcpus: profile.vcpus,
+            ram_bytes: profile.ram_bytes,
+            descriptor_cap: connection_cap.max_per_host,
+            explicit_concurrency: match config.concurrency() {
+                ConcurrencyMode::Explicit(n) => Some(*n),
+                ConcurrencyMode::Auto => None,
+            },
+            explicit_part_size: match config.part_size() {
+                PartSize::Target(n) => Some(*n),
+                PartSize::Auto => None,
+            },
+            ceiling_override_bytes: explicit_pool_ceiling,
+        });
+
+        let (controller, telemetry): (Arc<dyn ConcurrencyController>, _) = (
+            Arc::new(FixedConcurrency::new(sizing.concurrency)),
+            Arc::new(Telemetry::new(Duration::from_millis(500))),
+        );
 
         // 2. Build Handle with Arc::new_cyclic so scheduler and runtime
         //    can hold Weak<Handle> without creating a reference cycle.
@@ -292,7 +325,7 @@ impl Client {
         let memory_diagnostics = config.diagnostics().memory();
         let buffer_pool = match config.memory() {
             MemoryConfig::Auto => BufferPool::from_capacity(
-                crate::types::MemoryBudgetConfig::Auto,
+                crate::types::MemoryBudgetConfig::Limit(sizing.ceiling_bytes),
                 profile.ram_bytes,
                 memory_diagnostics,
             )
@@ -301,11 +334,13 @@ impl Client {
         };
         // Runtime HTTP is built only when it will be installed on an S3 client
         // this transfer manager constructs.
-        let connection_cap = crate::runtime::platform::ConnectionCap::detect();
-        let runtime_http = config.runtime_http(connection_cap.max_per_host);
-        if runtime_http.is_some() {
-            log_connection_cap(&connection_cap, controller.target());
-        }
+        let runtime_http = config.runtime_http(sizing.connection_cap);
+        log_resource_sizing(
+            &sizing,
+            &connection_cap,
+            runtime_http.is_some(),
+            config.ignored_throughput_target_gbps(),
+        );
         // wasm targets have no managed execution; see `Managed`.
         #[cfg(not(target_family = "wasm"))]
         let managed = match config.managed_config_mut() {
@@ -370,6 +405,7 @@ impl Client {
                 controller,
                 telemetry,
                 buffer_pool,
+                sizing,
                 retry_partitions: std::sync::Mutex::new(std::collections::HashMap::new()),
             }
         });
@@ -531,94 +567,76 @@ impl Client {
     }
 }
 
-/// Report the per-host connection cap, and warn when the descriptor limit holds
-/// it below the concurrency target.
-fn log_connection_cap(cap: &crate::runtime::platform::ConnectionCap, target: usize) {
+/// Report the resolved sizing, and warn when a signal held a resource below
+/// what the rest of the configuration asks for.
+///
+/// Emitted for every client. `connection_cap_installed` is false when TM does
+/// not build the transport (a supplied S3 or HTTP client, caller-runtime
+/// execution, wasm), in which case `max_connections_per_host` is not applied.
+fn log_resource_sizing(
+    sizing: &Sizing,
+    cap: &crate::runtime::platform::ConnectionCap,
+    connection_cap_installed: bool,
+    ignored_throughput_gbps: Option<f64>,
+) {
     let soft = cap.descriptors.map(|limit| limit.soft);
     let hard = cap.descriptors.and_then(|limit| limit.hard);
-    if cap.limited_by_descriptors() && cap.max_per_host < target {
+    if let Some(gbps) = ignored_throughput_gbps {
         tracing::warn!(
             target: crate::telemetry::TARGET_CONCURRENCY,
-            max_connections_per_host = cap.max_per_host,
-            concurrency_target = target,
-            soft_descriptor_limit = ?soft,
-            hard_descriptor_limit = ?hard,
-            "per-host connection cap is below the concurrency target because it is limited to half \
-             the soft file-descriptor limit (RLIMIT_NOFILE); raise the soft limit to allow more connections",
-        );
-    } else {
-        tracing::debug!(
-            target: crate::telemetry::TARGET_CONCURRENCY,
-            max_connections_per_host = cap.max_per_host,
-            concurrency_target = target,
-            soft_descriptor_limit = ?soft,
-            hard_descriptor_limit = ?hard,
-            "resolved per-host connection cap",
+            configured_throughput_gbps = gbps,
+            "configured throughput target is not finite and positive and was ignored; throughput \
+             is estimated from the execution environment instead",
         );
     }
-}
+    tracing::info!(
+        target: crate::telemetry::TARGET_CONCURRENCY,
+        concurrency_target = sizing.concurrency,
+        source = sizing.concurrency_source.as_str(),
+        bounded_by = sizing.concurrency_bound.as_str(),
+        throughput_gbps = ?sizing.throughput_gbps,
+        memory_ceiling_bytes = sizing.ceiling_bytes,
+        memory_detected = sizing.memory_detected,
+        part_size_bytes = sizing.part_size,
+        max_connections_per_host = sizing.connection_cap,
+        connection_cap_installed,
+        max_funded_concurrency = sizing.max_funded_concurrency,
+        soft_descriptor_limit = ?soft,
+        hard_descriptor_limit = ?hard,
+        "resolved resource sizing",
+    );
 
-/// Resolve the fixed in-flight concurrency target from the concurrency mode and
-/// the detected machine profile. Called by [`Client::new`] to build the
-/// [`FixedConcurrency`] controller.
-///
-/// - [`ConcurrencyMode::Explicit`] — the caller's value verbatim.
-/// - [`ConcurrencyMode::TargetThroughput`] — derived from the download target
-///   (the scheduler has one global concurrency target; independent up/down
-///   limiting is not yet supported).
-/// - [`ConcurrencyMode::Auto`] — instance-aware seed from the profile's instance
-///   type and vCPU count; falls back to a vCPU-scaled seed when the family is
-///   unknown or the instance type was not detected.
-fn resolve_concurrency_target(
-    mode: &ConcurrencyMode,
-    profile: &crate::runtime::platform::MachineProfile,
-) -> usize {
-    use crate::runtime::platform;
-    match mode {
-        // Guard the trait's `target >= 1` invariant: `Explicit(0)` would panic in
-        // `FixedConcurrency::new`. Clamp to 1 rather than panic on a config value.
-        ConcurrencyMode::Explicit(n) => {
-            let target = (*n).max(1);
-            tracing::debug!(
-                target: crate::telemetry::TARGET_CONCURRENCY,
-                mode = "explicit",
-                source = "configured_concurrency",
-                requested_concurrency = *n,
-                concurrency_target = target,
-                "resolved concurrency target",
-            );
-            target
-        }
-        ConcurrencyMode::TargetThroughput(t) => {
-            let gbps = t.download().as_unit_per_sec(ByteUnit::Gigabit);
-            let target = platform::seed_from_gbps(gbps);
-            tracing::debug!(
-                target: crate::telemetry::TARGET_CONCURRENCY,
-                mode = "target_throughput",
-                source = "configured_throughput",
-                target_gbps = gbps,
-                assumed_gbps_per_inflight = platform::GBPS_PER_CONN,
-                concurrency_target = target,
-                "resolved concurrency target",
-            );
-            target
-        }
-        ConcurrencyMode::Auto => {
-            let resolved =
-                platform::resolve_auto_concurrency(profile.instance_type.as_deref(), profile.vcpus);
-            tracing::debug!(
-                target: crate::telemetry::TARGET_CONCURRENCY,
-                mode = "auto",
-                source = resolved.source.as_str(),
-                instance_type = ?profile.instance_type,
-                vcpus = profile.vcpus,
-                estimated_gbps = ?resolved.estimated_gbps,
-                assumed_gbps_per_inflight = platform::GBPS_PER_CONN,
-                concurrency_target = resolved.target,
-                "resolved concurrency target",
-            );
-            resolved.target
-        }
+    if sizing.configured_concurrency_unfunded {
+        tracing::warn!(
+            target: crate::telemetry::TARGET_CONCURRENCY,
+            concurrency_target = sizing.concurrency,
+            max_funded_concurrency = sizing.max_funded_concurrency,
+            max_connections_per_host = sizing.connection_cap,
+            "configured concurrency target exceeds what the payload-memory ceiling and connection \
+             cap sustain; requests beyond that point wait on memory admission or a connection",
+        );
+    }
+
+    if sizing.configured_part_size_unfunded {
+        tracing::warn!(
+            target: crate::telemetry::TARGET_CONCURRENCY,
+            part_size_bytes = sizing.part_size,
+            memory_ceiling_bytes = sizing.ceiling_bytes,
+            "configured part size exceeds what the payload-memory ceiling funds for a single \
+             concurrency slot; raise the memory ceiling or lower the part size",
+        );
+    }
+
+    if cap.limited_by_descriptors() && sizing.concurrency_bound == ConcurrencyBound::Connections {
+        tracing::warn!(
+            target: crate::telemetry::TARGET_CONCURRENCY,
+            max_connections_per_host = sizing.connection_cap,
+            concurrency_target = sizing.concurrency,
+            soft_descriptor_limit = ?soft,
+            hard_descriptor_limit = ?hard,
+            "concurrency is limited to half the soft file-descriptor limit (RLIMIT_NOFILE); raise \
+             the soft limit to allow more connections",
+        );
     }
 }
 
@@ -1189,8 +1207,8 @@ mod tests {
 
     // --- concurrency resolution wiring ---
 
-    use crate::runtime::platform::MachineProfile;
-    use crate::types::{ConcurrencyMode, TargetThroughput};
+    use crate::runtime::platform::{self, MachineProfile};
+    use crate::types::ConcurrencyMode;
 
     /// A profile with the given instance type and vCPU count; RAM is irrelevant
     /// to concurrency resolution.
@@ -1211,57 +1229,96 @@ mod tests {
             .build()
     }
 
-    #[test]
-    fn resolve_explicit_is_verbatim() {
-        assert_eq!(
-            resolve_concurrency_target(&ConcurrencyMode::Explicit(42), &profile(None, 8)),
-            42
-        );
-    }
-
-    #[test]
-    fn resolve_target_throughput_derives_from_download() {
-        // 100 Gbps target -> ceil(100 / 0.4) = 250 in-flight.
-        let mode = ConcurrencyMode::TargetThroughput(TargetThroughput::new_gigabits_per_sec(100));
-        assert_eq!(resolve_concurrency_target(&mode, &profile(None, 8)), 250);
-    }
-
-    #[test]
-    fn resolve_auto_uses_profile_instance_type() {
-        // m6idn.16xlarge @ 64 vCPU -> 100 Gbps -> 250.
-        let p = profile(Some("m6idn.16xlarge"), 64);
-        assert_eq!(resolve_concurrency_target(&ConcurrencyMode::Auto, &p), 250);
-    }
-
-    #[test]
-    fn resolve_auto_profile_without_instance_type_uses_vcpu_fallback() {
-        // Detected vCPU but no instance type (DMI/IMDS miss): fallback 5 * 16 = 80.
-        let p = profile(None, 16);
-        assert_eq!(resolve_concurrency_target(&ConcurrencyMode::Auto, &p), 80);
-    }
-
-    #[test]
-    fn resolve_explicit_zero_is_clamped_not_panic() {
-        // `FixedConcurrency::new(0)` would panic; resolution must guard it.
-        let p = profile(None, 8);
-        assert_eq!(
-            resolve_concurrency_target(&ConcurrencyMode::Explicit(0), &p),
-            1
-        );
-    }
-
     // FIXME: crossbeam-epoch is incompatible with miri
     #[cfg_attr(miri, ignore)]
     #[test]
     fn client_new_wires_resolved_target_into_controller() {
         // End-to-end: the resolved seed reaches the live controller's target().
-        // c8gn.16xlarge: 3.125 Gbps/vCPU * 64 = 200 Gbps -> 500.
-        let config = config_with(
-            ConcurrencyMode::Auto,
-            Some(profile(Some("c8gn.16xlarge"), 64)),
-        );
+        // The target the pass resolves is the target the scheduler runs with.
+        // Derived from the pass rather than written as a literal, because the
+        // descriptor cap depends on the host's RLIMIT_NOFILE.
+        let p = profile(Some("c8gn.16xlarge"), 64);
+        let expected = sizing::resolve(Signals {
+            throughput_gbps: None,
+            instance_type: p.instance_type.as_deref(),
+            vcpus: p.vcpus,
+            ram_bytes: p.ram_bytes,
+            descriptor_cap: platform::ConnectionCap::detect().max_per_host,
+            explicit_concurrency: None,
+            explicit_part_size: None,
+            ceiling_override_bytes: None,
+        });
+
+        let client = Client::new(config_with(ConcurrencyMode::Auto, Some(p)));
+
+        assert_eq!(client.handle.controller.target(), expected.concurrency);
+        assert_eq!(client.handle.part_size_bytes(), expected.part_size);
+    }
+
+    // FIXME: crossbeam-epoch is incompatible with miri
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn client_new_sizes_an_automatic_pool_from_the_resolved_ceiling() {
+        // `MemoryConfig::Auto` takes its admission ceiling from the pass, not
+        // from a RAM share computed independently inside the pool.
+        let p = profile(None, 4);
+        let config = crate::config::Config::builder()
+            .sdk_client(aws_smithy_mocks::mock_client!(aws_sdk_s3, []))
+            .machine_profile(Some(p))
+            .build();
+
         let client = Client::new(config);
-        assert_eq!(client.handle.controller.target(), 500);
+        let configured = client
+            .handle
+            .buffer_pool
+            .metrics()
+            .configured_capacity_bytes();
+
+        // Carrier rounding can only round the ceiling down, never above it.
+        assert!(configured <= client.handle.sizing.ceiling_bytes as u64);
+        assert!(configured > 0);
+    }
+
+    // FIXME: crossbeam-epoch is incompatible with miri
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn configured_throughput_drives_the_resolved_target() {
+        // The top-level knob reaches the scheduler without a concurrency mode
+        // being set, which is the point of offering a single figure.
+        let config = crate::config::Config::builder()
+            .sdk_client(aws_smithy_mocks::mock_client!(aws_sdk_s3, []))
+            .throughput_target_gbps(100.0)
+            .machine_profile(Some(profile(None, 4)))
+            .build();
+
+        let client = Client::new(config);
+
+        // Pin the value rather than a range: 100 Gbps seeds the target, and the
+        // pass bounds it by the host's descriptor cap and the fallback ceiling.
+        let expected = sizing::resolve(Signals {
+            throughput_gbps: Some(100.0),
+            instance_type: None,
+            vcpus: 4,
+            ram_bytes: None,
+            descriptor_cap: platform::ConnectionCap::detect().max_per_host,
+            explicit_concurrency: None,
+            explicit_part_size: None,
+            ceiling_override_bytes: None,
+        });
+        assert_eq!(client.handle.controller.target(), expected.concurrency);
+        assert_eq!(client.handle.sizing.throughput_gbps, Some(100.0));
+    }
+
+    #[test]
+    fn invalid_throughput_target_reads_as_unset() {
+        for gbps in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let config = crate::config::Config::builder()
+                .sdk_client(aws_smithy_mocks::mock_client!(aws_sdk_s3, []))
+                .throughput_target_gbps(gbps)
+                .build();
+            assert_eq!(config.throughput_target_gbps(), None, "gbps {gbps}");
+            assert!(config.ignored_throughput_target_gbps().is_some());
+        }
     }
 
     // FIXME: crossbeam-epoch is incompatible with miri
@@ -1274,11 +1331,18 @@ mod tests {
         // the detected core count — pinning it, so a regression that stops
         // feeding local vCPU into resolution is caught (not just a clamp-range
         // check that holds by construction).
-        use crate::runtime::platform;
-        let expected = platform::resolve_auto_concurrency(None, platform::local_vcpus()).target;
-        let config = config_with(ConcurrencyMode::Auto, None);
-        let client = Client::new(config);
-        assert_eq!(client.handle.controller.target(), expected);
+        let expected = sizing::resolve(Signals {
+            throughput_gbps: None,
+            instance_type: None,
+            vcpus: platform::local_vcpus(),
+            ram_bytes: platform::available_ram(),
+            descriptor_cap: platform::ConnectionCap::detect().max_per_host,
+            explicit_concurrency: None,
+            explicit_part_size: None,
+            ceiling_override_bytes: None,
+        });
+        let client = Client::new(config_with(ConcurrencyMode::Auto, None));
+        assert_eq!(client.handle.controller.target(), expected.concurrency);
     }
 
     // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)

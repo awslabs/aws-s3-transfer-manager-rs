@@ -7,7 +7,7 @@ use aws_sdk_s3_transfer_manager::memory::{BufferPool, MemoryBudgetConfig, Memory
 use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
 use aws_sdk_s3_transfer_manager::metrics::Throughput;
 use aws_sdk_s3_transfer_manager::operation::download::Body;
-use aws_sdk_s3_transfer_manager::types::{ConcurrencyMode, PartSize, TargetThroughput};
+use aws_sdk_s3_transfer_manager::types::{ConcurrencyMode, PartSize};
 use aws_sdk_s3_transfer_manager::RuntimeConfig;
 use aws_smithy_types::date_time::{DateTime, Format};
 use clap::{CommandFactory, Parser};
@@ -98,6 +98,13 @@ pub struct Args {
     #[command(flatten)]
     concurrency: ConcurrencyModeArg,
 
+    /// Network throughput, in Gbps, to size the client for
+    ///
+    /// Flag name predates the config method it feeds; kept stable for callers
+    /// that drive this example.
+    #[arg(long = "target-throughput-gbps")]
+    throughput_target_gbps: Option<f64>,
+
     /// Execution runtime: managed threads (default) or the ambient tokio runtime
     #[arg(long, value_enum, default_value_t = RuntimeArg::Managed)]
     runtime: RuntimeArg,
@@ -154,10 +161,6 @@ struct ConcurrencyModeArg {
     #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
     concurrency_auto: bool,
 
-    /// ConcurrencyMode::TargetThroughput(Gbps)
-    #[arg(long)]
-    target_throughput_gbps: Option<u64>,
-
     /// ConcurrencyMode::Explicit(n)
     #[arg(long)]
     concurrency: Option<usize>,
@@ -169,12 +172,9 @@ impl ConcurrencyModeArg {
             return ConcurrencyMode::Auto;
         }
 
-        match (self.target_throughput_gbps, self.concurrency) {
-            (None, Some(concurrency)) => ConcurrencyMode::Explicit(concurrency),
-            (Some(gbps), None) => {
-                ConcurrencyMode::TargetThroughput(TargetThroughput::new_gigabits_per_sec(gbps))
-            }
-            _ => ConcurrencyMode::Auto,
+        match self.concurrency {
+            Some(concurrency) => ConcurrencyMode::Explicit(concurrency),
+            None => ConcurrencyMode::Auto,
         }
     }
 }
@@ -500,6 +500,10 @@ async fn run(args: Args) -> Result<(), BoxError> {
         .concurrency(args.concurrency.mode())
         .runtime_config(args.runtime.mode())
         .part_size(PartSize::Target(args.part_size));
+
+    if let Some(gbps) = args.throughput_target_gbps {
+        config_loader = config_loader.throughput_target_gbps(gbps);
+    }
 
     // S3FIO_MEMORY_LIMIT=N caps the transfer manager's memory pool at N GiB
     // (in-flight plus buffered transfer data; transfers backpressure at the cap).
