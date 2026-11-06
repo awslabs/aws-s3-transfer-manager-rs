@@ -4,14 +4,19 @@ version = "0.0.0"
 edition = "2024"
 rust-version = "1.94.1"
 publish = false
-description = "Customer-scenario code for the transfer manager 1.0 API review"
+description = "Customer-scenario code for the transfer manager API review"
 
 # A standalone workspace, so this crate resolves its dependencies and features the way a downstream
 # consumer would, rather than through the transfer manager workspace's unified graph.
 [workspace]
 resolver = "3"
 
+[features]
+# Scenarios that need the transfer manager's AWS SDK for Rust S3 interoperability.
+sdk-v1 = ["aws-sdk-s3-transfer-manager/sdk-v1"]
+
 [dependencies]
 aws-sdk-s3-transfer-manager = { path = "../aws-sdk-s3-transfer-manager" }
+aws-sdk-s3 = "1.154.0"
 aws-config = { version = "1.13.0", features = ["behavior-version-latest"] }
 tokio = { version = "1", features = ["full"] }
