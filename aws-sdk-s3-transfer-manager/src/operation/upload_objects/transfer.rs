@@ -1695,6 +1695,16 @@ mod tests {
                 failed[0].error().kind(),
                 &crate::error::ErrorKind::InputInvalid
             );
+            let message = std::error::Error::source(failed[0].error())
+                .unwrap()
+                .to_string();
+            let failed_path = failed[0].source_path().unwrap();
+            let other = names
+                .iter()
+                .map(|n| dir.path().join(n))
+                .find(|p| p != failed_path)
+                .unwrap();
+            assert!(message.contains(&other.display().to_string()), "{message}");
             if !abort {
                 assert_eq!(transfer.successful_uploads(), 1, "key={key:?}");
                 assert_eq!(*captured.lock().unwrap(), [key], "key={key:?}");

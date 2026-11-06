@@ -1532,6 +1532,10 @@ mod tests {
             assert_eq!(failed.len(), 1, "key={second:?}");
             assert_eq!(failed[0].input().key(), Some(second));
             assert_eq!(failed[0].error().kind(), &ErrorKind::InputInvalid);
+            let message = std::error::Error::source(failed[0].error())
+                .unwrap()
+                .to_string();
+            assert!(message.contains(&format!("'{first}'")), "{message}");
             let published = dir.path().join(first.replace("//", "/"));
             assert_eq!(std::fs::read(published).unwrap(), b"first");
             assert_eq!(std::fs::read_dir(dir.path().join("a")).unwrap().count(), 1);
