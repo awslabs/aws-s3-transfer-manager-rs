@@ -476,6 +476,16 @@ fn spawn_resolution_runtime<T>(
     });
 }
 
+#[cfg(not(target_family = "wasm"))]
+fn default_background_resolver() -> SharedDnsResolver {
+    SharedDnsResolver::new(aws_smithy_runtime::client::dns::TokioDnsResolver::new())
+}
+
+#[cfg(target_family = "wasm")]
+fn default_background_resolver() -> SharedDnsResolver {
+    SharedDnsResolver::new(aws_smithy_dns::HickoryDnsResolver::default())
+}
+
 impl ResolverImpl {
     /// Creates a new resolver implementation using the default constructor for the bookkeeping
     /// state
@@ -510,9 +520,9 @@ impl ResolverImpl {
         };
 
         // Config resolver || basic getaddrinfo resolver
-        let internal_resolver = config.internal_resolver.unwrap_or(SharedDnsResolver::new(
-            aws_smithy_runtime::client::dns::TokioDnsResolver::new(),
-        ));
+        let internal_resolver = config
+            .internal_resolver
+            .unwrap_or(default_background_resolver());
         let mut resolver_process = ResolverProcess::<T>::new(state, internal_resolver, atx, rx);
 
         // Config runtime || create a new runtime
