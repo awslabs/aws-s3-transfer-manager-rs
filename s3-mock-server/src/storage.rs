@@ -115,6 +115,9 @@ pub(crate) fn etag_condition_holds(condition: &s3s::dto::ETagCondition, etag: &s
     }
 }
 
+/// The most parts an object can have, counting each append as one.
+pub(crate) const MAX_PARTS: u32 = 10_000;
+
 /// Request for appending to an object (PutObject with `x-amz-write-offset-bytes`).
 pub(crate) struct AppendObjectRequest {
     /// Where the appended data must start: the current size of the object.
@@ -489,7 +492,8 @@ pub(crate) trait StorageBackend: Send + Sync + Debug {
     /// Fails with `NoSuchKey` for a missing key at a non-zero offset or with `If-Match`,
     /// `PreconditionFailed` when `If-Match` does not hold or the key exists with
     /// `If-None-Match: *`, `InvalidArgument` for an empty append to a non-empty object,
-    /// `InvalidWriteOffset` when the offset is not the object's size, and `ChecksumTypeMismatch`
+    /// `InvalidWriteOffset` when the offset is not the object's size, `TooManyParts` when the
+    /// object already has [`MAX_PARTS`] parts, and `ChecksumTypeMismatch`
     /// when the object stores checksums but none of the request's algorithm, CRC64NVME if the
     /// request has none.
     async fn append_object(&self, _request: AppendObjectRequest) -> Result<StoredObjectMetadata> {

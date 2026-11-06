@@ -128,6 +128,7 @@ impl StorageBackend for InMemoryStorage {
             content_language: request.content_language,
             parts: Vec::new(),
             append_segments: Vec::new(),
+            append_parts: 0,
             restore_status: request.restore_status,
         };
 
@@ -707,6 +708,14 @@ impl StorageBackend for InMemoryStorage {
         if metadata.content_length != request.offset {
             return Err(Error::InvalidWriteOffset);
         }
+        // Each append adds a part to those the object has: its multipart upload's, or one.
+        let parts = match metadata.append_parts {
+            0 => (metadata.parts.len() as u32).max(1),
+            parts => parts,
+        };
+        if parts >= crate::storage::MAX_PARTS {
+            return Err(Error::TooManyParts);
+        }
         let algorithms = metadata.checksum_algorithms();
         // An append without a checksum is checked as a CRC64NVME one, S3's default.
         let algorithm = request
@@ -791,6 +800,7 @@ impl StorageBackend for InMemoryStorage {
         // An appended object has no part layout to report.
         metadata.parts = Vec::new();
         metadata.append_segments = append_segments;
+        metadata.append_parts = parts + 1;
         bucket_state
             .objects
             .insert(request.put_object.key, (content, metadata));

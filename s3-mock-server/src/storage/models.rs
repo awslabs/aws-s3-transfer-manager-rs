@@ -122,6 +122,12 @@ pub(crate) struct ObjectMetadata {
     #[serde(default)]
     pub append_segments: Vec<String>,
 
+    /// The number of parts of an object that has been appended to, at most
+    /// [`MAX_PARTS`](crate::storage::MAX_PARTS): the parts it had when it was first appended to
+    /// (one for an object written in one request), and one per append. 0 for other objects.
+    #[serde(default)]
+    pub append_parts: u32,
+
     /// Restore status of an object in an archival storage class, reported in the
     /// `x-amz-restore` header.
     #[serde(default)]
@@ -286,6 +292,7 @@ impl Default for ObjectMetadata {
             content_language: None,
             parts: Vec::new(),
             append_segments: Vec::new(),
+            append_parts: 0,
             restore_status: None,
         }
     }

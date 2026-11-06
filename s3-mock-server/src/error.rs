@@ -126,6 +126,10 @@ pub enum Error {
     #[error("invalid write offset")]
     InvalidWriteOffset,
 
+    /// An append to an object that already has 10,000 parts.
+    #[error("too many parts")]
+    TooManyParts,
+
     /// An append carries a checksum of an algorithm the object does not store.
     #[error("checksum type mismatch: expected {expected}, got {actual}")]
     ChecksumTypeMismatch {
@@ -412,6 +416,14 @@ impl From<Error> for s3s::S3Error {
                 StatusCode::CONFLICT,
                 "The requested bucket name is not available. The bucket namespace is shared by \
                  all users of the system. Please select a different name and try again."
+                    .into(),
+            ),
+            Error::TooManyParts => (
+                S3ErrorCode::Custom("TooManyParts".into()),
+                StatusCode::BAD_REQUEST,
+                "You have attempted to add more parts than the maximum of 10000 that are allowed for \
+                 this object. You can use the CopyObject operation to copy this object to another \
+                 and then add more data to the newly copied object."
                     .into(),
             ),
             Error::InvalidWriteOffset => (

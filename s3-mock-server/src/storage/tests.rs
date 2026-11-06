@@ -698,3 +698,69 @@ async fn test_filesystem_list_multipart_uploads() {
     let dir = tempdir().unwrap();
     test_list_multipart_uploads(&FilesystemStorage::new(dir.path()).await.unwrap()).await;
 }
+
+/// Appends to a multipart object count from its parts: with 3 parts, the 9,997th append makes
+/// 10,000 and the next fails with TooManyParts, leaving the object as it was.
+#[tokio::test]
+async fn test_in_memory_append_part_limit_counts_multipart_parts() {
+    let storage = InMemoryStorage::new();
+    storage.create_bucket(TEST_BUCKET).await.unwrap();
+    let (key, upload_id) = ("appended", "upload-limit");
+    storage
+        .create_multipart_upload(CreateMultipartUploadRequest {
+            bucket: TEST_BUCKET,
+            key,
+            upload_id,
+            metadata: ObjectMetadata::default(),
+            checksum_type: aws_sdk_s3::types::ChecksumType::FullObject,
+        })
+        .await
+        .unwrap();
+    let mut parts = Vec::new();
+    for part_number in 1..=3 {
+        let request = UploadPartRequest {
+            upload_id,
+            part_number,
+            content: Bytes::from_static(b"p"),
+            client_checksum: false,
+        };
+        parts.push((
+            part_number,
+            storage.upload_part(request).await.unwrap().etag,
+        ));
+    }
+    storage
+        .complete_multipart_upload(CompleteMultipartUploadRequest {
+            bucket: TEST_BUCKET,
+            upload_id,
+            parts,
+            client_checksums: None,
+        })
+        .await
+        .unwrap();
+    let append = |offset: u64| crate::storage::AppendObjectRequest {
+        offset,
+        content: Bytes::from_static(b"x"),
+        precondition: crate::storage::WritePrecondition::None,
+        checksum_algorithm: None,
+        put_object: StoreObjectRequest::new(
+            TEST_BUCKET,
+            key,
+            Box::pin(futures::stream::empty()),
+            ObjectIntegrityChecks::new(),
+        ),
+    };
+    for offset in 3..10_000 {
+        storage.append_object(append(offset)).await.unwrap();
+    }
+    assert!(matches!(
+        storage.append_object(append(10_000)).await,
+        Err(crate::Error::TooManyParts)
+    ));
+    let metadata = storage
+        .head_object(TEST_BUCKET, key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(metadata.content_length, 10_000);
+}

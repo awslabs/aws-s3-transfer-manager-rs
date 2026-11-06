@@ -579,3 +579,18 @@ async fn test_append_checksums() -> Result {
     f.shutdown().await;
     Ok(())
 }
+
+/// An object written in one request has one part, and each append adds one. An append past 10,000
+/// parts fails with 400 TooManyParts and leaves the object as it was.
+#[tokio::test]
+async fn test_append_part_limit() -> Result {
+    let f = Fixture::directory().await;
+    for offset in 0..10_000 {
+        append(&f, "limit", offset, b"x").await?;
+    }
+    let fail = failure(append(&f, "limit", 10_000, b"x").await);
+    assert_failure(&fail, 400, "TooManyParts");
+    assert_eq!(f.content("limit").await, vec![b'x'; 10_000]);
+    f.shutdown().await;
+    Ok(())
+}
