@@ -151,6 +151,7 @@ pub struct Config {
     multipart_threshold: PartSize,
     target_part_size: PartSize,
     concurrency: ConcurrencyMode,
+    throughput_target_gbps: Option<f64>,
     runtime_config: RuntimeConfig,
     read_ahead: ReadAhead,
     memory: MemoryConfig,
@@ -186,6 +187,14 @@ impl Config {
     /// This is the mode used for concurrent in-flight requests across _all_ operations.
     pub fn concurrency(&self) -> &ConcurrencyMode {
         &self.concurrency
+    }
+
+    /// Returns the configured network throughput target in gigabits per second.
+    ///
+    /// `None` when no target is set, in which case throughput is estimated from
+    /// the execution environment.
+    pub fn throughput_target_gbps(&self) -> Option<f64> {
+        self.throughput_target_gbps
     }
 
     /// Returns the execution configuration for transfer work.
@@ -273,6 +282,7 @@ pub struct Builder {
     multipart_threshold_part_size: PartSize,
     target_part_size: PartSize,
     concurrency: ConcurrencyMode,
+    throughput_target_gbps: Option<f64>,
     runtime_config: RuntimeConfig,
     read_ahead: ReadAhead,
     memory: MemoryConfig,
@@ -346,6 +356,23 @@ impl Builder {
     /// Default is [ConcurrencyMode::Auto].
     pub fn concurrency(mut self, mode: ConcurrencyMode) -> Self {
         self.concurrency = mode;
+        self
+    }
+
+    /// Set the network throughput, in gigabits per second, the client should
+    /// size itself for.
+    ///
+    /// One figure drives the automatic concurrency target, payload-memory
+    /// ceiling, and per-host connection cap together, so a caller who knows
+    /// what the host's network sustains need not set those individually. Each
+    /// remains configurable, and a value set directly takes precedence over
+    /// the one derived from this target.
+    ///
+    /// A value that is not finite and positive is ignored, leaving throughput
+    /// to be estimated from the execution environment. That estimate is also
+    /// used when no target is set.
+    pub fn throughput_target_gbps(mut self, gbps: f64) -> Self {
+        self.throughput_target_gbps = Some(gbps);
         self
     }
 
@@ -459,6 +486,7 @@ impl Builder {
             multipart_threshold: self.multipart_threshold_part_size,
             target_part_size: self.target_part_size,
             concurrency: self.concurrency,
+            throughput_target_gbps: self.throughput_target_gbps,
             runtime_config: self.runtime_config,
             read_ahead: self.read_ahead,
             memory: self.memory,

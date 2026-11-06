@@ -824,10 +824,10 @@ impl UploadTransfer {
         // without one uses the configured size and enforces the limit as parts are produced.
         let part_size = match size_hint.upper() {
             Some(upper) => cmp::max(
-                self.inner.ctx.handle.upload_part_size_bytes(),
+                self.inner.ctx.handle.part_size_bytes(),
                 upper.div_ceil(MAX_PARTS),
             ),
-            None => self.inner.ctx.handle.upload_part_size_bytes(),
+            None => self.inner.ctx.handle.part_size_bytes(),
         };
         let plan = if reads_until_eof {
             PartPlan::UntilEof { size_hint }

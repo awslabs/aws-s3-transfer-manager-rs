@@ -19,6 +19,15 @@ use std::path::{Path, PathBuf};
 /// in-flight connection.
 const POOL_FD_BUDGET_FRACTION: f64 = 0.5;
 
+/// Descriptors withheld from the connection budget regardless of the fraction.
+///
+/// The descriptors a process holds besides its connections — stdio, resolver
+/// sockets, the log sink, open transfer files — are closer to a fixed count than
+/// to a share of the limit, so the fraction alone leaves proportionally less
+/// headroom as the soft limit falls. Below roughly twice this value the reserve
+/// is what bounds the budget.
+const POOL_FD_RESERVE: usize = 64;
+
 /// Ceiling on connections to one origin across all managed threads.
 ///
 /// Above every concurrency target outside the largest accelerator families,
@@ -53,8 +62,10 @@ impl ConnectionCap {
         Self::from_descriptor_limit(descriptor_limit())
     }
 
-    /// `clamp(soft × POOL_FD_BUDGET_FRACTION, MIN_CONNECTIONS_PER_HOST,
-    /// MAX_CONNECTIONS_PER_HOST)`, or the ceiling when no limit is known.
+    /// `clamp(min(soft × POOL_FD_BUDGET_FRACTION, soft - POOL_FD_RESERVE),
+    /// MIN_CONNECTIONS_PER_HOST, MAX_CONNECTIONS_PER_HOST)`, or the ceiling when
+    /// no limit is known. The floor takes precedence, so a soft limit under the
+    /// reserve still yields a cap the client can attempt a transfer with.
     pub(crate) fn from_descriptor_limit(descriptors: Option<DescriptorLimit>) -> Self {
         let max_per_host = descriptors
             .map_or(MAX_CONNECTIONS_PER_HOST, |limit| {
@@ -75,7 +86,8 @@ impl ConnectionCap {
 
 /// Connections the descriptor budget allows for a soft limit.
 fn descriptor_budget(soft: usize) -> usize {
-    (soft as f64 * POOL_FD_BUDGET_FRACTION) as usize
+    let fraction = (soft as f64 * POOL_FD_BUDGET_FRACTION) as usize;
+    fraction.min(soft.saturating_sub(POOL_FD_RESERVE))
 }
 
 /// `RLIMIT_NOFILE` on Unix; `None` where there is no descriptor limit or
@@ -613,15 +625,6 @@ pub(crate) enum AutoConcurrencySource {
     VcpuFallback,
 }
 
-impl AutoConcurrencySource {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::InstanceFamily => "instance_family",
-            Self::VcpuFallback => "vcpu_fallback",
-        }
-    }
-}
-
 /// Result of resolving automatic concurrency from one detected machine profile.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct ResolvedAutoConcurrency {
@@ -673,10 +676,31 @@ mod tests {
 
     #[test]
     fn test_cap_low_descriptor_limit_is_floored() {
-        // 8 descriptors -> 4 by fraction -> floored.
+        // 8 descriptors: under the reserve entirely, so the budget is zero and
+        // the floor supplies the cap.
         let cap = ConnectionCap::from_descriptor_limit(soft(8));
         assert_eq!(cap.max_per_host, MIN_CONNECTIONS_PER_HOST);
         assert!(cap.limited_by_descriptors());
+    }
+
+    #[test]
+    fn test_cap_reserve_binds_below_twice_the_reserve() {
+        // 100 descriptors: the fraction would allow 50, but withholding the
+        // reserve leaves 36, and the smaller of the two is the budget.
+        assert_eq!(
+            ConnectionCap::from_descriptor_limit(soft(100)).max_per_host,
+            36
+        );
+    }
+
+    #[test]
+    fn test_cap_reserve_does_not_bind_above_twice_the_reserve() {
+        // 160 descriptors: the fraction allows 80 and the reserve leaves 96, so
+        // the fraction is still what bounds the budget.
+        assert_eq!(
+            ConnectionCap::from_descriptor_limit(soft(160)).max_per_host,
+            80
+        );
     }
 
     #[test]
@@ -899,7 +923,6 @@ mod tests {
                 source: AutoConcurrencySource::InstanceFamily,
             }
         );
-        assert_eq!(resolved.source.as_str(), "instance_family");
     }
 
     #[test]
@@ -913,7 +936,6 @@ mod tests {
                 source: AutoConcurrencySource::VcpuFallback,
             }
         );
-        assert_eq!(resolved.source.as_str(), "vcpu_fallback");
     }
 
     #[test]
