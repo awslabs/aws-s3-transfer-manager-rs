@@ -27,6 +27,10 @@ use crate::s3s::ServerState;
 /// How long a session's credentials are valid, as in S3.
 const SESSION_DURATION: Duration = Duration::from_secs(5 * 60);
 
+/// How long an expired session is remembered. A request signed with an expired session fails with
+/// AccessDenied, and once the session is forgotten, with InvalidAccessKeyId.
+const EXPIRED_SESSION_RETENTION: Duration = Duration::from_secs(60 * 60);
+
 const SESSION_TOKEN_HEADER: &str = "x-amz-s3session-token";
 const SESSION_TOKEN_QUERY: &str = "X-Amz-S3session-Token";
 
@@ -62,7 +66,7 @@ impl Sessions {
             secret_access_key: secret_key,
             session_token: session.token.clone(),
         };
-        self.sessions.lock().unwrap().insert(access_key, session);
+        self.insert(access_key, session);
         credentials
     }
 
@@ -77,6 +81,14 @@ impl Sessions {
     /// Forget every session: requests signed with one fail with InvalidAccessKeyId.
     pub(crate) fn clear(&self) {
         self.sessions.lock().unwrap().clear();
+    }
+
+    /// Add `session`, and forget those that expired more than [`EXPIRED_SESSION_RETENTION`] ago.
+    fn insert(&self, access_key: String, session: Session) {
+        let mut sessions = self.sessions.lock().unwrap();
+        let now = SystemTime::now();
+        sessions.retain(|_, session| session.expiration + EXPIRED_SESSION_RETENTION >= now);
+        sessions.insert(access_key, session);
     }
 }
 
@@ -329,6 +341,26 @@ mod tests {
             read_only,
             expiration,
         }
+    }
+
+    #[test]
+    fn creating_a_session_forgets_long_expired_ones() {
+        let sessions = Sessions::default();
+        let now = SystemTime::now();
+        let bucket = "bucket--usw2-az1--x-s3";
+        let long_ago = now - EXPIRED_SESSION_RETENTION - Duration::from_secs(1);
+        sessions.insert("long-expired".to_owned(), session(bucket, false, long_ago));
+        sessions.insert(
+            "expired".to_owned(),
+            session(bucket, false, now - Duration::from_secs(1)),
+        );
+        sessions.insert(
+            "new".to_owned(),
+            session(bucket, false, now + SESSION_DURATION),
+        );
+        let mut keys: Vec<_> = sessions.sessions.lock().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, ["expired", "new"]);
     }
 
     #[test]

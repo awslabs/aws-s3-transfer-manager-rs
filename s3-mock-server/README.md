@@ -225,7 +225,8 @@ or with the server's credentials and no token. As in S3:
   AuthorizationHeaderMalformed (AuthorizationQueryParametersError if presigned).
 
 CreateSession requests that pass these checks are counted as `Operation::CreateSession`, and one
-for a missing bucket fails with 404 NoSuchBucket. `S3MockServer::reset` forgets all sessions. The server checks a session's token
+for a missing bucket fails with 404 NoSuchBucket. `S3MockServer::reset` forgets all sessions. An
+expired session is remembered for an hour after it expires. The server checks a session's token
 after verifying the request's signature, where S3 checks it first: a request with another
 session's token and a wrong signature fails with 403 SignatureDoesNotMatch.
 
