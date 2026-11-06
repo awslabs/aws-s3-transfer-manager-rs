@@ -1,5 +1,5 @@
 [release]
-tag = "release-2026-11-03"
+tag = "release-2026-11-05"
 
 [release.crates]
 aws-sdk-s3-transfer-manager = "0.4.0"
