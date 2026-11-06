@@ -56,6 +56,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parent, or a worker panic sends no AbortMultipartUpload; it now logs the ID of a multipart upload
   it leaves open at `WARN`.
   ([#226](https://github.com/awslabs/aws-s3-transfer-manager-rs/issues/226))
+- A finished transfer could be retained for the life of the process, and the client with it:
+  dropping the `Client` did not shut down its runtime. A download to disk (`write_to_path`,
+  `write_to_file`, or `download_objects`) kept its file open, preventing opens that deny write
+  sharing on Windows and keeping deleted files' storage allocated. Ready-set entries now hold weak
+  descriptors, so transfers and their resources are released when the registry and remaining
+  transient owners retire, without waiting for epoch reclamation. The destination file can remain
+  open after `join` or `abort` returns while transfer cleanup finishes.
 
 ## [0.3.1] - 2026-10-09
 

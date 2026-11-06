@@ -524,6 +524,42 @@ mod tests {
         }
     }
 
+    // ref: V2429410200
+    /// Dropping the last client handle on a managed thread shuts the runtime
+    /// down: the drop returns without panicking, and shutdown completion
+    /// confirms that every managed thread, including the one that ran the
+    /// drop, has been joined.
+    ///
+    /// A transfer's work item can hold the last handle, and once the scheduler
+    /// releases finished transfers this drop runs on whichever managed thread
+    /// retires that item, so the transfer manager depends on it.
+    #[tokio::test]
+    async fn last_handle_dropped_on_a_managed_thread_shuts_the_runtime_down() {
+        const TIMEOUT: Duration = Duration::from_secs(5);
+        let (handle, execution) = test_handle(2);
+        let completion = execution
+            .shutdown_completion()
+            .expect("managed execution reports shutdown completion");
+        let partition = execution.partitions[0].clone();
+        drop(execution);
+
+        let (dropped_tx, dropped_rx) = std::sync::mpsc::channel();
+        drop(partition.spawn(async move {
+            let dropped = std::panic::catch_unwind(AssertUnwindSafe(|| drop(handle)));
+            dropped_tx.send(dropped.is_ok()).unwrap();
+        }));
+        assert!(
+            dropped_rx
+                .recv_timeout(TIMEOUT)
+                .expect("the handle drop did not return"),
+            "dropping the last handle on a managed thread panicked"
+        );
+        tokio::time::timeout(TIMEOUT, completion.wait())
+            .await
+            .expect("managed threads were not joined")
+            .expect("managed thread shutdown failed");
+    }
+
     #[test]
     fn router_selects_least_loaded() {
         let router = DispatchRouter;
