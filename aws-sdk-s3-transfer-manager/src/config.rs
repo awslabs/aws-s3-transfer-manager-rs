@@ -191,10 +191,18 @@ impl Config {
 
     /// Returns the configured network throughput target in gigabits per second.
     ///
-    /// `None` when no target is set, in which case throughput is estimated from
-    /// the execution environment.
+    /// `None` when no valid target is set, in which case throughput is
+    /// estimated from the execution environment. A configured value that is
+    /// not finite and positive is ignored and reads as `None`.
     pub fn throughput_target_gbps(&self) -> Option<f64> {
         self.throughput_target_gbps
+            .filter(|gbps| gbps.is_finite() && *gbps > 0.0)
+    }
+
+    /// The configured throughput target when it was ignored as invalid.
+    pub(crate) fn ignored_throughput_target_gbps(&self) -> Option<f64> {
+        self.throughput_target_gbps
+            .filter(|gbps| !(gbps.is_finite() && *gbps > 0.0))
     }
 
     /// Returns the execution configuration for transfer work.
@@ -362,15 +370,18 @@ impl Builder {
     /// Set the network throughput, in gigabits per second, the client should
     /// size itself for.
     ///
-    /// One figure drives the automatic concurrency target, payload-memory
-    /// ceiling, and per-host connection cap together, so a caller who knows
-    /// what the host's network sustains need not set those individually. Each
-    /// remains configurable, and a value set directly takes precedence over
-    /// the one derived from this target.
+    /// One figure drives the automatic concurrency target, and through it the
+    /// per-host connection cap, so a caller who knows what the host's network
+    /// sustains need not set those individually. A concurrency target set
+    /// directly takes precedence over the one derived from this value. The
+    /// payload-memory ceiling is not derived from throughput; it is a bound
+    /// against exhausting host memory and comes from detected memory or
+    /// [`Builder::memory`].
     ///
-    /// A value that is not finite and positive is ignored, leaving throughput
-    /// to be estimated from the execution environment. That estimate is also
-    /// used when no target is set.
+    /// A value that is not finite and positive is ignored with a warning at
+    /// client construction, leaving throughput to be estimated from the
+    /// execution environment. That estimate is also used when no target is
+    /// set.
     pub fn throughput_target_gbps(mut self, gbps: f64) -> Self {
         self.throughput_target_gbps = Some(gbps);
         self

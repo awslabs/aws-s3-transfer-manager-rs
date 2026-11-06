@@ -70,6 +70,10 @@ pub enum MemoryBudgetConfig {
 #[derive(Debug, Clone, Default)]
 pub enum MemoryConfig {
     /// Construct an automatically sized pool when the client is created.
+    ///
+    /// The ceiling follows [`MemoryBudgetConfig::Auto`], except that on a small
+    /// host it is raised to at most 256 MiB so the pool funds the minimum
+    /// concurrency target, and never above half of detected memory.
     #[default]
     Auto,
     /// Use an existing pool.

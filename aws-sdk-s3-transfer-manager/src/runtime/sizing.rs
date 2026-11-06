@@ -22,6 +22,9 @@
 
 use crate::metrics::unit::ByteUnit;
 
+use super::buffer_pool::config::{
+    AUTO_CAPACITY_FALLBACK_BYTES, AUTO_CAPACITY_MAX_BYTES, AUTO_MEMORY_SHARE_DENOMINATOR,
+};
 use super::platform::{
     resolve_auto_concurrency, seed_from_gbps, AutoConcurrencySource, ResolvedAutoConcurrency,
 };
@@ -33,20 +36,26 @@ const BUFFERS_PER_SLOT: u64 = 3;
 /// Part size for uploads and downloads when none is configured.
 pub(crate) const DEFAULT_PART_SIZE: u64 = 8 * ByteUnit::Mebibyte.as_bytes_u64();
 
-/// Divisor applied to detected memory when choosing the automatic ceiling.
-const RAM_SHARE_DIVISOR: usize = 4;
-
-/// Upper bound on the automatic ceiling.
-const AUTO_CEILING_MAX_BYTES: u64 = 32 * ByteUnit::Gibibyte.as_bytes_u64();
+// The detected-memory share, its cap, and the no-detection fallback are the
+// buffer pool's own `MemoryBudgetConfig::Auto` policy, imported rather than
+// restated so the two cannot drift. The floor below is the only addition.
+const RAM_SHARE_DIVISOR: usize = AUTO_MEMORY_SHARE_DENOMINATOR;
+const AUTO_CEILING_MAX_BYTES: u64 = AUTO_CAPACITY_MAX_BYTES;
+const NO_RAM_FALLBACK_BYTES: u64 = AUTO_CAPACITY_FALLBACK_BYTES;
 
 /// Lower bound on the automatic ceiling.
 ///
-/// Takes precedence over the detected-memory share, so a host with very little
-/// memory still receives a ceiling that can fund one concurrency slot.
+/// Raises the detected-memory share on small hosts so the ceiling funds the
+/// minimum concurrency target at the default part size. Never exceeds
+/// [`FLOOR_MAX_RAM_DIVISOR`] of detected memory.
 const AUTO_FLOOR_BYTES: u64 = 256 * ByteUnit::Mebibyte.as_bytes_u64();
 
-/// Automatic ceiling when memory cannot be detected.
-const NO_RAM_FALLBACK_BYTES: u64 = 2 * ByteUnit::Gibibyte.as_bytes_u64();
+/// The floor is limited to detected memory divided by this value.
+///
+/// The ceiling is a bound against exhausting host memory, so on a host smaller
+/// than twice the floor (a 128 MiB Lambda, a small container) the floor yields
+/// to half of memory rather than admitting more than the host holds.
+const FLOOR_MAX_RAM_DIVISOR: usize = 2;
 
 /// In-flight work items one connection sustains.
 ///
@@ -122,8 +131,8 @@ impl From<AutoConcurrencySource> for ConcurrencySource {
 pub(crate) enum ConcurrencyBound {
     /// The configured target was used as given.
     Configured,
-    /// The throughput estimate was not reduced.
-    Throughput,
+    /// The derived target was not reduced by any bound.
+    Unbounded,
     /// The connection cap reachable with the descriptor limit.
     Connections,
     /// The part demand the memory ceiling can fund.
@@ -134,7 +143,7 @@ impl ConcurrencyBound {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Configured => "configured",
-            Self::Throughput => "throughput",
+            Self::Unbounded => "unbounded",
             Self::Connections => "connections",
             Self::Memory => "memory",
         }
@@ -203,7 +212,7 @@ pub(crate) fn resolve(signals: Signals<'_>) -> Sizing {
                 let target = derived_concurrency(&auto, throughput_gbps);
                 let bounded = target.min(connections_bound).min(memory_bound).max(1);
                 let bound = if bounded == target {
-                    ConcurrencyBound::Throughput
+                    ConcurrencyBound::Unbounded
                 } else if connections_bound <= memory_bound {
                     ConcurrencyBound::Connections
                 } else {
@@ -251,8 +260,9 @@ fn configured_throughput(signals: &Signals<'_>) -> Option<f64> {
 ///
 /// A caller-supplied ceiling is used as given. Otherwise the ceiling is a share
 /// of detected memory, bounded above and below, and a fixed value when memory
-/// cannot be detected. The ceiling bounds admission only; it is not reserved at
-/// construction, so it does not reflect expected demand.
+/// cannot be detected. The lower bound never exceeds half of detected memory.
+/// The ceiling bounds admission only; it is not reserved at construction, so it
+/// does not reflect expected demand.
 fn ceiling(signals: &Signals<'_>) -> usize {
     if let Some(override_bytes) = signals.ceiling_override_bytes {
         return override_bytes;
@@ -260,7 +270,8 @@ fn ceiling(signals: &Signals<'_>) -> usize {
     match signals.ram_bytes.filter(|&ram| ram > 0) {
         Some(ram) => {
             let share = (ram / RAM_SHARE_DIVISOR) as u64;
-            saturating_usize(share.clamp(AUTO_FLOOR_BYTES, AUTO_CEILING_MAX_BYTES))
+            let floor = AUTO_FLOOR_BYTES.min((ram / FLOOR_MAX_RAM_DIVISOR) as u64);
+            saturating_usize(share.clamp(floor, AUTO_CEILING_MAX_BYTES))
         }
         None => saturating_usize(NO_RAM_FALLBACK_BYTES),
     }
@@ -320,7 +331,7 @@ mod tests {
 
         assert_eq!(sizing.throughput_gbps, Some(100.0));
         assert_eq!(sizing.concurrency, seed_from_gbps(100.0));
-        assert_eq!(sizing.concurrency_bound, ConcurrencyBound::Throughput);
+        assert_eq!(sizing.concurrency_bound, ConcurrencyBound::Unbounded);
     }
 
     #[test]
@@ -391,6 +402,23 @@ mod tests {
         // still fund a slot; the ceiling bounds admission and reserves nothing.
         let sizing = resolve(signals(Some(GIB as usize), 2));
         assert_eq!(sizing.ceiling_bytes, saturating_usize(AUTO_FLOOR_BYTES));
+    }
+
+    #[test]
+    fn ceiling_floor_yields_to_half_of_memory_on_a_tiny_host() {
+        // A 128 MiB host: the floor alone would admit 256 MiB, twice what the
+        // host holds. The floor is limited to half of memory instead.
+        let sizing = resolve(signals(Some(128 * MIB as usize), 1));
+        assert_eq!(sizing.ceiling_bytes, 64 * MIB as usize);
+    }
+
+    #[test]
+    fn automatic_ceiling_never_exceeds_detected_memory() {
+        for mib in [1, 16, 128, 256, 511, 512, 1024, 4096] {
+            let ram = (mib * MIB) as usize;
+            let ceiling = resolve(signals(Some(ram), 1)).ceiling_bytes;
+            assert!(ceiling <= ram / FLOOR_MAX_RAM_DIVISOR, "ram {mib} MiB");
+        }
     }
 
     #[test]

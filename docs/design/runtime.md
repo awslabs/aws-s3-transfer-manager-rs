@@ -82,7 +82,12 @@ The pool ceiling is a safety bound against exhausting host memory and nothing
 more. Demand never lowers it. This holds because the pool commits no memory at
 construction and reclaims toward a fraction of its configured blocks once the
 scheduler is globally idle, so an unused ceiling is not resource use. Throughput
-and concurrency set the operating point beneath it.
+and concurrency set the operating point beneath it. The automatic ceiling uses
+the pool's own `MemoryBudgetConfig::Auto` share, cap, and fallback, plus one
+addition: a floor that lets a small host fund the minimum concurrency target at
+the default part size. The floor never exceeds half of detected memory, so on a
+host smaller than twice the floor it yields rather than admit more than the host
+holds.
 
 Where one signal is the binding constraint, the remaining quantities are sized
 to the performance achievable under it, so the client does not reserve

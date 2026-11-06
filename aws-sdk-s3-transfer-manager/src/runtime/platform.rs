@@ -379,11 +379,11 @@ fn walk_paths(mount: &str, cgroup_path: &str, filename: &str) -> Vec<PathBuf> {
 // ---------------------------------------------------------------------------
 // Concurrency seeding
 //
-// Resolves `ConcurrencyMode::Auto` (and `TargetThroughput`) to a fixed in-flight
-// request target. The target is derived from an estimate of the machine's
-// network bandwidth: recognized EC2 instance families map to a per-vCPU Gbps rate
-// (NIC bandwidth scales linearly with vCPU count within a family), and
-// `target = ceil(gbps / GBPS_PER_CONN)`.
+// Resolves `ConcurrencyMode::Auto` and a configured throughput target to a
+// fixed in-flight request target. The target is derived from an estimate of the
+// machine's network bandwidth: recognized EC2 instance families map to a
+// per-vCPU Gbps rate (NIC bandwidth scales linearly with vCPU count within a
+// family), and `target = ceil(gbps / GBPS_PER_CONN)`.
 //
 // `N` is target *in-flight work* (the scheduler's `poll_work` gate). The
 // connection pool is capped separately, per host (`ConnectionCap`).

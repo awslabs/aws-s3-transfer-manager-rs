@@ -80,9 +80,8 @@ impl Handle {
 
     /// Get the concrete target part size to use for transfer operations.
     ///
-    /// Uploads and downloads share one size. When the part size is left
-    /// automatic it is derived from the payload-memory ceiling and the resolved
-    /// concurrency target; a configured size is used as given.
+    /// Uploads and downloads share one size: the configured size when set, and
+    /// a fixed default otherwise.
     pub(crate) fn part_size_bytes(&self) -> u64 {
         self.sizing.part_size
     }
@@ -336,9 +335,12 @@ impl Client {
         // Runtime HTTP is built only when it will be installed on an S3 client
         // this transfer manager constructs.
         let runtime_http = config.runtime_http(sizing.connection_cap);
-        if runtime_http.is_some() {
-            log_resource_sizing(&sizing, &connection_cap);
-        }
+        log_resource_sizing(
+            &sizing,
+            &connection_cap,
+            runtime_http.is_some(),
+            config.ignored_throughput_target_gbps(),
+        );
         // wasm targets have no managed execution; see `Managed`.
         #[cfg(not(target_family = "wasm"))]
         let managed = match config.managed_config_mut() {
@@ -567,9 +569,26 @@ impl Client {
 
 /// Report the resolved sizing, and warn when a signal held a resource below
 /// what the rest of the configuration asks for.
-fn log_resource_sizing(sizing: &Sizing, cap: &crate::runtime::platform::ConnectionCap) {
+///
+/// Emitted for every client. `connection_cap_installed` is false when TM does
+/// not build the transport (a supplied S3 or HTTP client, caller-runtime
+/// execution, wasm), in which case `max_connections_per_host` is not applied.
+fn log_resource_sizing(
+    sizing: &Sizing,
+    cap: &crate::runtime::platform::ConnectionCap,
+    connection_cap_installed: bool,
+    ignored_throughput_gbps: Option<f64>,
+) {
     let soft = cap.descriptors.map(|limit| limit.soft);
     let hard = cap.descriptors.and_then(|limit| limit.hard);
+    if let Some(gbps) = ignored_throughput_gbps {
+        tracing::warn!(
+            target: crate::telemetry::TARGET_CONCURRENCY,
+            configured_throughput_gbps = gbps,
+            "configured throughput target is not finite and positive and was ignored; throughput \
+             is estimated from the execution environment instead",
+        );
+    }
     tracing::info!(
         target: crate::telemetry::TARGET_CONCURRENCY,
         concurrency_target = sizing.concurrency,
@@ -580,6 +599,7 @@ fn log_resource_sizing(sizing: &Sizing, cap: &crate::runtime::platform::Connecti
         memory_detected = sizing.memory_detected,
         part_size_bytes = sizing.part_size,
         max_connections_per_host = sizing.connection_cap,
+        connection_cap_installed,
         descriptor_connection_cap = cap.max_per_host,
         max_funded_concurrency = sizing.max_funded_concurrency,
         soft_descriptor_limit = ?soft,
@@ -1274,8 +1294,32 @@ mod tests {
 
         let client = Client::new(config);
 
-        assert!(client.handle.controller.target() > 1);
+        // Pin the value rather than a range: 100 Gbps seeds the target, and the
+        // pass bounds it by the host's descriptor cap and the fallback ceiling.
+        let expected = sizing::resolve(Signals {
+            throughput_gbps: Some(100.0),
+            instance_type: None,
+            vcpus: 4,
+            ram_bytes: None,
+            descriptor_cap: platform::ConnectionCap::detect().max_per_host,
+            explicit_concurrency: None,
+            explicit_part_size: None,
+            ceiling_override_bytes: None,
+        });
+        assert_eq!(client.handle.controller.target(), expected.concurrency);
         assert_eq!(client.handle.sizing.throughput_gbps, Some(100.0));
+    }
+
+    #[test]
+    fn invalid_throughput_target_reads_as_unset() {
+        for gbps in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let config = crate::config::Config::builder()
+                .sdk_client(aws_smithy_mocks::mock_client!(aws_sdk_s3, []))
+                .throughput_target_gbps(gbps)
+                .build();
+            assert_eq!(config.throughput_target_gbps(), None, "gbps {gbps}");
+            assert!(config.ignored_throughput_target_gbps().is_some());
+        }
     }
 
     // FIXME: crossbeam-epoch is incompatible with miri

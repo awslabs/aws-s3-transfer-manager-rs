@@ -27,7 +27,7 @@ mod acquisition;
 mod admission;
 mod arena;
 mod block;
-mod config;
+pub(super) mod config;
 #[cfg(not(all(test, s3_tm_loom)))]
 mod diagnostics;
 mod geometry;
