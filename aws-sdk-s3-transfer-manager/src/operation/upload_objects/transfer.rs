@@ -1701,7 +1701,7 @@ mod tests {
             let failed_path = failed[0].source_path().unwrap();
             let other = names
                 .iter()
-                .map(|n| dir.path().join(n))
+                .map(|n| dir.path().join(n).components().collect::<PathBuf>())
                 .find(|p| p != failed_path)
                 .unwrap();
             assert!(message.contains(&other.display().to_string()), "{message}");
