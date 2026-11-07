@@ -435,17 +435,6 @@ async fn test_rename_errors() -> Result {
     Ok(())
 }
 
-/// In a general purpose bucket, a rename to a too-long key fails with 501, like any other rename.
-#[tokio::test]
-async fn test_rename_long_key_not_implemented_in_general_purpose_buckets() -> Result {
-    let f = Fixture::new().await;
-    f.put("a", "hello").await;
-    let fail = failure(rename(&f, "a", &"k".repeat(1025)).await);
-    assert_failure(&fail, 501, "NotImplemented");
-    f.shutdown().await;
-    Ok(())
-}
-
 /// A rename fault targets the destination key and fails the rename before it moves anything.
 #[tokio::test]
 async fn test_rename_fault_targets_destination_key() -> Result {
@@ -462,6 +451,85 @@ async fn test_rename_fault_targets_destination_key() -> Result {
     assert!(f.exists("dir/a").await);
     rename(&f, "dir/a", "dir/b").await?;
     assert_eq!(f.content("dir/b").await, b"hello");
+    f.shutdown().await;
+    Ok(())
+}
+
+/// A rename to a too-long key that is not signed fails with 403 AccessDenied without being counted
+/// or drawing a fault, so the next signed rename still draws it.
+#[tokio::test]
+async fn test_unsigned_rename_to_long_key_leaves_counts_and_faults() -> Result {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let f = Fixture::directory().await;
+    f.put("a", "hello").await;
+    let long_key = "k".repeat(1025);
+    f.server.insert_fault_for(
+        FaultTarget::operation(Operation::RenameObject).key(&long_key),
+        FaultType::Error(Error::SlowDown),
+        0,
+        Occurrence::Once,
+    );
+    let request = format!(
+        "PUT /{}/{long_key}?renameObject HTTP/1.1\r\nHost: localhost\r\nx-amz-rename-source: a\r\n\
+         Content-Length: 0\r\nConnection: close\r\n\r\n",
+        f.bucket
+    );
+    let mut stream = tokio::net::TcpStream::connect(f.handle.socket_addr()).await?;
+    stream.write_all(request.as_bytes()).await?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await?;
+    assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+    assert!(response.contains("<Code>AccessDenied</Code>"), "{response}");
+    assert_eq!(f.server.request_count(Operation::RenameObject), 0);
+
+    let fail = failure(rename(&f, "a", &long_key).await);
+    assert_failure(&fail, 503, "SlowDown");
+    assert_eq!(f.server.request_count(Operation::RenameObject), 1);
+    f.shutdown().await;
+    Ok(())
+}
+
+/// Sends the request with the `/` after the bucket in its path percent-encoded,
+/// `/{bucket}%2F{key}`.
+#[derive(Debug)]
+struct EncodeSlashAfterBucket(String);
+
+impl aws_sdk_s3::config::Intercept for EncodeSlashAfterBucket {
+    fn name(&self) -> &'static str {
+        "EncodeSlashAfterBucket"
+    }
+
+    fn modify_before_transmit(
+        &self,
+        context: &mut aws_sdk_s3::config::interceptors::BeforeTransmitInterceptorContextMut<'_>,
+        _runtime_components: &aws_sdk_s3::config::RuntimeComponents,
+        _cfg: &mut aws_sdk_s3::config::ConfigBag,
+    ) -> std::result::Result<(), aws_sdk_s3::error::BoxError> {
+        let request = context.request_mut();
+        let uri = request
+            .uri()
+            .replacen(&format!("/{}/", self.0), &format!("/{}%2F", self.0), 1);
+        request.set_uri(uri)?;
+        Ok(())
+    }
+}
+
+/// A rename's path is read as for any other request: decoded, then split after the bucket, so
+/// `/{bucket}%2F{key}` renames to `key` of the bucket.
+#[tokio::test]
+async fn test_rename_path_decoded_before_split() -> Result {
+    let f = Fixture::directory().await;
+    f.put("source", "hello").await;
+    f.s3.rename_object()
+        .bucket(&f.bucket)
+        .key("destination")
+        .rename_source("source")
+        .customize()
+        .interceptor(EncodeSlashAfterBucket(f.bucket.clone()))
+        .send()
+        .await?;
+    assert!(!f.exists("source").await);
+    assert_eq!(f.content("destination").await, b"hello");
     f.shutdown().await;
     Ok(())
 }

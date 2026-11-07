@@ -5,12 +5,8 @@
 
 //! RenameObject, which s3s does not model, served as a custom s3s route.
 //!
-//! A rename is `PUT /{bucket}/{key}?renameObject` with the source key in `x-amz-rename-source`,
-//! as S3 directory buckets serve it; s3s would serve it as a PutObject with an empty body. Only
-//! path-style requests are supported. [`RenameRoute`] serves renames once s3s has parsed them
-//! and they are authenticated. s3s rejects a key over 1,024 bytes while parsing the path, before
-//! any route runs, so [`reject_rename_to_long_key`] answers renames to such keys ahead of the s3s
-//! service.
+//! [`RenameRoute`] serves renames as an s3s custom route, once s3s has verified their signature.
+//! Renames to keys longer than 1,024 bytes fail with KeyTooLongError.
 
 use std::sync::Arc;
 
@@ -85,6 +81,12 @@ impl S3Route for RenameRoute {
         if BucketType::of(&bucket) == BucketType::GeneralPurpose {
             return Err(Error::NotImplemented.into());
         }
+        // The error reports the key's size and the limit, which an s3s error cannot carry.
+        if dst_key.len() > MAX_KEY_LENGTH {
+            return Ok(error_response(Error::KeyTooLong {
+                size: dst_key.len(),
+            }));
+        }
 
         let header = |name: &str| {
             req.headers
@@ -137,12 +139,7 @@ impl S3Route for RenameRoute {
             }
             // S3 names the failed condition in a `Condition` element, which an s3s error
             // cannot carry, so the route answers with the error response.
-            Err(error @ Error::RenamePreconditionFailed(_)) => {
-                let (parts, body) = error.into_response().into_parts();
-                let mut response = S3Response::with_status(body, parts.status);
-                response.headers = parts.headers;
-                Ok(response)
-            }
+            Err(error @ Error::RenamePreconditionFailed(_)) => Ok(error_response(error)),
             Err(error) => Err(error.into()),
         }
     }
@@ -174,37 +171,13 @@ fn client_token(headers: &HeaderMap) -> crate::Result<Option<String>> {
     ))
 }
 
-/// Check a RenameObject's destination key length ahead of the s3s service, which would reject a
-/// key longer than 1,024 bytes while parsing the path, before [`RenameRoute`] runs. Returns the
-/// response for a rename to such a key, and `None` for any other request, which goes on to s3s.
-/// A rename to such a key is answered with 400 `KeyTooLongError`, reporting the key's `Size` and
-/// the `MaxSizeAllowed`, as S3 does.
-///
-/// Such a request is counted and draws its fault like any other rename, and gets 501 in a
-/// general purpose bucket. A fault that fails the request answers it instead; any other fault it
-/// draws has no effect. A rename to a missing bucket gets `KeyTooLongError`, not
-/// NoSuchBucket. It is authenticated only when it is signed for S3 Express sessions (see
-/// [`crate::express`]).
-pub(crate) fn reject_rename_to_long_key(
-    state: &ServerState,
-    method: &Method,
-    uri: &Uri,
-) -> Option<http::Response<Body>> {
-    if !is_rename(method, uri) {
-        return None;
-    }
-    let (bucket, dst_key) = split_path(uri.path()).ok()?;
-    if dst_key.len() <= MAX_KEY_LENGTH {
-        return None;
-    }
-    let error = match state.admit(Operation::RenameObject, Some(&bucket), Some(&dst_key)) {
-        Err(error) => error,
-        Ok(_) if BucketType::of(&bucket) == BucketType::GeneralPurpose => Error::NotImplemented,
-        Ok(_) => Error::KeyTooLong {
-            size: dst_key.len(),
-        },
-    };
-    Some(error.into_response())
+/// The route's response for `error`, with the elements an s3s error cannot carry
+/// ([`Error::into_response`]).
+fn error_response(error: Error) -> S3Response<Body> {
+    let (parts, body) = error.into_response().into_parts();
+    let mut response = S3Response::with_status(body, parts.status);
+    response.headers = parts.headers;
+    response
 }
 
 fn is_rename(method: &Method, uri: &Uri) -> bool {
@@ -216,13 +189,11 @@ fn is_rename(method: &Method, uri: &Uri) -> bool {
         })
 }
 
-/// The bucket and decoded key of a path-style request path.
+/// The bucket and key of a path-style request path, read as s3s reads them
+/// ([`crate::bucket::path_bucket_and_key`]).
 fn split_path(path: &str) -> crate::Result<(String, String)> {
-    let path = path.strip_prefix('/').unwrap_or(path);
-    match path.split_once('/') {
-        Some((bucket, key)) if !bucket.is_empty() && !key.is_empty() => {
-            Ok((percent_decode(bucket)?, percent_decode(key)?))
-        }
+    match crate::bucket::path_bucket_and_key(path)? {
+        (Some(bucket), Some(key)) => Ok((bucket, key)),
         _ => Err(Error::InvalidRequest(
             "Expected a path-style /{bucket}/{key} request",
         )),
@@ -241,14 +212,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn splits_and_decodes_path_style_paths() {
-        assert_eq!(
-            split_path("/bucket/dir/key%20x%E2%9C%93").unwrap(),
-            ("bucket".to_owned(), "dir/key x\u{2713}".to_owned())
-        );
+    fn needs_a_bucket_and_a_key() {
         assert!(split_path("/bucket").is_err());
         assert!(split_path("/bucket/").is_err());
-        assert!(split_path("/bucket/%FF").is_err());
     }
 
     #[test]

@@ -120,9 +120,42 @@ impl BucketType {
     }
 }
 
+/// The bucket and key of a path-style request path, read as s3s reads them: the path is
+/// percent-decoded, then split at the first `/` after the leading one, so `/b%2Fk` is key `k` in
+/// bucket `b`. An empty bucket or key is `None`. Fails with `InvalidUri` if the path is not
+/// percent-encoded UTF-8.
+pub(crate) fn path_bucket_and_key(path: &str) -> crate::Result<(Option<String>, Option<String>)> {
+    let decoded = percent_encoding::percent_decode_str(path)
+        .decode_utf8()
+        .map_err(|_| Error::InvalidUri)?;
+    let path = decoded.strip_prefix('/').unwrap_or(&decoded);
+    let (bucket, key) = path.split_once('/').unwrap_or((path, ""));
+    let non_empty = |s: &str| (!s.is_empty()).then(|| s.to_owned());
+    Ok((non_empty(bucket), non_empty(key)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_path_style_paths_decoded_then_split() {
+        let parts = |bucket: Option<&str>, key: Option<&str>| {
+            (bucket.map(str::to_owned), key.map(str::to_owned))
+        };
+        assert_eq!(
+            path_bucket_and_key("/b/dir/key%20x%E2%9C%93").unwrap(),
+            parts(Some("b"), Some("dir/key x\u{2713}"))
+        );
+        assert_eq!(
+            path_bucket_and_key("/b%2Fkey").unwrap(),
+            parts(Some("b"), Some("key"))
+        );
+        assert_eq!(path_bucket_and_key("/b").unwrap(), parts(Some("b"), None));
+        assert_eq!(path_bucket_and_key("/b/").unwrap(), parts(Some("b"), None));
+        assert_eq!(path_bucket_and_key("/").unwrap(), parts(None, None));
+        assert!(path_bucket_and_key("/b/%FF").is_err());
+    }
 
     #[test]
     fn type_follows_from_the_name() {
