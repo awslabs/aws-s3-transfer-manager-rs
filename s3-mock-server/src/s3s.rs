@@ -680,6 +680,8 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             Some(&req.input.bucket),
             Some(&req.input.key),
         )?;
+        let trailing_headers = req.trailing_headers;
+        let declares_trailer = req.headers.contains_key("x-amz-trailer");
         let input = req.input;
         tracing::trace!(bucket = %input.bucket, key = %input.key, "PutObject");
         check_bucket(&self.storage, &input.bucket).await?;
@@ -697,16 +699,10 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         bucket_type
             .check_storage_class(input.storage_class.as_ref().map(|class| class.as_str()))?;
         bucket_type.check_content_md5(input.content_md5.as_deref())?;
-        let client_checksums = crate::types::ClientChecksums::from(&input);
+        let mut client_checksums = crate::types::ClientChecksums::from(&input);
         validate_digest_headers(&client_checksums)?;
         let write_offset = input.write_offset_bytes;
-        let integrity_checks = crate::types::ObjectIntegrityChecks::from(&client_checksums);
-
-        // Create storage request with configured checksums
         let mut request = crate::storage::StoreObjectRequest::from(input);
-        request.integrity_checks = integrity_checks;
-        // Storage rejects a body that does not match them before it replaces the object.
-        request.client_checksums = Some(client_checksums);
 
         // StallRequestRead: wrap the body stream to stall after `after_bytes`.
         if let Some(crate::faults::FaultType::StallRequestRead { after_bytes }) = fault {
@@ -736,6 +732,22 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             );
             request.body = Box::pin(stalled);
         }
+
+        // A trailer follows the data, so a body with one is read in full to check its checksums.
+        if declares_trailer {
+            let mut data = BytesMut::new();
+            while let Some(chunk) = request.body.next().await {
+                let chunk = chunk.map_err(|e| Error::Internal(format!("Stream error: {e}")))?;
+                data.extend_from_slice(&chunk);
+            }
+            let data = data.freeze();
+            request.body = Box::pin(futures_util::stream::once(async move { Ok(data) }));
+            add_trailing_checksums(trailing_headers.as_ref(), &mut client_checksums);
+            validate_digest_headers(&client_checksums)?;
+        }
+        request.integrity_checks = crate::types::ObjectIntegrityChecks::from(&client_checksums);
+        // Storage rejects a body that does not match them before it replaces the object.
+        request.client_checksums = Some(client_checksums);
 
         if let Some(offset) = write_offset {
             let response = self.append_object(request, offset).await?;
@@ -883,8 +895,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             Some(&req.input.bucket),
             Some(&req.input.key),
         )?;
-        // s3s keeps a trailing checksum out of the input; the request declares it.
-        let trailing_checksum = req.headers.contains_key("x-amz-trailer");
+        let trailing_headers = req.trailing_headers;
         let input = req.input;
         let upload_id = &input.upload_id;
         let part_number = input.part_number;
@@ -892,9 +903,8 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         check_bucket(&self.storage, &input.bucket).await?;
 
         BucketType::of(&input.bucket).check_content_md5(input.content_md5.as_deref())?;
-        let client_checksums = crate::types::ClientChecksums::from(&input);
+        let mut client_checksums = crate::types::ClientChecksums::from(&input);
         validate_digest_headers(&client_checksums)?;
-        let mut integrity_checks = crate::types::ObjectIntegrityChecks::from(&client_checksums);
 
         // Read the part content and calculate checksums.
         // StallRequestRead: after consuming `after_bytes`, pend forever.
@@ -918,14 +928,12 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
                             if new_total > limit {
                                 // Consume up to the limit, then stall.
                                 let allowed = (limit - bytes_consumed) as usize;
-                                integrity_checks.update(&chunk[..allowed]);
                                 content.extend_from_slice(&chunk[..allowed]);
                                 std::future::pending::<()>().await;
                                 unreachable!("pending future never resolves");
                             }
                             bytes_consumed = new_total;
                         }
-                        integrity_checks.update(&chunk);
                         content.extend_from_slice(&chunk);
                     }
                     Err(e) => {
@@ -935,6 +943,10 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             }
         }
         let content = content.freeze();
+        add_trailing_checksums(trailing_headers.as_ref(), &mut client_checksums);
+        validate_digest_headers(&client_checksums)?;
+        let mut integrity_checks = crate::types::ObjectIntegrityChecks::from(&client_checksums);
+        integrity_checks.update(&content);
         let calculated_integrity = integrity_checks.finalize();
 
         // Validate client-provided checksums
@@ -951,7 +963,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             upload_id,
             part_number,
             content,
-            client_checksum: client_checksums.has_any() || trailing_checksum,
+            client_checksum: client_checksums.has_any(),
         };
         let response = self.storage.upload_part(request).await?;
 
@@ -1239,6 +1251,38 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         Ok(S3Response::new(s3s::dto::RestoreObjectOutput::default()))
     }
 
+    /// Serve CreateSession (`GET /{bucket}?session`) for a directory bucket: create a session
+    /// valid for the bucket for five minutes, `ReadWrite` unless `x-amz-create-session-mode` is
+    /// `ReadOnly`. Fails with NoSuchBucket for a missing bucket, 400 InvalidArgument for another
+    /// session mode, and 501 NotImplemented in a general purpose bucket.
+    async fn create_session(
+        &self,
+        req: S3Request<s3s::dto::CreateSessionInput>,
+    ) -> S3Result<S3Response<s3s::dto::CreateSessionOutput>> {
+        let input = req.input;
+        if BucketType::of(&input.bucket) == BucketType::GeneralPurpose {
+            return Err(Error::NotImplemented.into());
+        }
+        self.state
+            .admit(Operation::CreateSession, Some(&input.bucket), None)?;
+        tracing::trace!(bucket = %input.bucket, "CreateSession");
+        check_bucket(&self.storage, &input.bucket).await?;
+        let read_only = match input.session_mode.as_ref().map(|mode| mode.as_str()) {
+            None | Some(s3s::dto::SessionMode::READ_WRITE) => false,
+            Some(s3s::dto::SessionMode::READ_ONLY) => true,
+            Some(_) => {
+                return Err(
+                    Error::InvalidArgument("Invalid value for x-amz-create-session-mode").into(),
+                )
+            }
+        };
+        let credentials = self.state.sessions.create(&input.bucket, read_only);
+        Ok(S3Response::new(s3s::dto::CreateSessionOutput {
+            credentials,
+            ..Default::default()
+        }))
+    }
+
     async fn head_bucket(
         &self,
         req: S3Request<HeadBucketInput>,
@@ -1439,6 +1483,34 @@ fn omits_part_checksums(
         && !metadata.parts.is_empty()
         && (full_object_in_general_purpose
             || metadata.parts.iter().any(|part| !part.client_checksum))
+}
+
+/// Add the checksums in the trailer of an `aws-chunked` body to `checksums`: s3s keeps them out of
+/// the operation's input. The trailer is available once the body has been read to its end.
+fn add_trailing_checksums(
+    trailing_headers: Option<&s3s::TrailingHeaders>,
+    checksums: &mut crate::types::ClientChecksums,
+) {
+    let Some(trailers) = trailing_headers.and_then(|trailing| trailing.take()) else {
+        return;
+    };
+    let value = |name: &str| {
+        trailers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+    };
+    for (slot, name) in [
+        (&mut checksums.crc32, "x-amz-checksum-crc32"),
+        (&mut checksums.crc32c, "x-amz-checksum-crc32c"),
+        (&mut checksums.crc64nvme, "x-amz-checksum-crc64nvme"),
+        (&mut checksums.sha1, "x-amz-checksum-sha1"),
+        (&mut checksums.sha256, "x-amz-checksum-sha256"),
+    ] {
+        if let Some(value) = value(name) {
+            *slot = Some(value);
+        }
+    }
 }
 
 /// Fail a request whose digest headers are malformed before its body is read, as S3 does: a

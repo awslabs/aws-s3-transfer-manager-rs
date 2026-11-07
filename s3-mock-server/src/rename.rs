@@ -63,14 +63,19 @@ impl S3Route for RenameRoute {
         is_rename(method, uri)
     }
 
-    /// Admit renames s3s authenticated and renames to directory buckets whose S3 Express
-    /// signature the server verified.
+    /// Admit renames as [`crate::express::check_access`] admits other requests.
     async fn check_access(&self, req: &mut S3Request<Body>) -> S3Result<()> {
-        if req.credentials.is_some() || crate::express::is_verified(&req.extensions) {
-            Ok(())
-        } else {
-            Err(s3s::s3_error!(AccessDenied, "Signature is required"))
-        }
+        let (bucket, key) = crate::bucket::path_bucket_and_key(req.uri.path())?;
+        let request = crate::express::AccessRequest {
+            credentials: req.credentials.as_ref(),
+            bucket: bucket.as_deref(),
+            object: key.is_some(),
+            create_session: false,
+            method: &req.method,
+            uri: &req.uri,
+            headers: &req.headers,
+        };
+        crate::express::check_access(&self.state, &request)
     }
 
     async fn call(&self, req: S3Request<Body>) -> S3Result<S3Response<Body>> {

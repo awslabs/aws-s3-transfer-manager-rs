@@ -3799,7 +3799,9 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "aws-config",
+ "aws-credential-types",
  "aws-sdk-s3",
+ "aws-sigv4",
  "aws-smithy-checksums",
  "base64",
  "bytes",

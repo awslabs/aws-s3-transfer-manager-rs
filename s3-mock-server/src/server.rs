@@ -30,24 +30,50 @@ use tokio::task::JoinHandle;
 const TEST_ACCESS_KEY: &str = "mock-akid";
 const TEST_SECRET_KEY: &str = "mock-secret";
 
+/// The secret keys s3s verifies signatures with: the server's and those of the S3 Express sessions
+/// it created.
+struct MockAuth {
+    server: SimpleAuth,
+    state: Arc<ServerState>,
+}
+
+#[async_trait::async_trait]
+impl s3s::auth::S3Auth for MockAuth {
+    async fn get_secret_key(&self, access_key: &str) -> s3s::S3Result<s3s::auth::SecretKey> {
+        match self.state.sessions.secret_key(access_key) {
+            Some(secret_key) => Ok(secret_key.into()),
+            // Unknown credentials fail with InvalidAccessKeyId.
+            None => self
+                .server
+                .get_secret_key(access_key)
+                .await
+                .map_err(|_| crate::Error::InvalidAccessKeyId.into()),
+        }
+    }
+}
+
 /// The service serving the S3 API over `storage`, sharing `state` with the server.
 fn build_service(
     storage: Arc<dyn StorageBackend>,
     state: Arc<ServerState>,
-) -> crate::service::MockService {
+) -> s3s::service::S3Service {
     let rename_route = crate::rename::RenameRoute::new(storage.clone(), state.clone());
     let mut builder = S3ServiceBuilder::new(Inner::with_state(storage.clone(), state.clone()));
-    builder.set_auth(SimpleAuth::from_single(TEST_ACCESS_KEY, TEST_SECRET_KEY));
-    builder.set_access(crate::express::ExpressAccess);
+    builder.set_auth(MockAuth {
+        server: SimpleAuth::from_single(TEST_ACCESS_KEY, TEST_SECRET_KEY),
+        state: state.clone(),
+    });
+    // s3s also verifies requests signed for `s3express`.
+    let mut config = s3s::config::S3Config::default();
+    config.sig_v4_allowed_services = ["s3", "sts", "s3express"].map(str::to_owned).into();
+    builder.set_config(Arc::new(s3s::config::StaticConfigProvider::new(Arc::new(
+        config,
+    ))));
+    builder.set_access(crate::express::ExpressAccess {
+        state: state.clone(),
+    });
     builder.set_route(rename_route);
-    crate::service::MockService::new(
-        builder.build(),
-        state,
-        storage,
-        crate::express::ServerCredentials {
-            access_key: TEST_ACCESS_KEY,
-        },
-    )
+    builder.build()
 }
 
 /// Configuration for the S3 Mock Server.
@@ -583,8 +609,8 @@ impl S3MockServer {
 
     /// Remove all buckets, objects, in-flight uploads and S3 Express sessions. Faults, the
     /// throttle and request counts are kept. Clients create a session again only when theirs
-    /// expires, so a client that holds one gets AccessDenied for its directory buckets after a
-    /// reset: use a new client.
+    /// expires, so a client that holds one gets InvalidAccessKeyId for its directory buckets
+    /// after a reset: use a new client.
     pub async fn reset(&self) -> Result<()> {
         self.state.sessions.clear();
         self.storage.reset().await

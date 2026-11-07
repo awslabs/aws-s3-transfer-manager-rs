@@ -85,15 +85,16 @@ async fn test_wrong_trailing_checksum() -> Result {
     let handle = server.start().await?;
     // The CRC32 of `jello`, sent with `hello`.
     let body = "5\r\nhello\r\n0\r\nx-amz-checksum-crc32:TND15g==\r\n\r\n";
-    let request = format!(
-        "PUT /{BUCKET}/key HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\
-         Authorization: AWS4-HMAC-SHA256 Credential=mock-akid/20261104/us-west-2/s3express/aws4_request, \
-         SignedHeaders=host, Signature=0\r\n\
-         x-amz-content-sha256: STREAMING-UNSIGNED-PAYLOAD-TRAILER\r\nContent-Encoding: aws-chunked\r\n\
-         x-amz-decoded-content-length: 5\r\nx-amz-trailer: x-amz-checksum-crc32\r\n\
-         Content-Length: {}\r\n\r\n{body}",
-        body.len()
-    );
+    let content_length = body.len().to_string();
+    let headers = [
+        ("host", "localhost"),
+        ("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER"),
+        ("content-encoding", "aws-chunked"),
+        ("x-amz-decoded-content-length", "5"),
+        ("x-amz-trailer", "x-amz-checksum-crc32"),
+        ("content-length", content_length.as_str()),
+    ];
+    let request = signed_request("PUT", &format!("/{BUCKET}/key"), &headers, body);
     let mut stream = tokio::net::TcpStream::connect(handle.socket_addr()).await?;
     stream.write_all(request.as_bytes()).await?;
     let mut response = String::new();
@@ -105,31 +106,226 @@ async fn test_wrong_trailing_checksum() -> Result {
     Ok(())
 }
 
+/// An HTTP/1.1 request with `headers` and `body`, signed for `s3express` with the server's
+/// credentials and no session, as a directory bucket accepts it.
+fn signed_request(method: &str, path: &str, headers: &[(&str, &str)], body: &str) -> String {
+    signed_request_with(
+        ("mock-akid", "mock-secret"),
+        "s3express",
+        method,
+        path,
+        headers,
+        body,
+    )
+}
+
+/// An HTTP/1.1 request with `headers` and `body`, signed for `service` with `credentials`
+/// (access key, secret key).
+fn signed_request_with(
+    credentials: (&str, &str),
+    service: &str,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &str,
+) -> String {
+    use aws_sigv4::http_request::{sign, SignableBody, SignableRequest, SigningSettings};
+    let payload_hash = headers
+        .iter()
+        .find(|(name, _)| *name == "x-amz-content-sha256")
+        .map_or("UNSIGNED-PAYLOAD", |(_, value)| *value)
+        .to_owned();
+    let identity =
+        aws_credential_types::Credentials::new(credentials.0, credentials.1, None, None, "test")
+            .into();
+    let params = aws_sigv4::sign::v4::SigningParams::builder()
+        .identity(&identity)
+        .region("us-west-2")
+        .name(service)
+        .time(std::time::SystemTime::now())
+        .settings(SigningSettings::default())
+        .build()
+        .unwrap()
+        .into();
+    let signable = SignableRequest::new(
+        method,
+        format!("http://localhost{path}"),
+        headers.iter().copied(),
+        SignableBody::Precomputed(payload_hash),
+    )
+    .unwrap();
+    let (instructions, _) = sign(signable, &params).unwrap().into_parts();
+    let (signing_headers, _) = instructions.into_parts();
+    let mut request = format!("{method} {path} HTTP/1.1\r\nConnection: close\r\n");
+    for (name, value) in headers {
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
+    for header in signing_headers {
+        request.push_str(&format!("{}: {}\r\n", header.name(), header.value()));
+    }
+    request.push_str("\r\n");
+    request.push_str(body);
+    request
+}
+
+/// Sends `request` to the server and returns its response.
+async fn send(handle: &s3_mock_server::ServerHandle, request: &str) -> Result<String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(handle.socket_addr()).await?;
+    stream.write_all(request.as_bytes()).await?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await?;
+    Ok(response)
+}
+
+/// A session's credentials are valid with the session's token, whatever service the request is
+/// signed for, and only in a directory bucket. Without the token, or in a general purpose bucket,
+/// they fail with 403 InvalidAccessKeyId and store nothing.
+#[tokio::test]
+async fn test_session_credentials_need_token_and_directory_bucket() -> Result {
+    let server = server().await;
+    server.create_bucket("general-purpose").await?;
+    let handle = server.start().await?;
+    let s3 = no_retry(&handle.client().await);
+    let session = s3
+        .create_session()
+        .bucket(BUCKET)
+        .send()
+        .await?
+        .credentials
+        .expect("credentials");
+    let headers = [
+        ("host", "localhost"),
+        ("x-amz-content-sha256", "UNSIGNED-PAYLOAD"),
+        ("content-length", "5"),
+    ];
+    let with_token = [
+        &headers[..],
+        &[("x-amz-s3session-token", session.session_token.as_str())],
+    ]
+    .concat();
+    let put = |bucket: &str, headers: &[(&str, &str)]| {
+        signed_request_with(
+            (&session.access_key_id, &session.secret_access_key),
+            "s3",
+            "PUT",
+            &format!("/{bucket}/key"),
+            headers,
+            "hello",
+        )
+    };
+    for (bucket, headers) in [(BUCKET, &headers[..]), ("general-purpose", &with_token[..])] {
+        let response = send(&handle, &put(bucket, headers)).await?;
+        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+        assert!(
+            response.contains("<Code>InvalidAccessKeyId</Code>"),
+            "{response}"
+        );
+        assert!(!server.object_exists(bucket, "key").await?, "{bucket}");
+    }
+    let response = send(&handle, &put(BUCKET, &with_token)).await?;
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(server.object_exists(BUCKET, "key").await?);
+    handle.shutdown().await?;
+    Ok(())
+}
+
+/// A request to a general purpose bucket signed for S3 Express fails with 400
+/// AuthorizationHeaderMalformed and stores nothing.
+#[tokio::test]
+async fn test_s3express_signature_in_general_purpose_bucket() -> Result {
+    let server = server().await;
+    server.create_bucket("general-purpose").await?;
+    let handle = server.start().await?;
+    let headers = [
+        ("host", "localhost"),
+        ("x-amz-content-sha256", "UNSIGNED-PAYLOAD"),
+        ("content-length", "5"),
+    ];
+    let request = signed_request("PUT", "/general-purpose/key", &headers, "hello");
+    let response = send(&handle, &request).await?;
+    assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+    assert!(
+        response.contains("<Code>AuthorizationHeaderMalformed</Code>"),
+        "{response}"
+    );
+    assert!(!server.object_exists("general-purpose", "key").await?);
+    handle.shutdown().await?;
+    Ok(())
+}
+
+/// A request to a directory bucket with a wrong signature fails with 403 SignatureDoesNotMatch and
+/// changes nothing: a PutObject stores nothing, and a CreateSession creates no session. Correctly
+/// signed, the CreateSession succeeds.
+#[tokio::test]
+async fn test_wrong_signature() -> Result {
+    let server = server().await;
+    let handle = server.start().await?;
+    let wrong = |request: &str| {
+        let signature =
+            request.find("Signature=").expect("the request is signed") + "Signature=".len();
+        let mut wrong = request.as_bytes().to_vec();
+        wrong[signature] = if wrong[signature] == b'0' { b'1' } else { b'0' };
+        String::from_utf8(wrong).unwrap()
+    };
+    let put = signed_request(
+        "PUT",
+        &format!("/{BUCKET}/key"),
+        &[
+            ("host", "localhost"),
+            ("x-amz-content-sha256", "UNSIGNED-PAYLOAD"),
+            ("content-length", "5"),
+        ],
+        "hello",
+    );
+    let create_session = signed_request(
+        "GET",
+        &format!("/{BUCKET}?session"),
+        &[
+            ("host", "localhost"),
+            ("x-amz-content-sha256", "UNSIGNED-PAYLOAD"),
+        ],
+        "",
+    );
+    for request in [&put, &create_session] {
+        let response = send(&handle, &wrong(request)).await?;
+        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+        assert!(
+            response.contains("<Code>SignatureDoesNotMatch</Code>"),
+            "{response}"
+        );
+    }
+    assert!(!server.object_exists(BUCKET, "key").await?);
+    assert_eq!(server.request_count(Operation::CreateSession), 0);
+
+    let response = send(&handle, &create_session).await?;
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(response.contains("<SessionToken>"), "{response}");
+    assert_eq!(server.request_count(Operation::CreateSession), 1);
+    handle.shutdown().await?;
+    Ok(())
+}
+
 /// A request to a directory bucket without a signature fails with 403 AccessDenied and changes
 /// nothing.
 #[tokio::test]
 async fn test_unsigned_requests_are_denied() -> Result {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let server = server().await;
     let handle = server.start().await?;
-    for request in [
-        format!("PUT /{BUCKET}/key HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello"),
-        format!("PUT /{BUCKET}/key?renameObject HTTP/1.1\r\nHost: localhost\r\nx-amz-rename-source: other\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
-    ] {
-        let mut stream = tokio::net::TcpStream::connect(handle.socket_addr()).await?;
-        stream.write_all(request.as_bytes()).await?;
-        let mut response = String::new();
-        stream.read_to_string(&mut response).await?;
-        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
-        assert!(response.contains("<Code>AccessDenied</Code>"), "{response}");
-    }
+    let request = format!(
+        "PUT /{BUCKET}/key HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\
+         Connection: close\r\n\r\nhello"
+    );
+    let response = send(&handle, &request).await?;
+    assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+    assert!(response.contains("<Code>AccessDenied</Code>"), "{response}");
     assert!(!server.object_exists(BUCKET, "key").await?);
     handle.shutdown().await?;
     Ok(())
 }
 
-/// `reset` forgets the sessions: a client that holds one gets AccessDenied, and a new client
-/// creates another.
+/// `reset` forgets the sessions: a client that holds one gets InvalidAccessKeyId, as with an
+/// unknown session, and a new client creates another.
 #[tokio::test]
 async fn test_reset_forgets_sessions() -> Result {
     let server = server().await;
@@ -139,15 +335,166 @@ async fn test_reset_forgets_sessions() -> Result {
     server.reset().await?;
     server.create_bucket(BUCKET).await?;
     let fail = failure(s3.get_object().bucket(BUCKET).key("key").send().await);
-    assert_failure(&fail, 403, "AccessDenied");
+    assert_failure(&fail, 403, "InvalidAccessKeyId");
     round_trip(&no_retry(&handle.client().await)).await?;
     handle.shutdown().await?;
     Ok(())
 }
 
-/// CreateSession returns temporary credentials that expire in five minutes, as S3's do, and
-/// fails with NoSuchBucket for a missing bucket. Its requests are counted
-/// and draw faults.
+/// A CreateSession with a session token fails with 400 InvalidRequest and creates no session.
+#[tokio::test]
+async fn test_create_session_with_session() -> Result {
+    let server = server().await;
+    let handle = server.start().await?;
+    let s3 = no_retry(&handle.client().await);
+    let session = s3
+        .create_session()
+        .bucket(BUCKET)
+        .session_mode(SessionMode::ReadOnly)
+        .send()
+        .await?
+        .credentials
+        .expect("credentials");
+    let headers = [
+        ("host", "localhost"),
+        ("x-amz-content-sha256", "UNSIGNED-PAYLOAD"),
+        ("x-amz-s3session-token", &session.session_token),
+    ];
+    let request = signed_request_with(
+        (&session.access_key_id, &session.secret_access_key),
+        "s3express",
+        "GET",
+        &format!("/{BUCKET}?session"),
+        &headers,
+        "",
+    );
+    let response = send(&handle, &request).await?;
+    assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+    assert!(
+        response.contains(
+            "<Message>CreateSession request should not include \
+             &quot;x-amz-s3session-token&quot;</Message>"
+        ),
+        "{response}"
+    );
+    assert_eq!(server.request_count(Operation::CreateSession), 1);
+    handle.shutdown().await?;
+    Ok(())
+}
+
+/// A presigned URL `method path` with `session`'s credentials and token in its query, and an
+/// `authorization` header if given.
+fn presigned_request(
+    session: &aws_sdk_s3::types::SessionCredentials,
+    method: &str,
+    path: &str,
+    authorization: Option<&str>,
+    body: &str,
+) -> String {
+    use aws_sigv4::http_request::{sign, SignableBody, SignableRequest, SignatureLocation};
+    use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
+    let identity = aws_credential_types::Credentials::new(
+        &session.access_key_id,
+        &session.secret_access_key,
+        None,
+        None,
+        "test",
+    )
+    .into();
+    let mut settings = aws_sigv4::http_request::SigningSettings::default();
+    settings.signature_location = SignatureLocation::QueryParams;
+    settings.expires_in = Some(std::time::Duration::from_secs(60));
+    let params = aws_sigv4::sign::v4::SigningParams::builder()
+        .identity(&identity)
+        .region("us-west-2")
+        .name("s3express")
+        .time(std::time::SystemTime::now())
+        .settings(settings)
+        .build()
+        .unwrap()
+        .into();
+    let token = utf8_percent_encode(&session.session_token, NON_ALPHANUMERIC).to_string();
+    let path = format!("{path}?X-Amz-S3session-Token={token}");
+    let signable = SignableRequest::new(
+        method,
+        format!("http://localhost{path}"),
+        [("host", "localhost")].into_iter(),
+        SignableBody::UnsignedPayload,
+    )
+    .unwrap();
+    let (instructions, _) = sign(signable, &params).unwrap().into_parts();
+    let (_, query) = instructions.into_parts();
+    let query: String = query
+        .iter()
+        .map(|(name, value)| format!("&{name}={}", utf8_percent_encode(value, NON_ALPHANUMERIC)))
+        .collect();
+    let authorization = authorization
+        .map(|value| format!("authorization: {value}\r\n"))
+        .unwrap_or_default();
+    format!(
+        "{method} {path}{query} HTTP/1.1\r\nhost: localhost\r\nConnection: close\r\n\
+         content-length: {}\r\n{authorization}\r\n{body}",
+        body.len()
+    )
+}
+
+/// A presigned URL with a session's credentials and token is served, within the session's limits: a
+/// read-only session's PUT fails with 403 AccessDenied. A presigned URL with an `Authorization`
+/// header too fails with 400 InvalidArgument. Neither stores anything.
+#[tokio::test]
+async fn test_presigned_with_session() -> Result {
+    let server = server().await;
+    let handle = server.start().await?;
+    let s3 = no_retry(&handle.client().await);
+    s3.put_object()
+        .bucket(BUCKET)
+        .key("key")
+        .body(ByteStream::from_static(b"x"))
+        .send()
+        .await?;
+    let session = |mode| {
+        let s3 = s3.clone();
+        async move {
+            s3.create_session()
+                .bucket(BUCKET)
+                .session_mode(mode)
+                .send()
+                .await
+                .unwrap()
+                .credentials
+                .unwrap()
+        }
+    };
+    let read_only = session(SessionMode::ReadOnly).await;
+    let path = format!("/{BUCKET}/new");
+    let get = presigned_request(&read_only, "GET", &format!("/{BUCKET}/key"), None, "");
+    let response = send(&handle, &get).await?;
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    let response = send(
+        &handle,
+        &presigned_request(&read_only, "PUT", &path, None, "hello"),
+    )
+    .await?;
+    assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+    assert!(response.contains("<Code>AccessDenied</Code>"), "{response}");
+    let read_write = session(SessionMode::ReadWrite).await;
+    let authorization = "AWS4-HMAC-SHA256 Credential=mock-akid/20260101/us-west-2/s3express/\
+                         aws4_request, SignedHeaders=host, Signature=00";
+    let request = presigned_request(&read_write, "PUT", &path, Some(authorization), "hello");
+    let response = send(&handle, &request).await?;
+    assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+    assert!(
+        response.contains("<Code>InvalidArgument</Code>"),
+        "{response}"
+    );
+    assert!(!server.object_exists(BUCKET, "new").await?);
+    handle.shutdown().await?;
+    Ok(())
+}
+
+/// CreateSession returns temporary credentials that expire in five minutes. It fails with
+/// NoSuchBucket for a missing bucket and with 400 InvalidArgument for an unknown session mode. Its
+/// requests are counted and draw faults.
 #[tokio::test]
 async fn test_create_session() -> Result {
     let server = server().await;
@@ -180,6 +527,16 @@ async fn test_create_session() -> Result {
     let fail = failure(s3.create_session().bucket(BUCKET).send().await);
     assert_failure(&fail, 503, "SlowDown");
     assert_eq!(server.request_count(Operation::CreateSession), 3);
+
+    let mode = SessionMode::from("ReadAppend");
+    let fail = failure(
+        s3.create_session()
+            .bucket(BUCKET)
+            .session_mode(mode)
+            .send()
+            .await,
+    );
+    assert_failure(&fail, 400, "InvalidArgument");
     handle.shutdown().await?;
     Ok(())
 }
@@ -229,9 +586,10 @@ impl aws_sdk_s3::config::Intercept for AddToken {
     }
 }
 
-/// Requests signed with a session's credentials and token are served, also without a session
-/// with the server's credentials, as in S3. A session is valid only with its own token and for
-/// its own bucket, and a read-only session only for reads.
+/// Requests signed with a session's credentials and token are served, as are requests with the
+/// server's credentials and no session. A session is valid only with its own token and for its own
+/// bucket, and a read-only session only for reads; a token of no session fails with 400
+/// InvalidRequest.
 #[tokio::test]
 async fn test_session_authorization() -> Result {
     let server = server().await;
@@ -295,6 +653,8 @@ async fn test_session_authorization() -> Result {
     assert_failure(&fail, 403, "AccessDenied");
     let fail = failure(get(with_session(&read_write, &read_only.session_token)).await);
     assert_failure(&fail, 403, "InvalidAccessKeyId");
+    let fail = failure(get(with_session(&read_write, "bogus")).await);
+    assert_failure(&fail, 400, "InvalidRequest");
     let fail = failure(get(signing_with(&s3, base, Some("bogus".to_owned()))).await);
     assert_failure(&fail, 403, "AccessDenied");
     let unknown = Credentials::new("unknown", "mock-secret", None, None, "unknown");
@@ -304,8 +664,9 @@ async fn test_session_authorization() -> Result {
     Ok(())
 }
 
-/// A CreateSession that names no bucket, as a client may send it to a path-style endpoint,
-/// creates a session valid for every directory bucket.
+/// A CreateSession that names no bucket, as a client may send it to a path-style endpoint, is
+/// not served: signed for `s3express`, a request to no bucket fails with 400
+/// AuthorizationHeaderMalformed, as one to a general purpose bucket.
 #[tokio::test]
 async fn test_session_without_bucket() -> Result {
     let server = server().await;
@@ -315,7 +676,7 @@ async fn test_session_without_bucket() -> Result {
     let s3 = signing_with(&http, base, None);
     // `GET /?session`: the SDK names the bucket in the path, so the request is rewritten to
     // address the host only.
-    let response = s3
+    let result = s3
         .create_session()
         .bucket(BUCKET)
         .customize()
@@ -324,28 +685,9 @@ async fn test_session_without_bucket() -> Result {
             request.set_uri(uri).unwrap();
         })
         .send()
-        .await?;
-    let credentials = response.credentials.unwrap();
-    for bucket in [BUCKET, OTHER_BUCKET] {
-        let client = signing_with(
-            &http,
-            Credentials::new(
-                &credentials.access_key_id,
-                &credentials.secret_access_key,
-                None,
-                None,
-                "session",
-            ),
-            Some(credentials.session_token.clone()),
-        );
-        client
-            .put_object()
-            .bucket(bucket)
-            .key("key")
-            .body(ByteStream::from_static(b"x"))
-            .send()
-            .await?;
-    }
+        .await;
+    assert_failure(&failure(result), 400, "AuthorizationHeaderMalformed");
+    assert_eq!(server.request_count(Operation::CreateSession), 0);
     handle.shutdown().await?;
     Ok(())
 }
