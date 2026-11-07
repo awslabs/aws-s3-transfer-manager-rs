@@ -776,7 +776,8 @@ pub(crate) struct MultipartCompletion {
 /// State machine for tracking upload work progress.
 ///
 /// A multipart upload ID is held from `Transferring` through `CompleteInFlight`
-/// and leaves the state only when CompleteMultipartUpload succeeds.
+/// (or `Aborting`) and leaves the state only when CompleteMultipartUpload
+/// succeeds or the transfer ends.
 #[derive(Debug)]
 pub(crate) enum UploadState {
     /// Waiting to start CreateMPU or PutObject.
@@ -800,12 +801,57 @@ pub(crate) enum UploadState {
     /// CompleteMultipartUpload has been dispatched and has not succeeded.
     ///
     /// The multipart upload remains open in this state, including after the
-    /// request fails or its execution is dropped, so it can still be aborted.
+    /// request's execution is dropped, so it can still be aborted. A failed
+    /// request moves the state to `Aborting`.
     CompleteInFlight { upload_id: String },
     /// PutObject is in flight.
     PutObjectInFlight,
-    /// S3 has committed the object; no multipart upload remains open.
+    /// Clean up the upload in S3 when failure or user requested abort.
+    /// Based on the previous state, tracking the necessary cleanup work here.
+    Aborting {
+        /// S3 Multipart Upload ID to abort.
+        /// `None` before CreateMultipartUpload response received.
+        upload_id: Option<String>,
+        /// CreateMultipartUpload has been sent and response has not yet received.
+        create_in_flight: bool,
+        /// CompleteMultipartUpload has been sent and and response has not yet received.
+        /// Its response determines whether the object stored in S3 or not.
+        complete_mpu_in_flight: bool,
+        /// Progress of the AbortMultipartUpload request.
+        abort_mpu: AbortMpuProgress,
+        /// The first failure, if a failure started or joined the abort. When
+        /// set, the transfer ends as failed with it instead of as cancelled.
+        failure: Option<UploadFailure>,
+    },
+    /// The upload has ended: S3 committed the object, the abort finished, or
+    /// the transfer was ended from outside. The body and part state have been
+    /// dropped.
     Done,
+}
+
+/// Progress of the AbortMultipartUpload request while `UploadState::Aborting`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AbortMpuProgress {
+    /// No AbortMultipartUpload will be sent: no multipart upload exists,
+    /// or the request's `FailedMultipartUploadPolicy` is `Retain`.
+    NotNeeded,
+    /// AbortMultipartUpload is sent once an upload ID is known.
+    ToSend,
+    /// AbortMultipartUpload has been emitted and has not returned.
+    InFlight,
+    /// AbortMultipartUpload succeeded.
+    Done,
+    /// AbortMultipartUpload failed. It is not sent again.
+    Failed,
+}
+
+/// A failure recorded while the transfer aborts.
+#[derive(Debug)]
+pub(crate) struct UploadFailure {
+    /// The error the transfer ends with.
+    pub(crate) error: crate::error::Error,
+    /// The state when the failure happened, for the terminal report.
+    pub(crate) snapshot: UploadStateSnapshot,
 }
 
 #[cfg(test)]

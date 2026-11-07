@@ -9,6 +9,11 @@ use aws_runtime::sdk_feature::AwsSdkFeature;
 use aws_runtime::user_agent::{AdditionalMetadata, ApiMetadata, AwsUserAgent, FrameworkMetadata};
 use aws_sdk_s3::config::{AppName, Intercept, IntoShared};
 use aws_types::os_shim_internal::Env;
+use std::sync::Arc;
+
+use crate::runtime::platform::MachineProfile;
+use crate::types::{ConcurrencyMode, MemoryConfig, PartSize};
+use crate::Config;
 
 /// This crate's name and version, as the `md/` pair the user agent carries. Neither
 /// `aws-sdk-rust/…` nor `api/s3/…` carries the transfer manager's version, and `rust-tm`
@@ -18,12 +23,87 @@ const RUST_TM_VERSION: &str = concat!("rust-tm#", env!("CARGO_PKG_VERSION"));
 /// Identifies our interceptor on a client that already carries one.
 const INTERCEPTOR_NAME: &str = "S3TransferManager";
 
+/// Identifies the per-operation interceptor on an operation's request.
+const OPERATION_INTERCEPTOR_NAME: &str = "S3TransferManagerOperation";
+
+/// The features that describe the client's configuration and environment, carried on every
+/// request it issues.
+pub(crate) fn client_features(config: &Config, profile: &MachineProfile) -> Vec<AwsSdkFeature> {
+    let mut features = Vec::new();
+    if matches!(config.part_size(), PartSize::Target(_)) {
+        features.push(AwsSdkFeature::S3CustomPartSize);
+    }
+    if !matches!(config.concurrency(), ConcurrencyMode::Auto) {
+        features.push(AwsSdkFeature::S3CustomThroughput);
+    }
+    if matches!(config.memory(), MemoryConfig::Explicit(_)) {
+        features.push(AwsSdkFeature::S3CustomMemoryLimit);
+    }
+    if profile.instance_type.is_some() {
+        features.push(AwsSdkFeature::S3OnEc2);
+    }
+    features
+}
+
 /// Install the transfer manager's user agent attribution on an S3 client builder.
 pub(crate) fn install(
     builder: &mut aws_sdk_s3::config::Builder,
     framework_metadata: Option<FrameworkMetadata>,
+    features: Vec<AwsSdkFeature>,
 ) {
-    builder.push_interceptor(S3TransferManagerInterceptor { framework_metadata }.into_shared());
+    builder.push_interceptor(
+        S3TransferManagerInterceptor {
+            framework_metadata,
+            features,
+        }
+        .into_shared(),
+    );
+}
+
+/// The features one operation adds to the requests it issues, on top of the client's.
+///
+/// Applied per request through `config_override`, so they never mark the shared client.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct OperationFeatures(Arc<[AwsSdkFeature]>);
+
+impl OperationFeatures {
+    pub(crate) fn new(features: impl IntoIterator<Item = AwsSdkFeature>) -> Self {
+        Self(features.into_iter().collect())
+    }
+
+    /// Adds the features to a per-request config override.
+    pub(crate) fn apply(
+        &self,
+        builder: aws_sdk_s3::config::Builder,
+    ) -> aws_sdk_s3::config::Builder {
+        if self.0.is_empty() {
+            builder
+        } else {
+            builder.interceptor(self.clone())
+        }
+    }
+
+    /// Adds the features to a client that issues only this operation's requests.
+    pub(crate) fn apply_to_client(&self, client: &aws_sdk_s3::Client) -> aws_sdk_s3::Client {
+        aws_sdk_s3::Client::from_conf(self.apply(client.config().to_builder()).build())
+    }
+}
+
+impl Intercept for OperationFeatures {
+    fn name(&self) -> &'static str {
+        OPERATION_INTERCEPTOR_NAME
+    }
+
+    fn read_before_execution(
+        &self,
+        _ctx: &aws_sdk_s3::config::interceptors::BeforeSerializationInterceptorContextRef<'_>,
+        cfg: &mut aws_sdk_s3::config::ConfigBag,
+    ) -> Result<(), aws_sdk_s3::error::BoxError> {
+        for feature in self.0.iter() {
+            cfg.interceptor_state().store_append(feature.clone());
+        }
+        Ok(())
+    }
 }
 
 /// Install on a client the caller handed over, rebuilding it from its own configuration.
@@ -39,6 +119,7 @@ pub(crate) fn install(
 pub(crate) fn install_on_client(
     client: aws_sdk_s3::Client,
     framework_metadata: Option<FrameworkMetadata>,
+    features: Vec<AwsSdkFeature>,
 ) -> aws_sdk_s3::Client {
     if client
         .config()
@@ -48,13 +129,14 @@ pub(crate) fn install_on_client(
         return client;
     }
     let mut builder = client.config().to_builder();
-    install(&mut builder, framework_metadata);
+    install(&mut builder, framework_metadata, features);
     aws_sdk_s3::Client::from_conf(builder.build())
 }
 
 #[derive(Debug)]
 struct S3TransferManagerInterceptor {
     framework_metadata: Option<FrameworkMetadata>,
+    features: Vec<AwsSdkFeature>,
 }
 
 impl Intercept for S3TransferManagerInterceptor {
@@ -73,6 +155,9 @@ impl Intercept for S3TransferManagerInterceptor {
     ) -> Result<(), aws_sdk_s3::error::BoxError> {
         cfg.interceptor_state()
             .store_append(AwsSdkFeature::S3Transfer);
+        for feature in &self.features {
+            cfg.interceptor_state().store_append(feature.clone());
+        }
 
         let existing = cfg.load::<AwsUserAgent>().cloned();
         let base = existing.or_else(|| {
@@ -106,14 +191,27 @@ impl Intercept for S3TransferManagerInterceptor {
 
 #[cfg(test)]
 mod tests {
+    use crate::runtime::platform::MachineProfile;
+    use crate::types::{ConcurrencyMode, MemoryConfig, PartSize};
     use crate::RuntimeConfig;
     use aws_config::{BehaviorVersion, Region};
-    use aws_runtime::user_agent::FrameworkMetadata;
+    use aws_runtime::user_agent::{AwsUserAgent, BusinessMetric, FrameworkMetadata};
+    use aws_sdk_s3::config::interceptors::BeforeTransmitInterceptorContextRef;
     use aws_sdk_s3::config::{
         AppName, Credentials, Intercept, IntoShared, SharedCredentialsProvider,
     };
+    use aws_sdk_s3::config::{ConfigBag, RuntimeComponents};
+    use aws_sdk_s3::error::BoxError;
+    use aws_sdk_s3::operation::get_object::GetObjectOutput;
+    use aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output;
+    use aws_sdk_s3::operation::put_object::PutObjectOutput;
+    use aws_sdk_s3::primitives::ByteStream;
+    use aws_sdk_s3::types::Object;
     use aws_smithy_http_client::test_util::capture_request;
+    use aws_smithy_mocks::{mock, mock_client, RuleMode};
+    use aws_smithy_runtime_api::client::orchestrator::Metadata;
     use std::borrow::Cow;
+    use std::sync::{Arc, Mutex};
 
     fn test_credentials() -> SharedCredentialsProvider {
         SharedCredentialsProvider::new(Credentials::new(
@@ -283,6 +381,7 @@ mod tests {
         let tm = crate::Client::new(
             crate::Config::builder()
                 .runtime_config(RuntimeConfig::multi_thread_tokio())
+                .part_size(PartSize::Target(8 << 20))
                 .sdk_client(client)
                 .build(),
         );
@@ -311,10 +410,13 @@ mod tests {
             .split_whitespace()
             .find_map(|section| section.strip_prefix("m/"))
             .expect("user agent carries a metrics section");
-        assert!(
-            metrics.split(',').any(|id| id == "G"),
-            "S3Transfer metric missing from {metrics:?} in {ua:?}"
-        );
+        for metric in [BusinessMetric::S3Transfer, BusinessMetric::S3CustomPartSize] {
+            let id = id_of(metric);
+            assert!(
+                metrics.split(',').any(|m| m == id),
+                "{id} missing from {metrics:?} in {ua:?}"
+            );
+        }
     }
 
     /// Rebuilding a caller's client must not cost them anything they configured on it, so this
@@ -470,5 +572,258 @@ mod tests {
         })
         .await;
         assert_eq!(ua, OWNED_USER_AGENT);
+    }
+
+    /// The id `aws-runtime` encodes `metric` as, so these tests do not repeat its table.
+    fn id_of(metric: BusinessMetric) -> String {
+        let header = AwsUserAgent::for_tests()
+            .with_business_metric(metric)
+            .aws_ua_header();
+        metric_ids(&header).remove(0)
+    }
+
+    /// The business metric ids in a user agent.
+    fn metric_ids(ua: &str) -> Vec<String> {
+        ua.split_whitespace()
+            .find_map(|section| section.strip_prefix("m/"))
+            .map(|metrics| metrics.split(',').map(str::to_owned).collect())
+            .unwrap_or_default()
+    }
+
+    /// One transmitted attempt: its operation and the transfer manager's attribution metrics in its
+    /// `x-amz-user-agent`, in [`attribution`] order.
+    #[derive(Debug)]
+    struct Sent {
+        operation: String,
+        attribution: Vec<BusinessMetric>,
+    }
+
+    /// Records every attempt a client transmits.
+    #[derive(Debug, Clone, Default)]
+    struct MetricsRecorder(Arc<Mutex<Vec<Sent>>>);
+
+    impl MetricsRecorder {
+        /// Drains the recorded attempts. Panics if none were sent, so an assertion over them cannot
+        /// pass vacuously.
+        #[track_caller]
+        fn take(&self) -> Vec<Sent> {
+            let sent = std::mem::take(&mut *self.0.lock().unwrap());
+            assert!(!sent.is_empty(), "no request was sent");
+            sent
+        }
+    }
+
+    impl Intercept for MetricsRecorder {
+        fn name(&self) -> &'static str {
+            "MetricsRecorder"
+        }
+
+        fn read_before_transmit(
+            &self,
+            ctx: &BeforeTransmitInterceptorContextRef<'_>,
+            _components: &RuntimeComponents,
+            cfg: &mut ConfigBag,
+        ) -> Result<(), BoxError> {
+            let operation = cfg.load::<Metadata>().expect("operation metadata").name();
+            let ua = ctx
+                .request()
+                .headers()
+                .get("x-amz-user-agent")
+                .unwrap_or_default();
+            self.0.lock().unwrap().push(Sent {
+                operation: operation.to_owned(),
+                attribution: attribution(&metric_ids(ua)),
+            });
+            Ok(())
+        }
+    }
+
+    /// The transfer manager's attribution metrics among `ids`, in declaration order.
+    fn attribution(ids: &[String]) -> Vec<BusinessMetric> {
+        use BusinessMetric::*;
+        [
+            S3CustomPartSize,
+            S3CustomThroughput,
+            S3CustomMemoryLimit,
+            S3OnEc2,
+            S3FilePath,
+            S3TransferUploadDirectory,
+            S3TransferDownloadDirectory,
+        ]
+        .into_iter()
+        .filter(|metric| ids.contains(&id_of(metric.clone())))
+        .collect()
+    }
+
+    /// A configuration for a machine that is not EC2, so `S3OnEc2` stays out of the expectations
+    /// wherever the tests run.
+    fn off_ec2() -> crate::config::Builder {
+        crate::Config::builder().machine_profile(Some(MachineProfile {
+            instance_type: None,
+            vcpus: 4,
+            ram_bytes: None,
+        }))
+    }
+
+    /// A transfer manager configured by `builder` over a mock S3 that lists one one-byte object,
+    /// serves it, and accepts uploads, recording every attempt into `recorder`.
+    fn tm_over(builder: crate::config::Builder, recorder: &MetricsRecorder) -> crate::Client {
+        let list = mock!(aws_sdk_s3::Client::list_objects_v2).then_output(|| {
+            ListObjectsV2Output::builder()
+                .contents(Object::builder().key("a.txt").size(1).build())
+                .build()
+        });
+        let get = mock!(aws_sdk_s3::Client::get_object).then_output(|| {
+            GetObjectOutput::builder()
+                .content_length(1)
+                .content_range("bytes 0-0/1")
+                .body(ByteStream::from_static(b"x"))
+                .build()
+        });
+        let put = mock!(aws_sdk_s3::Client::put_object)
+            .then_output(|| PutObjectOutput::builder().build());
+        let s3 = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[list, get, put], |c| c
+            .interceptor(recorder.clone()));
+        crate::Client::new(
+            builder
+                .runtime_config(RuntimeConfig::multi_thread_tokio())
+                .sdk_client(s3)
+                .build(),
+        )
+    }
+
+    /// Streams the one object the mock S3 serves.
+    async fn download(tm: &crate::Client) {
+        let mut handle = tm.download().bucket("foo").key("a.txt").initiate().unwrap();
+        while handle.body_mut().next().await.is_some() {}
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn configuration_metrics_follow_the_configuration() {
+        let pool = crate::runtime::buffer_pool::BufferPool::from_capacity(
+            crate::types::MemoryBudgetConfig::Limit(256 * 1024 * 1024),
+            None,
+            Default::default(),
+        )
+        .unwrap();
+        let ec2 = MachineProfile {
+            instance_type: Some("m6i.large".to_owned()),
+            vcpus: 2,
+            ram_bytes: None,
+        };
+        let cases = vec![
+            ("defaults", off_ec2(), vec![]),
+            (
+                "part size",
+                off_ec2().part_size(PartSize::Target(8 << 20)),
+                vec![BusinessMetric::S3CustomPartSize],
+            ),
+            (
+                "concurrency",
+                off_ec2().concurrency(ConcurrencyMode::Explicit(4)),
+                vec![BusinessMetric::S3CustomThroughput],
+            ),
+            (
+                "memory",
+                off_ec2().memory(MemoryConfig::Explicit(pool)),
+                vec![BusinessMetric::S3CustomMemoryLimit],
+            ),
+            (
+                "ec2",
+                off_ec2().machine_profile(Some(ec2)),
+                vec![BusinessMetric::S3OnEc2],
+            ),
+        ];
+        for (name, builder, expected) in cases {
+            let recorder = MetricsRecorder::default();
+            download(&tm_over(builder, &recorder)).await;
+            assert_eq!(expected, recorder.take()[0].attribution, "{name}");
+        }
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn upload_objects_emits_upload_directory_and_file_path() {
+        let recorder = MetricsRecorder::default();
+        let tm = tm_over(off_ec2(), &recorder);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"x").unwrap();
+        tm.upload_objects()
+            .bucket("foo")
+            .source(dir.path())
+            .initiate()
+            .unwrap()
+            .join()
+            .await
+            .unwrap();
+        for sent in recorder.take() {
+            assert_eq!(
+                vec![
+                    BusinessMetric::S3FilePath,
+                    BusinessMetric::S3TransferUploadDirectory
+                ],
+                sent.attribution,
+                "{}",
+                sent.operation
+            );
+        }
+
+        // The markers belong to the operation: a later plain upload from the same client has none.
+        let body = crate::io::InputStream::from(bytes::Bytes::from_static(b"x"));
+        tm.upload()
+            .bucket("foo")
+            .key("k")
+            .body(body)
+            .initiate()
+            .unwrap()
+            .join()
+            .await
+            .unwrap();
+        for sent in recorder.take() {
+            assert_eq!(Vec::<BusinessMetric>::new(), sent.attribution);
+        }
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn download_objects_emits_download_directory_and_file_path_on_objects() {
+        let recorder = MetricsRecorder::default();
+        let tm = tm_over(off_ec2(), &recorder);
+        let dir = tempfile::tempdir().unwrap();
+        tm.download_objects()
+            .bucket("foo")
+            .destination(dir.path())
+            .initiate()
+            .unwrap()
+            .join()
+            .await
+            .unwrap();
+        let sent = recorder.take();
+        let (listings, objects): (Vec<_>, Vec<_>) = sent
+            .iter()
+            .partition(|sent| sent.operation == "ListObjectsV2");
+        assert!(!listings.is_empty() && !objects.is_empty(), "{sent:?}");
+        for sent in listings {
+            assert_eq!(
+                vec![BusinessMetric::S3TransferDownloadDirectory],
+                sent.attribution
+            );
+        }
+        for sent in objects {
+            assert_eq!(
+                vec![
+                    BusinessMetric::S3FilePath,
+                    BusinessMetric::S3TransferDownloadDirectory
+                ],
+                sent.attribution
+            );
+        }
+
+        // The markers belong to the operation: a later plain download from the same client has none.
+        download(&tm).await;
+        for sent in recorder.take() {
+            assert_eq!(Vec::<BusinessMetric>::new(), sent.attribution);
+        }
     }
 }

@@ -42,6 +42,8 @@ pub(crate) enum UploadExecutionState {
     CompleteMultipartUploadInFlight,
     /// PutObject is in flight.
     PutObjectInFlight,
+    /// An abort was requested; waiting for the requests that decide its outcome.
+    Aborting,
     /// No more upload work can be produced.
     Done,
 }
@@ -55,6 +57,7 @@ impl UploadExecutionState {
             Self::MultipartCompletionPending => "multipart_completion_pending",
             Self::CompleteMultipartUploadInFlight => "complete_multipart_upload_in_flight",
             Self::PutObjectInFlight => "put_object_in_flight",
+            Self::Aborting => "aborting",
             Self::Done => "done",
         }
     }

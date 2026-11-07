@@ -291,7 +291,11 @@ async fn do_recursive_download(
     let handle = tm
         .download_objects()
         .bucket(bucket)
-        .key_prefix(key_prefix)
+        .walker(
+            aws_sdk_s3_transfer_manager::io::walk::S3Walker::builder()
+                .prefix(key_prefix)
+                .build(),
+        )
         .destination(dest)
         .initiate()?;
 

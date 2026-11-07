@@ -16,8 +16,6 @@ aws-smithy-runtime-api = { workspace = true, features = ["client", "http-1x"] }
 aws-smithy-types = { workspace = true, features = ["http-body-1-x"] }
 aws-types = { workspace = true }
 bytes = "1"
-# Reclaims scheduler descriptors deferred by the transfer manager's lock-free sets.
-crossbeam-epoch = "0.9"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1.20", features = ["client-legacy", "http1", "tokio"] }
 tokio = { version = "1.43.0", features = ["net", "rt", "time"] }

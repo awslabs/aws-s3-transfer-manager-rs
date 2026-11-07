@@ -84,8 +84,9 @@
 //! # State Machine Contracts
 //!
 //! A [`Transfer`](crate::transfer::Transfer) implementation must uphold:
-//! - **Failed lifecycle**: record the error and signal termination before returning
-//!   a failure outcome.
+//! - **Failed lifecycle**: record the error before returning a failure outcome, then
+//!   either end the transfer and signal termination, or keep it active with a wake
+//!   path until `poll_work` ends it.
 //! - **Poll-time pending/wake obligation**: every `PollWork::Pending` must record
 //!   its cause through `TransferContext::set_pending` and have a future wake path.
 //!   Transfer-owned mutations use the edge-triggered
@@ -140,6 +141,7 @@ use super::gate::GenerateWorkGate;
 pub(crate) struct Scheduler(Arc<SchedulerInner>);
 
 struct SchedulerInner {
+    /// Transfers registered for scheduling.
     transfers: RwLock<HashMap<TransferId, TransferDescriptor>>,
     ready_set: ReadySet,
     handle: Weak<crate::client::Handle>,
@@ -672,6 +674,13 @@ impl Scheduler {
     /// other caller's request is coalesced into an extra pass the runner makes
     /// on its behalf, so no wake is lost.
     fn generate_work(&self) {
+        // A popped or removed descriptor can be the last owner of its
+        // transfer, and through it of the client handle. Holding the handle
+        // keeps it alive until the pass ends. With the client gone there is
+        // nothing to generate.
+        let Some(_handle) = self.0.handle.upgrade() else {
+            return;
+        };
         // Become the sole runner, or bail — a request was recorded for the
         // active runner to drain on our behalf (this is also the re-entrancy
         // guard; see `GenerateWorkGate::try_acquire`).
@@ -1387,6 +1396,106 @@ mod tests {
             Arc::new(crate::scheduler::FixedConcurrency::new(concurrency)),
             |weak| Arc::new(crate::runtime::ManagedExecution::for_test(weak, 4)),
         )
+    }
+
+    // ref: V2429410200
+    /// The scheduler releases a transfer once it has completed and been
+    /// removed, while the client is still alive.
+    ///
+    /// The mock's state machine is owned only by the transfer, so its weak
+    /// reference dies exactly when the scheduler drops the transfer. The
+    /// final worker reference can outlive registry removal, so the check
+    /// waits a bounded time without forcing epoch collection.
+    /// A transfer retained by scheduler structures past removal keeps its
+    /// resources, such as a destination file and the client handle, alive.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn completed_transfer_is_dropped_while_the_client_is_alive() {
+        let handle = test_handle(1);
+        let scheduler = &handle.scheduler;
+        let id = TransferId {
+            id: 1,
+            parent: None,
+        };
+        let sm = Arc::new(FixedWorkCount::new(2));
+        let released = Arc::downgrade(&sm);
+        scheduler.enqueue_transfer(Box::new(MockTransfer::new_with_handle(
+            id,
+            sm,
+            Arc::clone(&handle),
+        )));
+
+        let dropped = tokio::time::timeout(Duration::from_secs(2), async {
+            while released.strong_count() > 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        let completed = released.upgrade().map(|sm| sm.completed_count());
+        assert_eq!(scheduler.transfer_count(), 0, "transfer was not removed");
+        assert!(
+            dropped.is_ok(),
+            "completed transfer is still retained; completed work items: {completed:?}"
+        );
+        crate::runtime::test_util::shutdown(&handle).await;
+    }
+
+    /// Returns `Pending` on its first poll and `Done` after.
+    #[derive(Debug, Default)]
+    struct PendingThenDone {
+        polls: AtomicUsize,
+    }
+
+    impl MockStateMachine for PendingThenDone {
+        fn poll_work(&self, _id: TransferId) -> PollWork {
+            if self.polls.fetch_add(1, Ordering::SeqCst) == 0 {
+                PollWork::Pending
+            } else {
+                PollWork::Done
+            }
+        }
+
+        fn execute<'a>(
+            &'a self,
+            _work: &'a mut IoRequest,
+        ) -> Pin<Box<dyn Future<Output = WorkOutcome> + Send + 'a>> {
+            Box::pin(async { WorkOutcome::Success { data: None } })
+        }
+    }
+
+    // ref: V2429410200
+    /// A work-generation pass that retires the last transfer holding the
+    /// client handle finishes without panicking, and the handle is dropped
+    /// once the pass ends.
+    ///
+    /// The scheduler holds the handle weakly, and a wake reaches it without a
+    /// handle of its own. Once a retired transfer drops, nothing else may own
+    /// the handle; a pass that did not hold it would fail its next handle
+    /// lookup.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn generation_pass_survives_retiring_the_last_handle_owner() {
+        let handle = test_handle(1);
+        let scheduler = handle.scheduler.clone();
+        let released = Arc::downgrade(&handle);
+        let id = TransferId {
+            id: 1,
+            parent: None,
+        };
+        scheduler.enqueue_transfer(Box::new(MockTransfer::new_with_handle(
+            id,
+            Arc::new(PendingThenDone::default()),
+            Arc::clone(&handle),
+        )));
+        drop(handle);
+        assert!(
+            released.upgrade().is_some(),
+            "the pending transfer holds the handle"
+        );
+
+        scheduler.wake(id);
+        assert_eq!(scheduler.transfer_count(), 0, "transfer was not removed");
+        assert!(released.upgrade().is_none(), "the handle is still alive");
     }
 
     #[cfg_attr(miri, ignore)]

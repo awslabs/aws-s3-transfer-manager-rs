@@ -11,6 +11,9 @@ readme = "README.md"
 categories = ["asynchronous", "network-programming"]
 keywords = ["aws", "smithy", "http", "https"]
 
+[package.metadata.docs.rs]
+features = ["client"]
+
 [dependencies]
 aws-smithy-execution = { version = "0.1.0", path = "../aws-smithy-execution", optional = true }
 aws-smithy-http-client = { workspace = true, default-features = false, features = ["default-client", "rt-tokio"], optional = true }
