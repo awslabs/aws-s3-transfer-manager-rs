@@ -1292,6 +1292,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         self.storage.create_bucket(&input.bucket).await?;
         let output = s3s::dto::CreateBucketOutput {
             location: Some(format!("/{}", input.bucket)),
+            ..Default::default()
         };
         Ok(S3Response::new(output))
     }
