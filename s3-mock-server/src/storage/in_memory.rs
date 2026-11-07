@@ -87,7 +87,7 @@ impl StorageBackend for InMemoryStorage {
         let mut content = BytesMut::new();
 
         while let Some(chunk) = body.next().await {
-            let chunk = chunk.map_err(|e| Error::Internal(format!("Stream error: {}", e)))?;
+            let chunk = chunk.map_err(|e| Error::from_body_error(&e))?;
             integrity_checks.update(&chunk);
             content.extend_from_slice(&chunk);
         }

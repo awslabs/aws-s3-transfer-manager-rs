@@ -202,33 +202,8 @@ buckets (S3 Express One Zone), with S3 Express sessions and the behavior of dire
 
 **Sessions.** The server serves CreateSession (`GET /{bucket}?session`), which returns credentials
 valid for five minutes, in `ReadWrite` or `ReadOnly` mode. A directory bucket accepts requests
-signed, for the `s3express` or the `s3` service, either with a session's credentials and its token,
-or with the server's credentials and no token. As in S3:
-
-- a request with a session that has expired or that was created for another bucket, with a
-  `ReadOnly` session other than a GET or HEAD, or that is a bucket-level write (CreateBucket,
-  DeleteBucket, bucket configuration) signed with a session fails with 403 AccessDenied, as does
-  one with the server's credentials and a session token;
-- a session's credentials without its token, with another session's token, or to a general
-  purpose bucket fail with 403 InvalidAccessKeyId, as do unknown credentials; with a token of no
-  session they fail with 400 InvalidRequest;
-- a CreateSession with a session token fails with 400 InvalidRequest;
-- a request signed for `s3express` to a general purpose bucket, or to no bucket, fails with 400
-  AuthorizationHeaderMalformed (AuthorizationQueryParametersError if presigned).
-
-CreateSession requests that pass these checks are counted as `Operation::CreateSession`, and one
-for a missing bucket fails with 404 NoSuchBucket. `S3MockServer::reset` forgets all sessions. An
-expired session is remembered for an hour after it expires. The server checks a session's token
-after verifying the request's signature, where S3 checks it first: a request with another
-session's token and a wrong signature fails with 403 SignatureDoesNotMatch.
-
-**Request bodies and signatures.** s3s verifies every signature, CreateSession's included, with
-the secret key of the session or the server, and a wrong signature fails with 403
-SignatureDoesNotMatch. A request signed both in its `Authorization` header and in its query fails
-with 400 InvalidArgument. A request with `x-amz-sdk-checksum-algorithm` but no checksum header or
-trailer fails with 400 InvalidRequest. SigV4a is not supported. In either bucket type, the trailing
-checksums of a chunked body that declares them in `x-amz-trailer` are checked as checksum headers
-are, once the body has been read; a PutObject with such a body is read in full before it is stored.
+signed with a session's credentials and its token in `x-amz-s3session-token`, or with the server's
+credentials and no token. `S3MockServer::reset` forgets all sessions.
 
 **Creating and deleting directory buckets.** Create them with `S3MockServer::create_bucket`, and
 remove them with `S3MockServer::reset`. The SDK's CreateBucket and DeleteBucket for a directory

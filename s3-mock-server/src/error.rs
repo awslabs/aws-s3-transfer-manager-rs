@@ -126,6 +126,23 @@ pub enum Error {
     #[error("invalid write offset")]
     InvalidWriteOffset,
 
+    /// A chunked request body does not match its declared length, or its framing or trailer is
+    /// malformed.
+    #[error("incomplete body")]
+    IncompleteBody,
+
+    /// A chunk signature of a request body does not match.
+    #[error("signature does not match")]
+    SignatureDoesNotMatch,
+
+    /// A request body does not match its `x-amz-content-sha256`.
+    #[error("x-amz-content-sha256 mismatch")]
+    XAmzContentSha256Mismatch,
+
+    /// A chunk of a request body is larger than s3s accepts.
+    #[error("entity too large")]
+    EntityTooLarge,
+
     /// An append to an object that already has 10,000 parts.
     #[error("too many parts")]
     TooManyParts,
@@ -219,6 +236,48 @@ pub enum ServerError {
 impl From<io::Error> for Error {
     fn from(error: io::Error) -> Self {
         Error::Io(Arc::new(error))
+    }
+}
+
+impl Error {
+    /// The error for a request whose body could not be read:
+    /// - the S3 error s3s reports for a body that does not match its headers: a wrong chunk
+    ///   signature, payload hash, decoded length or chunk framing;
+    /// - an internal error for any other failure, such as a client that disconnected.
+    pub(crate) fn from_body_error(error: &(dyn std::error::Error + 'static)) -> Self {
+        use s3s::stream::aws_chunked_stream::AwsChunkedStreamError;
+        use s3s::stream::upload_stream::UploadStreamError;
+        let mut cause = error;
+        loop {
+            if let Some(error) = cause.downcast_ref::<AwsChunkedStreamError>() {
+                return match error {
+                    AwsChunkedStreamError::Underlying(_) => break,
+                    AwsChunkedStreamError::SignatureMismatch => Error::SignatureDoesNotMatch,
+                    AwsChunkedStreamError::ChunkMetaTooLarge(..)
+                    | AwsChunkedStreamError::ChunkDataTooLarge(..) => Error::EntityTooLarge,
+                    _ => Error::IncompleteBody,
+                };
+            }
+            if let Some(error) = cause.downcast_ref::<UploadStreamError>() {
+                return match error {
+                    UploadStreamError::Underlying(_) => break,
+                    UploadStreamError::Sha256Mismatch => Error::XAmzContentSha256Mismatch,
+                    UploadStreamError::LengthMismatch | UploadStreamError::Incomplete => {
+                        Error::IncompleteBody
+                    }
+                };
+            }
+            // An `io::Error` wrapping another error does not report it as its source.
+            let inner = cause
+                .downcast_ref::<std::io::Error>()
+                .and_then(|io| io.get_ref())
+                .map(|inner| inner as &(dyn std::error::Error + 'static));
+            match inner.or_else(|| cause.source()) {
+                Some(next) => cause = next,
+                None => break,
+            }
+        }
+        Error::Internal(format!("Failed to read body: {error}"))
     }
 }
 
@@ -428,6 +487,28 @@ impl From<Error> for s3s::S3Error {
                  this object. You can use the CopyObject operation to copy this object to another \
                  and then add more data to the newly copied object."
                     .into(),
+            ),
+            Error::IncompleteBody => (
+                S3ErrorCode::IncompleteBody,
+                StatusCode::BAD_REQUEST,
+                "The request body terminated unexpectedly".into(),
+            ),
+            Error::SignatureDoesNotMatch => (
+                S3ErrorCode::SignatureDoesNotMatch,
+                StatusCode::FORBIDDEN,
+                "The request signature we calculated does not match the signature you provided. \
+                 Check your key and signing method."
+                    .into(),
+            ),
+            Error::XAmzContentSha256Mismatch => (
+                S3ErrorCode::Custom("XAmzContentSHA256Mismatch".into()),
+                StatusCode::BAD_REQUEST,
+                "The provided 'x-amz-content-sha256' header does not match what was computed.".into(),
+            ),
+            Error::EntityTooLarge => (
+                S3ErrorCode::EntityTooLarge,
+                StatusCode::BAD_REQUEST,
+                "Your proposed upload exceeds the maximum allowed size".into(),
             ),
             Error::InvalidWriteOffset => (
                 S3ErrorCode::Custom("InvalidWriteOffset".into()),

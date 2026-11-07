@@ -254,6 +254,83 @@ async fn test_s3express_signature_in_general_purpose_bucket() -> Result {
     Ok(())
 }
 
+/// A request body that does not match what its headers declare fails and stores nothing:
+/// - a chunked body with bytes after its trailer, or with another length than
+///   `x-amz-decoded-content-length`, with 400 IncompleteBody;
+/// - a body that does not match its `x-amz-content-sha256` with 400 XAmzContentSHA256Mismatch.
+///
+/// In a general purpose bucket, the request is signed for `s3`.
+#[tokio::test]
+async fn test_malformed_bodies() -> Result {
+    let server = server().await;
+    server.create_bucket("general-purpose").await?;
+    let handle = server.start().await?;
+    // The SHA-256 of `hello`, sent with `jello`.
+    let hello_sha256 = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+    let trailer = "5\r\nhello\r\n0\r\nx-amz-checksum-crc32:NhCmhg==\r\n\r\n";
+    let extra = format!("{trailer}EXTRA");
+    let cases: [(&str, &str, &str, u16, &str); 3] = [
+        (
+            "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+            "5",
+            &extra,
+            400,
+            "IncompleteBody",
+        ),
+        (
+            "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+            "6",
+            trailer,
+            400,
+            "IncompleteBody",
+        ),
+        (hello_sha256, "", "jello", 400, "XAmzContentSHA256Mismatch"),
+    ];
+    for (bucket, service) in [(BUCKET, "s3express"), ("general-purpose", "s3")] {
+        for (index, (content_sha256, decoded_length, body, status, code)) in
+            cases.iter().enumerate()
+        {
+            let key = format!("key-{index}");
+            let content_length = body.len().to_string();
+            let mut headers = vec![
+                ("host", "localhost"),
+                ("x-amz-content-sha256", *content_sha256),
+                ("content-length", content_length.as_str()),
+            ];
+            if !decoded_length.is_empty() {
+                headers.extend([
+                    ("content-encoding", "aws-chunked"),
+                    ("x-amz-decoded-content-length", *decoded_length),
+                    ("x-amz-trailer", "x-amz-checksum-crc32"),
+                ]);
+            }
+            let request = signed_request_with(
+                ("mock-akid", "mock-secret"),
+                service,
+                "PUT",
+                &format!("/{bucket}/{key}"),
+                &headers,
+                body,
+            );
+            let response = send(&handle, &request).await?;
+            assert!(
+                response.starts_with(&format!("HTTP/1.1 {status}")),
+                "{bucket} {index}: {response}"
+            );
+            assert!(
+                response.contains(&format!("<Code>{code}</Code>")),
+                "{bucket} {index}: {response}"
+            );
+            assert!(
+                !server.object_exists(bucket, &key).await?,
+                "{bucket} {index}"
+            );
+        }
+    }
+    handle.shutdown().await?;
+    Ok(())
+}
+
 /// A request to a directory bucket with a wrong signature fails with 403 SignatureDoesNotMatch and
 /// changes nothing: a PutObject stores nothing, and a CreateSession creates no session. Correctly
 /// signed, the CreateSession succeeds.

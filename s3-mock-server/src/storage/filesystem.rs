@@ -282,7 +282,7 @@ impl StorageBackend for FilesystemStorage {
             // Closed at the end of the block, before the rename.
             let mut file = fs::OpenOptions::new().write(true).open(&temp_path).await?;
             while let Some(chunk) = body.next().await {
-                let chunk = chunk.map_err(|e| Error::Internal(format!("Stream error: {}", e)))?;
+                let chunk = chunk.map_err(|e| Error::from_body_error(&e))?;
                 integrity_checks.update(&chunk);
                 content_length += chunk.len() as u64;
                 file.write_all(&chunk).await?;

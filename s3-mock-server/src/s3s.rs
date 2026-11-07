@@ -190,7 +190,7 @@ impl<S: StorageBackend + 'static> Inner<S> {
 
         let mut content = BytesMut::new();
         while let Some(chunk) = request.body.next().await {
-            let chunk = chunk.map_err(|e| Error::Internal(format!("Stream error: {}", e)))?;
+            let chunk = chunk.map_err(|e| Error::from_body_error(&e))?;
             content.extend_from_slice(&chunk);
         }
         let content = content.freeze();
@@ -752,7 +752,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         if declares_trailer {
             let mut data = BytesMut::new();
             while let Some(chunk) = request.body.next().await {
-                let chunk = chunk.map_err(|e| Error::Internal(format!("Stream error: {e}")))?;
+                let chunk = chunk.map_err(|e| Error::from_body_error(&e))?;
                 data.extend_from_slice(&chunk);
             }
             let data = data.freeze();
@@ -952,9 +952,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
                         }
                         content.extend_from_slice(&chunk);
                     }
-                    Err(e) => {
-                        return Err(Error::Internal(format!("Failed to read body: {e}")).into())
-                    }
+                    Err(e) => return Err(Error::from_body_error(&*e).into()),
                 }
             }
         }
