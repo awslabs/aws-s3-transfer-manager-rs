@@ -69,7 +69,7 @@ closed-form and the function is re-callable on new signals.
 
 Its inputs are a throughput target, usable memory, usable vCPUs, the
 descriptor-derived connection cap, and explicit configuration. Throughput comes
-from `Config::throughput_target_gbps` when set and otherwise from the detected
+from `ConcurrencyMode::TargetThroughput` when set and otherwise from the detected
 instance family's bandwidth estimate; a value that is not finite or not positive
 is treated as unset. Machine facts are discovery-only and have no public
 override. Explicitly configured memory, concurrency, and part size are

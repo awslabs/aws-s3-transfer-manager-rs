@@ -78,10 +78,7 @@ impl Handle {
         }
     }
 
-    /// Get the concrete target part size to use for transfer operations.
-    ///
-    /// Uploads and downloads share one size: the configured size when set, and
-    /// a fixed default otherwise.
+    /// Part size for uploads and downloads.
     pub(crate) fn part_size_bytes(&self) -> u64 {
         self.sizing.part_size
     }
@@ -213,14 +210,14 @@ impl Handle {
             .expect("test buffer-pool configuration must be valid"),
             MemoryConfig::Explicit(pool) => pool.clone(),
         };
-        // Resolve sizing against the pool this handle actually uses, so the
-        // part size agrees with the ceiling the test is running under.
+        // Sized against this handle's own pool, so results do not depend on
+        // host memory.
         let sizing = sizing::resolve(Signals {
             throughput_gbps: config.throughput_target_gbps(),
             instance_type: None,
             vcpus: 1,
             ram_bytes: None,
-            descriptor_cap: crate::runtime::platform::MAX_CONNECTIONS_PER_HOST,
+            connection_cap: crate::runtime::platform::ConnectionCap::from_descriptor_limit(None),
             explicit_concurrency: Some(controller.target()),
             explicit_part_size: match config.part_size() {
                 PartSize::Target(n) => Some(*n),
@@ -285,9 +282,6 @@ impl Client {
 
         let client_features = crate::config::user_agent::client_features(&config, &profile);
 
-        // Resolve every sized resource from one pass over the available
-        // signals, so the concurrency target, payload-memory ceiling, part
-        // size, and connection cap agree on what the host can sustain.
         let connection_cap = crate::runtime::platform::ConnectionCap::detect();
         let explicit_pool_ceiling = match config.memory() {
             MemoryConfig::Explicit(pool) => Some(
@@ -300,10 +294,10 @@ impl Client {
             instance_type: profile.instance_type.as_deref(),
             vcpus: profile.vcpus,
             ram_bytes: profile.ram_bytes,
-            descriptor_cap: connection_cap.max_per_host,
+            connection_cap,
             explicit_concurrency: match config.concurrency() {
                 ConcurrencyMode::Explicit(n) => Some(*n),
-                ConcurrencyMode::Auto => None,
+                ConcurrencyMode::Auto | ConcurrencyMode::TargetThroughput(_) => None,
             },
             explicit_part_size: match config.part_size() {
                 PartSize::Target(n) => Some(*n),
@@ -567,12 +561,11 @@ impl Client {
     }
 }
 
-/// Report the resolved sizing, and warn when a signal held a resource below
-/// what the rest of the configuration asks for.
+/// Logs the resolved sizing at `INFO`, and a `WARN` for each configured value
+/// the host cannot fund.
 ///
-/// Emitted for every client. `connection_cap_installed` is false when TM does
-/// not build the transport (a supplied S3 or HTTP client, caller-runtime
-/// execution, wasm), in which case `max_connections_per_host` is not applied.
+/// `connection_cap_installed` is whether the cap is applied to a transport this
+/// client builds.
 fn log_resource_sizing(
     sizing: &Sizing,
     cap: &crate::runtime::platform::ConnectionCap,
@@ -1233,17 +1226,15 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn client_new_wires_resolved_target_into_controller() {
-        // End-to-end: the resolved seed reaches the live controller's target().
-        // The target the pass resolves is the target the scheduler runs with.
-        // Derived from the pass rather than written as a literal, because the
-        // descriptor cap depends on the host's RLIMIT_NOFILE.
+        // The resolved target is the controller's target. Expected values come
+        // from the pass because the descriptor cap depends on RLIMIT_NOFILE.
         let p = profile(Some("c8gn.16xlarge"), 64);
         let expected = sizing::resolve(Signals {
             throughput_gbps: None,
             instance_type: p.instance_type.as_deref(),
             vcpus: p.vcpus,
             ram_bytes: p.ram_bytes,
-            descriptor_cap: platform::ConnectionCap::detect().max_per_host,
+            connection_cap: platform::ConnectionCap::detect(),
             explicit_concurrency: None,
             explicit_part_size: None,
             ceiling_override_bytes: None,
@@ -1259,8 +1250,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn client_new_sizes_an_automatic_pool_from_the_resolved_ceiling() {
-        // `MemoryConfig::Auto` takes its admission ceiling from the pass, not
-        // from a RAM share computed independently inside the pool.
+        // `MemoryConfig::Auto` uses the resolved ceiling.
         let p = profile(None, 4);
         let config = crate::config::Config::builder()
             .sdk_client(aws_smithy_mocks::mock_client!(aws_sdk_s3, []))
@@ -1283,24 +1273,20 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn configured_throughput_drives_the_resolved_target() {
-        // The top-level knob reaches the scheduler without a concurrency mode
-        // being set, which is the point of offering a single figure.
-        let config = crate::config::Config::builder()
-            .sdk_client(aws_smithy_mocks::mock_client!(aws_sdk_s3, []))
-            .throughput_target_gbps(100.0)
-            .machine_profile(Some(profile(None, 4)))
-            .build();
+        // A throughput target sets the controller's target.
+        let client = Client::new(config_with(
+            ConcurrencyMode::TargetThroughput(100.0),
+            Some(profile(None, 4)),
+        ));
 
-        let client = Client::new(config);
-
-        // Pin the value rather than a range: 100 Gbps seeds the target, and the
-        // pass bounds it by the host's descriptor cap and the fallback ceiling.
+        // Expected value from the pass, which bounds the 100 Gbps seed by the
+        // host's descriptor cap and the fallback ceiling.
         let expected = sizing::resolve(Signals {
             throughput_gbps: Some(100.0),
             instance_type: None,
             vcpus: 4,
             ram_bytes: None,
-            descriptor_cap: platform::ConnectionCap::detect().max_per_host,
+            connection_cap: platform::ConnectionCap::detect(),
             explicit_concurrency: None,
             explicit_part_size: None,
             ceiling_override_bytes: None,
@@ -1312,10 +1298,7 @@ mod tests {
     #[test]
     fn invalid_throughput_target_reads_as_unset() {
         for gbps in [0.0, -1.0, f64::NAN, f64::INFINITY] {
-            let config = crate::config::Config::builder()
-                .sdk_client(aws_smithy_mocks::mock_client!(aws_sdk_s3, []))
-                .throughput_target_gbps(gbps)
-                .build();
+            let config = config_with(ConcurrencyMode::TargetThroughput(gbps), None);
             assert_eq!(config.throughput_target_gbps(), None, "gbps {gbps}");
             assert!(config.ignored_throughput_target_gbps().is_some());
         }
@@ -1336,7 +1319,7 @@ mod tests {
             instance_type: None,
             vcpus: platform::local_vcpus(),
             ram_bytes: platform::available_ram(),
-            descriptor_cap: platform::ConnectionCap::detect().max_per_host,
+            connection_cap: platform::ConnectionCap::detect(),
             explicit_concurrency: None,
             explicit_part_size: None,
             ceiling_override_bytes: None,

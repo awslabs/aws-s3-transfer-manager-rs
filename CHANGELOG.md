@@ -8,15 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- `config::Builder::throughput_target_gbps` and `ConfigLoader::throughput_target_gbps` take the
-  network throughput, in Gbps, the client should size itself for. It drives the automatic
-  concurrency target. A configured concurrency target takes precedence. A value that is not
-  finite and positive is ignored with a warning.
 - Client construction logs one `INFO` record of the resolved sizing (concurrency target and the
   signal it came from and was bounded by, memory ceiling, part size, connection cap) and a
   `WARN` for each configured value the host cannot fund.
 
 ### Changed
+- `ConcurrencyMode::TargetThroughput` takes an `f64` in Gbps instead of a `TargetThroughput`, so
+  targets below 1 Gbps can be expressed. A value that is not finite and positive is ignored with
+  a warning, and concurrency resolves as for `Auto`.
 - The concurrency target, payload-memory ceiling, and part size are resolved together. A
   derived concurrency target is lowered to what the descriptor-derived connection cap and the
   memory ceiling can sustain at the resolved part size. Configured values are used as given.
@@ -29,8 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   memory. `BufferPool` built with `MemoryBudgetConfig::Auto` directly is unchanged.
 
 ### Removed
-- `ConcurrencyMode::TargetThroughput` and `types::TargetThroughput`. Use
-  `throughput_target_gbps` instead.
+- `types::TargetThroughput`. Its upload target was never applied; the client has one
+  concurrency target, sized from the download target.
 
 ## [release-2026-11-05]
 

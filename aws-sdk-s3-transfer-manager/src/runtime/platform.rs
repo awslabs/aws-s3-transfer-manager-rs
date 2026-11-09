@@ -19,13 +19,11 @@ use std::path::{Path, PathBuf};
 /// in-flight connection.
 const POOL_FD_BUDGET_FRACTION: f64 = 0.5;
 
-/// Descriptors withheld from the connection budget regardless of the fraction.
+/// Descriptors withheld from the connection budget for non-connection use.
 ///
-/// The descriptors a process holds besides its connections — stdio, resolver
-/// sockets, the log sink, open transfer files — are closer to a fixed count than
-/// to a share of the limit, so the fraction alone leaves proportionally less
-/// headroom as the soft limit falls. Below roughly twice this value the reserve
-/// is what bounds the budget.
+/// That use (stdio, resolver sockets, logging, open transfer files) does not
+/// scale with the soft limit, so below twice this value the reserve, not
+/// [`POOL_FD_BUDGET_FRACTION`], bounds the budget.
 const POOL_FD_RESERVE: usize = 64;
 
 /// Ceiling on connections to one origin across all managed threads.
@@ -64,8 +62,8 @@ impl ConnectionCap {
 
     /// `clamp(min(soft × POOL_FD_BUDGET_FRACTION, soft - POOL_FD_RESERVE),
     /// MIN_CONNECTIONS_PER_HOST, MAX_CONNECTIONS_PER_HOST)`, or the ceiling when
-    /// no limit is known. The floor takes precedence, so a soft limit under the
-    /// reserve still yields a cap the client can attempt a transfer with.
+    /// no limit is known. The floor applies even when the reserve exceeds the
+    /// soft limit.
     pub(crate) fn from_descriptor_limit(descriptors: Option<DescriptorLimit>) -> Self {
         let max_per_host = descriptors
             .map_or(MAX_CONNECTIONS_PER_HOST, |limit| {
@@ -676,8 +674,8 @@ mod tests {
 
     #[test]
     fn test_cap_low_descriptor_limit_is_floored() {
-        // 8 descriptors: under the reserve entirely, so the budget is zero and
-        // the floor supplies the cap.
+        // 8 descriptors: below the reserve, so the budget is zero and the floor
+        // sets the cap.
         let cap = ConnectionCap::from_descriptor_limit(soft(8));
         assert_eq!(cap.max_per_host, MIN_CONNECTIONS_PER_HOST);
         assert!(cap.limited_by_descriptors());
@@ -685,8 +683,7 @@ mod tests {
 
     #[test]
     fn test_cap_reserve_binds_below_twice_the_reserve() {
-        // 100 descriptors: the fraction would allow 50, but withholding the
-        // reserve leaves 36, and the smaller of the two is the budget.
+        // 100 descriptors: the fraction allows 50 and the reserve leaves 36.
         assert_eq!(
             ConnectionCap::from_descriptor_limit(soft(100)).max_per_host,
             36
@@ -695,8 +692,7 @@ mod tests {
 
     #[test]
     fn test_cap_reserve_does_not_bind_above_twice_the_reserve() {
-        // 160 descriptors: the fraction allows 80 and the reserve leaves 96, so
-        // the fraction is still what bounds the budget.
+        // 160 descriptors: the fraction allows 80 and the reserve leaves 96.
         assert_eq!(
             ConnectionCap::from_descriptor_limit(soft(160)).max_per_host,
             80

@@ -53,15 +53,6 @@ impl ConfigLoader {
         self
     }
 
-    /// Set the network throughput, in gigabits per second, the client should
-    /// size itself for.
-    ///
-    /// See [`Builder::throughput_target_gbps`](crate::config::Builder::throughput_target_gbps).
-    pub fn throughput_target_gbps(mut self, gbps: f64) -> Self {
-        self.builder = self.builder.throughput_target_gbps(gbps);
-        self
-    }
-
     /// Set the execution runtime this client should use.
     ///
     /// Defaults to owned managed execution.

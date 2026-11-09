@@ -3,30 +3,26 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Construction-time resource sizing policy.
+//! Construction-time resource sizing.
 //!
-//! [`resolve`] turns the machine and configuration signals available when a
-//! client is built into the memory ceiling, concurrency target, part size, and
-//! per-host connection cap the client runs with. It is policy over the facts
-//! that [`super::platform`] detects, and performs no detection itself.
+//! [`resolve`] maps the signals available when a client is built to its
+//! payload-memory ceiling, concurrency target, part size, and per-host
+//! connection cap. It performs no detection; [`super::platform`] supplies the
+//! machine facts.
 //!
-//! Resolution is one pass in a fixed order, so each quantity depends only on
-//! quantities already resolved. Part size is not derived: it is the configured
-//! value when set and a fixed default otherwise, which keeps it an input to the
-//! concurrency bound rather than an output of it.
+//! Resolution is a single pass in which each quantity reads only quantities
+//! resolved before it. Part size is an input: the configured value, or
+//! [`DEFAULT_PART_SIZE`].
 //!
-//! Two rules govern the pass. An explicitly configured value is used as given
-//! and is never narrowed. Every derived value is bounded by what the binding
-//! constraint can actually sustain, so a client does not reserve capability it
-//! cannot use.
+//! A configured value is used as given. A derived concurrency target is bounded
+//! by the connection cap and by the slots the ceiling funds at the part size.
 
 use crate::metrics::unit::ByteUnit;
 
-use super::buffer_pool::config::{
-    AUTO_CAPACITY_FALLBACK_BYTES, AUTO_CAPACITY_MAX_BYTES, AUTO_MEMORY_SHARE_DENOMINATOR,
-};
+use super::buffer_pool::auto_capacity_bytes;
 use super::platform::{
-    resolve_auto_concurrency, seed_from_gbps, AutoConcurrencySource, ResolvedAutoConcurrency,
+    resolve_auto_concurrency, seed_from_gbps, AutoConcurrencySource, ConnectionCap,
+    ResolvedAutoConcurrency,
 };
 
 /// Part-sized buffers one concurrency slot may hold: one filling from the
@@ -36,64 +32,43 @@ const BUFFERS_PER_SLOT: u64 = 3;
 /// Part size for uploads and downloads when none is configured.
 pub(crate) const DEFAULT_PART_SIZE: u64 = 8 * ByteUnit::Mebibyte.as_bytes_u64();
 
-// The detected-memory share, its cap, and the no-detection fallback are the
-// buffer pool's own `MemoryBudgetConfig::Auto` policy, imported rather than
-// restated so the two cannot drift. The floor below is the only addition.
-const RAM_SHARE_DIVISOR: usize = AUTO_MEMORY_SHARE_DENOMINATOR;
-const AUTO_CEILING_MAX_BYTES: u64 = AUTO_CAPACITY_MAX_BYTES;
-const NO_RAM_FALLBACK_BYTES: u64 = AUTO_CAPACITY_FALLBACK_BYTES;
-
-/// Lower bound on the automatic ceiling.
+/// Lower bound on the automatic ceiling when memory is detected.
 ///
-/// Raises the detected-memory share on small hosts so the ceiling funds the
-/// minimum concurrency target at the default part size. Never exceeds
-/// [`FLOOR_MAX_RAM_DIVISOR`] of detected memory.
+/// Funds the minimum concurrency target at [`DEFAULT_PART_SIZE`]. Limited to
+/// `1 / FLOOR_MAX_RAM_DIVISOR` of detected memory.
 const AUTO_FLOOR_BYTES: u64 = 256 * ByteUnit::Mebibyte.as_bytes_u64();
 
-/// The floor is limited to detected memory divided by this value.
-///
-/// The ceiling is a bound against exhausting host memory, so on a host smaller
-/// than twice the floor (a 128 MiB Lambda, a small container) the floor yields
-/// to half of memory rather than admitting more than the host holds.
+/// Divisor of detected memory that limits [`AUTO_FLOOR_BYTES`], so the
+/// automatic ceiling stays below detected memory.
 const FLOOR_MAX_RAM_DIVISOR: usize = 2;
 
-/// In-flight work items one connection sustains.
+/// In-flight work items one connection carries.
 ///
-/// Bounds the concurrency target by the connection cap: a work item occupies a
-/// connection for the duration of its request, so a target above the reachable
-/// connection count cannot be realized.
+/// A work item holds a connection for the duration of its request.
 const INFLIGHT_PER_CONNECTION: usize = 1;
 
-/// Signals available when a client is constructed.
-///
-/// `descriptor_cap` is the descriptor-derived per-host connection cap, which is
-/// independent of the concurrency target. `ceiling_override_bytes` carries the
-/// capacity of a caller-supplied pool or byte limit, which replaces the
-/// detected-memory ceiling. The `explicit_*` fields carry configured values,
-/// which are used as given.
+/// Inputs to [`resolve`].
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Signals<'a> {
-    /// Configured throughput target in Gbps, if set and valid.
+    /// Configured throughput target, in Gbps.
     pub(crate) throughput_gbps: Option<f64>,
-    /// EC2 instance type, used to estimate throughput when none is configured.
+    /// EC2 instance type.
     pub(crate) instance_type: Option<&'a str>,
-    /// Usable vCPU count.
+    /// Usable vCPUs.
     pub(crate) vcpus: usize,
-    /// Usable memory in bytes, or `None` when undetectable.
+    /// Usable memory in bytes; `None` when undetected.
     pub(crate) ram_bytes: Option<usize>,
     /// Descriptor-derived per-host connection cap.
-    pub(crate) descriptor_cap: usize,
-    /// Configured concurrency target.
+    pub(crate) connection_cap: ConnectionCap,
+    /// Configured concurrency target; used as given.
     pub(crate) explicit_concurrency: Option<usize>,
-    /// Configured part size.
+    /// Configured part size; used as given.
     pub(crate) explicit_part_size: Option<u64>,
-    /// Capacity of a caller-supplied memory ceiling.
+    /// Capacity of a caller-supplied pool; replaces the automatic ceiling.
     pub(crate) ceiling_override_bytes: Option<usize>,
 }
 
-/// Which signal the concurrency target was derived from, before any bound.
-///
-/// Distinct from [`ConcurrencyBound`], which reports what narrowed that target.
+/// Signal the concurrency target was derived from, before any bound.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ConcurrencySource {
     /// A configured target was used as given.
@@ -126,16 +101,16 @@ impl From<AutoConcurrencySource> for ConcurrencySource {
     }
 }
 
-/// What bounded the concurrency target.
+/// Bound that set the concurrency target.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ConcurrencyBound {
-    /// The configured target was used as given.
+    /// The target was configured.
     Configured,
-    /// The derived target was not reduced by any bound.
+    /// No bound reduced the derived target.
     Unbounded,
-    /// The connection cap reachable with the descriptor limit.
+    /// The connection cap.
     Connections,
-    /// The part demand the memory ceiling can fund.
+    /// The slots the ceiling funds at the part size.
     Memory,
 }
 
@@ -153,45 +128,38 @@ impl ConcurrencyBound {
 /// Resolved sizing for one client.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Sizing {
-    /// Admission ceiling for the shared buffer pool.
+    /// Admission ceiling for the buffer pool.
     pub(crate) ceiling_bytes: usize,
-    /// In-flight work target installed in the scheduler.
+    /// Concurrency target for the scheduler.
     pub(crate) concurrency: usize,
     /// Part size for uploads and downloads.
     pub(crate) part_size: u64,
-    /// Maximum connections to one origin: the descriptor-derived cap.
+    /// Per-host connection cap; the descriptor-derived cap.
     ///
-    /// Not narrowed to the concurrency target. The cap is a descriptor safety
-    /// bound, and connections open lazily, so headroom above the target costs
-    /// nothing until used. It keeps connections partition-local rather than
-    /// borrowed or reclaimed across partitions at the cap, and leaves room for
-    /// requests outside the scheduler, such as listing and session creation.
+    /// Not narrowed to [`Self::concurrency`]: connections open on demand, so a
+    /// cap above the target reserves nothing.
     pub(crate) connection_cap: usize,
-    /// Largest concurrency the ceiling funds at `part_size`.
-    ///
-    /// A target above this value is bounded by memory admission rather than by
-    /// the scheduler.
+    /// Largest concurrency the ceiling funds at [`Self::part_size`].
     pub(crate) max_funded_concurrency: usize,
-    /// Throughput the pass resolved, in Gbps, when one was available.
+    /// Throughput the target was seeded from, in Gbps, when known.
     pub(crate) throughput_gbps: Option<f64>,
-    /// Which signal [`Self::concurrency`] was derived from.
+    /// Signal [`Self::concurrency`] was derived from.
     pub(crate) concurrency_source: ConcurrencySource,
-    /// Which signal bounded [`Self::concurrency`].
+    /// Bound that set [`Self::concurrency`].
     pub(crate) concurrency_bound: ConcurrencyBound,
-    /// Whether memory was detected rather than assumed.
+    /// Whether usable memory was detected.
     pub(crate) memory_detected: bool,
-    /// Whether the configured concurrency target exceeds what the ceiling and
-    /// connection cap sustain.
+    /// Whether a configured target exceeds the connection cap or the slots the
+    /// ceiling funds.
     pub(crate) configured_concurrency_unfunded: bool,
-    /// Whether the ceiling cannot fund one concurrency slot at the configured
-    /// part size.
+    /// Whether the ceiling funds no slot at a configured part size.
     pub(crate) configured_part_size_unfunded: bool,
 }
 
-/// Resolves sizing from one set of signals.
+/// Resolves sizing from `signals`.
 ///
-/// Never panics and performs no I/O. All arithmetic saturates, so no
-/// combination of signals produces a zero concurrency target.
+/// Performs no I/O and does not panic. Arithmetic saturates; the concurrency
+/// target and connection cap are at least one.
 pub(crate) fn resolve(signals: Signals<'_>) -> Sizing {
     let auto = resolve_auto_concurrency(signals.instance_type, signals.vcpus);
     let configured_throughput = configured_throughput(&signals);
@@ -200,15 +168,15 @@ pub(crate) fn resolve(signals: Signals<'_>) -> Sizing {
     let part_size = signals.explicit_part_size.unwrap_or(DEFAULT_PART_SIZE);
 
     let connections_bound = signals
-        .descriptor_cap
+        .connection_cap
+        .max_per_host
         .saturating_mul(INFLIGHT_PER_CONNECTION);
     let memory_bound = funded_concurrency(ceiling_bytes, part_size);
 
     let (concurrency, concurrency_bound, configured_concurrency_unfunded) =
         match signals.explicit_concurrency {
-            // A configured target is authoritative. Memory admission and
-            // connection acquisition still bound execution, so an unfundable
-            // target costs backpressure rather than correctness.
+            // Not narrowed: memory admission and connection acquisition bound
+            // an unfunded target at run time.
             Some(configured) => {
                 let target = configured.max(1);
                 let unfunded = target > connections_bound.min(memory_bound);
@@ -232,7 +200,7 @@ pub(crate) fn resolve(signals: Signals<'_>) -> Sizing {
         ceiling_bytes,
         concurrency,
         part_size,
-        connection_cap: signals.descriptor_cap.max(1),
+        connection_cap: signals.connection_cap.max_per_host.max(1),
         max_funded_concurrency: memory_bound,
         throughput_gbps,
         concurrency_source: if signals.explicit_concurrency.is_some() {
@@ -251,10 +219,7 @@ pub(crate) fn resolve(signals: Signals<'_>) -> Sizing {
     }
 }
 
-/// Configured throughput in Gbps, or `None` when none was set.
-///
-/// A value that is not finite or not positive is treated as unset, matching the
-/// sentinel that distinguishes "no target" from a target of zero.
+/// Configured throughput, when finite and positive.
 fn configured_throughput(signals: &Signals<'_>) -> Option<f64> {
     signals
         .throughput_gbps
@@ -263,22 +228,21 @@ fn configured_throughput(signals: &Signals<'_>) -> Option<f64> {
 
 /// Admission ceiling in bytes.
 ///
-/// A caller-supplied ceiling is used as given. Otherwise the ceiling is a share
-/// of detected memory, bounded above and below, and a fixed value when memory
-/// cannot be detected. The lower bound never exceeds half of detected memory.
-/// The ceiling bounds admission only; it is not reserved at construction, so it
-/// does not reflect expected demand.
+/// A caller-supplied capacity is used as given. Otherwise the buffer pool's
+/// automatic capacity, raised to at least [`AUTO_FLOOR_BYTES`] limited to
+/// `1 / FLOOR_MAX_RAM_DIVISOR` of detected memory.
 fn ceiling(signals: &Signals<'_>) -> usize {
     if let Some(override_bytes) = signals.ceiling_override_bytes {
         return override_bytes;
     }
-    match signals.ram_bytes.filter(|&ram| ram > 0) {
+    let ram = signals.ram_bytes.filter(|&ram| ram > 0);
+    let automatic = auto_capacity_bytes(ram);
+    match ram {
         Some(ram) => {
-            let share = (ram / RAM_SHARE_DIVISOR) as u64;
-            let floor = AUTO_FLOOR_BYTES.min((ram / FLOOR_MAX_RAM_DIVISOR) as u64);
-            saturating_usize(share.clamp(floor, AUTO_CEILING_MAX_BYTES))
+            let floor = saturating_usize(AUTO_FLOOR_BYTES).min(ram / FLOOR_MAX_RAM_DIVISOR);
+            automatic.max(floor)
         }
-        None => saturating_usize(NO_RAM_FALLBACK_BYTES),
+        None => automatic,
     }
 }
 
@@ -312,6 +276,14 @@ mod tests {
     const MIB: u64 = 1024 * 1024;
     const GIB: u64 = 1024 * MIB;
 
+    /// A connection cap of `max_per_host`, with no descriptor limit detected.
+    fn cap(max_per_host: usize) -> ConnectionCap {
+        ConnectionCap {
+            max_per_host,
+            descriptors: None,
+        }
+    }
+
     /// Signals for a host with ample descriptors and no configured overrides.
     fn signals<'a>(ram_bytes: Option<usize>, vcpus: usize) -> Signals<'a> {
         Signals {
@@ -319,7 +291,7 @@ mod tests {
             instance_type: None,
             vcpus,
             ram_bytes,
-            descriptor_cap: 4096,
+            connection_cap: cap(4096),
             explicit_concurrency: None,
             explicit_part_size: None,
             ceiling_override_bytes: None,
@@ -328,8 +300,8 @@ mod tests {
 
     #[test]
     fn configured_throughput_is_the_sizing_root() {
-        // A configured target drives concurrency through the same seed the
-        // instance-family estimate uses, so both paths agree at equal Gbps.
+        // A configured target and an instance-family estimate share one seed,
+        // so equal Gbps resolve to equal targets.
         let mut s = signals(Some(256 * GIB as usize), 64);
         s.throughput_gbps = Some(100.0);
         let sizing = resolve(s);
@@ -341,8 +313,7 @@ mod tests {
 
     #[test]
     fn configured_throughput_takes_precedence_over_the_family_estimate() {
-        // Both signals are present; the configured value wins so a caller can
-        // correct a detection that does not match the host's real capability.
+        // With both present, the configured value is used.
         let mut s = signals(Some(256 * GIB as usize), 64);
         s.instance_type = Some("m6idn.16xlarge");
         s.throughput_gbps = Some(10.0);
@@ -363,8 +334,7 @@ mod tests {
 
     #[test]
     fn invalid_configured_throughput_is_treated_as_unset() {
-        // Zero is the unset sentinel; the remaining values cannot describe a
-        // rate, and accepting any of them would produce a target of one.
+        // None of these describes a rate; each resolves as if unset.
         for gbps in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             let mut s = signals(Some(8 * GIB as usize), 4);
             s.throughput_gbps = Some(gbps);
@@ -388,31 +358,32 @@ mod tests {
     #[test]
     fn ceiling_is_a_share_of_detected_memory() {
         let sizing = resolve(signals(Some(64 * GIB as usize), 16));
-        assert_eq!(sizing.ceiling_bytes, 64 * GIB as usize / RAM_SHARE_DIVISOR);
+        assert_eq!(
+            sizing.ceiling_bytes,
+            auto_capacity_bytes(Some(64 * GIB as usize))
+        );
         assert!(sizing.memory_detected);
     }
 
     #[test]
     fn ceiling_is_capped_on_a_large_host() {
-        let sizing = resolve(signals(Some(768 * GIB as usize), 192));
-        assert_eq!(
-            sizing.ceiling_bytes,
-            saturating_usize(AUTO_CEILING_MAX_BYTES)
-        );
+        let ram = 768 * GIB as usize;
+        let sizing = resolve(signals(Some(ram), 192));
+        assert_eq!(sizing.ceiling_bytes, auto_capacity_bytes(Some(ram)));
+        assert!(sizing.ceiling_bytes < ram / 4);
     }
 
     #[test]
     fn ceiling_floor_takes_precedence_over_a_small_memory_share() {
-        // A quarter of 1 GiB is below the floor. The floor wins, so the pool can
-        // still fund a slot; the ceiling bounds admission and reserves nothing.
+        // The pool's share of 1 GiB is below the floor, and half of 1 GiB is
+        // above it, so the floor sets the ceiling.
         let sizing = resolve(signals(Some(GIB as usize), 2));
         assert_eq!(sizing.ceiling_bytes, saturating_usize(AUTO_FLOOR_BYTES));
     }
 
     #[test]
     fn ceiling_floor_yields_to_half_of_memory_on_a_tiny_host() {
-        // A 128 MiB host: the floor alone would admit 256 MiB, twice what the
-        // host holds. The floor is limited to half of memory instead.
+        // Half of 128 MiB is below the floor, so half of memory sets the ceiling.
         let sizing = resolve(signals(Some(128 * MIB as usize), 1));
         assert_eq!(sizing.ceiling_bytes, 64 * MIB as usize);
     }
@@ -429,20 +400,14 @@ mod tests {
     #[test]
     fn undetected_memory_uses_the_fallback_ceiling() {
         let sizing = resolve(signals(None, 4));
-        assert_eq!(
-            sizing.ceiling_bytes,
-            saturating_usize(NO_RAM_FALLBACK_BYTES)
-        );
+        assert_eq!(sizing.ceiling_bytes, auto_capacity_bytes(None));
         assert!(!sizing.memory_detected);
     }
 
     #[test]
     fn zero_detected_memory_is_treated_as_undetected() {
         let sizing = resolve(signals(Some(0), 4));
-        assert_eq!(
-            sizing.ceiling_bytes,
-            saturating_usize(NO_RAM_FALLBACK_BYTES)
-        );
+        assert_eq!(sizing.ceiling_bytes, auto_capacity_bytes(None));
         assert!(!sizing.memory_detected);
     }
 
@@ -459,7 +424,7 @@ mod tests {
         // 200 Gbps seeds 500 in-flight, but 128 connections cannot carry it.
         let mut s = signals(Some(256 * GIB as usize), 64);
         s.throughput_gbps = Some(200.0);
-        s.descriptor_cap = 128;
+        s.connection_cap = cap(128);
         let sizing = resolve(s);
 
         assert_eq!(sizing.concurrency, 128);
@@ -482,8 +447,7 @@ mod tests {
 
     #[test]
     fn configured_concurrency_is_not_narrowed_by_a_bound() {
-        // Configured values are authoritative. The target survives a ceiling
-        // that cannot fund it, and the condition is reported instead.
+        // A configured target the ceiling cannot fund is kept and reported.
         let mut s = signals(Some(GIB as usize), 2);
         s.explicit_concurrency = Some(500);
         let sizing = resolve(s);
@@ -505,8 +469,8 @@ mod tests {
 
     #[test]
     fn zero_configured_concurrency_resolves_to_one() {
-        // The scheduler requires a target of at least one: at zero, "at
-        // capacity" would hold with nothing in flight and strand queued work.
+        // At zero the scheduler would be at capacity with nothing in flight and
+        // never dispatch queued work.
         let mut s = signals(Some(8 * GIB as usize), 4);
         s.explicit_concurrency = Some(0);
 
@@ -515,8 +479,7 @@ mod tests {
 
     #[test]
     fn concurrency_source_names_the_signal_the_target_came_from() {
-        // Reported independently of what bounded the target, so a log reader can
-        // tell a vCPU-fallback seed from a family estimate.
+        // The source is reported independently of the bound.
         let mut configured = signals(Some(8 * GIB as usize), 8);
         configured.explicit_concurrency = Some(4);
         assert_eq!(
@@ -547,10 +510,8 @@ mod tests {
 
     #[test]
     fn part_size_is_the_default_unless_configured() {
-        // Part size does not respond to the ceiling or the concurrency target.
-        // A ceiling large enough to fund a larger part does not grow it, and a
-        // ceiling too small to fund it across the derived target lowers
-        // concurrency instead.
+        // Neither a large nor a small ceiling changes the part size; a small
+        // ceiling lowers concurrency instead.
         let mut large = signals(Some(256 * GIB as usize), 64);
         large.throughput_gbps = Some(100.0);
         assert_eq!(resolve(large).part_size, DEFAULT_PART_SIZE);
@@ -586,8 +547,7 @@ mod tests {
 
     #[test]
     fn configured_part_size_bounds_concurrency_before_it_is_resolved() {
-        // The configured part size sizes the memory bound, so a large part
-        // reduces the funded slot count.
+        // A large configured part reduces the slots the ceiling funds.
         let mut s = signals(Some(8 * GIB as usize), 8);
         s.throughput_gbps = Some(100.0);
         s.explicit_part_size = Some(256 * MIB);
@@ -602,9 +562,7 @@ mod tests {
 
     #[test]
     fn connection_cap_is_not_narrowed_to_the_concurrency_target() {
-        // The cap is a descriptor safety bound. A small target leaves it intact
-        // so partitions keep their own connections and unscheduled requests
-        // have room.
+        // A small target leaves the descriptor-derived cap unchanged.
         let mut s = signals(Some(8 * GIB as usize), 4);
         s.explicit_concurrency = Some(12);
         let sizing = resolve(s);
@@ -617,7 +575,7 @@ mod tests {
     fn connection_cap_is_bounded_by_the_descriptor_cap() {
         let mut s = signals(Some(256 * GIB as usize), 64);
         s.throughput_gbps = Some(200.0);
-        s.descriptor_cap = 64;
+        s.connection_cap = cap(64);
 
         assert_eq!(resolve(s).connection_cap, 64);
     }
@@ -637,9 +595,9 @@ mod tests {
 
     #[test]
     fn every_signal_combination_resolves_within_its_contract() {
-        // Sweeps the extremes of each independent signal. Pins the invariants
-        // the caller relies on: a usable concurrency target, the default part
-        // size when none is configured, and a cap that carries the target.
+        // Sweeps the extremes of each independent signal: the target and cap are
+        // at least one, the cap is the descriptor-derived cap, and part size is
+        // the configured value or the default.
         let rams = [
             None,
             Some(0),
@@ -656,7 +614,7 @@ mod tests {
                         let mut s = signals(ram, 1);
                         s.explicit_part_size = part;
                         s.explicit_concurrency = concurrency;
-                        s.descriptor_cap = descriptor_cap;
+                        s.connection_cap = cap(descriptor_cap);
                         let sizing = resolve(s);
 
                         assert!(sizing.concurrency >= 1);

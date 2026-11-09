@@ -98,13 +98,6 @@ pub struct Args {
     #[command(flatten)]
     concurrency: ConcurrencyModeArg,
 
-    /// Network throughput, in Gbps, to size the client for
-    ///
-    /// Flag name predates the config method it feeds; kept stable for callers
-    /// that drive this example.
-    #[arg(long = "target-throughput-gbps")]
-    throughput_target_gbps: Option<f64>,
-
     /// Execution runtime: managed threads (default) or the ambient tokio runtime
     #[arg(long, value_enum, default_value_t = RuntimeArg::Managed)]
     runtime: RuntimeArg,
@@ -161,6 +154,10 @@ struct ConcurrencyModeArg {
     #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
     concurrency_auto: bool,
 
+    /// ConcurrencyMode::TargetThroughput(Gbps)
+    #[arg(long)]
+    target_throughput_gbps: Option<f64>,
+
     /// ConcurrencyMode::Explicit(n)
     #[arg(long)]
     concurrency: Option<usize>,
@@ -172,9 +169,10 @@ impl ConcurrencyModeArg {
             return ConcurrencyMode::Auto;
         }
 
-        match self.concurrency {
-            Some(concurrency) => ConcurrencyMode::Explicit(concurrency),
-            None => ConcurrencyMode::Auto,
+        match (self.target_throughput_gbps, self.concurrency) {
+            (Some(gbps), _) => ConcurrencyMode::TargetThroughput(gbps),
+            (None, Some(concurrency)) => ConcurrencyMode::Explicit(concurrency),
+            (None, None) => ConcurrencyMode::Auto,
         }
     }
 }
@@ -500,10 +498,6 @@ async fn run(args: Args) -> Result<(), BoxError> {
         .concurrency(args.concurrency.mode())
         .runtime_config(args.runtime.mode())
         .part_size(PartSize::Target(args.part_size));
-
-    if let Some(gbps) = args.throughput_target_gbps {
-        config_loader = config_loader.throughput_target_gbps(gbps);
-    }
 
     // S3FIO_MEMORY_LIMIT=N caps the transfer manager's memory pool at N GiB
     // (in-flight plus buffered transfer data; transfers backpressure at the cap).

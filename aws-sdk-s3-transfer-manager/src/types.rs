@@ -71,9 +71,8 @@ pub enum MemoryBudgetConfig {
 pub enum MemoryConfig {
     /// Construct an automatically sized pool when the client is created.
     ///
-    /// The ceiling follows [`MemoryBudgetConfig::Auto`], except that on a small
-    /// host it is raised to at most 256 MiB so the pool funds the minimum
-    /// concurrency target, and never above half of detected memory.
+    /// The ceiling follows [`MemoryBudgetConfig::Auto`], raised to at least
+    /// 256 MiB but not above half of detected memory.
     #[default]
     Auto,
     /// Use an existing pool.
@@ -90,6 +89,15 @@ pub enum ConcurrencyMode {
     /// Automatically configured concurrency based on the execution environment.
     #[default]
     Auto,
+
+    /// Concurrency sized for a network throughput target, in gigabits per second.
+    ///
+    /// The target replaces the throughput estimated from the execution
+    /// environment. It sets the in-flight request target once, when the client
+    /// is constructed; it does not limit throughput at run time. A value that
+    /// is not finite and positive is ignored with a warning, and concurrency is
+    /// resolved as for [`Auto`](Self::Auto).
+    TargetThroughput(f64),
 
     /// Explicit concurrency control
     Explicit(usize),
