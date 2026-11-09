@@ -542,7 +542,9 @@ mod tests {
     fn runtime_http_carries_tcp_keepalive() {
         let interval = std::time::Duration::from_secs(30);
         let config = Config::builder()
-            .s3_config(S3ClientConfig::from_sdk_builder(s3_config_builder()).tcp_keepalive(interval))
+            .s3_config(
+                S3ClientConfig::from_sdk_builder(s3_config_builder()).tcp_keepalive(interval),
+            )
             .build();
         let http = config.runtime_http(64).expect("runtime HTTP enabled");
         assert_eq!(http.tcp_keepalive, Some(Some(interval)));
