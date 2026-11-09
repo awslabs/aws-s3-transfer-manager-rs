@@ -34,7 +34,6 @@ fn operation_exports_are_canonical_and_preserve_construction_and_empty_metadata(
     let input: types::DownloadInput = input;
     let builder: download::DownloadInputBuilder = input.clone().into();
     assert_eq!(input, builder.build().unwrap());
-    assert_eq!(input.part_number(), None);
     assert_eq!(input.read_ahead(), Some(&ReadAhead::Parts(3)));
     assert!(types::DownloadInput::builder().key("key").build().is_err());
     assert!(types::DownloadInput::builder()

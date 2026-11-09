@@ -64,18 +64,38 @@ struct ErrorExtra {
 }
 
 /// General categories of transfer errors.
+///
+/// The kind classifies where a failure arose. It does not say whether
+/// resubmitting the operation can succeed: failures the transfer manager can
+/// repair, such as throttling responses and interrupted body reads, are retried
+/// internally before an error of any kind is returned.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ErrorKind {
-    /// Operation input validation issues.
+    /// The operation's input was rejected: a required field is missing, a value
+    /// is out of range, settings conflict, or the source cannot be transferred as
+    /// requested, such as a stream that produces more parts than a multipart
+    /// upload allows or an object key that resolves outside the download
+    /// destination. Conditions visible in the input are reported before any
+    /// request is sent; conditions that depend on the source data are reported
+    /// when the transfer encounters them.
     InputInvalid,
 
-    /// I/O errors. Covers local filesystem failures and transport-level failures
-    /// reading an object body. When a body read fails for a specific chunk,
-    /// [`Error::chunk`] identifies it.
+    /// An I/O operation failed. This covers both local filesystem failures
+    /// (opening, reading, writing, or renaming a file) and transport failures
+    /// while reading an object body from S3, such as a reset connection or a
+    /// truncated response. The source error identifies which.
+    ///
+    /// Because the kind spans local and remote failures, it does not indicate
+    /// whether resubmitting the operation can succeed. When a body read fails
+    /// for a specific chunk, [`Error::chunk`] identifies it.
     IOError,
 
-    /// Some kind of internal runtime issue (e.g. task failure, poisoned mutex).
+    /// The transfer manager could not continue for an internal reason that is
+    /// neither an input, I/O, nor service failure: a worker panicked while
+    /// executing the transfer, the memory budget could not admit a request, or
+    /// a response violated an invariant the transfer depends on, such as a
+    /// `Content-Range` that does not match the requested range.
     RuntimeError,
 
     /// Object discovery failed for a reason that is not a service-call error, such
@@ -409,30 +429,9 @@ impl std::error::Error for Error {
     }
 }
 
-impl From<crate::io::error::Error> for Error {
-    fn from(value: crate::io::error::Error) -> Self {
-        Self::new(ErrorKind::IOError, value)
-    }
-}
-
 impl From<std::io::Error> for Error {
     fn from(value: std::io::Error) -> Self {
         Self::new(ErrorKind::IOError, value)
-    }
-}
-
-impl From<tokio::task::JoinError> for Error {
-    fn from(value: tokio::task::JoinError) -> Self {
-        Self::new(ErrorKind::RuntimeError, value)
-    }
-}
-
-impl<T> From<std::sync::PoisonError<T>> for Error
-where
-    T: Send + Sync + 'static,
-{
-    fn from(value: std::sync::PoisonError<T>) -> Self {
-        Self::new(ErrorKind::RuntimeError, value)
     }
 }
 

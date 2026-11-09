@@ -259,6 +259,23 @@ impl Client {
     }
 
     /// Creates a new client from a transfer manager config.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a component the configuration selects cannot be constructed:
+    ///
+    /// - With the automatic memory configuration, the buffer pool cannot be
+    ///   sized for this machine: the OS page size is unavailable or produces an
+    ///   unsupported pool layout, or the detected memory is too small to hold
+    ///   one buffer. An explicitly configured [`BufferPool`] reports these
+    ///   conditions as errors from [`BufferPoolBuilder::build`] instead.
+    /// - With managed execution, the managed runtime cannot be started, for
+    ///   example because topology discovery fails or a managed thread cannot be
+    ///   created or initialized.
+    /// - With managed execution and no HTTP client configured on the S3
+    ///   configuration, the default HTTP transport cannot be constructed.
+    ///
+    /// [`BufferPoolBuilder::build`]: crate::memory::BufferPoolBuilder::build
     pub fn new(mut config: Config) -> Client {
         // Machine facts for auto-sizing: use the loader-detected profile if the
         // config came through `ConfigLoader::load`, else detect locally (DMI +
@@ -496,6 +513,12 @@ impl Client {
     ///
     /// Constructs a fluent builder for the
     /// [`UploadObjects`](crate::operation::upload_objects::builders::UploadObjectsFluentBuilder) operation.
+    ///
+    /// The default walk is not recursive: it uploads the regular files directly
+    /// inside the source directory and skips subdirectories. To upload a
+    /// directory tree, supply a walker built with
+    /// [`FsWalker::builder().recursive(true)`](crate::io::walk::FsWalkerBuilder::recursive),
+    /// as in the example below.
     ///
     /// Examples
     /// ```no_run

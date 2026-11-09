@@ -114,7 +114,7 @@ pub struct DownloadInput {
     pub read_ahead: ::std::option::Option<crate::types::ReadAhead>,
     /// <p>Part number of the object being read. This is a positive integer between 1 and 10,000. Effectively performs a 'ranged' GET request for the part specified. Useful for downloading just a part of an object.</p>
     /// Caller-selected part downloads are not supported. Transfer discovery manages request part numbers.
-    pub part_number: ::std::option::Option<i32>,
+    pub(crate) part_number: ::std::option::Option<i32>,
 }
 impl DownloadInput {
     /// <p>The bucket name containing the object.</p>
@@ -303,7 +303,8 @@ impl crate::model::DownloadInput {
     }
     /// <p>Part number of the object being read. This is a positive integer between 1 and 10,000. Effectively performs a 'ranged' GET request for the part specified. Useful for downloading just a part of an object.</p>
     /// Caller-selected part downloads are not supported. Transfer discovery manages request part numbers.
-    pub fn part_number(&self) -> ::std::option::Option<i32> {
+    #[allow(dead_code)]
+    pub(crate) fn part_number(&self) -> ::std::option::Option<i32> {
         self.part_number
     }
 }

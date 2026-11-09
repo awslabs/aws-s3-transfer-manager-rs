@@ -146,8 +146,8 @@ where
                                 .freeze();
                             let part_number = *this.next_part;
                             *this.next_part += 1;
-                            // Parts are not marked last: for a full part, that would need another
-                            // `poll_read`.
+                            // A full part is returned without reading ahead: the next poll
+                            // reports the end of the stream by returning `None`.
                             let part = PartData::from_segmented(part_number, data);
                             return Poll::Ready(Some(Ok(part)));
                         } else if n == 0 {

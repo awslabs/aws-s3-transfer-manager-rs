@@ -24,7 +24,7 @@ descriptions for more information.
 * **Automatic Request Splitting:** Improves throughput by automatically splitting large requests into part-sized chunks and processing them in parallel across multiple connections. This overcomes single-connection bandwidth limitations.
 * **Automatic Retries:** Enhances reliability by automatically retrying failed chunks independently, eliminating the need to restart entire transfers when intermittent errors occur.
 * **Optimized Parallel Reads:** Implements parallel read operations across different sections of large files during uploads, providing superior performance compared to sequential reading.
-* **Simplified Directory Operations:** Transfer entire directories or objects sharing a common prefix with a single API call, streamlining bulk transfer operations.
+* **Simplified Directory Operations:** Upload the files in a local directory, optionally recursing into its subdirectories, or download the objects sharing a common prefix with a single API call, streamlining bulk transfer operations.
 * **Advanced Load Balancing:** Automatically optimizes throughput by dynamically adjusting parallelism based on current workload and network bandwidth.
 
 ## Getting started
@@ -85,7 +85,7 @@ while let Some(chunk_result) = handle
 ```
 
 **Upload directory example:**
-This will recursively upload all files in the directory, combining the given prefix with each file's path from the filesystem.
+By default only the files directly inside the source directory are uploaded. This example supplies a recursive walker, so it uploads every file in the directory tree, combining the given prefix with each file's path from the filesystem.
 For example, if your prefix is `"prefix"` and the file path is `"test/docs/key.json"` , it will be uploaded with the key `"prefix/test/docs/key.json"` .
 
 ```rs
@@ -99,9 +99,8 @@ let handle = transfer_manager
     .key_prefix(key_prefix)
     .bucket(bucket)
     .source(source_dir)
-    .recursive(true)
-    .send()
-    .await?;
+    .walker(FsWalker::builder().recursive(true).build())
+    .initiate()?;
 
 let response = handle.join().await?;
 ```
@@ -120,8 +119,7 @@ let handle = transfer_manager
     .walker(S3Walker::builder().prefix(key_prefix).build())
     .bucket(bucket)
     .destination(destination_dir)
-    .send()
-    .await?;
+    .initiate()?;
 
 let response = handle.join().await?;
 ```
