@@ -13,6 +13,7 @@ use crate::io::key::stream::{EntryMeta, Obstruction};
 use crate::io::walk::{FsWalkContext, FsWalker, SortOrder, WalkError, WalkErrorKind};
 use crate::operation::sync::input::DeleteMode;
 
+use super::links::LinkNamer;
 use super::*;
 
 // A stream that hands back a written-down sequence, counting what was read so a test
@@ -1562,76 +1563,10 @@ async fn a_destination_that_appeared_after_the_check_still_ends_the_run() {
     );
 }
 
-// The merge holds a bounded number of names for followed links, and past the bound it holds
-// every later delete. A name the merge has passed stops counting toward the bound.
-#[cfg(unix)]
-#[cfg_attr(miri, ignore)]
-#[tokio::test]
-async fn the_names_followed_links_hold_stay_bounded() {
-    use std::os::unix::fs::symlink;
-
-    // The root contains more links than the bound allows names for. Each link holds its own
-    // name and a target the merge reaches only after `0.txt`.
-    fn forward(root: &Path) {
-        for n in 0..=ALIASED_NAMES_HELD / 2 {
-            let target = root.join(format!("z/t{n:04}"));
-            std::fs::create_dir_all(&target).expect("a target");
-            symlink(&target, root.join(format!("a{n:04}"))).expect("a link");
-        }
-    }
-    // The same number of links sit one per directory. The merge passes each link's names before
-    // the walk reads the next directory.
-    fn passed(root: &Path) {
-        for n in 0..=ALIASED_NAMES_HELD / 2 {
-            let dir = root.join(format!("d{n:04}"));
-            std::fs::create_dir_all(dir.join("real")).expect("a target");
-            std::fs::write(dir.join("real/x.txt"), b"x").expect("a file");
-            symlink("real", dir.join("link")).expect("a link");
-        }
-    }
-
-    type Case = (&'static str, fn(&Path), At);
-    let cases: [Case; 2] = [
-        ("forward links", forward, At::UnknownRange),
-        ("passed links", passed, At::Gone),
-    ];
-    for (name, build, expected) in cases {
-        let dir = tempfile::tempdir().expect("a temp dir");
-        let root = dir.path().to_path_buf();
-        build(&root);
-        std::fs::write(root.join("0.txt"), b"stale").expect("a stale file");
-        std::fs::write(root.join("zz.txt"), b"stale").expect("a stale file");
-
-        let walker = Walker::builder().follow_symlinks(true).build();
-        let local = LocalDestination::new(walker.local_walk(root.clone()), &root);
-        let mut walk = Walk::new(Scripted::of(&[]), local).with_roots(None, Some(root));
-        let mut most = 0;
-        let mut stale = Vec::new();
-        while let Some(next) = walk.next().await {
-            most = most.max(walk.src.gap.under.len());
-            let pairing = next.expect("the walk does not fail");
-            if pairing.key().ends_with(".txt") && !pairing.key().contains('/') {
-                stale.push((pairing.key().to_string(), at(pairing.source())));
-            }
-        }
-        assert!(
-            most <= ALIASED_NAMES_HELD,
-            "{name}: {most} names held at once"
-        );
-        assert_eq!(
-            stale,
-            [
-                ("0.txt".to_string(), expected),
-                ("zz.txt".to_string(), expected)
-            ],
-            "{name}"
-        );
-    }
-}
-
-// A link the walk finds only after the merge reached its target leaves the plan incomplete,
-// because a delete under the target may already have gone out. A key the target's name only
-// extends, such as `link.txt` beside `link`, does not reach the target.
+// A link the scan never saw, found by the walk only after the merge reached its target, leaves
+// the plan incomplete, because a delete under the target may already have gone out. A key the
+// target's name only extends, such as `link.txt` beside `link`, does not reach the target. The
+// walk here starts as if its scan had ended with no links found.
 #[cfg(unix)]
 #[cfg_attr(miri, ignore)]
 #[tokio::test]
@@ -1668,7 +1603,12 @@ async fn a_link_found_after_the_merge_reached_its_target_leaves_the_plan_incompl
         build(&root);
         let walker = Walker::builder().follow_symlinks(true).build();
         let local = LocalDestination::new(walker.local_walk(root.clone()), &root);
-        let mut walk = Walk::new(Scripted::of(source), local).with_roots(None, Some(root));
+        let mut walk = Walk::new(Scripted::of(source), local).with_roots(None, Some(root.clone()));
+        walk.links = Links::Scanned {
+            namer: LinkNamer::new(&root),
+            seen: Vec::new(),
+            names: Vec::new(),
+        };
         while let Some(next) = walk.next().await {
             next.expect("the walk does not fail");
         }
@@ -1992,19 +1932,24 @@ async fn the_prefix_reaches_the_listing_in_either_direction() {
 // bound it cannot keep them all, so every waiting delete stays, whatever the scan found.
 #[tokio::test]
 async fn names_the_walk_finds_past_the_bound_keep_every_waiting_delete() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let root = dir.path().to_path_buf();
     let mut walk = Walk::new(Scripted::of(&[]), Scripted::of(&[]));
     walk.links = Links::Scanning {
-        found: Vec::new(),
-        overflow: false,
+        namer: LinkNamer::new(&root),
+        followed: Vec::new(),
     };
-    for n in 0..=ALIASED_NAMES_HELD {
-        walk.hold_aliased(AliasedName::Directory(format!("l{n:04}")));
-    }
+    let links = (0..=ALIASED_NAMES_HELD)
+        .map(|n| FollowedLink::Directory(root.join(format!("l{n:04}"))))
+        .collect();
+    walk.note_followed(links);
+    let scan = LinkScan::new(&Walker::builder().build(), &root);
     assert_eq!(
-        walk.accept_link_scan(LinkScanResult::Names(Vec::new())),
+        walk.accept_link_scan(scan),
         None,
         "a waiting delete under a dropped name could go out"
     );
+    assert!(walk.past_link_bound());
 }
 
 // The link scan keeps at most `ALIASED_NAMES_HELD` names for the whole tree. Many links to one
@@ -2035,11 +1980,10 @@ async fn the_link_scan_gives_up_past_its_bound() {
         let mut scan = walk.take_link_scan().expect("the run has a link scan");
         while !scan.advance(64).await {}
         // Each link names itself, and all of them name `real` once.
-        let result = scan.finish();
         assert_eq!(
-            matches!(result, LinkScanResult::TooMany),
+            scan.too_many,
             too_many,
-            "{links} links name {} keys: {result:?}",
+            "{links} links name {} keys",
             links + 1
         );
     }

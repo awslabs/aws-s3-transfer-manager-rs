@@ -713,15 +713,16 @@ removes nothing anywhere in the folder, even in folders with no links. A run tha
 | Step | What happens |
 |---|---|
 | 1 | the scan passes 1,024 names and stops recording |
-| 2 | the scan returns `TooMany` |
+| 2 | the scan marks itself past the bound |
 | 3 | sync keeps every local delete in the run |
 | 4 | each kept key reports `skipped-unknown` |
 | 5 | the run ends `Warned`, and it records that it passed the bound |
 
 **What sync does.** The run records that the tree passed the bound, and it logs a warning that names
 the bound and two ways out: turn off following links, or exclude the folders that hold many links.
-The walk keeps its own bound while the scan reads. When the walk finds more names than the bound,
-every waiting delete stays, whatever the scan found. The tree alone decides whether a run passes
+The walk keeps the links it follows while the scan reads, and the same bound applies to them.
+When the walk follows more links than the bound, every waiting delete stays, whatever the scan
+found. The tree alone decides whether a run passes
 the bound, so every run over the tree ends the same way.
 
 ## 1. Scope, and why it is this
@@ -993,25 +994,29 @@ also carries the cause, and a form that covers only the keys below a name.
    not followed, download          the destination   its own name              take_destination
    excluded by the filter          its side          its own name              Walk::next
    dangling or endless, upload     the source        its own name              cost_of
-   dangling or endless, download   the destination   the keys below its name   LocalDestination
+   dangling or endless, download   the destination   the keys below its name   cost_of         
    in a loop                       its side          the keys below its name   cost_of
    target cannot be read           its side          its own name              cost_of
-   followed, delete mode on        the source        own name, target, chain   hold_aliased
+   followed, delete mode on        the source        own name, target, chain   accept_link_scan
 ```
 
 Every row but the last covers a link the walk does not resolve (D2). A link's side is the source on
 an upload and the destination on a download. The walk checks the path filter before it resolves a
 link, in both settings, and yields an excluded link marked `PathFiltered::Excluded`. The key stream
 reports that mark as `Obstruction::ExcludedLink`. With following on, the walk reports a dangling
-link, an endless chain, and a loop as errors. On a download, `LocalDestination` turns a dangling
-link or an endless chain into a stretch over the keys below the name, and it drops the error.
-`cost_of` gives a loop that same stretch on both sides. `take_destination` mirrors `take_source`:
+link, an endless chain, and a loop as errors. On a download's destination, `cost_of` turns a
+dangling link or an endless chain into a stretch over the keys below the name, and the merge drops
+the error. `cost_of` gives a loop that same stretch on both sides. One method on a side holds the
+keys under a link the walk did not resolve, on either side:
 
 ```rust
-fn take_destination(&mut self) -> Entry<D::Source> {
-    let entry = self.dst.take();
-    if entry.meta.obstruction == Some(Obstruction::UnfollowedLink) {
-        self.dst.gap.add(Stretch {
+fn take_holding(&mut self) -> Entry<K::Source> {
+    let entry = self.take();
+    if matches!(
+        entry.meta.obstruction,
+        Some(Obstruction::UnfollowedLink | Obstruction::ExcludedLink)
+    ) {
+        self.gap.add(Stretch {
             under: Some(entry.key.clone()),
         });
     }
@@ -1070,26 +1075,17 @@ that entry in the hop's resolved parent by matching the hop's identity. The link
 spell the name differently, as `Z.TXT` for a stored `z.txt` on a filesystem that ignores case. A
 hold under that spelling would miss the stored key.
 
-`Walker::downloading` takes the delete mode. With delete mode off, the run starts no scan, and the
-destination walk names nothing. So a download with following on and delete mode off resolves no link
-targets (D4). With delete mode on, the destination walk names each link it follows the same way the
-scan does. The two share one `LinkNamer`. The walk needs its own names for two reasons. A link the
-walk follows while the scan still reads guards the waiting deletes too. A link the walk follows
-after the scan ended shows whether someone created it during the run (case M).
+`Walker::downloading` takes the delete mode. A download with following on and delete mode on
+starts a link scan. Every other run starts none, and its walk drops the links it follows, so it
+resolves no link targets (D4).
 
-The scan reads with `SortOrder::Native`, because it needs every link and no key order. Its result
-is a list of names, or a mark that the tree passed the bound (D5):
+The destination walk follows the same links the scan does, so it names a link only when the scan
+missed it. The scan records the path of each link it follows, and the walk looks a link up there
+before it names it. Someone created a link the scan missed after the scan read its directory (case
+M). Both name a link with one `LinkNamer`, so each link costs its `canonicalize` calls once.
 
-```rust
-pub(crate) enum LinkScanResult {
-    // Every name the tree's followed links reach, at most `ALIASED_NAMES_HELD` of them.
-    Names(Vec<AliasedName>),
-    // The tree holds more names than the bound, so the run holds every local delete.
-    TooMany,
-}
-```
-
-Many links can reach one target, so the scan counts each name once before it judges the bound.
+The scan reads with `SortOrder::Native`, because it needs every link and no key order. Many links
+can reach one target, so the scan counts each name once before it judges the bound (D5).
 
 ### Waiting for the scan
 
@@ -1103,21 +1099,21 @@ The walk tracks where the run stands with its scan:
 
 ```rust
 enum Links {
-    // The run has no link scan. A delete goes out as soon as the merge decides it.
+    // No scan: the run deletes nothing through a link, and the walk drops the links it follows.
     NoScan,
-    // The scan is still reading. `found` keeps each link the walk follows now.
-    Scanning { found: Vec<AliasedName> },
-    // The scan ended. `names` holds the scan's names, sorted.
-    Scanned { names: Vec<String> },
+    // The scan is still reading. `followed` keeps each link the walk follows now.
+    Scanning { namer: LinkNamer, followed: Vec<FollowedLink> },
+    // The scan ended. `seen` holds its link paths and `names` its names, both sorted.
+    Scanned { namer: LinkNamer, seen: Vec<PathBuf>, names: Vec<String> },
 }
 ```
 
-When the scan ends and the merge is back in `State`, the run settles the scan. The walk holds the
-scan's names on the source side, and it returns the sorted union of the scan's names and the names
-in `found`. The run keeps each waiting delete the union covers, and it sends the rest:
+When the scan ends and the merge is back in `State`, the run hands the scan to the walk. The walk
+names the links in `followed` that the scan missed, holds every name on the source side, and returns
+the names sorted. The run keeps each waiting delete the returned names cover, and it sends the rest:
 
 ```rust
-let names = walk.accept_link_scan(result);
+let names = walk.accept_link_scan(scan);
 let (kept, sent): (Vec<String>, Vec<String>) = self
     .deletes
     .waiting
@@ -1125,13 +1121,14 @@ let (kept, sent): (Vec<String>, Vec<String>) = self
     .partition(|key| names.as_deref().is_none_or(|names| names_cover(names, key)));
 ```
 
-`None` stands for `TooMany`. The walk then holds every delete on the source side, and every waiting
-delete stays. The run reports each kept delete as `skipped-unknown` and marks the plan incomplete.
-A download held behind a kept key fails, as it does behind a refused removal.
+`None` means the tree passed the bound. The walk keeps one count of the names it holds for links and
+one flag for the bound. Past the bound, the walk holds every delete on the source side, and every
+waiting delete stays. The run reports each kept delete as `skipped-unknown` and marks the plan
+incomplete. A download held behind a kept key fails, as it does behind a refused removal.
 
 `names_cover` finds the key or a directory above it in the sorted names with a binary search per
-path level. After the scan, `Walk::hold_aliased` marks the plan incomplete for a name the merge
-already reached only when the scan never saw the name (case M).
+path level. After the scan, the walk marks the plan incomplete when it names a missed link whose
+name the merge already reached (case M).
 
 ### Checking a path when sync acts
 

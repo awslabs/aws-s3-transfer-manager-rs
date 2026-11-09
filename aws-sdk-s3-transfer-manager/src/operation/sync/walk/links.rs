@@ -9,9 +9,9 @@
 use std::path::{Path, PathBuf};
 
 use crate::io::key::stream::{key_under_root, AliasedName};
-use crate::io::walk::{FollowedLink, FsWalk};
+use crate::io::walk::{FollowedLink, FsWalk, SortOrder};
 
-use super::LinkScanResult;
+use super::walker::Walker;
 
 // Followed destination links keep at most this many names held at once, and the link scan records
 // at most this many names for the whole tree. Past the bound, the source holds back every later
@@ -19,22 +19,25 @@ use super::LinkScanResult;
 // cost about what that queue does.
 pub(crate) const ALIASED_NAMES_HELD: usize = 1024;
 
-// Where a run stands with its link scan. The merge reads this when the destination walk follows a
-// link, to decide whether a delete under the link's names may already have gone out.
+// Where a run stands with its link scan. The destination walk follows the same links the scan
+// does, so the walk names only the links the scan missed.
 #[derive(Debug)]
 pub(super) enum Links {
-    // The run has no link scan. A delete goes out as soon as the merge decides it.
+    // The run has no link scan, so it deletes nothing through a link, and the walk drops the links
+    // it follows.
     NoScan,
-    // The scan is still reading, and every local delete waits for it. A link the walk follows now
-    // is kept here, so the waiting deletes are checked against it too.
-    // `overflow` is set once the walk found more names than the bound, so `found` lacks some.
+    // The scan is still reading, and every local delete waits for it. The walk keeps each link it
+    // follows, and names the ones the scan missed once the scan ends.
     Scanning {
-        found: Vec<AliasedName>,
-        overflow: bool,
+        namer: LinkNamer,
+        followed: Vec<FollowedLink>,
     },
-    // The scan ended. These are its names, sorted. A link the walk follows from now on was either
-    // named by the scan or created after the scan read its directory.
+    // The scan ended. `seen` holds the paths of the links it followed, and `names` the names those
+    // links reach, both sorted. A link the walk follows now and `seen` lacks was created after the
+    // scan read its directory.
     Scanned {
+        namer: LinkNamer,
+        seen: Vec<PathBuf>,
         names: Vec<String>,
     },
 }
@@ -68,14 +71,28 @@ pub(super) fn name_of(name: &AliasedName) -> &str {
     name
 }
 
+pub(super) fn into_name(name: AliasedName) -> String {
+    let (AliasedName::File(name) | AliasedName::Directory(name)) = name;
+    name
+}
+
+// The names of the directories above `key`, from the top down. `a/b/c` yields `a`, then `a/b`.
+pub(crate) fn key_parents(key: &str) -> impl Iterator<Item = &str> {
+    key.bytes()
+        .enumerate()
+        .filter(|(_, byte)| *byte == b'/')
+        .map(move |(at, _)| &key[..at])
+}
+
 // Whether `names`, sorted, holds `key` or a directory above it.
 pub(crate) fn names_cover(names: &[String], key: &str) -> bool {
     let has = |name: &str| names.binary_search_by(|n| n.as_str().cmp(name)).is_ok();
-    has(key)
-        || key
-            .bytes()
-            .enumerate()
-            .any(|(at, byte)| byte == b'/' && has(&key[..at]))
+    has(key) || key_parents(key).any(has)
+}
+
+// Whether `sorted` holds `item`.
+pub(super) fn contains<T: Ord + ?Sized, U: std::borrow::Borrow<T>>(sorted: &[U], item: &T) -> bool {
+    sorted.binary_search_by(|x| x.borrow().cmp(item)).is_ok()
 }
 
 // Turns the links a walk followed into the names they reach. The destination walk and the link
@@ -142,45 +159,61 @@ impl LinkNamer {
 // until it ends, because a link anywhere in the tree can reach the file a delete removes.
 #[derive(Debug)]
 pub(crate) struct LinkScan {
-    pub(super) walk: FsWalk,
-    pub(super) namer: LinkNamer,
+    walk: FsWalk,
+    namer: LinkNamer,
     pub(super) names: Vec<AliasedName>,
+    // The path of each link the scan followed, so the destination walk can tell which links the
+    // scan already named.
+    pub(super) seen: Vec<PathBuf>,
     // Set once the tree holds more names than the bound. The scan stops there, because one more
     // name changes nothing: the run holds every local delete either way.
     pub(super) too_many: bool,
+    done: bool,
 }
 
 impl LinkScan {
+    pub(super) fn new(walker: &Walker, root: &Path) -> Self {
+        Self {
+            walk: walker.fs_walk(root.to_path_buf(), SortOrder::Native, true),
+            namer: LinkNamer::new(root),
+            names: Vec::new(),
+            seen: Vec::new(),
+            too_many: false,
+            done: false,
+        }
+    }
+
+    // Whether the scan has read the whole tree, or given up past the bound.
+    pub(crate) fn is_done(&self) -> bool {
+        self.done
+    }
+
     // Read up to `budget` directories. Return true once the scan has read the whole tree. A
     // directory the scan cannot read costs it nothing: the destination walk cannot read that
     // directory either, so no key reaches a file through a link inside it.
     pub(crate) async fn advance(&mut self, budget: usize) -> bool {
-        if self.too_many {
+        if self.done {
             return true;
         }
-        let done = self.walk.read_dirs(budget);
-        self.namer.name(self.walk.followed_links(), &mut self.names);
+        self.done = self.walk.read_dirs(budget);
+        let links = self.walk.take_followed();
+        self.seen
+            .extend(links.iter().map(|link| link.path().to_path_buf()));
+        self.namer.name(&links, &mut self.names);
         // Many links can reach one target, so the scan counts each name once before it judges the
         // bound.
         if self.names.len() > ALIASED_NAMES_HELD {
             self.names
                 .sort_unstable_by(|a, b| name_of(a).cmp(name_of(b)));
-            self.names.dedup();
+            self.names.dedup_by(|a, b| name_of(a) == name_of(b));
             if self.names.len() > ALIASED_NAMES_HELD {
                 self.too_many = true;
+                self.done = true;
                 self.names = Vec::new();
-                return true;
+                self.seen = Vec::new();
             }
         }
-        done
-    }
-
-    pub(crate) fn finish(self) -> LinkScanResult {
-        if self.too_many {
-            LinkScanResult::TooMany
-        } else {
-            LinkScanResult::Names(self.names)
-        }
+        self.done
     }
 }
 

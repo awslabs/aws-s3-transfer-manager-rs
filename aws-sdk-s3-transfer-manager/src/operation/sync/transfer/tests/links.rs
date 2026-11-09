@@ -955,7 +955,14 @@ async fn a_link_created_after_the_scan_read_its_directory_marks_the_plan_incompl
         DeleteMode::On,
         Walker::builder().follow_symlinks(true).build(),
     );
-    while t.inner.state.lock().links.result.is_none() {
+    while !t
+        .inner
+        .state
+        .lock()
+        .link_scan
+        .as_ref()
+        .is_some_and(|scan| scan.is_done())
+    {
         let PollWork::Ready { io: mut work, .. } = t.poll_work() else {
             panic!("the first work a run hands out is its link scan");
         };

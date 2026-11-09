@@ -9,12 +9,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::io::key::filter::KeyFilter;
-use crate::io::key::stream::{
-    local_predicate, s3_predicate, AliasedName, Entry, KeyStream, StreamError,
-};
+use crate::io::key::stream::{local_predicate, s3_predicate, Entry, KeyStream, StreamError};
 use crate::io::walk::{
-    FsEntry, FsWalk, FsWalkContext, FsWalker, S3Walk, S3WalkContext, S3Walker, SortOrder,
-    WalkErrorKind,
+    FollowedLink, FsEntry, FsWalk, FsWalkContext, FsWalker, S3Walk, S3WalkContext, S3Walker,
+    SortOrder, WalkErrorKind,
 };
 use crate::operation::sync::input::DeleteMode;
 
@@ -103,21 +101,14 @@ impl Walker {
     ) -> Result<Walk<S3Walk, LocalDestination>, crate::error::Error> {
         let root = ctx.local_root.clone();
         let remote = self.remote_walk(ctx.client, ctx.bucket, ctx.prefix)?;
-        let names = delete_mode == DeleteMode::On;
-        let local =
-            LocalDestination::new(self.local_walk(ctx.local_root), &root).naming_aliases(names);
+        let local = LocalDestination::new(self.local_walk(ctx.local_root), &root);
         let mut walk = Walk::new(remote, local).with_roots(None, Some(root.clone()));
         walk.checks_transfers = !self.follow_symlinks;
-        if names && self.follow_symlinks {
-            walk.link_scan = Some(LinkScan {
-                walk: self.fs_walk(root.clone(), SortOrder::Native, true),
-                namer: LinkNamer::new(&root),
-                names: Vec::new(),
-                too_many: false,
-            });
+        if delete_mode == DeleteMode::On && self.follow_symlinks {
+            walk.link_scan = Some(LinkScan::new(self, &root));
             walk.links = Links::Scanning {
-                found: Vec::new(),
-                overflow: false,
+                namer: LinkNamer::new(&root),
+                followed: Vec::new(),
             };
         }
         Ok(walk)
@@ -135,7 +126,7 @@ impl Walker {
     // The link scan reads the same tree with the same rules, in whatever order the filesystem gives.
     // It needs every link and no key order, so it skips the sort, and `links_only` skips each file's
     // metadata.
-    fn fs_walk(&self, root: PathBuf, sort: SortOrder, links_only: bool) -> FsWalk {
+    pub(super) fn fs_walk(&self, root: PathBuf, sort: SortOrder, links_only: bool) -> FsWalk {
         FsWalker::builder()
             .root_as_named(true)
             .links_only(links_only)
@@ -207,11 +198,6 @@ impl Walker {
 pub(crate) struct LocalDestination {
     walk: FsWalk,
     pub(super) absent: bool,
-    // Names what followed links reach. `None` when the run deletes nothing, because only delete
-    // mode needs the names.
-    pub(super) namer: Option<LinkNamer>,
-    // The names followed links aliased wait here until the merge takes them.
-    aliased: Vec<AliasedName>,
 }
 
 impl LocalDestination {
@@ -222,24 +208,6 @@ impl LocalDestination {
         Self {
             walk,
             absent: matches!(root.try_exists(), Ok(false)),
-            namer: Some(LinkNamer::new(root)),
-            aliased: Vec::new(),
-        }
-    }
-
-    // Set whether the destination names what followed links reach. A run with delete mode off
-    // deletes nothing, so it resolves no link targets.
-    #[must_use]
-    fn naming_aliases(mut self, names: bool) -> Self {
-        if !names {
-            self.namer = None;
-        }
-        self
-    }
-
-    fn record_aliases(&mut self) {
-        if let Some(namer) = &mut self.namer {
-            namer.name(self.walk.followed_links(), &mut self.aliased);
         }
     }
 }
@@ -253,9 +221,6 @@ impl KeyStream for LocalDestination {
 
     async fn next_entry(&mut self) -> Option<Result<Entry<FsEntry>, StreamError>> {
         let next = self.walk.next_entry().await;
-        // Record the links on every outcome, because a call that returns a failure can also follow a
-        // link.
-        self.record_aliases();
         match next {
             Some(Err(StreamError::Walk(err)))
                 if self.absent
@@ -268,8 +233,9 @@ impl KeyStream for LocalDestination {
         }
     }
 
-    fn take_aliased_names(&mut self) -> Vec<AliasedName> {
-        std::mem::take(&mut self.aliased)
+    // A call that returns a failure can also follow a link, so the links come out on every outcome.
+    fn take_followed_links(&mut self) -> Vec<FollowedLink> {
+        self.walk.take_followed()
     }
 }
 

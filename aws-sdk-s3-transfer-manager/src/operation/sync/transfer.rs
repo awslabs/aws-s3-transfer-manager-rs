@@ -435,8 +435,11 @@ where
     // Hand the link scan to a work item. The scan goes before the merge, so the deletes waiting for
     // it go out as early as they can.
     fn dispatch_scan(&self, state: &mut State<S, D>) -> Option<PollWork> {
-        let scan = state.links.scan.take()?;
-        state.links.in_flight = true;
+        if state.link_scan.as_ref()?.is_done() {
+            return None;
+        }
+        let scan = state.link_scan.take()?;
+        state.link_scan_in_flight = true;
         Some(PollWork::ready(IoRequest {
             data: Some(Box::new(SyncWork::<S, D>::ScanLinks {
                 scan: Some(Box::new(scan)),
@@ -473,16 +476,12 @@ where
     // Read one batch of the link scan. `MERGE_BATCH` bounds how long the item holds an executor
     // slot, as it does for the merge.
     async fn execute_scan(&self, mut scan: LinkScan) -> WorkOutcome {
-        let done = scan.advance(MERGE_BATCH).await;
+        scan.advance(MERGE_BATCH).await;
         let mut state = self.inner.state.lock();
-        state.links.in_flight = false;
+        state.link_scan_in_flight = false;
         // A stopped run drops its waiting deletes, so it has no use for the scan.
         if !self.has_stopped(&state) {
-            if done {
-                state.links.result = Some(scan.finish());
-            } else {
-                state.links.scan = Some(scan);
-            }
+            state.link_scan = Some(scan);
         }
         if self.check_terminal(&mut state).is_some() {
             drop(state);

@@ -246,9 +246,9 @@ pub(crate) trait KeyStream {
     // consumer, and `WalkErrorKind` is `#[non_exhaustive]`, so the two could disagree.
     fn is_done(&self) -> bool;
 
-    // Each call returns the names followed links aliased since the last call. A delete under an
-    // aliased name can remove a file another key names.
-    fn take_aliased_names(&mut self) -> Vec<AliasedName> {
+    // Each call returns the links the stream followed since the last call. Two keys can name one
+    // file through a followed link, so the consumer decides what each link aliases.
+    fn take_followed_links(&mut self) -> Vec<crate::io::walk::FollowedLink> {
         Vec::new()
     }
 }

@@ -21,10 +21,10 @@ use std::path::{Path, PathBuf};
 use crate::io::key::stream::{
     key_under_root, AliasedName, Entry, KeyStream, KeysLost, Obstruction, StreamError,
 };
-use crate::io::walk::WalkErrorKind;
+use crate::io::walk::{FollowedLink, WalkErrorKind};
 
-pub(crate) use links::{link_on_path, names_cover, LinkScan, ALIASED_NAMES_HELD};
-use links::{name_of, Links};
+use links::{contains, into_name, name_of, Links};
+pub(crate) use links::{key_parents, link_on_path, names_cover, LinkScan, ALIASED_NAMES_HELD};
 pub(crate) use walker::LocalDestination;
 #[cfg(test)]
 pub(crate) use walker::{LocalAndBucket, Walker};
@@ -388,9 +388,7 @@ impl Stretches {
         if self.under.contains(key) {
             return true;
         }
-        key.bytes().enumerate().any(|(at, byte)| {
-            byte == b'/' && (self.under.contains(&key[..at]) || self.below.contains(&key[..at]))
-        })
+        key_parents(key).any(|name| self.under.contains(name) || self.below.contains(name))
     }
 
     // Drop every stretch the merge has passed.
@@ -460,15 +458,6 @@ fn at_or_under(key: &str, name: &str) -> bool {
     key.starts_with(name) && (key.len() == name.len() || key.as_bytes()[name.len()] == b'/')
 }
 
-// What a link scan found once it read the whole destination.
-#[derive(Debug)]
-pub(crate) enum LinkScanResult {
-    // Every name the tree's followed links reach, at most `ALIASED_NAMES_HELD` of them.
-    Names(Vec<AliasedName>),
-    // The tree holds more names than the bound, so the run holds every local delete.
-    TooMany,
-}
-
 // Two key-ordered streams merged into one pairing per key.
 // `Progress` tells callers whether the merge can infer absence from key position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -498,6 +487,10 @@ pub(crate) struct Walk<S: KeyStream, D: KeyStream> {
     // The link scan this walk's run starts, until the run takes it.
     link_scan: Option<LinkScan>,
     links: Links,
+    // How many names this walk holds back for followed links, and whether the tree passed the
+    // bound on them. Past the bound, the source holds back every delete.
+    alias_names: usize,
+    past_link_bound: bool,
     // Whether the run checks the path for a link before each read and write, as well as before each
     // local delete. True with following off. With following on, a read or a write passes
     // through a link above the file on purpose.
@@ -515,6 +508,8 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
             ended_by_failure: false,
             link_scan: None,
             links: Links::NoScan,
+            alias_names: 0,
+            past_link_bound: false,
             checks_transfers: false,
         }
     }
@@ -532,36 +527,95 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
         self.link_scan.take()
     }
 
-    // Take what the link scan found. Hold its names on the source side, and return every name a
-    // waiting local delete must not touch, sorted. `None` means every waiting delete stays.
-    pub(crate) fn accept_link_scan(&mut self, result: LinkScanResult) -> Option<Vec<String>> {
-        let found = match std::mem::replace(&mut self.links, Links::NoScan) {
-            Links::Scanning { found, overflow } => {
-                if overflow {
-                    self.links = Links::Scanned { names: Vec::new() };
-                    return None;
-                }
-                found
-            }
-            _ => Vec::new(),
+    // Whether the tree held more link names than the bound, so the run keeps every local delete.
+    pub(crate) fn past_link_bound(&self) -> bool {
+        self.past_link_bound
+    }
+
+    // Take the finished link scan. Name the links the walk followed and the scan missed, hold every
+    // name on the source side, and return the names a waiting local delete must not touch, sorted.
+    // `None` means every waiting delete stays.
+    pub(crate) fn accept_link_scan(&mut self, scan: LinkScan) -> Option<Vec<String>> {
+        let Links::Scanning {
+            mut namer,
+            followed,
+        } = std::mem::replace(&mut self.links, Links::NoScan)
+        else {
+            unreachable!("only a walk with a link scan takes one back");
         };
-        let LinkScanResult::Names(scanned) = result else {
-            self.src.gap.add(Stretch { under: None });
-            self.links = Links::Scanned { names: Vec::new() };
-            return None;
-        };
-        let mut names: Vec<String> = Vec::with_capacity(scanned.len() + found.len());
-        for name in scanned {
-            names.push(name_of(&name).to_string());
-            self.add_alias_hold(name);
+        let LinkScan {
+            mut names,
+            mut seen,
+            too_many,
+            ..
+        } = scan;
+        if too_many {
+            self.pass_link_bound();
         }
-        names.extend(found.iter().map(|name| name_of(name).to_string()));
-        names.sort_unstable();
-        names.dedup();
+        if self.past_link_bound {
+            self.links = Links::Scanned {
+                namer,
+                seen: Vec::new(),
+                names: Vec::new(),
+            };
+            return None;
+        }
+        seen.sort_unstable();
+        seen.dedup();
+        let missed: Vec<FollowedLink> = followed
+            .into_iter()
+            .filter(|link| !contains(&seen, link.path()))
+            .collect();
+        namer.name(&missed, &mut names);
+        let mut keys: Vec<String> = names.into_iter().map(into_name).collect();
+        keys.sort_unstable();
+        keys.dedup();
+        for key in &keys {
+            self.add_alias_hold(key.clone());
+        }
+        let past = self.past_link_bound;
         self.links = Links::Scanned {
-            names: names.clone(),
+            namer,
+            seen,
+            names: if past { Vec::new() } else { keys.clone() },
         };
-        Some(names)
+        (!past).then_some(keys)
+    }
+
+    // Take the links the destination walk just followed. While the scan reads, keep them for when it
+    // ends. After it ended, name each link it missed: someone created that link during the run. A
+    // delete under its names may already have gone out once the merge reached them.
+    fn note_followed(&mut self, links: Vec<FollowedLink>) {
+        if links.is_empty() || self.past_link_bound {
+            return;
+        }
+        let mut named = Vec::new();
+        match &mut self.links {
+            Links::NoScan => return,
+            Links::Scanning { followed, .. } => {
+                followed.extend(links);
+                if followed.len() > ALIASED_NAMES_HELD {
+                    followed.clear();
+                    self.pass_link_bound();
+                }
+                return;
+            }
+            Links::Scanned { namer, seen, .. } => {
+                let missed: Vec<FollowedLink> = links
+                    .into_iter()
+                    .filter(|link| !contains(seen, link.path()))
+                    .collect();
+                namer.name(&missed, &mut named);
+            }
+        }
+        for name in named {
+            let known = match &self.links {
+                Links::Scanned { names, .. } => contains(names, name_of(&name)),
+                _ => false,
+            };
+            self.incomplete |= self.reached(&name) && !known;
+            self.add_alias_hold(into_name(name));
+        }
     }
 
     // The next key either side holds, or the failure that interrupted one of them.
@@ -589,9 +643,8 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
             let failure = self.dst.fill().await;
             // A followed destination link makes two keys name one file. The source holds back the
             // deletes under every name the link aliases, including when the read also failed.
-            for name in self.dst.stream.take_aliased_names() {
-                self.hold_aliased(name);
-            }
+            let followed = self.dst.stream.take_followed_links();
+            self.note_followed(followed);
             // A link in the destination that reaches nothing is no failure. It holds the keys
             // below its name, and a download can still land at the name itself.
             if failure.as_ref().is_some_and(reaches_nothing) {
@@ -692,17 +745,11 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
         }
     }
 
-    // Hold back the deletes under a name a followed destination link aliases.
-    //
-    // The merge may already have reached the name. A delete under it then went out before the walk
-    // found the link, unless the run still holds its deletes for the link scan. While the scan
-    // reads, the name joins the ones the waiting deletes are checked against. Once the scan ended, a
-    // reached name the scan never saw marks the plan incomplete: someone created the link during the
-    // run. A run without a scan marks every reached name.
-    fn hold_aliased(&mut self, name: AliasedName) {
+    // Whether the merge has reached an aliased name, so a delete under it may already have gone out.
+    fn reached(&self, name: &AliasedName) -> bool {
         // No name sorts at or before the empty key, so nothing reads as reached before a pairing.
         let paired = std::cmp::max(self.src.taken.as_str(), self.dst.taken.as_str());
-        let reached = match &name {
+        match name {
             // The merge reaches a file when it pairs that key or a later one.
             AliasedName::File(name) => name.as_str() <= paired,
             // The merge reaches a directory when it enters the subtree or passes it.
@@ -712,40 +759,27 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
                 };
                 stretch.covers(paired) || stretch.passed_by(paired)
             }
-        };
-        match &mut self.links {
-            Links::NoScan => self.incomplete |= reached,
-            Links::Scanning { found, overflow } => {
-                if found.len() < ALIASED_NAMES_HELD {
-                    found.push(name.clone());
-                } else {
-                    // A waiting delete under a name `found` lacks would go out, so every waiting
-                    // delete stays when the scan ends.
-                    *overflow = true;
-                    // The waiting deletes can no longer be checked against every name, so the
-                    // source holds back every delete.
-                    self.src.gap.add(Stretch { under: None });
-                }
-            }
-            Links::Scanned { names } => {
-                let seen = names
-                    .binary_search_by(|n| n.as_str().cmp(name_of(&name)))
-                    .is_ok();
-                self.incomplete |= reached && !seen;
-            }
         }
-        self.add_alias_hold(name);
     }
 
-    // Hold back the deletes under one aliased name. Past the bound on held names, the source holds
-    // back every later delete.
-    fn add_alias_hold(&mut self, name: AliasedName) {
-        let (AliasedName::File(name) | AliasedName::Directory(name)) = name;
-        if self.src.gap.under.len() < ALIASED_NAMES_HELD {
-            self.src.gap.add(Stretch { under: Some(name) });
-        } else {
-            self.src.gap.add(Stretch { under: None });
+    // Hold back the deletes under one aliased name. The walk counts only these names toward the
+    // bound, so a failure's hold never uses up room meant for links.
+    fn add_alias_hold(&mut self, name: String) {
+        if self.past_link_bound {
+            return;
         }
+        if self.alias_names == ALIASED_NAMES_HELD {
+            self.pass_link_bound();
+            return;
+        }
+        self.alias_names += 1;
+        self.src.gap.add(Stretch { under: Some(name) });
+    }
+
+    // Record that the tree passed the bound on link names, and hold back every delete.
+    fn pass_link_bound(&mut self) {
+        self.past_link_bound = true;
+        self.src.gap.add(Stretch { under: None });
     }
 
     fn take_source_only(&mut self) -> Pairing<S::Source, D::Source> {

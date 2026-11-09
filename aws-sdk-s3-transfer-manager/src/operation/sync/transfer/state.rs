@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use crate::io::key::stream::{KeyStream, StreamError};
 use crate::operation::sync::compare::Decision;
 use crate::operation::sync::walk::{
-    names_cover, LinkScan, LinkScanResult, Pairing, Progress, Walk, ALIASED_NAMES_HELD,
+    key_parents, names_cover, LinkScan, Pairing, Progress, Walk, ALIASED_NAMES_HELD,
 };
 use crate::types::FailedTransferPolicy;
 
@@ -455,19 +455,6 @@ pub(super) struct Deletes {
     // Set while the run's link scan reads. No delete goes out until the scan ends, because a link
     // the scan has not reached yet can make a waiting key name a file another key keeps.
     held_for_links: bool,
-    // Set when the tree held more link names than the bound, so the run kept every local delete.
-    // The run says so, so a caller can tell why delete mode removed nothing.
-    past_link_bound: bool,
-}
-
-// The run's link scan, for a download with following on and delete mode on.
-#[derive(Debug, Default)]
-pub(super) struct Links {
-    // The scan between work items. `None` while a work item reads it, and once it ended.
-    pub(super) scan: Option<LinkScan>,
-    pub(super) in_flight: bool,
-    // What the scan found, until the merge is back in state to take it.
-    pub(super) result: Option<LinkScanResult>,
 }
 
 impl Deletes {
@@ -482,10 +469,7 @@ impl Deletes {
     // Return the name on this key's path that the run is still removing. On a tree destination,
     // the key can land only after that name is gone.
     pub(super) fn blocker_of(&self, key: &str) -> Option<String> {
-        key.bytes()
-            .enumerate()
-            .filter(|(_, byte)| *byte == b'/')
-            .map(|(at, _)| &key[..at])
+        key_parents(key)
             .find(|name| self.clearing.contains(*name))
             .map(str::to_string)
     }
@@ -551,7 +535,10 @@ impl Deletes {
 // The scheduler locks `State` while it chooses work or records completed work.
 pub(super) struct State<S: KeyStream, D: KeyStream> {
     pub(super) merge: Merge<S, D>,
-    pub(super) links: Links,
+    // The link scan of a download with following on and delete mode on, between work items. `None`
+    // while a work item reads it, and once the merge took it back.
+    pub(super) link_scan: Option<LinkScan>,
+    pub(super) link_scan_in_flight: bool,
     decided: Decided,
     pub(super) transfers: Transfers<S, D>,
     pub(super) deletes: Deletes,
@@ -564,14 +551,11 @@ pub(super) struct State<S: KeyStream, D: KeyStream> {
 
 impl<S: KeyStream, D: KeyStream> State<S, D> {
     pub(super) fn new(mut walk: Walk<S, D>, max_children: usize, namespace: Namespace) -> Self {
-        let scan = walk.take_link_scan();
-        let held_for_links = scan.is_some();
+        let link_scan = walk.take_link_scan();
+        let held_for_links = link_scan.is_some();
         State {
-            links: Links {
-                scan,
-                in_flight: false,
-                result: None,
-            },
+            link_scan,
+            link_scan_in_flight: false,
             merge: Merge {
                 walk: Some(walk),
                 in_flight: false,
@@ -596,7 +580,6 @@ impl<S: KeyStream, D: KeyStream> State<S, D> {
                 namespace,
                 clearing: HashSet::new(),
                 held_for_links,
-                past_link_bound: false,
             },
             failures: Sampled::default(),
             warnings: Sampled::default(),
@@ -703,7 +686,7 @@ impl<S: KeyStream, D: KeyStream> State<S, D> {
 
     pub(super) fn work_outstanding(&self) -> bool {
         self.merge.in_flight
-            || self.links.in_flight
+            || self.link_scan_in_flight
             || self.deletes.in_flight > 0
             || !self.transfers.running.is_idle()
     }
@@ -716,12 +699,12 @@ impl<S: KeyStream, D: KeyStream> State<S, D> {
         let Some(walk) = self.merge.walk.as_mut() else {
             return;
         };
-        let Some(result) = self.links.result.take() else {
+        if !self.link_scan.as_ref().is_some_and(LinkScan::is_done) {
             return;
-        };
-        let names = walk.accept_link_scan(result);
+        }
+        let scan = self.link_scan.take().expect("a finished scan is in state");
+        let names = walk.accept_link_scan(scan);
         if names.is_none() {
-            self.deletes.past_link_bound = true;
             tracing::warn!(
                 bound = ALIASED_NAMES_HELD,
                 "the destination holds more link names than the run can track, so the run removes \
@@ -874,7 +857,7 @@ impl<S: KeyStream, D: KeyStream> State<S, D> {
             plan_incomplete: self.plan_incomplete,
             walk_plan_incomplete: self.walk_plan_incomplete,
             stopped: self.stopped_by.is_some(),
-            past_link_bound: self.deletes.past_link_bound,
+            past_link_bound: self.merge.walk.as_ref().is_some_and(Walk::past_link_bound),
         }
     }
 
