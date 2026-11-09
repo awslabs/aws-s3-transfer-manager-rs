@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::memory::BufferPool;
-use crate::runtime::sizing::{self, ConcurrencyBound, ResourcePlan, Signals};
+use crate::runtime::sizing::{self, ConcurrencyBound, ConcurrencySource, ResourcePlan, Signals};
 use crate::runtime::ExecutionRuntime;
 
 /// Transfer manager client for Amazon Simple Storage Service.
@@ -331,6 +331,7 @@ impl Client {
         let runtime_http = config.runtime_http(plan.connection_cap);
         log_resource_sizing(
             &plan,
+            &profile,
             &connection_cap,
             runtime_http.is_some(),
             config.ignored_throughput_target_gbps(),
@@ -568,6 +569,7 @@ impl Client {
 /// client builds.
 fn log_resource_sizing(
     plan: &ResourcePlan,
+    profile: &crate::runtime::platform::MachineProfile,
     cap: &crate::runtime::platform::ConnectionCap,
     connection_cap_installed: bool,
     ignored_throughput_gbps: Option<f64>,
@@ -588,6 +590,8 @@ fn log_resource_sizing(
         source = plan.concurrency_source.as_str(),
         bounded_by = plan.concurrency_bound.as_str(),
         throughput_gbps = ?plan.throughput_gbps,
+        instance_type = ?profile.instance_type,
+        vcpus = profile.vcpus,
         memory_ceiling_bytes = plan.ceiling_bytes,
         memory_detected = plan.memory_detected,
         part_size_bytes = plan.part_size,
@@ -605,30 +609,59 @@ fn log_resource_sizing(
             concurrency_target = plan.concurrency,
             max_funded_concurrency = plan.max_funded_concurrency,
             max_connections_per_host = plan.connection_cap,
-            "configured concurrency target exceeds what the payload-memory ceiling and connection \
-             cap sustain; requests beyond that point wait on memory admission or a connection",
+            "configured concurrency target exceeds what the payload-memory ceiling or the \
+             connection cap sustains; requests beyond that point wait on memory admission or a \
+             connection",
         );
     }
 
-    if plan.configured_part_size_unfunded {
+    let descriptors_bind = cap.limited_by_descriptors()
+        && match plan.concurrency_bound {
+            ConcurrencyBound::Connections => true,
+            ConcurrencyBound::Configured => plan.concurrency > plan.connection_cap,
+            ConcurrencyBound::Unbounded | ConcurrencyBound::Memory => false,
+        };
+
+    // The descriptor warning below covers a target lowered by a
+    // descriptor-limited cap.
+    let throughput_lowered = plan.concurrency_source == ConcurrencySource::ConfiguredThroughput
+        && match plan.concurrency_bound {
+            ConcurrencyBound::Memory => true,
+            ConcurrencyBound::Connections => !descriptors_bind,
+            ConcurrencyBound::Configured | ConcurrencyBound::Unbounded => false,
+        };
+    if throughput_lowered {
+        tracing::warn!(
+            target: crate::telemetry::TARGET_CONCURRENCY,
+            throughput_gbps = ?plan.throughput_gbps,
+            concurrency_target = plan.concurrency,
+            bounded_by = plan.concurrency_bound.as_str(),
+            max_funded_concurrency = plan.max_funded_concurrency,
+            max_connections_per_host = plan.connection_cap,
+            "concurrency for the configured throughput target is lowered to what the \
+             payload-memory ceiling or the connection cap sustains",
+        );
+    }
+
+    if plan.part_size_unfunded {
         tracing::warn!(
             target: crate::telemetry::TARGET_CONCURRENCY,
             part_size_bytes = plan.part_size,
             memory_ceiling_bytes = plan.ceiling_bytes,
-            "configured part size exceeds what the payload-memory ceiling funds for a single \
-             concurrency slot; raise the memory ceiling or lower the part size",
+            "payload-memory ceiling does not fund one concurrency slot at the part size; raise \
+             the memory ceiling or lower the part size",
         );
     }
 
-    if cap.limited_by_descriptors() && plan.concurrency_bound == ConcurrencyBound::Connections {
+    if descriptors_bind {
         tracing::warn!(
             target: crate::telemetry::TARGET_CONCURRENCY,
             max_connections_per_host = plan.connection_cap,
             concurrency_target = plan.concurrency,
             soft_descriptor_limit = ?soft,
             hard_descriptor_limit = ?hard,
-            "concurrency is limited to half the soft file-descriptor limit (RLIMIT_NOFILE); raise \
-             the soft limit to allow more connections",
+            "per-host connection cap is below the concurrency target because of the soft \
+             file-descriptor limit (RLIMIT_NOFILE); raise the soft limit to allow more connections",
         );
     }
 }
@@ -1203,8 +1236,8 @@ mod tests {
     use crate::runtime::platform::{self, MachineProfile};
     use crate::types::ConcurrencyMode;
 
-    /// A profile with the given instance type and vCPU count; RAM is irrelevant
-    /// to concurrency resolution.
+    /// A profile with the given instance type and vCPU count, and no detected
+    /// memory, so the ceiling is the no-detection fallback.
     fn profile(instance_type: Option<&str>, vcpus: usize) -> MachineProfile {
         MachineProfile {
             instance_type: instance_type.map(str::to_string),
@@ -1308,12 +1341,10 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn client_new_bypass_path_detects_locally() {
-        // No profile on the config (built directly, not via the loader):
-        // Client::new detects locally. Off EC2 (the test host) DMI yields no
-        // instance type, so the resolved target must equal the vCPU fallback for
-        // the detected core count — pinning it, so a regression that stops
-        // feeding local vCPU into resolution is caught (not just a clamp-range
-        // check that holds by construction).
+        // Without a profile on the config, Client::new detects locally. Off EC2
+        // no instance type is detected, so the target is resolved from the
+        // local vCPU count and memory, which the expected plan reads the same
+        // way.
         let expected = sizing::resolve(Signals {
             throughput_gbps: None,
             instance_type: None,

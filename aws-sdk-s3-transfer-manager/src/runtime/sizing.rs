@@ -24,6 +24,7 @@ use super::platform::{
     resolve_auto_concurrency, seed_from_gbps, AutoConcurrencySource, ConnectionCap,
     ResolvedAutoConcurrency,
 };
+use crate::config::is_valid_throughput;
 
 /// Part-sized buffers one concurrency slot may hold: one filling from the
 /// source, one in flight to S3, and one draining to the consumer.
@@ -139,21 +140,24 @@ pub(crate) struct ResourcePlan {
     /// Not narrowed to [`Self::concurrency`]: connections open on demand, so a
     /// cap above the target reserves nothing.
     pub(crate) connection_cap: usize,
-    /// Largest concurrency the ceiling funds at [`Self::part_size`].
+    /// Largest concurrency the ceiling funds at [`Self::part_size`]; zero when
+    /// the ceiling funds no slot.
     pub(crate) max_funded_concurrency: usize,
-    /// Throughput the target was seeded from, in Gbps, when known.
+    /// Throughput the target was seeded from, in Gbps; `None` for a configured
+    /// target or when no estimate is available.
     pub(crate) throughput_gbps: Option<f64>,
     /// Signal [`Self::concurrency`] was derived from.
     pub(crate) concurrency_source: ConcurrencySource,
     /// Bound that set [`Self::concurrency`].
     pub(crate) concurrency_bound: ConcurrencyBound,
-    /// Whether usable memory was detected.
+    /// Whether the ceiling was derived from detected memory.
     pub(crate) memory_detected: bool,
     /// Whether a configured target exceeds the connection cap or the slots the
     /// ceiling funds.
     pub(crate) configured_concurrency_unfunded: bool,
-    /// Whether the ceiling funds no slot at a configured part size.
-    pub(crate) configured_part_size_unfunded: bool,
+    /// Whether the ceiling funds no slot at the part size, when the part size or
+    /// the pool is configured.
+    pub(crate) part_size_unfunded: bool,
 }
 
 /// Resolves the resource plan for `signals`.
@@ -202,7 +206,11 @@ pub(crate) fn resolve(signals: Signals<'_>) -> ResourcePlan {
         part_size,
         connection_cap: signals.connection_cap.max_per_host.max(1),
         max_funded_concurrency: memory_bound,
-        throughput_gbps,
+        throughput_gbps: if signals.explicit_concurrency.is_some() {
+            None
+        } else {
+            throughput_gbps
+        },
         concurrency_source: if signals.explicit_concurrency.is_some() {
             ConcurrencySource::ConfiguredConcurrency
         } else if configured_throughput.is_some() {
@@ -211,11 +219,12 @@ pub(crate) fn resolve(signals: Signals<'_>) -> ResourcePlan {
             auto.source.into()
         },
         concurrency_bound,
-        memory_detected: signals.ram_bytes.is_some_and(|ram| ram > 0),
+        memory_detected: signals.ceiling_override_bytes.is_none()
+            && signals.ram_bytes.is_some_and(|ram| ram > 0),
         configured_concurrency_unfunded,
-        configured_part_size_unfunded: signals
-            .explicit_part_size
-            .is_some_and(|part| BUFFERS_PER_SLOT.saturating_mul(part) > ceiling_bytes as u64),
+        part_size_unfunded: (signals.explicit_part_size.is_some()
+            || signals.ceiling_override_bytes.is_some())
+            && memory_bound == 0,
     }
 }
 
@@ -223,7 +232,7 @@ pub(crate) fn resolve(signals: Signals<'_>) -> ResourcePlan {
 fn configured_throughput(signals: &Signals<'_>) -> Option<f64> {
     signals
         .throughput_gbps
-        .filter(|gbps| gbps.is_finite() && *gbps > 0.0)
+        .filter(|gbps| is_valid_throughput(*gbps))
 }
 
 /// Admission ceiling in bytes.
@@ -254,14 +263,14 @@ fn derived_concurrency(auto: &ResolvedAutoConcurrency, throughput_gbps: Option<f
     }
 }
 
-/// Concurrency slots a ceiling funds at a given part size, at least one.
+/// Concurrency slots a ceiling funds at a given part size.
 fn funded_concurrency(ceiling_bytes: usize, part_size: u64) -> usize {
     let per_slot = BUFFERS_PER_SLOT.saturating_mul(part_size);
     if per_slot == 0 {
         return usize::MAX;
     }
     // The quotient never exceeds `ceiling_bytes`, so it always fits `usize`.
-    ((ceiling_bytes as u64 / per_slot) as usize).max(1)
+    (ceiling_bytes as u64 / per_slot) as usize
 }
 
 /// Narrows a byte count to `usize`, saturating on targets where it does not fit.
@@ -299,7 +308,7 @@ mod tests {
     }
 
     #[test]
-    fn configured_throughput_is_the_sizing_root() {
+    fn configured_throughput_seeds_the_concurrency_target() {
         // A configured target and an instance-family estimate share one seed,
         // so equal Gbps resolve to equal targets.
         let mut s = signals(Some(256 * GIB as usize), 64);
@@ -458,6 +467,16 @@ mod tests {
     }
 
     #[test]
+    fn configured_concurrency_reports_no_throughput() {
+        // The family estimate is not what the target came from.
+        let mut s = signals(Some(256 * GIB as usize), 64);
+        s.instance_type = Some("m6idn.16xlarge");
+        s.explicit_concurrency = Some(64);
+
+        assert_eq!(resolve(s).throughput_gbps, None);
+    }
+
+    #[test]
     fn configured_concurrency_within_the_bounds_is_not_reported_unfunded() {
         let mut s = signals(Some(256 * GIB as usize), 64);
         s.explicit_concurrency = Some(64);
@@ -532,7 +551,7 @@ mod tests {
         let plan = resolve(s);
 
         assert_eq!(plan.part_size, 64 * MIB);
-        assert!(!plan.configured_part_size_unfunded);
+        assert!(!plan.part_size_unfunded);
     }
 
     #[test]
@@ -542,11 +561,35 @@ mod tests {
         let plan = resolve(s);
 
         assert_eq!(plan.part_size, 512 * MIB);
-        assert!(plan.configured_part_size_unfunded);
+        assert!(plan.part_size_unfunded);
+        assert_eq!(plan.max_funded_concurrency, 0);
+        assert_eq!(plan.concurrency, 1);
     }
 
     #[test]
-    fn configured_part_size_bounds_concurrency_before_it_is_resolved() {
+    fn configured_pool_too_small_for_the_default_part_size_is_reported() {
+        // 16 MiB holds two default parts, not the three one slot uses.
+        let mut s = signals(Some(256 * GIB as usize), 64);
+        s.ceiling_override_bytes = Some(16 * MIB as usize);
+        let plan = resolve(s);
+
+        assert_eq!(plan.part_size, DEFAULT_PART_SIZE);
+        assert!(plan.part_size_unfunded);
+        assert!(!plan.memory_detected);
+    }
+
+    #[test]
+    fn automatic_ceiling_does_not_report_the_default_part_size_unfunded() {
+        // Only configured inputs are reported; the automatic ceiling on a tiny
+        // host lowers concurrency instead.
+        let plan = resolve(signals(Some(32 * MIB as usize), 1));
+
+        assert_eq!(plan.max_funded_concurrency, 0);
+        assert!(!plan.part_size_unfunded);
+    }
+
+    #[test]
+    fn configured_part_size_bounds_the_derived_concurrency_target() {
         // A large configured part reduces the slots the ceiling funds.
         let mut s = signals(Some(8 * GIB as usize), 8);
         s.throughput_gbps = Some(100.0);
@@ -581,7 +624,7 @@ mod tests {
     }
 
     #[test]
-    fn funded_concurrency_is_published_for_the_resolved_part_size() {
+    fn max_funded_concurrency_is_for_the_resolved_part_size() {
         let mut s = signals(Some(256 * GIB as usize), 64);
         s.throughput_gbps = Some(100.0);
         let plan = resolve(s);
@@ -596,8 +639,9 @@ mod tests {
     #[test]
     fn every_signal_combination_resolves_within_its_contract() {
         // Sweeps the extremes of each independent signal: the target and cap are
-        // at least one, the cap is the descriptor-derived cap, and part size is
-        // the configured value or the default.
+        // at least one, the cap is the descriptor-derived cap, a derived target
+        // stays within the funded slots, and part size is the configured value
+        // or the default.
         let rams = [
             None,
             Some(0),
@@ -620,7 +664,9 @@ mod tests {
                         assert!(plan.concurrency >= 1);
                         assert!(plan.ceiling_bytes > 0);
                         assert_eq!(plan.connection_cap, descriptor_cap);
-                        assert!(plan.max_funded_concurrency >= 1);
+                        if concurrency.is_none() {
+                            assert!(plan.concurrency <= plan.max_funded_concurrency.max(1));
+                        }
                         assert_eq!(plan.part_size, part.unwrap_or(DEFAULT_PART_SIZE));
                     }
                 }

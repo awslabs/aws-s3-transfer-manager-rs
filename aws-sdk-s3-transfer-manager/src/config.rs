@@ -494,7 +494,7 @@ impl Builder {
 }
 
 /// Whether a throughput target in Gbps can describe a rate.
-fn is_valid_throughput(gbps: f64) -> bool {
+pub(crate) fn is_valid_throughput(gbps: f64) -> bool {
     gbps.is_finite() && gbps > 0.0
 }
 

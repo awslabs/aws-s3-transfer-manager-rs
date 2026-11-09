@@ -395,7 +395,7 @@ const MAX_CONCURRENCY_SEED: usize = 10_000;
 
 /// Assumed goodput per in-flight request, in Gbps. Matches CRT's per-connection
 /// figure (`100 / 250`).
-pub(crate) const GBPS_PER_CONN: f64 = 0.4;
+const GBPS_PER_CONN: f64 = 0.4;
 
 /// In-flight requests per vCPU for the fallback seed, used when the instance
 /// family is unknown (unrecognized type, or detection failed / off-EC2). Without

@@ -94,9 +94,11 @@ pub enum ConcurrencyMode {
     ///
     /// The target replaces the throughput estimated from the execution
     /// environment. It sets the in-flight request target once, when the client
-    /// is constructed; it does not limit throughput at run time. A value that
-    /// is not finite and positive is ignored with a warning, and concurrency is
-    /// resolved as for [`Auto`](Self::Auto).
+    /// is constructed; it does not limit throughput at run time. The resulting
+    /// target is lowered, with a warning, when the per-host connection cap or the
+    /// payload-memory ceiling cannot sustain it. A value that is not finite and
+    /// positive is ignored with a warning, and concurrency is resolved as for
+    /// [`Auto`](Self::Auto).
     TargetThroughput(f64),
 
     /// Explicit concurrency control

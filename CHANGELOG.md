@@ -10,7 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Client construction logs one `INFO` record of the resolved sizing (concurrency target and the
   signal it came from and was bounded by, memory ceiling, part size, connection cap) and a
-  `WARN` for each configured value the host cannot fund.
+  `WARN` for each configured value the host cannot fund, including a throughput target whose
+  concurrency is lowered, and for a concurrency target the descriptor limit lowers.
 
 ### Changed
 - `ConcurrencyMode::TargetThroughput` takes an `f64` in Gbps instead of a `TargetThroughput`, so
@@ -19,6 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The concurrency target, payload-memory ceiling, and part size are resolved together. A
   derived concurrency target is lowered to what the descriptor-derived connection cap and the
   memory ceiling can sustain at the resolved part size. Configured values are used as given.
+  A large configured part size therefore lowers the automatic concurrency target; for
+  example, 256 MiB parts on a 16 GiB host resolve to 5.
 - The automatic part size is 8 MiB for both uploads and downloads. Downloads previously used
   5 MiB, so objects between 5 and 8 MiB now download with a single GET.
 - The per-host connection cap's descriptor budget is the smaller of half the soft

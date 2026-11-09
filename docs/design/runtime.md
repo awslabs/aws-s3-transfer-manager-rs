@@ -71,33 +71,30 @@ Its inputs are a throughput target, usable memory, usable vCPUs, the
 descriptor-derived connection cap, and explicit configuration. Throughput comes
 from `ConcurrencyMode::TargetThroughput` when set and otherwise from the detected
 instance family's bandwidth estimate; a value that is not finite or not positive
-is treated as unset. Machine facts are discovery-only and have no public
-override. Explicitly configured memory, concurrency, and part size are
-authoritative and are never narrowed: a value the host cannot fund is reported
-rather than rejected, because memory admission and connection acquisition still
-bound execution, so an unfundable value costs backpressure rather than
-correctness.
+is ignored with a warning. Machine facts are discovery-only and have no public
+override. Explicitly configured memory, concurrency, and part size are used as
+given. A value the host cannot fund is reported rather than rejected, because
+memory admission and connection acquisition still bound execution.
 
-The pool ceiling is a safety bound against exhausting host memory and nothing
-more. Demand never lowers it. This holds because the pool commits no memory at
-construction and reclaims toward a fraction of its configured blocks once the
-scheduler is globally idle, so an unused ceiling is not resource use. Throughput
-and concurrency set the operating point beneath it. The automatic ceiling uses
-the pool's own `MemoryBudgetConfig::Auto` share, cap, and fallback, plus one
+The pool ceiling bounds admission against exhausting host memory; demand does
+not lower it. This holds because the pool commits no memory at construction and
+reclaims toward a fraction of its configured blocks once the scheduler is
+globally idle, so an unused ceiling is not resource use. Throughput and
+concurrency set the operating point beneath it. The automatic ceiling uses the
+pool's own `MemoryBudgetConfig::Auto` share, cap, and fallback, plus one
 addition: a floor that lets a small host fund the minimum concurrency target at
 the default part size. The floor never exceeds half of detected memory, so on a
 host smaller than twice the floor it yields rather than admit more than the host
 holds.
 
-Where one signal is the binding constraint, the remaining quantities are sized
-to the performance achievable under it, so the client does not reserve
-capability it cannot use. Both the connection cap and the part demand the
-ceiling funds therefore lower a derived concurrency target; a configured target
-is exempt. Part size is an input to that pass rather than an output — the
-configured value when set, and otherwise one default shared by uploads and
-downloads. The pass also reports the largest concurrency the ceiling funds, so a
-later adaptive layer reads its own upper bound instead of discovering it through
-admission stalls.
+A derived concurrency target is lowered to the smaller of the connection cap and
+the slots the ceiling funds at the part size; a configured target is exempt.
+Part size is an input to that pass rather than an output — the configured value
+when set, and otherwise one default shared by uploads and downloads. The pass
+also reports the largest concurrency the ceiling funds. That figure is planned
+at the resolved part size; uploads too large for the part count limit and
+validated downloads realigned to the stored part size use larger parts, and
+memory admission bounds them at run time.
 
 The connection cap is the descriptor-derived cap, not narrowed to the
 concurrency target. It is a bound that keeps the process within its descriptor
@@ -109,7 +106,9 @@ creation. The descriptor budget is the smaller of a fraction of the soft limit
 and that limit less a fixed reserve, because the descriptors a process holds
 besides its connections are closer to a fixed count than to a share of the
 limit. A floor applies underneath both, so a soft limit below the reserve still
-yields a cap the client can attempt a transfer with.
+yields a cap the client can attempt a transfer with. The descriptor limit bounds
+the process whether or not TM builds the transport, so the cap lowers a derived
+concurrency target even when it is not installed.
 
 Sizing resolves before the managed execution owner is constructed, so an adopted
 runtime's own topology is not visible to it and the vCPU count comes from the
@@ -118,8 +117,9 @@ throughput is available and the instance family is unrecognized.
 
 Construction emits one record naming every resolved quantity, the signal the
 concurrency target was derived from, and the signal that bounded it, followed by
-a warning for each resource a signal held below its target. Resolved sizing is
-observable only through that record; it is not reported on `Client::metrics`.
+a warning for each configured value the host cannot fund and for a concurrency
+target the descriptor limit lowers. Resolved sizing is observable only through
+that record; it is not reported on `Client::metrics`.
 
 ## HTTP precedence and partitions
 
