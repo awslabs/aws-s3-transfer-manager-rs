@@ -44,6 +44,7 @@ jobs:
       - clippy
       - docs
       - minrust
+      - sdk-floor
       - check-external-types
       - check-deny
       - sanitizers
@@ -595,6 +596,32 @@ jobs:
         run: cargo check --locked --workspace --all-features
         env:
           RUSTFLAGS: "" # remove -Dwarnings
+
+  sdk-floor:
+    # Every other job builds the lockfile's aws-sdk-s3, which can be newer than
+    # the minimum the transfer manager's manifest accepts.
+    name: aws-sdk-s3 minimum version
+    needs: basics
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust ${{ env.rust_stable }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.rust_stable }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Resolve aws-sdk-s3 to the declared minimum
+        run: |
+          floor=$(cargo metadata --format-version 1 --no-deps | jq -er '
+            [.packages[] | select(.name == "aws-sdk-s3-transfer-manager")
+              | .dependencies[] | select(.name == "aws-sdk-s3" and .kind == null) | .req]
+            | unique
+            | if length == 1 then .[0] | ltrimstr("^")
+              else error("conflicting aws-sdk-s3 requirements") end')
+          cargo update -p aws-sdk-s3 --precise "$floor"
+      - name: check --workspace
+        run: cargo check --workspace --all-features --tests
 
   freebsd:
     name: FreeBSD 14.4
