@@ -37,8 +37,6 @@ const UNSUPPORTED_CONDITION_HEADERS: &[&str] = &[
     "x-amz-rename-source-if-modified-since",
     "x-amz-rename-source-if-unmodified-since",
 ];
-/// The longest key, in bytes of UTF-8.
-pub(crate) const MAX_KEY_LENGTH: usize = 1024;
 
 /// Serves authenticated RenameObject requests.
 pub(crate) struct RenameRoute {
@@ -88,7 +86,7 @@ impl S3Route for RenameRoute {
             return Err(Error::NotImplemented.into());
         }
         // The error reports the key's size and the limit, which an s3s error cannot carry.
-        if dst_key.len() > MAX_KEY_LENGTH {
+        if dst_key.len() > crate::storage::MAX_KEY_LENGTH {
             return Ok(error_response(Error::KeyTooLong {
                 size: dst_key.len(),
             }));

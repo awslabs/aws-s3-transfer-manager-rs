@@ -119,6 +119,9 @@ pub(crate) fn etag_condition_holds(condition: &s3s::dto::ETagCondition, etag: &s
 /// The most parts an object can have, counting each append as one.
 pub(crate) const MAX_PARTS: u32 = 10_000;
 
+/// The longest object key, in bytes of UTF-8.
+pub(crate) const MAX_KEY_LENGTH: usize = 1024;
+
 /// Request for appending to an existing object (PutObject with `x-amz-write-offset-bytes`).
 pub(crate) struct AppendObjectRequest {
     pub bucket: String,

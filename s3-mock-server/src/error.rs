@@ -311,7 +311,7 @@ impl Error {
                     }
                     if let Some(size) = key_size {
                         s.content("Size", &i64::try_from(size).unwrap_or(i64::MAX))?;
-                        s.content("MaxSizeAllowed", &(crate::rename::MAX_KEY_LENGTH as i64))?;
+                        s.content("MaxSizeAllowed", &(crate::storage::MAX_KEY_LENGTH as i64))?;
                     }
                     Ok(())
                 })

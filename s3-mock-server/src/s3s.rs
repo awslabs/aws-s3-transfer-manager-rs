@@ -1312,11 +1312,11 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         req: S3Request<s3s::dto::CreateSessionInput>,
     ) -> S3Result<S3Response<s3s::dto::CreateSessionOutput>> {
         let input = req.input;
+        self.state
+            .admit(Operation::CreateSession, Some(&input.bucket), None)?;
         if BucketType::of(&input.bucket) == BucketType::GeneralPurpose {
             return Err(Error::NotImplemented.into());
         }
-        self.state
-            .admit(Operation::CreateSession, Some(&input.bucket), None)?;
         tracing::trace!(bucket = %input.bucket, "CreateSession");
         check_bucket(&self.storage, &input.bucket).await?;
         let read_only = match input.session_mode.as_ref().map(|mode| mode.as_str()) {

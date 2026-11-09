@@ -102,7 +102,7 @@ struct Session {
     expiration: SystemTime,
 }
 
-/// What [`check_access`] reads of a request whose signature s3s verified.
+/// The parts of a request that authorization depends on.
 pub(crate) struct AccessRequest<'a> {
     /// The credentials s3s verified the signature with; `None` for an unsigned request.
     pub(crate) credentials: Option<&'a s3s::auth::Credentials>,

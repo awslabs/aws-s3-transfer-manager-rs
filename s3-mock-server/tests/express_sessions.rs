@@ -845,3 +845,23 @@ async fn test_streaming_uploads() -> Result {
     handle.shutdown().await?;
     Ok(())
 }
+
+/// A CreateSession to a general purpose bucket fails with 501 NotImplemented, and is counted and
+/// draws its faults as other requests are.
+#[tokio::test]
+async fn test_create_session_in_general_purpose_bucket_is_counted() -> Result {
+    let f = common::Fixture::new().await;
+    let first = failure(f.s3.create_session().bucket(&f.bucket).send().await);
+    assert_failure(&first, 501, "NotImplemented");
+    assert_eq!(f.server.request_count(Operation::CreateSession), 1);
+    f.server.insert_fault_for(
+        FaultTarget::operation(Operation::CreateSession).bucket(&f.bucket),
+        FaultType::Error(Error::SlowDown),
+        0,
+        Occurrence::Once,
+    );
+    let second = failure(f.s3.create_session().bucket(&f.bucket).send().await);
+    assert_failure(&second, 503, "SlowDown");
+    f.shutdown().await;
+    Ok(())
+}
