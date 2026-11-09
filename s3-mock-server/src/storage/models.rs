@@ -116,6 +116,24 @@ pub(crate) struct ObjectMetadata {
     #[serde(default)]
     pub parts: Vec<ObjectPart>,
 
+    /// The SHA-1 or SHA-256 checksums of the segments of an appended object with a checksum of
+    /// either: the data it was created with (each part of a multipart object), then each append.
+    /// Its checksum is their composite. Empty for other objects.
+    #[serde(default)]
+    pub append_segments: Vec<String>,
+
+    /// The number of parts of an object that has been appended to, at most
+    /// [`MAX_PARTS`](crate::storage::MAX_PARTS): the parts it had when it was first appended to
+    /// (one for an object written in one request), and one per append. 0 for other objects.
+    #[serde(default)]
+    pub append_parts: u32,
+
+    /// Whether the object's multipart upload was created with a checksum algorithm. Reads of a part
+    /// report its checksum only for such an object, and in a directory bucket every part of such an
+    /// upload carries a checksum.
+    #[serde(default)]
+    pub part_checksums: bool,
+
     /// Restore status of an object in an archival storage class, reported in the
     /// `x-amz-restore` header.
     #[serde(default)]
@@ -276,6 +294,9 @@ impl Default for ObjectMetadata {
             content_disposition: None,
             content_language: None,
             parts: Vec::new(),
+            append_segments: Vec::new(),
+            append_parts: 0,
+            part_checksums: false,
             restore_status: None,
         }
     }

@@ -1,7 +1,8 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! ListObjectsV2: pagination with and without a delimiter, and the attributes of listed objects.
+//! ListObjectsV2: pagination with and without a delimiter, the attributes of listed objects, and
+//! unordered listing.
 
 mod common;
 
@@ -196,6 +197,92 @@ async fn test_list_missing_bucket_and_bad_token() -> Result {
         f.s3.list_objects_v2()
             .bucket(&f.bucket)
             .continuation_token("%%%not-base64")
+            .send()
+            .await,
+    );
+    assert_failure(&fail, 400, "InvalidArgument");
+    f.shutdown().await;
+    Ok(())
+}
+
+/// A fixture whose bucket is a directory bucket, which lists keys unordered.
+async fn directory_fixture() -> Fixture {
+    let mut f = Fixture::new().await;
+    f.bucket = "unordered--usw2-az1--x-s3".to_owned();
+    f.server
+        .create_bucket(&f.bucket)
+        .await
+        .expect("create bucket");
+    f
+}
+
+async fn unordered_keys(f: &Fixture, max_keys: i32) -> Result<Vec<String>> {
+    let pages = list_pages(f, None, None, max_keys, None).await?;
+    Ok(pages.into_iter().flat_map(|(keys, _)| keys).collect())
+}
+
+/// A directory bucket lists keys in an order that is not lexicographic, the same for every page
+/// size and on every server, and lists every key once.
+#[tokio::test]
+async fn test_unordered_listing() -> Result {
+    let f = directory_fixture().await;
+    let all: Vec<String> = (0..50).map(|i| format!("key-{i:02}")).collect();
+    for key in &all {
+        f.server.add_object(&f.bucket, key, "x", None).await?;
+    }
+
+    let listed = unordered_keys(&f, 1000).await?;
+    assert_ne!(listed, all, "listing should not be sorted");
+    let mut sorted = listed.clone();
+    sorted.sort();
+    assert_eq!(sorted, all);
+
+    // Every key exactly once across pages, in the same order as a single page.
+    for max_keys in [1, 3, 7, 50] {
+        assert_eq!(
+            unordered_keys(&f, max_keys).await?,
+            listed,
+            "max_keys={max_keys}"
+        );
+    }
+
+    // The same on another server.
+    let g = directory_fixture().await;
+    for key in &all {
+        g.server.add_object(&g.bucket, key, "x", None).await?;
+    }
+    assert_eq!(unordered_keys(&g, 1000).await?, listed);
+
+    f.shutdown().await;
+    g.shutdown().await;
+    Ok(())
+}
+
+/// In a directory bucket listing with a delimiter, each common prefix is reported once, the pages
+/// together cover every entry, and an invalid token fails with InvalidArgument.
+#[tokio::test]
+async fn test_unordered_listing_with_delimiter() -> Result {
+    let f = directory_fixture().await;
+    seed_list_keys(&f).await?;
+    for max_keys in [1, 2, 3, 1000] {
+        let pages = list_pages(&f, None, Some("/"), max_keys, None).await?;
+        // Each page holds at most `max_keys` entries, and the pages list every entry once.
+        let mut prefixes = Vec::new();
+        let mut keys = Vec::new();
+        for (page_keys, page_prefixes) in &pages {
+            assert!(page_keys.len() + page_prefixes.len() <= max_keys as usize);
+            prefixes.extend(page_prefixes.iter().cloned());
+            keys.extend(page_keys.iter().cloned());
+        }
+        keys.sort();
+        prefixes.sort();
+        assert_eq!(keys, ["b", "d", "f"], "max_keys={max_keys}");
+        assert_eq!(prefixes, ["a/", "c/", "e/"], "max_keys={max_keys}");
+    }
+    let fail = failure(
+        f.s3.list_objects_v2()
+            .bucket(&f.bucket)
+            .continuation_token("not-an-index")
             .send()
             .await,
     );
