@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use aws_runtime::user_agent::FrameworkMetadata;
+use aws_smithy_types::error::operation::BuildError;
 use std::cmp;
 
 use crate::metrics::unit::ByteUnit;
@@ -17,7 +17,8 @@ pub(crate) use diagnostics::{
     DiagnosticsConfig, MemoryDiagnosticsConfig, TransferDiagnosticsConfig,
 };
 
-pub(crate) mod loader;
+mod loader;
+pub use loader::ConfigLoader;
 pub(crate) mod user_agent;
 
 /// Minimum upload part size in bytes
@@ -34,11 +35,14 @@ pub(crate) const MIN_MULTIPART_PART_SIZE_BYTES: u64 = 5 * ByteUnit::Mebibyte.as_
 /// `aws_sdk_s3::config::Builder` for S3-specific configuration.
 ///
 /// ```no_run
-/// # async fn example() {
-/// let sdk_config = aws_config::load_from_env().await;
+/// # async fn example() -> Result<(), aws_smithy_types::error::operation::BuildError> {
+/// use aws_config::BehaviorVersion;
+///
+/// let sdk_config = aws_config::load_defaults(BehaviorVersion::latest()).await;
 /// let config = aws_sdk_s3_transfer_manager::Config::builder()
 ///     .s3_config(&sdk_config)
-///     .build();
+///     .build()?;
+/// # Ok(())
 /// # }
 /// ```
 pub struct S3ClientConfig {
@@ -155,18 +159,19 @@ pub struct Config {
     read_ahead: ReadAhead,
     memory: MemoryConfig,
     diagnostics: DiagnosticsConfig,
-    framework_metadata: Option<FrameworkMetadata>,
     s3_client_source: Option<S3ClientSource>,
     /// Machine facts detected once by the async config loader, off the
     /// `Client::new` hot path. `None` when the config was built directly
     /// (bypassing the loader); consumers then fall back to cheap local detection.
     machine_profile: Option<crate::runtime::platform::MachineProfile>,
-    #[cfg(feature = "dial9")]
-    pub(crate) dial9_handle: Option<dial9::Dial9Handle>,
 }
 
 impl Config {
-    /// Create a new `Config` builder
+    /// Create a new `Config` builder.
+    ///
+    /// The builder uses only the values it is given: it loads no shared AWS
+    /// configuration and does not query EC2 instance metadata. Use
+    /// [`from_env`](crate::from_env) to load configuration from the environment.
     pub fn builder() -> Builder {
         Builder::default()
     }
@@ -222,12 +227,6 @@ impl Config {
         self.machine_profile.as_ref()
     }
 
-    /// Returns the framework metadata setting when using transfer manager.
-    #[doc(hidden)]
-    pub fn framework_metadata(&self) -> Option<&FrameworkMetadata> {
-        self.framework_metadata.as_ref()
-    }
-
     /// HTTP options for the runtime-provided transport, or `None` when the
     /// managed transport would not be installed: HTTP is already configured,
     /// a finished S3 client was supplied, execution uses the caller's runtime,
@@ -259,12 +258,6 @@ impl Config {
             .take()
             .expect("s3 client source already taken")
     }
-
-    /// Take the dial9 handle, if set.
-    #[cfg(feature = "dial9")]
-    pub(crate) fn take_dial9_handle(&mut self) -> Option<dial9::Dial9Handle> {
-        self.dial9_handle.take()
-    }
 }
 
 /// Fluent style builder for [Config]
@@ -277,12 +270,9 @@ pub struct Builder {
     read_ahead: ReadAhead,
     memory: MemoryConfig,
     diagnostics: Option<DiagnosticsConfig>,
-    pub(crate) framework_metadata: Option<FrameworkMetadata>,
     client: Option<aws_sdk_s3::Client>,
     s3_client_config: Option<S3ClientConfig>,
     machine_profile: Option<crate::runtime::platform::MachineProfile>,
-    #[cfg(feature = "dial9")]
-    dial9_handle: Option<dial9::Dial9Handle>,
 }
 
 impl Builder {
@@ -394,16 +384,6 @@ impl Builder {
         self
     }
 
-    /// Sets the framework metadata for the transfer manager.
-    ///
-    /// This _optional_ name is used to identify the framework using transfer manager in the user agent that
-    /// gets sent along with requests.
-    #[doc(hidden)]
-    pub fn framework_metadata(mut self, framework_metadata: Option<FrameworkMetadata>) -> Self {
-        self.framework_metadata = framework_metadata;
-        self
-    }
-
     /// Inject a finished SDK client for library unit fixtures.
     #[cfg(test)]
     pub(crate) fn sdk_client(mut self, client: aws_sdk_s3::Client) -> Self {
@@ -417,29 +397,14 @@ impl Builder {
     /// configured HTTP, managed execution installs its default transport;
     /// caller-runtime execution uses the SDK default.
     ///
-    /// This configuration is required.
+    /// Required: [`build`](Self::build) fails without it.
     pub fn s3_config(mut self, config: impl Into<S3ClientConfig>) -> Self {
         self.s3_client_config = Some(config.into());
         self
     }
 
-    /// Set a dial9 handle for runtime tracing.
-    ///
-    /// When set, each managed worker runtime is attached to the handle's
-    /// recorder. The caller keeps the recorder itself, and should drop
-    /// this client before calling [`Recorder::graceful_shutdown`],
-    /// so the workers flush into the trace.
-    ///
-    /// [`Recorder::graceful_shutdown`]: dial9::Recorder::graceful_shutdown
-    #[cfg(feature = "dial9")]
-    pub fn dial9_handle(mut self, handle: dial9::Dial9Handle) -> Self {
-        self.dial9_handle = Some(handle);
-        self
-    }
-
     /// Set the machine profile detected by the async config loader. Internal:
-    /// populated by [`ConfigLoader`](crate::config::loader::ConfigLoader), not a
-    /// public builder method.
+    /// populated by [`ConfigLoader`], not a public builder method.
     pub(crate) fn machine_profile(
         mut self,
         profile: Option<crate::runtime::platform::MachineProfile>,
@@ -448,14 +413,23 @@ impl Builder {
         self
     }
 
-    /// Consumes the builder and constructs a [`Config`]
-    pub fn build(self) -> Config {
+    /// Consumes the builder and constructs a [`Config`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`BuildError`] if [`s3_config`](Self::s3_config) was not set.
+    pub fn build(self) -> Result<Config, BuildError> {
         let s3_client_source = match (self.client, self.s3_client_config) {
             (Some(client), _) => S3ClientSource::Provided(client),
             (None, Some(config)) => S3ClientSource::FromConfig(Box::new(config)),
-            (None, None) => panic!("s3_config() must be set"),
+            (None, None) => {
+                return Err(BuildError::missing_field(
+                    "s3_config",
+                    "S3 client configuration is required",
+                ))
+            }
         };
-        Config {
+        Ok(Config {
             multipart_threshold: self.multipart_threshold_part_size,
             target_part_size: self.target_part_size,
             concurrency: self.concurrency,
@@ -463,12 +437,9 @@ impl Builder {
             read_ahead: self.read_ahead,
             memory: self.memory,
             diagnostics: self.diagnostics.unwrap_or_else(DiagnosticsConfig::from_env),
-            framework_metadata: self.framework_metadata,
             s3_client_source: Some(s3_client_source),
             machine_profile: self.machine_profile,
-            #[cfg(feature = "dial9")]
-            dial9_handle: self.dial9_handle,
-        }
+        })
     }
 }
 
@@ -512,7 +483,8 @@ mod tests {
                 S3ClientConfig::from_sdk_builder(s3_config_builder())
                     .network_interfaces(["ens5", "ens6"]),
             )
-            .build();
+            .build()
+            .expect("valid config");
         let http = config.runtime_http(64).expect("runtime HTTP enabled");
         assert_eq!(http.network_interfaces, ["ens5", "ens6"]);
         assert_eq!(http.max_connections_per_host, 64);
@@ -522,7 +494,8 @@ mod tests {
     fn runtime_http_present_for_s3_config() {
         let config = Config::builder()
             .s3_config(S3ClientConfig::from_sdk_builder(s3_config_builder()))
-            .build();
+            .build()
+            .expect("valid config");
         assert!(config.runtime_http(64).is_some());
     }
 
@@ -531,7 +504,8 @@ mod tests {
         let shared = Config::builder()
             .s3_config(S3ClientConfig::from_sdk_builder(s3_config_builder()))
             .runtime_config(RuntimeConfig::multi_thread_tokio())
-            .build();
+            .build()
+            .expect("valid config");
         assert!(shared.runtime_http(64).is_none());
 
         let configured = Config::builder()
@@ -540,14 +514,27 @@ mod tests {
                     .config()
                     .to_builder(),
             ))
-            .build();
+            .build()
+            .expect("valid config");
         assert!(configured.runtime_http(64).is_none());
 
         // A mock client: a real one would build the default HTTPS client, whose
         // TLS initialization is foreign code that miri cannot run.
         let provided = Config::builder()
             .sdk_client(aws_smithy_mocks::mock_client!(aws_sdk_s3, []))
-            .build();
+            .build()
+            .expect("valid config");
         assert!(provided.runtime_http(64).is_none());
+    }
+
+    #[test]
+    fn build_without_s3_config_is_an_error() {
+        let error = Config::builder()
+            .build()
+            .expect_err("s3_config is required");
+        assert!(
+            error.to_string().contains("s3_config"),
+            "error does not name the missing field: {error}"
+        );
     }
 }

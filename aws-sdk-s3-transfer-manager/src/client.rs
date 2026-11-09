@@ -303,9 +303,6 @@ impl Client {
 
         // 2. Build Handle with Arc::new_cyclic so scheduler and runtime
         //    can hold Weak<Handle> without creating a reference cycle.
-        #[cfg(feature = "dial9")]
-        let dial9_handle = config.take_dial9_handle();
-
         let memory_diagnostics = config.diagnostics().memory();
         let buffer_pool = match config.memory() {
             MemoryConfig::Auto => BufferPool::from_capacity(
@@ -328,10 +325,7 @@ impl Client {
         let managed = match config.managed_config_mut() {
             Some(managed) => {
                 let owner = managed
-                    .build(
-                        #[cfg(feature = "dial9")]
-                        dial9_handle,
-                    )
+                    .build()
                     .expect("failed to construct transfer manager execution");
                 let components = crate::runtime::prepare_components(&owner, runtime_http)
                     .expect("failed to construct transfer manager HTTP transport");
@@ -359,22 +353,14 @@ impl Client {
 
             let s3_client = match config.take_s3_client_source() {
                 crate::config::S3ClientSource::Provided(client) => {
-                    crate::config::user_agent::install_on_client(
-                        client,
-                        config.framework_metadata().cloned(),
-                        client_features,
-                    )
+                    crate::config::user_agent::install_on_client(client, client_features)
                 }
                 crate::config::S3ClientSource::FromConfig(s3_config) => {
                     let mut builder = s3_config.config.to_builder();
                     if let Some(http_client) = runtime.components().http_client() {
                         builder = builder.http_client(http_client.clone());
                     }
-                    crate::config::user_agent::install(
-                        &mut builder,
-                        config.framework_metadata().cloned(),
-                        client_features,
-                    );
+                    crate::config::user_agent::install(&mut builder, client_features);
                     aws_sdk_s3::Client::from_conf(builder.build())
                 }
             };
@@ -653,7 +639,10 @@ mod tests {
 
     fn test_config() -> crate::Config {
         let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
-        crate::Config::builder().sdk_client(s3_client).build()
+        crate::Config::builder()
+            .sdk_client(s3_client)
+            .build()
+            .expect("valid config")
     }
 
     fn runtime_http_client(client: &Client) -> Option<&SharedHttpClient> {
@@ -810,7 +799,8 @@ mod tests {
                     crate::Config::builder()
                         .s3_config(&sdk)
                         .runtime_config(runtime)
-                        .build(),
+                        .build()
+                        .expect("valid config"),
                 );
                 let components = client.handle.runtime.components();
                 assert!(
@@ -919,7 +909,8 @@ mod tests {
             crate::Config::builder()
                 .s3_config(crate::config::S3ClientConfig::from_sdk_builder(s3))
                 .runtime_config(RuntimeConfig::managed(crate::unstable::managed(owner)))
-                .build(),
+                .build()
+                .expect("valid config"),
         );
         assert!(client
             .handle
@@ -980,42 +971,10 @@ mod tests {
                     .network_interfaces(["bad\0interface"]),
             )
             .runtime_config(RuntimeConfig::managed(crate::unstable::managed(owner)))
-            .build();
+            .build()
+            .expect("valid config");
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Client::new(config)));
         assert!(result.is_err());
-        assert!(tokio::time::timeout(Duration::from_secs(5), watch)
-            .await
-            .unwrap()
-            .unwrap_err()
-            .is_cancelled());
-    }
-
-    #[cfg(all(feature = "__unstable_ext", feature = "dial9", not(miri)))]
-    #[tokio::test]
-    async fn adopted_runtime_rejects_tm_recorder_and_releases_ownership() {
-        let owner = aws_smithy_execution::ManagedRuntime::builder()
-            .topology(
-                aws_smithy_execution::topology::Topology::detect()
-                    .unwrap()
-                    .with_max_placements(1),
-            )
-            .pin_threads(false)
-            .build()
-            .unwrap();
-        let execution = owner.handle();
-        let watch = execution.partitions()[0].spawn(std::future::pending::<()>());
-        let config = crate::Config::builder()
-            .s3_config(mock_s3_config())
-            .runtime_config(RuntimeConfig::managed(crate::unstable::managed(owner)))
-            .dial9_handle(dial9::Dial9Handle::disabled())
-            .build();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Client::new(config)));
-        let panic = match result {
-            Err(panic) => panic,
-            Ok(_) => panic!("conflicting recorder must fail client construction"),
-        };
-        let message = panic.downcast_ref::<String>().unwrap();
-        assert!(message.contains("configure Dial9 on the runtime builder before adoption"));
         assert!(tokio::time::timeout(Duration::from_secs(5), watch)
             .await
             .unwrap()
@@ -1032,7 +991,8 @@ mod tests {
             crate::Config::builder()
                 .s3_config(crate::config::S3ClientConfig::from_sdk_builder(s3))
                 .runtime_config(RuntimeConfig::multi_thread_tokio())
-                .build(),
+                .build()
+                .expect("valid config"),
         );
         let components = client.handle.runtime.components();
         assert!(components.http_client().is_none());
@@ -1054,7 +1014,8 @@ mod tests {
         let client = Client::new(
             crate::Config::builder()
                 .s3_config(crate::config::S3ClientConfig::from_sdk_builder(builder))
-                .build(),
+                .build()
+                .expect("valid config"),
         );
         assert!(runtime_http_client(&client).is_some());
         assert!(client.handle.runtime.components().direct_io());
@@ -1073,7 +1034,10 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn managed_runtime_preserves_configured_http() {
-        let config = crate::Config::builder().s3_config(mock_s3_config()).build();
+        let config = crate::Config::builder()
+            .s3_config(mock_s3_config())
+            .build()
+            .expect("valid config");
         let client = Client::new(config);
         assert!(runtime_http_client(&client).is_none());
     }
@@ -1112,7 +1076,8 @@ mod tests {
         let config = crate::Config::builder()
             .sdk_client(s3_client)
             .memory(MemoryConfig::Explicit(pool.clone()))
-            .build();
+            .build()
+            .expect("valid config");
 
         let client = Client::new(config);
         let reservation = pool
@@ -1142,7 +1107,8 @@ mod tests {
                 vcpus: 4,
                 ram_bytes: Some(512 * ByteUnit::Mebibyte.as_bytes_usize()),
             }))
-            .build();
+            .build()
+            .expect("valid config");
         let client = Client::new(config);
         let client_metrics = client.metrics();
         let memory = client_metrics.memory();
@@ -1166,7 +1132,8 @@ mod tests {
         let config = crate::Config::builder()
             .sdk_client(s3_client)
             .memory(MemoryConfig::Explicit(pool.clone()))
-            .build();
+            .build()
+            .expect("valid config");
 
         let handle = Handle::new_for_test(config, 2);
         let reservation = pool
@@ -1232,6 +1199,7 @@ mod tests {
             .concurrency(mode)
             .machine_profile(profile)
             .build()
+            .expect("valid config")
     }
 
     #[test]
@@ -1350,7 +1318,8 @@ mod tests {
         let config = crate::Config::builder()
             .sdk_client(s3_client)
             .runtime_config(RuntimeConfig::default())
-            .build();
+            .build()
+            .expect("valid config");
         let _client = Client::new(config);
     }
 
@@ -1362,7 +1331,8 @@ mod tests {
         let config = crate::Config::builder()
             .sdk_client(s3_client)
             .runtime_config(RuntimeConfig::multi_thread_tokio())
-            .build();
+            .build()
+            .expect("valid config");
         let _client = Client::new(config);
     }
 }

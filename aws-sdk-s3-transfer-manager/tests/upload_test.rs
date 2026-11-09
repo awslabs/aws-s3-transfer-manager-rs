@@ -381,7 +381,8 @@ fn tm_with(client: aws_sdk_s3::Client) -> aws_sdk_s3_transfer_manager::Client {
             .s3_config(test_common::s3_config_with_test_http(
                 client.config().to_builder(),
             ))
-            .build(),
+            .build()
+            .expect("valid config"),
     )
 }
 
@@ -662,7 +663,8 @@ async fn test_custom_stream_resumes_after_part_buffer_admission() {
             MultipartMock::new().client().config().to_builder(),
         ))
         .memory(MemoryConfig::Explicit(pool.clone()))
-        .build();
+        .build()
+        .expect("valid config");
     let tm = aws_sdk_s3_transfer_manager::Client::new(config);
     let handle = tm
         .upload()
@@ -2064,7 +2066,8 @@ async fn test_worker_panic_releases_stream_held_by_a_hung_part() {
                 client.config().to_builder(),
             ))
             .concurrency(aws_sdk_s3_transfer_manager::types::ConcurrencyMode::Explicit(4))
-            .build(),
+            .build()
+            .expect("valid config"),
     );
     let (tx, handle) = upload_from_channel(&tm);
 

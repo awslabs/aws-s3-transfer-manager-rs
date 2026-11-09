@@ -129,12 +129,12 @@ let response = handle.join().await?;
 The `cp` example supports optional [dial9](https://github.com/dial9-rs/dial9) instrumentation for tracing all internal worker runtimes. This is useful for diagnosing hangs, load imbalance, and poll latency issues.
 
 ```sh
-RUSTFLAGS="--cfg tokio_unstable -C force-frame-pointers=yes" cargo build --features dial9 --example cp --release
+RUSTFLAGS="--cfg s3_tm_dial9 --cfg tokio_unstable -C force-frame-pointers=yes" cargo build --example cp --release
 ```
 
-`--cfg tokio_unstable` enables per-task poll and spawn events for the worker runtimes. `-C force-frame-pointers=yes` is required for the stacks captured by `--cpu-profiling` (Linux only).
+`--cfg s3_tm_dial9` builds the example's tracing support, which attaches the recorder to a managed runtime that the transfer manager then adopts. `--cfg tokio_unstable` enables per-task poll and spawn events for the worker runtimes. `-C force-frame-pointers=yes` is required for the stacks captured by `--cpu-profiling` (Linux only).
 
-Then run with `--trace-dir` to enable tracing:
+Then run with `--trace-dir` to enable tracing with the default managed runtime:
 
 ```sh
 ./target/release/examples/cp s3://bucket/key /tmp/download --trace-dir /tmp/traces

@@ -101,7 +101,7 @@ async fn test_transfer_manager_integration() -> Result<(), Box<dyn std::error::E
     // Create Transfer Manager with mock server client
     let tm_config = Config::builder()
         .client(s3_client)
-        .build();
+        .build()?;
     let tm = Client::new(tm_config);
 
     // Use Transfer Manager for uploads/downloads

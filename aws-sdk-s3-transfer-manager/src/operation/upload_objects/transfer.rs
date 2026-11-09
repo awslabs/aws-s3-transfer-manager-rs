@@ -1401,7 +1401,10 @@ mod tests {
         UploadObjectsTransfer,
         crate::transfer::StateMachineTerminalReceiver,
     ) {
-        let config = crate::Config::builder().sdk_client(s3_client).build();
+        let config = crate::Config::builder()
+            .sdk_client(s3_client)
+            .build()
+            .expect("valid config");
         let handle = crate::client::Handle::test_handle_tokio(config);
 
         let input = super::super::UploadObjectsInputBuilder::default()
@@ -1525,7 +1528,10 @@ mod tests {
             .then_output(|| PutObjectOutput::builder().e_tag("test-etag").build());
         let s3_client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[put]);
 
-        let config = crate::Config::builder().sdk_client(s3_client).build();
+        let config = crate::Config::builder()
+            .sdk_client(s3_client)
+            .build()
+            .expect("valid config");
         let handle = crate::client::Handle::test_handle_tokio(config);
 
         let input = super::super::UploadObjectsInputBuilder::default()
@@ -2204,7 +2210,8 @@ mod tests {
 
         let config = crate::Config::builder()
             .sdk_client(mock_s3_success())
-            .build();
+            .build()
+            .expect("valid config");
         let handle = crate::client::Handle::test_handle_tokio(config);
 
         let input = super::super::UploadObjectsInputBuilder::default()
@@ -2285,7 +2292,8 @@ mod tests {
 
         let config = crate::Config::builder()
             .sdk_client(mock_s3_success())
-            .build();
+            .build()
+            .expect("valid config");
         let handle = crate::client::Handle::test_handle_tokio(config);
 
         let input = super::super::UploadObjectsInputBuilder::default()
@@ -2337,7 +2345,8 @@ mod tests {
 
         let config = crate::Config::builder()
             .sdk_client(mock_s3_success())
-            .build();
+            .build()
+            .expect("valid config");
         let handle = crate::client::Handle::test_handle_tokio(config);
 
         let input = super::super::UploadObjectsInputBuilder::default()

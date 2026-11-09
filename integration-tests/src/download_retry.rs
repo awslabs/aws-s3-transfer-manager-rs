@@ -651,7 +651,8 @@ async fn requests_carry_per_bucket_retry_partition() {
                 s3.config().to_builder(),
             ))
             .part_size(PART_SIZE)
-            .build(),
+            .build()
+            .expect("valid config"),
     );
 
     let run = uuid::Uuid::new_v4();

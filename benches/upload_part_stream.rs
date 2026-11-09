@@ -150,7 +150,8 @@ async fn setup(
             &shared_config,
         ))
         .concurrency(ConcurrencyMode::Explicit(concurrency))
-        .build();
+        .build()
+        .expect("valid config");
     let client = aws_sdk_s3_transfer_manager::Client::new(config);
     (server, handle, client)
 }

@@ -4,16 +4,39 @@
  */
 
 use aws_config::BehaviorVersion;
-use aws_runtime::user_agent::FrameworkMetadata;
 
 use crate::config::{Builder, Config, S3ClientConfig};
-use crate::types::{ConcurrencyMode, MemoryConfig, PartSize};
+use crate::types::{ConcurrencyMode, MemoryConfig, PartSize, ReadAhead};
 use crate::RuntimeConfig;
 
-/// Load transfer manager [`Config`] from the environment.
+/// Loads transfer manager [`Config`] from the environment.
+///
+/// Created by [`from_env`](crate::from_env). [`load`](Self::load) resolves the S3
+/// client configuration from the shared AWS configuration sources (environment
+/// variables, shared config and credentials files, and the default credential and
+/// region provider chains) unless [`s3_config`](Self::s3_config) supplies one. It
+/// also detects the host's EC2 instance type, vCPU count, and memory, which size
+/// the automatic defaults. Settings not configured on the loader keep their
+/// defaults.
+///
+/// Use [`Config::builder`] instead to construct a configuration from explicit
+/// values without loading or instance-metadata detection.
+///
+/// ```no_run
+/// # async fn example() {
+/// use aws_sdk_s3_transfer_manager::types::PartSize;
+///
+/// let config = aws_sdk_s3_transfer_manager::from_env()
+///     .part_size(PartSize::Target(16 * 1024 * 1024))
+///     .load()
+///     .await;
+/// let client = aws_sdk_s3_transfer_manager::Client::new(config);
+/// # }
+/// ```
 #[derive(Default, Debug)]
 pub struct ConfigLoader {
     builder: Builder,
+    s3_config: Option<S3ClientConfig>,
     network_interfaces: Vec<String>,
 }
 
@@ -53,11 +76,23 @@ impl ConfigLoader {
         self
     }
 
-    /// Set the execution runtime this client should use.
+    /// Sets execution for transfer work.
     ///
     /// Defaults to owned managed execution.
-    pub fn runtime_config(mut self, mode: RuntimeConfig) -> Self {
-        self.builder = self.builder.runtime_config(mode);
+    pub fn runtime_config(mut self, config: RuntimeConfig) -> Self {
+        self.builder = self.builder.runtime_config(config);
+        self
+    }
+
+    /// Set how far downloads may prefetch ahead of the consumer.
+    ///
+    /// This is the client default for all downloads; a request may override it via
+    /// [`DownloadInput`](crate::operation::download::DownloadInput), or a running
+    /// transfer may adjust it via
+    /// [`DownloadIoCtl`](crate::operation::download::DownloadIoCtl).
+    /// Default is [ReadAhead::Auto].
+    pub fn read_ahead(mut self, mode: ReadAhead) -> Self {
+        self.builder = self.builder.read_ahead(mode);
         self
     }
 
@@ -69,8 +104,34 @@ impl ConfigLoader {
         self
     }
 
+    /// Use this S3 client configuration instead of loading shared AWS
+    /// configuration.
+    ///
+    /// When set, [`load`](Self::load) reads no shared AWS configuration
+    /// sources; it still detects the machine profile.
+    /// [`Builder::s3_config`] describes how the transfer manager uses the
+    /// configuration. A non-empty list set with
+    /// [`network_interfaces`](Self::network_interfaces) replaces this
+    /// configuration's network interfaces; an empty list keeps them.
+    ///
+    /// ```no_run
+    /// # async fn example(sdk_config: aws_config::SdkConfig) {
+    /// let config = aws_sdk_s3_transfer_manager::from_env()
+    ///     .s3_config(&sdk_config)
+    ///     .load()
+    ///     .await;
+    /// # }
+    /// ```
+    pub fn s3_config(mut self, config: impl Into<S3ClientConfig>) -> Self {
+        self.s3_config = Some(config.into());
+        self
+    }
+
     /// Bind the runtime-provided HTTP transport's connections to these network
     /// interfaces.
+    ///
+    /// A non-empty list replaces the network interfaces of a configuration
+    /// supplied with [`s3_config`](Self::s3_config); an empty list keeps them.
     ///
     /// See [`S3ClientConfig::network_interfaces`] for assignment, scope, and
     /// platform availability.
@@ -110,44 +171,33 @@ impl ConfigLoader {
         self
     }
 
-    /// Sets the framework metadata for the transfer manager.
+    /// Load the configuration.
     ///
-    /// This _optional_ name is used to identify the framework using transfer manager in the user agent that
-    /// gets sent along with requests.
-    #[doc(hidden)]
-    pub fn framework_metadata(mut self, framework_metadata: Option<FrameworkMetadata>) -> Self {
-        self.builder = self.builder.framework_metadata(framework_metadata);
-        self
-    }
-
-    /// Set a dial9 handle for runtime tracing.
-    ///
-    /// See [`Builder::dial9_handle`](crate::config::Builder::dial9_handle)
-    /// for recorder ownership and shutdown ordering.
-    #[cfg(feature = "dial9")]
-    pub fn dial9_handle(mut self, handle: dial9::Dial9Handle) -> Self {
-        self.builder = self.builder.dial9_handle(handle);
-        self
-    }
-
-    /// Load the default configuration
-    ///
-    /// If fields have been overridden during builder construction, the override values will be
-    /// used. Otherwise, the default values for each field will be provided.
+    /// Without [`s3_config`](Self::s3_config), the S3 client configuration is
+    /// loaded from the shared AWS configuration sources with the latest
+    /// behavior version. Machine detection always runs. Where local DMI does
+    /// not identify the host, it makes one EC2 instance metadata (IMDS)
+    /// request with a short timeout, unless `AWS_EC2_METADATA_DISABLED` is `true`.
     pub async fn load(self) -> Config {
-        let shared_config = aws_config::defaults(BehaviorVersion::latest()).load().await;
+        let mut s3_config = match self.s3_config {
+            Some(config) => config,
+            None => {
+                S3ClientConfig::new(&aws_config::defaults(BehaviorVersion::latest()).load().await)
+            }
+        };
 
         // Detect machine facts here, on the async load path, so client
         // construction stays free of blocking DMI reads and network IMDS calls.
         let profile = detect_machine_profile().await;
 
-        let mut s3_config = S3ClientConfig::new(&shared_config);
-        s3_config.network_interfaces = self.network_interfaces;
-        let builder = self
-            .builder
+        if !self.network_interfaces.is_empty() {
+            s3_config.network_interfaces = self.network_interfaces;
+        }
+        self.builder
             .machine_profile(Some(profile))
-            .s3_config(s3_config);
-        builder.build()
+            .s3_config(s3_config)
+            .build()
+            .expect("the loader always sets s3_config, the only required field")
     }
 }
 
@@ -246,8 +296,8 @@ async fn imds_instance_type() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use crate::types::PartSize;
-    use aws_config::Region;
-    use aws_sdk_s3::config::Intercept;
+    use aws_config::{BehaviorVersion, Region};
+    use aws_sdk_s3::config::{Credentials, Intercept, SharedCredentialsProvider};
     use aws_smithy_http_client::test_util::capture_request;
 
     #[cfg_attr(miri, ignore)]
@@ -279,6 +329,89 @@ mod tests {
             .machine_profile()
             .expect("loader populates a machine profile");
         assert!(profile.vcpus >= 1);
+    }
+
+    /// A supplied configuration replaces the shared-configuration load, so the request is
+    /// sent through its HTTP client to its region. Loaded defaults would carry neither: the
+    /// capture client exists only in the supplied configuration, and the test environment
+    /// does not set this region.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn load_uses_supplied_s3_config() {
+        let (http_client, captured_request) = capture_request(None);
+        let sdk_config = aws_types::SdkConfig::builder()
+            .http_client(http_client)
+            .region(Region::from_static("ap-southeast-4"))
+            .credentials_provider(SharedCredentialsProvider::new(Credentials::for_tests()))
+            .behavior_version(BehaviorVersion::latest())
+            .build();
+        let config = crate::from_env()
+            .s3_config(&sdk_config)
+            .runtime_config(crate::RuntimeConfig::multi_thread_tokio())
+            .load()
+            .await;
+        assert!(
+            config.machine_profile().is_some(),
+            "machine detection runs with a supplied configuration"
+        );
+
+        let tm = crate::Client::new(config);
+        let mut handle = tm.download().bucket("foo").key("bar").initiate().unwrap();
+        // The capture client returns a canned response, so the transfer is expected to fail.
+        let _ = handle.body_mut().next().await;
+        let uri = captured_request.expect_request().uri().to_string();
+        assert!(
+            uri.contains("ap-southeast-4"),
+            "request did not use the supplied region: {uri}"
+        );
+    }
+
+    #[cfg(any(
+        target_os = "android",
+        target_os = "fuchsia",
+        target_os = "illumos",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "solaris",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos",
+    ))]
+    mod network_interfaces {
+        use crate::config::S3ClientConfig;
+
+        fn supplied(interfaces: &[&str]) -> S3ClientConfig {
+            S3ClientConfig::from_sdk_builder(aws_sdk_s3::config::Builder::new())
+                .network_interfaces(interfaces.iter().copied())
+        }
+
+        #[cfg_attr(miri, ignore)]
+        #[tokio::test]
+        async fn supplied_config_keeps_its_interfaces_when_loader_sets_none() {
+            let config = crate::from_env()
+                .s3_config(supplied(&["ens5"]))
+                .load()
+                .await;
+            let http = config
+                .runtime_http(64)
+                .expect("loader enables runtime HTTP");
+            assert_eq!(http.network_interfaces, ["ens5"]);
+        }
+
+        #[cfg_attr(miri, ignore)]
+        #[tokio::test]
+        async fn loader_interfaces_replace_supplied_config_interfaces() {
+            let config = crate::from_env()
+                .s3_config(supplied(&["ens5"]))
+                .network_interfaces(["ens6", "ens7"])
+                .load()
+                .await;
+            let http = config
+                .runtime_http(64)
+                .expect("loader enables runtime HTTP");
+            assert_eq!(http.network_interfaces, ["ens6", "ens7"]);
+        }
     }
 
     #[cfg(any(
@@ -349,7 +482,8 @@ mod tests {
         let capture_request_config = crate::Config::builder()
             .sdk_client(aws_sdk_s3::Client::from_conf(sdk_s3_config))
             .part_size(PartSize::Target(8))
-            .build();
+            .build()
+            .expect("valid config");
 
         let transfer_manager = crate::Client::new(capture_request_config);
 

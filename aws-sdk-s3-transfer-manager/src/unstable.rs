@@ -17,8 +17,6 @@
 /// requests runtime shutdown; execution handles do not retain shutdown ownership.
 ///
 /// Configure any Dial9 recorder on the runtime builder before construction.
-/// Supplying a separate transfer-manager `dial9_handle` for an adopted runtime
-/// causes client construction to panic.
 ///
 /// The transfer manager continues to preserve HTTP configured through the
 /// SDK or S3 configuration. With no configured HTTP it builds its default
