@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::memory::BufferPool;
-use crate::runtime::sizing::{self, ConcurrencyBound, Signals, Sizing};
+use crate::runtime::sizing::{self, ConcurrencyBound, ResourcePlan, Signals};
 use crate::runtime::ExecutionRuntime;
 
 /// Transfer manager client for Amazon Simple Storage Service.
@@ -35,8 +35,8 @@ pub(crate) struct Handle {
     pub(crate) controller: Arc<dyn ConcurrencyController>,
     pub(crate) telemetry: Arc<Telemetry>,
     pub(crate) buffer_pool: BufferPool,
-    /// Resource sizing resolved when the client was constructed.
-    pub(crate) sizing: Sizing,
+    /// Resource plan resolved when the client was constructed.
+    pub(crate) plan: ResourcePlan,
     /// Per-bucket retry token bucket, cached so all operations and retries to a
     /// given bucket share one live token bucket. The SDK does not share a bucket
     /// across custom retry partitions, and a partition built per operation would
@@ -80,7 +80,7 @@ impl Handle {
 
     /// Part size for uploads and downloads.
     pub(crate) fn part_size_bytes(&self) -> u64 {
-        self.sizing.part_size
+        self.plan.part_size
     }
 
     /// Whether the user pinned an explicit part size (vs leaving it `Auto`).
@@ -212,7 +212,7 @@ impl Handle {
         };
         // Sized against this handle's own pool, so results do not depend on
         // host memory.
-        let sizing = sizing::resolve(Signals {
+        let plan = sizing::resolve(Signals {
             throughput_gbps: config.throughput_target_gbps(),
             instance_type: None,
             vcpus: 1,
@@ -245,7 +245,7 @@ impl Handle {
                 controller,
                 telemetry: Arc::new(Telemetry::new(std::time::Duration::from_millis(500))),
                 buffer_pool,
-                sizing,
+                plan,
                 retry_partitions: std::sync::Mutex::new(std::collections::HashMap::new()),
             }
         })
@@ -289,7 +289,7 @@ impl Client {
             ),
             MemoryConfig::Auto => None,
         };
-        let sizing = sizing::resolve(Signals {
+        let plan = sizing::resolve(Signals {
             throughput_gbps: config.throughput_target_gbps(),
             instance_type: profile.instance_type.as_deref(),
             vcpus: profile.vcpus,
@@ -307,7 +307,7 @@ impl Client {
         });
 
         let (controller, telemetry): (Arc<dyn ConcurrencyController>, _) = (
-            Arc::new(FixedConcurrency::new(sizing.concurrency)),
+            Arc::new(FixedConcurrency::new(plan.concurrency)),
             Arc::new(Telemetry::new(Duration::from_millis(500))),
         );
 
@@ -319,7 +319,7 @@ impl Client {
         let memory_diagnostics = config.diagnostics().memory();
         let buffer_pool = match config.memory() {
             MemoryConfig::Auto => BufferPool::from_capacity(
-                crate::types::MemoryBudgetConfig::Limit(sizing.ceiling_bytes),
+                crate::types::MemoryBudgetConfig::Limit(plan.ceiling_bytes),
                 profile.ram_bytes,
                 memory_diagnostics,
             )
@@ -328,9 +328,9 @@ impl Client {
         };
         // Runtime HTTP is built only when it will be installed on an S3 client
         // this transfer manager constructs.
-        let runtime_http = config.runtime_http(sizing.connection_cap);
+        let runtime_http = config.runtime_http(plan.connection_cap);
         log_resource_sizing(
-            &sizing,
+            &plan,
             &connection_cap,
             runtime_http.is_some(),
             config.ignored_throughput_target_gbps(),
@@ -399,7 +399,7 @@ impl Client {
                 controller,
                 telemetry,
                 buffer_pool,
-                sizing,
+                plan,
                 retry_partitions: std::sync::Mutex::new(std::collections::HashMap::new()),
             }
         });
@@ -567,7 +567,7 @@ impl Client {
 /// `connection_cap_installed` is whether the cap is applied to a transport this
 /// client builds.
 fn log_resource_sizing(
-    sizing: &Sizing,
+    plan: &ResourcePlan,
     cap: &crate::runtime::platform::ConnectionCap,
     connection_cap_installed: bool,
     ignored_throughput_gbps: Option<f64>,
@@ -584,47 +584,47 @@ fn log_resource_sizing(
     }
     tracing::info!(
         target: crate::telemetry::TARGET_CONCURRENCY,
-        concurrency_target = sizing.concurrency,
-        source = sizing.concurrency_source.as_str(),
-        bounded_by = sizing.concurrency_bound.as_str(),
-        throughput_gbps = ?sizing.throughput_gbps,
-        memory_ceiling_bytes = sizing.ceiling_bytes,
-        memory_detected = sizing.memory_detected,
-        part_size_bytes = sizing.part_size,
-        max_connections_per_host = sizing.connection_cap,
+        concurrency_target = plan.concurrency,
+        source = plan.concurrency_source.as_str(),
+        bounded_by = plan.concurrency_bound.as_str(),
+        throughput_gbps = ?plan.throughput_gbps,
+        memory_ceiling_bytes = plan.ceiling_bytes,
+        memory_detected = plan.memory_detected,
+        part_size_bytes = plan.part_size,
+        max_connections_per_host = plan.connection_cap,
         connection_cap_installed,
-        max_funded_concurrency = sizing.max_funded_concurrency,
+        max_funded_concurrency = plan.max_funded_concurrency,
         soft_descriptor_limit = ?soft,
         hard_descriptor_limit = ?hard,
         "resolved resource sizing",
     );
 
-    if sizing.configured_concurrency_unfunded {
+    if plan.configured_concurrency_unfunded {
         tracing::warn!(
             target: crate::telemetry::TARGET_CONCURRENCY,
-            concurrency_target = sizing.concurrency,
-            max_funded_concurrency = sizing.max_funded_concurrency,
-            max_connections_per_host = sizing.connection_cap,
+            concurrency_target = plan.concurrency,
+            max_funded_concurrency = plan.max_funded_concurrency,
+            max_connections_per_host = plan.connection_cap,
             "configured concurrency target exceeds what the payload-memory ceiling and connection \
              cap sustain; requests beyond that point wait on memory admission or a connection",
         );
     }
 
-    if sizing.configured_part_size_unfunded {
+    if plan.configured_part_size_unfunded {
         tracing::warn!(
             target: crate::telemetry::TARGET_CONCURRENCY,
-            part_size_bytes = sizing.part_size,
-            memory_ceiling_bytes = sizing.ceiling_bytes,
+            part_size_bytes = plan.part_size,
+            memory_ceiling_bytes = plan.ceiling_bytes,
             "configured part size exceeds what the payload-memory ceiling funds for a single \
              concurrency slot; raise the memory ceiling or lower the part size",
         );
     }
 
-    if cap.limited_by_descriptors() && sizing.concurrency_bound == ConcurrencyBound::Connections {
+    if cap.limited_by_descriptors() && plan.concurrency_bound == ConcurrencyBound::Connections {
         tracing::warn!(
             target: crate::telemetry::TARGET_CONCURRENCY,
-            max_connections_per_host = sizing.connection_cap,
-            concurrency_target = sizing.concurrency,
+            max_connections_per_host = plan.connection_cap,
+            concurrency_target = plan.concurrency,
             soft_descriptor_limit = ?soft,
             hard_descriptor_limit = ?hard,
             "concurrency is limited to half the soft file-descriptor limit (RLIMIT_NOFILE); raise \
@@ -1265,7 +1265,7 @@ mod tests {
             .configured_capacity_bytes();
 
         // Carrier rounding can only round the ceiling down, never above it.
-        assert!(configured <= client.handle.sizing.ceiling_bytes as u64);
+        assert!(configured <= client.handle.plan.ceiling_bytes as u64);
         assert!(configured > 0);
     }
 
@@ -1292,7 +1292,7 @@ mod tests {
             ceiling_override_bytes: None,
         });
         assert_eq!(client.handle.controller.target(), expected.concurrency);
-        assert_eq!(client.handle.sizing.throughput_gbps, Some(100.0));
+        assert_eq!(client.handle.plan.throughput_gbps, Some(100.0));
     }
 
     #[test]

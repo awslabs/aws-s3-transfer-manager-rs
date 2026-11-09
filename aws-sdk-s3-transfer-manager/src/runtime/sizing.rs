@@ -125,9 +125,9 @@ impl ConcurrencyBound {
     }
 }
 
-/// Resolved sizing for one client.
+/// Resource sizes one client runs with, and how each was resolved.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct Sizing {
+pub(crate) struct ResourcePlan {
     /// Admission ceiling for the buffer pool.
     pub(crate) ceiling_bytes: usize,
     /// Concurrency target for the scheduler.
@@ -156,11 +156,11 @@ pub(crate) struct Sizing {
     pub(crate) configured_part_size_unfunded: bool,
 }
 
-/// Resolves sizing from `signals`.
+/// Resolves the resource plan for `signals`.
 ///
 /// Performs no I/O and does not panic. Arithmetic saturates; the concurrency
 /// target and connection cap are at least one.
-pub(crate) fn resolve(signals: Signals<'_>) -> Sizing {
+pub(crate) fn resolve(signals: Signals<'_>) -> ResourcePlan {
     let auto = resolve_auto_concurrency(signals.instance_type, signals.vcpus);
     let configured_throughput = configured_throughput(&signals);
     let throughput_gbps = configured_throughput.or(auto.estimated_gbps);
@@ -196,7 +196,7 @@ pub(crate) fn resolve(signals: Signals<'_>) -> Sizing {
             }
         };
 
-    Sizing {
+    ResourcePlan {
         ceiling_bytes,
         concurrency,
         part_size,
@@ -304,11 +304,11 @@ mod tests {
         // so equal Gbps resolve to equal targets.
         let mut s = signals(Some(256 * GIB as usize), 64);
         s.throughput_gbps = Some(100.0);
-        let sizing = resolve(s);
+        let plan = resolve(s);
 
-        assert_eq!(sizing.throughput_gbps, Some(100.0));
-        assert_eq!(sizing.concurrency, seed_from_gbps(100.0));
-        assert_eq!(sizing.concurrency_bound, ConcurrencyBound::Unbounded);
+        assert_eq!(plan.throughput_gbps, Some(100.0));
+        assert_eq!(plan.concurrency, seed_from_gbps(100.0));
+        assert_eq!(plan.concurrency_bound, ConcurrencyBound::Unbounded);
     }
 
     #[test]
@@ -326,10 +326,10 @@ mod tests {
         // m6idn's flagship is 200 Gbps at 128 vCPU, so 64 vCPU estimates 100.
         let mut s = signals(Some(256 * GIB as usize), 64);
         s.instance_type = Some("m6idn.16xlarge");
-        let sizing = resolve(s);
+        let plan = resolve(s);
 
-        assert_eq!(sizing.throughput_gbps, Some(100.0));
-        assert_eq!(sizing.concurrency, seed_from_gbps(100.0));
+        assert_eq!(plan.throughput_gbps, Some(100.0));
+        assert_eq!(plan.concurrency, seed_from_gbps(100.0));
     }
 
     #[test]
@@ -346,46 +346,46 @@ mod tests {
     fn unknown_family_falls_back_to_vcpu_scaling() {
         let mut s = signals(Some(64 * GIB as usize), 16);
         s.instance_type = Some("gcp-n2-standard-16");
-        let sizing = resolve(s);
+        let plan = resolve(s);
 
-        assert_eq!(sizing.throughput_gbps, None);
+        assert_eq!(plan.throughput_gbps, None);
         assert_eq!(
-            sizing.concurrency,
+            plan.concurrency,
             resolve_auto_concurrency(Some("gcp-n2-standard-16"), 16).target
         );
     }
 
     #[test]
     fn ceiling_is_a_share_of_detected_memory() {
-        let sizing = resolve(signals(Some(64 * GIB as usize), 16));
+        let plan = resolve(signals(Some(64 * GIB as usize), 16));
         assert_eq!(
-            sizing.ceiling_bytes,
+            plan.ceiling_bytes,
             auto_capacity_bytes(Some(64 * GIB as usize))
         );
-        assert!(sizing.memory_detected);
+        assert!(plan.memory_detected);
     }
 
     #[test]
     fn ceiling_is_capped_on_a_large_host() {
         let ram = 768 * GIB as usize;
-        let sizing = resolve(signals(Some(ram), 192));
-        assert_eq!(sizing.ceiling_bytes, auto_capacity_bytes(Some(ram)));
-        assert!(sizing.ceiling_bytes < ram / 4);
+        let plan = resolve(signals(Some(ram), 192));
+        assert_eq!(plan.ceiling_bytes, auto_capacity_bytes(Some(ram)));
+        assert!(plan.ceiling_bytes < ram / 4);
     }
 
     #[test]
     fn ceiling_floor_takes_precedence_over_a_small_memory_share() {
         // The pool's share of 1 GiB is below the floor, and half of 1 GiB is
         // above it, so the floor sets the ceiling.
-        let sizing = resolve(signals(Some(GIB as usize), 2));
-        assert_eq!(sizing.ceiling_bytes, saturating_usize(AUTO_FLOOR_BYTES));
+        let plan = resolve(signals(Some(GIB as usize), 2));
+        assert_eq!(plan.ceiling_bytes, saturating_usize(AUTO_FLOOR_BYTES));
     }
 
     #[test]
     fn ceiling_floor_yields_to_half_of_memory_on_a_tiny_host() {
         // Half of 128 MiB is below the floor, so half of memory sets the ceiling.
-        let sizing = resolve(signals(Some(128 * MIB as usize), 1));
-        assert_eq!(sizing.ceiling_bytes, 64 * MIB as usize);
+        let plan = resolve(signals(Some(128 * MIB as usize), 1));
+        assert_eq!(plan.ceiling_bytes, 64 * MIB as usize);
     }
 
     #[test]
@@ -399,16 +399,16 @@ mod tests {
 
     #[test]
     fn undetected_memory_uses_the_fallback_ceiling() {
-        let sizing = resolve(signals(None, 4));
-        assert_eq!(sizing.ceiling_bytes, auto_capacity_bytes(None));
-        assert!(!sizing.memory_detected);
+        let plan = resolve(signals(None, 4));
+        assert_eq!(plan.ceiling_bytes, auto_capacity_bytes(None));
+        assert!(!plan.memory_detected);
     }
 
     #[test]
     fn zero_detected_memory_is_treated_as_undetected() {
-        let sizing = resolve(signals(Some(0), 4));
-        assert_eq!(sizing.ceiling_bytes, auto_capacity_bytes(None));
-        assert!(!sizing.memory_detected);
+        let plan = resolve(signals(Some(0), 4));
+        assert_eq!(plan.ceiling_bytes, auto_capacity_bytes(None));
+        assert!(!plan.memory_detected);
     }
 
     #[test]
@@ -425,11 +425,11 @@ mod tests {
         let mut s = signals(Some(256 * GIB as usize), 64);
         s.throughput_gbps = Some(200.0);
         s.connection_cap = cap(128);
-        let sizing = resolve(s);
+        let plan = resolve(s);
 
-        assert_eq!(sizing.concurrency, 128);
-        assert_eq!(sizing.concurrency_bound, ConcurrencyBound::Connections);
-        assert_eq!(sizing.connection_cap, 128);
+        assert_eq!(plan.concurrency, 128);
+        assert_eq!(plan.concurrency_bound, ConcurrencyBound::Connections);
+        assert_eq!(plan.connection_cap, 128);
     }
 
     #[test]
@@ -438,11 +438,11 @@ mod tests {
         // target 100 Gbps seeds.
         let mut s = signals(Some(GIB as usize), 2);
         s.throughput_gbps = Some(100.0);
-        let sizing = resolve(s);
+        let plan = resolve(s);
 
         let funded = funded_concurrency(saturating_usize(AUTO_FLOOR_BYTES), DEFAULT_PART_SIZE);
-        assert_eq!(sizing.concurrency, funded);
-        assert_eq!(sizing.concurrency_bound, ConcurrencyBound::Memory);
+        assert_eq!(plan.concurrency, funded);
+        assert_eq!(plan.concurrency_bound, ConcurrencyBound::Memory);
     }
 
     #[test]
@@ -450,21 +450,21 @@ mod tests {
         // A configured target the ceiling cannot fund is kept and reported.
         let mut s = signals(Some(GIB as usize), 2);
         s.explicit_concurrency = Some(500);
-        let sizing = resolve(s);
+        let plan = resolve(s);
 
-        assert_eq!(sizing.concurrency, 500);
-        assert_eq!(sizing.concurrency_bound, ConcurrencyBound::Configured);
-        assert!(sizing.configured_concurrency_unfunded);
+        assert_eq!(plan.concurrency, 500);
+        assert_eq!(plan.concurrency_bound, ConcurrencyBound::Configured);
+        assert!(plan.configured_concurrency_unfunded);
     }
 
     #[test]
     fn configured_concurrency_within_the_bounds_is_not_reported_unfunded() {
         let mut s = signals(Some(256 * GIB as usize), 64);
         s.explicit_concurrency = Some(64);
-        let sizing = resolve(s);
+        let plan = resolve(s);
 
-        assert_eq!(sizing.concurrency, 64);
-        assert!(!sizing.configured_concurrency_unfunded);
+        assert_eq!(plan.concurrency, 64);
+        assert!(!plan.configured_concurrency_unfunded);
     }
 
     #[test]
@@ -516,12 +516,12 @@ mod tests {
         large.throughput_gbps = Some(100.0);
         assert_eq!(resolve(large).part_size, DEFAULT_PART_SIZE);
 
-        let sizing = resolve(signals(Some(GIB as usize), 2));
-        assert_eq!(sizing.part_size, DEFAULT_PART_SIZE);
-        assert_eq!(sizing.concurrency_bound, ConcurrencyBound::Memory);
+        let plan = resolve(signals(Some(GIB as usize), 2));
+        assert_eq!(plan.part_size, DEFAULT_PART_SIZE);
+        assert_eq!(plan.concurrency_bound, ConcurrencyBound::Memory);
         assert_eq!(
-            sizing.concurrency,
-            funded_concurrency(sizing.ceiling_bytes, DEFAULT_PART_SIZE)
+            plan.concurrency,
+            funded_concurrency(plan.ceiling_bytes, DEFAULT_PART_SIZE)
         );
     }
 
@@ -529,20 +529,20 @@ mod tests {
     fn configured_part_size_is_used_as_given() {
         let mut s = signals(Some(256 * GIB as usize), 64);
         s.explicit_part_size = Some(64 * MIB);
-        let sizing = resolve(s);
+        let plan = resolve(s);
 
-        assert_eq!(sizing.part_size, 64 * MIB);
-        assert!(!sizing.configured_part_size_unfunded);
+        assert_eq!(plan.part_size, 64 * MIB);
+        assert!(!plan.configured_part_size_unfunded);
     }
 
     #[test]
     fn configured_part_size_beyond_the_ceiling_is_reported() {
         let mut s = signals(Some(GIB as usize), 2);
         s.explicit_part_size = Some(512 * MIB);
-        let sizing = resolve(s);
+        let plan = resolve(s);
 
-        assert_eq!(sizing.part_size, 512 * MIB);
-        assert!(sizing.configured_part_size_unfunded);
+        assert_eq!(plan.part_size, 512 * MIB);
+        assert!(plan.configured_part_size_unfunded);
     }
 
     #[test]
@@ -551,13 +551,13 @@ mod tests {
         let mut s = signals(Some(8 * GIB as usize), 8);
         s.throughput_gbps = Some(100.0);
         s.explicit_part_size = Some(256 * MIB);
-        let sizing = resolve(s);
+        let plan = resolve(s);
 
         assert_eq!(
-            sizing.concurrency,
-            funded_concurrency(sizing.ceiling_bytes, 256 * MIB)
+            plan.concurrency,
+            funded_concurrency(plan.ceiling_bytes, 256 * MIB)
         );
-        assert_eq!(sizing.concurrency_bound, ConcurrencyBound::Memory);
+        assert_eq!(plan.concurrency_bound, ConcurrencyBound::Memory);
     }
 
     #[test]
@@ -565,10 +565,10 @@ mod tests {
         // A small target leaves the descriptor-derived cap unchanged.
         let mut s = signals(Some(8 * GIB as usize), 4);
         s.explicit_concurrency = Some(12);
-        let sizing = resolve(s);
+        let plan = resolve(s);
 
-        assert_eq!(sizing.concurrency, 12);
-        assert_eq!(sizing.connection_cap, 4096);
+        assert_eq!(plan.concurrency, 12);
+        assert_eq!(plan.connection_cap, 4096);
     }
 
     #[test]
@@ -584,13 +584,13 @@ mod tests {
     fn funded_concurrency_is_published_for_the_resolved_part_size() {
         let mut s = signals(Some(256 * GIB as usize), 64);
         s.throughput_gbps = Some(100.0);
-        let sizing = resolve(s);
+        let plan = resolve(s);
 
         assert_eq!(
-            sizing.max_funded_concurrency,
-            funded_concurrency(sizing.ceiling_bytes, sizing.part_size)
+            plan.max_funded_concurrency,
+            funded_concurrency(plan.ceiling_bytes, plan.part_size)
         );
-        assert!(sizing.max_funded_concurrency >= sizing.concurrency);
+        assert!(plan.max_funded_concurrency >= plan.concurrency);
     }
 
     #[test]
@@ -615,13 +615,13 @@ mod tests {
                         s.explicit_part_size = part;
                         s.explicit_concurrency = concurrency;
                         s.connection_cap = cap(descriptor_cap);
-                        let sizing = resolve(s);
+                        let plan = resolve(s);
 
-                        assert!(sizing.concurrency >= 1);
-                        assert!(sizing.ceiling_bytes > 0);
-                        assert_eq!(sizing.connection_cap, descriptor_cap);
-                        assert!(sizing.max_funded_concurrency >= 1);
-                        assert_eq!(sizing.part_size, part.unwrap_or(DEFAULT_PART_SIZE));
+                        assert!(plan.concurrency >= 1);
+                        assert!(plan.ceiling_bytes > 0);
+                        assert_eq!(plan.connection_cap, descriptor_cap);
+                        assert!(plan.max_funded_concurrency >= 1);
+                        assert_eq!(plan.part_size, part.unwrap_or(DEFAULT_PART_SIZE));
                     }
                 }
             }
