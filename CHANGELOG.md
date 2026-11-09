@@ -23,7 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A large configured part size therefore lowers the automatic concurrency target; for
   example, 256 MiB parts on a 16 GiB host resolve to 5.
 - The automatic part size is 8 MiB for both uploads and downloads. Downloads previously used
-  5 MiB, so objects between 5 and 8 MiB now download with a single GET.
+  5 MiB, so objects larger than 5 MiB and up to 8 MiB now download with a single GET.
 - The per-host connection cap's descriptor budget is the smaller of half the soft
   `RLIMIT_NOFILE` and the soft limit less 64 descriptors, so it binds only below a soft limit
   of 128.
