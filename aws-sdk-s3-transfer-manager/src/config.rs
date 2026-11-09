@@ -44,6 +44,9 @@ pub(crate) const MIN_MULTIPART_PART_SIZE_BYTES: u64 = 5 * ByteUnit::Mebibyte.as_
 pub struct S3ClientConfig {
     pub(crate) config: aws_sdk_s3::Config,
     pub(crate) network_interfaces: Vec<String>,
+    /// TCP keepalive interval for the runtime-managed connection pool.
+    /// `None` uses the pool default; `Some(None)` disables keepalive.
+    pub(crate) tcp_keepalive: Option<Option<std::time::Duration>>,
 }
 
 impl S3ClientConfig {
@@ -58,6 +61,7 @@ impl S3ClientConfig {
         Self {
             config: builder.build(),
             network_interfaces: Vec::new(),
+            tcp_keepalive: None,
         }
     }
 
@@ -113,6 +117,20 @@ impl S3ClientConfig {
         self.network_interfaces = interfaces.into_iter().map(Into::into).collect();
         self
     }
+
+    /// Set the TCP keepalive probe interval for the runtime-managed connection pool.
+    ///
+    /// Pass `Some(duration)` to override the default (30 s); pass `None` to
+    /// disable keepalive entirely. When not called, the pool's built-in 30 s
+    /// default applies — enough to survive NAT table expiry before an idle
+    /// connection is reused.
+    ///
+    /// Applies only to the default managed HTTP transport. A configured HTTP
+    /// client uses its own socket configuration.
+    pub fn tcp_keepalive(mut self, interval: impl Into<Option<std::time::Duration>>) -> Self {
+        self.tcp_keepalive = Some(interval.into());
+        self
+    }
 }
 
 impl From<&aws_types::SdkConfig> for S3ClientConfig {
@@ -132,6 +150,7 @@ impl std::fmt::Debug for S3ClientConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("S3ClientConfig")
             .field("network_interfaces", &self.network_interfaces)
+            .field("tcp_keepalive", &self.tcp_keepalive)
             .finish_non_exhaustive()
     }
 }
@@ -247,6 +266,7 @@ impl Config {
                 Some(crate::runtime::RuntimeHttpOptions {
                     network_interfaces: config.network_interfaces.clone(),
                     max_connections_per_host,
+                    tcp_keepalive: config.tcp_keepalive,
                 })
             }
             _ => None,
@@ -516,6 +536,34 @@ mod tests {
         let http = config.runtime_http(64).expect("runtime HTTP enabled");
         assert_eq!(http.network_interfaces, ["ens5", "ens6"]);
         assert_eq!(http.max_connections_per_host, 64);
+    }
+
+    #[test]
+    fn runtime_http_carries_tcp_keepalive() {
+        let interval = std::time::Duration::from_secs(30);
+        let config = Config::builder()
+            .s3_config(S3ClientConfig::from_sdk_builder(s3_config_builder()).tcp_keepalive(interval))
+            .build();
+        let http = config.runtime_http(64).expect("runtime HTTP enabled");
+        assert_eq!(http.tcp_keepalive, Some(Some(interval)));
+    }
+
+    #[test]
+    fn runtime_http_carries_disabled_tcp_keepalive() {
+        let config = Config::builder()
+            .s3_config(S3ClientConfig::from_sdk_builder(s3_config_builder()).tcp_keepalive(None))
+            .build();
+        let http = config.runtime_http(64).expect("runtime HTTP enabled");
+        assert_eq!(http.tcp_keepalive, Some(None));
+    }
+
+    #[test]
+    fn runtime_http_default_tcp_keepalive_is_unset() {
+        let config = Config::builder()
+            .s3_config(S3ClientConfig::from_sdk_builder(s3_config_builder()))
+            .build();
+        let http = config.runtime_http(64).expect("runtime HTTP enabled");
+        assert_eq!(http.tcp_keepalive, None);
     }
 
     #[test]

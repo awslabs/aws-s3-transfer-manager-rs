@@ -83,6 +83,11 @@ pub(crate) struct RuntimeHttpOptions {
     pub(crate) network_interfaces: Vec<String>,
     /// Maximum connections to one origin across all worker threads.
     pub(crate) max_connections_per_host: usize,
+    /// TCP keepalive probe interval for new sockets.
+    ///
+    /// `None` = pool default; `Some(None)` = disabled;
+    /// `Some(Some(d))` = explicit interval.
+    pub(crate) tcp_keepalive: Option<Option<std::time::Duration>>,
 }
 
 /// Components provided by the execution runtime to the rest of the system.

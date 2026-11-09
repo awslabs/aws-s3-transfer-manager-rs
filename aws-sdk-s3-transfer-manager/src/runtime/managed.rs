@@ -102,12 +102,17 @@ fn build_http_client(
         let partition = Partition::new(PartitionId::from_index(index), spawner);
         bind_interface(partition, index, &options.network_interfaces)
     });
-    let pool = ConnectionPool::builder()
+    let pool_builder = ConnectionPool::builder()
         .dns_resolver(dns_resolver)
         .idle_timeout(POOL_IDLE_TIMEOUT)
         .max_connections_per_host(options.max_connections_per_host)
         .proxy_config(ProxyConfig::from_env())
-        .partitions(partitions)
+        .partitions(partitions);
+    let pool_builder = match options.tcp_keepalive {
+        None => pool_builder,
+        Some(interval) => pool_builder.tcp_keepalive(interval),
+    };
+    let pool = pool_builder
         .tls_provider(Provider::Rustls(CryptoMode::AwsLc))
         .build_https()?;
     Ok(ManagedHttpPool::from_pool(execution, pool)?.into_shared())
