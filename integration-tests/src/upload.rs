@@ -403,7 +403,7 @@ async fn when_required_tm() -> (
         .interceptor(recorder.clone());
     let tm = aws_sdk_s3_transfer_manager::Client::new(
         aws_sdk_s3_transfer_manager::Config::builder()
-            .s3_config(S3ClientConfig::new(s3_config).enable_runtime_http(false))
+            .s3_config(S3ClientConfig::new(s3_config))
             .build(),
     );
     (handle, tm, recorder)
