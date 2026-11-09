@@ -7,6 +7,7 @@ mod common;
 
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+use aws_sdk_s3::Client;
 use common::{assert_failure, failure, Fixture, Result};
 use s3_mock_server::{Error, FaultTarget, FaultType, Occurrence, Operation};
 
@@ -121,6 +122,31 @@ async fn test_missing_bucket_on_multipart_upload() -> Result {
     assert_failure(&fail, 404, "NoSuchBucket");
     let fail = failure(f.s3.head_bucket().bucket("doomed").send().await);
     assert_eq!(fail.status, 404);
+    f.shutdown().await;
+    Ok(())
+}
+
+/// RenameObject, which directory buckets serve, fails with NoSuchBucket for a missing bucket.
+#[tokio::test]
+async fn test_missing_bucket_on_rename() -> Result {
+    let f = Fixture::new().await;
+    // Signed with the server's credentials: a CreateSession for the missing bucket would fail
+    // before the rename is sent.
+    let s3 = Client::from_conf(
+        f.s3.config()
+            .to_builder()
+            .disable_s3_express_session_auth(true)
+            .build(),
+    );
+    let fail = failure(
+        s3.rename_object()
+            .bucket("missing--usw2-az1--x-s3")
+            .key("b")
+            .rename_source("a")
+            .send()
+            .await,
+    );
+    assert_failure(&fail, 404, "NoSuchBucket");
     f.shutdown().await;
     Ok(())
 }

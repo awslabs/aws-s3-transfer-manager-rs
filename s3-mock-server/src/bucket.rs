@@ -14,6 +14,9 @@ use crate::error::Error;
 /// The suffix of directory bucket names.
 const DIRECTORY_BUCKET_SUFFIX: &str = "--x-s3";
 
+/// The storage class of every object in a directory bucket.
+const EXPRESS_ONEZONE: &str = "EXPRESS_ONEZONE";
+
 /// The type of a bucket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BucketType {
@@ -31,6 +34,35 @@ impl BucketType {
         } else {
             Self::GeneralPurpose
         }
+    }
+
+    /// The storage class of an object stored without one: STANDARD or EXPRESS_ONEZONE.
+    pub(crate) fn default_storage_class(self) -> &'static str {
+        match self {
+            Self::GeneralPurpose => s3s::dto::StorageClass::STANDARD,
+            Self::Directory => EXPRESS_ONEZONE,
+        }
+    }
+
+    /// Check the storage class a request sets. Fails with 400 InvalidStorageClass for
+    /// EXPRESS_ONEZONE in a general purpose bucket, and for any other class in a directory bucket.
+    pub(crate) fn check_storage_class(self, storage_class: Option<&str>) -> crate::Result<()> {
+        match (self, storage_class) {
+            (Self::GeneralPurpose, Some(EXPRESS_ONEZONE)) => Err(Error::InvalidStorageClass),
+            (Self::Directory, Some(class)) if class != EXPRESS_ONEZONE => {
+                Err(Error::InvalidStorageClass)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Check that a request to a directory bucket does not set `Content-MD5`, which directory
+    /// buckets do not support. Fails with 501 NotImplemented.
+    pub(crate) fn check_content_md5(self, content_md5: Option<&str>) -> crate::Result<()> {
+        if self == Self::Directory && content_md5.is_some() {
+            return Err(Error::ContentMd5NotImplemented);
+        }
+        Ok(())
     }
 
     /// Fail a ListObjectsV2 request that buckets of this type do not serve: in directory
@@ -63,11 +95,66 @@ impl BucketType {
         }
         Ok(())
     }
+
+    /// The `x-amz-storage-class` header of a GetObject or HeadObject response for an object
+    /// stored with `storage_class`. General purpose buckets omit it for STANDARD objects, also
+    /// when STANDARD was requested explicitly; directory buckets always report it.
+    pub(crate) fn storage_class_header(
+        self,
+        storage_class: Option<String>,
+    ) -> Option<s3s::dto::StorageClass> {
+        match self {
+            Self::GeneralPurpose => storage_class
+                .filter(|class| class != s3s::dto::StorageClass::STANDARD)
+                .map(s3s::dto::StorageClass::from),
+            Self::Directory => Some(self.listed_storage_class(&storage_class).into()),
+        }
+    }
+
+    /// The storage class of an object in ListObjectsV2 entries, which always report one.
+    pub(crate) fn listed_storage_class(self, storage_class: &Option<String>) -> String {
+        storage_class
+            .clone()
+            .unwrap_or_else(|| self.default_storage_class().to_owned())
+    }
+}
+
+/// The bucket and key of a path-style request path, read as s3s reads them: the path is
+/// percent-decoded, then split at the first `/` after the leading one, so `/b%2Fk` is key `k` in
+/// bucket `b`. An empty bucket or key is `None`. Fails with `InvalidUri` if the path is not
+/// percent-encoded UTF-8.
+pub(crate) fn path_bucket_and_key(path: &str) -> crate::Result<(Option<String>, Option<String>)> {
+    let decoded = percent_encoding::percent_decode_str(path)
+        .decode_utf8()
+        .map_err(|_| Error::InvalidUri)?;
+    let path = decoded.strip_prefix('/').unwrap_or(&decoded);
+    let (bucket, key) = path.split_once('/').unwrap_or((path, ""));
+    let non_empty = |s: &str| (!s.is_empty()).then(|| s.to_owned());
+    Ok((non_empty(bucket), non_empty(key)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_path_style_paths_decoded_then_split() {
+        let parts = |bucket: Option<&str>, key: Option<&str>| {
+            (bucket.map(str::to_owned), key.map(str::to_owned))
+        };
+        assert_eq!(
+            path_bucket_and_key("/b/dir/key%20x%E2%9C%93").unwrap(),
+            parts(Some("b"), Some("dir/key x\u{2713}"))
+        );
+        assert_eq!(
+            path_bucket_and_key("/b%2Fkey").unwrap(),
+            parts(Some("b"), Some("key"))
+        );
+        assert_eq!(path_bucket_and_key("/b").unwrap(), parts(Some("b"), None));
+        assert_eq!(path_bucket_and_key("/b/").unwrap(), parts(Some("b"), None));
+        assert_eq!(path_bucket_and_key("/").unwrap(), parts(None, None));
+        assert!(path_bucket_and_key("/b/%FF").is_err());
+    }
 
     #[test]
     fn type_follows_from_the_name() {
@@ -83,5 +170,23 @@ mod tests {
                 "{bucket}"
             );
         }
+    }
+
+    #[test]
+    fn storage_classes_per_type() {
+        let gp = BucketType::GeneralPurpose;
+        let dir = BucketType::Directory;
+        assert!(gp.check_storage_class(Some("GLACIER")).is_ok());
+        assert!(gp.check_storage_class(Some(EXPRESS_ONEZONE)).is_err());
+        assert!(dir.check_storage_class(Some(EXPRESS_ONEZONE)).is_ok());
+        assert!(dir.check_storage_class(Some("STANDARD")).is_err());
+        assert!(dir.check_storage_class(None).is_ok());
+        assert_eq!(gp.storage_class_header(Some("STANDARD".into())), None);
+        assert_eq!(
+            dir.storage_class_header(None),
+            Some(s3s::dto::StorageClass::from(EXPRESS_ONEZONE.to_owned()))
+        );
+        assert_eq!(dir.listed_storage_class(&None), EXPRESS_ONEZONE);
+        assert_eq!(gp.listed_storage_class(&None), "STANDARD");
     }
 }

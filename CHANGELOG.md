@@ -14,6 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   concurrency is lowered, and for a concurrency target the descriptor limit lowers.
 
 ### Changed
+- `aws-sdk-s3-transfer-manager`, `aws-sdk-s3-transfer-manager-ext`, `aws-smithy-topology`,
+  `aws-smithy-execution` and `aws-smithy-managed-http`: the minimum supported Rust version is
+  1.96.0.
 - `ConcurrencyMode::TargetThroughput` takes an `f64` in Gbps instead of a `TargetThroughput`, so
   targets below 1 Gbps can be expressed. A value that is not finite and positive is ignored with
   a warning, and concurrency resolves as for `Auto`.
