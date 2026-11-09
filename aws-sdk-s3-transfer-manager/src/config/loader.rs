@@ -366,6 +366,39 @@ mod tests {
         );
     }
 
+    /// A supplied configuration without an HTTP client keeps the managed transport under
+    /// managed execution, as loaded defaults do; one with an HTTP client uses it instead.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn supplied_s3_config_selects_managed_transport_unless_it_has_http() {
+        use aws_sdk_s3::config::IntoShared;
+
+        let sdk_config = |http_client: Option<_>| {
+            let mut builder = aws_types::SdkConfig::builder()
+                .region(Region::from_static("us-west-2"))
+                .credentials_provider(SharedCredentialsProvider::new(Credentials::for_tests()))
+                .behavior_version(BehaviorVersion::latest());
+            builder.set_http_client(http_client);
+            builder.build()
+        };
+
+        let config = crate::from_env().s3_config(&sdk_config(None)).load().await;
+        assert!(
+            config.runtime_http(64).is_some(),
+            "no HTTP client supplied: the managed transport is installed"
+        );
+
+        let (http_client, _captured) = capture_request(None);
+        let config = crate::from_env()
+            .s3_config(&sdk_config(Some(http_client.into_shared())))
+            .load()
+            .await;
+        assert!(
+            config.runtime_http(64).is_none(),
+            "an HTTP client is supplied: the managed transport is not installed"
+        );
+    }
+
     #[cfg(any(
         target_os = "android",
         target_os = "fuchsia",
