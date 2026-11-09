@@ -7,9 +7,8 @@ use aws_sdk_s3_transfer_manager::memory::{BufferPool, MemoryBudgetConfig, Memory
 use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
 use aws_sdk_s3_transfer_manager::metrics::Throughput;
 use aws_sdk_s3_transfer_manager::operation::download::Body;
-use aws_sdk_s3_transfer_manager::types::{
-    ConcurrencyMode, PartSize, RuntimeMode, TargetThroughput,
-};
+use aws_sdk_s3_transfer_manager::types::{ConcurrencyMode, PartSize, TargetThroughput};
+use aws_sdk_s3_transfer_manager::RuntimeConfig;
 use aws_smithy_types::date_time::{DateTime, Format};
 use clap::{CommandFactory, Parser};
 use std::error::Error;
@@ -65,7 +64,7 @@ enum OutputFormat {
     Json,
 }
 
-/// Execution runtime selection, mapped to `RuntimeMode`.
+/// Execution runtime selection, mapped to `RuntimeConfig`.
 #[derive(Debug, Clone, Default, clap::ValueEnum)]
 enum RuntimeArg {
     /// Managed OS threads owned by the transfer manager (default).
@@ -76,10 +75,10 @@ enum RuntimeArg {
 }
 
 impl RuntimeArg {
-    fn mode(&self) -> RuntimeMode {
+    fn mode(&self) -> RuntimeConfig {
         match self {
-            RuntimeArg::Managed => RuntimeMode::Managed,
-            RuntimeArg::MultiThreadTokio => RuntimeMode::MultiThreadTokio,
+            RuntimeArg::Managed => RuntimeConfig::default(),
+            RuntimeArg::MultiThreadTokio => RuntimeConfig::multi_thread_tokio(),
         }
     }
 }
@@ -292,7 +291,11 @@ async fn do_recursive_download(
     let handle = tm
         .download_objects()
         .bucket(bucket)
-        .key_prefix(key_prefix)
+        .walker(
+            aws_sdk_s3_transfer_manager::io::walk::S3Walker::builder()
+                .prefix(key_prefix)
+                .build(),
+        )
         .destination(dest)
         .initiate()?;
 
@@ -495,7 +498,7 @@ async fn run(args: Args) -> Result<(), BoxError> {
     #[allow(unused_mut)]
     let mut config_loader = aws_sdk_s3_transfer_manager::from_env()
         .concurrency(args.concurrency.mode())
-        .runtime_mode(args.runtime.mode())
+        .runtime_config(args.runtime.mode())
         .part_size(PartSize::Target(args.part_size));
 
     // S3FIO_MEMORY_LIMIT=N caps the transfer manager's memory pool at N GiB

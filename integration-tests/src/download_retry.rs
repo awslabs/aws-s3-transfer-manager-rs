@@ -374,8 +374,12 @@ async fn slow_progressing_body_download_completes() {
 async fn corrupt_body_always_fails() {
     let t = Target::mock_gp().connect_with(Some(PART_SIZE)).await;
     let data = multipart_data();
-    t.put("obj", data, ChecksumStrategy::with_calculated_crc32())
-        .await;
+    t.put(
+        "obj",
+        data,
+        ChecksumStrategy::with_calculated_crc32_composite_if_multipart(),
+    )
+    .await;
 
     let mock = t.mock().expect("requires the mock backend");
     mock.insert_fault(
@@ -401,8 +405,12 @@ async fn corrupt_body_always_fails() {
 async fn corrupt_body_once_is_not_retried() {
     let t = Target::mock_gp().connect_with(Some(PART_SIZE)).await;
     let data = multipart_data();
-    t.put("obj", data, ChecksumStrategy::with_calculated_crc32())
-        .await;
+    t.put(
+        "obj",
+        data,
+        ChecksumStrategy::with_calculated_crc32_composite_if_multipart(),
+    )
+    .await;
 
     let mock = t.mock().expect("requires the mock backend");
     mock.insert_fault(
@@ -639,10 +647,9 @@ async fn requests_carry_per_bucket_retry_partition() {
     };
     let tm = TmClient::new(
         aws_sdk_s3_transfer_manager::Config::builder()
-            .s3_config(
-                aws_sdk_s3_transfer_manager::config::S3ClientConfig::new(s3.config().to_builder())
-                    .enable_runtime_http(false),
-            )
+            .s3_config(aws_sdk_s3_transfer_manager::config::S3ClientConfig::new(
+                s3.config().to_builder(),
+            ))
             .part_size(PART_SIZE)
             .build(),
     );

@@ -7,6 +7,7 @@
 
 mod pending;
 
+use crate::config::user_agent::OperationFeatures;
 use crate::error;
 use crate::scheduler::concurrency::ErrorKind;
 use std::any::Any;
@@ -66,8 +67,10 @@ pub(crate) mod wake_flag {
 /// # Contracts
 ///
 /// Implementations must uphold:
-/// - **Failed lifecycle**: record the error and signal termination before returning
-///   `WorkOutcome::Failed`.
+/// - **Failed lifecycle**: record the error before returning `WorkOutcome::Failed`.
+///   Then either end the transfer and signal termination, or keep it active
+///   with a wake path so `poll_work` drives it to an end (an upload aborts
+///   its multipart upload first).
 /// - **Pending/wake obligation**: every `PollWork::Pending` must first call
 ///   `ctx.set_pending(cause)` and have a future wake path. See
 ///   [`TransferContext`] for the wake primitive protocol.
@@ -242,31 +245,25 @@ impl PollWork {
     }
 }
 
-/// Result of executing a work item.
-///
-/// Contract between transfer state machines and the scheduler:
-/// - `Success`: Work completed. Scheduler continues polling the transfer for more work.
-/// - `Yielded`: Dispatched execution retired without completing a reportable I/O operation or
-///   reporting a failure. Transfer state has retained any continuation or has retracted or retired
-///   the speculative operation. The scheduler releases the execution slot without producing a
-///   concurrency-controller sample.
-/// - `Failed`: Transfer has already transitioned itself to terminal state (via `set_failed` +
-///   `signal_terminal`). Scheduler will not poll it again and will remove it once idle.
-/// - `Cancelled`: Transfer is already terminal (failed or cancelled by another work item).
-///   Same cleanup as `Failed`.
+/// How a work item's execution ended. Each variant states what the transfer guarantees in
+/// returning it.
 pub(crate) enum WorkOutcome {
     /// Work completed successfully.
     Success { data: Option<Box<dyn WorkData>> },
-    /// Dispatched execution retired without completing an I/O operation or reporting a failure.
-    ///
-    /// Before returning, transfer state must reconcile the work exactly once. If it retains a
-    /// continuation, that continuation must retain its progress and future wake path. The scheduler
-    /// releases the execution slot but does not report a completion sample to the concurrency
+    /// The work ended without completing an I/O operation or reporting a failure, and the
+    /// transfer continues. Unlike every other outcome, it is not a completion for the concurrency
     /// controller.
+    ///
+    /// The transfer has reconciled the work exactly once. A continuation it kept retains the
+    /// work's progress and a future wake path; otherwise the operation was retracted or retired.
     Yielded,
-    /// Work failed. Transfer must have called `set_failed` + `signal_terminal` before returning.
+    /// The work failed, and the transfer recorded the error.
+    ///
+    /// The transfer has ended, or stays active with a wake path to its end; see the Failed
+    /// lifecycle contract on [`Transfer`]. `classification` is the error's kind, if it has one.
     Failed { classification: Option<ErrorKind> },
-    /// Work was skipped or aborted because the transfer is already terminal.
+    /// The work was skipped, or stood down without an error of its own, because the transfer is
+    /// ending or has ended.
     Cancelled,
 }
 
@@ -402,6 +399,11 @@ impl StateMachineStatus {
     #[inline]
     pub(crate) fn is_active(&self) -> bool {
         self.0.load(Ordering::Acquire) == STATUS_ACTIVE
+    }
+
+    #[inline]
+    pub(crate) fn is_completed(&self) -> bool {
+        self.0.load(Ordering::Acquire) == STATUS_COMPLETED
     }
 
     #[inline]
@@ -558,6 +560,8 @@ pub(crate) struct TransferContext {
     pending_state: Option<Arc<TransferPendingState>>,
     /// Per-transfer metrics backing store
     pub(crate) metrics: Arc<MetricsState>,
+    /// User agent features of the operation this transfer belongs to
+    features: OperationFeatures,
 }
 
 /// In-progress measurement for one logical transfer-manager request.
@@ -820,8 +824,41 @@ impl TransferContext {
             completion_tx: Arc::new(Mutex::new(Some(completion_tx))),
             wake_flag: Arc::new(wake_flag::WakeFlag::new()),
             pending_state,
+            features: OperationFeatures::default(),
         };
         (ctx, completion_rx)
+    }
+
+    /// Marks every request this transfer issues with `features`.
+    pub(crate) fn with_features(mut self, features: OperationFeatures) -> Self {
+        self.features = features;
+        self
+    }
+
+    /// [`Handle::bucket_partition_override`](crate::client::Handle::bucket_partition_override)
+    /// carrying this transfer's user agent features.
+    pub(crate) fn bucket_partition_override(
+        &self,
+        bucket: Option<&str>,
+    ) -> aws_sdk_s3::config::Builder {
+        self.features
+            .apply(self.handle.bucket_partition_override(bucket))
+    }
+
+    /// [`Handle::download_get_override`](crate::client::Handle::download_get_override)
+    /// carrying this transfer's user agent features.
+    pub(crate) fn download_get_override(
+        &self,
+        bucket: Option<&str>,
+    ) -> aws_sdk_s3::config::Builder {
+        self.features
+            .apply(self.handle.download_get_override(bucket))
+    }
+
+    /// [`Handle::upload_override`](crate::client::Handle::upload_override) carrying this
+    /// transfer's user agent features.
+    pub(crate) fn upload_override(&self, bucket: Option<&str>) -> aws_sdk_s3::config::Builder {
+        self.features.apply(self.handle.upload_override(bucket))
     }
 
     /// Create a new transfer context with a specific ID (for testing).
@@ -1047,6 +1084,12 @@ impl TransferContext {
     #[inline]
     pub(crate) fn is_active(&self) -> bool {
         self.status.is_active()
+    }
+
+    /// Check if transfer completed successfully
+    #[inline]
+    pub(crate) fn is_completed(&self) -> bool {
+        self.status.is_completed()
     }
 
     /// Signal that the transfer has reached a terminal state.

@@ -27,8 +27,8 @@
 //! [`S3ClientConfig`]: aws_sdk_s3_transfer_manager::config::S3ClientConfig
 
 use aws_sdk_s3_transfer_manager::config::S3ClientConfig;
-use aws_sdk_s3_transfer_manager::types::RuntimeMode;
 use aws_sdk_s3_transfer_manager::Client as TmClient;
+use aws_sdk_s3_transfer_manager::RuntimeConfig;
 use s3_mock_server::S3MockServer;
 
 /// Installs a process-global tracing subscriber for test diagnosis, once.
@@ -94,14 +94,14 @@ impl MockTm {
 }
 
 /// Build a mock TM on the given runtime with default config.
-pub(crate) async fn mock_tm(runtime: RuntimeMode) -> MockTm {
+pub(crate) async fn mock_tm(runtime: RuntimeConfig) -> MockTm {
     mock_tm_with(runtime, |b| b).await
 }
 
 /// Build a mock TM, applying `configure` to the TM Config builder (part size,
 /// concurrency, ...). The runtime mode is set by the harness after `configure`.
 pub(crate) async fn mock_tm_with(
-    runtime: RuntimeMode,
+    runtime: RuntimeConfig,
     configure: impl FnOnce(
         aws_sdk_s3_transfer_manager::config::Builder,
     ) -> aws_sdk_s3_transfer_manager::config::Builder,
@@ -113,7 +113,7 @@ pub(crate) async fn mock_tm_with(
 /// [`S3ClientConfig`] (runtime-HTTP options) and `configure` to the TM Config
 /// builder.
 pub(crate) async fn mock_tm_with_s3_config(
-    runtime: RuntimeMode,
+    runtime: RuntimeConfig,
     configure_s3: impl FnOnce(S3ClientConfig) -> S3ClientConfig,
     configure: impl FnOnce(
         aws_sdk_s3_transfer_manager::config::Builder,
@@ -131,7 +131,7 @@ pub(crate) async fn mock_tm_with_s3_config(
         .expect("create bucket");
     let s3_config = configure_s3(mock_s3_config(&handle).await);
     let cfg = configure(aws_sdk_s3_transfer_manager::Config::builder().s3_config(s3_config))
-        .runtime_mode(runtime)
+        .runtime_config(runtime)
         .build();
     MockTm {
         server,
@@ -173,8 +173,6 @@ pub(crate) enum BucketKind {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Target {
     pub(crate) backend: Backend,
-    /// Read only on the real-S3 path to pick the bucket name.
-    #[cfg_attr(not(e2e_test), allow(dead_code))]
     pub(crate) bucket_kind: BucketKind,
 }
 
@@ -387,6 +385,30 @@ impl TmTestClient {
         self.s3_client
             .as_ref()
             .expect("s3() requires a real-S3 target")
+    }
+
+    /// HeadObject of part `part_number` of `key`, in checksum mode.
+    pub(crate) async fn head_part(
+        &self,
+        key: &str,
+        part_number: i32,
+    ) -> aws_sdk_s3::operation::head_object::HeadObjectOutput {
+        let client = match &self.mock {
+            Some(mock) => mock.handle.client().await,
+            #[cfg(e2e_test)]
+            None => self.s3().clone(),
+            #[cfg(not(e2e_test))]
+            None => unreachable!("every target is a mock without e2e_test"),
+        };
+        client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(self.key(key))
+            .part_number(part_number)
+            .checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled)
+            .send()
+            .await
+            .expect("HeadObject of a part")
     }
 
     /// Upload `data` under `key` with the given checksum strategy.

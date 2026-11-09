@@ -10,11 +10,18 @@
 mod tokio_mt;
 pub(crate) use tokio_mt::TokioMultiThreadRuntime;
 
-mod managed;
-pub(crate) use managed::ManagedThreadRuntime;
+#[cfg(test)]
+pub(crate) mod test_util;
 
-mod topology;
-pub(crate) use topology::Topology;
+mod shutdown;
+pub use shutdown::{ShutdownCompletion, ShutdownError, ShutdownErrorKind};
+
+// Managed execution spawns OS threads and builds a native HTTP transport,
+// neither of which wasm targets provide.
+#[cfg(not(target_family = "wasm"))]
+mod managed;
+#[cfg(not(target_family = "wasm"))]
+pub(crate) use managed::{prepare_components, ManagedExecution};
 
 #[allow(dead_code)]
 pub(crate) mod buffer_pool;
@@ -48,8 +55,11 @@ pub(crate) trait ExecutionRuntime: Send + Sync + std::fmt::Debug {
     /// Dispatch a batch of IO requests for execution.
     fn dispatch(&self, batch: &mut SubmissionGuard<'_, ScheduledWork>);
 
-    /// Shut down the runtime, draining in-flight work.
+    /// Requests execution shutdown.
     fn shutdown(&self);
+
+    /// Returns an observer for owned execution, or None for caller-owned execution.
+    fn shutdown_completion(&self) -> Option<ShutdownCompletion>;
 
     /// Remove all pending work for a transfer. Returns count removed.
     fn remove_pending_for_transfer(&self, id: TransferId) -> usize;
@@ -63,6 +73,10 @@ pub(crate) trait ExecutionRuntime: Send + Sync + std::fmt::Debug {
 /// Present only when that transport will be installed, so a runtime given
 /// `None` builds no HTTP client.
 #[derive(Debug, Clone)]
+#[cfg_attr(
+    target_family = "wasm",
+    expect(dead_code, reason = "read only by the managed runtime's transport")
+)]
 pub(crate) struct RuntimeHttpOptions {
     /// Interfaces to bind connections to, assigned to worker threads
     /// round-robin. Empty leaves interface selection to OS routing.
@@ -77,9 +91,13 @@ pub(crate) struct RuntimeHttpOptions {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RuntimeComponents {
     http_client: Option<SharedHttpClient>,
-    /// When true, file I/O runs directly on the calling thread (managed threads).
+    /// When true, file I/O runs directly on the calling thread: managed
+    /// threads, and wasm targets, whose threads are unavailable or cooperative.
     /// When false, file I/O is offloaded via spawn_blocking (shared runtimes).
     direct_io: bool,
+    /// Whether file bodies may read synchronously on the HTTP polling thread:
+    /// with TM-built managed HTTP, and on wasm targets.
+    direct_body_io: bool,
 }
 
 impl RuntimeComponents {
@@ -88,18 +106,35 @@ impl RuntimeComponents {
         self.http_client.as_ref()
     }
 
-    /// Set the HTTP client.
-    pub(crate) fn set_http_client(&mut self, client: SharedHttpClient) {
-        self.http_client = Some(client);
-    }
-
     /// Whether file I/O should run directly on the calling thread.
     pub(crate) fn direct_io(&self) -> bool {
         self.direct_io
     }
 
-    /// Set direct I/O mode.
-    pub(crate) fn set_direct_io(&mut self, direct: bool) {
-        self.direct_io = direct;
+    /// Whether file bodies may read synchronously when HTTP polls them.
+    pub(crate) fn direct_body_io(&self) -> bool {
+        self.direct_body_io
+    }
+
+    /// Enables direct transfer reads, and direct body reads only for owned HTTP.
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn managed(http_client: Option<SharedHttpClient>) -> Self {
+        Self {
+            direct_io: true,
+            direct_body_io: http_client.is_some(),
+            http_client,
+        }
+    }
+
+    /// Enables direct transfer and body reads without an HTTP client, for
+    /// targets where blocking offload cannot keep a read off the polling
+    /// thread: wasip1 and wasip2 cannot spawn the threads a blocking pool
+    /// needs, and wasip3's cooperative threads run one at a time.
+    pub(crate) fn inline_io() -> Self {
+        Self {
+            direct_io: true,
+            direct_body_io: true,
+            http_client: None,
+        }
     }
 }

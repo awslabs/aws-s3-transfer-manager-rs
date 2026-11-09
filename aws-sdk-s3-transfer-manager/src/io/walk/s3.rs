@@ -98,15 +98,13 @@ impl std::fmt::Debug for S3Walker {
 impl Default for S3Walker {
     /// A default walker that filters out 0-byte folder markers (keys ending in '/').
     fn default() -> Self {
-        S3Walker::builder()
-            .filter(exclude_s3_folder_markers)
-            .build()
+        S3Walker::builder().build()
     }
 }
 
 /// Exclude 0-byte objects whose key ends with `/`. These are "folder markers"
 /// created by the S3 console and have no meaningful content to download.
-pub(crate) fn exclude_s3_folder_markers(obj: &Object) -> bool {
+fn exclude_s3_folder_markers(obj: &Object) -> bool {
     let dominated_by_slash = obj.key().unwrap_or("").ends_with('/');
     let is_zero_byte = obj.size().unwrap_or(1) == 0;
     !(dominated_by_slash && is_zero_byte)
@@ -163,7 +161,8 @@ impl S3Walker {
 /// Builder for [`S3Walker`].
 ///
 /// All fields are optional with sensible defaults: no prefix, no delimiter,
-/// no filter, no pagination overrides.
+/// no filter, no pagination overrides. Every walker skips 0-byte folder
+/// markers (keys ending in `/`), whether or not a filter is set.
 #[derive(Default)]
 pub struct S3WalkerBuilder {
     prefix: Option<String>,
@@ -227,6 +226,9 @@ impl S3WalkerBuilder {
     /// The predicate receives a [`crate::model::Object`] containing the
     /// metadata returned by `ListObjectsV2`. Returning `false` drops the
     /// object silently.
+    ///
+    /// Each call replaces any previously set filter. 0-byte folder markers
+    /// (keys ending in `/`) are skipped before the filter runs.
     #[must_use]
     pub fn filter(mut self, f: impl Fn(&Object) -> bool + Send + Sync + 'static) -> Self {
         self.filter = Some(Arc::new(f));
@@ -393,6 +395,11 @@ impl std::fmt::Debug for S3Walk {
 }
 
 impl S3Walk {
+    /// The prefix this walk lists under. Every key the walk yields starts with it.
+    pub(crate) fn prefix(&self) -> Option<&str> {
+        self.config.prefix.as_deref()
+    }
+
     /// Return the next [`crate::model::Object`] from the walk.
     ///
     /// Returns:
@@ -531,9 +538,11 @@ impl S3Walk {
             .into_iter()
             .map(|object| crate::sdk_v1::object_from_sdk(&object))
             .collect();
-        if let Some(ref filter) = self.config.filter {
-            objects.retain(|obj| filter(obj));
-        }
+        // Folder markers are always skipped; the caller's filter only sees
+        // the objects that remain.
+        objects.retain(|obj| {
+            exclude_s3_folder_markers(obj) && self.config.filter.as_ref().is_none_or(|f| f(obj))
+        });
 
         let common_prefixes = output
             .common_prefixes
@@ -613,7 +622,7 @@ mod tests {
             .build();
         let tm = crate::Client::new(
             crate::Config::builder()
-                .s3_config(crate::config::S3ClientConfig::new(&shared).enable_runtime_http(false))
+                .s3_config(crate::config::S3ClientConfig::new(&shared))
                 .build(),
         );
         let context = S3WalkContext::builder()
@@ -710,6 +719,59 @@ mod tests {
             keys.push(object.key.unwrap());
         }
         assert_eq!(keys, vec!["file.txt", "other.txt"]);
+    }
+
+    /// Helper function to test walker filter . Lists one page of a folder marker,
+    /// a file and a non-empty key ending in `/`, and returns the keys the walker yields.
+    async fn walk_marker_page(builder: S3WalkerBuilder) -> Vec<String> {
+        let rule = mock!(aws_sdk_s3::Client::list_objects_v2).then_output(|| {
+            ListObjectsV2Output::builder()
+                .set_contents(Some(vec![
+                    Object::builder().key("dir/").size(0).build(),
+                    Object::builder().key("dir/file.txt").size(4).build(),
+                    Object::builder().key("data/").size(4).build(),
+                ]))
+                .build()
+        });
+        let client = mock_client!(aws_sdk_s3, RuleMode::Sequential, &[&rule]);
+
+        let mut walk = builder.build().walk(s3ctx(client, "test-bucket"));
+        let mut keys = Vec::new();
+        while let Some(result) = walk.next().await {
+            keys.push(result.unwrap().key.unwrap());
+        }
+        keys
+    }
+
+    /// Only 0-byte keys ending in `/` are skipped; a non-empty one is kept.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_folder_markers_skipped_without_filter() {
+        assert_eq!(
+            walk_marker_page(walker()).await,
+            vec!["dir/file.txt", "data/"]
+        );
+    }
+
+    /// A filter that accepts everything does not bring folder markers back,
+    /// and the filter never sees them.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_folder_markers_skipped_with_filter() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+        let builder = walker().filter(move |obj: &crate::model::Object| {
+            recorder
+                .lock()
+                .unwrap()
+                .push(obj.key().unwrap_or_default().to_owned());
+            true
+        });
+        assert_eq!(
+            walk_marker_page(builder).await,
+            vec!["dir/file.txt", "data/"]
+        );
+        assert_eq!(*seen.lock().unwrap(), vec!["dir/file.txt", "data/"]);
     }
 
     #[cfg_attr(miri, ignore)]

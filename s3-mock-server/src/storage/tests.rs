@@ -67,6 +67,7 @@ async fn test_multipart_streaming_comprehensive<S: StorageBackend>(storage: &S) 
         upload_id,
         part_number: 1,
         content: part1.clone(),
+        client_checksum_algorithms: vec![],
     };
     let etag1 = storage.upload_part(request1).await.unwrap().etag;
 
@@ -74,6 +75,7 @@ async fn test_multipart_streaming_comprehensive<S: StorageBackend>(storage: &S) 
         upload_id,
         part_number: 2,
         content: part2.clone(),
+        client_checksum_algorithms: vec![],
     };
     let etag2 = storage.upload_part(request2).await.unwrap().etag;
 
@@ -81,6 +83,7 @@ async fn test_multipart_streaming_comprehensive<S: StorageBackend>(storage: &S) 
         upload_id,
         part_number: 3,
         content: part3.clone(),
+        client_checksum_algorithms: vec![],
     };
     let etag3 = storage.upload_part(request3).await.unwrap().etag;
 
@@ -90,6 +93,7 @@ async fn test_multipart_streaming_comprehensive<S: StorageBackend>(storage: &S) 
         upload_id,
         parts: vec![(1, etag1), (2, etag2), (3, etag3)],
         client_checksums: None,
+        listed_part_checksum: None,
     };
     storage
         .complete_multipart_upload(complete_request)
@@ -188,6 +192,8 @@ async fn test_concurrent_operations<S: StorageBackend>(storage: &S) {
             content_language: None,
             client_checksums: None,
             precondition: Default::default(),
+            etag: None,
+            restore_status: None,
         };
 
         storage.put_object(request).await.unwrap();
@@ -255,6 +261,8 @@ async fn test_storage_backend_consistency() {
             content_language: None,
             client_checksums: None,
             precondition: Default::default(),
+            etag: None,
+            restore_status: None,
         };
         let stored_metadata = storage.put_object(request).await.unwrap();
 
@@ -435,6 +443,107 @@ async fn test_write_preconditions<S: StorageBackend>(storage: &S) {
         .is_none());
 }
 
+/// A rename moves the data and the metadata to the destination, replacing it, and fails with
+/// `NoSuchKey` for a missing source or `RenamePreconditionFailed` for a failed condition without
+/// moving anything. A retry with the client token of a rename that succeeded succeeds without
+/// renaming again, and another request with the token fails with `IdempotentParameterMismatch`.
+async fn test_rename<S: StorageBackend>(storage: &S) {
+    use crate::storage::{RenamePreconditions, RenameRequest};
+    let request = |src: &str, dst: &str, preconditions, client_token: Option<&str>| RenameRequest {
+        src_key: src.to_owned(),
+        dst_key: dst.to_owned(),
+        preconditions,
+        client_token: client_token.map(str::to_owned),
+    };
+    storage.create_bucket(TEST_BUCKET).await.unwrap();
+    let etag = storage
+        .put_object(store_request("dir/source", b"content"))
+        .await
+        .unwrap()
+        .object_integrity
+        .etag()
+        .unwrap();
+    storage
+        .put_object(store_request("destination", b"old"))
+        .await
+        .unwrap();
+
+    let conditions = RenamePreconditions {
+        if_none_match_any: true,
+        ..Default::default()
+    };
+    let result = storage
+        .rename_object(
+            TEST_BUCKET,
+            request("dir/source", "destination", conditions, None),
+        )
+        .await;
+    assert!(
+        matches!(
+            result,
+            Err(crate::Error::RenamePreconditionFailed("If-None-Match"))
+        ),
+        "{result:?}"
+    );
+    assert_eq!(content_of(storage, "destination").await.unwrap(), "old");
+
+    let conditions = RenamePreconditions {
+        source_if_match: Some(etag.clone()),
+        ..Default::default()
+    };
+    let with_token = || {
+        request(
+            "dir/source",
+            "other/destination",
+            conditions.clone(),
+            Some("t"),
+        )
+    };
+    storage
+        .rename_object(TEST_BUCKET, with_token())
+        .await
+        .unwrap();
+    // A retry with the token succeeds without renaming again; another request with it fails.
+    storage
+        .rename_object(TEST_BUCKET, with_token())
+        .await
+        .unwrap();
+    let result = storage
+        .rename_object(
+            TEST_BUCKET,
+            request("dir/source", "elsewhere", Default::default(), Some("t")),
+        )
+        .await;
+    assert!(
+        matches!(result, Err(crate::Error::IdempotentParameterMismatch)),
+        "{result:?}"
+    );
+    storage
+        .rename_object(
+            TEST_BUCKET,
+            request("other/destination", "destination", Default::default(), None),
+        )
+        .await
+        .unwrap();
+    assert!(content_of(storage, "dir/source").await.is_none());
+    assert!(content_of(storage, "other/destination").await.is_none());
+    assert_eq!(content_of(storage, "destination").await.unwrap(), "content");
+    let metadata = storage
+        .head_object(TEST_BUCKET, "destination")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(metadata.etag, etag);
+
+    let result = storage
+        .rename_object(
+            TEST_BUCKET,
+            request("missing", "destination", Default::default(), None),
+        )
+        .await;
+    assert!(matches!(result, Err(crate::Error::NoSuchKey)), "{result:?}");
+}
+
 /// `delete_object_if_match` deletes the object only when its ETag matches, quoted or not, or the
 /// condition is `*`, fails with `PreconditionFailed` otherwise, and with `NoSuchKey` for a
 /// missing key.
@@ -493,4 +602,163 @@ async fn test_filesystem_write_preconditions() {
     let dir = tempdir().unwrap();
     test_write_preconditions(&FilesystemStorage::new(dir.path().join("a")).await.unwrap()).await;
     test_delete_object_if_match(&FilesystemStorage::new(dir.path().join("b")).await.unwrap()).await;
+}
+
+#[tokio::test]
+async fn test_in_memory_rename() {
+    test_rename(&InMemoryStorage::new()).await;
+}
+
+/// `update_metadata` changes the stored metadata and leaves the data alone, and fails with
+/// `NoSuchKey` for a missing key.
+async fn test_update_metadata<S: StorageBackend>(storage: &S) {
+    storage.create_bucket(TEST_BUCKET).await.unwrap();
+    storage
+        .put_object(store_request("object", b"content"))
+        .await
+        .unwrap();
+    storage
+        .update_metadata(
+            TEST_BUCKET,
+            "object",
+            Box::new(|metadata| metadata.storage_class = Some("GLACIER".to_owned())),
+        )
+        .await
+        .unwrap();
+    let metadata = storage
+        .head_object(TEST_BUCKET, "object")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(metadata.storage_class.as_deref(), Some("GLACIER"));
+    assert_eq!(content_of(storage, "object").await.unwrap(), "content");
+
+    let result = storage
+        .update_metadata(TEST_BUCKET, "missing", Box::new(|_| {}))
+        .await;
+    assert!(matches!(result, Err(crate::Error::NoSuchKey)), "{result:?}");
+}
+
+#[tokio::test]
+async fn test_in_memory_update_metadata() {
+    test_update_metadata(&InMemoryStorage::new()).await;
+}
+
+#[tokio::test]
+async fn test_filesystem_update_metadata() {
+    let dir = tempdir().unwrap();
+    test_update_metadata(&FilesystemStorage::new(dir.path()).await.unwrap()).await;
+}
+
+/// `list_multipart_uploads` reports the uploads in progress in one bucket, ordered by key, and
+/// drops an upload once it is aborted.
+async fn test_list_multipart_uploads<S: StorageBackend>(storage: &S) {
+    storage.create_bucket(TEST_BUCKET).await.unwrap();
+    storage.create_bucket("other-bucket").await.unwrap();
+    for (bucket, key, upload_id) in [
+        (TEST_BUCKET, "b", "upload-1"),
+        (TEST_BUCKET, "a", "upload-2"),
+        ("other-bucket", "c", "upload-3"),
+    ] {
+        let request = CreateMultipartUploadRequest {
+            bucket,
+            key,
+            upload_id,
+            metadata: ObjectMetadata::default(),
+            checksum_type: aws_sdk_s3::types::ChecksumType::Composite,
+        };
+        storage.create_multipart_upload(request).await.unwrap();
+    }
+    let listed = |uploads: Vec<crate::storage::MultipartUploadInfo>| -> Vec<(String, String)> {
+        uploads
+            .into_iter()
+            .map(|upload| (upload.key, upload.upload_id))
+            .collect()
+    };
+    assert_eq!(
+        listed(storage.list_multipart_uploads(TEST_BUCKET).await.unwrap()),
+        [
+            ("a".to_owned(), "upload-2".to_owned()),
+            ("b".to_owned(), "upload-1".to_owned())
+        ]
+    );
+    storage.abort_multipart_upload("upload-2").await.unwrap();
+    assert_eq!(
+        listed(storage.list_multipart_uploads(TEST_BUCKET).await.unwrap()),
+        [("b".to_owned(), "upload-1".to_owned())]
+    );
+}
+
+#[tokio::test]
+async fn test_in_memory_list_multipart_uploads() {
+    test_list_multipart_uploads(&InMemoryStorage::new()).await;
+}
+
+#[tokio::test]
+async fn test_filesystem_list_multipart_uploads() {
+    let dir = tempdir().unwrap();
+    test_list_multipart_uploads(&FilesystemStorage::new(dir.path()).await.unwrap()).await;
+}
+
+/// Appends to a multipart object count from its parts: with 3 parts, the 9,997th append makes
+/// 10,000 and the next fails with TooManyParts, leaving the object as it was.
+#[tokio::test]
+async fn test_in_memory_append_part_limit_counts_multipart_parts() {
+    let storage = InMemoryStorage::new();
+    storage.create_bucket(TEST_BUCKET).await.unwrap();
+    let (key, upload_id) = ("appended", "upload-limit");
+    storage
+        .create_multipart_upload(CreateMultipartUploadRequest {
+            bucket: TEST_BUCKET,
+            key,
+            upload_id,
+            metadata: ObjectMetadata::default(),
+            checksum_type: aws_sdk_s3::types::ChecksumType::FullObject,
+        })
+        .await
+        .unwrap();
+    let mut parts = Vec::new();
+    for part_number in 1..=3 {
+        let request = UploadPartRequest {
+            upload_id,
+            part_number,
+            content: Bytes::from_static(b"p"),
+            client_checksum_algorithms: vec![],
+        };
+        parts.push((
+            part_number,
+            storage.upload_part(request).await.unwrap().etag,
+        ));
+    }
+    storage
+        .complete_multipart_upload(CompleteMultipartUploadRequest {
+            bucket: TEST_BUCKET,
+            upload_id,
+            parts,
+            client_checksums: None,
+            listed_part_checksum: None,
+        })
+        .await
+        .unwrap();
+    let append = |offset: u64| crate::storage::AppendObjectRequest {
+        bucket: TEST_BUCKET.to_owned(),
+        key: key.to_owned(),
+        offset,
+        content: Bytes::from_static(b"x"),
+        precondition: crate::storage::WritePrecondition::None,
+        checksum_algorithm: None,
+    };
+    for offset in 3..10_000 {
+        storage.append_object(append(offset)).await.unwrap();
+    }
+    assert!(matches!(
+        storage.append_object(append(10_000)).await,
+        Err(crate::Error::TooManyParts)
+    ));
+    let metadata = storage
+        .head_object(TEST_BUCKET, key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(metadata.content_length, 10_000);
 }

@@ -79,29 +79,6 @@ pub enum MemoryConfig {
     Explicit(BufferPool),
 }
 
-/// Selects the execution runtime the transfer manager runs on.
-#[non_exhaustive]
-#[derive(Debug, Clone, Default)]
-pub enum RuntimeMode {
-    /// Managed OS threads owned by the transfer manager (default, recommended).
-    ///
-    /// Spawns and owns its own worker threads; the performance path.
-    #[default]
-    Managed,
-    /// Run on the caller's tokio multi-threaded runtime instead of spawning
-    /// dedicated threads.
-    ///
-    /// An escape hatch for embedding the transfer manager where it must not
-    /// spawn its own OS threads. This is not a performance tuning knob —
-    /// `Managed` is faster by design; prefer it unless you specifically need
-    /// the transfer manager to run on your existing runtime.
-    ///
-    /// Requires a multi-threaded runtime: transfer workers run via
-    /// `tokio::spawn`, so on a current-thread runtime they serialize onto one
-    /// thread and throughput collapses.
-    MultiThreadTokio,
-}
-
 /// The concurrency mode the client should use for executing requests.
 #[non_exhaustive]
 #[derive(Debug, Clone, Default)]
@@ -191,10 +168,39 @@ pub enum FailedMultipartUploadPolicy {
 pub struct AbortedUpload {
     pub(crate) upload_id: Option<String>,
     pub(crate) request_charged: Option<crate::model::RequestCharged>,
+    pub(crate) outcome: AbortOutcome,
+    pub(crate) output: Option<crate::operation::upload::UploadOutput>,
+}
+
+/// What an abort established about the object.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AbortOutcome {
+    /// The upload was stopped before S3 completes the object.
+    #[default]
+    Cancelled,
+    /// S3 finished storing the object before the abort took effect. The object is not
+    /// deleted; its metadata is available from [`AbortedUpload::output`].
+    AlreadyCompleted,
+    /// The upload was stopped before S3 completed the object, and its multipart upload
+    /// was left open.
+    Retained,
 }
 
 impl AbortedUpload {
-    /// Get the multipart upload ID that was cancelled
+    /// Returns whether the abort stopped the upload or the object already
+    /// exists.
+    pub fn outcome(&self) -> AbortOutcome {
+        self.outcome
+    }
+
+    /// Returns the upload's output when [`outcome`](Self::outcome) is
+    /// [`AbortOutcome::AlreadyCompleted`], and `None` otherwise.
+    pub fn output(&self) -> Option<&crate::operation::upload::UploadOutput> {
+        self.output.as_ref()
+    }
+    /// Get the multipart upload ID that was aborted, or that was left open when
+    /// [`outcome`](Self::outcome) is [`AbortOutcome::Retained`].
     ///
     /// Not present for uploads that did not utilize a multipart upload
     pub fn upload_id(&self) -> Option<&str> {

@@ -16,6 +16,21 @@ The S3 Mock Server provides a local HTTP server that implements the S3 API opera
 
 ## Usage
 
+### Command Line
+
+The `s3-mock-server` binary serves in-memory storage on an ephemeral port of `127.0.0.1` until it
+receives SIGINT:
+
+```sh
+cargo run -p s3-mock-server -- [--slow-down-once <bucket>/<key>]... [<bucket>...]
+```
+
+It creates each bucket named on the command line, and answers the first GetObject, PutObject, or
+UploadPart request for each `--slow-down-once` object with 503 SlowDown. It then prints its
+address, such as `127.0.0.1:49152`, as the first line of standard output once it accepts
+connections. Clients sign requests with access key `mock-akid` and secret key `mock-secret`, and
+address buckets path-style.
+
 ### Basic Setup
 
 ```rust
@@ -129,16 +144,93 @@ async fn test_filesystem_storage() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-### Conditional Requests
+### Conditional Writes, Appends and Renames
 
 - GetObject, HeadObject and DeleteObject honor `If-Match`; PutObject honors `If-Match` with an
   ETag and `If-None-Match: *`. The server ignores other conditions. The in-memory store checks a
   write's or a delete's condition atomically with it.
+- PutObject with `x-amz-write-offset-bytes` appends to an object in directory buckets (in-memory
+  store only), honoring `If-Match` and `If-None-Match: *`. Unlike S3's, an append's 412 does not
+  name the failed condition in a `Condition` element.
+- RenameObject is served in directory buckets (in-memory store only), honoring `If-Match`,
+  `If-None-Match: *`, `x-amz-rename-source-if-match` and `x-amz-client-token`. Other conditions
+  fail with 501 NotImplemented.
+
+### Archived Objects
+
+- Objects in `GLACIER` and `DEEP_ARCHIVE` cannot be read until restored (403
+  InvalidObjectState). RestoreObject restores them immediately, answering 200 (S3 answers 202 for
+  a new restore); `S3MockServer::set_restore_status` sets any restore status,
+  including a restore in progress, which a further RestoreObject fails with 409.
+
+### Storage Classes
+
+GetObject and HeadObject omit `x-amz-storage-class` for `STANDARD` objects; ListObjectsV2 reports
+`STANDARD` for objects stored without a storage class, as S3 general purpose buckets do.
+
+### Checksums
+
+- GetObject and HeadObject return an object's checksums only when the request sets
+  `x-amz-checksum-mode: ENABLED`, as S3 does. The SDK sets it on GetObject unless response
+  checksum validation is only performed when required.
+- PutObject and UploadPart check `x-amz-checksum-*` and `Content-MD5` headers as S3 general
+  purpose buckets do: a malformed value fails with InvalidRequest (InvalidDigest for
+  `Content-MD5`) before the body is read, and a body that does not match fails with BadDigest,
+  storing nothing.
+- Objects report their checksum type, on reads, writes and listings:
+  COMPOSITE for a multipart object whose checksum combines its parts' checksums, FULL_OBJECT
+  otherwise.
+- A GetObject or HeadObject with `partNumber` returns or describes that part, with its
+  `Content-Range`; an object uploaded in one request is a single part. A HeadObject with a `Range`
+  describes the range. HeadObject is always answered 200, where S3 answers 206 for a part or a
+  range.
+- UploadPart, CompleteMultipartUpload and reads of a part (by `partNumber` or by a range) report
+  and check part checksums according to the checksum algorithm and type the multipart upload was
+  created with.
+
+### Listing
+
+ListObjectsV2 pages hold at most `max-keys` entries, counting each common prefix once. Listed
+objects report their checksum algorithms, storage class and, when requested, restore status.
+General purpose buckets list keys in lexicographic order and never split a common prefix across
+pages; directory buckets list them in a fixed pseudo-random order.
+
+### Directory Buckets
+
+Buckets whose names end in `--x-s3`, such as `amzn-s3-demo-bucket--usw2-az1--x-s3`, are directory
+buckets (S3 Express One Zone), with S3 Express sessions and the behavior of directory buckets.
+
+**Sessions.** The server serves CreateSession (`GET /{bucket}?session`), which returns credentials
+valid for five minutes, in `ReadWrite` or `ReadOnly` mode. A directory bucket accepts requests
+signed with a session's credentials and its token in `x-amz-s3session-token`, or with the server's
+credentials and no token. `S3MockServer::reset` forgets all sessions.
+
+**Creating and deleting directory buckets.** Create them with `S3MockServer::create_bucket`, and
+remove them with `S3MockServer::reset`. The SDK's CreateBucket and DeleteBucket for a directory
+bucket fail against the server.
+
+**Differences from general purpose buckets.**
+
+- Objects are EXPRESS_ONEZONE. Any other storage class fails with 400 InvalidStorageClass, and
+  EXPRESS_ONEZONE does in general purpose buckets.
+- `Content-MD5` fails with 501 NotImplemented.
+- ListObjectsV2 lists keys in a fixed pseudo-random order (see *Listing*). It fails with 400
+  InvalidRequest for a delimiter other than `/` or a prefix that does not end in `/`, and with
+  501 NotSupported for `start-after`.
+- Part checksums: every part of an upload created with a checksum algorithm must carry a checksum.
+- Appends and RenameObject are served; general purpose buckets fail them with 501
+  NotImplemented.
 
 ### Buckets
 
 Create buckets with CreateBucket or `S3MockServer::create_bucket` before using them: object
 requests for a missing bucket fail with NoSuchBucket.
+
+### Seeding and Inspection
+
+`add_object_with` seeds an object directly in storage. `AddObjectRequest` sets the content type,
+user metadata and last-modified time, and also an explicit ETag, storage class, restore status and
+checksum algorithms. `list_multipart_uploads` reports the multipart uploads in progress.
 
 ### Request Counts and Faults
 
@@ -146,12 +238,12 @@ The server counts the requests it receives per operation, and can fail or reshap
 `FaultTarget` matches:
 
 ```rust
-use s3_mock_server::{FaultTarget, FaultType, Occurrence, Operation};
+use s3_mock_server::{Error, FaultTarget, FaultType, Occurrence, Operation};
 
 // Fail the second HeadObject request for `key` that the target sees with 403 AccessDenied.
 server.insert_fault_for(
     FaultTarget::operation(Operation::HeadObject).bucket("test-bucket").key("key"),
-    FaultType::ServiceError { status: 403, code: "AccessDenied" },
+    FaultType::Error(Error::AccessDenied),
     1,
     Occurrence::Once,
 );
@@ -163,6 +255,12 @@ assert_eq!(server.request_count(Operation::HeadObject), 2);
 
 `insert_fault(bucket, key, ..)` targets the GetObject, PutObject and UploadPart requests for one
 key. Counts and faults apply per HTTP request, so each retry and each part request counts.
+`FaultType::Error(Error::Custom { code, status, message })` answers with an error the server does
+not otherwise send, such as 400 RequestTimeout.
+
+A request draws its fault once its signature has been verified. CreateSession is affected only by
+faults that fail the request (`FaultType::Error`). A PutObject whose chunked body declares trailing
+checksums is read in full before it is stored.
 
 ## License
 

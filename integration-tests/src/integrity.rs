@@ -115,7 +115,7 @@
 //! object, SHA-256 for the composite case.
 
 use crate::assertions::{assert_integrity_error, assert_same_content};
-use crate::harness::Target;
+use crate::harness::{BucketKind, Target};
 use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
 use aws_sdk_s3_transfer_manager::operation::download::DownloadOutput;
 use aws_sdk_s3_transfer_manager::operation::upload::ChecksumStrategy;
@@ -342,6 +342,27 @@ async fn multipart_full_object(target: Target) {
         output.integrity_checks().checksum_crc32().is_none(),
         "must not surface a part checksum as the object checksum"
     );
+
+    // S3 returns the checksum of a part of a FULL_OBJECT multipart object only in directory
+    // buckets; a general purpose bucket returns none.
+    let part = t.head_part("obj", 1).await;
+    match target.bucket_kind {
+        BucketKind::GeneralPurpose => assert!(
+            part.checksum_crc32().is_none(),
+            "a general purpose bucket returns no checksum for a part of a FULL_OBJECT object"
+        ),
+        #[cfg(e2e_test)]
+        BucketKind::Express => {
+            assert!(
+                part.checksum_crc32().is_some(),
+                "a directory bucket returns the checksum of a part of a FULL_OBJECT object"
+            );
+            assert_eq!(
+                part.checksum_type(),
+                Some(&aws_sdk_s3::types::ChecksumType::FullObject)
+            );
+        }
+    }
 
     t.shutdown().await;
 }
@@ -749,8 +770,12 @@ async fn tampered_many_part_file_cleans_up(target: Target) {
     let dest = dir.path().join("dest.bin");
     let _ = write_pattern_file(&src, many_part_len());
 
-    t.put_from_path("obj", &src, ChecksumStrategy::with_calculated_crc32())
-        .await;
+    t.put_from_path(
+        "obj",
+        &src,
+        ChecksumStrategy::with_calculated_crc32_composite_if_multipart(),
+    )
+    .await;
 
     let mock = t.mock().expect("tamper faults require the mock backend");
     // Skip the first 8 chunks so several parts flush to the temp before the
@@ -866,8 +891,12 @@ async fn tampered_multipart_errors(target: Target) {
     // a per-part checksum the SDK validates, so a tampered checksum fails.
     let t = target.connect_with(Some(ALIGNED_PART_SIZE)).await;
     let data = multipart_data();
-    t.put("obj", data, ChecksumStrategy::with_calculated_crc32())
-        .await;
+    t.put(
+        "obj",
+        data,
+        ChecksumStrategy::with_calculated_crc32_composite_if_multipart(),
+    )
+    .await;
 
     let mock = t.mock().expect("tamper faults require the mock backend");
     // Fail every chunk for a deterministic transfer outcome.
@@ -942,8 +971,12 @@ async fn multipart_aligned_round_trips_real_express() {
 async fn multipart_default_tamper_caught(target: Target) {
     let t = target.connect().await; // default (Auto) part size -> auto-aligned
     let data = multipart_data();
-    t.put("obj", data, ChecksumStrategy::with_calculated_crc32())
-        .await;
+    t.put(
+        "obj",
+        data,
+        ChecksumStrategy::with_calculated_crc32_composite_if_multipart(),
+    )
+    .await;
 
     let mock = t.mock().expect("requires the mock backend");
     mock.insert_fault(

@@ -8,6 +8,8 @@
 
 use std::fmt::Debug;
 
+use base64::Engine;
+
 use aws_sdk_s3::config::http::HttpResponse;
 use aws_sdk_s3::config::retry::RetryConfig;
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
@@ -33,13 +35,25 @@ impl Fixture {
     }
 
     pub async fn with(builder: S3MockServerBuilder) -> Self {
+        Self::with_bucket(builder, format!("test-bucket-{}", Uuid::new_v4())).await
+    }
+
+    /// A fixture whose bucket is a directory bucket, whose name ends in `--x-s3`.
+    pub async fn directory() -> Self {
+        Self::with_bucket(
+            S3MockServer::builder(),
+            format!("test-{}--usw2-az1--x-s3", Uuid::new_v4()),
+        )
+        .await
+    }
+
+    async fn with_bucket(builder: S3MockServerBuilder, bucket: String) -> Self {
         let server = builder
             .with_in_memory_store()
             .build()
             .expect("build server");
         let handle = server.start().await.expect("start server");
         let s3 = no_retry(&handle.client().await);
-        let bucket = format!("test-bucket-{}", Uuid::new_v4());
         server.create_bucket(&bucket).await.expect("create bucket");
         Self {
             server,
@@ -131,4 +145,37 @@ pub fn assert_failure(failure: &Failure, status: u16, code: &str) {
 /// The quoted MD5 ETag S3 gives an object uploaded in one request.
 pub fn md5_etag(content: &[u8]) -> String {
     format!("\"{}\"", hex::encode(md5::compute(content).0))
+}
+
+pub fn crc32(data: &[u8]) -> String {
+    let mut digest = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc);
+    digest.update(data);
+    base64::engine::general_purpose::STANDARD.encode((digest.finalize() as u32).to_be_bytes())
+}
+
+pub fn crc32c(data: &[u8]) -> String {
+    let mut digest = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32Iscsi);
+    digest.update(data);
+    base64::engine::general_purpose::STANDARD.encode((digest.finalize() as u32).to_be_bytes())
+}
+
+pub fn crc64nvme(data: &[u8]) -> String {
+    let mut digest = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc64Nvme);
+    digest.update(data);
+    base64::engine::general_purpose::STANDARD.encode(digest.finalize().to_be_bytes())
+}
+
+/// The `Condition` element of the error document of a failed request, if any. The response is
+/// an XML error document.
+pub fn condition<E>(err: &SdkError<E, HttpResponse>) -> Option<String> {
+    let response = err.raw_response().unwrap();
+    assert_eq!(
+        response.headers().get("content-type"),
+        Some("application/xml"),
+        "{response:?}"
+    );
+    let body = String::from_utf8(response.body().bytes().unwrap().to_vec()).unwrap();
+    let (_, rest) = body.split_once("<Condition>")?;
+    let (condition, _) = rest.split_once("</Condition>")?;
+    Some(condition.to_owned())
 }

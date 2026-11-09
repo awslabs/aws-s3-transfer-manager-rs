@@ -17,9 +17,9 @@ env:
   # Change to specific Rust release to pin
   rust_stable: stable
   rust_nightly: nightly-2026-09-10
-  rust_clippy: '1.94.1'
+  rust_clippy: '1.96.0'
   # When updating this, also update relevant docs
-  rust_min: '1.94.1'
+  rust_min: '1.96.0'
   CI_ROLE_ARN: ${{ secrets.CI_ROLE_ARN }}
   AWS_REGION: us-west-2
 
@@ -54,6 +54,7 @@ jobs:
       - loom
       - semver
       - modeled-codegen
+      - release-tools
     steps:
       - name: Verify required results
         env:
@@ -65,6 +66,65 @@ jobs:
               <<<"$NEEDS_JSON" >&2
             exit 1
           fi
+
+  release-tools:
+    name: Release tooling
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: extractions/setup-just@v3
+      - name: Install Rust ${{ env.rust_min }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.rust_min }}
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            tools/tmdev -> target
+          prefix-key: v1-release-rust
+      - name: Format, lint, and test the locked developer tool
+        run: |
+          cargo fmt --manifest-path tools/tmdev/Cargo.toml -- --check
+          cargo clippy --locked --manifest-path tools/tmdev/Cargo.toml \
+            --target-dir tools/tmdev/target --all-targets --no-deps -- -D warnings
+          cargo test --locked --manifest-path tools/tmdev/Cargo.toml \
+            --target-dir tools/tmdev/target --all-targets
+      - name: Audit published workspace dependency requirements
+        run: just release audit
+      - name: Check developer tool lockfile
+        run: git diff --exit-code -- tools/tmdev/Cargo.lock
+      - name: Detect release preparation
+        id: changes
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if git diff --quiet "$PR_BASE_SHA" HEAD -- release.toml; then
+            echo "record=false" >> "$GITHUB_OUTPUT"
+          else
+            status=$?
+            if [[ "$status" != 1 ]]; then
+              exit "$status"
+            fi
+            echo "record=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Validate the release record
+        if: steps.changes.outputs.record == 'true'
+        run: just release check --ref HEAD
+      - name: Verify the release packages
+        if: steps.changes.outputs.record == 'true'
+        run: just release publish --ref HEAD --dry-run
+      - name: Save the release report
+        if: always() && steps.changes.outputs.record == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-preparation-plan
+          path: target/release/plan.json
+          if-no-files-found: warn
 
   modeled-codegen:
     name: Modeled API generation
@@ -149,6 +209,7 @@ jobs:
       - musl
       - freebsd
       - android
+      - wasm32-wasi
       - e2e
     steps:
       - name: Verify platform results
@@ -362,6 +423,105 @@ jobs:
           "${{ matrix.page_size }}"
           "${{ matrix.system_image_target }}"
 
+  wasm32-wasi:
+    name: ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    needs: basics
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: wasm32-wasip2
+            nightly: false
+            rustflags: -Dwarnings --cfg tokio_unstable
+          # Only nightly ships a prebuilt wasm32-wasip3 standard library.
+          - target: wasm32-wasip3
+            nightly: true
+            rustflags: -Dwarnings -Adeprecated --cfg tokio_unstable
+    env:
+      # The S3 client's tokio integration enables tokio's `fs` feature, and the
+      # harness's HTTP connector enables `net`. tokio accepts both on wasm only
+      # with `tokio_unstable`.
+      RUSTFLAGS: ${{ matrix.rustflags }}
+      HARNESS: ${{ github.workspace }}/target/${{ matrix.target }}/release/wasm32-wasi-tests.wasm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust ${{ matrix.nightly && env.rust_nightly || env.rust_clippy }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.nightly && env.rust_nightly || env.rust_clippy }}
+          targets: ${{ matrix.target }}
+          components: clippy
+      - name: Install Wasmtime
+        uses: bytecodealliance/actions/wasmtime/setup@v1
+        with:
+          # Wasmtime 39 rejects the wasm32-wasip3 components that the pinned
+          # nightly builds.
+          version: "50.0.0"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Clippy
+        run: |
+          cargo clippy --locked -p aws-sdk-s3-transfer-manager -p wasm32-wasi-tests \
+            --target ${{ matrix.target }} --no-deps
+          cargo clippy --locked -p aws-sdk-s3-transfer-manager --features sdk-v1 \
+            --target ${{ matrix.target }} --no-deps
+      - name: Docs
+        run: |
+          cargo doc --locked -p aws-sdk-s3-transfer-manager --target ${{ matrix.target }} \
+            --no-deps --document-private-items
+        env:
+          RUSTDOCFLAGS: -Dwarnings
+      - name: Build runtime harness
+        run: cargo build --locked -p wasm32-wasi-tests --target ${{ matrix.target }} --release
+      - name: Build mock S3 server
+        run: cargo build --locked -p s3-mock-server --bin s3-mock-server
+        env:
+          # The server runs on the host, so the wasm flags do not apply.
+          RUSTFLAGS: ""
+      - name: Run harness under Wasmtime
+        run: |
+          work="$RUNNER_TEMP/wasi-work"
+          log="$RUNNER_TEMP/wasi-harness.log"
+          server_log="$RUNNER_TEMP/s3-mock-server.log"
+          mkdir -p "$work"
+          target/debug/s3-mock-server --slow-down-once bucket/retried bucket > "$server_log" 2>&1 &
+          server=$!
+          trap 'kill "$server" 2>/dev/null || true' EXIT
+          # The server prints its loopback address once it accepts connections.
+          address=
+          for _ in {1..100}; do
+            address=$(grep -m 1 -E '^127\.0\.0\.1:[0-9]+$' "$server_log" || true)
+            [[ -n "$address" ]] && break
+            sleep 0.1
+          done
+          if [[ -z "$address" ]]; then
+            echo "s3-mock-server did not report an address" >&2
+            exit 1
+          fi
+          # `inherit-network` lets the module connect to the server.
+          wasmtime run -S inherit-network --dir "$work::/work" "$HARNESS" /work "$address" \
+            | tee "$log"
+          # The module reports what it ran, so an empty or mistargeted build
+          # cannot pass by exiting zero.
+          header="^wasm32-wasi-tests: ([0-9]+) scenarios on ${{ matrix.target }}$"
+          if ! [[ "$(head -n 1 "$log")" =~ $header ]]; then
+            echo "the harness did not report running on ${{ matrix.target }}" >&2
+            exit 1
+          fi
+          count=${BASH_REMATCH[1]}
+          passed=$(grep -c '^PASS ' "$log" || true)
+          if (( count == 0 || passed != count )) \
+            || [[ "$(tail -n 1 "$log")" != "$count scenarios passed" ]]; then
+            echo "the harness reported $passed of $count scenarios passing" >&2
+            exit 1
+          fi
+      - name: Show mock S3 server output
+        if: failure()
+        run: cat "$RUNNER_TEMP/s3-mock-server.log" || true
+
   fmt:
     name: fmt
     runs-on: ubuntu-24.04
@@ -487,20 +647,8 @@ jobs:
         uses: taiki-e/cache-cargo-install-action@v2
         with:
           tool: cargo-check-external-types@0.5.0
-      - name: check-external-types
-        # Otherwise the checker forwards workspace-resolved features, including
-        # sdk-v1 enabled by the integration-tests package.
-        run: cargo check-external-types --no-default-features --features '' --config external-types.toml
-        working-directory: aws-sdk-s3-transfer-manager
-      - name: Check topology API
-        run: cargo check-external-types --no-default-features --features '' --config external-types.toml
-        working-directory: crates/aws-smithy-topology
-      - name: Check execution API
-        run: cargo check-external-types --all-features --config external-types.toml
-        working-directory: crates/aws-smithy-execution
-      - name: Check managed HTTP API
-        run: cargo check-external-types --all-features --config external-types.toml
-        working-directory: crates/aws-smithy-managed-http
+      - name: Check TM, extension, and runtime component APIs
+        run: python3 tools/check-tm-public-api.py
 
   check-deny:
     name: check deps with cargo-deny
@@ -566,14 +714,11 @@ jobs:
           # Detect leaked ownership and stack lifetime errors, stop at the
           # first report, and reject invalid C-string operations.
           ASAN_OPTIONS: detect_leaks=1:detect_stack_use_after_return=1:halt_on_error=1:strict_string_checks=1
-          # Retain additional access history for race reports and stop at the
-          # first race diagnostic. Managed-runtime lifecycle tests can leave a
-          # finished Tokio blocking worker for process teardown, so thread-leak
-          # reporting remains disabled until their drain-and-join teardown is
-          # deterministic. The suppression covers Tokio's kernel-mediated
-          # reactor registration; transfer-manager races remain unsuppressed.
-          # Deadlock detection is not enabled.
-          TSAN_OPTIONS: halt_on_error=1:history_size=7:report_thread_leaks=0:suppressions=${{ github.workspace }}/.github/tsan-suppressions.txt
+          # Report races and unjoined threads, retain additional access history,
+          # and stop at the first report. The suppression covers Tokio's
+          # kernel-mediated reactor registration; transfer-manager races and
+          # thread leaks remain unsuppressed.
+          TSAN_OPTIONS: halt_on_error=1:history_size=7:report_thread_leaks=1:suppressions=${{ github.workspace }}/.github/tsan-suppressions.txt
           # Ignore `trybuild` errors as they are irrelevant and flaky on nightly
           TRYBUILD: overwrite
 
@@ -639,6 +784,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
+      # Generated consumers resolve dependencies without the workspace lockfile.
+      CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: fallback
       # The checker includes optional features; dial9 needs Tokio's unstable API.
       RUSTFLAGS: "-Dwarnings --cfg tokio_unstable"
     steps:
@@ -668,6 +815,18 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: check --feature-powerset
         run: cargo hack check --all --feature-powerset
+        env:
+          RUSTFLAGS: -Dwarnings -Adeprecated
+      - name: Check ordinary and extension consumers
+        run: python3 tools/check-tm-consumers.py
+      - name: Test ordinary and unstable managed configuration
+        run: |
+          cargo test --locked -p aws-sdk-s3-transfer-manager --no-default-features \
+            --lib client::tests -- --test-threads 1
+          cargo test --locked -p aws-sdk-s3-transfer-manager --no-default-features \
+            --features __unstable_ext --lib client::tests -- --test-threads 1
+          cargo test --locked -p aws-sdk-s3-transfer-manager --no-default-features \
+            --features __unstable_ext --lib config::runtime -- --test-threads 1
         env:
           RUSTFLAGS: -Dwarnings -Adeprecated
 

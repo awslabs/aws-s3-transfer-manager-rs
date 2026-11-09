@@ -117,7 +117,7 @@ let key_prefix = "<KEY-PREFIX>";
 
 let handle = transfer_manager
     .download_objects()
-    .key_prefix(key_prefix)
+    .walker(S3Walker::builder().prefix(key_prefix).build())
     .bucket(bucket)
     .destination(destination_dir)
     .send()

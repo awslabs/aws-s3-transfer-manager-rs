@@ -5,9 +5,43 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.4.0] - Unreleased
+## [Unreleased]
 
 ### Changed
+- `aws-sdk-s3-transfer-manager`, `aws-sdk-s3-transfer-manager-ext`, `aws-smithy-topology`,
+  `aws-smithy-execution` and `aws-smithy-managed-http`: the minimum supported Rust version is
+  1.96.0.
+
+## [release-2026-11-05]
+
+### Added
+- `aws-smithy-topology` 0.1.0: CPU and NUMA discovery, execution placement targets, and
+  explicit CPU binding for use independently of the transfer manager.
+- `aws-smithy-execution` 0.1.0: managed partitioned execution with targeted task submission
+  and explicit shutdown completion.
+- `aws-smithy-managed-http` 0.1.0: native Smithy pool composition with managed execution
+  and the Smithy HTTP client interface, enabled by the `client` feature.
+- `aws-sdk-s3-transfer-manager-ext` 0.1.0: adoption of caller-configured managed execution
+  through TM's `__unstable_ext` feature and an exact TM version dependency.
+- The crate builds for `wasm32-wasip1`, `wasm32-wasip2`, and `wasm32-wasip3` with
+  `RUSTFLAGS="--cfg tokio_unstable"`. On these targets the application supplies the HTTP client,
+  `Managed` execution runs on the caller's tokio runtime, which may be current-thread, and file
+  I/O runs inline. The crate documentation lists the requirements.
+- Experimental managed-runtime adoption through the non-default `__unstable_ext` feature,
+  used by the new `aws-sdk-s3-transfer-manager-ext` adapter. The adapter transfers runtime
+  ownership into opaque TM configuration. Managed pools implement the Smithy HTTP client
+  interface independently in `aws-smithy-managed-http`. Configure adopted-runtime tracing
+  on its execution builder.
+
+### Changed
+- `RuntimeConfig` and opaque `Managed` replace `RuntimeMode`; builders and loaders use
+  `runtime_config`. Managed execution uses reusable runtime components while the transfer
+  manager retains runtime ownership and scheduling.
+- An HTTP client configured on the SDK or S3 configuration is preserved under either execution
+  mode. Managed execution supplies its transport only when HTTP is absent. The
+  `S3ClientConfig::enable_runtime_http` switch is removed; configure HTTP through the SDK/S3
+  configuration instead. File bodies using configured HTTP offload filesystem reads because
+  the transport controls their polling threads.
 - The `dial9` feature depends on `dial9` 0.5 instead of `dial9-tokio-telemetry` 0.3, and compiles
   without `--cfg tokio_unstable`. Per-task poll, spawn, and terminate events and per-worker queue
   depth for the managed runtime are recorded only when built with the flag.
@@ -15,6 +49,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `dial9_handle` and take a `dial9::Dial9Handle`. The caller owns the `dial9::Recorder`: pass
   `recorder.handle().clone()`, and call `Recorder::graceful_shutdown` after the client, its clones,
   and its transfer handles are dropped.
+
+### Fixed
+- `ByteUnit::as_bits_usize` defined `Gibibyte` as `1 << 33`, which overflows a 32-bit `usize`
+  and stopped the crate from compiling on such targets. `as_bits_u64` now computes every unit in
+  `u64`, and `as_bits_usize` panics for `Gibibyte` where `usize` is 32 bits. Values on 64-bit
+  targets are unchanged.
+- A failed or cancelled upload kept its `PartStream` until the `UploadHandle` and the transfer
+  itself were dropped, so a producer waiting for the upload to take its next part waited
+  indefinitely while the caller held the handle to learn why the upload failed. The upload now
+  drops a `PartStream` when it fails or is cancelled, and a producer observes that through the
+  stream's own drop, such as its channel closing. An upload ended by a dropped handle, a cancelled
+  parent, or a worker panic sends no AbortMultipartUpload; it now logs the ID of a multipart upload
+  it leaves open at `WARN`.
+  ([#226](https://github.com/awslabs/aws-s3-transfer-manager-rs/issues/226))
+- A finished transfer could be retained for the life of the process, and the client with it:
+  dropping the `Client` did not shut down its runtime. A download to disk (`write_to_path`,
+  `write_to_file`, or `download_objects`) kept its file open, preventing opens that deny write
+  sharing on Windows and keeping deleted files' storage allocated. Ready-set entries now hold weak
+  descriptors, so transfers and their resources are released when the registry and remaining
+  transient owners retire, without waiting for epoch reclamation. The destination file can remain
+  open after `join` or `abort` returns while transfer cleanup finishes.
 
 ## [0.3.1] - 2026-10-09
 

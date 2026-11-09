@@ -155,8 +155,23 @@ pub(super) fn vruntime_delta_for_cost(cost: u64, priority: u8) -> u64 {
 /// - Virtual runtime for CFS-style fair scheduling  
 /// - Outstanding work tracking (queued + executing)
 /// - The transfer itself for polling work
+///
+/// The transfer is dropped when the last clone drops.
+// Weak references require std::sync::Arc; Loom's Arc has no Weak.
+// Descriptor atomics remain Loom-instrumented; reference counts do not.
 #[derive(Clone)]
-pub(crate) struct TransferDescriptor(Arc<Inner>);
+pub(crate) struct TransferDescriptor(std::sync::Arc<Inner>);
+
+/// A reference to a [`TransferDescriptor`] that does not keep it alive.
+pub(crate) struct WeakTransferDescriptor(std::sync::Weak<Inner>);
+
+impl WeakTransferDescriptor {
+    /// Returns the descriptor, or `None` once every [`TransferDescriptor`]
+    /// clone has dropped.
+    pub(crate) fn upgrade(&self) -> Option<TransferDescriptor> {
+        self.0.upgrade().map(TransferDescriptor)
+    }
+}
 
 struct Inner {
     priority: AtomicU8,
@@ -196,7 +211,7 @@ impl TransferDescriptor {
         initial_vruntime: u64,
         group_vruntime: Arc<AtomicU64>,
     ) -> Self {
-        Self(Arc::new(Inner {
+        Self(std::sync::Arc::new(Inner {
             priority: AtomicU8::new(DEFAULT_PRIORITY),
             vruntime: AtomicU64::new(initial_vruntime),
             group_vruntime,
@@ -245,6 +260,11 @@ impl TransferDescriptor {
         }
         self.transfer().ctx().record_wake();
         true
+    }
+
+    /// Returns a reference to this descriptor that does not keep it alive.
+    pub(crate) fn downgrade(&self) -> WeakTransferDescriptor {
+        WeakTransferDescriptor(std::sync::Arc::downgrade(&self.0))
     }
 
     pub(crate) fn transfer(&self) -> &dyn Transfer {

@@ -24,6 +24,8 @@ exceptions = [
     { allow = ["OpenSSL"], name = "ring", version = "*" },
     { allow = ["OpenSSL"], name = "aws-lc-sys", version = "*" },
     { allow = ["OpenSSL"], name = "aws-lc-fips-sys", version = "*" },
+    # s3s, used by s3-mock-server and the test crates, which are not published.
+    { allow = ["BSL-1.0"], name = "xxhash-rust", version = "*" },
 ]
 
 [[licenses.clarify]]

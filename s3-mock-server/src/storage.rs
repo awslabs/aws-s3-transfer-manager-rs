@@ -19,7 +19,8 @@ use std::ops::Range;
 use std::pin::Pin;
 use std::time::SystemTime;
 
-use crate::storage::models::ObjectMetadata;
+use crate::bucket::BucketType;
+use crate::storage::models::{MultipartUploadMetadata, ObjectMetadata, PartMetadata};
 use crate::types::{ClientChecksums, ObjectIntegrity, ObjectIntegrityChecks, StoredObjectMetadata};
 use crate::Result;
 
@@ -48,12 +49,16 @@ pub struct StoreObjectRequest {
     pub content_disposition: Option<String>,
     pub content_language: Option<String>,
     /// Checksums the client sent with the body. A body that does not match them fails with
-    /// [`Error::ChecksumMismatch`](crate::Error::ChecksumMismatch), and the key is left
+    /// [`Error::BadDigest`](crate::Error::BadDigest), and the key is left
     /// unchanged.
     pub client_checksums: Option<ClientChecksums>,
     /// Condition on the current state of the key, checked atomically with the write by
     /// backends that support it.
     pub precondition: WritePrecondition,
+    /// When set, the quoted ETag stored instead of the MD5 of the body.
+    pub etag: Option<String>,
+    /// Restore status to store, for an object in an archival storage class.
+    pub restore_status: Option<crate::storage::models::RestoreStatus>,
 }
 
 /// Condition on the current state of a key for a write to succeed.
@@ -111,6 +116,79 @@ pub(crate) fn etag_condition_holds(condition: &s3s::dto::ETagCondition, etag: &s
     }
 }
 
+/// The most parts an object can have, counting each append as one.
+pub(crate) const MAX_PARTS: u32 = 10_000;
+
+/// The longest object key, in bytes of UTF-8.
+pub(crate) const MAX_KEY_LENGTH: usize = 1024;
+
+/// Request for appending to an existing object (PutObject with `x-amz-write-offset-bytes`).
+pub(crate) struct AppendObjectRequest {
+    pub bucket: String,
+    pub key: String,
+    /// Where the appended data must start: the current size of the object.
+    pub offset: u64,
+    /// The data to append. Its checksums have been validated against the request's.
+    pub content: Bytes,
+    /// `If-Match` (the ETag the object must have) or `If-None-Match: *` (the key must not exist).
+    pub precondition: WritePrecondition,
+    /// The algorithm of the request's checksum, if it has one.
+    pub checksum_algorithm: Option<aws_smithy_checksums::ChecksumAlgorithm>,
+}
+
+/// An in-place change to the stored metadata of an object.
+pub(crate) type MetadataUpdate = Box<dyn FnOnce(&mut ObjectMetadata) + Send>;
+
+/// Conditions on a RenameObject request.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RenamePreconditions {
+    /// `If-Match` on the destination.
+    pub if_match: Option<String>,
+    /// `If-None-Match: *` on the destination.
+    pub if_none_match_any: bool,
+    /// `x-amz-rename-source-if-match` on the source.
+    pub source_if_match: Option<String>,
+}
+
+/// Request for renaming an object (RenameObject).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RenameRequest {
+    pub src_key: String,
+    pub dst_key: String,
+    pub preconditions: RenamePreconditions,
+    /// The `x-amz-client-token` that makes a retry of the rename idempotent.
+    pub client_token: Option<String>,
+}
+
+impl RenamePreconditions {
+    /// Check the conditions against the current source and destination, in this order:
+    /// - a missing source fails with `NoSuchKey`;
+    /// - the destination's `If-Match`, then the source's `x-amz-rename-source-if-match`, both
+    ///   reported as `If-Match`; `If-Match` fails on a missing destination;
+    /// - `If-None-Match`.
+    pub(crate) fn check(
+        &self,
+        source: Option<&ObjectMetadata>,
+        destination: Option<&ObjectMetadata>,
+    ) -> Result<()> {
+        let source = source.ok_or(crate::Error::NoSuchKey)?;
+        if let Some(etag) = &self.if_match {
+            if !destination.is_some_and(|destination| etags_match(etag, &destination.etag)) {
+                return Err(crate::Error::RenamePreconditionFailed("If-Match"));
+            }
+        }
+        if let Some(etag) = &self.source_if_match {
+            if !etags_match(etag, &source.etag) {
+                return Err(crate::Error::RenamePreconditionFailed("If-Match"));
+            }
+        }
+        if self.if_none_match_any && destination.is_some() {
+            return Err(crate::Error::RenamePreconditionFailed("If-None-Match"));
+        }
+        Ok(())
+    }
+}
+
 /// Request for retrieving an object.
 pub(crate) struct GetObjectRequest<'a> {
     pub bucket: &'a str,
@@ -137,9 +215,17 @@ pub(crate) struct ListObjectsResponse {
 }
 
 /// Information about an object.
+#[derive(Debug)]
 pub(crate) struct ObjectInfo {
     pub key: String,
     pub metadata: ObjectMetadata,
+}
+
+/// An in-progress multipart upload.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct MultipartUploadInfo {
+    pub key: String,
+    pub upload_id: String,
 }
 
 /// Information about a bucket.
@@ -162,12 +248,60 @@ pub(crate) struct UploadPartRequest<'a> {
     pub upload_id: &'a str,
     pub part_number: i32,
     pub content: Bytes,
+    /// The algorithms of the checksums the request carried.
+    pub client_checksum_algorithms: Vec<aws_smithy_checksums::ChecksumAlgorithm>,
+}
+
+impl UploadPartRequest<'_> {
+    /// Check that an UploadPart to an upload created with a checksum algorithm carries a checksum
+    /// of that algorithm. It fails with 400 InvalidRequest:
+    /// - with a checksum of another algorithm only, in either bucket type;
+    /// - without a checksum, in a directory bucket, and in a general purpose bucket for the
+    ///   COMPOSITE checksum type.
+    pub(crate) fn check_checksum(&self, upload: &MultipartUploadMetadata) -> Result<()> {
+        let Some(algorithm) = upload
+            .metadata
+            .checksum_algorithm
+            .filter(|_| upload.metadata.part_checksums)
+        else {
+            return Ok(());
+        };
+        let directory = upload_in_directory_bucket(upload);
+        let composite = upload.checksum_type == Some(aws_sdk_s3::types::ChecksumType::Composite);
+        let actual = match self.client_checksum_algorithms.first() {
+            _ if self.client_checksum_algorithms.contains(&algorithm) => return Ok(()),
+            Some(other) => other.as_str(),
+            None if directory => "None",
+            None if composite => "null",
+            None => return Ok(()),
+        };
+        Err(crate::Error::ChecksumTypeMismatch {
+            expected: algorithm.as_str().to_owned(),
+            actual: actual.to_owned(),
+            bucket_type: if directory {
+                BucketType::Directory
+            } else {
+                BucketType::GeneralPurpose
+            },
+        })
+    }
+}
+
+/// Whether `upload` is to a directory bucket.
+fn upload_in_directory_bucket(upload: &MultipartUploadMetadata) -> bool {
+    upload
+        .bucket
+        .as_deref()
+        .is_some_and(|bucket| BucketType::of(bucket) == BucketType::Directory)
 }
 
 /// Response for uploading a part.
 #[derive(Debug)]
 pub(crate) struct UploadPartResponse {
     pub etag: String,
+    /// The part as stored, with its checksum in the algorithm of its upload, if the upload was
+    /// created with a checksum algorithm.
+    pub checksums: Option<PartMetadata>,
 }
 
 /// Information about a part.
@@ -183,6 +317,34 @@ pub(crate) struct CompleteMultipartUploadRequest<'a> {
     pub upload_id: &'a str,
     pub parts: Vec<(i32, String)>,
     pub client_checksums: Option<&'a ClientChecksums>,
+    /// Lowercase name of the algorithm of the first part checksum the request lists, if it lists
+    /// any.
+    pub listed_part_checksum: Option<&'static str>,
+}
+
+impl CompleteMultipartUploadRequest<'_> {
+    /// Check the part checksums a CompleteMultipartUpload lists. Listing one for an upload created
+    /// without a checksum algorithm fails with 400 InvalidRequest in a directory bucket, and with
+    /// 400 InvalidPart in a general purpose bucket.
+    pub(crate) fn check_listed_part_checksums(
+        &self,
+        upload: &MultipartUploadMetadata,
+    ) -> Result<()> {
+        match self.listed_part_checksum {
+            Some(algorithm) if !upload.metadata.part_checksums => {
+                if upload_in_directory_bucket(upload) {
+                    Err(crate::Error::ChecksumTypeMismatch {
+                        expected: "None".to_owned(),
+                        actual: algorithm.to_owned(),
+                        bucket_type: BucketType::Directory,
+                    })
+                } else {
+                    Err(crate::Error::InvalidPart)
+                }
+            }
+            _ => Ok(()),
+        }
+    }
 }
 
 /// Response for completing a multipart upload.
@@ -216,6 +378,8 @@ impl StoreObjectRequest {
             content_language: None,
             client_checksums: None,
             precondition: WritePrecondition::None,
+            etag: None,
+            restore_status: None,
         }
     }
 
@@ -274,6 +438,8 @@ impl From<s3s::dto::PutObjectInput> for StoreObjectRequest {
                 .map(|s| Cow::<str>::from(s).into_owned()),
             client_checksums: None,
             precondition,
+            etag: None,
+            restore_status: None,
         }
     }
 }
@@ -356,7 +522,8 @@ pub(crate) trait StorageBackend: Send + Sync + Debug {
     /// Create a new bucket.
     async fn create_bucket(&self, bucket: &str) -> Result<()>;
 
-    /// Delete a bucket. Fails if the bucket is non-empty.
+    /// Delete a bucket. Fails with [`Error::BucketNotEmpty`](crate::Error::BucketNotEmpty) if the
+    /// bucket has objects.
     async fn delete_bucket(&self, bucket: &str) -> Result<()>;
 
     /// Check if a bucket exists.
@@ -395,6 +562,38 @@ pub(crate) trait StorageBackend: Send + Sync + Debug {
 
     /// Abort a multipart upload and clean up all associated data.
     async fn abort_multipart_upload(&self, upload_id: &str) -> Result<()>;
+
+    /// Append to an existing object.
+    ///
+    /// Fails with:
+    /// - `NoSuchKey` for a missing key;
+    /// - `PreconditionFailed` when `If-Match` does not hold, or with `If-None-Match: *`;
+    /// - `InvalidArgument` for an empty append to a non-empty object;
+    /// - `InvalidWriteOffset` when the offset is not the object's size;
+    /// - `TooManyParts` when the object already has [`MAX_PARTS`] parts;
+    /// - `ChecksumTypeMismatch` when the object stores checksums, none of them of the request's
+    ///   algorithm (CRC64NVME for a request without a checksum).
+    async fn append_object(&self, _request: AppendObjectRequest) -> Result<StoredObjectMetadata> {
+        Err(crate::Error::NotImplemented)
+    }
+
+    /// Move an object to a new key in the same bucket, replacing any object at the destination.
+    ///
+    /// A request with the client token of a rename that succeeded succeeds without renaming again
+    /// if it is the same request, and fails with `IdempotentParameterMismatch` otherwise. Fails
+    /// with `NoSuchKey` when the source does not exist, and with `RenamePreconditionFailed`, naming
+    /// the failed condition's header, when a condition does not hold.
+    async fn rename_object(&self, _bucket: &str, _request: RenameRequest) -> Result<()> {
+        Err(crate::Error::NotImplemented)
+    }
+
+    /// The multipart uploads in progress in `bucket`, ordered by key and then upload id.
+    async fn list_multipart_uploads(&self, bucket: &str) -> Result<Vec<MultipartUploadInfo>>;
+
+    /// Change the stored metadata of an object in place, leaving its data unchanged.
+    ///
+    /// Fails with `NoSuchBucket` or `NoSuchKey` when the object does not exist.
+    async fn update_metadata(&self, bucket: &str, key: &str, update: MetadataUpdate) -> Result<()>;
 
     /// Reset all state, removing all buckets, objects, and in-flight uploads.
     async fn reset(&self) -> Result<()>;
@@ -479,6 +678,22 @@ impl StorageBackend for std::sync::Arc<dyn StorageBackend + '_> {
 
     async fn abort_multipart_upload(&self, upload_id: &str) -> Result<()> {
         (**self).abort_multipart_upload(upload_id).await
+    }
+
+    async fn append_object(&self, request: AppendObjectRequest) -> Result<StoredObjectMetadata> {
+        (**self).append_object(request).await
+    }
+
+    async fn rename_object(&self, bucket: &str, request: RenameRequest) -> Result<()> {
+        (**self).rename_object(bucket, request).await
+    }
+
+    async fn list_multipart_uploads(&self, bucket: &str) -> Result<Vec<MultipartUploadInfo>> {
+        (**self).list_multipart_uploads(bucket).await
+    }
+
+    async fn update_metadata(&self, bucket: &str, key: &str, update: MetadataUpdate) -> Result<()> {
+        (**self).update_metadata(bucket, key, update).await
     }
 
     async fn reset(&self) -> Result<()> {

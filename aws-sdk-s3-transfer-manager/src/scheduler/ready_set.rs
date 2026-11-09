@@ -22,7 +22,7 @@ use std::sync::RwLock;
 
 use crossbeam_skiplist::SkipMap;
 
-use super::descriptor::TransferDescriptor;
+use super::descriptor::{TransferDescriptor, WeakTransferDescriptor};
 use crate::runtime::sync::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use crate::runtime::sync::sync::Arc;
 use crate::transfer::TransferId;
@@ -172,8 +172,6 @@ impl GroupState {
     }
 }
 
-/// Per-tree CFS queue. Holds the top-level transfer plus all its descendants
-/// in a single SkipMap ordered by individual vruntime.
 /// Per-group CFS queue. Holds the top-level transfer plus all its
 /// descendants in a single SkipMap ordered by individual vruntime.
 ///
@@ -185,7 +183,11 @@ struct GroupQueue {
     /// Atomic coordination state (member count, root presence, vruntime).
     state: GroupState,
     /// Members of this group, ordered by individual vruntime.
-    inner: SkipMap<ReadyKey, TransferDescriptor>,
+    ///
+    /// Entries do not keep their descriptors alive. A removed `SkipMap` node
+    /// is freed only by epoch-based reclamation, which has no bound on when
+    /// it runs, so an owning entry would keep a retired transfer alive.
+    inner: SkipMap<ReadyKey, WeakTransferDescriptor>,
 }
 
 impl GroupQueue {
@@ -203,20 +205,30 @@ impl GroupQueue {
 
     /// Insert a descriptor. Returns the previous nr_queued count (0 means
     /// this insert transitioned the group from empty to non-empty).
-    fn insert(&self, descriptor: TransferDescriptor) -> usize {
+    fn insert(&self, descriptor: &TransferDescriptor) -> usize {
         let vruntime = descriptor.vruntime();
         let key = ReadyKey::new(vruntime, descriptor.id());
-        self.inner.insert(key, descriptor);
+        self.inner.insert(key, descriptor.downgrade());
         self.state.enqueue()
     }
 
-    /// Pop the member with the lowest vruntime. Returns `None` if the
-    /// group is empty. Advances the group's min_vruntime floor.
+    /// Pop the member with the lowest vruntime and advance the group's
+    /// min_vruntime floor.
+    ///
+    /// Removes at most one entry. Returns `None` if the queue is empty or the
+    /// selected descriptor cannot be upgraded. A removed entry decrements
+    /// `nr_queued` and advances the group's `min_vruntime` floor even if its
+    /// descriptor has dropped.
+    ///
+    /// An insert publishes its entry before counting it, so a second removal
+    /// in the same call could take an entry whose `enqueue` has not happened
+    /// and wrap `nr_queued`. One removal per root-tree pop keeps every
+    /// `dequeue` paired with a completed `enqueue`.
     fn pop(&self) -> Option<TransferDescriptor> {
         let entry = self.inner.pop_front()?;
         self.state.dequeue();
         self.state.advance_min_vruntime(entry.key().vruntime);
-        Some(entry.value().clone())
+        entry.value().upgrade()
     }
 
     /// Number of members currently queued in this group.
@@ -286,10 +298,10 @@ impl ReadySet {
     /// Resolve the group_vruntime Arc for a transfer about to be enqueued.
     ///
     /// - For children: returns the parent group's existing Arc.
-    /// - For top-level: creates a new Arc (will be installed into the
-    ///   GroupQueue during insert_top_level).
+    /// - For top-level: returns its existing group's Arc, or creates a new
+    ///   Arc initialized to the root's current `min_vruntime` floor.
     ///
-    /// Returns None if the parent group has been removed (orphaned child).
+    /// Returns `None` if the child's parent group is absent (orphaned child).
     pub(super) fn resolve_group_vruntime(&self, id: &TransferId) -> Option<Arc<AtomicU64>> {
         match id.parent {
             Some(parent_id) => {
@@ -312,17 +324,21 @@ impl ReadySet {
     /// Add a transfer to the ready set.
     ///
     /// Dispatches on `descriptor.id().parent`:
-    /// - `parent = None` - creates a new group and inserts the descriptor as its first member.
+    /// - `parent = None` - creates a new group or rejoins its existing group.
     /// - `parent = Some(pid)` - routes the descriptor into the existing group for `pid`.
     ///
-    /// Returns `Err(OrphanedChild)` if `parent` is `Some(pid)` but no group with that id exists
-    /// (the parent was cancelled between spawn and enqueue).
+    /// For a newly claimed child, returns `Err(OrphanedChild)` if its parent
+    /// group is absent. The error does not unregister or cancel the child.
     ///
     /// Idempotent against double-insert: gated by a compare-and-swap on
     /// the descriptor's claim flag. A descriptor that is already claimed
     /// (queued or being polled) silently returns `Ok(())` - the existing
     /// presence in the ready set or the in-flight poll is the canonical
     /// one.
+    ///
+    /// The ready set does not keep `descriptor` alive. If the supplied reference
+    /// is its last strong owner, the descriptor is dropped after the ready set's
+    /// locks have been released.
     pub(super) fn insert(&self, descriptor: TransferDescriptor) -> Result<(), OrphanedChild> {
         // try_claim succeeds only when the descriptor is not already
         // claimed. On failure, the existing claim owner is responsible
@@ -364,34 +380,24 @@ impl ReadySet {
         }
     }
 
-    /// Helper for the inner ready_set lock-ordering protocol: consistency
-    /// between `by_group` and `groups`.
+    /// Inserts a member into an existing group.
     ///
     /// Lock-ordering invariant: `by_group.read` is held across both
-    /// `group.insert(descriptor)` (into the inner queue) AND
+    /// `group.insert(&descriptor)` (into the inner queue) and
     /// `self.groups.insert(...)` (into the root tree). A concurrent
-    /// `remove_group` (which needs `by_group.write`) blocks until this
-    /// method returns. Without this ordering, `remove_group` could clear
-    /// `by_group` and `groups` between our drop-of-read and our write,
-    /// leaving a phantom entry in `groups` for a group_id no longer
-    /// present in `by_group`. The phantom misleads pop and stalls
-    /// scheduling for that descriptor.
+    /// `remove_group` (which needs `by_group.write`) blocks until publication
+    /// finishes. Without this ordering, `remove_group` could clear
+    /// `by_group` and `groups` between releasing the read lock and publishing
+    /// the root entry, leaving an entry in `groups` for a group absent from
+    /// `by_group`. The entry misleads pop and stalls scheduling.
     ///
-    /// Verified by `loom_tests::child_insert_phantom_group`.
+    /// Returns `Err(descriptor)` if the group does not exist, preserving the
+    /// supplied descriptor unchanged. On success, releases the supplied
+    /// reference after releasing `by_group.read`.
     ///
-    /// On `Err(descriptor)`: group is gone (parent was cancelled
-    /// concurrently). Caller decides whether this is an error
-    /// (`insert_child` returns OrphanedChild) or benign (Ready-path
-    /// reinsert: descriptor will be cleaned up via terminal flag).
-    /// Importantly, `descriptor` is returned UNCONSUMED on this path,
-    /// so callers can run cleanup or fall back to a different code path.
-    ///
-    /// `reset_group_vruntime`: when true, the group's vruntime is reset
-    /// to the current root floor (used by `insert_top_level` and
-    /// `insert_child`, which are wake/spawn paths). When false, the
-    /// existing group vruntime is preserved (used by
-    /// `reinsert_under_claim`, where the descriptor was popped from
-    /// this group and the vruntime is current).
+    /// If `reset_group_vruntime` is true, resets `group_vruntime` to the root's
+    /// current `min_vruntime` on an empty-to-nonempty transition that claims
+    /// root entry. Otherwise preserves `group_vruntime`.
     fn try_insert_into_existing_group(
         &self,
         group_id: u64,
@@ -403,9 +409,9 @@ impl ReadySet {
             Some(g) => Arc::clone(g),
             None => return Err(descriptor),
         };
-        // From here, by_group.read is held until end-of-scope. Concurrent
-        // remove_group blocks waiting for by_group.write.
-        let prev_count = group.insert(descriptor);
+        // Hold the lookup lock across member and root publication so removal
+        // cannot leave a root entry without a matching lookup entry.
+        let prev_count = group.insert(&descriptor);
         if prev_count == 0 && group.state.try_enter_root() {
             let gv = if reset_group_vruntime {
                 let root_min = self.min_vruntime();
@@ -420,57 +426,67 @@ impl ReadySet {
             };
             self.groups.insert(key, group);
         }
+        // Dropping the last descriptor can run transfer destructors that
+        // re-enter the scheduler. Release the lookup lock first.
         drop(by_group);
+        drop(descriptor);
         Ok(())
     }
 
-    /// Pop the transfer with lowest vruntime (highest scheduling priority).
+    /// Returns a live descriptor selected by hierarchical virtual-runtime order.
     ///
-    /// Selects the group with lowest group_vruntime, then the member with
+    /// Selects the group with lowest `group_vruntime`, then the member with
     /// lowest individual vruntime within that group.
     ///
-    /// Updates min_vruntime to the popped group's group_vruntime.
+    /// Monotonically advances the root's `min_vruntime` floor to at least the
+    /// popped root entry's `group_vruntime`.
     ///
-    /// Does **not** release the descriptor's claim - the claim is held
-    /// through `poll_work` and released by `generate_work` after the
-    /// poll outcome is handled. This is what guarantees at most one
-    /// worker is inside `poll_work` for any given transfer at a time.
+    /// Does not release the descriptor's claim. The claim must remain held
+    /// through `poll_work` and handling its outcome, preserving at most one
+    /// worker inside `poll_work` for a given transfer at a time.
+    ///
+    /// Entries whose descriptors have been dropped are discarded, and the
+    /// pop continues from the root tree. Each selected group completes root
+    /// exit and re-entry coordination before another selection, even if its
+    /// queue is empty or its selected descriptor has dropped. Returns `None`
+    /// once the root tree is empty.
     pub(super) fn pop(&self) -> Option<TransferDescriptor> {
-        let entry = self.groups.pop_front()?;
-        let group_key = *entry.key();
-        let group = entry.value().clone();
+        loop {
+            let entry = self.groups.pop_front()?;
+            let group_key = *entry.key();
+            let group = entry.value().clone();
 
-        let descriptor = group.pop()?;
+            let descriptor = group.pop();
 
-        // Mark group as not in root tree (we just popped it out).
-        group.state.exit_root();
+            // Complete root exit and re-entry before discarding a dead member.
+            // A second removal from this group could take an uncounted insert.
+            group.state.exit_root();
 
-        // Update root min_vruntime (monotonically increasing)
-        self.min_vruntime
-            .fetch_max(group_key.group_vruntime, Ordering::AcqRel);
+            self.min_vruntime
+                .fetch_max(group_key.group_vruntime, Ordering::AcqRel);
 
-        // Re-insert group if it still has members, using CAS to
-        // coordinate with concurrent insert_child's 0->1 path.
-        // Only the thread that wins the CAS adds the group to the
-        // root tree, preventing duplicate entries.
-        if group.count() > 0 && group.state.try_enter_root() {
-            let new_key = GroupKey {
-                group_vruntime: group.group_vruntime(),
-                group_id: group_key.group_id,
-            };
-            self.groups.insert(new_key, group);
+            // Re-insert the group if members remain, coordinating with
+            // insertion's 0-to-1 path. Only the CAS winner adds the group to
+            // the root tree, preventing duplicate entries.
+            if group.count() > 0 && group.state.try_enter_root() {
+                let new_key = GroupKey {
+                    group_vruntime: group.group_vruntime(),
+                    group_id: group_key.group_id,
+                };
+                self.groups.insert(new_key, group);
+            }
+
+            if let Some(descriptor) = descriptor {
+                return Some(descriptor);
+            }
         }
-
-        Some(descriptor)
     }
 
-    /// Test-only helper: advance a group's `group_vruntime` by `units`.
+    /// Advance a group's `group_vruntime` by `units`.
     ///
-    /// Useful when a test wants to set up a specific gv state directly.
-    /// Production code does not need to call this: `group_vruntime` is advanced
-    /// by `work_generated`/`work_generated_spawn` when a member generates work,
-    /// not by `pop` (which advances only the `min_vruntime` floor).
-    /// No-op if `group_id` is not found.
+    /// This changes the accumulated `group_vruntime`, not the group's
+    /// `min_vruntime` floor or the root's `min_vruntime` floor advanced by pop.
+    /// Does nothing if the group is absent.
     #[cfg(test)]
     pub(super) fn advance_group_vruntime(&self, group_id: u64, units: u64) {
         let by_group = self.by_group.read().unwrap();
@@ -575,7 +591,7 @@ impl ReadySet {
         let root_min = self.min_vruntime();
         let gv_arc = descriptor.group_vruntime_arc();
         let group = Arc::new(GroupQueue::new(gv_arc));
-        group.insert(descriptor);
+        group.insert(&descriptor);
         // Fresh group with a member goes directly into root tree.
         // No CAS needed: we just created it, no one else has a reference.
         group.state.in_root.store(true, Ordering::SeqCst);
@@ -608,8 +624,7 @@ impl ReadySet {
 }
 
 /// Marker error returned from [`ReadySet::insert`] when a child's parent group
-/// does not exist (parent was cancelled between spawn and enqueue).
-/// The caller is responsible for cancelling the orphaned child.
+/// does not exist. The child is not queued, and its ready-set claim is released.
 #[derive(Debug)]
 pub(super) struct OrphanedChild;
 
@@ -620,7 +635,8 @@ mod tests {
     use crate::scheduler::MockTransfer;
     use std::sync::Arc as StdArc;
 
-    fn make_descriptor(
+    /// A descriptor that only the caller's clones keep alive.
+    fn make_unheld_descriptor(
         id: u64,
         parent: Option<u64>,
         priority: u8,
@@ -635,12 +651,31 @@ mod tests {
         desc
     }
 
+    fn make_descriptor(
+        id: u64,
+        parent: Option<u64>,
+        priority: u8,
+        vruntime: u64,
+    ) -> TransferDescriptor {
+        let desc = make_unheld_descriptor(id, parent, priority, vruntime);
+        // The ready set does not keep descriptors alive. Hold each one for
+        // the test thread's lifetime, as the scheduler registry does for a
+        // live transfer.
+        REGISTRY.with(|registry| registry.borrow_mut().push(desc.clone()));
+        desc
+    }
+
+    thread_local! {
+        static REGISTRY: std::cell::RefCell<Vec<TransferDescriptor>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
     #[cfg_attr(miri, ignore)]
     #[test]
     fn group_queue_insert_pop_single() {
         let gq = GroupQueue::new_with_initial_vruntime(0);
         let desc = make_descriptor(1, None, 128, 0);
-        gq.insert(desc.clone());
+        gq.insert(&desc);
         assert_eq!(gq.count(), 1);
 
         let popped = gq.pop().unwrap();
@@ -653,9 +688,9 @@ mod tests {
     #[test]
     fn group_queue_pop_lowest_vruntime() {
         let gq = GroupQueue::new_with_initial_vruntime(0);
-        gq.insert(make_descriptor(10, None, 128, 5));
-        gq.insert(make_descriptor(11, None, 128, 1));
-        gq.insert(make_descriptor(12, None, 128, 3));
+        gq.insert(&make_descriptor(10, None, 128, 5));
+        gq.insert(&make_descriptor(11, None, 128, 1));
+        gq.insert(&make_descriptor(12, None, 128, 3));
 
         assert_eq!(gq.pop().unwrap().id().id, 11); // vruntime 1
         assert_eq!(gq.pop().unwrap().id().id, 12); // vruntime 3
@@ -722,6 +757,122 @@ mod tests {
         // Pop picks group B (lower gv), then its lowest-vruntime member.
         let popped = set.pop().unwrap();
         assert_eq!(popped.id().id, 2);
+    }
+
+    // ref: V2429410200
+    /// A queued descriptor is dropped as soon as its last owner outside the
+    /// ready set drops it.
+    ///
+    /// A removed `SkipMap` node is freed only by epoch-based reclamation,
+    /// which has no bound on when it runs. A ready set that kept descriptors
+    /// alive would retain a retired transfer, and the destination file and
+    /// client handle it owns, after the scheduler drops it.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn ready_set_does_not_keep_descriptors_alive() {
+        let set = ReadySet::new();
+        let desc = make_unheld_descriptor(1, None, 128, 0);
+        let weak = desc.downgrade();
+        set.insert(desc).unwrap();
+
+        assert!(
+            weak.upgrade().is_none(),
+            "the queued entry owns its descriptor"
+        );
+        assert!(set.pop().is_none(), "popped a dropped descriptor");
+        assert!(set.is_empty());
+    }
+
+    // ref: V2429410200
+    /// A pop discards entries whose descriptors were dropped while queued and
+    /// returns the next live descriptor, leaving the emptied group out of the
+    /// root tree and its count at zero.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn pop_skips_dropped_descriptors_to_the_next_live_one() {
+        let set = ReadySet::new();
+        set.insert(make_unheld_descriptor(1, None, 128, 0)).unwrap();
+        set.insert(make_unheld_descriptor(11, Some(1), 128, 0))
+            .unwrap();
+        // Group 1 sorts first: both groups enter the root tree at the same
+        // vruntime, and ties break on the lower group id.
+        set.insert(make_descriptor(2, None, 128, 0)).unwrap();
+
+        assert_eq!(set.pop().map(|d| d.id().id), Some(2));
+        assert!(!set.root_contains_group(1));
+        assert_eq!(set.member_count(1), Some(0));
+        assert!(set.pop().is_none());
+    }
+
+    /// A state machine whose drop removes a group from `set`, standing in for
+    /// a transfer whose drop re-enters the scheduler.
+    struct RemovesGroupOnDrop {
+        set: StdArc<ReadySet>,
+        group_id: u64,
+    }
+
+    impl std::fmt::Debug for RemovesGroupOnDrop {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("RemovesGroupOnDrop")
+                .field("group_id", &self.group_id)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl crate::scheduler::transfer::mock::MockStateMachine for RemovesGroupOnDrop {
+        fn poll_work(&self, _id: TransferId) -> crate::transfer::PollWork {
+            crate::transfer::PollWork::Done
+        }
+
+        fn execute<'a>(
+            &'a self,
+            _work: &'a mut crate::transfer::IoRequest,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::transfer::WorkOutcome> + Send + 'a>,
+        > {
+            Box::pin(async { crate::transfer::WorkOutcome::Success { data: None } })
+        }
+    }
+
+    impl Drop for RemovesGroupOnDrop {
+        fn drop(&mut self) {
+            self.set.remove_group(self.group_id);
+        }
+    }
+
+    // ref: V2429410200
+    /// Inserting a descriptor that no one else holds drops its transfer
+    /// after the ready set's locks are released.
+    ///
+    /// The group's entry does not keep the descriptor alive, so an insert can
+    /// be its last owner. A transfer dropped while `by_group` is held would
+    /// deadlock if its drop re-entered the ready set for a write, as
+    /// `remove_group` does.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn insert_drops_an_unheld_descriptor_outside_the_ready_set_locks() {
+        let set = StdArc::new(ReadySet::new());
+        set.insert(make_descriptor(1, None, 128, 0)).unwrap();
+        let child = TransferDescriptor::new(Box::new(MockTransfer::new(
+            TransferId {
+                id: 11,
+                parent: Some(1),
+            },
+            StdArc::new(RemovesGroupOnDrop {
+                set: StdArc::clone(&set),
+                group_id: 2,
+            }),
+        )));
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let inserter = StdArc::clone(&set);
+        std::thread::spawn(move || {
+            inserter.insert(child).unwrap();
+            done_tx.send(()).unwrap();
+        });
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the insert deadlocked or panicked dropping its descriptor");
     }
 
     #[cfg_attr(miri, ignore)]
@@ -935,22 +1086,13 @@ mod loom_tests {
     use loom::sync::Arc;
     use loom::thread;
 
-    // Loom tests for the ready-set's atomic protocols.
-    //
-    // Tests use the real `ClaimState` and `GroupState` types (both
-    // loom-compatible via the compat layer). `LoomGroup` wraps the real
-    // `GroupState` with a `root_entries` counter to detect duplicate
-    // root-tree insertions (a correctness violation the real code prevents
-    // but that loom should verify).
-    //
-    // The scheduler integration tests in `tests/upload_objects_test.rs`
-    // exercise the full `ReadySet` + `GroupQueue` under concurrent load
-    // without loom's exhaustive exploration.
+    // Claim tests execute production ClaimState. Group tests execute production
+    // GroupState atomics with separate insert/pop sequencing and root counters.
 
-    /// Wraps the real `GroupState` with a root-tree entry counter for
-    /// loom verification. In production, the root SkipMap naturally
-    /// prevents duplicate keys; here we model that as a counter and
-    /// assert it never exceeds 1.
+    /// Models group transitions with production atomics and a root-entry counter.
+    ///
+    /// The root counter detects duplicate publication. Storage operations and
+    /// their ordering are implemented separately from `ReadySet`.
     struct LoomGroup {
         state: super::GroupState,
         /// Tracks how many times this group is "in" the root tree.
@@ -977,7 +1119,7 @@ mod loom_tests {
             }
         }
 
-        /// Mirrors `ReadySet::insert_child` + the 0->1 root-entry path.
+        /// Adds a counted member and claims root entry on a 0-to-1 transition.
         fn insert(&self) {
             let prev = self.state.enqueue();
             if prev == 0 && self.state.try_enter_root() {
@@ -986,7 +1128,7 @@ mod loom_tests {
             }
         }
 
-        /// Mirrors `ReadySet::pop` for this group.
+        /// Removes root presence and one counted member, then attempts re-entry.
         fn pop(&self) {
             self.root_entries.fetch_sub(1, Ordering::SeqCst);
             self.state.exit_root();
@@ -1029,6 +1171,85 @@ mod loom_tests {
 
             assert_eq!(group.count(), 3); // parent + 2 children
             assert!(group.is_in_root());
+        });
+    }
+
+    /// Models member publication, counting, and root coordination.
+    ///
+    /// Uses production `GroupState` atomics with separate insert/pop control
+    /// flow and mutex-backed storage. Does not execute `ReadySet` or model
+    /// weak-reference ownership.
+    struct LoomMemberGroup {
+        group: LoomGroup,
+        members: loom::sync::Mutex<std::collections::VecDeque<usize>>,
+    }
+
+    impl LoomMemberGroup {
+        fn insert(&self, member: usize) {
+            // A lower-vruntime arrival can be selected before its count update.
+            self.members.lock().unwrap().push_front(member);
+            let prev = self.group.state.enqueue();
+            if prev == 0 && self.group.state.try_enter_root() {
+                self.group.state.set_group_vruntime(0);
+                self.group.root_entries.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        /// Removes at most one member per root selection, then coordinates re-entry.
+        fn pop(&self) -> Option<usize> {
+            self.group.root_entries.fetch_sub(1, Ordering::SeqCst);
+            let member = self.members.lock().unwrap().pop_front();
+            if member.is_some() {
+                assert!(self.group.state.dequeue() > 0, "nr_queued underflow");
+            }
+            self.group.state.exit_root();
+            if self.group.state.nr_queued() > 0 && self.group.state.try_enter_root() {
+                self.group.root_entries.fetch_add(1, Ordering::SeqCst);
+            }
+            member
+        }
+    }
+
+    // ref: V2429410200
+    /// A modeled pop racing member publication removes exactly one entry.
+    /// After insertion completes, the remaining member is counted and reachable.
+    ///
+    /// Removing more than one entry per root-tree pop can wrap the count: the
+    /// racing insert publishes its entry before incrementing `nr_queued`.
+    #[test]
+    fn pop_concurrent_with_member_publication_preserves_group_membership() {
+        loom::model(|| {
+            const FIRST: usize = 1;
+            const SECOND: usize = 2;
+            let group = Arc::new(LoomMemberGroup {
+                group: LoomGroup::new(1),
+                members: loom::sync::Mutex::new([FIRST].into_iter().collect()),
+            });
+
+            let g = Arc::clone(&group);
+            let insert = thread::spawn(move || g.insert(SECOND));
+            let popped = group.pop().expect("the initial member is available");
+            let remaining = match popped {
+                FIRST => SECOND,
+                SECOND => FIRST,
+                member => panic!("unexpected member {member}"),
+            };
+            insert.join().unwrap();
+
+            assert_eq!(
+                *group.members.lock().unwrap(),
+                [remaining],
+                "one root pop removes exactly one entry"
+            );
+            assert_eq!(group.group.count(), 1, "nr_queued drifted");
+            assert!(group.group.is_in_root(), "remaining member is unreachable");
+            assert!(group.group.root_entries_valid(), "duplicate root entry");
+
+            assert_eq!(group.pop(), Some(remaining));
+            assert!(group.members.lock().unwrap().is_empty());
+            assert_eq!(group.group.count(), 0);
+            assert!(!group.group.is_in_root());
+            assert!(group.group.root_entries_valid(), "duplicate root entry");
         });
     }
 
