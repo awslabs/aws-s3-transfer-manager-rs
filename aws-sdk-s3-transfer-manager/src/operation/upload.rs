@@ -12,6 +12,16 @@
 //! transfer metrics. Optional response fields depend on the selected path
 //! and the values returned by S3; see [`UploadOutput`](crate::model::UploadOutput)
 //! for their provenance.
+//!
+//! # Integrity inputs
+//!
+//! An upload fails with [`ErrorKind::InputInvalid`](crate::error::ErrorKind::InputInvalid) when a
+//! checksum you supplied is invalid. These are the invalid cases:
+//!
+//! - A [`PartStream`](crate::io::PartStream) part carries a
+//!   [checksum](crate::io::PartData::with_checksum), but the upload has no [`ChecksumStrategy`] set.
+//! - [`UploadInput::content_md5`] is set, and the upload is sent as a multipart upload. A
+//!   Content-MD5 covers the whole object, which only a single-request upload can carry.
 
 /// Operation builders
 pub mod builders;

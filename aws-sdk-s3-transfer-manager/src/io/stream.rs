@@ -362,9 +362,10 @@ impl PartData {
     /// using the algorithm specified in the [ChecksumStrategy](crate::operation::upload::ChecksumStrategy)).
     ///
     /// The value is sent with the part only if the upload has a checksum
-    /// strategy, either set on the upload or applied by default; otherwise it is
-    /// ignored. If you don't set it, the SDK calculates the part's checksum as it
-    /// sends the part, when the S3 client's `request_checksum_calculation` is
+    /// strategy, either set on the upload or applied by default, otherwise the upload
+    /// will fail with [`ErrorKind::InputInvalid`](crate::error::ErrorKind::InputInvalid).
+    ///  If you don't set it, the SDK calculates the part's checksum as it sends the part,
+    /// when the S3 client's `request_checksum_calculation` is
     /// `WhenSupported` (the default). See
     /// [ChecksumStrategy](crate::operation::upload::ChecksumStrategy).
     pub fn with_checksum(mut self, checksum: impl Into<String>) -> Self {

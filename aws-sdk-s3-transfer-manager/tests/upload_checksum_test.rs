@@ -215,6 +215,28 @@ fn mock_s3_client_for_multipart_upload(
     expect_checksums_from_part_stream: bool,
     expect_full_object_checksum_from_part_stream: bool,
 ) -> aws_sdk_s3::Client {
+    let mock_client_rules = multipart_upload_rules(
+        request_strategy,
+        response_algorithm,
+        response_checksum_type,
+        expected_parts,
+        expect_checksums_from_part_stream,
+        expect_full_object_checksum_from_part_stream,
+    );
+    mock_client!(aws_sdk_s3, RuleMode::Sequential, &mock_client_rules)
+}
+
+/// Rules for a multipart upload, in the order a completed upload sends them: CreateMultipartUpload
+/// (index 0), one UploadPart per expected part (indices `1..=expected_parts.len()`),
+/// CompleteMultipartUpload, then AbortMultipartUpload, which only a failed upload sends.
+fn multipart_upload_rules(
+    request_strategy: Option<ChecksumStrategy>,
+    response_algorithm: ChecksumAlgorithm,
+    response_checksum_type: ChecksumType,
+    expected_parts: &Vec<Bytes>,
+    expect_checksums_from_part_stream: bool,
+    expect_full_object_checksum_from_part_stream: bool,
+) -> Vec<Rule> {
     let mut mock_client_rules: Vec<Rule> = Vec::new();
 
     // Pre-calculate stuff for later
@@ -408,7 +430,20 @@ fn mock_s3_client_for_multipart_upload(
             }),
     );
 
-    mock_client!(aws_sdk_s3, RuleMode::Sequential, &mock_client_rules)
+    // AbortMultipartUpload, sent only when the upload fails
+    mock_client_rules.push(
+        mock!(aws_sdk_s3::Client::abort_multipart_upload)
+            .match_requests(move |input| {
+                assert_eq!(input.upload_id(), Some(upload_id.as_str()));
+                true
+            })
+            .then_output(|| {
+                aws_sdk_s3::operation::abort_multipart_upload::AbortMultipartUploadOutput::builder()
+                    .build()
+            }),
+    );
+
+    mock_client_rules
 }
 
 fn mock_s3_client_for_put_object(
@@ -956,4 +991,179 @@ async fn test_mpu_checksums_from_part_stream() {
     .await;
     assert_eq!(output.checksum_type(), Some(&ChecksumType::FullObject));
     assert!(output.checksum_crc32().is_some());
+}
+
+//
+// Unsupported checksum inputs
+//
+
+/// Helper function builds a Transfer Manager over `s3_client` with the given request checksum policy.
+fn helper_create_transfer_manager(
+    s3_client: aws_sdk_s3::Client,
+    sdk_checksum_calculation: aws_sdk_s3::config::RequestChecksumCalculation,
+) -> aws_sdk_s3_transfer_manager::Client {
+    let s3_config = s3_client
+        .config()
+        .to_builder()
+        .request_checksum_calculation(sdk_checksum_calculation);
+    let tm_config = aws_sdk_s3_transfer_manager::Config::builder()
+        .s3_config(test_common::s3_config_with_test_http(s3_config))
+        .part_size(PartSize::Target(PART_SIZE as u64))
+        .multipart_threshold(PartSize::Target(PART_SIZE as u64))
+        .concurrency(ConcurrencyMode::Explicit(1))
+        .build();
+    aws_sdk_s3_transfer_manager::Client::new(tm_config)
+}
+
+/// Asserts that `error` is an input error whose cause names `expected_cause`.
+///
+/// The cause is reached through `source()`: the error's own `Display` carries only its kind.
+fn assert_input_invalid(error: &aws_sdk_s3_transfer_manager::error::Error, expected_cause: &str) {
+    assert_eq!(
+        *error.kind(),
+        aws_sdk_s3_transfer_manager::error::ErrorKind::InputInvalid,
+        "{error}"
+    );
+    let cause = std::error::Error::source(error)
+        .expect("an input error carries its cause")
+        .to_string();
+    assert!(cause.contains(expected_cause), "unexpected cause: {cause}");
+}
+
+#[tokio::test]
+async fn test_mpu_part_checksum_without_strategy_is_rejected() {
+    // The PartStream supplies part checksums, but no ChecksumStrategy is set and the SDK's
+    // config disables the default one, so nothing names the checksum algorithm.
+    let parts = vec![
+        Bytes::from(vec![b'a'; PART_SIZE]),
+        Bytes::from("abcdefghijklm".as_bytes()),
+    ];
+    let part_checksums = parts
+        .iter()
+        .map(|part| Some(calculate_checksum(&ChecksumAlgorithm::Crc32, part)))
+        .collect();
+    // With no strategy, S3 reports its default full-object CRC64NVME.
+    let rules = multipart_upload_rules(
+        None,
+        ChecksumAlgorithm::Crc64Nvme,
+        ChecksumType::FullObject,
+        &parts,
+        false,
+        false,
+    );
+    let (create, upload_parts, complete, abort) = (
+        &rules[0],
+        &rules[1..=parts.len()],
+        &rules[parts.len() + 1],
+        &rules[parts.len() + 2],
+    );
+    let stream = TestStream {
+        parts,
+        next_part_num: 1,
+        part_checksums,
+        full_object_checksum: None,
+    };
+
+    // The failed upload sends AbortMultipartUpload right after Create, out of the sequential order.
+    let tm = helper_create_transfer_manager(
+        mock_client!(aws_sdk_s3, RuleMode::MatchAny, &rules),
+        aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired,
+    );
+    let error = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .body(InputStream::from_part_stream(stream))
+        .initiate()
+        .unwrap()
+        .join()
+        .await
+        .expect_err("a part checksum without a ChecksumStrategy must fail the upload");
+
+    // Parts are read in order at concurrency 1, so part 1 is the first one rejected.
+    assert_input_invalid(
+        &error,
+        "upload stream supplied a checksum for part 1, but the upload has no ChecksumStrategy",
+    );
+    assert_eq!(create.num_calls(), 1);
+    assert!(
+        upload_parts.iter().all(|rule| rule.num_calls() == 0),
+        "the part carrying the checksum must not be sent"
+    );
+    assert_eq!(complete.num_calls(), 0);
+    // The failed upload is aborted, as for any failed part.
+    assert_eq!(abort.num_calls(), 1);
+}
+
+#[tokio::test]
+async fn test_mpu_content_md5_is_rejected() {
+    // A whole-object Content-MD5 cannot be sent with any multipart request.
+    let body = Bytes::from(vec![b'a'; PART_SIZE + 1]);
+    let content_md5 = aws_smithy_types::base64::encode(md5::compute(&body).0);
+
+    let strategy = ChecksumStrategy::default();
+    let rules = multipart_upload_rules(
+        Some(strategy.clone()),
+        strategy.algorithm().clone(),
+        strategy.type_if_multipart().clone(),
+        &vec![body.slice(..PART_SIZE), body.slice(PART_SIZE..)],
+        false,
+        false,
+    );
+    let tm = helper_create_transfer_manager(
+        mock_client!(aws_sdk_s3, RuleMode::MatchAny, &rules),
+        aws_sdk_s3::config::RequestChecksumCalculation::WhenSupported,
+    );
+    let error = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .content_md5(content_md5)
+        .body(InputStream::from(body))
+        .initiate()
+        .unwrap()
+        .join()
+        .await
+        .expect_err("content_md5 on a multipart upload must fail the upload");
+
+    assert_input_invalid(
+        &error,
+        "upload content_md5 is not supported for multipart uploads",
+    );
+    assert!(
+        rules.iter().all(|rule| rule.num_calls() == 0),
+        "no multipart request may be sent"
+    );
+}
+
+#[tokio::test]
+async fn test_put_object_content_md5_is_sent() {
+    let body = Bytes::from("abcdefghijklm".as_bytes());
+    let content_md5 = aws_smithy_types::base64::encode(md5::compute(&body).0);
+
+    let put_object = mock!(aws_sdk_s3::Client::put_object)
+        .match_requests({
+            let content_md5 = content_md5.clone();
+            move |input| input.content_md5() == Some(content_md5.as_str())
+        })
+        .then_output({
+            let etag = calculate_etag(&body);
+            move || PutObjectOutput::builder().e_tag(&etag).build()
+        });
+    let tm = helper_create_transfer_manager(
+        mock_client!(aws_sdk_s3, RuleMode::Sequential, &[&put_object]),
+        aws_sdk_s3::config::RequestChecksumCalculation::WhenSupported,
+    );
+    tm.upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .content_md5(content_md5)
+        .body(InputStream::from(body))
+        .initiate()
+        .unwrap()
+        .join()
+        .await
+        .expect("a single-request upload sends content_md5");
+
+    assert_eq!(put_object.num_calls(), 1);
 }
