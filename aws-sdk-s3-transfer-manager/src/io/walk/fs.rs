@@ -1141,10 +1141,7 @@ impl FsWalk {
                                     ));
                                 }
                             }
-                            // Anything else leaves the target's kind unknown, and a link to a
-                            // directory would have filed a whole subtree under this name. Reported
-                            // even when the filter excluded the name, because a rule on a name says
-                            // nothing about the keys under it.
+                            // A link into an endless chain reaches nothing, as a dangling link does.
                             _ if is_endless_chain(&e) => {
                                 if rejected {
                                     self.push_excluded_link(&mut result.children, path);
@@ -1156,6 +1153,10 @@ impl FsWalk {
                                     ));
                                 }
                             }
+                            // Anything else leaves the target's kind unknown, and a link to a
+                            // directory would have filed a whole subtree under this name. Reported
+                            // even when the filter excluded the name, because a rule on a name says
+                            // nothing about the keys under it.
                             _ => {
                                 result.errors.push(WalkError::new(
                                     Some(path),
@@ -3617,9 +3618,6 @@ mod tests {
         );
     }
 
-    // The oracle the other ordering tests compare against goes through `to_string_lossy`, so it
-    // cannot express a name that is not valid UTF-8 — both such names become the same string. The
-    // comparator works on bytes, which is what keeps two names differing only in their invalid bytes
     // A links-only walk yields nothing and still records every link it follows, in both kinds.
     #[cfg(unix)]
     #[tokio::test]
@@ -3653,6 +3651,9 @@ mod tests {
         );
     }
 
+    // The oracle the other ordering tests compare against goes through `to_string_lossy`, so it
+    // cannot express a name that is not valid UTF-8 — both such names become the same string. The
+    // comparator works on bytes, which is what keeps two names differing only in their invalid bytes
     // apart, so it is compared here against the byte order directly.
     #[cfg(unix)]
     #[test]
