@@ -562,12 +562,8 @@ async fn tampered_single_part_errors_mock_gp() {
     tampered_single_part_errors(Target::mock_gp()).await;
 }
 
-// Backwards-compatibility guard: a real checksum mismatch must populate the
-// IntegrityError fields. These are extracted from the SDK's
-// `aws_smithy_checksums::body::validate::Error` shape at the body-read boundary;
-// if the SDK changes that error type, the extraction silently degrades to a bare
-// IOError and integrity failures stop being distinguishable. This test fails
-// loudly in that case.
+// A real checksum mismatch populates every IntegrityError field from the SDK's
+// checksum outcome for the response.
 #[tokio::test]
 async fn integrity_error_carries_extracted_fields_mock_gp() {
     let t = Target::mock_gp().connect().await;
@@ -587,14 +583,18 @@ async fn integrity_error_carries_extracted_fields_mock_gp() {
     let result = t.download("obj", Some(ChecksumMode::Enabled)).await;
     let ie = crate::assertions::expect_integrity_error(result);
 
-    // The expected/computed checksums must be recovered from the SDK error.
+    assert_eq!(
+        ie.algorithm(),
+        Some(&aws_sdk_s3_transfer_manager::types::ChecksumAlgorithm::Crc32),
+        "the algorithm should come from the SDK's checksum outcome"
+    );
     assert!(
         ie.expected().is_some(),
-        "expected checksum should be extracted from the SDK mismatch error"
+        "expected checksum should be reported by the SDK's checksum outcome"
     );
     assert!(
         ie.computed().is_some(),
-        "computed checksum should be extracted from the SDK mismatch error"
+        "computed checksum should be reported by the SDK's checksum outcome"
     );
     assert_ne!(
         ie.expected(),

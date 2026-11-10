@@ -196,7 +196,6 @@ dependencies = [
  "aws-config",
  "aws-runtime",
  "aws-sdk-s3",
- "aws-smithy-checksums",
  "aws-smithy-dns",
  "aws-smithy-execution",
  "aws-smithy-http-client",

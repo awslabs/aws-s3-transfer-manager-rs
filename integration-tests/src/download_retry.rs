@@ -29,17 +29,13 @@
 //! buffers it. These tests use multi-megabyte objects and place the fault well
 //! into the stream.
 //!
-//! `corrupt_body_once_is_not_retried` and `corrupt_body_always_fails` cover the
-//! checksum path: a corrupt body fails the download and is not retried. Both
-//! assert the failure is `ErrorKind::IntegrityError`, not merely that it failed.
-//!
-//! That assertion is also the standing guard for the classifier's source-chain
-//! downcast (`error::checksum_mismatch_values`), which is fragile across
-//! `aws-smithy-checksums` versions (a `0.x` minor bump changes the `TypeId` and
-//! the downcast misses — see https://github.com/smithy-lang/smithy-rs/issues/4718).
-//! These run against the version `aws-sdk-s3` actually links, so a bump that broke
-//! the downcast turns the mismatch into a retryable I/O error and fails the
-//! `IntegrityError` assertion here — making the break CI-visible rather than silent.
+//! The `corrupt_body_*` tests cover the checksum path: a corrupt body fails the
+//! download and is not retried, including one that arrives on a retry of a range
+//! chunk's GET, of either discovery GET, or of the discovery chunk's read. Each
+//! asserts the failure is `ErrorKind::IntegrityError`, not merely that it failed.
+//! The transfer manager classifies the mismatch from the SDK's checksum outcome
+//! for the response, so the kind does not depend on the error type that
+//! `aws-smithy-checksums` returns.
 
 use crate::assertions::{assert_integrity_error, assert_io_error, assert_same_content};
 use crate::harness::Target;
@@ -49,7 +45,7 @@ use aws_sdk_s3_transfer_manager::types::ChecksumMode;
 use aws_sdk_s3_transfer_manager::types::PartSize;
 use aws_sdk_s3_transfer_manager::Client as TmClient;
 use s3_mock_server::S3MockServer;
-use s3_mock_server::{BodyCadence, FaultType, Occurrence};
+use s3_mock_server::{BodyCadence, FaultType, Occurrence, Operation};
 
 /// Part size pinned equally for upload and download so multipart download ranges
 /// align to the uploaded part boundaries (the precondition for per-part
@@ -367,9 +363,7 @@ async fn slow_progressing_body_download_completes() {
 // checksum mismatch -> not retried --------------------------------------------
 
 /// A corrupt body (bytes altered, checksum intact) injected `Always` fails the
-/// download. The classifier walks the source chain to a checksum
-/// `validate::Error`, so this also exercises that downcast against the linked
-/// `aws-smithy-checksums` version.
+/// download with `ErrorKind::IntegrityError`.
 #[tokio::test]
 async fn corrupt_body_always_fails() {
     let t = Target::mock_gp().connect_with(Some(PART_SIZE)).await;
@@ -423,6 +417,247 @@ async fn corrupt_body_once_is_not_retried() {
 
     let result = t.download("obj", Some(ChecksumMode::Enabled)).await;
     assert_integrity_error(result);
+
+    t.shutdown().await;
+}
+
+/// An object that uploads as two parts, since 16 MiB meets the default multipart
+/// threshold, and downloads as discovery + exactly ONE range chunk aligned to
+/// part 2. Unlike `single_range_chunk_data`, the range chunk carries a part
+/// checksum when uploaded with a composite checksum, so a corrupt body on it is
+/// a checksum mismatch.
+fn two_part_data() -> Vec<u8> {
+    (0..16 * ByteUnit::Mebibyte.as_bytes_usize())
+        .map(|i| (i % 256) as u8)
+        .collect()
+}
+
+/// A corrupt body on a chunk's retry fails the download with
+/// `ErrorKind::IntegrityError` and is not retried again. Attempt 1 is truncated,
+/// so the corrupt body arrives on attempt 2, which must be checked with its own
+/// checksum capture.
+#[tokio::test]
+async fn corrupt_body_on_retry_is_not_retried() {
+    let t = Target::mock_gp().connect_with(Some(PART_SIZE)).await;
+    t.put(
+        "obj",
+        two_part_data(),
+        ChecksumStrategy::with_calculated_crc32_composite_if_multipart(),
+    )
+    .await;
+
+    // The two faults fire in order, on the lone range chunk's first two attempts.
+    let mock = t.mock().expect("requires the mock backend");
+    mock.insert_fault(
+        t.bucket(),
+        &t.key("obj"),
+        FaultType::TruncateBody {
+            after_bytes: FAULT_AFTER_BYTES,
+        },
+        SKIP_DISCOVERY,
+        Occurrence::Once,
+    );
+    mock.insert_fault(
+        t.bucket(),
+        &t.key("obj"),
+        FaultType::CorruptBody,
+        SKIP_DISCOVERY,
+        Occurrence::Once,
+    );
+
+    let result = t.download("obj", Some(ChecksumMode::Enabled)).await;
+    assert_integrity_error(result);
+    assert_eq!(
+        mock.request_count(Operation::GetObject),
+        3,
+        "the discovery GET, then the range chunk's two attempts"
+    );
+
+    t.shutdown().await;
+}
+
+/// An object of one `PART_SIZE`: it uploads with a single PUT and downloads as
+/// the discovery chunk alone, so every GET after the upload is that chunk's, and
+/// each covers the whole object and carries its checksum.
+fn one_part_data() -> Vec<u8> {
+    (0..8 * ByteUnit::Mebibyte.as_bytes_usize())
+        .map(|i| (i % 256) as u8)
+        .collect()
+}
+
+/// Turns off the SDK's own retries, so a throttled discovery attempt reaches the
+/// transfer manager's discovery retry instead of being retried within one call.
+fn without_sdk_retries(builder: aws_types::sdk_config::Builder) -> aws_types::sdk_config::Builder {
+    builder.retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
+}
+
+/// A corrupt body on the discovery GET's retry fails the download with
+/// `ErrorKind::IntegrityError` and is not retried again. With the SDK's own
+/// retries off, attempt 1 is throttled, so the corrupt body arrives on attempt 2,
+/// which must be checked with its own checksum capture.
+#[tokio::test]
+async fn corrupt_body_on_discovery_retry_is_not_retried() {
+    let t = Target::mock_gp()
+        .connect_mock_configured(Some(PART_SIZE), without_sdk_retries)
+        .await;
+    t.put(
+        "obj",
+        one_part_data(),
+        ChecksumStrategy::with_calculated_crc32(),
+    )
+    .await;
+
+    // The two faults fire in order, on the discovery GET's first two attempts.
+    let mock = t.mock().expect("requires the mock backend");
+    mock.insert_fault(
+        t.bucket(),
+        &t.key("obj"),
+        FaultType::slow_down(),
+        0,
+        Occurrence::Once,
+    );
+    mock.insert_fault(
+        t.bucket(),
+        &t.key("obj"),
+        FaultType::CorruptBody,
+        0,
+        Occurrence::Once,
+    );
+
+    let result = t.download("obj", Some(ChecksumMode::Enabled)).await;
+    assert_integrity_error(result);
+    assert_eq!(
+        mock.request_count(Operation::GetObject),
+        2,
+        "the discovery GET's two attempts"
+    );
+
+    t.shutdown().await;
+}
+
+/// A corrupt body on the SDK's own retry of the discovery GET fails the download
+/// with `ErrorKind::IntegrityError` and is not retried again. With the SDK's
+/// default retries, attempt 1 is throttled and the SDK retries it within the same
+/// call, so the call's checksum capture must report the latest attempt.
+#[tokio::test]
+async fn corrupt_body_on_sdk_retry_is_not_retried() {
+    let t = Target::mock_gp().connect_with(Some(PART_SIZE)).await;
+    t.put(
+        "obj",
+        one_part_data(),
+        ChecksumStrategy::with_calculated_crc32(),
+    )
+    .await;
+
+    // The two faults fire in order, on the SDK's first two attempts of the call.
+    let mock = t.mock().expect("requires the mock backend");
+    mock.insert_fault(
+        t.bucket(),
+        &t.key("obj"),
+        FaultType::slow_down(),
+        0,
+        Occurrence::Once,
+    );
+    mock.insert_fault(
+        t.bucket(),
+        &t.key("obj"),
+        FaultType::CorruptBody,
+        0,
+        Occurrence::Once,
+    );
+
+    let result = t.download("obj", Some(ChecksumMode::Enabled)).await;
+    assert_integrity_error(result);
+    assert_eq!(
+        mock.request_count(Operation::GetObject),
+        2,
+        "the SDK's two attempts of the discovery GET"
+    );
+
+    t.shutdown().await;
+}
+
+/// A corrupt body on the realigned discovery GET's retry fails the download with
+/// `ErrorKind::IntegrityError` and is not retried again. With no part size pinned,
+/// validation re-discovers the multipart object with a partNumber=1 GET. With the
+/// SDK's own retries off, that GET's attempt 1 is throttled, so the corrupt body
+/// arrives on attempt 2, which must be checked with its own checksum capture.
+#[tokio::test]
+async fn corrupt_body_on_realigned_discovery_retry_is_not_retried() {
+    let t = Target::mock_gp()
+        .connect_mock_configured(None, without_sdk_retries)
+        .await;
+    t.put(
+        "obj",
+        two_part_data(),
+        ChecksumStrategy::with_calculated_crc32_composite_if_multipart(),
+    )
+    .await;
+
+    // The two faults fire in order, on the partNumber=1 GET's first two attempts.
+    let mock = t.mock().expect("requires the mock backend");
+    mock.insert_fault(
+        t.bucket(),
+        &t.key("obj"),
+        FaultType::slow_down(),
+        1, // the ranged discovery GET that the partNumber=1 GET replaces
+        Occurrence::Once,
+    );
+    mock.insert_fault(
+        t.bucket(),
+        &t.key("obj"),
+        FaultType::CorruptBody,
+        1,
+        Occurrence::Once,
+    );
+
+    let result = t.download("obj", Some(ChecksumMode::Enabled)).await;
+    assert_integrity_error(result);
+
+    t.shutdown().await;
+}
+
+/// A corrupt body on the discovery chunk's re-issue fails the download with
+/// `ErrorKind::IntegrityError` and is not retried again. The discovery body and
+/// the first re-issue are truncated, so the corrupt body arrives on the second
+/// re-issue, which must be checked with its own checksum capture.
+#[tokio::test]
+async fn corrupt_body_on_discovery_chunk_reissue_is_not_retried() {
+    let t = Target::mock_gp().connect_with(Some(PART_SIZE)).await;
+    t.put(
+        "obj",
+        one_part_data(),
+        ChecksumStrategy::with_calculated_crc32(),
+    )
+    .await;
+
+    // The faults fire in order: on the discovery GET, then the chunk's first two
+    // re-issues.
+    let mock = t.mock().expect("requires the mock backend");
+    mock.insert_fault(
+        t.bucket(),
+        &t.key("obj"),
+        FaultType::TruncateBody {
+            after_bytes: FAULT_AFTER_BYTES,
+        },
+        0,
+        Occurrence::NTimes(2),
+    );
+    mock.insert_fault(
+        t.bucket(),
+        &t.key("obj"),
+        FaultType::CorruptBody,
+        0,
+        Occurrence::Once,
+    );
+
+    let result = t.download("obj", Some(ChecksumMode::Enabled)).await;
+    assert_integrity_error(result);
+    assert_eq!(
+        mock.request_count(Operation::GetObject),
+        3,
+        "the discovery GET, then the chunk's two re-issues"
+    );
 
     t.shutdown().await;
 }

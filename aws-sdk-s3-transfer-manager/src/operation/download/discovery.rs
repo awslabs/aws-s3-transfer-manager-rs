@@ -4,6 +4,8 @@
  */
 
 use aws_sdk_s3::operation::get_object::GetObjectOutput;
+use aws_smithy_observability::unit_of_work::checksums::ChecksumCapture;
+use aws_smithy_observability::unit_of_work::Capture;
 use aws_smithy_types::body::SdkBody;
 use aws_smithy_types::byte_stream::ByteStream;
 use std::ops::RangeInclusive;
@@ -62,6 +64,8 @@ pub(super) struct ObjectDiscovery {
 #[derive(Debug)]
 pub(super) struct InitialChunk {
     pub(super) body: ByteStream,
+    /// The capture attached to the request that returned `body`.
+    pub(super) checksum: ChecksumCapture,
     pub(super) expected_len: usize,
     /// Request measurement carried until the lazy response body is validated.
     pub(super) request_metrics: Option<DownloadRequestMeasurement>,
@@ -181,14 +185,17 @@ async fn discover_obj_with_get_first_part(
     let result = crate::retry::retry(req_metrics.metrics_mut(), retry_classify, |_allow_hedge| {
         let builder =
             copy_fields_to_get_object_request(input, transfer.ctx().s3_client().get_object());
+        let checksum = ChecksumCapture::new();
         let req = builder
             .set_range(None)
             .set_part_number(Some(1))
             .customize()
+            .interceptor(Capture::new().with(&checksum))
             .config_override(transfer.ctx().bucket_partition_override(input.bucket()));
         async move {
             req.send()
                 .await
+                .map(|resp| (resp, checksum))
                 .map_err(|e| crate::retry::GuardError::Inner(error::Error::from(e)))
         }
     })
@@ -198,8 +205,8 @@ async fn discover_obj_with_get_first_part(
         tid = %transfer.ctx().id
     ))
     .await;
-    let resp = result?;
-    let discovery = first_chunk_response_handler(resp, None, None)?;
+    let (resp, checksum) = result?;
+    let discovery = first_chunk_response_handler(resp, checksum, None, None)?;
     Ok(attach_request_measurement(discovery, req_metrics))
 }
 
@@ -366,13 +373,16 @@ async fn discover_obj_with_get(
     let result = crate::retry::retry(req_metrics.metrics_mut(), retry_classify, |_allow_hedge| {
         let builder =
             copy_fields_to_get_object_request(input, transfer.ctx().s3_client().get_object());
+        let checksum = ChecksumCapture::new();
         let req = builder
             .range(header::Range::bytes(byte_range.clone()))
             .customize()
+            .interceptor(Capture::new().with(&checksum))
             .config_override(transfer.ctx().bucket_partition_override(input.bucket()));
         async move {
             req.send()
                 .await
+                .map(|resp| (resp, checksum))
                 .map_err(|e| crate::retry::GuardError::Inner(error::Error::from(e)))
         }
     })
@@ -393,9 +403,13 @@ async fn discover_obj_with_get(
             req_metrics.finish();
             Err(error)
         }
-        Ok(response) => {
-            let discovery =
-                first_chunk_response_handler(response, range_from_user, Some(&byte_range))?;
+        Ok((response, checksum)) => {
+            let discovery = first_chunk_response_handler(
+                response,
+                checksum,
+                range_from_user,
+                Some(&byte_range),
+            )?;
             Ok(attach_request_measurement(discovery, req_metrics))
         }
     }
@@ -424,6 +438,7 @@ fn attach_request_measurement(
 
 /// Converts an initial `GetObject` response into object discovery state.
 ///
+/// `checksum` is the capture attached to the request that returned `resp`.
 /// `requested_range` is the range sent with the request. `range_from_user`
 /// bounds the complete transfer independently of the discovery request.
 /// Passing no requested range denotes `partNumber` discovery.
@@ -432,6 +447,7 @@ fn attach_request_measurement(
 /// malformed, or inconsistent with an explicit range.
 fn first_chunk_response_handler(
     mut resp: GetObjectOutput,
+    checksum: ChecksumCapture,
     range_from_user: Option<RangeInclusive<u64>>,
     requested_range: Option<&ByteRange>,
 ) -> Result<ObjectDiscovery, error::Error> {
@@ -497,6 +513,7 @@ fn first_chunk_response_handler(
         0 => None,
         length => Some(InitialChunk {
             body,
+            checksum,
             expected_len: usize::try_from(length).map_err(|_| {
                 error::discovery_failed("response content-length exceeds platform representation")
             })?,
@@ -532,6 +549,7 @@ mod tests {
     use aws_sdk_s3::operation::head_object::HeadObjectOutput;
     use aws_sdk_s3::Client;
     use aws_smithy_mocks::{mock, mock_client};
+    use aws_smithy_observability::unit_of_work::checksums::ChecksumCapture;
     use aws_smithy_types::byte_stream::ByteStream;
     use aws_smithy_types::error::ErrorMetadata;
     use bytes::Buf;
@@ -603,7 +621,7 @@ mod tests {
     fn test_first_chunk_rejects_negative_content_length() {
         let response = GetObjectOutput::builder().content_length(-1).build();
 
-        let error = first_chunk_response_handler(response, None, None)
+        let error = first_chunk_response_handler(response, ChecksumCapture::new(), None, None)
             .expect_err("negative content-length must not become an unsigned response length");
 
         assert_eq!(
@@ -620,9 +638,13 @@ mod tests {
             .build();
         let requested_chunk = ByteRange::Inclusive(100, 199);
 
-        let discovery =
-            first_chunk_response_handler(response, Some(100..=300), Some(&requested_chunk))
-                .unwrap();
+        let discovery = first_chunk_response_handler(
+            response,
+            ChecksumCapture::new(),
+            Some(100..=300),
+            Some(&requested_chunk),
+        )
+        .unwrap();
 
         assert_eq!(100, discovery.object_range_start);
         assert_eq!(Some(200..=300), discovery.remaining);
@@ -636,8 +658,13 @@ mod tests {
             .build();
         let requested_chunk = ByteRange::Inclusive(100, 199);
 
-        let error = first_chunk_response_handler(response, Some(100..=300), Some(&requested_chunk))
-            .expect_err("response offsets must match the range sent to S3");
+        let error = first_chunk_response_handler(
+            response,
+            ChecksumCapture::new(),
+            Some(100..=300),
+            Some(&requested_chunk),
+        )
+        .expect_err("response offsets must match the range sent to S3");
 
         assert_eq!(
             error.kind(),
@@ -650,8 +677,13 @@ mod tests {
         let response = GetObjectOutput::builder().content_length(5).build();
         let requested_chunk = ByteRange::Inclusive(0, 499);
 
-        let discovery =
-            first_chunk_response_handler(response, None, Some(&requested_chunk)).unwrap();
+        let discovery = first_chunk_response_handler(
+            response,
+            ChecksumCapture::new(),
+            None,
+            Some(&requested_chunk),
+        )
+        .unwrap();
 
         assert_eq!(0, discovery.object_range_start);
         assert!(discovery.remaining.is_none());
@@ -665,7 +697,8 @@ mod tests {
             .content_range("bytes */0")
             .build();
 
-        let discovery = first_chunk_response_handler(response, None, None).unwrap();
+        let discovery =
+            first_chunk_response_handler(response, ChecksumCapture::new(), None, None).unwrap();
 
         assert_eq!(0, discovery.object_range_start);
         assert!(discovery.remaining.is_none());
@@ -677,8 +710,13 @@ mod tests {
         let response = GetObjectOutput::builder().content_length(100).build();
         let requested_chunk = ByteRange::Inclusive(100, 199);
 
-        let error = first_chunk_response_handler(response, Some(100..=300), Some(&requested_chunk))
-            .expect_err("a user range requires absolute response offsets");
+        let error = first_chunk_response_handler(
+            response,
+            ChecksumCapture::new(),
+            Some(100..=300),
+            Some(&requested_chunk),
+        )
+        .expect_err("a user range requires absolute response offsets");
 
         assert_eq!(
             error.kind(),
@@ -694,7 +732,7 @@ mod tests {
                 .set_content_range(content_range.map(str::to_string))
                 .build();
 
-            let error = first_chunk_response_handler(response, None, None)
+            let error = first_chunk_response_handler(response, ChecksumCapture::new(), None, None)
                 .expect_err("a nonempty partNumber response requires valid object offsets");
 
             assert_eq!(

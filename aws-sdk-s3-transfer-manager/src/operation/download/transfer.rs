@@ -21,7 +21,7 @@ use crate::operation::download::body::{BodySlot, BodyWriter, ChunkOutput, DrainE
 use crate::operation::download::context::{
     CompletionClaim, DownloadPendingReason, DownloadState, PendingClaim,
 };
-use crate::operation::download::discovery::{discover_obj, ObjectDiscovery};
+use crate::operation::download::discovery::{discover_obj, InitialChunk, ObjectDiscovery};
 use crate::operation::download::observability::{
     DownloadDestination, DownloadEvent, DownloadExecutionState, DownloadObservability,
     DownloadRequestKind, DownloadRequestMeasurement, DownloadStateSnapshot, DownloadTerminalReport,
@@ -36,6 +36,8 @@ use crate::runtime::buffer_pool::{
 };
 use crate::transfer::{IoRequest, PollWork, Transfer, TransferContext, TransferId, WorkOutcome};
 use crate::types::BucketType;
+use aws_smithy_observability::unit_of_work::checksums::ChecksumCapture;
+use aws_smithy_observability::unit_of_work::Capture;
 use aws_smithy_types::error::display::DisplayErrorContext;
 use tracing::Instrument;
 
@@ -861,15 +863,16 @@ impl DownloadTransfer {
         // returning `Pending` to the scheduler (discovery runs in async `execute`,
         // not `poll_work`).
         let initial_work = match (initial_chunk, chunk_meta) {
-            (Some(initial), Some(meta)) => {
+            (Some(mut initial), Some(meta)) => {
                 let req_metrics = initial
                     .request_metrics
+                    .take()
                     .expect("ranged discovery body carries its request measurement");
                 let mut slot = self.inner.writer.claim();
                 match self.reserve_discovery_chunk(initial.expected_len).await {
                     Ok(Some(reservation)) => {
                         slot.attach_reservation(reservation);
-                        Some((initial.body, initial.expected_len, req_metrics, meta, slot))
+                        Some((initial, req_metrics, meta, slot))
                     }
                     // Terminal (cancel/fail by another path) while reserving the discovery
                     // chunk: the transfer is already in its terminal state, so drop the
@@ -946,16 +949,9 @@ impl DownloadTransfer {
 
         // If discovery returned an initial chunk, process it
         match initial_work {
-            Some((stream, expected_len, request, chunk_meta, slot)) => {
-                self.execute_read_discovery_body(
-                    stream,
-                    expected_len,
-                    request,
-                    slot,
-                    chunk_meta,
-                    etag,
-                )
-                .await
+            Some((initial, request, chunk_meta, slot)) => {
+                self.execute_read_discovery_body(initial, request, slot, chunk_meta, etag)
+                    .await
             }
             None => WorkOutcome::Success { data: None },
         }
@@ -963,13 +959,18 @@ impl DownloadTransfer {
 
     async fn execute_read_discovery_body(
         &self,
-        stream: aws_sdk_s3::primitives::ByteStream,
-        expected_len: usize,
+        initial: InitialChunk,
         mut req_metrics: DownloadRequestMeasurement,
         slot: BodySlot,
         chunk_meta: ChunkMetadata,
         etag: Option<Arc<str>>,
     ) -> WorkOutcome {
+        let InitialChunk {
+            body,
+            checksum,
+            expected_len,
+            request_metrics: _,
+        } = initial;
         req_metrics.resume();
         let seq = slot.seq();
         let input = self.inner.request.as_ref();
@@ -985,7 +986,7 @@ impl DownloadTransfer {
             .as_deref()
             .and_then(crate::http::header::parse_content_range);
 
-        let mut initial = Some(stream);
+        let mut initial = Some((body, checksum));
         let recv_latencies = &self.inner.ctx.handle.telemetry.recv_latencies;
         // The deadline guards only the GET response (TTFB); the body-read is
         // untimed. The first attempt reuses the discovery body — no network send
@@ -1007,14 +1008,16 @@ impl DownloadTransfer {
             if let Some(etag) = etag.as_ref() {
                 builder = builder.if_match(etag.as_ref());
             }
+            let checksum = ChecksumCapture::new();
             let req = builder
                 .customize()
+                .interceptor(Capture::new().with(&checksum))
                 .config_override(ctx.download_get_override(input.bucket()));
             async move {
                 // Obtain the body stream. First attempt reuses the discovery body
                 // (no send, untimed); a re-issue is TTFB-guarded (times + records).
-                let body = match pre_issued {
-                    Some(s) => s,
+                let (body, checksum) = match pre_issued {
+                    Some(initial) => initial,
                     None => {
                         // A re-issue without a byte range would fetch the whole
                         // object into this chunk's slot. S3 always returns a
@@ -1032,20 +1035,22 @@ impl DownloadTransfer {
                                 ),
                             ));
                         }
-                        recv_latencies
+                        let body = recv_latencies
                             .guarded(allow_hedge, async {
                                 req.send()
                                     .await
                                     .map(|resp| resp.body)
                                     .map_err(crate::error::Error::from)
                             })
-                            .await?
+                            .await?;
+                        (body, checksum)
                     }
                 };
                 // Untimed: drain the body. Errors here are inner (retryable IO).
                 collect_response_body(
                     &ctx.handle.buffer_pool,
                     body,
+                    &checksum,
                     reservation,
                     expected_len,
                     || ctx.is_active(),
@@ -1171,8 +1176,10 @@ impl DownloadTransfer {
                 if let Some(etag) = etag.as_ref() {
                     builder = builder.if_match(etag.as_ref());
                 }
+                let checksum = ChecksumCapture::new();
                 let req = builder
                     .customize()
+                    .interceptor(Capture::new().with(&checksum))
                     .config_override(ctx.download_get_override(input.bucket()));
                 async move {
                     // Timed (TTFB): obtain response headers. Validate the range here
@@ -1190,6 +1197,7 @@ impl DownloadTransfer {
                     let bytes = collect_response_body(
                         &ctx.handle.buffer_pool,
                         resp.body,
+                        &checksum,
                         reservation,
                         expected_len,
                         || ctx.is_active(),
@@ -1575,9 +1583,13 @@ fn chunk_len(remaining: &std::ops::RangeInclusive<u64>, part_size: u64) -> usize
 ///
 /// A zero expected length is invalid. Empty objects complete without issuing a
 /// response-collection operation.
+///
+/// `checksum` is the capture attached to the request that returned `body`; a body
+/// error is classified from its outcome.
 async fn collect_response_body(
     pool: &BufferPool,
     body: aws_sdk_s3::primitives::ByteStream,
+    checksum: &ChecksumCapture,
     reservation: &Reservation,
     expected_len: usize,
     is_active: impl Fn() -> bool,
@@ -1592,7 +1604,7 @@ async fn collect_response_body(
     let mut body_stream = body;
 
     while let Some(result) = body_stream.next().await {
-        let data = result.map_err(|error| error::body_read_error(error, None))?;
+        let data = result.map_err(|error| error::body_read_error(error, checksum.try_outcome()))?;
         let remaining = expected_len
             .checked_sub(bytes_received)
             .ok_or_else(|| response_length_error(expected_len, bytes_received))?;
@@ -1879,9 +1891,11 @@ mod tests {
         expected_len: usize,
         is_active: impl Fn() -> bool,
     ) -> Result<SegmentedBytes, Error> {
+        let checksum = ChecksumCapture::new();
         let mut future = std::pin::pin!(collect_response_body(
             pool,
             body,
+            &checksum,
             reservation,
             expected_len,
             is_active,
