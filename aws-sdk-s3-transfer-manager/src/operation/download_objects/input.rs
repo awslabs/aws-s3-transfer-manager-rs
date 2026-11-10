@@ -28,13 +28,27 @@ use std::{
 /// whose local path resolves outside the destination, or to the destination
 /// directory itself, is not downloaded. It is reported as a failure and
 /// handled by the [`failure_policy`](Self::failure_policy).
+///
+/// Before any object is downloaded, the destination is checked: a directory
+/// that does not exist is created, together with any missing parents, with
+/// the platform's default permissions. A destination that exists and is not a
+/// directory fails the transfer with
+/// [`ErrorKind::InputInvalid`](crate::error::ErrorKind::InputInvalid), and a
+/// directory that cannot be created fails it with
+/// [`ErrorKind::IOError`](crate::error::ErrorKind::IOError). Both are returned
+/// by [`DownloadObjectsHandle::join`](crate::operation::download_objects::DownloadObjectsHandle::join).
+///
+/// `.` and `..` components in the destination are resolved lexically, without
+/// following symbolic links: `./out` and `out/../out` both name `out`, and
+/// files are written under that form.
 #[non_exhaustive]
 #[derive(Clone)]
 pub struct DownloadObjectsInput {
     /// The bucket name containing the object(s).
     pub bucket: Option<String>,
 
-    /// The destination directory to which files should be downloaded.
+    /// The destination directory to which files should be downloaded. Created
+    /// if it does not exist.
     pub destination: Option<PathBuf>,
 
     /// Character used to group keys.
@@ -136,7 +150,8 @@ impl DownloadObjectsInputBuilder {
         self.bucket.as_deref()
     }
 
-    /// Set the destination directory. Required.
+    /// Set the destination directory. Required. Created, with any missing
+    /// parents, if it does not exist.
     pub fn destination(mut self, input: impl Into<PathBuf>) -> Self {
         self.destination = Some(input.into());
         self

@@ -130,8 +130,8 @@ impl Download {
     /// The destination sink is created by `sinks` over the temp file, which the
     /// transfer manager owns and may therefore preallocate. A failure to create
     /// the temp file or the sink is returned as
-    /// [`ErrorKind::IOError`](error::ErrorKind::IOError); a temp file whose sink
-    /// could not be created is removed.
+    /// [`ErrorKind::IOError`](error::ErrorKind::IOError); a
+    /// temp file whose sink could not be created is removed.
     ///
     /// When `parent_id` is `Some`, the transfer is linked as a child of the
     /// given composite transfer via [`TransferContext::new_child`](crate::transfer::TransferContext::new_child).
@@ -148,14 +148,14 @@ impl Download {
             temp_file_candidates(&dest_path, std::iter::repeat_with(|| fastrand::u32(..)));
         let (file, temp_path) = crate::io::fs::create_first_new_async(candidates)
             .await
-            .map_err(|e| error::from_kind(error::ErrorKind::IOError)(e))?;
+            .map_err(|e| error::io_at("creating temporary file for", &dest_path, e))?;
 
         let sink = match sinks.create(file, true) {
             Ok(sink) => sink,
             Err(e) => {
                 // No handle owns the temp file yet, so remove it here.
                 let _ = crate::io::fs::remove_file_async(&temp_path).await;
-                return Err(error::from_kind(error::ErrorKind::IOError)(e));
+                return Err(error::io_at("preparing temporary file for", &dest_path, e));
             }
         };
         let inner = Self::orchestrate_with_sink(handle, input, sink, parent_id)?;

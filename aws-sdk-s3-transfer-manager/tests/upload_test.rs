@@ -24,6 +24,7 @@ use aws_sdk_s3_transfer_manager::memory::{
 };
 use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
 use aws_sdk_s3_transfer_manager::operation::upload::ChecksumStrategy;
+use aws_sdk_s3_transfer_manager::types::FailedMultipartUploadPolicy;
 use aws_smithy_mocks::{mock, mock_client, Rule, RuleMode};
 use aws_smithy_runtime::test_util::capture_test_logs::capture_test_logs;
 use aws_smithy_runtime_api::client::http::{
@@ -1672,6 +1673,156 @@ async fn test_upload_part_without_e_tag_error_carries_request_ids() {
         display.contains(REQUEST_ID),
         "Display must include the request id, got: {display}"
     );
+}
+
+// --- Multipart upload left open ------------------------------------------------
+
+/// Uploads parts 1 to 3 against `mock`, where UploadPart for part 2 fails with a non-retryable
+/// `AccessDenied`, under `policy`, and returns the error `join()` reports.
+async fn join_error_after_part_two_fails(
+    mock: MultipartMock,
+    policy: Option<FailedMultipartUploadPolicy>,
+) -> (Error, MultipartMock) {
+    let part_two = mock!(aws_sdk_s3::Client::upload_part)
+        .match_requests(|req| req.part_number() == Some(2))
+        .then_http_response(|| {
+            HttpResponse::new(
+                StatusCode::try_from(403).unwrap(),
+                SdkBody::from("<Error><Code>AccessDenied</Code></Error>"),
+            )
+        });
+    let mock = mock.with_override(&part_two);
+    let error = mock
+        .tm()
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .body(InputStream::from_part_stream(ScriptedPartStream::numbered(
+            &[1, 2, 3],
+        )))
+        .set_failed_multipart_upload_policy(policy)
+        .initiate()
+        .unwrap()
+        .join()
+        .await
+        .expect_err("a failed part must fail the upload");
+    assert_eq!(Some("UploadPart"), error.operation_name());
+    (error, mock)
+}
+
+/// Under `FailedMultipartUploadPolicy::Retain`, a failed upload leaves its multipart upload open,
+/// sends no AbortMultipartUpload, and the error carries the upload ID.
+#[tokio::test]
+async fn test_retained_failed_upload_error_carries_upload_id() {
+    let (error, mock) = join_error_after_part_two_fails(
+        MultipartMock::new(),
+        Some(FailedMultipartUploadPolicy::Retain),
+    )
+    .await;
+
+    assert_eq!(0, mock.record().abort_calls());
+    assert_eq!(Some(MOCK_UPLOAD_ID), error.upload_id());
+}
+
+/// When the AbortMultipartUpload a failure sends also fails, the multipart upload is still open,
+/// and the error carries its upload ID.
+#[tokio::test]
+async fn test_failed_abort_error_carries_upload_id() {
+    let abort_mpu = mock!(aws_sdk_s3::Client::abort_multipart_upload).then_http_response(|| {
+        HttpResponse::new(
+            StatusCode::try_from(403).unwrap(),
+            SdkBody::from("<Error><Code>AccessDenied</Code></Error>"),
+        )
+    });
+    let (error, _mock) =
+        join_error_after_part_two_fails(MultipartMock::new().with_override(&abort_mpu), None).await;
+
+    assert_eq!(1, abort_mpu.num_calls());
+    assert_eq!(Some(MOCK_UPLOAD_ID), error.upload_id());
+}
+
+/// When the AbortMultipartUpload a failure sends succeeds, no multipart upload is left open, and
+/// the error carries no upload ID.
+#[tokio::test]
+async fn test_aborted_failed_upload_error_has_no_upload_id() {
+    let (error, mock) = join_error_after_part_two_fails(MultipartMock::new(), None).await;
+
+    assert_eq!(1, mock.record().abort_calls());
+    assert_eq!(None, error.upload_id());
+}
+
+// --- Local file errors -------------------------------------------------------
+
+/// Asserts that `error` is an `IOError` whose message is `I/O error {action} "{path}"` and whose
+/// source is a `NotFound` operating system error.
+fn assert_missing_file_error(error: &Error, action: &str, path: &std::path::Path) {
+    assert_eq!(ErrorKind::IOError, *error.kind());
+    assert_eq!(
+        format!("I/O error {action} \"{}\"", path.display()),
+        error.to_string()
+    );
+    let io_error = std::error::Error::source(error)
+        .and_then(|s| s.downcast_ref::<std::io::Error>())
+        .expect("the source is the operating system's error");
+    assert_eq!(std::io::ErrorKind::NotFound, io_error.kind());
+}
+
+/// Reading the size of a missing source file fails with an error naming the action and path.
+#[test]
+fn test_from_path_missing_file_error_names_action_and_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("missing.bin");
+
+    let error = InputStream::from_path(&path).expect_err("a missing file has no size");
+    assert_missing_file_error(&error, "reading metadata of", &path);
+}
+
+/// Uploads a body read from `path`, which does not exist, with an explicit `length` so the
+/// stream builds without reading the file, and returns the error `join()` reports.
+async fn upload_missing_file(path: &std::path::Path, length: u64) -> Error {
+    let mock = MultipartMock::new();
+    let put_object = mock!(aws_sdk_s3::Client::put_object)
+        .then_output(|| PutObjectOutput::builder().e_tag("test-etag").build());
+    let tm = mock.with_override(&put_object).tm();
+    let stream = InputStream::read_from()
+        .path(path)
+        .length(length)
+        .build()
+        .expect("an explicit length skips reading the file");
+    let error = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .body(stream)
+        .initiate()
+        .unwrap()
+        .join()
+        .await
+        .expect_err("a missing source file must fail the upload");
+    assert_eq!(0, put_object.num_calls(), "no PutObject is sent");
+    error
+}
+
+/// A single-request upload whose source file cannot be opened fails with an error naming the
+/// action and path.
+#[tokio::test]
+async fn test_put_object_upload_missing_file_error_names_action_and_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("missing.bin");
+
+    let error = upload_missing_file(&path, 16).await;
+    assert_missing_file_error(&error, "opening", &path);
+}
+
+/// A multipart upload whose source file cannot be opened fails with an error naming the action
+/// and path.
+#[tokio::test]
+async fn test_multipart_upload_missing_file_error_names_action_and_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("missing.bin");
+
+    let error = upload_missing_file(&path, 32 * ByteUnit::Mebibyte.as_bytes_u64()).await;
+    assert_missing_file_error(&error, "opening", &path);
 }
 
 // --- Request body ------------------------------------------------------------

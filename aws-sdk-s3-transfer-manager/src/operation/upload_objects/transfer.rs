@@ -601,8 +601,16 @@ impl UploadObjectsTransfer {
         PollWork::Pending
     }
 
-    /// Record the failure cause and signal terminal. Children are cancelled
-    /// when the handle's cancel path runs `scheduler.cancel_transfer(parent_id)`.
+    /// Fails the transfer with [`ErrorKind::ChildOperationFailed`] and
+    /// signals terminal. Children are cancelled when the handle's cancel path
+    /// runs `scheduler.cancel_transfer(parent_id)`.
+    ///
+    /// The caller records the triggering failure in `state.failed` first. The
+    /// error carries no detail of its own: the handle attaches the failed
+    /// uploads, and the error's source and message are taken from them.
+    /// `cause` is logged.
+    ///
+    /// [`ErrorKind::ChildOperationFailed`]: crate::error::ErrorKind::ChildOperationFailed
     fn abort(&self, _state: &mut State, cause: impl Into<String>) -> PollWork {
         let cause = cause.into();
         tracing::debug!(
@@ -610,17 +618,11 @@ impl UploadObjectsTransfer {
             tid = %self.inner.ctx.id,
             "upload_objects aborting: {cause}"
         );
-        // TODO: the triggering child's error is preserved structurally in
-        // `state.failed` (reachable via `Error::failed_uploads`), but the root
-        // error's `source()` is only this string. Connecting the root `source()`
-        // to the failing child's error needs a shareable error (`Arc`) since
-        // `Error` is not `Clone` and the child is also owned by the
-        // failed-uploads list.
         self.inner
             .ctx
             .set_failed_and_signal(crate::error::Error::new(
                 crate::error::ErrorKind::ChildOperationFailed,
-                format!("upload_objects aborted: {cause}"),
+                "upload_objects aborted",
             ));
         PollWork::Done
     }
@@ -1298,10 +1300,12 @@ fn claim_key(
 
 /// Derive the S3 object key for a file at `relative_filename` inside the walk root.
 ///
-/// The key is formed by optionally prepending a prefix and substituting the
-/// path separator with a custom delimiter if one is configured. When the
-/// custom delimiter appears inside `relative_filename`, derivation fails with
-/// an invalid-input error.
+/// The key is `relative_filename` with the path separator replaced by the
+/// delimiter (default `/`), prefixed by `object_key_prefix`. The delimiter is
+/// inserted between a prefix and the path unless the prefix already ends with
+/// it. An empty prefix is the same as no prefix. When a custom delimiter
+/// appears inside `relative_filename`, derivation fails with an invalid-input
+/// error.
 pub(crate) fn derive_object_key<'a>(
     relative_filename: &'a str,
     object_key_prefix: Option<&str>,
@@ -1323,7 +1327,7 @@ pub(crate) fn derive_object_key<'a>(
         Cow::Owned(relative_filename.replace(MAIN_SEPARATOR, delim))
     };
 
-    let object_key = if let Some(prefix) = object_key_prefix {
+    let object_key = if let Some(prefix) = object_key_prefix.filter(|p| !p.is_empty()) {
         if prefix.ends_with(delim) {
             Cow::Owned(format!("{prefix}{relative_filename}"))
         } else {
@@ -1416,6 +1420,25 @@ mod tests {
             "2023/Jan/1.png",
             derive_object_key("2023\\Jan\\1.png", None, None).unwrap()
         );
+    }
+
+    /// An empty prefix is no prefix: the key is the relative path, with no
+    /// leading delimiter, whichever delimiter is configured.
+    #[test]
+    fn test_derive_object_key_empty_prefix_adds_no_delimiter() {
+        let nested = ["2023", "Jan", "1.png"].join(MAIN_SEPARATOR_STR);
+        for (relative, delimiter, expected) in [
+            ("README.md", None, "README.md"),
+            ("README.md", Some("-"), "README.md"),
+            (nested.as_str(), None, "2023/Jan/1.png"),
+            (nested.as_str(), Some("-"), "2023-Jan-1.png"),
+        ] {
+            assert_eq!(
+                expected,
+                derive_object_key(relative, Some(""), delimiter).unwrap(),
+                "relative={relative:?} delimiter={delimiter:?}"
+            );
+        }
     }
 
     fn mock_s3_success() -> aws_sdk_s3::Client {
@@ -1550,9 +1573,10 @@ mod tests {
         assert!(transfer.take_failed().is_empty());
     }
 
-    #[cfg_attr(miri, ignore)]
-    #[tokio::test]
-    async fn test_keys_derived_correctly_with_prefix() {
+    /// Uploads a directory holding `top.txt` and `sub/nested.txt` with
+    /// `key_prefix`, and returns the keys the PutObject requests carried,
+    /// sorted.
+    async fn uploaded_keys(key_prefix: &str) -> Vec<String> {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("top.txt"), "x").unwrap();
         fs::create_dir(dir.path().join("sub")).unwrap();
@@ -1582,7 +1606,7 @@ mod tests {
             .bucket("test-bucket")
             .source(dir.path())
             .failure_policy(FailedTransferPolicy::Continue)
-            .key_prefix("photos/2024")
+            .key_prefix(key_prefix)
             .build()
             .unwrap();
 
@@ -1610,11 +1634,17 @@ mod tests {
 
         assert_eq!(transfer.successful_uploads(), 2);
 
-        // Verify the captured keys are derived with the prefix + default delimiter ("/")
         let mut keys = captured.lock().unwrap().clone();
         keys.sort();
+        keys
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_keys_derived_correctly_with_prefix() {
+        // Keys are the prefix, the default delimiter ("/"), and the relative path.
         assert_eq!(
-            keys,
+            uploaded_keys("photos/2024").await,
             vec![
                 "photos/2024/sub/nested.txt".to_string(),
                 "photos/2024/top.txt".to_string(),
@@ -1762,6 +1792,17 @@ mod tests {
             upload_names(&[name], None, FailedTransferPolicy::Continue, 16).await;
         assert_eq!(transfer.successful_uploads(), 1);
         assert_eq!(keys, ["caf\u{fffd}"]);
+    }
+
+    /// An empty key prefix uploads each file under its relative path, with no
+    /// leading delimiter.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_keys_derived_correctly_with_empty_prefix() {
+        assert_eq!(
+            uploaded_keys("").await,
+            vec!["sub/nested.txt".to_string(), "top.txt".to_string()]
+        );
     }
 
     #[cfg(unix)]

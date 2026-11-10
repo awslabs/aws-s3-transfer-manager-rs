@@ -596,6 +596,93 @@ async fn test_failed_get_object_should_cancel_the_operation() {
     .expect("test_failed_get_object_should_cancel_the_operation timed out");
 }
 
+/// Under the Abort policy, the aggregate error's source is the error of the
+/// child download that triggered the abort, so the error chain names the
+/// failed S3 operation and its error code.
+#[tokio::test]
+async fn test_aborted_download_objects_error_source_is_failed_child_error() {
+    use aws_sdk_s3_transfer_manager::error::Error;
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    timeout(Duration::from_secs(10), async {
+        let bucket = MockBucket::builder()
+            .key_with_size("key1", 12)
+            .key_with_size("key2", 7)
+            .build();
+        let denied = mock!(aws_sdk_s3::Client::get_object)
+            .match_requests(|r| r.key() == Some("denied"))
+            .then_http_response(|| {
+                HttpResponse::new(
+                    StatusCode::try_from(403).unwrap(),
+                    "<Error><Code>AccessDenied</Code></Error>".into(),
+                )
+            });
+        let listed = bucket
+            .objects
+            .iter()
+            .map(|m| m.object.clone())
+            .chain([aws_sdk_s3::types::Object::builder()
+                .key("denied")
+                .size(10)
+                .build()])
+            .collect::<Vec<_>>();
+        let list = mock!(aws_sdk_s3::Client::list_objects_v2).then_output(move || {
+            ListObjectsV2Output::builder()
+                .set_contents(Some(listed.clone()))
+                .build()
+        });
+        let mut rules = bucket.get_object_rules();
+        rules.extend([denied, list]);
+        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, rules.as_slice());
+
+        let config = aws_sdk_s3_transfer_manager::Config::builder()
+            .s3_config(test_common::s3_config_with_test_http(
+                client.config().to_builder(),
+            ))
+            .build()
+            .expect("valid config");
+        let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+        let dest = tempfile::tempdir().unwrap();
+
+        let err = tm
+            .download_objects()
+            .bucket("test-bucket")
+            .destination(dest.path())
+            .failure_policy(FailedTransferPolicy::Abort)
+            .initiate()
+            .unwrap()
+            .join()
+            .await
+            .unwrap_err();
+
+        assert_eq!(&ErrorKind::ChildOperationFailed, err.kind());
+        let first = err
+            .failed_downloads()
+            .and_then(|f| f.first())
+            .expect("the aggregate carries the failed downloads");
+        assert_eq!(Some("denied"), first.input().key());
+
+        let source = std::error::Error::source(&err)
+            .and_then(|s| s.downcast_ref::<Error>())
+            .expect("the source is the failed child's error");
+        assert!(
+            std::ptr::eq(source, first.error()),
+            "the source is the first failed download's error"
+        );
+        assert_eq!(Some("GetObject"), source.operation_name());
+        assert_eq!(Some("AccessDenied"), source.code());
+
+        let context = format!("{}", DisplayErrorContext(&err));
+        assert!(
+            context.contains("GetObject") && context.contains("AccessDenied"),
+            "the error context names the child's operation and code, got: {context}"
+        );
+    })
+    .await
+    .expect("test_aborted_download_objects_error_source_is_failed_child_error timed out");
+}
+
 /// Dropping the handle mid-transfer should not panic.
 #[tokio::test]
 async fn test_drop_download_objects_handle() {

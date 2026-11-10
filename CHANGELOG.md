@@ -19,6 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ConfigLoader::read_ahead` sets the client's default download read-ahead, as
   `config::Builder::read_ahead` does.
 - `ConfigLoader` is exported as `config::ConfigLoader`.
+- `Error::upload_id` returns the ID of a multipart upload that a failed upload left open in S3:
+  under `FailedMultipartUploadPolicy::Retain`, or when AbortMultipartUpload failed. It is `None`
+  when the multipart upload was aborted.
 
 ### Changed
 - `aws-sdk-s3-transfer-manager`, `aws-sdk-s3-transfer-manager-ext`, `aws-smithy-topology`,
@@ -54,6 +57,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The hidden `config::Builder::framework_metadata`, `ConfigLoader::framework_metadata`, and
   `Config::framework_metadata` are removed. Set framework metadata on the `SdkConfig` or S3
   configuration.
+- `ErrorKind::IOError` and `ErrorKind::InputInvalid` errors from a local filesystem operation on a
+  known path name the operation and the path, as in `I/O error creating directory "out/logs"`,
+  and the object key for a `download_objects` object.
+  This covers temporary file creation and renaming for downloads to a path, directory creation in
+  `download_objects`, opening and reading upload source files, and the directory walk. Except for
+  the directory walk, whose source remains the `io::walk::WalkError`, the error's source is the
+  `std::io::Error` itself, where some of these sites previously used a message that embedded it,
+  such as `failed to open …` or `failed to create directory for key …`.
+- The source of an `ErrorKind::ChildOperationFailed` error from `upload_objects` or
+  `download_objects` is the error of the first failed object, the one that stopped the transfer
+  under `FailedTransferPolicy::Abort`, instead of a message naming it.
 
 ### Fixed
 - `PathBodyBuilder::build` without a path returns an `ErrorKind::InputInvalid` error instead of
@@ -68,6 +82,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `a/-b` with the delimiter `--`, and report both as uploaded while the later write replaced the
   earlier one. It now fails the second file with `ErrorKind::InputInvalid`, names the first file, and
   follows the `FailedTransferPolicy`. The default and native delimiters keep no key registry.
+- `upload_objects` with an empty `key_prefix` uploads each file under its relative path instead of
+  a key with a leading `/`.
+- `download_objects` accepts a destination containing `.` or `..` components, such as `./out` or
+  `out/../out`, instead of rejecting every object as resolving outside it. The destination is
+  resolved lexically, without following symbolic links.
+- `download_objects` rejects a key that resolves outside a destination made of `..` components, such
+  as `../b.txt` under `..`, which was previously accepted.
+- `download_objects` creates a destination directory that does not exist, with any missing
+  parents, instead of failing.
 
 ## [release-2026-11-05]
 

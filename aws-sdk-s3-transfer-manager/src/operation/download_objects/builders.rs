@@ -61,6 +61,13 @@ impl DownloadObjectsFluentBuilder {
     }
 
     /// The local directory to download into. Required.
+    ///
+    /// Created, with any missing parents, if it does not exist. A destination
+    /// that exists and is not a directory fails the transfer with
+    /// [`ErrorKind::InputInvalid`](crate::error::ErrorKind::InputInvalid) from
+    /// [`join`](DownloadObjectsHandle::join). See
+    /// [`DownloadObjectsInput`](super::DownloadObjectsInput) for how keys map
+    /// to paths under it.
     pub fn destination(mut self, input: impl Into<PathBuf>) -> Self {
         self.inner = self.inner.destination(input);
         self

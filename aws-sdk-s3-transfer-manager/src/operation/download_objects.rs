@@ -33,16 +33,17 @@ pub(crate) struct DownloadObjects;
 impl DownloadObjects {
     /// Execute a single `DownloadObjects` transfer operation.
     ///
-    /// Destination validation (exists, is a directory) is performed
-    /// synchronously. Walker errors surface from `handle.join()`.
+    /// Required inputs are checked synchronously. Preparing the destination
+    /// directory (checking it, or creating it) and walker errors surface from
+    /// `handle.join()`.
     pub(crate) fn orchestrate(
         handle: Arc<crate::client::Handle>,
         input: DownloadObjectsInput,
     ) -> Result<DownloadObjectsHandle, crate::error::Error> {
-        // Destination presence is validated here (cheap, no I/O); directory
-        // validation is deferred to the state machine's first walker advance so
-        // the blocking stat runs during work-item execution, not on the
-        // caller's thread. That error surfaces from `handle.join()`.
+        // Destination presence is validated here (cheap, no I/O); preparing the
+        // directory is deferred to the state machine's first walker advance so
+        // the blocking filesystem calls run during work-item execution, not on
+        // the caller's thread. That error surfaces from `handle.join()`.
         if input.destination().is_none() {
             return Err(crate::error::invalid_input("destination is required"));
         }

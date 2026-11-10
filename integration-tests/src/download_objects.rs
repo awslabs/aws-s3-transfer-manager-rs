@@ -664,6 +664,109 @@ async fn test_download_objects_key_mapping_to_destination_root_fails() {
     .expect("test_download_objects_key_mapping_to_destination_root_fails timed out");
 }
 
+/// Seeds `objects`, downloads the bucket to `dest`, and asserts every object
+/// downloads with no failures.
+async fn download_all(dest: &Path, objects: &[(&str, &[u8])]) {
+    let m = mock_tm(RuntimeConfig::default()).await;
+    let bucket = "test-bucket";
+    seed_objects(&m.server, bucket, objects).await;
+
+    let output = m
+        .client
+        .download_objects()
+        .bucket(bucket)
+        .destination(dest)
+        .initiate()
+        .expect("initiate download_objects")
+        .join()
+        .await
+        .expect("join download_objects");
+    assert_eq!(objects.len() as u64, output.objects_downloaded());
+    assert!(output.failed_transfers().is_empty());
+
+    m.handle.shutdown().await.expect("shutdown");
+}
+
+/// A destination written with `.` or `..` components downloads every object
+/// into the directory it names lexically. Comparing each object's cleaned path
+/// against the uncleaned destination would reject every key as resolving
+/// outside it.
+#[tokio::test]
+async fn test_download_objects_destination_with_dot_components() {
+    timeout(TEST_TIMEOUT, async {
+        let objects: &[(&str, &[u8])] = &[("a.txt", b"a"), ("nested/b.txt", b"b")];
+        let mut expected: HashMap<&str, Vec<u8>> = HashMap::new();
+        expected.insert("a.txt", b"a".to_vec());
+        expected.insert("nested/b.txt", b"b".to_vec());
+
+        for form in ["./out", "out/../out", "x/./../out/."] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            // `tmp` is absolute, so each destination is an absolute path
+            // holding `/./` or `/../`.
+            let dest = tmp.path().join(form);
+            download_all(&dest, objects).await;
+            verify_dir(&tmp.path().join("out"), &expected);
+        }
+    })
+    .await
+    .expect("test_download_objects_destination_with_dot_components timed out");
+}
+
+/// A destination that does not exist is created, with its missing parents,
+/// and the objects are downloaded into it.
+#[tokio::test]
+async fn test_download_objects_creates_missing_destination() {
+    timeout(TEST_TIMEOUT, async {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dest = tmp.path().join("a").join("b").join("out");
+        let objects: &[(&str, &[u8])] = &[("a.txt", b"a"), ("nested/b.txt", b"b")];
+
+        download_all(&dest, objects).await;
+
+        let mut expected: HashMap<&str, Vec<u8>> = HashMap::new();
+        expected.insert("a.txt", b"a".to_vec());
+        expected.insert("nested/b.txt", b"b".to_vec());
+        verify_dir(&dest, &expected);
+    })
+    .await
+    .expect("test_download_objects_creates_missing_destination timed out");
+}
+
+/// A destination that exists and is not a directory fails the download with
+/// `InputInvalid`, and the file is left as it was.
+#[tokio::test]
+async fn test_download_objects_destination_file_is_input_invalid() {
+    timeout(TEST_TIMEOUT, async {
+        let m = mock_tm(RuntimeConfig::default()).await;
+        let bucket = "test-bucket";
+        seed_objects(&m.server, bucket, &[("a.txt", b"a")]).await;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dest = tmp.path().join("out");
+        std::fs::write(&dest, b"not a directory").expect("write file");
+
+        let err = m
+            .client
+            .download_objects()
+            .bucket(bucket)
+            .destination(&dest)
+            .initiate()
+            .expect("initiate download_objects")
+            .join()
+            .await
+            .expect_err("a file destination must fail");
+        assert_eq!(
+            &aws_sdk_s3_transfer_manager::error::ErrorKind::InputInvalid,
+            err.kind()
+        );
+        assert_eq!(b"not a directory".as_slice(), std::fs::read(&dest).unwrap());
+
+        m.handle.shutdown().await.expect("shutdown");
+    })
+    .await
+    .expect("test_download_objects_destination_file_is_input_invalid timed out");
+}
+
 /// FailedTransferPolicy::Continue with one faulted key: the other objects
 /// succeed and the faulted key appears in `failed_transfers()`.
 #[tokio::test]

@@ -159,7 +159,15 @@ pub enum FailedMultipartUploadPolicy {
     /// Abort the upload on any individual part failure
     #[default]
     AbortUpload,
-    /// Retain any uploaded parts. The upload ID will be available in the response.
+    /// Leave the multipart upload open in S3, with any uploaded parts, instead of
+    /// sending AbortMultipartUpload.
+    ///
+    /// When the upload fails, the error that
+    /// [`UploadHandle::join`](crate::operation::upload::UploadHandle::join) returns carries the
+    /// upload ID in [`Error::upload_id`](crate::error::Error::upload_id). After
+    /// [`UploadHandle::abort`](crate::operation::upload::UploadHandle::abort), an
+    /// [`AbortedUpload`] whose outcome is [`AbortOutcome::Retained`] carries it. S3 keeps, and
+    /// bills for, the parts until the multipart upload is completed or aborted with that ID.
     Retain,
 }
 
