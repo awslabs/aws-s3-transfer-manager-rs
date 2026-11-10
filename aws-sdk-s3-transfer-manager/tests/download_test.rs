@@ -20,7 +20,10 @@ use aws_sdk_s3_transfer_manager::RuntimeConfig;
 use aws_sdk_s3_transfer_manager::{
     error::{BoxError, ErrorKind},
     metrics::unit::ByteUnit,
-    types::{ConcurrencyMode, PartSize, TransferStatus},
+    types::{
+        ChecksumAlgorithm, ChecksumMode, ChecksumValidation, ConcurrencyMode, NotValidatedReason,
+        PartSize, TransferStatus,
+    },
 };
 use aws_smithy_runtime_api::client::http::{
     http_client_fn, HttpConnector, HttpConnectorFuture, SharedHttpConnector,
@@ -1069,39 +1072,96 @@ fn single_part_connector(data: &Bytes, crc32: Option<&str>) -> StaticReplayClien
     )])
 }
 
+/// Like `simple_object_connector`, but each response carries the
+/// `x-amz-checksum-crc32` value `crc32` returns for the chunk's index.
+fn crc32_object_connector(
+    data: &Bytes,
+    part_size: usize,
+    crc32: impl Fn(usize) -> String,
+) -> StaticReplayClient {
+    let events = data
+        .chunks(part_size)
+        .enumerate()
+        .map(|(idx, chunk)| {
+            let start = idx * part_size;
+            let end = start + chunk.len() - 1;
+            ReplayEvent::new(
+                dummy_expected_request(),
+                http::Response::builder()
+                    .status(200)
+                    .header("Content-Length", format!("{}", chunk.len()))
+                    .header(
+                        "Content-Range",
+                        format!("bytes {start}-{end}/{}", data.len()),
+                    )
+                    .header("ETag", "my-etag")
+                    .header("x-amz-checksum-crc32", crc32(idx))
+                    .body(SdkBody::from(chunk))
+                    .unwrap(),
+            )
+        })
+        .collect();
+
+    StaticReplayClient::new(events)
+}
+
 // "hello world" has CRC32 `DUoRhQ==`. Using a correct value lets the SDK's
 // default validation pass so we exercise the success path.
 const HELLO: &[u8] = b"hello world";
 const HELLO_CRC32: &str = "DUoRhQ==";
 
-/// Default checksum_mode (unset): the SDK auto-enables validation when the client
-/// resolves ResponseChecksumValidation to WhenSupported (the default), so the
-/// verdict is Unavailable (validation attempted) — NOT Disabled. See
-/// `test_integrity_checks_disabled_when_validation_when_required` for the only
-/// genuinely-disabled case.
-#[tokio::test]
-async fn test_integrity_checks_default_mode_attempts_validation() {
-    use aws_sdk_s3_transfer_manager::types::{ChecksumValidation, NotValidatedReason};
+/// The base64 CRC32 of `bytes`, as S3 reports it.
+fn crc32_base64(bytes: &[u8]) -> String {
+    let mut crc32 = aws_smithy_checksums::ChecksumAlgorithm::Crc32.into_impl();
+    crc32.update(bytes);
+    aws_smithy_types::base64::encode(crc32.finalize())
+}
 
-    let data = Bytes::from_static(HELLO);
-    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
-    let tm = test_tm(single_part_connector(&data, Some(HELLO_CRC32)), part_size);
-
+/// Downloads `test-object` through `tm`, with `checksum_mode` if set, and returns
+/// the download's checksum verdict.
+async fn download_checksum_validation(
+    tm: &aws_sdk_s3_transfer_manager::Client,
+    checksum_mode: Option<ChecksumMode>,
+) -> ChecksumValidation {
     let mut handle = tm
         .download()
         .bucket("test-bucket")
         .key("test-object")
+        .set_checksum_mode(checksum_mode)
         .initiate()
         .unwrap();
     let _ = drain(&mut handle).await.unwrap();
     let output = handle.join().await.unwrap();
+    output.integrity_checks().checksum_validation().clone()
+}
 
-    match output.integrity_checks().checksum_validation() {
-        ChecksumValidation::NotValidated { reason, .. } => {
-            assert_eq!(*reason, NotValidatedReason::Unavailable);
-        }
-        other => panic!("expected NotValidated{{Unavailable}}, got {other:?}"),
+fn assert_validated(validation: &ChecksumValidation, expected: ChecksumAlgorithm) {
+    match validation {
+        ChecksumValidation::Validated { algorithm, .. } => assert_eq!(*algorithm, expected),
+        other => panic!("expected Validated{{{expected:?}}}, got {other:?}"),
     }
+}
+
+fn assert_not_validated(validation: &ChecksumValidation, expected: NotValidatedReason) {
+    match validation {
+        ChecksumValidation::NotValidated { reason, .. } => assert_eq!(*reason, expected),
+        other => panic!("expected NotValidated{{{expected:?}}}, got {other:?}"),
+    }
+}
+
+/// Default checksum_mode (unset): the SDK auto-enables validation when the client
+/// resolves ResponseChecksumValidation to WhenSupported (the default), so a
+/// response whose CRC32 matches reads Validated, NOT Disabled. See
+/// `test_integrity_checks_disabled_when_validation_when_required` for the only
+/// genuinely-disabled case.
+#[tokio::test]
+async fn test_integrity_checks_default_mode_validates() {
+    let data = Bytes::from_static(HELLO);
+    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let tm = test_tm(single_part_connector(&data, Some(HELLO_CRC32)), part_size);
+
+    let validation = download_checksum_validation(&tm, None).await;
+    assert_validated(&validation, ChecksumAlgorithm::Crc32);
 }
 
 /// Client ResponseChecksumValidation=WhenRequired with no request override: the
@@ -1109,8 +1169,6 @@ async fn test_integrity_checks_default_mode_attempts_validation() {
 /// verdict is Disabled.
 #[tokio::test]
 async fn test_integrity_checks_disabled_when_validation_when_required() {
-    use aws_sdk_s3_transfer_manager::types::{ChecksumValidation, NotValidatedReason};
-
     let data = Bytes::from_static(HELLO);
     let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
     let http_client = single_part_connector(&data, Some(HELLO_CRC32));
@@ -1146,34 +1204,58 @@ async fn test_integrity_checks_disabled_when_validation_when_required() {
     }
 }
 
-/// checksum_mode on → reported as NotValidated (never falsely Validated) until
-/// the SDK surfaces a positive validation outcome. Guards that an unconfirmed
-/// chunk MUST NOT read Validated.
+/// checksum_mode on, and the response's CRC32 matches the delivered bytes: the
+/// verdict is Validated{Crc32}.
 #[tokio::test]
-async fn test_integrity_checks_enabled_not_falsely_validated() {
-    use aws_sdk_s3_transfer_manager::types::ChecksumValidation;
-
+async fn test_integrity_checks_enabled_validates() {
     let data = Bytes::from_static(HELLO);
     let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
     let tm = test_tm(single_part_connector(&data, Some(HELLO_CRC32)), part_size);
 
-    let mut handle = tm
-        .download()
-        .bucket("test-bucket")
-        .key("test-object")
-        .checksum_mode(aws_sdk_s3_transfer_manager::types::ChecksumMode::Enabled)
-        .initiate()
-        .unwrap();
-    let _ = drain(&mut handle).await.unwrap();
-    let output = handle.join().await.unwrap();
+    let validation = download_checksum_validation(&tm, Some(ChecksumMode::Enabled)).await;
+    assert_validated(&validation, ChecksumAlgorithm::Crc32);
+}
 
-    assert!(
-        !matches!(
-            output.integrity_checks().checksum_validation(),
-            ChecksumValidation::Validated { .. }
-        ),
-        "must not report Validated without an SDK-confirmed outcome"
-    );
+/// A response that carries only a part-level checksum (`<base64>-<parts>`), which
+/// the SDK cannot validate, reads NotValidated{CompositeChecksum}.
+#[tokio::test]
+async fn test_integrity_checks_part_level_only_reads_composite_checksum() {
+    let data = Bytes::from_static(HELLO);
+    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let tm = test_tm(single_part_connector(&data, Some("DUoRhQ==-3")), part_size);
+
+    let validation = download_checksum_validation(&tm, Some(ChecksumMode::Enabled)).await;
+    assert_not_validated(&validation, NotValidatedReason::CompositeChecksum);
+}
+
+/// The first chunk's response carries its CRC32 and the second's only a part-level
+/// checksum: some delivered bytes were validated, so the verdict is
+/// NotValidated{PartialCoverage}.
+#[tokio::test]
+async fn test_integrity_checks_validated_and_part_level_read_partial_coverage() {
+    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let data = rand_data(part_size + 1024);
+    let first_crc32 = crc32_base64(&data[..part_size]);
+    let http_client = crc32_object_connector(&data, part_size, |index| match index {
+        0 => first_crc32.clone(),
+        _ => "AAAAAA==-2".to_owned(),
+    });
+    let tm = test_tm(http_client, part_size);
+
+    let validation = download_checksum_validation(&tm, Some(ChecksumMode::Enabled)).await;
+    assert_not_validated(&validation, NotValidatedReason::PartialCoverage);
+}
+
+/// A response with no checksum header, with validation requested, reads
+/// NotValidated{Unavailable}.
+#[tokio::test]
+async fn test_integrity_checks_no_checksum_reads_unavailable() {
+    let data = Bytes::from_static(HELLO);
+    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let tm = test_tm(single_part_connector(&data, None), part_size);
+
+    let validation = download_checksum_validation(&tm, Some(ChecksumMode::Enabled)).await;
+    assert_not_validated(&validation, NotValidatedReason::Unavailable);
 }
 
 /// Whole object in the discovery chunk → the response checksum IS the object's,

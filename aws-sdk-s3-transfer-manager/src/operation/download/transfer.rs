@@ -18,7 +18,7 @@ use crate::sdk_v1::copy_download_input_fields_to_get_object as copy_fields_to_ge
 
 use crate::error::{self, ChunkRef, Error};
 use crate::operation::download::body::{BodySlot, BodyWriter, ChunkOutput, DrainError, Drained};
-use crate::operation::download::checksum::build_integrity_checks;
+use crate::operation::download::checksum::ChecksumTally;
 use crate::operation::download::context::{
     CompletionClaim, DownloadPendingReason, DownloadState, PendingClaim,
 };
@@ -72,8 +72,10 @@ struct DownloadTransferInner {
     read_ahead: ReadAhead,
     /// Object metadata from discovery (set once discovery completes)
     object_meta: std::sync::OnceLock<ObjectMetadata>,
-    /// Object-integrity result (set once discovery completes)
+    /// Object-integrity result (set once the download completes successfully)
     integrity_checks: std::sync::OnceLock<crate::types::IntegrityChecks>,
+    /// Checksum facts the object-integrity result is built from
+    checksum_tally: Mutex<ChecksumTally>,
     /// Expected total bytes produced by this download, discovered from the response.
     expected_download_len: std::sync::OnceLock<u64>,
     /// Notified when discovery completes (success or failure)
@@ -141,6 +143,7 @@ impl DownloadTransfer {
             writer,
             object_meta: std::sync::OnceLock::new(),
             integrity_checks: std::sync::OnceLock::new(),
+            checksum_tally: Mutex::default(),
             expected_download_len: std::sync::OnceLock::new(),
             discovery_notify: tokio::sync::Notify::new(),
         });
@@ -272,7 +275,7 @@ impl DownloadTransfer {
         self.inner.object_meta.get()
     }
 
-    /// Object-integrity result from discovery.
+    /// Object-integrity result, set once the download completes successfully.
     pub(crate) fn integrity_checks(&self) -> Option<&crate::types::IntegrityChecks> {
         self.inner.integrity_checks.get()
     }
@@ -812,12 +815,11 @@ impl DownloadTransfer {
         // chunk. A larger multipart object's discovery chunk carries part 1's
         // checksum, which is not the object checksum.
         let whole_object_in_chunk = input.range.is_none() && remaining.is_none();
-        let integrity = build_integrity_checks(
-            chunk_meta.as_ref(),
-            whole_object_in_chunk,
-            validation_enabled,
-        );
-        let _ = self.inner.integrity_checks.set(integrity);
+        self.inner
+            .checksum_tally
+            .lock()
+            .unwrap()
+            .record_discovery(chunk_meta.as_ref(), whole_object_in_chunk);
 
         // Notify waiters that discovery completed
         self.inner.discovery_notify.notify_waiters();
@@ -1057,6 +1059,7 @@ impl DownloadTransfer {
                     || ctx.is_active(),
                 )
                 .await
+                .map(|bytes| (bytes, checksum))
                 .map_err(crate::retry::GuardError::Inner)
             }
         })
@@ -1068,7 +1071,7 @@ impl DownloadTransfer {
         .await;
         let _ = req_metrics.finish();
 
-        let bytes = match result {
+        let (bytes, checksum) = match result {
             Ok(val) => val,
             // Go terminal without retiring this chunk: fail() sets Terminal under
             // the lock, so no later retirement can claim completion over this
@@ -1079,14 +1082,15 @@ impl DownloadTransfer {
             }
         };
 
+        let offset = chunk_meta
+            .content_range
+            .as_deref()
+            .and_then(crate::http::header::parse_content_range)
+            .map(|r| *r.start())
+            .unwrap_or(0);
         let chunk = ChunkOutput {
             seq,
-            offset: chunk_meta
-                .content_range
-                .as_deref()
-                .and_then(crate::http::header::parse_content_range)
-                .map(|r| *r.start())
-                .unwrap_or(0),
+            offset,
             data: bytes,
             metadata: chunk_meta,
         };
@@ -1117,6 +1121,8 @@ impl DownloadTransfer {
             network_rx: bytes_received,
             ..Default::default()
         });
+        // Runs before decrement_in_flight, so finalize_completion sees every committed chunk.
+        self.record_checksum(offset, bytes_received, &checksum);
 
         if let Some(claim) = self.decrement_in_flight(freed) {
             return self.finalize_completion(claim);
@@ -1205,7 +1211,9 @@ impl DownloadTransfer {
                     )
                     .await
                     .map_err(crate::retry::GuardError::Inner)?;
-                    Ok::<_, crate::retry::GuardError<crate::error::Error>>((chunk_meta, bytes))
+                    Ok::<_, crate::retry::GuardError<crate::error::Error>>((
+                        chunk_meta, bytes, checksum,
+                    ))
                 }
             })
             .instrument(tracing::debug_span!(
@@ -1216,7 +1224,7 @@ impl DownloadTransfer {
             .await;
         let _ = req_metrics.finish();
 
-        let (chunk_meta, bytes) = match result {
+        let (chunk_meta, bytes, checksum) = match result {
             Ok(val) => val,
             Err(e) => {
                 return self.fail_range(ChunkRef::new(seq, Some(*range.start()..=*range.end())), e)
@@ -1259,6 +1267,8 @@ impl DownloadTransfer {
             network_rx: bytes_received,
             ..Default::default()
         });
+        // Runs before decrement_in_flight, so finalize_completion sees every committed chunk.
+        self.record_checksum(*range.start(), bytes_received, &checksum);
 
         if let Some(claim) = self.decrement_in_flight(freed) {
             return self.finalize_completion(claim);
@@ -1334,6 +1344,17 @@ impl DownloadTransfer {
         completion
     }
 
+    /// Records the checksum outcome of the response whose bytes a chunk delivered.
+    /// A chunk calls this after it is filled and before it retires, so every record
+    /// precedes the completion claim.
+    fn record_checksum(&self, offset: u64, len: u64, checksum: &ChecksumCapture) {
+        self.inner
+            .checksum_tally
+            .lock()
+            .unwrap()
+            .record(offset, len, checksum.try_outcome());
+    }
+
     /// Finalize a transfer whose successful completion `_claim` proves: flush the tail to
     /// disk (returning the last carrier charges as `ChunkOutput`s drop), establish the
     /// destination length, set the terminal status, and signal waiters. A finalization
@@ -1355,6 +1376,16 @@ impl DownloadTransfer {
             let guard = self.inner.state.lock().unwrap();
             return self.fail(guard, error::Error::new(error::ErrorKind::IOError, e));
         }
+        // Every chunk records its checksum outcome before it retires, and completion is
+        // claimed only after the last one retires, so the tally is complete.
+        let validation_enabled = self.validation_enabled(&self.inner.request);
+        let integrity_checks = self
+            .inner
+            .checksum_tally
+            .lock()
+            .unwrap()
+            .integrity_checks(validation_enabled);
+        let _ = self.inner.integrity_checks.set(integrity_checks);
         let state_snapshot = {
             let state = self.inner.state.lock().expect("lock poisoned");
             self.snapshot(&state)
@@ -1707,8 +1738,8 @@ mod tests {
     use super::*;
     use crate::operation::download::sink::FileSinkFactory;
     use crate::operation::download::test_util::fixtures::{
-        assert_discovery_succeeds, disk_test_handle, disk_transfer, execute, finalize_started,
-        object_client_failing_at, relief_scenario, spawn_relief,
+        assert_discovery_succeeds, crc32_object_client, disk_test_handle, disk_transfer, execute,
+        finalize_started, object_client_failing_at, relief_scenario, spawn_relief,
     };
     use crate::operation::download::DownloadInput;
     use crate::scheduler::test_util::{assert_done, assert_pending, assert_ready};
@@ -3396,6 +3427,75 @@ mod tests {
         assert_eq!(
             std::fs::read(dir.path().join("out")).unwrap(),
             &object[..part_size as usize]
+        );
+    }
+
+    /// Runs a three-part disk download over `crc32_object_client` whose part
+    /// `failing_part` (0-based), if set, fails, and returns the checksum verdict its
+    /// terminal report carries.
+    async fn crc32_download_terminal_checksum_validation(
+        failing_part: Option<u64>,
+    ) -> Option<crate::types::ChecksumValidation> {
+        use crate::operation::download::test_util::fixtures::object_bytes;
+
+        let part_size = 5 * MB;
+        let object = object_bytes(3 * part_size as usize);
+        let config = crate::Config::builder()
+            .sdk_client(crc32_object_client(
+                object,
+                failing_part.map(|n| n * part_size),
+            ))
+            .part_size(crate::types::PartSize::Target(part_size))
+            .diagnostics_for_test(crate::config::MemoryDiagnosticsConfig::default(), 1)
+            .build();
+        let (transfer, _consumer, _dir) = disk_transfer(
+            crate::client::Handle::test_handle_tokio(config),
+            &FileSinkFactory,
+        );
+
+        assert_discovery_succeeds(&transfer).await;
+        let mut second = assert_ready(transfer.poll_work());
+        let mut third = assert_ready(transfer.poll_work());
+        let outcome = execute(&transfer, &mut second).await;
+        assert!(
+            matches!(outcome, WorkOutcome::Success { .. }),
+            "{outcome:?}"
+        );
+        let outcome = execute(&transfer, &mut third).await;
+        assert_eq!(
+            matches!(outcome, WorkOutcome::Failed { .. }),
+            failing_part.is_some(),
+            "{outcome:?}"
+        );
+
+        transfer
+            .test_terminal_summary()
+            .expect("summary diagnostics enabled")
+            .checksum_validation
+    }
+
+    /// A download whose third part fails after its first two validated reports no
+    /// checksum verdict: the verdict is decided only when a download completes.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn failed_download_reports_no_checksum_verdict() {
+        assert_eq!(
+            crc32_download_terminal_checksum_validation(Some(2)).await,
+            None
+        );
+    }
+
+    /// The same download with no failing part completes, and its terminal report
+    /// carries `Validated{Crc32}`, so the parts the failed download delivered were
+    /// validated.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn completed_download_reports_checksum_verdict() {
+        assert_eq!(
+            crc32_download_terminal_checksum_validation(None).await,
+            Some(crate::types::ChecksumValidation::Validated {
+                algorithm: crate::model::ChecksumAlgorithm::Crc32,
+            })
         );
     }
 

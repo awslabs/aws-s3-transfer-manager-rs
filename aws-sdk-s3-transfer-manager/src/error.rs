@@ -472,8 +472,8 @@ where
 ///
 /// `checksum` is the response's checksum outcome when `err` was read. A
 /// [`ChecksumOutcome::Mismatch`] makes it an [`ErrorKind::IntegrityError`] carrying the
-/// expected and computed checksums, and the algorithm when [`ChecksumAlgorithm`] has a
-/// variant for it. Any other outcome, or none, makes it an [`ErrorKind::IOError`].
+/// algorithm and the expected and computed checksums. Any other outcome, or none,
+/// makes it an [`ErrorKind::IOError`].
 pub(crate) fn body_read_error<E>(err: E, checksum: Option<ChecksumOutcome>) -> Error
 where
     E: Into<BoxError>,
@@ -485,7 +485,7 @@ where
             computed,
         }) => Error {
             kind: ErrorKind::IntegrityError(IntegrityError {
-                algorithm: checksum_algorithm(algorithm),
+                algorithm: Some(checksum_algorithm(algorithm)),
                 expected: Some(expected),
                 computed: Some(computed),
             }),
@@ -496,17 +496,10 @@ where
     }
 }
 
-/// The [`ChecksumAlgorithm`] for a response checksum algorithm, or `None` when
-/// [`ChecksumAlgorithm`] has no variant for it.
-fn checksum_algorithm(algorithm: ResponseChecksumAlgorithm) -> Option<ChecksumAlgorithm> {
-    match algorithm {
-        ResponseChecksumAlgorithm::Crc32 => Some(ChecksumAlgorithm::Crc32),
-        ResponseChecksumAlgorithm::Crc32c => Some(ChecksumAlgorithm::Crc32C),
-        ResponseChecksumAlgorithm::Crc64Nvme => Some(ChecksumAlgorithm::Crc64Nvme),
-        ResponseChecksumAlgorithm::Sha1 => Some(ChecksumAlgorithm::Sha1),
-        ResponseChecksumAlgorithm::Sha256 => Some(ChecksumAlgorithm::Sha256),
-        _ => None,
-    }
+/// The [`ChecksumAlgorithm`] named like a response checksum algorithm: its variant
+/// for that name, or `Unknown` for a name it has no variant for.
+pub(crate) fn checksum_algorithm(algorithm: ResponseChecksumAlgorithm) -> ChecksumAlgorithm {
+    ChecksumAlgorithm::from(algorithm.as_str().to_ascii_uppercase().as_str())
 }
 
 /// Reads the operation name and service code/message/request ids into a
@@ -736,6 +729,24 @@ mod tests {
         assert_eq!(ie.algorithm(), Some(&ChecksumAlgorithm::Crc32));
         assert_eq!(ie.expected(), Some("AAAAAA=="));
         assert_eq!(ie.computed(), Some("BBBBBB=="));
+    }
+
+    /// Every algorithm the response outcome names maps to the variant of the same
+    /// name.
+    #[test]
+    fn checksum_algorithm_maps_each_known_name() {
+        for (algorithm, expected) in [
+            (ResponseChecksumAlgorithm::Crc32, ChecksumAlgorithm::Crc32),
+            (ResponseChecksumAlgorithm::Crc32c, ChecksumAlgorithm::Crc32C),
+            (
+                ResponseChecksumAlgorithm::Crc64Nvme,
+                ChecksumAlgorithm::Crc64Nvme,
+            ),
+            (ResponseChecksumAlgorithm::Sha1, ChecksumAlgorithm::Sha1),
+            (ResponseChecksumAlgorithm::Sha256, ChecksumAlgorithm::Sha256),
+        ] {
+            assert_eq!(checksum_algorithm(algorithm), expected);
+        }
     }
 
     #[test]

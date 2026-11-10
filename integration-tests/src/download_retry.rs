@@ -37,12 +37,14 @@
 //! for the response, so the kind does not depend on the error type that
 //! `aws-smithy-checksums` returns.
 
-use crate::assertions::{assert_integrity_error, assert_io_error, assert_same_content};
+use crate::assertions::{
+    assert_integrity_error, assert_io_error, assert_same_content, assert_validated,
+};
 use crate::harness::Target;
 use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
 use aws_sdk_s3_transfer_manager::operation::upload::ChecksumStrategy;
-use aws_sdk_s3_transfer_manager::types::ChecksumMode;
 use aws_sdk_s3_transfer_manager::types::PartSize;
+use aws_sdk_s3_transfer_manager::types::{ChecksumAlgorithm, ChecksumMode};
 use aws_sdk_s3_transfer_manager::Client as TmClient;
 use s3_mock_server::S3MockServer;
 use s3_mock_server::{BodyCadence, FaultType, Occurrence, Operation};
@@ -124,6 +126,46 @@ async fn truncate_body_once_recovers() {
         .await
         .expect("download recovers via retry");
     assert_same_content(&data, &bytes);
+
+    t.shutdown().await;
+}
+
+/// A range chunk whose first attempt is truncated and whose retry succeeds still
+/// reads `Validated`: the verdict counts only the attempt whose bytes the chunk
+/// delivered, checked with that attempt's own checksum capture.
+#[tokio::test]
+async fn truncate_body_once_recovers_validated() {
+    let t = Target::mock_gp().connect_with(Some(PART_SIZE)).await;
+    let data = two_part_data();
+    t.put(
+        "obj",
+        data.clone(),
+        ChecksumStrategy::with_calculated_crc32_composite_if_multipart(),
+    )
+    .await;
+
+    let mock = t.mock().expect("requires the mock backend");
+    mock.insert_fault(
+        t.bucket(),
+        &t.key("obj"),
+        FaultType::TruncateBody {
+            after_bytes: FAULT_AFTER_BYTES,
+        },
+        SKIP_DISCOVERY,
+        Occurrence::Once,
+    );
+
+    let (bytes, output) = t
+        .download("obj", Some(ChecksumMode::Enabled))
+        .await
+        .expect("download recovers via retry");
+    assert_same_content(&data, &bytes);
+    assert_validated(&output, ChecksumAlgorithm::Crc32);
+    assert_eq!(
+        mock.request_count(Operation::GetObject),
+        3,
+        "the discovery GET, then the range chunk's two attempts"
+    );
 
     t.shutdown().await;
 }

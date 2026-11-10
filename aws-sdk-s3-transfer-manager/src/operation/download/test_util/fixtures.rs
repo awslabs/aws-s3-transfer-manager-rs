@@ -96,6 +96,60 @@ pub(crate) fn object_client_failing_at(
     })
 }
 
+/// An S3 client serving `object` by range as HTTP responses that carry each
+/// range's CRC32, so the SDK validates every body it delivers. The range starting
+/// at `failing_start`, if any, answers with a server error. SDK retries are
+/// disabled.
+///
+/// Panics on a request without an inclusive byte range.
+pub(crate) fn crc32_object_client(
+    object: Arc<[u8]>,
+    failing_start: Option<u64>,
+) -> aws_sdk_s3::Client {
+    use aws_smithy_mocks::{mock, mock_client, MockResponse, RuleMode};
+    use aws_smithy_runtime_api::http::{Response, StatusCode};
+    use aws_smithy_types::body::SdkBody;
+
+    use crate::http::header::{ByteRange, Range};
+
+    let get = mock!(aws_sdk_s3::Client::get_object).then_compute_response(move |req| {
+        let (start, end) = match req.range().and_then(|r| r.parse::<Range>().ok()) {
+            Some(Range(ByteRange::Inclusive(start, end))) => {
+                (start, end.min(object.len() as u64 - 1))
+            }
+            other => panic!("unexpected range request {other:?}"),
+        };
+        if Some(start) == failing_start {
+            return MockResponse::Http(Response::new(
+                StatusCode::try_from(500).unwrap(),
+                SdkBody::from("internal error"),
+            ));
+        }
+        let body = &object[start as usize..=end as usize];
+        let mut crc32 = aws_smithy_checksums::ChecksumAlgorithm::Crc32.into_impl();
+        crc32.update(body);
+        let mut response = Response::new(
+            StatusCode::try_from(200).unwrap(),
+            SdkBody::from(body.to_vec()),
+        );
+        let headers = response.headers_mut();
+        headers.insert("content-length", body.len().to_string());
+        headers.insert(
+            "content-range",
+            format!("bytes {start}-{end}/{}", object.len()),
+        );
+        headers.insert("etag", "test-etag");
+        headers.insert(
+            "x-amz-checksum-crc32",
+            aws_smithy_types::base64::encode(crc32.finalize()),
+        );
+        MockResponse::Http(response)
+    });
+    mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get], |conf| {
+        conf.retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
+    })
+}
+
 /// A test handle on the ambient tokio runtime whose S3 client is `client`,
 /// slicing downloads into `part_size` ranges.
 pub(crate) fn disk_test_handle(

@@ -622,6 +622,17 @@ jobs:
           cargo update -p aws-sdk-s3 --precise "$floor"
       - name: check --workspace
         run: cargo check --workspace --all-features --tests
+      # A floor that compiles can still lack the SDK's checksum outcome, which these
+      # tests read. A filter that matches no test exits 0, so require a pass.
+      - name: checksum verdict tests
+        run: |
+          out=$(cargo test -p aws-sdk-s3-transfer-manager --all-features --test download_test \
+            -- test_integrity_checks 2>&1) || { echo "$out"; exit 1; }
+          echo "$out"
+          if ! grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$out"; then
+            echo "no checksum verdict test ran" >&2
+            exit 1
+          fi
 
   freebsd:
     name: FreeBSD 14.4

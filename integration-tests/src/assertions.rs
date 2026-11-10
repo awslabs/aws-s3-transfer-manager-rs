@@ -10,6 +10,16 @@
 //! to a particular output type) stay with their module.
 
 use aws_sdk_s3_transfer_manager::error::{Error, ErrorKind};
+use aws_sdk_s3_transfer_manager::operation::download::DownloadOutput;
+use aws_sdk_s3_transfer_manager::types::{ChecksumAlgorithm, ChecksumValidation};
+
+/// Assert a download's verdict is `Validated` with `expected`.
+pub(crate) fn assert_validated(output: &DownloadOutput, expected: ChecksumAlgorithm) {
+    match output.integrity_checks().checksum_validation() {
+        ChecksumValidation::Validated { algorithm, .. } => assert_eq!(*algorithm, expected),
+        other => panic!("expected Validated{{{expected:?}}}, got {other:?}"),
+    }
+}
 
 /// Assert a download failed because object integrity validation failed (a
 /// checksum mismatch). Pins the [`ErrorKind::IntegrityError`] kind, not merely
