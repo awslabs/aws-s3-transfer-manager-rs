@@ -4,8 +4,9 @@
  */
 //! Error types for the S3 Mock Server.
 //!
-//! Handlers and storage fail with an [`Error`](enum@Error), whose conversion into an
-//! `s3s::S3Error` is the only place the server builds an S3 error response.
+//! Handlers, routes and storage fail with an [`Error`](enum@Error). Its conversion into an
+//! `s3s::S3Error` builds every S3 error response, and [`Error::into_response`] writes the response
+//! with the elements an `S3Error` cannot carry.
 
 use std::borrow::Cow;
 use std::io;
@@ -68,6 +69,30 @@ pub enum Error {
     #[error("invalid digest")]
     InvalidDigest,
 
+    /// A request sets a storage class that the bucket does not have.
+    #[error("invalid storage class")]
+    InvalidStorageClass,
+
+    /// The request uses functionality the server does not implement.
+    #[error("not implemented")]
+    NotImplemented,
+
+    /// A request to a directory bucket sets `Content-MD5`, which directory buckets do not support.
+    #[error("Content-MD5 not implemented")]
+    ContentMd5NotImplemented,
+
+    /// A key is longer than 1,024 bytes. Carries its length in bytes, reported in the error's
+    /// `Size` element.
+    #[error("key too long: {size} bytes")]
+    KeyTooLong {
+        /// The length of the key in bytes.
+        size: usize,
+    },
+
+    /// A request's path or a key it names is not valid percent-encoded UTF-8.
+    #[error("invalid URI")]
+    InvalidUri,
+
     /// The request uses a parameter the bucket does not support.
     #[error("not supported: {0}")]
     NotSupported(&'static str),
@@ -80,6 +105,15 @@ pub enum Error {
     #[error("precondition failed")]
     PreconditionFailed,
 
+    /// A RenameObject condition did not hold. Carries the name of the condition's header, reported
+    /// in the error's `Condition` element.
+    #[error("rename precondition failed: {0}")]
+    RenamePreconditionFailed(&'static str),
+
+    /// A RenameObject reuses the client token of an earlier rename with other parameters.
+    #[error("idempotent parameter mismatch")]
+    IdempotentParameterMismatch,
+
     /// The bucket to delete has objects.
     #[error("bucket not empty")]
     BucketNotEmpty,
@@ -87,6 +121,44 @@ pub enum Error {
     /// The bucket name to create is taken.
     #[error("bucket already exists")]
     BucketAlreadyExists,
+
+    /// An append's write offset is not the current size of the object.
+    #[error("invalid write offset")]
+    InvalidWriteOffset,
+
+    /// A chunked request body does not match its declared length, or its framing or trailer is
+    /// malformed.
+    #[error("incomplete body")]
+    IncompleteBody,
+
+    /// A chunk signature of a request body does not match.
+    #[error("signature does not match")]
+    SignatureDoesNotMatch,
+
+    /// A request body does not match its `x-amz-content-sha256`.
+    #[error("x-amz-content-sha256 mismatch")]
+    XAmzContentSha256Mismatch,
+
+    /// A chunk of a request body is larger than s3s accepts.
+    #[error("entity too large")]
+    EntityTooLarge,
+
+    /// An append to an object that already has 10,000 parts.
+    #[error("too many parts")]
+    TooManyParts,
+
+    /// A write does not carry a checksum of the required algorithm: an append, of an algorithm the
+    /// object stores; an UploadPart, of the algorithm its upload was created with.
+    #[error("checksum type mismatch: expected {expected}, got {actual}")]
+    ChecksumTypeMismatch {
+        /// Lowercase names of the algorithms required.
+        expected: String,
+        /// Lowercase name of the algorithm of the request's checksum. If it has none: `None`, or
+        /// `null` in a general purpose bucket.
+        actual: String,
+        /// The type of the bucket. The message ends with a period only in a directory bucket.
+        bucket_type: crate::BucketType,
+    },
 
     /// The object's storage class does not allow the operation: a read of an archived object
     /// that has not been restored, or a restore of an object in another storage class.
@@ -121,6 +193,11 @@ pub enum Error {
     /// The request is not allowed.
     #[error("access denied")]
     AccessDenied,
+
+    /// A request names credentials the server does not have, or a session's credentials where the
+    /// session is not valid.
+    #[error("invalid access key ID")]
+    InvalidAccessKeyId,
 
     /// The throttle shed the request.
     #[error("slow down")]
@@ -162,8 +239,95 @@ impl From<io::Error> for Error {
     }
 }
 
+impl Error {
+    /// The error for a request whose body could not be read:
+    /// - the S3 error s3s reports for a body that does not match its headers: a wrong chunk
+    ///   signature, payload hash, decoded length or chunk framing;
+    /// - an internal error for any other failure, such as a client that disconnected.
+    pub(crate) fn from_body_error(error: &(dyn std::error::Error + 'static)) -> Self {
+        use s3s::stream::aws_chunked_stream::AwsChunkedStreamError;
+        use s3s::stream::upload_stream::UploadStreamError;
+        let mut cause = error;
+        loop {
+            if let Some(error) = cause.downcast_ref::<AwsChunkedStreamError>() {
+                return match error {
+                    AwsChunkedStreamError::Underlying(_) => break,
+                    AwsChunkedStreamError::SignatureMismatch => Error::SignatureDoesNotMatch,
+                    AwsChunkedStreamError::ChunkMetaTooLarge(..)
+                    | AwsChunkedStreamError::ChunkDataTooLarge(..) => Error::EntityTooLarge,
+                    _ => Error::IncompleteBody,
+                };
+            }
+            if let Some(error) = cause.downcast_ref::<UploadStreamError>() {
+                return match error {
+                    UploadStreamError::Underlying(_) => break,
+                    UploadStreamError::Sha256Mismatch => Error::XAmzContentSha256Mismatch,
+                    UploadStreamError::LengthMismatch | UploadStreamError::Incomplete => {
+                        Error::IncompleteBody
+                    }
+                };
+            }
+            // An `io::Error` wrapping another error does not report it as its source.
+            let inner = cause
+                .downcast_ref::<std::io::Error>()
+                .and_then(|io| io.get_ref())
+                .map(|inner| inner as &(dyn std::error::Error + 'static));
+            match inner.or_else(|| cause.source()) {
+                Some(next) => cause = next,
+                None => break,
+            }
+        }
+        Error::Internal(format!("Failed to read body: {error}"))
+    }
+}
+
 /// S3's message for an internal error.
 const INTERNAL_ERROR_MESSAGE: &str = "We encountered an internal error. Please try again.";
+
+impl Error {
+    /// The HTTP response for this error: the status, headers and XML error document of the
+    /// `S3Error` it converts into, with the elements an `S3Error` cannot carry: `Condition` for a
+    /// failed RenameObject condition, and `Size` and `MaxSizeAllowed` for a key that is too long.
+    pub(crate) fn into_response(self) -> http::Response<s3s::Body> {
+        let condition = match &self {
+            Error::RenamePreconditionFailed(condition) => Some(*condition),
+            _ => None,
+        };
+        let key_size = match &self {
+            Error::KeyTooLong { size } => Some(*size),
+            _ => None,
+        };
+        let error = s3s::S3Error::from(self);
+        let mut body = Vec::new();
+        let mut serializer = s3s::xml::Serializer::new(&mut body);
+        serializer
+            .decl()
+            .and_then(|()| {
+                serializer.element("Error", |s| {
+                    s.content("Code", error.code().as_str())?;
+                    s.content("Message", error.message().unwrap_or_default())?;
+                    if let Some(condition) = condition {
+                        s.content("Condition", condition)?;
+                    }
+                    if let Some(size) = key_size {
+                        s.content("Size", &i64::try_from(size).unwrap_or(i64::MAX))?;
+                        s.content("MaxSizeAllowed", &(crate::storage::MAX_KEY_LENGTH as i64))?;
+                    }
+                    Ok(())
+                })
+            })
+            .expect("an error document serializes into memory");
+        http::Response::builder()
+            .status(
+                error
+                    .status_code()
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            )
+            .header(http::header::CONTENT_TYPE, "application/xml")
+            .body(s3s::Body::from(body))
+            .expect("status and header are valid")
+    }
+}
 
 /// The S3 error response to a request that fails with `error`, which it keeps as its source: the
 /// code, HTTP status and message of each variant's response.
@@ -257,6 +421,31 @@ impl From<Error> for s3s::S3Error {
                 StatusCode::BAD_REQUEST,
                 "The Content-MD5 you specified was invalid.".into(),
             ),
+            Error::InvalidStorageClass => (
+                S3ErrorCode::InvalidStorageClass,
+                StatusCode::BAD_REQUEST,
+                "The storage class you specified is not valid".into(),
+            ),
+            Error::NotImplemented => (
+                S3ErrorCode::NotImplemented,
+                StatusCode::NOT_IMPLEMENTED,
+                "A header you provided implies functionality that is not implemented".into(),
+            ),
+            Error::ContentMd5NotImplemented => (
+                S3ErrorCode::NotImplemented,
+                StatusCode::NOT_IMPLEMENTED,
+                "This bucket does not support Content Md5 header.".into(),
+            ),
+            Error::KeyTooLong { .. } => (
+                S3ErrorCode::KeyTooLongError,
+                StatusCode::BAD_REQUEST,
+                "Your key is too long".into(),
+            ),
+            Error::InvalidUri => (
+                S3ErrorCode::InvalidURI,
+                StatusCode::BAD_REQUEST,
+                "The path is not valid percent-encoded UTF-8".into(),
+            ),
             Error::NotSupported(message) => (
                 S3ErrorCode::Custom("NotSupported".into()),
                 StatusCode::NOT_IMPLEMENTED,
@@ -267,10 +456,17 @@ impl From<Error> for s3s::S3Error {
                 StatusCode::RANGE_NOT_SATISFIABLE,
                 "The requested range is not satisfiable".into(),
             ),
-            Error::PreconditionFailed => (
+            Error::PreconditionFailed | Error::RenamePreconditionFailed(_) => (
                 S3ErrorCode::PreconditionFailed,
                 StatusCode::PRECONDITION_FAILED,
                 "At least one of the pre-conditions you specified did not hold".into(),
+            ),
+            Error::IdempotentParameterMismatch => (
+                S3ErrorCode::Custom("IdempotentParameterMismatch".into()),
+                StatusCode::BAD_REQUEST,
+                "Parameters on this idempotent request are inconsistent with parameters used in \
+                 previous request(s)."
+                    .into(),
             ),
             Error::BucketNotEmpty => (
                 S3ErrorCode::BucketNotEmpty,
@@ -283,6 +479,60 @@ impl From<Error> for s3s::S3Error {
                 "The requested bucket name is not available. The bucket namespace is shared by \
                  all users of the system. Please select a different name and try again."
                     .into(),
+            ),
+            Error::TooManyParts => (
+                S3ErrorCode::Custom("TooManyParts".into()),
+                StatusCode::BAD_REQUEST,
+                "You have attempted to add more parts than the maximum of 10000 that are allowed for \
+                 this object. You can use the CopyObject operation to copy this object to another \
+                 and then add more data to the newly copied object."
+                    .into(),
+            ),
+            Error::IncompleteBody => (
+                S3ErrorCode::IncompleteBody,
+                StatusCode::BAD_REQUEST,
+                "The request body terminated unexpectedly".into(),
+            ),
+            Error::SignatureDoesNotMatch => (
+                S3ErrorCode::SignatureDoesNotMatch,
+                StatusCode::FORBIDDEN,
+                "The request signature we calculated does not match the signature you provided. \
+                 Check your key and signing method."
+                    .into(),
+            ),
+            Error::XAmzContentSha256Mismatch => (
+                S3ErrorCode::Custom("XAmzContentSHA256Mismatch".into()),
+                StatusCode::BAD_REQUEST,
+                "The provided 'x-amz-content-sha256' header does not match what was computed.".into(),
+            ),
+            Error::EntityTooLarge => (
+                S3ErrorCode::EntityTooLarge,
+                StatusCode::BAD_REQUEST,
+                "Your proposed upload exceeds the maximum allowed size".into(),
+            ),
+            Error::InvalidWriteOffset => (
+                S3ErrorCode::Custom("InvalidWriteOffset".into()),
+                StatusCode::BAD_REQUEST,
+                "The write offset value that you specified does not match the current object size."
+                    .into(),
+            ),
+            Error::ChecksumTypeMismatch {
+                expected,
+                actual,
+                bucket_type,
+            } => (
+                S3ErrorCode::InvalidRequest,
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "Checksum Type mismatch occurred, expected checksum Type: {expected}, actual \
+                     checksum Type: {actual}{}",
+                    if *bucket_type == crate::BucketType::Directory {
+                        "."
+                    } else {
+                        ""
+                    }
+                )
+                .into(),
             ),
             Error::InvalidObjectState { restore: false } => (
                 S3ErrorCode::InvalidObjectState,
@@ -326,6 +576,11 @@ impl From<Error> for s3s::S3Error {
                 StatusCode::FORBIDDEN,
                 "Access Denied".into(),
             ),
+            Error::InvalidAccessKeyId => (
+                S3ErrorCode::InvalidAccessKeyId,
+                StatusCode::FORBIDDEN,
+                "The AWS Access Key Id you provided does not exist in our records.".into(),
+            ),
             Error::SlowDown => (
                 S3ErrorCode::SlowDown,
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -357,6 +612,26 @@ impl From<Error> for s3s::S3Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn error_responses_escape_xml() {
+        let error = Error::Custom {
+            code: "Custom".to_owned(),
+            status: StatusCode::BAD_REQUEST,
+            message: "a < b & c".to_owned(),
+        };
+        let body = error
+            .into_response()
+            .into_body()
+            .store_all_limited(usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            body.contains("<Message>a &lt; b &amp; c</Message>"),
+            "{body}"
+        );
+    }
 
     #[test]
     fn internal_errors_have_s3_message_and_keep_their_source() {

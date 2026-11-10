@@ -38,6 +38,8 @@ struct MultipartState {
 struct BucketState {
     created_at: SystemTime,
     objects: HashMap<String, (Bytes, ObjectMetadata)>,
+    /// The renames that succeeded with a client token, by token.
+    renames: HashMap<String, crate::storage::RenameRequest>,
 }
 
 impl BucketState {
@@ -45,6 +47,7 @@ impl BucketState {
         Self {
             created_at: SystemTime::now(),
             objects: HashMap::new(),
+            renames: HashMap::new(),
         }
     }
 }
@@ -84,7 +87,7 @@ impl StorageBackend for InMemoryStorage {
         let mut content = BytesMut::new();
 
         while let Some(chunk) = body.next().await {
-            let chunk = chunk.map_err(|e| Error::Internal(format!("Stream error: {}", e)))?;
+            let chunk = chunk.map_err(|e| Error::from_body_error(&e))?;
             integrity_checks.update(&chunk);
             content.extend_from_slice(&chunk);
         }
@@ -124,6 +127,9 @@ impl StorageBackend for InMemoryStorage {
             content_disposition: request.content_disposition,
             content_language: request.content_language,
             parts: Vec::new(),
+            append_segments: Vec::new(),
+            append_parts: 0,
+            part_checksums: false,
             restore_status: request.restore_status,
         };
 
@@ -315,13 +321,17 @@ impl StorageBackend for InMemoryStorage {
         request: crate::storage::UploadPartRequest<'_>,
     ) -> Result<crate::storage::UploadPartResponse> {
         // Get upload metadata to determine checksum algorithm
-        let checksum_algorithm = {
+        let (checksum_algorithm, part_checksums) = {
             let multipart = self.multipart.read().await;
             let upload = multipart
                 .uploads
                 .get(request.upload_id)
                 .ok_or(Error::NoSuchUpload)?;
-            upload.metadata.checksum_algorithm
+            request.check_checksum(upload)?;
+            (
+                upload.metadata.checksum_algorithm,
+                upload.metadata.part_checksums,
+            )
         };
 
         // Calculate ETag (MD5 hash)
@@ -378,9 +388,10 @@ impl StorageBackend for InMemoryStorage {
             request.part_number,
             (request.content.clone(), part_metadata.clone()),
         );
+        let checksums = part_checksums.then(|| part_metadata.clone());
         upload.parts.insert(request.part_number, part_metadata);
 
-        Ok(crate::storage::UploadPartResponse { etag })
+        Ok(crate::storage::UploadPartResponse { etag, checksums })
     }
 
     async fn list_parts(&self, upload_id: &str) -> Result<Vec<crate::storage::PartInfo>> {
@@ -425,6 +436,7 @@ impl StorageBackend for InMemoryStorage {
                 .get(request.upload_id)
                 .cloned()
                 .ok_or(Error::NoSuchUpload)?;
+            request.check_listed_part_checksums(&upload)?;
             let upload_parts = multipart
                 .parts
                 .get(request.upload_id)
@@ -649,6 +661,158 @@ impl StorageBackend for InMemoryStorage {
         }
         multipart.parts.remove(upload_id);
 
+        Ok(())
+    }
+
+    async fn append_object(
+        &self,
+        request: crate::storage::AppendObjectRequest,
+    ) -> Result<StoredObjectMetadata> {
+        let mut buckets = self.buckets.write().await;
+        let bucket_state = buckets
+            .get_mut(&request.bucket)
+            .ok_or(Error::NoSuchBucket)?;
+        let (data, metadata) = bucket_state
+            .objects
+            .get(&request.key)
+            .ok_or(Error::NoSuchKey)?;
+
+        request.precondition.check(Some(metadata))?;
+        if request.content.is_empty() && metadata.content_length > 0 {
+            return Err(Error::InvalidArgument(
+                "Request body cannot be empty when 'write offset' is specified",
+            ));
+        }
+        if metadata.content_length != request.offset {
+            return Err(Error::InvalidWriteOffset);
+        }
+        // Each append adds a part to those the object has: its multipart upload's, or one.
+        let parts = match metadata.append_parts {
+            0 => (metadata.parts.len() as u32).max(1),
+            parts => parts,
+        };
+        if parts >= crate::storage::MAX_PARTS {
+            return Err(Error::TooManyParts);
+        }
+        let algorithms = metadata.checksum_algorithms();
+        // An append without a checksum is checked as a CRC64NVME one, the default algorithm.
+        let algorithm = request
+            .checksum_algorithm
+            .unwrap_or(aws_smithy_checksums::ChecksumAlgorithm::Crc64Nvme);
+        if !algorithms.is_empty() && !algorithms.contains(&algorithm) {
+            return Err(Error::ChecksumTypeMismatch {
+                expected: algorithms
+                    .iter()
+                    .map(|a| a.as_str())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                actual: algorithm.as_str().to_owned(),
+                // Only directory buckets serve appends.
+                bucket_type: crate::BucketType::Directory,
+            });
+        }
+
+        // The ETag and the full-object checksums cover the combined content.
+        let mut checks = crate::types::ObjectIntegrityChecks::new().with_md5();
+        for algorithm in &algorithms {
+            checks = checks.with_checksum_algorithm(*algorithm);
+        }
+        let mut content = BytesMut::with_capacity(data.len() + request.content.len());
+        content.extend_from_slice(data);
+        content.extend_from_slice(&request.content);
+        let content = content.freeze();
+        checks.update(&content);
+        let mut object_integrity = checks.finalize();
+
+        // A SHA-1 or SHA-256 checksum is not extended: an appended object's is the composite of the
+        // checksums of its segments.
+        let mut append_segments = Vec::new();
+        if let Some(algorithm) = algorithms.iter().copied().find(|algorithm| {
+            matches!(
+                algorithm,
+                aws_smithy_checksums::ChecksumAlgorithm::Sha1
+                    | aws_smithy_checksums::ChecksumAlgorithm::Sha256
+            )
+        }) {
+            let sha256 = algorithm == aws_smithy_checksums::ChecksumAlgorithm::Sha256;
+            let checksum_of = |sha1: &Option<String>, sha256_value: &Option<String>| {
+                if sha256 {
+                    sha256_value.clone()
+                } else {
+                    sha1.clone()
+                }
+            };
+            append_segments = if !metadata.append_segments.is_empty() {
+                metadata.append_segments.clone()
+            } else if !metadata.parts.is_empty() {
+                metadata
+                    .parts
+                    .iter()
+                    .filter_map(|part| checksum_of(&part.sha1, &part.sha256))
+                    .collect()
+            } else {
+                checksum_of(&metadata.sha1, &metadata.sha256)
+                    .into_iter()
+                    .collect()
+            };
+            let mut appended =
+                crate::types::ObjectIntegrityChecks::new().with_checksum_algorithm(algorithm);
+            appended.update(&request.content);
+            let appended = appended.finalize();
+            append_segments.extend(checksum_of(&appended.sha1, &appended.sha256));
+            let composite = Some(crate::types::composite_of(&append_segments, algorithm));
+            if sha256 {
+                object_integrity.sha256 = composite;
+            } else {
+                object_integrity.sha1 = composite;
+            }
+        }
+
+        let mut metadata = metadata.clone();
+        metadata.content_length = content.len() as u64;
+        metadata.etag = object_integrity.etag().unwrap_or_default();
+        metadata.last_modified = SystemTime::now();
+        metadata.crc32 = object_integrity.crc32.clone();
+        metadata.crc32c = object_integrity.crc32c.clone();
+        metadata.crc64nvme = object_integrity.crc64nvme.clone();
+        metadata.sha1 = object_integrity.sha1.clone();
+        metadata.sha256 = object_integrity.sha256.clone();
+        // An appended object has no part layout to report.
+        metadata.parts = Vec::new();
+        metadata.append_segments = append_segments;
+        metadata.append_parts = parts + 1;
+        bucket_state
+            .objects
+            .insert(request.key, (content, metadata));
+        Ok(StoredObjectMetadata { object_integrity })
+    }
+
+    async fn rename_object(
+        &self,
+        bucket: &str,
+        request: crate::storage::RenameRequest,
+    ) -> Result<()> {
+        let mut buckets = self.buckets.write().await;
+        let bucket_state = buckets.get_mut(bucket).ok_or(Error::NoSuchBucket)?;
+        if let Some(token) = &request.client_token {
+            match bucket_state.renames.get(token) {
+                Some(previous) if *previous == request => return Ok(()),
+                Some(_) => return Err(Error::IdempotentParameterMismatch),
+                None => {}
+            }
+        }
+        request.preconditions.check(
+            bucket_state.objects.get(&request.src_key).map(|(_, m)| m),
+            bucket_state.objects.get(&request.dst_key).map(|(_, m)| m),
+        )?;
+        let object = bucket_state
+            .objects
+            .remove(&request.src_key)
+            .expect("the preconditions check that the source exists");
+        bucket_state.objects.insert(request.dst_key.clone(), object);
+        if let Some(token) = request.client_token.clone() {
+            bucket_state.renames.insert(token, request);
+        }
         Ok(())
     }
 
@@ -906,12 +1070,14 @@ mod tests {
             upload_id,
             part_number: 1,
             content: part1.clone(),
+            client_checksum_algorithms: vec![],
         };
         let etag1 = storage.upload_part(request1).await.unwrap();
         let request2 = crate::storage::UploadPartRequest {
             upload_id,
             part_number: 2,
             content: part2.clone(),
+            client_checksum_algorithms: vec![],
         };
         let etag2 = storage.upload_part(request2).await.unwrap();
 
@@ -925,6 +1091,7 @@ mod tests {
             upload_id,
             parts: parts_to_complete,
             client_checksums: None,
+            listed_part_checksum: None,
         };
         let response = storage.complete_multipart_upload(request).await.unwrap();
 
@@ -995,6 +1162,7 @@ mod tests {
                         upload_id: &upload_id,
                         part_number: 1,
                         content: Bytes::from_static(b"part"),
+                        client_checksum_algorithms: vec![],
                     })
                     .await
                     .map(|_| ())
@@ -1033,6 +1201,7 @@ mod tests {
             upload_id,
             part_number: 1,
             content: part1,
+            client_checksum_algorithms: vec![],
         };
         let etag1 = storage.upload_part(request).await.unwrap();
 
@@ -1043,6 +1212,7 @@ mod tests {
             upload_id,
             parts: parts_to_complete,
             client_checksums: None,
+            listed_part_checksum: None,
         };
         let result = storage.complete_multipart_upload(request).await;
         assert!(result.is_err());
@@ -1059,6 +1229,7 @@ mod tests {
             upload_id,
             parts: vec![(1, valid_etag)],
             client_checksums: None,
+            listed_part_checksum: None,
         };
         storage
             .complete_multipart_upload(request)
@@ -1091,6 +1262,7 @@ mod tests {
                 upload_id,
                 part_number: 1,
                 content: Bytes::from_static(b"part1"),
+                client_checksum_algorithms: vec![],
             })
             .await
             .unwrap()
@@ -1110,6 +1282,7 @@ mod tests {
                 upload_id,
                 parts: vec![(1, etag.clone())],
                 client_checksums: Some(&invalid_checksum),
+                listed_part_checksum: None,
             })
             .await;
         assert!(matches!(
@@ -1131,6 +1304,7 @@ mod tests {
                 upload_id,
                 parts: vec![(1, etag)],
                 client_checksums: None,
+                listed_part_checksum: None,
             })
             .await
             .expect("completion must remain retryable after checksum rejection");
@@ -1157,6 +1331,7 @@ mod tests {
             upload_id,
             part_number: 1,
             content: part1,
+            client_checksum_algorithms: vec![],
         };
         storage.upload_part(request).await.unwrap();
 

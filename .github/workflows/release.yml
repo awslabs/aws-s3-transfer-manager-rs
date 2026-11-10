@@ -24,7 +24,7 @@ permissions:
 env:
   RUSTFLAGS: -Dwarnings
   RUST_BACKTRACE: 1
-  rust_min: '1.94.1'
+  rust_min: '1.96.0'
   AWS_REGION: us-west-2
 
 jobs:
