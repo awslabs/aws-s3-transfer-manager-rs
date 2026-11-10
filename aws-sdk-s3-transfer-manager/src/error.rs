@@ -114,7 +114,8 @@ pub enum ErrorKind {
 
 /// Detail about an integrity (checksum) validation failure.
 ///
-/// Each value is `Some` when the response's checksum outcome reported it. The
+/// [`algorithm`](Self::algorithm), [`expected`](Self::expected) and
+/// [`computed`](Self::computed) are all `Some` for a mismatch the SDK reported. The
 /// body error that ended the read is available via [`std::error::Error::source`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -497,7 +498,9 @@ where
 }
 
 /// The [`ChecksumAlgorithm`] named like a response checksum algorithm: its variant
-/// for that name, or `Unknown` for a name it has no variant for.
+/// for that name, or `Unknown` for a name it has no variant for. It maps by name so
+/// an algorithm a newer SDK validates, which observability has no variant for yet,
+/// still reads `Validated`.
 pub(crate) fn checksum_algorithm(algorithm: ResponseChecksumAlgorithm) -> ChecksumAlgorithm {
     ChecksumAlgorithm::from(algorithm.as_str().to_ascii_uppercase().as_str())
 }

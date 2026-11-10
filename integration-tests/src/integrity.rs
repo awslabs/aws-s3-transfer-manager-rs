@@ -141,7 +141,7 @@ fn large_single_put() -> Vec<u8> {
         .collect()
 }
 
-fn assert_not_validated(output: &DownloadOutput, expected: NotValidatedReason) {
+pub(crate) fn assert_not_validated(output: &DownloadOutput, expected: NotValidatedReason) {
     match output.integrity_checks().checksum_validation() {
         ChecksumValidation::NotValidated { reason, .. } => assert_eq!(*reason, expected),
         other => panic!("expected NotValidated{{{expected:?}}}, got {other:?}"),

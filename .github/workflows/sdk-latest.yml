@@ -20,8 +20,8 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Resolve dependencies to their latest compatible releases
-        run: cargo update
+      - name: Update aws-sdk-s3 and its dependencies to their latest compatible releases
+        run: cargo update -p aws-sdk-s3 --recursive
       # A filter that matches no test exits 0, so require a pass.
       - name: checksum verdict tests
         run: |
