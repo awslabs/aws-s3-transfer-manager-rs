@@ -1122,41 +1122,36 @@ impl FsWalk {
                     }
                     continue;
                 }
+                // The walk never resolves a link the filter excludes, with following on too. The
+                // link stands as its marker, so sync never reads or writes through it.
+                if rejected {
+                    self.push_excluded_link(&mut result.children, path);
+                    continue;
+                }
                 let metadata = match std::fs::metadata(&path) {
                     Ok(m) => m,
                     Err(e) => {
                         match e.kind() {
                             // A dangling link can still stand for a directory, such as one on an
                             // unmounted volume. The key stream costs the link as its name and every
-                            // key under it. The walk yields an excluded link marked, in place of a
-                            // failure. A link into an endless chain reaches nothing the same way.
+                            // key under it.
                             std::io::ErrorKind::NotFound => {
-                                if rejected {
-                                    self.push_excluded_link(&mut result.children, path);
-                                } else {
-                                    result.errors.push(WalkError::new(
-                                        Some(path),
-                                        WalkErrorKind::BrokenSymlink,
-                                        Box::new(e),
-                                    ));
-                                }
+                                result.errors.push(WalkError::new(
+                                    Some(path),
+                                    WalkErrorKind::BrokenSymlink,
+                                    Box::new(e),
+                                ));
                             }
                             // A link into an endless chain reaches nothing, as a dangling link does.
                             _ if is_endless_chain(&e) => {
-                                if rejected {
-                                    self.push_excluded_link(&mut result.children, path);
-                                } else {
-                                    result.errors.push(WalkError::new(
-                                        Some(path),
-                                        WalkErrorKind::BrokenSymlink,
-                                        Box::new(e),
-                                    ));
-                                }
+                                result.errors.push(WalkError::new(
+                                    Some(path),
+                                    WalkErrorKind::BrokenSymlink,
+                                    Box::new(e),
+                                ));
                             }
                             // Anything else leaves the target's kind unknown, and a link to a
-                            // directory would have filed a whole subtree under this name. Reported
-                            // even when the filter excluded the name, because a rule on a name says
-                            // nothing about the keys under it.
+                            // directory would have filed a whole subtree under this name.
                             _ => {
                                 result.errors.push(WalkError::new(
                                     Some(path),
@@ -1186,7 +1181,7 @@ impl FsWalk {
                                 // The link's own name is taken, even though no file sits there. A
                                 // consumer that reads absence from the stream hears about it, as it
                                 // hears about a special file.
-                                if self.config.include_special_files && !rejected {
+                                if self.config.include_special_files {
                                     self.push_entry(
                                         &mut result.children,
                                         path.clone(),
@@ -1217,9 +1212,6 @@ impl FsWalk {
                         }
                     }
                 } else if metadata.is_file() {
-                    if rejected {
-                        continue;
-                    }
                     result.followed.push(FollowedLink::File(path.clone()));
                     self.push_entry(
                         &mut result.children,
@@ -1228,7 +1220,7 @@ impl FsWalk {
                         FileType::Regular,
                         true,
                     );
-                } else if !rejected && self.config.include_special_files {
+                } else if self.config.include_special_files {
                     // The link points at something no transfer could read. The entry says so,
                     // and the key stays accounted for.
                     //
@@ -1691,16 +1683,12 @@ mod tests {
                 .map(|e| (norm(e.relative_path()), e.path_filtered()))
                 .collect();
             seen.sort_by(|a, b| a.0.cmp(&b.0));
-            // With following on, the walk descends into the link to a real directory, so only the
-            // dangling link stands as a link. With following off, both links stand as links.
-            let expected: Vec<(String, PathFiltered)> = if follow {
-                vec![("dangling".to_string(), PathFiltered::Excluded)]
-            } else {
-                vec![
-                    ("dangling".to_string(), PathFiltered::Excluded),
-                    ("photos".to_string(), PathFiltered::Excluded),
-                ]
-            };
+            // The walk never resolves an excluded link, so both links stand as markers with
+            // following on or off.
+            let expected: Vec<(String, PathFiltered)> = vec![
+                ("dangling".to_string(), PathFiltered::Excluded),
+                ("photos".to_string(), PathFiltered::Excluded),
+            ];
             assert_eq!(seen, expected, "follow_symlinks({follow})");
         }
     }

@@ -1210,12 +1210,13 @@ mod tests {
     }
 
     // A filter excluding a name says nothing about the keys under it: `exclude("link")` matches
-    // `link` and not `link/a.txt`. So when the walk cannot tell what `link` is, suppressing the
-    // failure because the name was excluded loses every key beneath it with nothing said.
+    // `link` and not `link/a.txt`. The walk never resolves an excluded link, so it never learns
+    // that the target is unreadable. The link arrives as its marker, and the marker holds every key
+    // under its name.
     #[cfg(unix)]
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
-    async fn an_excluded_name_of_unknown_type_still_reports_its_range() {
+    async fn an_excluded_link_to_an_unreadable_target_arrives_as_its_marker() {
         use std::os::unix::fs::PermissionsExt;
 
         let outside = tempdir().unwrap();
@@ -1242,20 +1243,21 @@ mod tests {
             .build()
             .walk(FsWalkContext::builder().root(dir.path()).build());
 
-        let mut costs = Vec::new();
+        let mut seen = Vec::new();
         while let Some(next) = walk.next_entry().await {
-            if let Err(err) = next {
-                costs.push((walk_kind(&err), err.keys_lost()));
+            match next {
+                Ok(entry) => seen.push((entry.key, entry.meta.obstruction)),
+                Err(err) => panic!("an excluded link reported a failure: {err:?}"),
             }
         }
         fs::set_permissions(&protected, fs::Permissions::from_mode(0o755)).unwrap();
 
-        assert!(
-            costs.contains(&(
-                Some(WalkErrorKind::DirectoryUnreadable),
-                KeysLost::UnknownRange
-            )),
-            "the keys under an excluded name are not themselves excluded, got {costs:?}"
+        assert_eq!(
+            seen,
+            vec![
+                ("a.txt".to_string(), None),
+                ("link".to_string(), Some(Obstruction::ExcludedLink)),
+            ]
         );
     }
 
@@ -1887,7 +1889,21 @@ mod tests {
             .build()
             .walk(FsWalkContext::builder().root(dir.path()).build());
 
-        assert_eq!(keys(&mut walk).await, vec!["keep.txt", "target.txt"]);
+        // The walk never resolves an excluded link, so the link arrives as its marker and never
+        // as the file it points at.
+        let mut seen = Vec::new();
+        while let Some(next) = walk.next_entry().await {
+            let entry = next.expect("stream failed");
+            seen.push((entry.key, entry.meta.obstruction));
+        }
+        assert_eq!(
+            seen,
+            vec![
+                ("keep.txt".to_string(), None),
+                ("logs/link.txt".to_string(), Some(Obstruction::ExcludedLink)),
+                ("target.txt".to_string(), None),
+            ]
+        );
     }
 
     // An excluded entry must not warn even when it cannot be read, which means the

@@ -147,6 +147,94 @@ async fn an_excluded_directory_link_still_holds_back_the_objects_under_its_name(
     );
 }
 
+// With following on, the walk still never resolves a link the filter excludes. So an upload sends
+// nothing from behind `photos`.
+#[cfg(unix)]
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn an_upload_following_links_sends_nothing_from_behind_an_excluded_link() {
+    use crate::io::key::filter::{KeyFilter, Rule};
+
+    let real = tempfile::tempdir().expect("real photos dir");
+    std::fs::write(real.path().join("y.jpg"), b"x").expect("y.jpg");
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path().canonicalize().expect("canonical root");
+    std::os::unix::fs::symlink(real.path(), root.join("photos")).expect("symlink");
+    let (client, _deleted) = listing_and_recording_deletes(&[], 1);
+    let walker = Walker::builder()
+        .follow_symlinks(true)
+        .filter(Arc::new(KeyFilter::new(vec![Rule::exclude("photos")])))
+        .build();
+    let (t, _ctx) = upload_run(&root, client, walker);
+    drive(&t).await;
+    let decided = t.inner.state.lock().snapshot().decided.transfers;
+    assert_eq!(
+        decided, 0,
+        "the run uploaded a file behind an excluded link"
+    );
+}
+
+// The same on a download. A changed object under `photos` must not land behind the excluded link.
+#[cfg(unix)]
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn a_download_following_links_writes_nothing_through_an_excluded_link() {
+    use crate::io::key::filter::{KeyFilter, Rule};
+
+    let outside = tempfile::tempdir().expect("outside");
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path().canonicalize().expect("canonical root");
+    std::os::unix::fs::symlink(outside.path(), root.join("photos")).expect("symlink");
+    let walker = Walker::builder()
+        .follow_symlinks(true)
+        .filter(Arc::new(KeyFilter::new(vec![Rule::exclude("photos")])))
+        .build();
+    let (t, ctx, rx) = downloading_into_walking(
+        &root,
+        a_bucket_to_download(&["photos/y.jpg"], 1_600_000_000),
+        DeleteMode::Off,
+        walker,
+    );
+    run_managed(&t, &ctx, rx).await;
+    let escaped: Vec<_> = std::fs::read_dir(outside.path())
+        .expect("outside reads")
+        .collect();
+    assert!(
+        escaped.is_empty(),
+        "the download wrote through an excluded link: {escaped:?}"
+    );
+}
+
+// Case L. The filter excludes `photos -> real` and leaves `real` in scope. The scan does not name
+// `real` through the excluded link, so delete mode removes `real/x.txt`, as for any other key.
+#[cfg(unix)]
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn an_excluded_link_protects_nothing_it_points_at() {
+    use crate::io::key::filter::{KeyFilter, Rule};
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path().canonicalize().expect("canonical root");
+    std::fs::create_dir(root.join("real")).expect("real");
+    std::fs::write(root.join("real/x.txt"), b"x").expect("x.txt");
+    std::os::unix::fs::symlink(root.join("real"), root.join("photos")).expect("symlink");
+    let walker = Walker::builder()
+        .follow_symlinks(true)
+        .filter(Arc::new(KeyFilter::new(vec![Rule::exclude("photos")])))
+        .build();
+    let (t, ctx, rx) =
+        downloading_into_walking(&root, a_bucket_to_download(&[], 0), DeleteMode::On, walker);
+    run_managed(&t, &ctx, rx).await;
+    assert!(
+        !root.join("real/x.txt").exists(),
+        "an excluded link kept the file it points at"
+    );
+    assert!(
+        std::fs::symlink_metadata(root.join("photos")).is_ok(),
+        "delete mode removed an excluded link"
+    );
+}
+
 // Two links the filter excludes. Skipping past the second must not release the hold of the first.
 #[cfg(unix)]
 #[cfg_attr(miri, ignore)]
