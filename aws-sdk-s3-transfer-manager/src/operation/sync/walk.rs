@@ -23,7 +23,7 @@ use crate::io::key::stream::{
 };
 use crate::io::walk::{FollowedLink, WalkErrorKind};
 
-use links::{contains, into_name, name_of, Links};
+use links::{contains, insert_sorted, into_name, name_of, Links};
 pub(crate) use links::{key_parents, link_on_path, names_cover, LinkScan, ALIASED_NAMES_HELD};
 pub(crate) use walker::LocalDestination;
 #[cfg(test)]
@@ -532,42 +532,26 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
         self.past_link_bound
     }
 
-    // Take the finished link scan. Name the links the walk followed and the scan missed, hold every
-    // name on the source side, and return the names a waiting local delete must not touch, sorted.
-    // `None` means every waiting delete stays.
+    // Take the finished link scan. Hold every name the scan and the walk found on the source side,
+    // and return the names a waiting local delete must not touch, sorted. `None` means every waiting
+    // delete stays.
     pub(crate) fn accept_link_scan(&mut self, scan: LinkScan) -> Option<Vec<String>> {
-        let Links::Scanning {
-            mut namer,
-            followed,
-        } = std::mem::replace(&mut self.links, Links::NoScan)
+        let Links::Scanning { namer, names } = std::mem::replace(&mut self.links, Links::NoScan)
         else {
             unreachable!("only a walk with a link scan takes one back");
         };
-        let LinkScan {
-            mut names,
-            mut seen,
-            too_many,
-            ..
-        } = scan;
-        if too_many {
+        if scan.too_many {
             self.pass_link_bound();
         }
         if self.past_link_bound {
             self.links = Links::Scanned {
                 namer,
-                seen: Vec::new(),
                 names: Vec::new(),
             };
             return None;
         }
-        seen.sort_unstable();
-        seen.dedup();
-        let missed: Vec<FollowedLink> = followed
-            .into_iter()
-            .filter(|link| !contains(&seen, link.path()))
-            .collect();
-        namer.name(&missed, &mut names);
-        let mut keys: Vec<String> = names.into_iter().map(into_name).collect();
+        let mut keys = names;
+        keys.extend(scan.names.into_iter().map(into_name));
         keys.sort_unstable();
         keys.dedup();
         for key in &keys {
@@ -576,15 +560,15 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
         let past = self.past_link_bound;
         self.links = Links::Scanned {
             namer,
-            seen,
             names: if past { Vec::new() } else { keys.clone() },
         };
         (!past).then_some(keys)
     }
 
-    // Take the links the destination walk just followed. While the scan reads, keep them for when it
-    // ends. After it ended, name each link it missed: someone created that link during the run. A
-    // delete under its names may already have gone out once the merge reached them.
+    // Name the links the destination walk just followed. While the scan reads, keep each name once
+    // for when it ends. After it ended, hold each name the run did not hold yet: someone created
+    // that link during the run. A delete under that name may already have gone out once the merge
+    // reached it.
     fn note_followed(&mut self, links: Vec<FollowedLink>) {
         if links.is_empty() || self.past_link_bound {
             return;
@@ -592,28 +576,28 @@ impl<S: KeyStream, D: KeyStream> Walk<S, D> {
         let mut named = Vec::new();
         match &mut self.links {
             Links::NoScan => return,
-            Links::Scanning { followed, .. } => {
-                followed.extend(links);
-                if followed.len() > ALIASED_NAMES_HELD {
-                    followed.clear();
+            Links::Scanning { namer, names } => {
+                namer.name(&links, &mut named);
+                for name in named {
+                    insert_sorted(names, into_name(name));
+                }
+                if names.len() > ALIASED_NAMES_HELD {
+                    names.clear();
                     self.pass_link_bound();
                 }
                 return;
             }
-            Links::Scanned { namer, seen, .. } => {
-                let missed: Vec<FollowedLink> = links
-                    .into_iter()
-                    .filter(|link| !contains(seen, link.path()))
-                    .collect();
-                namer.name(&missed, &mut named);
-            }
+            Links::Scanned { namer, .. } => namer.name(&links, &mut named),
         }
         for name in named {
-            let known = match &self.links {
-                Links::Scanned { names, .. } => contains(names, name_of(&name)),
-                _ => false,
+            let Links::Scanned { names, .. } = &mut self.links else {
+                return;
             };
-            self.incomplete |= self.reached(&name) && !known;
+            if contains(names, name_of(&name)) {
+                continue;
+            }
+            insert_sorted(names, name_of(&name).to_string());
+            self.incomplete |= self.reached(&name);
             self.add_alias_hold(into_name(name));
         }
     }

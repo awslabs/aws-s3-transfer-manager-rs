@@ -19,27 +19,37 @@ use super::walker::Walker;
 // cost about what that queue does.
 pub(crate) const ALIASED_NAMES_HELD: usize = 1024;
 
-// Where a run stands with its link scan. The destination walk follows the same links the scan
-// does, so the walk names only the links the scan missed.
+// Where a run stands with its link scan. The walk names each link it follows as the scan does, so
+// both count the bound in names, and the tree alone decides whether a run passes it.
 #[derive(Debug)]
 pub(super) enum Links {
     // The run has no link scan, so it deletes nothing through a link, and the walk drops the links
     // it follows.
     NoScan,
-    // The scan is still reading, and every local delete waits for it. The walk keeps each link it
-    // follows, and names the ones the scan missed once the scan ends.
+    // The scan is still reading, and every local delete waits for it. `names` holds the names the
+    // walk's links reach, sorted and each once. The run holds them with the scan's once the scan ends.
     Scanning {
         namer: LinkNamer,
-        followed: Vec<FollowedLink>,
-    },
-    // The scan ended. `seen` holds the paths of the links it followed, and `names` the names those
-    // links reach, both sorted. A link the walk follows now and `seen` lacks was created after the
-    // scan read its directory.
-    Scanned {
-        namer: LinkNamer,
-        seen: Vec<PathBuf>,
         names: Vec<String>,
     },
+    // The scan ended. `names` holds every name the run holds for links, sorted and each once. A
+    // name the walk reaches now and `names` lacks comes from a link created after the scan read its
+    // directory.
+    Scanned {
+        namer: LinkNamer,
+        names: Vec<String>,
+    },
+}
+
+// Add `name` to `names`, sorted, and return whether it was new.
+pub(super) fn insert_sorted(names: &mut Vec<String>, name: String) -> bool {
+    match names.binary_search(&name) {
+        Ok(_) => false,
+        Err(at) => {
+            names.insert(at, name);
+            true
+        }
+    }
 }
 
 // Whether a link stands among a key's parent directories below the root. A read, a write, or
@@ -162,9 +172,6 @@ pub(crate) struct LinkScan {
     walk: FsWalk,
     namer: LinkNamer,
     pub(super) names: Vec<AliasedName>,
-    // The path of each link the scan followed, so the destination walk can tell which links the
-    // scan already named.
-    pub(super) seen: Vec<PathBuf>,
     // Set once the tree holds more names than the bound. The scan stops there, because one more
     // name changes nothing: the run holds every local delete either way.
     pub(super) too_many: bool,
@@ -177,7 +184,6 @@ impl LinkScan {
             walk: walker.fs_walk(root.to_path_buf(), SortOrder::Native, true),
             namer: LinkNamer::new(root),
             names: Vec::new(),
-            seen: Vec::new(),
             too_many: false,
             done: false,
         }
@@ -197,8 +203,6 @@ impl LinkScan {
         }
         self.done = self.walk.read_dirs(budget);
         let links = self.walk.take_followed();
-        self.seen
-            .extend(links.iter().map(|link| link.path().to_path_buf()));
         self.namer.name(&links, &mut self.names);
         // Many links can reach one target, so the scan counts each name once before it judges the
         // bound.
@@ -210,7 +214,6 @@ impl LinkScan {
                 self.too_many = true;
                 self.done = true;
                 self.names = Vec::new();
-                self.seen = Vec::new();
             }
         }
         self.done

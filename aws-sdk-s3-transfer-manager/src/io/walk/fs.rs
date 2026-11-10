@@ -178,14 +178,6 @@ pub(crate) enum FollowedLink {
     File(PathBuf),
 }
 
-impl FollowedLink {
-    // The link's own path, as the walk reached it.
-    pub(crate) fn path(&self) -> &Path {
-        let (Self::Directory(path) | Self::File(path)) = self;
-        path
-    }
-}
-
 /// One thing a filesystem walk found.
 ///
 /// Carries the absolute path, the path relative to the walk root, what the filesystem said is

@@ -108,7 +108,7 @@ impl Walker {
             walk.link_scan = Some(LinkScan::new(self, &root));
             walk.links = Links::Scanning {
                 namer: LinkNamer::new(&root),
-                followed: Vec::new(),
+                names: Vec::new(),
             };
         }
         Ok(walk)

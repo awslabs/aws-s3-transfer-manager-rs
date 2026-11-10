@@ -720,10 +720,9 @@ removes nothing anywhere in the folder, even in folders with no links. A run tha
 
 **What sync does.** The run records that the tree passed the bound, and it logs a warning that names
 the bound and two ways out: turn off following links, or exclude the folders that hold many links.
-The walk keeps the links it follows while the scan reads, and the same bound applies to them.
-When the walk follows more links than the bound, every waiting delete stays, whatever the scan
-found. The tree alone decides whether a run passes
-the bound, so every run over the tree ends the same way.
+While the scan reads, the walk names each link it follows the same way, and the same bound applies
+to those names. Both count names, and each name counts once. The tree alone decides whether a run
+passes the bound, so every run over the tree ends the same way.
 
 ## 1. Scope, and why it is this
 
@@ -1076,10 +1075,10 @@ the link's own text.
 starts a link scan. Every other run starts none, and its walk drops the links it follows, so it
 resolves no link targets (D4).
 
-The destination walk follows the same links the scan does, so it names a link only when the scan
-missed it. The scan records the path of each link it follows, and the walk looks a link up there
-before it names it. Someone created a link the scan missed after the scan read its directory (case
-M). Both name a link with one `LinkNamer`, so each link costs its `canonicalize` calls once.
+The destination walk names each link it follows with the scan's `LinkNamer`, so both name a link
+the same way. When the scan ends, the run holds the names both found. After that, a name the walk
+finds and the run does not hold comes from a link someone created after the scan read its directory
+(case M). A link both reads follow costs its `canonicalize` calls twice, once in each read.
 
 The scan reads with `SortOrder::Native`, because it needs every link and no key order. Many links
 can reach one target, so the scan counts each name once before it judges the bound (D5).

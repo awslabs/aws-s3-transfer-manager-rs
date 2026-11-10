@@ -1606,7 +1606,6 @@ async fn a_link_found_after_the_merge_reached_its_target_leaves_the_plan_incompl
         let mut walk = Walk::new(Scripted::of(source), local).with_roots(None, Some(root.clone()));
         walk.links = Links::Scanned {
             namer: LinkNamer::new(&root),
-            seen: Vec::new(),
             names: Vec::new(),
         };
         while let Some(next) = walk.next().await {
@@ -1937,8 +1936,9 @@ async fn names_the_walk_finds_past_the_bound_keep_every_waiting_delete() {
     let mut walk = Walk::new(Scripted::of(&[]), Scripted::of(&[]));
     walk.links = Links::Scanning {
         namer: LinkNamer::new(&root),
-        followed: Vec::new(),
+        names: Vec::new(),
     };
+    // Each directory link names itself, so these links name more keys than the bound.
     let links = (0..=ALIASED_NAMES_HELD)
         .map(|n| FollowedLink::Directory(root.join(format!("l{n:04}"))))
         .collect();

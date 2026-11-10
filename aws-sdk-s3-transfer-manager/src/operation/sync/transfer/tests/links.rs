@@ -1104,6 +1104,53 @@ async fn a_tree_past_the_link_bound_keeps_every_local_delete() {
     );
 }
 
+// 1,100 file links to one target name one key, well under the bound. The run must decide the same
+// whether the scan ends before the walk reads the links or after it: `old.txt` goes, `target.txt`
+// stays, and the run never passes the bound.
+#[cfg(unix)]
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn many_links_to_one_file_stay_under_the_bound_in_either_order() {
+    for scan_first in [true, false] {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonical root");
+        std::fs::write(root.join("target.txt"), b"x").expect("the target");
+        for n in 0..1100 {
+            std::os::unix::fs::symlink(root.join("target.txt"), root.join(format!("l{n:04}.txt")))
+                .expect("a link");
+        }
+        std::fs::write(root.join("old.txt"), b"x").expect("a local-only file");
+        let (t, _ctx, _rx) = downloading_into_walking(
+            &root,
+            a_bucket_to_download(&[], 1_600_000_000),
+            DeleteMode::On,
+            Walker::builder().follow_symlinks(true).build(),
+        );
+        if !scan_first {
+            let mut scan = drive_holding_the_scan(&t).await;
+            t.execute(&mut scan).await;
+        }
+        drive(&t).await;
+        let order = if scan_first {
+            "scan first"
+        } else {
+            "walk first"
+        };
+        assert!(
+            !t.inner.state.lock().snapshot().past_link_bound,
+            "{order}: 1,100 links to one file passed the bound"
+        );
+        assert!(
+            !root.join("old.txt").exists(),
+            "{order}: the run kept a local-only file no link reaches"
+        );
+        assert!(
+            root.join("target.txt").exists(),
+            "{order}: the run removed the file the links reach"
+        );
+    }
+}
+
 // The names a followed link reaches exist only to stop deletes. With delete mode off, the run names
 // none, so the destination-only key `link/x.txt` stays destination-only and the plan is whole. With
 // delete mode on, the same key reads as unknown.
