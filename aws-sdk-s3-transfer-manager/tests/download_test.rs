@@ -1055,6 +1055,15 @@ async fn test_checksum_mode_enabled_by_default() {
 }
 
 fn single_part_connector(data: &Bytes, crc32: Option<&str>) -> StaticReplayClient {
+    single_part_connector_with_checksum(data, crc32.map(|value| ("x-amz-checksum-crc32", value)))
+}
+
+/// Like `single_part_connector`, but `checksum` sets any checksum header, as
+/// `(header, value)`.
+fn single_part_connector_with_checksum(
+    data: &Bytes,
+    checksum: Option<(&str, &str)>,
+) -> StaticReplayClient {
     let mut resp = http::Response::builder()
         .status(200)
         .header("Content-Length", format!("{}", data.len()))
@@ -1063,8 +1072,8 @@ fn single_part_connector(data: &Bytes, crc32: Option<&str>) -> StaticReplayClien
             format!("bytes 0-{}/{}", data.len() - 1, data.len()),
         )
         .header("ETag", "my-etag");
-    if let Some(c) = crc32 {
-        resp = resp.header("x-amz-checksum-crc32", c);
+    if let Some((header, value)) = checksum {
+        resp = resp.header(header, value);
     }
     StaticReplayClient::new(vec![ReplayEvent::new(
         dummy_expected_request(),
