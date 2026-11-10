@@ -850,8 +850,8 @@ and in no other.
 The scan costs one `readdir` for each directory and one `stat` for each link. On Linux and macOS
 `readdir` reports each entry's type, so the scan never stats a regular file. The walk calls `stat`
 on every file, so the scan costs less than the walk. The `walk_sync_link_scan` group in
-`benches/walk.rs` measures both on a balanced tree. There the scan costs about three quarters of the
-walk, and the walk and the scan together cost less than twice the walk. The benchmark reads a tree
+`benches/walk.rs` measures both on a balanced tree. There the scan costs about 0.6 of the walk,
+and the walk and the scan, run one after the other, cost about 1.6 walks. The benchmark reads a tree
 held in the page cache, so it shows how the two reads compare, and not what a cold disk adds. The
 scan and the walk run at the same time. A run with fewer than 1,024 deletes waiting never pauses the
 merge for the scan.
@@ -1065,15 +1065,12 @@ pub(crate) enum AliasedName {
 need two tests. A link to anything other than a directory names its target as a `File`, so a socket
 that a link reaches stays held too. A link's own name sits under the root as spelled. A target comes
 from `canonicalize`, so it sits under the resolved root. On macOS a temporary root reads `/var/...`
-and resolves to `/private/var/...`, so each kind of name takes its key under its own root. macOS can
-also spell one directory as `/Users/...` and as `/System/Volumes/Data/Users/...`. When a target's
-resolved path does not start with the resolved root, the merge compares the identity of the target's
-ancestors with the root's.
+and resolves to `/private/var/...`, so each kind of name takes its key under its own root. A target
+takes its key by removing the resolved root from the front of its resolved path. A target whose
+resolved path does not start with the resolved root takes no key. The merge holds no name for it.
 
-A later link on a file link's chain takes its key as its directory stores the name. The merge finds
-that entry in the hop's resolved parent by matching the hop's identity. The link's own text can
-spell the name differently, as `Z.TXT` for a stored `z.txt` on a filesystem that ignores case. A
-hold under that spelling would miss the stored key.
+A later link on a file link's chain takes its key from its resolved parent directory and the name in
+the link's own text.
 
 `Walker::downloading` takes the delete mode. A download with following on and delete mode on
 starts a link scan. Every other run starts none, and its walk drops the links it follows, so it
@@ -1185,3 +1182,14 @@ not remove a directory through a link.
 
 A Windows device name such as `NUL` names a device in every directory, so a key like that leaves the
 root through its own name. **FR-Root-8** covers it.
+
+Link naming compares paths as text. Two spellings of one place defeat it in two ways.
+
+- macOS can spell one directory as `/Users/...` and as `/System/Volumes/Data/Users/...`. A target
+  resolved to the second spelling under a root resolved to the first takes no key. The merge then
+  holds no name for that target.
+- A link's own text can spell a later link on its chain differently from the stored name, as `Z.TXT`
+  for a stored `z.txt` on a filesystem that ignores case. The hold then sits under `Z.TXT`, and the
+  stored key `z.txt` stays deletable.
+
+Comparing the identity of each directory, its device and inode, would close both gaps.
