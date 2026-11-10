@@ -282,17 +282,19 @@ the pending delete batch, and answers the caller. An aborting run differs,
 because the run itself decides to stop. It cancels its own children through
 `abort()` (D5).
 
-**D11. The merge pauses at three watermarks.** The merge decides keys as fast as
+**D11. The merge pauses at four watermarks.** The merge decides keys as fast as
 the two sides list them, and children and deletes finish far more slowly. An
 unpaused merge queues a decision for nearly every key, so the run's memory grows
 with the tree.
 
-The merge pauses while any of three conditions holds:
+The merge pauses while any of four conditions holds:
 
 1. 1,024 transfers wait to start, counting the downloads that D12 holds.
 2. A full delete batch waits to go out. `poll_work` offers merge work before
    deletes, so the pause lets the batch go first.
 3. Two full delete batches are in flight.
+4. 1,024 local deletes wait for the link scan to end. Only a download with
+   following on and delete mode on runs that scan ([links](links.md), D6).
 
 A child finishing or a delete answer makes the run poll again, and the merge
 resumes.

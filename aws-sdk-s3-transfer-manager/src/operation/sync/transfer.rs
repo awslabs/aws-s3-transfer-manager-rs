@@ -12,7 +12,7 @@ use std::sync::Arc;
 use crate::io::key::stream::{KeyStream, StreamError};
 use crate::operation::sync::compare::{Compare, Decision, Verdict};
 use crate::operation::sync::input::{DeleteMode, RunSettings};
-use crate::operation::sync::walk::{Progress, Walk};
+use crate::operation::sync::walk::{link_on_path, LinkScan, Progress, Walk};
 use crate::transfer::{IoRequest, PollWork, Transfer, TransferContext, WorkOutcome};
 use crate::types::FailedTransferPolicy;
 
@@ -64,6 +64,10 @@ pub(crate) enum SyncWork<S: KeyStream, D: KeyStream> {
     DeleteKeys {
         keys: Vec<String>,
     },
+    // The link scan leaves `State` while a work item reads it, as the merge does.
+    ScanLinks {
+        scan: Option<Box<LinkScan>>,
+    },
 }
 
 impl<S: KeyStream, D: KeyStream> fmt::Debug for SyncWork<S, D> {
@@ -77,6 +81,7 @@ impl<S: KeyStream, D: KeyStream> fmt::Debug for SyncWork<S, D> {
                 write!(f, "CancelChildren({:?})", batch.as_ref().map(Reaping::len))
             }
             SyncWork::DeleteKeys { keys } => write!(f, "DeleteKeys({})", keys.len()),
+            SyncWork::ScanLinks { .. } => f.write_str("ScanLinks"),
         }
     }
 }
@@ -134,6 +139,10 @@ where
     failure_policy: FailedTransferPolicy,
     // Allow sync to remove destination-only keys. Delete mode requires caller opt-in.
     delete_mode: DeleteMode,
+    // The local root, when the run checks a path for a link just before it acts.
+    check_root: Option<std::path::PathBuf>,
+    // Whether the check also runs before each read and write. Local deletes are always checked.
+    check_transfers: bool,
 }
 
 impl<S, D> SyncTransfer<S, D>
@@ -152,6 +161,10 @@ where
         settings: RunSettings,
     ) -> Self {
         let namespace = deleter.namespace();
+        let (check_root, check_transfers) = match walk.link_check() {
+            Some((root, transfers)) => (Some(root.to_path_buf()), transfers),
+            None => (None, false),
+        };
         Self {
             inner: Arc::new(Inner {
                 ctx,
@@ -160,6 +173,8 @@ where
                 deleter,
                 delete_mode: settings.delete_mode,
                 failure_policy: settings.failure_policy,
+                check_root,
+                check_transfers,
                 state: Mutex::new(State::new(walk, settings.max_children, namespace)),
             }),
         }
@@ -177,10 +192,14 @@ where
 
     pub(crate) fn poll_work(&self) -> PollWork {
         let mut state = self.inner.state.lock();
+        state.settle_link_scan();
 
         // Check for stop between phases. A failed spawn can stop the run before the delete phase
         // starts.
         if !self.has_stopped(&state) {
+            if let Some(work) = self.dispatch_scan(&mut state) {
+                return work;
+            }
             if let Some(work) = self.dispatch_merge(&mut state) {
                 return work;
             }
@@ -188,6 +207,13 @@ where
                 // Spawn without the state lock. The reservation holds the slot until the child
                 // starts.
                 drop(state);
+                // A link that appeared after the walk read its directory, or that the walk matched
+                // to the key only by case, can stand on the path. The slot goes back when the
+                // reservation drops.
+                if self.link_on_path_of(pairing.key(), self.inner.check_transfers) {
+                    self.inner.state.lock().skip_transfer();
+                    return PollWork::Spawned;
+                }
                 let spawned = match pairing.source().entry() {
                     Some(entry) => {
                         self.inner
@@ -242,6 +268,15 @@ where
         // transfer.
         self.inner.ctx.set_pending();
         PollWork::Pending
+    }
+
+    // Whether a link stands on the path of `key` below the local root, when `checked` asks for the
+    // check.
+    fn link_on_path_of(&self, key: &str, checked: bool) -> bool {
+        match &self.inner.check_root {
+            Some(root) if checked => link_on_path(root, key),
+            _ => false,
+        }
     }
 
     // Return true after cancellation or an aborting failure. The transfer stays active until
@@ -377,11 +412,15 @@ where
         // `poll_work` hands out merge work before deletes, so a full delete batch pauses the merge
         // and goes out first. A partial batch on a bucket goes out only after the merge finishes,
         // so only a full batch pauses the merge.
+        //
+        // While the link scan reads, local deletes wait for it, and the merge pauses at
+        // `MERGE_LOW_WATER` of them. The scan does not need the merge, so the pause always ends.
         if state.transfers.waiting_len() >= MERGE_LOW_WATER
             || state
                 .deletes
                 .has_full_batch(self.inner.deleter.batch_size())
             || state.deletes.in_flight() >= DELETES_IN_FLIGHT_LOW_WATER
+            || state.deletes.held_for_links() >= MERGE_LOW_WATER
         {
             return None;
         }
@@ -389,6 +428,21 @@ where
         Some(PollWork::ready(IoRequest {
             data: Some(Box::new(SyncWork::AdvanceMerge {
                 walk: Some(Box::new(walk)),
+            })),
+        }))
+    }
+
+    // Hand the link scan to a work item. The scan goes before the merge, so the deletes waiting for
+    // it go out as early as they can.
+    fn dispatch_scan(&self, state: &mut State<S, D>) -> Option<PollWork> {
+        if state.link_scan.as_ref()?.is_done() {
+            return None;
+        }
+        let scan = state.link_scan.take()?;
+        state.link_scan_in_flight = true;
+        Some(PollWork::ready(IoRequest {
+            data: Some(Box::new(SyncWork::<S, D>::ScanLinks {
+                scan: Some(Box::new(scan)),
             })),
         }))
     }
@@ -412,7 +466,30 @@ where
                 let keys = std::mem::take(keys);
                 self.execute_deletes(keys).await
             }
+            SyncWork::ScanLinks { scan } => {
+                let scan = scan.take().expect("the scan was already taken");
+                self.execute_scan(*scan).await
+            }
         }
+    }
+
+    // Read one batch of the link scan. `MERGE_BATCH` bounds how long the item holds an executor
+    // slot, as it does for the merge.
+    async fn execute_scan(&self, mut scan: LinkScan) -> WorkOutcome {
+        scan.advance(MERGE_BATCH).await;
+        let mut state = self.inner.state.lock();
+        state.link_scan_in_flight = false;
+        // A stopped run drops its waiting deletes, so it has no use for the scan.
+        if !self.has_stopped(&state) {
+            state.link_scan = Some(scan);
+        }
+        if self.check_terminal(&mut state).is_some() {
+            drop(state);
+            return WorkOutcome::Success { data: None };
+        }
+        drop(state);
+        self.inner.ctx.try_wake();
+        WorkOutcome::Success { data: None }
     }
 
     async fn execute_deletes(&self, keys: Vec<String>) -> WorkOutcome {
@@ -431,6 +508,18 @@ where
                 self.inner.ctx.try_wake();
                 return WorkOutcome::Cancelled;
             }
+        }
+
+        // Each local delete checks its path for a link first. A delete through a link would
+        // remove a file outside the place the merge decided about.
+        let tree = self.inner.deleter.namespace() == delete::Namespace::Tree;
+        let (kept, keys): (Vec<String>, Vec<String>) = keys
+            .into_iter()
+            .partition(|key| self.link_on_path_of(key, tree));
+        if !kept.is_empty() {
+            let mut state = self.inner.state.lock();
+            state.deletes.record_response(kept.len(), 0);
+            state.keep_deletes(&kept);
         }
 
         let sent = keys.len();

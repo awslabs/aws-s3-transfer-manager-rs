@@ -170,6 +170,27 @@ impl SpawnChild<crate::io::walk::FsEntry> for SpawnUpload {
     }
 }
 
+// Open a new temporary file beside `dest`. Each attempt picks a random name, and the open fails on
+// a name already taken.
+fn open_temporary(dest: &std::path::Path) -> std::io::Result<(std::path::PathBuf, std::fs::File)> {
+    const ATTEMPTS: usize = 8;
+    let name = dest.file_name().unwrap_or_default().to_string_lossy();
+    let mut last = None;
+    for _ in 0..ATTEMPTS {
+        let path = dest.with_file_name(format!("{name}.s3tmp.{:08x}", fastrand::u32(..)));
+        match std::fs::File::options()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => return Ok((path, file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last = Some(e),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last.expect("every attempt found its name taken"))
+}
+
 // `SpawnDownload` starts a child that writes one object into the local tree.
 pub(crate) struct SpawnDownload {
     handle: Arc<crate::client::Handle>,
@@ -238,12 +259,10 @@ impl SpawnChild<aws_sdk_s3::types::Object> for SpawnDownload {
         // forbids a blocking call in `poll_work`. `download_objects` creates its temporary file the
         // same way. A shared child constructor that creates the file in the child's own work item
         // would fix both.
-        let temp_path = dest_path.with_file_name(format!(
-            "{}.s3tmp.{:08x}",
-            dest_path.file_name().unwrap_or_default().to_string_lossy(),
-            fastrand::u32(..)
-        ));
-        let file = std::fs::File::create(&temp_path).map_err(|e| {
+        //
+        // The open uses `create_new`, so it never opens a file or a link already at that name. A
+        // link planted there would send the bytes to its target. The download tries a new name.
+        let (temp_path, file) = open_temporary(&dest_path).map_err(|e| {
             crate::error::Error::new(
                 crate::error::ErrorKind::IOError,
                 format!("could not open a temporary file for '{key}': {e}"),

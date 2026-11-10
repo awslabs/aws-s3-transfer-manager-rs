@@ -75,6 +75,10 @@ pub(crate) enum Obstruction {
     // still hides the keys under the name, so the merge drops this entry and holds back those
     // keys.
     ExcludedLink,
+    // The item is a link the walk followed into a directory. The keys under its name come from the
+    // directory, so this entry stands only for the name itself. It pairs only with the same key on
+    // the other side: a download there replaces the link, and no-overwrite keeps it.
+    LinkToDirectory,
     // An object whose bytes sit in an archive with no restored copy to read.
     Archived,
     // A restore is under way. The bytes arrive when it finishes, so a later run gets them.
@@ -91,6 +95,8 @@ impl Obstruction {
             Self::NothingToRead => true,
             // The merge drops an excluded link before any comparison reads this answer.
             Self::ExcludedLink => true,
+            // The rename replaces the link and leaves the directory it points at alone.
+            Self::LinkToDirectory => false,
             // A download renames its file onto the destination name, and the rename replaces a
             // link at that name. `download_objects` replaces the link the same way.
             Self::UnfollowedLink => false,
@@ -240,9 +246,9 @@ pub(crate) trait KeyStream {
     // consumer, and `WalkErrorKind` is `#[non_exhaustive]`, so the two could disagree.
     fn is_done(&self) -> bool;
 
-    // Each call returns the names followed links aliased since the last call. A delete under an
-    // aliased name can remove a file another key names.
-    fn take_aliased_names(&mut self) -> Vec<AliasedName> {
+    // Each call returns the links the stream followed since the last call. Two keys can name one
+    // file through a followed link, so the consumer decides what each link aliases.
+    fn take_followed_links(&mut self) -> Vec<crate::io::walk::FollowedLink> {
         Vec::new()
     }
 }
@@ -494,7 +500,13 @@ impl KeyStream for FsWalk {
                     obstruction: match (entry.path_filtered(), entry.file_type()) {
                         (PathFiltered::Excluded, _) => Some(Obstruction::ExcludedLink),
                         (PathFiltered::Kept, FileType::Regular) => None,
-                        // The walk reports a link as a link when it left the link unfollowed.
+                        // The walk followed this link into a directory. It went inside, and it
+                        // also reports the link's own name here.
+                        (PathFiltered::Kept, FileType::Symlink) if entry.followed_symlink() => {
+                            Some(Obstruction::LinkToDirectory)
+                        }
+                        // The walk did not follow this link. The entry is the link itself, and the
+                        // walk read nothing behind it.
                         (PathFiltered::Kept, FileType::Symlink) => {
                             Some(Obstruction::UnfollowedLink)
                         }
@@ -1198,12 +1210,13 @@ mod tests {
     }
 
     // A filter excluding a name says nothing about the keys under it: `exclude("link")` matches
-    // `link` and not `link/a.txt`. So when the walk cannot tell what `link` is, suppressing the
-    // failure because the name was excluded loses every key beneath it with nothing said.
+    // `link` and not `link/a.txt`. The walk never resolves an excluded link, so it never learns
+    // that the target is unreadable. The link arrives as its marker, and the marker holds every key
+    // under its name.
     #[cfg(unix)]
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
-    async fn an_excluded_name_of_unknown_type_still_reports_its_range() {
+    async fn an_excluded_link_to_an_unreadable_target_arrives_as_its_marker() {
         use std::os::unix::fs::PermissionsExt;
 
         let outside = tempdir().unwrap();
@@ -1230,20 +1243,21 @@ mod tests {
             .build()
             .walk(FsWalkContext::builder().root(dir.path()).build());
 
-        let mut costs = Vec::new();
+        let mut seen = Vec::new();
         while let Some(next) = walk.next_entry().await {
-            if let Err(err) = next {
-                costs.push((walk_kind(&err), err.keys_lost()));
+            match next {
+                Ok(entry) => seen.push((entry.key, entry.meta.obstruction)),
+                Err(err) => panic!("an excluded link reported a failure: {err:?}"),
             }
         }
         fs::set_permissions(&protected, fs::Permissions::from_mode(0o755)).unwrap();
 
-        assert!(
-            costs.contains(&(
-                Some(WalkErrorKind::DirectoryUnreadable),
-                KeysLost::UnknownRange
-            )),
-            "the keys under an excluded name are not themselves excluded, got {costs:?}"
+        assert_eq!(
+            seen,
+            vec![
+                ("a.txt".to_string(), None),
+                ("link".to_string(), Some(Obstruction::ExcludedLink)),
+            ]
         );
     }
 
@@ -1875,7 +1889,21 @@ mod tests {
             .build()
             .walk(FsWalkContext::builder().root(dir.path()).build());
 
-        assert_eq!(keys(&mut walk).await, vec!["keep.txt", "target.txt"]);
+        // The walk never resolves an excluded link, so the link arrives as its marker and never
+        // as the file it points at.
+        let mut seen = Vec::new();
+        while let Some(next) = walk.next_entry().await {
+            let entry = next.expect("stream failed");
+            seen.push((entry.key, entry.meta.obstruction));
+        }
+        assert_eq!(
+            seen,
+            vec![
+                ("keep.txt".to_string(), None),
+                ("logs/link.txt".to_string(), Some(Obstruction::ExcludedLink)),
+                ("target.txt".to_string(), None),
+            ]
+        );
     }
 
     // An excluded entry must not warn even when it cannot be read, which means the

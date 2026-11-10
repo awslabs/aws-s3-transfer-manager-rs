@@ -14,16 +14,41 @@ use same_file::Handle;
 use super::error::{WalkError, WalkErrorKind};
 use crate::io::fs::{special_file_type, FileType};
 
-/// A directory queued for traversal, carrying the chain of ancestor directory
-/// handles needed for per-path symlink cycle detection.
+/// A directory queued for traversal, carrying the chain of ancestor directories
+/// needed for per-path symlink cycle detection.
 struct PendingDir {
     path: PathBuf,
     depth: usize,
-    /// Handles of all directories on the path from the walk root to (and
-    /// including) this directory's parent. Used to detect cycles: before
-    /// entering a symlinked directory, we check whether its target handle
-    /// already appears in this chain.
-    ancestor_handles: Vec<Arc<Handle>>,
+    /// All directories on the path from the walk root to (and including) this
+    /// directory's parent. Used to detect cycles: before entering a symlinked
+    /// directory, we check whether its target appears in this chain.
+    ancestor_handles: Vec<Arc<Ancestor>>,
+}
+
+// One directory on a descent path. Its handle is opened the first time a link to a directory asks
+// for it, so a tree without such links opens none. Children share the `Arc`, so each directory opens
+// at most one handle.
+struct Ancestor {
+    path: PathBuf,
+    handle: std::sync::OnceLock<Option<Handle>>,
+}
+
+impl Ancestor {
+    fn lazy(path: PathBuf) -> Self {
+        Self {
+            path,
+            handle: std::sync::OnceLock::new(),
+        }
+    }
+
+    // Whether this directory is the one `target` names. A directory whose handle cannot be opened
+    // matches nothing: the walk cannot read it either, so a link to it reaches no entries.
+    fn is(&self, target: &Handle) -> bool {
+        self.handle
+            .get_or_init(|| Handle::from_path(&self.path).ok())
+            .as_ref()
+            .is_some_and(|handle| handle == target)
+    }
 }
 
 // Result of reading a single directory: its entries in emission order, plus any
@@ -167,7 +192,8 @@ pub struct FsEntry {
     file_type: FileType,
     // True when the walk arrived here through a symlink it resolved, so this describes what the
     // link points at. False for a path reached directly, and for a link left alone — which
-    // `file_type` reports as `Symlink`.
+    // `file_type` reports as `Symlink`. A `Symlink` entry with this set is a link the walk followed
+    // into a directory: the walk yields the link's own name, and descends into it as well.
     followed_symlink: bool,
     path_filtered: PathFiltered,
     // The walk root, shared by every entry it produces. `relative_path` is a suffix of
@@ -314,6 +340,8 @@ pub struct FsWalker {
     sort_order: SortOrder,
     include_special_files: bool,
     canonicalize_root: bool,
+    root_as_named: bool,
+    links_only: bool,
     filter: Option<FilterFn>,
     path_filter: Option<PathFilterFn>,
 }
@@ -360,6 +388,21 @@ impl FsWalker {
                     done = true;
                 }
             }
+        } else if self.root_as_named {
+            // A root that is a link to nothing exists, and it is no directory. Asking with
+            // `lstat` keeps it from reading as a directory nobody has created yet.
+            let is_link =
+                std::fs::symlink_metadata(&root).is_ok_and(|md| md.file_type().is_symlink());
+            if is_link
+                && std::fs::metadata(&root).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+            {
+                pending_errors.push_back(WalkError::new(
+                    Some(root.clone()),
+                    WalkErrorKind::NotADirectory,
+                    Box::from("the root is a link that points at nothing"),
+                ));
+                done = true;
+            }
         } else if !self.follow_symlinks {
             match std::fs::symlink_metadata(&root) {
                 Ok(md) if md.file_type().is_symlink() => {
@@ -378,10 +421,17 @@ impl FsWalker {
             }
         }
 
+        // A link to a directory that holds the root would walk the root again, and the files beside
+        // it too. The loop check reads the descent path, so the directories above the root join it.
+        let ancestor_handles = if self.root_as_named && self.follow_symlinks && !done {
+            above_root(&root)
+        } else {
+            Vec::new()
+        };
         let root_dir = PendingDir {
             path: root.clone(),
             depth: 0,
-            ancestor_handles: Vec::new(),
+            ancestor_handles,
         };
         // Matched over every order rather than tested against one, so an order added later has to
         // say which traversal it needs instead of silently taking the breadth-first one.
@@ -442,6 +492,8 @@ pub struct FsWalkerBuilder {
     sort_order: SortOrder,
     include_special_files: bool,
     canonicalize_root: bool,
+    root_as_named: bool,
+    links_only: bool,
     filter: Option<FilterFn>,
     path_filter: Option<PathFilterFn>,
 }
@@ -528,6 +580,33 @@ impl FsWalkerBuilder {
         self
     }
 
+    // Start at the root the caller named, even when the root is a link and links are not followed.
+    // The follow setting covers the entries inside the root. With following on, a link to a
+    // directory that holds the root counts as a loop, so the walk never climbs above the root.
+    pub(crate) fn root_as_named(mut self, as_named: bool) -> Self {
+        self.root_as_named = as_named;
+        self
+    }
+
+    // Read the tree only for its links. The walk follows links as configured and records each one it
+    // follows, and it yields no entries and reads no file's metadata. A sync download's link scan
+    // needs nothing more, and a `stat` per file would double its cost.
+    #[cfg(not(any(test, feature = "test-util")))]
+    pub(crate) fn links_only(mut self, links_only: bool) -> Self {
+        self.links_only = links_only;
+        self
+    }
+
+    /// Read the tree only for its links: yield no entries and read no file's metadata.
+    ///
+    /// Public only for the benchmarks, behind the `test-util` feature.
+    #[cfg(any(test, feature = "test-util"))]
+    #[doc(hidden)]
+    pub fn links_only(mut self, links_only: bool) -> Self {
+        self.links_only = links_only;
+        self
+    }
+
     /// Resolve the walk root via `std::fs::canonicalize` before walking.
     ///
     /// When `true`, the root path is canonicalized (symlinks resolved,
@@ -589,6 +668,8 @@ impl FsWalkerBuilder {
             sort_order: self.sort_order,
             include_special_files: self.include_special_files,
             canonicalize_root: self.canonicalize_root,
+            root_as_named: self.root_as_named,
+            links_only: self.links_only,
             filter: self.filter,
             path_filter: self.path_filter,
         }
@@ -791,6 +872,58 @@ impl FsWalk {
         }
     }
 
+    // Read up to `budget` directories of a links-only walk in native order, and record the links
+    // they hold. Return true once the walk has read the whole tree. A links-only walk yields no
+    // entries, so `next` would read the whole tree in one call. This bounds one call to a batch
+    // of directories. A directory the walk cannot read is skipped, and its error is dropped.
+    //
+    // The call does not yield between directories, because the budget already bounds it. On the
+    // transfer manager's current-thread runtimes a yield polls the I/O driver, and that costs
+    // about 13 µs, as much as reading a small directory.
+    #[cfg(not(any(test, feature = "test-util")))]
+    pub(crate) fn read_dirs(&mut self, budget: usize) -> bool {
+        self.read_dir_batch(budget)
+    }
+
+    /// Read up to `budget` directories of a links-only walk, and return whether the walk is done.
+    ///
+    /// Public only for the benchmarks, behind the `test-util` feature.
+    #[cfg(any(test, feature = "test-util"))]
+    #[doc(hidden)]
+    pub fn read_dirs(&mut self, budget: usize) -> bool {
+        self.read_dir_batch(budget)
+    }
+
+    fn read_dir_batch(&mut self, budget: usize) -> bool {
+        self.followed.clear();
+        self.pending_errors.clear();
+        for _ in 0..budget {
+            if self.done {
+                return true;
+            }
+            let Cursor::Breadth { pending_dirs, .. } = &mut self.cursor else {
+                unreachable!("a links-only walk reads in native order");
+            };
+            let Some(dir) = pending_dirs.pop_front() else {
+                self.done = true;
+                return true;
+            };
+            let Ok(result) = self.read_dir(&dir.path, dir.depth, &dir.ancestor_handles) else {
+                continue;
+            };
+            self.followed.extend(result.followed);
+            let Cursor::Breadth { pending_dirs, .. } = &mut self.cursor else {
+                unreachable!("a links-only walk reads in native order");
+            };
+            for child in result.children {
+                if let Child::Dir(dir) = child {
+                    pending_dirs.push_back(dir);
+                }
+            }
+        }
+        false
+    }
+
     /// Whether the walk has finished (no more entries will be produced).
     pub fn is_done(&self) -> bool {
         self.done
@@ -891,15 +1024,21 @@ impl FsWalk {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn followed_links(&self) -> &[FollowedLink] {
         &self.followed
+    }
+
+    // Take the links the last call followed. A second take before the next call returns none.
+    pub(crate) fn take_followed(&mut self) -> Vec<FollowedLink> {
+        std::mem::take(&mut self.followed)
     }
 
     fn read_dir(
         &self,
         dir: &Path,
         depth: usize,
-        ancestor_handles: &[Arc<Handle>],
+        ancestor_handles: &[Arc<Ancestor>],
     ) -> Result<ReadDirResult, WalkError> {
         let entries = std::fs::read_dir(dir).map_err(|e| {
             let kind = dir_open_error_kind(&e, depth);
@@ -910,12 +1049,8 @@ impl FsWalk {
         // directories can form a cycle, so when symlinks are not followed the
         // chain is never consulted and the open()+fstat is pure cost.
         let next_ancestors = if self.config.follow_symlinks {
-            let self_handle = Arc::new(Handle::from_path(dir).map_err(|e| {
-                let kind = dir_open_error_kind(&e, depth);
-                WalkError::new(Some(dir.to_path_buf()), kind, Box::new(e))
-            })?);
             let mut chain = ancestor_handles.to_vec();
-            chain.push(self_handle);
+            chain.push(Arc::new(Ancestor::lazy(dir.to_path_buf())));
             chain
         } else {
             Vec::new()
@@ -979,29 +1114,36 @@ impl FsWalk {
                     }
                     continue;
                 }
+                // The walk never resolves a link the filter excludes, with following on too. The
+                // link stands as its marker, so sync never reads or writes through it.
+                if rejected {
+                    self.push_excluded_link(&mut result.children, path);
+                    continue;
+                }
                 let metadata = match std::fs::metadata(&path) {
                     Ok(m) => m,
                     Err(e) => {
                         match e.kind() {
                             // A dangling link can still stand for a directory, such as one on an
                             // unmounted volume. The key stream costs the link as its name and every
-                            // key under it. The walk yields an excluded link marked, in place of a
-                            // failure.
+                            // key under it.
                             std::io::ErrorKind::NotFound => {
-                                if rejected {
-                                    self.push_excluded_link(&mut result.children, path);
-                                } else {
-                                    result.errors.push(WalkError::new(
-                                        Some(path),
-                                        WalkErrorKind::BrokenSymlink,
-                                        Box::new(e),
-                                    ));
-                                }
+                                result.errors.push(WalkError::new(
+                                    Some(path),
+                                    WalkErrorKind::BrokenSymlink,
+                                    Box::new(e),
+                                ));
+                            }
+                            // A link into an endless chain reaches nothing, as a dangling link does.
+                            _ if is_endless_chain(&e) => {
+                                result.errors.push(WalkError::new(
+                                    Some(path),
+                                    WalkErrorKind::BrokenSymlink,
+                                    Box::new(e),
+                                ));
                             }
                             // Anything else leaves the target's kind unknown, and a link to a
-                            // directory would have filed a whole subtree under this name. Reported
-                            // even when the filter excluded the name, because a rule on a name says
-                            // nothing about the keys under it.
+                            // directory would have filed a whole subtree under this name.
                             _ => {
                                 result.errors.push(WalkError::new(
                                     Some(path),
@@ -1019,7 +1161,7 @@ impl FsWalk {
                     // on the current descent path.
                     match Handle::from_path(&path) {
                         Ok(target_handle) => {
-                            if next_ancestors.iter().any(|a| **a == target_handle) {
+                            if next_ancestors.iter().any(|a| a.is(&target_handle)) {
                                 result.errors.push(WalkError::new(
                                     Some(path),
                                     WalkErrorKind::SymlinkCycle,
@@ -1028,6 +1170,18 @@ impl FsWalk {
                                 continue;
                             }
                             if depth < self.config.max_depth {
+                                // The link's own name is taken, even though no file sits there. A
+                                // consumer that reads absence from the stream hears about it, as it
+                                // hears about a special file.
+                                if self.config.include_special_files {
+                                    self.push_entry(
+                                        &mut result.children,
+                                        path.clone(),
+                                        None,
+                                        FileType::Symlink,
+                                        true,
+                                    );
+                                }
                                 result.followed.push(FollowedLink::Directory(path.clone()));
                                 result.children.push(Child::Dir(PendingDir {
                                     path,
@@ -1050,9 +1204,6 @@ impl FsWalk {
                         }
                     }
                 } else if metadata.is_file() {
-                    if rejected {
-                        continue;
-                    }
                     result.followed.push(FollowedLink::File(path.clone()));
                     self.push_entry(
                         &mut result.children,
@@ -1061,7 +1212,7 @@ impl FsWalk {
                         FileType::Regular,
                         true,
                     );
-                } else if !rejected && self.config.include_special_files {
+                } else if self.config.include_special_files {
                     // The link points at something no transfer could read. The entry says so,
                     // and the key stays accounted for.
                     //
@@ -1078,7 +1229,7 @@ impl FsWalk {
                     );
                 }
             } else if file_type.is_file() {
-                if rejected {
+                if rejected || self.config.links_only {
                     continue;
                 }
                 // TODO(walker): read this when the entry is handed over, not when its directory is.
@@ -1120,7 +1271,7 @@ impl FsWalk {
                         ancestor_handles: next_ancestors.clone(),
                     }));
                 }
-            } else if !rejected && self.config.include_special_files {
+            } else if !rejected && self.config.include_special_files && !self.config.links_only {
                 // A socket, FIFO, or device. Yielded so a consumer knows the name is taken: a
                 // name absent from the stream reads as nothing being there, which is a
                 // different fact. An excluded name is different again — nothing is going to
@@ -1177,6 +1328,9 @@ impl FsWalk {
         file_type: FileType,
         followed_symlink: bool,
     ) {
+        if self.config.links_only {
+            return;
+        }
         let entry = FsEntry {
             path,
             file_type,
@@ -1194,6 +1348,9 @@ impl FsWalk {
     // because the consumer drops the link before it acts on any entry. The walk skips the
     // metadata read, so a rejected name still costs zero `stat` calls.
     fn push_excluded_link(&self, children: &mut Vec<Child>, path: PathBuf) {
+        if self.config.links_only {
+            return;
+        }
         children.push(Child::File(FsEntry {
             path,
             file_type: FileType::Symlink,
@@ -1212,6 +1369,36 @@ impl FsWalk {
             let relative = path.strip_prefix(&self.root).unwrap_or(path);
             !f(relative)
         })
+    }
+}
+
+// Handles for every directory above the root, both as the caller spelled it and with its links
+// resolved, because a link can reach either chain. A directory the walk cannot open is left out.
+fn above_root(root: &Path) -> Vec<Arc<Ancestor>> {
+    let spelled = std::path::absolute(root).ok();
+    let resolved = std::fs::canonicalize(root).ok();
+    let mut above: Vec<Arc<Ancestor>> = Vec::new();
+    for start in [spelled, resolved].into_iter().flatten() {
+        for dir in start.ancestors().skip(1) {
+            if !above.iter().any(|known| known.path == dir) {
+                above.push(Arc::new(Ancestor::lazy(dir.to_path_buf())));
+            }
+        }
+    }
+    above
+}
+
+// Whether resolving a link failed because its chain of links never ends. The system gives up after
+// about 40 links on Linux and 32 on macOS.
+fn is_endless_chain(e: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        e.raw_os_error() == Some(nix::errno::Errno::ELOOP as i32)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = e;
+        false
     }
 }
 
@@ -1488,16 +1675,12 @@ mod tests {
                 .map(|e| (norm(e.relative_path()), e.path_filtered()))
                 .collect();
             seen.sort_by(|a, b| a.0.cmp(&b.0));
-            // With following on, the walk descends into the link to a real directory, so only the
-            // dangling link stands as a link. With following off, both links stand as links.
-            let expected: Vec<(String, PathFiltered)> = if follow {
-                vec![("dangling".to_string(), PathFiltered::Excluded)]
-            } else {
-                vec![
-                    ("dangling".to_string(), PathFiltered::Excluded),
-                    ("photos".to_string(), PathFiltered::Excluded),
-                ]
-            };
+            // The walk never resolves an excluded link, so both links stand as markers with
+            // following on or off.
+            let expected: Vec<(String, PathFiltered)> = vec![
+                ("dangling".to_string(), PathFiltered::Excluded),
+                ("photos".to_string(), PathFiltered::Excluded),
+            ];
             assert_eq!(seen, expected, "follow_symlinks({follow})");
         }
     }
@@ -3412,6 +3595,39 @@ mod tests {
         assert_eq!(
             parallel_set, serial_set,
             "concurrent walks must yield the same entries as serial walk"
+        );
+    }
+
+    // A links-only walk yields nothing and still records every link it follows, in both kinds.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_links_only_walk_records_links_and_yields_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join("real")).unwrap();
+        std::fs::write(root.join("real/a.txt"), b"x").unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("dlink")).unwrap();
+        std::os::unix::fs::symlink(root.join("real/a.txt"), root.join("flink")).unwrap();
+        let mut walk = FsWalker::builder()
+            .recursive(true)
+            .follow_symlinks(true)
+            .include_special_files(true)
+            .links_only(true)
+            .build()
+            .walk(FsWalkContext::builder().root(root).build());
+        let mut yielded = 0;
+        let mut followed = Vec::new();
+        while let Some(next) = walk.next().await {
+            next.expect("the walk does not fail");
+            yielded += 1;
+            followed.extend(walk.followed_links().iter().map(|l| format!("{l:?}")));
+        }
+        followed.extend(walk.followed_links().iter().map(|l| format!("{l:?}")));
+        assert_eq!(yielded, 0, "a links-only walk yielded entries");
+        assert_eq!(
+            followed.len(),
+            2,
+            "the walk did not record both links: {followed:?}"
         );
     }
 
