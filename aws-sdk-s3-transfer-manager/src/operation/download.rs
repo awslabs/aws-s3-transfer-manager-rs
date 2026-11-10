@@ -269,6 +269,8 @@ mod tests {
 
     // Single-part downloads are not a supported transfer. Both entry points
     // must reject a part number as invalid input rather than panic.
+    // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn part_number_download_is_invalid_input() {
         let err = Download::orchestrate(mock_handle(), part_number_input(), false)
@@ -276,6 +278,8 @@ mod tests {
         assert_eq!(err.kind(), &ErrorKind::InputInvalid);
     }
 
+    // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn part_number_download_to_sink_is_invalid_input() {
         let file = tempfile::tempfile().unwrap();
