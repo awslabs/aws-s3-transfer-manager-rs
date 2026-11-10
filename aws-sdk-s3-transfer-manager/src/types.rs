@@ -422,43 +422,54 @@ impl IntegrityChecks {
     }
 }
 
-/// Whether the bytes delivered by a download were validated against a checksum.
+/// Whether the bytes a download delivered were validated against S3's checksums.
 ///
-/// `Validated` means the *entire* delivered object was covered by a checksum and
-/// matched. Anything short of whole-object coverage is `NotValidated` with a
-/// [`NotValidatedReason`]; there is no partial state.
+/// Validation checks the bytes as they were received from S3, not the destination
+/// they were written to. `Validated` means a response checksum covered every
+/// delivered byte, and every one of those checksums matched. Anything less is
+/// `NotValidated` with a [`NotValidatedReason`]; partial coverage is
+/// `NotValidated { reason: PartialCoverage }`, not a separate state.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChecksumValidation {
-    /// Every delivered byte was validated against a checksum and matched.
+    /// A response checksum covered every delivered byte, and every one of those
+    /// checksums matched.
     #[non_exhaustive]
     Validated {
-        /// The algorithm used to validate.
+        /// The algorithm of the checksum that covered the lowest-offset delivered bytes.
         algorithm: crate::model::ChecksumAlgorithm,
     },
-    /// No whole-object validation occurred. `reason` explains why.
+    /// Not every delivered byte was validated. `reason` says why.
     #[non_exhaustive]
     NotValidated {
-        /// Why validation did not cover the whole object.
+        /// Why not every delivered byte was validated.
         reason: NotValidatedReason,
     },
 }
 
-/// Why a download's bytes were not whole-object checksum-validated.
+/// Why not every byte a download delivered was validated.
+///
+/// When more than one reason holds, the download reports the first in this order:
+/// `Disabled`, `PartialCoverage`, `CompositeChecksum`, `UnsupportedAlgorithm`,
+/// `Unavailable`.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotValidatedReason {
-    /// Checksum validation was not enabled for the request (client
-    /// `ResponseChecksumValidation::WhenRequired` with no request override).
+    /// Validation was not enabled: the request did not set `ChecksumMode::Enabled`,
+    /// and the client's `ResponseChecksumValidation` is `WhenRequired`.
     Disabled,
-    /// The object carries only a composite (`-N`) checksum, which cannot be
-    /// validated against delivered bytes.
+    /// A response carried only a part-level checksum, a value ending in `-N` such as
+    /// a composite upload's object checksum, which cannot be checked against the
+    /// bytes the response delivered.
     CompositeChecksum,
-    /// Some delivered bytes were validated but not the whole object.
+    /// Some delivered bytes were validated, and some were not.
     PartialCoverage,
-    /// No checksum covered the delivered bytes (object has no stored checksum,
-    /// or the requested range did not align to a stored part).
+    /// No response carried a checksum that could be checked, for example because the
+    /// object has no stored checksum. Also reported when no bytes were delivered.
     Unavailable,
+    /// A response carried checksums only in algorithms the SDK does not compute,
+    /// such as MD5.
+    UnsupportedAlgorithm,
 }
 
 impl IntegrityChecks {

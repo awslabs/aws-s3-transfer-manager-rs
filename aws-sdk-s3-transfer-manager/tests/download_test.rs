@@ -1267,6 +1267,22 @@ async fn test_integrity_checks_no_checksum_reads_unavailable() {
     assert_not_validated(&validation, NotValidatedReason::Unavailable);
 }
 
+/// A response whose only checksum is MD5, which the SDK does not compute, reads
+/// `NotValidated { reason: UnsupportedAlgorithm }`.
+#[tokio::test]
+async fn test_integrity_checks_md5_only_reads_unsupported_algorithm() {
+    let data = Bytes::from_static(HELLO);
+    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let http_client = single_part_connector_with_checksum(
+        &data,
+        Some(("x-amz-checksum-md5", "XrY7u+Ae7tCTyyK7j1rNww==")),
+    );
+    let tm = test_tm(http_client, part_size);
+
+    let validation = download_checksum_validation(&tm, Some(ChecksumMode::Enabled)).await;
+    assert_not_validated(&validation, NotValidatedReason::UnsupportedAlgorithm);
+}
+
 /// Whole object in the discovery chunk → the response checksum IS the object's,
 /// surfaced on the value members.
 #[tokio::test]

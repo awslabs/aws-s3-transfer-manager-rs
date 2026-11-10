@@ -26,6 +26,9 @@ pub(super) struct ChecksumTally {
     first_validated: Option<(u64, ChecksumAlgorithm)>,
     /// Whether a delivered chunk's response carried only a part-level checksum.
     part_level: bool,
+    /// Whether a delivered chunk's response carried checksums only in algorithms
+    /// the SDK does not compute.
+    unsupported_algorithm: bool,
 }
 
 impl ChecksumTally {
@@ -58,20 +61,26 @@ impl ChecksumTally {
             Some(ChecksumOutcome::NotValidated {
                 reason: ResponseNotValidatedReason::PartLevelChecksum,
             }) => self.part_level = true,
+            Some(ChecksumOutcome::NotValidated {
+                reason: ResponseNotValidatedReason::UnsupportedAlgorithm,
+            }) => self.unsupported_algorithm = true,
             _ => {}
         }
     }
 
     /// The download's verdict, by the first rule that holds:
     ///
-    /// 1. `NotValidated { Disabled }` when validation was not enabled.
+    /// 1. `NotValidated { reason: Disabled }` when validation was not enabled.
     /// 2. `Validated` when more than 0 bytes were delivered and every delivered byte
     ///    was validated, with the algorithm of the lowest-offset chunk.
-    /// 3. `NotValidated { PartialCoverage }` when some delivered bytes were validated.
-    /// 4. `NotValidated { CompositeChecksum }` when a delivered chunk's response
-    ///    carried only a part-level checksum.
-    /// 5. `NotValidated { Unavailable }` otherwise, including when no bytes were
-    ///    delivered.
+    /// 3. `NotValidated { reason: PartialCoverage }` when some delivered bytes were
+    ///    validated.
+    /// 4. `NotValidated { reason: CompositeChecksum }` when a delivered chunk's
+    ///    response carried only a part-level checksum.
+    /// 5. `NotValidated { reason: UnsupportedAlgorithm }` when a delivered chunk's
+    ///    response carried checksums only in algorithms the SDK does not compute.
+    /// 6. `NotValidated { reason: Unavailable }` otherwise, including when no bytes
+    ///    were delivered.
     pub(super) fn checksum_validation(&self, validation_enabled: bool) -> ChecksumValidation {
         let not_validated = |reason| ChecksumValidation::NotValidated { reason };
         if !validation_enabled {
@@ -88,6 +97,8 @@ impl ChecksumTally {
             NotValidatedReason::PartialCoverage
         } else if self.part_level {
             NotValidatedReason::CompositeChecksum
+        } else if self.unsupported_algorithm {
+            NotValidatedReason::UnsupportedAlgorithm
         } else {
             NotValidatedReason::Unavailable
         })
@@ -177,6 +188,55 @@ mod tests {
             not_validated(ResponseNotValidatedReason::PartLevelChecksum),
         );
         tally.record(8, 8, not_validated(ResponseNotValidatedReason::NoChecksum));
+        assert_eq!(
+            tally.checksum_validation(true),
+            reason(NotValidatedReason::CompositeChecksum)
+        );
+    }
+
+    #[test]
+    fn unsupported_algorithm_when_a_chunk_had_only_an_unsupported_checksum() {
+        let mut tally = ChecksumTally::default();
+        tally.record(
+            0,
+            8,
+            not_validated(ResponseNotValidatedReason::UnsupportedAlgorithm),
+        );
+        tally.record(8, 8, not_validated(ResponseNotValidatedReason::NoChecksum));
+        assert_eq!(
+            tally.checksum_validation(true),
+            reason(NotValidatedReason::UnsupportedAlgorithm)
+        );
+    }
+
+    #[test]
+    fn partial_coverage_outranks_an_unsupported_algorithm() {
+        let mut tally = ChecksumTally::default();
+        tally.record(0, 8, validated(ResponseChecksumAlgorithm::Crc32));
+        tally.record(
+            8,
+            8,
+            not_validated(ResponseNotValidatedReason::UnsupportedAlgorithm),
+        );
+        assert_eq!(
+            tally.checksum_validation(true),
+            reason(NotValidatedReason::PartialCoverage)
+        );
+    }
+
+    #[test]
+    fn a_part_level_checksum_outranks_an_unsupported_algorithm() {
+        let mut tally = ChecksumTally::default();
+        tally.record(
+            0,
+            8,
+            not_validated(ResponseNotValidatedReason::UnsupportedAlgorithm),
+        );
+        tally.record(
+            8,
+            8,
+            not_validated(ResponseNotValidatedReason::PartLevelChecksum),
+        );
         assert_eq!(
             tally.checksum_validation(true),
             reason(NotValidatedReason::CompositeChecksum)

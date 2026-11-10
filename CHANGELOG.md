@@ -7,10 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Downloads report `ChecksumValidation::Validated` when a response checksum covered every
+  delivered byte and every one of those checksums matched. `IntegrityChecks::checksum_validation`
+  previously never reported `Validated`.
+- `NotValidatedReason::UnsupportedAlgorithm`, reported when a download's responses carried
+  checksums only in algorithms the SDK does not compute, such as MD5.
+
 ### Changed
 - `aws-sdk-s3-transfer-manager`, `aws-sdk-s3-transfer-manager-ext`, `aws-smithy-topology`,
   `aws-smithy-execution` and `aws-smithy-managed-http`: the minimum supported Rust version is
   1.96.0.
+- The minimum `aws-sdk-s3` is now 1.158.0, the first release that reports the response checksum
+  outcome the verdict is built from.
+
+### Fixed
+- `IntegrityError::algorithm()` now names the algorithm on a checksum mismatch. It was always
+  `None`.
 
 ## [release-2026-11-05]
 
