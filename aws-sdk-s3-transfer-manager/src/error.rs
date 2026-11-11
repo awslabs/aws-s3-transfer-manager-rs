@@ -81,9 +81,9 @@ pub enum ErrorKind {
     /// is out of range, settings conflict, or the source cannot be transferred as
     /// requested, such as a stream that produces more parts than a multipart
     /// upload allows or an object key that resolves outside the download
-    /// destination. Conditions visible in the input are reported before any
-    /// request is sent; conditions that depend on the source data are reported
-    /// when the transfer encounters them.
+    /// destination or to the destination itself. Conditions visible in the
+    /// input are reported before any request is sent; conditions that depend
+    /// on the source data are reported when the transfer encounters them.
     InputInvalid,
 
     /// An I/O operation failed. This covers both local filesystem failures
@@ -336,10 +336,16 @@ impl Error {
     ///
     /// Set on the error an upload's [`join`](crate::operation::upload::UploadHandle::join) or
     /// [`abort`](crate::operation::upload::UploadHandle::abort) returns when the upload created a
-    /// multipart upload that was neither completed nor aborted: either the
+    /// multipart upload that was neither completed nor aborted: the
     /// [`FailedMultipartUploadPolicy::Retain`](crate::types::FailedMultipartUploadPolicy::Retain)
-    /// policy kept it, or the AbortMultipartUpload request failed. S3 keeps, and bills for, the
-    /// uploaded parts until the multipart upload is completed or aborted with this ID.
+    /// policy kept it, the AbortMultipartUpload request failed, or a worker panicked while
+    /// executing the upload, as when the caller's [`PartStream`](crate::io::PartStream) panics,
+    /// which ends it with [`ErrorKind::RuntimeError`] without sending AbortMultipartUpload. S3
+    /// keeps, and bills for, the uploaded parts until the multipart upload is completed or
+    /// aborted with this ID.
+    ///
+    /// A panic that ends the upload while CompleteMultipartUpload or AbortMultipartUpload is in
+    /// flight also sets the ID, although that request may still close the multipart upload.
     ///
     /// `None` when no multipart upload was created, when AbortMultipartUpload removed it, and on
     /// errors from other operations.

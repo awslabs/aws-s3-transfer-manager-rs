@@ -875,9 +875,12 @@ impl DownloadObjectsTransfer {
                         .key(&key)
                         .build()
                         .unwrap();
+                    // A child's local failure, such as renaming its temporary
+                    // file, names the path but not the key. Errors without a
+                    // local path are left unchanged.
                     state.failed.push(FailedDownload {
                         input: failed_input,
-                        error: err,
+                        error: err.with_local_key(key),
                     });
                     if self.inner.failure_policy == FailedTransferPolicy::Abort {
                         self.inner.ctx.set_failed_and_signal(child_failed());
@@ -962,8 +965,10 @@ fn replace_delim<'a>(key: &'a str, delimiter: Option<&str>, path_separator: &str
 ///
 /// Strips the configured prefix, replaces the delimiter with the OS path
 /// separator, joins with `root_dir`, and normalizes the result. Returns
-/// [`ErrorKind::InputInvalid`] when the result lies outside `root_dir` (path
-/// traversal guard).
+/// [`ErrorKind::InputInvalid`] unless the result lies beneath `root_dir`: when
+/// it lies outside `root_dir` (path traversal guard), and when it is
+/// `root_dir` itself, as for the keys `.` and `a/..` or a key that the prefix
+/// strips to nothing. The filesystem is not touched.
 ///
 /// `root_dir` and the joined path are both cleaned lexically, with
 /// `path_clean`, before they are compared, so a destination such as `./out`
@@ -986,35 +991,30 @@ pub(crate) fn local_key_path(
     Ok(local_path)
 }
 
-/// Rejects `local_path` unless it is `root_dir` or lies beneath it. Both must
-/// be lexically clean.
+/// Rejects `local_path` with [`ErrorKind::InputInvalid`] unless it lies
+/// beneath `root_dir`. Both must be lexically clean.
 ///
 /// A clean path holds `..` only as leading components, so `local_path` is
-/// inside `root_dir` when it starts with `root_dir` and the rest neither
-/// climbs out with `..` nor is rooted. This also holds for a root that is
-/// itself `.` or made of `..` components.
+/// beneath `root_dir` when it starts with `root_dir` and the rest begins with
+/// a normal component: not `..`, a root, or a drive prefix, which leave
+/// `root_dir`, and not empty, which is `root_dir` itself. This also holds for
+/// a root made of `..` components. A root of `.` is the one that does not
+/// prefix the paths beneath it, and a clean path equal to it is `.`.
 fn validate_path(root_dir: &Path, local_path: &Path, key: &str) -> Result<(), Error> {
     let rest = if root_dir == Path::new(".") {
         Some(local_path)
     } else {
         local_path.strip_prefix(root_dir).ok()
     };
-    let inside = rest.is_some_and(|rest| {
-        !matches!(
-            rest.components().next(),
-            Some(Component::ParentDir | Component::RootDir | Component::Prefix(_))
-        )
-    });
-    if !inside {
-        return Err(Error::new(
-            ErrorKind::InputInvalid,
-            format!(
-                "Unable to download key: '{key}', its relative path resolves \
-                 outside the target destination directory"
-            ),
-        ));
-    }
-    Ok(())
+    let reason = match rest.map(|rest| rest.components().next()) {
+        Some(Some(Component::Normal(_))) => return Ok(()),
+        Some(None | Some(Component::CurDir)) => "resolves to the destination directory itself",
+        _ => "resolves outside the target destination directory",
+    };
+    Err(Error::new(
+        ErrorKind::InputInvalid,
+        format!("Unable to download key: '{key}', its relative path {reason}"),
+    ))
 }
 
 #[cfg(test)]
@@ -1026,6 +1026,7 @@ mod tests {
     use aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output;
     use aws_sdk_s3::types::Object;
     use aws_smithy_mocks::{mock, mock_client, RuleMode};
+    use aws_smithy_types::error::display::DisplayErrorContext;
     use std::time::Duration;
     use tempfile::tempdir;
     use tokio::time::timeout;
@@ -1287,38 +1288,109 @@ mod tests {
         }
     }
 
+    /// Asserts, for each `(root, cleaned)` destination and for the default and
+    /// `/` delimiters, that a key inside the destination maps under `cleaned`,
+    /// that each key in `escapes` is rejected as resolving outside it, and
+    /// that a key that maps to the destination itself is rejected.
+    ///
+    /// The last covers `.`, `a/..`, `./`, and a key equal to the listing
+    /// prefix, which `strip_key_prefix` reduces to the empty path. Accepting
+    /// one would place its temporary file in the destination's parent.
+    #[cfg(any(unix, windows))]
+    fn assert_dot_component_destinations(cases: &[(&str, &str)], escapes: &[&str]) {
+        for &(root, cleaned) in cases {
+            let root = Path::new(root);
+            for delim in [None, Some("/")] {
+                let actual = local_key_path(root, "a/b.txt", None, delim)
+                    .unwrap_or_else(|e| panic!("root={root:?} delim={delim:?}: {e}"));
+                assert_eq!(
+                    Path::new(cleaned).join("a/b.txt").clean(),
+                    actual,
+                    "root={root:?} delim={delim:?}"
+                );
+
+                for escape in escapes {
+                    let err = local_key_path(root, escape, None, delim).expect_err(&format!(
+                        "root={root:?} delim={delim:?} key={escape:?} must be rejected"
+                    ));
+                    assert_eq!(err.kind(), &ErrorKind::InputInvalid, "key={escape:?}");
+                    let message = DisplayErrorContext(&err).to_string();
+                    assert!(
+                        message.contains("outside the target destination"),
+                        "root={root:?} key={escape:?}: {message}"
+                    );
+                }
+
+                for (key, prefix) in [
+                    (".", None),
+                    ("a/..", None),
+                    ("./", None),
+                    ("photos/", Some("photos/")),
+                ] {
+                    let err = local_key_path(root, key, prefix, delim).expect_err(&format!(
+                        "root={root:?} delim={delim:?} key={key:?} maps to the destination"
+                    ));
+                    assert_eq!(err.kind(), &ErrorKind::InputInvalid, "key={key:?}");
+                    let message = DisplayErrorContext(&err).to_string();
+                    assert!(
+                        message.contains("destination directory itself"),
+                        "root={root:?} key={key:?}: {message}"
+                    );
+                }
+            }
+        }
+    }
+
     /// A destination with `.` or `..` components contains the same paths as
     /// its lexically cleaned form: keys inside it are accepted and placed
-    /// under the cleaned form, and keys that escape it are still rejected.
+    /// under the cleaned form, and keys that escape it or map to it are
+    /// rejected.
     #[cfg(target_family = "unix")]
     #[test]
     fn test_local_key_path_destination_with_dot_components() {
-        for (root, cleaned) in [
-            ("./out", "out"),
-            ("out/../out", "out"),
-            ("out/./", "out"),
-            ("/data/./out", "/data/out"),
-            ("/data/x/../out", "/data/out"),
-            (".", "."),
-            ("./", "."),
-            ("..", ".."),
-            ("../out", "../out"),
-        ] {
-            let root = Path::new(root);
-            let actual = local_key_path(root, "a/b.txt", None, None)
-                .unwrap_or_else(|e| panic!("root={root:?}: {e}"));
-            assert_eq!(
-                Path::new(cleaned).join("a/b.txt").clean(),
-                actual,
-                "root={root:?}"
-            );
+        assert_dot_component_destinations(
+            &[
+                ("./out", "out"),
+                ("out/../out", "out"),
+                ("out/./", "out"),
+                ("/data/./out", "/data/out"),
+                ("/data/x/../out", "/data/out"),
+                (".", "."),
+                ("./", "."),
+                ("..", ".."),
+                ("../out", "../out"),
+            ],
+            &["../b.txt", "a/../../b.txt", "/etc/passwd"],
+        );
+    }
 
-            for escape in ["../b.txt", "a/../../b.txt", "/etc/passwd"] {
-                let err = local_key_path(root, escape, None, None)
-                    .expect_err(&format!("root={root:?} key={escape:?} must be rejected"));
-                assert_eq!(err.kind(), &ErrorKind::InputInvalid, "root={root:?}");
-            }
-        }
+    /// The Windows form of `test_local_key_path_destination_with_dot_components`,
+    /// with drive-qualified destinations. A key that introduces a root (`\x`),
+    /// a drive (`C:x`, `C:/x`), or a UNC prefix replaces the destination when
+    /// joined to it, and is rejected.
+    #[cfg(windows)]
+    #[test]
+    fn test_local_key_path_destination_with_dot_components_windows() {
+        assert_dot_component_destinations(
+            &[
+                (r".\out", "out"),
+                (r"out\..\out", "out"),
+                (r"out\.\", "out"),
+                (r"C:\data\.\out", r"C:\data\out"),
+                (r"C:\data\x\..\out", r"C:\data\out"),
+                (".", "."),
+                (r"..\out", r"..\out"),
+            ],
+            &[
+                "../b.txt",
+                "a/../../b.txt",
+                "/etc/passwd",
+                r"\x",
+                "C:x",
+                "C:/x",
+                r"\\server\share\x",
+            ],
+        );
     }
 
     // --- State machine tests ---
@@ -1615,6 +1687,135 @@ mod tests {
         assert!(std::error::Error::source(err)
             .and_then(|s| s.downcast_ref::<std::io::Error>())
             .is_some());
+    }
+
+    /// An object whose key is the listing prefix followed by the delimiter
+    /// maps to the destination directory itself. It fails with
+    /// `InputInvalid` under `Continue` before any file is created or any
+    /// GetObject is sent. Accepted, its temporary file would be created in
+    /// the destination's parent, the object downloaded, and only the rename
+    /// onto the destination would fail.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_key_mapping_to_destination_fails_before_any_file_is_created() {
+        let dir = tempdir().unwrap();
+        let dest = dir.path().join("out");
+
+        // Any GetObject would be answered by this rule; none must be sent.
+        let get = mock!(aws_sdk_s3::Client::get_object).then_output(|| {
+            GetObjectOutput::builder()
+                .content_length(5)
+                .body(aws_sdk_s3::primitives::ByteStream::from_static(b"hello"))
+                .build()
+        });
+        let list = mock!(aws_sdk_s3::Client::list_objects_v2).then_output(|| {
+            ListObjectsV2Output::builder()
+                .set_contents(Some(vec![Object::builder().key("photos/").size(5).build()]))
+                .build()
+        });
+        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[list, get.clone()]);
+
+        let config = crate::Config::builder()
+            .sdk_client(client.clone())
+            .build()
+            .expect("valid config");
+        let handle = crate::client::Handle::test_handle_tokio(config);
+        let walk = S3Walker::builder().prefix("photos/").build().walk(
+            S3WalkContext::builder()
+                .sdk_client(client)
+                .bucket("test-bucket")
+                .build(),
+        );
+        let (ctx, completion_rx) = TransferContext::new(handle);
+        ctx.handle
+            .scheduler
+            .register_empty_group_for_test(ctx.id.id);
+        let input = crate::operation::download_objects::DownloadObjectsInput::builder()
+            .bucket("test-bucket")
+            .destination(&dest)
+            .failure_policy(FailedTransferPolicy::Continue)
+            .build()
+            .unwrap();
+        let transfer = DownloadObjectsTransfer::new(ctx, &input, walk, 1000);
+
+        timeout(Duration::from_secs(10), async {
+            drive_transfer(&transfer).await;
+            let _ = completion_rx.await;
+        })
+        .await
+        .expect("transfer should complete within timeout");
+
+        assert!(transfer.ctx().take_error().is_none());
+        let failed = transfer.take_failed().expect("the key must fail");
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].input().key(), Some("photos/"));
+        assert_eq!(failed[0].error().kind(), &ErrorKind::InputInvalid);
+        assert_eq!(get.num_calls(), 0);
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            entries,
+            ["out"],
+            "nothing may be created beside the destination"
+        );
+        assert_eq!(std::fs::read_dir(&dest).unwrap().count(), 0);
+    }
+
+    /// A child whose temporary file cannot be renamed onto the object's path,
+    /// because a non-empty directory holds it, fails with an `IOError` that
+    /// names the path and the object's key, with the operating system's error
+    /// as its source. The rename error is built where only the path is known;
+    /// the key is attached when the child's result is recorded.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_rename_failure_names_path_and_key() {
+        let dir = tempdir().unwrap();
+        let blocked = dir.path().join("a.txt");
+        std::fs::create_dir(&blocked).unwrap();
+        std::fs::write(blocked.join("inner"), b"kept").unwrap();
+
+        let (transfer, completion_rx) = setup(
+            dir.path(),
+            FailedTransferPolicy::Continue,
+            mock_s3_success(),
+        );
+
+        timeout(Duration::from_secs(10), async {
+            drive_transfer(&transfer).await;
+            let _ = completion_rx.await;
+        })
+        .await
+        .expect("transfer should complete within timeout");
+
+        assert_eq!(transfer.successful_downloads(), 2);
+        let failed = transfer.take_failed().expect("a.txt must fail");
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].input().key(), Some("a.txt"));
+        let err = failed[0].error();
+        assert_eq!(err.kind(), &ErrorKind::IOError);
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "I/O error renaming temporary file to \"{}\" (key \"a.txt\")",
+                blocked.display()
+            )
+        );
+        assert!(std::error::Error::source(err)
+            .and_then(|s| s.downcast_ref::<std::io::Error>())
+            .is_some());
+        assert_eq!(std::fs::read(blocked.join("inner")).unwrap(), b"kept");
+        let mut entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        entries.sort();
+        assert_eq!(
+            entries,
+            ["a.txt", "b.txt", "c.txt"],
+            "the failed child's temporary file must be removed"
+        );
     }
 
     #[cfg_attr(miri, ignore)]

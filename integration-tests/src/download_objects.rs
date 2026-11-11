@@ -712,6 +712,74 @@ async fn test_download_objects_destination_with_dot_components() {
     .expect("test_download_objects_destination_with_dot_components timed out");
 }
 
+/// The relative path from the directory `base` to `target`, both absolute:
+/// one `..` for each component of `base` below their common ancestor, then
+/// the rest of `target`.
+///
+/// `None` when the two have different roots or prefixes, such as Windows
+/// paths on different drives, which no relative path connects.
+fn relative_path(base: &Path, target: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+
+    let mut base = base.components().peekable();
+    let mut target = target.components().peekable();
+    while let (Some(b), Some(t)) = (base.peek(), target.peek()) {
+        if b != t {
+            break;
+        }
+        base.next();
+        target.next();
+    }
+    let (base, target): (Vec<_>, Vec<_>) = (base.collect(), target.collect());
+    if base
+        .iter()
+        .chain(&target)
+        .any(|c| matches!(c, Component::Prefix(_) | Component::RootDir))
+    {
+        return None;
+    }
+    Some(
+        base.iter()
+            .map(|_| Component::ParentDir)
+            .chain(target)
+            .collect(),
+    )
+}
+
+/// A relative destination with `.` or `..` components, resolved against the
+/// working directory, downloads every object into the directory it names
+/// lexically. The working directory is not changed: each destination climbs
+/// from it with `..` to the temporary directory.
+#[tokio::test]
+async fn test_download_objects_relative_destination_with_dot_components() {
+    timeout(TEST_TIMEOUT, async {
+        let objects: &[(&str, &[u8])] = &[("a.txt", b"a"), ("nested/b.txt", b"b")];
+        let mut expected: HashMap<&str, Vec<u8>> = HashMap::new();
+        expected.insert("a.txt", b"a".to_vec());
+        expected.insert("nested/b.txt", b"b".to_vec());
+        let cwd = std::env::current_dir().expect("current dir");
+
+        for form in ["./out", "x/../out"] {
+            let mut tmp = tempfile::tempdir().expect("tempdir");
+            // The system temporary directory can be on another Windows drive
+            // than the working directory; use one beneath the working
+            // directory instead.
+            if relative_path(&cwd, tmp.path()).is_none() {
+                tmp = tempfile::tempdir_in(&cwd).expect("tempdir");
+            }
+            let dest = relative_path(&cwd, tmp.path())
+                .expect("a relative path to the temporary directory")
+                .join(form);
+            assert!(dest.is_relative(), "{dest:?}");
+            download_all(&dest, objects).await;
+            verify_dir(&tmp.path().join("out"), &expected);
+            assert!(!tmp.path().join("x").exists(), "x/.. is resolved lexically");
+        }
+    })
+    .await
+    .expect("test_download_objects_relative_destination_with_dot_components timed out");
+}
+
 /// A destination that does not exist is created, with its missing parents,
 /// and the objects are downloaded into it.
 #[tokio::test]

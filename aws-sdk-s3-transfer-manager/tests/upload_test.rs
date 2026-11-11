@@ -1751,6 +1751,34 @@ async fn test_aborted_failed_upload_error_has_no_upload_id() {
     assert_eq!(None, error.upload_id());
 }
 
+/// A panic in the caller's `PartStream` after CreateMultipartUpload fails the upload with
+/// `RuntimeError` from outside its state machine, which sends no AbortMultipartUpload. The
+/// multipart upload is left open, and the error carries its upload ID.
+#[tokio::test]
+async fn test_part_stream_panic_error_carries_upload_id() {
+    let mock = MultipartMock::new();
+    // An unknown size selects a multipart upload, whose parts are read only once
+    // CreateMultipartUpload has returned the upload ID.
+    let stream = ScriptedPartStream::new(SizeHint::default(), |_stream_cx| {
+        panic!("PartStream panicked")
+    });
+    let error = mock
+        .tm()
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .body(InputStream::from_part_stream(stream))
+        .initiate()
+        .unwrap()
+        .join()
+        .await
+        .expect_err("a PartStream panic must fail the upload");
+
+    assert_eq!(&ErrorKind::RuntimeError, error.kind());
+    assert_eq!(0, mock.record().abort_calls());
+    assert_eq!(Some(MOCK_UPLOAD_ID), error.upload_id());
+}
+
 // --- Local file errors -------------------------------------------------------
 
 /// Asserts that `error` is an `IOError` whose message is `I/O error {action} "{path}"` and whose

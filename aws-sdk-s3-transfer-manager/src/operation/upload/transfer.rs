@@ -1861,6 +1861,15 @@ impl Transfer for UploadTransfer {
         self.inner.abort_parts_token.cancel();
         if let Some(upload_id) = left_open {
             self.warn_upload_left_open(&upload_id);
+            // A failure forced from outside, such as a worker panic, is stored
+            // before this hook runs and before the terminal signal `join()`
+            // waits on, so the ID reaches the error `join()` returns.
+            if self.inner.ctx.is_failed() {
+                self.inner.ctx.amend_error(|err| match err.upload_id() {
+                    Some(_) => err,
+                    None => err.with_upload_id(upload_id),
+                });
+            }
         }
         self.report_terminal(snapshot);
         // Last, after the lock and the transfer's own cleanup: it can own the

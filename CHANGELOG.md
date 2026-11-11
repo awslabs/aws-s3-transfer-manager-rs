@@ -20,8 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `config::Builder::read_ahead` does.
 - `ConfigLoader` is exported as `config::ConfigLoader`.
 - `Error::upload_id` returns the ID of a multipart upload that a failed upload left open in S3:
-  under `FailedMultipartUploadPolicy::Retain`, or when AbortMultipartUpload failed. It is `None`
-  when the multipart upload was aborted.
+  under `FailedMultipartUploadPolicy::Retain`, when AbortMultipartUpload failed, or when a worker
+  panic, such as one in the caller's `PartStream`, failed the upload after the multipart upload
+  was created. It is `None` when the multipart upload was aborted.
 
 ### Changed
 - `aws-sdk-s3-transfer-manager`, `aws-sdk-s3-transfer-manager-ext`, `aws-smithy-topology`,
@@ -60,8 +61,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ErrorKind::IOError` and `ErrorKind::InputInvalid` errors from a local filesystem operation on a
   known path name the operation and the path, as in `I/O error creating directory "out/logs"`,
   and the object key for a `download_objects` object.
-  This covers temporary file creation and renaming for downloads to a path, directory creation in
-  `download_objects`, opening and reading upload source files, and the directory walk. Except for
+  This covers temporary file creation and renaming, for downloads to a path and for
+  `download_objects` objects, directory creation in `download_objects`, opening and reading upload source files, and the directory walk. Except for
   the directory walk, whose source remains the `io::walk::WalkError`, the error's source is the
   `std::io::Error` itself, where some of these sites previously used a message that embedded it,
   such as `failed to open …` or `failed to create directory for key …`.
@@ -91,6 +92,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as `../b.txt` under `..`, which was previously accepted.
 - `download_objects` creates a destination directory that does not exist, with any missing
   parents, instead of failing.
+- `download_objects` fails an object whose key maps to the destination directory itself, such as
+  `.`, `a/..`, or the listing prefix followed by the delimiter, with `ErrorKind::InputInvalid`
+  before creating any file or requesting the object. Such an object was previously downloaded to
+  a temporary file beside the destination and then failed to be renamed onto it.
 
 ## [release-2026-11-05]
 
