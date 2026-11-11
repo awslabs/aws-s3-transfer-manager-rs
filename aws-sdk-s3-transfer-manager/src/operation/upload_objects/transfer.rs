@@ -1422,6 +1422,7 @@ mod tests {
         );
     }
 
+    // ref: RUST-1202
     /// An empty prefix is no prefix: the key is the relative path, with no
     /// leading delimiter, whichever delimiter is configured.
     #[test]
@@ -1794,6 +1795,7 @@ mod tests {
         assert_eq!(keys, ["caf\u{fffd}"]);
     }
 
+    // ref: RUST-1202
     /// An empty key prefix uploads each file under its relative path, with no
     /// leading delimiter.
     #[cfg_attr(miri, ignore)]

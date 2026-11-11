@@ -1275,6 +1275,7 @@ mod tests {
         }
     }
 
+    // ref: RUST-1202
     /// A destination with `.` or `..` components contains the same paths as
     /// its lexically cleaned form: keys inside it are accepted and placed
     /// under the cleaned form, and keys that escape it or map to it are
@@ -1298,6 +1299,7 @@ mod tests {
         );
     }
 
+    // ref: RUST-1202
     /// The Windows form of `test_local_key_path_destination_with_dot_components`,
     /// with drive-qualified destinations. A key that introduces a root (`\x`),
     /// a drive (`C:x`, `C:/x`), or a UNC prefix replaces the destination when
@@ -1356,6 +1358,7 @@ mod tests {
         assert!(dir.path().join("c.txt").exists());
     }
 
+    // ref: RUST-1202
     /// A destination that does not exist is created, with every missing
     /// parent, before any object is written into it.
     #[cfg_attr(miri, ignore)]
@@ -1384,6 +1387,7 @@ mod tests {
         }
     }
 
+    // ref: RUST-1202
     /// A destination that exists but is not a directory fails the transfer
     /// with `InputInvalid` before any object is requested, and is left as it
     /// was.
@@ -1581,6 +1585,7 @@ mod tests {
         assert!(dir.path().join("docs/readme.txt").exists());
     }
 
+    // ref: RUST-1202
     /// A key whose parent directory cannot be created, because a file holds
     /// its name, fails with an `IOError` that names the directory, with the
     /// operating system's error as its source.
@@ -1724,6 +1729,7 @@ mod tests {
         assert_eq!(std::fs::read(dir.path().join("photos")).unwrap(), b"hello");
     }
 
+    // ref: RUST-1202
     /// A child whose temporary file cannot be renamed onto the object's path,
     /// because a non-empty directory holds it, fails with an `IOError` that
     /// names the path and the object's key, with the operating system's error

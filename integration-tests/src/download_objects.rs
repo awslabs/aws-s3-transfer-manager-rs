@@ -753,6 +753,7 @@ async fn download_all(dest: &Path, objects: &[(&str, &[u8])]) {
     m.handle.shutdown().await.expect("shutdown");
 }
 
+// ref: RUST-1202
 /// A destination written with `.` or `..` components downloads every object
 /// into the directory it names lexically. Comparing each object's cleaned path
 /// against the uncleaned destination would reject every key as resolving
@@ -812,6 +813,7 @@ fn relative_path(base: &Path, target: &Path) -> Option<PathBuf> {
     )
 }
 
+// ref: RUST-1202
 /// A relative destination with `.` or `..` components, resolved against the
 /// working directory, downloads every object into the directory it names
 /// lexically. The working directory is not changed: each destination climbs
@@ -846,6 +848,7 @@ async fn test_download_objects_relative_destination_with_dot_components() {
     .expect("test_download_objects_relative_destination_with_dot_components timed out");
 }
 
+// ref: RUST-1202
 /// A destination that does not exist is created, with its missing parents,
 /// and the objects are downloaded into it.
 #[tokio::test]
@@ -866,6 +869,7 @@ async fn test_download_objects_creates_missing_destination() {
     .expect("test_download_objects_creates_missing_destination timed out");
 }
 
+// ref: RUST-1202
 /// A destination that exists and is not a directory fails the download with
 /// `InputInvalid`, and the file is left as it was.
 #[tokio::test]

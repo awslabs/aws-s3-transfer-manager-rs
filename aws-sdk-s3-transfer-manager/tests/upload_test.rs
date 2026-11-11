@@ -1710,6 +1710,7 @@ async fn join_error_after_part_two_fails(
     (error, mock)
 }
 
+// ref: RUST-1693
 /// Under `FailedMultipartUploadPolicy::Retain`, a failed upload leaves its multipart upload open,
 /// sends no AbortMultipartUpload, and the error carries the upload ID.
 #[tokio::test]
@@ -1724,6 +1725,7 @@ async fn test_retained_failed_upload_error_carries_upload_id() {
     assert_eq!(Some(MOCK_UPLOAD_ID), error.upload_id());
 }
 
+// ref: RUST-1693
 /// When the AbortMultipartUpload a failure sends also fails, the multipart upload is still open,
 /// and the error carries its upload ID.
 #[tokio::test]
@@ -1741,6 +1743,7 @@ async fn test_failed_abort_error_carries_upload_id() {
     assert_eq!(Some(MOCK_UPLOAD_ID), error.upload_id());
 }
 
+// ref: RUST-1693
 /// When the AbortMultipartUpload a failure sends succeeds, no multipart upload is left open, and
 /// the error carries no upload ID.
 #[tokio::test]
@@ -1751,6 +1754,7 @@ async fn test_aborted_failed_upload_error_has_no_upload_id() {
     assert_eq!(None, error.upload_id());
 }
 
+// ref: RUST-1693
 /// A panic in the caller's `PartStream` after CreateMultipartUpload fails the upload with
 /// `RuntimeError` from outside its state machine, which sends no AbortMultipartUpload. The
 /// multipart upload is left open, and the error carries its upload ID.
@@ -1795,6 +1799,7 @@ fn assert_missing_file_error(error: &Error, action: &str, path: &std::path::Path
     assert_eq!(std::io::ErrorKind::NotFound, io_error.kind());
 }
 
+// ref: RUST-1202
 /// Reading the size of a missing source file fails with an error naming the action and path.
 #[test]
 fn test_from_path_missing_file_error_names_action_and_path() {
@@ -1831,6 +1836,7 @@ async fn upload_missing_file(path: &std::path::Path, length: u64) -> Error {
     error
 }
 
+// ref: RUST-1202
 /// A single-request upload whose source file cannot be opened fails with an error naming the
 /// action and path.
 #[tokio::test]
@@ -1842,6 +1848,7 @@ async fn test_put_object_upload_missing_file_error_names_action_and_path() {
     assert_missing_file_error(&error, "opening", &path);
 }
 
+// ref: RUST-1202
 /// A multipart upload whose source file cannot be opened fails with an error naming the action
 /// and path.
 #[tokio::test]

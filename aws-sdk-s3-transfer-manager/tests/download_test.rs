@@ -713,6 +713,7 @@ async fn test_download_write_to_path() {
     assert!(tmp_files.is_empty(), "leftover temp files: {:?}", tmp_files);
 }
 
+// ref: RUST-1202
 /// A `write_to_path` destination whose parent directory does not exist fails with an
 /// `IOError` that names what failed and the destination path, with the operating system's
 /// error as its source.

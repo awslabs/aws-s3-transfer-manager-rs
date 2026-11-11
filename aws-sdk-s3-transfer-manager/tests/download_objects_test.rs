@@ -604,6 +604,7 @@ async fn test_failed_get_object_should_cancel_the_operation() {
     .expect("test_failed_get_object_should_cancel_the_operation timed out");
 }
 
+// ref: RUST-1202
 /// Under the Abort policy, the aggregate error's source is the error of the
 /// child download that triggered the abort, so the error chain names the
 /// failed S3 operation and its error code.

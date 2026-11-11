@@ -584,6 +584,7 @@ async fn test_failed_child_operation_should_cause_ongoing_requests_to_be_cancell
     .expect("test_failed_child_operation_should_cause_ongoing_requests_to_be_cancelled timed out");
 }
 
+// ref: RUST-1202
 /// Under the Abort policy, the aggregate error's source is the error of the
 /// child upload that triggered the abort, so the error chain names the failed
 /// S3 operation and its error code.
