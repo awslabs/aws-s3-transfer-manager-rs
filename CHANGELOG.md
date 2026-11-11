@@ -69,6 +69,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The source of an `ErrorKind::ChildOperationFailed` error from `upload_objects` or
   `download_objects` is the error of the first failed object, the one that stopped the transfer
   under `FailedTransferPolicy::Abort`, instead of a message naming it.
+- `download_objects` writes each object at its full key under the destination. The walker's
+  prefix only selects objects and is no longer removed from local paths: with the prefix
+  `photos/`, the key `photos/a.txt` was written to `<dest>/a.txt` and is now written to
+  `<dest>/photos/a.txt`. A prefix that ends partway through a name no longer cuts it: with the
+  prefix `photos`, the key `photos-other/x.txt` was written to `<dest>/-other/x.txt`.
 
 ### Fixed
 - `PathBodyBuilder::build` without a path returns an `ErrorKind::InputInvalid` error instead of
@@ -93,9 +98,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `download_objects` creates a destination directory that does not exist, with any missing
   parents, instead of failing.
 - `download_objects` fails an object whose key maps to the destination directory itself, such as
-  `.`, `a/..`, or the listing prefix followed by the delimiter, with `ErrorKind::InputInvalid`
-  before creating any file or requesting the object. Such an object was previously downloaded to
-  a temporary file beside the destination and then failed to be renamed onto it.
+  `.`, `./`, or `a/..`, with `ErrorKind::InputInvalid` before creating any file or requesting the
+  object. Such an object was previously downloaded to a temporary file beside the destination
+  and then failed to be renamed onto it.
 
 ## [release-2026-11-05]
 

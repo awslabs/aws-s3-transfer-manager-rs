@@ -181,9 +181,11 @@ fn relative_path_names(dir: &Path) -> Result<Vec<String>, io::Error> {
     Ok(paths)
 }
 
-/// Should remove the prefix in the local filepath
+// ref: RUST-1426
+/// The walker's prefix selects objects and is kept in each local path: every
+/// object is written at its full key under the destination.
 #[tokio::test]
-async fn test_strip_prefix_in_destination_path() {
+async fn test_prefix_kept_in_destination_path() {
     use std::time::Duration;
     use tokio::time::timeout;
 
@@ -218,10 +220,14 @@ async fn test_strip_prefix_in_destination_path() {
         assert_eq!(3, output.objects_downloaded());
 
         let paths = relative_path_names(dest.path()).unwrap();
-        let mut expected = vec!["image.jpg", "title.jpg", "ghi/xyz.txt"]
-            .into_iter()
-            .map(str::to_owned)
-            .collect::<Vec<String>>();
+        let mut expected = vec![
+            "abc/def/image.jpg",
+            "abc/def/title.jpg",
+            "abc/def/ghi/xyz.txt",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<String>>();
         expected.sort();
         assert_eq!(expected, paths);
     })
@@ -229,7 +235,9 @@ async fn test_strip_prefix_in_destination_path() {
     result.expect("timed out");
 }
 
-/// Should not strip prefix from object name
+// ref: RUST-1426
+/// A prefix that ends partway through a key segment does not cut object names:
+/// under the prefix `abc`, `abc/def/image.jpg` and `abcd` keep their full keys.
 #[tokio::test]
 async fn test_object_with_prefix_included() {
     let bucket = MockBucket::builder()
@@ -262,7 +270,7 @@ async fn test_object_with_prefix_included() {
     assert_eq!(3, output.objects_downloaded());
 
     let paths = relative_path_names(dest.path()).unwrap();
-    let mut expected = vec!["def/image.jpg", "def/title.jpg", "abcd"]
+    let mut expected = vec!["abc/def/image.jpg", "abc/def/title.jpg", "abcd"]
         .into_iter()
         .map(str::to_owned)
         .collect::<Vec<String>>();

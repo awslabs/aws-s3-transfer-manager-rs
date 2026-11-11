@@ -106,7 +106,7 @@ let response = handle.join().await?;
 ```
 
 **Download directory example:**
-This will download every object under the prefix and will create a local directory with similar hierarchy.
+This will download every object under the prefix, writing each one at its full key under the destination directory. With the prefix `"photos/"`, the object `"photos/2023/a.jpg"` is written to `"<DESTINATION-DIRECTORY-PATH>/photos/2023/a.jpg"`.
 
 ```rs
 // Download objects with a common prefix to a local directory

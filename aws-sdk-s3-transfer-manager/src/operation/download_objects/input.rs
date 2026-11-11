@@ -18,11 +18,14 @@ use std::{
 /// [`S3Walker`] via [`walker`](DownloadObjectsInputBuilder::walker). When not
 /// set, the default walker lists the whole bucket.
 ///
-/// The walker's prefix, set with
+/// Each object is written at its full key under
+/// [`destination`](Self::destination): the key, with the
+/// [`delimiter`](Self::delimiter) replaced by the platform's path separator
+/// when one is set, is the file's path relative to the destination. The
+/// walker's prefix, set with
 /// [`S3WalkerBuilder::prefix`](crate::io::walk::S3WalkerBuilder::prefix),
-/// scopes the listing and is stripped from each key to build its path under
-/// [`destination`](Self::destination). Without a prefix, the full key is
-/// used.
+/// only selects objects, so with the prefix `photos/` the key
+/// `photos/2023/a.jpg` is written to `<destination>/photos/2023/a.jpg`.
 ///
 /// 0-byte objects whose key ends in `/` (folder markers) are skipped. A key
 /// whose local path resolves outside the destination, or to the destination
@@ -48,7 +51,8 @@ pub struct DownloadObjectsInput {
     pub bucket: Option<String>,
 
     /// The destination directory to which files should be downloaded. Created
-    /// if it does not exist.
+    /// if it does not exist. Each object is written at its full key beneath
+    /// it.
     pub destination: Option<PathBuf>,
 
     /// Character used to group keys.
@@ -151,7 +155,8 @@ impl DownloadObjectsInputBuilder {
     }
 
     /// Set the destination directory. Required. Created, with any missing
-    /// parents, if it does not exist.
+    /// parents, if it does not exist. Each object is written at its full key
+    /// beneath it.
     pub fn destination(mut self, input: impl Into<PathBuf>) -> Self {
         self.destination = Some(input.into());
         self
@@ -208,8 +213,8 @@ impl DownloadObjectsInputBuilder {
     /// Walker configuration (prefix, filter, pagination, etc.).
     ///
     /// Pass an [`S3Walker`] built via [`S3Walker::builder`] to customize the
-    /// listing. Its prefix scopes the listing and is stripped from each key
-    /// to build its local path. When not set, a default walker is used that
+    /// listing. Its prefix selects the objects to download and does not
+    /// change their local paths. When not set, a default walker is used that
     /// filters out 0-byte folder markers.
     pub fn walker(mut self, input: S3Walker) -> Self {
         self.walker = Some(input);
