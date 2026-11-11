@@ -72,7 +72,10 @@
 //! * [`download`](crate::Client::download) - download a single object
 //! * [`upload`](crate::Client::upload) - upload a single object
 //! * [`download_objects`](crate::Client::download_objects) - download an entire bucket or prefix to a local directory
-//! * [`upload_objects`](crate::Client::upload_objects) - upload an entire local directory to a bucket
+//! * [`upload_objects`](crate::Client::upload_objects) - upload the files in a local directory to a bucket.
+//!   By default only the directory's immediate files are uploaded; supply
+//!   [`FsWalker::builder().recursive(true)`](crate::io::walk::FsWalkerBuilder::recursive)
+//!   to upload the whole tree.
 //!
 //! # WebAssembly
 //!
@@ -99,6 +102,24 @@
 //!   fit the module's linear memory.
 //!
 //! # Runtime diagnostics
+//!
+//! Tracing output and `AWS_S3_TM_DIAGNOSTICS` are diagnostics, not stable API:
+//! tracing targets, event and span names, their fields, and the settings the
+//! environment variable accepts may change in minor releases. Events are
+//! grouped under these subsystem targets:
+//!
+//! - `aws_sdk_s3_transfer_manager::concurrency`: concurrency resolution and
+//!   control.
+//! - `aws_sdk_s3_transfer_manager::scheduling`: scheduler capacity decisions,
+//!   worker pool growth, and memory-budget admission.
+//! - `aws_sdk_s3_transfer_manager::memory`: buffer-pool admission, physical
+//!   storage, and reclamation.
+//! - `aws_sdk_s3_transfer_manager::execution`: per-work-item dispatch and
+//!   completion.
+//! - `aws_sdk_s3_transfer_manager::transfer`: transfer lifecycle and state
+//!   transitions.
+//!
+//! Other events use the target of the module that emits them.
 //!
 //! `AWS_S3_TM_DIAGNOSTICS` enables optional diagnostic collection without
 //! changing the client configuration API. Settings are namespaced by subsystem

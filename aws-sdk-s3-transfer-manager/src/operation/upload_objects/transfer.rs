@@ -706,7 +706,7 @@ impl UploadObjectsTransfer {
                 Err(e) => {
                     state.failed.push(FailedUpload {
                         input: None,
-                        error: e.into(),
+                        error: e,
                         source_path: Some(entry.path().to_path_buf()),
                     });
                     if *self.failure_policy() == FailedTransferPolicy::Abort {

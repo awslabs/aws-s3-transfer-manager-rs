@@ -7,10 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `UploadObjectsInput::builder`, matching the other operation inputs.
+- `set_failure_policy` on `UploadObjectsInputBuilder`, `DownloadObjectsInputBuilder`,
+  `UploadObjectsFluentBuilder`, and `DownloadObjectsFluentBuilder`. `None` selects the default,
+  `FailedTransferPolicy::Abort`.
+
 ### Changed
 - `aws-sdk-s3-transfer-manager`, `aws-sdk-s3-transfer-manager-ext`, `aws-smithy-topology`,
   `aws-smithy-execution` and `aws-smithy-managed-http`: the minimum supported Rust version is
   1.96.0.
+- `error::Error` no longer implements `From<tokio::task::JoinError>` or
+  `From<std::sync::PoisonError<T>>`. Construct an error of the intended kind with `Error::new`.
+- `io::error` is no longer public. `InputStream::from_path` and `PathBodyBuilder::build` return
+  `error::Error`: a missing path or an offset past the end of the file is
+  `ErrorKind::InputInvalid`, and a failure reading file metadata, such as a missing file, is
+  `ErrorKind::IOError` with the `std::io::Error` as its source.
+- A failure of the transfer manager's own file reader that is not a read error, such as a panicked
+  read task, is `ErrorKind::RuntimeError` instead of `ErrorKind::IOError`.
+- `PartData::mark_last` is removed. A `PartStream` ends an upload by returning `None` from
+  `poll_part`.
+- `DownloadInput::part_number` and its getter are no longer public. Single-part downloads are
+  not supported.
+- `io::walk::WalkErrorKind` and `metrics::unit::ByteUnit` are `#[non_exhaustive]`.
+- The fields of `metrics::ThroughputDisplayContext` and `metrics::unit::ByteCountDisplayContext`
+  are private. Create them with `Throughput::display_as`, `ByteUnit::display`, or
+  `ByteCountDisplayContext::new`.
+
+### Fixed
+- `PathBodyBuilder::build` without a path returns an `ErrorKind::InputInvalid` error instead of
+  panicking.
 
 ## [release-2026-11-05]
 

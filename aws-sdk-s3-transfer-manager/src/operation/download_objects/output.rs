@@ -78,7 +78,8 @@ impl DownloadObjectsOutputBuilder {
         self
     }
 
-    /// Consume the builder and return the output.
+    /// Consume the builder and return the output. Panics if `metrics` has
+    /// not been set.
     pub fn build(self) -> DownloadObjectsOutput {
         DownloadObjectsOutput {
             objects_downloaded: self.objects_downloaded,

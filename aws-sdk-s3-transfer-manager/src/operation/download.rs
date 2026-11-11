@@ -105,7 +105,9 @@ impl Download {
         use crate::transfer::TransferContext;
 
         if input.part_number().is_some() {
-            todo!("single part download not implemented")
+            return Err(error::invalid_input(
+                "downloading a single part by part number is not supported",
+            ));
         }
 
         let bucket_type =
@@ -203,7 +205,9 @@ impl Download {
         use crate::transfer::TransferContext;
 
         if input.part_number().is_some() {
-            todo!("single part download not implemented")
+            return Err(error::invalid_input(
+                "downloading a single part by part number is not supported",
+            ));
         }
 
         let bucket_type =
@@ -237,8 +241,53 @@ impl Download {
 
 #[cfg(test)]
 mod tests {
-    use super::{temp_file_candidates, TEMP_FILE_ATTEMPTS};
+    use super::sink::{FileSinkFactory, SinkFactory};
+    use super::{temp_file_candidates, Download, DownloadInput, TEMP_FILE_ATTEMPTS};
+    use crate::error::ErrorKind;
     use std::path::{Path, PathBuf};
+
+    fn part_number_input() -> DownloadInput {
+        DownloadInput::builder()
+            .bucket("test-bucket")
+            .key("test-key")
+            .part_number(1)
+            .build()
+            .unwrap()
+    }
+
+    fn mock_handle() -> std::sync::Arc<crate::client::Handle> {
+        crate::client::Handle::test_handle_tokio(
+            crate::Config::builder()
+                .sdk_client(aws_smithy_mocks::mock_client!(
+                    aws_sdk_s3,
+                    aws_smithy_mocks::RuleMode::MatchAny,
+                    &[]
+                ))
+                .build(),
+        )
+    }
+
+    // Single-part downloads are not a supported transfer. Both entry points
+    // must reject a part number as invalid input rather than panic.
+    // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn part_number_download_is_invalid_input() {
+        let err = Download::orchestrate(mock_handle(), part_number_input(), false)
+            .expect_err("a part-number download is rejected");
+        assert_eq!(err.kind(), &ErrorKind::InputInvalid);
+    }
+
+    // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn part_number_download_to_sink_is_invalid_input() {
+        let file = tempfile::tempfile().unwrap();
+        let sink = FileSinkFactory.create(file, true).unwrap();
+        let err = Download::orchestrate_with_sink(mock_handle(), part_number_input(), sink, None)
+            .expect_err("a part-number download is rejected");
+        assert_eq!(err.kind(), &ErrorKind::InputInvalid);
+    }
 
     #[test]
     fn temp_file_candidates_name_files_beside_the_destination() {

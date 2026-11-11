@@ -48,6 +48,11 @@ pub struct UploadObjectsInput {
 }
 
 impl UploadObjectsInput {
+    /// Creates a new builder.
+    pub fn builder() -> UploadObjectsInputBuilder {
+        UploadObjectsInputBuilder::default()
+    }
+
     /// The S3 bucket name that objects will upload to.
     pub fn bucket(&self) -> Option<&str> {
         self.bucket.as_deref()
@@ -224,6 +229,14 @@ impl UploadObjectsInputBuilder {
         self
     }
 
+    /// Sets the failure policy to use when any individual object upload fails.
+    ///
+    /// `None` selects the default, [`FailedTransferPolicy::Abort`].
+    pub fn set_failure_policy(mut self, input: Option<FailedTransferPolicy>) -> Self {
+        self.failure_policy = input.unwrap_or_default();
+        self
+    }
+
     /// The failure policy to use when any individual object upload fails.
     pub fn get_failure_policy(&self) -> &FailedTransferPolicy {
         &self.failure_policy
@@ -295,5 +308,24 @@ mod tests {
             .build()
             .expect("valid input");
         assert_eq!(4, input.max_concurrent_uploads());
+    }
+
+    // `set_failure_policy` replaces the policy, and `None` restores the
+    // default rather than keeping a previously set policy.
+    #[test]
+    fn set_failure_policy_replaces_and_none_restores_default() {
+        let builder = UploadObjectsInput::builder()
+            .bucket("test-bucket")
+            .source("/tmp/test")
+            .set_failure_policy(Some(FailedTransferPolicy::Continue));
+        assert_eq!(
+            builder.get_failure_policy(),
+            &FailedTransferPolicy::Continue
+        );
+        let input = builder
+            .set_failure_policy(None)
+            .build()
+            .expect("valid input");
+        assert_eq!(input.failure_policy(), &FailedTransferPolicy::Abort);
     }
 }
