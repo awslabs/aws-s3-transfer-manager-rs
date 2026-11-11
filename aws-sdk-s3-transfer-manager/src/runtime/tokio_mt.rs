@@ -263,7 +263,10 @@ mod tests {
 
     fn test_config() -> crate::Config {
         let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
-        crate::Config::builder().sdk_client(s3_client).build()
+        crate::Config::builder()
+            .sdk_client(s3_client)
+            .build()
+            .expect("valid config")
     }
 
     /// Helper: builds a Handle with a TokioMultiThreadRuntime and an adjustable

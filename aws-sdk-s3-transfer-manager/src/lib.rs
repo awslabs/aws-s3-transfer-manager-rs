@@ -22,13 +22,27 @@
 //!
 //! [service API]: https://docs.aws.amazon.com/AmazonS3/latest/API/API_Operations_Amazon_Simple_Storage_Service.html
 //!
-//! # Modeled types and configuration
+//! # Configuration
+//!
+//! [`from_env`] returns a [`ConfigLoader`], which loads
+//! S3 client configuration from the shared AWS configuration sources, detects
+//! the host to size the automatic defaults, and applies any settings made on
+//! it. [`ConfigLoader::s3_config`](config::ConfigLoader::s3_config) replaces
+//! the shared-configuration load with an existing [`aws_types::SdkConfig`] or
+//! [`S3ClientConfig`].
+//!
+//! [`Config::builder`] constructs a configuration from explicit values
+//! instead. It requires an [`S3ClientConfig`], loads no shared configuration,
+//! and makes no EC2 instance metadata request; the client detects the host
+//! from local system information only. Use it when the S3 configuration is
+//! already complete and neither environment loading nor network detection is
+//! wanted.
+//!
+//! # Modeled types
 //!
 //! S3 request values, response metadata, and enums live in [`types`], and
 //! their builders in [`types::builders`]. Operation modules re-export the
 //! modeled types and builders they use.
-//! Configure a client from shared [`aws_types::SdkConfig`] using
-//! [`S3ClientConfig`], or load configuration with [`from_env`].
 //!
 //! The `sdk-v1` feature enables conversions between modeled values and AWS SDK
 //! for Rust S3 v1 types, conversion from an S3 configuration builder, and
@@ -269,13 +283,16 @@ pub mod metrics;
 pub(crate) mod retry;
 
 pub use self::client::Client;
-use self::config::loader::ConfigLoader;
+use self::config::ConfigLoader;
 pub use self::config::S3ClientConfig;
 pub use self::config::{Config, Managed, RuntimeConfig};
 pub use self::runtime::{ShutdownCompletion, ShutdownError, ShutdownErrorKind};
 pub use self::transfer::SchedulingCtl;
 
-/// Create a config loader
+/// Create a [`ConfigLoader`] that loads configuration from the environment.
+///
+/// This is the usual way to configure a [`Client`]; see
+/// [`ConfigLoader`] for what [`load`](ConfigLoader::load) resolves.
 pub fn from_env() -> ConfigLoader {
     ConfigLoader::default()
 }

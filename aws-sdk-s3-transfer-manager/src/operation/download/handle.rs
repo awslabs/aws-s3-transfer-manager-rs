@@ -529,7 +529,8 @@ mod tests {
                     aws_smithy_mocks::RuleMode::MatchAny,
                     &[]
                 ))
-                .build(),
+                .build()
+                .expect("valid config"),
         );
         let input = DownloadInput::builder()
             .bucket("test-bucket")

@@ -588,7 +588,12 @@ mod tests {
                 .build()
         });
         let sdk = mock_client!(aws_sdk_s3, RuleMode::Sequential, &[&list]);
-        let tm = crate::Client::new(crate::Config::builder().sdk_client(sdk).build());
+        let tm = crate::Client::new(
+            crate::Config::builder()
+                .sdk_client(sdk)
+                .build()
+                .expect("valid config"),
+        );
         let handle = Arc::downgrade(&tm.handle);
         let context = S3WalkContext::builder()
             .client(&tm)
@@ -623,7 +628,8 @@ mod tests {
         let tm = crate::Client::new(
             crate::Config::builder()
                 .s3_config(crate::config::S3ClientConfig::new(&shared))
-                .build(),
+                .build()
+                .expect("valid config"),
         );
         let context = S3WalkContext::builder()
             .client(&tm)

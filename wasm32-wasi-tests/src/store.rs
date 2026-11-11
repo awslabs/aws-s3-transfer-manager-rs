@@ -181,7 +181,7 @@ impl Store {
         let config = Config::builder()
             .s3_config(&self.sdk)
             .part_size(PartSize::Target(PART_SIZE));
-        Client::new(configure(config).build())
+        Client::new(configure(config).build().expect("valid config"))
     }
 
     /// Returns the request counters.

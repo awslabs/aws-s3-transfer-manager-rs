@@ -12,6 +12,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `set_failure_policy` on `UploadObjectsInputBuilder`, `DownloadObjectsInputBuilder`,
   `UploadObjectsFluentBuilder`, and `DownloadObjectsFluentBuilder`. `None` selects the default,
   `FailedTransferPolicy::Abort`.
+- `ConfigLoader::s3_config` uses an existing `SdkConfig` or `S3ClientConfig` in place of loading
+  the shared AWS configuration; `load` still detects the machine profile. A non-empty list set with
+  `ConfigLoader::network_interfaces` replaces the supplied configuration's network interfaces, and
+  an empty list keeps them.
+- `ConfigLoader::read_ahead` sets the client's default download read-ahead, as
+  `config::Builder::read_ahead` does.
+- `ConfigLoader` is exported as `config::ConfigLoader`.
 
 ### Changed
 - `aws-sdk-s3-transfer-manager`, `aws-sdk-s3-transfer-manager-ext`, `aws-smithy-topology`,
@@ -33,10 +40,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The fields of `metrics::ThroughputDisplayContext` and `metrics::unit::ByteCountDisplayContext`
   are private. Create them with `Throughput::display_as`, `ByteUnit::display`, or
   `ByteCountDisplayContext::new`.
+- `config::Builder::build` returns `Result<Config, BuildError>` and returns an error when
+  `s3_config` is not set, instead of panicking.
+- The transfer manager no longer enables the `behavior-version-latest` feature of `aws-config` or
+  `aws-sdk-s3`. Configuration loaded without a behavior version, such as with
+  `aws_config::load_from_env`, needs one: use `aws_config::load_defaults(BehaviorVersion::latest())`
+  or enable the feature in the application.
+- The `dial9` feature, `config::Builder::dial9_handle`, and `ConfigLoader::dial9_handle` are
+  removed. To trace managed execution, pass the recorder's handle to
+  `ManagedRuntime::builder().dial9_handle`, then adopt the runtime with
+  `aws_sdk_s3_transfer_manager_ext::managed`. The `aws-sdk-s3-transfer-manager-ext` `dial9` feature
+  enables `aws-smithy-execution/dial9` only.
+- The hidden `config::Builder::framework_metadata`, `ConfigLoader::framework_metadata`, and
+  `Config::framework_metadata` are removed. Set framework metadata on the `SdkConfig` or S3
+  configuration.
 
 ### Fixed
 - `PathBodyBuilder::build` without a path returns an `ErrorKind::InputInvalid` error instead of
   panicking.
+- Framework metadata set on the `SdkConfig` or S3 configuration was missing from the
+  `x-amz-user-agent` header of requests the transfer manager sent. The header now carries each
+  entry as `lib/<name>/<version>` alongside the transfer manager's attribution, in the order
+  configured and without duplicates.
 
 ## [release-2026-11-05]
 
