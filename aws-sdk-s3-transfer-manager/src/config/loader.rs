@@ -110,9 +110,7 @@ impl ConfigLoader {
     /// When set, [`load`](Self::load) reads no shared AWS configuration
     /// sources; it still detects the machine profile.
     /// [`Builder::s3_config`] describes how the transfer manager uses the
-    /// configuration. A non-empty list set with
-    /// [`network_interfaces`](Self::network_interfaces) replaces this
-    /// configuration's network interfaces; an empty list keeps them.
+    /// configuration.
     ///
     /// ```no_run
     /// # async fn example(sdk_config: aws_config::SdkConfig) {

@@ -24,8 +24,6 @@ pub(crate) mod user_agent;
 /// Minimum upload part size in bytes
 pub(crate) const MIN_MULTIPART_PART_SIZE_BYTES: u64 = 5 * ByteUnit::Mebibyte.as_bytes_u64();
 
-// FIXME - should target throughput be configurable for upload and download independently?
-
 /// S3 client configuration for the transfer manager.
 ///
 /// The transfer manager builds its S3 client from shared AWS configuration,
