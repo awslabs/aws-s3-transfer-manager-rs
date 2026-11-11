@@ -1650,7 +1650,7 @@ mod tests {
             .then_output(|| PutObjectOutput::builder().e_tag("test-etag").build());
         let s3_client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[put]);
         let handle = crate::client::Handle::test_handle_tokio(
-            crate::Config::builder().sdk_client(s3_client).build(),
+            crate::Config::builder().sdk_client(s3_client).build().expect("valid config"),
         );
 
         let input = super::super::UploadObjectsInputBuilder::default()
