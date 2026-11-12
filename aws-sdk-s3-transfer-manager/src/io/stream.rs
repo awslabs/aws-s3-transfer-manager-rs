@@ -125,7 +125,7 @@ impl InputStream {
     ///
     /// # Errors
     ///
-    /// Returns an error if a file-backed stream cannot open its path.
+    /// Returns [`ErrorKind::IOError`](crate::error::ErrorKind::IOError) if a file-backed stream cannot open it.
     ///
     /// # Panics
     ///
@@ -142,7 +142,7 @@ impl InputStream {
         self,
         direct_io: bool,
         buffer_pool: BufferPool,
-    ) -> std::io::Result<aws_smithy_types::body::SdkBody> {
+    ) -> Result<aws_smithy_types::body::SdkBody, crate::error::Error> {
         use crate::operation::upload::file_body::{
             DirectFileBody, FileBodySource, OffloadedFileBody,
         };
@@ -150,7 +150,8 @@ impl InputStream {
         match self.inner {
             RawInputStream::Buf(bytes) => Ok(SdkBody::from(bytes)),
             RawInputStream::Fs(path_body) => {
-                let source = FileBodySource::open(&path_body.path, buffer_pool)?;
+                let source = FileBodySource::open(&path_body.path, buffer_pool)
+                    .map_err(|e| crate::error::io_at("opening", &path_body.path, e))?;
                 let offset = path_body.offset;
                 let length = path_body.length;
                 if direct_io {

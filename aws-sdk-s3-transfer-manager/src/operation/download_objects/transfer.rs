@@ -14,7 +14,7 @@ use path_clean::PathClean;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -55,9 +55,6 @@ const WALK_LOW_WATER: usize = MAX_ENTRIES_PER_WALK;
 /// while a page is still being fetched, large enough to amortize the state-lock
 /// acquisition across many keys.
 const WALK_FLUSH_CHUNK: usize = 64;
-
-/// Default S3 key delimiter.
-const DEFAULT_DELIMITER: &str = "/";
 
 /// Work items produced by [`DownloadObjectsTransfer::poll_work`].
 pub(crate) enum DownloadObjectsWork {
@@ -216,8 +213,9 @@ struct State {
     /// The S3 listing walker (taken out during AdvanceWalker execution).
     walk: Option<S3Walk>,
 
-    /// Whether the destination directory has been validated (once, on the
-    /// first walker advance, so the blocking stat runs off the caller thread).
+    /// Whether the destination directory has been prepared: checked to be a
+    /// directory, or created. Done once, on the first walker advance, so the
+    /// blocking filesystem calls run off the caller thread.
     validated: bool,
 
     /// Whether a walker work item is currently in flight.
@@ -258,8 +256,9 @@ struct DownloadObjectsTransferInner {
     ctx: TransferContext,
     state: Mutex<State>,
     bucket: String,
+    /// The caller's destination, lexically cleaned. Every local path the
+    /// transfer creates or checks is derived from this one form.
     destination: PathBuf,
-    key_prefix: Option<String>,
     delimiter: Option<String>,
     failure_policy: FailedTransferPolicy,
     pipeline_depth: usize,
@@ -276,8 +275,7 @@ impl DownloadObjectsTransfer {
         pipeline_depth: usize,
     ) -> Self {
         let bucket = input.bucket().unwrap().to_string();
-        let destination = input.destination().unwrap().to_path_buf();
-        let key_prefix = walk.prefix().map(str::to_owned);
+        let destination = input.destination().unwrap().clean();
         let delimiter = input.delimiter().map(|s| s.to_string());
         let failure_policy = input.failure_policy().clone();
 
@@ -297,7 +295,6 @@ impl DownloadObjectsTransfer {
                 }),
                 bucket,
                 destination,
-                key_prefix,
                 delimiter,
                 failure_policy,
                 pipeline_depth,
@@ -497,13 +494,22 @@ impl DownloadObjectsTransfer {
             .collect()
     }
 
-    /// Stat the destination and confirm it is a directory. Blocking; called
-    /// once from the first walker advance, during work-item execution rather
-    /// than on the caller's `initiate` thread.
-    fn validate_destination(&self) -> Result<(), Error> {
+    /// Ensures the destination is a directory, creating it and any missing
+    /// parents, with default permissions, when it does not exist. Blocking;
+    /// called once from the first walker advance, during work-item execution
+    /// rather than on the caller's `initiate` thread.
+    ///
+    /// Returns [`ErrorKind::InputInvalid`] when the destination exists and is
+    /// not a directory, and [`ErrorKind::IOError`] when
+    /// its metadata cannot be read or it cannot be created.
+    fn prepare_destination(&self) -> Result<(), Error> {
         let dest = &self.inner.destination;
-        let metadata = std::fs::metadata(dest)?;
-        crate::operation::validate_target_is_dir(&metadata, dest)
+        match std::fs::metadata(dest) {
+            Ok(metadata) => crate::operation::validate_target_is_dir(&metadata, dest),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir_all(dest)
+                .map_err(|e| error::io_at("creating directory", dest, e)),
+            Err(e) => Err(error::io_at("reading metadata of", dest, e)),
+        }
     }
 
     fn spawn_single_child(
@@ -515,7 +521,6 @@ impl DownloadObjectsTransfer {
         let dest_path = local_key_path(
             &self.inner.destination,
             key,
-            self.inner.key_prefix.as_deref(),
             self.inner.delimiter.as_deref(),
         )?;
 
@@ -533,10 +538,7 @@ impl DownloadObjectsTransfer {
             let known = self.inner.created_dirs.lock().contains(parent);
             if !known {
                 std::fs::create_dir_all(parent).map_err(|e| {
-                    error::Error::new(
-                        ErrorKind::IOError,
-                        format!("failed to create directory for key '{key}': {e}"),
-                    )
+                    error::io_at("creating directory", parent, e).with_local_key(key)
                 })?;
                 self.inner.created_dirs.lock().insert(parent.to_path_buf());
             }
@@ -557,18 +559,12 @@ impl DownloadObjectsTransfer {
                 std::iter::repeat_with(|| fastrand::u32(..)),
             ))
             .map_err(|e| {
-                error::Error::new(
-                    ErrorKind::IOError,
-                    format!("failed to create temp file for key '{key}': {e}"),
-                )
+                error::io_at("creating temporary file for", &dest_path, e).with_local_key(key)
             })?;
         let sink = FileSinkFactory.create(file, true).map_err(|e| {
             // No handle owns the temp file yet, so remove it here.
             let _ = std::fs::remove_file(&temp_path);
-            error::Error::new(
-                ErrorKind::IOError,
-                format!("failed to create destination sink for key '{key}': {e}"),
-            )
+            error::io_at("preparing temporary file for", &dest_path, e).with_local_key(key)
         })?;
 
         let inner = Download::orchestrate_with_sink(handle.clone(), input, sink, Some(parent_id))?;
@@ -613,16 +609,7 @@ impl DownloadObjectsTransfer {
                         error: err,
                     });
                     if self.inner.failure_policy == FailedTransferPolicy::Abort {
-                        // TODO: the triggering child's error is preserved in
-                        // `state.failed` (reachable via
-                        // `Error::failed_downloads`), but the root error's
-                        // `source()` is only this string. Connecting the root
-                        // `source()` to the failing child's error needs a
-                        // shareable error (`Arc`) since `Error` is not `Clone`.
-                        self.inner.ctx.set_failed_and_signal(Error::new(
-                            ErrorKind::ChildOperationFailed,
-                            format!("download failed for key '{key}'"),
-                        ));
+                        self.inner.ctx.set_failed_and_signal(child_failed());
                     }
                 }
             }
@@ -739,9 +726,10 @@ impl DownloadObjectsTransfer {
     }
 
     async fn execute_advance_walker(&self, mut walk: S3Walk) -> WorkOutcome {
-        // Validate the destination directory once, on the first advance, so the
-        // blocking stat runs here (during work-item execution) rather than on
-        // the caller's `initiate` thread. On failure, fail the transfer; the
+        // Prepare the destination directory once, on the first advance, so the
+        // blocking stat and directory creation run here (during work-item
+        // execution) rather than on the caller's `initiate` thread, and before
+        // any child is spawned into it. On failure, fail the transfer; the
         // error surfaces from `handle.join()`.
         let needs_validation = {
             let mut state = self.inner.state.lock();
@@ -750,7 +738,7 @@ impl DownloadObjectsTransfer {
             first
         };
         if needs_validation {
-            if let Err(err) = self.validate_destination() {
+            if let Err(err) = self.prepare_destination() {
                 let mut state = self.inner.state.lock();
                 state.walk_in_flight = false;
                 // set_failed alone: check_terminal arbitrates the terminal signal once in-flight work (children/walks/reaps) drains.
@@ -880,21 +868,15 @@ impl DownloadObjectsTransfer {
                         .key(&key)
                         .build()
                         .unwrap();
+                    // A child's local failure, such as renaming its temporary
+                    // file, names the path but not the key. Errors without a
+                    // local path are left unchanged.
                     state.failed.push(FailedDownload {
                         input: failed_input,
-                        error: err,
+                        error: err.with_local_key(key),
                     });
                     if self.inner.failure_policy == FailedTransferPolicy::Abort {
-                        // TODO: the triggering child's error is preserved in
-                        // `state.failed` (reachable via
-                        // `Error::failed_downloads`), but the root error's
-                        // `source()` is only this string. Connecting the root
-                        // `source()` to the failing child's error needs a
-                        // shareable error (`Arc`) since `Error` is not `Clone`.
-                        self.inner.ctx.set_failed_and_signal(Error::new(
-                            ErrorKind::ChildOperationFailed,
-                            format!("download failed for key '{key}'"),
-                        ));
+                        self.inner.ctx.set_failed_and_signal(child_failed());
                     }
                 }
             }
@@ -935,21 +917,14 @@ impl Transfer for DownloadObjectsTransfer {
     fn on_terminal(&self) {}
 }
 
-fn strip_key_prefix<'a>(key: &'a str, prefix: Option<&str>, delimiter: Option<&str>) -> &'a str {
-    let prefix = prefix.unwrap_or("");
-    let delim = delimiter.unwrap_or(DEFAULT_DELIMITER);
-
-    if key.is_empty() || prefix.is_empty() || !key.starts_with(prefix) || !key.contains(delim) {
-        return key;
-    }
-
-    let stripped = &key[prefix.len()..];
-
-    if prefix.ends_with(delim) || !stripped.starts_with(delim) {
-        return stripped;
-    }
-
-    &stripped[1..]
+/// The error a child failure under [`FailedTransferPolicy::Abort`] fails the
+/// parent with.
+///
+/// It carries no detail of its own: the handle attaches the failed downloads,
+/// the first of which is the triggering child, and the error's source and
+/// message are taken from them.
+fn child_failed() -> Error {
+    Error::new(ErrorKind::ChildOperationFailed, "download_objects aborted")
 }
 
 fn replace_delim<'a>(key: &'a str, delimiter: Option<&str>, path_separator: &str) -> Cow<'a, str> {
@@ -964,35 +939,59 @@ fn replace_delim<'a>(key: &'a str, delimiter: Option<&str>, path_separator: &str
 
 /// Derive the local filesystem path for a given S3 key.
 ///
-/// Strips the configured prefix, replaces the delimiter with the OS path
-/// separator, joins with the destination root, normalizes via `path_clean`,
-/// and validates the result stays within the root (path traversal guard).
+/// The whole key is the path relative to `root_dir`, whatever prefix selected
+/// it: the delimiter, when one is set, is replaced with the OS path separator,
+/// the result is joined to `root_dir`, and the joined path is normalized.
+/// Returns [`ErrorKind::InputInvalid`] unless the result lies beneath
+/// `root_dir`: when it lies outside `root_dir` (path traversal guard), and
+/// when it is `root_dir` itself, as for the keys `.`, `./`, and `a/..`. The
+/// filesystem is not touched.
+///
+/// `root_dir` and the joined path are both cleaned lexically, with
+/// `path_clean`, before they are compared, so a destination such as `./out`
+/// or `out/../out` contains the same paths as `out`, and the returned path is
+/// under the cleaned form. Cleaning does not consult the filesystem: `..`
+/// removes the preceding component without resolving symbolic links.
+// TODO(sep): an opt-in mode could map keys relative to the listing prefix by
+// whole path components, as the AWS CLI does.
 pub(crate) fn local_key_path(
     root_dir: &Path,
     key: &str,
-    prefix: Option<&str>,
     delimiter: Option<&str>,
 ) -> Result<PathBuf, Error> {
-    let stripped = strip_key_prefix(key, prefix, delimiter);
-    let relative_path = replace_delim(stripped, delimiter, std::path::MAIN_SEPARATOR_STR);
+    let relative_path = replace_delim(key, delimiter, std::path::MAIN_SEPARATOR_STR);
 
+    let root_dir = root_dir.clean();
     let local_path = root_dir.join(relative_path.as_ref()).clean();
-    validate_path(root_dir, &local_path, key)?;
+    validate_path(&root_dir, &local_path, key)?;
 
     Ok(local_path)
 }
 
+/// Rejects `local_path` with [`ErrorKind::InputInvalid`] unless it lies
+/// beneath `root_dir`. Both must be lexically clean.
+///
+/// A clean path holds `..` only as leading components, so `local_path` is
+/// beneath `root_dir` when it starts with `root_dir` and the rest begins with
+/// a normal component: not `..`, a root, or a drive prefix, which leave
+/// `root_dir`, and not empty, which is `root_dir` itself. This also holds for
+/// a root made of `..` components. A root of `.` is the one that does not
+/// prefix the paths beneath it, and a clean path equal to it is `.`.
 fn validate_path(root_dir: &Path, local_path: &Path, key: &str) -> Result<(), Error> {
-    if !local_path.starts_with(root_dir) {
-        return Err(Error::new(
-            ErrorKind::InputInvalid,
-            format!(
-                "Unable to download key: '{key}', its relative path resolves \
-                 outside the target destination directory"
-            ),
-        ));
-    }
-    Ok(())
+    let rest = if root_dir == Path::new(".") {
+        Some(local_path)
+    } else {
+        local_path.strip_prefix(root_dir).ok()
+    };
+    let reason = match rest.map(|rest| rest.components().next()) {
+        Some(Some(Component::Normal(_))) => return Ok(()),
+        Some(None | Some(Component::CurDir)) => "resolves to the destination directory itself",
+        _ => "resolves outside the target destination directory",
+    };
+    Err(Error::new(
+        ErrorKind::InputInvalid,
+        format!("Unable to download key: '{key}', its relative path {reason}"),
+    ))
 }
 
 #[cfg(test)]
@@ -1004,6 +1003,7 @@ mod tests {
     use aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output;
     use aws_sdk_s3::types::Object;
     use aws_smithy_mocks::{mock, mock_client, RuleMode};
+    use aws_smithy_types::error::display::DisplayErrorContext;
     use std::time::Duration;
     use tempfile::tempdir;
     use tokio::time::timeout;
@@ -1064,13 +1064,26 @@ mod tests {
         DownloadObjectsTransfer,
         crate::transfer::StateMachineTerminalReceiver,
     ) {
+        setup_with_walker(dest, policy, s3_client, S3Walker::builder().build())
+    }
+
+    /// [`setup`], listing with `walker` instead of the default walker.
+    fn setup_with_walker(
+        dest: &Path,
+        policy: FailedTransferPolicy,
+        s3_client: aws_sdk_s3::Client,
+        walker: S3Walker,
+    ) -> (
+        DownloadObjectsTransfer,
+        crate::transfer::StateMachineTerminalReceiver,
+    ) {
         let config = crate::Config::builder()
             .sdk_client(s3_client.clone())
             .build()
             .expect("valid config");
         let handle = crate::client::Handle::test_handle_tokio(config);
 
-        let walk = S3Walker::builder().build().walk(
+        let walk = walker.walk(
             S3WalkContext::builder()
                 .sdk_client(s3_client)
                 .bucket("test-bucket")
@@ -1144,113 +1157,53 @@ mod tests {
 
     // --- Key derivation tests (ported from worker.rs) ---
 
+    /// A delimiter of any length, `/` or not, is replaced with the path
+    /// separator, and every segment of the key is kept.
     #[test]
-    fn test_strip_key_prefix() {
-        let cases: &[(&str, Option<&str>, Option<&str>, &str)] = &[
-            ("no-delim", None, None, "no-delim"),
-            ("no-delim", Some(""), None, "no-delim"),
-            (
-                "delim/with/separator",
-                Some(""),
-                None,
-                "delim/with/separator",
-            ),
-            ("", Some("no-delim"), None, ""),
-            ("no-delim", Some("no-delim"), None, "no-delim"),
-            ("delim/", Some("delim"), None, ""),
-            ("not-in-key", Some("prefix"), None, "not-in-key"),
-            ("notes/2021/1.txt", Some("notes/2021"), None, "1.txt"),
-            ("notes/2021/1.txt", Some("notes/2021/"), None, "1.txt"),
-            (
-                "top-level/sub-folder/1.txt",
-                Some("top-"),
-                None,
-                "level/sub-folder/1.txt",
-            ),
-            (
-                "someInnerFolder/another/file1.txt",
-                Some("someInner"),
-                None,
-                "Folder/another/file1.txt",
-            ),
-            (
-                "someInnerF/another/file1.txt",
-                Some("someInner"),
-                None,
-                "F/another/file1.txt",
-            ),
-            (
-                "someInner/another/file1.txt",
-                Some("someInner"),
-                None,
-                "another/file1.txt",
-            ),
-            (
-                "someInner/another/file1.txt",
-                Some("someInner/a"),
-                None,
-                "nother/file1.txt",
-            ),
-        ];
-        for (key, prefix, delim, expected) in cases {
-            let actual = strip_key_prefix(key, *prefix, *delim);
-            assert_eq!(
-                *expected, actual,
-                "key={key:?} prefix={prefix:?} delim={delim:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_strip_key_prefix_delims() {
+    fn test_local_key_path_delimiters() {
         for delim in ["/", "//", "\\", "|", "delim"] {
-            let prefix = format!("notes{delim}2021{delim}");
             let key = format!("notes{delim}2021{delim}1.txt");
-            let actual = strip_key_prefix(&key, Some(&prefix), Some(delim));
-            assert_eq!("1.txt", actual, "delim={delim:?}");
+            let actual = local_key_path(Path::new("test"), &key, Some(delim))
+                .unwrap_or_else(|e| panic!("delim={delim:?}: {e}"));
+            assert_eq!(
+                Path::new("test/notes/2021/1.txt"),
+                actual,
+                "delim={delim:?}"
+            );
         }
     }
 
     #[cfg(target_family = "unix")]
     #[test]
     fn test_local_key_path_comprehensive() {
-        // (key, key_prefix, delimiter, expected) for derive_local_path.
+        // (key, delimiter, expected) for local_key_path.
         type Case = (
             &'static str,
-            Option<&'static str>,
             Option<&'static str>,
             Result<&'static str, &'static str>,
         );
         let root = Path::new("test");
         let cases: &[Case] = &[
-            ("2023/Jan/1.png", None, None, Ok("test/2023/Jan/1.png")),
-            ("2023/Jan/1.png", Some("2023/Jan/"), None, Ok("test/1.png")),
-            ("2023/Jan/1.png", Some("2023/Jan"), None, Ok("test/1.png")),
-            ("2023-Jan-1.png", None, Some("-"), Ok("test/2023/Jan/1.png")),
-            ("2023-Jan-.png", None, Some("-"), Ok("test/2023/Jan/.png")),
+            ("2023/Jan/1.png", None, Ok("test/2023/Jan/1.png")),
+            ("2023-Jan-1.png", Some("-"), Ok("test/2023/Jan/1.png")),
+            ("2023-Jan-.png", Some("-"), Ok("test/2023/Jan/.png")),
             (
                 "many////delims-in-a-row",
-                None,
                 Some("/"),
                 Ok("test/many/delims-in-a-row"),
             ),
-            ("../2023/Jan/1.png", None, None, Err("outside the target")),
-            ("/2023/Jan/1.png", None, None, Err("outside the target")),
+            ("safe/../escape.bin", None, Ok("test/escape.bin")),
+            ("../2023/Jan/1.png", None, Err("outside the target")),
+            ("/2023/Jan/1.png", None, Err("outside the target")),
             (
                 "foo/../2023/../../Jan/1.png",
                 None,
-                None,
                 Err("outside the target"),
             ),
-            (
-                "../test-2/object.dat",
-                None,
-                None,
-                Err("outside the target"),
-            ),
+            ("../test-2/object.dat", None, Err("outside the target")),
         ];
-        for (key, prefix, delim, expected) in cases {
-            let actual = local_key_path(root, key, *prefix, *delim);
+        for (key, delim, expected) in cases {
+            let actual = local_key_path(root, key, *delim);
             match expected {
                 Ok(path) => {
                     let actual =
@@ -1263,6 +1216,117 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Asserts, for each `(root, cleaned)` destination and for the default and
+    /// `/` delimiters, that a key inside the destination maps under `cleaned`,
+    /// that each key in `escapes` is rejected as resolving outside it, and
+    /// that a key that maps to the destination itself is rejected.
+    ///
+    /// The keys that map to the destination are `.`, `a/..`, and `./`.
+    /// Accepting one would place its temporary file in the destination's
+    /// parent. A key ending in the delimiter, such as `photos/`, is not one of
+    /// them: it maps to the path its last segment names.
+    #[cfg(any(unix, windows))]
+    fn assert_dot_component_destinations(cases: &[(&str, &str)], escapes: &[&str]) {
+        for &(root, cleaned) in cases {
+            let root = Path::new(root);
+            for delim in [None, Some("/")] {
+                let actual = local_key_path(root, "a/b.txt", delim)
+                    .unwrap_or_else(|e| panic!("root={root:?} delim={delim:?}: {e}"));
+                assert_eq!(
+                    Path::new(cleaned).join("a/b.txt").clean(),
+                    actual,
+                    "root={root:?} delim={delim:?}"
+                );
+
+                for escape in escapes {
+                    let err = local_key_path(root, escape, delim).expect_err(&format!(
+                        "root={root:?} delim={delim:?} key={escape:?} must be rejected"
+                    ));
+                    assert_eq!(err.kind(), &ErrorKind::InputInvalid, "key={escape:?}");
+                    let message = DisplayErrorContext(&err).to_string();
+                    assert!(
+                        message.contains("outside the target destination"),
+                        "root={root:?} key={escape:?}: {message}"
+                    );
+                }
+
+                for key in [".", "a/..", "./"] {
+                    let err = local_key_path(root, key, delim).expect_err(&format!(
+                        "root={root:?} delim={delim:?} key={key:?} maps to the destination"
+                    ));
+                    assert_eq!(err.kind(), &ErrorKind::InputInvalid, "key={key:?}");
+                    let message = DisplayErrorContext(&err).to_string();
+                    assert!(
+                        message.contains("destination directory itself"),
+                        "root={root:?} key={key:?}: {message}"
+                    );
+                }
+
+                let actual = local_key_path(root, "photos/", delim)
+                    .unwrap_or_else(|e| panic!("root={root:?} delim={delim:?}: {e}"));
+                assert_eq!(
+                    Path::new(cleaned).join("photos").clean(),
+                    actual,
+                    "root={root:?} delim={delim:?}"
+                );
+            }
+        }
+    }
+
+    // ref: RUST-1202
+    /// A destination with `.` or `..` components contains the same paths as
+    /// its lexically cleaned form: keys inside it are accepted and placed
+    /// under the cleaned form, and keys that escape it or map to it are
+    /// rejected.
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn test_local_key_path_destination_with_dot_components() {
+        assert_dot_component_destinations(
+            &[
+                ("./out", "out"),
+                ("out/../out", "out"),
+                ("out/./", "out"),
+                ("/data/./out", "/data/out"),
+                ("/data/x/../out", "/data/out"),
+                (".", "."),
+                ("./", "."),
+                ("..", ".."),
+                ("../out", "../out"),
+            ],
+            &["../b.txt", "a/../../b.txt", "/etc/passwd"],
+        );
+    }
+
+    // ref: RUST-1202
+    /// The Windows form of `test_local_key_path_destination_with_dot_components`,
+    /// with drive-qualified destinations. A key that introduces a root (`\x`),
+    /// a drive (`C:x`, `C:/x`), or a UNC prefix replaces the destination when
+    /// joined to it, and is rejected.
+    #[cfg(windows)]
+    #[test]
+    fn test_local_key_path_destination_with_dot_components_windows() {
+        assert_dot_component_destinations(
+            &[
+                (r".\out", "out"),
+                (r"out\..\out", "out"),
+                (r"out\.\", "out"),
+                (r"C:\data\.\out", r"C:\data\out"),
+                (r"C:\data\x\..\out", r"C:\data\out"),
+                (".", "."),
+                (r"..\out", r"..\out"),
+            ],
+            &[
+                "../b.txt",
+                "a/../../b.txt",
+                "/etc/passwd",
+                r"\x",
+                "C:x",
+                "C:/x",
+                r"\\server\share\x",
+            ],
+        );
     }
 
     // --- State machine tests ---
@@ -1292,6 +1356,77 @@ mod tests {
         assert!(dir.path().join("a.txt").exists());
         assert!(dir.path().join("b.txt").exists());
         assert!(dir.path().join("c.txt").exists());
+    }
+
+    // ref: RUST-1202
+    /// A destination that does not exist is created, with every missing
+    /// parent, before any object is written into it.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_missing_destination_is_created() {
+        let dir = tempdir().unwrap();
+        let dest = dir.path().join("a/b/out");
+
+        let (transfer, completion_rx) =
+            setup(&dest, FailedTransferPolicy::Abort, mock_s3_success());
+
+        timeout(Duration::from_secs(10), async {
+            drive_transfer(&transfer).await;
+            let _ = completion_rx.await;
+        })
+        .await
+        .expect("transfer should complete within timeout");
+
+        assert!(
+            transfer.ctx().take_error().is_none(),
+            "a missing destination must not fail the transfer"
+        );
+        assert_eq!(transfer.successful_downloads(), 3);
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            assert_eq!(std::fs::read(dest.join(name)).unwrap(), b"hello");
+        }
+    }
+
+    // ref: RUST-1202
+    /// A destination that exists but is not a directory fails the transfer
+    /// with `InputInvalid` before any object is requested, and is left as it
+    /// was.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_destination_that_is_a_file_is_input_invalid() {
+        let dir = tempdir().unwrap();
+        let dest = dir.path().join("out");
+        std::fs::write(&dest, b"not a directory").unwrap();
+
+        // Any GetObject would be answered by this rule; none must be sent.
+        let get = mock!(aws_sdk_s3::Client::get_object).then_output(|| {
+            GetObjectOutput::builder()
+                .content_length(5)
+                .body(aws_sdk_s3::primitives::ByteStream::from_static(b"hello"))
+                .build()
+        });
+        let list = mock!(aws_sdk_s3::Client::list_objects_v2).then_output(|| {
+            ListObjectsV2Output::builder()
+                .set_contents(Some(vec![Object::builder().key("a.txt").size(5).build()]))
+                .build()
+        });
+        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[list, get.clone()]);
+        let (transfer, completion_rx) = setup(&dest, FailedTransferPolicy::Continue, client);
+
+        timeout(Duration::from_secs(10), async {
+            drive_transfer(&transfer).await;
+            let _ = completion_rx.await;
+        })
+        .await
+        .expect("transfer should complete within timeout");
+
+        let err = transfer
+            .ctx()
+            .take_error()
+            .expect("a file destination must fail the transfer");
+        assert_eq!(err.kind(), &ErrorKind::InputInvalid);
+        assert_eq!(get.num_calls(), 0);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"not a directory");
     }
 
     #[cfg_attr(miri, ignore)]
@@ -1450,9 +1585,213 @@ mod tests {
         assert!(dir.path().join("docs/readme.txt").exists());
     }
 
+    // ref: RUST-1202
+    /// A key whose parent directory cannot be created, because a file holds
+    /// its name, fails with an `IOError` that names the directory, with the
+    /// operating system's error as its source.
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
-    async fn test_prefix_stripping() {
+    async fn test_parent_directory_failure_names_directory_and_key() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("docs"), b"a file, not a directory").unwrap();
+
+        let list = mock!(aws_sdk_s3::Client::list_objects_v2).then_output(|| {
+            ListObjectsV2Output::builder()
+                .set_contents(Some(vec![Object::builder()
+                    .key("docs/readme.txt")
+                    .size(5)
+                    .build()]))
+                .build()
+        });
+        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[list]);
+        let (transfer, completion_rx) = setup(dir.path(), FailedTransferPolicy::Continue, client);
+
+        timeout(Duration::from_secs(10), async {
+            drive_transfer(&transfer).await;
+            let _ = completion_rx.await;
+        })
+        .await
+        .expect("transfer should complete within timeout");
+
+        let failed = transfer.take_failed().expect("the key must fail");
+        let err = failed[0].error();
+        assert_eq!(err.kind(), &ErrorKind::IOError);
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "I/O error creating directory \"{}\" (key \"docs/readme.txt\")",
+                dir.path().join("docs").display()
+            )
+        );
+        assert!(std::error::Error::source(err)
+            .and_then(|s| s.downcast_ref::<std::io::Error>())
+            .is_some());
+    }
+
+    /// Objects whose keys map to the destination directory itself (`.`, `./`,
+    /// and `a/..`) fail with `InputInvalid` under `Continue` before any file
+    /// is created or any GetObject is sent. Accepted, each one's temporary
+    /// file would be created in the destination's parent, the object
+    /// downloaded, and only the rename onto the destination would fail.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_key_mapping_to_destination_fails_before_any_file_is_created() {
+        let dir = tempdir().unwrap();
+        let dest = dir.path().join("out");
+        let keys = [".", "./", "a/.."];
+
+        // Any GetObject would be answered by this rule; none must be sent.
+        let get = mock!(aws_sdk_s3::Client::get_object).then_output(|| {
+            GetObjectOutput::builder()
+                .content_length(5)
+                .body(aws_sdk_s3::primitives::ByteStream::from_static(b"hello"))
+                .build()
+        });
+        let list = mock!(aws_sdk_s3::Client::list_objects_v2).then_output(move || {
+            ListObjectsV2Output::builder()
+                .set_contents(Some(
+                    keys.iter()
+                        .map(|key| Object::builder().key(*key).size(5).build())
+                        .collect(),
+                ))
+                .build()
+        });
+        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[list, get.clone()]);
+        let (transfer, completion_rx) = setup(&dest, FailedTransferPolicy::Continue, client);
+
+        timeout(Duration::from_secs(10), async {
+            drive_transfer(&transfer).await;
+            let _ = completion_rx.await;
+        })
+        .await
+        .expect("transfer should complete within timeout");
+
+        assert!(transfer.ctx().take_error().is_none());
+        let failed = transfer.take_failed().expect("the keys must fail");
+        let mut failed_keys: Vec<_> = failed.iter().map(|f| f.input().key()).collect();
+        failed_keys.sort();
+        assert_eq!(failed_keys, [Some("."), Some("./"), Some("a/..")]);
+        for f in &failed {
+            assert_eq!(f.error().kind(), &ErrorKind::InputInvalid);
+        }
+        assert_eq!(get.num_calls(), 0);
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            entries,
+            ["out"],
+            "nothing may be created beside the destination"
+        );
+        assert_eq!(std::fs::read_dir(&dest).unwrap().count(), 0);
+    }
+
+    // ref: RUST-1426
+    /// A non-empty object whose key is the listing prefix `photos/` is
+    /// downloaded to the file `photos` beneath the destination: the prefix
+    /// does not shorten the key, so the key does not map to the destination
+    /// itself.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_key_equal_to_prefix_downloads_to_its_last_segment() {
+        let dir = tempdir().unwrap();
+
+        let list = mock!(aws_sdk_s3::Client::list_objects_v2).then_output(|| {
+            ListObjectsV2Output::builder()
+                .set_contents(Some(vec![Object::builder().key("photos/").size(5).build()]))
+                .build()
+        });
+        let get = mock!(aws_sdk_s3::Client::get_object).then_output(|| {
+            GetObjectOutput::builder()
+                .content_length(5)
+                .body(aws_sdk_s3::primitives::ByteStream::from_static(b"hello"))
+                .build()
+        });
+        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[list, get]);
+        let (transfer, completion_rx) = setup_with_walker(
+            dir.path(),
+            FailedTransferPolicy::Abort,
+            client,
+            S3Walker::builder().prefix("photos/").build(),
+        );
+
+        timeout(Duration::from_secs(10), async {
+            drive_transfer(&transfer).await;
+            let _ = completion_rx.await;
+        })
+        .await
+        .expect("transfer should complete within timeout");
+
+        assert!(transfer.ctx().take_error().is_none());
+        assert!(transfer.take_failed().is_none());
+        assert_eq!(transfer.successful_downloads(), 1);
+        assert_eq!(std::fs::read(dir.path().join("photos")).unwrap(), b"hello");
+    }
+
+    // ref: RUST-1202
+    /// A child whose temporary file cannot be renamed onto the object's path,
+    /// because a non-empty directory holds it, fails with an `IOError` that
+    /// names the path and the object's key, with the operating system's error
+    /// as its source. The rename error is built where only the path is known;
+    /// the key is attached when the child's result is recorded.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_rename_failure_names_path_and_key() {
+        let dir = tempdir().unwrap();
+        let blocked = dir.path().join("a.txt");
+        std::fs::create_dir(&blocked).unwrap();
+        std::fs::write(blocked.join("inner"), b"kept").unwrap();
+
+        let (transfer, completion_rx) = setup(
+            dir.path(),
+            FailedTransferPolicy::Continue,
+            mock_s3_success(),
+        );
+
+        timeout(Duration::from_secs(10), async {
+            drive_transfer(&transfer).await;
+            let _ = completion_rx.await;
+        })
+        .await
+        .expect("transfer should complete within timeout");
+
+        assert_eq!(transfer.successful_downloads(), 2);
+        let failed = transfer.take_failed().expect("a.txt must fail");
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].input().key(), Some("a.txt"));
+        let err = failed[0].error();
+        assert_eq!(err.kind(), &ErrorKind::IOError);
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "I/O error renaming temporary file to \"{}\" (key \"a.txt\")",
+                blocked.display()
+            )
+        );
+        assert!(std::error::Error::source(err)
+            .and_then(|s| s.downcast_ref::<std::io::Error>())
+            .is_some());
+        assert_eq!(std::fs::read(blocked.join("inner")).unwrap(), b"kept");
+        let mut entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        entries.sort();
+        assert_eq!(
+            entries,
+            ["a.txt", "b.txt", "c.txt"],
+            "the failed child's temporary file must be removed"
+        );
+    }
+
+    // ref: RUST-1426
+    /// The walker's prefix selects objects and does not shorten their keys:
+    /// `backup/2023/a.txt` listed under `backup/2023/` is written to
+    /// `<dest>/backup/2023/a.txt`, not `<dest>/a.txt`.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_walker_prefix_keeps_full_key_in_local_path() {
         let dir = tempdir().unwrap();
 
         let list = mock!(aws_sdk_s3::Client::list_objects_v2).then_output(|| {
@@ -1470,32 +1809,12 @@ mod tests {
                 .build()
         });
         let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[list, get]);
-
-        let config = crate::Config::builder()
-            .sdk_client(client.clone())
-            .build()
-            .expect("valid config");
-        let handle = crate::client::Handle::test_handle_tokio(config);
-
-        let walk = S3Walker::builder().prefix("backup/2023/").build().walk(
-            S3WalkContext::builder()
-                .sdk_client(client)
-                .bucket("test-bucket")
-                .build(),
+        let (transfer, completion_rx) = setup_with_walker(
+            dir.path(),
+            FailedTransferPolicy::Continue,
+            client,
+            S3Walker::builder().prefix("backup/2023/").build(),
         );
-
-        let (ctx, completion_rx) = TransferContext::new(handle);
-        ctx.handle
-            .scheduler
-            .register_empty_group_for_test(ctx.id.id);
-
-        let input = crate::operation::download_objects::DownloadObjectsInput::builder()
-            .bucket("test-bucket")
-            .destination(dir.path())
-            .failure_policy(FailedTransferPolicy::Continue)
-            .build()
-            .unwrap();
-        let transfer = DownloadObjectsTransfer::new(ctx, &input, walk, 1000);
 
         timeout(Duration::from_secs(10), async {
             drive_transfer(&transfer).await;
@@ -1505,9 +1824,20 @@ mod tests {
         .expect("transfer should complete within timeout");
 
         assert_eq!(transfer.successful_downloads(), 2);
-        // Prefix stripped: "backup/2023/a.txt" → "a.txt"
-        assert!(dir.path().join("a.txt").exists());
-        assert!(dir.path().join("b.txt").exists());
+        assert!(transfer.take_failed().is_none());
+        assert_eq!(
+            std::fs::read(dir.path().join("backup/2023/a.txt")).unwrap(),
+            b"abc"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("backup/2023/b.txt")).unwrap(),
+            b"abc"
+        );
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, ["backup"]);
     }
 
     #[cfg_attr(miri, ignore)]
