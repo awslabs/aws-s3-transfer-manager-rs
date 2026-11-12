@@ -114,7 +114,8 @@ impl PathBodyBuilder {
                 // TODO(aws-sdk-rust#1159, design) - evaluate if we want build() to be async and to use tokio for stat() call (bytestream FsBuilder::build() is async)
                 let metadata = match self.metadata {
                     Some(metadata) => metadata,
-                    None => fs::metadata(&path)?,
+                    None => fs::metadata(&path)
+                        .map_err(|e| error::io_at("reading metadata of", &path, e))?,
                 };
                 let file_size = metadata.len();
 

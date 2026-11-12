@@ -461,6 +461,11 @@ impl Client {
 
     /// Download multiple objects from an Amazon S3 bucket to a local directory
     ///
+    /// Each object is written at its full key under the destination directory.
+    /// The walker's prefix selects the objects and does not shorten their
+    /// paths. See [`DownloadObjectsInput`](crate::operation::download_objects::DownloadObjectsInput)
+    /// for how keys map to paths.
+    ///
     /// Constructs a fluent builder for the
     /// [`DownloadObjects`](crate::operation::download_objects::builders::DownloadObjectsFluentBuilder) operation.
     ///

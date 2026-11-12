@@ -6,6 +6,7 @@ use std::error::Error as StdError;
 use std::fmt;
 use std::fmt::Formatter;
 use std::io::Error as StdIoError;
+use std::path::PathBuf;
 use tokio::task::JoinError;
 
 #[derive(Debug)]
@@ -13,6 +14,13 @@ pub(crate) enum ErrorKind {
     OffsetNotAlignedWithPartNumber(u64, u64),
     TaskFailed(JoinError),
     IoError(StdIoError),
+    /// A filesystem operation on `path` failed. `action` is as for
+    /// [`crate::error::io_at`].
+    LocalIo {
+        action: &'static str,
+        path: PathBuf,
+        source: StdIoError,
+    },
 }
 
 /// Failure reading parts from an [`InputStream`](crate::io::InputStream).
@@ -25,21 +33,37 @@ impl Error {
     pub(crate) fn offset_not_aligned_with_part_number(offset: u64, part_number: u64) -> Error {
         ErrorKind::OffsetNotAlignedWithPartNumber(offset, part_number).into()
     }
+
+    /// A filesystem operation on `path` that failed with `err`. Converts to
+    /// the transfer error [`crate::error::io_at`] builds.
+    pub(crate) fn io_at(action: &'static str, path: impl Into<PathBuf>, err: StdIoError) -> Error {
+        ErrorKind::LocalIo {
+            action,
+            path: path.into(),
+            source: err,
+        }
+        .into()
+    }
 }
 
 /// Converts to a transfer error.
 ///
 /// A failed read is [`IOError`](crate::error::ErrorKind::IOError), with the
 /// underlying [`std::io::Error`] as the transfer error's direct source, so the
-/// cause chain names the failure once. A read task that panicked or was
-/// cancelled, and a reader whose position disagrees with its part numbering,
-/// are internal failures and are
+/// cause chain names the failure once. A read task
+/// that panicked or was cancelled, and a reader whose position disagrees with
+/// its part numbering, are internal failures and are
 /// [`RuntimeError`](crate::error::ErrorKind::RuntimeError).
 impl From<Error> for crate::error::Error {
     fn from(err: Error) -> Self {
         use crate::error::ErrorKind as Kind;
         match err.kind {
             ErrorKind::IoError(err) => crate::error::Error::new(Kind::IOError, err),
+            ErrorKind::LocalIo {
+                action,
+                path,
+                source,
+            } => crate::error::io_at(action, path, source),
             other => crate::error::Error::new(Kind::RuntimeError, Error { kind: other }),
         }
     }
@@ -66,6 +90,9 @@ impl fmt::Display for Error {
                 offset, part_number,
             ),
             ErrorKind::IoError(_) => write!(f, "I/O error"),
+            ErrorKind::LocalIo { action, path, .. } => {
+                write!(f, "I/O error {action} \"{}\"", path.display())
+            }
             ErrorKind::TaskFailed(_) => write!(f, "task failed"),
         }
     }
@@ -76,6 +103,7 @@ impl StdError for Error {
         match &self.kind {
             ErrorKind::OffsetNotAlignedWithPartNumber(_, _) => None,
             ErrorKind::IoError(err) => Some(err as _),
+            ErrorKind::LocalIo { source, .. } => Some(source as _),
             ErrorKind::TaskFailed(err) => Some(err as _),
         }
     }

@@ -403,7 +403,13 @@ async fn do_manifest_upload(
     for entry in entries {
         let tm = tm.clone();
         let bucket = bucket.to_string();
-        let upload_key = format!("{key_prefix}/{}", entry.local);
+        // Match `upload_objects`: no separator after an empty prefix or one that
+        // already ends with `/`.
+        let upload_key = if key_prefix.is_empty() || key_prefix.ends_with('/') {
+            format!("{key_prefix}{}", entry.local)
+        } else {
+            format!("{key_prefix}/{}", entry.local)
+        };
         let source = source_dir.join(&entry.local);
         set.spawn(async move { do_single_upload(&tm, &bucket, &upload_key, &source).await });
     }
