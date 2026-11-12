@@ -54,17 +54,18 @@
 //!
 //! ## Positive: a good download round-trips and reports an honest verdict
 //!
-//! | Object                  | Request mode | Client validation | Verdict asserted                        | Backend     |
-//! |-------------------------|--------------|-------------------|-----------------------------------------|-------------|
-//! | single-part             | unset        | WhenSupported     | Validated{Crc32}                        | mock + real |
-//! | single-part             | unset        | WhenRequired      | NotValidated{Disabled}                  | mock        |
-//! | single-part             | ENABLED      | default           | object value surfaced; Validated{Crc32} | mock + real |
-//! | multipart full-obj      | ENABLED      | default           | object value is NOT a part checksum     | mock + real |
-//! | multipart composite     | ENABLED      | default           | object value is NOT a part checksum     | mock + real |
-//! | multipart (Auto sz)     | ENABLED      | default           | round-trip (ranges auto-aligned)        | mock + real |
-//! | composite MPU (Auto sz) | ENABLED      | default           | Validated{Crc32}                        | mock        |
-//! | single-part (file)      | ENABLED      | default           | round-trip on disk                      | mock + real |
-//! | composite MPU value     | ENABLED      | default           | object value == composite_checksum      | real        |
+//! | Object                       | Request mode | Client validation | Verdict asserted                                       | Backend     |
+//! |------------------------------|--------------|-------------------|--------------------------------------------------------|-------------|
+//! | single-part                  | unset        | WhenSupported     | Validated{Crc32}                                       | mock + real |
+//! | single-part                  | unset        | WhenRequired      | NotValidated{Disabled}                                 | mock        |
+//! | single-part                  | ENABLED      | default           | object value surfaced; Validated{Crc32}                | mock + real |
+//! | multipart full-obj (GP)      | ENABLED      | default           | object value is NOT a part checksum; Unavailable       | mock + real |
+//! | multipart full-obj (Express) | ENABLED      | default           | object value is NOT a part checksum; Validated{Crc32}  | real        |
+//! | multipart composite          | ENABLED      | default           | object value is NOT a part checksum; Validated{Sha256} | mock + real |
+//! | multipart (Auto sz)          | ENABLED      | default           | round-trip (ranges auto-aligned)                       | mock + real |
+//! | composite MPU (Auto sz)      | ENABLED      | default           | Validated{Crc32}                                       | mock        |
+//! | single-part (file)           | ENABLED      | default           | round-trip on disk; Validated{Crc32}                   | mock + real |
+//! | composite MPU value          | ENABLED      | default           | object value == composite_checksum                     | real        |
 //!
 //! ## Negative: a tampered download MUST fail (mock only)
 //!
@@ -84,11 +85,11 @@
 //! the stored part size (a partNumber=1 GET reports part 1's exact length) and
 //! slices download ranges to it, so every range aligns to a stored part boundary
 //! (including the ragged tail). A download of a composite upload then validates
-//! every part; with a full-object upload in a general purpose bucket the mock's
-//! parts carry no checksum, so the download reads
-//! `NotValidated { reason: Unavailable }`. An explicit user part size is
-//! respected as-is (no auto-align), so a composite upload validates only when
-//! the user's part size matches the uploaded one.
+//! every part. A full-object upload validates only in a directory bucket, which
+//! returns each part's checksum; a general purpose bucket returns none, so the
+//! download reads `NotValidated { reason: Unavailable }`. An explicit user part
+//! size is respected as-is (no auto-align), so a composite upload validates only
+//! when the user's part size matches the uploaded one.
 //!
 //! One `#[ignore]`d intent test states the remaining deferred goal (gated on wire
 //! checksum): `single_put_split_tamper_caught_mock_gp` — a large single-PUT
@@ -102,15 +103,14 @@
 //! through this matrix. Representative algorithms are used: CRC32 for full
 //! object, SHA-256 for the composite case.
 
-use crate::assertions::{assert_integrity_error, assert_same_content, assert_validated};
+use crate::assertions::{
+    assert_integrity_error, assert_not_validated, assert_same_content, assert_validated,
+};
 use crate::harness::{BucketKind, Target};
 use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
-use aws_sdk_s3_transfer_manager::operation::download::DownloadOutput;
 use aws_sdk_s3_transfer_manager::operation::upload::ChecksumStrategy;
 use aws_sdk_s3_transfer_manager::types::ChecksumMode;
-use aws_sdk_s3_transfer_manager::types::{
-    ChecksumAlgorithm, ChecksumValidation, NotValidatedReason, PartSize,
-};
+use aws_sdk_s3_transfer_manager::types::{ChecksumAlgorithm, NotValidatedReason, PartSize};
 use s3_mock_server::{FaultType, Occurrence};
 
 /// A part size pinned equally for upload and download. Multipart downloads align
@@ -139,13 +139,6 @@ fn large_single_put() -> Vec<u8> {
     (0..12 * ByteUnit::Mebibyte.as_bytes_usize())
         .map(|i| (i % 256) as u8)
         .collect()
-}
-
-pub(crate) fn assert_not_validated(output: &DownloadOutput, expected: NotValidatedReason) {
-    match output.integrity_checks().checksum_validation() {
-        ChecksumValidation::NotValidated { reason, .. } => assert_eq!(*reason, expected),
-        other => panic!("expected NotValidated{{{expected:?}}}, got {other:?}"),
-    }
 }
 
 /// Write `len` bytes of the deterministic `i % 256` pattern to `path` and return
@@ -327,10 +320,13 @@ async fn multipart_full_object(target: Target) {
     // buckets; a general purpose bucket returns none.
     let part = t.head_part("obj", 1).await;
     match target.bucket_kind {
-        BucketKind::GeneralPurpose => assert!(
-            part.checksum_crc32().is_none(),
-            "a general purpose bucket returns no checksum for a part of a FULL_OBJECT object"
-        ),
+        BucketKind::GeneralPurpose => {
+            assert!(
+                part.checksum_crc32().is_none(),
+                "a general purpose bucket returns no checksum for a part of a FULL_OBJECT object"
+            );
+            assert_not_validated(&output, NotValidatedReason::Unavailable);
+        }
         #[cfg(e2e_test)]
         BucketKind::Express => {
             assert!(
@@ -341,6 +337,7 @@ async fn multipart_full_object(target: Target) {
                 part.checksum_type(),
                 Some(&aws_sdk_s3::types::ChecksumType::FullObject)
             );
+            assert_validated(&output, ChecksumAlgorithm::Crc32);
         }
     }
 
@@ -383,6 +380,7 @@ async fn multipart_composite(target: Target) {
         output.integrity_checks().checksum_sha256().is_none(),
         "must not surface a part checksum as the object checksum"
     );
+    assert_validated(&output, ChecksumAlgorithm::Sha256);
 
     t.shutdown().await;
 }
@@ -650,12 +648,14 @@ async fn file_download_round_trips(target: Target) {
 
     let dir = tempfile::tempdir().expect("tempdir");
     let dest = dir.path().join("obj.bin");
-    t.download_to_path("obj", &dest, Some(ChecksumMode::Enabled))
+    let output = t
+        .download_to_path("obj", &dest, Some(ChecksumMode::Enabled))
         .await
         .expect("file download");
 
     let on_disk = std::fs::read(&dest).expect("read destination");
     assert_same_content(&data, &on_disk);
+    assert_validated(&output, ChecksumAlgorithm::Crc32);
 
     t.shutdown().await;
 }
@@ -909,9 +909,8 @@ async fn tampered_multipart_errors_mock_gp() {
 // tests pin that aligned-by-default behavior.
 
 /// Default part size (Auto): a non-tampered multipart download round-trips. The
-/// TM aligns ranges to the stored part size, but the upload is full-object, and
-/// in a general purpose bucket the mock's parts carry no checksum, so the
-/// download reads `NotValidated { reason: Unavailable }`.
+/// TM aligns ranges to the stored part size; `multipart_full_object` asserts the
+/// verdict for this full-object upload.
 async fn multipart_aligned_round_trips(target: Target) {
     let t = target.connect().await;
     let data = multipart_data();
@@ -922,14 +921,11 @@ async fn multipart_aligned_round_trips(target: Target) {
     )
     .await;
 
-    let (bytes, output) = t
+    let (bytes, _output) = t
         .download("obj", Some(ChecksumMode::Enabled))
         .await
         .expect("download");
     assert_same_content(&data, &bytes);
-    if t.mock().is_some() {
-        assert_not_validated(&output, NotValidatedReason::Unavailable);
-    }
 
     t.shutdown().await;
 }

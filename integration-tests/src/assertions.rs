@@ -11,13 +11,23 @@
 
 use aws_sdk_s3_transfer_manager::error::{Error, ErrorKind};
 use aws_sdk_s3_transfer_manager::operation::download::DownloadOutput;
-use aws_sdk_s3_transfer_manager::types::{ChecksumAlgorithm, ChecksumValidation};
+use aws_sdk_s3_transfer_manager::types::{
+    ChecksumAlgorithm, ChecksumValidation, NotValidatedReason,
+};
 
 /// Assert a download's verdict is `Validated` with `expected`.
 pub(crate) fn assert_validated(output: &DownloadOutput, expected: ChecksumAlgorithm) {
     match output.integrity_checks().checksum_validation() {
         ChecksumValidation::Validated { algorithm, .. } => assert_eq!(*algorithm, expected),
         other => panic!("expected Validated{{{expected:?}}}, got {other:?}"),
+    }
+}
+
+/// Assert a download's verdict is `NotValidated` with `expected`.
+pub(crate) fn assert_not_validated(output: &DownloadOutput, expected: NotValidatedReason) {
+    match output.integrity_checks().checksum_validation() {
+        ChecksumValidation::NotValidated { reason, .. } => assert_eq!(*reason, expected),
+        other => panic!("expected NotValidated{{{expected:?}}}, got {other:?}"),
     }
 }
 

@@ -4,25 +4,25 @@
  */
 
 mod common;
-#[cfg(any(unix, windows))]
-#[path = "download_test/test_util.rs"]
+#[path = "download_test/test_util/mod.rs"]
 mod test_util;
 
 #[cfg(unix)]
-use test_util::await_shutdown;
+use test_util::retention::await_shutdown;
 #[cfg(any(unix, windows))]
-use test_util::{
+use test_util::retention::{
     assert_download_releases_destination, drop_and_await_shutdown, Destination, Ending,
     OpenFileProbe,
 };
+use test_util::{object_connector, object_connector_with_checksum_headers};
 
 use aws_sdk_s3_transfer_manager::RuntimeConfig;
 use aws_sdk_s3_transfer_manager::{
     error::{BoxError, ErrorKind},
     metrics::unit::ByteUnit,
     types::{
-        ChecksumAlgorithm, ChecksumMode, ChecksumValidation, ConcurrencyMode, NotValidatedReason,
-        PartSize, TransferStatus,
+        ChecksumAlgorithm, ChecksumMode, ChecksumValidation, ConcurrencyMode, IntegrityChecks,
+        NotValidatedReason, PartSize, TransferStatus,
     },
 };
 use aws_smithy_runtime_api::client::http::{
@@ -72,47 +72,11 @@ fn dummy_expected_request() -> http::Request<SdkBody> {
         .unwrap()
 }
 
-/// Create a static replay client (http connector) for an object of the given size.
-///
-/// Assumptions:
-///     1. Expected requests are not created. A dummy placeholder is used. Callers need to make
-///        assertions directly on the captured requests.
-///     2. Object discovery goes through ranged get which will fetch the first part.
-///     3. Concurrency of 1 is used since responses for a static replay client are just returned in
-///        the order given.
-fn simple_object_connector(data: &Bytes, part_size: usize) -> StaticReplayClient {
-    let events = data
-        .chunks(part_size)
-        .enumerate()
-        .map(|(idx, chunk)| {
-            let start = idx * part_size;
-            let end = std::cmp::min(start + part_size, data.len()) - 1;
-            ReplayEvent::new(
-                // NOTE: Rather than try to recreate all the expected requests we just put in placeholders and
-                // make our own assertions against the captured requests.
-                dummy_expected_request(),
-                http::Response::builder()
-                    .status(200)
-                    .header("Content-Length", format!("{}", end - start + 1))
-                    .header(
-                        "Content-Range",
-                        format!("bytes {start}-{end}/{}", data.len()),
-                    )
-                    .header("ETag", "my-etag")
-                    .body(SdkBody::from(chunk))
-                    .unwrap(),
-            )
-        })
-        .collect();
-
-    StaticReplayClient::new(events)
-}
-
 fn simple_test_tm(
     data: &Bytes,
     part_size: usize,
 ) -> (aws_sdk_s3_transfer_manager::Client, StaticReplayClient) {
-    let http_client = simple_object_connector(data, part_size);
+    let http_client = object_connector(data, part_size);
     let tm = test_tm(http_client.clone(), part_size);
     (tm, http_client)
 }
@@ -1055,63 +1019,9 @@ async fn test_checksum_mode_enabled_by_default() {
 }
 
 fn single_part_connector(data: &Bytes, crc32: Option<&str>) -> StaticReplayClient {
-    single_part_connector_with_checksum(data, crc32.map(|value| ("x-amz-checksum-crc32", value)))
-}
-
-/// Like `single_part_connector`, but `checksum` sets any checksum header, as
-/// `(header, value)`.
-fn single_part_connector_with_checksum(
-    data: &Bytes,
-    checksum: Option<(&str, &str)>,
-) -> StaticReplayClient {
-    let mut resp = http::Response::builder()
-        .status(200)
-        .header("Content-Length", format!("{}", data.len()))
-        .header(
-            "Content-Range",
-            format!("bytes 0-{}/{}", data.len() - 1, data.len()),
-        )
-        .header("ETag", "my-etag");
-    if let Some((header, value)) = checksum {
-        resp = resp.header(header, value);
-    }
-    StaticReplayClient::new(vec![ReplayEvent::new(
-        dummy_expected_request(),
-        resp.body(SdkBody::from(data.clone())).unwrap(),
-    )])
-}
-
-/// Like `simple_object_connector`, but each response carries the
-/// `x-amz-checksum-crc32` value `crc32` returns for the chunk's index.
-fn crc32_object_connector(
-    data: &Bytes,
-    part_size: usize,
-    crc32: impl Fn(usize) -> String,
-) -> StaticReplayClient {
-    let events = data
-        .chunks(part_size)
-        .enumerate()
-        .map(|(idx, chunk)| {
-            let start = idx * part_size;
-            let end = start + chunk.len() - 1;
-            ReplayEvent::new(
-                dummy_expected_request(),
-                http::Response::builder()
-                    .status(200)
-                    .header("Content-Length", format!("{}", chunk.len()))
-                    .header(
-                        "Content-Range",
-                        format!("bytes {start}-{end}/{}", data.len()),
-                    )
-                    .header("ETag", "my-etag")
-                    .header("x-amz-checksum-crc32", crc32(idx))
-                    .body(SdkBody::from(chunk))
-                    .unwrap(),
-            )
-        })
-        .collect();
-
-    StaticReplayClient::new(events)
+    object_connector_with_checksum_headers(data, data.len(), |_, _| {
+        crc32.map(|value| ("x-amz-checksum-crc32", value.to_owned()))
+    })
 }
 
 // "hello world" has CRC32 `DUoRhQ==`. Using a correct value lets the SDK's
@@ -1119,11 +1029,79 @@ fn crc32_object_connector(
 const HELLO: &[u8] = b"hello world";
 const HELLO_CRC32: &str = "DUoRhQ==";
 
-/// The base64 CRC32 of `bytes`, as S3 reports it.
-fn crc32_base64(bytes: &[u8]) -> String {
-    let mut crc32 = aws_smithy_checksums::ChecksumAlgorithm::Crc32.into_impl();
-    crc32.update(bytes);
-    aws_smithy_types::base64::encode(crc32.finalize())
+/// The base64 checksum of `bytes` under `algorithm`, as S3 reports it.
+fn checksum_value(algorithm: aws_smithy_checksums::ChecksumAlgorithm, bytes: &[u8]) -> String {
+    let mut checksum = algorithm.into_impl();
+    checksum.update(bytes);
+    aws_smithy_types::base64::encode(checksum.finalize())
+}
+
+/// An algorithm the SDK validates: the SDK's algorithm, the transfer manager's,
+/// the response header S3 reports it in, and the getter for the object's value.
+type ChecksumCase = (
+    aws_smithy_checksums::ChecksumAlgorithm,
+    ChecksumAlgorithm,
+    &'static str,
+    fn(&IntegrityChecks) -> Option<&str>,
+);
+
+/// Every algorithm the SDK validates.
+fn checksum_cases() -> [ChecksumCase; 5] {
+    use aws_smithy_checksums::ChecksumAlgorithm as Sdk;
+    [
+        (
+            Sdk::Crc32,
+            ChecksumAlgorithm::Crc32,
+            "x-amz-checksum-crc32",
+            IntegrityChecks::checksum_crc32,
+        ),
+        (
+            Sdk::Crc32c,
+            ChecksumAlgorithm::Crc32C,
+            "x-amz-checksum-crc32c",
+            IntegrityChecks::checksum_crc32c,
+        ),
+        (
+            Sdk::Crc64Nvme,
+            ChecksumAlgorithm::Crc64Nvme,
+            "x-amz-checksum-crc64nvme",
+            IntegrityChecks::checksum_crc64_nvme,
+        ),
+        (
+            Sdk::Sha1,
+            ChecksumAlgorithm::Sha1,
+            "x-amz-checksum-sha1",
+            IntegrityChecks::checksum_sha1,
+        ),
+        (
+            Sdk::Sha256,
+            ChecksumAlgorithm::Sha256,
+            "x-amz-checksum-sha256",
+            IntegrityChecks::checksum_sha256,
+        ),
+    ]
+}
+
+/// A transfer manager whose S3 client sets `ResponseChecksumValidation` to
+/// `WhenRequired`, so a download validates only when its request enables it.
+fn when_required_tm(
+    http_client: StaticReplayClient,
+    part_size: usize,
+) -> aws_sdk_s3_transfer_manager::Client {
+    let shared = common::shared_config(http_client)
+        .into_builder()
+        .response_checksum_validation(
+            aws_smithy_types::checksum_config::ResponseChecksumValidation::WhenRequired,
+        )
+        .build();
+    let config = aws_sdk_s3_transfer_manager::Config::builder()
+        .s3_config(aws_sdk_s3_transfer_manager::config::S3ClientConfig::new(
+            &shared,
+        ))
+        .part_size(PartSize::Target(part_size as u64))
+        .concurrency(ConcurrencyMode::Explicit(1))
+        .build();
+    aws_sdk_s3_transfer_manager::Client::new(config)
 }
 
 /// Downloads `test-object` through `tm`, with `checksum_mode` if set, and returns
@@ -1180,21 +1158,7 @@ async fn test_integrity_checks_default_mode_validates() {
 async fn test_integrity_checks_disabled_when_validation_when_required() {
     let data = Bytes::from_static(HELLO);
     let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
-    let http_client = single_part_connector(&data, Some(HELLO_CRC32));
-    let shared = common::shared_config(http_client)
-        .into_builder()
-        .response_checksum_validation(
-            aws_smithy_types::checksum_config::ResponseChecksumValidation::WhenRequired,
-        )
-        .build();
-    let config = aws_sdk_s3_transfer_manager::Config::builder()
-        .s3_config(aws_sdk_s3_transfer_manager::config::S3ClientConfig::new(
-            &shared,
-        ))
-        .part_size(PartSize::Target(part_size as u64))
-        .concurrency(ConcurrencyMode::Explicit(1))
-        .build();
-    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+    let tm = when_required_tm(single_part_connector(&data, Some(HELLO_CRC32)), part_size);
 
     let mut handle = tm
         .download()
@@ -1244,10 +1208,12 @@ async fn test_integrity_checks_part_level_only_reads_composite_checksum() {
 async fn test_integrity_checks_validated_and_part_level_read_partial_coverage() {
     let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
     let data = rand_data(part_size + 1024);
-    let first_crc32 = crc32_base64(&data[..part_size]);
-    let http_client = crc32_object_connector(&data, part_size, |index| match index {
-        0 => first_crc32.clone(),
-        _ => "AAAAAA==-2".to_owned(),
+    let http_client = object_connector_with_checksum_headers(&data, part_size, |index, chunk| {
+        let value = match index {
+            0 => checksum_value(aws_smithy_checksums::ChecksumAlgorithm::Crc32, chunk),
+            _ => "AAAAAA==-2".to_owned(),
+        };
+        Some(("x-amz-checksum-crc32", value))
     });
     let tm = test_tm(http_client, part_size);
 
@@ -1273,14 +1239,156 @@ async fn test_integrity_checks_no_checksum_reads_unavailable() {
 async fn test_integrity_checks_md5_only_reads_unsupported_algorithm() {
     let data = Bytes::from_static(HELLO);
     let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
-    let http_client = single_part_connector_with_checksum(
-        &data,
-        Some(("x-amz-checksum-md5", "XrY7u+Ae7tCTyyK7j1rNww==")),
-    );
+    let http_client = object_connector_with_checksum_headers(&data, data.len(), |_, _| {
+        Some(("x-amz-checksum-md5", "XrY7u+Ae7tCTyyK7j1rNww==".to_owned()))
+    });
     let tm = test_tm(http_client, part_size);
 
     let validation = download_checksum_validation(&tm, Some(ChecksumMode::Enabled)).await;
     assert_not_validated(&validation, NotValidatedReason::UnsupportedAlgorithm);
+}
+
+/// Client ResponseChecksumValidation=WhenRequired, with checksum_mode Enabled on
+/// the request: the request turns validation on, so a response whose CRC32
+/// matches reads Validated{Crc32}.
+#[tokio::test]
+async fn test_integrity_checks_enabled_validates_when_validation_when_required() {
+    let data = Bytes::from_static(HELLO);
+    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let tm = when_required_tm(single_part_connector(&data, Some(HELLO_CRC32)), part_size);
+
+    let validation = download_checksum_validation(&tm, Some(ChecksumMode::Enabled)).await;
+    assert_validated(&validation, ChecksumAlgorithm::Crc32);
+}
+
+/// Each algorithm the SDK validates: a response whose checksum matches its body
+/// delivers the body, reads Validated with that algorithm, and reports the value
+/// as the object's checksum.
+#[tokio::test]
+async fn test_integrity_checks_each_algorithm_validates() {
+    let data = Bytes::from_static(HELLO);
+    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    for (sdk_algorithm, tm_algorithm, header, object_value) in checksum_cases() {
+        let value = checksum_value(sdk_algorithm, HELLO);
+        let http_client = object_connector_with_checksum_headers(&data, part_size, |_, _| {
+            Some((header, value.clone()))
+        });
+        let tm = test_tm(http_client, part_size);
+
+        let mut handle = tm
+            .download()
+            .bucket("test-bucket")
+            .key("test-object")
+            .checksum_mode(ChecksumMode::Enabled)
+            .initiate()
+            .unwrap();
+        let body = drain(&mut handle).await.unwrap();
+        let output = handle.join().await.unwrap();
+
+        assert_eq!(body, data, "{tm_algorithm:?}");
+        assert_validated(
+            output.integrity_checks().checksum_validation(),
+            tm_algorithm.clone(),
+        );
+        assert_eq!(
+            object_value(output.integrity_checks()),
+            Some(value.as_str()),
+            "{tm_algorithm:?}"
+        );
+    }
+}
+
+/// Each algorithm the SDK validates: a response whose checksum does not match its
+/// body fails the body and `join` with IntegrityError, carrying the algorithm and
+/// both values, after a single request.
+#[tokio::test]
+async fn test_integrity_checks_each_algorithm_mismatch_is_integrity_error() {
+    let data = Bytes::from_static(HELLO);
+    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    for (sdk_algorithm, tm_algorithm, header, _) in checksum_cases() {
+        let expected = checksum_value(sdk_algorithm, b"other object");
+        let computed = checksum_value(sdk_algorithm, HELLO);
+        let http_client = object_connector_with_checksum_headers(&data, part_size, |_, _| {
+            Some((header, expected.clone()))
+        });
+        let tm = test_tm(http_client.clone(), part_size);
+
+        let mut handle = tm
+            .download()
+            .bucket("test-bucket")
+            .key("test-object")
+            .checksum_mode(ChecksumMode::Enabled)
+            .initiate()
+            .unwrap();
+        let body_error = handle.body_mut().next().await.unwrap().unwrap_err();
+        let join_error = handle.join().await.unwrap_err();
+
+        for error in [&body_error, &join_error] {
+            let ErrorKind::IntegrityError(details) = error.kind() else {
+                panic!("{tm_algorithm:?}: expected IntegrityError, got {error:?}");
+            };
+            assert_eq!(details.algorithm(), Some(&tm_algorithm));
+            assert_eq!(details.expected(), Some(expected.as_str()));
+            assert_eq!(details.computed(), Some(computed.as_str()));
+        }
+        assert_eq!(http_client.actual_requests().count(), 1, "{tm_algorithm:?}");
+    }
+}
+
+/// A range with no end is discovered with HeadObject, so every delivered byte
+/// comes from a ranged GET. When that response's CRC32 matches, the verdict is
+/// Validated{Crc32}.
+#[tokio::test]
+async fn test_integrity_checks_head_discovery_validates() {
+    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let tail = Bytes::from_static(&HELLO[6..]);
+    let content_range = format!("bytes 6-{}/{}", HELLO.len() - 1, HELLO.len());
+    let response = || {
+        http::Response::builder()
+            .status(206)
+            .header("Content-Length", format!("{}", tail.len()))
+            .header("Content-Range", content_range.as_str())
+            .header("ETag", "my-etag")
+    };
+    let http_client = StaticReplayClient::new(vec![
+        ReplayEvent::new(
+            dummy_expected_request(),
+            response().body(SdkBody::empty()).unwrap(),
+        ),
+        ReplayEvent::new(
+            dummy_expected_request(),
+            response()
+                .header(
+                    "x-amz-checksum-crc32",
+                    checksum_value(aws_smithy_checksums::ChecksumAlgorithm::Crc32, &tail),
+                )
+                .body(SdkBody::from(tail.clone()))
+                .unwrap(),
+        ),
+    ]);
+    let tm = test_tm(http_client.clone(), part_size);
+
+    let mut handle = tm
+        .download()
+        .bucket("test-bucket")
+        .key("test-object")
+        .range("bytes=6-")
+        .checksum_mode(ChecksumMode::Enabled)
+        .initiate()
+        .unwrap();
+    let body = drain(&mut handle).await.unwrap();
+    let output = handle.join().await.unwrap();
+
+    let methods: Vec<_> = http_client
+        .actual_requests()
+        .map(|request| request.method().to_owned())
+        .collect();
+    assert_eq!(methods, ["HEAD", "GET"]);
+    assert_eq!(body, tail);
+    assert_validated(
+        output.integrity_checks().checksum_validation(),
+        ChecksumAlgorithm::Crc32,
+    );
 }
 
 /// Whole object in the discovery chunk → the response checksum IS the object's,
@@ -1312,7 +1420,7 @@ async fn test_integrity_checks_surfaces_whole_object_checksum() {
 async fn test_integrity_checks_multipart_does_not_surface_part_checksum() {
     let data = rand_data(12 * ByteUnit::Mebibyte.as_bytes_usize());
     let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
-    // simple_object_connector splits into parts and stamps no checksum header,
+    // object_connector splits into parts and stamps no checksum header,
     // but even if part 1 carried one, it must not be reported as the object value.
     let (tm, _c) = simple_test_tm(&data, part_size);
 

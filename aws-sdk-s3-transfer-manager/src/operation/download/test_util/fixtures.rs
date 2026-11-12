@@ -62,37 +62,18 @@ pub(crate) fn object_client_failing_at(
 ) -> aws_sdk_s3::Client {
     use aws_sdk_s3::operation::get_object::GetObjectOutput;
     use aws_sdk_s3::primitives::ByteStream;
-    use aws_smithy_mocks::{mock, mock_client, MockResponse, RuleMode};
-    use aws_smithy_runtime_api::http::{Response, StatusCode};
-    use aws_smithy_types::body::SdkBody;
+    use aws_smithy_mocks::MockResponse;
 
-    use crate::http::header::{ByteRange, Range};
-
-    let get = mock!(aws_sdk_s3::Client::get_object).then_compute_response(move |req| {
-        let (start, end) = match req.range().and_then(|r| r.parse::<Range>().ok()) {
-            Some(Range(ByteRange::Inclusive(start, end))) => {
-                (start, end.min(object.len() as u64 - 1))
-            }
-            other => panic!("unexpected range request {other:?}"),
-        };
-        if start == failing_start {
-            return MockResponse::Http(Response::new(
-                StatusCode::try_from(500).unwrap(),
-                SdkBody::from("internal error"),
-            ));
-        }
-        let body = object[start as usize..=end as usize].to_vec();
+    let object_len = object.len();
+    strict_range_client(object, Some(failing_start), move |start, end, body| {
         MockResponse::Output(
             GetObjectOutput::builder()
                 .content_length(body.len() as i64)
-                .content_range(format!("bytes {start}-{end}/{}", object.len()))
+                .content_range(format!("bytes {start}-{end}/{object_len}"))
                 .e_tag("test-etag")
-                .body(ByteStream::from(body))
+                .body(ByteStream::from(body.to_vec()))
                 .build(),
         )
-    });
-    mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get], |conf| {
-        conf.retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
     })
 }
 
@@ -105,6 +86,50 @@ pub(crate) fn object_client_failing_at(
 pub(crate) fn crc32_object_client(
     object: Arc<[u8]>,
     failing_start: Option<u64>,
+) -> aws_sdk_s3::Client {
+    use aws_smithy_mocks::MockResponse;
+    use aws_smithy_runtime_api::http::{Response, StatusCode};
+    use aws_smithy_types::body::SdkBody;
+
+    let object_len = object.len();
+    strict_range_client(object, failing_start, move |start, end, body| {
+        let mut crc32 = aws_smithy_checksums::ChecksumAlgorithm::Crc32.into_impl();
+        crc32.update(body);
+        let mut response = Response::new(
+            StatusCode::try_from(200).unwrap(),
+            SdkBody::from(body.to_vec()),
+        );
+        let headers = response.headers_mut();
+        headers.insert("content-length", body.len().to_string());
+        headers.insert("content-range", format!("bytes {start}-{end}/{object_len}"));
+        headers.insert("etag", "test-etag");
+        headers.insert(
+            "x-amz-checksum-crc32",
+            aws_smithy_types::base64::encode(crc32.finalize()),
+        );
+        MockResponse::Http(response)
+    })
+}
+
+/// An S3 client serving `object` by inclusive byte range, clamped to the object,
+/// with SDK retries disabled. `respond` builds the answer from the range's start,
+/// end and bytes; the range starting at `failing_start`, if any, answers with a
+/// server error instead.
+///
+/// Panics on a request without an inclusive byte range.
+fn strict_range_client(
+    object: Arc<[u8]>,
+    failing_start: Option<u64>,
+    respond: impl Fn(
+            u64,
+            u64,
+            &[u8],
+        ) -> aws_smithy_mocks::MockResponse<
+            aws_sdk_s3::operation::get_object::GetObjectOutput,
+            aws_sdk_s3::operation::get_object::GetObjectError,
+        > + Send
+        + Sync
+        + 'static,
 ) -> aws_sdk_s3::Client {
     use aws_smithy_mocks::{mock, mock_client, MockResponse, RuleMode};
     use aws_smithy_runtime_api::http::{Response, StatusCode};
@@ -125,25 +150,7 @@ pub(crate) fn crc32_object_client(
                 SdkBody::from("internal error"),
             ));
         }
-        let body = &object[start as usize..=end as usize];
-        let mut crc32 = aws_smithy_checksums::ChecksumAlgorithm::Crc32.into_impl();
-        crc32.update(body);
-        let mut response = Response::new(
-            StatusCode::try_from(200).unwrap(),
-            SdkBody::from(body.to_vec()),
-        );
-        let headers = response.headers_mut();
-        headers.insert("content-length", body.len().to_string());
-        headers.insert(
-            "content-range",
-            format!("bytes {start}-{end}/{}", object.len()),
-        );
-        headers.insert("etag", "test-etag");
-        headers.insert(
-            "x-amz-checksum-crc32",
-            aws_smithy_types::base64::encode(crc32.finalize()),
-        );
-        MockResponse::Http(response)
+        respond(start, end, &object[start as usize..=end as usize])
     });
     mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get], |conf| {
         conf.retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
@@ -262,7 +269,7 @@ pub(crate) struct ReliefScenario {
 /// The memory budget fits two parts, and a reservation outside the transfer
 /// holds one of them. Discovery fills the first part below the drain batch,
 /// the second part's claim then waits on memory, and `poll_work` relieves the
-/// resident first part.
+/// resident first part. Each part's response carries its CRC32.
 pub(crate) async fn relief_scenario(script: &Arc<WriteScript>) -> ReliefScenario {
     let part_size = 8 * 1024 * 1024;
     let object = object_bytes(2 * part_size as usize);
@@ -277,7 +284,7 @@ pub(crate) async fn relief_scenario(script: &Arc<WriteScript>) -> ReliefScenario
         .unwrap()
         .expect("the budget fits the blocker");
     let config = crate::Config::builder()
-        .sdk_client(object_client(Arc::clone(&object)))
+        .sdk_client(crc32_object_client(Arc::clone(&object), None))
         .part_size(crate::types::PartSize::Target(part_size))
         .memory(crate::types::MemoryConfig::Explicit(pool))
         .build();

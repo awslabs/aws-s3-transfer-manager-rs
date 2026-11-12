@@ -3502,6 +3502,20 @@ mod tests {
     /// How long a test waits for a scripted hold to start.
     const HOLD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+    /// The checksum verdict `transfer` has published, if any.
+    fn published_verdict(transfer: &DownloadTransfer) -> Option<&crate::types::ChecksumValidation> {
+        transfer
+            .integrity_checks()
+            .map(crate::types::IntegrityChecks::checksum_validation)
+    }
+
+    /// The verdict of a download whose every part carried a matching CRC32.
+    fn validated_crc32() -> crate::types::ChecksumValidation {
+        crate::types::ChecksumValidation::Validated {
+            algorithm: crate::model::ChecksumAlgorithm::Crc32,
+        }
+    }
+
     /// The final range retiring while a memory-relief write is still landing does
     /// not complete the transfer: finalization cannot see the run that write
     /// claimed. The relief write completes the transfer when it retires, and the
@@ -3536,6 +3550,7 @@ mod tests {
             transfer.ctx().is_active(),
             "the transfer completed while a destination write was in flight"
         );
+        assert_eq!(published_verdict(transfer), None);
         assert_pending(transfer.poll_work());
         assert_eq!(
             std::fs::metadata(path).unwrap().len(),
@@ -3551,6 +3566,7 @@ mod tests {
             transfer.ctx().transfer_status(),
             crate::types::TransferStatus::Completed
         );
+        assert_eq!(published_verdict(transfer), Some(&validated_crc32()));
         assert_eq!(std::fs::read(path).unwrap(), &object[..]);
         assert_eq!(transfer.ctx().metrics().disk_write, object.len() as u64);
         assert_done(transfer.poll_work());
@@ -3583,6 +3599,7 @@ mod tests {
             .take_error()
             .expect("the failure is reported");
         assert_eq!(error.kind(), &crate::error::ErrorKind::IOError);
+        assert_eq!(published_verdict(transfer), None);
         assert!(
             !finalize_started(&script.events()),
             "a failed transfer must not finalize its destination"
@@ -3667,6 +3684,7 @@ mod tests {
             transfer.ctx().is_active(),
             "the transfer completed while a relief item was queued"
         );
+        assert_eq!(published_verdict(transfer), None);
         assert_pending(transfer.poll_work());
         assert!(!finalize_started(&script.events()));
 
@@ -3676,6 +3694,7 @@ mod tests {
             transfer.ctx().transfer_status(),
             crate::types::TransferStatus::Completed
         );
+        assert_eq!(published_verdict(transfer), Some(&validated_crc32()));
         assert_eq!(std::fs::read(&scenario.path).unwrap(), &scenario.object[..]);
         assert_done(transfer.poll_work());
     }
@@ -3713,7 +3732,7 @@ mod tests {
         max_partitions: usize,
     ) -> HeldReliefDownload {
         use crate::operation::download::test_util::fixtures::{
-            managed_test_handle_with_max_partitions, object_bytes, object_client,
+            managed_test_handle_with_max_partitions, object_bytes,
         };
         use crate::operation::download::test_util::sink::{
             Action, Match, Op, ScriptedSinkFactory, WriteScript,
@@ -3735,7 +3754,7 @@ mod tests {
             .expect("the budget fits the blocker");
         let script = Arc::new(WriteScript::default()).on(Match::NthWrite(1), Action::Hold);
         let config = crate::Config::builder()
-            .sdk_client(object_client(Arc::clone(&object)))
+            .sdk_client(crc32_object_client(Arc::clone(&object), None))
             .part_size(crate::types::PartSize::Target(part_size as u64))
             .memory(crate::types::MemoryConfig::Explicit(pool))
             .build();
@@ -3816,13 +3835,17 @@ mod tests {
     }
 
     /// `join` waits for an in-flight memory-relief write, then publishes the
-    /// complete object.
+    /// complete object and its verdict.
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn write_to_path_join_waits_for_a_held_relief_write() {
         let download = write_to_path_with_held_relief_write(None, 4).await;
-        download.result.expect("the download succeeds");
+        let output = download.result.expect("the download succeeds");
         assert_eq!(std::fs::read(&download.dest).unwrap(), &download.object[..]);
+        assert_eq!(
+            output.integrity_checks().checksum_validation(),
+            &validated_crc32()
+        );
     }
 
     /// A memory-relief write that fails after the final range was received fails
@@ -3851,10 +3874,14 @@ mod tests {
     #[tokio::test]
     async fn held_relief_write_on_one_partition_preserves_completion_and_cleanup() {
         let download = write_to_path_with_held_relief_write(None, 1).await;
-        download
+        let output = download
             .result
             .expect("download succeeds after the write is released");
         assert_eq!(std::fs::read(&download.dest).unwrap(), &download.object[..]);
+        assert_eq!(
+            output.integrity_checks().checksum_validation(),
+            &validated_crc32()
+        );
 
         let download =
             write_to_path_with_held_relief_write(Some(std::io::ErrorKind::StorageFull), 1).await;

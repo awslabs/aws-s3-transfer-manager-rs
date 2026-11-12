@@ -9,8 +9,8 @@ use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
 use aws_sdk_s3_transfer_manager::types::{ConcurrencyMode, NotValidatedReason, PartSize};
 use aws_sdk_s3_transfer_manager::RuntimeConfig;
 
+use crate::assertions::assert_not_validated;
 use crate::harness::{mock_tm, mock_tm_with, MockTm};
-use crate::integrity::assert_not_validated;
 use crate::test_data::deterministic_data;
 
 async fn setup() -> MockTm {
