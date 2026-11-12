@@ -208,7 +208,8 @@ pub(crate) async fn assert_download_releases_destination(
         .part_size(PartSize::Target(part_size as u64))
         .concurrency(ConcurrencyMode::Explicit(1))
         .runtime_config(runtime_config)
-        .build();
+        .build()
+        .expect("valid config");
     let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
     let dir = tempfile::tempdir().unwrap();

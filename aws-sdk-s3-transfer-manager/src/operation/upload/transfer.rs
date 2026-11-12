@@ -358,7 +358,17 @@ impl UploadTransfer {
         drop(state);
         match failure {
             Some(failure) => {
-                self.inner.ctx.set_failed(failure.error);
+                // The upload is still open in S3 unless AbortMultipartUpload
+                // removed it: the policy is `Retain`, or the abort failed.
+                // `end_aborting` runs only once no abort is pending, so these
+                // are the remaining outcomes.
+                let error = match upload_id {
+                    Some(upload_id) if abort_mpu != AbortMpuProgress::Done => {
+                        failure.error.with_upload_id(upload_id)
+                    }
+                    _ => failure.error,
+                };
+                self.inner.ctx.set_failed(error);
             }
             None => {
                 // An upload ID with no AbortMultipartUpload to send means the
@@ -1315,7 +1325,7 @@ impl UploadTransfer {
                 Ok(body) => body,
                 Err(error) => {
                     let state = self.inner.state.lock().expect("lock poisoned");
-                    return self.fail(state, error.into(), FailedRequest::Other);
+                    return self.fail(state, error, FailedRequest::Other);
                 }
             };
 
@@ -1851,6 +1861,15 @@ impl Transfer for UploadTransfer {
         self.inner.abort_parts_token.cancel();
         if let Some(upload_id) = left_open {
             self.warn_upload_left_open(&upload_id);
+            // A failure forced from outside, such as a worker panic, is stored
+            // before this hook runs and before the terminal signal `join()`
+            // waits on, so the ID reaches the error `join()` returns.
+            if self.inner.ctx.is_failed() {
+                self.inner.ctx.amend_error(|err| match err.upload_id() {
+                    Some(_) => err,
+                    None => err.with_upload_id(upload_id),
+                });
+            }
         }
         self.report_terminal(snapshot);
         // Last, after the lock and the transfer's own cleanup: it can own the
@@ -1902,7 +1921,8 @@ mod tests {
             crate::Config::builder()
                 .sdk_client(s3_client)
                 .diagnostics_for_test(crate::config::MemoryDiagnosticsConfig::default(), detail)
-                .build(),
+                .build()
+                .expect("valid config"),
         );
 
         let mut input = UploadInput::builder()
@@ -3252,7 +3272,10 @@ mod tests {
         tmp.flush().unwrap();
 
         let handle = crate::client::Handle::test_handle_tokio(
-            crate::Config::builder().sdk_client(s3_client).build(),
+            crate::Config::builder()
+                .sdk_client(s3_client)
+                .build()
+                .expect("valid config"),
         );
         let mut input = UploadInput::builder()
             .bucket("test-bucket")

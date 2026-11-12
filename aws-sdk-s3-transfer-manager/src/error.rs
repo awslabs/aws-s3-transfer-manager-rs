@@ -5,6 +5,7 @@
 
 use std::fmt;
 use std::ops::RangeInclusive;
+use std::path::PathBuf;
 
 use aws_sdk_s3::operation::abort_multipart_upload::AbortMultipartUploadError;
 use aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadError;
@@ -40,8 +41,8 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 pub struct Error {
     kind: ErrorKind,
     source: BoxError,
-    /// Optional metadata. `None` unless a builder attached service, chunk, or
-    /// bulk-failure detail. Boxed to keep [`Error`] small.
+    /// Optional metadata. `None` unless a builder attached service, chunk,
+    /// local-path, upload, or bulk-failure detail. Boxed to keep [`Error`] small.
     extra: Option<Box<ErrorExtra>>,
 }
 
@@ -52,6 +53,10 @@ struct ErrorExtra {
     service: Option<ServiceMetadata>,
     /// Set when the error is attributable to a specific chunk of an object.
     location: Option<ChunkRef>,
+    /// Set when a local filesystem operation on a known path failed.
+    local: Option<LocalContext>,
+    /// Set when a failed upload left this multipart upload open in S3.
+    upload_id: Option<String>,
     /// Per-object upload failures when this error aggregates a bulk upload.
     failed_uploads: Option<Vec<FailedUpload>>,
     /// Per-object download failures when this error aggregates a bulk download.
@@ -67,18 +72,38 @@ struct ErrorExtra {
 }
 
 /// General categories of transfer errors.
+///
+/// The kind classifies where a failure arose. It does not say whether
+/// resubmitting the operation can succeed: failures the transfer manager can
+/// repair, such as throttling responses and interrupted body reads, are retried
+/// internally before an error of any kind is returned.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ErrorKind {
-    /// Operation input validation issues.
+    /// The operation's input was rejected: a required field is missing, a value
+    /// is out of range, settings conflict, or the source cannot be transferred as
+    /// requested, such as a stream that produces more parts than a multipart
+    /// upload allows or an object key that resolves outside the download
+    /// destination or to the destination itself. Conditions visible in the
+    /// input are reported before any request is sent; conditions that depend
+    /// on the source data are reported when the transfer encounters them.
     InputInvalid,
 
-    /// I/O errors. Covers local filesystem failures and transport-level failures
-    /// reading an object body. When a body read fails for a specific chunk,
-    /// [`Error::chunk`] identifies it.
+    /// An I/O operation failed. This covers both local filesystem failures
+    /// (opening, reading, writing, or renaming a file) and transport failures
+    /// while reading an object body from S3, such as a reset connection or a
+    /// truncated response. The source error identifies which.
+    ///
+    /// Because the kind spans local and remote failures, it does not indicate
+    /// whether resubmitting the operation can succeed. When a body read fails
+    /// for a specific chunk, [`Error::chunk`] identifies it.
     IOError,
 
-    /// Some kind of internal runtime issue (e.g. task failure, poisoned mutex).
+    /// The transfer manager could not continue for an internal reason that is
+    /// neither an input, I/O, nor service failure: a worker panicked while
+    /// executing the transfer, the memory budget could not admit a request, or
+    /// a response violated an invariant the transfer depends on, such as a
+    /// `Content-Range` that does not match the requested range.
     RuntimeError,
 
     /// Object discovery failed for a reason that is not a service-call error, such
@@ -105,6 +130,11 @@ pub enum ErrorKind {
     /// A child of a bulk transfer (`upload_objects` / `download_objects`) failed.
     /// The individual failures are available via [`Error::failed_uploads`] /
     /// [`Error::failed_downloads`].
+    ///
+    /// The error's [`source`](std::error::Error::source) is the error of the
+    /// first failed object. Under
+    /// [`FailedTransferPolicy::Abort`](crate::types::FailedTransferPolicy::Abort)
+    /// that is the failure that stopped the transfer.
     ChildOperationFailed,
 
     /// The operation was cancelled, either because the user called `.abort()` on the
@@ -164,6 +194,19 @@ impl ChunkRef {
     pub fn byte_range(&self) -> Option<&RangeInclusive<u64>> {
         self.range.as_ref()
     }
+}
+
+/// A failed local filesystem operation and the path it acted on.
+///
+/// `action` is a lowercase gerund phrase whose object is `path`, such as
+/// `"opening"` or `"creating temporary file for"`, so that `Display` reads
+/// `I/O error opening "/data/a.bin"`.
+#[derive(Debug)]
+struct LocalContext {
+    action: &'static str,
+    path: PathBuf,
+    /// The object key the operation was for, when there is one.
+    key: Option<String>,
 }
 
 /// Service-call detail, read from the concrete `SdkError` of a failed request, or from the output
@@ -292,6 +335,27 @@ impl Error {
         self.extra.as_ref().and_then(|e| e.location.as_ref())
     }
 
+    /// The ID of a multipart upload that the failed upload left open in S3.
+    ///
+    /// Set on the error an upload's [`join`](crate::operation::upload::UploadHandle::join) or
+    /// [`abort`](crate::operation::upload::UploadHandle::abort) returns when the upload created a
+    /// multipart upload that was neither completed nor aborted: the
+    /// [`FailedMultipartUploadPolicy::Retain`](crate::types::FailedMultipartUploadPolicy::Retain)
+    /// policy kept it, the AbortMultipartUpload request failed, or a worker panicked while
+    /// executing the upload, as when the caller's [`PartStream`](crate::io::PartStream) panics,
+    /// which ends it with [`ErrorKind::RuntimeError`] without sending AbortMultipartUpload. S3
+    /// keeps, and bills for, the uploaded parts until the multipart upload is completed or
+    /// aborted with this ID.
+    ///
+    /// A panic that ends the upload while CompleteMultipartUpload or AbortMultipartUpload is in
+    /// flight also sets the ID, although that request may still close the multipart upload.
+    ///
+    /// `None` when no multipart upload was created, when AbortMultipartUpload removed it, and on
+    /// errors from other operations.
+    pub fn upload_id(&self) -> Option<&str> {
+        self.extra.as_ref().and_then(|e| e.upload_id.as_deref())
+    }
+
     /// Per-object upload failures, when this error aggregates a bulk upload.
     pub fn failed_uploads(&self) -> Option<&[FailedUpload]> {
         self.extra
@@ -309,6 +373,33 @@ impl Error {
     /// Attaches chunk location, preserving kind and source.
     pub(crate) fn with_chunk(mut self, location: ChunkRef) -> Self {
         self.extra_mut().location = Some(location);
+        self
+    }
+
+    /// Attaches the local operation that failed and the path it acted on,
+    /// preserving kind and source. See [`io_at`] for `action`.
+    pub(crate) fn with_local(mut self, action: &'static str, path: impl Into<PathBuf>) -> Self {
+        self.extra_mut().local = Some(LocalContext {
+            action,
+            path: path.into(),
+            key: None,
+        });
+        self
+    }
+
+    /// Names the object key a local operation attached with
+    /// [`with_local`](Self::with_local) was for. No effect without one.
+    pub(crate) fn with_local_key(mut self, key: impl Into<String>) -> Self {
+        if let Some(local) = self.extra.as_mut().and_then(|e| e.local.as_mut()) {
+            local.key = Some(key.into());
+        }
+        self
+    }
+
+    /// Attaches the ID of a multipart upload the failed upload left open,
+    /// preserving kind and source.
+    pub(crate) fn with_upload_id(mut self, upload_id: String) -> Self {
+        self.extra_mut().upload_id = Some(upload_id);
         self
     }
 
@@ -384,6 +475,13 @@ impl fmt::Display for Error {
             }
         }
 
+        if let Some(local) = self.extra.as_ref().and_then(|e| e.local.as_ref()) {
+            write!(f, " {} \"{}\"", local.action, local.path.display())?;
+            if let Some(key) = &local.key {
+                write!(f, " (key \"{key}\")")?;
+            }
+        }
+
         if let Some(loc) = self.chunk() {
             match &loc.range {
                 Some(r) => write!(f, " [chunk {}, bytes {}-{}]", loc.seq, r.start(), r.end())?,
@@ -407,35 +505,34 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {
+    /// The underlying cause.
+    ///
+    /// For [`ErrorKind::ChildOperationFailed`] carrying per-object failures,
+    /// this is the first failed object's error, so the source chain reaches
+    /// the child's own cause. Otherwise it is the error this one was created
+    /// from.
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        if matches!(self.kind, ErrorKind::ChildOperationFailed) {
+            let first_child = self
+                .failed_uploads()
+                .and_then(<[FailedUpload]>::first)
+                .map(FailedUpload::error)
+                .or_else(|| {
+                    self.failed_downloads()
+                        .and_then(<[FailedDownload]>::first)
+                        .map(FailedDownload::error)
+                });
+            if let Some(child) = first_child {
+                return Some(child);
+            }
+        }
         Some(self.source.as_ref())
-    }
-}
-
-impl From<crate::io::error::Error> for Error {
-    fn from(value: crate::io::error::Error) -> Self {
-        Self::new(ErrorKind::IOError, value)
     }
 }
 
 impl From<std::io::Error> for Error {
     fn from(value: std::io::Error) -> Self {
         Self::new(ErrorKind::IOError, value)
-    }
-}
-
-impl From<tokio::task::JoinError> for Error {
-    fn from(value: tokio::task::JoinError) -> Self {
-        Self::new(ErrorKind::RuntimeError, value)
-    }
-}
-
-impl<T> From<std::sync::PoisonError<T>> for Error
-where
-    T: Send + Sync + 'static,
-{
-    fn from(value: std::sync::PoisonError<T>) -> Self {
-        Self::new(ErrorKind::RuntimeError, value)
     }
 }
 
@@ -450,6 +547,16 @@ where
     E: Into<BoxError>,
 {
     Error::new(ErrorKind::InputInvalid, err)
+}
+
+/// An [`ErrorKind::IOError`] for a local filesystem operation on `path` that
+/// failed with `err`.
+///
+/// `action` is a lowercase gerund phrase whose object is `path`, such as
+/// `"opening"`, `"reading"`, or `"renaming temporary file to"`. `Display`
+/// renders `I/O error {action} "{path}"`; `err` is the source.
+pub(crate) fn io_at(action: &'static str, path: impl Into<PathBuf>, err: std::io::Error) -> Error {
+    Error::new(ErrorKind::IOError, err).with_local(action, path)
 }
 
 /// Object discovery failed for a non-service reason (e.g. a response missing
@@ -659,6 +766,11 @@ impl From<crate::io::walk::WalkError> for Error {
     /// per-entry filesystem failures are [`ErrorKind::IOError`].
     fn from(e: crate::io::walk::WalkError) -> Self {
         use crate::io::walk::WalkErrorKind;
+        let path = e.path().map(std::path::Path::to_path_buf);
+        let local = |err: Error| match path {
+            Some(path) => err.with_local("walking", path),
+            None => err,
+        };
         match e.kind() {
             WalkErrorKind::Service => {
                 // The S3 walker's only service call is ListObjectsV2, so the
@@ -672,12 +784,12 @@ impl From<crate::io::walk::WalkError> for Error {
                 }
             }
             WalkErrorKind::SourceUnreadable | WalkErrorKind::NotADirectory => {
-                Error::new(ErrorKind::InputInvalid, e)
+                local(Error::new(ErrorKind::InputInvalid, e))
             }
             WalkErrorKind::Io
             | WalkErrorKind::PermissionDenied
             | WalkErrorKind::BrokenSymlink
-            | WalkErrorKind::SymlinkCycle => Error::new(ErrorKind::IOError, e),
+            | WalkErrorKind::SymlinkCycle => local(Error::new(ErrorKind::IOError, e)),
         }
     }
 }
@@ -859,6 +971,96 @@ mod tests {
         }];
         let e = Error::new(ErrorKind::ChildOperationFailed, "aborted").with_failed_uploads(failed);
         assert_eq!(e.to_string(), "child operation failed: 1 object");
+    }
+
+    #[test]
+    fn display_local_context_names_action_and_path() {
+        let e = io_at(
+            "creating temporary file for",
+            "out/logs/a.log",
+            std::io::Error::from(std::io::ErrorKind::NotFound),
+        );
+        assert_eq!(
+            e.to_string(),
+            "I/O error creating temporary file for \"out/logs/a.log\""
+        );
+        // The OS error is the source, not part of the message.
+        let source = std::error::Error::source(&e)
+            .and_then(|s| s.downcast_ref::<std::io::Error>())
+            .expect("the io::Error is the direct source");
+        assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+
+        let e = io_at(
+            "creating directory",
+            "out/logs",
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        )
+        .with_local_key("logs/a.log");
+        assert_eq!(
+            e.to_string(),
+            "I/O error creating directory \"out/logs\" (key \"logs/a.log\")"
+        );
+        // A key without a local operation adds nothing.
+        let e = Error::new(ErrorKind::IOError, "x").with_local_key("logs/a.log");
+        assert_eq!(e.to_string(), "I/O error");
+    }
+
+    #[test]
+    fn display_walker_error_names_path() {
+        use crate::io::walk::{WalkError, WalkErrorKind};
+        let e = Error::from(WalkError::new(
+            Some(std::path::PathBuf::from("/data/sub")),
+            WalkErrorKind::PermissionDenied,
+            Box::new(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+        ));
+        assert_eq!(e.kind(), &ErrorKind::IOError);
+        assert_eq!(e.to_string(), "I/O error walking \"/data/sub\"");
+
+        let root = Error::from(WalkError::new(
+            Some(std::path::PathBuf::from("/data/missing")),
+            WalkErrorKind::SourceUnreadable,
+            Box::new(std::io::Error::from(std::io::ErrorKind::NotFound)),
+        ));
+        assert_eq!(root.kind(), &ErrorKind::InputInvalid);
+        assert_eq!(root.to_string(), "invalid input walking \"/data/missing\"");
+    }
+
+    #[test]
+    fn child_operation_failed_source_is_first_failed_child() {
+        let failed = vec![
+            FailedUpload {
+                input: None,
+                error: Error::new(ErrorKind::ServiceError, "first"),
+                source_path: None,
+            },
+            FailedUpload {
+                input: None,
+                error: Error::new(ErrorKind::ServiceError, "second"),
+                source_path: None,
+            },
+        ];
+        let e = Error::new(ErrorKind::ChildOperationFailed, "aborted").with_failed_uploads(failed);
+        let source = std::error::Error::source(&e)
+            .and_then(|s| s.downcast_ref::<Error>())
+            .expect("the source is a child's error");
+        assert!(std::ptr::eq(source, e.failed_uploads().unwrap()[0].error()));
+
+        // Without per-object failures, the stored source is reported.
+        let bare = Error::new(ErrorKind::ChildOperationFailed, "aborted");
+        assert_eq!(
+            std::error::Error::source(&bare).map(|s| s.to_string()),
+            Some("aborted".to_owned())
+        );
+    }
+
+    #[test]
+    fn upload_id_is_none_unless_attached() {
+        let e = Error::new(ErrorKind::ServiceError, "x");
+        assert_eq!(e.upload_id(), None);
+        let e = e.with_upload_id("abc".to_owned());
+        assert_eq!(e.upload_id(), Some("abc"));
+        // The upload ID is not part of the message.
+        assert_eq!(e.to_string(), "service error");
     }
 
     // --- transient-transport classification -----------------------------------

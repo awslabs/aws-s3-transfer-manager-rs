@@ -34,7 +34,6 @@ fn operation_exports_are_canonical_and_preserve_construction_and_empty_metadata(
     let input: types::DownloadInput = input;
     let builder: download::DownloadInputBuilder = input.clone().into();
     assert_eq!(input, builder.build().unwrap());
-    assert_eq!(input.part_number(), None);
     assert_eq!(input.read_ahead(), Some(&ReadAhead::Parts(3)));
     assert!(types::DownloadInput::builder().key("key").build().is_err());
     assert!(types::DownloadInput::builder()
@@ -61,7 +60,8 @@ fn fluent_fields_use_upstream_getters_and_preserve_conditions_read_ahead_and_red
             .s3_config(common::s3_config(
                 aws_smithy_mocks::create_mock_http_client(),
             ))
-            .build(),
+            .build()
+            .expect("valid config"),
     );
     let since = DateTime::from_secs(123);
     let builder = tm
@@ -131,7 +131,8 @@ async fn fluent_and_modeled_initiation_return_canonical_object_and_chunk_metadat
                 .s3_config(test_common::s3_config_with_test_http(
                     sdk.config().to_builder(),
                 ))
-                .build(),
+                .build()
+                .expect("valid config"),
         );
         let mut handle = if fluent {
             tm.download()
@@ -232,7 +233,8 @@ async fn managed_suffix_download_preserves_head_discovery_metadata_and_absolute_
             .s3_config(test_common::s3_config_with_test_http(
                 sdk.config().to_builder(),
             ))
-            .build(),
+            .build()
+            .expect("valid config"),
     );
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("download");

@@ -10,8 +10,7 @@ pub(crate) mod part_reader;
 mod path_body;
 mod stream;
 
-/// Error types related to I/O abstractions
-pub mod error;
+pub(crate) mod error;
 pub(crate) mod fs;
 mod size_hint;
 /// Walker types for traversing filesystems and S3 buckets.

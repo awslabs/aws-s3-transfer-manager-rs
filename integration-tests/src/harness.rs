@@ -132,7 +132,8 @@ pub(crate) async fn mock_tm_with_s3_config(
     let s3_config = configure_s3(mock_s3_config(&handle).await);
     let cfg = configure(aws_sdk_s3_transfer_manager::Config::builder().s3_config(s3_config))
         .runtime_config(runtime)
-        .build();
+        .build()
+        .expect("valid config");
     MockTm {
         server,
         handle,
@@ -319,7 +320,7 @@ impl TmTestClient {
                 .concurrency(aws_sdk_s3_transfer_manager::types::ConcurrencyMode::Explicit(4));
         }
         Self {
-            tm: TmClient::new(builder.build()),
+            tm: TmClient::new(builder.build().expect("valid config")),
             bucket: "test-bucket".to_string(),
             key_prefix: format!("it-{}", uuid::Uuid::new_v4()),
             mock: Some(MockBackend { server, handle }),

@@ -2090,7 +2090,8 @@ mod tests {
             .sdk_client(client)
             .part_size(crate::types::PartSize::Target(part_size))
             .diagnostics_for_test(crate::config::MemoryDiagnosticsConfig::default(), detail)
-            .build();
+            .build()
+            .expect("valid config");
 
         let handle = crate::client::Handle::test_handle_tokio(config);
 
@@ -2379,7 +2380,8 @@ mod tests {
         let config = crate::Config::builder()
             .sdk_client(client)
             .part_size(crate::types::PartSize::Target(8 * MB))
-            .build();
+            .build()
+            .expect("valid config");
 
         let handle = crate::client::Handle::test_handle_tokio(config);
 
@@ -2689,7 +2691,8 @@ mod tests {
         let config = crate::Config::builder()
             .sdk_client(client)
             .diagnostics_for_test(crate::config::MemoryDiagnosticsConfig::default(), 1)
-            .build();
+            .build()
+            .expect("valid config");
         let handle = crate::client::Handle::test_handle_tokio(config);
         assert!(!handle.user_set_part_size());
         let input = DownloadInput::builder()
@@ -2778,7 +2781,7 @@ mod tests {
                 .expect("test pool");
             config = config.memory(crate::types::MemoryConfig::Explicit(pool));
         }
-        let config = config.build();
+        let config = config.build().expect("valid config");
 
         let handle = crate::client::Handle::test_handle_tokio(config);
 
@@ -3156,7 +3159,8 @@ mod tests {
             .part_size(crate::types::PartSize::Target(part_size))
             .memory(crate::types::MemoryConfig::Explicit(pool.clone()))
             .diagnostics_for_test(crate::config::MemoryDiagnosticsConfig::default(), 1)
-            .build();
+            .build()
+            .expect("valid config");
 
         let handle = crate::client::Handle::test_handle_tokio(config);
 
@@ -3434,7 +3438,8 @@ mod tests {
             ))
             .part_size(crate::types::PartSize::Target(part_size))
             .diagnostics_for_test(crate::config::MemoryDiagnosticsConfig::default(), 1)
-            .build();
+            .build()
+            .expect("valid config");
         let (transfer, _consumer, _dir) = disk_transfer(
             crate::client::Handle::test_handle_tokio(config),
             &FileSinkFactory,
@@ -3744,7 +3749,8 @@ mod tests {
             .sdk_client(crc32_object_client(Arc::clone(&object), None))
             .part_size(crate::types::PartSize::Target(part_size as u64))
             .memory(crate::types::MemoryConfig::Explicit(pool))
-            .build();
+            .build()
+            .expect("valid config");
         let (handle, partition_count) =
             managed_test_handle_with_max_partitions(config, 2, max_partitions);
         let input = DownloadInput::builder()
@@ -4052,7 +4058,8 @@ mod tests {
             .sdk_client(mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get_obj]))
             .part_size(crate::types::PartSize::Target(part_size))
             .memory(crate::types::MemoryConfig::Explicit(pool.clone()))
-            .build();
+            .build()
+            .expect("valid config");
         let handle = crate::client::Handle::test_handle_tokio(config);
 
         let (a, _ca, _da) = disk_transfer(handle.clone(), &FileSinkFactory);
@@ -4134,7 +4141,8 @@ mod tests {
             .sdk_client(mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get_obj]))
             .part_size(crate::types::PartSize::Target(part_size))
             .memory(crate::types::MemoryConfig::Explicit(pool.clone()))
-            .build();
+            .build()
+            .expect("valid config");
         let handle = crate::client::Handle::test_handle_tokio(config);
 
         let (a, _ca, _da) = disk_transfer(handle.clone(), &FileSinkFactory);
@@ -4203,7 +4211,8 @@ mod tests {
                 .sdk_client(mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get_obj]))
                 .part_size(crate::types::PartSize::Target(8 * MB))
                 .read_ahead(client_mode)
-                .build();
+                .build()
+                .expect("valid config");
             let handle = crate::client::Handle::test_handle_tokio(config);
             let input = DownloadInput::builder()
                 .bucket("test-bucket")

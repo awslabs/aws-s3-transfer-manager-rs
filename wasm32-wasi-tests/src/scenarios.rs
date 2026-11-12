@@ -374,7 +374,8 @@ fn write_tree(root: &Path) -> Result<Vec<(PathBuf, Bytes)>, String> {
 }
 
 /// A recursive directory uploads under a key prefix and downloads into
-/// another directory with the same layout and contents.
+/// another directory, where each object lands at its full key: the same
+/// layout and contents beneath the prefix's directory.
 async fn directory_round_trip(store: Store, work: &Path) -> Result<String, String> {
     let before = alive_tasks();
     let client = store.client(|config| config);
@@ -423,7 +424,7 @@ async fn directory_round_trip(store: Store, work: &Path) -> Result<String, Strin
         downloaded.failed_transfers()
     );
     for (relative, data) in &tree {
-        let path = destination.join(relative);
+        let path = destination.join("tree").join(relative);
         ensure_same(&path.display().to_string(), data, &read(&path)?)?;
     }
     shut_down(client, before, store).await
@@ -515,7 +516,7 @@ async fn many_files(store: Store, work: &Path) -> Result<String, String> {
         downloaded.objects_downloaded()
     );
     for index in 0..FILES {
-        let path = destination.join(format!("f{index:04}"));
+        let path = destination.join("many").join(format!("f{index:04}"));
         ensure_same(&path.display().to_string(), &contents(index), &read(&path)?)?;
     }
     shut_down(client, before, store).await

@@ -89,7 +89,8 @@ fn test_tm(
         .s3_config(common::s3_config(http_client))
         .part_size(PartSize::Target(part_size as u64))
         .concurrency(ConcurrencyMode::Explicit(1))
-        .build();
+        .build()
+        .expect("valid config");
 
     aws_sdk_s3_transfer_manager::Client::new(config)
 }
@@ -280,7 +281,8 @@ async fn abort_download_with_executing_gets(runtime_config: RuntimeConfig) {
         .part_size(PartSize::Target(part_size as u64))
         .concurrency(ConcurrencyMode::Explicit(2))
         .runtime_config(runtime_config)
-        .build();
+        .build()
+        .expect("valid config");
     let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
     let handle = tm
@@ -678,6 +680,41 @@ async fn test_download_write_to_path() {
     assert!(tmp_files.is_empty(), "leftover temp files: {:?}", tmp_files);
 }
 
+// ref: RUST-1202
+/// A `write_to_path` destination whose parent directory does not exist fails with an
+/// `IOError` that names what failed and the destination path, with the operating system's
+/// error as its source.
+#[cfg(any(unix, windows))]
+#[tokio::test]
+async fn test_download_write_to_path_missing_parent_error_names_action_and_path() {
+    let data = rand_data(16);
+    let (tm, _http_client) = simple_test_tm(&data, 5 * ByteUnit::Mebibyte.as_bytes_usize());
+
+    let dir = tempfile::tempdir().unwrap();
+    let dest_path = dir.path().join("missing").join("output.dat");
+
+    let error = tm
+        .download()
+        .bucket("test-bucket")
+        .key("test-object")
+        .write_to_path(&dest_path)
+        .await
+        .expect_err("a destination in a missing directory must fail");
+
+    assert_eq!(&ErrorKind::IOError, error.kind());
+    assert_eq!(
+        format!(
+            "I/O error creating temporary file for \"{}\"",
+            dest_path.display()
+        ),
+        error.to_string()
+    );
+    let io_error = std::error::Error::source(&error)
+        .and_then(|s| s.downcast_ref::<std::io::Error>())
+        .expect("the source is the operating system's error");
+    assert_eq!(std::io::ErrorKind::NotFound, io_error.kind());
+}
+
 macro_rules! download_releases_destination_tests {
     ($($(#[$attr:meta])* $name:ident: $destination:ident, $ending:ident, $runtime:expr;)*) => {$(
         $(#[$attr])*
@@ -755,7 +792,8 @@ async fn download_objects_releases_destination_files() {
     let config = aws_sdk_s3_transfer_manager::Config::builder()
         .s3_config(common::s3_config(StaticReplayClient::new(vec![list, get])))
         .concurrency(ConcurrencyMode::Explicit(1))
-        .build();
+        .build()
+        .expect("valid config");
     let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
     let dir = tempfile::tempdir().unwrap();
@@ -796,7 +834,8 @@ async fn write_to_path_drop_clients_then_unlink_releases_destination() {
     let tm = aws_sdk_s3_transfer_manager::Client::new(
         aws_sdk_s3_transfer_manager::Config::builder()
             .s3_config(&shared)
-            .build(),
+            .build()
+            .expect("valid config"),
     );
     let completion = tm.shutdown_completion();
     let dir = tempfile::tempdir().unwrap();
@@ -1100,7 +1139,8 @@ fn when_required_tm(
         ))
         .part_size(PartSize::Target(part_size as u64))
         .concurrency(ConcurrencyMode::Explicit(1))
-        .build();
+        .build()
+        .expect("valid config");
     aws_sdk_s3_transfer_manager::Client::new(config)
 }
 

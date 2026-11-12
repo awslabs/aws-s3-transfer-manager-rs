@@ -166,7 +166,8 @@ pub(crate) fn disk_test_handle(
     let config = crate::Config::builder()
         .sdk_client(client)
         .part_size(crate::types::PartSize::Target(part_size))
-        .build();
+        .build()
+        .expect("valid config");
     crate::client::Handle::test_handle_tokio(config)
 }
 
@@ -287,7 +288,8 @@ pub(crate) async fn relief_scenario(script: &Arc<WriteScript>) -> ReliefScenario
         .sdk_client(crc32_object_client(Arc::clone(&object), None))
         .part_size(crate::types::PartSize::Target(part_size))
         .memory(crate::types::MemoryConfig::Explicit(pool))
-        .build();
+        .build()
+        .expect("valid config");
     let handle = crate::client::Handle::test_handle_tokio(config);
     let (transfer, consumer, dir) = disk_transfer(handle, &ScriptedSinkFactory(Arc::clone(script)));
     let path = dir.path().join("out");

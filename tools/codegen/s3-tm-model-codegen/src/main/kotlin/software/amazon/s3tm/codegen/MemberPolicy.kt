@@ -122,13 +122,14 @@ class MemberPolicy(private val source: Model, private val sourceSymbols: RustSym
             runtime("read_ahead", readAhead, Construction.OPTIONAL,
                 "How far this download may prefetch ahead of the consumer. `None` uses the " +
                     "client default from [`Config`](crate::config::Config); `Some` overrides it for this request."),
-            // Discovery owns SDK part numbers; do not add a public setter for an unsupported transfer.
+            // Discovery owns SDK part numbers; the field, its getter, and its setters stay crate-private
+            // because callers cannot select a part to download.
             modeled(
                 source.expectShape(TmModelProjection.id("GetObjectRequest"), StructureShape::class.java)
                     .getMember("PartNumber").orElseThrow(),
                 "part_number",
+                "pub(crate)",
             ).copy(
-                builderVisibility = "pub(crate)",
                 documentation = "Caller-selected part downloads are not supported. Transfer discovery manages request part numbers.",
             ),
         ))

@@ -455,7 +455,8 @@ mod tests {
         let handle = crate::client::Handle::new_for_test_with_runtime(
             crate::Config::builder()
                 .sdk_client(aws_smithy_mocks::mock_client!(aws_sdk_s3, []))
-                .build(),
+                .build()
+                .expect("valid config"),
             Arc::new(crate::scheduler::FixedConcurrency::new(max_partitions)),
             move |weak| {
                 let execution = Arc::new(ManagedExecution::for_test(weak, max_partitions));

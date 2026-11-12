@@ -1003,7 +1003,10 @@ mod tests {
 
     fn test_handle(concurrency: usize) -> Arc<Handle> {
         let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
-        let config = crate::Config::builder().sdk_client(s3_client).build();
+        let config = crate::Config::builder()
+            .sdk_client(s3_client)
+            .build()
+            .expect("valid config");
         Handle::new_for_test(config, concurrency)
     }
 
@@ -1012,7 +1015,8 @@ mod tests {
         let config = crate::Config::builder()
             .sdk_client(s3_client)
             .diagnostics_for_test(crate::config::MemoryDiagnosticsConfig::default(), detail)
-            .build();
+            .build()
+            .expect("valid config");
         Handle::new_for_test(config, concurrency)
     }
 
@@ -1361,7 +1365,10 @@ mod tests {
             samples: AtomicUsize::new(0),
         });
         let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
-        let config = crate::Config::builder().sdk_client(s3_client).build();
+        let config = crate::Config::builder()
+            .sdk_client(s3_client)
+            .build()
+            .expect("valid config");
         let handle = Handle::new_for_test_with_runtime(config, controller.clone(), |weak| {
             Arc::new(crate::runtime::TokioMultiThreadRuntime::new(weak))
         });
@@ -1390,7 +1397,10 @@ mod tests {
 
     fn test_handle_managed(concurrency: usize) -> Arc<Handle> {
         let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
-        let config = crate::Config::builder().sdk_client(s3_client).build();
+        let config = crate::Config::builder()
+            .sdk_client(s3_client)
+            .build()
+            .expect("valid config");
         Handle::new_for_test_with_runtime(
             config,
             Arc::new(crate::scheduler::FixedConcurrency::new(concurrency)),
@@ -1957,7 +1967,10 @@ mod tests {
             completions: AtomicUsize::new(0),
         });
         let s3_client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
-        let config = crate::Config::builder().sdk_client(s3_client).build();
+        let config = crate::Config::builder()
+            .sdk_client(s3_client)
+            .build()
+            .expect("valid config");
         let handle =
             Handle::new_for_test_with_runtime(
                 config,

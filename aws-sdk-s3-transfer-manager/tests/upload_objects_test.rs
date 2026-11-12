@@ -101,7 +101,8 @@ async fn test_successful_multiple_objects_upload_via_put_object() {
                     .config()
                     .to_builder(),
             ))
-            .build();
+            .build()
+            .expect("valid config");
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
         let handle = sut
@@ -144,7 +145,8 @@ async fn test_successful_multiple_objects_upload_via_multipart_upload() {
                     .to_builder(),
             ))
             .multipart_threshold(PartSize::Target(5))
-            .build();
+            .build()
+            .expect("valid config");
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
         let handle = sut
@@ -202,7 +204,8 @@ async fn test_successful_multiple_objects_upload_with_symlinks() {
                     .config()
                     .to_builder(),
             ))
-            .build();
+            .build()
+            .expect("valid config");
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
         // Test with following symbolic links while uploading recursively
@@ -263,7 +266,8 @@ async fn test_source_dir_is_symlink() {
                     .config()
                     .to_builder(),
             ))
-            .build();
+            .build()
+            .expect("valid config");
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
         // When the source is a symbolic link to a directory and follow_symlinks is false,
@@ -327,7 +331,8 @@ async fn test_failed_upload_policy_continue() {
                     .config()
                     .to_builder(),
             ))
-            .build();
+            .build()
+            .expect("valid config");
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
         let handle = sut
@@ -366,7 +371,8 @@ async fn test_server_error_should_be_recorded_as_such_in_failed_transfers() {
             .s3_config(test_common::s3_config_with_test_http(
                 s3_client.config().to_builder(),
             ))
-            .build();
+            .build()
+            .expect("valid config");
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
         let handle = sut
@@ -402,7 +408,8 @@ async fn test_source_dir_not_valid() {
                     .config()
                     .to_builder(),
             ))
-            .build();
+            .build()
+            .expect("valid config");
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
         // The walker detects the non-directory root on first iteration; the error
@@ -441,7 +448,8 @@ async fn test_error_when_custom_delimiter_appears_in_filename() {
                     .config()
                     .to_builder(),
             ))
-            .build();
+            .build()
+            .expect("valid config");
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
         let handle = sut
@@ -454,11 +462,21 @@ async fn test_error_when_custom_delimiter_appears_in_filename() {
             .unwrap();
 
         // Under the default Abort policy, the first key derivation failure aborts
-        // the transfer. The terminal error is ChildOperationFailed with the cause
-        // text threaded through abort().
+        // the transfer. The terminal error is ChildOperationFailed, and its
+        // source chain carries the key derivation error.
         let err = handle.join().await.unwrap_err();
         assert_eq!(&ErrorKind::ChildOperationFailed, err.kind());
-        assert!(format!("{}", DisplayErrorContext(err)).contains("key derivation failure"));
+        let child = std::error::Error::source(&err)
+            .and_then(|s| s.downcast_ref::<aws_sdk_s3_transfer_manager::error::Error>())
+            .expect("the source is the failed child's error");
+        assert_eq!(&ErrorKind::InputInvalid, child.kind());
+        let cause = std::error::Error::source(child).expect("the child keeps its cause");
+        assert!(
+            cause
+                .to_string()
+                .contains("a custom delimiter `-` should not appear in"),
+            "the child's cause is the key derivation error, got: {cause}"
+        );
     })
     .await
     .expect("test_error_when_custom_delimiter_appears_in_filename timed out");
@@ -495,7 +513,8 @@ async fn test_abort_on_handle_should_terminate_tasks_gracefully() {
             .s3_config(test_common::s3_config_with_test_http(
                 s3_client.config().to_builder(),
             ))
-            .build();
+            .build()
+            .expect("valid config");
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
         let handle = sut
@@ -546,7 +565,8 @@ async fn test_failed_child_operation_should_cause_ongoing_requests_to_be_cancell
             .s3_config(test_common::s3_config_with_test_http(
                 s3_client.config().to_builder(),
             ))
-            .build();
+            .build()
+            .expect("valid config");
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
         let handle = sut
@@ -562,6 +582,84 @@ async fn test_failed_child_operation_should_cause_ongoing_requests_to_be_cancell
     })
     .await
     .expect("test_failed_child_operation_should_cause_ongoing_requests_to_be_cancelled timed out");
+}
+
+// ref: RUST-1202
+/// Under the Abort policy, the aggregate error's source is the error of the
+/// child upload that triggered the abort, so the error chain names the failed
+/// S3 operation and its error code.
+#[tokio::test]
+async fn test_aborted_upload_objects_error_source_is_failed_child_error() {
+    use aws_sdk_s3_transfer_manager::error::Error;
+
+    timeout(TEST_TIMEOUT, async {
+        let test_dir = create_test_dir(
+            Some("test"),
+            vec![("a.txt", 1), ("denied.txt", 1), ("b.txt", 1)],
+            &[],
+        );
+
+        let denied = mock!(aws_sdk_s3::Client::put_object)
+            .match_requests(|input| input.key() == Some("denied.txt"))
+            .then_http_response(|| {
+                HttpResponse::new(
+                    StatusCode::try_from(403).unwrap(),
+                    SdkBody::from("<Error><Code>AccessDenied</Code></Error>"),
+                )
+            });
+        let put_object = mock!(aws_sdk_s3::Client::put_object)
+            .then_output(|| PutObjectOutput::builder().build());
+        let s3_client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[denied, put_object]);
+        let config = aws_sdk_s3_transfer_manager::Config::builder()
+            .s3_config(test_common::s3_config_with_test_http(
+                s3_client.config().to_builder(),
+            ))
+            .build()
+            .expect("valid config");
+        let sut = aws_sdk_s3_transfer_manager::Client::new(config);
+
+        let err = sut
+            .upload_objects()
+            .bucket("test-bucket")
+            .source(test_dir.path())
+            .failure_policy(FailedTransferPolicy::Abort)
+            .initiate()
+            .unwrap()
+            .join()
+            .await
+            .unwrap_err();
+
+        assert_eq!(&ErrorKind::ChildOperationFailed, err.kind());
+        let first = err
+            .failed_uploads()
+            .and_then(|f| f.first())
+            .expect("the aggregate carries the failed uploads");
+        assert_eq!(
+            Some("denied.txt"),
+            first
+                .source_path()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+        );
+
+        let source = std::error::Error::source(&err)
+            .and_then(|s| s.downcast_ref::<Error>())
+            .expect("the source is the failed child's error");
+        assert!(
+            std::ptr::eq(source, first.error()),
+            "the source is the first failed upload's error"
+        );
+        assert_eq!(Some("PutObject"), source.operation_name());
+        assert_eq!(Some("AccessDenied"), source.code());
+
+        let context = format!("{}", DisplayErrorContext(&err));
+        assert!(
+            context.contains("PutObject") && context.contains("AccessDenied"),
+            "the error context names the child's operation and code, got: {context}"
+        );
+    })
+    .await
+    .expect("test_aborted_upload_objects_error_source_is_failed_child_error timed out");
 }
 
 #[tokio::test]
@@ -595,7 +693,8 @@ async fn test_drop_upload_objects_handle() {
             .s3_config(test_common::s3_config_with_test_http(
                 s3_client.config().to_builder(),
             ))
-            .build();
+            .build()
+            .expect("valid config");
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
         let handle = sut
@@ -649,7 +748,8 @@ async fn test_metrics_correctness_on_success() {
                     .config()
                     .to_builder(),
             ))
-            .build();
+            .build()
+            .expect("valid config");
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
         let handle = sut
@@ -703,7 +803,8 @@ async fn test_max_concurrent_uploads_one_serial_execution() {
                     .config()
                     .to_builder(),
             ))
-            .build();
+            .build()
+            .expect("valid config");
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
         let handle = sut
@@ -750,7 +851,8 @@ async fn test_deep_tree_subtree_claiming() {
                     .config()
                     .to_builder(),
             ))
-            .build();
+            .build()
+            .expect("valid config");
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
         let handle = sut
@@ -796,7 +898,8 @@ async fn test_walker_filter_restricts_uploads() {
                     .config()
                     .to_builder(),
             ))
-            .build();
+            .build()
+            .expect("valid config");
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
         let handle = sut
@@ -842,7 +945,8 @@ async fn test_empty_source_directory() {
                     .config()
                     .to_builder(),
             ))
-            .build();
+            .build()
+            .expect("valid config");
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
         let handle = sut
@@ -905,7 +1009,8 @@ async fn test_interleaved_success_failure_continue() {
             .s3_config(test_common::s3_config_with_test_http(
                 s3_client.config().to_builder(),
             ))
-            .build();
+            .build()
+            .expect("valid config");
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
         let handle = sut
@@ -959,7 +1064,8 @@ async fn test_drop_during_walk_in_progress() {
                     .config()
                     .to_builder(),
             ))
-            .build();
+            .build()
+            .expect("valid config");
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
         let handle = sut
@@ -1007,7 +1113,8 @@ async fn test_multipart_metrics_aggregate_across_children() {
                     .to_builder(),
             ))
             .multipart_threshold(PartSize::Target(5))
-            .build();
+            .build()
+            .expect("valid config");
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
         let handle = sut
@@ -1047,7 +1154,8 @@ async fn test_status_transitions_to_terminal() {
                     .config()
                     .to_builder(),
             ))
-            .build();
+            .build()
+            .expect("valid config");
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
         let handle = sut
@@ -1091,7 +1199,8 @@ async fn test_hidden_files_uploaded_by_default() {
                     .config()
                     .to_builder(),
             ))
-            .build();
+            .build()
+            .expect("valid config");
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
         let handle = sut
@@ -1138,7 +1247,8 @@ async fn test_multiple_iterations_on_same_client_do_not_hang() {
                     .config()
                     .to_builder(),
             ))
-            .build();
+            .build()
+            .expect("valid config");
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
         for iter in 0..ITERATIONS {
@@ -1204,7 +1314,8 @@ async fn test_concurrent_child_completion_terminates_cleanly() {
                     .config()
                     .to_builder(),
             ))
-            .build();
+            .build()
+            .expect("valid config");
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
         let handle = sut
@@ -1256,7 +1367,8 @@ async fn test_continue_policy_records_all_failures_under_concurrent_orchestratio
             .s3_config(test_common::s3_config_with_test_http(
                 s3.config().to_builder(),
             ))
-            .build();
+            .build()
+            .expect("valid config");
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
         let handle = sut
@@ -1319,7 +1431,8 @@ async fn test_max_concurrent_uploads_respected_during_concurrent_orchestration()
         let s3 = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&put_object]);
         let config = aws_sdk_s3_transfer_manager::Config::builder()
             .s3_config(test_common::s3_config_with_test_http(s3.config().to_builder()))
-            .build();
+            .build()
+.expect("valid config");
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
         let handle = sut
@@ -1354,8 +1467,8 @@ async fn test_max_concurrent_uploads_respected_during_concurrent_orchestration()
 /// populated exercises the lock-released orchestration window plus the
 /// merge-spawned reservation-release path.
 ///
-/// Asserts: `join()` returns `Err`, the surfaced error string contains
-/// the abort cause, and the test completes within its timeout (no hang
+/// Asserts: `join()` returns `Err`, the error's source is the failed
+/// PutObject that caused the abort, and the test completes within its timeout (no hang
 /// on stale `children_reserved` or `reaping_in_flight`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_abort_policy_terminates_cleanly_during_concurrent_orchestration() {
@@ -1384,7 +1497,8 @@ async fn test_abort_policy_terminates_cleanly_during_concurrent_orchestration() 
                 .config()
                 .to_builder(),
             ))
-            .build();
+            .build()
+            .expect("valid config");
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
         let handle = sut
@@ -1407,11 +1521,12 @@ async fn test_abort_policy_terminates_cleanly_during_concurrent_orchestration() 
             err.kind(),
         );
         let source = std::error::Error::source(&err)
-            .map(|s| s.to_string())
-            .unwrap_or_default();
-        assert!(
-            source.contains("upload_objects aborted"),
-            "expected abort cause in error source, got: {source:?}",
+            .and_then(|s| s.downcast_ref::<aws_sdk_s3_transfer_manager::error::Error>())
+            .expect("the error's source is the failed child upload's error");
+        assert_eq!(
+            Some("PutObject"),
+            source.operation_name(),
+            "expected the failed PutObject as the abort cause, got: {source:?}",
         );
     })
     .await
@@ -1451,7 +1566,8 @@ async fn test_drop_during_active_uploads_cancels_without_hang() {
                     .config()
                     .to_builder(),
             ))
-            .build();
+            .build()
+            .expect("valid config");
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
         let handle = sut
@@ -1522,7 +1638,8 @@ async fn test_stress_multi_iter_reproduce_ec2_hang() {
                     .config()
                     .to_builder(),
             ))
-            .build();
+            .build()
+            .expect("valid config");
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
         for iter in 0..ITERATIONS {
@@ -1693,7 +1810,8 @@ async fn test_stress_parent_lock_contention() {
                 bucket_name.to_owned(),
                 PUT_LATENCY,
             ).config().to_builder()))
-            .build();
+            .build()
+.expect("valid config");
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
         let start = std::time::Instant::now();
@@ -1788,7 +1906,8 @@ async fn test_upload_objects_children_send_mpu_object_size() {
         let config = aws_sdk_s3_transfer_manager::Config::builder()
             .s3_config(test_common::s3_config_with_test_http(client.config().to_builder()))
             .multipart_threshold(PartSize::Target(5))
-            .build();
+            .build()
+.expect("valid config");
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);
 
         let handle = sut

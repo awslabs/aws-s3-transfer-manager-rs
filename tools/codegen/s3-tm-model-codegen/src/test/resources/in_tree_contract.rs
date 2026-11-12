@@ -71,6 +71,29 @@ pub mod operation {
 mod tests {
     use super::{io::InputStream, model::*, operation::upload::ChecksumStrategy, types::*};
 
+    // The part number is crate-private: callers cannot select a part, but the
+    // crate sets it on its own requests and relies on the builder conversion
+    // carrying it. An unset part number is left for the service to supply.
+    #[test]
+    fn crate_private_part_number_defaults_unset_and_survives_builder_conversion() {
+        let input = DownloadInput::builder().bucket("bucket").key("key").build().unwrap();
+        assert_eq!(input.part_number(), None);
+        let mut part_input = input.clone();
+        part_input.part_number = Some(3);
+        assert_eq!(part_input.part_number(), Some(3));
+        let part_input = super::model::builders::DownloadInputBuilder::from(part_input)
+            .build()
+            .unwrap();
+        assert_eq!(part_input.part_number(), Some(3));
+        let built = DownloadInput::builder()
+            .bucket("bucket")
+            .key("key")
+            .part_number(4)
+            .build()
+            .unwrap();
+        assert_eq!(built.part_number(), Some(4));
+    }
+
     #[test]
     fn download_fluent_delegation_preserves_conditions_and_read_ahead_override() {
         use super::operation::download::builders::DownloadFluentBuilder;
