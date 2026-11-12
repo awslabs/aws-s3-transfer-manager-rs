@@ -370,12 +370,8 @@ impl PathBodyPartReader {
         // order is sequential so kernel readahead would help, but concurrent execution creates
         // some scatter. Benchmark before adding.
         // TODO(vnext): does this need to be async now?
-        let file = Arc::new(File::open(&body.path).map_err(|e| {
-            Error::from(std::io::Error::new(
-                e.kind(),
-                format!("failed to open {}: {e}", body.path.display()),
-            ))
-        })?);
+        let file =
+            Arc::new(File::open(&body.path).map_err(|e| Error::io_at("opening", &body.path, e))?);
         let offset = body.offset;
         let content_length = body.length;
         Ok(Self {
@@ -404,9 +400,10 @@ impl PathBodyPartReader {
         let mut dst = stream_cx.part_buffer();
         poll_fn(|cx| dst.poll_acquire(cx, part_size)).await?;
 
+        let read_error = |e| Error::io_at("reading", &self.body.path, e);
         if stream_cx.direct_io() {
             // Managed threads: read directly, no thread pool hop.
-            read_exact_at(&self.file, &mut dst, offset)?;
+            read_exact_at(&self.file, &mut dst, offset).map_err(read_error)?;
         } else {
             // Shared runtime: offload to blocking thread pool.
             let fd = Arc::clone(&self.file);
@@ -414,7 +411,8 @@ impl PathBodyPartReader {
                 read_exact_at(&fd, &mut dst, offset)?;
                 Ok::<_, std::io::Error>(dst)
             })
-            .await??;
+            .await?
+            .map_err(read_error)?;
         }
 
         stream_cx.record_io(&crate::metrics::IoSample {
