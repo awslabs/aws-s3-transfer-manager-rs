@@ -61,7 +61,9 @@ impl DownloadObjectsFluentBuilder {
         self.inner.get_bucket()
     }
 
-    /// The local directory to download into. Required.
+    /// The local directory to download into. Required: an unset or empty path
+    /// fails [`initiate`](Self::initiate) with
+    /// [`ErrorKind::InputInvalid`](crate::error::ErrorKind::InputInvalid).
     ///
     /// Created, with any missing parents, if it does not exist. A destination
     /// that exists and is not a directory fails the transfer with

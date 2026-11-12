@@ -449,6 +449,40 @@ async fn test_destination_dir_not_valid() {
     assert!(err_str.contains("target is not a directory"));
 }
 
+// ref: RUST-1202
+/// An empty destination is rejected by `initiate` as unset, before any request,
+/// instead of downloading into the current working directory.
+#[tokio::test]
+async fn test_empty_destination_rejected() {
+    let bucket = MockBucket::builder().key_with_size("image.png", 12).build();
+    let list = bucket.list_objects_rule();
+    let gets = bucket.get_object_rules();
+    let mut rules = gets.iter().collect::<Vec<_>>();
+    rules.push(&list);
+
+    let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, rules.as_slice());
+
+    let config = aws_sdk_s3_transfer_manager::Config::builder()
+        .s3_config(test_common::s3_config_with_test_http(
+            client.config().to_builder(),
+        ))
+        .build()
+        .expect("valid config");
+    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+
+    let err = tm
+        .download_objects()
+        .bucket("test-bucket")
+        .destination("")
+        .initiate()
+        .expect_err("an empty destination is rejected");
+
+    assert_eq!(&ErrorKind::InputInvalid, err.kind());
+    assert!(format!("{}", DisplayErrorContext(err)).contains("destination is required"));
+    assert_eq!(0, list.num_calls());
+    assert!(gets.iter().all(|get| get.num_calls() == 0));
+}
+
 /// Calling `abort()` on the handle should complete without hanging.
 /// The transfer is cancelled and all in-flight work settles.
 #[tokio::test]

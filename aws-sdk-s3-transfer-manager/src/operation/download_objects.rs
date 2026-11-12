@@ -44,7 +44,14 @@ impl DownloadObjects {
         // directory is deferred to the state machine's first walker advance so
         // the blocking filesystem calls run during work-item execution, not on
         // the caller's thread. That error surfaces from `handle.join()`.
-        if input.destination().is_none() {
+        //
+        // An empty path counts as unset: `create_dir_all("")` succeeds and
+        // keys joined to it are relative, so it would download into the
+        // current working directory.
+        if input
+            .destination()
+            .is_none_or(|destination| destination.as_os_str().is_empty())
+        {
             return Err(crate::error::invalid_input("destination is required"));
         }
 

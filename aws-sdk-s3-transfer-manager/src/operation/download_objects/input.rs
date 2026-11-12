@@ -154,9 +154,9 @@ impl DownloadObjectsInputBuilder {
         self.bucket.as_deref()
     }
 
-    /// Set the destination directory. Required. Created, with any missing
-    /// parents, if it does not exist. Each object is written at its full key
-    /// beneath it.
+    /// Set the destination directory. Required; an empty path counts as unset.
+    /// Created, with any missing parents, if it does not exist. Each object is
+    /// written at its full key beneath it.
     pub fn destination(mut self, input: impl Into<PathBuf>) -> Self {
         self.destination = Some(input.into());
         self
