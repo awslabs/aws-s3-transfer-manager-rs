@@ -30,6 +30,11 @@ pub struct UploadObjectsInput {
     pub walker: Option<FsWalker>,
 
     /// The S3 key prefix to use for each object.
+    ///
+    /// Each object's key is the prefix, then the delimiter unless the prefix
+    /// already ends with it, then the file's path relative to
+    /// [`source`](Self::source). An empty prefix is the same as no prefix: the
+    /// key is the relative path, with no leading delimiter.
     pub key_prefix: Option<String>,
 
     /// Character used to group keys.
@@ -189,7 +194,8 @@ impl UploadObjectsInputBuilder {
         self.walker.as_ref()
     }
 
-    /// The S3 key prefix to use for each object.
+    /// The S3 key prefix to use for each object. An empty prefix is the same
+    /// as no prefix.
     pub fn key_prefix(mut self, input: impl Into<String>) -> Self {
         self.key_prefix = Some(input.into());
         self

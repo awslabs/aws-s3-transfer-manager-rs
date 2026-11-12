@@ -1055,6 +1055,16 @@ impl TransferContext {
         }
     }
 
+    /// Replaces the stored error with `f` applied to it, under the lock
+    /// [`take_error`](Self::take_error) takes it under.
+    ///
+    /// No effect when no error is stored: the transfer has not failed, or its
+    /// error was already taken. The status is unchanged.
+    pub(crate) fn amend_error(&self, f: impl FnOnce(error::Error) -> error::Error) {
+        let mut stored = self.error.lock().unwrap();
+        *stored = stored.take().map(|err| Box::new(f(*err)));
+    }
+
     /// Peek at the error kind if transfer failed. Returns None if not failed or already taken.
     pub(crate) fn error_kind(&self) -> Option<error::ErrorKind> {
         if self.status.is_failed() {
@@ -1398,6 +1408,32 @@ mod tests {
                 ctx.transfer_status(),
                 crate::types::TransferStatus::Cancelled
             );
+        }
+
+        /// `amend_error` rewrites a stored error in place, and does nothing
+        /// before a failure is stored or after the error is taken.
+        #[cfg_attr(miri, ignore)]
+        #[test]
+        fn amend_error_rewrites_only_a_stored_error() {
+            let handle = test_handle();
+            let (ctx, _rx) = TransferContext::new(handle);
+            let with_id = |err: crate::error::Error| err.with_upload_id("id".to_owned());
+
+            ctx.amend_error(with_id);
+            assert!(ctx.is_active());
+            assert!(ctx.take_error().is_none());
+
+            ctx.set_failed(crate::error::Error::new(
+                crate::error::ErrorKind::RuntimeError,
+                "test",
+            ));
+            ctx.amend_error(with_id);
+            let err = ctx.take_error().expect("the failure is stored");
+            assert_eq!(err.kind(), &crate::error::ErrorKind::RuntimeError);
+            assert_eq!(err.upload_id(), Some("id"));
+
+            ctx.amend_error(|_| panic!("a taken error must not be amended"));
+            assert!(ctx.take_error().is_none());
         }
 
         #[cfg_attr(miri, ignore)]

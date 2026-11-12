@@ -19,6 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ConfigLoader::read_ahead` sets the client's default download read-ahead, as
   `config::Builder::read_ahead` does.
 - `ConfigLoader` is exported as `config::ConfigLoader`.
+- `Error::upload_id` returns the ID of a multipart upload that a failed upload left open in S3:
+  under `FailedMultipartUploadPolicy::Retain`, when AbortMultipartUpload failed, or when a worker
+  panic, such as one in the caller's `PartStream`, failed the upload after the multipart upload
+  was created. It is `None` when the multipart upload was aborted.
 - Client construction logs one `INFO` record of the resolved sizing (concurrency target and the
   signal it came from, memory ceiling, part size, connection cap), a `WARN` when the part size
   exceeds the memory ceiling, and a `WARN` when the soft file-descriptor limit holds connections
@@ -58,6 +62,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The hidden `config::Builder::framework_metadata`, `ConfigLoader::framework_metadata`, and
   `Config::framework_metadata` are removed. Set framework metadata on the `SdkConfig` or S3
   configuration.
+- `ErrorKind::IOError` and `ErrorKind::InputInvalid` errors from a local filesystem operation on a
+  known path name the operation and the path, as in `I/O error creating directory "out/logs"`,
+  and the object key for a `download_objects` object.
+  This covers temporary file creation and renaming, for downloads to a path and for
+  `download_objects` objects, directory creation in `download_objects`, opening and reading upload source files, and the directory walk. Except for
+  the directory walk, whose source remains the `io::walk::WalkError`, the error's source is the
+  `std::io::Error` itself, where some of these sites previously used a message that embedded it,
+  such as `failed to open …` or `failed to create directory for key …`.
+- The source of an `ErrorKind::ChildOperationFailed` error from `upload_objects` or
+  `download_objects` is the error of the first failed object, the one that stopped the transfer
+  under `FailedTransferPolicy::Abort`, instead of a message naming it.
+- `download_objects` writes each object at its full key under the destination. The walker's
+  prefix only selects objects and is no longer removed from local paths: with the prefix
+  `photos/`, the key `photos/a.txt` was written to `<dest>/a.txt` and is now written to
+  `<dest>/photos/a.txt`. A prefix that ends partway through a name no longer cuts it: with the
+  prefix `photos`, the key `photos-other/x.txt` was written to `<dest>/-other/x.txt`.
 - `TargetThroughput::gbps` replaces `new_gigabits_per_sec`. It takes an `f64` instead of a `u64`,
   so targets below 1 Gbps can be expressed, and returns `Result<TargetThroughput, BuildError>`,
   rejecting a value that is not finite and positive.
@@ -87,6 +107,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `a/-b` with the delimiter `--`, and report both as uploaded while the later write replaced the
   earlier one. It now fails the second file with `ErrorKind::InputInvalid`, names the first file, and
   follows the `FailedTransferPolicy`. The default and native delimiters keep no key registry.
+- `upload_objects` with an empty `key_prefix` uploads each file under its relative path instead of
+  a key with a leading `/`.
+- `download_objects` accepts a destination containing `.` or `..` components, such as `./out` or
+  `out/../out`, instead of rejecting every object as resolving outside it. The destination is
+  resolved lexically, without following symbolic links.
+- `download_objects` rejects a key that resolves outside a destination made of `..` components, such
+  as `../b.txt` under `..`, which was previously accepted.
+- `download_objects` creates a destination directory that does not exist, with any missing
+  parents, instead of failing.
+- `download_objects` fails an object whose key maps to the destination directory itself, such as
+  `.`, `./`, or `a/..`, with `ErrorKind::InputInvalid` before creating any file or requesting the
+  object. Such an object was previously downloaded to a temporary file beside the destination
+  and then failed to be renamed onto it.
 
 ## [release-2026-11-05]
 
