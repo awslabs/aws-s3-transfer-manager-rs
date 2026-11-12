@@ -1066,7 +1066,8 @@ mod tests {
     ) {
         let config = crate::Config::builder()
             .sdk_client(s3_client.clone())
-            .build();
+            .build()
+            .expect("valid config");
         let handle = crate::client::Handle::test_handle_tokio(config);
 
         let walk = S3Walker::builder().build().walk(
@@ -1470,7 +1471,10 @@ mod tests {
         });
         let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[list, get]);
 
-        let config = crate::Config::builder().sdk_client(client.clone()).build();
+        let config = crate::Config::builder()
+            .sdk_client(client.clone())
+            .build()
+            .expect("valid config");
         let handle = crate::client::Handle::test_handle_tokio(config);
 
         let walk = S3Walker::builder().prefix("backup/2023/").build().walk(
@@ -1618,7 +1622,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let config = crate::Config::builder()
             .sdk_client(mock_s3_success())
-            .build();
+            .build()
+            .expect("valid config");
         let handle = crate::client::Handle::test_handle_managed(config);
 
         let (transfer, completion_rx) = setup_enqueued(
@@ -1670,7 +1675,8 @@ mod tests {
 
         let config = crate::Config::builder()
             .sdk_client(s3_client.clone())
-            .build();
+            .build()
+            .expect("valid config");
         let handle = crate::client::Handle::test_handle_managed(config);
 
         let (transfer, completion_rx) = setup_enqueued(
@@ -1750,7 +1756,8 @@ mod tests {
 
         let config = crate::Config::builder()
             .sdk_client(s3_client.clone())
-            .build();
+            .build()
+            .expect("valid config");
         let handle = crate::client::Handle::test_handle_managed(config);
 
         let (transfer, completion_rx) =
@@ -1812,7 +1819,8 @@ mod tests {
 
         let config = crate::Config::builder()
             .sdk_client(s3_client.clone())
-            .build();
+            .build()
+            .expect("valid config");
         let handle = crate::client::Handle::test_handle_managed(config);
 
         let (transfer, completion_rx) = setup_enqueued(
@@ -1846,7 +1854,8 @@ mod tests {
 
         let config = crate::Config::builder()
             .sdk_client(s3_client.clone())
-            .build();
+            .build()
+            .expect("valid config");
         let handle = crate::client::Handle::test_handle_managed(config);
 
         let (transfer, completion_rx) = setup_enqueued(
@@ -2093,7 +2102,10 @@ mod tests {
         });
         let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[list, get]);
 
-        let config = crate::Config::builder().sdk_client(client.clone()).build();
+        let config = crate::Config::builder()
+            .sdk_client(client.clone())
+            .build()
+            .expect("valid config");
         let handle = crate::client::Handle::test_handle_managed(config);
 
         let (transfer, completion_rx) =
@@ -2145,7 +2157,10 @@ mod tests {
         });
         let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[list, get]);
 
-        let config = crate::Config::builder().sdk_client(client.clone()).build();
+        let config = crate::Config::builder()
+            .sdk_client(client.clone())
+            .build()
+            .expect("valid config");
         let handle = crate::client::Handle::test_handle_tokio(config);
 
         let walk = S3Walker::builder().build().walk(

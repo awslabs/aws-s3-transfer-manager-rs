@@ -200,7 +200,8 @@ async fn test_strip_prefix_in_destination_path() {
             .s3_config(test_common::s3_config_with_test_http(
                 client.config().to_builder(),
             ))
-            .build();
+            .build()
+            .expect("valid config");
         let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
         let dest = tempfile::tempdir().unwrap();
@@ -243,7 +244,8 @@ async fn test_object_with_prefix_included() {
         .s3_config(test_common::s3_config_with_test_http(
             client.config().to_builder(),
         ))
-        .build();
+        .build()
+        .expect("valid config");
     let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
     let dest = tempfile::tempdir().unwrap();
@@ -283,7 +285,8 @@ async fn test_failed_download_policy_continue() {
         .s3_config(test_common::s3_config_with_test_http(
             client.config().to_builder(),
         ))
-        .build();
+        .build()
+        .expect("valid config");
     let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
     let dest = tempfile::tempdir().unwrap();
@@ -342,7 +345,8 @@ async fn test_recursively_downloads() {
         .s3_config(test_common::s3_config_with_test_http(
             client.config().to_builder(),
         ))
-        .build();
+        .build()
+        .expect("valid config");
     let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
     let dest = tempfile::tempdir().unwrap();
@@ -379,7 +383,8 @@ async fn test_delimiter() {
         .s3_config(test_common::s3_config_with_test_http(
             client.config().to_builder(),
         ))
-        .build();
+        .build()
+        .expect("valid config");
     let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
     let dest = tempfile::tempdir().unwrap();
@@ -418,7 +423,8 @@ async fn test_destination_dir_not_valid() {
         .s3_config(test_common::s3_config_with_test_http(
             client.config().to_builder(),
         ))
-        .build();
+        .build()
+        .expect("valid config");
     let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
     let dest = tempfile::NamedTempFile::new().unwrap();
@@ -469,7 +475,8 @@ async fn test_abort_on_handle_should_terminate_tasks_gracefully() {
             .s3_config(test_common::s3_config_with_test_http(
                 client.config().to_builder(),
             ))
-            .build();
+            .build()
+            .expect("valid config");
         let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
         let dest = tempfile::tempdir().unwrap();
@@ -517,7 +524,8 @@ async fn test_failed_list_objects_should_cancel_the_operation() {
             .s3_config(test_common::s3_config_with_test_http(
                 client.config().to_builder(),
             ))
-            .build();
+            .build()
+            .expect("valid config");
         let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
         let dest = tempfile::tempdir().unwrap();
@@ -559,7 +567,8 @@ async fn test_failed_get_object_should_cancel_the_operation() {
             .s3_config(test_common::s3_config_with_test_http(
                 client.config().to_builder(),
             ))
-            .build();
+            .build()
+            .expect("valid config");
         let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
         let dest = tempfile::tempdir().unwrap();
@@ -618,7 +627,8 @@ async fn test_drop_download_objects_handle() {
             .s3_config(test_common::s3_config_with_test_http(
                 client.config().to_builder(),
             ))
-            .build();
+            .build()
+            .expect("valid config");
         let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
         let dest = tempfile::tempdir().unwrap();
@@ -748,7 +758,8 @@ async fn test_abort_stops_child_get_before_temp_file_cleanup() {
         .s3_config(test_common::s3_config_with_test_http(
             client.config().to_builder(),
         ))
-        .build();
+        .build()
+        .expect("valid config");
     let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
     let handle = tm

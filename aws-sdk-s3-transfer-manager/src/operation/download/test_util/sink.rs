@@ -495,7 +495,8 @@ mod tests {
         let config = crate::Config::builder()
             .sdk_client(object_client(Arc::clone(&object)))
             .part_size(crate::types::PartSize::Target(5 * MIB as u64))
-            .build();
+            .build()
+            .expect("valid config");
         let handle = managed_test_handle(config, 128);
         let input = DownloadInput::builder()
             .bucket("bucket")

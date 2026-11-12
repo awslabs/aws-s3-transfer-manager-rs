@@ -786,7 +786,8 @@ jobs:
     env:
       # Generated consumers resolve dependencies without the workspace lockfile.
       CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: fallback
-      # The checker includes optional features; dial9 needs Tokio's unstable API.
+      # The checker builds the baseline with all features, and the baseline's
+      # `dial9` feature needs Tokio's unstable API.
       RUSTFLAGS: "-Dwarnings --cfg tokio_unstable"
     steps:
       - uses: actions/checkout@v4
@@ -831,13 +832,14 @@ jobs:
           RUSTFLAGS: -Dwarnings -Adeprecated
 
   dial9-build:
-    # Builds the library and the `cp` example with every feature and
-    # `--cfg tokio_unstable`. dial9 0.5 compiles without the flag; the
-    # `features` job checks the library with `dial9` in that configuration.
-    # With the flag, dial9's Tokio instrumentation also compiles its
-    # task-poll hooks, task spawn and terminate tracking, and per-worker
-    # queue depth, which the crate README's tracing build enables. A
-    # dedicated job keeps `tokio_unstable` out of the rest of CI.
+    # Builds the `cp` example's dial9 tracing, which `--cfg s3_tm_dial9`
+    # enables, with every feature and `--cfg tokio_unstable`. dial9 0.5
+    # compiles without `tokio_unstable`; the `features` job checks the
+    # extension crate's `dial9` feature in that configuration. With the flag,
+    # dial9's Tokio instrumentation also compiles its task-poll hooks, task
+    # spawn and terminate tracking, and per-worker queue depth, which the
+    # crate README's tracing build enables. A dedicated job keeps both cfgs
+    # out of the rest of CI.
     name: dial9 build
     needs: basics
     runs-on: ubuntu-24.04
@@ -852,7 +854,7 @@ jobs:
       - name: build cp example with dial9
         run: cargo build -p aws-sdk-s3-transfer-manager --example cp --all-features
         env:
-          RUSTFLAGS: "-Dwarnings --cfg tokio_unstable"
+          RUSTFLAGS: "-Dwarnings --cfg tokio_unstable --cfg s3_tm_dial9"
 
   miri:
     name: miri

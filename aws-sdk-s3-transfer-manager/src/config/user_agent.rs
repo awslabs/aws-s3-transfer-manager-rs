@@ -50,18 +50,8 @@ pub(crate) fn client_features(config: &Config, profile: &MachineProfile) -> Vec<
 }
 
 /// Install the transfer manager's user agent attribution on an S3 client builder.
-pub(crate) fn install(
-    builder: &mut aws_sdk_s3::config::Builder,
-    framework_metadata: Option<FrameworkMetadata>,
-    features: Vec<AwsSdkFeature>,
-) {
-    builder.push_interceptor(
-        S3TransferManagerInterceptor {
-            framework_metadata,
-            features,
-        }
-        .into_shared(),
-    );
+pub(crate) fn install(builder: &mut aws_sdk_s3::config::Builder, features: Vec<AwsSdkFeature>) {
+    builder.push_interceptor(S3TransferManagerInterceptor { features }.into_shared());
 }
 
 /// The features one operation adds to the requests it issues, on top of the client's.
@@ -122,7 +112,6 @@ impl Intercept for OperationFeatures {
 /// every child transfer.
 pub(crate) fn install_on_client(
     client: aws_sdk_s3::Client,
-    framework_metadata: Option<FrameworkMetadata>,
     features: Vec<AwsSdkFeature>,
 ) -> aws_sdk_s3::Client {
     if client
@@ -133,13 +122,12 @@ pub(crate) fn install_on_client(
         return client;
     }
     let mut builder = client.config().to_builder();
-    install(&mut builder, framework_metadata, features);
+    install(&mut builder, features);
     aws_sdk_s3::Client::from_conf(builder.build())
 }
 
 #[derive(Debug)]
 struct S3TransferManagerInterceptor {
-    framework_metadata: Option<FrameworkMetadata>,
     features: Vec<AwsSdkFeature>,
 }
 
@@ -150,8 +138,8 @@ impl Intercept for S3TransferManagerInterceptor {
 
     /// The SDK's own `UserAgentInterceptor` runs later and yields to any [`AwsUserAgent`]
     /// already in the bag, so this must extend what it finds rather than replace it, and must
-    /// copy the customer's [`AppName`] itself when it builds the base — the SDK's
-    /// `set_app_name` is below the yield it takes.
+    /// copy the customer's [`AppName`] and [`FrameworkMetadata`] itself when it builds the
+    /// base — the SDK copies both only below the yield it takes.
     fn read_before_execution(
         &self,
         _ctx: &aws_sdk_s3::config::interceptors::BeforeSerializationInterceptorContextRef<'_>,
@@ -170,6 +158,9 @@ impl Intercept for S3TransferManagerInterceptor {
                 if let Some(app_name) = cfg.load::<AppName>().cloned() {
                     ua.set_app_name(app_name);
                 }
+                for framework_metadata in framework_metadata(cfg) {
+                    ua.add_framework_metadata(framework_metadata);
+                }
                 ua
             })
         });
@@ -183,14 +174,33 @@ impl Intercept for S3TransferManagerInterceptor {
             ua = ua.with_additional_metadata(metadata);
         }
 
-        if let Some(framework_metadata) = self.framework_metadata.clone() {
-            ua = ua.with_framework_metadata(framework_metadata);
-        }
-
         cfg.interceptor_state().store_put(ua);
 
         Ok(())
     }
+}
+
+/// Upper bound on the framework metadata entries the SDK's `UserAgentInterceptor` carries.
+const MAX_FRAMEWORK_METADATA: usize = 10;
+
+/// The framework metadata the SDK's `UserAgentInterceptor` would carry for this config bag.
+///
+/// The entries are returned in insertion order with exact `(name, version)` duplicates
+/// removed, at most [`MAX_FRAMEWORK_METADATA`] of them, matching the user agent the SDK
+/// builds when no interceptor stores one first.
+fn framework_metadata(cfg: &aws_sdk_s3::config::ConfigBag) -> Vec<FrameworkMetadata> {
+    // `load` over a `StoreAppend` type yields entries newest first.
+    let appended: Vec<&FrameworkMetadata> = cfg.load::<FrameworkMetadata>().collect();
+    let mut kept: Vec<FrameworkMetadata> = Vec::new();
+    for metadata in appended.into_iter().rev() {
+        if kept.len() == MAX_FRAMEWORK_METADATA {
+            break;
+        }
+        if !kept.contains(metadata) {
+            kept.push(metadata.clone());
+        }
+    }
+    kept
 }
 
 #[cfg(test)]
@@ -211,7 +221,7 @@ mod tests {
     use aws_sdk_s3::operation::put_object::PutObjectOutput;
     use aws_sdk_s3::primitives::ByteStream;
     use aws_sdk_s3::types::Object;
-    use aws_smithy_http_client::test_util::capture_request;
+    use aws_smithy_http_client::test_util::{capture_request, CaptureRequestReceiver};
     use aws_smithy_mocks::{mock, mock_client, RuleMode};
     use aws_smithy_runtime_api::client::orchestrator::Metadata;
     use std::borrow::Cow;
@@ -241,7 +251,6 @@ mod tests {
     /// assembly under test; credentials and behavior version are set directly instead.
     async fn captured_user_agent(
         runtime_config: RuntimeConfig,
-        framework_metadata: Option<FrameworkMetadata>,
         tweak: impl FnOnce(aws_sdk_s3::config::Builder) -> aws_sdk_s3::config::Builder,
     ) -> String {
         let (http_client, captured) = capture_request(None);
@@ -254,13 +263,23 @@ mod tests {
         // The capture-request client is the transport under test, so the runtime must
         // not substitute its own.
         let s3_config = crate::config::S3ClientConfig::from_sdk_builder(tweak(builder));
+        captured_user_agent_from(runtime_config, s3_config, captured).await
+    }
 
+    /// Drives one download through a transfer manager built from `s3_config`, whose HTTP
+    /// client must be the capture client behind `captured`, and returns the
+    /// `x-amz-user-agent` it sent.
+    async fn captured_user_agent_from(
+        runtime_config: RuntimeConfig,
+        s3_config: crate::config::S3ClientConfig,
+        captured: CaptureRequestReceiver,
+    ) -> String {
         let tm = crate::Client::new(
             crate::Config::builder()
                 .runtime_config(runtime_config)
-                .framework_metadata(framework_metadata)
                 .s3_config(s3_config)
-                .build(),
+                .build()
+                .expect("valid config"),
         );
 
         let mut handle = tm.download().bucket("foo").key("bar").initiate().unwrap();
@@ -282,7 +301,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn preserves_customer_app_name() {
-        let ua = captured_user_agent(RuntimeConfig::multi_thread_tokio(), None, |b| {
+        let ua = captured_user_agent(RuntimeConfig::multi_thread_tokio(), |b| {
             b.app_name(AppName::new("my-app").unwrap())
         })
         .await;
@@ -294,7 +313,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn emits_transfer_manager_version() {
-        let ua = captured_user_agent(RuntimeConfig::multi_thread_tokio(), None, |b| b).await;
+        let ua = captured_user_agent(RuntimeConfig::multi_thread_tokio(), |b| b).await;
         let expected = concat!("md/rust-tm#", env!("CARGO_PKG_VERSION"));
         assert!(ua.contains(expected), "{expected:?} missing from {ua:?}");
     }
@@ -305,28 +324,62 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn emits_our_marker_once() {
-        let ua = captured_user_agent(RuntimeConfig::default(), None, |b| b).await;
+        let ua = captured_user_agent(RuntimeConfig::default(), |b| b).await;
         assert_eq!(ua.matches("md/rust-tm#").count(), 1, "{ua:?}");
     }
 
-    /// A framework adding its own attribution must not cost ours, so both belong in the same
-    /// assertion. This is also the `s3_config(..)` path.
+    /// Framework metadata configured on the shared configuration is the customer's, and, like
+    /// the app id, the SDK copies it out of the config bag only when it builds the user agent
+    /// itself. A framework adding its own attribution must not cost ours either, so both
+    /// belong in the same assertion, and every entry keeps the order it was configured in.
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
-    async fn framework_metadata_joins_our_attribution() {
-        let framework =
-            FrameworkMetadata::new("some-framework", Some(Cow::Borrowed("1.3"))).unwrap();
-        let ua =
-            captured_user_agent(RuntimeConfig::multi_thread_tokio(), Some(framework), |b| b).await;
-        assert!(
-            ua.contains("lib/some-framework/1.3"),
-            "framework metadata missing from {ua:?}"
-        );
+    async fn sdk_config_framework_metadata_joins_our_attribution() {
+        let (http_client, captured) = capture_request(None);
+        let sdk_config = aws_types::SdkConfig::builder()
+            .http_client(http_client)
+            .region(Region::from_static("us-west-2"))
+            .credentials_provider(test_credentials())
+            .behavior_version(BehaviorVersion::latest())
+            .framework_metadata(framework("first-framework", "1.0"))
+            .framework_metadata(framework("second-framework", "2.0"))
+            .build();
+        let ua = captured_user_agent_from(
+            RuntimeConfig::multi_thread_tokio(),
+            crate::config::S3ClientConfig::from(&sdk_config),
+            captured,
+        )
+        .await;
+
         let ours = concat!("md/rust-tm#", env!("CARGO_PKG_VERSION"));
         assert!(
             ua.contains(ours),
             "our attribution was displaced by the framework's: {ua:?}"
         );
+        let first = ua.find("lib/first-framework/1.0");
+        let second = ua.find("lib/second-framework/2.0");
+        assert!(
+            matches!((first, second), (Some(first), Some(second)) if first < second),
+            "framework metadata missing or out of order in {ua:?}"
+        );
+    }
+
+    /// The SDK carries each `(name, version)` pair once, so a framework configured twice is not
+    /// attributed twice.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn repeated_framework_metadata_is_carried_once() {
+        let ua = captured_user_agent(RuntimeConfig::multi_thread_tokio(), |b| {
+            b.framework_metadata(framework("some-framework", "1.3"))
+                .framework_metadata(framework("some-framework", "1.3"))
+        })
+        .await;
+        assert_eq!(ua.matches("lib/some-framework/1.3").count(), 1, "{ua:?}");
+    }
+
+    fn framework(name: &'static str, version: &'static str) -> FrameworkMetadata {
+        FrameworkMetadata::new(name, Some(Cow::Borrowed(version)))
+            .expect("valid framework metadata")
     }
 
     /// A user agent already in the config bag is extended, not replaced — otherwise a
@@ -335,7 +388,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn preserves_user_agent_already_in_config_bag() {
-        let ua = captured_user_agent(RuntimeConfig::multi_thread_tokio(), None, |b| {
+        let ua = captured_user_agent(RuntimeConfig::multi_thread_tokio(), |b| {
             b.with_test_defaults()
         })
         .await;
@@ -355,7 +408,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn emits_s3_transfer_business_metric() {
-        let ua = captured_user_agent(RuntimeConfig::multi_thread_tokio(), None, |b| b).await;
+        let ua = captured_user_agent(RuntimeConfig::multi_thread_tokio(), |b| b).await;
         let metrics = ua
             .split_whitespace()
             .find_map(|section| section.strip_prefix("m/"))
@@ -387,7 +440,8 @@ mod tests {
                 .runtime_config(RuntimeConfig::multi_thread_tokio())
                 .part_size(PartSize::Target(8 << 20))
                 .sdk_client(client)
-                .build(),
+                .build()
+                .expect("valid config"),
         );
         let mut handle = tm.download().bucket("foo").key("bar").initiate().unwrap();
         let _ = handle.body_mut().next().await;
@@ -514,7 +568,8 @@ mod tests {
             crate::Config::builder()
                 .runtime_config(RuntimeConfig::multi_thread_tokio())
                 .sdk_client(provided_client(http_client))
-                .build(),
+                .build()
+                .expect("valid config"),
         );
         // The clone a child transfer would be handed.
         download_through(first.handle.s3_client.clone()).await;
@@ -570,7 +625,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn a_caller_can_own_both_headers() {
-        let ua = captured_user_agent(RuntimeConfig::multi_thread_tokio(), None, |mut b| {
+        let ua = captured_user_agent(RuntimeConfig::multi_thread_tokio(), |mut b| {
             b.push_interceptor(OverrideUserAgent.into_shared());
             b
         })
@@ -692,7 +747,8 @@ mod tests {
             builder
                 .runtime_config(RuntimeConfig::multi_thread_tokio())
                 .sdk_client(s3)
-                .build(),
+                .build()
+                .expect("valid config"),
         )
     }
 

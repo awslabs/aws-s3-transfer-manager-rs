@@ -177,6 +177,14 @@ impl DownloadObjectsInputBuilder {
         self
     }
 
+    /// Sets the failure policy to use when any individual object download fails.
+    ///
+    /// `None` selects the default, [`FailedTransferPolicy::Abort`].
+    pub fn set_failure_policy(mut self, input: Option<FailedTransferPolicy>) -> Self {
+        self.failure_policy = input.unwrap_or_default();
+        self
+    }
+
     /// The failure policy.
     pub fn get_failure_policy(&self) -> &FailedTransferPolicy {
         &self.failure_policy
@@ -260,6 +268,26 @@ impl fmt::Debug for DownloadObjectsInputBuilder {
 #[cfg(test)]
 mod tests {
     use super::DownloadObjectsInput;
+    use crate::types::FailedTransferPolicy;
+
+    // `set_failure_policy` replaces the policy, and `None` restores the
+    // default rather than keeping a previously set policy.
+    #[test]
+    fn set_failure_policy_replaces_and_none_restores_default() {
+        let builder = DownloadObjectsInput::builder()
+            .bucket("test-bucket")
+            .destination("/tmp/test")
+            .set_failure_policy(Some(FailedTransferPolicy::Continue));
+        assert_eq!(
+            builder.get_failure_policy(),
+            &FailedTransferPolicy::Continue
+        );
+        let input = builder
+            .set_failure_policy(None)
+            .build()
+            .expect("valid input");
+        assert_eq!(input.failure_policy(), &FailedTransferPolicy::Abort);
+    }
 
     #[test]
     fn test_no_destination_error() {

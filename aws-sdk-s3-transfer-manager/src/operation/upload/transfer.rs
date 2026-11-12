@@ -1902,7 +1902,8 @@ mod tests {
             crate::Config::builder()
                 .sdk_client(s3_client)
                 .diagnostics_for_test(crate::config::MemoryDiagnosticsConfig::default(), detail)
-                .build(),
+                .build()
+                .expect("valid config"),
         );
 
         let mut input = UploadInput::builder()
@@ -3252,7 +3253,10 @@ mod tests {
         tmp.flush().unwrap();
 
         let handle = crate::client::Handle::test_handle_tokio(
-            crate::Config::builder().sdk_client(s3_client).build(),
+            crate::Config::builder()
+                .sdk_client(s3_client)
+                .build()
+                .expect("valid config"),
         );
         let mut input = UploadInput::builder()
             .bucket("test-bucket")

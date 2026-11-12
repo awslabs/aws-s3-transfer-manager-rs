@@ -122,7 +122,8 @@ fn test_tm(
         .s3_config(common::s3_config(http_client))
         .part_size(PartSize::Target(part_size as u64))
         .concurrency(ConcurrencyMode::Explicit(1))
-        .build();
+        .build()
+        .expect("valid config");
 
     aws_sdk_s3_transfer_manager::Client::new(config)
 }
@@ -313,7 +314,8 @@ async fn abort_download_with_executing_gets(runtime_config: RuntimeConfig) {
         .part_size(PartSize::Target(part_size as u64))
         .concurrency(ConcurrencyMode::Explicit(2))
         .runtime_config(runtime_config)
-        .build();
+        .build()
+        .expect("valid config");
     let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
     let handle = tm
@@ -788,7 +790,8 @@ async fn download_objects_releases_destination_files() {
     let config = aws_sdk_s3_transfer_manager::Config::builder()
         .s3_config(common::s3_config(StaticReplayClient::new(vec![list, get])))
         .concurrency(ConcurrencyMode::Explicit(1))
-        .build();
+        .build()
+        .expect("valid config");
     let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
     let dir = tempfile::tempdir().unwrap();
@@ -829,7 +832,8 @@ async fn write_to_path_drop_clients_then_unlink_releases_destination() {
     let tm = aws_sdk_s3_transfer_manager::Client::new(
         aws_sdk_s3_transfer_manager::Config::builder()
             .s3_config(&shared)
-            .build(),
+            .build()
+            .expect("valid config"),
     );
     let completion = tm.shutdown_completion();
     let dir = tempfile::tempdir().unwrap();
@@ -1126,7 +1130,8 @@ async fn test_integrity_checks_disabled_when_validation_when_required() {
         ))
         .part_size(PartSize::Target(part_size as u64))
         .concurrency(ConcurrencyMode::Explicit(1))
-        .build();
+        .build()
+        .expect("valid config");
     let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
     let mut handle = tm

@@ -101,6 +101,14 @@ impl DownloadObjectsFluentBuilder {
         self
     }
 
+    /// Sets the failure policy to use when any individual object download fails.
+    ///
+    /// `None` selects the default, [`FailedTransferPolicy::Abort`].
+    pub fn set_failure_policy(mut self, input: Option<FailedTransferPolicy>) -> Self {
+        self.inner = self.inner.set_failure_policy(input);
+        self
+    }
+
     /// The failure policy.
     pub fn get_failure_policy(&self) -> &FailedTransferPolicy {
         self.inner.get_failure_policy()

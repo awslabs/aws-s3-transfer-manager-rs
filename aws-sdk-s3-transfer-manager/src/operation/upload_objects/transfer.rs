@@ -6,7 +6,7 @@
 //! State machine for plural upload (`upload_objects`).
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{hash_map::Entry, BTreeMap, HashMap, VecDeque};
 use std::fmt;
 use std::future::Future;
 use std::path::{PathBuf, MAIN_SEPARATOR, MAIN_SEPARATOR_STR};
@@ -376,6 +376,9 @@ struct State {
     reaping_in_flight: usize,
     failed: Vec<FailedUpload>,
     successful_uploads: u64,
+    /// Keys already derived, mapped to the file that derived each one. `None` unless a custom
+    /// delimiter can make distinct paths derive one key.
+    derived_keys: Option<HashMap<String, PathBuf>>,
 }
 
 impl State {
@@ -428,6 +431,10 @@ impl UploadObjectsTransfer {
     ) -> Self {
         let mut walks = BTreeMap::new();
         walks.insert(0, walker);
+        let derived_keys = request
+            .delimiter()
+            .filter(|delimiter| *delimiter != DEFAULT_DELIMITER && *delimiter != MAIN_SEPARATOR_STR)
+            .map(|_| HashMap::new());
         let inner = Arc::new(UploadObjectsTransferInner {
             ctx,
             request: Arc::new(request),
@@ -440,6 +447,7 @@ impl UploadObjectsTransfer {
                 children_reserved: 0,
                 reaping_in_flight: 0,
                 failed: Vec::new(),
+                derived_keys,
                 successful_uploads: 0,
             }),
         });
@@ -706,7 +714,7 @@ impl UploadObjectsTransfer {
                 Err(e) => {
                     state.failed.push(FailedUpload {
                         input: None,
-                        error: e.into(),
+                        error: e,
                         source_path: Some(entry.path().to_path_buf()),
                     });
                     if *self.failure_policy() == FailedTransferPolicy::Abort {
@@ -716,6 +724,23 @@ impl UploadObjectsTransfer {
                     continue;
                 }
             };
+
+            let claimed = match state.derived_keys.as_mut() {
+                Some(keys) => claim_key(keys, &key, entry.path()),
+                None => Ok(()),
+            };
+            if let Err(e) = claimed {
+                state.failed.push(FailedUpload {
+                    input: None,
+                    error: e,
+                    source_path: Some(entry.path().to_path_buf()),
+                });
+                if *self.failure_policy() == FailedTransferPolicy::Abort {
+                    self.abort(state, "key conflict");
+                    return SpawnDecision::Abort;
+                }
+                continue;
+            }
 
             let input = UploadInput::builder()
                 .bucket(bucket)
@@ -1252,6 +1277,25 @@ impl Transfer for UploadObjectsTransfer {
     fn on_terminal(&self) {}
 }
 
+/// Record that `path` derived `key`, failing when another file already derived it.
+fn claim_key(
+    derived_keys: &mut HashMap<String, PathBuf>,
+    key: &str,
+    path: &std::path::Path,
+) -> Result<(), error::Error> {
+    match derived_keys.entry(key.to_owned()) {
+        Entry::Occupied(e) => Err(error::invalid_input(format!(
+            "`{}` derives key `{key}`, already derived from `{}`",
+            path.display(),
+            e.get().display()
+        ))),
+        Entry::Vacant(e) => {
+            e.insert(path.to_path_buf());
+            Ok(())
+        }
+    }
+}
+
 /// Derive the S3 object key for a file at `relative_filename` inside the walk root.
 ///
 /// The key is formed by optionally prepending a prefix and substituting the
@@ -1401,7 +1445,10 @@ mod tests {
         UploadObjectsTransfer,
         crate::transfer::StateMachineTerminalReceiver,
     ) {
-        let config = crate::Config::builder().sdk_client(s3_client).build();
+        let config = crate::Config::builder()
+            .sdk_client(s3_client)
+            .build()
+            .expect("valid config");
         let handle = crate::client::Handle::test_handle_tokio(config);
 
         let input = super::super::UploadObjectsInputBuilder::default()
@@ -1525,7 +1572,10 @@ mod tests {
             .then_output(|| PutObjectOutput::builder().e_tag("test-etag").build());
         let s3_client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[put]);
 
-        let config = crate::Config::builder().sdk_client(s3_client).build();
+        let config = crate::Config::builder()
+            .sdk_client(s3_client)
+            .build()
+            .expect("valid config");
         let handle = crate::client::Handle::test_handle_tokio(config);
 
         let input = super::super::UploadObjectsInputBuilder::default()
@@ -1570,6 +1620,148 @@ mod tests {
                 "photos/2024/top.txt".to_string(),
             ]
         );
+    }
+
+    /// Upload `names` (relative to a fresh temp dir) and return the finished transfer and the
+    /// keys sent in `PutObject` requests.
+    async fn upload_names(
+        names: &[&std::path::Path],
+        delimiter: Option<&str>,
+        policy: FailedTransferPolicy,
+        max_concurrent: usize,
+    ) -> (tempfile::TempDir, UploadObjectsTransfer, Vec<String>) {
+        let dir = tempdir().unwrap();
+        for name in names {
+            let path = dir.path().join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "x").unwrap();
+        }
+
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_cl = captured.clone();
+        let put = mock!(aws_sdk_s3::Client::put_object)
+            .match_requests(move |req| {
+                captured_cl
+                    .lock()
+                    .unwrap()
+                    .push(req.key().unwrap().to_string());
+                true
+            })
+            .then_output(|| PutObjectOutput::builder().e_tag("test-etag").build());
+        let s3_client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[put]);
+        let handle = crate::client::Handle::test_handle_tokio(
+            crate::Config::builder()
+                .sdk_client(s3_client)
+                .build()
+                .expect("valid config"),
+        );
+
+        let input = super::super::UploadObjectsInputBuilder::default()
+            .bucket("test-bucket")
+            .source(dir.path())
+            .failure_policy(policy)
+            .max_concurrent_uploads(max_concurrent)
+            .set_delimiter(delimiter.map(str::to_string))
+            .build()
+            .unwrap();
+        let walker = FsWalker::builder()
+            .recursive(true)
+            .build()
+            .walk(FsWalkContext::builder().root(dir.path()).build());
+
+        let (ctx, completion_rx) = TransferContext::new(handle);
+        let transfer = UploadObjectsTransfer::new(ctx, input, walker);
+        transfer
+            .inner
+            .ctx
+            .handle
+            .scheduler
+            .register_empty_group_for_test(transfer.inner.ctx.id.id);
+
+        timeout(Duration::from_secs(5), async {
+            drive_transfer(&transfer).await;
+            let _ = completion_rx.await;
+        })
+        .await
+        .expect("transfer should complete within timeout");
+
+        let keys = captured.lock().unwrap().clone();
+        (dir, transfer, keys)
+    }
+
+    /// With a custom delimiter, of two files that derive one key the second fails without
+    /// uploading. A concurrency of 1 makes the duplicate arrive after the first child finished.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_files_deriving_one_key_upload_once() {
+        let names = [std::path::Path::new("a-/b"), std::path::Path::new("a/-b")];
+        for (policy, max_concurrent) in [
+            (FailedTransferPolicy::Continue, 16),
+            (FailedTransferPolicy::Continue, 1),
+            (FailedTransferPolicy::Abort, 16),
+        ] {
+            let (dir, transfer, keys) =
+                upload_names(&names, Some("--"), policy.clone(), max_concurrent).await;
+
+            let abort = policy == FailedTransferPolicy::Abort;
+            assert_eq!(transfer.ctx().is_failed(), abort, "{policy:?}");
+            let failed = transfer.take_failed();
+            assert_eq!(failed.len(), 1, "{policy:?}");
+            assert_eq!(
+                failed[0].error().kind(),
+                &crate::error::ErrorKind::InputInvalid
+            );
+            let message = std::error::Error::source(failed[0].error())
+                .unwrap()
+                .to_string();
+            let failed_path = failed[0].source_path().unwrap();
+            let other = names
+                .iter()
+                .map(|n| dir.path().join(n).components().collect::<PathBuf>())
+                .find(|p| p != failed_path)
+                .unwrap();
+            assert!(message.contains(&other.display().to_string()), "{message}");
+            if !abort {
+                assert_eq!(transfer.successful_uploads(), 1, "{policy:?}");
+                assert_eq!(keys, ["a---b"], "{policy:?}");
+            }
+        }
+    }
+
+    /// The default and native delimiters keep no key registry; a custom one does.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_key_registry_only_for_custom_delimiter() {
+        let names = [std::path::Path::new("a.txt")];
+        for (delimiter, tracked) in [
+            (None, false),
+            (Some(DEFAULT_DELIMITER), false),
+            (Some(MAIN_SEPARATOR_STR), false),
+            (Some("--"), true),
+        ] {
+            let (_dir, transfer, _) =
+                upload_names(&names, delimiter, FailedTransferPolicy::Continue, 16).await;
+            let state = transfer.inner.state.lock();
+            assert_eq!(state.derived_keys.is_some(), tracked, "{delimiter:?}");
+            assert_eq!(
+                state.derived_keys.as_ref().map_or(0, HashMap::len),
+                usize::from(tracked),
+                "{delimiter:?}"
+            );
+        }
+    }
+
+    /// A lone file whose name needs lossy conversion still uploads under its lossy key.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_lone_lossy_name_uploads_under_lossy_key() {
+        use std::os::unix::ffi::OsStrExt;
+        let name = std::path::Path::new(std::ffi::OsStr::from_bytes(b"caf\xe9"));
+        let (_dir, transfer, keys) =
+            upload_names(&[name], None, FailedTransferPolicy::Continue, 16).await;
+        assert_eq!(transfer.successful_uploads(), 1);
+        assert_eq!(keys, ["caf\u{fffd}"]);
     }
 
     #[cfg(unix)]
@@ -2204,7 +2396,8 @@ mod tests {
 
         let config = crate::Config::builder()
             .sdk_client(mock_s3_success())
-            .build();
+            .build()
+            .expect("valid config");
         let handle = crate::client::Handle::test_handle_tokio(config);
 
         let input = super::super::UploadObjectsInputBuilder::default()
@@ -2285,7 +2478,8 @@ mod tests {
 
         let config = crate::Config::builder()
             .sdk_client(mock_s3_success())
-            .build();
+            .build()
+            .expect("valid config");
         let handle = crate::client::Handle::test_handle_tokio(config);
 
         let input = super::super::UploadObjectsInputBuilder::default()
@@ -2337,7 +2531,8 @@ mod tests {
 
         let config = crate::Config::builder()
             .sdk_client(mock_s3_success())
-            .build();
+            .build()
+            .expect("valid config");
         let handle = crate::client::Handle::test_handle_tokio(config);
 
         let input = super::super::UploadObjectsInputBuilder::default()

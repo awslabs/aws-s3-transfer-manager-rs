@@ -475,11 +475,11 @@ async fn run(args: Args) -> Result<(), BoxError> {
         (S3(_), S3(_)) => invalid_arg("s3 to s3 transfer not supported"),
     };
 
-    #[cfg(feature = "dial9")]
+    #[cfg(s3_tm_dial9)]
     let trace_dir = args
         .trace_dir
         .or_else(|| std::env::var("S3FIO_TRACE_DIR").ok());
-    #[cfg(feature = "dial9")]
+    #[cfg(s3_tm_dial9)]
     let recorder = if let Some(ref trace_dir) = trace_dir {
         use dial9::DiskBuffer;
         let _ = std::fs::create_dir_all(trace_dir);
@@ -560,9 +560,19 @@ async fn run(args: Args) -> Result<(), BoxError> {
         return Err("--network-interfaces is not supported on this platform".into());
     }
 
-    #[cfg(feature = "dial9")]
-    if let Some(ref recorder) = recorder {
-        config_loader = config_loader.dial9_handle(recorder.handle().clone());
+    // Tracing instruments the managed runtime's threads, so it applies only to managed execution.
+    // The runtime is built here, with the transfer manager's automatic thread naming and
+    // placement, so the recorder can be attached before the transfer manager adopts it.
+    #[cfg(s3_tm_dial9)]
+    if let (Some(recorder), RuntimeArg::Managed) = (&recorder, &args.runtime) {
+        let runtime = aws_smithy_execution::ManagedRuntime::builder()
+            .thread_name_prefix("s3-tm")
+            .pin_threads(false)
+            .dial9_handle(recorder.handle().clone())
+            .build()?;
+        config_loader = config_loader.runtime_config(RuntimeConfig::managed(
+            aws_sdk_s3_transfer_manager_ext::managed(runtime),
+        ));
     }
 
     let tm_config = config_loader.load().await;
@@ -641,7 +651,7 @@ async fn run(args: Args) -> Result<(), BoxError> {
     }
 
     // Drop the client first so its worker runtimes flush, then drain.
-    #[cfg(feature = "dial9")]
+    #[cfg(s3_tm_dial9)]
     if let Some(recorder) = recorder {
         drop(tm);
         recorder.graceful_shutdown(time::Duration::from_secs(10));
