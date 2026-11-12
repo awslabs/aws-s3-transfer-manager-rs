@@ -4,6 +4,7 @@
  */
 
 use crate::operation::download::body::BodySlot;
+use crate::operation::download::checksum::ChecksumTally;
 use crate::runtime::buffer_pool::ReserveFuture;
 use crate::transfer::{PendingCategory, PendingCause};
 
@@ -105,6 +106,10 @@ pub(crate) enum DownloadState {
         /// capacity is granted. Dropping terminal state releases the slot and
         /// cancellation-safely removes the future from the FIFO.
         pending: Option<PendingClaim>,
+        /// Checksum facts for the verdict: set at discovery, then updated in the
+        /// critical section that retires each range. A completion claim moves them
+        /// out.
+        integrity: Box<ChecksumTally>,
     },
 
     /// Terminal state - transfer ended (success, failure, or cancelled)
@@ -122,7 +127,8 @@ impl DownloadState {
     /// Returns any pending claim so its reservation future can be cancelled
     /// after the caller releases the state lock. Cancellation enters memory
     /// admission, which must not be nested under this lock. Assign `Terminal`
-    /// through this method rather than directly.
+    /// through this method rather than directly; `try_claim_completion`, which
+    /// requires `pending: None`, is the one exception.
     #[must_use = "drop the returned PendingClaim only after releasing the state lock"]
     pub(crate) fn enter_terminal(&mut self) -> Option<PendingClaim> {
         let pending = match self {
@@ -138,14 +144,16 @@ impl DownloadState {
     ///
     /// Returns `Some` at most once per transfer: from `Transferring` with no range
     /// remaining, no range or memory-relief item in flight, and no pending claim,
-    /// after which the state is `Terminal`. Any other state returns `None` and is
-    /// left unchanged. The caller holds the state lock across the check and the
+    /// after which the state is `Terminal`. The claim carries the checksum tally
+    /// out of `Transferring`. Any other state returns `None` and is left
+    /// unchanged. The caller holds the state lock across the check and the
     /// transition, and finalizes the destination only after releasing it.
     ///
     /// `remaining: None` implies `pending: None`: a claim waits in `pending` only
     /// while its range is still in `remaining`, because `poll_work` commits a range
     /// only once its slot is ready. The pattern matches `pending: None` to state the
-    /// full condition, so entering `Terminal` here never returns a claim to cancel.
+    /// full condition, so entering `Terminal` here never leaves a claim to cancel,
+    /// and the state is replaced directly to move the tally out.
     pub(crate) fn try_claim_completion(&mut self) -> Option<CompletionClaim> {
         let DownloadState::Transferring {
             remaining: None,
@@ -157,12 +165,17 @@ impl DownloadState {
         else {
             return None;
         };
-        let _no_claim = self.enter_terminal();
-        Some(CompletionClaim(()))
+        let DownloadState::Transferring { integrity, .. } =
+            std::mem::replace(self, DownloadState::Terminal)
+        else {
+            unreachable!("the state matched Transferring above");
+        };
+        Some(CompletionClaim(integrity))
     }
 }
 
-/// Proof that this caller claimed successful completion under the state lock.
+/// Proof that this caller claimed successful completion under the state lock,
+/// carrying the checksum tally of every range that retired before the claim.
 ///
 /// Only [`DownloadState::try_claim_completion`] constructs it; `finalize_completion`
 /// consumes it. The private field keeps code outside this module from
@@ -176,7 +189,14 @@ impl DownloadState {
 /// status and the state together under the state lock.
 #[must_use = "a completion claimed while active must be finalized after releasing the state lock"]
 #[derive(Debug)]
-pub(crate) struct CompletionClaim(());
+pub(crate) struct CompletionClaim(Box<ChecksumTally>);
+
+impl CompletionClaim {
+    /// The checksum facts of the completed download.
+    pub(super) fn checksum_tally(&self) -> &ChecksumTally {
+        &self.0
+    }
+}
 
 /// Read-ahead occupancy accounting: the numerator of the issuance gate.
 ///
@@ -274,6 +294,7 @@ mod tests {
             part_size: 8,
             gate: OccupancyGate::default(),
             pending: None,
+            integrity: Box::default(),
         }
     }
 

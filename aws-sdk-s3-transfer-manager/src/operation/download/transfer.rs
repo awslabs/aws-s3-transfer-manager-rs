@@ -37,7 +37,7 @@ use crate::runtime::buffer_pool::{
 };
 use crate::transfer::{IoRequest, PollWork, Transfer, TransferContext, TransferId, WorkOutcome};
 use crate::types::BucketType;
-use aws_smithy_observability::unit_of_work::checksums::ChecksumCapture;
+use aws_smithy_observability::unit_of_work::checksums::{ChecksumCapture, ChecksumOutcome};
 use aws_smithy_observability::unit_of_work::Capture;
 use aws_smithy_types::error::display::DisplayErrorContext;
 use tracing::Instrument;
@@ -74,8 +74,6 @@ struct DownloadTransferInner {
     object_meta: std::sync::OnceLock<ObjectMetadata>,
     /// Object-integrity result (set once the download completes successfully)
     integrity_checks: std::sync::OnceLock<crate::types::IntegrityChecks>,
-    /// Checksum facts the object-integrity result is built from
-    checksum_tally: Mutex<ChecksumTally>,
     /// Expected total bytes produced by this download, discovered from the response.
     expected_download_len: std::sync::OnceLock<u64>,
     /// Notified when discovery completes (success or failure)
@@ -105,7 +103,7 @@ macro_rules! bail_if_terminal {
             // no longer active, so a completion this retirement claims is dropped rather
             // than finalized: the cancellation's terminal path owns the destination (see
             // `CompletionClaim`).
-            let _ = $self.decrement_in_flight(0);
+            let _ = $self.decrement_in_flight(0, None);
             return WorkOutcome::Cancelled;
         }
     };
@@ -143,7 +141,6 @@ impl DownloadTransfer {
             writer,
             object_meta: std::sync::OnceLock::new(),
             integrity_checks: std::sync::OnceLock::new(),
-            checksum_tally: Mutex::default(),
             expected_download_len: std::sync::OnceLock::new(),
             discovery_notify: tokio::sync::Notify::new(),
         });
@@ -348,6 +345,7 @@ impl DownloadTransfer {
                 part_size,
                 gate,
                 pending,
+                integrity: _,
             } => {
                 // Resolve the slot to issue into this poll, if one is ready. Two gates
                 // compose in order: the per-transfer read-ahead window, then shared
@@ -815,11 +813,8 @@ impl DownloadTransfer {
         // chunk. A larger multipart object's discovery chunk carries part 1's
         // checksum, which is not the object checksum.
         let whole_object_in_chunk = input.range.is_none() && remaining.is_none();
-        self.inner
-            .checksum_tally
-            .lock()
-            .unwrap()
-            .record_discovery(chunk_meta.as_ref(), whole_object_in_chunk);
+        let mut integrity = Box::<ChecksumTally>::default();
+        integrity.record_discovery(chunk_meta.as_ref(), whole_object_in_chunk);
 
         // Notify waiters that discovery completed
         self.inner.discovery_notify.notify_waiters();
@@ -915,6 +910,7 @@ impl DownloadTransfer {
                 part_size: effective_part_size,
                 gate: super::context::OccupancyGate::with_issued(initial),
                 pending: None,
+                integrity,
             };
             let snapshot = self.snapshot(&work);
             // With no chunk and nothing remaining, discovery is the last work item to
@@ -1082,11 +1078,9 @@ impl DownloadTransfer {
             }
         };
 
-        let offset = chunk_meta
-            .content_range
-            .as_deref()
-            .and_then(crate::http::header::parse_content_range)
-            .map(|r| *r.start())
+        let offset = reissue_range
+            .as_ref()
+            .map(|range| *range.start())
             .unwrap_or(0);
         let chunk = ChunkOutput {
             seq,
@@ -1121,10 +1115,8 @@ impl DownloadTransfer {
             network_rx: bytes_received,
             ..Default::default()
         });
-        // Runs before decrement_in_flight, so finalize_completion sees every committed chunk.
-        self.record_checksum(offset, bytes_received, &checksum);
-
-        if let Some(claim) = self.decrement_in_flight(freed) {
+        let completed = Some((offset, bytes_received, checksum.try_outcome()));
+        if let Some(claim) = self.decrement_in_flight(freed, completed) {
             return self.finalize_completion(claim);
         }
 
@@ -1267,10 +1259,8 @@ impl DownloadTransfer {
             network_rx: bytes_received,
             ..Default::default()
         });
-        // Runs before decrement_in_flight, so finalize_completion sees every committed chunk.
-        self.record_checksum(*range.start(), bytes_received, &checksum);
-
-        if let Some(claim) = self.decrement_in_flight(freed) {
+        let completed = Some((*range.start(), bytes_received, checksum.try_outcome()));
+        if let Some(claim) = self.decrement_in_flight(freed, completed) {
             return self.finalize_completion(claim);
         }
 
@@ -1293,17 +1283,27 @@ impl DownloadTransfer {
         self.fail(guard, e.with_chunk(location))
     }
 
-    /// Retire one in-flight range: drop `ranges_in_flight` and release `freed` parts of
-    /// read-ahead occupancy, then claim completion if no range remains and no range or
-    /// memory-relief item is still in flight. Both happen under the state lock, so
-    /// completion is claimed exactly once; the caller that receives the claim finalizes
-    /// the transfer.
+    /// Retire one in-flight range: record the checksum outcome of a range that
+    /// `completed`, drop `ranges_in_flight` and release `freed` parts of read-ahead
+    /// occupancy, then claim completion if no range remains and no range or
+    /// memory-relief item is still in flight. All of it happens under the state lock,
+    /// so completion is claimed exactly once, and the claim carries the outcome of
+    /// every range that retired before it; the caller that receives the claim
+    /// finalizes the transfer.
+    ///
+    /// `completed` is the offset, length and checksum outcome of the bytes a
+    /// successful range delivered, and `None` for a range retired without
+    /// delivering, on cancellation.
     ///
     /// Releasing the occupancy under the same lock `poll_work` reads the gate and arms
     /// `set_pending` under is what orders this completion's release against the issuer's
     /// park (the mutator protocol `lock -> mutate -> unlock -> try_wake`). `freed` is the
     /// disk drain's freed count (0 if this fill did not hit a drain edge).
-    fn decrement_in_flight(&self, freed: u64) -> Option<CompletionClaim> {
+    fn decrement_in_flight(
+        &self,
+        freed: u64,
+        completed: Option<(u64, u64, Option<ChecksumOutcome>)>,
+    ) -> Option<CompletionClaim> {
         let (completion, snapshot) = {
             let mut work = self.inner.state.lock().unwrap();
             match &mut *work {
@@ -1312,8 +1312,12 @@ impl DownloadTransfer {
                     gate,
                     remaining,
                     pending,
+                    integrity,
                     ..
                 } => {
+                    if let Some((offset, len, outcome)) = completed {
+                        integrity.record(offset, len, outcome);
+                    }
                     *ranges_in_flight = ranges_in_flight.saturating_sub(1);
                     gate.release(freed);
                     let snapshot = transferring_snapshot(
@@ -1344,18 +1348,7 @@ impl DownloadTransfer {
         completion
     }
 
-    /// Records the checksum outcome of the response whose bytes a chunk delivered.
-    /// A chunk calls this after it is filled and before it retires, so every record
-    /// precedes the completion claim.
-    fn record_checksum(&self, offset: u64, len: u64, checksum: &ChecksumCapture) {
-        self.inner
-            .checksum_tally
-            .lock()
-            .unwrap()
-            .record(offset, len, checksum.try_outcome());
-    }
-
-    /// Finalize a transfer whose successful completion `_claim` proves: flush the tail to
+    /// Finalize a transfer whose successful completion `claim` proves: flush the tail to
     /// disk (returning the last carrier charges as `ChunkOutput`s drop), establish the
     /// destination length, set the terminal status, and signal waiters. A finalization
     /// error fails the transfer with `ErrorKind::IOError` instead.
@@ -1363,7 +1356,7 @@ impl DownloadTransfer {
     /// The state is already `Terminal`, entered when the claim was taken; this runs after
     /// the state lock is released so disk IO never happens under it. Symmetric with
     /// `fail`, which error paths call from `execute`.
-    fn finalize_completion(&self, _claim: CompletionClaim) -> WorkOutcome {
+    fn finalize_completion(&self, claim: CompletionClaim) -> WorkOutcome {
         let expected_len = *self
             .inner
             .expected_download_len
@@ -1376,15 +1369,8 @@ impl DownloadTransfer {
             let guard = self.inner.state.lock().unwrap();
             return self.fail(guard, error::Error::new(error::ErrorKind::IOError, e));
         }
-        // Every chunk records its checksum outcome before it retires, and completion is
-        // claimed only after the last one retires, so the tally is complete.
         let validation_enabled = self.validation_enabled(&self.inner.request);
-        let integrity_checks = self
-            .inner
-            .checksum_tally
-            .lock()
-            .unwrap()
-            .integrity_checks(validation_enabled);
+        let integrity_checks = claim.checksum_tally().integrity_checks(validation_enabled);
         let _ = self.inner.integrity_checks.set(integrity_checks);
         let state_snapshot = {
             let state = self.inner.state.lock().expect("lock poisoned");
@@ -1779,6 +1765,7 @@ mod tests {
             part_size: 8,
             gate,
             pending: None,
+            integrity: Box::default(),
         };
         assert_eq!(
             snapshot_state(&transferring, 4),
