@@ -24,7 +24,6 @@ use super::platform::{
     resolve_auto_concurrency, seed_from_gbps, AutoConcurrencySource, ConnectionCap,
     ResolvedAutoConcurrency,
 };
-use crate::config::is_valid_throughput;
 
 /// Part-sized buffers one concurrency slot may hold: one filling from the
 /// source, one in flight to S3, and one draining to the consumer.
@@ -166,7 +165,7 @@ pub(crate) struct ResourcePlan {
 /// target and connection cap are at least one.
 pub(crate) fn resolve(signals: Signals<'_>) -> ResourcePlan {
     let auto = resolve_auto_concurrency(signals.instance_type, signals.vcpus);
-    let configured_throughput = configured_throughput(&signals);
+    let configured_throughput = signals.throughput_gbps;
     let throughput_gbps = configured_throughput.or(auto.estimated_gbps);
     let ceiling_bytes = ceiling(&signals);
     let part_size = signals.explicit_part_size.unwrap_or(DEFAULT_PART_SIZE);
@@ -226,13 +225,6 @@ pub(crate) fn resolve(signals: Signals<'_>) -> ResourcePlan {
             || signals.ceiling_override_bytes.is_some())
             && memory_bound == 0,
     }
-}
-
-/// Configured throughput, when finite and positive.
-fn configured_throughput(signals: &Signals<'_>) -> Option<f64> {
-    signals
-        .throughput_gbps
-        .filter(|gbps| is_valid_throughput(*gbps))
 }
 
 /// Admission ceiling in bytes.
@@ -339,16 +331,6 @@ mod tests {
 
         assert_eq!(plan.throughput_gbps, Some(100.0));
         assert_eq!(plan.concurrency, seed_from_gbps(100.0));
-    }
-
-    #[test]
-    fn invalid_configured_throughput_is_treated_as_unset() {
-        // None of these describes a rate; each resolves as if unset.
-        for gbps in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-            let mut s = signals(Some(8 * GIB as usize), 4);
-            s.throughput_gbps = Some(gbps);
-            assert_eq!(resolve(s).throughput_gbps, None, "gbps {gbps}");
-        }
     }
 
     #[test]

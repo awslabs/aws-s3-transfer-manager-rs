@@ -4,6 +4,7 @@
  */
 
 use crate::runtime::buffer_pool::BufferPool;
+use aws_smithy_types::error::operation::BuildError;
 
 pub use crate::model::builders;
 pub use crate::model::{
@@ -96,13 +97,42 @@ pub enum ConcurrencyMode {
     /// environment. It sets the in-flight request target once, when the client
     /// is constructed; it does not limit throughput at run time. The resulting
     /// target is lowered, with a warning, when the per-host connection cap or the
-    /// payload-memory ceiling cannot sustain it. A value that is not finite and
-    /// positive is ignored with a warning, and concurrency is resolved as for
-    /// [`Auto`](Self::Auto).
-    TargetThroughput(f64),
+    /// payload-memory ceiling cannot sustain it.
+    TargetThroughput(TargetThroughput),
 
     /// Explicit concurrency control
     Explicit(usize),
+}
+
+/// A network throughput target for [`ConcurrencyMode::TargetThroughput`].
+///
+/// One target currently applies to uploads and downloads alike. The value is
+/// private so that per-direction targets can be added later without breaking
+/// callers.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TargetThroughput {
+    gbps: f64,
+}
+
+impl TargetThroughput {
+    /// A target of `gbps` gigabits per second, for uploads and downloads.
+    ///
+    /// Returns an error unless `gbps` is finite and positive.
+    pub fn new_gigabits_per_sec(gbps: f64) -> Result<Self, BuildError> {
+        if gbps.is_finite() && gbps > 0.0 {
+            Ok(Self { gbps })
+        } else {
+            Err(BuildError::invalid_field(
+                "gbps",
+                format!("throughput target must be finite and positive, got {gbps}"),
+            ))
+        }
+    }
+
+    /// The target in gigabits per second.
+    pub fn gigabits_per_sec(&self) -> f64 {
+        self.gbps
+    }
 }
 
 /// How far a download may prefetch ahead of the consumer.
@@ -452,6 +482,29 @@ impl IntegrityChecks {
             checksum_sha256,
             checksum_type,
             checksum_validation,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TargetThroughput;
+
+    #[test]
+    fn target_throughput_accepts_finite_positive_gbps() {
+        for gbps in [0.5, 1.0, 200.0] {
+            let target = TargetThroughput::new_gigabits_per_sec(gbps).unwrap();
+            assert_eq!(target.gigabits_per_sec(), gbps);
+        }
+    }
+
+    #[test]
+    fn target_throughput_rejects_values_that_are_not_a_rate() {
+        for gbps in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(
+                TargetThroughput::new_gigabits_per_sec(gbps).is_err(),
+                "gbps {gbps}"
+            );
         }
     }
 }

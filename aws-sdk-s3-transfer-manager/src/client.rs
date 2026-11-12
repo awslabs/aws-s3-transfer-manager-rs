@@ -329,13 +329,7 @@ impl Client {
         // Runtime HTTP is built only when it will be installed on an S3 client
         // this transfer manager constructs.
         let runtime_http = config.runtime_http(plan.connection_cap);
-        log_resource_sizing(
-            &plan,
-            &profile,
-            &connection_cap,
-            runtime_http.is_some(),
-            config.ignored_throughput_target_gbps(),
-        );
+        log_resource_sizing(&plan, &profile, &connection_cap, runtime_http.is_some());
         // wasm targets have no managed execution; see `Managed`.
         #[cfg(not(target_family = "wasm"))]
         let managed = match config.managed_config_mut() {
@@ -572,18 +566,9 @@ fn log_resource_sizing(
     profile: &crate::runtime::platform::MachineProfile,
     cap: &crate::runtime::platform::ConnectionCap,
     connection_cap_installed: bool,
-    ignored_throughput_gbps: Option<f64>,
 ) {
     let soft = cap.descriptors.map(|limit| limit.soft);
     let hard = cap.descriptors.and_then(|limit| limit.hard);
-    if let Some(gbps) = ignored_throughput_gbps {
-        tracing::warn!(
-            target: crate::telemetry::TARGET_CONCURRENCY,
-            configured_throughput_gbps = gbps,
-            "configured throughput target is not finite and positive and was ignored; throughput \
-             is estimated from the execution environment instead",
-        );
-    }
     tracing::info!(
         target: crate::telemetry::TARGET_CONCURRENCY,
         concurrency_target = plan.concurrency,
@@ -1308,7 +1293,9 @@ mod tests {
     fn configured_throughput_drives_the_resolved_target() {
         // A throughput target sets the controller's target.
         let client = Client::new(config_with(
-            ConcurrencyMode::TargetThroughput(100.0),
+            ConcurrencyMode::TargetThroughput(
+                crate::types::TargetThroughput::new_gigabits_per_sec(100.0).unwrap(),
+            ),
             Some(profile(None, 4)),
         ));
 
@@ -1326,15 +1313,6 @@ mod tests {
         });
         assert_eq!(client.handle.controller.target(), expected.concurrency);
         assert_eq!(client.handle.plan.throughput_gbps, Some(100.0));
-    }
-
-    #[test]
-    fn invalid_throughput_target_reads_as_unset() {
-        for gbps in [0.0, -1.0, f64::NAN, f64::INFINITY] {
-            let config = config_with(ConcurrencyMode::TargetThroughput(gbps), None);
-            assert_eq!(config.throughput_target_gbps(), None, "gbps {gbps}");
-            assert!(config.ignored_throughput_target_gbps().is_some());
-        }
     }
 
     // FIXME: crossbeam-epoch is incompatible with miri

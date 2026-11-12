@@ -188,23 +188,10 @@ impl Config {
         &self.concurrency
     }
 
-    /// The [`ConcurrencyMode::TargetThroughput`] value, when it is finite and
-    /// positive.
+    /// The [`ConcurrencyMode::TargetThroughput`] target in Gbps, if configured.
     pub(crate) fn throughput_target_gbps(&self) -> Option<f64> {
-        self.configured_throughput_gbps()
-            .filter(|gbps| is_valid_throughput(*gbps))
-    }
-
-    /// The [`ConcurrencyMode::TargetThroughput`] value, when it is ignored as
-    /// invalid.
-    pub(crate) fn ignored_throughput_target_gbps(&self) -> Option<f64> {
-        self.configured_throughput_gbps()
-            .filter(|gbps| !is_valid_throughput(*gbps))
-    }
-
-    fn configured_throughput_gbps(&self) -> Option<f64> {
-        match self.concurrency {
-            ConcurrencyMode::TargetThroughput(gbps) => Some(gbps),
+        match &self.concurrency {
+            ConcurrencyMode::TargetThroughput(target) => Some(target.gigabits_per_sec()),
             _ => None,
         }
     }
@@ -491,11 +478,6 @@ impl Builder {
             dial9_handle: self.dial9_handle,
         }
     }
-}
-
-/// Whether a throughput target in Gbps can describe a rate.
-pub(crate) fn is_valid_throughput(gbps: f64) -> bool {
-    gbps.is_finite() && gbps > 0.0
 }
 
 #[cfg(test)]

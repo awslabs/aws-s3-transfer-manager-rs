@@ -7,7 +7,7 @@ use aws_sdk_s3_transfer_manager::memory::{BufferPool, MemoryBudgetConfig, Memory
 use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
 use aws_sdk_s3_transfer_manager::metrics::Throughput;
 use aws_sdk_s3_transfer_manager::operation::download::Body;
-use aws_sdk_s3_transfer_manager::types::{ConcurrencyMode, PartSize};
+use aws_sdk_s3_transfer_manager::types::{ConcurrencyMode, PartSize, TargetThroughput};
 use aws_sdk_s3_transfer_manager::RuntimeConfig;
 use aws_smithy_types::date_time::{DateTime, Format};
 use clap::{CommandFactory, Parser};
@@ -155,8 +155,8 @@ struct ConcurrencyModeArg {
     concurrency_auto: bool,
 
     /// ConcurrencyMode::TargetThroughput(Gbps)
-    #[arg(long)]
-    target_throughput_gbps: Option<f64>,
+    #[arg(long, value_parser = parse_target_throughput)]
+    target_throughput_gbps: Option<TargetThroughput>,
 
     /// ConcurrencyMode::Explicit(n)
     #[arg(long)]
@@ -170,11 +170,17 @@ impl ConcurrencyModeArg {
         }
 
         match (self.target_throughput_gbps, self.concurrency) {
-            (Some(gbps), _) => ConcurrencyMode::TargetThroughput(gbps),
+            (Some(target), _) => ConcurrencyMode::TargetThroughput(target),
             (None, Some(concurrency)) => ConcurrencyMode::Explicit(concurrency),
             (None, None) => ConcurrencyMode::Auto,
         }
     }
+}
+
+/// Parses `--target-throughput-gbps`, rejecting values that are not finite and positive.
+fn parse_target_throughput(s: &str) -> Result<TargetThroughput, String> {
+    let gbps: f64 = s.parse().map_err(|e| format!("{e}"))?;
+    TargetThroughput::new_gigabits_per_sec(gbps).map_err(|e| e.to_string())
 }
 
 #[derive(Clone, Debug)]

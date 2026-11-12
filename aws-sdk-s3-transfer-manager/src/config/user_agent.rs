@@ -35,8 +35,7 @@ pub(crate) fn client_features(config: &Config, profile: &MachineProfile) -> Vec<
     }
     let custom_concurrency = match config.concurrency() {
         ConcurrencyMode::Auto => false,
-        ConcurrencyMode::TargetThroughput(_) => config.throughput_target_gbps().is_some(),
-        ConcurrencyMode::Explicit(_) => true,
+        ConcurrencyMode::TargetThroughput(_) | ConcurrencyMode::Explicit(_) => true,
     };
     if custom_concurrency {
         features.push(AwsSdkFeature::S3CustomThroughput);
@@ -731,13 +730,10 @@ mod tests {
             ),
             (
                 "throughput target",
-                off_ec2().concurrency(ConcurrencyMode::TargetThroughput(25.0)),
+                off_ec2().concurrency(ConcurrencyMode::TargetThroughput(
+                    crate::types::TargetThroughput::new_gigabits_per_sec(25.0).unwrap(),
+                )),
                 vec![BusinessMetric::S3CustomThroughput],
-            ),
-            (
-                "ignored throughput target",
-                off_ec2().concurrency(ConcurrencyMode::TargetThroughput(f64::NAN)),
-                vec![],
             ),
             (
                 "memory",

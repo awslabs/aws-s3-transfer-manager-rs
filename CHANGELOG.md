@@ -17,9 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `aws-sdk-s3-transfer-manager`, `aws-sdk-s3-transfer-manager-ext`, `aws-smithy-topology`,
   `aws-smithy-execution` and `aws-smithy-managed-http`: the minimum supported Rust version is
   1.96.0.
-- `ConcurrencyMode::TargetThroughput` takes an `f64` in Gbps instead of a `TargetThroughput`, so
-  targets below 1 Gbps can be expressed. A value that is not finite and positive is ignored with
-  a warning, and concurrency resolves as for `Auto`.
+- `TargetThroughput::new_gigabits_per_sec` takes an `f64` instead of a `u64`, so targets below
+  1 Gbps can be expressed, and returns `Result<TargetThroughput, BuildError>`, rejecting a value
+  that is not finite and positive.
+- `TargetThroughput` holds one target for uploads and downloads. `upload()` and `download()` are
+  replaced by `gigabits_per_sec()`.
 - The concurrency target, payload-memory ceiling, and part size are resolved together. A
   derived concurrency target is lowered to what the descriptor-derived connection cap and the
   memory ceiling can sustain at the resolved part size. Configured values are used as given.
@@ -32,10 +34,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of 128.
 - The automatic memory ceiling for a client is at least 256 MiB, limited to half of detected
   memory. `BufferPool` built with `MemoryBudgetConfig::Auto` directly is unchanged.
-
-### Removed
-- `types::TargetThroughput`. Its upload target was never applied; the client has one
-  concurrency target, sized from the download target.
 
 ## [release-2026-11-05]
 
