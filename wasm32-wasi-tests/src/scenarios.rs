@@ -516,7 +516,7 @@ async fn many_files(store: Store, work: &Path) -> Result<String, String> {
         downloaded.objects_downloaded()
     );
     for index in 0..FILES {
-        let path = destination.join(format!("f{index:04}"));
+        let path = destination.join("many").join(format!("f{index:04}"));
         ensure_same(&path.display().to_string(), &contents(index), &read(&path)?)?;
     }
     shut_down(client, before, store).await
