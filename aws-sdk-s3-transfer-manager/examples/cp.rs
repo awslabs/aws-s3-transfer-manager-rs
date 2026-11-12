@@ -155,8 +155,8 @@ struct ConcurrencyModeArg {
     concurrency_auto: bool,
 
     /// ConcurrencyMode::TargetThroughput(Gbps)
-    #[arg(long)]
-    target_throughput_gbps: Option<u64>,
+    #[arg(long, value_parser = parse_target_throughput)]
+    target_throughput_gbps: Option<TargetThroughput>,
 
     /// ConcurrencyMode::Explicit(n)
     #[arg(long)]
@@ -170,13 +170,17 @@ impl ConcurrencyModeArg {
         }
 
         match (self.target_throughput_gbps, self.concurrency) {
+            (Some(target), _) => ConcurrencyMode::TargetThroughput(target),
             (None, Some(concurrency)) => ConcurrencyMode::Explicit(concurrency),
-            (Some(gbps), None) => {
-                ConcurrencyMode::TargetThroughput(TargetThroughput::new_gigabits_per_sec(gbps))
-            }
-            _ => ConcurrencyMode::Auto,
+            (None, None) => ConcurrencyMode::Auto,
         }
     }
+}
+
+/// Parses `--target-throughput-gbps`, rejecting values that are not finite and positive.
+fn parse_target_throughput(s: &str) -> Result<TargetThroughput, String> {
+    let gbps: f64 = s.parse().map_err(|e| format!("{e}"))?;
+    TargetThroughput::gbps(gbps).map_err(|e| e.to_string())
 }
 
 #[derive(Clone, Debug)]
@@ -403,7 +407,13 @@ async fn do_manifest_upload(
     for entry in entries {
         let tm = tm.clone();
         let bucket = bucket.to_string();
-        let upload_key = format!("{key_prefix}/{}", entry.local);
+        // Match `upload_objects`: no separator after an empty prefix or one that
+        // already ends with `/`.
+        let upload_key = if key_prefix.is_empty() || key_prefix.ends_with('/') {
+            format!("{key_prefix}{}", entry.local)
+        } else {
+            format!("{key_prefix}/{}", entry.local)
+        };
         let source = source_dir.join(&entry.local);
         set.spawn(async move { do_single_upload(&tm, &bucket, &upload_key, &source).await });
     }
@@ -471,11 +481,11 @@ async fn run(args: Args) -> Result<(), BoxError> {
         (S3(_), S3(_)) => invalid_arg("s3 to s3 transfer not supported"),
     };
 
-    #[cfg(feature = "dial9")]
+    #[cfg(s3_tm_dial9)]
     let trace_dir = args
         .trace_dir
         .or_else(|| std::env::var("S3FIO_TRACE_DIR").ok());
-    #[cfg(feature = "dial9")]
+    #[cfg(s3_tm_dial9)]
     let recorder = if let Some(ref trace_dir) = trace_dir {
         use dial9::DiskBuffer;
         let _ = std::fs::create_dir_all(trace_dir);
@@ -556,9 +566,19 @@ async fn run(args: Args) -> Result<(), BoxError> {
         return Err("--network-interfaces is not supported on this platform".into());
     }
 
-    #[cfg(feature = "dial9")]
-    if let Some(ref recorder) = recorder {
-        config_loader = config_loader.dial9_handle(recorder.handle().clone());
+    // Tracing instruments the managed runtime's threads, so it applies only to managed execution.
+    // The runtime is built here, with the transfer manager's automatic thread naming and
+    // placement, so the recorder can be attached before the transfer manager adopts it.
+    #[cfg(s3_tm_dial9)]
+    if let (Some(recorder), RuntimeArg::Managed) = (&recorder, &args.runtime) {
+        let runtime = aws_smithy_execution::ManagedRuntime::builder()
+            .thread_name_prefix("s3-tm")
+            .pin_threads(false)
+            .dial9_handle(recorder.handle().clone())
+            .build()?;
+        config_loader = config_loader.runtime_config(RuntimeConfig::managed(
+            aws_sdk_s3_transfer_manager_ext::managed(runtime),
+        ));
     }
 
     let tm_config = config_loader.load().await;
@@ -637,7 +657,7 @@ async fn run(args: Args) -> Result<(), BoxError> {
     }
 
     // Drop the client first so its worker runtimes flush, then drain.
-    #[cfg(feature = "dial9")]
+    #[cfg(s3_tm_dial9)]
     if let Some(recorder) = recorder {
         drop(tm);
         recorder.graceful_shutdown(time::Duration::from_secs(10));

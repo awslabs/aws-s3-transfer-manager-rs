@@ -2684,7 +2684,7 @@ let pool = BufferPool::builder()
 let config = Config::builder()
     .memory(MemoryConfig::Explicit(pool.clone()))
     // S3 client configuration omitted.
-    .build();
+    .build()?;
 let transfer_manager = Client::new(config);
 ```
 

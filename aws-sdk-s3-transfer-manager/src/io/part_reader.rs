@@ -348,8 +348,7 @@ impl BytesPartReader {
         state.part_number += 1;
         state.offset += data.len() as u64;
         state.remaining -= data.len() as u64;
-        let part = PartData::new(part_number, data).mark_last(state.is_end());
-        Ok(Some(part))
+        Ok(Some(PartData::new(part_number, data)))
     }
 }
 
@@ -371,12 +370,8 @@ impl PathBodyPartReader {
         // order is sequential so kernel readahead would help, but concurrent execution creates
         // some scatter. Benchmark before adding.
         // TODO(vnext): does this need to be async now?
-        let file = Arc::new(File::open(&body.path).map_err(|e| {
-            Error::from(std::io::Error::new(
-                e.kind(),
-                format!("failed to open {}: {e}", body.path.display()),
-            ))
-        })?);
+        let file =
+            Arc::new(File::open(&body.path).map_err(|e| Error::io_at("opening", &body.path, e))?);
         let offset = body.offset;
         let content_length = body.length;
         Ok(Self {
@@ -393,22 +388,22 @@ impl PathBodyPartReader {
     /// The complete range is admitted before file I/O begins. The returned
     /// payload retains its pooled storage independently of this reader.
     async fn next_part(&self, stream_cx: &StreamContext) -> Result<Option<PartData>, Error> {
-        let (offset, part_number, part_size, is_last) = match self.advance(stream_cx)? {
+        let (offset, part_number, part_size) = match self.advance(stream_cx)? {
             Some(PathBodyReadCursor {
                 offset,
                 part_number,
                 part_size,
-                is_last,
-            }) => (offset, part_number, part_size, is_last),
+            }) => (offset, part_number, part_size),
             None => return Ok(None),
         };
         let part_size = part_size as usize;
         let mut dst = stream_cx.part_buffer();
         poll_fn(|cx| dst.poll_acquire(cx, part_size)).await?;
 
+        let read_error = |e| Error::io_at("reading", &self.body.path, e);
         if stream_cx.direct_io() {
             // Managed threads: read directly, no thread pool hop.
-            read_exact_at(&self.file, &mut dst, offset)?;
+            read_exact_at(&self.file, &mut dst, offset).map_err(read_error)?;
         } else {
             // Shared runtime: offload to blocking thread pool.
             let fd = Arc::clone(&self.file);
@@ -416,7 +411,8 @@ impl PathBodyPartReader {
                 read_exact_at(&fd, &mut dst, offset)?;
                 Ok::<_, std::io::Error>(dst)
             })
-            .await??;
+            .await?
+            .map_err(read_error)?;
         }
 
         stream_cx.record_io(&crate::metrics::IoSample {
@@ -424,9 +420,7 @@ impl PathBodyPartReader {
             ..Default::default()
         });
 
-        Ok(Some(
-            PartData::from_segmented(part_number, dst.freeze()).mark_last(is_last),
-        ))
+        Ok(Some(PartData::from_segmented(part_number, dst.freeze())))
     }
 
     /// Claims the next disjoint file range without performing I/O.
@@ -457,7 +451,6 @@ impl PathBodyPartReader {
             offset,
             part_number,
             part_size,
-            is_last: state.is_end(),
         }))
     }
 }
@@ -468,7 +461,6 @@ struct PathBodyReadCursor {
     offset: u64,
     part_number: u64,
     part_size: u64,
-    is_last: bool,
 }
 
 /// Custom-stream reader state shared by the reader and its currently active future.
@@ -1257,15 +1249,19 @@ mod test {
         assert!(result.is_err());
     }
 
+    // A payload shorter than one part is a single final part: the read after it
+    // must report the end of the stream rather than an empty part.
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
-    async fn test_bytes_part_reader_detects_last_true() {
+    async fn test_bytes_part_reader_ends_after_final_part() {
         let data = Bytes::from("test");
         let reader = BytesPartReader::new(data);
         let stream_cx = test_stream_cx(10);
 
         let result = reader.next_part(&stream_cx).unwrap().unwrap();
-        assert!(result.is_last.unwrap());
+        assert_eq!(result.part_number, 1);
+        assert_eq!(result.data.len(), 4);
+        assert!(reader.next_part(&stream_cx).unwrap().is_none());
     }
 
     #[test]
@@ -1286,14 +1282,14 @@ mod test {
         assert_eq!(result.offset, 10);
         assert_eq!(result.part_number, 1);
         assert_eq!(result.part_size, 5);
-        assert!(!result.is_last);
+        assert!(!reader.state.lock().unwrap().is_end());
 
         // Second advance should succeed
         let result = reader.advance(&stream_cx).unwrap().unwrap();
         assert_eq!(result.offset, 15);
         assert_eq!(result.part_number, 2);
         assert_eq!(result.part_size, 5);
-        assert!(!result.is_last);
+        assert!(!reader.state.lock().unwrap().is_end());
 
         // Manually corrupt the offset to test validation
         {
@@ -1306,8 +1302,10 @@ mod test {
         assert!(result.is_err());
     }
 
+    // A range shorter than one part is claimed whole, and the claim after it
+    // reports the end of the range.
     #[test]
-    fn test_path_body_part_reader_advance_detects_last_part() {
+    fn test_path_body_part_reader_advance_ends_after_final_part() {
         let mut tmp = NamedTempFile::new().unwrap();
         tmp.write_all(&[0u8; 3]).unwrap();
 
@@ -1320,6 +1318,8 @@ mod test {
         let stream_cx = test_stream_cx(10);
 
         let result = reader.advance(&stream_cx).unwrap().unwrap();
-        assert!(result.is_last);
+        assert_eq!(result.offset, 0);
+        assert_eq!(result.part_size, 3);
+        assert!(reader.advance(&stream_cx).unwrap().is_none());
     }
 }

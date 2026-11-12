@@ -4,6 +4,18 @@
  */
 
 mod common;
+#[cfg(any(unix, windows))]
+#[path = "download_test/test_util.rs"]
+mod test_util;
+
+#[cfg(unix)]
+use test_util::await_shutdown;
+#[cfg(any(unix, windows))]
+use test_util::{
+    assert_download_releases_destination, drop_and_await_shutdown, Destination, Ending,
+    OpenFileProbe,
+};
+
 use aws_sdk_s3_transfer_manager::RuntimeConfig;
 use aws_sdk_s3_transfer_manager::{
     error::{BoxError, ErrorKind},
@@ -110,7 +122,8 @@ fn test_tm(
         .s3_config(common::s3_config(http_client))
         .part_size(PartSize::Target(part_size as u64))
         .concurrency(ConcurrencyMode::Explicit(1))
-        .build();
+        .build()
+        .expect("valid config");
 
     aws_sdk_s3_transfer_manager::Client::new(config)
 }
@@ -301,7 +314,8 @@ async fn abort_download_with_executing_gets(runtime_config: RuntimeConfig) {
         .part_size(PartSize::Target(part_size as u64))
         .concurrency(ConcurrencyMode::Explicit(2))
         .runtime_config(runtime_config)
-        .build();
+        .build()
+        .expect("valid config");
     let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
     let handle = tm
@@ -699,6 +713,186 @@ async fn test_download_write_to_path() {
     assert!(tmp_files.is_empty(), "leftover temp files: {:?}", tmp_files);
 }
 
+// ref: RUST-1202
+/// A `write_to_path` destination whose parent directory does not exist fails with an
+/// `IOError` that names what failed and the destination path, with the operating system's
+/// error as its source.
+#[cfg(any(unix, windows))]
+#[tokio::test]
+async fn test_download_write_to_path_missing_parent_error_names_action_and_path() {
+    let data = rand_data(16);
+    let (tm, _http_client) = simple_test_tm(&data, 5 * ByteUnit::Mebibyte.as_bytes_usize());
+
+    let dir = tempfile::tempdir().unwrap();
+    let dest_path = dir.path().join("missing").join("output.dat");
+
+    let error = tm
+        .download()
+        .bucket("test-bucket")
+        .key("test-object")
+        .write_to_path(&dest_path)
+        .await
+        .expect_err("a destination in a missing directory must fail");
+
+    assert_eq!(&ErrorKind::IOError, error.kind());
+    assert_eq!(
+        format!(
+            "I/O error creating temporary file for \"{}\"",
+            dest_path.display()
+        ),
+        error.to_string()
+    );
+    let io_error = std::error::Error::source(&error)
+        .and_then(|s| s.downcast_ref::<std::io::Error>())
+        .expect("the source is the operating system's error");
+    assert_eq!(std::io::ErrorKind::NotFound, io_error.kind());
+}
+
+macro_rules! download_releases_destination_tests {
+    ($($(#[$attr:meta])* $name:ident: $destination:ident, $ending:ident, $runtime:expr;)*) => {$(
+        $(#[$attr])*
+        #[tokio::test(flavor = "multi_thread")]
+        async fn $name() {
+            assert_download_releases_destination(
+                Destination::$destination,
+                Ending::$ending,
+                $runtime,
+            )
+            .await;
+        }
+    )*};
+}
+
+// ref: awslabs/aws-s3-transfer-manager-rs#228, V2429410200
+// Windows probes by path, so `write_to_path` endings that remove the
+// temporary file are covered on Unix only.
+download_releases_destination_tests! {
+    #[cfg(any(unix, windows))]
+    write_to_path_success_releases_destination: Path, Success, RuntimeConfig::default();
+    #[cfg(any(unix, windows))]
+    write_to_path_success_on_tokio_runtime_releases_destination: Path, Success, RuntimeConfig::multi_thread_tokio();
+    #[cfg(unix)]
+    write_to_path_body_failure_releases_temporary_file: Path, BodyFailure, RuntimeConfig::default();
+    #[cfg(unix)]
+    write_to_path_abort_releases_temporary_file: Path, Abort, RuntimeConfig::default();
+    #[cfg(unix)]
+    write_to_path_dropped_handle_releases_temporary_file: Path, DropHandle, RuntimeConfig::default();
+    #[cfg(any(unix, windows))]
+    write_to_file_success_releases_caller_file: File, Success, RuntimeConfig::default();
+    #[cfg(any(unix, windows))]
+    write_to_file_body_failure_releases_caller_file: File, BodyFailure, RuntimeConfig::default();
+    #[cfg(any(unix, windows))]
+    write_to_file_abort_releases_caller_file: File, Abort, RuntimeConfig::default();
+    #[cfg(any(unix, windows))]
+    write_to_file_dropped_handle_releases_caller_file: File, DropHandle, RuntimeConfig::default();
+}
+
+// ref: V2429410200
+/// Completed `download_objects` children release their destination files
+/// through ordinary retirement, with the client still alive.
+#[cfg(any(unix, windows))]
+#[tokio::test(flavor = "multi_thread")]
+async fn download_objects_releases_destination_files() {
+    const LIST_ONE_KEY: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+    <Name>test-bucket</Name>
+    <KeyCount>1</KeyCount>
+    <MaxKeys>1000</MaxKeys>
+    <IsTruncated>false</IsTruncated>
+    <Contents>
+        <Key>key1</Key>
+        <Size>8</Size>
+    </Contents>
+</ListBucketResult>"#;
+    let data = rand_data(8);
+    let list = ReplayEvent::new(
+        dummy_expected_request(),
+        http::Response::builder()
+            .status(200)
+            .body(SdkBody::from(LIST_ONE_KEY))
+            .unwrap(),
+    );
+    let get = ReplayEvent::new(
+        dummy_expected_request(),
+        http::Response::builder()
+            .status(200)
+            .header("Content-Length", "8")
+            .header("Content-Range", "bytes 0-7/8")
+            .header("ETag", "my-etag")
+            .body(SdkBody::from(data.clone()))
+            .unwrap(),
+    );
+    let config = aws_sdk_s3_transfer_manager::Config::builder()
+        .s3_config(common::s3_config(StaticReplayClient::new(vec![list, get])))
+        .concurrency(ConcurrencyMode::Explicit(1))
+        .build()
+        .expect("valid config");
+    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+
+    let dir = tempfile::tempdir().unwrap();
+    let output = tm
+        .download_objects()
+        .bucket("test-bucket")
+        .destination(dir.path())
+        .initiate()
+        .unwrap()
+        .join()
+        .await
+        .unwrap();
+    assert_eq!(output.objects_downloaded(), 1);
+    let path = dir.path().join("key1");
+    assert_eq!(std::fs::read(&path).unwrap(), data.as_ref());
+    OpenFileProbe::new(&path).assert_released().await;
+    drop_and_await_shutdown(tm).await;
+}
+
+// ref: V2429410200
+/// A completed download releases its destination after both clients are
+/// dropped and the destination is unlinked.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn write_to_path_drop_clients_then_unlink_releases_destination() {
+    let data = Bytes::from_static(b"snapshot");
+    let response = ReplayEvent::new(
+        dummy_expected_request(),
+        http::Response::builder()
+            .status(200)
+            .header("Content-Length", data.len().to_string())
+            .body(SdkBody::from(data.clone()))
+            .unwrap(),
+    );
+    let shared = common::shared_config(StaticReplayClient::new(vec![response]));
+    // Reproduce the reported drop sequence with both clients sharing SDK configuration.
+    let s3 = aws_sdk_s3::Client::new(&shared);
+    let tm = aws_sdk_s3_transfer_manager::Client::new(
+        aws_sdk_s3_transfer_manager::Config::builder()
+            .s3_config(&shared)
+            .build()
+            .expect("valid config"),
+    );
+    let completion = tm.shutdown_completion();
+    let dir = tempfile::tempdir().unwrap();
+    let destination = dir.path().join("snapshot.bin");
+    tm.download()
+        .bucket("bucket")
+        .key("key")
+        .write_to_path(&destination)
+        .await
+        .unwrap()
+        .join()
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(&destination).unwrap(), data.as_ref());
+    let probe = OpenFileProbe::new(&destination);
+    drop(tm);
+    drop(s3);
+    drop(shared);
+    std::fs::remove_file(&destination).unwrap();
+    assert!(!destination.exists());
+    probe.assert_released().await;
+    await_shutdown(completion).await;
+}
+
 /// A file already at the temporary name `write_to_path` draws is left
 /// untouched, and the download writes through another name. Seeding
 /// `fastrand` on the polling thread, which draws the name, makes the first
@@ -971,7 +1165,8 @@ async fn test_integrity_checks_disabled_when_validation_when_required() {
         ))
         .part_size(PartSize::Target(part_size as u64))
         .concurrency(ConcurrencyMode::Explicit(1))
-        .build();
+        .build()
+        .expect("valid config");
     let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
     let mut handle = tm

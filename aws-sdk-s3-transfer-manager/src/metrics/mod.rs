@@ -42,6 +42,7 @@ pub mod unit {
     use std::{fmt, str::FromStr};
 
     /// SI byte units
+    #[non_exhaustive]
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum ByteUnit {
         /// 1 byte
@@ -161,13 +162,15 @@ pub mod unit {
         }
     }
 
-    /// Display context to format a value representing number of bytres in a particular unit
+    /// Formats a byte count in a fixed [`ByteUnit`].
+    ///
+    /// A count that is a whole multiple of the unit is displayed as an integer;
+    /// any other count is displayed with the formatter's precision, three
+    /// decimal places by default.
     #[derive(Debug)]
     pub struct ByteCountDisplayContext {
-        /// The throughput measurment to display
-        pub total_bytes: u64,
-        /// The precise unit to display the throughput as
-        pub unit: ByteUnit,
+        total_bytes: u64,
+        unit: ByteUnit,
     }
 
     impl ByteCountDisplayContext {
@@ -314,13 +317,15 @@ impl fmt::Display for Throughput {
     }
 }
 
-/// Display context to format throughput in a particular unit
+/// Formats a [`Throughput`] as a rate in a fixed [`ByteUnit`](unit::ByteUnit) per
+/// second.
+///
+/// Created by [`Throughput::display_as`]. The rate is displayed with the
+/// formatter's precision when one is given.
 #[derive(Debug)]
 pub struct ThroughputDisplayContext<'a> {
-    /// The throughput measurment to display
-    pub throughput: &'a Throughput,
-    /// The precise unit to display the throughput as
-    pub unit: unit::ByteUnit,
+    throughput: &'a Throughput,
+    unit: unit::ByteUnit,
 }
 
 impl fmt::Display for ThroughputDisplayContext<'_> {

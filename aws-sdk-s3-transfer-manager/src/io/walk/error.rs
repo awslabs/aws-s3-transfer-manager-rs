@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 /// Each kind has a deterministic fatality (see [`WalkErrorKind::is_fatal`]).
 /// Errors whose kind is fatal terminate the walk; non-fatal kinds report
 /// the affected entry and the walk continues.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WalkErrorKind {
     /// Source root cannot be opened for reading (I/O or permission error

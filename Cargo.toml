@@ -16,7 +16,7 @@ members = [
 exclude = ["fuzz", "tools/tmdev"]
 
 [workspace.package]
-rust-version = "1.94.1"
+rust-version = "1.96.0"
 edition = "2024"
 authors = ["AWS Rust SDK Team <aws-sdk-rust@amazon.com>"]
 

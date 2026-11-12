@@ -101,7 +101,7 @@ async fn test_transfer_manager_integration() -> Result<(), Box<dyn std::error::E
     // Create Transfer Manager with mock server client
     let tm_config = Config::builder()
         .client(s3_client)
-        .build();
+        .build()?;
     let tm = Client::new(tm_config);
 
     // Use Transfer Manager for uploads/downloads
@@ -144,11 +144,17 @@ async fn test_filesystem_storage() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-### Conditional Requests
+### Conditional Writes, Appends and Renames
 
 - GetObject, HeadObject and DeleteObject honor `If-Match`; PutObject honors `If-Match` with an
   ETag and `If-None-Match: *`. The server ignores other conditions. The in-memory store checks a
   write's or a delete's condition atomically with it.
+- PutObject with `x-amz-write-offset-bytes` appends to an object in directory buckets (in-memory
+  store only), honoring `If-Match` and `If-None-Match: *`. Unlike S3's, an append's 412 does not
+  name the failed condition in a `Condition` element.
+- RenameObject is served in directory buckets (in-memory store only), honoring `If-Match`,
+  `If-None-Match: *`, `x-amz-rename-source-if-match` and `x-amz-client-token`. Other conditions
+  fail with 501 NotImplemented.
 
 ### Archived Objects
 
@@ -178,14 +184,42 @@ GetObject and HeadObject omit `x-amz-storage-class` for `STANDARD` objects; List
   `Content-Range`; an object uploaded in one request is a single part. A HeadObject with a `Range`
   describes the range. HeadObject is always answered 200, where S3 answers 206 for a part or a
   range.
-- A GetObject or HeadObject of part of a multipart object with a full-object checksum, by
-  `partNumber` or by a range, returns no checksum, as S3 general purpose buckets do.
+- UploadPart, CompleteMultipartUpload and reads of a part (by `partNumber` or by a range) report
+  and check part checksums according to the checksum algorithm and type the multipart upload was
+  created with.
 
 ### Listing
 
-ListObjectsV2 pages hold at most `max-keys` entries, counting each common prefix once, and never
-split a common prefix across pages. Listed objects report their checksum algorithms, storage class
-and, when requested, restore status.
+ListObjectsV2 pages hold at most `max-keys` entries, counting each common prefix once. Listed
+objects report their checksum algorithms, storage class and, when requested, restore status.
+General purpose buckets list keys in lexicographic order and never split a common prefix across
+pages; directory buckets list them in a fixed pseudo-random order.
+
+### Directory Buckets
+
+Buckets whose names end in `--x-s3`, such as `amzn-s3-demo-bucket--usw2-az1--x-s3`, are directory
+buckets (S3 Express One Zone), with S3 Express sessions and the behavior of directory buckets.
+
+**Sessions.** The server serves CreateSession (`GET /{bucket}?session`), which returns credentials
+valid for five minutes, in `ReadWrite` or `ReadOnly` mode. A directory bucket accepts requests
+signed with a session's credentials and its token in `x-amz-s3session-token`, or with the server's
+credentials and no token. `S3MockServer::reset` forgets all sessions.
+
+**Creating and deleting directory buckets.** Create them with `S3MockServer::create_bucket`, and
+remove them with `S3MockServer::reset`. The SDK's CreateBucket and DeleteBucket for a directory
+bucket fail against the server.
+
+**Differences from general purpose buckets.**
+
+- Objects are EXPRESS_ONEZONE. Any other storage class fails with 400 InvalidStorageClass, and
+  EXPRESS_ONEZONE does in general purpose buckets.
+- `Content-MD5` fails with 501 NotImplemented.
+- ListObjectsV2 lists keys in a fixed pseudo-random order (see *Listing*). It fails with 400
+  InvalidRequest for a delimiter other than `/` or a prefix that does not end in `/`, and with
+  501 NotSupported for `start-after`.
+- Part checksums: every part of an upload created with a checksum algorithm must carry a checksum.
+- Appends and RenameObject are served; general purpose buckets fail them with 501
+  NotImplemented.
 
 ### Buckets
 
@@ -223,6 +257,10 @@ assert_eq!(server.request_count(Operation::HeadObject), 2);
 key. Counts and faults apply per HTTP request, so each retry and each part request counts.
 `FaultType::Error(Error::Custom { code, status, message })` answers with an error the server does
 not otherwise send, such as 400 RequestTimeout.
+
+A request draws its fault once its signature has been verified. CreateSession is affected only by
+faults that fail the request (`FaultType::Error`). A PutObject whose chunked body declares trailing
+checksums is read in full before it is stored.
 
 ## License
 

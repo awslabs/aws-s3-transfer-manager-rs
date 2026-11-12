@@ -140,7 +140,7 @@ fn multipart_data() -> Vec<u8> {
         .collect()
 }
 
-/// Data above the download part size (5 MiB) but below the multipart-upload
+/// Data above the default part size (8 MiB) but below the multipart-upload
 /// threshold (16 MiB): uploaded as a SINGLE PUT (full-object checksum, no `-N`),
 /// but downloaded as multiple ranged GETs (split for throughput). S3 returns no
 /// per-range checksum for a single-stored-part object, so the SDK validates

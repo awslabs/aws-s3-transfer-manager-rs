@@ -34,8 +34,7 @@ panics. Ordinary public configuration exposes no execution crate types.
 Dropping unused adopted configuration or the final client owner requests runtime
 shutdown without synchronously joining managed threads. Pending async tasks are
 cancelled when the partition's Tokio runtime exits. Running blocking tasks and
-async tasks that do not yield can delay thread exit. Scheduler descriptors
-retired through epoch reclamation may retain client ownership until reclamation.
+async tasks that do not yield can delay thread exit.
 
 `Client::shutdown_completion` returns a non-owning observer for automatic and
 adopted managed execution, and `None` for caller-owned Tokio execution. Retaining
@@ -58,6 +57,71 @@ observers remain usable. Configuring a separate
 TM Dial9 recorder for an already built adopted runtime causes client construction
 to panic;
 its recorder must be attached during execution construction.
+
+## Resource sizing
+
+`runtime::sizing::resolve` turns the signals available at client construction
+into the payload-memory ceiling, the concurrency target, the part size, and the
+per-host connection cap. It is policy over the facts `runtime::platform`
+detects and performs no detection itself. Resolution is one pass in a fixed
+order, each step reading only quantities already resolved, so every result is
+closed-form and the function is re-callable on new signals.
+
+Its inputs are a throughput target, usable memory, usable vCPUs, the
+descriptor-derived connection cap, and explicit configuration. Throughput comes
+from `ConcurrencyMode::TargetThroughput` when set and otherwise from the
+detected instance family's bandwidth estimate; `TargetThroughput` rejects a
+value that is not finite and positive when it is constructed. Machine facts are
+discovery-only and have no public override. Explicitly configured memory,
+concurrency, and part size are used as given. A value the host cannot fund is
+reported rather than rejected, because memory admission and connection
+acquisition still bound execution.
+
+The pool ceiling bounds admission against exhausting host memory; demand does
+not lower it. This holds because the pool commits no memory at construction and
+reclaims toward a fraction of its configured blocks once the scheduler is
+globally idle, so an unused ceiling is not resource use. Throughput and
+concurrency set the operating point beneath it. The automatic ceiling uses the
+pool's own `MemoryBudgetConfig::Auto` share, cap, and fallback, plus one
+addition: a floor that holds three default-size parts for each request at the
+minimum concurrency target, so a small host rarely waits on memory there. The
+floor never exceeds half of detected memory, so on a host smaller than twice the
+floor it yields rather than admit more than the host holds.
+
+The concurrency target is the scheduler's dispatch limit, and it is not lowered
+by the ceiling or the connection cap. Those bound different things: the pool
+bounds the bytes work may hold, and the connection pool bounds connections per
+host. Work beyond either waits for memory admission or a connection, and work
+that holds neither, such as a small in-memory upload, is not held back by
+either. Part size is an input to the pass rather than an output — the configured
+value when set, and otherwise one default shared by uploads and downloads. The
+pass reports a part size larger than the ceiling, because the pool rejects a
+reservation larger than its capacity.
+
+The connection cap is the descriptor-derived cap, not narrowed to the
+concurrency target. It is a bound that keeps the process within its descriptor
+limit, and connections open lazily, so headroom above the target costs nothing
+until used. That headroom keeps connections local to the partition that opened
+them instead of borrowed or reclaimed across partitions at the cap, and leaves
+room for requests outside the scheduler, such as listing and S3 Express session
+creation. The descriptor budget is the smaller of a fraction of the soft limit
+and that limit less a fixed reserve, because the descriptors a process holds
+besides its connections are closer to a fixed count than to a share of the
+limit. A floor applies underneath both, so a soft limit below the reserve still
+yields a cap the client can attempt a transfer with. The cap is installed only on
+a transport TM builds; when the caller supplies the HTTP client, the cap is an
+estimate of what the descriptor limit allows and is reported as such.
+
+Sizing resolves before the managed execution owner is constructed, so an adopted
+runtime's own topology is not visible to it and the vCPU count comes from the
+detected machine profile. This affects only the fallback path taken when no
+throughput is available and the instance family is unrecognized.
+
+Construction emits one record naming every resolved quantity and the signal the
+concurrency target was derived from, followed by a warning when the part size
+exceeds the ceiling and when the descriptor limit holds connections per host
+below the concurrency target. Resolved sizing is observable only through
+that record; it is not reported on `Client::metrics`.
 
 ## HTTP precedence and partitions
 
@@ -108,6 +172,10 @@ cannot spawn threads, and wasip3's cooperative threads run one at a time.
 `RuntimeConfig::multi_thread_tokio()` does, and a current-thread runtime is
 supported. No managed owner exists, so `Client::shutdown_completion` returns
 `None`, and `__unstable_ext` does not compile.
+
+Neither usable memory nor the descriptor limit is detectable on wasm, so the
+pool ceiling comes from the no-detection fallback and the connection cap is
+immaterial because TM builds no transport.
 
 TM builds no transport; the S3 configuration must supply HTTP. Transfer tasks
 and file-backed request bodies both read and write directly on the polling

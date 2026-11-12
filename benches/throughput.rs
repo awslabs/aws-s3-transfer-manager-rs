@@ -62,7 +62,8 @@ async fn setup_test(
         .s3_config(aws_sdk_s3_transfer_manager::config::S3ClientConfig::new(
             &shared_config,
         ))
-        .build();
+        .build()
+        .expect("valid config");
     let tm = aws_sdk_s3_transfer_manager::Client::new(tm_config);
 
     (mock_server, handle, tm)

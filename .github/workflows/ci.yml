@@ -17,9 +17,9 @@ env:
   # Change to specific Rust release to pin
   rust_stable: stable
   rust_nightly: nightly-2026-09-10
-  rust_clippy: '1.94.1'
+  rust_clippy: '1.96.0'
   # When updating this, also update relevant docs
-  rust_min: '1.94.1'
+  rust_min: '1.96.0'
   CI_ROLE_ARN: ${{ secrets.CI_ROLE_ARN }}
   AWS_REGION: us-west-2
 
@@ -714,11 +714,11 @@ jobs:
           # Detect leaked ownership and stack lifetime errors, stop at the
           # first report, and reject invalid C-string operations.
           ASAN_OPTIONS: detect_leaks=1:detect_stack_use_after_return=1:halt_on_error=1:strict_string_checks=1
-          # Retain additional access history for race reports and stop at the
-          # first race. The suppression covers Tokio's kernel-mediated reactor
-          # registration; transfer-manager races remain unsuppressed.
-          # Thread-leak and deadlock detection are not enabled.
-          TSAN_OPTIONS: halt_on_error=1:history_size=7:report_thread_leaks=0:suppressions=${{ github.workspace }}/.github/tsan-suppressions.txt
+          # Report races and unjoined threads, retain additional access history,
+          # and stop at the first report. The suppression covers Tokio's
+          # kernel-mediated reactor registration; transfer-manager races and
+          # thread leaks remain unsuppressed.
+          TSAN_OPTIONS: halt_on_error=1:history_size=7:report_thread_leaks=1:suppressions=${{ github.workspace }}/.github/tsan-suppressions.txt
           # Ignore `trybuild` errors as they are irrelevant and flaky on nightly
           TRYBUILD: overwrite
 
@@ -786,7 +786,8 @@ jobs:
     env:
       # Generated consumers resolve dependencies without the workspace lockfile.
       CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: fallback
-      # The checker includes optional features; dial9 needs Tokio's unstable API.
+      # The checker builds the baseline with all features, and the baseline's
+      # `dial9` feature needs Tokio's unstable API.
       RUSTFLAGS: "-Dwarnings --cfg tokio_unstable"
     steps:
       - uses: actions/checkout@v4
@@ -831,13 +832,14 @@ jobs:
           RUSTFLAGS: -Dwarnings -Adeprecated
 
   dial9-build:
-    # Builds the library and the `cp` example with every feature and
-    # `--cfg tokio_unstable`. dial9 0.5 compiles without the flag; the
-    # `features` job checks the library with `dial9` in that configuration.
-    # With the flag, dial9's Tokio instrumentation also compiles its
-    # task-poll hooks, task spawn and terminate tracking, and per-worker
-    # queue depth, which the crate README's tracing build enables. A
-    # dedicated job keeps `tokio_unstable` out of the rest of CI.
+    # Builds the `cp` example's dial9 tracing, which `--cfg s3_tm_dial9`
+    # enables, with every feature and `--cfg tokio_unstable`. dial9 0.5
+    # compiles without `tokio_unstable`; the `features` job checks the
+    # extension crate's `dial9` feature in that configuration. With the flag,
+    # dial9's Tokio instrumentation also compiles its task-poll hooks, task
+    # spawn and terminate tracking, and per-worker queue depth, which the
+    # crate README's tracing build enables. A dedicated job keeps both cfgs
+    # out of the rest of CI.
     name: dial9 build
     needs: basics
     runs-on: ubuntu-24.04
@@ -852,7 +854,7 @@ jobs:
       - name: build cp example with dial9
         run: cargo build -p aws-sdk-s3-transfer-manager --example cp --all-features
         env:
-          RUSTFLAGS: "-Dwarnings --cfg tokio_unstable"
+          RUSTFLAGS: "-Dwarnings --cfg tokio_unstable --cfg s3_tm_dial9"
 
   miri:
     name: miri

@@ -77,7 +77,8 @@ async fn test_managed_runtime_http_uses_environment_proxy() {
         aws_sdk_s3_transfer_manager::Config::builder()
             .s3_config(S3ClientConfig::new(&s3_config))
             .runtime_config(RuntimeConfig::default())
-            .build(),
+            .build()
+            .expect("valid config"),
     );
 
     let mut download = tm

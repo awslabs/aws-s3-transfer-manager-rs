@@ -29,10 +29,6 @@ const MIB: usize = 1024 * KIB;
 /// The automatic memory limit on WASI targets.
 const AUTO_MEMORY_BYTES: u64 = 2 * 1024 * MIB as u64;
 
-/// Epoch flushes that advance a single-participant collector far enough to
-/// destroy garbage deferred before the first flush.
-const EPOCH_FLUSHES: usize = 4;
-
 /// How long dropped clients' tasks may take to exit.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -175,10 +171,8 @@ fn write(path: &Path, data: &[u8]) -> Result<(), String> {
 /// requests the scenario's clients sent and the number of tasks that exited.
 ///
 /// Workers exit when the client's shared state drops, and connection tasks
-/// exit when the store's connection pool drops. The scheduler's lock-free sets
-/// hand removed transfer descriptors, which reference the client's state, to
-/// crossbeam-epoch, which destroys them only after the epoch advances.
-/// Flushing the epoch makes the drop deterministic.
+/// exit when the store's connection pool drops. Ready-set entries do not retain
+/// transfer ownership, so their deferred reclamation cannot delay client teardown.
 async fn shut_down(client: Client, tasks_before: usize, store: Store) -> Result<String, String> {
     let tasks = alive_tasks().saturating_sub(tasks_before);
     let requests = store.to_string();
@@ -187,9 +181,6 @@ async fn shut_down(client: Client, tasks_before: usize, store: Store) -> Result<
     let metrics = tokio::runtime::Handle::current().metrics();
     let deadline = tokio::time::Instant::now() + SHUTDOWN_TIMEOUT;
     loop {
-        for _ in 0..EPOCH_FLUSHES {
-            crossbeam_epoch::pin().flush();
-        }
         let alive = metrics.num_alive_tasks();
         if alive <= tasks_before {
             return Ok(format!(
@@ -383,7 +374,8 @@ fn write_tree(root: &Path) -> Result<Vec<(PathBuf, Bytes)>, String> {
 }
 
 /// A recursive directory uploads under a key prefix and downloads into
-/// another directory with the same layout and contents.
+/// another directory, where each object lands at its full key: the same
+/// layout and contents beneath the prefix's directory.
 async fn directory_round_trip(store: Store, work: &Path) -> Result<String, String> {
     let before = alive_tasks();
     let client = store.client(|config| config);
@@ -432,7 +424,7 @@ async fn directory_round_trip(store: Store, work: &Path) -> Result<String, Strin
         downloaded.failed_transfers()
     );
     for (relative, data) in &tree {
-        let path = destination.join(relative);
+        let path = destination.join("tree").join(relative);
         ensure_same(&path.display().to_string(), data, &read(&path)?)?;
     }
     shut_down(client, before, store).await
@@ -524,7 +516,7 @@ async fn many_files(store: Store, work: &Path) -> Result<String, String> {
         downloaded.objects_downloaded()
     );
     for index in 0..FILES {
-        let path = destination.join(format!("f{index:04}"));
+        let path = destination.join("many").join(format!("f{index:04}"));
         ensure_same(&path.display().to_string(), &contents(index), &read(&path)?)?;
     }
     shut_down(client, before, store).await
