@@ -178,20 +178,29 @@ impl PoolConfig {
     }
 }
 
+/// Capacity in bytes that [`MemoryBudgetConfig::Auto`] selects, before carrier
+/// rounding.
+///
+/// A share of `detected_memory`, capped at [`AUTO_CAPACITY_MAX_BYTES`], or
+/// [`AUTO_CAPACITY_FALLBACK_BYTES`] when memory is undetected. Saturates where
+/// a bound does not fit `usize`.
+pub(crate) fn auto_capacity_bytes(detected_memory: Option<usize>) -> usize {
+    match detected_memory {
+        Some(bytes) => {
+            let maximum = usize::try_from(AUTO_CAPACITY_MAX_BYTES).unwrap_or(usize::MAX);
+            (bytes / AUTO_MEMORY_SHARE_DENOMINATOR).min(maximum)
+        }
+        None => usize::try_from(AUTO_CAPACITY_FALLBACK_BYTES).unwrap_or(usize::MAX),
+    }
+}
+
 /// Resolves one capacity policy to bytes before carrier rounding.
 fn resolve_capacity_bytes(
     capacity: MemoryBudgetConfig,
     detected_memory: Option<usize>,
 ) -> Result<usize, BufferPoolBuildError> {
     match capacity {
-        MemoryBudgetConfig::Auto => match detected_memory {
-            Some(bytes) => {
-                let maximum = usize::try_from(AUTO_CAPACITY_MAX_BYTES).unwrap_or(usize::MAX);
-                Ok((bytes / AUTO_MEMORY_SHARE_DENOMINATOR).min(maximum))
-            }
-            None => usize::try_from(AUTO_CAPACITY_FALLBACK_BYTES)
-                .map_err(|_| BufferPoolBuildError::CapacityOverflow),
-        },
+        MemoryBudgetConfig::Auto => Ok(auto_capacity_bytes(detected_memory)),
         MemoryBudgetConfig::Fraction(fraction) => {
             if !(0.0 < fraction && fraction <= 1.0) {
                 return Err(BufferPoolBuildError::InvalidCapacity);
