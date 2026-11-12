@@ -118,7 +118,7 @@ impl TargetThroughput {
     /// A target of `gbps` gigabits per second, for uploads and downloads.
     ///
     /// Returns an error unless `gbps` is finite and positive.
-    pub fn new_gigabits_per_sec(gbps: f64) -> Result<Self, BuildError> {
+    pub fn gbps(gbps: f64) -> Result<Self, BuildError> {
         if gbps.is_finite() && gbps > 0.0 {
             Ok(Self { gbps })
         } else {
@@ -130,7 +130,7 @@ impl TargetThroughput {
     }
 
     /// The target in gigabits per second.
-    pub fn gigabits_per_sec(&self) -> f64 {
+    pub fn as_gbps(&self) -> f64 {
         self.gbps
     }
 }
@@ -493,18 +493,15 @@ mod tests {
     #[test]
     fn target_throughput_accepts_finite_positive_gbps() {
         for gbps in [0.5, 1.0, 200.0] {
-            let target = TargetThroughput::new_gigabits_per_sec(gbps).unwrap();
-            assert_eq!(target.gigabits_per_sec(), gbps);
+            let target = TargetThroughput::gbps(gbps).unwrap();
+            assert_eq!(target.as_gbps(), gbps);
         }
     }
 
     #[test]
     fn target_throughput_rejects_values_that_are_not_a_rate() {
         for gbps in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-            assert!(
-                TargetThroughput::new_gigabits_per_sec(gbps).is_err(),
-                "gbps {gbps}"
-            );
+            assert!(TargetThroughput::gbps(gbps).is_err(), "gbps {gbps}");
         }
     }
 }

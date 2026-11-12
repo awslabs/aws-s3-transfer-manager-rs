@@ -1259,9 +1259,7 @@ mod tests {
     fn configured_throughput_drives_the_resolved_target() {
         // A throughput target sets the controller's target.
         let client = Client::new(config_with(
-            ConcurrencyMode::TargetThroughput(
-                crate::types::TargetThroughput::new_gigabits_per_sec(100.0).unwrap(),
-            ),
+            ConcurrencyMode::TargetThroughput(crate::types::TargetThroughput::gbps(100.0).unwrap()),
             Some(profile(None, 4)),
         ));
 

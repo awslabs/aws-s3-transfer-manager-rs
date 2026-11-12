@@ -180,7 +180,7 @@ impl ConcurrencyModeArg {
 /// Parses `--target-throughput-gbps`, rejecting values that are not finite and positive.
 fn parse_target_throughput(s: &str) -> Result<TargetThroughput, String> {
     let gbps: f64 = s.parse().map_err(|e| format!("{e}"))?;
-    TargetThroughput::new_gigabits_per_sec(gbps).map_err(|e| e.to_string())
+    TargetThroughput::gbps(gbps).map_err(|e| e.to_string())
 }
 
 #[derive(Clone, Debug)]

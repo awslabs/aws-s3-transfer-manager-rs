@@ -194,7 +194,7 @@ impl Config {
     /// The [`ConcurrencyMode::TargetThroughput`] target in Gbps, if configured.
     pub(crate) fn throughput_target_gbps(&self) -> Option<f64> {
         match &self.concurrency {
-            ConcurrencyMode::TargetThroughput(target) => Some(target.gigabits_per_sec()),
+            ConcurrencyMode::TargetThroughput(target) => Some(target.as_gbps()),
             _ => None,
         }
     }

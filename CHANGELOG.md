@@ -58,11 +58,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The hidden `config::Builder::framework_metadata`, `ConfigLoader::framework_metadata`, and
   `Config::framework_metadata` are removed. Set framework metadata on the `SdkConfig` or S3
   configuration.
-- `TargetThroughput::new_gigabits_per_sec` takes an `f64` instead of a `u64`, so targets below
-  1 Gbps can be expressed, and returns `Result<TargetThroughput, BuildError>`, rejecting a value
-  that is not finite and positive.
+- `TargetThroughput::gbps` replaces `new_gigabits_per_sec`. It takes an `f64` instead of a `u64`,
+  so targets below 1 Gbps can be expressed, and returns `Result<TargetThroughput, BuildError>`,
+  rejecting a value that is not finite and positive.
 - `TargetThroughput` holds one target for uploads and downloads. `upload()` and `download()` are
-  replaced by `gigabits_per_sec()`.
+  replaced by `as_gbps()`.
 - The concurrency target, payload-memory ceiling, part size, and connection cap are resolved
   together at client construction. The concurrency target is not lowered by the memory ceiling
   or the connection cap: requests beyond either wait for memory admission or a connection.

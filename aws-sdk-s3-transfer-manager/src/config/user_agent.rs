@@ -787,7 +787,7 @@ mod tests {
             (
                 "throughput target",
                 off_ec2().concurrency(ConcurrencyMode::TargetThroughput(
-                    crate::types::TargetThroughput::new_gigabits_per_sec(25.0).unwrap(),
+                    crate::types::TargetThroughput::gbps(25.0).unwrap(),
                 )),
                 vec![BusinessMetric::S3CustomThroughput],
             ),
