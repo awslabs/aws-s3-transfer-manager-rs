@@ -591,7 +591,15 @@ fn reclaim_front<T>(inner: &Inner<T>) {
 // under the lock). The consumer reads only after observing FILLED. T: Send is
 // required because items cross thread boundaries.
 unsafe impl<T: Send> Send for PagedRecvBuffer<T> {}
-unsafe impl<T: Send> Sync for PagedRecvBuffer<T> {}
+// Safety: PagedRecvBuffer holds slots through Arc<Inner<T>>, and each slot wraps
+// its payload in UnsafeCell<Option<T>>, so Sync is not derived automatically.
+// A shared &PagedRecvBuffer<T> can reach &T only through take_drain_run →
+// SegmentWrite::payloads() → Slot::get(). By the time get() is reachable the
+// slot is FILLED and write-once: no producer can write it again, and the
+// SegmentWrite::drained flag ensures each run is consumed exactly once, so no
+// two threads hold a writable view of the same slot simultaneously. The only
+// concurrent access to T is read-only via &T, which requires T: Sync.
+unsafe impl<T: Send + Sync> Sync for PagedRecvBuffer<T> {}
 unsafe impl<T: Send> Send for RecvBufferConsumer<T> {}
 // Safety: all mutation goes through `poll_next(&mut self)`, so a shared `&consumer`
 // exposes only Arc/Copy state with no interior mutation — Sync is sound. Needed so a
@@ -601,8 +609,18 @@ unsafe impl<T: Send> Sync for RecvBufferConsumer<T> {}
 // download claims in poll_work, fills in the async execute task). It carries an
 // Arc<Segment<T>> and indices; moving it and filling moves a `T`, so T: Send suffices.
 unsafe impl<T: Send> Send for SlotHandle<T> {}
+// Safety: a SegmentWrite can be sent to another thread while it holds a claimed run;
+// the run contains T values that may be read on the receiving thread, so T: Send is
+// required. No shared reference to T is created by moving the SegmentWrite itself.
 unsafe impl<T: Send> Send for SegmentWrite<T> {}
-unsafe impl<T: Send> Sync for SegmentWrite<T> {}
+// Safety: SegmentWrite holds an Arc<Segment<T>>, and each slot in the segment
+// wraps its payload in UnsafeCell<Option<T>>, so Sync is not derived automatically.
+// A shared &SegmentWrite<T> reaches &T only through payloads() → Slot::get().
+// Every slot in the run is FILLED and write-once before the SegmentWrite is
+// issued, and the drained flag ensures the run is consumed exactly once, so no
+// two threads hold a writable view of the same slot simultaneously. The only
+// concurrent access to T is read-only via &T, which requires T: Sync.
+unsafe impl<T: Send + Sync> Sync for SegmentWrite<T> {}
 
 impl<T> PagedRecvBuffer<T> {
     /// Create an empty buffer with the default segment size ([`DEFAULT_SEG_SIZE`]),
@@ -1063,6 +1081,26 @@ impl<T> PagedRecvBuffer<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn recv_buffer_send_sync_bounds() {
+        fn assert_send<T: Send>() {}
+        fn assert_send_sync<T: Send + Sync>() {}
+
+        assert_send_sync::<PagedRecvBuffer<u8>>();
+        assert_send_sync::<SegmentWrite<u8>>();
+        assert_send_sync::<RecvBufferConsumer<u8>>();
+        assert_send::<SlotHandle<u8>>();
+
+        // Cell<u8> is Send but !Sync. The types are Send (items cross thread
+        // boundaries) but must not be Sync (exposing &Cell<u8> across threads
+        // would allow concurrent mutation with no synchronization).
+        assert_send::<PagedRecvBuffer<Cell<u8>>>();
+        assert_send::<SegmentWrite<Cell<u8>>>();
+        static_assertions::assert_not_impl_all!(PagedRecvBuffer<Cell<u8>>: Sync);
+        static_assertions::assert_not_impl_all!(SegmentWrite<Cell<u8>>: Sync);
+    }
 
     /// All permutations of `0..n`, via Heap's algorithm. Used to exhaustively drive
     /// fill orders in the sequencing tests.
