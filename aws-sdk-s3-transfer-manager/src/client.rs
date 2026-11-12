@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::memory::BufferPool;
-use crate::runtime::sizing::{self, ConcurrencyBound, ConcurrencySource, ResourcePlan, Signals};
+use crate::runtime::sizing::{self, ResourcePlan, Signals};
 use crate::runtime::ExecutionRuntime;
 
 /// Transfer manager client for Amazon Simple Storage Service.
@@ -556,8 +556,9 @@ impl Client {
     }
 }
 
-/// Logs the resolved sizing at `INFO`, and a `WARN` for each configured value
-/// the host cannot fund.
+/// Logs the resolved sizing at `INFO`, a `WARN` when the part size exceeds the
+/// memory ceiling, and a `WARN` when the descriptor limit holds connections per
+/// host below the concurrency target.
 ///
 /// `connection_cap_installed` is whether the cap is applied to a transport this
 /// client builds.
@@ -573,7 +574,6 @@ fn log_resource_sizing(
         target: crate::telemetry::TARGET_CONCURRENCY,
         concurrency_target = plan.concurrency,
         source = plan.concurrency_source.as_str(),
-        bounded_by = plan.concurrency_bound.as_str(),
         throughput_gbps = ?plan.throughput_gbps,
         instance_type = ?profile.instance_type,
         vcpus = profile.vcpus,
@@ -582,72 +582,46 @@ fn log_resource_sizing(
         part_size_bytes = plan.part_size,
         max_connections_per_host = plan.connection_cap,
         connection_cap_installed,
-        max_funded_concurrency = plan.max_funded_concurrency,
         soft_descriptor_limit = ?soft,
         hard_descriptor_limit = ?hard,
         "resolved resource sizing",
     );
 
-    if plan.configured_concurrency_unfunded {
-        tracing::warn!(
-            target: crate::telemetry::TARGET_CONCURRENCY,
-            concurrency_target = plan.concurrency,
-            max_funded_concurrency = plan.max_funded_concurrency,
-            max_connections_per_host = plan.connection_cap,
-            "configured concurrency target exceeds what the payload-memory ceiling or the \
-             connection cap sustains; requests beyond that point wait on memory admission or a \
-             connection",
-        );
-    }
-
-    let descriptors_bind = cap.limited_by_descriptors()
-        && match plan.concurrency_bound {
-            ConcurrencyBound::Connections => true,
-            ConcurrencyBound::Configured => plan.concurrency > plan.connection_cap,
-            ConcurrencyBound::Unbounded | ConcurrencyBound::Memory => false,
-        };
-
-    // The descriptor warning below covers a target lowered by a
-    // descriptor-limited cap.
-    let throughput_lowered = plan.concurrency_source == ConcurrencySource::ConfiguredThroughput
-        && match plan.concurrency_bound {
-            ConcurrencyBound::Memory => true,
-            ConcurrencyBound::Connections => !descriptors_bind,
-            ConcurrencyBound::Configured | ConcurrencyBound::Unbounded => false,
-        };
-    if throughput_lowered {
-        tracing::warn!(
-            target: crate::telemetry::TARGET_CONCURRENCY,
-            throughput_gbps = ?plan.throughput_gbps,
-            concurrency_target = plan.concurrency,
-            bounded_by = plan.concurrency_bound.as_str(),
-            max_funded_concurrency = plan.max_funded_concurrency,
-            max_connections_per_host = plan.connection_cap,
-            "concurrency for the configured throughput target is lowered to what the \
-             payload-memory ceiling or the connection cap sustains",
-        );
-    }
-
-    if plan.part_size_unfunded {
+    if plan.part_exceeds_ceiling {
         tracing::warn!(
             target: crate::telemetry::TARGET_CONCURRENCY,
             part_size_bytes = plan.part_size,
             memory_ceiling_bytes = plan.ceiling_bytes,
-            "payload-memory ceiling does not fund one concurrency slot at the part size; raise \
+            "part size exceeds the payload-memory ceiling, so transfers that use it fail; raise \
              the memory ceiling or lower the part size",
         );
     }
 
-    if descriptors_bind {
-        tracing::warn!(
-            target: crate::telemetry::TARGET_CONCURRENCY,
-            max_connections_per_host = plan.connection_cap,
-            concurrency_target = plan.concurrency,
-            soft_descriptor_limit = ?soft,
-            hard_descriptor_limit = ?hard,
-            "per-host connection cap is below the concurrency target because of the soft \
-             file-descriptor limit (RLIMIT_NOFILE); raise the soft limit to allow more connections",
-        );
+    if cap.limited_by_descriptors() && plan.concurrency > plan.connection_cap {
+        if connection_cap_installed {
+            tracing::warn!(
+                target: crate::telemetry::TARGET_CONCURRENCY,
+                max_connections_per_host = plan.connection_cap,
+                concurrency_target = plan.concurrency,
+                soft_descriptor_limit = ?soft,
+                hard_descriptor_limit = ?hard,
+                "the soft file-descriptor limit (RLIMIT_NOFILE) caps connections per host below \
+                 the concurrency target; requests beyond the cap wait for a connection. Raise the \
+                 soft limit to allow more connections",
+            );
+        } else {
+            tracing::warn!(
+                target: crate::telemetry::TARGET_CONCURRENCY,
+                max_connections_per_host = plan.connection_cap,
+                concurrency_target = plan.concurrency,
+                soft_descriptor_limit = ?soft,
+                hard_descriptor_limit = ?hard,
+                "the soft file-descriptor limit (RLIMIT_NOFILE) allows fewer connections per host \
+                 than the concurrency target; the supplied HTTP client is not capped by the \
+                 transfer manager and may fail to open connections past the limit. Raise the soft \
+                 limit or lower the concurrency target",
+            );
+        }
     }
 }
 
@@ -1299,8 +1273,7 @@ mod tests {
             Some(profile(None, 4)),
         ));
 
-        // Expected value from the pass, which bounds the 100 Gbps seed by the
-        // host's descriptor cap and the fallback ceiling.
+        // Expected value from the pass, which seeds the target from 100 Gbps.
         let expected = sizing::resolve(Signals {
             throughput_gbps: Some(100.0),
             instance_type: None,

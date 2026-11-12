@@ -9,9 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - Client construction logs one `INFO` record of the resolved sizing (concurrency target and the
-  signal it came from and was bounded by, memory ceiling, part size, connection cap) and a
-  `WARN` for each configured value the host cannot fund, including a throughput target whose
-  concurrency is lowered, and for a concurrency target the descriptor limit lowers.
+  signal it came from, memory ceiling, part size, connection cap), a `WARN` when the part size
+  exceeds the memory ceiling, and a `WARN` when the soft file-descriptor limit holds connections
+  per host below the concurrency target.
 
 ### Changed
 - `aws-sdk-s3-transfer-manager`, `aws-sdk-s3-transfer-manager-ext`, `aws-smithy-topology`,
@@ -22,11 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that is not finite and positive.
 - `TargetThroughput` holds one target for uploads and downloads. `upload()` and `download()` are
   replaced by `gigabits_per_sec()`.
-- The concurrency target, payload-memory ceiling, and part size are resolved together. A
-  derived concurrency target is lowered to what the descriptor-derived connection cap and the
-  memory ceiling can sustain at the resolved part size. Configured values are used as given.
-  A large configured part size therefore lowers the automatic concurrency target; for
-  example, 256 MiB parts on a 16 GiB host resolve to 5.
+- The concurrency target, payload-memory ceiling, part size, and connection cap are resolved
+  together at client construction. The concurrency target is not lowered by the memory ceiling
+  or the connection cap: requests beyond either wait for memory admission or a connection.
 - The automatic part size is 8 MiB for both uploads and downloads. Downloads previously used
   5 MiB, so objects larger than 5 MiB and up to 8 MiB now download with a single GET.
 - The per-host connection cap's descriptor budget is the smaller of half the soft

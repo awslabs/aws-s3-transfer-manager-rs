@@ -95,9 +95,9 @@ pub enum ConcurrencyMode {
     ///
     /// The target replaces the throughput estimated from the execution
     /// environment. It sets the in-flight request target once, when the client
-    /// is constructed; it does not limit throughput at run time. The resulting
-    /// target is lowered, with a warning, when the per-host connection cap or the
-    /// payload-memory ceiling cannot sustain it.
+    /// is constructed; it does not limit throughput at run time. Requests beyond
+    /// what the per-host connection cap or the payload-memory ceiling allows wait
+    /// for a connection or for memory.
     TargetThroughput(TargetThroughput),
 
     /// Explicit concurrency control
