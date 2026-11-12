@@ -16,7 +16,8 @@
 //! at their offsets, and [`create_first_new`] creates the first of several
 //! candidate paths that does not exist yet, without opening any existing entry.
 //! [`Handle`] identifies the file a path names, so that two paths can be
-//! compared.
+//! compared. [`open_regular_file`] opens an upload source and rejects any
+//! handle that is not a regular file.
 //!
 //! The `_async` helpers keep blocking filesystem calls off async worker
 //! threads: natively through `tokio::fs` or tokio's blocking pool, and inline
@@ -263,6 +264,64 @@ pub(crate) async fn create_first_new_async(
     candidates: Vec<PathBuf>,
 ) -> io::Result<(File, PathBuf)> {
     run_blocking(move || create_first_new(candidates)).await
+}
+
+/// Opens `path` for reading
+///
+/// # Errors
+///
+/// Returns the error from opening the path or querying its handle. Returns an
+/// [`io::ErrorKind::InvalidInput`] error if the handle names anything other
+/// than a regular file.
+pub(crate) fn open_regular_file(path: &Path) -> io::Result<File> {
+    // Get the open handle to avoid the race between a separate metadata lookup
+    // and the actual open.
+    // The open does not block, so a FIFO without a writer is rejected rather
+    // than waited on.
+    let file = open_without_blocking(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            crate::io::error::Error::not_regular_file(path),
+        ));
+    }
+    restore_blocking(&file)?;
+    Ok(file)
+}
+
+/// On unix, we open the file with O_NONBLOCK to avoid blocking on FIFO.
+#[cfg(all(unix, not(miri)))]
+fn open_without_blocking(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    File::options()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+}
+
+/// Clears the `O_NONBLOCK` status flag set by [`open_without_blocking`].
+#[cfg(all(unix, not(miri)))]
+fn restore_blocking(file: &File) -> io::Result<()> {
+    use nix::fcntl::{fcntl, FcntlArg, OFlag};
+    use std::os::unix::io::AsFd;
+
+    let flags =
+        OFlag::from_bits_truncate(fcntl(file.as_fd(), FcntlArg::F_GETFL).map_err(io::Error::from)?);
+    fcntl(file.as_fd(), FcntlArg::F_SETFL(flags - OFlag::O_NONBLOCK)).map_err(io::Error::from)?;
+    Ok(())
+}
+
+/// Opens `path` read-only.
+#[cfg(not(all(unix, not(miri))))]
+fn open_without_blocking(path: &Path) -> io::Result<File> {
+    File::open(path)
+}
+
+/// Does nothing: [`open_without_blocking`] sets no status flags here.
+#[cfg(not(all(unix, not(miri))))]
+fn restore_blocking(_file: &File) -> io::Result<()> {
+    Ok(())
 }
 
 /// Renames `from` to `to`.

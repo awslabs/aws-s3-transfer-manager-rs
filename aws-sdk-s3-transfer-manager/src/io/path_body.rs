@@ -102,7 +102,7 @@ impl PathBodyBuilder {
     ///   and the offset is greater than the file's size.
     /// - [`ErrorKind::IOError`](crate::error::ErrorKind::IOError) when no length
     ///   was set and the file's metadata cannot be read, for example because the
-    ///   file does not exist.
+    ///   file does not exist, or the path does not name a regular file.
     pub fn build(self) -> Result<InputStream, Error> {
         let path = self
             .path
@@ -117,6 +117,9 @@ impl PathBodyBuilder {
                     None => fs::metadata(&path)
                         .map_err(|e| error::io_at("reading metadata of", &path, e))?,
                 };
+                if !metadata.is_file() {
+                    return Err(crate::io::error::Error::not_regular_file(path).into());
+                }
                 let file_size = metadata.len();
 
                 if offset > file_size {
@@ -223,6 +226,28 @@ mod test {
         let body = path_body(&stream);
         assert_eq!(12, body.offset);
         assert_eq!(64, body.length);
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    #[cfg(unix)]
+    fn test_rejects_non_regular_files() {
+        use aws_smithy_types::error::display::DisplayErrorContext;
+
+        let directory = tempfile::tempdir().unwrap();
+        let fifo = directory.path().join("fifo");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).unwrap();
+
+        for path in [std::path::Path::new("/dev/zero"), &fifo, directory.path()] {
+            let error = PathBodyBuilder::new().path(path).build().unwrap_err();
+            assert_eq!(error.kind(), &crate::error::ErrorKind::IOError);
+            let message = DisplayErrorContext(&error).to_string();
+            assert!(
+                message.contains("is not a regular file"),
+                "{}: {message}",
+                path.display()
+            );
+        }
     }
 
     #[test]

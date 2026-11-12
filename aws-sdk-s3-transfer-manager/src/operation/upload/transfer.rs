@@ -3023,6 +3023,103 @@ mod tests {
         );
     }
 
+    /// Helper function to replace the regular file at `path` with a FIFO, so the path
+    /// names a non-regular file only after the input stream read its metadata.
+    #[cfg(unix)]
+    fn replace_with_fifo(path: &std::path::Path) {
+        std::fs::remove_file(path).unwrap();
+        nix::unistd::mkfifo(path, nix::sys::stat::Mode::S_IRWXU).unwrap();
+    }
+
+    /// Helper function to assert on not_regular_file_error
+    fn assert_not_regular_file_error(error: &crate::error::Error) {
+        use aws_smithy_types::error::display::DisplayErrorContext;
+
+        assert_eq!(error.kind(), &crate::error::ErrorKind::IOError);
+        let message = DisplayErrorContext(error).to_string();
+        assert!(message.contains("is not a regular file"), "{message}");
+    }
+
+    /// A file input that no longer opens as a regular file fails PutObject
+    /// before the request is sent.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn put_object_rejects_a_source_replaced_by_a_fifo() {
+        // Create a regular file, that it would pass InputStream check
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("body");
+        std::fs::write(&path, vec![0u8; 1024]).unwrap();
+        let stream = InputStream::from_path(&path).unwrap();
+
+        // Replace it with FIFO
+        replace_with_fifo(&path);
+
+        // Then make sure we validate the file before sending the request.
+        let put_object = mock!(aws_sdk_s3::Client::put_object)
+            .then_output(|| aws_sdk_s3::operation::put_object::PutObjectOutput::builder().build());
+        let transfer = create_test_transfer_with_stream(
+            mock_client!(
+                aws_sdk_s3,
+                RuleMode::MatchAny,
+                std::slice::from_ref(&put_object)
+            ),
+            stream,
+        );
+
+        let mut work = assert_ready(transfer.poll_work());
+        assert!(matches!(
+            work.data_mut::<UploadWork>(),
+            UploadWork::PutObject { .. }
+        ));
+        assert!(matches!(
+            transfer.execute(&mut work).await,
+            WorkOutcome::Failed { .. }
+        ));
+        assert_done(transfer.poll_work());
+        assert_eq!(put_object.num_calls(), 0);
+        assert_not_regular_file_error(&final_error(&transfer));
+    }
+
+    /// A multipart file input that no longer opens as a regular file fails
+    /// before any part is sent, and the upload is aborted.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn multipart_rejects_a_source_replaced_by_a_fifo() {
+        // Create a regular file, that it would pass InputStream check
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("body");
+        std::fs::write(&path, vec![0u8; 16 * 1024 * 1024]).unwrap();
+        let stream = InputStream::from_path(&path).unwrap();
+
+        // Replace the regular file with fifo
+        replace_with_fifo(&path);
+
+        // Start a multi upload transfer
+        let upload_part = mock!(aws_sdk_s3::Client::upload_part)
+            .then_output(|| UploadPartOutput::builder().e_tag("test-etag").build());
+        let abort_mpu = abort_mpu_for_test_upload();
+        let transfer = create_test_transfer_with_stream(
+            mock_client!(
+                aws_sdk_s3,
+                RuleMode::MatchAny,
+                &[create_mpu_ok(), upload_part.clone(), abort_mpu.clone()]
+            ),
+            stream,
+        );
+
+        let mut create = assert_ready(transfer.poll_work());
+        assert!(matches!(
+            transfer.execute(&mut create).await,
+            WorkOutcome::Failed { .. }
+        ));
+        finish_failure_abort(&transfer).await;
+        assert_eq!(upload_part.num_calls(), 0);
+        assert_eq!(abort_mpu.num_calls(), 1);
+        assert_not_regular_file_error(&final_error(&transfer));
+    }
+
     /// A failed UploadPart aborts the upload and reports the part's error.
     #[cfg_attr(miri, ignore)]
     #[tokio::test]

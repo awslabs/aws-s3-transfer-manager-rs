@@ -12,6 +12,7 @@ use tokio::task::JoinError;
 #[derive(Debug)]
 pub(crate) enum ErrorKind {
     OffsetNotAlignedWithPartNumber(u64, u64),
+    NotRegularFile(PathBuf),
     TaskFailed(JoinError),
     IoError(StdIoError),
     /// A filesystem operation on `path` failed. `action` is as for
@@ -34,6 +35,11 @@ impl Error {
         ErrorKind::OffsetNotAlignedWithPartNumber(offset, part_number).into()
     }
 
+    /// The file input at `path` is not a regular file.
+    pub(crate) fn not_regular_file(path: impl Into<PathBuf>) -> Error {
+        ErrorKind::NotRegularFile(path.into()).into()
+    }
+
     /// A filesystem operation on `path` that failed with `err`. Converts to
     /// the transfer error [`crate::error::io_at`] builds.
     pub(crate) fn io_at(action: &'static str, path: impl Into<PathBuf>, err: StdIoError) -> Error {
@@ -50,9 +56,10 @@ impl Error {
 ///
 /// A failed read is [`IOError`](crate::error::ErrorKind::IOError), with the
 /// underlying [`std::io::Error`] as the transfer error's direct source, so the
-/// cause chain names the failure once. A read task
-/// that panicked or was cancelled, and a reader whose position disagrees with
-/// its part numbering, are internal failures and are
+/// cause chain names the failure once. A file input that is not a regular file
+/// is also [`IOError`](crate::error::ErrorKind::IOError), with this error as
+/// its source. A read task that panicked or was cancelled, and a reader whose
+/// position disagrees with its part numbering, are internal failures and are
 /// [`RuntimeError`](crate::error::ErrorKind::RuntimeError).
 impl From<Error> for crate::error::Error {
     fn from(err: Error) -> Self {
@@ -64,6 +71,9 @@ impl From<Error> for crate::error::Error {
                 path,
                 source,
             } => crate::error::io_at(action, path, source),
+            ErrorKind::NotRegularFile(path) => {
+                crate::error::Error::new(Kind::IOError, Error::not_regular_file(path))
+            }
             other => crate::error::Error::new(Kind::RuntimeError, Error { kind: other }),
         }
     }
@@ -89,6 +99,9 @@ impl fmt::Display for Error {
                 "offset {} is not aligned with part number {}",
                 offset, part_number,
             ),
+            ErrorKind::NotRegularFile(path) => {
+                write!(f, "{} is not a regular file", path.display())
+            }
             ErrorKind::IoError(_) => write!(f, "I/O error"),
             ErrorKind::LocalIo { action, path, .. } => {
                 write!(f, "I/O error {action} \"{}\"", path.display())
@@ -102,6 +115,7 @@ impl StdError for Error {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match &self.kind {
             ErrorKind::OffsetNotAlignedWithPartNumber(_, _) => None,
+            ErrorKind::NotRegularFile(_) => None,
             ErrorKind::IoError(err) => Some(err as _),
             ErrorKind::LocalIo { source, .. } => Some(source as _),
             ErrorKind::TaskFailed(err) => Some(err as _),

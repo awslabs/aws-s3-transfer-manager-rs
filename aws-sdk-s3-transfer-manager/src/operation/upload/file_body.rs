@@ -27,7 +27,7 @@ use bytes::Bytes;
 use http_body_1x::{Body, Frame, SizeHint};
 use tokio::sync::mpsc;
 
-use crate::io::fs::read_exact_at;
+use crate::io::fs::{open_regular_file, read_exact_at};
 use crate::io::PartBuffer;
 use crate::memory::{BufferPool, SegmentedBytes};
 
@@ -56,7 +56,7 @@ impl FileBodySource {
     ///
     /// Returns the error from opening `path`.
     pub(crate) fn open(path: &Path, pool: BufferPool) -> io::Result<Self> {
-        let file = File::open(path)?;
+        let file = open_regular_file(path)?;
         Ok(Self {
             file: Arc::new(file),
             pool,
@@ -923,5 +923,48 @@ mod tests {
             .and_then(|source| source.downcast_ref::<io::Error>())
             .expect("the open error is the source");
         assert_eq!(source.kind(), io::ErrorKind::NotFound);
+    }
+
+    /// An explicit length skips the builder's metadata check, so the open
+    /// itself must reject a FIFO, without waiting for a writer.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn file_body_source_rejects_a_fifo_at_open() {
+        let directory = tempfile::tempdir().unwrap();
+        let fifo = directory.path().join("fifo");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).unwrap();
+        for direct_io in [true, false] {
+            let stream = InputStream::read_from()
+                .path(&fifo)
+                .length(16)
+                .build()
+                .unwrap();
+            let error = stream.into_sdk_body(direct_io, test_pool()).unwrap_err();
+            assert_eq!(error.kind(), &crate::error::ErrorKind::IOError);
+            let message = aws_smithy_types::error::display::DisplayErrorContext(&error).to_string();
+            assert!(message.contains("is not a regular file"), "{message}");
+        }
+    }
+
+    /// A symbolic link to a regular file passes both the builder and the
+    /// open-time check, and the body reads the target's bytes.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn file_body_reads_a_regular_file_through_a_symlink() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target");
+        let link = directory.path().join("link");
+        std::fs::write(&target, b"through a link").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        for direct_io in [true, false] {
+            let body = InputStream::from_path(&link)
+                .unwrap()
+                .into_sdk_body(direct_io, test_pool())
+                .unwrap();
+            assert_eq!(collect_body(body).await.unwrap(), b"through a link");
+        }
     }
 }

@@ -125,7 +125,8 @@ impl InputStream {
     ///
     /// # Errors
     ///
-    /// Returns [`ErrorKind::IOError`](crate::error::ErrorKind::IOError) if a file-backed stream cannot open it.
+    /// Returns [`ErrorKind::IOError`](crate::error::ErrorKind::IOError) if a file-backed stream cannot open it, or if
+    /// the opened path is not a regular file.
     ///
     /// # Panics
     ///

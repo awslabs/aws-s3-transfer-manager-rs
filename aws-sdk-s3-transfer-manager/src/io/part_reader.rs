@@ -13,7 +13,7 @@ use bytes::{Buf, Bytes};
 use tokio::sync::Notify;
 
 use crate::io::error::Error;
-use crate::io::fs::read_exact_at;
+use crate::io::fs::{open_regular_file, read_exact_at};
 use crate::io::path_body::PathBody;
 use crate::io::stream::RawInputStream;
 use crate::io::InputStream;
@@ -370,8 +370,9 @@ impl PathBodyPartReader {
         // order is sequential so kernel readahead would help, but concurrent execution creates
         // some scatter. Benchmark before adding.
         // TODO(vnext): does this need to be async now?
-        let file =
-            Arc::new(File::open(&body.path).map_err(|e| Error::io_at("opening", &body.path, e))?);
+        let file = Arc::new(
+            open_regular_file(&body.path).map_err(|e| Error::io_at("opening", &body.path, e))?,
+        );
         let offset = body.offset;
         let content_length = body.length;
         Ok(Self {
