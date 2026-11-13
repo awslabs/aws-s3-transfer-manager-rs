@@ -813,6 +813,9 @@ mod tests {
         assert_eq!(parse_cgroup_limit("max\n"), None);
     }
 
+    // 2^32 does not fit a 32-bit `usize`; the > u32 value is only meaningful
+    // on 64-bit platforms.
+    #[cfg(target_pointer_width = "64")]
     #[test]
     fn test_parse_cgroup_value() {
         assert_eq!(parse_cgroup_limit("4294967296\n"), Some(4_294_967_296));
