@@ -5,8 +5,12 @@
 
 //! Positioned filesystem operations used by transfer data paths.
 //!
-//! Reads and writes operate at explicit offsets without changing the file
-//! cursor, allowing disjoint ranges of one open file to progress concurrently.
+//! Reads and writes operate at explicit offsets so disjoint ranges of one
+//! open file can progress concurrently without coordinating on a shared
+//! cursor. The cursor is left unchanged on Unix and WASI; on Windows it ends
+//! after the last byte transferred, as a side effect of `ReadFile` /
+//! `WriteFile` with `OVERLAPPED` on a synchronous handle. Callers that rely on
+//! cursor state for other I/O must restore it themselves after these calls.
 //! The read facade initializes pooled writable runs, while the write facade
 //! preserves segmented buffers for vectored I/O where the platform supports
 //! it. Preallocation prepares an output file for later writes but does not
@@ -244,10 +248,13 @@ pub(crate) fn read_exact_at(file: &File, dst: &mut PartBuffer, mut offset: u64) 
 
 /// Writes all remaining bytes from `buf` beginning at `offset`.
 ///
-/// The file cursor is unchanged. Disjoint calls may therefore write the same
-/// open file concurrently without serializing on cursor position. The buffer
-/// is advanced after each successful write; an error leaves it positioned
-/// after the bytes already written so the caller can observe partial progress.
+/// Each call writes at its own offset, so disjoint calls on the same open file
+/// may progress concurrently without coordinating on a shared cursor. The
+/// cursor is unchanged on Unix and WASI; on Windows it ends after the last
+/// byte written, as a side effect of `WriteFile` with `OVERLAPPED` on a
+/// synchronous handle. The buffer is advanced after each successful write; an
+/// error leaves it positioned after the bytes already written so the caller
+/// can observe partial progress.
 ///
 /// Unix uses vectored positioned writes to preserve segment boundaries.
 /// Windows and WASI write one segment per call. Platforms without
@@ -546,9 +553,9 @@ mod sys {
             };
             if ok == 0 {
                 let err = io::Error::last_os_error();
-                // Disk files at EOF return TRUE+bytes_read=0. Pipes and
-                // serial ports can return FALSE+ERROR_HANDLE_EOF instead;
-                // normalize both to Ok(0) so the loop emits UnexpectedEof.
+                // On a synchronous handle with a non-null OVERLAPPED, EOF is
+                // reported as FALSE + ERROR_HANDLE_EOF. Normalize to Ok(0)
+                // so the loop emits UnexpectedEof like Unix.
                 if err.raw_os_error() == Some(ERROR_HANDLE_EOF as i32) {
                     Ok(0)
                 } else {
@@ -839,6 +846,8 @@ mod tests {
 
         assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
         assert_eq!(calls, 2);
+        assert_eq!(unsafe { dst[0].assume_init() }, b'a');
+        assert_eq!(unsafe { dst[1].assume_init() }, b'b');
     }
 
     #[test]
@@ -1026,6 +1035,34 @@ mod tests {
         let mut dst = [MaybeUninit::<u8>::uninit(); 40];
         let error = sys::read_exact_at(tmp.as_file(), &mut dst, 29).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    /// The Unix read path validates against `off64_t::MAX` before calling
+    /// `pread64`. A `u64::MAX` offset exceeds that ceiling even on 64-bit
+    /// targets and must be rejected without touching the file.
+    #[cfg(unix)]
+    #[test]
+    fn read_exact_at_rejects_unrepresentable_unix_offset() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let mut dst = [MaybeUninit::<u8>::uninit(); 1];
+
+        let error = sys::read_exact_at(tmp.as_file(), &mut dst, u64::MAX).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    /// The Windows read path validates against `i64::MAX` (the NTFS
+    /// `LARGE_INTEGER` ceiling) before calling `ReadFile`. A `u64::MAX` offset
+    /// sits above that ceiling and must be rejected.
+    #[cfg(windows)]
+    #[test]
+    fn read_exact_at_rejects_unrepresentable_windows_offset() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let mut dst = [MaybeUninit::<u8>::uninit(); 1];
+
+        let error = sys::read_exact_at(tmp.as_file(), &mut dst, u64::MAX).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]
