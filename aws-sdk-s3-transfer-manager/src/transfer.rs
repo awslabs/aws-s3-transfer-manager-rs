@@ -560,6 +560,10 @@ pub(crate) struct TransferContext {
     pending_state: Option<Arc<TransferPendingState>>,
     /// Per-transfer metrics backing store
     pub(crate) metrics: Arc<MetricsState>,
+    /// The scheduler's descriptor for this transfer, set when it is enqueued. Work in
+    /// flight keeps the descriptor alive after the scheduler drops the transfer from its
+    /// registry, so the reference upgrades while work remains.
+    descriptor: Arc<std::sync::OnceLock<crate::scheduler::descriptor::WeakTransferDescriptor>>,
     /// User agent features of the operation this transfer belongs to
     features: OperationFeatures,
 }
@@ -818,6 +822,7 @@ impl TransferContext {
         let ctx = Self {
             id,
             metrics: Arc::new(MetricsState::new()),
+            descriptor: Arc::new(std::sync::OnceLock::new()),
             handle,
             status: StateMachineStatus::new(),
             error: Arc::new(Mutex::new(None)),
@@ -1277,7 +1282,7 @@ impl SchedulingCtl<'_> {
 #[derive(Debug, Clone)]
 pub struct AbortHandle {
     ctx: TransferContext,
-    /// `None` when the transfer had already completed or been cancelled.
+    /// `None` when no work of the transfer was in flight.
     descriptor: Option<crate::scheduler::descriptor::TransferDescriptor>,
 }
 
@@ -1323,12 +1328,20 @@ impl AbortHandle {
 }
 
 impl TransferContext {
-    /// A handle that cancels this transfer and waits for it, taken while the
-    /// transfer is still registered with the scheduler.
+    /// Records the scheduler's descriptor for this transfer. Called once, when the
+    /// scheduler enqueues the transfer.
+    pub(crate) fn set_descriptor(
+        &self,
+        descriptor: crate::scheduler::descriptor::WeakTransferDescriptor,
+    ) {
+        let _ = self.descriptor.set(descriptor);
+    }
+
+    /// A handle that cancels this transfer and waits for it.
     pub(crate) fn abort_handle(&self) -> AbortHandle {
         AbortHandle {
             ctx: self.clone(),
-            descriptor: self.handle.scheduler.descriptor(self.id),
+            descriptor: self.descriptor.get().and_then(|weak| weak.upgrade()),
         }
     }
 }
