@@ -40,6 +40,7 @@ pub(crate) mod read_ahead;
 
 mod context;
 mod observability;
+pub(crate) use observability::DownloadTerminalOutcome;
 
 pub(crate) mod discovery;
 

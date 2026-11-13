@@ -56,6 +56,7 @@ async fn setup_with_fault(
     aws_sdk_s3_transfer_manager::Client,
     fault_connector::InjectionTally,
 ) {
+    crate::harness::init_test_logs();
     let server = S3MockServer::builder()
         .with_in_memory_store()
         .build()
@@ -219,6 +220,7 @@ mod server_faults {
     /// so stalled-stream protection is enabled exactly as in the field. `path`
     /// selects the multipart threshold so the object exercises the intended path.
     async fn setup(path: Path) -> (S3MockServer, s3_mock_server::ServerHandle, TmClient) {
+        crate::harness::init_test_logs();
         let server = S3MockServer::builder()
             .with_in_memory_store()
             .build()

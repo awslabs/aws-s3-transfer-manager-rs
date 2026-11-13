@@ -629,6 +629,7 @@ impl Intercept for PartitionRecorder {
 /// races.)
 #[tokio::test]
 async fn requests_carry_per_bucket_retry_partition() {
+    crate::harness::init_test_logs();
     let server = S3MockServer::builder()
         .with_in_memory_store()
         .build()

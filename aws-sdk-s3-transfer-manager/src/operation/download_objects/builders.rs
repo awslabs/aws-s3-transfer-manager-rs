@@ -9,6 +9,7 @@ use std::{
 };
 
 use crate::io::walk::S3Walker;
+use crate::telemetry::TARGET_TRANSFER_DOWNLOAD_OBJECTS;
 use crate::types::FailedTransferPolicy;
 
 use super::{DownloadObjectsHandle, DownloadObjectsInputBuilder};
@@ -34,7 +35,7 @@ impl DownloadObjectsFluentBuilder {
     }
 
     /// Initiate download of multiple objects.
-    #[tracing::instrument(skip_all, level = "debug", name = "initiate-download-objects", fields(
+    #[tracing::instrument(skip_all, level = "debug", target = TARGET_TRANSFER_DOWNLOAD_OBJECTS, name = "initiate-download-objects", fields(
         bucket = self.inner.bucket.as_deref().unwrap_or_default(),
         destination = self.inner.destination.as_deref().map(|p| p.to_str().unwrap_or_default()).unwrap_or_default(),
     ))]

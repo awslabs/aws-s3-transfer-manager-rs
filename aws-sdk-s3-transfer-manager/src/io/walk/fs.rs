@@ -203,6 +203,7 @@ impl FsWalker {
         }
 
         tracing::debug!(
+            target: crate::telemetry::TARGET_TRANSFER_UPLOAD_OBJECTS,
             ?root,
             follow_symlinks = self.follow_symlinks,
             max_depth = self.max_depth,
@@ -465,6 +466,7 @@ impl FsWalk {
             if let Some(err) = self.pending_errors.pop_front() {
                 if !err.is_fatal() {
                     tracing::warn!(
+                        target: crate::telemetry::TARGET_TRANSFER_UPLOAD_OBJECTS,
                         path = ?err.path(),
                         kind = ?err.kind(),
                         "skipping entry",
@@ -705,6 +707,7 @@ impl FsWalk {
         }
 
         tracing::trace!(
+            target: crate::telemetry::TARGET_TRANSFER_UPLOAD_OBJECTS,
             ?dir,
             files = result.files.len(),
             subdirs = result.subdirs.len(),
