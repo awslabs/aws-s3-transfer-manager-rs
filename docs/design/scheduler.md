@@ -372,6 +372,11 @@ at execution start and cooperatively cancels. `wait_for_idle()` blocks until the
 outstanding count (queued + executing) reaches zero. This wait does not imply that all descriptor
 references have dropped.
 
+Cancelling removes the transfer from the registry, so a later `cancel_transfer` finds no descriptor
+and its wait returns immediately. A caller that must wait after an earlier cancel, such as a dropped
+handle, takes a descriptor clone with `Scheduler::descriptor` while the transfer is registered and
+waits on the clone.
+
 ### State Machine Contracts
 
 A Transfer implementation must uphold several contracts:

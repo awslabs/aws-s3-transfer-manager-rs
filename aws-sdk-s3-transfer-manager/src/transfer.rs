@@ -1257,6 +1257,82 @@ impl SchedulingCtl<'_> {
     }
 }
 
+/// Cancels a transfer and waits until none of its work is running.
+///
+/// Obtained from a handle's `abort_handle` method, for example
+/// [`ManagedDownloadHandle::abort_handle`](crate::operation::download::ManagedDownloadHandle::abort_handle).
+/// Unlike the handle, it outlives a `join` that a timeout dropped, and so it
+/// outlives the handle itself. Dropping a handle cancels without waiting, so a
+/// caller that must reuse a resource it supplied, such as a file, calls
+/// [`abort`](Self::abort) first.
+///
+/// ```ignore
+/// let handle = tm.download().bucket("b").key("k").write_to_file(file)?;
+/// let abort = handle.abort_handle();
+/// if tokio::time::timeout(deadline, handle.join()).await.is_err() {
+///     abort.abort().await;
+///     // No write or resize of the file is still running.
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct AbortHandle {
+    ctx: TransferContext,
+    /// `None` when the transfer had already completed or been cancelled.
+    descriptor: Option<crate::scheduler::descriptor::TransferDescriptor>,
+}
+
+impl AbortHandle {
+    /// Cancel the transfer and wait for its in-flight work to stop.
+    ///
+    /// When this method returns, no work of the transfer is running and none will
+    /// start, so the caller may reuse a resource it provided. Calling it again is
+    /// harmless, and after the transfer finished it returns immediately. Call it
+    /// after the handle has been dropped or joined, not while another thread is
+    /// still dropping it.
+    ///
+    /// The wait has no limit: a write stalled in the operating system keeps this
+    /// pending. Wrap it in a timeout to bound it, and treat the resource as in use
+    /// when that timeout expires.
+    ///
+    /// Returns [`AlreadyCompleted`] when the transfer had completed before the
+    /// cancel took effect, and [`Cancelled`] otherwise, including a transfer that
+    /// had failed.
+    ///
+    /// [`AlreadyCompleted`]: crate::types::AbortOutcome::AlreadyCompleted
+    /// [`Cancelled`]: crate::types::AbortOutcome::Cancelled
+    pub async fn abort(&self) -> crate::types::AbortOutcome {
+        // The cancellation also waits for the transfer's direct children. Cancelling
+        // removes the transfer from the scheduler registry, so after an earlier
+        // cancel, such as a handle drop, only the descriptor taken while the
+        // transfer was registered still counts the work that was executing.
+        self.ctx
+            .handle
+            .scheduler
+            .cancel_transfer(self.ctx.id)
+            .wait_for_idle()
+            .await;
+        if let Some(descriptor) = &self.descriptor {
+            descriptor.wait_for_idle().await;
+        }
+        if self.ctx.transfer_status() == crate::types::TransferStatus::Completed {
+            crate::types::AbortOutcome::AlreadyCompleted
+        } else {
+            crate::types::AbortOutcome::Cancelled
+        }
+    }
+}
+
+impl TransferContext {
+    /// A handle that cancels this transfer and waits for it, taken while the
+    /// transfer is still registered with the scheduler.
+    pub(crate) fn abort_handle(&self) -> AbortHandle {
+        AbortHandle {
+            ctx: self.clone(),
+            descriptor: self.handle.scheduler.descriptor(self.id),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

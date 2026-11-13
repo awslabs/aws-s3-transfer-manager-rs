@@ -454,6 +454,15 @@ impl Scheduler {
         }
     }
 
+    /// The registered descriptor of a transfer, or `None` once the transfer has
+    /// completed or been cancelled.
+    ///
+    /// A clone keeps reporting idleness after [`cancel_transfer`](Self::cancel_transfer)
+    /// removes the transfer from the registry.
+    pub(crate) fn descriptor(&self, id: TransferId) -> Option<TransferDescriptor> {
+        self.0.transfers.read().unwrap().get(&id).cloned()
+    }
+
     /// Set the priority of a transfer.
     ///
     /// Priority affects how fast vruntime accumulates (CFS-style scheduling):

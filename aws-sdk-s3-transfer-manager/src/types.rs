@@ -186,11 +186,13 @@ pub struct AbortedUpload {
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum AbortOutcome {
-    /// The upload was stopped before S3 completes the object.
+    /// The transfer was stopped before it completed. For an upload, S3 had not
+    /// completed the object.
     #[default]
     Cancelled,
-    /// S3 finished storing the object before the abort took effect. The object is not
-    /// deleted; its metadata is available from [`AbortedUpload::output`].
+    /// The transfer completed before the abort took effect. For an upload, S3
+    /// finished storing the object, which is not deleted, and its metadata is
+    /// available from [`AbortedUpload::output`].
     AlreadyCompleted,
     /// The upload was stopped before S3 completed the object, and its multipart upload
     /// was left open.
