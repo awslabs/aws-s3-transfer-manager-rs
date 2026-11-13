@@ -80,9 +80,15 @@ impl InputStream {
     ///
     /// Furthermore, a partial write MAY seek in the file and resume from the previous location.
     ///
+    /// The path must name a regular file, directly or through symbolic links.
+    /// Upload pipes and devices with [`InputStream::from_part_stream`] and
+    /// [`TokioIo`](crate::io::adapters::TokioIo).
+    ///
     /// # Errors
     ///
-    /// Returns [`ErrorKind::IOError`](crate::error::ErrorKind::IOError) when the
+    /// Returns [`ErrorKind::InputInvalid`](crate::error::ErrorKind::InputInvalid)
+    /// when the path does not name a regular file, and
+    /// [`ErrorKind::IOError`](crate::error::ErrorKind::IOError) when the
     /// file's metadata cannot be read, for example because the file does not
     /// exist.
     ///
@@ -101,6 +107,23 @@ impl InputStream {
     /// Returns `true` when this `InputStream` reads from a local file.
     pub(crate) fn is_file_backed(&self) -> bool {
         matches!(self.inner, RawInputStream::Fs(_))
+    }
+
+    /// Checks, without opening it, that a file-backed stream's path names a
+    /// regular file. Does nothing for other streams. The file is checked again
+    /// when it is opened.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::InputInvalid`](crate::error::ErrorKind::InputInvalid)
+    /// if the path does not name a regular file, and
+    /// [`ErrorKind::IOError`](crate::error::ErrorKind::IOError) if its metadata
+    /// cannot be read.
+    pub(crate) fn check_file_type(&self) -> Result<(), crate::error::Error> {
+        match &self.inner {
+            RawInputStream::Fs(path_body) => path_body.check_file_type(),
+            RawInputStream::Buf(_) | RawInputStream::Dyn(_) => Ok(()),
+        }
     }
 
     /// Convert this input stream into an [`SdkBody`] suitable for a top-level
@@ -125,7 +148,10 @@ impl InputStream {
     ///
     /// # Errors
     ///
-    /// Returns [`ErrorKind::IOError`](crate::error::ErrorKind::IOError) if a file-backed stream cannot open it.
+    /// Returns [`ErrorKind::InputInvalid`](crate::error::ErrorKind::InputInvalid)
+    /// if a file-backed stream's path does not open as a regular file, and
+    /// [`ErrorKind::IOError`](crate::error::ErrorKind::IOError) if it cannot be
+    /// opened.
     ///
     /// # Panics
     ///
@@ -150,8 +176,7 @@ impl InputStream {
         match self.inner {
             RawInputStream::Buf(bytes) => Ok(SdkBody::from(bytes)),
             RawInputStream::Fs(path_body) => {
-                let source = FileBodySource::open(&path_body.path, buffer_pool)
-                    .map_err(|e| crate::error::io_at("opening", &path_body.path, e))?;
+                let source = FileBodySource::new(path_body.open()?, buffer_pool);
                 let offset = path_body.offset;
                 let length = path_body.length;
                 if direct_io {

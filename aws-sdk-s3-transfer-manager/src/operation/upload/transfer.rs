@@ -790,7 +790,50 @@ impl UploadTransfer {
         outcome
     }
 
+    /// Checks, without opening it, that a file-backed source names a regular
+    /// file before CreateMultipartUpload is sent, so a source that is already
+    /// non-regular fails without creating a multipart upload. The part reader
+    /// checks the opened file again after Create returns.
+    ///
+    /// The stream leaves `PendingInit` while the metadata is read, so the read
+    /// runs without the state lock, and returns afterwards. If the upload left
+    /// `PendingInit` in the meantime, the stream is dropped and Create proceeds
+    /// as it would for an abort that lands while Create is on the wire.
+    ///
+    /// Returns the failed outcome when the check fails, and `None` otherwise.
+    fn check_file_source(&self) -> Option<WorkOutcome> {
+        let stream = {
+            let mut state = self.inner.state.lock().expect("lock poisoned");
+            match &mut *state {
+                UploadState::PendingInit { stream, .. }
+                    if stream.as_ref().is_some_and(InputStream::is_file_backed) =>
+                {
+                    stream.take().expect("stream checked above")
+                }
+                _ => return None,
+            }
+        };
+        let checked = stream.check_file_type();
+        let mut state = self.inner.state.lock().expect("lock poisoned");
+        match checked {
+            // Create has not been sent, so no upload exists to abort.
+            Err(error) => {
+                Some(self.fail(state, error, FailedRequest::CreateMpu { upload_id: None }))
+            }
+            Ok(()) => {
+                if let UploadState::PendingInit { stream: slot, .. } = &mut *state {
+                    *slot = Some(stream);
+                }
+                None
+            }
+        }
+    }
+
     async fn do_execute_create_mpu(&self) -> WorkOutcome {
+        if let Some(outcome) = self.check_file_source() {
+            return outcome;
+        }
+
         let client = self.inner.ctx.s3_client();
 
         let mpu_req =
@@ -905,7 +948,7 @@ impl UploadTransfer {
                     let state = self.inner.state.lock().expect("lock poisoned");
                     return self.fail(
                         state,
-                        e.into(),
+                        e,
                         FailedRequest::CreateMpu {
                             upload_id: Some(upload_id),
                         },
@@ -3031,25 +3074,27 @@ mod tests {
         assert_eq!(final_error(&transfer).code(), Some("PreconditionFailed"));
     }
 
-    /// When the part reader cannot be built after Create succeeded, the
-    /// upload ID is handed to the abort and the upload is aborted.
+    /// A multipart file input whose metadata cannot be read fails before
+    /// CreateMultipartUpload is sent, so there is no upload to abort.
+    /// ref: RUST-1674
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
-    async fn part_reader_failure_after_create_aborts_the_upload() {
+    async fn file_open_failure_fails_before_create() {
         use std::io::Write;
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
         tmp.write_all(&vec![0u8; 16 * 1024 * 1024]).unwrap();
+        let create_mpu = create_mpu_ok();
         let abort_mpu = abort_mpu_for_test_upload();
         let transfer = create_test_transfer_with_stream(
             mock_client!(
                 aws_sdk_s3,
                 RuleMode::MatchAny,
-                &[create_mpu_ok(), abort_mpu.clone()]
+                &[create_mpu.clone(), abort_mpu.clone()]
             ),
             InputStream::from_path(tmp.path()).unwrap(),
         );
-        // The reader opens the file after Create returns; removing it makes
-        // that open fail.
+        // The file's metadata is read before Create is sent; removing the file
+        // makes that read fail.
         tmp.close().unwrap();
 
         let mut create = assert_ready(transfer.poll_work());
@@ -3057,22 +3102,122 @@ mod tests {
             transfer.execute(&mut create).await,
             WorkOutcome::Failed { .. }
         ));
-        assert_eq!(
-            aborting_view(&transfer),
-            AbortingView {
-                upload_id: Some("test-upload-id".to_owned()),
-                create_in_flight: false,
-                complete_mpu_in_flight: false,
-                abort_mpu: AbortMpuProgress::ToSend,
-                failure_recorded: true,
-            }
-        );
-        finish_failure_abort(&transfer).await;
-        assert_eq!(abort_mpu.num_calls(), 1);
+        assert_done(transfer.poll_work());
+        assert_eq!(create_mpu.num_calls(), 0);
+        assert_eq!(abort_mpu.num_calls(), 0);
         assert_eq!(
             final_error(&transfer).kind(),
             &crate::error::ErrorKind::IOError
         );
+    }
+
+    /// Helper function to replace the regular file at `path` with a FIFO, so the path
+    /// names a non-regular file only after the input stream read its metadata.
+    /// Android's app sandbox denies creating the FIFO.
+    #[cfg(all(unix, not(target_os = "android")))]
+    fn replace_with_fifo(path: &std::path::Path) {
+        std::fs::remove_file(path).unwrap();
+        nix::unistd::mkfifo(path, nix::sys::stat::Mode::S_IRWXU).unwrap();
+    }
+
+    /// Helper function to assert on not_regular_file_error
+    #[cfg(all(unix, not(target_os = "android")))]
+    fn assert_not_regular_file_error(error: &crate::error::Error) {
+        use aws_smithy_types::error::display::DisplayErrorContext;
+
+        assert_eq!(error.kind(), &crate::error::ErrorKind::InputInvalid);
+        let message = DisplayErrorContext(error).to_string();
+        assert!(message.contains("is not a regular file"), "{message}");
+    }
+
+    /// A file input that no longer opens as a regular file fails PutObject
+    /// before the request is sent.
+    /// ref: RUST-1674
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    #[cfg(all(unix, not(target_os = "android")))]
+    async fn put_object_rejects_a_source_replaced_by_a_fifo() {
+        // Create a regular file, that it would pass InputStream check
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("body");
+        std::fs::write(&path, vec![0u8; 1024]).unwrap();
+        let stream = InputStream::from_path(&path).unwrap();
+
+        // Replace it with FIFO
+        replace_with_fifo(&path);
+
+        // Then make sure we validate the file before sending the request.
+        let put_object = mock!(aws_sdk_s3::Client::put_object)
+            .then_output(|| aws_sdk_s3::operation::put_object::PutObjectOutput::builder().build());
+        let transfer = create_test_transfer_with_stream(
+            mock_client!(
+                aws_sdk_s3,
+                RuleMode::MatchAny,
+                std::slice::from_ref(&put_object)
+            ),
+            stream,
+        );
+
+        let mut work = assert_ready(transfer.poll_work());
+        assert!(matches!(
+            work.data_mut::<UploadWork>(),
+            UploadWork::PutObject { .. }
+        ));
+        assert!(matches!(
+            transfer.execute(&mut work).await,
+            WorkOutcome::Failed { .. }
+        ));
+        assert_done(transfer.poll_work());
+        assert_eq!(put_object.num_calls(), 0);
+        assert_not_regular_file_error(&final_error(&transfer));
+    }
+
+    /// A multipart file input that no longer opens as a regular file fails
+    /// before CreateMultipartUpload is sent, so no multipart upload exists to
+    /// abort or to be left open, whatever the failed-upload policy.
+    /// ref: RUST-1674
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    #[cfg(all(unix, not(target_os = "android")))]
+    async fn multipart_rejects_a_source_replaced_by_a_fifo() {
+        for policy in [None, Some(FailedMultipartUploadPolicy::Retain)] {
+            // Create a regular file, that it would pass InputStream check
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("body");
+            std::fs::write(&path, vec![0u8; 16 * 1024 * 1024]).unwrap();
+            let stream = InputStream::from_path(&path).unwrap();
+
+            // Replace the regular file with fifo
+            replace_with_fifo(&path);
+
+            let create_mpu = create_mpu_ok();
+            let upload_part = mock!(aws_sdk_s3::Client::upload_part)
+                .then_output(|| UploadPartOutput::builder().e_tag("test-etag").build());
+            let abort_mpu = abort_mpu_for_test_upload();
+            let transfer = create_test_transfer_with_policy(
+                mock_client!(
+                    aws_sdk_s3,
+                    RuleMode::MatchAny,
+                    &[create_mpu.clone(), upload_part.clone(), abort_mpu.clone()]
+                ),
+                stream,
+                2,
+                policy.clone(),
+            );
+
+            let mut create = assert_ready(transfer.poll_work());
+            assert!(matches!(
+                transfer.execute(&mut create).await,
+                WorkOutcome::Failed { .. }
+            ));
+            assert_done(transfer.poll_work());
+            assert_eq!(create_mpu.num_calls(), 0, "{policy:?}");
+            assert_eq!(upload_part.num_calls(), 0, "{policy:?}");
+            assert_eq!(abort_mpu.num_calls(), 0, "{policy:?}");
+            let error = final_error(&transfer);
+            assert_eq!(error.upload_id(), None, "{policy:?}");
+            assert_not_regular_file_error(&error);
+        }
     }
 
     /// A failed UploadPart aborts the upload and reports the part's error.
