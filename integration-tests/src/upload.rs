@@ -404,7 +404,8 @@ async fn when_required_tm() -> (
     let tm = aws_sdk_s3_transfer_manager::Client::new(
         aws_sdk_s3_transfer_manager::Config::builder()
             .s3_config(S3ClientConfig::new(s3_config))
-            .build(),
+            .build()
+            .expect("valid config"),
     );
     (handle, tm, recorder)
 }
