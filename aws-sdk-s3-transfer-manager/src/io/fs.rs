@@ -25,38 +25,38 @@
 use bytes::{Buf, BufMut};
 use std::fs::File;
 use std::io;
+use std::mem::MaybeUninit;
 use std::path::{Path, PathBuf};
 
 use crate::io::PartBuffer;
 
-/// Repeats positioned reads until `dst` is full.
+/// Repeats positioned reads until every byte of `dst` is initialized.
 ///
-/// The callback may complete a prefix, return [`io::ErrorKind::Interrupted`],
-/// or report end of file with a zero-length read. Offsets advance only by bytes
-/// the callback reports initialized.
-/// # Safety
-/// `ptr` must be valid for writes of `len` bytes for the duration of the call.
-unsafe fn read_exact_at_loop(
-    mut ptr: *mut u8,
-    mut len: usize,
+/// `read` receives the uninitialized remainder of `dst` and the file offset of
+/// its first byte, and returns how many leading bytes it initialized. It may
+/// initialize a prefix, return [`io::ErrorKind::Interrupted`], or report end of
+/// file with a zero-length read. Offsets advance only by bytes `read` reports
+/// initialized, so a successful return initializes all of `dst` provided `read`
+/// reports no byte it did not write.
+fn read_exact_at_loop(
+    mut dst: &mut [MaybeUninit<u8>],
     mut offset: u64,
-    mut read: impl FnMut(*mut u8, usize, u64) -> io::Result<usize>,
+    mut read: impl FnMut(&mut [MaybeUninit<u8>], u64) -> io::Result<usize>,
 ) -> io::Result<()> {
-    while len > 0 {
-        match read(ptr, len, offset) {
+    while !dst.is_empty() {
+        match read(dst, offset) {
             Ok(0) => {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "positioned read reached end of file",
                 ));
             }
-            Ok(count) if count <= len => {
+            Ok(count) if count <= dst.len() => {
                 offset = offset
                     .checked_add(count as u64)
                     .ok_or_else(|| io::Error::other("file read offset overflowed"))?;
-                // SAFETY: `count <= len` and `ptr` is valid for `len` bytes.
-                ptr = unsafe { ptr.add(count) };
-                len -= count;
+                let current = dst;
+                dst = &mut current[count..];
             }
             Ok(_) => {
                 return Err(io::Error::new(
@@ -158,10 +158,56 @@ fn validate_off_t_range(offset: u64, len: usize) -> io::Result<()> {
     validate_range(offset, len, off_t_max, max_len)
 }
 
+/// Initializes every byte of `dst` from `file`, starting at `offset`, without
+/// changing the file cursor.
+///
+/// Calls `pread64` with the destination's raw pointer, so no `&mut [u8]` is
+/// formed over uninitialized memory. `pread64` takes a 64-bit offset even where
+/// `off_t` is 32 bits; targets whose `pread` already takes a 64-bit `off_t` use
+/// `pread`.
+#[cfg(unix)]
+fn read_exact_at_unix(file: &File, dst: &mut [MaybeUninit<u8>], offset: u64) -> io::Result<()> {
+    #[cfg(any(
+        all(target_os = "linux", not(target_env = "musl")),
+        target_os = "android"
+    ))]
+    use libc::{off64_t, pread64};
+    #[cfg(not(any(
+        all(target_os = "linux", not(target_env = "musl")),
+        target_os = "android"
+    )))]
+    use libc::{off_t as off64_t, pread as pread64};
+    use std::os::unix::io::AsRawFd;
+
+    // `pread`'s count is bounded by SSIZE_MAX regardless of off_t width; a
+    // >2 GB chunk on 32-bit + LFS would get EINVAL from the kernel.
+    validate_range(
+        offset,
+        dst.len(),
+        off64_t::MAX as u64,
+        libc::ssize_t::MAX as usize,
+    )?;
+    let fd = file.as_raw_fd();
+    read_exact_at_loop(dst, offset, |dst, offset| {
+        // `validate_range` bounds every offset in the range by `off64_t::MAX`,
+        // and intermediate offsets stay within that range.
+        let offset = offset as off64_t;
+        // SAFETY: `dst` is valid for writes of `dst.len()` bytes, and `pread64`
+        // writes only within the count it is given.
+        let n = unsafe { pread64(fd, dst.as_mut_ptr().cast(), dst.len(), offset) };
+        match n {
+            0 => Ok(0),
+            n if n > 0 => Ok(n as usize),
+            _ => Err(io::Error::last_os_error()),
+        }
+    })
+}
+
 /// Reads exactly enough bytes to fill every writable run in `dst`.
 ///
 /// The first byte is read from `offset`; subsequent runs continue from the end
-/// of the preceding run. The file cursor is unchanged.
+/// of the preceding run. The file cursor is unchanged on Unix and WASI; on
+/// Windows it ends after the last byte read.
 ///
 /// A run is published to [`PartBuffer`] only after the positioned read has
 /// initialized that complete run. If a later read fails, earlier completed
@@ -183,17 +229,9 @@ pub(crate) fn read_exact_at(file: &File, dst: &mut PartBuffer, mut offset: u64) 
             ));
         }
 
-        // SAFETY: `ptr` is the exclusive writable start of the run returned by
-        // `BufMut::chunk_mut`; `count` is its byte length. `sys::read_exact_at`
-        // fills every byte through the OS before `advance_mut` publishes the range.
-        // Unix and Windows call the OS with the raw pointer directly, forming no
-        // Rust reference over uninitialized memory. The WASI path constructs
-        // `&mut [u8]` internally; `u8` has no invalid bit patterns and the OS
-        // write precedes any Rust read.
-        unsafe {
-            sys::read_exact_at(file, uninitialized.as_mut_ptr().cast::<u8>(), count, offset)?;
-        }
-        // SAFETY: the positioned read initialized every byte in `bytes`.
+        sys::read_exact_at(file, uninitialized, offset)?;
+        // SAFETY: `sys::read_exact_at` returned `Ok`, so it initialized all
+        // `count` bytes of the run.
         unsafe {
             dst.advance_mut(count);
         }
@@ -371,35 +409,7 @@ mod sys {
     /// Maximum number of I/O vector entries per system call.
     const MAX_IO_SLICES: usize = 128;
 
-    /// Fills one contiguous destination range without changing the file cursor.
-    ///
-    /// # Safety
-    /// `ptr` must be valid for writes of `len` bytes for the duration of the call.
-    pub(super) unsafe fn read_exact_at(
-        file: &File,
-        ptr: *mut u8,
-        len: usize,
-        offset: u64,
-    ) -> io::Result<()> {
-        use std::os::unix::io::AsRawFd;
-        super::validate_off_t_range(offset, len)?;
-        // SAFETY: `ptr` is valid for `len` bytes (caller contract).
-        // `pread` takes a raw pointer and does not form a Rust reference.
-        unsafe {
-            super::read_exact_at_loop(ptr, len, offset, |ptr, len, offset| {
-                // validate_off_t_range proved the last byte <= off_t::MAX before
-                // the loop; intermediate offsets stay within that range, so the
-                // cast is infallible.
-                let off = offset as libc::off_t;
-                let n = libc::pread(file.as_raw_fd(), ptr.cast::<libc::c_void>(), len, off);
-                match n {
-                    0 => Ok(0),
-                    n if n > 0 => Ok(n as usize),
-                    _ => Err(io::Error::last_os_error()),
-                }
-            })
-        }
-    }
+    pub(super) use super::read_exact_at_unix as read_exact_at;
 
     /// Drains segmented input with as few positioned writes as the iovec limit permits.
     pub(super) fn write_all_at(file: &File, buf: &mut impl Buf, offset: u64) -> io::Result<()> {
@@ -453,30 +463,7 @@ mod sys {
     use std::io;
     use std::os::unix::fs::FileExt;
 
-    /// # Safety
-    /// `ptr` must be valid for writes of `len` bytes for the duration of the call.
-    pub(super) unsafe fn read_exact_at(
-        file: &File,
-        ptr: *mut u8,
-        len: usize,
-        offset: u64,
-    ) -> io::Result<()> {
-        super::validate_off_t_range(offset, len)?;
-        // Use std's read_at shim, which Miri supports without -Zmiri-disable-isolation.
-        // libc::pread via raw FFI requires that flag; std shims do not.
-        // SAFETY: `ptr` is valid for `len` bytes (caller contract). The closure
-        // constructs `&mut [u8]` to satisfy `read_at`'s signature. Miri tracks
-        // initialization at read time, not at reference-creation time (without
-        // -Zmiri-check-validity-on-ref-creation), so the reference over pooled
-        // memory is not flagged as long as `read_at` writes every byte before
-        // any instrumented code reads them — which it does on success.
-        unsafe {
-            super::read_exact_at_loop(ptr, len, offset, |ptr, len, offset| {
-                let dst = std::slice::from_raw_parts_mut(ptr, len);
-                file.read_at(dst, offset)
-            })
-        }
-    }
+    pub(super) use super::read_exact_at_unix as read_exact_at;
 
     pub(super) fn write_all_at(file: &File, buf: &mut impl Buf, offset: u64) -> io::Result<()> {
         super::validate_off_t_range(offset, buf.remaining())?;
@@ -499,19 +486,24 @@ mod sys {
 mod sys {
     //! Windows positioned I/O.
     //!
-    //! `seek_read` and `seek_write` do not mutate the shared file cursor.
+    //! `seek_read` and `seek_write` read and write at explicit offsets; unlike
+    //! Unix `pread`/`pwrite`, they leave the file cursor after the bytes
+    //! transferred.
 
     use bytes::Buf;
     use std::fs::File;
     use std::io;
+    use std::mem::MaybeUninit;
     use std::os::windows::fs::FileExt;
 
-    /// # Safety
-    /// `ptr` must be valid for writes of `len` bytes for the duration of the call.
-    pub(super) unsafe fn read_exact_at(
+    /// Initializes every byte of `dst` from `file`, starting at `offset`.
+    ///
+    /// Calls `ReadFile` with the destination's raw pointer, so no `&mut [u8]`
+    /// is formed over uninitialized memory. As with `seek_read`, the file
+    /// cursor ends after the last byte read.
+    pub(super) fn read_exact_at(
         file: &File,
-        ptr: *mut u8,
-        len: usize,
+        dst: &mut [MaybeUninit<u8>],
         offset: u64,
     ) -> io::Result<()> {
         use std::os::windows::io::AsRawHandle;
@@ -521,51 +513,51 @@ mod sys {
 
         // NTFS file sizes are stored as LARGE_INTEGER (i64); the last byte of
         // the range must not exceed i64::MAX or ReadFile hits the NTFS ceiling.
-        super::validate_range(offset, len, i64::MAX as u64, usize::MAX)?;
+        super::validate_range(offset, dst.len(), i64::MAX as u64, usize::MAX)?;
 
-        // SAFETY: `ptr` is valid for `len` bytes (caller contract). For a
-        // synchronous file handle, ReadFile with a non-null OVERLAPPED reads
-        // from the offset in OVERLAPPED.{Offset,OffsetHigh} without changing
-        // the file cursor. hEvent is null; the call blocks until complete.
-        unsafe {
-            super::read_exact_at_loop(ptr, len, offset, |ptr, len, offset| {
-                let count = len.min(u32::MAX as usize) as u32;
-                // `mut` required: ReadFile writes Internal and InternalHigh on
-                // every synchronous completion.
-                let mut overlapped = OVERLAPPED {
-                    Internal: 0,
-                    InternalHigh: 0,
-                    Anonymous: OVERLAPPED_0 {
-                        Anonymous: OVERLAPPED_0_0 {
-                            Offset: offset as u32,
-                            OffsetHigh: (offset >> 32) as u32,
-                        },
+        super::read_exact_at_loop(dst, offset, |dst, offset| {
+            let count = dst.len().min(u32::MAX as usize) as u32;
+            // `mut` required: ReadFile writes Internal and InternalHigh on
+            // every synchronous completion.
+            let mut overlapped = OVERLAPPED {
+                Internal: 0,
+                InternalHigh: 0,
+                Anonymous: OVERLAPPED_0 {
+                    Anonymous: OVERLAPPED_0_0 {
+                        Offset: offset as u32,
+                        OffsetHigh: (offset >> 32) as u32,
                     },
-                    hEvent: std::ptr::null_mut(),
-                };
-                let mut bytes_read: u32 = 0;
-                let ok = ReadFile(
+                },
+                hEvent: std::ptr::null_mut(),
+            };
+            let mut bytes_read: u32 = 0;
+            // SAFETY: `dst` is valid for writes of `count <= dst.len()` bytes,
+            // and the handle is borrowed from `file` for the call. On a
+            // synchronous handle, a non-null OVERLAPPED reads from its offset
+            // and the call returns once the read completes.
+            let ok = unsafe {
+                ReadFile(
                     file.as_raw_handle(),
-                    ptr.cast(),
+                    dst.as_mut_ptr().cast(),
                     count,
                     &mut bytes_read,
                     &mut overlapped,
-                );
-                if ok == 0 {
-                    let err = io::Error::last_os_error();
-                    // Disk files at EOF return TRUE+bytes_read=0. Pipes and
-                    // serial ports can return FALSE+ERROR_HANDLE_EOF instead;
-                    // normalize both to Ok(0) so the loop emits UnexpectedEof.
-                    if err.raw_os_error() == Some(ERROR_HANDLE_EOF as i32) {
-                        Ok(0)
-                    } else {
-                        Err(err)
-                    }
+                )
+            };
+            if ok == 0 {
+                let err = io::Error::last_os_error();
+                // Disk files at EOF return TRUE+bytes_read=0. Pipes and
+                // serial ports can return FALSE+ERROR_HANDLE_EOF instead;
+                // normalize both to Ok(0) so the loop emits UnexpectedEof.
+                if err.raw_os_error() == Some(ERROR_HANDLE_EOF as i32) {
+                    Ok(0)
                 } else {
-                    Ok(bytes_read as usize)
+                    Err(err)
                 }
-            })
-        }
+            } else {
+                Ok(bytes_read as usize)
+            }
+        })
     }
 
     pub(super) fn write_all_at(file: &File, buf: &mut impl Buf, offset: u64) -> io::Result<()> {
@@ -647,6 +639,7 @@ mod sys {
     use bytes::Buf;
     use std::fs::File;
     use std::io;
+    use std::mem::MaybeUninit;
     use std::path::Path;
 
     /// Identity of the file a path names.
@@ -686,25 +679,21 @@ mod sys {
         }
     }
 
-    /// # Safety
-    /// `ptr` must be valid for writes of `len` bytes for the duration of the call.
-    pub(super) unsafe fn read_exact_at(
+    /// Initializes every byte of `dst` from `file`, starting at `offset`,
+    /// without changing the file cursor.
+    ///
+    /// `rustix::io::pread` reads into `&mut [MaybeUninit<u8>]` and returns the
+    /// initialized prefix.
+    pub(super) fn read_exact_at(
         file: &File,
-        ptr: *mut u8,
-        len: usize,
+        dst: &mut [MaybeUninit<u8>],
         offset: u64,
     ) -> io::Result<()> {
-        super::validate_off_t_range(offset, len)?;
-        // SAFETY: `ptr` is valid for `len` bytes (caller contract). The closure
-        // constructs `&mut [u8]` to satisfy `rustix::io::pread`'s signature.
-        // `u8` has no invalid bit patterns, and `pread` writes every byte
-        // before any Rust code reads them.
-        unsafe {
-            super::read_exact_at_loop(ptr, len, offset, |ptr, len, offset| {
-                let dst = std::slice::from_raw_parts_mut(ptr, len);
-                Ok(rustix::io::pread(file, dst, offset)?)
-            })
-        }
+        super::validate_off_t_range(offset, dst.len())?;
+        super::read_exact_at_loop(dst, offset, |dst, offset| {
+            let (initialized, _) = rustix::io::pread(file, dst, offset)?;
+            Ok(initialized.len())
+        })
     }
 
     pub(super) fn write_all_at(file: &File, buf: &mut impl Buf, offset: u64) -> io::Result<()> {
@@ -732,13 +721,11 @@ mod sys {
     use bytes::Buf;
     use std::fs::File;
     use std::io;
+    use std::mem::MaybeUninit;
 
-    /// # Safety
-    /// `ptr` must be valid for writes of `len` bytes for the duration of the call.
-    pub(super) unsafe fn read_exact_at(
+    pub(super) fn read_exact_at(
         _file: &File,
-        _ptr: *mut u8,
-        _len: usize,
+        _dst: &mut [MaybeUninit<u8>],
         _offset: u64,
     ) -> io::Result<()> {
         Err(io::Error::new(
@@ -804,58 +791,54 @@ mod tests {
     #[test]
     fn read_exact_loop_retries_interrupts_and_short_reads() {
         let source = b"0123456789";
-        let mut dst = [0u8; 5];
+        let mut dst = [MaybeUninit::<u8>::uninit(); 5];
         let mut calls = 0usize;
         let mut offsets = Vec::new();
 
-        // SAFETY: `dst` is a valid initialized buffer; the closure writes through
-        // the raw pointer only within the bounds `read_exact_at_loop` enforces.
-        unsafe {
-            read_exact_at_loop(dst.as_mut_ptr(), dst.len(), 3, |ptr, len, offset| {
-                offsets.push(offset);
-                calls += 1;
-                if calls == 1 {
-                    return Err(io::Error::from(io::ErrorKind::Interrupted));
-                }
-                let count = match calls {
-                    2 => 2,
-                    3 => 1,
-                    _ => len,
-                };
-                let start = offset as usize;
-                let dst = std::slice::from_raw_parts_mut(ptr, len);
-                dst[..count].copy_from_slice(&source[start..start + count]);
-                Ok(count)
-            })
-        }
+        read_exact_at_loop(&mut dst, 3, |dst, offset| {
+            offsets.push(offset);
+            calls += 1;
+            if calls == 1 {
+                return Err(io::Error::from(io::ErrorKind::Interrupted));
+            }
+            let count = match calls {
+                2 => 2,
+                3 => 1,
+                _ => dst.len(),
+            };
+            let start = offset as usize;
+            for (i, byte) in dst[..count].iter_mut().enumerate() {
+                byte.write(source[start + i]);
+            }
+            Ok(count)
+        })
         .unwrap();
 
-        assert_eq!(&dst, b"34567");
+        // SAFETY: the loop returned `Ok`, so every byte of `dst` was written.
+        let read = dst.map(|byte| unsafe { byte.assume_init() });
+        assert_eq!(&read, b"34567");
         assert_eq!(offsets, [3, 3, 5, 6]);
     }
 
     #[test]
     fn read_exact_loop_reports_unexpected_eof_after_partial_progress() {
-        let mut dst = [0xff; 4];
+        let mut dst = [MaybeUninit::<u8>::uninit(); 4];
         let mut calls = 0usize;
 
-        // SAFETY: `dst` is a valid initialized buffer.
-        let error = unsafe {
-            read_exact_at_loop(dst.as_mut_ptr(), dst.len(), 0, |ptr, len, _| {
-                calls += 1;
-                let dst = std::slice::from_raw_parts_mut(ptr, len);
-                if calls == 1 {
-                    dst[..2].copy_from_slice(b"ab");
-                    Ok(2)
-                } else {
-                    Ok(0)
-                }
-            })
-        }
+        let error = read_exact_at_loop(&mut dst, 0, |dst, _| {
+            calls += 1;
+            if calls == 1 {
+                dst[0].write(b'a');
+                dst[1].write(b'b');
+                Ok(2)
+            } else {
+                Ok(0)
+            }
+        })
         .unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
-        assert_eq!(dst, [b'a', b'b', 0xff, 0xff]);
+        assert_eq!(calls, 2);
     }
 
     #[test]
@@ -1010,6 +993,39 @@ mod tests {
         let mut frozen = buffer.freeze();
         assert_eq!(frozen.copy_to_bytes(frozen.remaining()).as_ref(), data);
         assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+    }
+
+    /// Reads into memory that starts uninitialized, so Miri (with recursive
+    /// validation) rejects any `&mut [u8]` formed over the destination before
+    /// the read. Covers a read from a nonzero offset and a range that runs past
+    /// the end of the file.
+    // ref: RUST-1681
+    #[cfg(any(unix, windows, target_os = "wasi"))]
+    #[test]
+    fn positioned_read_fills_uninitialized_memory_and_reports_eof() {
+        let data = (0..64u8).collect::<Vec<_>>();
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut tmp, &data).unwrap();
+
+        let mut dst = [MaybeUninit::<u8>::uninit(); 40];
+        sys::read_exact_at(tmp.as_file(), &mut dst, 11).unwrap();
+        // SAFETY: `read_exact_at` returned `Ok`, so every byte is initialized.
+        let read = dst.map(|byte| unsafe { byte.assume_init() });
+        assert_eq!(&read[..], &data[11..51]);
+
+        // `sys::read_exact_at` returns `Ok` only once every byte of `dst` has
+        // been written, and `read_exact_at` relies on that to publish the run
+        // to the `PartBuffer` as initialized data. A file that ends before
+        // `dst` is full must therefore be an error, not a short success:
+        // a short `Ok` would publish the unwritten tail as file contents.
+        //
+        // 40 bytes are requested at offset 29 of the 64-byte file, so only 35
+        // exist. The first `pread` returns those 35, the next returns 0 at end
+        // of file, and the call fails with `UnexpectedEof`. `dst` is only
+        // partly written, so the test does not read it.
+        let mut dst = [MaybeUninit::<u8>::uninit(); 40];
+        let error = sys::read_exact_at(tmp.as_file(), &mut dst, 29).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
     }
 
     #[test]
