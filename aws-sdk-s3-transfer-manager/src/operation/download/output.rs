@@ -16,7 +16,10 @@ pub struct DownloadOutput {
     ///
     /// Service checksum values describe the stored object; use
     /// [`integrity_checks`](Self::integrity_checks) to determine whether the
-    /// delivered bytes were validated.
+    /// delivered bytes were validated. A checksum value is `None` when the
+    /// discovery response carried only part of the object, and for a
+    /// [`ChecksumType::Composite`](crate::model::ChecksumType::Composite)
+    /// checksum, a checksum of part checksums. The checksum type is retained.
     pub object_meta: ObjectMetadata,
     /// Snapshot of transfer metrics at completion.
     pub metrics: crate::types::TransferMetrics,

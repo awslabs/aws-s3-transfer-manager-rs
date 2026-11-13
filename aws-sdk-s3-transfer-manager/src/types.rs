@@ -378,6 +378,11 @@ impl Bucket {
 /// outcome of checksum validation over the delivered bytes. Validation is a
 /// completion-time fact, distinct from the discovery-time [`ObjectMetadata`].
 ///
+/// Checksum values are present only when a single returned checksum covers the
+/// whole delivered object. They are `None` for a [`ChecksumType::Composite`]
+/// checksum, a checksum of part checksums that a checksum over the delivered
+/// bytes does not reproduce.
+///
 /// A checksum mismatch is not represented here; it surfaces as an `Err` from the
 /// download's `join()`. On a successful `DownloadOutput`, [`ChecksumValidation`]
 /// distinguishes "validated" from "validation did not happen".
