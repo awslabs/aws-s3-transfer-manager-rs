@@ -11,12 +11,7 @@ use aws_smithy_http_client::proxy::ProxyConfig;
 use aws_smithy_http_client::tls::{rustls_provider::CryptoMode, Provider};
 use aws_smithy_managed_http::client::ManagedHttpPool;
 use aws_smithy_runtime_api::{
-    box_error::BoxError,
-    client::{
-        dns::{DnsFuture, ResolveDns},
-        http::SharedHttpClient,
-    },
-    shared::IntoShared,
+    box_error::BoxError, client::http::SharedHttpClient, shared::IntoShared,
 };
 use futures_util::FutureExt;
 use std::panic::AssertUnwindSafe;
@@ -25,37 +20,11 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use super::{ExecutionRuntime, RuntimeComponents, RuntimeHttpOptions, ScheduledWork};
+use crate::dns::sra::{new_sra_caching_resolver, SraResolverConfig};
+use crate::dns::ResolverConfig;
 use crate::runtime::sync::SubmissionGuard;
 use crate::scheduler::Scheduler;
 use crate::transfer::{TransferId, WorkOutcome};
-
-/// DNS resolver that shuffles returned IPs to distribute connections across
-/// S3 fleet addresses. Wraps any [`ResolveDns`] implementation.
-///
-/// hyper tries resolved IPs sequentially, so without shuffling all connections
-/// land on the first IP. Shuffling gives each connection a random starting IP,
-/// spreading load across all resolved addresses. The connection pool's
-/// transport has the same sequential behavior, so shuffling still applies.
-#[derive(Debug, Clone)]
-struct ShufflingDnsResolver<R> {
-    inner: R,
-}
-
-impl<R> ShufflingDnsResolver<R> {
-    fn new(inner: R) -> Self {
-        Self { inner }
-    }
-}
-
-impl<R: ResolveDns + 'static> ResolveDns for ShufflingDnsResolver<R> {
-    fn resolve_dns<'a>(&'a self, name: &'a str) -> DnsFuture<'a> {
-        DnsFuture::new(async move {
-            let mut ips = self.inner.resolve_dns(name).await?;
-            fastrand::shuffle(&mut ips);
-            Ok(ips)
-        })
-    }
-}
 
 /// How long a pooled connection may sit idle before the pool closes it.
 ///
@@ -84,14 +53,10 @@ fn build_http_client(
     execution: ManagedRuntimeHandle,
     options: &RuntimeHttpOptions,
 ) -> Result<SharedHttpClient, BoxError> {
-    #[cfg(target_os = "android")]
-    let dns_resolver = ShufflingDnsResolver::new(
-        // Hickory reads /etc/resolv.conf on Unix. Android routes libc
-        // resolution through netd and does not provide that file.
-        aws_smithy_runtime::client::dns::TokioDnsResolver::new(),
+    let dns_resolver = new_sra_caching_resolver(
+        SraResolverConfig::builder().build(),
+        ResolverConfig::builder().build(),
     );
-    #[cfg(not(target_os = "android"))]
-    let dns_resolver = ShufflingDnsResolver::new(aws_smithy_dns::HickoryDnsResolver::default());
 
     let partitions = execution.partitions().iter().map(|target| {
         let index = target.id().index();

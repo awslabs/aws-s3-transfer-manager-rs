@@ -220,6 +220,9 @@ pub mod operation;
 /// Transfer manager configuration
 pub mod config;
 
+/// DNS-related types and functionality
+pub mod dns;
+
 /// Experimental integrations with version-coupled managed execution.
 #[cfg(feature = "__unstable_ext")]
 pub mod unstable;
