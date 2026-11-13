@@ -100,6 +100,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   memory. `BufferPool` built with `MemoryBudgetConfig::Auto` directly is unchanged.
 - `aws-sdk-s3-transfer-manager`: the minimum `aws-sdk-s3` is now 1.158.0, the first release that
   reports the response checksum outcome the verdict is built from.
+- The bandwidth table adds m5n, m5dn, r5n, r5dn, m5zn, x2iezn, d3, d3en, is4gen, c8ine, g4dn
+  and g6e, and uses one network card's bandwidth for p5, p5e, p5en, p6-b200, p6-b300, trn1 and
+  trn1n.
 
 ### Fixed
 - `PathBodyBuilder::build` without a path returns an `ErrorKind::InputInvalid` error instead of
