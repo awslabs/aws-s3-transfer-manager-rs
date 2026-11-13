@@ -211,6 +211,7 @@ jobs:
       - freebsd
       - android
       - wasm32-wasi
+      - linux-i686
       - e2e
     steps:
       - name: Verify platform results
@@ -269,6 +270,41 @@ jobs:
           fi
           cargo nextest run --locked --workspace --all-features --no-fail-fast "${nextest_args[@]}"
           cargo test --locked --doc --workspace --all-features --no-fail-fast
+
+  linux-i686:
+    # 32-bit x86 target via multilib on x86_64 runner.
+    name: Linux i686 GNU
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    needs: basics
+    env:
+      CARGO_BUILD_TARGET: i686-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install 32-bit toolchain
+        # gcc-multilib provides the i686 C runtime and linker shims the Rust
+        # target needs; libssl-dev:i386 is required by crates that link
+        # OpenSSL (aws-lc-sys, openssl-sys) when built for 32-bit.
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y gcc-multilib g++-multilib libssl-dev:i386 pkg-config
+      - name: Install Rust ${{ env.rust_stable }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.rust_stable }}
+          targets: i686-unknown-linux-gnu
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: i686-unknown-linux-gnu
+      - name: Clippy (library and tests)
+        run: |
+          cargo clippy --locked -p aws-sdk-s3-transfer-manager --all-targets --no-deps
+      - name: Transfer-manager unit and integration tests
+        run: |
+          cargo test --locked -p aws-sdk-s3-transfer-manager --lib
+          cargo test --locked -p aws-sdk-s3-transfer-manager --tests
 
   e2e:
     name: E2E (${{ matrix.name }})
