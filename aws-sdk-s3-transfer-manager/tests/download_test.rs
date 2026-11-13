@@ -1217,7 +1217,7 @@ async fn test_integrity_checks_enabled_not_falsely_validated() {
 }
 
 /// Whole object in the discovery chunk → the response checksum IS the object's,
-/// surfaced on the value members.
+/// surfaced on the value members and retained in the object metadata.
 #[tokio::test]
 async fn test_integrity_checks_surfaces_whole_object_checksum() {
     let data = Bytes::from_static(HELLO);
@@ -1237,6 +1237,134 @@ async fn test_integrity_checks_surfaces_whole_object_checksum() {
         output.integrity_checks().checksum_crc32(),
         Some(HELLO_CRC32)
     );
+    assert_eq!(
+        output.object_meta.checksum_crc32.as_deref(),
+        Some(HELLO_CRC32)
+    );
+}
+
+/// A one-part multipart object with a composite checksum fits in the discovery
+/// response. Its `-1` value is a checksum of part checksum. Neither integrity_checks
+/// and object_meta should reports it; both keep the checksum type.
+#[tokio::test]
+async fn test_integrity_checks_one_part_composite_has_no_object_value() {
+    use aws_sdk_s3_transfer_manager::types::ChecksumType;
+
+    let data = Bytes::from_static(HELLO);
+    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let response = http::Response::builder()
+        .status(200)
+        .header("Content-Length", format!("{}", data.len()))
+        .header(
+            "Content-Range",
+            format!("bytes 0-{}/{}", data.len() - 1, data.len()),
+        )
+        .header("ETag", "\"my-etag-1\"")
+        .header("x-amz-checksum-crc32", "AAAAAA==-1")
+        .header("x-amz-checksum-type", "COMPOSITE")
+        .body(SdkBody::from(data.clone()))
+        .unwrap();
+    let http_client =
+        StaticReplayClient::new(vec![ReplayEvent::new(dummy_expected_request(), response)]);
+    let tm = test_tm(http_client, part_size);
+
+    let mut handle = tm
+        .download()
+        .bucket("test-bucket")
+        .key("test-object")
+        .initiate()
+        .unwrap();
+    assert_eq!(drain(&mut handle).await.unwrap(), data);
+    let output = handle.join().await.unwrap();
+
+    assert_eq!(output.integrity_checks().checksum_crc32(), None);
+    assert_eq!(
+        output.integrity_checks().checksum_type(),
+        Some(&ChecksumType::Composite)
+    );
+    assert_eq!(output.object_meta.checksum_crc32, None);
+    assert_eq!(
+        output.object_meta.checksum_type,
+        Some(ChecksumType::Composite)
+    );
+}
+
+/// A validated multipart download with an Auto part size re-issues discovery as
+/// `partNumber=1`. That response carries part 1's checksum with a `FULL_OBJECT`
+/// type. It describes only the part, so neither `integrity_checks()` nor
+/// `object_meta()` reports it as the object's checksum.
+#[tokio::test]
+async fn test_part_one_checksum_from_part_get_is_not_an_object_value() {
+    use aws_sdk_s3_transfer_manager::types::ChecksumType;
+
+    // Two stored parts, "hello" and "world"; CRC32("hello") is `NhCmhg==`.
+    const PART1_CRC32: &str = "NhCmhg==";
+    let data = Bytes::from_static(b"helloworld");
+    let response = |range: &str, body: &'static [u8]| {
+        http::Response::builder()
+            .status(200)
+            .header("Content-Length", format!("{}", body.len()))
+            .header("Content-Range", format!("bytes {range}/{}", data.len()))
+            .header("ETag", "\"my-etag-2\"")
+    };
+    let http_client = StaticReplayClient::new(vec![
+        // Ranged discovery: the whole object, with a two-part ETag.
+        ReplayEvent::new(
+            dummy_expected_request(),
+            response("0-9", b"helloworld")
+                .body(SdkBody::from(data.clone()))
+                .unwrap(),
+        ),
+        // partNumber=1: part 1 with its own checksum.
+        ReplayEvent::new(
+            dummy_expected_request(),
+            response("0-4", b"hello")
+                .header("x-amz-mp-parts-count", "2")
+                .header("x-amz-checksum-crc32", PART1_CRC32)
+                .header("x-amz-checksum-type", "FULL_OBJECT")
+                .body(SdkBody::from(&b"hello"[..]))
+                .unwrap(),
+        ),
+        // Part 2, fetched as a range aligned to the stored part size.
+        ReplayEvent::new(
+            dummy_expected_request(),
+            response("5-9", b"world")
+                .body(SdkBody::from(&b"world"[..]))
+                .unwrap(),
+        ),
+    ]);
+    // No part size, so discovery aligns ranges to the stored part size.
+    let config = aws_sdk_s3_transfer_manager::Config::builder()
+        .s3_config(common::s3_config(http_client.clone()))
+        .concurrency(ConcurrencyMode::Explicit(1))
+        .build()
+        .expect("valid config");
+    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+
+    let mut handle = tm
+        .download()
+        .bucket("test-bucket")
+        .key("test-object")
+        .initiate()
+        .unwrap();
+    assert_eq!(drain(&mut handle).await.unwrap(), data);
+    let object_meta = handle.object_meta().await.unwrap().clone();
+    let output = handle.join().await.unwrap();
+
+    let requests = http_client.actual_requests().collect::<Vec<_>>();
+    assert_eq!(requests.len(), 3);
+    assert!(
+        requests[1].uri().contains("partNumber=1"),
+        "discovery re-issued as partNumber=1: {}",
+        requests[1].uri()
+    );
+
+    assert_eq!(output.integrity_checks().checksum_crc32(), None);
+    for meta in [&object_meta, &output.object_meta] {
+        assert_eq!(meta.checksum_crc32, None);
+        assert_eq!(meta.checksum_type, Some(ChecksumType::FullObject));
+        assert_eq!(meta.parts_count, Some(2));
+    }
 }
 
 /// Multipart object (data larger than part_size) → discovery chunk carries only

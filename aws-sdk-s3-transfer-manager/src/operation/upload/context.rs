@@ -12,14 +12,14 @@ use aws_sdk_s3::types::CompletedPart;
 use smallvec::SmallVec;
 
 use crate::io::part_reader::{NextPartFuture, PartReader};
-use crate::io::{InputStream, SizeHint};
+use crate::io::{InputStream, PartData, SizeHint};
 #[cfg(test)]
 use crate::operation::upload::observability::MultipartTransferSummary;
 use crate::operation::upload::observability::{
     SourceReadObservation, UploadExecutionState, UploadObservability, UploadPartTiming,
     UploadStateSnapshot,
 };
-use crate::operation::upload::UploadOutputBuilder;
+use crate::operation::upload::{UploadInput, UploadOutputBuilder};
 use crate::transfer::{PendingCategory, PendingCause};
 
 /// Why multipart dispatch cannot schedule another source part.
@@ -293,6 +293,61 @@ pub(crate) fn validate_size_hint(size_hint: SizeHint) -> Result<(), SizeHintViol
                 upper,
             });
         }
+    }
+    Ok(())
+}
+
+/// A checksum the caller supplied cannot be sent with the request it belongs to.
+#[derive(Debug)]
+pub(crate) enum UploadChecksumViolation {
+    /// The request carries `content_md5` and is sent as a multipart upload. The value covers the
+    /// whole object, and no multipart request carries it.
+    ContentMd5WithMultipart,
+    /// A part carries a checksum, but the upload has no `ChecksumStrategy` to name its algorithm.
+    PartChecksumWithoutStrategy { part_number: u64 },
+}
+
+impl fmt::Display for UploadChecksumViolation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ContentMd5WithMultipart => write!(
+                formatter,
+                "upload content_md5 is not supported for multipart uploads; use a \
+                 ChecksumStrategy to verify the upload, or keep the object below the multipart \
+                 threshold"
+            ),
+            Self::PartChecksumWithoutStrategy { part_number } => write!(
+                formatter,
+                "upload stream supplied a checksum for part {part_number}, but the upload has no \
+                 ChecksumStrategy to name its algorithm; set a ChecksumStrategy or omit the part \
+                 checksum"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for UploadChecksumViolation {}
+
+/// Checks that `upload_input`, sent as a multipart upload, carries no `content_md5`.
+pub(crate) fn validate_content_md5_for_multipart(
+    upload_input: &UploadInput,
+) -> Result<(), UploadChecksumViolation> {
+    if upload_input.content_md5.is_some() {
+        return Err(UploadChecksumViolation::ContentMd5WithMultipart);
+    }
+    Ok(())
+}
+
+/// Checks that a checksum carried by `part` has a `ChecksumStrategy` in `upload_input` to name its
+/// algorithm. A part without a checksum needs no strategy.
+pub(crate) fn validate_part_checksum_has_strategy(
+    upload_input: &UploadInput,
+    part: &PartData,
+) -> Result<(), UploadChecksumViolation> {
+    if part.checksum.is_some() && upload_input.checksum_strategy.is_none() {
+        return Err(UploadChecksumViolation::PartChecksumWithoutStrategy {
+            part_number: part.part_number,
+        });
     }
     Ok(())
 }

@@ -802,8 +802,13 @@ impl DownloadTransfer {
             effective_part_size,
         } = discovery;
 
-        // Store object_meta for object_meta() and join()
-        let _ = self.inner.object_meta.set(object_meta.clone());
+        // Store object_meta for object_meta() and join(), without checksum values
+        // that describe a part. The local `object_meta` keeps the discovery
+        // response unchanged.
+        let _ = self
+            .inner
+            .object_meta
+            .set(process_object_metadata(object_meta.clone()));
 
         // Object checksum is known only when the whole object arrived in this
         // chunk. A larger multipart object's discovery chunk carries part 1's
@@ -1680,11 +1685,41 @@ fn validate_content_range(
     }
 }
 
+/// Convert discovered object metadata into the metadata of the stored object.
+///
+/// A [`ChecksumType::Composite`](crate::model::ChecksumType::Composite) value is
+/// a checksum of part checksums, so its value members are cleared.
+///
+/// A response reporting a `PartsCount`> 1 is a part of a multipart object.
+/// Its checksum values describe that part, so the value is cleared.
+///
+/// The checksum type and every other member are retained.
+fn process_object_metadata(mut meta: ObjectMetadata) -> ObjectMetadata {
+    let composite = meta.checksum_type == Some(crate::model::ChecksumType::Composite);
+    let part_of_multipart_object = meta.parts_count.is_some_and(|parts| parts > 1);
+    if composite || part_of_multipart_object {
+        meta.checksum_crc32 = None;
+        meta.checksum_crc32_c = None;
+        meta.checksum_crc64_nvme = None;
+        meta.checksum_md5 = None;
+        meta.checksum_sha1 = None;
+        meta.checksum_sha256 = None;
+        meta.checksum_sha512 = None;
+        meta.checksum_xxhash64 = None;
+        meta.checksum_xxhash3 = None;
+        meta.checksum_xxhash128 = None;
+    }
+    meta
+}
+
 /// Build the object-integrity result for a completed download.
 ///
 /// `whole_object_in_chunk` must be true only when the entire object arrived in
-/// the discovery chunk, the one case where the chunk checksum is the object
-/// checksum. Otherwise value members are left `None`.
+/// the discovery chunk, the one case where the chunk checksum can be the object
+/// checksum. Otherwise value members and the type are left `None`.
+///
+/// A [`ChecksumType::Composite`](crate::model::ChecksumType::Composite) value is a checksum of
+/// part checksums. Its value members are left `None` and only the type is reported.
 ///
 /// Validation is reported `Disabled` when not requested, else
 /// `NotValidated{Unavailable}`. `Validated{algorithm}` requires a per-response
@@ -1709,14 +1744,15 @@ fn build_integrity_checks(
         }
     };
 
-    // Surface checksum values only when they describe the whole object.
+    // Surface checksum values only when they describe the whole object's bytes.
     let cm = chunk_meta.filter(|_| whole_object_in_chunk);
+    let values = cm.filter(|m| m.checksum_type != Some(crate::model::ChecksumType::Composite));
     crate::types::IntegrityChecks::new(
-        cm.and_then(|m| m.checksum_crc32.clone()),
-        cm.and_then(|m| m.checksum_crc32_c.clone()),
-        cm.and_then(|m| m.checksum_crc64_nvme.clone()),
-        cm.and_then(|m| m.checksum_sha1.clone()),
-        cm.and_then(|m| m.checksum_sha256.clone()),
+        values.and_then(|m| m.checksum_crc32.clone()),
+        values.and_then(|m| m.checksum_crc32_c.clone()),
+        values.and_then(|m| m.checksum_crc64_nvme.clone()),
+        values.and_then(|m| m.checksum_sha1.clone()),
+        values.and_then(|m| m.checksum_sha256.clone()),
         cm.and_then(|m| m.checksum_type.clone()),
         checksum_validation,
     )
@@ -2110,6 +2146,27 @@ mod tests {
         let multipart = build_integrity_checks(Some(&chunk_with_crc32("DUoRhQ==")), false, false);
         assert_eq!(multipart.checksum_crc32(), None);
         assert_eq!(multipart.checksum_type(), None);
+    }
+
+    #[test]
+    fn integrity_omits_value_for_composite_whole_object_chunk() {
+        // A one-part multipart object with a composite checksum fits in the
+        // discovery chunk, but its `-1` value is a checksum of part checksums and
+        // does not describe the delivered bytes.
+        let mut m = ChunkMetadata::default();
+        m.checksum_crc32 = Some("DUoRhQ==-1".to_string());
+        m.checksum_crc32_c = Some("yZRlqg==-1".to_string());
+        m.checksum_sha1 = Some("Kq5sNclPz7QV2+lfQIuc6R7oRu0=-1".to_string());
+        m.checksum_sha256 = Some("uU0nuZNNPgilLlLX2n2r+sSE7+N6U4DukIj3rOLvzek=-1".to_string());
+        m.checksum_type = Some(ChecksumType::Composite);
+
+        let ic = build_integrity_checks(Some(&m), true, true);
+        assert_eq!(ic.checksum_crc32(), None);
+        assert_eq!(ic.checksum_crc32c(), None);
+        assert_eq!(ic.checksum_crc64_nvme(), None);
+        assert_eq!(ic.checksum_sha1(), None);
+        assert_eq!(ic.checksum_sha256(), None);
+        assert_eq!(ic.checksum_type(), Some(&ChecksumType::Composite));
     }
 
     fn create_download(object_size: u64, part_size: u64) -> DownloadTransfer {

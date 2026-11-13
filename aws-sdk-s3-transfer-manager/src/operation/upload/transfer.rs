@@ -46,7 +46,8 @@ use crate::error::{Error, ErrorKind};
 use crate::io::part_reader::{Builder as PartReaderBuilder, PartReadStart};
 use crate::io::{InputStream, PartData};
 use crate::operation::upload::context::{
-    apply_content_length, validate_distinct_part_numbers, validate_part_number, validate_size_hint,
+    apply_content_length, validate_content_md5_for_multipart, validate_distinct_part_numbers,
+    validate_part_checksum_has_strategy, validate_part_number, validate_size_hint,
     AbortMpuProgress, MultipartCompletion, PartPlan, PartReadWake, PartTransferState,
     PendingPartRead, UploadFailure, UploadPartWork, UploadState,
 };
@@ -763,6 +764,16 @@ impl UploadTransfer {
     }
 
     async fn do_execute_create_mpu(&self) -> WorkOutcome {
+        // Rejected before CreateMultipartUpload, so no multipart upload is opened.
+        if let Err(error) = validate_content_md5_for_multipart(&self.inner.request) {
+            let state = self.inner.state.lock().expect("lock poisoned");
+            return self.fail(
+                state,
+                crate::error::invalid_input(error),
+                FailedRequest::CreateMpu { upload_id: None },
+            );
+        }
+
         let client = self.inner.ctx.s3_client();
 
         let mpu_req =
@@ -1067,6 +1078,13 @@ impl UploadTransfer {
                 );
             }
             if let Err(error) = validate_part_number(data.part_number) {
+                return self.fail(
+                    state,
+                    crate::error::invalid_input(error),
+                    FailedRequest::Other,
+                );
+            }
+            if let Err(error) = validate_part_checksum_has_strategy(&self.inner.request, &data) {
                 return self.fail(
                     state,
                     crate::error::invalid_input(error),
