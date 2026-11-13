@@ -235,10 +235,19 @@ mod test {
         use aws_smithy_types::error::display::DisplayErrorContext;
 
         let directory = tempfile::tempdir().unwrap();
-        let fifo = directory.path().join("fifo");
-        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).unwrap();
+        let mut paths = vec![
+            std::path::PathBuf::from("/dev/zero"),
+            directory.path().to_path_buf(),
+        ];
+        // Android's app sandbox denies creating a FIFO in the test directory.
+        #[cfg(not(target_os = "android"))]
+        {
+            let fifo = directory.path().join("fifo");
+            nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).unwrap();
+            paths.push(fifo);
+        }
 
-        for path in [std::path::Path::new("/dev/zero"), &fifo, directory.path()] {
+        for path in &paths {
             let error = PathBodyBuilder::new().path(path).build().unwrap_err();
             assert_eq!(error.kind(), &crate::error::ErrorKind::IOError);
             let message = DisplayErrorContext(&error).to_string();

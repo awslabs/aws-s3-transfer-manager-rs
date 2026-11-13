@@ -926,10 +926,11 @@ mod tests {
     }
 
     /// An explicit length skips the builder's metadata check, so the open
-    /// itself must reject a FIFO, without waiting for a writer.
+    /// itself must reject a FIFO, without waiting for a writer. Android's app
+    /// sandbox denies creating the FIFO.
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "android")))]
     async fn file_body_source_rejects_a_fifo_at_open() {
         let directory = tempfile::tempdir().unwrap();
         let fifo = directory.path().join("fifo");

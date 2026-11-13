@@ -3025,13 +3025,15 @@ mod tests {
 
     /// Helper function to replace the regular file at `path` with a FIFO, so the path
     /// names a non-regular file only after the input stream read its metadata.
-    #[cfg(unix)]
+    /// Android's app sandbox denies creating the FIFO.
+    #[cfg(all(unix, not(target_os = "android")))]
     fn replace_with_fifo(path: &std::path::Path) {
         std::fs::remove_file(path).unwrap();
         nix::unistd::mkfifo(path, nix::sys::stat::Mode::S_IRWXU).unwrap();
     }
 
     /// Helper function to assert on not_regular_file_error
+    #[cfg(all(unix, not(target_os = "android")))]
     fn assert_not_regular_file_error(error: &crate::error::Error) {
         use aws_smithy_types::error::display::DisplayErrorContext;
 
@@ -3044,7 +3046,7 @@ mod tests {
     /// before the request is sent.
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "android")))]
     async fn put_object_rejects_a_source_replaced_by_a_fifo() {
         // Create a regular file, that it would pass InputStream check
         let directory = tempfile::tempdir().unwrap();
@@ -3085,7 +3087,7 @@ mod tests {
     /// before any part is sent, and the upload is aborted.
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "android")))]
     async fn multipart_rejects_a_source_replaced_by_a_fifo() {
         // Create a regular file, that it would pass InputStream check
         let directory = tempfile::tempdir().unwrap();
