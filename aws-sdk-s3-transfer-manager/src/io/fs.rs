@@ -356,7 +356,8 @@ mod sys {
         super::write_all_at_loop(buf, offset, |buf, offset| {
             let mut slices = [IoSlice::new(&[]); MAX_IO_SLICES];
             let n = buf.chunks_vectored(&mut slices);
-            let offset = i64::try_from(offset).expect("validated Unix file offset must fit in i64");
+            let offset = libc::off_t::try_from(offset)
+                .expect("validated Unix file offset must fit in off_t");
             nix::sys::uio::pwritev(fd, &slices[..n], offset).map_err(io::Error::from)
         })
     }
@@ -366,7 +367,7 @@ mod sys {
         if len == 0 {
             return file.set_len(0);
         }
-        let len = i64::try_from(len).map_err(|_| {
+        let len = libc::off_t::try_from(len).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "file length exceeds the platform limit",
