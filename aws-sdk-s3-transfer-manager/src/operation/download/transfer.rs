@@ -1719,8 +1719,7 @@ fn process_object_metadata(mut meta: ObjectMetadata) -> ObjectMetadata {
 /// checksum. Otherwise value members and the type are left `None`.
 ///
 /// A [`ChecksumType::Composite`](crate::model::ChecksumType::Composite) value is a checksum of
-/// part checksums. Its value members
-/// are left `None` and only the type is reported.
+/// part checksums. Its value members are left `None` and only the type is reported.
 ///
 /// Validation is reported `Disabled` when not requested, else
 /// `NotValidated{Unavailable}`. `Validated{algorithm}` requires a per-response
