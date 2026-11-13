@@ -1012,7 +1012,8 @@ fn helper_create_transfer_manager(
         .part_size(PartSize::Target(PART_SIZE as u64))
         .multipart_threshold(PartSize::Target(PART_SIZE as u64))
         .concurrency(ConcurrencyMode::Explicit(1))
-        .build();
+        .build()
+        .expect("valid config");
     aws_sdk_s3_transfer_manager::Client::new(tm_config)
 }
 
