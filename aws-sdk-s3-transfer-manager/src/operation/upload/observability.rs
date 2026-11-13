@@ -241,34 +241,7 @@ impl UploadMode {
 }
 
 /// Terminal status emitted once for an upload transfer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum UploadTerminalOutcome {
-    /// The upload completed successfully.
-    Completed,
-    /// The upload failed.
-    Failed,
-    /// The upload was cancelled.
-    Cancelled,
-}
-
-impl UploadTerminalOutcome {
-    pub(crate) fn from_status(status: TransferStatus) -> Option<Self> {
-        match status {
-            TransferStatus::Completed => Some(Self::Completed),
-            TransferStatus::Failed => Some(Self::Failed),
-            TransferStatus::Cancelled => Some(Self::Cancelled),
-            TransferStatus::Active => None,
-        }
-    }
-
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Completed => "completed",
-            Self::Failed => "failed",
-            Self::Cancelled => "cancelled",
-        }
-    }
-}
+pub(crate) type UploadTerminalOutcome = crate::transfer::TerminalOutcome;
 
 /// Closed diagnostic vocabulary for upload state-machine events.
 ///

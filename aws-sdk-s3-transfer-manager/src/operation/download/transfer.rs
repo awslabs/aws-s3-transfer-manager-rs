@@ -715,12 +715,6 @@ impl DownloadTransfer {
     pub(crate) async fn execute(&self, work: &mut IoRequest) -> WorkOutcome {
         let data = work.data_mut::<DownloadWork>();
         tracing::Span::current().record("work", data.kind());
-        tracing::trace!(
-            target: crate::telemetry::TARGET_TRANSFER_DOWNLOAD,
-            tid = %self.id(),
-            work_data = ?data,
-            "executing work item",
-        );
         match data {
             DownloadWork::Discovery => self.execute_discovery().await,
             DownloadWork::GetObjectRange { range, slot, etag } => {
@@ -1086,7 +1080,7 @@ impl DownloadTransfer {
                 .map_err(crate::retry::GuardError::Inner)
             }
         })
-        .instrument(tracing::debug_span!(
+        .instrument(tracing::trace_span!(
             target: crate::telemetry::TARGET_TRANSFER_DOWNLOAD,
             "download-part",
             tid = %self.id()
@@ -1231,7 +1225,7 @@ impl DownloadTransfer {
                     Ok::<_, crate::retry::GuardError<crate::error::Error>>((chunk_meta, bytes))
                 }
             })
-            .instrument(tracing::debug_span!(
+            .instrument(tracing::trace_span!(
                 target: crate::telemetry::TARGET_TRANSFER_DOWNLOAD,
                 "download-part-reissue",
                 tid = %self.id()

@@ -739,12 +739,6 @@ impl UploadTransfer {
         // A work item executes once, so execute takes its payload by value.
         let data = work.take_data::<UploadWork>();
         tracing::Span::current().record("work", data.kind());
-        tracing::trace!(
-            target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
-            tid = %self.inner.ctx.id,
-            work_data = ?data,
-            "executing work item",
-        );
         match data {
             // Each arm keeps its `InFlight` guard until the request future is
             // gone, so the count is released only after that.
@@ -814,7 +808,7 @@ impl UploadTransfer {
                     .bucket_partition_override(self.inner.request.bucket()),
             )
             .send()
-            .instrument(tracing::debug_span!(
+            .instrument(tracing::trace_span!(
                 target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
                 "send-create-multipart-upload",
             ))
@@ -1007,7 +1001,7 @@ impl UploadTransfer {
             None => {
                 let future = match part_reader
                     .start_part_read()
-                    .instrument(tracing::debug_span!(
+                    .instrument(tracing::trace_span!(
                         target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
                         "read-upload-body",
                     ))
@@ -1229,7 +1223,7 @@ impl UploadTransfer {
                     .config_override(self.inner.ctx.upload_override(self.inner.request.bucket()))
                     .disable_payload_signing()
                     .send()
-                    .instrument(tracing::debug_span!(
+                    .instrument(tracing::trace_span!(
                         target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
                         "send-upload-part",
                         part_number,
@@ -1238,7 +1232,7 @@ impl UploadTransfer {
                     .map_err(|e| crate::retry::GuardError::Inner(crate::error::Error::from(e)))
             }
         })
-        .instrument(tracing::debug_span!(
+        .instrument(tracing::trace_span!(
             target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
             "upload-part",
             tid = %self.inner.ctx.id,
@@ -1377,7 +1371,7 @@ impl UploadTransfer {
             };
 
         let transfer_id = self.inner.ctx.id;
-        tracing::debug!(
+        tracing::trace!(
             target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
             tid = %transfer_id,
             content_length,
@@ -1412,7 +1406,7 @@ impl UploadTransfer {
                     .config_override(self.inner.ctx.upload_override(self.inner.request.bucket()))
                     .disable_payload_signing()
                     .send()
-                    .instrument(tracing::debug_span!(
+                    .instrument(tracing::trace_span!(
                         target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
                         "send-put-object",
                     ))
@@ -1420,7 +1414,7 @@ impl UploadTransfer {
                     .map_err(|e| crate::retry::GuardError::Inner(crate::error::Error::from(e)))
             }
         })
-        .instrument(tracing::debug_span!(
+        .instrument(tracing::trace_span!(
             target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
             "put-object",
             tid = %transfer_id
@@ -1429,7 +1423,7 @@ impl UploadTransfer {
         let _ = req_metrics.finish();
         let resp = match result {
             Ok(resp) => {
-                tracing::debug!(
+                tracing::trace!(
                     target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
                     tid = %transfer_id,
                     "put_object.send_exit_ok",
@@ -1572,7 +1566,7 @@ impl UploadTransfer {
                     .bucket_partition_override(self.inner.request.bucket()),
             )
             .send()
-            .instrument(tracing::debug_span!(
+            .instrument(tracing::trace_span!(
                 target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
                 "send-complete-multipart-upload",
             ))
@@ -1664,7 +1658,7 @@ impl UploadTransfer {
                 .bucket_partition_override(self.inner.request.bucket()),
         )
         .send()
-        .instrument(tracing::debug_span!(
+        .instrument(tracing::trace_span!(
             target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
             "send-abort-multipart-upload",
         ))

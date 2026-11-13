@@ -9,36 +9,43 @@
 //! report state-machine transitions. The terminal summary is emitted once per
 //! transfer at DEBUG.
 
-use std::time::Duration;
-
-use crate::error::ErrorKind;
-use crate::operation::download::DownloadTerminalOutcome;
-use crate::transfer::{emit_pending_details, TransferContext, TransferId, TransferPendingStats};
-use crate::types::TransferMetrics;
+use crate::transfer::{emit_pending_details, CompositeTransferSummary, TransferContext};
 
 /// Closed diagnostic vocabulary for `download_objects` state-machine events.
 ///
-/// Each variant maps to one stable `event` and `reason` field pair.
+/// Each event is one TRACE record, `download_objects state-machine event`, on
+/// the `transfer::download_objects` target. It is written only when transfer
+/// diagnostics report state-machine transitions (`transfer.detail=2`). The
+/// record carries the variant's `event` and `reason` fields, shown on each
+/// variant, and the parent's counters from [`DownloadObjectsStateSnapshot`].
+/// The field values are stable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DownloadObjectsEvent {
     /// A listing page fetch was scheduled.
+    ///
+    /// `event="work_scheduled"`, `reason="advance_walker"`.
     WalkDispatched,
     /// The listing is exhausted, and no further entries will be listed.
+    ///
+    /// `event="dispatch_closed"`, `reason="listing_exhausted"`.
     ListingExhausted,
-    /// A child download was orchestrated for one entry.
-    ChildSpawned,
-    /// Terminal children were removed and scheduled for reaping.
+    /// Terminal children were removed from the running set, and a reap was
+    /// scheduled to join them.
+    ///
+    /// `event="work_scheduled"`, `reason="join_children"`.
     ReapScheduled,
-    /// Reaped children's results were recorded.
+    /// A reap joined its children and recorded their results.
+    ///
+    /// `event="state_changed"`, `reason="children_reaped"`.
     ReapCompleted,
 }
 
 impl DownloadObjectsEvent {
+    /// Returns the event's stable `event` and `reason` field values.
     fn fields(self) -> (&'static str, &'static str) {
         match self {
             Self::WalkDispatched => ("work_scheduled", "advance_walker"),
             Self::ListingExhausted => ("dispatch_closed", "listing_exhausted"),
-            Self::ChildSpawned => ("child_spawned", "orchestrated"),
             Self::ReapScheduled => ("work_scheduled", "join_children"),
             Self::ReapCompleted => ("state_changed", "children_reaped"),
         }
@@ -87,47 +94,6 @@ pub(crate) fn emit_event(
     );
 }
 
-/// Emits one event about a single child, naming its transfer ID and key.
-pub(crate) fn emit_child_event(
-    ctx: &TransferContext,
-    event: DownloadObjectsEvent,
-    child: TransferId,
-    key: &str,
-) {
-    if !events_enabled(ctx) {
-        return;
-    }
-    let (event_name, reason) = event.fields();
-    tracing::trace!(
-        target: crate::telemetry::TARGET_TRANSFER_DOWNLOAD_OBJECTS,
-        tid = %ctx.id,
-        event = event_name,
-        reason,
-        child_id = ?child,
-        key,
-        "download_objects state-machine event",
-    );
-}
-
-/// Terminal report for one `download_objects` transfer.
-#[derive(Clone, Debug)]
-pub(crate) struct DownloadObjectsTransferSummary {
-    /// Terminal outcome reported by the common transfer context.
-    pub(crate) outcome: DownloadTerminalOutcome,
-    /// Transfer-manager error classification for a failed transfer.
-    pub(crate) error_kind: Option<ErrorKind>,
-    /// Time from transfer creation through terminal reporting.
-    pub(crate) elapsed: Duration,
-    /// Common byte and I/O metrics. Bytes cover successful children only.
-    pub(crate) metrics: TransferMetrics,
-    /// Children that completed successfully.
-    pub(crate) successful: u64,
-    /// Children and entries recorded as failed.
-    pub(crate) failed: usize,
-    /// Scheduler pending intervals, present when summaries are enabled.
-    pub(crate) pending: Option<TransferPendingStats>,
-}
-
 /// Emits the `download_objects` terminal summary and returns it.
 ///
 /// Returns `None` and emits nothing while the transfer is still active.
@@ -137,21 +103,8 @@ pub(crate) struct DownloadObjectsTransferSummary {
 pub(crate) fn emit_terminal_summary(
     ctx: &TransferContext,
     snapshot: DownloadObjectsStateSnapshot,
-) -> Option<DownloadObjectsTransferSummary> {
-    let outcome = DownloadTerminalOutcome::from_status(ctx.transfer_status())?;
-    let metrics = ctx.metrics();
-    let summary = DownloadObjectsTransferSummary {
-        outcome,
-        error_kind: ctx.error_kind(),
-        elapsed: metrics
-            .finished_at
-            .map(|finished_at| finished_at.saturating_duration_since(metrics.started_at))
-            .unwrap_or_default(),
-        metrics,
-        successful: snapshot.successful,
-        failed: snapshot.failed,
-        pending: ctx.pending_stats(),
-    };
+) -> Option<CompositeTransferSummary> {
+    let summary = CompositeTransferSummary::new(ctx, snapshot.successful, snapshot.failed)?;
     let Some(pending) = summary.pending else {
         tracing::debug!(
             target: crate::telemetry::TARGET_TRANSFER_DOWNLOAD_OBJECTS,

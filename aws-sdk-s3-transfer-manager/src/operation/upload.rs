@@ -22,7 +22,6 @@ mod context;
 pub(crate) mod file_body;
 mod handle;
 mod observability;
-pub(crate) use observability::UploadTerminalOutcome;
 mod part_body;
 mod transfer;
 

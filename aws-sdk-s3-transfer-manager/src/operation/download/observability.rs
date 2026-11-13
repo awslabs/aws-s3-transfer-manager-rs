@@ -135,34 +135,7 @@ impl DownloadStateSnapshot {
 }
 
 /// Terminal status emitted once for a download transfer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum DownloadTerminalOutcome {
-    /// The download completed successfully.
-    Completed,
-    /// The download failed.
-    Failed,
-    /// The download was cancelled.
-    Cancelled,
-}
-
-impl DownloadTerminalOutcome {
-    pub(crate) fn from_status(status: TransferStatus) -> Option<Self> {
-        match status {
-            TransferStatus::Completed => Some(Self::Completed),
-            TransferStatus::Failed => Some(Self::Failed),
-            TransferStatus::Cancelled => Some(Self::Cancelled),
-            TransferStatus::Active => None,
-        }
-    }
-
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Completed => "completed",
-            Self::Failed => "failed",
-            Self::Cancelled => "cancelled",
-        }
-    }
-}
+pub(crate) type DownloadTerminalOutcome = crate::transfer::TerminalOutcome;
 
 /// Closed diagnostic vocabulary for download state-machine events.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

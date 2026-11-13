@@ -9,39 +9,56 @@
 //! report state-machine transitions. The terminal summary is emitted once per
 //! transfer at DEBUG.
 
-use std::time::Duration;
-
-use crate::error::ErrorKind;
-use crate::operation::upload::UploadTerminalOutcome;
-use crate::transfer::{emit_pending_details, TransferContext, TransferId, TransferPendingStats};
-use crate::types::TransferMetrics;
+use crate::transfer::{emit_pending_details, CompositeTransferSummary, TransferContext};
 
 /// Closed diagnostic vocabulary for `upload_objects` state-machine events.
 ///
-/// Each variant maps to one stable `event` and `reason` field pair.
+/// Each event is one TRACE record, `upload_objects state-machine event`, on the
+/// `transfer::upload_objects` target. It is written only when transfer
+/// diagnostics report state-machine transitions (`transfer.detail=2`). The
+/// record carries the variant's `event` and `reason` fields, shown on each
+/// variant, and the parent's counters from [`UploadObjectsStateSnapshot`]. The
+/// field values are stable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum UploadObjectsEvent {
-    /// A walker advance was scheduled.
+    /// A walker advance was scheduled to list more entries.
+    ///
+    /// `event="work_scheduled"`, `reason="advance_walker"`.
     WalkDispatched,
-    /// No walk was dispatched because the entry buffer is at its low-water mark.
+    /// A poll dispatched no walk because the entry buffer is at its low-water
+    /// mark.
+    ///
+    /// `event="walk_deferred"`, `reason="entry_buffer_full"`.
     WalkDeferredBufferFull,
-    /// No walk was dispatched because every walker is in flight.
+    /// A poll dispatched no walk because every walker is already advancing.
+    ///
+    /// `event="walk_deferred"`, `reason="walks_in_flight"`.
     WalkDeferredWalksInFlight,
-    /// No walk was dispatched because the walker limit is reached.
+    /// A poll dispatched no walk because the concurrent walk limit is reached.
+    ///
+    /// `event="walk_deferred"`, `reason="walks_saturated"`.
     WalkDeferredWalksSaturated,
-    /// No walk was dispatched because no walker remains.
+    /// A poll dispatched no walk because no walker remains.
+    ///
+    /// `event="walk_deferred"`, `reason="no_walk"`.
     WalkDeferredNoWalk,
     /// Every walker is exhausted, and no further entries will be listed.
+    ///
+    /// `event="dispatch_closed"`, `reason="listing_exhausted"`.
     ListingExhausted,
-    /// A child upload was orchestrated for one entry.
-    ChildSpawned,
-    /// Terminal children were removed and scheduled for reaping.
+    /// Terminal children were removed from the running set, and a reap was
+    /// scheduled to join them.
+    ///
+    /// `event="work_scheduled"`, `reason="join_children"`.
     ReapScheduled,
-    /// Reaped children's results were recorded.
+    /// A reap joined its children and recorded their results.
+    ///
+    /// `event="state_changed"`, `reason="children_reaped"`.
     ReapCompleted,
 }
 
 impl UploadObjectsEvent {
+    /// Returns the event's stable `event` and `reason` field values.
     fn fields(self) -> (&'static str, &'static str) {
         match self {
             Self::WalkDispatched => ("work_scheduled", "advance_walker"),
@@ -50,7 +67,6 @@ impl UploadObjectsEvent {
             Self::WalkDeferredWalksSaturated => ("walk_deferred", "walks_saturated"),
             Self::WalkDeferredNoWalk => ("walk_deferred", "no_walk"),
             Self::ListingExhausted => ("dispatch_closed", "listing_exhausted"),
-            Self::ChildSpawned => ("child_spawned", "orchestrated"),
             Self::ReapScheduled => ("work_scheduled", "join_children"),
             Self::ReapCompleted => ("state_changed", "children_reaped"),
         }
@@ -101,47 +117,6 @@ pub(crate) fn emit_event(
     );
 }
 
-/// Emits one event about a single child, naming its transfer ID and key.
-pub(crate) fn emit_child_event(
-    ctx: &TransferContext,
-    event: UploadObjectsEvent,
-    child: TransferId,
-    key: &str,
-) {
-    if !events_enabled(ctx) {
-        return;
-    }
-    let (event_name, reason) = event.fields();
-    tracing::trace!(
-        target: crate::telemetry::TARGET_TRANSFER_UPLOAD_OBJECTS,
-        tid = %ctx.id,
-        event = event_name,
-        reason,
-        child_id = ?child,
-        key,
-        "upload_objects state-machine event",
-    );
-}
-
-/// Terminal report for one `upload_objects` transfer.
-#[derive(Clone, Debug)]
-pub(crate) struct UploadObjectsTransferSummary {
-    /// Terminal outcome reported by the common transfer context.
-    pub(crate) outcome: UploadTerminalOutcome,
-    /// Transfer-manager error classification for a failed transfer.
-    pub(crate) error_kind: Option<ErrorKind>,
-    /// Time from transfer creation through terminal reporting.
-    pub(crate) elapsed: Duration,
-    /// Common byte and I/O metrics. Bytes cover successful children only.
-    pub(crate) metrics: TransferMetrics,
-    /// Children that completed successfully.
-    pub(crate) successful: u64,
-    /// Children and entries recorded as failed.
-    pub(crate) failed: usize,
-    /// Scheduler pending intervals, present when summaries are enabled.
-    pub(crate) pending: Option<TransferPendingStats>,
-}
-
 /// Emits the `upload_objects` terminal summary and returns it.
 ///
 /// Returns `None` and emits nothing while the transfer is still active.
@@ -151,21 +126,8 @@ pub(crate) struct UploadObjectsTransferSummary {
 pub(crate) fn emit_terminal_summary(
     ctx: &TransferContext,
     snapshot: UploadObjectsStateSnapshot,
-) -> Option<UploadObjectsTransferSummary> {
-    let outcome = UploadTerminalOutcome::from_status(ctx.transfer_status())?;
-    let metrics = ctx.metrics();
-    let summary = UploadObjectsTransferSummary {
-        outcome,
-        error_kind: ctx.error_kind(),
-        elapsed: metrics
-            .finished_at
-            .map(|finished_at| finished_at.saturating_duration_since(metrics.started_at))
-            .unwrap_or_default(),
-        metrics,
-        successful: snapshot.successful,
-        failed: snapshot.failed,
-        pending: ctx.pending_stats(),
-    };
+) -> Option<CompositeTransferSummary> {
+    let summary = CompositeTransferSummary::new(ctx, snapshot.successful, snapshot.failed)?;
     let Some(pending) = summary.pending else {
         tracing::debug!(
             target: crate::telemetry::TARGET_TRANSFER_UPLOAD_OBJECTS,

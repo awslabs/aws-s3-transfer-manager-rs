@@ -17,14 +17,13 @@ use crate::error;
 use crate::io::walk::{DirEntry, FsWalk};
 use crate::io::InputStream;
 use crate::operation::upload::{Upload, UploadHandle, UploadInput};
-use crate::operation::upload_objects::context::UploadObjectsPendingReason;
 use crate::operation::upload_objects::observability::{
-    emit_child_event, emit_event, emit_terminal_summary, UploadObjectsEvent,
-    UploadObjectsStateSnapshot,
+    emit_event, emit_terminal_summary, UploadObjectsEvent, UploadObjectsStateSnapshot,
 };
 use crate::operation::DEFAULT_DELIMITER;
 use crate::runtime::sync::Mutex;
 use crate::telemetry::TARGET_TRANSFER_UPLOAD_OBJECTS;
+use crate::transfer::CompositePendingReason;
 use crate::transfer::{IoRequest, PollWork, Transfer, TransferContext, TransferId, WorkOutcome};
 use crate::types::{FailedTransferPolicy, FailedUpload};
 
@@ -426,17 +425,17 @@ impl State {
     /// Called only at the `Pending` return of `poll_work`, after that poll
     /// dispatched no walk, claimed no entry, and reaped nothing. Waiting
     /// entries therefore mean the child limit is reached.
-    fn pending_reason(&self, active: bool) -> UploadObjectsPendingReason {
+    fn pending_reason(&self, active: bool) -> CompositePendingReason {
         if !active {
-            UploadObjectsPendingReason::Draining
+            CompositePendingReason::Draining
         } else if self.reaping_in_flight > 0 {
-            UploadObjectsPendingReason::Reaping
+            CompositePendingReason::Reaping
         } else if !self.pending_entries.is_empty() {
-            UploadObjectsPendingReason::ChildCapacity
+            CompositePendingReason::ChildCapacity
         } else if !self.walks.is_empty() || self.in_flight_walks > 0 {
-            UploadObjectsPendingReason::Listing
+            CompositePendingReason::Listing
         } else {
-            UploadObjectsPendingReason::ChildCompletion
+            CompositePendingReason::ChildCompletion
         }
     }
 
@@ -470,7 +469,7 @@ struct UploadObjectsTransferInner {
     request: Arc<super::UploadObjectsInput>,
     state: Mutex<State>,
     #[cfg(test)]
-    last_summary: std::sync::Mutex<Option<super::observability::UploadObjectsTransferSummary>>,
+    last_summary: std::sync::Mutex<Option<crate::transfer::CompositeTransferSummary>>,
 }
 
 impl UploadObjectsTransfer {
@@ -661,7 +660,11 @@ impl UploadObjectsTransfer {
     /// Emits the terminal summary once. The status must already be terminal.
     ///
     /// `snapshot` is the state the transfer ended in. Only the first call per
-    /// transfer emits.
+    /// transfer emits. Called under the state lock that made the status
+    /// terminal, before the terminal signal, and from `on_terminal` for
+    /// terminations from outside: once the status is terminal, the scheduler
+    /// may remove the transfer when its dispatched work retires, without
+    /// polling it again.
     fn report_terminal(&self, snapshot: UploadObjectsStateSnapshot) {
         self.inner.ctx.finalize_terminal_metrics();
         if !self.inner.ctx.claim_terminal_report() {
@@ -678,7 +681,7 @@ impl UploadObjectsTransfer {
     #[cfg(test)]
     pub(crate) fn test_terminal_summary(
         &self,
-    ) -> Option<super::observability::UploadObjectsTransferSummary> {
+    ) -> Option<crate::transfer::CompositeTransferSummary> {
         self.inner
             .last_summary
             .lock()
@@ -703,13 +706,12 @@ impl UploadObjectsTransfer {
             tid = %self.inner.ctx.id,
             "upload_objects aborting: {cause}"
         );
-        self.inner
-            .ctx
-            .set_failed_and_signal(crate::error::Error::new(
-                crate::error::ErrorKind::ChildOperationFailed,
-                "upload_objects aborted",
-            ));
+        self.inner.ctx.set_failed(crate::error::Error::new(
+            crate::error::ErrorKind::ChildOperationFailed,
+            "upload_objects aborted",
+        ));
         self.report_terminal(state.snapshot());
+        self.inner.ctx.signal_terminal();
         PollWork::Done
     }
 
@@ -896,15 +898,9 @@ impl UploadObjectsTransfer {
                     tracing::trace!(
                         target: crate::telemetry::TARGET_TRANSFER_UPLOAD_OBJECTS,
                         tid = %self.inner.ctx.id,
-                        child_id = ?child_id,
+                        child_id = %child_id,
                         key = %key,
                         "spawned child upload"
-                    );
-                    emit_child_event(
-                        &self.inner.ctx,
-                        UploadObjectsEvent::ChildSpawned,
-                        child_id,
-                        &key,
                     );
                     state.children.insert(
                         child_id,
@@ -1135,12 +1131,6 @@ impl UploadObjectsTransfer {
     pub(crate) async fn execute(&self, work: &mut IoRequest) -> WorkOutcome {
         let data = work.data_mut::<UploadObjectsWork>();
         tracing::Span::current().record("work", data.kind());
-        tracing::trace!(
-            target: crate::telemetry::TARGET_TRANSFER_UPLOAD_OBJECTS,
-            tid = %self.inner.ctx.id,
-            work_data = ?data,
-            "executing work item",
-        );
         match data {
             UploadObjectsWork::AdvanceWalker { slot } => {
                 let slot = slot.take().expect("WalkSlot already taken");
@@ -1209,8 +1199,9 @@ impl UploadObjectsTransfer {
             );
             // Transfer is failing: drop the walker (no walk_back).
             slot.consume(&mut state, None);
-            ctx.set_failed_and_signal(fatal);
+            ctx.set_failed(fatal);
             self.report_terminal(state.snapshot());
+            ctx.signal_terminal();
             return WorkOutcome::Failed {
                 classification: None,
             };
@@ -2089,37 +2080,28 @@ mod tests {
 
         assert_eq!(
             state.pending_reason(false),
-            UploadObjectsPendingReason::Draining
+            CompositePendingReason::Draining
         );
-        assert_eq!(
-            state.pending_reason(true),
-            UploadObjectsPendingReason::Listing
-        );
+        assert_eq!(state.pending_reason(true), CompositePendingReason::Listing);
 
         state.reaping_in_flight = 1;
-        assert_eq!(
-            state.pending_reason(true),
-            UploadObjectsPendingReason::Reaping
-        );
+        assert_eq!(state.pending_reason(true), CompositePendingReason::Reaping);
         state.reaping_in_flight = 0;
 
         state.pending_entries.push_back(entry);
         assert_eq!(
             state.pending_reason(true),
-            UploadObjectsPendingReason::ChildCapacity
+            CompositePendingReason::ChildCapacity
         );
         state.pending_entries.clear();
 
         let walks = std::mem::take(&mut state.walks);
         state.in_flight_walks = 1;
-        assert_eq!(
-            state.pending_reason(true),
-            UploadObjectsPendingReason::Listing
-        );
+        assert_eq!(state.pending_reason(true), CompositePendingReason::Listing);
         state.in_flight_walks = 0;
         assert_eq!(
             state.pending_reason(true),
-            UploadObjectsPendingReason::ChildCompletion
+            CompositePendingReason::ChildCompletion
         );
         state.walks = walks;
     }
@@ -2147,10 +2129,7 @@ mod tests {
         let summary = transfer
             .test_terminal_summary()
             .expect("terminal summary reported");
-        assert_eq!(
-            summary.outcome,
-            crate::operation::upload::UploadTerminalOutcome::Completed
-        );
+        assert_eq!(summary.outcome, crate::transfer::TerminalOutcome::Completed);
         assert_eq!(summary.successful, 2);
         assert_eq!(summary.failed, 0);
 
@@ -2186,10 +2165,7 @@ mod tests {
         let first = transfer
             .test_terminal_summary()
             .expect("terminal summary reported");
-        assert_eq!(
-            first.outcome,
-            crate::operation::upload::UploadTerminalOutcome::Failed
-        );
+        assert_eq!(first.outcome, crate::transfer::TerminalOutcome::Failed);
         assert!(first.error_kind.is_some());
 
         // A later external termination must not report again.
@@ -2222,10 +2198,7 @@ mod tests {
         let summary = transfer
             .test_terminal_summary()
             .expect("terminal summary reported");
-        assert_eq!(
-            summary.outcome,
-            crate::operation::upload::UploadTerminalOutcome::Cancelled
-        );
+        assert_eq!(summary.outcome, crate::transfer::TerminalOutcome::Cancelled);
         assert_eq!(summary.successful, 0);
 
         // A second external termination must not report again.

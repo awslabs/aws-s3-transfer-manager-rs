@@ -116,7 +116,7 @@ pub(super) async fn discover_obj(
     let mut discovery = match strategy {
         ObjectDiscoveryStrategy::HeadObject => {
             discover_obj_with_head(transfer, input)
-                .instrument(tracing::debug_span!(
+                .instrument(tracing::trace_span!(
                     target: crate::telemetry::TARGET_TRANSFER_DOWNLOAD,
                     "send-head-object-for-discovery",
                 ))
@@ -124,7 +124,7 @@ pub(super) async fn discover_obj(
         }
         ObjectDiscoveryStrategy::RangedGet(range) => {
             discover_obj_with_get(transfer, input, range)
-                .instrument(tracing::debug_span!(
+                .instrument(tracing::trace_span!(
                     target: crate::telemetry::TARGET_TRANSFER_DOWNLOAD,
                     "send-ranged-get-for-discovery",
                 ))
@@ -204,7 +204,7 @@ async fn discover_obj_with_get_first_part(
                 .map_err(|e| crate::retry::GuardError::Inner(error::Error::from(e)))
         }
     })
-    .instrument(tracing::debug_span!(
+    .instrument(tracing::trace_span!(
         target: crate::telemetry::TARGET_TRANSFER_DOWNLOAD,
         "discover-get-first-part",
         tid = %transfer.ctx().id
@@ -232,7 +232,7 @@ async fn discover_obj_with_head(
                 .map_err(|e| crate::retry::GuardError::Inner(error::Error::from(e)))
         }
     })
-    .instrument(tracing::debug_span!(
+    .instrument(tracing::trace_span!(
         target: crate::telemetry::TARGET_TRANSFER_DOWNLOAD,
         "discover-head",
         tid = %transfer.ctx().id
@@ -388,7 +388,7 @@ async fn discover_obj_with_get(
                 .map_err(|e| crate::retry::GuardError::Inner(error::Error::from(e)))
         }
     })
-    .instrument(tracing::debug_span!(
+    .instrument(tracing::trace_span!(
         target: crate::telemetry::TARGET_TRANSFER_DOWNLOAD,
         "discover-ranged-get",
         tid = %transfer.ctx().id

@@ -23,12 +23,11 @@ use crate::io::walk::S3Walk;
 use crate::model::Object;
 use crate::operation::download::sink::{FileSinkFactory, SinkFactory};
 use crate::operation::download::{Download, DownloadInput, ManagedDownloadHandle};
-use crate::operation::download_objects::context::DownloadObjectsPendingReason;
 use crate::operation::download_objects::observability::{
-    emit_child_event, emit_event, emit_terminal_summary, DownloadObjectsEvent,
-    DownloadObjectsStateSnapshot,
+    emit_event, emit_terminal_summary, DownloadObjectsEvent, DownloadObjectsStateSnapshot,
 };
 use crate::telemetry::TARGET_TRANSFER_DOWNLOAD_OBJECTS;
+use crate::transfer::CompositePendingReason;
 use crate::transfer::{IoRequest, PollWork, Transfer, TransferContext, TransferId, WorkOutcome};
 use crate::types::{FailedDownload, FailedTransferPolicy};
 
@@ -274,18 +273,18 @@ impl State {
     /// Called only at the `Pending` return of `poll_work`, after that poll
     /// dispatched no walk, claimed no entry, and reaped nothing. Waiting
     /// entries therefore mean the child limit is reached.
-    fn pending_reason(&self, active: bool) -> DownloadObjectsPendingReason {
+    fn pending_reason(&self, active: bool) -> CompositePendingReason {
         let listing = self.walk_in_flight || self.walk.as_ref().is_some_and(|w| !w.is_done());
         if !active {
-            DownloadObjectsPendingReason::Draining
+            CompositePendingReason::Draining
         } else if self.reaping_in_flight > 0 {
-            DownloadObjectsPendingReason::Reaping
+            CompositePendingReason::Reaping
         } else if !self.pending_entries.is_empty() {
-            DownloadObjectsPendingReason::ChildCapacity
+            CompositePendingReason::ChildCapacity
         } else if listing {
-            DownloadObjectsPendingReason::Listing
+            CompositePendingReason::Listing
         } else {
-            DownloadObjectsPendingReason::ChildCompletion
+            CompositePendingReason::ChildCompletion
         }
     }
 }
@@ -316,7 +315,7 @@ struct DownloadObjectsTransferInner {
     /// that share a prefix; objects in the same S3 "folder" map to one dir).
     created_dirs: Mutex<HashSet<PathBuf>>,
     #[cfg(test)]
-    last_summary: Mutex<Option<super::observability::DownloadObjectsTransferSummary>>,
+    last_summary: Mutex<Option<crate::transfer::CompositeTransferSummary>>,
 }
 
 impl DownloadObjectsTransfer {
@@ -655,11 +654,12 @@ impl DownloadObjectsTransfer {
             match result {
                 Ok(child) => {
                     let id = child.handle.transfer_id();
-                    emit_child_event(
-                        &self.inner.ctx,
-                        DownloadObjectsEvent::ChildSpawned,
-                        id,
-                        &child.key,
+                    tracing::trace!(
+                        target: crate::telemetry::TARGET_TRANSFER_DOWNLOAD_OBJECTS,
+                        tid = %self.inner.ctx.id,
+                        child_id = %id,
+                        key = %child.key,
+                        "spawned child download"
                     );
                     state.children.insert(id, child);
                     inserted += 1;
@@ -686,8 +686,9 @@ impl DownloadObjectsTransfer {
                         error: err,
                     });
                     if self.inner.failure_policy == FailedTransferPolicy::Abort {
-                        self.inner.ctx.set_failed_and_signal(child_failed());
+                        self.inner.ctx.set_failed(child_failed());
                         self.report_terminal(state.snapshot());
+                        self.inner.ctx.signal_terminal();
                     }
                 }
             }
@@ -701,7 +702,11 @@ impl DownloadObjectsTransfer {
     /// Emits the terminal summary once. The status must already be terminal.
     ///
     /// `snapshot` is the state the transfer ended in. Only the first call per
-    /// transfer emits.
+    /// transfer emits. Called under the state lock that made the status
+    /// terminal, before the terminal signal, and from `on_terminal` for
+    /// terminations from outside: once the status is terminal, the scheduler
+    /// may remove the transfer when its dispatched work retires, without
+    /// polling it again.
     fn report_terminal(&self, snapshot: DownloadObjectsStateSnapshot) {
         self.inner.ctx.finalize_terminal_metrics();
         if !self.inner.ctx.claim_terminal_report() {
@@ -718,7 +723,7 @@ impl DownloadObjectsTransfer {
     #[cfg(test)]
     pub(crate) fn test_terminal_summary(
         &self,
-    ) -> Option<super::observability::DownloadObjectsTransferSummary> {
+    ) -> Option<crate::transfer::CompositeTransferSummary> {
         self.inner.last_summary.lock().clone()
     }
 
@@ -829,12 +834,6 @@ impl DownloadObjectsTransfer {
             .downcast_mut::<DownloadObjectsWork>()
             .expect("work data must be DownloadObjectsWork");
         tracing::Span::current().record("work", data.kind());
-        tracing::trace!(
-            target: crate::telemetry::TARGET_TRANSFER_DOWNLOAD_OBJECTS,
-            tid = %self.inner.ctx.id,
-            work_data = ?data,
-            "executing work item",
-        );
 
         match data {
             DownloadObjectsWork::AdvanceWalker { walk } => {
@@ -865,6 +864,7 @@ impl DownloadObjectsTransfer {
                 state.walk_in_flight = false;
                 // set_failed alone: check_terminal arbitrates the terminal signal once in-flight work (children/walks/reaps) drains.
                 self.inner.ctx.set_failed(err);
+                self.report_terminal(state.snapshot());
                 if self.check_terminal(&state).is_some() {
                     return WorkOutcome::Success { data: None };
                 }
@@ -932,6 +932,7 @@ impl DownloadObjectsTransfer {
                 "download_objects fatal walker error",
             );
             self.inner.ctx.set_failed(err);
+            self.report_terminal(state.snapshot());
         } else {
             tracing::trace!(
                 target: crate::telemetry::TARGET_TRANSFER_DOWNLOAD_OBJECTS,
@@ -1004,8 +1005,9 @@ impl DownloadObjectsTransfer {
                         error: err.with_local_key(key),
                     });
                     if self.inner.failure_policy == FailedTransferPolicy::Abort {
-                        self.inner.ctx.set_failed_and_signal(child_failed());
+                        self.inner.ctx.set_failed(child_failed());
                         self.report_terminal(state.snapshot());
+                        self.inner.ctx.signal_terminal();
                     }
                 }
             }
@@ -1669,18 +1671,12 @@ mod tests {
 
         assert_eq!(
             state.pending_reason(false),
-            DownloadObjectsPendingReason::Draining
+            CompositePendingReason::Draining
         );
-        assert_eq!(
-            state.pending_reason(true),
-            DownloadObjectsPendingReason::Listing
-        );
+        assert_eq!(state.pending_reason(true), CompositePendingReason::Listing);
 
         state.reaping_in_flight = 1;
-        assert_eq!(
-            state.pending_reason(true),
-            DownloadObjectsPendingReason::Reaping
-        );
+        assert_eq!(state.pending_reason(true), CompositePendingReason::Reaping);
         state.reaping_in_flight = 0;
 
         state
@@ -1688,20 +1684,17 @@ mod tests {
             .push_back(crate::model::Object::builder().key("a.txt").build());
         assert_eq!(
             state.pending_reason(true),
-            DownloadObjectsPendingReason::ChildCapacity
+            CompositePendingReason::ChildCapacity
         );
         state.pending_entries.clear();
 
         let walk = state.walk.take();
         state.walk_in_flight = true;
-        assert_eq!(
-            state.pending_reason(true),
-            DownloadObjectsPendingReason::Listing
-        );
+        assert_eq!(state.pending_reason(true), CompositePendingReason::Listing);
         state.walk_in_flight = false;
         assert_eq!(
             state.pending_reason(true),
-            DownloadObjectsPendingReason::ChildCompletion
+            CompositePendingReason::ChildCompletion
         );
         state.walk = walk;
     }
@@ -1726,10 +1719,7 @@ mod tests {
         let summary = transfer
             .test_terminal_summary()
             .expect("terminal summary reported");
-        assert_eq!(
-            summary.outcome,
-            crate::operation::download::DownloadTerminalOutcome::Completed
-        );
+        assert_eq!(summary.outcome, crate::transfer::TerminalOutcome::Completed);
         assert_eq!(summary.successful, 3);
         assert_eq!(summary.failed, 0);
 
@@ -1762,10 +1752,7 @@ mod tests {
         let summary = transfer
             .test_terminal_summary()
             .expect("terminal summary reported");
-        assert_eq!(
-            summary.outcome,
-            crate::operation::download::DownloadTerminalOutcome::Failed
-        );
+        assert_eq!(summary.outcome, crate::transfer::TerminalOutcome::Failed);
         assert!(summary.error_kind.is_some());
         assert_eq!(summary.successful, 0);
 
@@ -1776,6 +1763,101 @@ mod tests {
             .test_terminal_summary()
             .expect("terminal summary reported");
         assert_eq!(summary.successful, 0, "summary reported more than once");
+    }
+
+    /// A response body that never yields a frame, so a child download that
+    /// reads it stays in flight until it is cancelled.
+    struct NeverBody;
+
+    impl http_body_1x::Body for NeverBody {
+        type Data = bytes::Bytes;
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<http_body_1x::Frame<Self::Data>, Self::Error>>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    /// A fatal listing error on a later page, while children spawned from an
+    /// earlier page are still downloading, ends the parent `Failed` and still
+    /// reports its terminal summary.
+    ///
+    /// Page 1 fills one walk advance (`MAX_ENTRIES_PER_WALK` keys), so page 2 is
+    /// fetched by a second advance. No GET body ever completes, so the children
+    /// spawned from page 1 are in flight when page 2 fails. The page-2 mock
+    /// sleeps so the parent spawns children before the failure lands. The
+    /// scheduler, not `check_terminal`, then ends the parent: its last
+    /// dispatched work has retired, so it is terminal and idle with children
+    /// still alive, and it is not polled again.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn terminal_summary_reported_on_listing_failure_with_children_in_flight() {
+        let dir = tempdir().unwrap();
+        let page1 = mock!(aws_sdk_s3::Client::list_objects_v2)
+            .match_requests(|r| r.continuation_token().is_none())
+            .then_output(|| {
+                ListObjectsV2Output::builder()
+                    .set_contents(Some(
+                        (0..MAX_ENTRIES_PER_WALK)
+                            .map(|i| Object::builder().key(format!("k{i:04}")).size(5).build())
+                            .collect(),
+                    ))
+                    .is_truncated(true)
+                    .next_continuation_token("page-2")
+                    .build()
+            });
+        let page2 = mock!(aws_sdk_s3::Client::list_objects_v2)
+            .match_requests(|r| r.continuation_token() == Some("page-2"))
+            .then_error(|| {
+                std::thread::sleep(Duration::from_millis(300));
+                aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Error::generic(
+                    aws_sdk_s3::error::ErrorMetadata::builder()
+                        .code("AccessDenied")
+                        .message("access denied")
+                        .build(),
+                )
+            });
+        let get = mock!(aws_sdk_s3::Client::get_object).then_output(|| {
+            GetObjectOutput::builder()
+                .content_length(5)
+                .body(aws_sdk_s3::primitives::ByteStream::new(
+                    aws_smithy_types::body::SdkBody::from_body_1_x(NeverBody),
+                ))
+                .build()
+        });
+        let s3_client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[page1, page2, get]);
+        let config = crate::Config::builder()
+            .sdk_client(s3_client.clone())
+            .build()
+            .expect("valid config");
+        let handle = crate::client::Handle::test_handle_managed(config);
+        let (transfer, completion_rx) = setup_enqueued(
+            dir.path(),
+            FailedTransferPolicy::Continue,
+            s3_client,
+            handle,
+        );
+
+        timeout(Duration::from_secs(10), async {
+            let _ = completion_rx.await;
+        })
+        .await
+        .expect("transfer should end within timeout");
+
+        assert!(transfer.ctx().is_failed());
+        assert!(
+            !transfer.inner.state.lock().children.is_empty(),
+            "the parent ended with children still recorded as running"
+        );
+        let summary = transfer
+            .test_terminal_summary()
+            .expect("terminal summary reported");
+        assert_eq!(summary.outcome, crate::transfer::TerminalOutcome::Failed);
+
+        crate::runtime::test_util::shutdown(&transfer.ctx().handle).await;
     }
 
     #[cfg_attr(miri, ignore)]
@@ -1794,10 +1876,7 @@ mod tests {
         let summary = transfer
             .test_terminal_summary()
             .expect("terminal summary reported");
-        assert_eq!(
-            summary.outcome,
-            crate::operation::download::DownloadTerminalOutcome::Cancelled
-        );
+        assert_eq!(summary.outcome, crate::transfer::TerminalOutcome::Cancelled);
         assert_eq!(summary.successful, 0);
 
         // A second external termination must not report again.

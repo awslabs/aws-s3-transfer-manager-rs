@@ -81,6 +81,10 @@ required-features = ["sdk-v1"]
 name = "download_objects_test"
 required-features = ["sdk-v1"]
 
+[[test]]
+name = "telemetry_targets_test"
+required-features = ["sdk-v1"]
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.189"
 nix = { version = "0.31", features = ["uio", "fs", "resource"] }
