@@ -109,7 +109,7 @@ pub(super) async fn discover_obj(
     input: &DownloadInput,
     validation_enabled: bool,
 ) -> Result<ObjectDiscovery, crate::error::Error> {
-    let configured_part_size = transfer.ctx().handle.download_part_size_bytes();
+    let configured_part_size = transfer.ctx().handle.part_size_bytes();
     let strategy = ObjectDiscoveryStrategy::from_request(input)?;
     tracing::trace!("discovering object with strategy {:?}", strategy);
     let user_explicit_part_size = transfer.ctx().handle.user_set_part_size();
@@ -359,7 +359,7 @@ async fn discover_obj_with_get(
     input: &DownloadInput,
     range_from_user: Option<RangeInclusive<u64>>,
 ) -> Result<ObjectDiscovery, error::Error> {
-    let target_part_size = transfer.ctx().handle.download_part_size_bytes();
+    let target_part_size = transfer.ctx().handle.part_size_bytes();
     // Convert input to builder and set the range properly as the first range get.
     let byte_range = match range_from_user.as_ref() {
         Some(r) => ByteRange::Inclusive(
@@ -579,8 +579,8 @@ mod tests {
         tm.handle.clone()
     }
 
-    // Handle with an Auto part size (download Auto = 5 MiB), so the multipart
-    // alignment branch (gated on `!user_set_part_size`) can be exercised.
+    // Handle with an Auto part size, so the multipart alignment branch (gated
+    // on `!user_set_part_size`) can be exercised.
     fn test_handle_auto(client: aws_sdk_s3::Client) -> Arc<crate::client::Handle> {
         let tm_config = crate::Config::builder()
             .sdk_client(client)
@@ -1029,15 +1029,15 @@ mod tests {
 
     // A validating download of a multipart object (ETag `-N`) with an Auto part
     // size re-issues discovery via partNumber=1 to learn the exact stored part
-    // size and aligns subsequent ranges to it. Download Auto = 5 MiB, but the
-    // stored part is 8 MiB; effective_part_size must become 8 MiB.
+    // size and aligns subsequent ranges to it. The stored part must differ from
+    // the resolved Auto size, or alignment would not be observable.
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_discover_obj_aligns_multipart_when_validating() {
         const MIB: u64 = 1024 * 1024;
-        let download_default = 5 * MIB; // Auto download part size
-        let stored_part = 8 * MIB;
-        let total = 20 * MIB; // 8 + 8 + 4 -> 3 parts
+        let download_default = crate::runtime::sizing::DEFAULT_PART_SIZE;
+        let stored_part = 16 * MIB;
+        let total = 36 * MIB; // 16 + 16 + 4 -> 3 parts
         let ranged = mock!(Client::get_object)
             .match_requests(move |r| {
                 r.range() == Some(format!("bytes=0-{}", download_default - 1).as_str())
@@ -1073,7 +1073,7 @@ mod tests {
 
         let discovery = discover_obj(&transfer, &request, true).await.unwrap();
 
-        // Aligned to the stored part size (8 MiB), not the Auto default (5 MiB).
+        // Aligned to the stored part size, not the resolved Auto size.
         assert_eq!(discovery.effective_part_size, stored_part);
         // remaining starts at the first stored boundary (after part 1).
         assert_eq!(discovery.remaining, Some(stored_part..=total - 1));

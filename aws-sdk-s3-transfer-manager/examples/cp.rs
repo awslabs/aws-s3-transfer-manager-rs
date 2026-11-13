@@ -155,8 +155,8 @@ struct ConcurrencyModeArg {
     concurrency_auto: bool,
 
     /// ConcurrencyMode::TargetThroughput(Gbps)
-    #[arg(long)]
-    target_throughput_gbps: Option<u64>,
+    #[arg(long, value_parser = parse_target_throughput)]
+    target_throughput_gbps: Option<TargetThroughput>,
 
     /// ConcurrencyMode::Explicit(n)
     #[arg(long)]
@@ -170,13 +170,17 @@ impl ConcurrencyModeArg {
         }
 
         match (self.target_throughput_gbps, self.concurrency) {
+            (Some(target), _) => ConcurrencyMode::TargetThroughput(target),
             (None, Some(concurrency)) => ConcurrencyMode::Explicit(concurrency),
-            (Some(gbps), None) => {
-                ConcurrencyMode::TargetThroughput(TargetThroughput::new_gigabits_per_sec(gbps))
-            }
-            _ => ConcurrencyMode::Auto,
+            (None, None) => ConcurrencyMode::Auto,
         }
     }
+}
+
+/// Parses `--target-throughput-gbps`, rejecting values that are not finite and positive.
+fn parse_target_throughput(s: &str) -> Result<TargetThroughput, String> {
+    let gbps: f64 = s.parse().map_err(|e| format!("{e}"))?;
+    TargetThroughput::gbps(gbps).map_err(|e| e.to_string())
 }
 
 #[derive(Clone, Debug)]

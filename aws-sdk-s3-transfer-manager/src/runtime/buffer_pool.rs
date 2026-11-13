@@ -51,6 +51,7 @@ use admission::{
 pub use admission::{Reservation, ReserveError, ReserveFuture};
 use arena::{Arena, ArenaError, ArenaOptions};
 use block::BlockError;
+pub(crate) use config::auto_capacity_bytes;
 use config::PoolConfig;
 pub use config::{BufferPoolBuildError, BufferPoolBuilder};
 use geometry::{GeometryError, PoolGeometry};

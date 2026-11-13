@@ -3,8 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use crate::metrics::{unit::ByteUnit, Throughput};
 use crate::runtime::buffer_pool::BufferPool;
+use aws_smithy_types::error::operation::BuildError;
 
 pub use crate::model::builders;
 pub use crate::model::{
@@ -62,6 +62,7 @@ pub enum MemoryBudgetConfig {
     ///
     /// [`MemoryMetrics::configured_capacity_bytes`]:
     ///     crate::metrics::MemoryMetrics::configured_capacity_bytes
+    /// [`ByteUnit`]: crate::metrics::unit::ByteUnit
     Limit(usize),
 }
 
@@ -70,6 +71,9 @@ pub enum MemoryBudgetConfig {
 #[derive(Debug, Clone, Default)]
 pub enum MemoryConfig {
     /// Construct an automatically sized pool when the client is created.
+    ///
+    /// The ceiling follows [`MemoryBudgetConfig::Auto`], raised to at least
+    /// 256 MiB but not above half of detected memory.
     #[default]
     Auto,
     /// Use an existing pool.
@@ -87,13 +91,48 @@ pub enum ConcurrencyMode {
     #[default]
     Auto,
 
-    /// Explicitly configured throughput setting the client should aim for.
+    /// Concurrency sized for a network throughput target, in gigabits per second.
     ///
-    /// In this mode, concurrency is limited by attempting to hit a throughput target.
+    /// The target replaces the throughput estimated from the execution
+    /// environment. It sets the in-flight request target once, when the client
+    /// is constructed; it does not limit throughput at run time. Requests beyond
+    /// what the per-host connection cap or the payload-memory ceiling allows wait
+    /// for a connection or for memory.
     TargetThroughput(TargetThroughput),
 
     /// Explicit concurrency control
     Explicit(usize),
+}
+
+/// A network throughput target for [`ConcurrencyMode::TargetThroughput`].
+///
+/// One target currently applies to uploads and downloads alike. The value is
+/// private so that per-direction targets can be added later without breaking
+/// callers.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TargetThroughput {
+    gbps: f64,
+}
+
+impl TargetThroughput {
+    /// A target of `gbps` gigabits per second, for uploads and downloads.
+    ///
+    /// Returns an error unless `gbps` is finite and positive.
+    pub fn gbps(gbps: f64) -> Result<Self, BuildError> {
+        if gbps.is_finite() && gbps > 0.0 {
+            Ok(Self { gbps })
+        } else {
+            Err(BuildError::invalid_field(
+                "gbps",
+                format!("throughput target must be finite and positive, got {gbps}"),
+            ))
+        }
+    }
+
+    /// The target in gigabits per second.
+    pub fn as_gbps(&self) -> f64 {
+        self.gbps
+    }
 }
 
 /// How far a download may prefetch ahead of the consumer.
@@ -111,43 +150,6 @@ pub enum ReadAhead {
     /// Read ahead at most `n` parts beyond the consumer's position. `0` fetches only
     /// the part the consumer is waiting on (no speculation). Still bounded by memory.
     Parts(usize),
-}
-
-/// Throughput target(s)
-#[derive(Debug, Clone)]
-pub struct TargetThroughput {
-    download: Throughput,
-    upload: Throughput,
-}
-
-impl TargetThroughput {
-    /// Create a new target throughput in Gigabits/sec that is
-    /// the same for both uploads and downloads.
-    pub fn new_gigabits_per_sec(gbps: u64) -> Self {
-        let target = Throughput::new_bytes_per_sec(gbps * ByteUnit::Gigabit.as_bytes_u64());
-        Self::new(target, target)
-    }
-
-    // TODO: we don't actually support limiting throughput by upload/download independently (yet), it will require updates to scheduler.
-
-    /// Create a new target throughput using the given upload and download
-    /// throughputs.
-    fn new(download_target: Throughput, upload_target: Throughput) -> Self {
-        Self {
-            download: download_target,
-            upload: upload_target,
-        }
-    }
-
-    /// Get the target throughput for uploads
-    pub fn upload(&self) -> &Throughput {
-        &self.upload
-    }
-
-    /// Get the target throughput for downloads
-    pub fn download(&self) -> &Throughput {
-        &self.download
-    }
 }
 
 /// Policy for how to handle a failed multipart upload
@@ -499,6 +501,26 @@ impl IntegrityChecks {
             checksum_sha256,
             checksum_type,
             checksum_validation,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TargetThroughput;
+
+    #[test]
+    fn target_throughput_accepts_finite_positive_gbps() {
+        for gbps in [0.5, 1.0, 200.0] {
+            let target = TargetThroughput::gbps(gbps).unwrap();
+            assert_eq!(target.as_gbps(), gbps);
+        }
+    }
+
+    #[test]
+    fn target_throughput_rejects_values_that_are_not_a_rate() {
+        for gbps in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(TargetThroughput::gbps(gbps).is_err(), "gbps {gbps}");
         }
     }
 }

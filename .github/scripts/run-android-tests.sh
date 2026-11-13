@@ -100,8 +100,9 @@ adb_bounded() {
 }
 
 run_android_tests() {
-    local deps_directory
-    local target_directory
+    local build_directory
+    local profile_directory
+    local search_directories
     local test_binary
     local test_binaries
 
@@ -109,23 +110,32 @@ run_android_tests() {
     # own runner and consumes Cargo's compiler-artifact messages. Clean this
     # package's target artifacts, build without executing, then identify the
     # sole test executable for the repository runner.
-    target_directory=$(
+    #
+    # Test executables are intermediate artifacts, so they live in the build
+    # directory, not the target directory. Cargo 1.100 changed the build
+    # directory's layout: executables moved from `deps/` to
+    # `build/<package>/<hash>/out/`. Search both so older toolchains still work.
+    build_directory=$(
         cargo metadata --locked --no-deps --format-version 1 |
-            jq -r '.target_directory'
+            jq -r '.build_directory // .target_directory'
     )
-    deps_directory="$target_directory/$rust_target/debug/deps"
+    profile_directory="$build_directory/$rust_target/debug"
 
     cargo clean --locked -p aws-sdk-s3-transfer-manager --target "$rust_target"
     cargo ndk --target "$abi" --platform "$android_api_level" \
         test --locked -p aws-sdk-s3-transfer-manager --lib --no-run
 
-    if [[ ! -d "$deps_directory" ]]; then
-        echo "Android test artifact directory is missing: $deps_directory" >&2
+    search_directories=()
+    for directory in "$profile_directory/deps" "$profile_directory/build/aws-sdk-s3-transfer-manager"; do
+        [[ -d "$directory" ]] && search_directories+=("$directory")
+    done
+    if (( ${#search_directories[@]} == 0 )); then
+        echo "Android test artifact directory is missing under: $profile_directory" >&2
         exit 1
     fi
     test_binaries=$(
-        find "$deps_directory" \
-            -maxdepth 1 \
+        find "${search_directories[@]}" \
+            -maxdepth 3 \
             -type f \
             -name 'aws_sdk_s3_transfer_manager-*' \
             -perm -111 \
