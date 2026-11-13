@@ -26,6 +26,7 @@ pub(crate) use managed::{prepare_components, ManagedExecution};
 #[allow(dead_code)]
 pub(crate) mod buffer_pool;
 pub(crate) mod platform;
+pub(crate) mod sizing;
 pub(crate) mod sync;
 
 use aws_smithy_runtime_api::client::http::SharedHttpClient;

@@ -187,6 +187,10 @@ impl std::fmt::Debug for S3WalkerBuilder {
 impl S3WalkerBuilder {
     /// Restrict listing to keys beginning with the given prefix.
     ///
+    /// The prefix only selects objects; the walk yields each selected object
+    /// with its full key. It is matched against keys as a string, so `photos`
+    /// selects both `photos/a.txt` and `photos-old/b.txt`.
+    ///
     /// When unset, the walker lists all objects in the bucket.
     #[must_use]
     pub fn prefix(mut self, prefix: impl Into<String>) -> Self {
@@ -395,11 +399,6 @@ impl std::fmt::Debug for S3Walk {
 }
 
 impl S3Walk {
-    /// The prefix this walk lists under. Every key the walk yields starts with it.
-    pub(crate) fn prefix(&self) -> Option<&str> {
-        self.config.prefix.as_deref()
-    }
-
     /// Return the next [`crate::model::Object`] from the walk.
     ///
     /// Returns:
@@ -588,7 +587,12 @@ mod tests {
                 .build()
         });
         let sdk = mock_client!(aws_sdk_s3, RuleMode::Sequential, &[&list]);
-        let tm = crate::Client::new(crate::Config::builder().sdk_client(sdk).build());
+        let tm = crate::Client::new(
+            crate::Config::builder()
+                .sdk_client(sdk)
+                .build()
+                .expect("valid config"),
+        );
         let handle = Arc::downgrade(&tm.handle);
         let context = S3WalkContext::builder()
             .client(&tm)
@@ -623,7 +627,8 @@ mod tests {
         let tm = crate::Client::new(
             crate::Config::builder()
                 .s3_config(crate::config::S3ClientConfig::new(&shared))
-                .build(),
+                .build()
+                .expect("valid config"),
         );
         let context = S3WalkContext::builder()
             .client(&tm)

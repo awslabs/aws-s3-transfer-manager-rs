@@ -239,7 +239,8 @@ mod test {
             .set_multipart_threshold(PartSize::Target(10))
             .set_target_part_size(PartSize::Target(5 * ByteUnit::Mebibyte.as_bytes_u64()))
             .sdk_client(client)
-            .build();
+            .build()
+            .expect("valid config");
         let tm = crate::Client::new(tm_config);
         let handle = UploadInput::builder()
             .bucket("test-bucket")
@@ -521,7 +522,8 @@ mod test {
             .set_multipart_threshold(PartSize::Target(10))
             .set_target_part_size(PartSize::Target(5 * ByteUnit::Mebibyte.as_bytes_u64()))
             .sdk_client(client)
-            .build();
+            .build()
+            .expect("valid config");
         let tm = crate::Client::new(tm_config);
         let handle = UploadInput::builder()
             .bucket("test-bucket")
@@ -807,7 +809,8 @@ mod test {
             .runtime_config(runtime_config)
             .set_multipart_threshold(PartSize::Target(ByteUnit::Mebibyte.as_bytes_u64()))
             .sdk_client(client)
-            .build();
+            .build()
+            .expect("valid config");
         let tm = crate::Client::new(tm_config);
         let handle = UploadInput::builder()
             .bucket("test-bucket")
@@ -883,7 +886,8 @@ mod test {
             .set_multipart_threshold(PartSize::Target(10))
             .set_target_part_size(PartSize::Target(5 * ByteUnit::Mebibyte.as_bytes_u64()))
             .sdk_client(client)
-            .build();
+            .build()
+            .expect("valid config");
 
         let tm = crate::Client::new(tm_config);
 
@@ -996,7 +1000,8 @@ mod retry_tests {
             .set_multipart_threshold(PartSize::Target(10))
             .set_target_part_size(PartSize::Target(5 * ByteUnit::Mebibyte.as_bytes_u64()))
             .sdk_client(s3_client)
-            .build();
+            .build()
+            .expect("valid config");
 
         let tm = crate::Client::new(tm_config);
 
@@ -1107,7 +1112,8 @@ mod retry_tests {
             .set_multipart_threshold(PartSize::Target(10))
             .set_target_part_size(PartSize::Target(5 * ByteUnit::Mebibyte.as_bytes_u64()))
             .sdk_client(s3_client)
-            .build();
+            .build()
+            .expect("valid config");
 
         let tm = crate::Client::new(tm_config);
 

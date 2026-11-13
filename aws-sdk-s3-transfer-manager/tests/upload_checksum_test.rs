@@ -597,7 +597,8 @@ async fn run_test(config: TestConfig) -> UploadOutput {
         .part_size(PartSize::Target(PART_SIZE as u64))
         .multipart_threshold(PartSize::Target(PART_SIZE as u64))
         .concurrency(ConcurrencyMode::Explicit(1)) // guarantee parts sent in order
-        .build();
+        .build()
+        .expect("valid config");
     let tm = aws_sdk_s3_transfer_manager::Client::new(tm_config);
 
     // Do upload

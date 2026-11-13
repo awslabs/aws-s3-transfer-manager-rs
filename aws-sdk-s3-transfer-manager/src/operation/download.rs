@@ -105,7 +105,9 @@ impl Download {
         use crate::transfer::TransferContext;
 
         if input.part_number().is_some() {
-            todo!("single part download not implemented")
+            return Err(error::invalid_input(
+                "downloading a single part by part number is not supported",
+            ));
         }
 
         let bucket_type =
@@ -128,8 +130,8 @@ impl Download {
     /// The destination sink is created by `sinks` over the temp file, which the
     /// transfer manager owns and may therefore preallocate. A failure to create
     /// the temp file or the sink is returned as
-    /// [`ErrorKind::IOError`](error::ErrorKind::IOError); a temp file whose sink
-    /// could not be created is removed.
+    /// [`ErrorKind::IOError`](error::ErrorKind::IOError); a
+    /// temp file whose sink could not be created is removed.
     ///
     /// When `parent_id` is `Some`, the transfer is linked as a child of the
     /// given composite transfer via [`TransferContext::new_child`](crate::transfer::TransferContext::new_child).
@@ -146,14 +148,14 @@ impl Download {
             temp_file_candidates(&dest_path, std::iter::repeat_with(|| fastrand::u32(..)));
         let (file, temp_path) = crate::io::fs::create_first_new_async(candidates)
             .await
-            .map_err(|e| error::from_kind(error::ErrorKind::IOError)(e))?;
+            .map_err(|e| error::io_at("creating temporary file for", &dest_path, e))?;
 
         let sink = match sinks.create(file, true) {
             Ok(sink) => sink,
             Err(e) => {
                 // No handle owns the temp file yet, so remove it here.
                 let _ = crate::io::fs::remove_file_async(&temp_path).await;
-                return Err(error::from_kind(error::ErrorKind::IOError)(e));
+                return Err(error::io_at("preparing temporary file for", &dest_path, e));
             }
         };
         let inner = Self::orchestrate_with_sink(handle, input, sink, parent_id)?;
@@ -203,7 +205,9 @@ impl Download {
         use crate::transfer::TransferContext;
 
         if input.part_number().is_some() {
-            todo!("single part download not implemented")
+            return Err(error::invalid_input(
+                "downloading a single part by part number is not supported",
+            ));
         }
 
         let bucket_type =
@@ -237,8 +241,54 @@ impl Download {
 
 #[cfg(test)]
 mod tests {
-    use super::{temp_file_candidates, TEMP_FILE_ATTEMPTS};
+    use super::sink::{FileSinkFactory, SinkFactory};
+    use super::{temp_file_candidates, Download, DownloadInput, TEMP_FILE_ATTEMPTS};
+    use crate::error::ErrorKind;
     use std::path::{Path, PathBuf};
+
+    fn part_number_input() -> DownloadInput {
+        DownloadInput::builder()
+            .bucket("test-bucket")
+            .key("test-key")
+            .part_number(1)
+            .build()
+            .unwrap()
+    }
+
+    fn mock_handle() -> std::sync::Arc<crate::client::Handle> {
+        crate::client::Handle::test_handle_tokio(
+            crate::Config::builder()
+                .sdk_client(aws_smithy_mocks::mock_client!(
+                    aws_sdk_s3,
+                    aws_smithy_mocks::RuleMode::MatchAny,
+                    &[]
+                ))
+                .build()
+                .expect("valid config"),
+        )
+    }
+
+    // Single-part downloads are not a supported transfer. Both entry points
+    // must reject a part number as invalid input rather than panic.
+    // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn part_number_download_is_invalid_input() {
+        let err = Download::orchestrate(mock_handle(), part_number_input(), false)
+            .expect_err("a part-number download is rejected");
+        assert_eq!(err.kind(), &ErrorKind::InputInvalid);
+    }
+
+    // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn part_number_download_to_sink_is_invalid_input() {
+        let file = tempfile::tempfile().unwrap();
+        let sink = FileSinkFactory.create(file, true).unwrap();
+        let err = Download::orchestrate_with_sink(mock_handle(), part_number_input(), sink, None)
+            .expect_err("a part-number download is rejected");
+        assert_eq!(err.kind(), &ErrorKind::InputInvalid);
+    }
 
     #[test]
     fn temp_file_candidates_name_files_beside_the_destination() {

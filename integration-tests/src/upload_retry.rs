@@ -80,7 +80,8 @@ async fn setup_with_fault(
             &shared_config,
         ))
         .part_size(PartSize::Target(PART_SIZE))
-        .build();
+        .build()
+        .expect("valid config");
     let tm = aws_sdk_s3_transfer_manager::Client::new(tm_config);
     (handle, tm, tally)
 }
@@ -239,7 +240,8 @@ mod server_faults {
                 ))
                 .part_size(PART_SIZE)
                 .multipart_threshold(threshold)
-                .build(),
+                .build()
+                .expect("valid config"),
         );
         (server, handle, tm)
     }

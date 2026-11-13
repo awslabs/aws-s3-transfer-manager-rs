@@ -43,8 +43,8 @@ class MemberPolicyTest {
         val generated = ModelGenerator.generate(TmModelProjection.project(source()), temporary, "1.6.3")
         fun rust(name: String) = Files.readString(generated.baseDir.resolve("src/model/_$name.rs"))
         val download = rust("download_input")
-        assertTrue(download.contains("pub part_number: ::std::option::Option<i32>,"))
-        assertTrue(download.contains("pub fn part_number(&self) -> ::std::option::Option<i32>"))
+        assertTrue(download.contains("pub(crate) part_number: ::std::option::Option<i32>,"))
+        assertTrue(download.contains("pub(crate) fn part_number(&self) -> ::std::option::Option<i32>"))
         assertTrue(download.contains("pub(crate) fn set_part_number(mut self, input: ::std::option::Option<i32>)"))
         assertTrue(download.contains("pub(crate) fn get_part_number(&self) -> &::std::option::Option<i32>"))
         assertTrue(download.contains(
@@ -164,8 +164,8 @@ class MemberPolicyTest {
         assertTrue(writer.dependencies.containsAll(RuntimeType.dateTime(settings.runtimeConfig).toSymbol().dependencies))
         val generated = ModelGenerator.generate(projection, temporary, "1.6.3")
         val rust = Files.readString(generated.baseDir.resolve("src/model/_download_input.rs"))
-        assertTrue(rust.contains("pub part_number: ::std::option::Option<::aws_smithy_types::DateTime>"))
-        assertTrue(rust.contains("pub fn part_number(&self) -> ::std::option::Option<&::aws_smithy_types::DateTime>"))
+        assertTrue(rust.contains("pub(crate) part_number: ::std::option::Option<::aws_smithy_types::DateTime>"))
+        assertTrue(rust.contains("pub(crate) fn part_number(&self) -> ::std::option::Option<&::aws_smithy_types::DateTime>"))
         assertTrue(rust.contains("pub(crate) fn part_number(mut self, input: ::aws_smithy_types::DateTime)"))
     }
 

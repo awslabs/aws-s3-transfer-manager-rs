@@ -28,7 +28,7 @@ let client = tm::Client::new(
     tm::Config::builder()
         .s3_config(&sdk_config)
         .runtime_config(tm::RuntimeConfig::managed(tm_ext::managed(runtime)))
-        .build(),
+        .build()?,
 );
 drop(client);
 completion.wait().await?;
@@ -66,7 +66,9 @@ experimental independently of TM's ordinary API. Adapter releases pin the tested
 TM version and support the declared 0.1 execution line; use that pairing.
 Changing those dependency requirements requires validating the combination.
 
-The optional `dial9` feature enables tracing support. Configure the recorder on
-the execution builder before building the runtime and keep it alive while
-recording. TM's separate `dial9_handle` setting cannot instrument an already-built
-runtime and causes client construction to panic for adoption.
+The optional `dial9` feature enables the execution crate's dial9 tracing. Pass
+the recorder's handle to `ManagedRuntime::builder().dial9_handle(..)` before
+building the runtime, then adopt the runtime with `managed(runtime)`. Keep the
+recorder alive while recording. To flush managed-thread events, wait for
+shutdown completion after releasing the client and its transfers, then shut
+down the recorder.

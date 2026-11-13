@@ -201,7 +201,7 @@ async fn test_download_objects_flat_content_roundtrip() {
 
         // Verify byte content of every file.
         for i in 0..count {
-            let file_path = dest.path().join(format!("{i:03}.bin"));
+            let file_path = dest.path().join(format!("{prefix}{i:03}.bin"));
             let got = std::fs::read(&file_path).unwrap_or_else(|_| {
                 panic!("expected file {:03}.bin not found on disk", i);
             });
@@ -219,7 +219,9 @@ async fn test_download_objects_flat_content_roundtrip() {
     .expect("test_download_objects_flat_content_roundtrip timed out");
 }
 
-/// Objects under nested prefixes download into the correct directory tree.
+// ref: RUST-1426
+/// Objects under nested prefixes download into the directory tree their full
+/// keys name, the listing prefix included.
 #[tokio::test]
 async fn test_download_objects_nested_prefixes() {
     timeout(TEST_TIMEOUT, async {
@@ -251,12 +253,8 @@ async fn test_download_objects_nested_prefixes() {
         assert!(output.failed_transfers().is_empty());
 
         // Verify directory structure and content.
-        let mut expected: HashMap<&str, Vec<u8>> = HashMap::new();
-        expected.insert("top.txt", b"top-level".to_vec());
-        expected.insert("a/one.txt", b"a-1".to_vec());
-        expected.insert("a/two.txt", b"a-2".to_vec());
-        expected.insert("b/inner/deep.txt", b"deep-content".to_vec());
-        expected.insert("c/1/2/3/leaf.bin", b"leaf".to_vec());
+        let expected: HashMap<&str, Vec<u8>> =
+            objects.iter().map(|(k, v)| (*k, v.to_vec())).collect();
         verify_dir(dest.path(), &expected);
 
         m.handle.shutdown().await.expect("shutdown");
@@ -314,7 +312,7 @@ async fn test_download_objects_multipart_children(rt: RuntimeConfig) {
         // Verify content of each downloaded file.
         let expected_body: Vec<u8> = (0..size).map(|b| (b % 256) as u8).collect();
         for i in 0..count {
-            let file_path = dest.path().join(format!("{i:04}.bin"));
+            let file_path = dest.path().join(format!("{prefix}{i:04}.bin"));
             let got = std::fs::read(&file_path)
                 .unwrap_or_else(|_| panic!("expected file {:04}.bin not found on disk", i));
             assert_eq!(got, expected_body, "content mismatch for {:04}.bin", i);
@@ -518,7 +516,7 @@ async fn test_download_objects_listing_pagination(rt: RuntimeConfig) {
         );
 
         // Verify content of a sample file to ensure no mix-up across pages.
-        let sample_path = dest.path().join("0025.bin");
+        let sample_path = dest.path().join(format!("{prefix}0025.bin"));
         let got = std::fs::read(&sample_path).expect("read sample file");
         assert_eq!(got, vec![25u8; size], "sample content should match");
 
@@ -538,8 +536,9 @@ async fn test_download_objects_listing_pagination_tokio_mt() {
     test_download_objects_listing_pagination(RuntimeConfig::multi_thread_tokio()).await;
 }
 
-/// A supplied walker's prefix scopes the listing and is stripped from each
-/// key to build its local path.
+// ref: RUST-1426
+/// A supplied walker's prefix scopes the listing, and each listed object is
+/// written at its full key.
 #[tokio::test]
 async fn test_download_objects_walker_prefix_scopes_listing_and_paths() {
     timeout(TEST_TIMEOUT, async {
@@ -568,14 +567,82 @@ async fn test_download_objects_walker_prefix_scopes_listing_and_paths() {
         assert!(output.failed_transfers().is_empty());
 
         let mut expected: HashMap<&str, Vec<u8>> = HashMap::new();
-        expected.insert("1.txt", b"chosen-1".to_vec());
-        expected.insert("sub/2.txt", b"chosen-2".to_vec());
+        expected.insert("chosen/1.txt", b"chosen-1".to_vec());
+        expected.insert("chosen/sub/2.txt", b"chosen-2".to_vec());
         verify_dir(dest.path(), &expected);
 
         m.handle.shutdown().await.expect("shutdown");
     })
     .await
     .expect("test_download_objects_walker_prefix_scopes_listing_and_paths timed out");
+}
+
+/// Seeds `keys`, each holding its own key as content, downloads the objects
+/// under `prefix`, and asserts each one is written at its full key beneath the
+/// destination.
+async fn assert_prefix_keeps_full_keys(prefix: &str, keys: &[&str]) {
+    let m = mock_tm(RuntimeConfig::default()).await;
+    let bucket = "test-bucket";
+    let objects: Vec<(&str, &[u8])> = keys.iter().map(|k| (*k, k.as_bytes())).collect();
+    seed_objects(&m.server, bucket, &objects).await;
+
+    let dest = tempfile::tempdir().expect("tempdir");
+    let output = m
+        .client
+        .download_objects()
+        .bucket(bucket)
+        .destination(dest.path())
+        .walker(S3Walker::builder().prefix(prefix).build())
+        .initiate()
+        .expect("initiate download_objects")
+        .join()
+        .await
+        .expect("join download_objects");
+    assert_eq!(keys.len() as u64, output.objects_downloaded());
+    assert!(output.failed_transfers().is_empty());
+
+    let expected: HashMap<&str, Vec<u8>> =
+        keys.iter().map(|k| (*k, k.as_bytes().to_vec())).collect();
+    verify_dir(dest.path(), &expected);
+
+    m.handle.shutdown().await.expect("shutdown");
+}
+
+// ref: RUST-1426
+/// A prefix that is a key segment without its trailing delimiter selects
+/// `photos/readme.txt` and also `photos-other/x.txt`, and both keep their full
+/// keys. Removing the prefix as a string from each key would write the second
+/// object as `-other/x.txt`.
+#[tokio::test]
+async fn test_download_objects_prefix_without_delimiter_keeps_full_keys() {
+    timeout(
+        TEST_TIMEOUT,
+        assert_prefix_keeps_full_keys("photos", &["photos/readme.txt", "photos-other/x.txt"]),
+    )
+    .await
+    .expect("test_download_objects_prefix_without_delimiter_keeps_full_keys timed out");
+}
+
+// ref: RUST-1426
+/// A prefix that ends partway through a file name selects `1.txt`, `10.txt`,
+/// and the directory `1/`, and each keeps its full key. Removing the prefix as
+/// a string from each key would write them as `.txt`, `0.txt`, and
+/// `inner.txt`.
+#[tokio::test]
+async fn test_download_objects_prefix_ending_mid_name_keeps_full_keys() {
+    timeout(
+        TEST_TIMEOUT,
+        assert_prefix_keeps_full_keys(
+            "notes/2021/1",
+            &[
+                "notes/2021/1.txt",
+                "notes/2021/10.txt",
+                "notes/2021/1/inner.txt",
+            ],
+        ),
+    )
+    .await
+    .expect("test_download_objects_prefix_ending_mid_name_keeps_full_keys timed out");
 }
 
 /// Folder markers are skipped even when the supplied walker's filter accepts
@@ -613,7 +680,7 @@ async fn test_download_objects_skips_folder_markers_with_supplied_walker() {
         assert!(output.failed_transfers().is_empty());
 
         let mut expected: HashMap<&str, Vec<u8>> = HashMap::new();
-        expected.insert("sub/file.txt", b"content".to_vec());
+        expected.insert("markers/sub/file.txt", b"content".to_vec());
         verify_dir(dest.path(), &expected);
 
         m.handle.shutdown().await.expect("shutdown");
@@ -630,7 +697,7 @@ async fn test_download_objects_key_mapping_to_destination_root_fails() {
         let m = mock_tm(RuntimeConfig::default()).await;
 
         let bucket = "test-bucket";
-        let objects: &[(&str, &[u8])] = &[("root/", b"not-a-marker"), ("root/ok.txt", b"ok")];
+        let objects: &[(&str, &[u8])] = &[("./", b"not-a-marker"), ("ok.txt", b"ok")];
         seed_objects(&m.server, bucket, objects).await;
 
         let dest = tempfile::tempdir().expect("tempdir");
@@ -639,7 +706,6 @@ async fn test_download_objects_key_mapping_to_destination_root_fails() {
             .download_objects()
             .bucket(bucket)
             .destination(dest.path())
-            .walker(S3Walker::builder().prefix("root/").build())
             .failure_policy(FailedTransferPolicy::Continue)
             .initiate()
             .expect("initiate download_objects");
@@ -651,7 +717,7 @@ async fn test_download_objects_key_mapping_to_destination_root_fails() {
             .input()
             .key()
             .expect("failed input should have key");
-        assert_eq!("root/", failed_key);
+        assert_eq!("./", failed_key);
 
         assert!(dest.path().is_dir(), "destination must remain a directory");
         let mut expected: HashMap<&str, Vec<u8>> = HashMap::new();
@@ -662,6 +728,181 @@ async fn test_download_objects_key_mapping_to_destination_root_fails() {
     })
     .await
     .expect("test_download_objects_key_mapping_to_destination_root_fails timed out");
+}
+
+/// Seeds `objects`, downloads the bucket to `dest`, and asserts every object
+/// downloads with no failures.
+async fn download_all(dest: &Path, objects: &[(&str, &[u8])]) {
+    let m = mock_tm(RuntimeConfig::default()).await;
+    let bucket = "test-bucket";
+    seed_objects(&m.server, bucket, objects).await;
+
+    let output = m
+        .client
+        .download_objects()
+        .bucket(bucket)
+        .destination(dest)
+        .initiate()
+        .expect("initiate download_objects")
+        .join()
+        .await
+        .expect("join download_objects");
+    assert_eq!(objects.len() as u64, output.objects_downloaded());
+    assert!(output.failed_transfers().is_empty());
+
+    m.handle.shutdown().await.expect("shutdown");
+}
+
+// ref: RUST-1202
+/// A destination written with `.` or `..` components downloads every object
+/// into the directory it names lexically. Comparing each object's cleaned path
+/// against the uncleaned destination would reject every key as resolving
+/// outside it.
+#[tokio::test]
+async fn test_download_objects_destination_with_dot_components() {
+    timeout(TEST_TIMEOUT, async {
+        let objects: &[(&str, &[u8])] = &[("a.txt", b"a"), ("nested/b.txt", b"b")];
+        let mut expected: HashMap<&str, Vec<u8>> = HashMap::new();
+        expected.insert("a.txt", b"a".to_vec());
+        expected.insert("nested/b.txt", b"b".to_vec());
+
+        for form in ["./out", "out/../out", "x/./../out/."] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            // `tmp` is absolute, so each destination is an absolute path
+            // holding `/./` or `/../`.
+            let dest = tmp.path().join(form);
+            download_all(&dest, objects).await;
+            verify_dir(&tmp.path().join("out"), &expected);
+        }
+    })
+    .await
+    .expect("test_download_objects_destination_with_dot_components timed out");
+}
+
+/// The relative path from the directory `base` to `target`, both absolute:
+/// one `..` for each component of `base` below their common ancestor, then
+/// the rest of `target`.
+///
+/// `None` when the two have different roots or prefixes, such as Windows
+/// paths on different drives, which no relative path connects.
+fn relative_path(base: &Path, target: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+
+    let mut base = base.components().peekable();
+    let mut target = target.components().peekable();
+    while let (Some(b), Some(t)) = (base.peek(), target.peek()) {
+        if b != t {
+            break;
+        }
+        base.next();
+        target.next();
+    }
+    let (base, target): (Vec<_>, Vec<_>) = (base.collect(), target.collect());
+    if base
+        .iter()
+        .chain(&target)
+        .any(|c| matches!(c, Component::Prefix(_) | Component::RootDir))
+    {
+        return None;
+    }
+    Some(
+        base.iter()
+            .map(|_| Component::ParentDir)
+            .chain(target)
+            .collect(),
+    )
+}
+
+// ref: RUST-1202
+/// A relative destination with `.` or `..` components, resolved against the
+/// working directory, downloads every object into the directory it names
+/// lexically. The working directory is not changed: each destination climbs
+/// from it with `..` to the temporary directory.
+#[tokio::test]
+async fn test_download_objects_relative_destination_with_dot_components() {
+    timeout(TEST_TIMEOUT, async {
+        let objects: &[(&str, &[u8])] = &[("a.txt", b"a"), ("nested/b.txt", b"b")];
+        let mut expected: HashMap<&str, Vec<u8>> = HashMap::new();
+        expected.insert("a.txt", b"a".to_vec());
+        expected.insert("nested/b.txt", b"b".to_vec());
+        let cwd = std::env::current_dir().expect("current dir");
+
+        for form in ["./out", "x/../out"] {
+            let mut tmp = tempfile::tempdir().expect("tempdir");
+            // The system temporary directory can be on another Windows drive
+            // than the working directory; use one beneath the working
+            // directory instead.
+            if relative_path(&cwd, tmp.path()).is_none() {
+                tmp = tempfile::tempdir_in(&cwd).expect("tempdir");
+            }
+            let dest = relative_path(&cwd, tmp.path())
+                .expect("a relative path to the temporary directory")
+                .join(form);
+            assert!(dest.is_relative(), "{dest:?}");
+            download_all(&dest, objects).await;
+            verify_dir(&tmp.path().join("out"), &expected);
+            assert!(!tmp.path().join("x").exists(), "x/.. is resolved lexically");
+        }
+    })
+    .await
+    .expect("test_download_objects_relative_destination_with_dot_components timed out");
+}
+
+// ref: RUST-1202
+/// A destination that does not exist is created, with its missing parents,
+/// and the objects are downloaded into it.
+#[tokio::test]
+async fn test_download_objects_creates_missing_destination() {
+    timeout(TEST_TIMEOUT, async {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dest = tmp.path().join("a").join("b").join("out");
+        let objects: &[(&str, &[u8])] = &[("a.txt", b"a"), ("nested/b.txt", b"b")];
+
+        download_all(&dest, objects).await;
+
+        let mut expected: HashMap<&str, Vec<u8>> = HashMap::new();
+        expected.insert("a.txt", b"a".to_vec());
+        expected.insert("nested/b.txt", b"b".to_vec());
+        verify_dir(&dest, &expected);
+    })
+    .await
+    .expect("test_download_objects_creates_missing_destination timed out");
+}
+
+// ref: RUST-1202
+/// A destination that exists and is not a directory fails the download with
+/// `InputInvalid`, and the file is left as it was.
+#[tokio::test]
+async fn test_download_objects_destination_file_is_input_invalid() {
+    timeout(TEST_TIMEOUT, async {
+        let m = mock_tm(RuntimeConfig::default()).await;
+        let bucket = "test-bucket";
+        seed_objects(&m.server, bucket, &[("a.txt", b"a")]).await;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dest = tmp.path().join("out");
+        std::fs::write(&dest, b"not a directory").expect("write file");
+
+        let err = m
+            .client
+            .download_objects()
+            .bucket(bucket)
+            .destination(&dest)
+            .initiate()
+            .expect("initiate download_objects")
+            .join()
+            .await
+            .expect_err("a file destination must fail");
+        assert_eq!(
+            &aws_sdk_s3_transfer_manager::error::ErrorKind::InputInvalid,
+            err.kind()
+        );
+        assert_eq!(b"not a directory".as_slice(), std::fs::read(&dest).unwrap());
+
+        m.handle.shutdown().await.expect("shutdown");
+    })
+    .await
+    .expect("test_download_objects_destination_file_is_input_invalid timed out");
 }
 
 /// FailedTransferPolicy::Continue with one faulted key: the other objects
@@ -741,12 +982,13 @@ async fn test_download_objects_key_path_safety() {
 
         let bucket = "test-bucket";
         let prefix = "safe/";
-        // Include a known-good object alongside traversal keys.
+        // Include a known-good object alongside traversal keys. Each
+        // traversal key climbs one level above the destination.
         let objects: &[(&str, &[u8])] = &[
             ("safe/good.txt", b"safe-content"),
-            ("safe/../escape.bin", b"escape-attempt-1"),
+            ("safe/../../escape.bin", b"escape-attempt-1"),
             ("safe/../../etc/passwd", b"escape-attempt-2"),
-            ("safe/sub/../../other.bin", b"escape-attempt-3"),
+            ("safe/sub/../../../other.bin", b"escape-attempt-3"),
         ];
         seed_objects(&m.server, bucket, objects).await;
 
@@ -767,7 +1009,7 @@ async fn test_download_objects_key_path_safety() {
         let output = handle.join().await.expect("join download_objects");
 
         // The good file must land on disk inside the destination.
-        let good_path = dest_path.join("good.txt");
+        let good_path = dest_path.join("safe/good.txt");
         assert!(good_path.exists(), "good.txt should exist on disk");
         assert_eq!(
             std::fs::read(&good_path).expect("read good.txt"),
@@ -793,21 +1035,381 @@ async fn test_download_objects_key_path_safety() {
             }
         }
 
-        // The traversal keys should appear as failures (InputInvalid).
-        assert!(
-            !output.failed_transfers().is_empty(),
+        // Every traversal key fails with InputInvalid; only the safe object
+        // downloads.
+        assert_eq!(
+            3,
+            output.failed_transfers().len(),
             "traversal keys should fail rather than silently succeed"
         );
-        // At minimum the good object succeeded.
-        assert!(
-            output.objects_downloaded() >= 1,
-            "at least the safe object should download"
-        );
+        for failed in output.failed_transfers() {
+            assert_eq!(
+                &aws_sdk_s3_transfer_manager::error::ErrorKind::InputInvalid,
+                failed.error().kind()
+            );
+        }
+        assert_eq!(1, output.objects_downloaded());
 
         m.handle.shutdown().await.expect("shutdown");
     })
     .await
     .expect("test_download_objects_key_path_safety timed out");
+}
+
+// ---------------------------------------------------------------------------
+// SHARED TEST CORPUS
+// ---------------------------------------------------------------------------
+
+/// Part size of every ported corpus case (`targetPartSizeBytes`).
+const CORPUS_PART_SIZE: u64 = 8 * ByteUnit::Mebibyte.as_bytes_u64();
+
+/// A `download-directory` case from the shared transfer manager test corpus.
+///
+/// Paths are written as the corpus states them. The case's destination is
+/// recreated beneath a temporary directory, and each expected file beneath it,
+/// by keeping only the normal components of the path.
+struct CorpusCase {
+    /// The destination named by the case.
+    destination: &'static str,
+    /// The walker carrying the case's `s3Prefix` and `filter`.
+    walker: S3Walker,
+    failure_policy: FailedTransferPolicy,
+    /// The case's `maxConcurrency`, when it sets one.
+    max_concurrency: Option<usize>,
+    /// Key and size of each object in the bucket (`s3Objects`).
+    objects: &'static [(&'static str, usize)],
+    /// Path and size of each file the download leaves on disk
+    /// (`expectedFiles`).
+    expected_files: &'static [(&'static str, u64)],
+    objects_downloaded: u64,
+    objects_failed: usize,
+}
+
+/// `path` beneath `base`, with any root or drive of `path` removed.
+fn beneath(base: &Path, path: &str) -> PathBuf {
+    use std::path::Component;
+
+    let normal = Path::new(path)
+        .components()
+        .filter(|c| matches!(c, Component::Normal(_)));
+    base.join(normal.collect::<PathBuf>())
+}
+
+/// Every file beneath `dir`, by path relative to `dir`, with its size.
+fn file_sizes(dir: &Path) -> std::collections::BTreeMap<PathBuf, u64> {
+    let mut files = HashMap::new();
+    collect_files(dir, dir, &mut files);
+    files
+        .into_iter()
+        .map(|(path, content)| (path, content.len() as u64))
+        .collect()
+}
+
+/// Runs `case` against the mock server and asserts its outcome counts and
+/// that the files it expects, and no others, are written beneath the
+/// temporary directory that holds the destination.
+///
+/// Every failure is asserted to be an `InputInvalid` rejection of the key's
+/// local path, the only failure the ported cases expect.
+async fn run_corpus_case(case: CorpusCase) {
+    let m = crate::harness::mock_tm_with(RuntimeConfig::default(), |b| {
+        b.part_size(aws_sdk_s3_transfer_manager::types::PartSize::Target(
+            CORPUS_PART_SIZE,
+        ))
+    })
+    .await;
+    let bucket = "test-bucket";
+    for (i, (key, size)) in case.objects.iter().enumerate() {
+        m.server
+            .add_object(bucket, key, vec![i as u8; *size], None)
+            .await
+            .expect("seed object");
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dest = beneath(tmp.path(), case.destination);
+    let mut request = m
+        .client
+        .download_objects()
+        .bucket(bucket)
+        .destination(&dest)
+        .walker(case.walker)
+        .failure_policy(case.failure_policy);
+    if let Some(max) = case.max_concurrency {
+        request = request.max_concurrent_downloads(max);
+    }
+    let output = request
+        .initiate()
+        .expect("initiate download_objects")
+        .join()
+        .await
+        .expect("join download_objects");
+
+    assert_eq!(case.objects_downloaded, output.objects_downloaded());
+    assert_eq!(
+        case.objects_failed,
+        output.failed_transfers().len(),
+        "failed: {:?}",
+        output
+            .failed_transfers()
+            .iter()
+            .map(|f| f.input().key())
+            .collect::<Vec<_>>()
+    );
+    for failed in output.failed_transfers() {
+        assert_eq!(
+            &aws_sdk_s3_transfer_manager::error::ErrorKind::InputInvalid,
+            failed.error().kind(),
+            "key {:?}",
+            failed.input().key()
+        );
+    }
+
+    let expected: std::collections::BTreeMap<PathBuf, u64> = case
+        .expected_files
+        .iter()
+        .map(|(path, size)| (beneath(Path::new(""), path), *size))
+        .collect();
+    assert_eq!(expected, file_sizes(tmp.path()));
+
+    m.handle.shutdown().await.expect("shutdown");
+}
+
+// ref: RUST-1426
+/// download-directory.json: "Test download directory - with s3Prefix".
+#[tokio::test]
+async fn sep_download_directory_with_s3prefix() {
+    timeout(
+        TEST_TIMEOUT,
+        run_corpus_case(CorpusCase {
+            destination: "/local/downloads",
+            walker: S3Walker::builder().prefix("photos/").build(),
+            failure_policy: FailedTransferPolicy::Abort,
+            max_concurrency: Some(10),
+            objects: &[
+                ("photos/2023/jan/photo1.jpg", 1048576),
+                ("photos/2023/jan/photo2.jpg", 1048576),
+                ("photos/readme.txt", 1024),
+            ],
+            expected_files: &[
+                ("/local/downloads/photos/2023/jan/photo1.jpg", 1048576),
+                ("/local/downloads/photos/2023/jan/photo2.jpg", 1048576),
+                ("/local/downloads/photos/readme.txt", 1024),
+            ],
+            objects_downloaded: 3,
+            objects_failed: 0,
+        }),
+    )
+    .await
+    .expect("sep_download_directory_with_s3prefix timed out");
+}
+
+// ref: RUST-1426
+/// download-directory.json: "Test download directory - with filter callback".
+///
+/// The corpus lists the expected file as `/local/downloads/image.jpg`, with
+/// the prefix removed; the derivation rule keeps the full key.
+#[tokio::test]
+async fn sep_download_directory_with_filter_callback() {
+    timeout(
+        TEST_TIMEOUT,
+        run_corpus_case(CorpusCase {
+            destination: "/local/downloads",
+            walker: S3Walker::builder()
+                .prefix("mixed/")
+                .filter(|obj| obj.key().is_some_and(|key| key.ends_with(".jpg")))
+                .build(),
+            failure_policy: FailedTransferPolicy::Abort,
+            max_concurrency: Some(10),
+            objects: &[("mixed/image.jpg", 1048576), ("mixed/document.txt", 2048)],
+            expected_files: &[("/local/downloads/mixed/image.jpg", 1048576)],
+            objects_downloaded: 1,
+            objects_failed: 0,
+        }),
+    )
+    .await
+    .expect("sep_download_directory_with_filter_callback timed out");
+}
+
+// ref: RUST-1426
+/// download-directory.json: "Test download directory - skip folder objects".
+///
+/// The corpus lists the expected file as `/local/downloads/file1.txt`, with
+/// the prefix removed; the derivation rule keeps the full key.
+#[tokio::test]
+async fn sep_download_directory_skip_folder_objects() {
+    timeout(
+        TEST_TIMEOUT,
+        run_corpus_case(CorpusCase {
+            destination: "/local/downloads",
+            walker: S3Walker::builder().prefix("data/").build(),
+            failure_policy: FailedTransferPolicy::Abort,
+            max_concurrency: None,
+            objects: &[
+                ("data/folder1/", 0),
+                ("data/file1.txt", 1024),
+                ("data/folder2/", 0),
+            ],
+            expected_files: &[("/local/downloads/data/file1.txt", 1024)],
+            objects_downloaded: 1,
+            objects_failed: 0,
+        }),
+    )
+    .await
+    .expect("sep_download_directory_skip_folder_objects timed out");
+}
+
+/// download-directory.json: "Test download directory - path traversal security validation".
+#[tokio::test]
+async fn sep_download_directory_path_traversal_security_validation() {
+    timeout(
+        TEST_TIMEOUT,
+        run_corpus_case(CorpusCase {
+            destination: "/local/downloads",
+            walker: S3Walker::builder().build(),
+            failure_policy: FailedTransferPolicy::Continue,
+            max_concurrency: None,
+            objects: &[("../../../etc/passwd", 1024), ("safe-file.txt", 2048)],
+            expected_files: &[("/local/downloads/safe-file.txt", 2048)],
+            objects_downloaded: 1,
+            objects_failed: 1,
+        }),
+    )
+    .await
+    .expect("sep_download_directory_path_traversal_security_validation timed out");
+}
+
+/// download-directory.json: "Test download directory - path traversal with relative parent directory".
+#[tokio::test]
+async fn sep_download_directory_path_traversal_with_relative_parent_directory() {
+    timeout(
+        TEST_TIMEOUT,
+        run_corpus_case(CorpusCase {
+            destination: "/local/downloads",
+            walker: S3Walker::builder().build(),
+            failure_policy: FailedTransferPolicy::Continue,
+            max_concurrency: None,
+            objects: &[("../2023/Jan/1.png", 1024), ("safe-file.txt", 2048)],
+            expected_files: &[("/local/downloads/safe-file.txt", 2048)],
+            objects_downloaded: 1,
+            objects_failed: 1,
+        }),
+    )
+    .await
+    .expect("sep_download_directory_path_traversal_with_relative_parent_directory timed out");
+}
+
+/// download-directory.json: "Test download directory - complex path traversal with multiple levels".
+#[tokio::test]
+async fn sep_download_directory_complex_path_traversal_with_multiple_levels() {
+    timeout(
+        TEST_TIMEOUT,
+        run_corpus_case(CorpusCase {
+            destination: "/local/downloads",
+            walker: S3Walker::builder().build(),
+            failure_policy: FailedTransferPolicy::Continue,
+            max_concurrency: None,
+            objects: &[
+                ("foo/../2023/../../Jan/1.png", 1024),
+                ("normal/file.txt", 512),
+            ],
+            expected_files: &[("/local/downloads/normal/file.txt", 512)],
+            objects_downloaded: 1,
+            objects_failed: 1,
+        }),
+    )
+    .await
+    .expect("sep_download_directory_complex_path_traversal_with_multiple_levels timed out");
+}
+
+// ref: RUST-1426
+/// download-directory-cross-platform-compatibility.json: "Test download directory - Linux happy case".
+#[cfg(unix)]
+#[tokio::test]
+async fn sep_download_directory_linux_happy_case() {
+    timeout(
+        TEST_TIMEOUT,
+        run_corpus_case(CorpusCase {
+            destination: "/home/user/downloads",
+            walker: S3Walker::builder().prefix("projects/").build(),
+            failure_policy: FailedTransferPolicy::Abort,
+            max_concurrency: Some(10),
+            objects: &[
+                ("projects/src/main.py", 4096),
+                ("projects/config/settings.json", 1024),
+                ("projects/README.md", 2048),
+            ],
+            expected_files: &[
+                ("/home/user/downloads/projects/src/main.py", 4096),
+                ("/home/user/downloads/projects/config/settings.json", 1024),
+                ("/home/user/downloads/projects/README.md", 2048),
+            ],
+            objects_downloaded: 3,
+            objects_failed: 0,
+        }),
+    )
+    .await
+    .expect("sep_download_directory_linux_happy_case timed out");
+}
+
+// ref: RUST-1426
+/// download-directory-cross-platform-compatibility.json: "Test download directory - macOS happy case".
+#[cfg(unix)]
+#[tokio::test]
+async fn sep_download_directory_macos_happy_case() {
+    timeout(
+        TEST_TIMEOUT,
+        run_corpus_case(CorpusCase {
+            destination: "/Users/user/Downloads",
+            walker: S3Walker::builder().prefix("photos/").build(),
+            failure_policy: FailedTransferPolicy::Abort,
+            max_concurrency: Some(10),
+            objects: &[
+                ("photos/2023/vacation.jpg", 3145728),
+                ("photos/2023/family.jpg", 2621440),
+                ("photos/metadata.json", 512),
+            ],
+            expected_files: &[
+                ("/Users/user/Downloads/photos/2023/vacation.jpg", 3145728),
+                ("/Users/user/Downloads/photos/2023/family.jpg", 2621440),
+                ("/Users/user/Downloads/photos/metadata.json", 512),
+            ],
+            objects_downloaded: 3,
+            objects_failed: 0,
+        }),
+    )
+    .await
+    .expect("sep_download_directory_macos_happy_case timed out");
+}
+
+// ref: RUST-1426
+/// download-directory-cross-platform-compatibility.json: "Test download directory - Windows happy case".
+#[cfg(windows)]
+#[tokio::test]
+async fn sep_download_directory_windows_happy_case() {
+    timeout(
+        TEST_TIMEOUT,
+        run_corpus_case(CorpusCase {
+            destination: r"C:\Downloads",
+            walker: S3Walker::builder().prefix("documents/").build(),
+            failure_policy: FailedTransferPolicy::Abort,
+            max_concurrency: Some(10),
+            objects: &[
+                ("documents/report.pdf", 1048576),
+                ("documents/data/spreadsheet.xlsx", 2097152),
+                ("documents/readme.txt", 1024),
+            ],
+            expected_files: &[
+                (r"C:\Downloads\documents\report.pdf", 1048576),
+                (r"C:\Downloads\documents\data\spreadsheet.xlsx", 2097152),
+                (r"C:\Downloads\documents\readme.txt", 1024),
+            ],
+            objects_downloaded: 3,
+            objects_failed: 0,
+        }),
+    )
+    .await
+    .expect("sep_download_directory_windows_happy_case timed out");
 }
 
 // ---------------------------------------------------------------------------
@@ -872,8 +1474,9 @@ async fn test_upload_then_download_objects_roundtrip(rt: RuntimeConfig) {
         assert_eq!(files.len() as u64, download_output.objects_downloaded());
         assert!(download_output.failed_transfers().is_empty());
 
-        // Verify the downloaded tree matches the source tree exactly.
-        verify_dir(dest_dir.path(), &expected_content);
+        // Verify the downloaded tree, written at the full keys, matches the
+        // source tree exactly.
+        verify_dir(&dest_dir.path().join(prefix), &expected_content);
 
         m.handle.shutdown().await.expect("shutdown");
     })

@@ -165,7 +165,8 @@ async fn adopted_file_upload_uses_configured_native_pool_and_retains_runtime_unt
             tm::Config::builder()
                 .s3_config(&sdk)
                 .runtime_config(tm::RuntimeConfig::managed(tm_ext::managed(owner)))
-                .build(),
+                .build()
+                .expect("valid config"),
         );
         let stopped = client.shutdown_completion().unwrap();
         let upload = client
@@ -248,7 +249,12 @@ async fn automatic_managed_completion_does_not_retain_client_clones() {
             aws_smithy_runtime_api::client::behavior_version::BehaviorVersion::latest(),
         )
         .build();
-    let client = tm::Client::new(tm::Config::builder().s3_config(&sdk).build());
+    let client = tm::Client::new(
+        tm::Config::builder()
+            .s3_config(&sdk)
+            .build()
+            .expect("valid config"),
+    );
     let completion = client
         .shutdown_completion()
         .expect("default execution is managed");
@@ -280,7 +286,8 @@ async fn caller_tokio_execution_has_no_owned_runtime_completion() {
         tm::Config::builder()
             .s3_config(&sdk)
             .runtime_config(tm::RuntimeConfig::multi_thread_tokio())
-            .build(),
+            .build()
+            .expect("valid config"),
     );
     assert!(client.shutdown_completion().is_none());
 }
@@ -314,7 +321,8 @@ async fn adopted_completion_waits_for_blocking_work_and_thread_local_cleanup() {
         tm::Config::builder()
             .s3_config(&sdk)
             .runtime_config(tm::RuntimeConfig::managed(tm_ext::managed(owner)))
-            .build(),
+            .build()
+            .expect("valid config"),
     );
     let stopped = client.shutdown_completion().unwrap();
     let self_wait = stopped.clone();

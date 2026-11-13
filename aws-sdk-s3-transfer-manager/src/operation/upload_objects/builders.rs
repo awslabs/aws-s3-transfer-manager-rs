@@ -101,6 +101,10 @@ impl UploadObjectsFluentBuilder {
 
     /// The S3 key prefix to use for each object. Defaults to no prefix
     /// (files are uploaded to the root of the bucket).
+    ///
+    /// Each object's key is the prefix, then the delimiter unless the prefix
+    /// already ends with it, then the file's path relative to the source
+    /// directory. An empty prefix is the same as no prefix.
     pub fn key_prefix(mut self, input: impl Into<String>) -> Self {
         self.inner = self.inner.key_prefix(input);
         self
@@ -138,6 +142,14 @@ impl UploadObjectsFluentBuilder {
     /// Defaults to [`FailedTransferPolicy::Abort`].
     pub fn failure_policy(mut self, input: FailedTransferPolicy) -> Self {
         self.inner = self.inner.failure_policy(input);
+        self
+    }
+
+    /// Sets the failure policy to use when any individual object upload fails.
+    ///
+    /// `None` selects the default, [`FailedTransferPolicy::Abort`].
+    pub fn set_failure_policy(mut self, input: Option<FailedTransferPolicy>) -> Self {
+        self.inner = self.inner.set_failure_policy(input);
         self
     }
 

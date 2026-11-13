@@ -59,7 +59,8 @@ fn fluent_fields_use_upstream_getters_and_preserve_collection_and_sensitive_sema
             .s3_config(common::s3_config(
                 aws_smithy_mocks::create_mock_http_client(),
             ))
-            .build(),
+            .build()
+            .expect("valid config"),
     );
     let builder = tm
         .upload()
@@ -117,7 +118,8 @@ async fn fluent_and_modeled_builder_initiation_return_canonical_metadata_and_tra
                 .s3_config(test_common::s3_config_with_test_http(
                     sdk.config().to_builder(),
                 ))
-                .build(),
+                .build()
+                .expect("valid config"),
         );
         let handle = if fluent {
             tm.upload()
@@ -214,7 +216,8 @@ async fn multipart_runtime_merges_response_metadata_without_synthesizing_absent_
                 .s3_config(test_common::s3_config_with_test_http(
                     sdk.config().to_builder(),
                 ))
-                .build(),
+                .build()
+                .expect("valid config"),
         );
         let output: upload::UploadOutput = tm
             .upload()

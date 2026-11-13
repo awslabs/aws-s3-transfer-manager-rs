@@ -512,7 +512,8 @@ async fn test_part_checksum_over_different_bytes_fails_before_complete() {
     let tm = aws_sdk_s3_transfer_manager::Client::new(
         aws_sdk_s3_transfer_manager::Config::builder()
             .s3_config(S3ClientConfig::new(s3.config().to_builder()))
-            .build(),
+            .build()
+            .expect("valid config"),
     );
 
     // A validly encoded CRC32 of bytes other than the part body.

@@ -80,6 +80,12 @@ impl InputStream {
     ///
     /// Furthermore, a partial write MAY seek in the file and resume from the previous location.
     ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::IOError`](crate::error::ErrorKind::IOError) when the
+    /// file's metadata cannot be read, for example because the file does not
+    /// exist.
+    ///
     /// # Examples
     /// ```no_run
     /// use aws_sdk_s3_transfer_manager::io::InputStream;
@@ -88,7 +94,7 @@ impl InputStream {
     ///     InputStream::from_path("docs/rows.csv").expect("file should be readable")
     /// }
     /// ```
-    pub fn from_path(path: impl AsRef<Path>) -> Result<InputStream, crate::io::error::Error> {
+    pub fn from_path(path: impl AsRef<Path>) -> Result<InputStream, crate::error::Error> {
         Self::read_from().path(path).build()
     }
 
@@ -119,7 +125,7 @@ impl InputStream {
     ///
     /// # Errors
     ///
-    /// Returns an error if a file-backed stream cannot open its path.
+    /// Returns [`ErrorKind::IOError`](crate::error::ErrorKind::IOError) if a file-backed stream cannot open it.
     ///
     /// # Panics
     ///
@@ -136,7 +142,7 @@ impl InputStream {
         self,
         direct_io: bool,
         buffer_pool: BufferPool,
-    ) -> std::io::Result<aws_smithy_types::body::SdkBody> {
+    ) -> Result<aws_smithy_types::body::SdkBody, crate::error::Error> {
         use crate::operation::upload::file_body::{
             DirectFileBody, FileBodySource, OffloadedFileBody,
         };
@@ -144,7 +150,8 @@ impl InputStream {
         match self.inner {
             RawInputStream::Buf(bytes) => Ok(SdkBody::from(bytes)),
             RawInputStream::Fs(path_body) => {
-                let source = FileBodySource::open(&path_body.path, buffer_pool)?;
+                let source = FileBodySource::open(&path_body.path, buffer_pool)
+                    .map_err(|e| crate::error::io_at("opening", &path_body.path, e))?;
                 let offset = path_body.offset;
                 let length = path_body.length;
                 if direct_io {
@@ -295,7 +302,6 @@ pub struct PartData {
     pub(crate) part_number: u64,
     pub(crate) data: SegmentedBytes,
     pub(crate) checksum: Option<String>,
-    pub(crate) is_last: Option<bool>,
 }
 
 impl std::fmt::Debug for PartData {
@@ -304,7 +310,6 @@ impl std::fmt::Debug for PartData {
             .field("part_number", &self.part_number)
             .field("data_len", &self.data.len())
             .field("checksum", &self.checksum)
-            .field("is_last", &self.is_last)
             .finish()
     }
 }
@@ -353,7 +358,6 @@ impl PartData {
             part_number,
             data,
             checksum: None,
-            is_last: None,
         }
     }
 
@@ -369,12 +373,6 @@ impl PartData {
     /// [ChecksumStrategy](crate::operation::upload::ChecksumStrategy).
     pub fn with_checksum(mut self, checksum: impl Into<String>) -> Self {
         self.checksum = Some(checksum.into());
-        self
-    }
-
-    /// Mark this part as the last part
-    pub fn mark_last(mut self, is_last: bool) -> Self {
-        self.is_last = Some(is_last);
         self
     }
 }

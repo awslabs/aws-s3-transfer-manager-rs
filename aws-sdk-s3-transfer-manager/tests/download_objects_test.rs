@@ -181,9 +181,11 @@ fn relative_path_names(dir: &Path) -> Result<Vec<String>, io::Error> {
     Ok(paths)
 }
 
-/// Should remove the prefix in the local filepath
+// ref: RUST-1426
+/// The walker's prefix selects objects and is kept in each local path: every
+/// object is written at its full key under the destination.
 #[tokio::test]
-async fn test_strip_prefix_in_destination_path() {
+async fn test_prefix_kept_in_destination_path() {
     use std::time::Duration;
     use tokio::time::timeout;
 
@@ -200,7 +202,8 @@ async fn test_strip_prefix_in_destination_path() {
             .s3_config(test_common::s3_config_with_test_http(
                 client.config().to_builder(),
             ))
-            .build();
+            .build()
+            .expect("valid config");
         let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
         let dest = tempfile::tempdir().unwrap();
@@ -217,10 +220,14 @@ async fn test_strip_prefix_in_destination_path() {
         assert_eq!(3, output.objects_downloaded());
 
         let paths = relative_path_names(dest.path()).unwrap();
-        let mut expected = vec!["image.jpg", "title.jpg", "ghi/xyz.txt"]
-            .into_iter()
-            .map(str::to_owned)
-            .collect::<Vec<String>>();
+        let mut expected = vec![
+            "abc/def/image.jpg",
+            "abc/def/title.jpg",
+            "abc/def/ghi/xyz.txt",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<String>>();
         expected.sort();
         assert_eq!(expected, paths);
     })
@@ -228,7 +235,9 @@ async fn test_strip_prefix_in_destination_path() {
     result.expect("timed out");
 }
 
-/// Should not strip prefix from object name
+// ref: RUST-1426
+/// A prefix that ends partway through a key segment does not cut object names:
+/// under the prefix `abc`, `abc/def/image.jpg` and `abcd` keep their full keys.
 #[tokio::test]
 async fn test_object_with_prefix_included() {
     let bucket = MockBucket::builder()
@@ -243,7 +252,8 @@ async fn test_object_with_prefix_included() {
         .s3_config(test_common::s3_config_with_test_http(
             client.config().to_builder(),
         ))
-        .build();
+        .build()
+        .expect("valid config");
     let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
     let dest = tempfile::tempdir().unwrap();
@@ -260,7 +270,7 @@ async fn test_object_with_prefix_included() {
     assert_eq!(3, output.objects_downloaded());
 
     let paths = relative_path_names(dest.path()).unwrap();
-    let mut expected = vec!["def/image.jpg", "def/title.jpg", "abcd"]
+    let mut expected = vec!["abc/def/image.jpg", "abc/def/title.jpg", "abcd"]
         .into_iter()
         .map(str::to_owned)
         .collect::<Vec<String>>();
@@ -283,7 +293,8 @@ async fn test_failed_download_policy_continue() {
         .s3_config(test_common::s3_config_with_test_http(
             client.config().to_builder(),
         ))
-        .build();
+        .build()
+        .expect("valid config");
     let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
     let dest = tempfile::tempdir().unwrap();
@@ -342,7 +353,8 @@ async fn test_recursively_downloads() {
         .s3_config(test_common::s3_config_with_test_http(
             client.config().to_builder(),
         ))
-        .build();
+        .build()
+        .expect("valid config");
     let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
     let dest = tempfile::tempdir().unwrap();
@@ -379,7 +391,8 @@ async fn test_delimiter() {
         .s3_config(test_common::s3_config_with_test_http(
             client.config().to_builder(),
         ))
-        .build();
+        .build()
+        .expect("valid config");
     let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
     let dest = tempfile::tempdir().unwrap();
@@ -418,7 +431,8 @@ async fn test_destination_dir_not_valid() {
         .s3_config(test_common::s3_config_with_test_http(
             client.config().to_builder(),
         ))
-        .build();
+        .build()
+        .expect("valid config");
     let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
     let dest = tempfile::NamedTempFile::new().unwrap();
@@ -433,6 +447,40 @@ async fn test_destination_dir_not_valid() {
     let err = handle.join().await.unwrap_err();
     let err_str = format!("{}", DisplayErrorContext(err));
     assert!(err_str.contains("target is not a directory"));
+}
+
+// ref: RUST-1202
+/// An empty destination is rejected by `initiate` as unset, before any request,
+/// instead of downloading into the current working directory.
+#[tokio::test]
+async fn test_empty_destination_rejected() {
+    let bucket = MockBucket::builder().key_with_size("image.png", 12).build();
+    let list = bucket.list_objects_rule();
+    let gets = bucket.get_object_rules();
+    let mut rules = gets.iter().collect::<Vec<_>>();
+    rules.push(&list);
+
+    let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, rules.as_slice());
+
+    let config = aws_sdk_s3_transfer_manager::Config::builder()
+        .s3_config(test_common::s3_config_with_test_http(
+            client.config().to_builder(),
+        ))
+        .build()
+        .expect("valid config");
+    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+
+    let err = tm
+        .download_objects()
+        .bucket("test-bucket")
+        .destination("")
+        .initiate()
+        .expect_err("an empty destination is rejected");
+
+    assert_eq!(&ErrorKind::InputInvalid, err.kind());
+    assert!(format!("{}", DisplayErrorContext(err)).contains("destination is required"));
+    assert_eq!(0, list.num_calls());
+    assert!(gets.iter().all(|get| get.num_calls() == 0));
 }
 
 /// Calling `abort()` on the handle should complete without hanging.
@@ -469,7 +517,8 @@ async fn test_abort_on_handle_should_terminate_tasks_gracefully() {
             .s3_config(test_common::s3_config_with_test_http(
                 client.config().to_builder(),
             ))
-            .build();
+            .build()
+            .expect("valid config");
         let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
         let dest = tempfile::tempdir().unwrap();
@@ -517,7 +566,8 @@ async fn test_failed_list_objects_should_cancel_the_operation() {
             .s3_config(test_common::s3_config_with_test_http(
                 client.config().to_builder(),
             ))
-            .build();
+            .build()
+            .expect("valid config");
         let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
         let dest = tempfile::tempdir().unwrap();
@@ -559,7 +609,8 @@ async fn test_failed_get_object_should_cancel_the_operation() {
             .s3_config(test_common::s3_config_with_test_http(
                 client.config().to_builder(),
             ))
-            .build();
+            .build()
+            .expect("valid config");
         let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
         let dest = tempfile::tempdir().unwrap();
@@ -585,6 +636,94 @@ async fn test_failed_get_object_should_cancel_the_operation() {
     })
     .await
     .expect("test_failed_get_object_should_cancel_the_operation timed out");
+}
+
+// ref: RUST-1202
+/// Under the Abort policy, the aggregate error's source is the error of the
+/// child download that triggered the abort, so the error chain names the
+/// failed S3 operation and its error code.
+#[tokio::test]
+async fn test_aborted_download_objects_error_source_is_failed_child_error() {
+    use aws_sdk_s3_transfer_manager::error::Error;
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    timeout(Duration::from_secs(10), async {
+        let bucket = MockBucket::builder()
+            .key_with_size("key1", 12)
+            .key_with_size("key2", 7)
+            .build();
+        let denied = mock!(aws_sdk_s3::Client::get_object)
+            .match_requests(|r| r.key() == Some("denied"))
+            .then_http_response(|| {
+                HttpResponse::new(
+                    StatusCode::try_from(403).unwrap(),
+                    "<Error><Code>AccessDenied</Code></Error>".into(),
+                )
+            });
+        let listed = bucket
+            .objects
+            .iter()
+            .map(|m| m.object.clone())
+            .chain([aws_sdk_s3::types::Object::builder()
+                .key("denied")
+                .size(10)
+                .build()])
+            .collect::<Vec<_>>();
+        let list = mock!(aws_sdk_s3::Client::list_objects_v2).then_output(move || {
+            ListObjectsV2Output::builder()
+                .set_contents(Some(listed.clone()))
+                .build()
+        });
+        let mut rules = bucket.get_object_rules();
+        rules.extend([denied, list]);
+        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, rules.as_slice());
+
+        let config = aws_sdk_s3_transfer_manager::Config::builder()
+            .s3_config(test_common::s3_config_with_test_http(
+                client.config().to_builder(),
+            ))
+            .build()
+            .expect("valid config");
+        let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+        let dest = tempfile::tempdir().unwrap();
+
+        let err = tm
+            .download_objects()
+            .bucket("test-bucket")
+            .destination(dest.path())
+            .failure_policy(FailedTransferPolicy::Abort)
+            .initiate()
+            .unwrap()
+            .join()
+            .await
+            .unwrap_err();
+
+        assert_eq!(&ErrorKind::ChildOperationFailed, err.kind());
+        let first = err
+            .failed_downloads()
+            .and_then(|f| f.first())
+            .expect("the aggregate carries the failed downloads");
+        assert_eq!(Some("denied"), first.input().key());
+
+        let source = std::error::Error::source(&err)
+            .and_then(|s| s.downcast_ref::<Error>())
+            .expect("the source is the failed child's error");
+        assert!(
+            std::ptr::eq(source, first.error()),
+            "the source is the first failed download's error"
+        );
+        assert_eq!(Some("GetObject"), source.operation_name());
+        assert_eq!(Some("AccessDenied"), source.code());
+
+        let context = format!("{}", DisplayErrorContext(&err));
+        assert!(
+            context.contains("GetObject") && context.contains("AccessDenied"),
+            "the error context names the child's operation and code, got: {context}"
+        );
+    })
+    .await
+    .expect("test_aborted_download_objects_error_source_is_failed_child_error timed out");
 }
 
 /// Dropping the handle mid-transfer should not panic.
@@ -618,7 +757,8 @@ async fn test_drop_download_objects_handle() {
             .s3_config(test_common::s3_config_with_test_http(
                 client.config().to_builder(),
             ))
-            .build();
+            .build()
+            .expect("valid config");
         let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
         let dest = tempfile::tempdir().unwrap();
@@ -748,7 +888,8 @@ async fn test_abort_stops_child_get_before_temp_file_cleanup() {
         .s3_config(test_common::s3_config_with_test_http(
             client.config().to_builder(),
         ))
-        .build();
+        .build()
+        .expect("valid config");
     let tm = aws_sdk_s3_transfer_manager::Client::new(config);
 
     let handle = tm

@@ -7,10 +7,119 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `UploadObjectsInput::builder`, matching the other operation inputs.
+- `set_failure_policy` on `UploadObjectsInputBuilder`, `DownloadObjectsInputBuilder`,
+  `UploadObjectsFluentBuilder`, and `DownloadObjectsFluentBuilder`. `None` selects the default,
+  `FailedTransferPolicy::Abort`.
+- `ConfigLoader::s3_config` uses an existing `SdkConfig` or `S3ClientConfig` in place of loading
+  the shared AWS configuration; `load` still detects the machine profile. A non-empty list set with
+  `ConfigLoader::network_interfaces` replaces the supplied configuration's network interfaces, and
+  an empty list keeps them.
+- `ConfigLoader::read_ahead` sets the client's default download read-ahead, as
+  `config::Builder::read_ahead` does.
+- `ConfigLoader` is exported as `config::ConfigLoader`.
+- `Error::upload_id` returns the ID of a multipart upload that a failed upload left open in S3:
+  under `FailedMultipartUploadPolicy::Retain`, when AbortMultipartUpload failed, or when a worker
+  panic, such as one in the caller's `PartStream`, failed the upload after the multipart upload
+  was created. It is `None` when the multipart upload was aborted.
+- Client construction logs one `INFO` record of the resolved sizing (concurrency target and the
+  signal it came from, memory ceiling, part size, connection cap), a `WARN` when the part size
+  exceeds the memory ceiling, and a `WARN` when the soft file-descriptor limit holds connections
+  per host below the concurrency target.
+
 ### Changed
 - `aws-sdk-s3-transfer-manager`, `aws-sdk-s3-transfer-manager-ext`, `aws-smithy-topology`,
   `aws-smithy-execution` and `aws-smithy-managed-http`: the minimum supported Rust version is
   1.96.0.
+- `error::Error` no longer implements `From<tokio::task::JoinError>` or
+  `From<std::sync::PoisonError<T>>`. Construct an error of the intended kind with `Error::new`.
+- `io::error` is no longer public. `InputStream::from_path` and `PathBodyBuilder::build` return
+  `error::Error`: a missing path or an offset past the end of the file is
+  `ErrorKind::InputInvalid`, and a failure reading file metadata, such as a missing file, is
+  `ErrorKind::IOError` with the `std::io::Error` as its source.
+- A failure of the transfer manager's own file reader that is not a read error, such as a panicked
+  read task, is `ErrorKind::RuntimeError` instead of `ErrorKind::IOError`.
+- `PartData::mark_last` is removed. A `PartStream` ends an upload by returning `None` from
+  `poll_part`.
+- `DownloadInput::part_number` and its getter are no longer public. Single-part downloads are
+  not supported.
+- `io::walk::WalkErrorKind` and `metrics::unit::ByteUnit` are `#[non_exhaustive]`.
+- The fields of `metrics::ThroughputDisplayContext` and `metrics::unit::ByteCountDisplayContext`
+  are private. Create them with `Throughput::display_as`, `ByteUnit::display`, or
+  `ByteCountDisplayContext::new`.
+- `config::Builder::build` returns `Result<Config, BuildError>` and returns an error when
+  `s3_config` is not set, instead of panicking.
+- The transfer manager no longer enables the `behavior-version-latest` feature of `aws-config` or
+  `aws-sdk-s3`. Configuration loaded without a behavior version, such as with
+  `aws_config::load_from_env`, needs one: use `aws_config::load_defaults(BehaviorVersion::latest())`
+  or enable the feature in the application.
+- The `dial9` feature, `config::Builder::dial9_handle`, and `ConfigLoader::dial9_handle` are
+  removed. To trace managed execution, pass the recorder's handle to
+  `ManagedRuntime::builder().dial9_handle`, then adopt the runtime with
+  `aws_sdk_s3_transfer_manager_ext::managed`. The `aws-sdk-s3-transfer-manager-ext` `dial9` feature
+  enables `aws-smithy-execution/dial9` only.
+- The hidden `config::Builder::framework_metadata`, `ConfigLoader::framework_metadata`, and
+  `Config::framework_metadata` are removed. Set framework metadata on the `SdkConfig` or S3
+  configuration.
+- `ErrorKind::IOError` and `ErrorKind::InputInvalid` errors from a local filesystem operation on a
+  known path name the operation and the path, as in `I/O error creating directory "out/logs"`,
+  and the object key for a `download_objects` object.
+  This covers temporary file creation and renaming, for downloads to a path and for
+  `download_objects` objects, directory creation in `download_objects`, opening and reading upload source files, and the directory walk. Except for
+  the directory walk, whose source remains the `io::walk::WalkError`, the error's source is the
+  `std::io::Error` itself, where some of these sites previously used a message that embedded it,
+  such as `failed to open …` or `failed to create directory for key …`.
+- The source of an `ErrorKind::ChildOperationFailed` error from `upload_objects` or
+  `download_objects` is the error of the first failed object, the one that stopped the transfer
+  under `FailedTransferPolicy::Abort`, instead of a message naming it.
+- `download_objects` writes each object at its full key under the destination. The walker's
+  prefix only selects objects and is no longer removed from local paths: with the prefix
+  `photos/`, the key `photos/a.txt` was written to `<dest>/a.txt` and is now written to
+  `<dest>/photos/a.txt`. A prefix that ends partway through a name no longer cuts it: with the
+  prefix `photos`, the key `photos-other/x.txt` was written to `<dest>/-other/x.txt`.
+- `TargetThroughput::gbps` replaces `new_gigabits_per_sec`. It takes an `f64` instead of a `u64`,
+  so targets below 1 Gbps can be expressed, and returns `Result<TargetThroughput, BuildError>`,
+  rejecting a value that is not finite and positive.
+- `TargetThroughput` holds one target for uploads and downloads. `upload()` and `download()` are
+  replaced by `as_gbps()`.
+- The concurrency target, payload-memory ceiling, part size, and connection cap are resolved
+  together at client construction. The concurrency target is not lowered by the memory ceiling
+  or the connection cap: requests beyond either wait for memory admission or a connection.
+- The automatic part size is 8 MiB for both uploads and downloads. Downloads previously used
+  5 MiB, so objects larger than 5 MiB and up to 8 MiB now download with a single GET.
+- The per-host connection cap's descriptor budget is the smaller of half the soft
+  `RLIMIT_NOFILE` and the soft limit less 64 descriptors, so it binds only below a soft limit
+  of 128.
+- The automatic memory ceiling for a client is at least 256 MiB, limited to half of detected
+  memory. `BufferPool` built with `MemoryBudgetConfig::Auto` directly is unchanged.
+
+### Fixed
+- `PathBodyBuilder::build` without a path returns an `ErrorKind::InputInvalid` error instead of
+  panicking.
+- Framework metadata set on the `SdkConfig` or S3 configuration was missing from the
+  `x-amz-user-agent` header of requests the transfer manager sent. The header now carries each
+  entry as `lib/<name>/<version>` alongside the transfer manager's attribution, in the order
+  configured and without duplicates.
+
+### Fixed
+- `upload_objects` with a custom delimiter could derive one key from two files, such as `a-/b` and
+  `a/-b` with the delimiter `--`, and report both as uploaded while the later write replaced the
+  earlier one. It now fails the second file with `ErrorKind::InputInvalid`, names the first file, and
+  follows the `FailedTransferPolicy`. The default and native delimiters keep no key registry.
+- `upload_objects` with an empty `key_prefix` uploads each file under its relative path instead of
+  a key with a leading `/`.
+- `download_objects` accepts a destination containing `.` or `..` components, such as `./out` or
+  `out/../out`, instead of rejecting every object as resolving outside it. The destination is
+  resolved lexically, without following symbolic links.
+- `download_objects` rejects a key that resolves outside a destination made of `..` components, such
+  as `../b.txt` under `..`, which was previously accepted.
+- `download_objects` creates a destination directory that does not exist, with any missing
+  parents, instead of failing.
+- `download_objects` fails an object whose key maps to the destination directory itself, such as
+  `.`, `./`, or `a/..`, with `ErrorKind::InputInvalid` before creating any file or requesting the
+  object. Such an object was previously downloaded to a temporary file beside the destination
+  and then failed to be renamed onto it.
 
 ## [release-2026-11-05]
 

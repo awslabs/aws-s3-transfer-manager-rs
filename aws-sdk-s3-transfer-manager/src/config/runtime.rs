@@ -110,29 +110,16 @@ impl Managed {
     #[cfg(not(target_family = "wasm"))]
     pub(crate) fn build(
         &mut self,
-        #[cfg(feature = "dial9")] recorder: Option<dial9::Dial9Handle>,
     ) -> Result<aws_smithy_execution::ManagedRuntime, aws_smithy_runtime_api::box_error::BoxError>
     {
         match &mut self.source {
-            Source::Automatic => {
-                let builder = aws_smithy_execution::ManagedRuntime::builder()
-                    .thread_name_prefix("s3-tm")
-                    .pin_threads(false);
-                #[cfg(feature = "dial9")]
-                let builder = match recorder {
-                    Some(recorder) => builder.dial9_handle(recorder),
-                    None => builder,
-                };
-                builder.build().map_err(Into::into)
-            }
+            Source::Automatic => aws_smithy_execution::ManagedRuntime::builder()
+                .thread_name_prefix("s3-tm")
+                .pin_threads(false)
+                .build()
+                .map_err(Into::into),
             #[cfg(feature = "__unstable_ext")]
             Source::Adopted(owner) => {
-                #[cfg(feature = "dial9")]
-                if recorder.is_some() {
-                    return Err("configure Dial9 on the runtime builder before adoption; \
-                         a transfer-manager dial9_handle cannot instrument an adopted runtime"
-                        .into());
-                }
                 // Config retains its managed selection after execution takes
                 // ownership. A second take must not construct another runtime.
                 Ok(owner.take().expect("adopted managed runtime already taken"))
@@ -156,12 +143,7 @@ mod tests {
             .unwrap();
         let before = runtime.handle();
         let mut managed = Managed::from_runtime(runtime);
-        let runtime = managed
-            .build(
-                #[cfg(feature = "dial9")]
-                None,
-            )
-            .unwrap();
+        let runtime = managed.build().unwrap();
         let after = runtime.handle();
         assert_eq!(before.id(), after.id());
         assert_eq!(
@@ -184,38 +166,11 @@ mod tests {
                     .starts_with("external-"));
             }))
             .unwrap();
-        let repeated = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            managed.build(
-                #[cfg(feature = "dial9")]
-                None,
-            )
-        }));
+        let repeated = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| managed.build()));
         assert!(
             repeated.is_err(),
             "a consumed owner must not become automatic execution"
         );
         caller.block_on(runtime.shutdown()).unwrap();
-    }
-
-    #[cfg(feature = "dial9")]
-    #[test]
-    fn separate_recorder_is_rejected_without_consuming_the_owner() {
-        let runtime = ManagedRuntime::builder()
-            .topology(Topology::detect().unwrap().with_max_placements(1))
-            .pin_threads(false)
-            .dial9_handle(dial9::Dial9Handle::disabled())
-            .build()
-            .unwrap();
-        let id = runtime.handle().id();
-        let mut managed = Managed::from_runtime(runtime);
-        let error = managed
-            .build(Some(dial9::Dial9Handle::disabled()))
-            .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("configure Dial9 on the runtime builder before adoption"));
-        let runtime = managed.build(None).unwrap();
-        assert_eq!(runtime.handle().id(), id);
-        drop(runtime);
     }
 }

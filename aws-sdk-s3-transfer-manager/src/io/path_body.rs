@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use crate::io::error::{Error, ErrorKind};
+use crate::error::{self, Error};
 use crate::io::stream::{InputStream, RawInputStream};
 use std::fs;
 use std::path::PathBuf;
@@ -89,19 +89,41 @@ impl PathBodyBuilder {
         self
     }
 
-    /// Returns a [`InputStream`] from this builder.
+    /// Returns an [`InputStream`] that reads the configured byte range of the file.
+    ///
+    /// Without an explicit [`length`](PathBodyBuilder::length), the file's size
+    /// is read from filesystem metadata and the stream covers the bytes from
+    /// the offset to the end of the file.
+    ///
+    /// # Errors
+    ///
+    /// - [`ErrorKind::InputInvalid`](crate::error::ErrorKind::InputInvalid) when
+    ///   no [`path`](PathBodyBuilder::path) was set, or when no length was set
+    ///   and the offset is greater than the file's size.
+    /// - [`ErrorKind::IOError`](crate::error::ErrorKind::IOError) when no length
+    ///   was set and the file's metadata cannot be read, for example because the
+    ///   file does not exist.
     pub fn build(self) -> Result<InputStream, Error> {
-        let path = self.path.expect("path set");
+        let path = self
+            .path
+            .ok_or_else(|| error::invalid_input("a path is required to read a file"))?;
         let offset = self.offset.unwrap_or_default();
 
         let length = match self.length {
             None => {
                 // TODO(aws-sdk-rust#1159, design) - evaluate if we want build() to be async and to use tokio for stat() call (bytestream FsBuilder::build() is async)
-                let metadata = self.metadata.unwrap_or(fs::metadata(path.clone())?);
+                let metadata = match self.metadata {
+                    Some(metadata) => metadata,
+                    None => fs::metadata(&path)
+                        .map_err(|e| error::io_at("reading metadata of", &path, e))?,
+                };
                 let file_size = metadata.len();
 
                 if offset > file_size {
-                    return Err(ErrorKind::OffsetGreaterThanFileSize.into());
+                    return Err(error::invalid_input(format!(
+                        "offset {offset} is greater than the size of {} ({file_size} bytes)",
+                        path.display()
+                    )));
                 }
 
                 file_size - offset
@@ -128,6 +150,7 @@ mod test {
     use std::io::Write;
     use tempfile::NamedTempFile;
 
+    use crate::error::ErrorKind;
     use crate::io::{path_body::PathBodyBuilder, InputStream};
 
     use super::PathBody;
@@ -202,17 +225,72 @@ mod test {
         assert_eq!(64, body.length);
     }
 
-    #[should_panic]
     #[test]
     fn test_invalid_offset() {
         let mut tmp = NamedTempFile::new().unwrap();
         let content = "hello path body";
         tmp.write_all(content.as_bytes()).unwrap();
 
-        let _stream = PathBodyBuilder::new()
+        // One byte past the end of the file is the first rejected offset.
+        let err = PathBodyBuilder::new()
             .path(tmp.path())
-            .offset(22)
+            .offset(content.len() as u64 + 1)
+            .build()
+            .unwrap_err();
+        assert_eq!(err.kind(), &ErrorKind::InputInvalid);
+    }
+
+    #[test]
+    fn test_offset_at_end_of_file_is_empty() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        let content = "hello path body";
+        tmp.write_all(content.as_bytes()).unwrap();
+
+        let stream = PathBodyBuilder::new()
+            .path(tmp.path())
+            .offset(content.len() as u64)
             .build()
             .unwrap();
+        assert_eq!(0, path_body(&stream).length);
+    }
+
+    #[test]
+    fn test_missing_path_is_invalid_input() {
+        let err = PathBodyBuilder::new().build().unwrap_err();
+        assert_eq!(err.kind(), &ErrorKind::InputInvalid);
+    }
+
+    #[test]
+    fn test_missing_file_is_io_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = PathBodyBuilder::new()
+            .path(dir.path().join("missing"))
+            .build()
+            .unwrap_err();
+        assert_eq!(err.kind(), &ErrorKind::IOError);
+        let source = std::error::Error::source(&err)
+            .and_then(|source| source.downcast_ref::<std::io::Error>())
+            .expect("the filesystem error is the source");
+        assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn test_supplied_metadata_skips_stat() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        let content = "hello path body";
+        tmp.write_all(content.as_bytes()).unwrap();
+        let metadata = std::fs::metadata(tmp.path()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+
+        // Statting the missing path would fail, so success shows the supplied
+        // metadata was used in its place.
+        let stream = PathBodyBuilder::new()
+            .path(dir.path().join("missing"))
+            .metadata(metadata)
+            .build()
+            .unwrap();
+        let body = path_body(&stream);
+        assert_eq!(0, body.offset);
+        assert_eq!(content.len() as u64, body.length);
     }
 }
