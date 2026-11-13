@@ -1766,6 +1766,35 @@ mod tests {
 
     const MB: u64 = 1024 * 1024;
 
+    /// `chunk_len` returns a full `part_size` chunk for any range that spans
+    /// `remaining == 2^32` as long as `part_size` itself fits a `usize`. The
+    /// pre-fix narrowing would have truncated the span-derived count.
+    #[test]
+    fn chunk_len_does_not_truncate_a_remaining_that_crosses_four_gib() {
+        let part_size = 8 * MB;
+        let boundary = 1u64 << 32;
+        for len in [boundary - 1, boundary, boundary + 1] {
+            let range = 0..=(len - 1);
+            assert_eq!(
+                chunk_len(&range, part_size),
+                part_size as usize,
+                "len={len}",
+            );
+        }
+    }
+
+    /// The final chunk shrinks to what is left in the range, never the
+    /// configured part size. A range that ends just before the 4 GiB
+    /// boundary must still produce a non-zero, non-truncated length.
+    #[test]
+    fn chunk_len_handles_short_final_range_near_four_gib() {
+        let part_size = 8 * MB;
+        let boundary = 1u64 << 32;
+        // A range of exactly 3 bytes starting at 2^32 - 2.
+        let range = (boundary - 2)..=boundary;
+        assert_eq!(chunk_len(&range, part_size), 3);
+    }
+
     #[test]
     fn download_state_snapshot_classifies_execution_and_occupancy() {
         assert_eq!(

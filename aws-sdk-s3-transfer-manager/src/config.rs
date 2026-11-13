@@ -543,4 +543,27 @@ mod tests {
             "error does not name the missing field: {error}"
         );
     }
+
+    /// An explicit part size that fits `usize` on the current target builds
+    /// successfully. 2^32 bytes is representable on 64-bit targets and is the
+    /// smallest value a 32-bit target rejects, so this exercises both halves
+    /// of the platform boundary at a single value.
+    #[test]
+    fn build_accepts_part_size_up_to_usize_max() {
+        let bytes: u64 = 1u64 << 32;
+        let result = Config::builder()
+            .s3_config(S3ClientConfig::from_sdk_builder(s3_config_builder()))
+            .part_size(PartSize::Target(bytes))
+            .build();
+        #[cfg(target_pointer_width = "64")]
+        assert!(result.is_ok(), "expected build to accept {bytes} on 64-bit");
+        #[cfg(target_pointer_width = "32")]
+        {
+            let error = result.expect_err("expected build to reject {bytes} on 32-bit");
+            assert!(
+                error.to_string().contains("part_size"),
+                "error does not name the invalid field: {error}"
+            );
+        }
+    }
 }
