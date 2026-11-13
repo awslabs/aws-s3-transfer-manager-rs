@@ -250,7 +250,7 @@ pub(crate) struct DownloadTransferSummary {
     pub(crate) max_resident_parts: u64,
     /// File preparation, draining, and finalization work.
     pub(crate) destination_work: DownloadDestinationSummary,
-    /// SDK checksum-validation result captured during discovery.
+    /// The checksum verdict, set when the download completes successfully.
     pub(crate) checksum_validation: Option<ChecksumValidation>,
 }
 
@@ -268,7 +268,7 @@ pub(crate) struct DownloadTerminalReport {
     pub(crate) request_total: RequestMetrics,
     /// Scheduler pending intervals attributed by common category.
     pub(crate) pending: TransferPendingStats,
-    /// SDK checksum-validation result captured during discovery.
+    /// The checksum verdict, set when the download completes successfully.
     pub(crate) checksum_validation: Option<ChecksumValidation>,
     /// State captured at the terminal boundary.
     pub(crate) state_snapshot: DownloadStateSnapshot,

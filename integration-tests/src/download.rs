@@ -6,9 +6,10 @@
 //! Download integration tests.
 
 use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
-use aws_sdk_s3_transfer_manager::types::{ConcurrencyMode, PartSize};
+use aws_sdk_s3_transfer_manager::types::{ConcurrencyMode, NotValidatedReason, PartSize};
 use aws_sdk_s3_transfer_manager::RuntimeConfig;
 
+use crate::assertions::assert_not_validated;
 use crate::harness::{mock_tm, mock_tm_with, MockTm};
 use crate::test_data::deterministic_data;
 
@@ -610,7 +611,8 @@ async fn test_download_empty_object() {
     }
 
     assert_eq!(data.len(), 0);
-    handle.join().await.expect("join should succeed");
+    let output = handle.join().await.expect("join should succeed");
+    assert_not_validated(&output, NotValidatedReason::Unavailable);
     m.handle.shutdown().await.expect("shutdown");
 }
 
