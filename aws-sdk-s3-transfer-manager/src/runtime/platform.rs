@@ -400,10 +400,9 @@ const GBPS_PER_CONN: f64 = 0.4;
 /// In-flight requests per vCPU for the fallback seed, used when the instance
 /// family is unknown (unrecognized type, or detection failed / off-EC2). Without
 /// a NIC estimate the seed can't be bandwidth-derived, so it scales concurrency
-/// directly by vCPU. In-flight requests are roughly connection-count, so the
-/// slope is kept modest; the `[FALLBACK_MIN, MAX_CONCURRENCY_SEED]` clamp keeps a
+/// directly by vCPU; the `[FALLBACK_MIN, MAX_CONCURRENCY_SEED]` clamp keeps a
 /// small box off the floor and a large one bounded.
-const FALLBACK_INFLIGHT_PER_VCPU: usize = 5;
+const FALLBACK_INFLIGHT_PER_VCPU: usize = 1;
 
 /// Floor for the fallback seed. A small unknown box (2-6 vCPU) would otherwise
 /// seed below common general-purpose defaults (CRT's 10 Gbps target resolves to
@@ -414,6 +413,9 @@ const FALLBACK_MIN: usize = 32;
 
 /// Peak network bandwidth of each EC2 instance family, as the raw spec of its
 /// largest member: `(family, max_nic_gbps, vcpus_at_that_size)`.
+///
+/// For multi-card families the figure is one card's bandwidth, since the
+/// client uses one card unless network interfaces are configured.
 ///
 /// There is no formula for a family's bandwidth — it is assigned per hardware
 /// generation and read from the published EC2 network-performance spec (e.g.
@@ -434,14 +436,16 @@ const FALLBACK_MIN: usize = 32;
 /// families are excluded so we never seed off a burst ceiling.
 const FAMILY_NIC_GBPS: &[(&str, f64, u32)] = &[
     // Ultra-high (GPU / ML training / inference accelerators)
-    ("p6-b300", 6400.0, 192),
-    ("p5", 3200.0, 192),
-    ("p5en", 3200.0, 192),
-    ("p6-b200", 3200.0, 192),
-    ("trn1n", 1600.0, 128),
+    // Multi-card: one card's bandwidth.
+    ("p6-b300", 350.0, 192),
+    ("p5", 400.0, 192),
+    ("p5en", 100.0, 192),
+    ("p5e", 100.0, 192),
+    ("p6-b200", 200.0, 192),
+    ("trn1n", 800.0, 128),
     ("p6e-gb200", 1700.0, 144),
     ("g7e", 1600.0, 192),
-    ("trn1", 800.0, 128),
+    ("trn1", 600.0, 128),
     ("dl1", 400.0, 96),
     ("p4d", 400.0, 96),
     ("p4de", 400.0, 96),
@@ -486,6 +490,19 @@ const FAMILY_NIC_GBPS: &[(&str, f64, u32)] = &[
     ("f2", 100.0, 192),
     ("i7ie", 100.0, 192),
     ("inf2", 100.0, 192),
+    // Above 1 Gbps per vCPU, which the vCPU fallback would under-seed.
+    ("m5n", 100.0, 96),
+    ("m5dn", 100.0, 96),
+    ("r5n", 100.0, 96),
+    ("r5dn", 100.0, 96),
+    ("m5zn", 100.0, 48),
+    ("x2iezn", 100.0, 48),
+    ("d3en", 75.0, 48),
+    ("is4gen", 50.0, 32),
+    ("d3", 25.0, 32),
+    ("c8ine", 75.0, 48),
+    ("g4dn", 100.0, 96),
+    ("g6e", 400.0, 192),
 ];
 
 /// Machine facts detected once, off the client-construction hot path (in the
@@ -927,7 +944,7 @@ mod tests {
         assert_eq!(
             resolved,
             ResolvedAutoConcurrency {
-                target: 320,
+                target: 64,
                 estimated_gbps: None,
                 source: AutoConcurrencySource::VcpuFallback,
             }
@@ -950,9 +967,9 @@ mod tests {
         // distinct from BOTH the clamp ceiling and the fallback, so the test
         // fails if the hyphenated key stops matching (falling through to
         // fallback) rather than passing via a coincident clamp.
-        // p6-b300 = 6400/192 = 33.333 Gbps/vCPU. At 24 vCPU: 800 Gbps ->
-        // ceil(800/0.4) = 2000. Fallback would be 5*24 = 120. Distinct.
-        assert_eq!(auto_concurrency_seed(Some("p6-b300.6xlarge"), 24), 2000);
+        // p6-b300 = 350/192 Gbps/vCPU. At 24 vCPU: 43.75 Gbps ->
+        // ceil(43.75/0.4) = 110. Fallback would be max(1*24, 32) = 32. Distinct.
+        assert_eq!(auto_concurrency_seed(Some("p6-b300.6xlarge"), 24), 110);
         assert_ne!(
             auto_concurrency_seed(Some("p6-b300.6xlarge"), 24),
             FALLBACK_INFLIGHT_PER_VCPU * 24
@@ -961,26 +978,26 @@ mod tests {
 
     #[test]
     fn test_seed_fallback_scales_with_vcpu() {
-        // Unknown family -> FALLBACK_INFLIGHT_PER_VCPU (5) * vcpus, above the
+        // Unknown family -> FALLBACK_INFLIGHT_PER_VCPU (1) * vcpus, above the
         // FALLBACK_MIN (32) floor.
-        assert_eq!(auto_concurrency_seed(Some("t3.2xlarge"), 8), 40);
-        assert_eq!(auto_concurrency_seed(Some("gcp-n2-standard-64"), 64), 320);
+        assert_eq!(auto_concurrency_seed(Some("m7g.16xlarge"), 64), 64);
+        assert_eq!(auto_concurrency_seed(Some("gcp-n2-standard-96"), 96), 96);
         // No detection at all falls through the same path.
-        assert_eq!(auto_concurrency_seed(None, 16), 80);
+        assert_eq!(auto_concurrency_seed(None, 48), 48);
     }
 
     #[test]
     fn test_seed_fallback_floored_for_small_box() {
         // A small unknown box would seed below the general-purpose default; the
-        // FALLBACK_MIN floor (32) lifts it. 4 vCPU * 5 = 20 -> floored to 32.
+        // FALLBACK_MIN floor (32) lifts it. 4 vCPU * 1 = 4 -> floored to 32.
         assert_eq!(auto_concurrency_seed(None, 4), FALLBACK_MIN);
         assert_eq!(
             auto_concurrency_seed(Some("gcp-n2-standard-4"), 4),
             FALLBACK_MIN
         );
-        // The floor governs up to 6 vCPU (6 * 5 = 30 < 32); 7 vCPU crosses it.
-        assert_eq!(auto_concurrency_seed(None, 6), FALLBACK_MIN);
-        assert_eq!(auto_concurrency_seed(None, 7), 35);
+        // The floor governs up to 32 vCPU; 33 vCPU crosses it.
+        assert_eq!(auto_concurrency_seed(None, 32), FALLBACK_MIN);
+        assert_eq!(auto_concurrency_seed(None, 33), 33);
     }
 
     #[test]
