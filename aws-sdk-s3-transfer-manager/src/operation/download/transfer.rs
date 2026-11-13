@@ -4067,52 +4067,70 @@ mod tests {
     /// The scheduler drops a transfer from its registry once it has issued all its work,
     /// while that work can still run, and which core runs it decides how soon. The test
     /// drops the transfer by hand so the order is fixed. An abort handle taken after that
-    /// must still wait for the work.
+    /// must still wait for the work, and must still cancel the transfer, with or without
+    /// the handle alive.
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
-    async fn abort_waits_for_work_after_the_scheduler_drops_the_transfer() {
+    async fn abort_cancels_and_waits_after_the_scheduler_drops_the_transfer() {
         use crate::operation::download::test_util::sink::{Match, ScriptedSinkFactory};
         use crate::operation::download::Download;
         use std::sync::Arc;
         use std::time::Duration;
 
         const TIMEOUT: Duration = Duration::from_secs(5);
-        let HoldSetup {
-            handle,
-            script,
-            input,
-            dir,
-        } = hold_setup(Match::NthWrite(1));
-        let file = std::fs::File::create(dir.path().join("object")).unwrap();
-        let download = Download::orchestrate_to_file(
-            Arc::clone(&handle),
-            input,
-            file,
-            &ScriptedSinkFactory(Arc::clone(&script)),
-        )
-        .unwrap();
-        let held = tokio::task::spawn_blocking({
-            let script = Arc::clone(&script);
-            move || script.wait_held(TIMEOUT)
-        })
-        .await
-        .unwrap();
-        handle.scheduler.forget_for_test(download.transfer_id());
-
-        let abort_handle = download.abort_handle();
-        drop(download);
-        let abort = tokio::spawn(async move { abort_handle.abort().await });
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(
-            !abort.is_finished(),
-            "abort returned while the write was held"
-        );
-        held.release();
-        tokio::time::timeout(TIMEOUT, abort)
-            .await
-            .expect("abort returns once the write is released")
+        for scenario in [HoldScenario::DropHandle, HoldScenario::AbortDuringJoin] {
+            let HoldSetup {
+                handle,
+                script,
+                input,
+                dir,
+            } = hold_setup(Match::NthWrite(1));
+            let file = std::fs::File::create(dir.path().join("object")).unwrap();
+            let download = Download::orchestrate_to_file(
+                Arc::clone(&handle),
+                input,
+                file,
+                &ScriptedSinkFactory(Arc::clone(&script)),
+            )
             .unwrap();
-        crate::runtime::test_util::shutdown(&handle).await;
+            let held = tokio::task::spawn_blocking({
+                let script = Arc::clone(&script);
+                move || script.wait_held(TIMEOUT)
+            })
+            .await
+            .unwrap();
+            handle.scheduler.forget_for_test(download.transfer_id());
+
+            let abort_handle = download.abort_handle();
+            let join = match scenario {
+                HoldScenario::AbortDuringJoin => Some(tokio::spawn(download.join())),
+                _ => {
+                    drop(download);
+                    None
+                }
+            };
+            let abort = tokio::spawn(async move { abort_handle.abort().await });
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert!(
+                !abort.is_finished(),
+                "abort returned while the write was held: {scenario:?}"
+            );
+            held.release();
+            let outcome = tokio::time::timeout(TIMEOUT, abort)
+                .await
+                .expect("abort returns once the write is released")
+                .unwrap();
+            assert_eq!(
+                outcome,
+                crate::types::AbortOutcome::Cancelled,
+                "{scenario:?}"
+            );
+            if let Some(join) = join {
+                let error = join.await.unwrap().expect_err("an aborted download fails");
+                assert_eq!(error.kind(), &crate::error::ErrorKind::OperationCancelled);
+            }
+            crate::runtime::test_util::shutdown(&handle).await;
+        }
     }
 
     /// Aborting a download that already completed reports that it had completed,

@@ -1306,6 +1306,9 @@ impl AbortHandle {
     /// [`AlreadyCompleted`]: crate::types::AbortOutcome::AlreadyCompleted
     /// [`Cancelled`]: crate::types::AbortOutcome::Cancelled
     pub async fn abort(&self) -> crate::types::AbortOutcome {
+        // The scheduler finds nothing to cancel once it has dropped the transfer from its
+        // registry, so mark the transfer cancelled here, as dropping a handle does.
+        self.ctx.set_cancelled();
         // The cancellation also waits for the transfer's direct children. Cancelling
         // removes the transfer from the scheduler registry, so after an earlier
         // cancel, such as a handle drop, only the descriptor taken while the
