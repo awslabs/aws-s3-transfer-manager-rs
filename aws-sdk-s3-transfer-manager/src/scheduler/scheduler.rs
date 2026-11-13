@@ -962,8 +962,7 @@ impl Scheduler {
         self.0.transfers.read().unwrap().len()
     }
 
-    /// Removes a transfer from the registry as `PollWork::Done` does, leaving work
-    /// already dispatched for it running.
+    /// Removes a transfer from the registry as `PollWork::Done` does.
     #[cfg(test)]
     pub(crate) fn forget_for_test(&self, id: TransferId) {
         let _ = self.remove_transfer_atomic(id);

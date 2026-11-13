@@ -560,9 +560,7 @@ pub(crate) struct TransferContext {
     pending_state: Option<Arc<TransferPendingState>>,
     /// Per-transfer metrics backing store
     pub(crate) metrics: Arc<MetricsState>,
-    /// The scheduler's descriptor for this transfer, set when it is enqueued. Work in
-    /// flight keeps the descriptor alive after the scheduler drops the transfer from its
-    /// registry, so the reference upgrades while work remains.
+    /// The scheduler's descriptor for this transfer, set when it is enqueued.
     descriptor: Arc<std::sync::OnceLock<crate::scheduler::descriptor::WeakTransferDescriptor>>,
     /// User agent features of the operation this transfer belongs to
     features: OperationFeatures,
@@ -1264,12 +1262,9 @@ impl SchedulingCtl<'_> {
 
 /// Cancels a transfer and waits until none of its work is running.
 ///
-/// Obtained from a handle's `abort_handle` method, for example
+/// Obtained from a handle's `abort_handle` method, such as
 /// [`ManagedDownloadHandle::abort_handle`](crate::operation::download::ManagedDownloadHandle::abort_handle).
-/// Unlike the handle, it outlives a `join` that a timeout dropped, and so it
-/// outlives the handle itself. Dropping a handle cancels without waiting, so a
-/// caller that must reuse a resource it supplied, such as a file, calls
-/// [`abort`](Self::abort) first.
+/// It outlives the handle, so it still works after a timeout drops `join`.
 ///
 /// ```ignore
 /// let handle = tm.download().bucket("b").key("k").write_to_file(file)?;
@@ -1289,30 +1284,19 @@ pub struct AbortHandle {
 impl AbortHandle {
     /// Cancel the transfer and wait for its in-flight work to stop.
     ///
-    /// When this method returns, no work of the transfer is running and none will
-    /// start, so the caller may reuse a resource it provided. Calling it again is
-    /// harmless, and after the transfer finished it returns immediately. Call it
-    /// after the handle has been dropped or joined, not while another thread is
-    /// still dropping it.
+    /// When this returns, no work of the transfer is running and none will start.
+    /// Calling it again is harmless.
     ///
-    /// The wait has no limit: a write stalled in the operating system keeps this
-    /// pending. Wrap it in a timeout to bound it, and treat the resource as in use
-    /// when that timeout expires.
+    /// The wait has no limit: a write stalled in the operating system keeps it
+    /// pending. Wrap it in a timeout to bound it.
     ///
-    /// Returns [`AlreadyCompleted`] when the transfer had completed before the
-    /// cancel took effect, and [`Cancelled`] otherwise, including a transfer that
-    /// had failed.
+    /// Returns [`AlreadyCompleted`] if the transfer had completed before the cancel
+    /// took effect, and [`Cancelled`] otherwise, including a failed transfer.
     ///
     /// [`AlreadyCompleted`]: crate::types::AbortOutcome::AlreadyCompleted
     /// [`Cancelled`]: crate::types::AbortOutcome::Cancelled
     pub async fn abort(&self) -> crate::types::AbortOutcome {
-        // The scheduler finds nothing to cancel once it has dropped the transfer from its
-        // registry, so mark the transfer cancelled here, as dropping a handle does.
         self.ctx.set_cancelled();
-        // The cancellation also waits for the transfer's direct children. Cancelling
-        // removes the transfer from the scheduler registry, so after an earlier
-        // cancel, such as a handle drop, only the descriptor taken while the
-        // transfer was registered still counts the work that was executing.
         self.ctx
             .handle
             .scheduler
@@ -1331,8 +1315,6 @@ impl AbortHandle {
 }
 
 impl TransferContext {
-    /// Records the scheduler's descriptor for this transfer. Called once, when the
-    /// scheduler enqueues the transfer.
     pub(crate) fn set_descriptor(
         &self,
         descriptor: crate::scheduler::descriptor::WeakTransferDescriptor,

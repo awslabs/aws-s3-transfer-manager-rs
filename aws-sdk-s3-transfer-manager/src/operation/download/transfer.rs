@@ -4033,12 +4033,9 @@ mod tests {
     /// After the caller gives up on a `write_to_file` download and waits on its abort
     /// handle, no issued operation modifies data the caller then writes to the file.
     ///
-    /// A destination write and the final resize are synchronous, so cancelling
-    /// cannot stop one already issued. The test holds one of them, gives up on the
-    /// handle, and requires the abort handle to stay pending until the operation
-    /// is released. A late write would leave object bytes in the file, and a late
-    /// resize would pad it with zeros. Both fail the final comparison if
-    /// `AbortHandle::abort` returns before the operation finishes.
+    /// The test holds one destination operation, gives up on the handle, and requires
+    /// the abort handle to stay pending until the operation is released. A late write
+    /// would leave object bytes in the file, and a late resize would pad it with zeros.
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn file_is_safe_to_reuse_after_abort_returns() {
@@ -4064,11 +4061,9 @@ mod tests {
         assert!(failures.is_empty(), "{failures:#?}");
     }
 
-    /// The scheduler drops a transfer from its registry once it has issued all its work,
-    /// while that work can still run, and which core runs it decides how soon. The test
-    /// drops the transfer by hand so the order is fixed. An abort handle taken after that
-    /// must still wait for the work, and must still cancel the transfer, with or without
-    /// the handle alive.
+    /// After the scheduler has dropped a transfer from its registry, an abort handle must
+    /// still cancel the transfer and wait for its held write, with the download handle
+    /// dropped or alive.
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn abort_cancels_and_waits_after_the_scheduler_drops_the_transfer() {
