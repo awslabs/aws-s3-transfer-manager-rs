@@ -1718,7 +1718,8 @@ fn process_object_metadata(mut meta: ObjectMetadata) -> ObjectMetadata {
 /// the discovery chunk, the one case where the chunk checksum can be the object
 /// checksum. Otherwise value members and the type are left `None`.
 ///
-/// A [`ChecksumType::Composite`] value is a checksum of part checksums. Its value members
+/// A [`ChecksumType::Composite`](crate::model::ChecksumType::Composite) value is a checksum of
+/// part checksums. Its value members
 /// are left `None` and only the type is reported.
 ///
 /// Validation is reported `Disabled` when not requested, else

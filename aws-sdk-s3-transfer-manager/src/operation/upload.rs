@@ -19,8 +19,10 @@
 //! checksum you supplied is invalid. These are the invalid cases:
 //!
 //! - A [`PartStream`](crate::io::PartStream) part carries a
-//!   [checksum](crate::io::PartData::with_checksum), but the upload has no [`ChecksumStrategy`] set.
-//! - [`UploadInput::content_md5`] is set, and the upload is sent as a multipart upload. A
+//!   [checksum](crate::io::PartData::with_checksum), but the upload has no
+//!   [checksum strategy](crate::operation::upload::ChecksumStrategy) set.
+//! - The upload sets [Content-MD5](crate::operation::upload::UploadInput::content_md5()),
+//!   and the upload is sent as a multipart upload. A
 //!   Content-MD5 covers the whole object, which only a single-request upload can carry.
 
 /// Operation builders
