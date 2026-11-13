@@ -797,6 +797,9 @@ mod tests {
         assert!((MIN_CONNECTIONS_PER_HOST..=MAX_CONNECTIONS_PER_HOST).contains(&cap.max_per_host));
     }
 
+    // The test value represents a 64 GiB host (65_536_000 kB × 1024), which
+    // does not fit a 32-bit `usize`.
+    #[cfg(target_pointer_width = "64")]
     #[test]
     fn test_parse_meminfo_total() {
         let s = "MemFree: 100 kB\nMemTotal:    65536000 kB\nBuffers: 5 kB\n";

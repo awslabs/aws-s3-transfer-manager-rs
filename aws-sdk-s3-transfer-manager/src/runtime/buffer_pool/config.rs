@@ -467,6 +467,9 @@ mod tests {
         );
     }
 
+    // `8 * GIB` exceeds a 32-bit `usize`; the reserved-vs-prepared split only
+    // needs an above-committed value, which only exists on 64-bit.
+    #[cfg(target_pointer_width = "64")]
     #[test]
     fn test_pool_construction_prepares_no_capacity() {
         let pool = BufferPool::from_capacity(
