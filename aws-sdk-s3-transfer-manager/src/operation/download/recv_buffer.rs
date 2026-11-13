@@ -201,9 +201,7 @@
 use crossbeam_utils::CachePadded;
 
 use crate::runtime::sync::cell::UnsafeCell;
-use crate::runtime::sync::sync::atomic::{
-    AtomicBool, AtomicPtr, AtomicU64, AtomicU8, AtomicUsize, Ordering,
-};
+use crate::runtime::sync::sync::atomic::{AtomicPtr, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use crate::runtime::sync::sync::{Arc, Mutex};
 
 /// Default slots per segment for the test-only default buffer constructor.
@@ -478,7 +476,7 @@ pub(crate) struct SegmentWrite<T> {
     /// Exactly-once guard for [`drain`](Self::drain), shared by `complete` and `Drop`.
     /// Per-token (not per-segment): a segment may have several outstanding runs, each
     /// of which must free its own slots exactly once.
-    drained: AtomicBool,
+    drained: bool,
 }
 
 impl<T> SegmentWrite<T> {
@@ -511,10 +509,10 @@ impl<T> SegmentWrite<T> {
     /// A run written out of order (e.g. a later segment completed while an earlier one
     /// still writes) frees its memory immediately even though its shelf waits its turn
     /// at the front.
-    fn drain(&self) -> u64 {
-        // Idempotency guard: complete() then drop, or a double drain, frees nothing the
-        // second time. AcqRel so the freeing below happens once.
-        if self.drained.swap(true, Ordering::AcqRel) {
+    fn drain(&mut self) -> u64 {
+        // Exactly-once guard: complete() then drop, or a double drain, frees nothing
+        // the second time. The &mut receiver makes this structurally exclusive.
+        if std::mem::replace(&mut self.drained, true) {
             return 0;
         }
         let mut freed = 0u64;
@@ -522,7 +520,7 @@ impl<T> SegmentWrite<T> {
             // SAFETY: advancing `claim_cursor` under the lock in `take_drain_run` made
             // this token the sole accessor of `[start, start + len)`, and the two
             // consumption surfaces are mutually exclusive per instance (ordering rule
-            // 5, plus the surface contract), so no other drainer or stream consumer
+            // 6, plus the surface contract), so no other drainer or stream consumer
             // touches these slots. Freeing the payload releases whatever it carries
             // (e.g. a memory reservation).
             slot.data.with_mut(|p| unsafe {
@@ -543,7 +541,7 @@ impl<T> SegmentWrite<T> {
     /// reclaim drained front segments. Returns the parts freed (the run length) so the
     /// caller can release that much read-ahead occupancy. Equivalent to dropping the
     /// token, but explicit at the call site and it hands back the freed count.
-    pub(crate) fn complete(self) -> u64 {
+    pub(crate) fn complete(mut self) -> u64 {
         // `drain` runs the payload free + reclaim; `self` then drops here and its Drop
         // sees the `drained` guard set, so the drop-time drain is a no-op.
         self.drain()
@@ -591,35 +589,36 @@ fn reclaim_front<T>(inner: &Inner<T>) {
 // under the lock). The consumer reads only after observing FILLED. T: Send is
 // required because items cross thread boundaries.
 unsafe impl<T: Send> Send for PagedRecvBuffer<T> {}
-// Safety: PagedRecvBuffer holds slots through Arc<Inner<T>>, and each slot wraps
-// its payload in UnsafeCell<Option<T>>, so Sync is not derived automatically.
-// A shared &PagedRecvBuffer<T> can reach &T only through take_drain_run →
-// SegmentWrite::payloads() → Slot::get(). By the time get() is reachable the
-// slot is FILLED and write-once: no producer can write it again, and the
-// SegmentWrite::drained flag ensures each run is consumed exactly once, so no
-// two threads hold a writable view of the same slot simultaneously. The only
-// concurrent access to T is read-only via &T, which requires T: Sync.
-unsafe impl<T: Send + Sync> Sync for PagedRecvBuffer<T> {}
+// Safety: `PagedRecvBuffer` is `Clone`; every clone shares the same
+// `Arc<Inner<T>>`. Sharing `&PagedRecvBuffer<T>` across threads allows nothing
+// that two clones on different threads do not. The only `unsafe` operation
+// reachable on `&PagedRecvBuffer<T>` is `fill`, which writes a slot's
+// `UnsafeCell`. Each `SlotHandle` is a unique, consumed-on-use token: `issued`
+// advances monotonically under the mutex (rule 1), so no two handles name the
+// same slot (rule 3), and no two concurrent fills can race on the same
+// `UnsafeCell`. `T: Send` is sufficient: each `T` moves into its slot from
+// exactly one thread.
+unsafe impl<T: Send> Sync for PagedRecvBuffer<T> {}
 unsafe impl<T: Send> Send for RecvBufferConsumer<T> {}
-// Safety: all mutation goes through `poll_next(&mut self)`, so a shared `&consumer`
-// exposes only Arc/Copy state with no interior mutation — Sync is sound. Needed so a
-// holder of the consumer (e.g. the download `Body`) can itself be Sync.
+// Safety: every method that reads or moves a payload takes `&mut self`, so a
+// shared `&RecvBufferConsumer<T>` exposes no `T` and no interior mutation.
 unsafe impl<T: Send> Sync for RecvBufferConsumer<T> {}
-// Safety: a SlotHandle is claimed on one thread and may be filled on another (the
-// download claims in poll_work, fills in the async execute task). It carries an
-// Arc<Segment<T>> and indices; moving it and filling moves a `T`, so T: Send suffices.
+// Safety: a `SlotHandle` is the only writer of its slot. Filling it moves a `T`
+// into the slot from the thread that holds the handle, and dropping the handle
+// can drop the last `Arc<Segment<T>>`, and with it the segment's payloads. Both
+// move ownership of `T` across threads, so `T: Send` suffices.
 unsafe impl<T: Send> Send for SlotHandle<T> {}
-// Safety: a SegmentWrite can be sent to another thread while it holds a claimed run;
-// the run contains T values that may be read on the receiving thread, so T: Send is
-// required. No shared reference to T is created by moving the SegmentWrite itself.
+// Safety: a `SegmentWrite` has exclusive access to its run, so sending it moves
+// that access to the receiving thread, which reads the payloads and frees them
+// when the run is drained. Dropping the token can also drop the last
+// `Arc<Inner<T>>`, and with it every payload the buffer still holds. Both move
+// ownership of `T` across threads, so `T: Send` suffices.
 unsafe impl<T: Send> Send for SegmentWrite<T> {}
-// Safety: SegmentWrite holds an Arc<Segment<T>>, and each slot in the segment
-// wraps its payload in UnsafeCell<Option<T>>, so Sync is not derived automatically.
-// A shared &SegmentWrite<T> reaches &T only through payloads() → Slot::get().
-// Every slot in the run is FILLED and write-once before the SegmentWrite is
-// issued, and the drained flag ensures the run is consumed exactly once, so no
-// two threads hold a writable view of the same slot simultaneously. The only
-// concurrent access to T is read-only via &T, which requires T: Sync.
+// Safety: a `SegmentWrite` is the only accessor of its run's slots, and every
+// slot in the run is `FILLED`, so no other thread writes them while the token
+// is live. A shared `&SegmentWrite<T>` exposes only `&T`, through `payloads()`;
+// the payloads are freed by `drain`, which requires `&mut self`. Sharing `&T`
+// across threads requires `T: Sync`.
 unsafe impl<T: Send + Sync> Sync for SegmentWrite<T> {}
 
 impl<T> PagedRecvBuffer<T> {
@@ -810,7 +809,7 @@ impl<T> PagedRecvBuffer<T> {
                     inner: self.inner.clone(),
                     start,
                     len: take,
-                    drained: AtomicBool::new(false),
+                    drained: false,
                 });
             }
         }
@@ -1093,13 +1092,14 @@ mod tests {
         assert_send_sync::<RecvBufferConsumer<u8>>();
         assert_send::<SlotHandle<u8>>();
 
-        // Cell<u8> is Send but !Sync. The types are Send (items cross thread
-        // boundaries) but must not be Sync (exposing &Cell<u8> across threads
-        // would allow concurrent mutation with no synchronization).
-        assert_send::<PagedRecvBuffer<Cell<u8>>>();
+        // `Cell<u8>` is `Send` but not `Sync`. Two threads sharing one
+        // `SegmentWrite` each get `&Cell<u8>` to the same slot via `payloads()`,
+        // and `Cell::set` takes `&self` — so both could call `set` concurrently,
+        // a data race through shared references. `PagedRecvBuffer` never hands
+        // out `&T` through a shared reference, so it stays `Sync`.
         assert_send::<SegmentWrite<Cell<u8>>>();
-        static_assertions::assert_not_impl_all!(PagedRecvBuffer<Cell<u8>>: Sync);
         static_assertions::assert_not_impl_all!(SegmentWrite<Cell<u8>>: Sync);
+        assert_send_sync::<PagedRecvBuffer<Cell<u8>>>();
     }
 
     /// All permutations of `0..n`, via Heap's algorithm. Used to exhaustively drive
