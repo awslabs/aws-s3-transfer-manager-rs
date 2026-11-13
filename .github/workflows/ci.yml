@@ -305,6 +305,9 @@ jobs:
         run: |
           cargo test --locked -p aws-sdk-s3-transfer-manager --lib
           cargo test --locked -p aws-sdk-s3-transfer-manager --tests
+      - name: Mock-server integration tests
+        run: |
+          cargo test --locked -p integration-tests
 
   e2e:
     name: E2E (${{ matrix.name }})
