@@ -395,7 +395,6 @@ impl PathBodyPartReader {
             }) => (offset, part_number, part_size),
             None => return Ok(None),
         };
-        let part_size = part_size as usize;
         let mut dst = stream_cx.part_buffer();
         poll_fn(|cx| dst.poll_acquire(cx, part_size)).await?;
 
@@ -441,10 +440,10 @@ impl PathBodyPartReader {
                 part_number,
             ));
         }
-        let part_size = cmp::min(stream_cx.part_size() as u64, state.remaining);
-        state.offset += part_size;
+        let part_size = state.remaining.min(stream_cx.part_size() as u64) as usize;
+        state.offset += part_size as u64;
         state.part_number += 1;
-        state.remaining -= part_size;
+        state.remaining -= part_size as u64;
 
         Ok(Some(PathBodyReadCursor {
             offset,
@@ -459,7 +458,7 @@ impl PathBodyPartReader {
 struct PathBodyReadCursor {
     offset: u64,
     part_number: u64,
-    part_size: u64,
+    part_size: usize,
 }
 
 /// Custom-stream reader state shared by the reader and its currently active future.
@@ -1297,6 +1296,37 @@ mod test {
         // Third advance should fail due to misaligned offset
         let result = reader.advance(&stream_cx);
         assert!(result.is_err());
+    }
+
+    /// A `state.remaining` that does not fit `usize` still produces a
+    /// `part_size` equal to `stream_cx.part_size()`, and advances the
+    /// reader state by that same amount.
+    #[test]
+    #[cfg(target_pointer_width = "32")]
+    fn test_path_body_part_reader_advance_at_four_gib_remaining() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(&[0u8; 1]).unwrap();
+
+        // A length above `usize::MAX` on 32-bit; the file itself stays tiny
+        // because `advance` never touches it.
+        let length: u64 = (1u64 << 32) + 1;
+        let path_body = PathBody {
+            path: tmp.path().to_path_buf(),
+            offset: 0,
+            length,
+        };
+        let reader = PathBodyPartReader::new(path_body).unwrap();
+        let stream_cx = test_stream_cx(5);
+
+        let result = reader.advance(&stream_cx).unwrap().unwrap();
+        assert_eq!(result.offset, 0);
+        assert_eq!(result.part_number, 1);
+        assert_eq!(result.part_size, 5);
+
+        let state = reader.state.lock().unwrap();
+        assert_eq!(state.offset, 5);
+        assert_eq!(state.part_number, 2);
+        assert_eq!(state.remaining, length - 5);
     }
 
     // A range shorter than one part is claimed whole, and the claim after it
