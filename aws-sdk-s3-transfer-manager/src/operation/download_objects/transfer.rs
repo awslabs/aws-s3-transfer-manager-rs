@@ -862,7 +862,7 @@ impl DownloadObjectsTransfer {
             if let Err(err) = self.prepare_destination() {
                 let mut state = self.inner.state.lock();
                 state.walk_in_flight = false;
-                // set_failed alone: check_terminal arbitrates the terminal signal once in-flight work (children/walks/reaps) drains.
+                // Fail the transfer and write its summary; the terminal signal waits until in-flight work drains.
                 self.inner.ctx.set_failed(err);
                 self.report_terminal(state.snapshot());
                 if self.check_terminal(&state).is_some() {
