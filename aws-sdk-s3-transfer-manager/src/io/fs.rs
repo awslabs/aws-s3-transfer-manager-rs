@@ -16,8 +16,8 @@
 //! at their offsets, and [`create_first_new`] creates the first of several
 //! candidate paths that does not exist yet, without opening any existing entry.
 //! [`Handle`] identifies the file a path names, so that two paths can be
-//! compared. [`open_regular_file`] opens an upload source and rejects any
-//! handle that is not a regular file.
+//! compared. [`open_without_blocking`] opens a file without waiting for a
+//! FIFO writer, and [`restore_blocking`] clears that mode on the handle.
 //!
 //! The `_async` helpers keep blocking filesystem calls off async worker
 //! threads: natively through `tokio::fs` or tokio's blocking pool, and inline
@@ -266,32 +266,21 @@ pub(crate) async fn create_first_new_async(
     run_blocking(move || create_first_new(candidates)).await
 }
 
-/// Opens `path` for reading
-///
-/// # Errors
-///
-/// Returns the error from opening the path or querying its handle. Returns an
-/// [`io::ErrorKind::InvalidInput`] error if the handle names anything other
-/// than a regular file.
-pub(crate) fn open_regular_file(path: &Path) -> io::Result<File> {
-    // Get the open handle to avoid the race between a separate metadata lookup
-    // and the actual open.
-    // The open does not block, so a FIFO without a writer is rejected rather
-    // than waited on.
-    let file = open_without_blocking(path)?;
-    if !file.metadata()?.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            crate::io::error::Error::not_regular_file(path),
-        ));
-    }
-    restore_blocking(&file)?;
-    Ok(file)
+/// Whether `file` is a file on disk, rather than a pipe, a character device
+/// (such as `NUL` or a console), or a socket.
+#[cfg(windows)]
+pub(crate) fn is_disk_file(file: &File) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{GetFileType, FILE_TYPE_DISK};
+
+    // SAFETY: the handle is borrowed from `file` and stays open for the call.
+    unsafe { GetFileType(file.as_raw_handle()) == FILE_TYPE_DISK }
 }
 
-/// On unix, we open the file with O_NONBLOCK to avoid blocking on FIFO.
+/// Opens `path` read-only with `O_NONBLOCK`, so opening a FIFO does not wait
+/// for a writer.
 #[cfg(all(unix, not(miri)))]
-fn open_without_blocking(path: &Path) -> io::Result<File> {
+pub(crate) fn open_without_blocking(path: &Path) -> io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt;
 
     File::options()
@@ -302,7 +291,7 @@ fn open_without_blocking(path: &Path) -> io::Result<File> {
 
 /// Clears the `O_NONBLOCK` status flag set by [`open_without_blocking`].
 #[cfg(all(unix, not(miri)))]
-fn restore_blocking(file: &File) -> io::Result<()> {
+pub(crate) fn restore_blocking(file: &File) -> io::Result<()> {
     use nix::fcntl::{fcntl, FcntlArg, OFlag};
     use std::os::unix::io::AsFd;
 
@@ -314,13 +303,13 @@ fn restore_blocking(file: &File) -> io::Result<()> {
 
 /// Opens `path` read-only.
 #[cfg(not(all(unix, not(miri))))]
-fn open_without_blocking(path: &Path) -> io::Result<File> {
+pub(crate) fn open_without_blocking(path: &Path) -> io::Result<File> {
     File::open(path)
 }
 
 /// Does nothing: [`open_without_blocking`] sets no status flags here.
 #[cfg(not(all(unix, not(miri))))]
-fn restore_blocking(_file: &File) -> io::Result<()> {
+pub(crate) fn restore_blocking(_file: &File) -> io::Result<()> {
     Ok(())
 }
 
