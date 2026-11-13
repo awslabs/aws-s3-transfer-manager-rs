@@ -228,35 +228,41 @@ mod test {
         assert_eq!(64, body.length);
     }
 
+    /// Asserts that building from `path` fails with an I/O error naming a
+    /// non-regular file.
+    #[cfg(unix)]
+    fn assert_build_rejects_non_regular_file(path: &std::path::Path) {
+        use aws_smithy_types::error::display::DisplayErrorContext;
+
+        let error = PathBodyBuilder::new().path(path).build().unwrap_err();
+        assert_eq!(error.kind(), &crate::error::ErrorKind::IOError);
+        let message = DisplayErrorContext(&error).to_string();
+        assert!(
+            message.contains("is not a regular file"),
+            "{}: {message}",
+            path.display()
+        );
+    }
+
     #[cfg_attr(miri, ignore)]
     #[test]
     #[cfg(unix)]
     fn test_rejects_non_regular_files() {
-        use aws_smithy_types::error::display::DisplayErrorContext;
-
         let directory = tempfile::tempdir().unwrap();
-        let mut paths = vec![
-            std::path::PathBuf::from("/dev/zero"),
-            directory.path().to_path_buf(),
-        ];
-        // Android's app sandbox denies creating a FIFO in the test directory.
-        #[cfg(not(target_os = "android"))]
-        {
-            let fifo = directory.path().join("fifo");
-            nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).unwrap();
-            paths.push(fifo);
+        for path in [std::path::Path::new("/dev/zero"), directory.path()] {
+            assert_build_rejects_non_regular_file(path);
         }
+    }
 
-        for path in &paths {
-            let error = PathBodyBuilder::new().path(path).build().unwrap_err();
-            assert_eq!(error.kind(), &crate::error::ErrorKind::IOError);
-            let message = DisplayErrorContext(&error).to_string();
-            assert!(
-                message.contains("is not a regular file"),
-                "{}: {message}",
-                path.display()
-            );
-        }
+    /// Android's app sandbox denies creating the FIFO.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    #[cfg(all(unix, not(target_os = "android")))]
+    fn test_rejects_fifo() {
+        let directory = tempfile::tempdir().unwrap();
+        let fifo = directory.path().join("fifo");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).unwrap();
+        assert_build_rejects_non_regular_file(&fifo);
     }
 
     #[test]
