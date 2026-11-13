@@ -91,13 +91,24 @@ are independent.
 `transfer.detail` controls diagnostics for individual upload and download state
 machines. Level `0` is the default and collects nothing. Level `1` collects
 aggregate per-transfer summaries; level `2` also emits individual state-machine
-events. Uploads and downloads provide summaries and events. Transfer records use
-the `aws_sdk_s3_transfer_manager::transfer` tracing target:
+events. Uploads, downloads, `upload_objects` and `download_objects` provide
+summaries and events. Each operation logs under its own target below
+`aws_sdk_s3_transfer_manager::transfer` (`transfer::upload`,
+`transfer::download`, `transfer::upload_objects`, `transfer::download_objects`),
+so the `transfer` target enables all of them:
 
 ```sh
 AWS_S3_TM_DIAGNOSTICS=transfer.detail=1 \
 RUST_LOG=aws_sdk_s3_transfer_manager::transfer=debug \
 cargo run --release --example cp -- ...
+```
+
+A directive also matches longer targets that start with it, so
+`transfer::upload` includes `transfer::upload_objects`. Add a directive for the
+longer target to set it to a different level:
+
+```sh
+RUST_LOG=aws_sdk_s3_transfer_manager::transfer::upload=debug,aws_sdk_s3_transfer_manager::transfer::upload_objects=warn
 ```
 
 #### Flamegraphs

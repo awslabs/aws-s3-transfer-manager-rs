@@ -70,13 +70,21 @@ impl DownloadHandleInner {
         let id = self.transfer.id();
 
         if ctx.is_failed() {
-            tracing::debug!(tid = %ctx.id, "join: cancelling and waiting for idle");
+            tracing::debug!(
+                target: crate::telemetry::TARGET_TRANSFER_DOWNLOAD,
+                tid = %ctx.id,
+                "join: cancelling and waiting for idle",
+            );
             ctx.handle
                 .scheduler
                 .cancel_transfer(id)
                 .wait_for_idle()
                 .await;
-            tracing::debug!(tid = %ctx.id, "join: idle, returning error");
+            tracing::debug!(
+                target: crate::telemetry::TARGET_TRANSFER_DOWNLOAD,
+                tid = %ctx.id,
+                "join: idle, returning error",
+            );
             // take the actual error (only we should do this)
             let err = ctx.take_error().expect("error taken outside of join()");
             return Err(err);

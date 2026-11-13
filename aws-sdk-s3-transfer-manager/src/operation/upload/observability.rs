@@ -241,34 +241,7 @@ impl UploadMode {
 }
 
 /// Terminal status emitted once for an upload transfer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum UploadTerminalOutcome {
-    /// The upload completed successfully.
-    Completed,
-    /// The upload failed.
-    Failed,
-    /// The upload was cancelled.
-    Cancelled,
-}
-
-impl UploadTerminalOutcome {
-    fn from_status(status: TransferStatus) -> Option<Self> {
-        match status {
-            TransferStatus::Completed => Some(Self::Completed),
-            TransferStatus::Failed => Some(Self::Failed),
-            TransferStatus::Cancelled => Some(Self::Cancelled),
-            TransferStatus::Active => None,
-        }
-    }
-
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Completed => "completed",
-            Self::Failed => "failed",
-            Self::Cancelled => "cancelled",
-        }
-    }
-}
+pub(crate) type UploadTerminalOutcome = crate::transfer::TerminalOutcome;
 
 /// Closed diagnostic vocabulary for upload state-machine events.
 ///
@@ -958,7 +931,7 @@ fn emit_event(transfer_id: TransferId, event: UploadEvent, snapshot: UploadState
         | UploadEvent::MultipartUploadScheduled
         | UploadEvent::MultipartUploadCreated => {
             tracing::trace!(
-                target: crate::telemetry::TARGET_TRANSFER,
+                target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
                 tid = %transfer_id,
                 event = event_name,
                 reason,
@@ -971,7 +944,7 @@ fn emit_event(transfer_id: TransferId, event: UploadEvent, snapshot: UploadState
         | UploadEvent::EmptyObjectPartScheduled
         | UploadEvent::CustomSourceBlocked => {
             tracing::trace!(
-                target: crate::telemetry::TARGET_TRANSFER,
+                target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
                 tid = %transfer_id,
                 event = event_name,
                 reason,
@@ -984,7 +957,7 @@ fn emit_event(transfer_id: TransferId, event: UploadEvent, snapshot: UploadState
         }
         UploadEvent::SourceExhausted => {
             tracing::trace!(
-                target: crate::telemetry::TARGET_TRANSFER,
+                target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
                 tid = %transfer_id,
                 event = event_name,
                 reason,
@@ -999,7 +972,7 @@ fn emit_event(transfer_id: TransferId, event: UploadEvent, snapshot: UploadState
         }
         UploadEvent::CompletionReady | UploadEvent::MultipartCompletionStarted => {
             tracing::trace!(
-                target: crate::telemetry::TARGET_TRANSFER,
+                target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
                 tid = %transfer_id,
                 event = event_name,
                 reason,
@@ -1021,7 +994,7 @@ fn emit_source_pending(
     snapshot: UploadStateSnapshot,
 ) {
     tracing::trace!(
-        target: crate::telemetry::TARGET_TRANSFER,
+        target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
         tid = %transfer_id,
         pending_polls = observation.pending_polls(),
         scheduled_elapsed_us = duration_micros(observation.elapsed()),
@@ -1044,7 +1017,7 @@ fn emit_part_started(
     snapshot: UploadStateSnapshot,
 ) {
     tracing::trace!(
-        target: crate::telemetry::TARGET_TRANSFER,
+        target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
         tid = %transfer_id,
         part_number,
         bytes_sent,
@@ -1070,7 +1043,7 @@ fn emit_part_failed(
     _snapshot: UploadStateSnapshot,
 ) {
     tracing::trace!(
-        target: crate::telemetry::TARGET_TRANSFER,
+        target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
         tid = %transfer_id,
         part_number,
         bytes_sent,
@@ -1090,7 +1063,7 @@ fn emit_part_completed(
     snapshot: UploadStateSnapshot,
 ) {
     tracing::trace!(
-        target: crate::telemetry::TARGET_TRANSFER,
+        target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
         tid = %transfer_id,
         part_number,
         bytes_sent,
@@ -1113,7 +1086,7 @@ fn emit_terminal_lifecycle(report: &UploadTerminalReport, outcome: UploadTermina
         .map(|finished_at| finished_at.saturating_duration_since(report.metrics.started_at))
         .unwrap_or_default();
     tracing::debug!(
-        target: crate::telemetry::TARGET_TRANSFER,
+        target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
         tid = %report.transfer_id,
         outcome = outcome.as_str(),
         error_kind = ?report.error_kind,
@@ -1128,7 +1101,7 @@ fn emit_terminal_lifecycle(report: &UploadTerminalReport, outcome: UploadTermina
 fn emit_terminal_summary(transfer_id: TransferId, summary: &UploadTransferSummary) {
     if let Some(multipart) = summary.multipart {
         tracing::debug!(
-            target: crate::telemetry::TARGET_TRANSFER,
+            target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
             tid = %transfer_id,
             outcome = summary.outcome.as_str(),
             mode = summary.mode.as_str(),
@@ -1158,7 +1131,7 @@ fn emit_terminal_summary(transfer_id: TransferId, summary: &UploadTransferSummar
         );
     } else {
         tracing::debug!(
-            target: crate::telemetry::TARGET_TRANSFER,
+            target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
             tid = %transfer_id,
             outcome = summary.outcome.as_str(),
             mode = summary.mode.as_str(),
@@ -1209,7 +1182,7 @@ fn emit_terminal_details(transfer_id: TransferId, summary: &UploadTransferSummar
 
     if let Some(multipart) = summary.multipart {
         tracing::trace!(
-            target: crate::telemetry::TARGET_TRANSFER,
+            target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
             tid = %transfer_id,
             last_active_state = summary.last_active_state.as_str(),
             parts_completed = multipart.parts_completed,
@@ -1242,7 +1215,7 @@ fn emit_request_detail(transfer_id: TransferId, kind: UploadRequestKind, metrics
         return;
     }
     tracing::trace!(
-        target: crate::telemetry::TARGET_TRANSFER,
+        target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
         tid = %transfer_id,
         request_kind = kind.as_str(),
         requests = metrics.requests,

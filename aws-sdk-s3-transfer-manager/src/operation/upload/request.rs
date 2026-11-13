@@ -98,7 +98,10 @@ pub(crate) fn copy_fields_to_upload_part_request(
         // Warn if user is passing a checksum value, but the upload isn't doing checksums.
         // We can't just set a checksum header, because we don't know what algorithm to use.
         if checksum_value.is_some() {
-            tracing::warn!("Ignoring part checksum provided during upload, because no ChecksumStrategy is specified");
+            tracing::warn!(
+                target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
+                "Ignoring part checksum provided during upload, because no ChecksumStrategy is specified",
+            );
         }
     }
 
