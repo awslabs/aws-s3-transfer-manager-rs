@@ -560,6 +560,8 @@ pub(crate) struct TransferContext {
     pending_state: Option<Arc<TransferPendingState>>,
     /// Per-transfer metrics backing store
     pub(crate) metrics: Arc<MetricsState>,
+    /// The scheduler's descriptor for this transfer, set when it is enqueued.
+    descriptor: Arc<std::sync::OnceLock<crate::scheduler::descriptor::WeakTransferDescriptor>>,
     /// User agent features of the operation this transfer belongs to
     features: OperationFeatures,
 }
@@ -818,6 +820,7 @@ impl TransferContext {
         let ctx = Self {
             id,
             metrics: Arc::new(MetricsState::new()),
+            descriptor: Arc::new(std::sync::OnceLock::new()),
             handle,
             status: StateMachineStatus::new(),
             error: Arc::new(Mutex::new(None)),
@@ -1254,6 +1257,77 @@ impl SchedulingCtl<'_> {
             .handle
             .scheduler
             .set_priority(self.ctx.id, priority);
+    }
+}
+
+/// Cancels a transfer and waits until none of its work is running.
+///
+/// Obtained from a handle's `abort_handle` method, such as
+/// [`ManagedDownloadHandle::abort_handle`](crate::operation::download::ManagedDownloadHandle::abort_handle).
+/// It outlives the handle, so it still works after a timeout drops `join`.
+///
+/// ```ignore
+/// let handle = tm.download().bucket("b").key("k").write_to_file(file)?;
+/// let abort = handle.abort_handle();
+/// if tokio::time::timeout(deadline, handle.join()).await.is_err() {
+///     abort.abort().await;
+///     // No write or resize of the file is still running.
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct AbortHandle {
+    ctx: TransferContext,
+    /// `None` when no work of the transfer was in flight.
+    descriptor: Option<crate::scheduler::descriptor::TransferDescriptor>,
+}
+
+impl AbortHandle {
+    /// Cancel the transfer and wait for its in-flight work to stop.
+    ///
+    /// When this returns, no work of the transfer is running and none will start.
+    /// Calling it again is harmless.
+    ///
+    /// The wait has no limit: a write stalled in the operating system keeps it
+    /// pending. Wrap it in a timeout to bound it.
+    ///
+    /// Returns [`AlreadyCompleted`] if the transfer had completed before the cancel
+    /// took effect, and [`Cancelled`] otherwise, including a failed transfer.
+    ///
+    /// [`AlreadyCompleted`]: crate::types::AbortOutcome::AlreadyCompleted
+    /// [`Cancelled`]: crate::types::AbortOutcome::Cancelled
+    pub async fn abort(&self) -> crate::types::AbortOutcome {
+        self.ctx.set_cancelled();
+        self.ctx
+            .handle
+            .scheduler
+            .cancel_transfer(self.ctx.id)
+            .wait_for_idle()
+            .await;
+        if let Some(descriptor) = &self.descriptor {
+            descriptor.wait_for_idle().await;
+        }
+        if self.ctx.transfer_status() == crate::types::TransferStatus::Completed {
+            crate::types::AbortOutcome::AlreadyCompleted
+        } else {
+            crate::types::AbortOutcome::Cancelled
+        }
+    }
+}
+
+impl TransferContext {
+    pub(crate) fn set_descriptor(
+        &self,
+        descriptor: crate::scheduler::descriptor::WeakTransferDescriptor,
+    ) {
+        let _ = self.descriptor.set(descriptor);
+    }
+
+    /// A handle that cancels this transfer and waits for it.
+    pub(crate) fn abort_handle(&self) -> AbortHandle {
+        AbortHandle {
+            ctx: self.clone(),
+            descriptor: self.descriptor.get().and_then(|weak| weak.upgrade()),
+        }
     }
 }
 

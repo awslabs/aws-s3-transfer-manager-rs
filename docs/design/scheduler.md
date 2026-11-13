@@ -372,6 +372,13 @@ at execution start and cooperatively cancels. `wait_for_idle()` blocks until the
 outstanding count (queued + executing) reaches zero. This wait does not imply that all descriptor
 references have dropped.
 
+The scheduler removes a transfer from the registry when `poll_work` returns `Done`, and when it is
+cancelled. Work already dispatched can still be running at either point. A later `cancel_transfer` then
+finds no descriptor, and its wait returns immediately. So each transfer's `TransferContext` keeps a
+weak reference to its descriptor, set when the transfer is enqueued. Work in flight holds the
+descriptor, so the reference upgrades while any work remains. A caller that must wait after an earlier
+cancel, such as a dropped handle, upgrades the reference and waits on that descriptor.
+
 ### State Machine Contracts
 
 A Transfer implementation must uphold several contracts:

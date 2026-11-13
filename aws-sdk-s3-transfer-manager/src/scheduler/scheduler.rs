@@ -262,6 +262,7 @@ impl Scheduler {
                 self.0.ready_set.min_vruntime(),
                 group_vruntime.clone(),
             );
+            desc.transfer().ctx().set_descriptor(desc.downgrade());
             transfers.insert(desc.id(), desc.clone());
             // Serialize activity publication with registry insertion. An idle
             // observer holds this same lock while publishing, so either it
@@ -959,6 +960,12 @@ impl Scheduler {
     #[cfg(test)]
     pub(crate) fn transfer_count(&self) -> usize {
         self.0.transfers.read().unwrap().len()
+    }
+
+    /// Removes a transfer from the registry as `PollWork::Done` does.
+    #[cfg(test)]
+    pub(crate) fn forget_for_test(&self, id: TransferId) {
+        let _ = self.remove_transfer_atomic(id);
     }
 
     /// Current dispatched count (test-only).

@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `AbortHandle`, returned by `ManagedDownloadHandle::abort_handle`. After a timeout drops the `join`
+  future, `AbortHandle::abort` cancels the download and returns when no write or resize of the
+  destination is still running, so a file passed to `write_to_file` is safe to reuse. It returns an
+  `AbortOutcome`. Dropping a handle still cancels without waiting.
 - `UploadObjectsInput::builder`, matching the other operation inputs.
 - `set_failure_policy` on `UploadObjectsInputBuilder`, `DownloadObjectsInputBuilder`,
   `UploadObjectsFluentBuilder`, and `DownloadObjectsFluentBuilder`. `None` selects the default,

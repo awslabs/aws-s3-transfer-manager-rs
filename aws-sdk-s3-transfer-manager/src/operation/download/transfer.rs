@@ -3886,6 +3886,335 @@ mod tests {
         assert_eq!(std::fs::read_dir(download.dir.path()).unwrap().count(), 0);
     }
 
+    /// The setup for a hold scenario: a single-part download on a managed-thread
+    /// handle whose destination operation `hold` freezes until the test releases it.
+    struct HoldSetup {
+        handle: std::sync::Arc<crate::client::Handle>,
+        script: std::sync::Arc<crate::operation::download::test_util::sink::WriteScript>,
+        input: DownloadInput,
+        dir: tempfile::TempDir,
+    }
+
+    fn hold_setup(hold: crate::operation::download::test_util::sink::Match) -> HoldSetup {
+        use crate::operation::download::test_util::fixtures::{
+            managed_test_handle, object_bytes, object_client,
+        };
+        use crate::operation::download::test_util::sink::{Action, WriteScript};
+        use std::sync::Arc;
+
+        let script = Arc::new(WriteScript::default()).on(hold, Action::Hold);
+        let config = crate::Config::builder()
+            .sdk_client(object_client(object_bytes(1024)))
+            .part_size(crate::types::PartSize::Target(8 * 1024 * 1024))
+            .build()
+            .expect("valid config");
+        HoldSetup {
+            handle: managed_test_handle(config, 2),
+            script,
+            input: DownloadInput::builder()
+                .bucket("test-bucket")
+                .key("test-key")
+                .build()
+                .unwrap(),
+            dir: tempfile::tempdir().unwrap(),
+        }
+    }
+
+    /// How the caller gives up on a download whose destination operation is held,
+    /// before reusing the file.
+    #[derive(Debug, Clone, Copy)]
+    enum HoldScenario {
+        /// `join` under a deadline that expires while the operation is held.
+        JoinTimeout,
+        /// Drop the handle.
+        DropHandle,
+        /// Abort through the abort handle while `join` is still running.
+        AbortDuringJoin,
+    }
+
+    /// A caller-provided file after reuse, and the data the caller wrote to it.
+    struct FileAfterReuse {
+        contents: Vec<u8>,
+        caller_data: Vec<u8>,
+    }
+
+    /// Holds one destination operation of a `write_to_file` download and plays
+    /// `scenario`. Then waits on the abort handle taken beforehand, which must
+    /// not return until the old operation is released. Overwrites the file with the
+    /// caller's data and returns the file's final contents.
+    async fn reuse_file_in_hold_scenario(
+        hold: crate::operation::download::test_util::sink::Match,
+        scenario: HoldScenario,
+    ) -> FileAfterReuse {
+        use crate::operation::download::test_util::sink::{Event, ScriptedSinkFactory};
+        use crate::operation::download::Download;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        const TIMEOUT: Duration = Duration::from_secs(5);
+        let HoldSetup {
+            handle,
+            script,
+            input,
+            dir,
+        } = hold_setup(hold);
+        let caller_data = vec![0xEE; 300];
+        let path = dir.path().join("object");
+        let file = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        let download = Download::orchestrate_to_file(
+            Arc::clone(&handle),
+            input,
+            file,
+            &ScriptedSinkFactory(Arc::clone(&script)),
+        )
+        .unwrap();
+
+        let held = tokio::task::spawn_blocking({
+            let script = Arc::clone(&script);
+            move || script.wait_held(TIMEOUT)
+        })
+        .await
+        .unwrap();
+        let held_op = held.op();
+        let abort_handle = download.abort_handle();
+        let mut join = None;
+
+        match scenario {
+            HoldScenario::JoinTimeout => {
+                let timed_out = tokio::time::timeout(Duration::from_millis(100), download.join())
+                    .await
+                    .is_err();
+                assert!(timed_out, "join returned while the operation was held");
+            }
+            HoldScenario::DropHandle => drop(download),
+            HoldScenario::AbortDuringJoin => join = Some(tokio::spawn(download.join())),
+        }
+        let abort = tokio::spawn(async move { abort_handle.abort().await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !abort.is_finished(),
+            "abort returned while the operation was held: {hold:?}, {scenario:?}"
+        );
+        held.release();
+        let outcome = tokio::time::timeout(TIMEOUT, abort).await.unwrap().unwrap();
+        assert_eq!(outcome, crate::types::AbortOutcome::Cancelled);
+        if let Some(join) = join {
+            let error = join.await.unwrap().expect_err("an aborted download fails");
+            assert_eq!(error.kind(), &crate::error::ErrorKind::OperationCancelled);
+        }
+        std::fs::write(&path, &caller_data).unwrap();
+
+        // The old operation has finished once the script logs it, and managed
+        // shutdown waits for any work still queued behind it.
+        tokio::time::timeout(TIMEOUT, async {
+            while !script
+                .events()
+                .iter()
+                .any(|e| matches!(e, Event::Finished(op, _) if *op == held_op))
+            {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the released operation finishes");
+        crate::runtime::test_util::shutdown(&handle).await;
+        FileAfterReuse {
+            contents: std::fs::read(&path).unwrap(),
+            caller_data,
+        }
+    }
+
+    /// After the caller gives up on a `write_to_file` download and waits on its abort
+    /// handle, no issued operation modifies data the caller then writes to the file.
+    ///
+    /// The test holds one destination operation, gives up on the handle, and requires
+    /// the abort handle to stay pending until the operation is released. A late write
+    /// would leave object bytes in the file, and a late resize would pad it with zeros.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn file_is_safe_to_reuse_after_abort_returns() {
+        use crate::operation::download::test_util::sink::Match;
+
+        let mut failures = Vec::new();
+        for hold in [Match::NthWrite(1), Match::Finalize] {
+            for scenario in [
+                HoldScenario::JoinTimeout,
+                HoldScenario::DropHandle,
+                HoldScenario::AbortDuringJoin,
+            ] {
+                let reused = reuse_file_in_hold_scenario(hold, scenario).await;
+                if reused.contents != reused.caller_data {
+                    failures.push(format!(
+                        "{hold:?}/{scenario:?}: file is {} bytes, expected the {} caller bytes",
+                        reused.contents.len(),
+                        reused.caller_data.len()
+                    ));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// After the scheduler has dropped a transfer from its registry, an abort handle must
+    /// still cancel the transfer and wait for its held write, with the download handle
+    /// dropped or alive.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn abort_cancels_and_waits_after_the_scheduler_drops_the_transfer() {
+        use crate::operation::download::test_util::sink::{Match, ScriptedSinkFactory};
+        use crate::operation::download::Download;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        const TIMEOUT: Duration = Duration::from_secs(5);
+        for scenario in [HoldScenario::DropHandle, HoldScenario::AbortDuringJoin] {
+            let HoldSetup {
+                handle,
+                script,
+                input,
+                dir,
+            } = hold_setup(Match::NthWrite(1));
+            let file = std::fs::File::create(dir.path().join("object")).unwrap();
+            let download = Download::orchestrate_to_file(
+                Arc::clone(&handle),
+                input,
+                file,
+                &ScriptedSinkFactory(Arc::clone(&script)),
+            )
+            .unwrap();
+            let held = tokio::task::spawn_blocking({
+                let script = Arc::clone(&script);
+                move || script.wait_held(TIMEOUT)
+            })
+            .await
+            .unwrap();
+            handle.scheduler.forget_for_test(download.transfer_id());
+
+            let abort_handle = download.abort_handle();
+            let join = match scenario {
+                HoldScenario::AbortDuringJoin => Some(tokio::spawn(download.join())),
+                _ => {
+                    drop(download);
+                    None
+                }
+            };
+            let abort = tokio::spawn(async move { abort_handle.abort().await });
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert!(
+                !abort.is_finished(),
+                "abort returned while the write was held: {scenario:?}"
+            );
+            held.release();
+            let outcome = tokio::time::timeout(TIMEOUT, abort)
+                .await
+                .expect("abort returns once the write is released")
+                .unwrap();
+            assert_eq!(
+                outcome,
+                crate::types::AbortOutcome::Cancelled,
+                "{scenario:?}"
+            );
+            if let Some(join) = join {
+                let error = join.await.unwrap().expect_err("an aborted download fails");
+                assert_eq!(error.kind(), &crate::error::ErrorKind::OperationCancelled);
+            }
+            crate::runtime::test_util::shutdown(&handle).await;
+        }
+    }
+
+    /// Aborting a download that already completed reports that it had completed,
+    /// and returns without waiting.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn abort_handle_reports_a_completed_download() {
+        use crate::operation::download::sink::FileSinkFactory;
+        use crate::operation::download::test_util::fixtures::{
+            managed_test_handle, object_bytes, object_client,
+        };
+        use crate::operation::download::Download;
+        use std::sync::Arc;
+
+        let config = crate::Config::builder()
+            .sdk_client(object_client(object_bytes(1024)))
+            .build()
+            .expect("valid config");
+        let handle = managed_test_handle(config, 2);
+        let input = DownloadInput::builder()
+            .bucket("test-bucket")
+            .key("test-key")
+            .build()
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = std::fs::File::create(dir.path().join("object")).unwrap();
+        let download =
+            Download::orchestrate_to_file(Arc::clone(&handle), input, file, &FileSinkFactory)
+                .unwrap();
+        let abort_handle = download.abort_handle();
+        download.join().await.expect("the download succeeds");
+
+        assert_eq!(
+            abort_handle.abort().await,
+            crate::types::AbortOutcome::AlreadyCompleted
+        );
+        crate::runtime::test_util::shutdown(&handle).await;
+    }
+
+    /// A download to a path writes to a temporary file, so giving up on it without
+    /// waiting cannot modify what the caller then writes to the destination.
+    ///
+    /// The held write targets the temporary file that dropping the handle
+    /// removes. It lands on the unlinked file, and the destination keeps the
+    /// caller's data and no temporary file remains.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn path_download_late_write_cannot_reach_destination() {
+        use crate::operation::download::test_util::sink::{Match, ScriptedSinkFactory};
+        use crate::operation::download::Download;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        const TIMEOUT: Duration = Duration::from_secs(5);
+        let HoldSetup {
+            handle,
+            script,
+            input,
+            dir,
+        } = hold_setup(Match::NthWrite(1));
+        let dest = dir.path().join("object");
+        let download = Download::orchestrate_to_path(
+            Arc::clone(&handle),
+            input,
+            dest.clone(),
+            None,
+            &ScriptedSinkFactory(Arc::clone(&script)),
+        )
+        .await
+        .unwrap();
+        let held = tokio::task::spawn_blocking({
+            let script = Arc::clone(&script);
+            move || script.wait_held(TIMEOUT)
+        })
+        .await
+        .unwrap();
+
+        let timed_out = tokio::time::timeout(Duration::from_millis(100), download.join())
+            .await
+            .is_err();
+        assert!(timed_out, "join returned while the write was held");
+        std::fs::write(&dest, b"caller").unwrap();
+        held.release();
+        crate::runtime::test_util::shutdown(&handle).await;
+
+        assert_eq!(std::fs::read(&dest).unwrap(), b"caller");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
     /// A failure after the transfer completed panics in debug builds. The case
     /// is unreachable in practice, since completion is claimed only once every
     /// counted work item has retired. The test reaches it by construction,

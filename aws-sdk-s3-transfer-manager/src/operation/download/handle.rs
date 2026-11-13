@@ -414,6 +414,12 @@ impl ManagedDownloadHandle {
         result
     }
 
+    /// A handle that cancels the download and waits for it. Take it before
+    /// [`join`](Self::join); it outlives this handle.
+    pub fn abort_handle(&self) -> crate::AbortHandle {
+        self.inner.transfer.ctx().abort_handle()
+    }
+
     /// Abort the download and cancel any in-progress work.
     ///
     /// Deletes the temporary file. When this method returns, all work for
