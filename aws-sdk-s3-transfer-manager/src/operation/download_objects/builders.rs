@@ -17,9 +17,10 @@ use super::{DownloadObjectsHandle, DownloadObjectsInputBuilder};
 /// Fluent builder for constructing a multiple object download.
 ///
 /// Walk behavior (prefix, filter, pagination) is configured by supplying an
-/// [`S3Walker`] via [`walker`](Self::walker). The walker's prefix scopes the
-/// listing and is stripped from each key to build its local path. See
-/// [`DownloadObjectsInput`](super::DownloadObjectsInput) for the full rules.
+/// [`S3Walker`] via [`walker`](Self::walker). The walker's prefix selects the
+/// objects, and each object is written at its full key under the destination.
+/// See [`DownloadObjectsInput`](super::DownloadObjectsInput) for the full
+/// rules.
 #[derive(Debug)]
 pub struct DownloadObjectsFluentBuilder {
     handle: Arc<crate::client::Handle>,
@@ -61,7 +62,17 @@ impl DownloadObjectsFluentBuilder {
         self.inner.get_bucket()
     }
 
-    /// The local directory to download into. Required.
+    /// The local directory to download into. Required: an unset or empty path
+    /// fails [`initiate`](Self::initiate) with
+    /// [`ErrorKind::InputInvalid`](crate::error::ErrorKind::InputInvalid).
+    ///
+    /// Created, with any missing parents, if it does not exist. A destination
+    /// that exists and is not a directory fails the transfer with
+    /// [`ErrorKind::InputInvalid`](crate::error::ErrorKind::InputInvalid) from
+    /// [`join`](DownloadObjectsHandle::join). Each object is written at its
+    /// full key beneath it; see
+    /// [`DownloadObjectsInput`](super::DownloadObjectsInput) for how keys map
+    /// to paths.
     pub fn destination(mut self, input: impl Into<PathBuf>) -> Self {
         self.inner = self.inner.destination(input);
         self
@@ -117,8 +128,8 @@ impl DownloadObjectsFluentBuilder {
 
     /// Walker configuration (prefix, filter, pagination, etc.).
     ///
-    /// The walker's prefix scopes the listing and is stripped from each key
-    /// to build its local path. When not set, the default walker lists the
+    /// The walker's prefix selects the objects to download and does not
+    /// change their local paths. When not set, the default walker lists the
     /// whole bucket.
     pub fn walker(mut self, input: S3Walker) -> Self {
         self.inner = self.inner.walker(input);

@@ -372,7 +372,17 @@ impl UploadTransfer {
         drop(state);
         match failure {
             Some(failure) => {
-                self.inner.ctx.set_failed(failure.error);
+                // The upload is still open in S3 unless AbortMultipartUpload
+                // removed it: the policy is `Retain`, or the abort failed.
+                // `end_aborting` runs only once no abort is pending, so these
+                // are the remaining outcomes.
+                let error = match upload_id {
+                    Some(upload_id) if abort_mpu != AbortMpuProgress::Done => {
+                        failure.error.with_upload_id(upload_id)
+                    }
+                    _ => failure.error,
+                };
+                self.inner.ctx.set_failed(error);
             }
             None => {
                 // An upload ID with no AbortMultipartUpload to send means the
@@ -861,10 +871,10 @@ impl UploadTransfer {
         // without one uses the configured size and enforces the limit as parts are produced.
         let part_size = match size_hint.upper() {
             Some(upper) => cmp::max(
-                self.inner.ctx.handle.upload_part_size_bytes(),
+                self.inner.ctx.handle.part_size_bytes(),
                 upper.div_ceil(MAX_PARTS),
             ),
-            None => self.inner.ctx.handle.upload_part_size_bytes(),
+            None => self.inner.ctx.handle.part_size_bytes(),
         };
         let plan = if reads_until_eof {
             PartPlan::UntilEof { size_hint }
@@ -1362,7 +1372,7 @@ impl UploadTransfer {
                 Ok(body) => body,
                 Err(error) => {
                     let state = self.inner.state.lock().expect("lock poisoned");
-                    return self.fail(state, error.into(), FailedRequest::Other);
+                    return self.fail(state, error, FailedRequest::Other);
                 }
             };
 
@@ -1909,6 +1919,15 @@ impl Transfer for UploadTransfer {
         self.inner.abort_parts_token.cancel();
         if let Some(upload_id) = left_open {
             self.warn_upload_left_open(&upload_id);
+            // A failure forced from outside, such as a worker panic, is stored
+            // before this hook runs and before the terminal signal `join()`
+            // waits on, so the ID reaches the error `join()` returns.
+            if self.inner.ctx.is_failed() {
+                self.inner.ctx.amend_error(|err| match err.upload_id() {
+                    Some(_) => err,
+                    None => err.with_upload_id(upload_id),
+                });
+            }
         }
         self.report_terminal(snapshot);
         // Last, after the lock and the transfer's own cleanup: it can own the

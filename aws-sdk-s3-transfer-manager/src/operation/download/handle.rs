@@ -413,11 +413,7 @@ impl ManagedDownloadHandle {
         let result = self.inner.join().await;
 
         match &result {
-            Ok(_) => {
-                if let Err(e) = self.finalize().await {
-                    return Err(error::from_kind(error::ErrorKind::IOError)(e));
-                }
-            }
+            Ok(_) => self.finalize().await?,
             Err(_) => {
                 self.cleanup().await;
             }
@@ -463,7 +459,7 @@ impl ManagedDownloadHandle {
     ///
     /// Takes the temporary path before renaming, so neither
     /// [`cleanup`](Self::cleanup) nor drop acts on that name afterwards.
-    async fn finalize(&mut self) -> std::io::Result<()> {
+    async fn finalize(&mut self) -> Result<(), error::Error> {
         if let (Some(temp), Some(dest)) = (self.temp_path.take(), &self.dest_path) {
             // TODO(vnext): consider an opt-in download durability policy. Managed
             // path downloads would sync file data before rename and the parent
@@ -471,7 +467,7 @@ impl ManagedDownloadHandle {
             // semantics make this a client/API policy rather than the default.
             if let Err(e) = crate::io::fs::rename_async(&temp, dest).await {
                 let _ = crate::io::fs::remove_file_async(&temp).await;
-                return Err(e);
+                return Err(error::io_at("renaming temporary file to", dest, e));
             }
         }
         Ok(())
@@ -671,7 +667,18 @@ mod tests {
             .finalize()
             .await
             .expect_err("renaming into a missing directory must fail");
-        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(err.kind(), &ErrorKind::IOError);
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "I/O error renaming temporary file to \"{}\"",
+                dest.display()
+            )
+        );
+        let source = std::error::Error::source(&err)
+            .and_then(|s| s.downcast_ref::<std::io::Error>())
+            .expect("the rename's error is the source");
+        assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
         assert!(!temp.exists(), "a failed rename must remove the temp file");
         assert!(
             !dest.exists(),

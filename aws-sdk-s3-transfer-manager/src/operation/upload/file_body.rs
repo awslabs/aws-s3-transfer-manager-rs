@@ -53,13 +53,10 @@ pub(crate) struct FileBodySource {
 
 impl FileBodySource {
     /// Opens `path` once for use by every SDK and transfer-manager retry.
+    ///
+    /// Returns the error from opening `path`.
     pub(crate) fn open(path: &Path, pool: BufferPool) -> io::Result<Self> {
-        let file = File::open(path).map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!("failed to open {}: {error}", path.display()),
-            )
-        })?;
+        let file = File::open(path)?;
         Ok(Self {
             file: Arc::new(file),
             pool,
@@ -921,6 +918,10 @@ mod tests {
             .unwrap();
 
         let error = stream.into_sdk_body(true, test_pool()).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert_eq!(error.kind(), &crate::error::ErrorKind::IOError);
+        let source = std::error::Error::source(&error)
+            .and_then(|source| source.downcast_ref::<io::Error>())
+            .expect("the open error is the source");
+        assert_eq!(source.kind(), io::ErrorKind::NotFound);
     }
 }

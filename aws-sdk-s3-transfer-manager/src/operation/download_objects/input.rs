@@ -18,23 +18,41 @@ use std::{
 /// [`S3Walker`] via [`walker`](DownloadObjectsInputBuilder::walker). When not
 /// set, the default walker lists the whole bucket.
 ///
-/// The walker's prefix, set with
+/// Each object is written at its full key under
+/// [`destination`](Self::destination): the key, with the
+/// [`delimiter`](Self::delimiter) replaced by the platform's path separator
+/// when one is set, is the file's path relative to the destination. The
+/// walker's prefix, set with
 /// [`S3WalkerBuilder::prefix`](crate::io::walk::S3WalkerBuilder::prefix),
-/// scopes the listing and is stripped from each key to build its path under
-/// [`destination`](Self::destination). Without a prefix, the full key is
-/// used.
+/// only selects objects, so with the prefix `photos/` the key
+/// `photos/2023/a.jpg` is written to `<destination>/photos/2023/a.jpg`.
 ///
 /// 0-byte objects whose key ends in `/` (folder markers) are skipped. A key
 /// whose local path resolves outside the destination, or to the destination
 /// directory itself, is not downloaded. It is reported as a failure and
 /// handled by the [`failure_policy`](Self::failure_policy).
+///
+/// Before any object is downloaded, the destination is checked: a directory
+/// that does not exist is created, together with any missing parents, with
+/// the platform's default permissions. A destination that exists and is not a
+/// directory fails the transfer with
+/// [`ErrorKind::InputInvalid`](crate::error::ErrorKind::InputInvalid), and a
+/// directory that cannot be created fails it with
+/// [`ErrorKind::IOError`](crate::error::ErrorKind::IOError). Both are returned
+/// by [`DownloadObjectsHandle::join`](crate::operation::download_objects::DownloadObjectsHandle::join).
+///
+/// `.` and `..` components in the destination are resolved lexically, without
+/// following symbolic links: `./out` and `out/../out` both name `out`, and
+/// files are written under that form.
 #[non_exhaustive]
 #[derive(Clone)]
 pub struct DownloadObjectsInput {
     /// The bucket name containing the object(s).
     pub bucket: Option<String>,
 
-    /// The destination directory to which files should be downloaded.
+    /// The destination directory to which files should be downloaded. Created
+    /// if it does not exist. Each object is written at its full key beneath
+    /// it.
     pub destination: Option<PathBuf>,
 
     /// Character used to group keys.
@@ -136,7 +154,9 @@ impl DownloadObjectsInputBuilder {
         self.bucket.as_deref()
     }
 
-    /// Set the destination directory. Required.
+    /// Set the destination directory. Required; an empty path counts as unset.
+    /// Created, with any missing parents, if it does not exist. Each object is
+    /// written at its full key beneath it.
     pub fn destination(mut self, input: impl Into<PathBuf>) -> Self {
         self.destination = Some(input.into());
         self
@@ -193,8 +213,8 @@ impl DownloadObjectsInputBuilder {
     /// Walker configuration (prefix, filter, pagination, etc.).
     ///
     /// Pass an [`S3Walker`] built via [`S3Walker::builder`] to customize the
-    /// listing. Its prefix scopes the listing and is stripped from each key
-    /// to build its local path. When not set, a default walker is used that
+    /// listing. Its prefix selects the objects to download and does not
+    /// change their local paths. When not set, a default walker is used that
     /// filters out 0-byte folder markers.
     pub fn walker(mut self, input: S3Walker) -> Self {
         self.walker = Some(input);
