@@ -93,8 +93,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of 128.
 - The automatic memory ceiling for a client is at least 256 MiB, limited to half of detected
   memory. `BufferPool` built with `MemoryBudgetConfig::Auto` directly is unchanged.
-- The automatic concurrency target for an instance type not in the bandwidth table is one
-  in-flight request per vCPU, at least 32, instead of five per vCPU.
 - The bandwidth table adds m5n, m5dn, r5n, r5dn, m5zn, x2iezn, d3, d3en, is4gen, c8ine, g4dn
   and g6e, and uses one network card's bandwidth for p5, p5e, p5en, p6-b200, p6-b300, trn1 and
   trn1n.

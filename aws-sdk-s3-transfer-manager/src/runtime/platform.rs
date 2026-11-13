@@ -400,9 +400,10 @@ const GBPS_PER_CONN: f64 = 0.4;
 /// In-flight requests per vCPU for the fallback seed, used when the instance
 /// family is unknown (unrecognized type, or detection failed / off-EC2). Without
 /// a NIC estimate the seed can't be bandwidth-derived, so it scales concurrency
-/// directly by vCPU; the `[FALLBACK_MIN, MAX_CONCURRENCY_SEED]` clamp keeps a
+/// directly by vCPU. In-flight requests are roughly connection-count, so the
+/// slope is kept modest; the `[FALLBACK_MIN, MAX_CONCURRENCY_SEED]` clamp keeps a
 /// small box off the floor and a large one bounded.
-const FALLBACK_INFLIGHT_PER_VCPU: usize = 1;
+const FALLBACK_INFLIGHT_PER_VCPU: usize = 5;
 
 /// Floor for the fallback seed. A small unknown box (2-6 vCPU) would otherwise
 /// seed below common general-purpose defaults (CRT's 10 Gbps target resolves to
@@ -944,7 +945,7 @@ mod tests {
         assert_eq!(
             resolved,
             ResolvedAutoConcurrency {
-                target: 64,
+                target: 320,
                 estimated_gbps: None,
                 source: AutoConcurrencySource::VcpuFallback,
             }
@@ -968,7 +969,7 @@ mod tests {
         // fails if the hyphenated key stops matching (falling through to
         // fallback) rather than passing via a coincident clamp.
         // p6-b300 = 350/192 Gbps/vCPU. At 24 vCPU: 43.75 Gbps ->
-        // ceil(43.75/0.4) = 110. Fallback would be max(1*24, 32) = 32. Distinct.
+        // ceil(43.75/0.4) = 110. Fallback would be 5*24 = 120. Distinct.
         assert_eq!(auto_concurrency_seed(Some("p6-b300.6xlarge"), 24), 110);
         assert_ne!(
             auto_concurrency_seed(Some("p6-b300.6xlarge"), 24),
@@ -978,26 +979,26 @@ mod tests {
 
     #[test]
     fn test_seed_fallback_scales_with_vcpu() {
-        // Unknown family -> FALLBACK_INFLIGHT_PER_VCPU (1) * vcpus, above the
+        // Unknown family -> FALLBACK_INFLIGHT_PER_VCPU (5) * vcpus, above the
         // FALLBACK_MIN (32) floor.
-        assert_eq!(auto_concurrency_seed(Some("m7g.16xlarge"), 64), 64);
-        assert_eq!(auto_concurrency_seed(Some("gcp-n2-standard-96"), 96), 96);
+        assert_eq!(auto_concurrency_seed(Some("t3.2xlarge"), 8), 40);
+        assert_eq!(auto_concurrency_seed(Some("gcp-n2-standard-64"), 64), 320);
         // No detection at all falls through the same path.
-        assert_eq!(auto_concurrency_seed(None, 48), 48);
+        assert_eq!(auto_concurrency_seed(None, 16), 80);
     }
 
     #[test]
     fn test_seed_fallback_floored_for_small_box() {
         // A small unknown box would seed below the general-purpose default; the
-        // FALLBACK_MIN floor (32) lifts it. 4 vCPU * 1 = 4 -> floored to 32.
+        // FALLBACK_MIN floor (32) lifts it. 4 vCPU * 5 = 20 -> floored to 32.
         assert_eq!(auto_concurrency_seed(None, 4), FALLBACK_MIN);
         assert_eq!(
             auto_concurrency_seed(Some("gcp-n2-standard-4"), 4),
             FALLBACK_MIN
         );
-        // The floor governs up to 32 vCPU; 33 vCPU crosses it.
-        assert_eq!(auto_concurrency_seed(None, 32), FALLBACK_MIN);
-        assert_eq!(auto_concurrency_seed(None, 33), 33);
+        // The floor governs up to 6 vCPU (6 * 5 = 30 < 32); 7 vCPU crosses it.
+        assert_eq!(auto_concurrency_seed(None, 6), FALLBACK_MIN);
+        assert_eq!(auto_concurrency_seed(None, 7), 35);
     }
 
     #[test]
