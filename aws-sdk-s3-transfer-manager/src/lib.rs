@@ -190,8 +190,10 @@
 //!   state machines. Multipart uploads currently provide this summary.
 //! - `transfer.detail=2` also collects individual state transitions.
 //!
-//! Transfer summaries use the `aws_sdk_s3_transfer_manager::transfer` tracing
-//! target at `DEBUG`; level-2 transitions use the same target at `TRACE`:
+//! Transfer summaries use the operation's tracing target at `DEBUG`;
+//! level-2 transitions use the same target at `TRACE`. Each operation logs
+//! under its own target below `aws_sdk_s3_transfer_manager::transfer`, so the
+//! `transfer` target enables all of them:
 //!
 //! ```text
 //! AWS_S3_TM_DIAGNOSTICS=transfer.detail=1

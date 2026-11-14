@@ -4,6 +4,8 @@
  */
 use std::sync::Arc;
 
+use crate::telemetry::TARGET_TRANSFER_DOWNLOAD;
+
 use super::{DownloadHandle, DownloadInputBuilder, ManagedDownloadHandle};
 
 /// Fluent builder for constructing a single object download transfer.
@@ -22,7 +24,7 @@ impl DownloadFluentBuilder {
     }
 
     /// Initiate a download transfer for a single object.
-    #[tracing::instrument(skip_all, level = "debug", name = "initiate-download", fields(
+    #[tracing::instrument(skip_all, level = "debug", target = TARGET_TRANSFER_DOWNLOAD, name = "initiate-download", fields(
         bucket = self.inner.get_bucket().as_deref().unwrap_or_default(),
         key = self.inner.get_key().as_deref().unwrap_or_default(),
     ))]

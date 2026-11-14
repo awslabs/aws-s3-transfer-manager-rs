@@ -393,7 +393,7 @@ impl BodyWriter {
         }
         let drained = self.drain(DrainMode::Eager)?;
         tracing::debug!(
-            target: crate::telemetry::TARGET_TRANSFER,
+            target: crate::telemetry::TARGET_TRANSFER_DOWNLOAD,
             terminal_parts = drained.parts,
             terminal_bytes = drained.bytes,
             "terminal drain complete; tail flushed to disk",
