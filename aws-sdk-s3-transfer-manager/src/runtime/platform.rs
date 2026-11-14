@@ -797,6 +797,9 @@ mod tests {
         assert!((MIN_CONNECTIONS_PER_HOST..=MAX_CONNECTIONS_PER_HOST).contains(&cap.max_per_host));
     }
 
+    // The test value represents a 64 GiB host (65_536_000 kB × 1024), which
+    // does not fit a 32-bit `usize`.
+    #[cfg(target_pointer_width = "64")]
     #[test]
     fn test_parse_meminfo_total() {
         let s = "MemFree: 100 kB\nMemTotal:    65536000 kB\nBuffers: 5 kB\n";
@@ -813,6 +816,9 @@ mod tests {
         assert_eq!(parse_cgroup_limit("max\n"), None);
     }
 
+    // 2^32 does not fit a 32-bit `usize`; the > u32 value is only meaningful
+    // on 64-bit platforms.
+    #[cfg(target_pointer_width = "64")]
     #[test]
     fn test_parse_cgroup_value() {
         assert_eq!(parse_cgroup_limit("4294967296\n"), Some(4_294_967_296));
@@ -893,7 +899,14 @@ mod tests {
         const GIB: usize = 1024 * 1024 * 1024;
 
         // The detected machine has at least 1 GiB; guards the platform syscall.
-        assert!(available_ram().expect("RAM detected") >= GIB);
+        // On 32-bit, `parse_meminfo_total` returns `None` when the host has
+        // more than ~4 GiB RAM because `MemTotal` kB × 1024 overflows
+        // `usize`; `None` is only accepted there.
+        match available_ram() {
+            Some(bytes) => assert!(bytes >= GIB),
+            None if cfg!(target_pointer_width = "32") => {}
+            None => panic!("available_ram must detect RAM on a supported 64-bit platform"),
+        }
     }
 
     // --- concurrency seeding ---
