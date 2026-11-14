@@ -135,34 +135,7 @@ impl DownloadStateSnapshot {
 }
 
 /// Terminal status emitted once for a download transfer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum DownloadTerminalOutcome {
-    /// The download completed successfully.
-    Completed,
-    /// The download failed.
-    Failed,
-    /// The download was cancelled.
-    Cancelled,
-}
-
-impl DownloadTerminalOutcome {
-    fn from_status(status: TransferStatus) -> Option<Self> {
-        match status {
-            TransferStatus::Completed => Some(Self::Completed),
-            TransferStatus::Failed => Some(Self::Failed),
-            TransferStatus::Cancelled => Some(Self::Cancelled),
-            TransferStatus::Active => None,
-        }
-    }
-
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Completed => "completed",
-            Self::Failed => "failed",
-            Self::Cancelled => "cancelled",
-        }
-    }
-}
+pub(crate) type DownloadTerminalOutcome = crate::transfer::TerminalOutcome;
 
 /// Closed diagnostic vocabulary for download state-machine events.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -561,7 +534,7 @@ fn emit_event(transfer_id: TransferId, event: DownloadEvent, snapshot: DownloadS
     match event {
         DownloadEvent::DiscoveryScheduled | DownloadEvent::DiscoveryCompleted => {
             tracing::trace!(
-                target: crate::telemetry::TARGET_TRANSFER,
+                target: crate::telemetry::TARGET_TRANSFER_DOWNLOAD,
                 tid = %transfer_id,
                 event = event_name,
                 reason,
@@ -574,7 +547,7 @@ fn emit_event(transfer_id: TransferId, event: DownloadEvent, snapshot: DownloadS
         | DownloadEvent::RangeCompleted
         | DownloadEvent::AllRangesIssued => {
             tracing::trace!(
-                target: crate::telemetry::TARGET_TRANSFER,
+                target: crate::telemetry::TARGET_TRANSFER_DOWNLOAD,
                 tid = %transfer_id,
                 event = event_name,
                 reason,
@@ -589,7 +562,7 @@ fn emit_event(transfer_id: TransferId, event: DownloadEvent, snapshot: DownloadS
         }
         DownloadEvent::MemoryReliefScheduled | DownloadEvent::MemoryReliefCompleted => {
             tracing::trace!(
-                target: crate::telemetry::TARGET_TRANSFER,
+                target: crate::telemetry::TARGET_TRANSFER_DOWNLOAD,
                 tid = %transfer_id,
                 event = event_name,
                 reason,
@@ -602,7 +575,7 @@ fn emit_event(transfer_id: TransferId, event: DownloadEvent, snapshot: DownloadS
         }
         DownloadEvent::DestinationFinalized => {
             tracing::trace!(
-                target: crate::telemetry::TARGET_TRANSFER,
+                target: crate::telemetry::TARGET_TRANSFER_DOWNLOAD,
                 tid = %transfer_id,
                 event = event_name,
                 reason,
@@ -620,7 +593,7 @@ fn emit_terminal_lifecycle(report: &DownloadTerminalReport, outcome: DownloadTer
         .map(|finished_at| finished_at.saturating_duration_since(report.metrics.started_at))
         .unwrap_or_default();
     tracing::debug!(
-        target: crate::telemetry::TARGET_TRANSFER,
+        target: crate::telemetry::TARGET_TRANSFER_DOWNLOAD,
         tid = %report.transfer_id,
         outcome = outcome.as_str(),
         error_kind = ?report.error_kind,
@@ -635,7 +608,7 @@ fn emit_terminal_lifecycle(report: &DownloadTerminalReport, outcome: DownloadTer
 fn emit_terminal_summary(transfer_id: TransferId, summary: &DownloadTransferSummary) {
     if summary.destination == DownloadDestination::File {
         tracing::debug!(
-            target: crate::telemetry::TARGET_TRANSFER,
+            target: crate::telemetry::TARGET_TRANSFER_DOWNLOAD,
             tid = %transfer_id,
             outcome = summary.outcome.as_str(),
             destination = summary.destination.as_str(),
@@ -666,7 +639,7 @@ fn emit_terminal_summary(transfer_id: TransferId, summary: &DownloadTransferSumm
         );
     } else {
         tracing::debug!(
-            target: crate::telemetry::TARGET_TRANSFER,
+            target: crate::telemetry::TARGET_TRANSFER_DOWNLOAD,
             tid = %transfer_id,
             outcome = summary.outcome.as_str(),
             destination = summary.destination.as_str(),
@@ -721,7 +694,7 @@ fn emit_terminal_details(transfer_id: TransferId, summary: &DownloadTransferSumm
     if summary.destination == DownloadDestination::File {
         let destination = summary.destination_work;
         tracing::trace!(
-            target: crate::telemetry::TARGET_TRANSFER,
+            target: crate::telemetry::TARGET_TRANSFER_DOWNLOAD,
             tid = %transfer_id,
             last_active_state = summary.last_active_snapshot.state.as_str(),
             prepared = destination.prepared,
@@ -746,7 +719,7 @@ fn emit_request_detail(
         return;
     }
     tracing::trace!(
-        target: crate::telemetry::TARGET_TRANSFER,
+        target: crate::telemetry::TARGET_TRANSFER_DOWNLOAD,
         tid = %transfer_id,
         request_kind = kind.as_str(),
         requests = metrics.requests,

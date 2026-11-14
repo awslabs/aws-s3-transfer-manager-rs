@@ -35,6 +35,7 @@ use crate::operation::download::ObjectMetadata;
 use crate::runtime::buffer_pool::{
     AcquireError, BufferPool, Reservation, ReserveError, SegmentedBytes,
 };
+use crate::telemetry::TARGET_TRANSFER_DOWNLOAD;
 use crate::transfer::{IoRequest, PollWork, Transfer, TransferContext, TransferId, WorkOutcome};
 use crate::types::BucketType;
 use aws_smithy_observability::unit_of_work::checksums::{ChecksumCapture, ChecksumOutcome};
@@ -93,6 +94,17 @@ pub(crate) enum DownloadWork {
     /// its carrier charges before the transfer waits for more memory. Handled in
     /// `execute`; carries no data because it operates on the writer.
     DrainResident,
+}
+
+impl DownloadWork {
+    /// Short name of the work kind for span fields.
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Discovery => "discovery",
+            Self::GetObjectRange { .. } => "get_object_range",
+            Self::DrainResident => "drain_resident",
+        }
+    }
 }
 
 /// Early return if transfer is terminal (failed/cancelled by another work item).
@@ -313,10 +325,18 @@ impl DownloadTransfer {
     /// issues is counted when issued, and the item that retires last with
     /// nothing left to issue claims completion and finalizes, as
     /// [`DownloadState`] describes.
-    #[tracing::instrument(level = "debug", skip(self), fields(tid = %self.id()))]
+    #[tracing::instrument(
+        level = "trace",
+        target = TARGET_TRANSFER_DOWNLOAD,
+        skip_all,
+        fields(tid = %self.id()),
+    )]
     pub(crate) fn poll_work(&self) -> PollWork {
         if !self.inner.ctx.is_active() {
-            tracing::debug!("not active, returning Done");
+            tracing::debug!(
+                target: crate::telemetry::TARGET_TRANSFER_DOWNLOAD,
+                "not active, returning Done",
+            );
             return PollWork::Done;
         }
 
@@ -395,7 +415,7 @@ impl DownloadTransfer {
                         // consumer has freed and waits for a drain before claiming more.
                         // Trace: fires every gated poll in steady state.
                         tracing::trace!(
-                            target: crate::telemetry::TARGET_TRANSFER,
+                            target: crate::telemetry::TARGET_TRANSFER_DOWNLOAD,
                             issued = gate.issued(),
                             released = gate.released(),
                             in_flight = gate.resident(),
@@ -496,7 +516,7 @@ impl DownloadTransfer {
                     *remaining = None;
                     all_ranges_issued = true;
                     tracing::debug!(
-                        target: crate::telemetry::TARGET_TRANSFER,
+                        target: crate::telemetry::TARGET_TRANSFER_DOWNLOAD,
                         issued = gate.issued(),
                         ranges_in_flight = *ranges_in_flight,
                         "all ranges issued; draining in-flight tail",
@@ -690,9 +710,15 @@ impl DownloadTransfer {
         PollWork::Done
     }
 
-    #[tracing::instrument(level = "debug", skip(self, work), fields(tid = %self.id(), work = ?work.data))]
+    #[tracing::instrument(
+        level = "trace",
+        target = TARGET_TRANSFER_DOWNLOAD,
+        skip_all,
+        fields(tid = %self.id(), work = tracing::field::Empty),
+    )]
     pub(crate) async fn execute(&self, work: &mut IoRequest) -> WorkOutcome {
         let data = work.data_mut::<DownloadWork>();
+        tracing::Span::current().record("work", data.kind());
         match data {
             DownloadWork::Discovery => self.execute_discovery().await,
             DownloadWork::GetObjectRange { range, slot, etag } => {
@@ -1059,8 +1085,8 @@ impl DownloadTransfer {
                 .map_err(crate::retry::GuardError::Inner)
             }
         })
-        .instrument(tracing::debug_span!(
-            target: crate::telemetry::TARGET_TRANSFER,
+        .instrument(tracing::trace_span!(
+            target: crate::telemetry::TARGET_TRANSFER_DOWNLOAD,
             "download-part",
             tid = %self.id()
         ))
@@ -1208,8 +1234,8 @@ impl DownloadTransfer {
                     ))
                 }
             })
-            .instrument(tracing::debug_span!(
-                target: crate::telemetry::TARGET_TRANSFER,
+            .instrument(tracing::trace_span!(
+                target: crate::telemetry::TARGET_TRANSFER_DOWNLOAD,
                 "download-part-reissue",
                 tid = %self.id()
             ))
@@ -1265,7 +1291,7 @@ impl DownloadTransfer {
         }
 
         tracing::trace!(
-            target: crate::telemetry::TARGET_TRANSFER,
+            target: crate::telemetry::TARGET_TRANSFER_DOWNLOAD,
             seq,
             offset = *range.start(),
             "chunk downloaded",
@@ -1398,7 +1424,7 @@ impl DownloadTransfer {
     ) -> WorkOutcome {
         let description = DisplayErrorContext(&error).to_string();
         tracing::debug!(
-            target: crate::telemetry::TARGET_TRANSFER,
+            target: crate::telemetry::TARGET_TRANSFER_DOWNLOAD,
             error = %description,
             "download failed",
         );
@@ -1419,7 +1445,7 @@ impl DownloadTransfer {
                 "download failed after it had completed: {description}"
             );
             tracing::error!(
-                target: crate::telemetry::TARGET_TRANSFER,
+                target: crate::telemetry::TARGET_TRANSFER_DOWNLOAD,
                 tid = %self.inner.ctx.id,
                 error = %description,
                 "download failed after it had completed; the failure is not reported to the caller",

@@ -957,7 +957,7 @@ jobs:
         run: |
           cargo miri test -p aws-sdk-s3-transfer-manager --lib
         env:
-          MIRIFLAGS: -Zmiri-disable-isolation -Zmiri-strict-provenance
+          MIRIFLAGS: -Zmiri-disable-isolation -Zmiri-strict-provenance -Zmiri-recursive-validation
           RUSTFLAGS: -Dwarnings -Adeprecated
 
   loom:

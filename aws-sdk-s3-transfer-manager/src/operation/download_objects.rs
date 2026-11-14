@@ -16,6 +16,7 @@ pub use output::{DownloadObjectsOutput, DownloadObjectsOutputBuilder};
 mod handle;
 pub use handle::DownloadObjectsHandle;
 
+mod observability;
 pub(crate) mod transfer;
 use transfer::DownloadObjectsTransfer;
 
