@@ -924,4 +924,25 @@ mod tests {
             .expect("the open error is the source");
         assert_eq!(source.kind(), io::ErrorKind::NotFound);
     }
+
+    /// Exercises the real body path at a `length` that straddles `usize`
+    /// on a 32-bit target. Pre-fix, `(unread as usize).min(FILE_BODY_CHUNK_SIZE)`
+    /// truncates `2^32` to zero on 32-bit — `poll_frame` publishes a
+    /// zero-length chunk, which [`FileBodyProgress::publish`] rejects as
+    /// `UnexpectedEof`. Post-fix, the first frame is one full chunk.
+    #[cfg_attr(miri, ignore)] // tempfile / pread FFI
+    #[test]
+    fn direct_body_makes_progress_at_the_four_gib_boundary() {
+        let length = 1u64 << 32;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.as_file().set_len(length).unwrap();
+        let pool = test_pool();
+        let mut body = DirectFileBody::new(source(tmp.path(), &pool), 0, length);
+        match poll_body_once(&mut body) {
+            Poll::Ready(Some(Ok(frame))) => {
+                assert_eq!(frame.into_data().unwrap().len(), FILE_BODY_CHUNK_SIZE);
+            }
+            result => panic!("expected the first 1 MiB chunk, got {result:?}"),
+        }
+    }
 }

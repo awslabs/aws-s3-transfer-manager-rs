@@ -406,3 +406,38 @@ async fn test_part_checksum_over_different_bytes_fails_before_complete() {
 
     handle.shutdown().await.expect("shutdown");
 }
+
+/// End-to-end check that an upload makes progress when `length` crosses the
+/// 4 GiB boundary. On a 32-bit `usize` the pre-fix body narrows the remaining
+/// length to zero, so the first poll publishes an empty chunk and the upload
+/// fails with `UnexpectedEof` before any part is sent. The file is sparse, so
+/// no disk space holds 4 GiB at once; the payload still flows over loopback
+/// to the mock server, which absorbs the bytes without materialising them.
+#[tokio::test]
+async fn upload_makes_progress_at_the_four_gib_boundary() {
+    let m = setup().await;
+
+    let length: u64 = 1u64 << 32;
+    let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+    tmp.as_file().set_len(length).expect("sparse grow");
+
+    let body = InputStream::read_from()
+        .path(tmp.path())
+        .length(length)
+        .build()
+        .expect("build input stream");
+
+    let handle = m
+        .client
+        .upload()
+        .bucket("test-bucket")
+        .key("four-gib-boundary")
+        .body(body)
+        .initiate()
+        .expect("initiate upload");
+    let result = handle.join().await.expect("upload complete");
+
+    assert!(result.e_tag().is_some(), "expected ETag");
+
+    m.handle.shutdown().await.expect("shutdown");
+}
