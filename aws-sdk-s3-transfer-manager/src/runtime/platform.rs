@@ -899,7 +899,14 @@ mod tests {
         const GIB: usize = 1024 * 1024 * 1024;
 
         // The detected machine has at least 1 GiB; guards the platform syscall.
-        assert!(available_ram().expect("RAM detected") >= GIB);
+        // On 32-bit, `parse_meminfo_total` returns `None` when the host has
+        // more than ~4 GiB RAM because `MemTotal` kB × 1024 overflows
+        // `usize`; `None` is only accepted there.
+        match available_ram() {
+            Some(bytes) => assert!(bytes >= GIB),
+            None if cfg!(target_pointer_width = "32") => {}
+            None => panic!("available_ram must detect RAM on a supported 64-bit platform"),
+        }
     }
 
     // --- concurrency seeding ---
