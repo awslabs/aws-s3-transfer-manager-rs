@@ -1795,6 +1795,17 @@ mod tests {
         assert_eq!(chunk_len(&range, part_size), 3);
     }
 
+    /// A `part_size` that does not fit `usize` violates the function's
+    /// invariant and trips its `debug_assert!`. Pre-fix the cast would have
+    /// silently truncated `2^32` to `0` on a 32-bit `usize`.
+    #[test]
+    #[cfg(target_pointer_width = "32")]
+    #[should_panic(expected = "part_size")]
+    fn chunk_len_debug_asserts_on_part_size_exceeding_usize() {
+        let part_size = 1u64 << 32;
+        let _ = chunk_len(&(0..=(part_size + 100)), part_size);
+    }
+
     #[test]
     fn download_state_snapshot_classifies_execution_and_occupancy() {
         assert_eq!(
