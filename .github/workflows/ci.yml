@@ -342,12 +342,18 @@ jobs:
       - name: Run real-S3 tests
         run: |
           RUSTFLAGS="-Dwarnings --cfg e2e_test" cargo test --locked --test e2e_transfer_test
-          integration_test_args=()
+          integration_test_args=(--)
           if [[ "$RUNNER_OS" == "macOS" ]]; then
             # Mock integration tests start local servers and concurrent
             # transfers. Serial execution avoids exhausting macOS socket
             # buffers while preserving each test's internal concurrency.
-            integration_test_args+=(-- --test-threads 1)
+            integration_test_args+=(--test-threads 1)
+          fi
+          if [[ "$RUNNER_OS" != "Linux" ]]; then
+            # Integrity cases in the `extended` tier cross object shapes
+            # with algorithms, which is the same logic on every platform.
+            # Linux runs them; the other platforms run the rest.
+            integration_test_args+=(--skip ::extended::)
           fi
           RUSTFLAGS="-Dwarnings --cfg e2e_test" \
             cargo test --locked -p integration-tests "${integration_test_args[@]}"
