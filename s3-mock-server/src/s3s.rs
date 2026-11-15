@@ -106,6 +106,8 @@ pub(crate) struct ServerState {
     pub(crate) requests: crate::operation::RequestCounters,
     /// S3 Express sessions created with CreateSession.
     pub(crate) sessions: crate::express::Sessions,
+    /// What the server observed about each request.
+    pub(crate) journal: crate::journal::Journal,
 }
 
 impl ServerState {
@@ -122,13 +124,26 @@ impl ServerState {
         bucket: Option<&str>,
         key: Option<&str>,
     ) -> crate::Result<Option<crate::faults::FaultType>> {
+        self.admit_recorded(operation, bucket, key)
+            .map(|(fault, _)| fault)
+    }
+
+    /// [`admit`](Self::admit), also returning the request's journal record, for a handler that
+    /// records more about the request.
+    pub(crate) fn admit_recorded(
+        &self,
+        operation: Operation,
+        bucket: Option<&str>,
+        key: Option<&str>,
+    ) -> crate::Result<(Option<crate::faults::FaultType>, crate::journal::RequestId)> {
         self.requests.record(operation);
+        let id = self.journal.admit(operation, bucket, key);
         if operation.is_throttled() {
             self.check_throttle()?;
         }
         match self.faults.next_fault(operation, bucket, key) {
             Some(crate::faults::FaultType::Error(error)) => Err(error),
-            fault => Ok(fault),
+            fault => Ok((fault, id)),
         }
     }
 
@@ -254,8 +269,56 @@ impl<S: StorageBackend + 'static> Inner<S> {
         fault: Option<crate::faults::FaultType>,
         conn_fault: Option<&std::sync::Arc<crate::socket_fault::ConnectionFault>>,
         output: &mut s3s::dto::GetObjectOutput,
+        request: &GetRequest<'_>,
     ) -> S3Result<()> {
         match fault {
+            Some(crate::faults::FaultType::CorruptByte { offset }) => {
+                if let (Some(body), Some(range)) = (output.body.take(), request.range.as_ref()) {
+                    let flip = range.contains(&offset).then(|| offset - range.start);
+                    // State: (inner stream, body bytes yielded so far).
+                    let faulted = futures_util::stream::unfold(
+                        (body, 0u64),
+                        move |(mut stream, pos)| async move {
+                            match stream.next().await? {
+                                Ok(chunk) => {
+                                    let end = pos + chunk.len() as u64;
+                                    let chunk = match flip {
+                                        Some(at) if (pos..end).contains(&at) => {
+                                            let mut bytes = BytesMut::from(&chunk[..]);
+                                            bytes[(at - pos) as usize] ^= 0xFF;
+                                            bytes.freeze()
+                                        }
+                                        _ => chunk,
+                                    };
+                                    Some((Ok(chunk), (stream, end)))
+                                }
+                                Err(e) => Some((Err(std::io::Error::other(e)), (stream, pos))),
+                            }
+                        },
+                    );
+                    output.body = Some(StreamingBlob::wrap(faulted));
+                }
+            }
+            Some(crate::faults::FaultType::HoldBody { others, deadline }) => {
+                if let Some(body) = output.body.take() {
+                    let state = self.state.clone();
+                    let (id, bucket, key) = (
+                        request.id,
+                        request.bucket.to_owned(),
+                        request.key.to_owned(),
+                    );
+                    let held = futures_util::stream::once(async move {
+                        state
+                            .journal
+                            .hold(id, &bucket, &key, others, deadline)
+                            .await;
+                        body
+                    })
+                    .flatten()
+                    .map(|chunk| chunk.map_err(std::io::Error::other));
+                    output.body = Some(StreamingBlob::wrap(held));
+                }
+            }
             Some(crate::faults::FaultType::WrongStoredChecksum) => {
                 xor_first_byte_of_checksum(output);
             }
@@ -437,7 +500,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         &self,
         req: S3Request<s3s::dto::GetObjectInput>,
     ) -> S3Result<S3Response<s3s::dto::GetObjectOutput>> {
-        let fault = self.state.admit(
+        let (fault, id) = self.state.admit_recorded(
             Operation::GetObject,
             Some(&req.input.bucket),
             Some(&req.input.key),
@@ -481,6 +544,26 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         if let Some(part_number) = input.part_number {
             range = part_number_range(&metadata, part_number)?;
         }
+        let get = GetRequest {
+            id,
+            bucket,
+            key,
+            range: resolved_range(range.as_ref(), &metadata),
+        };
+        let fault = match fault {
+            Some(fault) => Some(fault),
+            None => match get.range.as_ref() {
+                Some(r) => match self.state.faults.next_covering_fault(bucket, key, r) {
+                    Some(crate::faults::FaultType::Error(error)) => return Err(error.into()),
+                    fault => fault,
+                },
+                None => None,
+            },
+        };
+        self.state.journal.update(id, |record| {
+            record.range = get.range.clone();
+            record.fault = fault.clone();
+        });
 
         // Get object stream with validated range
         let request = crate::storage::GetObjectRequest {
@@ -574,8 +657,29 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             output.checksum_type = stored_checksum_type(&metadata);
         }
         apply_response_defaults_get(&mut output);
-        self.apply_get_fault(fault, conn_fault.as_ref(), &mut output)
+        let sent = sent_checksum(
+            [
+                (&output.checksum_crc32, &metadata.crc32),
+                (&output.checksum_crc32c, &metadata.crc32c),
+                (&output.checksum_crc64nvme, &metadata.crc64nvme),
+                (&output.checksum_sha1, &metadata.sha1),
+                (&output.checksum_sha256, &metadata.sha256),
+            ],
+            output.checksum_type.as_ref(),
+        );
+        self.state
+            .journal
+            .update(id, |record| record.checksum = sent);
+        self.apply_get_fault(fault, conn_fault.as_ref(), &mut output, &get)
             .await?;
+        if let Some(body) = output.body.take_if(|_| self.state.journal.is_enabled()) {
+            output.body = Some(StreamingBlob::wrap(crate::journal::JournaledBody::new(
+                body,
+                output.content_length.unwrap_or_default() as u64,
+                self.state.clone(),
+                id,
+            )));
+        }
         Ok(S3Response::new(output))
     }
 
@@ -583,7 +687,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         &self,
         req: S3Request<s3s::dto::HeadObjectInput>,
     ) -> S3Result<S3Response<s3s::dto::HeadObjectOutput>> {
-        self.state.admit(
+        let (_, id) = self.state.admit_recorded(
             Operation::HeadObject,
             Some(&req.input.bucket),
             Some(&req.input.key),
@@ -624,6 +728,10 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             .as_ref()
             .map(|r| content_range_header(r, metadata.content_length));
         let checksum_type = stored_checksum_type(&metadata);
+        let object_checksums = metadata.clone();
+        self.state.journal.update(id, |record| {
+            record.range = resolved_range(range.as_ref(), &metadata);
+        });
         let omit_checksums =
             omits_part_checksums(bucket, &metadata, input.part_number, range.as_ref());
         let object_checksum = reports_object_checksum(bucket, &metadata, range.as_ref());
@@ -683,6 +791,19 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
             output.checksum_type = checksum_type;
         }
         apply_response_defaults_head(&mut output);
+        let sent = sent_checksum(
+            [
+                (&output.checksum_crc32, &object_checksums.crc32),
+                (&output.checksum_crc32c, &object_checksums.crc32c),
+                (&output.checksum_crc64nvme, &object_checksums.crc64nvme),
+                (&output.checksum_sha1, &object_checksums.sha1),
+                (&output.checksum_sha256, &object_checksums.sha256),
+            ],
+            output.checksum_type.as_ref(),
+        );
+        self.state
+            .journal
+            .update(id, |record| record.checksum = sent);
         Ok(S3Response::new(output))
     }
 
@@ -1482,6 +1603,58 @@ fn list_entry(
         key: Some(obj.key),
         ..Default::default()
     }
+}
+
+/// A GetObject being served: its journal record, object and resolved range.
+struct GetRequest<'a> {
+    id: crate::journal::RequestId,
+    bucket: &'a str,
+    key: &'a str,
+    /// The object bytes the response covers, end exclusive. `None` for an empty object.
+    range: Option<std::ops::Range<u64>>,
+}
+
+/// The object bytes a GetObject or HeadObject response covers: `range`, or else the whole
+/// object, which for an empty object is no bytes.
+fn resolved_range(
+    range: Option<&std::ops::Range<u64>>,
+    metadata: &ObjectMetadata,
+) -> Option<std::ops::Range<u64>> {
+    range
+        .cloned()
+        .or_else(|| (metadata.content_length > 0).then_some(0..metadata.content_length))
+}
+
+/// The checksum a response carries, given each algorithm's `(response value, object value)` in
+/// the order CRC32, CRC32C, CRC64NVME, SHA1, SHA256: the first the response carries, scoped to
+/// the object when it equals the object's stored value and to a part otherwise.
+fn sent_checksum(
+    values: [(&Option<String>, &Option<String>); 5],
+    checksum_type: Option<&s3s::dto::ChecksumType>,
+) -> Option<crate::journal::SentChecksum> {
+    use aws_sdk_s3::types::ChecksumAlgorithm;
+    let algorithms = [
+        ChecksumAlgorithm::Crc32,
+        ChecksumAlgorithm::Crc32C,
+        ChecksumAlgorithm::Crc64Nvme,
+        ChecksumAlgorithm::Sha1,
+        ChecksumAlgorithm::Sha256,
+    ];
+    algorithms
+        .into_iter()
+        .zip(values)
+        .find_map(|(algorithm, (sent, object))| {
+            let sent = sent.as_ref()?;
+            Some(crate::journal::SentChecksum {
+                algorithm,
+                checksum_type: checksum_type.map(|t| t.as_str().into()),
+                scope: if object.as_ref() == Some(sent) {
+                    crate::journal::ChecksumScope::Object
+                } else {
+                    crate::journal::ChecksumScope::Part
+                },
+            })
+        })
 }
 
 /// Fail a GetObject or HeadObject whose `partNumber` S3 rejects before looking up the object:

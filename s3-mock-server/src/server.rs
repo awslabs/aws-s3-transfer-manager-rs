@@ -160,6 +160,9 @@ pub struct S3MockServerBuilder {
 
     /// Storage backend.
     storage: Option<Arc<dyn StorageBackend>>,
+
+    /// Whether the server keeps a request journal.
+    request_journal: bool,
 }
 
 impl Default for S3MockServerBuilder {
@@ -174,7 +177,17 @@ impl S3MockServerBuilder {
         Self {
             config: ServerConfig::default(),
             storage: None,
+            request_journal: false,
         }
+    }
+
+    /// Keep a request journal: a record of every request served, which
+    /// [`S3MockServer::requests`] returns. GetObject bodies are then delivered in pieces of at
+    /// most 64 KiB, so a body's recorded end follows its last bytes reaching the connection.
+    /// Records are kept until [`S3MockServer::clear_requests`].
+    pub fn with_request_journal(mut self) -> Self {
+        self.request_journal = true;
+        self
     }
 
     /// Use in-memory storage.
@@ -205,9 +218,16 @@ impl S3MockServerBuilder {
             "Storage backend must be specified",
         ))?;
 
+        let journal = match self.request_journal {
+            true => crate::journal::Journal::enabled(),
+            false => crate::journal::Journal::default(),
+        };
         Ok(S3MockServer {
             storage,
-            state: Arc::new(ServerState::default()),
+            state: Arc::new(ServerState {
+                journal,
+                ..Default::default()
+            }),
             connect_reset: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             config: self.config,
         })
@@ -489,6 +509,19 @@ impl S3MockServer {
     /// Reset every request count to zero.
     pub fn reset_request_counts(&self) {
         self.state.requests.reset();
+    }
+
+    /// Every request received since the server started or [`clear_requests`](Self::clear_requests)
+    /// was last called, in the order handlers admitted them, with what the server observed about
+    /// each. Recorded for the requests [`request_count`](Self::request_count) counts, on a server
+    /// built [`with_request_journal`](S3MockServerBuilder::with_request_journal); empty otherwise.
+    pub fn requests(&self) -> Vec<crate::RequestRecord> {
+        self.state.journal.snapshot()
+    }
+
+    /// Drop every request record.
+    pub fn clear_requests(&self) {
+        self.state.journal.clear();
     }
 
     /// Install a server-wide load-driven throttle admitting a sustained `rate`

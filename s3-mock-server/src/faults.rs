@@ -38,6 +38,18 @@ pub enum FaultType {
     /// GET returns tampered body bytes (byte 0 XOR'd) with the checksum left
     /// intact. Exercises body-content validation, not just header comparison.
     CorruptBody,
+    /// GET returns the body with object byte `offset` XOR'd and the checksum left intact. Has no
+    /// effect on a GET whose range does not include the byte. Register it for a target built
+    /// with [`FaultTarget::covering`] to apply it to whichever GET carries the byte.
+    CorruptByte { offset: u64 },
+    /// GET sends its headers, then holds its body until `others` GetObject bodies of the same
+    /// object have ended, whether sent in full or not, or until `deadline` passes. The request
+    /// journal records which happened. Bodies are counted by the journal, so on a server built
+    /// without one the hold lasts until `deadline`.
+    HoldBody {
+        others: u32,
+        deadline: std::time::Duration,
+    },
     /// GET yields `after_bytes` body bytes, then errors the body stream, so hyper
     /// aborts the connection. The client observes a connection reset / incomplete
     /// body mid-stream.
@@ -104,6 +116,9 @@ pub struct FaultTarget {
     operations: Operations,
     bucket: Option<String>,
     key: Option<String>,
+    /// For a target built with [`FaultTarget::covering`], the object byte a GetObject's resolved
+    /// range must include.
+    covering: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,6 +138,7 @@ impl FaultTarget {
             operations: Operations::ObjectData,
             bucket: Some(bucket.into()),
             key: Some(key.into()),
+            covering: None,
         }
     }
 
@@ -132,6 +148,7 @@ impl FaultTarget {
             operations: Operations::One(operation),
             bucket: None,
             key: None,
+            covering: None,
         }
     }
 
@@ -149,7 +166,31 @@ impl FaultTarget {
         self
     }
 
-    fn matches(&self, operation: Operation, bucket: Option<&str>, key: Option<&str>) -> bool {
+    /// Restrict the target to GetObject requests whose resolved range, from `Range` or
+    /// `partNumber` or the whole object, includes object byte `offset`. The target counts only
+    /// those requests, so its `skip` counts GETs that carry the byte, in whatever order the
+    /// client sends them.
+    ///
+    /// A covering target's fault is drawn once the request's range is resolved, and only when no
+    /// other target's fault fired for the request.
+    pub fn covering(mut self, offset: u64) -> Self {
+        self.operations = Operations::One(Operation::GetObject);
+        self.covering = Some(offset);
+        self
+    }
+
+    fn matches(
+        &self,
+        operation: Operation,
+        bucket: Option<&str>,
+        key: Option<&str>,
+        range: Option<&std::ops::Range<u64>>,
+    ) -> bool {
+        let position_matches = match (self.covering, range) {
+            (None, None) => true,
+            (Some(offset), Some(range)) => range.contains(&offset),
+            _ => false,
+        };
         let operation_matches = match self.operations {
             Operations::ObjectData => matches!(
                 operation,
@@ -157,7 +198,8 @@ impl FaultTarget {
             ),
             Operations::One(target) => target == operation,
         };
-        operation_matches
+        position_matches
+            && operation_matches
             && self.bucket.as_deref().is_none_or(|b| Some(b) == bucket)
             && self.key.as_deref().is_none_or(|k| Some(k) == key)
     }
@@ -258,11 +300,33 @@ impl FaultRegistry {
         bucket: Option<&str>,
         key: Option<&str>,
     ) -> Option<FaultType> {
+        self.draw(operation, bucket, key, None)
+    }
+
+    /// Record a GetObject whose resolved range is `range` with the targets built with
+    /// [`FaultTarget::covering`], and return the fault to apply, if any, as
+    /// [`next_fault`](Self::next_fault) does for the other targets.
+    pub(crate) fn next_covering_fault(
+        &self,
+        bucket: &str,
+        key: &str,
+        range: &std::ops::Range<u64>,
+    ) -> Option<FaultType> {
+        self.draw(Operation::GetObject, Some(bucket), Some(key), Some(range))
+    }
+
+    fn draw(
+        &self,
+        operation: Operation,
+        bucket: Option<&str>,
+        key: Option<&str>,
+        range: Option<&std::ops::Range<u64>>,
+    ) -> Option<FaultType> {
         let mut targets = self.targets.lock().unwrap();
         let mut fired = None;
         for state in targets
             .iter_mut()
-            .filter(|state| state.target.matches(operation, bucket, key))
+            .filter(|state| state.target.matches(operation, bucket, key, range))
         {
             state.seen += 1;
             if fired.is_some() {
@@ -290,7 +354,7 @@ impl FaultRegistry {
             }
             tracing::warn!(
                 target: "s3_mock_server::fault",
-                ?operation, ?bucket, ?key, request = seen, ?fault, ?occurrence,
+                ?operation, ?bucket, ?key, ?range, request = seen, ?fault, ?occurrence,
                 "fault fired",
             );
             fired = Some(fault);
@@ -551,6 +615,60 @@ mod tests {
         assert!(r
             .next_fault(Operation::GetObject, Some("b"), Some("k"))
             .is_none());
+    }
+
+    #[test]
+    fn covering_target_matches_gets_whose_range_includes_the_byte() {
+        let r = reg();
+        r.insert(
+            FaultTarget::object("b", "k").covering(10),
+            FaultType::CorruptByte { offset: 10 },
+            1,
+            Occurrence::Always,
+        );
+        // Not drawn before the range is known, and not counted then.
+        assert!(r
+            .next_fault(Operation::GetObject, Some("b"), Some("k"))
+            .is_none());
+        // Ranges without the byte neither count nor fire.
+        assert!(r.next_covering_fault("b", "k", &(0..10)).is_none());
+        assert!(r.next_covering_fault("b", "k", &(11..20)).is_none());
+        // The first GET with the byte is skipped; the next fire.
+        assert!(r.next_covering_fault("b", "k", &(10..11)).is_none());
+        assert!(matches!(
+            r.next_covering_fault("b", "k", &(0..20)),
+            Some(FaultType::CorruptByte { offset: 10 })
+        ));
+        assert!(r.next_covering_fault("b", "other", &(0..20)).is_none());
+    }
+
+    #[test]
+    fn covering_and_unpositioned_targets_are_drawn_separately() {
+        let r = reg();
+        r.insert(
+            FaultTarget::object("b", "k"),
+            FaultType::CorruptBody,
+            0,
+            Occurrence::Once,
+        );
+        r.insert(
+            FaultTarget::object("b", "k").covering(0),
+            FaultType::CorruptByte { offset: 0 },
+            0,
+            Occurrence::Once,
+        );
+        assert!(matches!(
+            r.next_fault(Operation::GetObject, Some("b"), Some("k")),
+            Some(FaultType::CorruptBody)
+        ));
+        assert!(matches!(
+            r.next_covering_fault("b", "k", &(0..1)),
+            Some(FaultType::CorruptByte { offset: 0 })
+        ));
+        assert!(r
+            .next_fault(Operation::GetObject, Some("b"), Some("k"))
+            .is_none());
+        assert!(r.next_covering_fault("b", "k", &(0..1)).is_none());
     }
 
     #[test]
