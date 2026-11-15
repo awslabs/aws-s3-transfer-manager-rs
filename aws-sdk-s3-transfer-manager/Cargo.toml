@@ -13,7 +13,7 @@ categories = ["asynchronous", "concurrency"]
 keywords = ["AWS", "Amazon", "S3", "high-performance", "transfer-manager"]
 
 [dependencies]
-aws-config = { workspace = true, features = ["rt-tokio"] }
+aws-config = { workspace = true }
 aws-sdk-s3 = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-observability = { workspace = true }
@@ -25,7 +25,7 @@ bytes-utils = "0.1.4"
 futures-util = "0.3.31"
 path-clean = "1.0.1"
 pin-project-lite = "0.2.16"
-tokio = { version = "1.43.0", features = ["rt", "io-util", "sync", "macros"] }
+tokio = { version = "1.43.0", features = ["rt", "io-util", "sync", "macros", "time"] }
 tracing = "0.1"
 walkdir = "2"
 tokio-util = "0.7.13"
@@ -49,6 +49,13 @@ aws-smithy-managed-http = { workspace = true, features = ["client"] }
 aws-smithy-http-client = { workspace = true, features = ["rustls-aws-lc", "rt-tokio"] }
 aws-smithy-dns = { workspace = true, features = ["hickory-dns"] }
 tokio = { version = "1.43.0", features = ["rt-multi-thread", "fs"] }
+
+# The SDK's tokio sleep and filesystem body support, and SigV4a signing. The filesystem support
+# enables tokio's `fs` feature, which tokio rejects on wasm targets without `--cfg tokio_unstable`,
+# and SigV4a needs `getrandom`, which has no entropy source on `wasm32-unknown-unknown`.
+[target.'cfg(not(all(target_family = "wasm", target_os = "unknown")))'.dependencies]
+aws-config = { workspace = true, features = ["rt-tokio"] }
+aws-sdk-s3 = { workspace = true, features = ["rt-tokio", "sigv4a"] }
 
 # Directory identity for symlink cycle detection. same-file does not support WASI.
 [target.'cfg(not(target_os = "wasi"))'.dependencies]
