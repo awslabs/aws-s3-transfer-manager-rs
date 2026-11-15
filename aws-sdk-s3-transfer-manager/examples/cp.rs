@@ -13,6 +13,7 @@ use aws_sdk_s3_transfer_manager::types::Throughput;
 use aws_smithy_types::date_time::{DateTime, Format};
 use clap::{CommandFactory, Parser};
 use std::error::Error;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{self, SystemTime};
@@ -141,11 +142,19 @@ pub struct Args {
 
     /// Network interfaces to bind S3 connections to, comma-separated (e.g. `ens5,ens6`).
     ///
-    /// Managed worker threads are assigned interfaces round-robin. Applies only
-    /// to the managed runtime; supported on Linux, Android, Apple platforms,
-    /// illumos, Solaris, and Fuchsia.
+    /// Managed worker threads are assigned interfaces round-robin. Requires the
+    /// managed runtime; supported on Linux, Android, Apple platforms, illumos,
+    /// Solaris, and Fuchsia.
     #[arg(long, value_delimiter = ',')]
     network_interfaces: Vec<String>,
+
+    /// Maximum connections to one host across all worker threads, with `--network-interfaces`.
+    ///
+    /// Without `--network-interfaces`, the transfer manager derives this cap from the process
+    /// descriptor limit. The default, 4096, is the ceiling of that derivation, which applies
+    /// when the descriptor limit is high enough not to bind.
+    #[arg(long, default_value = "4096", requires = "network_interfaces")]
+    max_connections_per_host: NonZeroUsize,
 }
 
 #[derive(Debug, Clone, clap::Args)]
@@ -462,7 +471,53 @@ async fn async_main(args: Args) {
 }
 
 async fn run(args: Args) -> Result<(), BoxError> {
-    if args.tokio_console {
+    init_tracing(args.tokio_console);
+    tracing::debug!("using concurrency mode: {:?}", args.concurrency.mode());
+    let is_download = transfer_direction(&args.source, &args.dest);
+    let interfaces = network_interfaces(&args)?;
+    let loader = config_loader(&args)?;
+
+    #[cfg(s3_tm_dial9)]
+    if let Some(recorder) = trace_recorder(&args) {
+        // The recorder's `Drop` stops its pipeline without draining queued events, so every
+        // fallible step after this point runs inside `result`, ahead of the graceful shutdown.
+        let result = async {
+            let loader = match args.runtime {
+                // Tracing instruments the managed runtime's threads, so the recorder attaches to
+                // the runtime builder before the transfer manager adopts the runtime.
+                RuntimeArg::Managed => {
+                    let builder = managed_runtime_builder().dial9_handle(recorder.handle().clone());
+                    adopt_runtime(loader, builder, &interfaces, &args).await?
+                }
+                RuntimeArg::MultiThreadTokio => loader,
+            };
+            transfer(
+                aws_sdk_s3_transfer_manager::Client::new(loader.load().await),
+                &args,
+                is_download,
+            )
+            .await
+        }
+        .await;
+        recorder.graceful_shutdown(time::Duration::from_secs(10));
+        return result;
+    }
+
+    let loader = if interfaces.is_empty() {
+        loader
+    } else {
+        adopt_runtime(loader, managed_runtime_builder(), &interfaces, &args).await?
+    };
+    transfer(
+        aws_sdk_s3_transfer_manager::Client::new(loader.load().await),
+        &args,
+        is_download,
+    )
+    .await
+}
+
+fn init_tracing(tokio_console: bool) {
+    if tokio_console {
         console_subscriber::init();
     } else {
         tracing_subscriber::fmt()
@@ -470,50 +525,66 @@ async fn run(args: Args) -> Result<(), BoxError> {
             .with_thread_ids(true)
             .init();
     }
+}
 
-    tracing::debug!("using concurrency mode: {:?}", args.concurrency.mode());
-
-    // Validate direction early
+/// Returns whether the transfer is a download. Exits with a usage error unless exactly one
+/// side is an S3 URI.
+fn transfer_direction(source: &TransferUri, dest: &TransferUri) -> bool {
     use TransferUri::*;
-    let is_download = match (&args.source, &args.dest) {
+    match (source, dest) {
         (Local(_), S3(_)) => false,
         (S3(_), Local(_)) => true,
         (Local(_), Local(_)) => invalid_arg("local to local transfer not supported"),
         (S3(_), S3(_)) => invalid_arg("s3 to s3 transfer not supported"),
-    };
+    }
+}
 
-    #[cfg(s3_tm_dial9)]
-    let trace_dir = args
-        .trace_dir
-        .or_else(|| std::env::var("S3FIO_TRACE_DIR").ok());
-    #[cfg(s3_tm_dial9)]
-    let recorder = if let Some(ref trace_dir) = trace_dir {
-        use dial9::DiskBuffer;
-        let _ = std::fs::create_dir_all(trace_dir);
-        let writer = DiskBuffer::builder()
-            .base_path(trace_dir)
-            .max_file_size(64 * 1024 * 1024)
-            .max_total_size(512 * 1024 * 1024)
-            .build()
-            .expect("failed to create trace writer");
-        let mut builder = dial9::recorder(writer);
-        if args.cpu_profiling {
-            use dial9::RecorderPerfExt;
-            builder = builder.with_cpu_profiling(dial9::cpu::CpuProfilingConfig::default());
-        }
-        Some(builder.build())
-    } else {
-        None
-    };
+/// Returns the `--network-interfaces` names, trimmed, without empty entries.
+///
+/// Exits with a usage error when names are given with `--runtime multi-thread-tokio`, where the
+/// S3 client keeps the SDK's HTTP client. Errors when this platform cannot bind a connection to
+/// an interface.
+fn network_interfaces(args: &Args) -> Result<Vec<String>, BoxError> {
+    let interfaces: Vec<String> = args
+        .network_interfaces
+        .iter()
+        .map(|name| name.trim())
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect();
+    if interfaces.is_empty() {
+        return Ok(interfaces);
+    }
+    if matches!(args.runtime, RuntimeArg::MultiThreadTokio) {
+        invalid_arg("--network-interfaces requires --runtime managed");
+    }
+    if cfg!(not(any(
+        target_os = "android",
+        target_os = "fuchsia",
+        target_os = "illumos",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "solaris",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos",
+    ))) {
+        return Err("--network-interfaces is not supported on this platform".into());
+    }
+    Ok(interfaces)
+}
 
-    #[allow(unused_mut)]
+/// Returns a loader with the concurrency, runtime, part-size, and memory settings from `args`.
+///
+/// `S3FIO_MEMORY_LIMIT=N` caps the transfer manager's memory pool at N GiB (in-flight plus
+/// buffered transfer data; transfers backpressure at the cap).
+fn config_loader(args: &Args) -> Result<ConfigLoader, BoxError> {
     let mut config_loader = aws_sdk_s3_transfer_manager::from_env()
         .concurrency(args.concurrency.mode())
         .runtime_config(args.runtime.mode())
         .part_size(PartSize::Target(ByteSize::new(args.part_size)));
 
-    // S3FIO_MEMORY_LIMIT=N caps the transfer manager's memory pool at N GiB
-    // (in-flight plus buffered transfer data; transfers backpressure at the cap).
     if let Some(gib) = std::env::var("S3FIO_MEMORY_LIMIT")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -524,67 +595,195 @@ async fn run(args: Args) -> Result<(), BoxError> {
             .build()?;
         config_loader = config_loader.memory(MemoryConfig::Explicit(pool));
     }
+    Ok(config_loader)
+}
 
-    let network_interfaces: Vec<&str> = args
-        .network_interfaces
-        .iter()
-        .map(|name| name.trim())
-        .filter(|name| !name.is_empty())
-        .collect();
-    if !network_interfaces.is_empty() {
-        #[cfg(any(
-            target_os = "android",
-            target_os = "fuchsia",
-            target_os = "illumos",
-            target_os = "ios",
-            target_os = "linux",
-            target_os = "macos",
-            target_os = "solaris",
-            target_os = "tvos",
-            target_os = "visionos",
-            target_os = "watchos",
-        ))]
-        {
-            tracing::info!(
-                ?network_interfaces,
-                "binding connections to network interfaces"
-            );
-            config_loader = config_loader.network_interfaces(network_interfaces);
-        }
-        #[cfg(not(any(
-            target_os = "android",
-            target_os = "fuchsia",
-            target_os = "illumos",
-            target_os = "ios",
-            target_os = "linux",
-            target_os = "macos",
-            target_os = "solaris",
-            target_os = "tvos",
-            target_os = "visionos",
-            target_os = "watchos",
-        )))]
-        return Err("--network-interfaces is not supported on this platform".into());
+/// Returns a dial9 recorder writing to `--trace-dir` or `S3FIO_TRACE_DIR`, or `None` when
+/// neither is set. Panics if the trace writer cannot be created.
+#[cfg(s3_tm_dial9)]
+fn trace_recorder(args: &Args) -> Option<dial9::Recorder> {
+    use dial9::DiskBuffer;
+    let trace_dir = args
+        .trace_dir
+        .clone()
+        .or_else(|| std::env::var("S3FIO_TRACE_DIR").ok())?;
+    let _ = std::fs::create_dir_all(&trace_dir);
+    let writer = DiskBuffer::builder()
+        .base_path(&trace_dir)
+        .max_file_size(64 * 1024 * 1024)
+        .max_total_size(512 * 1024 * 1024)
+        .build()
+        .expect("failed to create trace writer");
+    let mut builder = dial9::recorder(writer);
+    if args.cpu_profiling {
+        use dial9::RecorderPerfExt;
+        builder = builder.with_cpu_profiling(dial9::cpu::CpuProfilingConfig::default());
     }
+    Some(builder.build())
+}
 
-    // Tracing instruments the managed runtime's threads, so it applies only to managed execution.
-    // The runtime is built here, with the transfer manager's automatic thread naming and
-    // placement, so the recorder can be attached before the transfer manager adopts it.
-    #[cfg(s3_tm_dial9)]
-    if let (Some(recorder), RuntimeArg::Managed) = (&recorder, &args.runtime) {
-        let runtime = aws_smithy_execution::ManagedRuntime::builder()
-            .thread_name_prefix("s3-tm")
-            .pin_threads(false)
-            .dial9_handle(recorder.handle().clone())
-            .build()?;
-        config_loader = config_loader.runtime_config(RuntimeConfig::managed(
-            aws_sdk_s3_transfer_manager_ext::managed(runtime),
-        ));
+/// Returns a runtime builder with the thread naming and placement the transfer manager uses
+/// for the runtime it builds itself.
+fn managed_runtime_builder() -> ManagedRuntimeBuilder {
+    ManagedRuntime::builder()
+        .thread_name_prefix("s3-tm")
+        .pin_threads(false)
+}
+
+/// Builds the runtime and returns `loader` configured to adopt it.
+///
+/// With `interfaces`, the S3 client configuration also carries an HTTP client whose connections
+/// bind to `interfaces`, assigned to the runtime's threads round-robin. That configuration is
+/// loaded from the shared AWS configuration sources, as [`ConfigLoader::load`] does.
+async fn adopt_runtime(
+    loader: ConfigLoader,
+    builder: ManagedRuntimeBuilder,
+    interfaces: &[String],
+    args: &Args,
+) -> Result<ConfigLoader, BoxError> {
+    let runtime = builder.build()?;
+    let mut loader = loader;
+    if !interfaces.is_empty() {
+        tracing::info!(
+            ?interfaces,
+            max_connections_per_host = args.max_connections_per_host,
+            "binding connections to network interfaces"
+        );
+        let http_client = interface_http_client(
+            runtime.handle(),
+            interfaces,
+            args.max_connections_per_host.get(),
+        )?;
+        let sdk_config = aws_config::load_defaults(BehaviorVersion::latest())
+            .await
+            .into_builder()
+            .http_client(http_client)
+            .build();
+        loader = loader.s3_config(S3ClientConfig::new(&sdk_config));
     }
+    Ok(loader.runtime_config(RuntimeConfig::managed(
+        aws_sdk_s3_transfer_manager_ext::managed(runtime),
+    )))
+}
 
-    let tm_config = config_loader.load().await;
+/// Returns an HTTP client over one connection pool with a partition per `runtime` thread,
+/// configured as the transfer manager's own managed transport, with partition `i` bound to
+/// `interfaces[i % interfaces.len()]`.
+///
+/// Pool partition indices match execution partition indices, and each partition spawns its
+/// connection tasks on its thread, so a connection's I/O stays on the thread that opened it.
+///
+/// `interfaces` must not be empty.
+fn interface_http_client(
+    runtime: ManagedRuntimeHandle,
+    interfaces: &[String],
+    max_connections_per_host: usize,
+) -> Result<SharedHttpClient, BoxError> {
+    #[cfg(target_os = "android")]
+    let dns_resolver = ShufflingDnsResolver::new(
+        // Hickory reads /etc/resolv.conf on Unix. Android routes libc
+        // resolution through netd and does not provide that file.
+        aws_smithy_runtime::client::dns::TokioDnsResolver::new(),
+    );
+    #[cfg(not(target_os = "android"))]
+    let dns_resolver = ShufflingDnsResolver::new(aws_smithy_dns::HickoryDnsResolver::default());
 
-    let tm = aws_sdk_s3_transfer_manager::Client::new(tm_config);
+    let partitions = runtime.partitions().iter().map(|target| {
+        let index = target.id().index();
+        let target = target.clone();
+        let spawner = DriverSpawner::from_fn(move |task| {
+            drop(target.spawn(task));
+        });
+        let partition = Partition::new(PartitionId::from_index(index), spawner);
+        bind_interface(partition, &interfaces[index % interfaces.len()])
+    });
+    let pool = ConnectionPool::builder()
+        .dns_resolver(dns_resolver)
+        // S3 closes idle connections server-side. Retiring them first avoids reusing a
+        // connection the server is closing, which fails before the request is accepted and
+        // costs a retry on a fresh connection.
+        .idle_timeout(time::Duration::from_secs(15))
+        .max_connections_per_host(max_connections_per_host)
+        .proxy_config(ProxyConfig::from_env())
+        .partitions(partitions)
+        .tls_provider(Provider::Rustls(CryptoMode::AwsLc))
+        .build_https()?;
+    Ok(ManagedHttpPool::from_pool(runtime, pool)?.into_shared())
+}
 
+/// Binds `partition`'s connections to `interface`.
+#[cfg(any(
+    target_os = "android",
+    target_os = "fuchsia",
+    target_os = "illumos",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "solaris",
+    target_os = "tvos",
+    target_os = "visionos",
+    target_os = "watchos",
+))]
+fn bind_interface(partition: Partition, interface: &str) -> Partition {
+    partition.interface(interface)
+}
+
+/// Interface binding is unavailable on this platform, where [`network_interfaces`] rejects
+/// interface names: `partition` is returned unbound.
+#[cfg(not(any(
+    target_os = "android",
+    target_os = "fuchsia",
+    target_os = "illumos",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "solaris",
+    target_os = "tvos",
+    target_os = "visionos",
+    target_os = "watchos",
+)))]
+fn bind_interface(partition: Partition, _interface: &str) -> Partition {
+    partition
+}
+
+// Copy of the transfer manager's private `ShufflingDnsResolver` in `src/runtime/managed.rs`.
+/// DNS resolver that shuffles returned IPs to distribute connections across
+/// S3 fleet addresses. Wraps any [`ResolveDns`] implementation.
+///
+/// hyper tries resolved IPs sequentially, so without shuffling all connections
+/// land on the first IP. Shuffling gives each connection a random starting IP,
+/// spreading load across all resolved addresses. The connection pool's
+/// transport has the same sequential behavior, so shuffling still applies.
+#[derive(Debug, Clone)]
+struct ShufflingDnsResolver<R> {
+    inner: R,
+}
+
+impl<R> ShufflingDnsResolver<R> {
+    fn new(inner: R) -> Self {
+        Self { inner }
+    }
+}
+
+impl<R: ResolveDns + 'static> ResolveDns for ShufflingDnsResolver<R> {
+    fn resolve_dns<'a>(&'a self, name: &'a str) -> DnsFuture<'a> {
+        DnsFuture::new(async move {
+            let mut ips = self.inner.resolve_dns(name).await?;
+            fastrand::shuffle(&mut ips);
+            Ok(ips)
+        })
+    }
+}
+
+/// Runs the configured iterations and writes their results.
+///
+/// Takes the client by value so it is dropped, and its worker runtimes flush their trace
+/// events, before the caller shuts the recorder down.
+async fn transfer(
+    tm: aws_sdk_s3_transfer_manager::Client,
+    args: &Args,
+    is_download: bool,
+) -> Result<(), BoxError> {
     let json_output = matches!(args.output, OutputFormat::Json);
 
     let mut iteration_results = Vec::new();
@@ -654,13 +853,6 @@ async fn run(args: Args) -> Result<(), BoxError> {
         } else {
             println!("{json}");
         }
-    }
-
-    // Drop the client first so its worker runtimes flush, then drain.
-    #[cfg(s3_tm_dial9)]
-    if let Some(recorder) = recorder {
-        drop(tm);
-        recorder.graceful_shutdown(time::Duration::from_secs(10));
     }
 
     Ok(())

@@ -3,12 +3,15 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Binding managed-runtime connections to network interfaces.
+//! Binding connections to network interfaces through a caller-built runtime and
+//! HTTP client.
 //!
-//! The mock server listens on loopback, so binding every connection to the
-//! loopback interface must still reach it, while binding to an interface that
-//! does not exist must fail the request rather than silently falling back to
-//! OS routing. Runs on Linux (`SO_BINDTODEVICE`) and macOS (`IP_BOUND_IF`),
+//! The transfer manager adopts a managed runtime and uses an HTTP client over
+//! one connection pool whose per-thread partitions bind their connections to an
+//! interface. The mock server listens on loopback, so binding every connection
+//! to the loopback interface must still reach it, while binding to an interface
+//! that does not exist must fail the request rather than silently falling back
+//! to OS routing. Runs on Linux (`SO_BINDTODEVICE`) and macOS (`IP_BOUND_IF`),
 //! whose loopback interfaces are named differently.
 
 use std::time::Duration;
@@ -25,16 +28,44 @@ const LOOPBACK: &str = "lo";
 const LOOPBACK: &str = "lo0";
 
 async fn setup(interfaces: &[&str]) -> MockTm {
-    let interfaces: Vec<String> = interfaces.iter().map(|s| s.to_string()).collect();
+    let runtime = ManagedRuntime::builder()
+        .pin_threads(false)
+        .build()
+        .expect("build managed runtime");
+    let http_client = interface_bound_http_client(runtime.handle(), interfaces);
     mock_tm_with_s3_config(
-        RuntimeConfig::default(),
-        |s3| s3.network_interfaces(interfaces),
+        RuntimeConfig::managed(aws_sdk_s3_transfer_manager_ext::managed(runtime)),
+        |shared| shared.http_client(http_client),
         |b| {
             b.part_size(PartSize::Target(ByteSize::mib(5)))
                 .concurrency(ConcurrencyMode::Explicit(8))
         },
     )
     .await
+}
+
+/// An HTTP client over one connection pool with a partition per `runtime`
+/// thread, partition `i` bound to `interfaces[i % interfaces.len()]`.
+fn interface_bound_http_client(
+    runtime: ManagedRuntimeHandle,
+    interfaces: &[&str],
+) -> SharedHttpClient {
+    let partitions = runtime.partitions().iter().map(|target| {
+        let index = target.id().index();
+        let target = target.clone();
+        let spawner = DriverSpawner::from_fn(move |task| {
+            drop(target.spawn(task));
+        });
+        Partition::new(PartitionId::from_index(index), spawner)
+            .interface(interfaces[index % interfaces.len()])
+    });
+    let pool = ConnectionPool::builder()
+        .partitions(partitions)
+        .build_http()
+        .expect("build connection pool");
+    ManagedHttpPool::from_pool(runtime, pool)
+        .expect("build managed HTTP client")
+        .into_shared()
 }
 
 async fn download(

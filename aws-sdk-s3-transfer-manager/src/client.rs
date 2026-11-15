@@ -235,8 +235,7 @@ impl Handle {
                 PartSize::Auto => None,
             },
             ceiling_override_bytes: Some(
-                usize::try_from(buffer_pool.metrics().configured_capacity_bytes())
-                    .unwrap_or(usize::MAX),
+                usize::try_from(buffer_pool.metrics().capacity_bytes()).unwrap_or(usize::MAX),
             ),
         });
         Arc::new_cyclic(|weak| {
@@ -312,9 +311,9 @@ impl Client {
 
         let connection_cap = crate::runtime::platform::ConnectionCap::detect();
         let explicit_pool_ceiling = match config.memory() {
-            MemoryConfig::Explicit(pool) => Some(
-                usize::try_from(pool.metrics().configured_capacity_bytes()).unwrap_or(usize::MAX),
-            ),
+            MemoryConfig::Explicit(pool) => {
+                Some(usize::try_from(pool.metrics().capacity_bytes()).unwrap_or(usize::MAX))
+            }
             MemoryConfig::Auto => None,
         };
         let plan = sizing::resolve(Signals {
@@ -984,14 +983,14 @@ mod tests {
         let watch = execution.partitions()[0].spawn(std::future::pending::<()>());
         let mut s3 = mock_s3_config().config.to_builder();
         s3.set_http_client(None);
-        let config = crate::Config::builder()
-            .s3_config(
-                crate::config::S3ClientConfig::from_sdk_builder(s3)
-                    .network_interfaces(["bad\0interface"]),
-            )
+        let mut config = crate::Config::builder()
+            .s3_config(crate::config::S3ClientConfig::from_sdk_builder(s3))
             .runtime_config(RuntimeConfig::managed(crate::unstable::managed(owner)))
             .build()
             .expect("valid config");
+        // A NUL byte cannot be passed to the OS as an interface name, so building
+        // the transport fails after the runtime owner has been adopted.
+        config.set_network_interfaces(vec!["bad\0interface".to_owned()]);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Client::new(config)));
         assert!(result.is_err());
         assert!(tokio::time::timeout(Duration::from_secs(5), watch)
@@ -1107,10 +1106,7 @@ mod tests {
         let client_metrics = client.metrics();
         let memory = client_metrics.memory();
         assert_eq!(memory.active_planned_demand_bytes(), carrier_size as u64);
-        assert_eq!(
-            memory.configured_capacity_bytes(),
-            pool.metrics().configured_capacity_bytes()
-        );
+        assert_eq!(memory.capacity_bytes(), pool.metrics().capacity_bytes());
         drop(reservation);
     }
 
@@ -1132,8 +1128,8 @@ mod tests {
         let client_metrics = client.metrics();
         let memory = client_metrics.memory();
 
-        assert!(memory.configured_capacity_bytes() > 0);
-        assert_eq!(memory.admission_used_bytes(), 0);
+        assert!(memory.capacity_bytes() > 0);
+        assert_eq!(memory.admitted_bytes(), 0);
         assert_eq!(memory.prepared_capacity_bytes(), 0);
     }
 
@@ -1258,11 +1254,7 @@ mod tests {
             .expect("valid config");
 
         let client = Client::new(config);
-        let configured = client
-            .handle
-            .buffer_pool
-            .metrics()
-            .configured_capacity_bytes();
+        let configured = client.handle.buffer_pool.metrics().capacity_bytes();
 
         // Carrier rounding can only round the ceiling down, never above it.
         assert!(configured <= client.handle.plan.ceiling_bytes as u64);

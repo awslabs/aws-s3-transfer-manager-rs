@@ -242,8 +242,7 @@ compile_error!("`__unstable_ext` adopts a managed runtime, which wasm targets ca
 /// use the `aws_sdk_s3_transfer_manager::memory` tracing target.
 pub mod memory {
     pub use crate::runtime::buffer_pool::{
-        AcquireError, BufferPool, BufferPoolBuildError, BufferPoolBuilder, PooledBufMut,
-        Reservation, ReserveError, ReserveFuture, SegmentedBytes,
+        BufferPool, BufferPoolBuildError, BufferPoolBuilder, SegmentedBytes,
     };
 }
 
@@ -260,6 +259,15 @@ pub mod __fuzz {
     pub fn buffer_pool_placement(data: &[u8]) {
         crate::runtime::buffer_pool::run_placement_fuzz_input(data);
     }
+}
+
+/// Allocation-API access for out-of-crate benchmarks, built only under `cfg(s3_tm_bench)`.
+#[cfg(s3_tm_bench)]
+#[doc(hidden)]
+pub mod __bench {
+    pub use crate::runtime::buffer_pool::bench::{
+        AcquireError, BufferPoolExt, PooledBufMut, Reservation, ReserveError, ReserveFuture,
+    };
 }
 
 /// HTTP related components and utils

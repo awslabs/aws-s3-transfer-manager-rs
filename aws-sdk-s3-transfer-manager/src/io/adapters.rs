@@ -83,7 +83,6 @@ where
         cx: &mut std::task::Context<'_>,
         stream_cx: &StreamContext,
     ) -> std::task::Poll<Option<std::io::Result<PartData>>> {
-        use bytes::BufMut;
         let mut this = self.project();
         if *this.eof {
             return Poll::Ready(None);
@@ -219,10 +218,7 @@ mod tests {
         let (stream_cx, pool) = test_stream_cx(part_size);
 
         assert_pending!(io.as_mut().poll_part(&mut task_cx, &stream_cx));
-        assert_eq!(
-            pool.metrics().charged_capacity_bytes(),
-            pool.carrier_size() as u64
-        );
+        assert_eq!(pool.metrics().in_use_bytes(), pool.carrier_size() as u64);
         handle.read(b"hello");
         assert_eq!(awoken_cnt.get(), 1);
 
@@ -231,12 +227,9 @@ mod tests {
             .unwrap();
         let expected = PartData::new(1, "hello");
         assert_eq!(expected, result);
-        assert_eq!(
-            pool.metrics().charged_capacity_bytes(),
-            pool.carrier_size() as u64
-        );
+        assert_eq!(pool.metrics().in_use_bytes(), pool.carrier_size() as u64);
         drop(result);
-        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_eq!(pool.metrics().in_use_bytes(), 0);
 
         assert_pending!(io.as_mut().poll_part(&mut task_cx, &stream_cx));
         handle.read(b"world");
@@ -252,7 +245,7 @@ mod tests {
         drop(handle);
         let result = assert_ready!(io.as_mut().poll_part(&mut task_cx, &stream_cx));
         assert!(result.is_none());
-        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_eq!(pool.metrics().in_use_bytes(), 0);
     }
 
     #[cfg_attr(miri, ignore)]
@@ -269,10 +262,7 @@ mod tests {
         // partial read
         handle.read(b"hello");
         assert_pending!(io.as_mut().poll_part(&mut task_cx, &stream_cx));
-        assert_eq!(
-            pool.metrics().charged_capacity_bytes(),
-            pool.carrier_size() as u64
-        );
+        assert_eq!(pool.metrics().in_use_bytes(), pool.carrier_size() as u64);
 
         handle.read(b"world"); // full part available
         handle.read(b"second"); // last part less than part size
@@ -298,7 +288,7 @@ mod tests {
         // one final poll to actual get done signal
         let result = assert_ready!(io.as_mut().poll_part(&mut task_cx, &stream_cx));
         assert!(result.is_none());
-        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_eq!(pool.metrics().in_use_bytes(), 0);
     }
 
     /// A reader that, on its first read, replaces the `ReadBuf` it was given with one over a
@@ -369,7 +359,7 @@ mod tests {
                 panic!("{case}: a replaced buffer must fail the read, got {result:?}");
             };
             assert_eq!(std::io::ErrorKind::InvalidData, error.kind(), "{case}");
-            assert_eq!(pool.metrics().charged_capacity_bytes(), 0, "{case}");
+            assert_eq!(pool.metrics().in_use_bytes(), 0, "{case}");
         }
     }
 
@@ -421,6 +411,6 @@ mod tests {
             io.inner().polls,
             "the reader must not be read after end-of-file"
         );
-        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_eq!(pool.metrics().in_use_bytes(), 0);
     }
 }

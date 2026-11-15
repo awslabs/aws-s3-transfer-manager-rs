@@ -27,7 +27,7 @@
 //! threads: natively through `tokio::fs` or tokio's blocking pool, and inline
 //! on wasm targets, which have no blocking pool.
 
-use bytes::{Buf, BufMut};
+use bytes::Buf;
 use std::fs::File;
 use std::io;
 #[cfg(any(unix, windows, target_os = "wasi"))]
@@ -227,7 +227,7 @@ fn read_exact_at_unix(file: &File, dst: &mut [MaybeUninit<u8>], offset: u64) -> 
 /// Returns [`io::ErrorKind::UnexpectedEof`] when the requested range extends
 /// beyond the file and an error when the range offset cannot be represented.
 pub(crate) fn read_exact_at(file: &File, dst: &mut PartBuffer, mut offset: u64) -> io::Result<()> {
-    while dst.remaining_mut() != 0 {
+    while dst.writable() != 0 {
         // SAFETY: the returned slice remains `MaybeUninit<u8>` until the
         // positioned read initializes the complete range.
         let uninitialized = unsafe { dst.chunk_mut().as_uninit_slice_mut() };
@@ -1048,7 +1048,7 @@ mod tests {
             .collect::<Vec<_>>();
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
         std::io::Write::write_all(&mut tmp, &data).unwrap();
-        let mut buffer = PartBuffer::new(pool.clone(), part_size);
+        let mut buffer = PartBuffer::new(&pool, part_size);
         let waker = Waker::noop();
         let mut cx = Context::from_waker(waker);
         assert!(buffer.poll_acquire(&mut cx, part_size).is_ready());
@@ -1056,7 +1056,7 @@ mod tests {
         read_exact_at(tmp.as_file(), &mut buffer, 0).unwrap();
         let mut frozen = buffer.freeze();
         assert_eq!(frozen.copy_to_bytes(frozen.remaining()).as_ref(), data);
-        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_eq!(pool.metrics().in_use_bytes(), 0);
     }
 
     /// Reads into memory that starts uninitialized, so Miri (with recursive

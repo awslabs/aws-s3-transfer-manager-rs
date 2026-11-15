@@ -78,7 +78,6 @@ pub enum ReadAhead {
 /// ```
 pub struct S3ClientConfig {
     pub(crate) config: aws_sdk_s3::Config,
-    pub(crate) network_interfaces: Vec<String>,
 }
 
 impl S3ClientConfig {
@@ -92,61 +91,7 @@ impl S3ClientConfig {
     pub(crate) fn from_sdk_builder(builder: aws_sdk_s3::config::Builder) -> Self {
         Self {
             config: builder.build(),
-            network_interfaces: Vec::new(),
         }
-    }
-
-    /// Bind the runtime-provided HTTP transport's connections to these network
-    /// interfaces.
-    ///
-    /// Managed worker threads are assigned interfaces round-robin in the order
-    /// given, and each thread opens connections only through its interface, so
-    /// traffic spreads across NICs by thread. The binding is applied to each
-    /// socket before connect (`SO_BINDTODEVICE` on Linux). An interface that
-    /// does not exist or cannot be bound surfaces as a connection error when a
-    /// request is sent. A name containing a NUL byte cannot be passed to the OS
-    /// and panics when the client is constructed.
-    ///
-    /// Applies only to the default managed HTTP transport. A configured HTTP
-    /// client or caller-runtime execution uses its own socket configuration.
-    /// Empty (the default) leaves interface selection to OS routing.
-    ///
-    /// Available on platforms that support binding a socket to an interface
-    /// (Linux, Android, Apple platforms, illumos, Solaris, and Fuchsia).
-    #[cfg(any(
-        target_os = "android",
-        target_os = "fuchsia",
-        target_os = "illumos",
-        target_os = "ios",
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "solaris",
-        target_os = "tvos",
-        target_os = "visionos",
-        target_os = "watchos",
-    ))]
-    #[cfg_attr(
-        docsrs,
-        doc(cfg(any(
-            target_os = "android",
-            target_os = "fuchsia",
-            target_os = "illumos",
-            target_os = "ios",
-            target_os = "linux",
-            target_os = "macos",
-            target_os = "solaris",
-            target_os = "tvos",
-            target_os = "visionos",
-            target_os = "watchos",
-        )))
-    )]
-    pub fn network_interfaces<I, S>(mut self, interfaces: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.network_interfaces = interfaces.into_iter().map(Into::into).collect();
-        self
     }
 }
 
@@ -165,9 +110,7 @@ impl From<aws_sdk_s3::config::Builder> for S3ClientConfig {
 
 impl std::fmt::Debug for S3ClientConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("S3ClientConfig")
-            .field("network_interfaces", &self.network_interfaces)
-            .finish_non_exhaustive()
+        f.debug_struct("S3ClientConfig").finish_non_exhaustive()
     }
 }
 
@@ -195,6 +138,9 @@ pub struct Config {
     /// `Client::new` hot path. `None` when the config was built directly
     /// (bypassing the loader); consumers then fall back to cheap local detection.
     machine_profile: Option<crate::runtime::platform::MachineProfile>,
+    /// Interfaces the runtime-provided transport binds its connections to;
+    /// empty leaves interface selection to OS routing.
+    network_interfaces: Vec<String>,
 }
 
 impl Config {
@@ -283,12 +229,18 @@ impl Config {
                     && config.config.http_client().is_none() =>
             {
                 Some(crate::runtime::RuntimeHttpOptions {
-                    network_interfaces: config.network_interfaces.clone(),
+                    network_interfaces: self.network_interfaces.clone(),
                     max_connections_per_host,
                 })
             }
             _ => None,
         }
+    }
+
+    /// Binds the runtime-provided transport's connections to `interfaces`.
+    #[cfg(test)]
+    pub(crate) fn set_network_interfaces(&mut self, interfaces: Vec<String>) {
+        self.network_interfaces = interfaces;
     }
 
     /// Consume the S3 client source, returning it.
@@ -478,6 +430,7 @@ impl Builder {
             diagnostics: self.diagnostics.unwrap_or_else(DiagnosticsConfig::from_env),
             s3_client_source: Some(s3_client_source),
             machine_profile: self.machine_profile,
+            network_interfaces: Vec::new(),
         })
     }
 }
@@ -492,41 +445,19 @@ mod tests {
 
     #[test]
     fn s3_client_config_converts_from_sdk_config_and_builder() {
-        let sdk_config = aws_types::SdkConfig::builder().build();
+        let region = aws_types::region::Region::from_static("us-west-2");
+        let sdk_config = aws_types::SdkConfig::builder()
+            .region(region.clone())
+            .build();
         let from_sdk = S3ClientConfig::from(&sdk_config);
-        assert!(from_sdk.network_interfaces.is_empty());
+        assert_eq!(from_sdk.config.region(), Some(&region));
 
+        let builder = s3_config_builder().region(region.clone());
         #[cfg(feature = "sdk-v1")]
-        let from_builder = S3ClientConfig::new(s3_config_builder());
+        let from_builder = S3ClientConfig::new(builder);
         #[cfg(not(feature = "sdk-v1"))]
-        let from_builder = S3ClientConfig::from_sdk_builder(s3_config_builder());
-        assert!(from_builder.network_interfaces.is_empty());
-    }
-
-    #[cfg(any(
-        target_os = "android",
-        target_os = "fuchsia",
-        target_os = "illumos",
-        target_os = "ios",
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "solaris",
-        target_os = "tvos",
-        target_os = "visionos",
-        target_os = "watchos",
-    ))]
-    #[test]
-    fn runtime_http_carries_network_interfaces() {
-        let config = Config::builder()
-            .s3_config(
-                S3ClientConfig::from_sdk_builder(s3_config_builder())
-                    .network_interfaces(["ens5", "ens6"]),
-            )
-            .build()
-            .expect("valid config");
-        let http = config.runtime_http(64).expect("runtime HTTP enabled");
-        assert_eq!(http.network_interfaces, ["ens5", "ens6"]);
-        assert_eq!(http.max_connections_per_host, 64);
+        let from_builder = S3ClientConfig::from_sdk_builder(builder);
+        assert_eq!(from_builder.config.region(), Some(&region));
     }
 
     #[test]
@@ -535,7 +466,9 @@ mod tests {
             .s3_config(S3ClientConfig::from_sdk_builder(s3_config_builder()))
             .build()
             .expect("valid config");
-        assert!(config.runtime_http(64).is_some());
+        let http = config.runtime_http(64).expect("runtime HTTP enabled");
+        assert!(http.network_interfaces.is_empty());
+        assert_eq!(http.max_connections_per_host, 64);
     }
 
     #[test]

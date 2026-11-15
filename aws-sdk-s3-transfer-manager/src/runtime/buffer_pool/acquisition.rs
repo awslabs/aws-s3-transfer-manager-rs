@@ -24,7 +24,7 @@ use crate::runtime::sync::sync::Arc;
 /// Failure to acquire a complete mutable carrier batch.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AcquireError {
+pub(crate) enum AcquireError {
     /// The byte request was zero.
     InvalidSize,
     /// The reservation belongs to another pool.
@@ -955,8 +955,8 @@ mod tests {
             closed.active_planned_demand_bytes(),
             (carrier_size * 3) as u64
         );
-        assert_eq!(closed.charged_capacity_bytes(), (carrier_size * 3) as u64);
-        assert_eq!(closed.admission_used_bytes(), (carrier_size * 6) as u64);
+        assert_eq!(closed.in_use_bytes(), (carrier_size * 3) as u64);
+        assert_eq!(closed.admitted_bytes(), (carrier_size * 6) as u64);
         assert!(
             pool.try_reserve(carrier_size * 4).unwrap().is_none(),
             "close made another reservation's coverage available for a new grant"
@@ -1096,7 +1096,7 @@ mod tests {
                     "sequence {sequence} retained {live} carriers above the normal ceiling"
                 );
                 assert_eq!(
-                    metrics.charged_capacity_bytes(),
+                    metrics.in_use_bytes(),
                     (live * carrier_size) as u64,
                     "sequence {sequence} lost or duplicated a carrier charge"
                 );
@@ -1113,8 +1113,8 @@ mod tests {
             drop(owners);
             let metrics = pool.metrics();
             assert_eq!(metrics.active_planned_demand_bytes(), 0);
-            assert_eq!(metrics.charged_capacity_bytes(), 0);
-            assert_eq!(metrics.admission_used_bytes(), 0);
+            assert_eq!(metrics.in_use_bytes(), 0);
+            assert_eq!(metrics.admitted_bytes(), 0);
         }
     }
 
@@ -1164,7 +1164,7 @@ mod tests {
             );
             let metrics = pool.metrics();
             assert_eq!(
-                metrics.charged_capacity_bytes(),
+                metrics.in_use_bytes(),
                 0,
                 "metadata boundary {boundary} leaked aggregate charges"
             );
@@ -1457,8 +1457,8 @@ mod loom_tests {
 
             let retained = pool.metrics();
             assert_eq!(retained.active_planned_demand_bytes(), 0);
-            assert_eq!(retained.charged_capacity_bytes(), carrier_size as u64);
-            assert_eq!(retained.queued_reservations(), 0);
+            assert_eq!(retained.in_use_bytes(), carrier_size as u64);
+            assert_eq!(retained.waiting_requests(), 0);
 
             let shared = pool
                 .try_reserve(carrier_size)
@@ -1467,8 +1467,8 @@ mod loom_tests {
             drop(shared);
             drop(escaped);
             let released = pool.metrics();
-            assert_eq!(released.admission_used_bytes(), 0);
-            assert_eq!(released.charged_capacity_bytes(), 0);
+            assert_eq!(released.admitted_bytes(), 0);
+            assert_eq!(released.in_use_bytes(), 0);
         });
     }
 
@@ -1508,7 +1508,7 @@ mod loom_tests {
             assert!(claim.is_complete());
             drop(claim);
             drop(debit);
-            assert_eq!(pool.metrics().admission_used_bytes(), 0);
+            assert_eq!(pool.metrics().admitted_bytes(), 0);
         });
     }
 }

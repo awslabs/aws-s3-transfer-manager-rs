@@ -22,7 +22,6 @@
 
 use std::task::{Context, Poll, Waker};
 
-use bytes::BufMut;
 #[cfg(not(miri))]
 use proptest::prelude::*;
 
@@ -126,7 +125,7 @@ fn run_case(
 ) {
     let (pool, carrier_size) = test_pool(geometry.block_carriers, geometry.configured_carriers);
     let max_len = geometry.max_len(carrier_size, max_len_selector);
-    let mut buffer = PartBuffer::new(pool.clone(), max_len);
+    let mut buffer = PartBuffer::new(&pool, max_len);
     let mut expected = Vec::new();
     let mut blocked_envelope = None;
 
@@ -183,15 +182,15 @@ fn run_case(
     pool.validate_quiescent_for_test();
     let frozen = pool.metrics();
     assert_eq!(frozen.active_planned_demand_bytes(), 0);
-    assert_eq!(frozen.queued_reservations(), 0);
+    assert_eq!(frozen.waiting_requests(), 0);
 
     drop(output);
     pool.validate_quiescent_for_test();
     let released = pool.metrics();
     assert_eq!(released.active_planned_demand_bytes(), 0);
-    assert_eq!(released.admission_used_bytes(), 0);
-    assert_eq!(released.charged_capacity_bytes(), 0);
-    assert_eq!(released.queued_reservations(), 0);
+    assert_eq!(released.admitted_bytes(), 0);
+    assert_eq!(released.in_use_bytes(), 0);
+    assert_eq!(released.waiting_requests(), 0);
 }
 
 /// Applies one resolved admission-and-write transition and checks its postconditions.
@@ -212,24 +211,24 @@ fn apply_write_step(
 
     if let Some(latched) = blocked_envelope.take() {
         assert_eq!(
-            buffer.remaining_mut(),
+            buffer.writable(),
             latched,
             "pending admission did not retain its first envelope"
         );
     }
 
-    let writable = buffer.remaining_mut().min(buffer.remaining());
+    let writable = buffer.writable().min(buffer.remaining());
     assert!(writable != 0, "ready part buffer exposed no writable bytes");
     let bytes = vec![step.byte; step.write_len(writable)];
-    buffer.put_slice(&bytes);
+    assert_eq!(buffer.fill_from_slice(&bytes), bytes.len());
     expected.extend_from_slice(&bytes);
 
     assert_eq!(buffer.len(), expected.len());
     assert_eq!(buffer.remaining(), max_len - expected.len());
-    assert!(buffer.remaining_mut() <= buffer.remaining());
+    assert!(buffer.writable() <= buffer.remaining());
     pool.validate_quiescent_for_test();
-    assert!(pool.metrics().queued_reservations() <= 1);
-    assert!(pool.metrics().admission_used_bytes() <= pool.metrics().configured_capacity_bytes());
+    assert!(pool.metrics().waiting_requests() <= 1);
+    assert!(pool.metrics().admitted_bytes() <= pool.metrics().capacity_bytes());
 }
 
 #[cfg(not(miri))]

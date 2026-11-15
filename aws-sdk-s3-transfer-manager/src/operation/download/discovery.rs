@@ -208,7 +208,7 @@ async fn discover_obj_with_get_first_part(
             req.send()
                 .await
                 .map(|resp| (resp, checksum))
-                .map_err(|e| crate::retry::GuardError::Inner(error::Error::from(e)))
+                .map_err(|e| crate::retry::GuardError::Inner(error::service_error(e)))
         }
     })
     .instrument(tracing::trace_span!(
@@ -236,7 +236,7 @@ async fn discover_obj_with_head(
         async move {
             req.send()
                 .await
-                .map_err(|e| crate::retry::GuardError::Inner(error::Error::from(e)))
+                .map_err(|e| crate::retry::GuardError::Inner(error::service_error(e)))
         }
     })
     .instrument(tracing::trace_span!(
@@ -392,7 +392,7 @@ async fn discover_obj_with_get(
             req.send()
                 .await
                 .map(|resp| (resp, checksum))
-                .map_err(|e| crate::retry::GuardError::Inner(error::Error::from(e)))
+                .map_err(|e| crate::retry::GuardError::Inner(error::service_error(e)))
         }
     })
     .instrument(tracing::trace_span!(

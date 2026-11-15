@@ -13,9 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `UploadObjectsFluentBuilder`, and `DownloadObjectsFluentBuilder`. `None` selects the default,
   `FailedTransferPolicy::Abort`.
 - `ConfigLoader::s3_config` uses an existing `SdkConfig` or `S3ClientConfig` in place of loading
-  the shared AWS configuration; `load` still detects the machine profile. A non-empty list set with
-  `ConfigLoader::network_interfaces` replaces the supplied configuration's network interfaces, and
-  an empty list keeps them.
+  the shared AWS configuration; `load` still detects the machine profile.
 - `ConfigLoader::read_ahead` sets the client's default download read-ahead, as
   `config::Builder::read_ahead` does.
 - `ConfigLoader` is exported as `config::ConfigLoader`.
@@ -32,6 +30,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `IntegrityChecks::checksum_validation` previously never reported `Validated`.
 - `aws-sdk-s3-transfer-manager`: `NotValidatedReason::UnsupportedAlgorithm`, reported when a
   download's responses carried checksums only in algorithms the SDK does not compute, such as MD5.
+- `io::PartBuffer::new` creates a buffer for one upload part charged to a caller's
+  `memory::BufferPool`. `PartBuffer::writable` returns the bytes writable without another
+  `poll_acquire`, and `PartBuffer::fill_from_slice` copies as much of a slice as fits and returns
+  the count.
 
 ### Changed
 - `TransferMetrics::started_at` and `TransferMetrics::finished_at` are replaced by
@@ -70,6 +72,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   1.96.0.
 - `error::Error` no longer implements `From<tokio::task::JoinError>` or
   `From<std::sync::PoisonError<T>>`. Construct an error of the intended kind with `Error::new`.
+- `error::Error` no longer implements `From<SdkError<E, HttpResponse>>` for the `aws-sdk-s3`
+  operation errors `GetObjectError`, `HeadObjectError`, `PutObjectError`, `UploadPartError`,
+  `CreateMultipartUploadError`, `CompleteMultipartUploadError`, `AbortMultipartUploadError`, and
+  `ListObjectsV2Error`. Errors returned by transfers are unchanged.
+- `S3ClientConfig::network_interfaces` and `ConfigLoader::network_interfaces` are removed. To bind
+  connections to network interfaces, build a `ManagedRuntime`, set the S3 configuration's HTTP
+  client to an `aws_smithy_managed_http::client::ManagedHttpPool` over a connection pool whose
+  partitions, one per runtime thread, bind to the interfaces, and adopt the runtime with
+  `aws_sdk_s3_transfer_manager_ext::managed`. `examples/cp.rs` builds this for
+  `--network-interfaces`.
 - `io::error` is no longer public. `InputStream::from_path` and `PathBodyBuilder::build` return
   `error::Error`: a missing path or an offset past the end of the file is
   `ErrorKind::InputInvalid`, and a failure reading file metadata, such as a missing file, is

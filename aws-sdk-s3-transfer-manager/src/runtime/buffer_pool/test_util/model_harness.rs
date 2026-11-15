@@ -1123,12 +1123,12 @@ impl Runner {
             "step {step} {operation:?}: active demand"
         );
         assert_eq!(
-            metrics.charged_capacity_bytes(),
+            metrics.in_use_bytes(),
             self.model.charged() as u64 * carrier_size,
             "step {step} {operation:?}: charged capacity"
         );
         assert_eq!(
-            metrics.admission_used_bytes(),
+            metrics.admitted_bytes(),
             self.model.admission_used() as u64 * carrier_size,
             "step {step} {operation:?}: admission usage"
         );
@@ -1138,12 +1138,12 @@ impl Runner {
             "step {step} {operation:?}: prepared capacity"
         );
         assert_eq!(
-            metrics.queued_reservations(),
+            metrics.waiting_requests(),
             self.model.queue.len(),
             "step {step} {operation:?}: FIFO depth"
         );
         assert_eq!(
-            metrics.reservation_enqueues_total(),
+            metrics.waits_total(),
             self.model.reservation_enqueues_total,
             "step {step} {operation:?}: cumulative FIFO entries"
         );

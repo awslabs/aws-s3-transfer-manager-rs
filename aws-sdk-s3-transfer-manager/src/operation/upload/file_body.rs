@@ -185,7 +185,7 @@ impl Body for DirectFileBody {
             let to_read = (this.unread as usize).min(FILE_BODY_CHUNK_SIZE);
             let buffer = this
                 .buffer
-                .get_or_insert_with(|| PartBuffer::new(this.source.pool.clone(), to_read));
+                .get_or_insert_with(|| PartBuffer::new(&this.source.pool, to_read));
             match buffer.poll_acquire(cx, to_read) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Ok(())) => {}
@@ -368,7 +368,7 @@ async fn read_task(
     while remaining > 0 {
         let to_read = (remaining as usize).min(FILE_BODY_CHUNK_SIZE);
         let read_offset = offset;
-        let mut buffer = PartBuffer::new(source.pool.clone(), to_read);
+        let mut buffer = PartBuffer::new(&source.pool, to_read);
         if let Err(error) = poll_fn(|cx| buffer.poll_acquire(cx, to_read)).await {
             let _ = tx.send(Err(error)).await;
             return;
@@ -528,7 +528,7 @@ mod tests {
 
         drop(frame);
         drop(body);
-        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_eq!(pool.metrics().in_use_bytes(), 0);
     }
 
     #[cfg_attr(miri, ignore)] // Tokio's I/O driver uses unsupported platform FFI under Miri.
@@ -541,7 +541,7 @@ mod tests {
 
         let out = collect_body(body).await.unwrap();
         assert_eq!(out, payload);
-        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_eq!(pool.metrics().in_use_bytes(), 0);
     }
 
     #[cfg_attr(miri, ignore)] // Tokio's I/O driver uses unsupported platform FFI under Miri.
@@ -557,7 +557,7 @@ mod tests {
         let out = collect_body(body).await.unwrap();
         assert_eq!(out.len(), size);
         assert_eq!(out, payload);
-        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_eq!(pool.metrics().in_use_bytes(), 0);
     }
 
     #[cfg_attr(miri, ignore)] // Tokio's I/O driver uses unsupported platform FFI under Miri.
@@ -572,7 +572,7 @@ mod tests {
 
         let out = collect_body(body).await.unwrap();
         assert_eq!(out, &payload[offset as usize..(offset + length) as usize]);
-        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_eq!(pool.metrics().in_use_bytes(), 0);
     }
 
     #[cfg_attr(miri, ignore)] // The 1 MiB cross-chunk path is prohibitively slow under Miri.
@@ -590,7 +590,7 @@ mod tests {
         };
         assert_eq!(first.as_ref(), &payload[..FILE_BODY_CHUNK_SIZE]);
         drop(first);
-        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_eq!(pool.metrics().in_use_bytes(), 0);
 
         tmp.as_file()
             .set_len((FILE_BODY_CHUNK_SIZE + 5) as u64)
@@ -602,7 +602,7 @@ mod tests {
 
         assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
         assert!(body.is_end_stream());
-        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_eq!(pool.metrics().in_use_bytes(), 0);
     }
 
     #[test]
@@ -617,13 +617,10 @@ mod tests {
             result => panic!("expected one body frame, got {result:?}"),
         };
         assert_eq!(frame, payload[..]);
-        assert_eq!(
-            pool.metrics().charged_capacity_bytes(),
-            pool.carrier_size() as u64
-        );
+        assert_eq!(pool.metrics().in_use_bytes(), pool.carrier_size() as u64);
 
         drop(frame);
-        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_eq!(pool.metrics().in_use_bytes(), 0);
         assert!(matches!(poll_body_once(&mut body), Poll::Ready(None)));
     }
 
@@ -639,13 +636,13 @@ mod tests {
         let mut body = DirectFileBody::new(source(tmp.path(), &pool), 0, payload.len() as u64);
 
         assert!(poll_body_once(&mut body).is_pending());
-        assert_eq!(pool.metrics().queued_reservations(), 1);
+        assert_eq!(pool.metrics().waiting_requests(), 1);
         drop(body);
-        assert_eq!(pool.metrics().queued_reservations(), 0);
+        assert_eq!(pool.metrics().waiting_requests(), 0);
 
         drop(acquisition);
         reservation.close_acquisition();
-        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_eq!(pool.metrics().in_use_bytes(), 0);
     }
 
     // ---- OffloadedFileBody ----
@@ -662,7 +659,7 @@ mod tests {
 
         assert!(matches!(poll_body_once(&mut body), Poll::Ready(None)));
         assert!(matches!(body.state, OffloadedState::Pending { .. }));
-        assert_eq!(pool.metrics().reservation_enqueues_total(), 0);
+        assert_eq!(pool.metrics().waits_total(), 0);
     }
 
     #[cfg_attr(miri, ignore)] // Tokio's runtime uses unsupported platform FFI under Miri.
@@ -726,7 +723,7 @@ mod tests {
 
         let out = collect_body(body).await.unwrap();
         assert_eq!(out, payload);
-        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_eq!(pool.metrics().in_use_bytes(), 0);
     }
 
     #[cfg_attr(miri, ignore)] // Tokio's I/O driver uses unsupported platform FFI under Miri.
@@ -746,7 +743,7 @@ mod tests {
         let out = collect_body(body).await.unwrap();
         assert_eq!(out.len(), size);
         assert_eq!(out, payload);
-        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_eq!(pool.metrics().in_use_bytes(), 0);
     }
 
     #[cfg_attr(miri, ignore)] // Tokio's I/O driver uses unsupported platform FFI under Miri.
@@ -766,7 +763,7 @@ mod tests {
 
         let out = collect_body(body).await.unwrap();
         assert_eq!(out, &payload[offset as usize..(offset + length) as usize]);
-        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_eq!(pool.metrics().in_use_bytes(), 0);
     }
 
     #[cfg_attr(miri, ignore)] // Tokio's I/O driver uses unsupported platform FFI under Miri.
@@ -788,25 +785,25 @@ mod tests {
 
         assert!(poll_body_once(&mut body).is_pending());
         for _ in 0..100 {
-            if pool.metrics().queued_reservations() == 1 {
+            if pool.metrics().waiting_requests() == 1 {
                 break;
             }
             tokio::task::yield_now().await;
         }
-        assert_eq!(pool.metrics().queued_reservations(), 1);
+        assert_eq!(pool.metrics().waiting_requests(), 1);
 
         drop(body);
         for _ in 0..100 {
-            if pool.metrics().queued_reservations() == 0 {
+            if pool.metrics().waiting_requests() == 0 {
                 break;
             }
             tokio::task::yield_now().await;
         }
-        assert_eq!(pool.metrics().queued_reservations(), 0);
+        assert_eq!(pool.metrics().waiting_requests(), 0);
 
         drop(acquisition);
         reservation.close_acquisition();
-        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_eq!(pool.metrics().in_use_bytes(), 0);
     }
 
     #[cfg_attr(miri, ignore)] // Tokio's I/O driver uses unsupported platform FFI under Miri.
@@ -831,7 +828,7 @@ mod tests {
 
             assert_eq!(collect_body(body).await.unwrap(), original);
             assert_eq!(collect_body(retry).await.unwrap(), original);
-            assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+            assert_eq!(pool.metrics().in_use_bytes(), 0);
         }
     }
 
@@ -863,7 +860,7 @@ mod tests {
         })
         .join()
         .unwrap();
-        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_eq!(pool.metrics().in_use_bytes(), 0);
     }
 
     #[cfg_attr(miri, ignore)]

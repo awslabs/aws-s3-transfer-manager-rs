@@ -62,7 +62,7 @@ type CarrierRuns = SmallVec<[CarrierRun; INLINE_CARRIER_RUNS]>;
 /// reservation's carrier allowance even when their initialized byte lengths
 /// fit within the reservation. The allowance returns when each final immutable
 /// owner drops.
-pub struct PooledBufMut {
+pub(crate) struct PooledBufMut {
     /// Selects reserved or unreserved acquisition for every later growth.
     growth: GrowthAuthority,
     /// Preserves logical byte order across physical runs.
@@ -103,7 +103,7 @@ impl PooledBufMut {
     ///
     /// This is `len() + remaining_mut()`, not the original allocation size.
     /// Publishing removes capacity from the mutable buffer.
-    pub fn capacity(&self) -> usize {
+    pub(crate) fn capacity(&self) -> usize {
         self.retained_capacity
     }
 
@@ -111,12 +111,12 @@ impl PooledBufMut {
     ///
     /// The bytes may span multiple carriers and therefore may not be
     /// contiguous in memory.
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.initialized
     }
 
     /// Returns whether no initialized unpublished bytes remain.
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.initialized == 0
     }
 
@@ -166,7 +166,7 @@ impl PooledBufMut {
     ///
     /// The result is empty exactly when [`Self::len`] is zero. A nonempty
     /// result never crosses a carrier boundary.
-    pub fn initialized_chunk(&self) -> &[u8] {
+    pub(crate) fn initialized_chunk(&self) -> &[u8] {
         if self.initialized == 0 {
             return &[];
         }
@@ -193,7 +193,7 @@ impl PooledBufMut {
     /// complete carriers. Only capacity retained by this buffer can satisfy
     /// the guarantee; unused tails discarded by other buffers are not shared.
     /// Failure leaves this buffer unchanged.
-    pub fn reserve(&mut self, min_writable: usize) -> Result<(), AcquireError> {
+    pub(crate) fn reserve(&mut self, min_writable: usize) -> Result<(), AcquireError> {
         let remaining = self.remaining_mut();
         if min_writable <= remaining {
             return Ok(());
@@ -220,7 +220,7 @@ impl PooledBufMut {
     ///
     /// Panics unless `count` is nonzero and no larger than
     /// `initialized_chunk().len()`.
-    pub fn publish_prefix(&mut self, count: usize) -> Bytes {
+    pub(crate) fn publish_prefix(&mut self, count: usize) -> Bytes {
         self.normalize_publish_cursor();
         let available = self.initialized_chunk().len();
         assert!(
@@ -270,7 +270,7 @@ impl PooledBufMut {
     /// drops. An initialized prefix in a partially used carrier retains that
     /// carrier and discards its writable suffix. The operation does not copy
     /// initialized bytes.
-    pub fn freeze(mut self) -> SegmentedBytes {
+    pub(crate) fn freeze(mut self) -> SegmentedBytes {
         let pool = Arc::clone(self.growth.pool());
         let mut builder = SegmentedBytesBuilder::for_pool(pool);
 
@@ -1085,10 +1085,7 @@ mod tests {
         buffer.reserve(buffer.remaining_mut()).unwrap();
 
         assert_eq!(buffer.capacity(), capacity);
-        assert_eq!(
-            pool.metrics().charged_capacity_bytes(),
-            metrics.charged_capacity_bytes()
-        );
+        assert_eq!(pool.metrics().in_use_bytes(), metrics.in_use_bytes());
     }
 
     #[test]
@@ -1158,7 +1155,7 @@ mod tests {
             assert_eq!(buffer.len(), 3);
             assert_eq!(buffer.remaining_mut(), carrier_size - 3);
             assert_eq!(buffer.initialized_chunk(), b"abc");
-            assert_eq!(pool.metrics().charged_capacity_bytes(), carrier_size as u64);
+            assert_eq!(pool.metrics().in_use_bytes(), carrier_size as u64);
 
             buffer
                 .reserve(carrier_size)
@@ -1247,24 +1244,15 @@ mod tests {
         expected.extend_from_slice(&second_input);
         assert_eq!(output, expected.as_slice());
 
-        assert_eq!(
-            pool.metrics().charged_capacity_bytes(),
-            (carrier_size * 3) as u64
-        );
+        assert_eq!(pool.metrics().in_use_bytes(), (carrier_size * 3) as u64);
         drop(first);
-        assert_eq!(
-            pool.metrics().charged_capacity_bytes(),
-            (carrier_size * 2) as u64
-        );
+        assert_eq!(pool.metrics().in_use_bytes(), (carrier_size * 2) as u64);
         drop(second_prefix);
-        assert_eq!(
-            pool.metrics().charged_capacity_bytes(),
-            (carrier_size * 2) as u64
-        );
+        assert_eq!(pool.metrics().in_use_bytes(), (carrier_size * 2) as u64);
         drop(second_rest);
-        assert_eq!(pool.metrics().charged_capacity_bytes(), carrier_size as u64);
+        assert_eq!(pool.metrics().in_use_bytes(), carrier_size as u64);
         drop(frozen);
-        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_eq!(pool.metrics().in_use_bytes(), 0);
     }
 
     #[test]
@@ -1285,21 +1273,18 @@ mod tests {
         let frozen = buffer.freeze().into_contiguous();
 
         assert_eq!(frozen, input);
-        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_eq!(pool.metrics().in_use_bytes(), 0);
     }
 
     #[test]
     fn test_dropping_empty_mutable_buffer_returns_every_carrier() {
         let (pool, carrier_size) = test_pool(1, 2);
         let buffer = pool.acquire_unreserved(carrier_size * 2).unwrap();
-        assert_eq!(
-            pool.metrics().charged_capacity_bytes(),
-            (carrier_size * 2) as u64
-        );
+        assert_eq!(pool.metrics().in_use_bytes(), (carrier_size * 2) as u64);
 
         drop(buffer);
 
-        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_eq!(pool.metrics().in_use_bytes(), 0);
     }
 
     // `usize::MAX` rounds to a carrier count that overflows the packed-lane
@@ -1384,7 +1369,7 @@ mod tests {
         assert_eq!(frozen.chunk(), suffix);
         drop(published);
         drop(frozen);
-        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_eq!(pool.metrics().in_use_bytes(), 0);
     }
 
     #[cfg(all(
@@ -1606,18 +1591,15 @@ mod tests {
         assert_eq!(first, input[..carrier_size]);
         assert_eq!(buffer.initialized_chunk(), &input[carrier_size..]);
         assert_eq!(buffer.capacity(), carrier_size);
-        assert_eq!(
-            pool.metrics().charged_capacity_bytes(),
-            (carrier_size * 2) as u64
-        );
+        assert_eq!(pool.metrics().in_use_bytes(), (carrier_size * 2) as u64);
 
         drop(first);
-        assert_eq!(pool.metrics().charged_capacity_bytes(), carrier_size as u64);
+        assert_eq!(pool.metrics().in_use_bytes(), carrier_size as u64);
         let second = buffer.publish_prefix(3);
         drop(buffer);
-        assert_eq!(pool.metrics().charged_capacity_bytes(), carrier_size as u64);
+        assert_eq!(pool.metrics().in_use_bytes(), carrier_size as u64);
         drop(second);
-        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_eq!(pool.metrics().in_use_bytes(), 0);
     }
 
     #[test]
@@ -1630,13 +1612,13 @@ mod tests {
         let slice = published.slice(2..7);
         drop(buffer);
 
-        assert_eq!(pool.metrics().charged_capacity_bytes(), carrier_size as u64);
+        assert_eq!(pool.metrics().in_use_bytes(), carrier_size as u64);
         drop(published);
         drop(clone);
         assert_eq!(slice, b"mutab"[..]);
-        assert_eq!(pool.metrics().charged_capacity_bytes(), carrier_size as u64);
+        assert_eq!(pool.metrics().in_use_bytes(), carrier_size as u64);
         drop(slice);
-        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_eq!(pool.metrics().in_use_bytes(), 0);
     }
 
     #[test]
@@ -1704,7 +1686,7 @@ mod tests {
                     frozen.advance(count);
                 }
                 assert_eq!(output.as_ref(), input.as_slice(), "length {length}");
-                assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+                assert_eq!(pool.metrics().in_use_bytes(), 0);
             }
         }
     }

@@ -38,7 +38,6 @@ use crate::config::{ConcurrencyMode, MemoryConfig, PartSize, ReadAhead};
 pub struct ConfigLoader {
     builder: Builder,
     s3_config: Option<S3ClientConfig>,
-    network_interfaces: Vec<String>,
 }
 
 impl ConfigLoader {
@@ -126,50 +125,6 @@ impl ConfigLoader {
         self
     }
 
-    /// Bind the runtime-provided HTTP transport's connections to these network
-    /// interfaces.
-    ///
-    /// A non-empty list replaces the network interfaces of a configuration
-    /// supplied with [`s3_config`](Self::s3_config); an empty list keeps them.
-    ///
-    /// See [`S3ClientConfig::network_interfaces`] for assignment, scope, and
-    /// platform availability.
-    #[cfg(any(
-        target_os = "android",
-        target_os = "fuchsia",
-        target_os = "illumos",
-        target_os = "ios",
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "solaris",
-        target_os = "tvos",
-        target_os = "visionos",
-        target_os = "watchos",
-    ))]
-    #[cfg_attr(
-        docsrs,
-        doc(cfg(any(
-            target_os = "android",
-            target_os = "fuchsia",
-            target_os = "illumos",
-            target_os = "ios",
-            target_os = "linux",
-            target_os = "macos",
-            target_os = "solaris",
-            target_os = "tvos",
-            target_os = "visionos",
-            target_os = "watchos",
-        )))
-    )]
-    pub fn network_interfaces<I, S>(mut self, interfaces: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.network_interfaces = interfaces.into_iter().map(Into::into).collect();
-        self
-    }
-
     /// Load the configuration.
     ///
     /// Without [`s3_config`](Self::s3_config), the S3 client configuration is
@@ -178,7 +133,7 @@ impl ConfigLoader {
     /// not identify the host, it makes one EC2 instance metadata (IMDS)
     /// request with a short timeout, unless `AWS_EC2_METADATA_DISABLED` is `true`.
     pub async fn load(self) -> Config {
-        let mut s3_config = match self.s3_config {
+        let s3_config = match self.s3_config {
             Some(config) => config,
             None => {
                 S3ClientConfig::new(&aws_config::defaults(BehaviorVersion::latest()).load().await)
@@ -189,9 +144,6 @@ impl ConfigLoader {
         // construction stays free of blocking DMI reads and network IMDS calls.
         let profile = detect_machine_profile().await;
 
-        if !self.network_interfaces.is_empty() {
-            s3_config.network_interfaces = self.network_interfaces;
-        }
         self.builder
             .machine_profile(Some(profile))
             .s3_config(s3_config)
@@ -397,79 +349,6 @@ mod tests {
             config.runtime_http(64).is_none(),
             "an HTTP client is supplied: the managed transport is not installed"
         );
-    }
-
-    #[cfg(any(
-        target_os = "android",
-        target_os = "fuchsia",
-        target_os = "illumos",
-        target_os = "ios",
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "solaris",
-        target_os = "tvos",
-        target_os = "visionos",
-        target_os = "watchos",
-    ))]
-    mod network_interfaces {
-        use crate::config::S3ClientConfig;
-
-        fn supplied(interfaces: &[&str]) -> S3ClientConfig {
-            S3ClientConfig::from_sdk_builder(aws_sdk_s3::config::Builder::new())
-                .network_interfaces(interfaces.iter().copied())
-        }
-
-        #[cfg_attr(miri, ignore)]
-        #[tokio::test]
-        async fn supplied_config_keeps_its_interfaces_when_loader_sets_none() {
-            let config = crate::from_env()
-                .s3_config(supplied(&["ens5"]))
-                .load()
-                .await;
-            let http = config
-                .runtime_http(64)
-                .expect("loader enables runtime HTTP");
-            assert_eq!(http.network_interfaces, ["ens5"]);
-        }
-
-        #[cfg_attr(miri, ignore)]
-        #[tokio::test]
-        async fn loader_interfaces_replace_supplied_config_interfaces() {
-            let config = crate::from_env()
-                .s3_config(supplied(&["ens5"]))
-                .network_interfaces(["ens6", "ens7"])
-                .load()
-                .await;
-            let http = config
-                .runtime_http(64)
-                .expect("loader enables runtime HTTP");
-            assert_eq!(http.network_interfaces, ["ens6", "ens7"]);
-        }
-    }
-
-    #[cfg(any(
-        target_os = "android",
-        target_os = "fuchsia",
-        target_os = "illumos",
-        target_os = "ios",
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "solaris",
-        target_os = "tvos",
-        target_os = "visionos",
-        target_os = "watchos",
-    ))]
-    #[cfg_attr(miri, ignore)]
-    #[tokio::test]
-    async fn load_applies_network_interfaces() {
-        let config = crate::from_env()
-            .network_interfaces(["ens5", "ens6"])
-            .load()
-            .await;
-        let http = config
-            .runtime_http(64)
-            .expect("loader enables runtime HTTP");
-        assert_eq!(http.network_interfaces, ["ens5", "ens6"]);
     }
 
     // Tests the pure parser, so it never touches the process environment and
