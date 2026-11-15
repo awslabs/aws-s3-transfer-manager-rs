@@ -112,6 +112,7 @@ mod coverage_tests;
 mod download_tests;
 mod negative_control_tests;
 pub(crate) mod test_util;
+mod upload_tests;
 
 /// Every case in the two case tables.
 fn table_cases() -> test_util::vocab::Cases {
