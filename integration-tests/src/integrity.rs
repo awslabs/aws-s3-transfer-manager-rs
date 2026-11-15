@@ -113,6 +113,7 @@ mod coverage_tests;
 mod download_tests;
 mod liveness_tests;
 mod negative_control_tests;
+mod service_tests;
 pub(crate) mod test_util;
 mod upload_tests;
 
