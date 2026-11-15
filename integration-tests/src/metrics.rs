@@ -35,6 +35,8 @@ async fn wait_for_terminal(status_fn: impl Fn() -> TransferStatus) {
     .expect("transfer did not reach terminal state within 30s");
 }
 
+/// A multipart upload's output reports the handle's final metrics: the bytes
+/// sent and the `elapsed` frozen at the recorded finish.
 #[tokio::test]
 async fn test_upload_metrics_and_status() {
     let m = setup().await;
@@ -60,6 +62,35 @@ async fn test_upload_metrics_and_status() {
     let elapsed = wait_for_finished_elapsed(|| handle.metrics()).await;
 
     let output = handle.join().await.expect("join");
+    assert_eq!(output.metrics.network_tx, size as u64);
+    assert_eq!(output.metrics.elapsed, elapsed);
+
+    m.handle.shutdown().await.expect("shutdown");
+}
+
+/// A single-request (PutObject) upload's output reports the bytes sent and the
+/// `elapsed` frozen at the recorded finish. 1 KiB is below the 5 MiB floor of
+/// the multipart threshold; the absent upload ID confirms the PutObject path.
+#[tokio::test]
+async fn test_put_object_upload_output_reports_final_metrics() {
+    let m = setup().await;
+
+    let size = ByteUnit::Kibibyte.as_bytes_usize();
+    let handle = m
+        .client
+        .upload()
+        .bucket("test-bucket")
+        .key("metrics-put-object")
+        .body(InputStream::from(vec![0u8; size]))
+        .initiate()
+        .expect("initiate upload");
+
+    wait_for_terminal(|| handle.status()).await;
+    assert_eq!(handle.status(), TransferStatus::Completed);
+    let elapsed = wait_for_finished_elapsed(|| handle.metrics()).await;
+
+    let output = handle.join().await.expect("join");
+    assert_eq!(output.upload_id(), None);
     assert_eq!(output.metrics.network_tx, size as u64);
     assert_eq!(output.metrics.elapsed, elapsed);
 

@@ -1442,13 +1442,6 @@ impl UploadTransfer {
             }
         };
 
-        let result = crate::sdk_v1::upload_output_from_put_object(&resp)
-            .metrics(self.inner.ctx.metrics())
-            .build()
-            .expect("valid response");
-
-        *self.inner.result.lock().expect("lock poisoned") = Some(UploadResult::Completed(result));
-
         // A successful response means the SDK fully read the body and
         // the bytes made it to the wire. For file-backed sources, the
         // body implementations above have therefore read `content_length`
@@ -1462,6 +1455,18 @@ impl UploadTransfer {
             disk_read,
             ..Default::default()
         });
+
+        // The output carries the transfer's final metrics, so its I/O and
+        // finish are recorded before the snapshot. The result is stored
+        // before `set_completed`, because the last `InFlight` guard signals
+        // terminal once the transfer is inactive.
+        self.inner.ctx.finalize_terminal_metrics();
+        let result = crate::sdk_v1::upload_output_from_put_object(&resp)
+            .metrics(self.inner.ctx.metrics())
+            .build()
+            .expect("valid response");
+
+        *self.inner.result.lock().expect("lock poisoned") = Some(UploadResult::Completed(result));
 
         let snapshot = self.set_done();
         self.inner.ctx.set_completed();
@@ -1591,6 +1596,9 @@ impl UploadTransfer {
             completion_timer.elapsed(),
         );
 
+        // The output carries the transfer's final metrics; see the PutObject
+        // completion for the ordering.
+        self.inner.ctx.finalize_terminal_metrics();
         let result = crate::sdk_v1::update_upload_output_from_complete_multipart_upload(
             response_builder,
             &resp,

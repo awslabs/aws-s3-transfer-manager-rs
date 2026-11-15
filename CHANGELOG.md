@@ -111,6 +111,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - `PathBodyBuilder::build` without a path returns an `ErrorKind::InputInvalid` error instead of
   panicking.
+- The metrics in an upload's output are the transfer's metrics at completion. A single-request
+  upload's output reported zero `network_tx`, and zero `disk_read` for a file source.
 - Framework metadata set on the `SdkConfig` or S3 configuration was missing from the
   `x-amz-user-agent` header of requests the transfer manager sent. The header now carries each
   entry as `lib/<name>/<version>` alongside the transfer manager's attribution, in the order
