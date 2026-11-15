@@ -107,7 +107,19 @@
 //! through this matrix. Representative algorithms are used: CRC32 for full
 //! object, SHA-256 for the composite case.
 
+mod algorithm_tests;
+mod coverage_tests;
+mod download_tests;
+mod negative_control_tests;
 pub(crate) mod test_util;
+
+/// Every case in the two case tables.
+fn table_cases() -> test_util::vocab::Cases {
+    let mut cases = Vec::new();
+    algorithm_tests::cases(&mut cases);
+    download_tests::cases(&mut cases);
+    cases
+}
 
 use crate::assertions::{
     assert_integrity_error, assert_not_validated, assert_same_content, assert_validated,
