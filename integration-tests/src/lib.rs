@@ -20,6 +20,7 @@ mod metrics;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod network_interfaces;
 mod test_data;
+mod test_util;
 mod upload;
 mod upload_objects;
 mod upload_retry;
