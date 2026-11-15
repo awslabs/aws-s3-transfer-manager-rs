@@ -29,6 +29,7 @@
 use bytes::{Buf, BufMut};
 use std::fs::File;
 use std::io;
+#[cfg(any(unix, windows, target_os = "wasi"))]
 use std::mem::MaybeUninit;
 use std::path::{Path, PathBuf};
 
@@ -42,6 +43,7 @@ use crate::io::PartBuffer;
 /// file with a zero-length read. Offsets advance only by bytes `read` reports
 /// initialized, so a successful return initializes all of `dst` provided `read`
 /// reports no byte it did not write.
+#[cfg(any(unix, windows, target_os = "wasi"))]
 fn read_exact_at_loop(
     mut dst: &mut [MaybeUninit<u8>],
     mut offset: u64,
@@ -80,6 +82,7 @@ fn read_exact_at_loop(
 /// The callback observes the buffer at its current cursor. A successful
 /// partial write advances both the buffer and absolute file offset. Interrupted
 /// calls are retried without advancement; zero progress is [`io::ErrorKind::WriteZero`].
+#[cfg(any(unix, windows, target_os = "wasi"))]
 fn write_all_at_loop<B>(
     buf: &mut B,
     mut offset: u64,
@@ -119,6 +122,7 @@ where
 /// Rejects a range whose last byte exceeds `max`, or whose length exceeds
 /// `max_len` (a tighter count limit, e.g. `SSIZE_MAX` on 32-bit Unix).
 /// `len == 0` is always accepted.
+#[cfg(any(unix, windows, target_os = "wasi"))]
 fn validate_range(offset: u64, len: usize, max: u64, max_len: usize) -> io::Result<()> {
     if len == 0 {
         return Ok(());
@@ -333,6 +337,7 @@ pub(crate) fn create_first_new(
 ///
 /// Returns its result, or an error if the blocking task panics or is
 /// cancelled.
+#[cfg(any(unix, windows, target_os = "wasi"))]
 pub(crate) async fn create_first_new_async(
     candidates: Vec<PathBuf>,
 ) -> io::Result<(File, PathBuf)> {
@@ -394,7 +399,7 @@ async fn run_blocking<T: Send + 'static>(
 ///
 /// wasip1 and wasip2 cannot spawn the threads a blocking pool needs, and
 /// wasip3's cooperative threads run one at a time.
-#[cfg(target_family = "wasm")]
+#[cfg(all(target_family = "wasm", not(target_os = "unknown")))]
 async fn run_blocking<T>(operation: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
     operation()
 }
