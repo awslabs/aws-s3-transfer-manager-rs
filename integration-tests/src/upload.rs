@@ -7,24 +7,21 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
-use aws_sdk_s3::config::interceptors::BeforeTransmitInterceptorContextRef;
-use aws_sdk_s3::config::{ConfigBag, Intercept, RuntimeComponents};
 use aws_sdk_s3_transfer_manager::config::PartSize;
 use aws_sdk_s3_transfer_manager::config::RuntimeConfig;
 use aws_sdk_s3_transfer_manager::config::S3ClientConfig;
 use aws_sdk_s3_transfer_manager::io::{InputStream, PartData, PartStream, SizeHint, StreamContext};
 use aws_sdk_s3_transfer_manager::operation::upload::ChecksumStrategy;
 use aws_sdk_s3_transfer_manager::types::ByteSize;
-use aws_smithy_runtime_api::client::orchestrator::Metadata;
 use s3_mock_server::S3MockServer;
 use tokio::sync::mpsc;
 
 use crate::assertions::assert_same_content;
 use crate::harness::{mock_tm, mock_tm_with, MockTm};
 use crate::test_data::{deterministic_data, deterministic_data_seeded};
+use crate::test_util::recorder::OperationRecorder;
 
 async fn setup() -> MockTm {
     mock_tm(RuntimeConfig::default()).await
@@ -296,44 +293,6 @@ impl PartStream for SinglePart {
 
     fn size_hint(&self) -> SizeHint {
         self.size_hint
-    }
-}
-
-/// Records the operation name of every request attempt the S3 client sends.
-#[derive(Debug, Clone, Default)]
-struct OperationRecorder {
-    /// Operation names in send order, one entry per attempt.
-    seen: Arc<Mutex<Vec<String>>>,
-}
-
-impl OperationRecorder {
-    /// Number of recorded attempts of `operation`.
-    fn count(&self, operation: &str) -> usize {
-        self.seen
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|op| *op == operation)
-            .count()
-    }
-}
-
-impl Intercept for OperationRecorder {
-    fn name(&self) -> &'static str {
-        "OperationRecorder"
-    }
-
-    // Runs once per attempt, so SDK retries are counted.
-    fn read_before_transmit(
-        &self,
-        _context: &BeforeTransmitInterceptorContextRef<'_>,
-        _rc: &RuntimeComponents,
-        cfg: &mut ConfigBag,
-    ) -> Result<(), aws_sdk_s3::error::BoxError> {
-        if let Some(metadata) = cfg.load::<Metadata>() {
-            self.seen.lock().unwrap().push(metadata.name().to_string());
-        }
-        Ok(())
     }
 }
 

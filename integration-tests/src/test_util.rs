@@ -6,3 +6,5 @@
 //! Support code shared by test modules. Nothing here is a test of the transfer manager.
 
 pub(crate) mod data;
+pub(crate) mod object;
+pub(crate) mod recorder;

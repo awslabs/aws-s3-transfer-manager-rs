@@ -107,6 +107,8 @@
 //! through this matrix. Representative algorithms are used: CRC32 for full
 //! object, SHA-256 for the composite case.
 
+pub(crate) mod test_util;
+
 use crate::assertions::{
     assert_integrity_error, assert_not_validated, assert_same_content, assert_validated,
 };
@@ -336,7 +338,6 @@ async fn multipart_full_object(target: Target) {
             );
             assert_not_validated(&output, NotValidatedReason::Unavailable);
         }
-        #[cfg(e2e_test)]
         BucketKind::Express => {
             assert!(
                 part.checksum_crc32().is_some(),

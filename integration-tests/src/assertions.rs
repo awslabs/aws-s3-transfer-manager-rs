@@ -111,3 +111,36 @@ pub(crate) fn assert_same_content(expected: &[u8], actual: &[u8]) {
         first_diff
     );
 }
+
+/// Whether `path` names a temporary file of a path download: the transfer manager writes to a
+/// file whose name contains `.s3tmp.` and renames it to the destination on success.
+pub(crate) fn is_download_temp_file(path: &std::path::Path) -> bool {
+    path.file_name()
+        .is_some_and(|name| name.to_string_lossy().contains(".s3tmp."))
+}
+
+/// Checks that `error` is an integrity error in `algorithm` whose expected and computed values
+/// are both set and differ. Returns the reason it isn't as `Err`.
+pub(crate) fn check_integrity_error(
+    error: &Error,
+    algorithm: &ChecksumAlgorithm,
+) -> Result<(), String> {
+    let ErrorKind::IntegrityError(integrity) = error.kind() else {
+        return Err(format!("expected an integrity error, got {error:?}"));
+    };
+    if integrity.algorithm() != Some(algorithm) {
+        return Err(format!(
+            "integrity error in {:?}, expected {algorithm:?}",
+            integrity.algorithm()
+        ));
+    }
+    if integrity.expected().is_none()
+        || integrity.computed().is_none()
+        || integrity.expected() == integrity.computed()
+    {
+        return Err(format!(
+            "integrity error must carry different expected and computed values: {integrity:?}"
+        ));
+    }
+    Ok(())
+}

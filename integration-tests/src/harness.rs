@@ -172,7 +172,7 @@ pub(crate) enum Backend {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BucketKind {
     GeneralPurpose,
-    #[cfg(e2e_test)]
+    /// A directory bucket. The mock treats a bucket whose name ends in `--x-s3` as one.
     Express,
 }
 
@@ -188,6 +188,13 @@ impl Target {
         Self {
             backend: Backend::Mock,
             bucket_kind: BucketKind::GeneralPurpose,
+        }
+    }
+
+    pub(crate) fn mock_express() -> Self {
+        Self {
+            backend: Backend::Mock,
+            bucket_kind: BucketKind::Express,
         }
     }
 
@@ -235,7 +242,7 @@ impl Target {
         configure: impl FnOnce(aws_types::sdk_config::Builder) -> aws_types::sdk_config::Builder,
     ) -> TmTestClient {
         assert_eq!(self.backend, Backend::Mock, "mock-only helper");
-        TmTestClient::connect_mock_with(part_size, Some(configure)).await
+        TmTestClient::connect_mock_with(self.bucket_kind, part_size, Some(configure)).await
     }
 
     /// Connect, optionally pinning an explicit part size. A pinned size applies
@@ -246,17 +253,54 @@ impl Target {
         part_size: Option<aws_sdk_s3_transfer_manager::config::PartSize>,
     ) -> TmTestClient {
         match self.backend {
-            Backend::Mock => TmTestClient::connect_mock(part_size).await,
+            Backend::Mock => TmTestClient::connect_mock(self.bucket_kind, part_size).await,
             #[cfg(e2e_test)]
             Backend::RealS3 => TmTestClient::connect_real(self.bucket_kind, part_size).await,
         }
     }
 }
 
+/// The number of requests in flight a test client is limited to when the test sets none: four
+/// under `--cfg s3_tm_tsan`, and otherwise `None`, the transfer manager's automatic concurrency.
+///
+/// TSan instruments both the client and the in-process mock server. The automatic concurrency's
+/// 32-request floor can then starve request bodies on the four-vCPU hosted runner until
+/// stalled-stream protection fires. Four requests keep transfers concurrent without making
+/// sanitizer overhead look like a transport stall.
+fn default_concurrency() -> Option<usize> {
+    if cfg!(s3_tm_tsan) {
+        Some(4)
+    } else {
+        None
+    }
+}
+
+/// Settings for a transfer manager client on a target's backend, from
+/// [`TmTestClient::client_with`]. The default is the transfer manager's and the SDK's defaults.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ClientOptions {
+    /// `Config::part_size`, in bytes.
+    pub(crate) part_size: Option<u64>,
+    /// `Config::multipart_threshold`, in bytes.
+    pub(crate) multipart_threshold: Option<u64>,
+    /// `ConcurrencyMode::Explicit` with this many requests.
+    pub(crate) concurrency: Option<usize>,
+    /// `ResponseChecksumValidation::WhenRequired`: a download that doesn't set a checksum mode
+    /// is not validated.
+    pub(crate) response_checksums_when_required: bool,
+    /// `RequestChecksumCalculation::WhenRequired`: an upload without a checksum strategy sends
+    /// no checksum.
+    pub(crate) request_checksums_when_required: bool,
+    /// Records every request attempt the client's S3 client sends.
+    pub(crate) recorder: Option<crate::test_util::recorder::OperationRecorder>,
+}
+
 /// A transfer manager wired to a target, plus the bucket and (for mock targets)
 /// the server handle used for fault injection and direct inspection.
 pub(crate) struct TmTestClient {
     tm: TmClient,
+    /// The configuration `tm`'s S3 client was built from, before any test override.
+    shared_config: aws_types::SdkConfig,
     bucket: String,
     /// A per-instance key prefix so concurrent tests sharing one (real) bucket do
     /// not collide on object keys. Each `connect()` gets a fresh prefix; callers
@@ -276,9 +320,11 @@ struct MockBackend {
 
 impl TmTestClient {
     async fn connect_mock(
+        kind: BucketKind,
         part_size: Option<aws_sdk_s3_transfer_manager::config::PartSize>,
     ) -> Self {
         Self::connect_mock_with(
+            kind,
             part_size,
             None::<fn(aws_types::sdk_config::Builder) -> aws_types::sdk_config::Builder>,
         )
@@ -290,6 +336,7 @@ impl TmTestClient {
     /// client uses SDK defaults (`ResponseChecksumValidation::WhenSupported`,
     /// stalled-stream protection enabled).
     async fn connect_mock_with(
+        kind: BucketKind,
         part_size: Option<aws_sdk_s3_transfer_manager::config::PartSize>,
         configure: Option<
             impl FnOnce(aws_types::sdk_config::Builder) -> aws_types::sdk_config::Builder,
@@ -298,38 +345,32 @@ impl TmTestClient {
         init_test_logs();
         let server = S3MockServer::builder()
             .with_in_memory_store()
+            .with_request_journal()
             .build()
             .expect("build mock server");
         let handle = server.start().await.expect("start mock server");
-        let mut shared_config = handle.shared_config().await;
+        let base_config = handle.shared_config().await;
+        let mut shared_config = base_config.clone();
         if let Some(configure) = configure {
             shared_config = configure(shared_config.into_builder()).build();
         }
-        handle
-            .client()
-            .await
-            .create_bucket()
-            .bucket("test-bucket")
-            .send()
-            .await
-            .ok();
+        let bucket = match kind {
+            BucketKind::GeneralPurpose => "test-bucket",
+            BucketKind::Express => "test-bucket--usw2-az1--x-s3",
+        };
+        server.create_bucket(bucket).await.expect("create bucket");
         let mut builder = aws_sdk_s3_transfer_manager::Config::builder().s3_config(&shared_config);
         if let Some(ps) = part_size {
             builder = builder.part_size(ps);
         }
-        #[cfg(s3_tm_tsan)]
-        {
-            // TSan instruments both the client and the in-process mock server.
-            // Auto's 32-request floor can then starve request bodies on the
-            // four-vCPU hosted runner until stalled-stream protection fires.
-            // Four requests preserve concurrent execution without making
-            // sanitizer overhead look like a transport stall.
+        if let Some(n) = default_concurrency() {
             builder = builder
-                .concurrency(aws_sdk_s3_transfer_manager::config::ConcurrencyMode::Explicit(4));
+                .concurrency(aws_sdk_s3_transfer_manager::config::ConcurrencyMode::Explicit(n));
         }
         Self {
             tm: TmClient::new(builder.build().expect("valid config")),
-            bucket: "test-bucket".to_string(),
+            shared_config: base_config,
+            bucket: bucket.to_string(),
             key_prefix: format!("it-{}", uuid::Uuid::new_v4()),
             mock: Some(MockBackend { server, handle }),
             #[cfg(e2e_test)]
@@ -360,6 +401,7 @@ impl TmTestClient {
         }
         Self {
             tm: TmClient::new(loader.load().await),
+            shared_config,
             bucket,
             key_prefix: format!("it-{}", uuid::Uuid::new_v4()),
             mock: None,
@@ -370,6 +412,55 @@ impl TmTestClient {
     /// The bucket name to target.
     pub(crate) fn bucket(&self) -> &str {
         &self.bucket
+    }
+
+    /// A new transfer manager client on this target's backend, with `options` applied.
+    ///
+    /// Built from the backend's base SDK configuration: the override and part size given to
+    /// [`Target::connect_mock_configured`] or [`Target::connect_with`] don't apply to it. Without
+    /// `options.concurrency`, it uses [`default_concurrency`].
+    pub(crate) fn client_with(&self, options: ClientOptions) -> TmClient {
+        use aws_sdk_s3_transfer_manager::config::{ConcurrencyMode, PartSize};
+        use aws_sdk_s3_transfer_manager::types::ByteSize;
+        let mut shared_config = self.shared_config.clone().into_builder();
+        if options.response_checksums_when_required {
+            shared_config.set_response_checksum_validation(Some(
+                aws_smithy_types::checksum_config::ResponseChecksumValidation::WhenRequired,
+            ));
+        }
+        if options.request_checksums_when_required {
+            shared_config.set_request_checksum_calculation(Some(
+                aws_smithy_types::checksum_config::RequestChecksumCalculation::WhenRequired,
+            ));
+        }
+        let mut s3_config = aws_sdk_s3::config::Builder::from(&shared_config.build());
+        if let Some(recorder) = options.recorder {
+            s3_config = s3_config.interceptor(recorder);
+        }
+        let mut builder = aws_sdk_s3_transfer_manager::Config::builder().s3_config(
+            aws_sdk_s3_transfer_manager::config::S3ClientConfig::new(s3_config),
+        );
+        if let Some(part_size) = options.part_size {
+            builder = builder.part_size(PartSize::Target(ByteSize::new(part_size)));
+        }
+        if let Some(threshold) = options.multipart_threshold {
+            builder = builder.multipart_threshold(PartSize::Target(ByteSize::new(threshold)));
+        }
+        if let Some(n) = options.concurrency.or(default_concurrency()) {
+            builder = builder.concurrency(ConcurrencyMode::Explicit(n));
+        }
+        TmClient::new(builder.build().expect("valid config"))
+    }
+
+    /// An S3 client on this target's backend, for requests the transfer manager doesn't make.
+    pub(crate) async fn s3_client(&self) -> aws_sdk_s3::Client {
+        match &self.mock {
+            Some(mock) => mock.handle.client().await,
+            #[cfg(e2e_test)]
+            None => self.s3().clone(),
+            #[cfg(not(e2e_test))]
+            None => unreachable!("every target is a mock without e2e_test"),
+        }
     }
 
     /// Namespace a logical key with this instance's unique prefix so concurrent
@@ -402,14 +493,8 @@ impl TmTestClient {
         key: &str,
         part_number: i32,
     ) -> aws_sdk_s3::operation::head_object::HeadObjectOutput {
-        let client = match &self.mock {
-            Some(mock) => mock.handle.client().await,
-            #[cfg(e2e_test)]
-            None => self.s3().clone(),
-            #[cfg(not(e2e_test))]
-            None => unreachable!("every target is a mock without e2e_test"),
-        };
-        client
+        self.s3_client()
+            .await
             .head_object()
             .bucket(&self.bucket)
             .key(self.key(key))
@@ -526,3 +611,46 @@ impl TmTestClient {
         }
     }
 }
+
+/// Declares a test function per target for each listed test body.
+///
+/// `target_tests! { name: [mock_gp, real_gp]; ... }` declares a module `name` holding one
+/// `#[tokio::test]` per listed target, named after the target, that runs
+/// `name(Target::<target>())`. The `real_*` functions are compiled only under `--cfg e2e_test`.
+/// So the test `mpu_intact` on the mock's directory bucket is `...::mpu_intact::mock_express`.
+macro_rules! target_tests {
+    ($( $name:ident: [$($target:ident),+ $(,)?]; )+) => {
+        $(
+            mod $name {
+                $( $crate::harness::target_tests!(@fn $name $target); )+
+            }
+        )+
+    };
+    (@fn $name:ident mock_gp) => {
+        #[tokio::test(flavor = "multi_thread")]
+        async fn mock_gp() {
+            super::$name($crate::harness::Target::mock_gp()).await;
+        }
+    };
+    (@fn $name:ident mock_express) => {
+        #[tokio::test(flavor = "multi_thread")]
+        async fn mock_express() {
+            super::$name($crate::harness::Target::mock_express()).await;
+        }
+    };
+    (@fn $name:ident real_gp) => {
+        #[cfg(e2e_test)]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn real_gp() {
+            super::$name($crate::harness::Target::real_gp()).await;
+        }
+    };
+    (@fn $name:ident real_express) => {
+        #[cfg(e2e_test)]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn real_express() {
+            super::$name($crate::harness::Target::real_express()).await;
+        }
+    };
+}
+pub(crate) use target_tests;
