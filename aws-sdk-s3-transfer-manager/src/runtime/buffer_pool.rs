@@ -27,7 +27,7 @@ mod acquisition;
 mod admission;
 mod arena;
 #[cfg(s3_tm_bench)]
-pub(crate) mod bench;
+pub(crate) mod bench_util;
 mod block;
 mod config;
 #[cfg(not(all(test, s3_tm_loom)))]

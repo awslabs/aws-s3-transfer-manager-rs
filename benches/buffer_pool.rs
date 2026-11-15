@@ -28,11 +28,11 @@ use std::task::{Context, Poll, Wake, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use aws_sdk_s3_transfer_manager::config::MemoryBudgetConfig;
-use aws_sdk_s3_transfer_manager::memory::{
-    BufferPool, PooledBufMut, Reservation, ReserveFuture, SegmentedBytes,
+use aws_sdk_s3_transfer_manager::__bench::{
+    BufferPoolExt, PooledBufMut, Reservation, ReserveFuture,
 };
-use aws_sdk_s3_transfer_manager::memory::{BufferPool, MemoryBudgetConfig, SegmentedBytes};
+use aws_sdk_s3_transfer_manager::config::MemoryBudgetConfig;
+use aws_sdk_s3_transfer_manager::memory::{BufferPool, SegmentedBytes};
 use bytes::{Buf, BufMut};
 use criterion::{criterion_group, BatchSize, BenchmarkId, Criterion, Throughput};
 

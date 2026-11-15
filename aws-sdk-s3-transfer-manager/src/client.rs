@@ -990,7 +990,7 @@ mod tests {
             .expect("valid config");
         // A NUL byte cannot be passed to the OS as an interface name, so building
         // the transport fails after the runtime owner has been adopted.
-        config.set_network_interfaces(vec!["bad\0interface".to_owned()]);
+        config.network_interfaces = vec!["bad\0interface".to_owned()];
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Client::new(config)));
         assert!(result.is_err());
         assert!(tokio::time::timeout(Duration::from_secs(5), watch)

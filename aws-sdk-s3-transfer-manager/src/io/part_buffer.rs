@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Pooled mutable storage for custom and adapted upload streams.
+//! Pooled mutable storage for upload parts.
 
 use std::future::Future;
 use std::io;
@@ -31,56 +31,6 @@ use crate::runtime::buffer_pool::{PooledBufMut, Reservation, ReserveFuture};
 /// The common path requests the part length once and fills the complete part through repeated
 /// polls. Smaller envelopes suit externally paced producers, but completed envelopes remain charged
 /// to the pool until the returned [`SegmentedBytes`] is released.
-///
-/// # Examples
-///
-/// A [`PartStream`](super::PartStream) that copies an in-memory source into parts charged to a
-/// pool shared with the client:
-///
-/// ```
-/// use std::pin::Pin;
-/// use std::task::{ready, Context, Poll};
-///
-/// use aws_sdk_s3_transfer_manager::io::{PartBuffer, PartData, PartStream, SizeHint, StreamContext};
-/// use aws_sdk_s3_transfer_manager::memory::BufferPool;
-///
-/// struct PooledSource {
-///     pool: BufferPool,
-///     source: &'static [u8],
-///     offset: usize,
-///     next_part: u64,
-///     current: Option<PartBuffer>,
-/// }
-///
-/// impl PartStream for PooledSource {
-///     fn poll_part(
-///         mut self: Pin<&mut Self>,
-///         cx: &mut Context<'_>,
-///         stream_cx: &StreamContext,
-///     ) -> Poll<Option<std::io::Result<PartData>>> {
-///         let this = &mut *self;
-///         if this.offset == this.source.len() {
-///             return Poll::Ready(None);
-///         }
-///         let part_len = stream_cx.part_size().min(this.source.len() - this.offset);
-///         let part = this
-///             .current
-///             .get_or_insert_with(|| PartBuffer::new(&this.pool, part_len));
-///         while part.remaining() != 0 {
-///             ready!(part.poll_acquire(cx, part.remaining()))?;
-///             this.offset += part.fill_from_slice(&this.source[this.offset..]);
-///         }
-///         let data = this.current.take().expect("part in progress").freeze();
-///         let part_number = this.next_part;
-///         this.next_part += 1;
-///         Poll::Ready(Some(Ok(PartData::from_segmented(part_number, data))))
-///     }
-///
-///     fn size_hint(&self) -> SizeHint {
-///         SizeHint::exact(self.source.len() as u64)
-///     }
-/// }
-/// ```
 #[derive(Debug)]
 pub struct PartBuffer {
     pool: BufferPool,
@@ -117,7 +67,7 @@ impl PartBuffer {
     ///
     /// Creating a buffer admits no memory; [`Self::poll_acquire`] does. The buffer is not tied to
     /// a client or a transfer. Share `pool` with a client through
-    /// [`MemoryConfig::Explicit`](crate::memory::MemoryConfig::Explicit) to bound their memory
+    /// [`MemoryConfig::Explicit`](crate::config::MemoryConfig::Explicit) to bound their memory
     /// use together.
     ///
     /// # Panics
@@ -456,13 +406,14 @@ mod tests {
 
         assert!(poll_acquire(&mut buffer, carrier_size).is_ready());
         let ptr = buffer.chunk_mut().as_mut_ptr();
-        assert_eq!(buffer.fill_from_slice(b"payload"), b"payload".len());
-        assert_eq!(buffer.len(), 7);
-        assert_eq!(buffer.remaining(), carrier_size - 7);
+        let data = b"payload";
+        assert_eq!(buffer.fill_from_slice(data), data.len());
+        assert_eq!(buffer.len(), data.len());
+        assert_eq!(buffer.remaining(), carrier_size - data.len());
 
         let frozen = buffer.freeze();
         assert_eq!(frozen.chunk().as_ptr(), ptr.cast());
-        assert_eq!(frozen.chunk(), b"payload");
+        assert_eq!(frozen.chunk(), data);
         assert_eq!(pool.metrics().in_use_bytes(), carrier_size as u64);
         drop(frozen);
         assert_eq!(pool.metrics().in_use_bytes(), 0);
@@ -471,21 +422,24 @@ mod tests {
     #[test]
     fn full_envelopes_roll_over_without_losing_carrier_tails() {
         let pool = test_pool();
-        let mut buffer = PartBuffer::new(&pool, 7);
+        let first = b"abc";
+        let second = b"defg";
+        let expected = [&first[..], &second[..]].concat();
+        let mut buffer = PartBuffer::new(&pool, expected.len());
 
-        assert!(poll_acquire(&mut buffer, 3).is_ready());
-        assert_eq!(buffer.fill_from_slice(b"abc"), b"abc".len());
+        assert!(poll_acquire(&mut buffer, first.len()).is_ready());
+        assert_eq!(buffer.fill_from_slice(first), first.len());
         assert_eq!(buffer.writable(), 0);
 
-        assert!(poll_acquire(&mut buffer, 4).is_ready());
-        assert_eq!(buffer.fill_from_slice(b"defg"), b"defg".len());
-        assert_eq!(buffer.len(), 7);
+        assert!(poll_acquire(&mut buffer, second.len()).is_ready());
+        assert_eq!(buffer.fill_from_slice(second), second.len());
+        assert_eq!(buffer.len(), expected.len());
         assert_eq!(pool.metrics().in_use_bytes(), pool.carrier_size() as u64);
 
         let frozen = buffer.freeze();
         let segments = frozen.into_segments();
         assert_eq!(segments.len(), 1);
-        assert_eq!(segments[0], b"abcdefg"[..]);
+        assert_eq!(segments[0], expected);
         drop(segments);
         assert_eq!(pool.metrics().in_use_bytes(), 0);
     }
@@ -497,9 +451,10 @@ mod tests {
         let mut buffer = PartBuffer::new(&pool, carrier_size + 3);
         let mut expected = Vec::with_capacity(carrier_size + 3);
 
+        let head = b"abc";
         assert!(poll_acquire(&mut buffer, 3).is_ready());
-        assert_eq!(buffer.fill_from_slice(b"abc"), b"abc".len());
-        expected.extend_from_slice(b"abc");
+        assert_eq!(buffer.fill_from_slice(head), head.len());
+        expected.extend_from_slice(head);
 
         assert!(poll_acquire(&mut buffer, carrier_size).is_ready());
         let tail_len = buffer.writable();
@@ -510,8 +465,9 @@ mod tests {
 
         assert!(poll_acquire(&mut buffer, 1).is_ready());
         assert_eq!(buffer.writable(), 3);
-        assert_eq!(buffer.fill_from_slice(b"end"), b"end".len());
-        expected.extend_from_slice(b"end");
+        let end = b"end";
+        assert_eq!(buffer.fill_from_slice(end), end.len());
+        expected.extend_from_slice(end);
 
         assert_eq!(buffer.freeze().into_contiguous(), expected);
         assert_eq!(pool.metrics().in_use_bytes(), 0);
@@ -522,13 +478,18 @@ mod tests {
         let pool = test_pool();
         let mut buffer = PartBuffer::new(&pool, 8);
 
+        let first = b"abc";
+        let rest = b"defgh";
         assert!(poll_acquire(&mut buffer, 8).is_ready());
-        assert_eq!(buffer.fill_from_slice(b"abc"), b"abc".len());
+        assert_eq!(buffer.fill_from_slice(first), first.len());
         assert!(poll_acquire(&mut buffer, 2).is_ready());
         assert_eq!(buffer.writable(), 5);
-        assert_eq!(buffer.fill_from_slice(b"defgh"), b"defgh".len());
+        assert_eq!(buffer.fill_from_slice(rest), rest.len());
 
-        assert_eq!(buffer.freeze().into_contiguous(), b"abcdefgh"[..]);
+        assert_eq!(
+            buffer.freeze().into_contiguous(),
+            [&first[..], &rest[..]].concat()
+        );
     }
 
     #[test]
@@ -629,12 +590,13 @@ mod tests {
         holder.close_acquisition();
         assert!(poll_acquire(&mut buffer, 4).is_ready());
         assert_eq!(buffer.writable(), 4);
-        assert_eq!(buffer.fill_from_slice(b"abcd"), 4);
+        let data = b"abcd";
+        assert_eq!(buffer.fill_from_slice(data), data.len());
         assert_eq!(buffer.writable(), 0);
         assert_eq!(buffer.remaining(), 4);
         assert_eq!(buffer.fill_from_slice(b"e"), 0);
 
-        assert_eq!(buffer.freeze().into_contiguous(), b"abcd"[..]);
+        assert_eq!(buffer.freeze().into_contiguous(), data[..]);
     }
 
     #[test]

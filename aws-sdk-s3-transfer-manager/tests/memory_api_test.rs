@@ -9,13 +9,13 @@ use std::io;
 use std::task::{Context, Poll, Waker};
 
 use aws_sdk_s3_transfer_manager::config::{MemoryBudgetConfig, MemoryConfig};
+use aws_sdk_s3_transfer_manager::io::PartBuffer;
 use aws_sdk_s3_transfer_manager::memory::{
-    AcquireError, BufferPool, BufferPoolBuildError, BufferPoolBuilder, PooledBufMut, Reservation,
-    ReserveError, ReserveFuture, SegmentedBytes,
+    BufferPool, BufferPoolBuildError, BufferPoolBuilder, SegmentedBytes,
 };
 use bytes::Buf;
 
-const POOL_BUDGET: usize = 1024 * 1024;
+const POOL_BUDGET: ByteSize = ByteSize::mib(1);
 
 fn assert_public_error<T: Error + Send + Sync + 'static>() {}
 
@@ -40,25 +40,27 @@ fn poll_acquire(buffer: &mut PartBuffer, envelope: usize) -> Poll<io::Result<()>
 fn public_memory_api_supports_an_explicit_pool_flow() {
     assert_public_error::<BufferPoolBuildError>();
 
-    let builder: BufferPoolBuilder =
-        BufferPool::builder().memory_budget(MemoryBudgetConfig::Limit(ByteSize::new(1024 * 1024)));
-    let pool: BufferPool = builder.build().expect("valid explicit pool");
+    let pool = test_pool();
     let _client_config = MemoryConfig::Explicit(pool.clone());
     assert_eq!(pool.metrics().in_use_bytes(), 0);
 
-    let mut buffer = PartBuffer::new(&pool, 3);
-    assert!(matches!(poll_acquire(&mut buffer, 3), Poll::Ready(Ok(()))));
-    assert_eq!(buffer.fill_from_slice(b"abc"), 3);
+    let payload = b"abc";
+    let mut buffer = PartBuffer::new(&pool, payload.len());
+    assert!(matches!(
+        poll_acquire(&mut buffer, payload.len()),
+        Poll::Ready(Ok(()))
+    ));
+    assert_eq!(buffer.fill_from_slice(payload), payload.len());
 
     let mut data: SegmentedBytes = buffer.freeze();
-    assert_eq!(data.chunk(), b"abc");
+    assert_eq!(data.chunk(), payload);
     let in_use = pool.metrics().in_use_bytes();
     assert!(
-        in_use >= 3,
+        in_use >= payload.len() as u64,
         "frozen part is not charged: {in_use} bytes in use"
     );
 
-    data.advance(3);
+    data.advance(payload.len());
     assert_eq!(pool.metrics().in_use_bytes(), 0);
 }
 

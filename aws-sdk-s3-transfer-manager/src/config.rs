@@ -140,7 +140,7 @@ pub struct Config {
     machine_profile: Option<crate::runtime::platform::MachineProfile>,
     /// Interfaces the runtime-provided transport binds its connections to;
     /// empty leaves interface selection to OS routing.
-    network_interfaces: Vec<String>,
+    pub(crate) network_interfaces: Vec<String>,
 }
 
 impl Config {
@@ -235,12 +235,6 @@ impl Config {
             }
             _ => None,
         }
-    }
-
-    /// Binds the runtime-provided transport's connections to `interfaces`.
-    #[cfg(test)]
-    pub(crate) fn set_network_interfaces(&mut self, interfaces: Vec<String>) {
-        self.network_interfaces = interfaces;
     }
 
     /// Consume the S3 client source, returning it.

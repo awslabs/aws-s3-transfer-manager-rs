@@ -93,6 +93,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `DownloadInput::part_number` and its getter are no longer public. Single-part downloads are
   not supported.
 - `io::walk::WalkErrorKind` and `types::ByteUnit` are `#[non_exhaustive]`.
+- `io::PartBuffer` no longer implements `bytes::BufMut`. Use `PartBuffer::writable` in place of
+  `remaining_mut`, and `PartBuffer::fill_from_slice` in place of `put_slice`.
+- `StreamContext::part_buffer` is no longer public.
+- `BufferPool::reserve`, `BufferPool::try_reserve`, `BufferPool::acquire`,
+  `BufferPool::acquire_unreserved`, `BufferPool::carrier_size`, and `memory::PooledBufMut`,
+  `memory::Reservation`, `memory::ReserveFuture`, `memory::AcquireError`, and
+  `memory::ReserveError` are no longer public. `PartBuffer::poll_acquire` still reports pool
+  failures as `std::io::ErrorKind::Other`; the source error's type is no longer public.
+- `MemoryMetrics` getters are renamed: `configured_capacity_bytes` to `capacity_bytes`,
+  `admission_used_bytes` to `admitted_bytes`, `charged_capacity_bytes` to `in_use_bytes`,
+  `queued_reservations` to `waiting_requests`, and `reservation_enqueues_total` to `waits_total`.
+  `prepared_capacity_bytes` is replaced by `committed_bytes`, which returns `Option<u64>`.
+  `active_planned_demand_bytes` and `admission_overage_bytes` are no longer public.
 - The fields of `types::ThroughputDisplayContext` and `types::ByteSizeDisplayContext` are private.
   Create them with `Throughput::display_as` or `ByteSize::display_as`.
 - `config::Builder::build` returns `Result<Config, BuildError>` and returns an error when

@@ -432,12 +432,6 @@ pub trait PartStream {
     /// progress or notification. A later poll may use a different thread and a different waker.
     ///
     /// Implementations must return promptly and must not block the executor thread.
-    ///
-    /// A part may be built in pooled memory charged to a [`BufferPool`] that the caller shares
-    /// with the client through [`MemoryConfig::Explicit`](crate::memory::MemoryConfig::Explicit). Create a [`PartBuffer`]
-    /// with [`PartBuffer::new`], retain it in `Self` across `Pending`, poll
-    /// [`PartBuffer::poll_acquire`] before writing, and freeze it only after the complete part is
-    /// available.
     fn poll_part(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,

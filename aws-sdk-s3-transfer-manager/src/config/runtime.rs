@@ -260,8 +260,8 @@ pub enum MemoryBudgetConfig {
     /// Use up to one quarter of detected effective memory, capped at 32 GiB.
     ///
     /// Effective memory includes process or container limits where the platform
-    /// exposes them. The result is rounded down to complete carriers. If
-    /// detection is unavailable, the pool uses 2 GiB.
+    /// exposes them. The result may be rounded down to the pool's allocation
+    /// unit. If detection is unavailable, the pool uses 2 GiB.
     #[default]
     Auto,
     /// Use the given fraction of detected effective memory.
@@ -274,9 +274,9 @@ pub enum MemoryBudgetConfig {
     /// The resolved capacity never exceeds this value and may be smaller by
     /// less than one platform allocation unit. Values too small to fund one
     /// allocation unit are rejected. The resolved capacity is reported by
-    /// [`MemoryMetrics::configured_capacity_bytes`].
+    /// [`MemoryMetrics::capacity_bytes`].
     ///
-    /// [`MemoryMetrics::configured_capacity_bytes`]:
-    ///     crate::metrics::MemoryMetrics::configured_capacity_bytes
+    /// [`MemoryMetrics::capacity_bytes`]:
+    ///     crate::metrics::MemoryMetrics::capacity_bytes
     Limit(ByteSize),
 }

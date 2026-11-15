@@ -2314,11 +2314,10 @@ Each in-flight upload part has two memory lifetimes:
 2. immutable storage retained until every network attempt using those bytes completes.
 
 `PartBuffer` joins those lifetimes without copying between them. Built-in streams and adapters
-create one charged to the client's pool; custom streams create one with `PartBuffer::new` on a pool
-they share with the client through `MemoryConfig::Explicit`. A producer retains the buffer with its
-source state and polls `PartBuffer::poll_acquire` before writing. Custom streams copy bytes in with
-`PartBuffer::fill_from_slice`; built-in readers write into its uninitialized runs through
-crate-private methods. Creating the facade itself does not reserve or allocate payload memory.
+create one charged to the client's pool. A producer retains the buffer with its source state and
+polls `PartBuffer::poll_acquire` before writing. `PartBuffer::fill_from_slice` copies bytes in;
+built-in readers write into its uninitialized runs through crate-private methods. Creating the
+facade itself does not reserve or allocate payload memory.
 
 An acquisition request admits one logical envelope. The first envelope supplied while admission is
 pending remains fixed until the request completes. A producer normally requests the complete

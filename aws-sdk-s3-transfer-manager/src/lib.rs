@@ -265,7 +265,7 @@ pub mod __fuzz {
 #[cfg(s3_tm_bench)]
 #[doc(hidden)]
 pub mod __bench {
-    pub use crate::runtime::buffer_pool::bench::{
+    pub use crate::runtime::buffer_pool::bench_util::{
         AcquireError, BufferPoolExt, PooledBufMut, Reservation, ReserveError, ReserveFuture,
     };
 }

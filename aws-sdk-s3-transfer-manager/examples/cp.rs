@@ -2,17 +2,27 @@
  * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
-use aws_sdk_s3_transfer_manager::config::RuntimeConfig;
+use aws_config::BehaviorVersion;
 use aws_sdk_s3_transfer_manager::config::{ConcurrencyMode, PartSize, TargetThroughput};
 use aws_sdk_s3_transfer_manager::config::{MemoryBudgetConfig, MemoryConfig};
+use aws_sdk_s3_transfer_manager::config::{RuntimeConfig, S3ClientConfig};
 use aws_sdk_s3_transfer_manager::io::InputStream;
 use aws_sdk_s3_transfer_manager::memory::BufferPool;
 use aws_sdk_s3_transfer_manager::operation::download::Body;
-use aws_sdk_s3_transfer_manager::types::ByteSize;
-use aws_sdk_s3_transfer_manager::types::Throughput;
+use aws_sdk_s3_transfer_manager::types::{ByteSize, Throughput};
+use aws_sdk_s3_transfer_manager::Config;
+use aws_smithy_execution::{ManagedRuntime, ManagedRuntimeBuilder, ManagedRuntimeHandle};
+use aws_smithy_http_client::pool::{ConnectionPool, DriverSpawner, Partition, PartitionId};
+use aws_smithy_http_client::proxy::ProxyConfig;
+use aws_smithy_http_client::tls::{rustls_provider::CryptoMode, Provider};
+use aws_smithy_managed_http::client::ManagedHttpPool;
+use aws_smithy_runtime_api::client::dns::{DnsFuture, ResolveDns};
+use aws_smithy_runtime_api::client::http::SharedHttpClient;
+use aws_smithy_runtime_api::shared::IntoShared;
 use aws_smithy_types::date_time::{DateTime, Format};
 use clap::{CommandFactory, Parser};
 use std::error::Error;
+use std::fmt;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -148,14 +158,19 @@ pub struct Args {
     #[arg(long, value_delimiter = ',')]
     network_interfaces: Vec<String>,
 
-    /// Maximum connections to one host across all worker threads, with `--network-interfaces`.
+    /// Maximum connections to one host across all worker threads.
     ///
-    /// Without `--network-interfaces`, the transfer manager derives this cap from the process
-    /// descriptor limit. The default, 4096, is the ceiling of that derivation, which applies
-    /// when the descriptor limit is high enough not to bind.
-    #[arg(long, default_value = "4096", requires = "network_interfaces")]
-    max_connections_per_host: NonZeroUsize,
+    /// This option or `--network-interfaces` replaces the transfer manager's HTTP client with
+    /// one cp builds, which requires the managed runtime. When unset, that client's cap is 4096,
+    /// the transfer manager's ceiling (`MAX_CONNECTIONS_PER_HOST` in `src/runtime/platform.rs`);
+    /// the transfer manager's own client derives its cap from the process descriptor limit.
+    #[arg(long)]
+    max_connections_per_host: Option<NonZeroUsize>,
 }
+
+/// Per-host connection cap of the HTTP client cp builds when `--max-connections-per-host` is
+/// unset: the transfer manager's `MAX_CONNECTIONS_PER_HOST` in `src/runtime/platform.rs`.
+const DEFAULT_MAX_CONNECTIONS_PER_HOST: NonZeroUsize = NonZeroUsize::new(4096).unwrap();
 
 #[derive(Debug, Clone, clap::Args)]
 #[group(multiple = false)]
@@ -261,10 +276,38 @@ struct ManifestEntry {
     size: u64,
 }
 
-fn invalid_arg(message: &str) -> ! {
-    Args::command()
-        .error(clap::error::ErrorKind::InvalidValue, message)
-        .exit()
+/// An invalid argument or argument combination, reported as a usage error.
+#[derive(Debug)]
+struct ArgError(&'static str);
+
+impl fmt::Display for ArgError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl Error for ArgError {}
+
+/// Direction of a transfer between the local filesystem and S3.
+#[derive(Clone, Copy, Debug)]
+enum Direction {
+    Upload,
+    Download,
+}
+
+impl Direction {
+    /// Returns the direction of a transfer from `source` to `dest`.
+    ///
+    /// Errors unless exactly one side is an S3 URI.
+    fn new(source: &TransferUri, dest: &TransferUri) -> Result<Self, ArgError> {
+        use TransferUri::*;
+        match (source, dest) {
+            (Local(_), S3(_)) => Ok(Direction::Upload),
+            (S3(_), Local(_)) => Ok(Direction::Download),
+            (Local(_), Local(_)) => Err(ArgError("local to local transfer not supported")),
+            (S3(_), S3(_)) => Err(ArgError("s3 to s3 transfer not supported")),
+        }
+    }
 }
 
 async fn do_single_download(
@@ -455,8 +498,15 @@ fn main() {
     rt.block_on(async_main(args));
 }
 
+/// Runs the command and exits the process on error: with a usage error for an [`ArgError`],
+/// otherwise with status 1 after printing the error and its source chain.
 async fn async_main(args: Args) {
     if let Err(e) = run(args).await {
+        if let Some(e) = e.downcast_ref::<ArgError>() {
+            Args::command()
+                .error(clap::error::ErrorKind::InvalidValue, e)
+                .exit();
+        }
         // The top-level Display already carries a TM error's operation, code, and
         // request ids; the source chain carries the underlying detail (SdkError
         // message, checksum values).
@@ -470,50 +520,26 @@ async fn async_main(args: Args) {
     }
 }
 
+/// Builds the client `args` configure and runs the transfer.
 async fn run(args: Args) -> Result<(), BoxError> {
     init_tracing(args.tokio_console);
     tracing::debug!("using concurrency mode: {:?}", args.concurrency.mode());
-    let is_download = transfer_direction(&args.source, &args.dest);
-    let interfaces = network_interfaces(&args)?;
-    let loader = config_loader(&args)?;
-
-    #[cfg(s3_tm_dial9)]
-    if let Some(recorder) = trace_recorder(&args) {
-        // The recorder's `Drop` stops its pipeline without draining queued events, so every
-        // fallible step after this point runs inside `result`, ahead of the graceful shutdown.
-        let result = async {
-            let loader = match args.runtime {
-                // Tracing instruments the managed runtime's threads, so the recorder attaches to
-                // the runtime builder before the transfer manager adopts the runtime.
-                RuntimeArg::Managed => {
-                    let builder = managed_runtime_builder().dial9_handle(recorder.handle().clone());
-                    adopt_runtime(loader, builder, &interfaces, &args).await?
-                }
-                RuntimeArg::MultiThreadTokio => loader,
-            };
-            transfer(
-                aws_sdk_s3_transfer_manager::Client::new(loader.load().await),
-                &args,
-                is_download,
-            )
-            .await
-        }
-        .await;
-        recorder.graceful_shutdown(time::Duration::from_secs(10));
-        return result;
+    let direction = Direction::new(&args.source, &args.dest)?;
+    let runtime_tracing = RuntimeTracing::from_args(&args);
+    // The recorder's `Drop` stops its pipeline without draining queued events, so every
+    // fallible step runs inside `result`, ahead of the graceful shutdown.
+    let result = async {
+        let config = client_config(&args, &runtime_tracing).await?;
+        transfer(
+            aws_sdk_s3_transfer_manager::Client::new(config),
+            &args,
+            direction,
+        )
+        .await
     }
-
-    let loader = if interfaces.is_empty() {
-        loader
-    } else {
-        adopt_runtime(loader, managed_runtime_builder(), &interfaces, &args).await?
-    };
-    transfer(
-        aws_sdk_s3_transfer_manager::Client::new(loader.load().await),
-        &args,
-        is_download,
-    )
-    .await
+    .await;
+    runtime_tracing.shutdown();
+    result
 }
 
 fn init_tracing(tokio_console: bool) {
@@ -527,24 +553,92 @@ fn init_tracing(tokio_console: bool) {
     }
 }
 
-/// Returns whether the transfer is a download. Exits with a usage error unless exactly one
-/// side is an S3 URI.
-fn transfer_direction(source: &TransferUri, dest: &TransferUri) -> bool {
-    use TransferUri::*;
-    match (source, dest) {
-        (Local(_), S3(_)) => false,
-        (S3(_), Local(_)) => true,
-        (Local(_), Local(_)) => invalid_arg("local to local transfer not supported"),
-        (S3(_), S3(_)) => invalid_arg("s3 to s3 transfer not supported"),
+/// Returns the transfer manager configuration `args` select.
+///
+/// Each component is built from `args` when an option needs it; otherwise the transfer
+/// manager's default for that component applies.
+async fn client_config(args: &Args, runtime_tracing: &RuntimeTracing) -> Result<Config, BoxError> {
+    let mut loader = aws_sdk_s3_transfer_manager::from_env()
+        .concurrency(args.concurrency.mode())
+        .part_size(PartSize::Target(ByteSize::new(args.part_size)))
+        .runtime_config(args.runtime.mode());
+    if let Some(pool) = memory_pool()? {
+        loader = loader.memory(MemoryConfig::Explicit(pool));
     }
+    let http_options = http_options(args)?;
+    if let Some(runtime) = managed_runtime(args, runtime_tracing, http_options.is_some())? {
+        if let Some(options) = &http_options {
+            let http_client = http_client(runtime.handle(), options)?;
+            // The same shared AWS configuration sources `ConfigLoader::load` reads when no S3
+            // configuration is set.
+            let sdk_config = aws_config::load_defaults(BehaviorVersion::latest())
+                .await
+                .into_builder()
+                .http_client(http_client)
+                .build();
+            loader = loader.s3_config(S3ClientConfig::new(&sdk_config));
+        }
+        loader = loader.runtime_config(RuntimeConfig::managed(
+            aws_sdk_s3_transfer_manager_ext::managed(runtime),
+        ));
+    }
+    Ok(loader.load().await)
 }
 
-/// Returns the `--network-interfaces` names, trimmed, without empty entries.
+/// Returns a memory pool capped at `S3FIO_MEMORY_LIMIT` GiB, or `None` when that variable is
+/// unset or not an integer.
 ///
-/// Exits with a usage error when names are given with `--runtime multi-thread-tokio`, where the
-/// S3 client keeps the SDK's HTTP client. Errors when this platform cannot bind a connection to
-/// an interface.
-fn network_interfaces(args: &Args) -> Result<Vec<String>, BoxError> {
+/// The cap bounds in-flight plus buffered transfer data; transfers backpressure at the cap.
+fn memory_pool() -> Result<Option<BufferPool>, BoxError> {
+    let Some(gib) = std::env::var("S3FIO_MEMORY_LIMIT")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    else {
+        return Ok(None);
+    };
+    tracing::info!(gib, "memory budget limit (S3FIO_MEMORY_LIMIT, GiB)");
+    let pool = BufferPool::builder()
+        .memory_budget(MemoryBudgetConfig::Limit(ByteSize::gib(gib)))
+        .build()?;
+    Ok(Some(pool))
+}
+
+/// Returns a managed runtime for the transfer manager to adopt, or `None` when no option needs
+/// one: runtime tracing with `--runtime managed`, or a replacement HTTP client (`http_client`).
+///
+/// The runtime has the thread naming and placement the transfer manager uses for the runtime
+/// it builds itself. Errors when the runtime cannot be built.
+fn managed_runtime(
+    args: &Args,
+    runtime_tracing: &RuntimeTracing,
+    http_client: bool,
+) -> Result<Option<ManagedRuntime>, BoxError> {
+    let traced = runtime_tracing.is_enabled() && matches!(args.runtime, RuntimeArg::Managed);
+    if !traced && !http_client {
+        return Ok(None);
+    }
+    let builder = ManagedRuntime::builder()
+        .thread_name_prefix("s3-tm")
+        .pin_threads(false);
+    Ok(Some(runtime_tracing.instrument(builder).build()?))
+}
+
+/// Options for an HTTP client that replaces the transfer manager's.
+#[derive(Debug)]
+struct HttpOptions {
+    /// Interfaces assigned to managed runtime threads round-robin; empty leaves connections
+    /// unbound.
+    interfaces: Vec<String>,
+    max_connections_per_host: NonZeroUsize,
+}
+
+/// Returns the HTTP client options from `args`, or `None` when neither `--network-interfaces`
+/// (after trimming names and dropping empty ones) nor `--max-connections-per-host` is set.
+///
+/// Errors when an option is set with `--runtime multi-thread-tokio`, where the S3 client keeps
+/// the SDK's HTTP client, or when interfaces are named on a platform that cannot bind a
+/// connection to one.
+fn http_options(args: &Args) -> Result<Option<HttpOptions>, ArgError> {
     let interfaces: Vec<String> = args
         .network_interfaces
         .iter()
@@ -552,133 +646,42 @@ fn network_interfaces(args: &Args) -> Result<Vec<String>, BoxError> {
         .filter(|name| !name.is_empty())
         .map(str::to_owned)
         .collect();
-    if interfaces.is_empty() {
-        return Ok(interfaces);
+    if interfaces.is_empty() && args.max_connections_per_host.is_none() {
+        return Ok(None);
     }
     if matches!(args.runtime, RuntimeArg::MultiThreadTokio) {
-        invalid_arg("--network-interfaces requires --runtime managed");
+        return Err(ArgError(
+            "--network-interfaces and --max-connections-per-host require --runtime managed",
+        ));
     }
-    if cfg!(not(any(
-        target_os = "android",
-        target_os = "fuchsia",
-        target_os = "illumos",
-        target_os = "ios",
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "solaris",
-        target_os = "tvos",
-        target_os = "visionos",
-        target_os = "watchos",
-    ))) {
-        return Err("--network-interfaces is not supported on this platform".into());
+    if !interfaces.is_empty() && !INTERFACE_BINDING_SUPPORTED {
+        return Err(ArgError(
+            "--network-interfaces is not supported on this platform",
+        ));
     }
-    Ok(interfaces)
+    Ok(Some(HttpOptions {
+        interfaces,
+        max_connections_per_host: args
+            .max_connections_per_host
+            .unwrap_or(DEFAULT_MAX_CONNECTIONS_PER_HOST),
+    }))
 }
 
-/// Returns a loader with the concurrency, runtime, part-size, and memory settings from `args`.
+/// Returns an HTTP client over `runtime` configured by `options`.
 ///
-/// `S3FIO_MEMORY_LIMIT=N` caps the transfer manager's memory pool at N GiB (in-flight plus
-/// buffered transfer data; transfers backpressure at the cap).
-fn config_loader(args: &Args) -> Result<ConfigLoader, BoxError> {
-    let mut config_loader = aws_sdk_s3_transfer_manager::from_env()
-        .concurrency(args.concurrency.mode())
-        .runtime_config(args.runtime.mode())
-        .part_size(PartSize::Target(ByteSize::new(args.part_size)));
-
-    if let Some(gib) = std::env::var("S3FIO_MEMORY_LIMIT")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-    {
-        tracing::info!(gib, "memory budget limit (S3FIO_MEMORY_LIMIT, GiB)");
-        let pool = BufferPool::builder()
-            .memory_budget(MemoryBudgetConfig::Limit(ByteSize::gib(gib)))
-            .build()?;
-        config_loader = config_loader.memory(MemoryConfig::Explicit(pool));
-    }
-    Ok(config_loader)
-}
-
-/// Returns a dial9 recorder writing to `--trace-dir` or `S3FIO_TRACE_DIR`, or `None` when
-/// neither is set. Panics if the trace writer cannot be created.
-#[cfg(s3_tm_dial9)]
-fn trace_recorder(args: &Args) -> Option<dial9::Recorder> {
-    use dial9::DiskBuffer;
-    let trace_dir = args
-        .trace_dir
-        .clone()
-        .or_else(|| std::env::var("S3FIO_TRACE_DIR").ok())?;
-    let _ = std::fs::create_dir_all(&trace_dir);
-    let writer = DiskBuffer::builder()
-        .base_path(&trace_dir)
-        .max_file_size(64 * 1024 * 1024)
-        .max_total_size(512 * 1024 * 1024)
-        .build()
-        .expect("failed to create trace writer");
-    let mut builder = dial9::recorder(writer);
-    if args.cpu_profiling {
-        use dial9::RecorderPerfExt;
-        builder = builder.with_cpu_profiling(dial9::cpu::CpuProfilingConfig::default());
-    }
-    Some(builder.build())
-}
-
-/// Returns a runtime builder with the thread naming and placement the transfer manager uses
-/// for the runtime it builds itself.
-fn managed_runtime_builder() -> ManagedRuntimeBuilder {
-    ManagedRuntime::builder()
-        .thread_name_prefix("s3-tm")
-        .pin_threads(false)
-}
-
-/// Builds the runtime and returns `loader` configured to adopt it.
+/// The client is configured as the transfer manager's own managed transport: one connection
+/// pool with a partition per `runtime` thread, with partition `i` bound to
+/// `interfaces[i % interfaces.len()]` when interfaces are named. Pool partition indices match
+/// execution partition indices, and each partition spawns its connection tasks on its thread,
+/// so a connection's I/O stays on the thread that opened it.
 ///
-/// With `interfaces`, the S3 client configuration also carries an HTTP client whose connections
-/// bind to `interfaces`, assigned to the runtime's threads round-robin. That configuration is
-/// loaded from the shared AWS configuration sources, as [`ConfigLoader::load`] does.
-async fn adopt_runtime(
-    loader: ConfigLoader,
-    builder: ManagedRuntimeBuilder,
-    interfaces: &[String],
-    args: &Args,
-) -> Result<ConfigLoader, BoxError> {
-    let runtime = builder.build()?;
-    let mut loader = loader;
-    if !interfaces.is_empty() {
-        tracing::info!(
-            ?interfaces,
-            max_connections_per_host = args.max_connections_per_host,
-            "binding connections to network interfaces"
-        );
-        let http_client = interface_http_client(
-            runtime.handle(),
-            interfaces,
-            args.max_connections_per_host.get(),
-        )?;
-        let sdk_config = aws_config::load_defaults(BehaviorVersion::latest())
-            .await
-            .into_builder()
-            .http_client(http_client)
-            .build();
-        loader = loader.s3_config(S3ClientConfig::new(&sdk_config));
-    }
-    Ok(loader.runtime_config(RuntimeConfig::managed(
-        aws_sdk_s3_transfer_manager_ext::managed(runtime),
-    )))
-}
-
-/// Returns an HTTP client over one connection pool with a partition per `runtime` thread,
-/// configured as the transfer manager's own managed transport, with partition `i` bound to
-/// `interfaces[i % interfaces.len()]`.
-///
-/// Pool partition indices match execution partition indices, and each partition spawns its
-/// connection tasks on its thread, so a connection's I/O stays on the thread that opened it.
-///
-/// `interfaces` must not be empty.
-fn interface_http_client(
+/// Errors when the pool or client cannot be built.
+fn http_client(
     runtime: ManagedRuntimeHandle,
-    interfaces: &[String],
-    max_connections_per_host: usize,
+    options: &HttpOptions,
 ) -> Result<SharedHttpClient, BoxError> {
+    tracing::info!(?options, "building the S3 HTTP client");
+
     #[cfg(target_os = "android")]
     let dns_resolver = ShufflingDnsResolver::new(
         // Hickory reads /etc/resolv.conf on Unix. Android routes libc
@@ -695,7 +698,10 @@ fn interface_http_client(
             drop(target.spawn(task));
         });
         let partition = Partition::new(PartitionId::from_index(index), spawner);
-        bind_interface(partition, &interfaces[index % interfaces.len()])
+        match options.interfaces.len() {
+            0 => partition,
+            n => bind_interface(partition, &options.interfaces[index % n]),
+        }
     });
     let pool = ConnectionPool::builder()
         .dns_resolver(dns_resolver)
@@ -703,13 +709,27 @@ fn interface_http_client(
         // connection the server is closing, which fails before the request is accepted and
         // costs a retry on a fresh connection.
         .idle_timeout(time::Duration::from_secs(15))
-        .max_connections_per_host(max_connections_per_host)
+        .max_connections_per_host(options.max_connections_per_host.get())
         .proxy_config(ProxyConfig::from_env())
         .partitions(partitions)
         .tls_provider(Provider::Rustls(CryptoMode::AwsLc))
         .build_https()?;
     Ok(ManagedHttpPool::from_pool(runtime, pool)?.into_shared())
 }
+
+/// Whether this platform can bind a connection to a network interface.
+const INTERFACE_BINDING_SUPPORTED: bool = cfg!(any(
+    target_os = "android",
+    target_os = "fuchsia",
+    target_os = "illumos",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "solaris",
+    target_os = "tvos",
+    target_os = "visionos",
+    target_os = "watchos",
+));
 
 /// Binds `partition`'s connections to `interface`.
 #[cfg(any(
@@ -728,7 +748,7 @@ fn bind_interface(partition: Partition, interface: &str) -> Partition {
     partition.interface(interface)
 }
 
-/// Interface binding is unavailable on this platform, where [`network_interfaces`] rejects
+/// Interface binding is unavailable on this platform, where [`http_options`] rejects
 /// interface names: `partition` is returned unbound.
 #[cfg(not(any(
     target_os = "android",
@@ -744,6 +764,90 @@ fn bind_interface(partition: Partition, interface: &str) -> Partition {
 )))]
 fn bind_interface(partition: Partition, _interface: &str) -> Partition {
     partition
+}
+
+/// Optional dial9 runtime tracing of the managed runtime's threads.
+///
+/// Enabled by `--trace-dir` or `S3FIO_TRACE_DIR` in builds with `cfg(s3_tm_dial9)`; in other
+/// builds it is never enabled and every operation is a no-op.
+struct RuntimeTracing {
+    #[cfg(s3_tm_dial9)]
+    recorder: Option<dial9::Recorder>,
+}
+
+#[cfg(s3_tm_dial9)]
+impl RuntimeTracing {
+    /// Returns tracing to a recorder writing to `--trace-dir` or `S3FIO_TRACE_DIR`, disabled
+    /// when neither is set. Panics if the trace writer cannot be created.
+    fn from_args(args: &Args) -> Self {
+        use dial9::DiskBuffer;
+        let Some(trace_dir) = args
+            .trace_dir
+            .clone()
+            .or_else(|| std::env::var("S3FIO_TRACE_DIR").ok())
+        else {
+            return Self { recorder: None };
+        };
+        let _ = std::fs::create_dir_all(&trace_dir);
+        let writer = DiskBuffer::builder()
+            .base_path(&trace_dir)
+            .max_file_size(64 * 1024 * 1024)
+            .max_total_size(512 * 1024 * 1024)
+            .build()
+            .expect("failed to create trace writer");
+        let mut builder = dial9::recorder(writer);
+        if args.cpu_profiling {
+            use dial9::RecorderPerfExt;
+            builder = builder.with_cpu_profiling(dial9::cpu::CpuProfilingConfig::default());
+        }
+        Self {
+            recorder: Some(builder.build()),
+        }
+    }
+
+    /// Whether a recorder is present.
+    fn is_enabled(&self) -> bool {
+        self.recorder.is_some()
+    }
+
+    /// Returns `builder` with the recorder attached, so the runtime it builds is traced.
+    fn instrument(&self, builder: ManagedRuntimeBuilder) -> ManagedRuntimeBuilder {
+        match &self.recorder {
+            Some(recorder) => builder.dial9_handle(recorder.handle().clone()),
+            None => builder,
+        }
+    }
+
+    /// Drains queued events and stops the recorder, waiting up to 10 seconds.
+    ///
+    /// Events a traced runtime has not flushed are lost, so every traced runtime must be dropped
+    /// first.
+    fn shutdown(self) {
+        if let Some(recorder) = self.recorder {
+            recorder.graceful_shutdown(time::Duration::from_secs(10));
+        }
+    }
+}
+
+#[cfg(not(s3_tm_dial9))]
+impl RuntimeTracing {
+    /// Returns disabled tracing.
+    fn from_args(_args: &Args) -> Self {
+        Self {}
+    }
+
+    /// Returns `false`.
+    fn is_enabled(&self) -> bool {
+        false
+    }
+
+    /// Returns `builder` unchanged.
+    fn instrument(&self, builder: ManagedRuntimeBuilder) -> ManagedRuntimeBuilder {
+        builder
+    }
+
+    /// Does nothing.
+    fn shutdown(self) {}
 }
 
 // Copy of the transfer manager's private `ShufflingDnsResolver` in `src/runtime/managed.rs`.
@@ -778,11 +882,11 @@ impl<R: ResolveDns + 'static> ResolveDns for ShufflingDnsResolver<R> {
 /// Runs the configured iterations and writes their results.
 ///
 /// Takes the client by value so it is dropped, and its worker runtimes flush their trace
-/// events, before the caller shuts the recorder down.
+/// events, before the caller shuts runtime tracing down.
 async fn transfer(
     tm: aws_sdk_s3_transfer_manager::Client,
     args: &Args,
-    is_download: bool,
+    direction: Direction,
 ) -> Result<(), BoxError> {
     let json_output = matches!(args.output, OutputFormat::Json);
 
@@ -791,33 +895,30 @@ async fn transfer(
         let start = SystemTime::now();
         let wall_start = time::Instant::now();
 
-        let bytes = if let Some(ref manifest_path) = args.manifest {
-            let content = fs::read_to_string(manifest_path).await?;
-            let entries: Vec<ManifestEntry> = serde_json::from_str(&content)?;
-            if is_download {
-                let (bucket, _key) = args.source.expect_s3().parts();
+        let manifest: Option<Vec<ManifestEntry>> = match &args.manifest {
+            Some(path) => Some(serde_json::from_str(&fs::read_to_string(path).await?)?),
+            None => None,
+        };
+        let bytes = match direction {
+            Direction::Download => {
+                let (bucket, key) = args.source.expect_s3().parts();
                 let dest = args.dest.expect_local();
-                do_manifest_download(&tm, bucket, &entries, dest).await?
-            } else {
+                match (&manifest, args.recursive) {
+                    (Some(entries), _) => do_manifest_download(&tm, bucket, entries, dest).await?,
+                    (None, true) => do_recursive_download(&tm, bucket, key, dest).await?,
+                    (None, false) => do_single_download(&tm, bucket, key, dest).await?,
+                }
+            }
+            Direction::Upload => {
                 let (bucket, key) = args.dest.expect_s3().parts();
                 let source = args.source.expect_local();
-                do_manifest_upload(&tm, bucket, key, &entries, source).await?
-            }
-        } else if is_download {
-            let (bucket, key) = args.source.expect_s3().parts();
-            let dest = args.dest.expect_local();
-            if args.recursive {
-                do_recursive_download(&tm, bucket, key, dest).await?
-            } else {
-                do_single_download(&tm, bucket, key, dest).await?
-            }
-        } else {
-            let (bucket, key) = args.dest.expect_s3().parts();
-            let source = args.source.expect_local();
-            if args.recursive {
-                do_recursive_upload(&tm, bucket, key, source).await?
-            } else {
-                do_single_upload(&tm, bucket, key, source).await?
+                match (&manifest, args.recursive) {
+                    (Some(entries), _) => {
+                        do_manifest_upload(&tm, bucket, key, entries, source).await?
+                    }
+                    (None, true) => do_recursive_upload(&tm, bucket, key, source).await?,
+                    (None, false) => do_single_upload(&tm, bucket, key, source).await?,
+                }
             }
         };
 

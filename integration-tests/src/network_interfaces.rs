@@ -19,6 +19,11 @@ use std::time::Duration;
 use aws_sdk_s3_transfer_manager::config::RuntimeConfig;
 use aws_sdk_s3_transfer_manager::config::{ConcurrencyMode, PartSize};
 use aws_sdk_s3_transfer_manager::types::ByteSize;
+use aws_smithy_execution::{ManagedRuntime, ManagedRuntimeHandle};
+use aws_smithy_http_client::pool::{ConnectionPool, DriverSpawner, Partition, PartitionId};
+use aws_smithy_managed_http::client::ManagedHttpPool;
+use aws_smithy_runtime_api::client::http::SharedHttpClient;
+use aws_smithy_runtime_api::shared::IntoShared;
 
 use crate::harness::{mock_tm_with_s3_config, MockTm};
 
