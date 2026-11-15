@@ -58,8 +58,7 @@ fn upload_output_validates_and_preserves_real_transfer_metrics() {
         disk_read: 42,
         disk_write: 0,
         total_bytes: Some(42),
-        started_at: std::time::Instant::now(),
-        finished_at: None,
+        elapsed: std::time::Duration::ZERO,
     };
     let builder = UploadOutput::builder().metrics(metrics);
     assert_eq!(builder.get_metrics().as_ref().unwrap().network_tx, 42);

@@ -34,6 +34,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   download's responses carried checksums only in algorithms the SDK does not compute, such as MD5.
 
 ### Changed
+- `TransferMetrics::started_at` and `TransferMetrics::finished_at` are replaced by
+  `TransferMetrics::elapsed`: the time from when the transfer was initiated until it recorded its
+  finish, or until the snapshot if it has not. The metrics in an operation's output hold the final
+  value; a handle's `status` reports whether the transfer has finished.
 - `aws-sdk-s3-transfer-manager`, `aws-sdk-s3-transfer-manager-ext`, `aws-smithy-topology`,
   `aws-smithy-execution` and `aws-smithy-managed-http`: the minimum supported Rust version is
   1.96.0.
