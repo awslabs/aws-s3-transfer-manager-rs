@@ -108,8 +108,10 @@
 //! object, SHA-256 for the composite case.
 
 mod algorithm_tests;
+mod bulk_tests;
 mod coverage_tests;
 mod download_tests;
+mod liveness_tests;
 mod negative_control_tests;
 pub(crate) mod test_util;
 mod upload_tests;
