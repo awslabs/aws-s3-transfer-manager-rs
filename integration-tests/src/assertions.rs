@@ -144,3 +144,30 @@ pub(crate) fn check_integrity_error(
     }
     Ok(())
 }
+
+/// The code and kind of an S3 request error, without its message or `Debug` form.
+///
+/// An authorization failure's message names the caller's account and role, and tests that run
+/// against real S3 print to public CI logs, so they describe a failed request with this instead.
+pub(crate) fn describe_sdk_error<E, R>(error: &aws_sdk_s3::error::SdkError<E, R>) -> String
+where
+    E: aws_sdk_s3::error::ProvideErrorMetadata + std::error::Error + 'static,
+    R: std::fmt::Debug,
+{
+    use aws_sdk_s3::error::ProvideErrorMetadata;
+    match error.code() {
+        Some(code) => format!("{error} ({code})"),
+        None => format!("{error}"),
+    }
+}
+
+/// The kind, operation and code of a transfer manager error, without its source, for the same
+/// reason as [`describe_sdk_error`].
+pub(crate) fn describe_error(error: &Error) -> String {
+    format!(
+        "{:?} from {:?} ({:?})",
+        error.kind(),
+        error.operation_name(),
+        error.code()
+    )
+}

@@ -45,6 +45,9 @@ pub struct RequestRecord {
     pub checksum: Option<SentChecksum>,
     /// For GetObject, the fault applied to the response.
     pub fault: Option<FaultType>,
+    /// For GetObject, the object byte a [`FaultType::CorruptByte`] fault flipped in the body the
+    /// response yielded. `None` if it flipped none.
+    pub flipped: Option<u64>,
     /// For GetObject, how a [`FaultType::HoldBody`] hold on the body ended.
     pub hold: Option<HoldEnd>,
     /// For GetObject, how the response body ended. `None` until it ends, and for a request that
@@ -102,7 +105,8 @@ pub struct BodyEnd {
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BodyEnding {
-    /// The body yielded its `Content-Length` bytes to the connection.
+    /// The body yielded its `Content-Length` bytes to the connection, which for a body of no
+    /// bytes is when it is created; or, for a body without a `Content-Length`, its stream ended.
     Sent,
     /// The body's stream failed, or ended before `Content-Length` bytes. The mock's body faults
     /// are the only source of either.
@@ -174,6 +178,7 @@ impl Journal {
             range: None,
             checksum: None,
             fault: None,
+            flipped: None,
             hold: None,
             body: None,
         });
@@ -279,8 +284,9 @@ pub(crate) struct JournaledBody<S> {
     inner: S,
     /// Bytes from the inner stream not yet yielded.
     pending: Bytes,
-    /// Bytes still to yield before the response's `Content-Length` is reached.
-    remaining: u64,
+    /// Bytes still to yield before the response's `Content-Length` is reached. `None` for a
+    /// response without one.
+    remaining: Option<u64>,
     state: Arc<crate::s3s::ServerState>,
     id: RequestId,
     ended: bool,
@@ -289,18 +295,23 @@ pub(crate) struct JournaledBody<S> {
 impl<S> JournaledBody<S> {
     pub(crate) fn new(
         inner: S,
-        content_length: u64,
+        content_length: Option<u64>,
         state: Arc<crate::s3s::ServerState>,
         id: RequestId,
     ) -> Self {
-        Self {
+        let mut body = Self {
             inner,
             pending: Bytes::new(),
             remaining: content_length,
             state,
             id,
             ended: false,
+        };
+        // The connection never polls a body of no bytes.
+        if content_length == Some(0) {
+            body.end(BodyEnding::Sent);
         }
+        body
     }
 
     fn end(&mut self, ending: BodyEnding) {
@@ -323,8 +334,8 @@ where
             if !self.pending.is_empty() {
                 let n = self.pending.len().min(PIECE_BYTES);
                 let piece = self.pending.split_to(n);
-                self.remaining = self.remaining.saturating_sub(n as u64);
-                if self.remaining == 0 {
+                self.remaining = self.remaining.map(|r| r.saturating_sub(n as u64));
+                if self.remaining == Some(0) {
                     // The connection may drop the body without polling it again.
                     self.end(BodyEnding::Sent);
                 }
@@ -350,8 +361,8 @@ impl<S> JournaledBody<S> {
             Poll::Ready(None) => {
                 // A stream that ends before Content-Length was cut short, by `ShortBody`.
                 self.end(match self.remaining {
-                    0 => BodyEnding::Sent,
-                    _ => BodyEnding::CutByFault,
+                    Some(0) | None => BodyEnding::Sent,
+                    Some(_) => BodyEnding::CutByFault,
                 });
                 Poll::Ready(None)
             }

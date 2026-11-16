@@ -18,6 +18,7 @@ use aws_sdk_s3::types::ChecksumType;
 use aws_sdk_s3_transfer_manager::io::{InputStream, PartData};
 use aws_sdk_s3_transfer_manager::operation::upload::ChecksumStrategy;
 
+use crate::assertions::describe_error;
 use crate::harness::{target_tests, ClientOptions, Target, TmTestClient};
 use crate::test_util::data::{fill_object_bytes, object_bytes};
 use crate::test_util::object::{
@@ -62,8 +63,14 @@ fn assert_bad_digest<T: std::fmt::Debug>(
     operation: &str,
 ) {
     let err = result.expect_err("an upload with a mismatched checksum must fail");
-    assert_eq!(err.operation_name(), Some(operation), "{err:?}");
-    assert_eq!(err.code(), Some("BadDigest"), "{err:?}");
+    assert_eq!(
+        err.operation_name(),
+        Some(operation),
+        "{}",
+        describe_error(&err)
+    );
+    assert_eq!(err.code(), Some("BadDigest"), "{}", describe_error(&err));
+    assert_eq!(err.upload_id(), None, "the upload was left open in S3");
 }
 
 /// A multipart upload with a CRC64NVME checksum the transfer manager calculates stores the

@@ -182,7 +182,9 @@ impl S3MockServerBuilder {
     }
 
     /// Keep a request journal: a record of every request served, which
-    /// [`S3MockServer::requests`] returns. GetObject bodies are then delivered in pieces of at
+    /// [`S3MockServer::requests`] returns. The request counts are kept either way: they are cheap
+    /// and always on, while the journal holds a record per request and changes how bodies are
+    /// delivered. GetObject bodies are then delivered in pieces of at
     /// most 64 KiB, so a body's recorded end follows its last bytes reaching the connection.
     /// Records are kept until [`S3MockServer::clear_requests`].
     pub fn with_request_journal(mut self) -> Self {

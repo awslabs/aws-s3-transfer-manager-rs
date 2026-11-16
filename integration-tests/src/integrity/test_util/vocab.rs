@@ -123,8 +123,12 @@ pub(crate) mod hold {
 /// How the object's bytes are checked against a stored checksum, given its layout and the
 /// download's ranges: the `via` of a group or algorithm line.
 ///
-/// On mock targets, a `validated` or `integrity_error` case checks the request journal for the
-/// mechanism's evidence; see `Case::check_journal`.
+/// The mechanism is part of what a case pins, not a description. On mock targets, a
+/// `validated` or `integrity_error` case checks the request journal for the mechanism's evidence
+/// (see `Case::check_journal`), and an `integrity_error` case requires the error to name the
+/// checksum the mechanism checks. A download that reaches its outcome by another mechanism fails
+/// the case, and the table's `via` must change with it; `coverage_tests` pins each group's and
+/// shape's mechanism.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Mechanism {
     /// The whole object comes back in one GET, which carries the object's checksum.
@@ -241,8 +245,9 @@ pub(crate) mod at {
     pub(crate) const tail: At = At::Tail;
 }
 
-/// Where the downloaded bytes go. The sinks differ in what they leave behind on failure, which
-/// the `integrity_error` checks assert.
+/// Where the downloaded bytes go. The sinks differ in what they leave behind on failure: the
+/// `integrity_error` checks assert the stream's last item and the path destination's state. A
+/// caller-owned file may hold anything after a failure, so a `file` case checks nothing there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Sink {
     /// `DownloadHandle::body_mut().next()` until it ends, then `join`.

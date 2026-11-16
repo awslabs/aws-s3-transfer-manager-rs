@@ -510,7 +510,12 @@ impl TmTestClient {
             .checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled)
             .send()
             .await
-            .expect("HeadObject of a part")
+            .unwrap_or_else(|e| {
+                panic!(
+                    "HeadObject of part {part_number} of {key}: {}",
+                    crate::assertions::describe_sdk_error(&e)
+                )
+            })
     }
 
     /// Upload `data` under `key` with the given checksum strategy.

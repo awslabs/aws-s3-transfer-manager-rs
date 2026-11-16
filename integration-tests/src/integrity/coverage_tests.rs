@@ -28,21 +28,33 @@ use super::test_util::vocab::*;
 use Alg::Crc64Nvme;
 use At::{First, Later, Tail};
 use CaseTarget::*;
+use Mechanism as M;
 use Sink::{File, Path, Stream};
 
 /// A shape `algorithm_tests` must have.
 struct Shape {
     name: &'static str,
-    /// The algorithms the shape's upload strategy can produce.
-    algorithms: &'static [Alg],
+    /// The algorithms the shape's upload strategy can produce, each line with the mechanism its
+    /// cases name.
+    lines: &'static [(&'static [Alg], Mechanism)],
     targets: &'static [CaseTarget],
     extended: bool,
+}
+
+impl Shape {
+    fn algorithms(&self) -> impl Iterator<Item = (Alg, Mechanism)> + '_ {
+        self.lines
+            .iter()
+            .flat_map(|(algs, via)| algs.iter().map(move |alg| (*alg, *via)))
+    }
 }
 
 /// A group `download_tests` must have.
 struct Group {
     name: &'static str,
     algorithms: &'static [Alg],
+    /// The mechanism the group's cases name.
+    via: Mechanism,
     targets: &'static [CaseTarget],
     /// The requirement lists each algorithm must meet.
     requirements: &'static [&'static [Required]],
@@ -140,75 +152,76 @@ const ALL_TARGETS: &[CaseTarget] = &[MockGp, MockExpress, RealGp, RealExpress];
 const ALL_CHECKSUMS: &[Alg] = &[Crc32, Crc32c, Crc64Nvme, Sha1, Sha256];
 const FULL_OBJECT_CRCS: &[Alg] = &[Crc32, Crc32c, Crc64Nvme];
 const COMPOSITE: &[Alg] = &[Crc32, Crc32c, Sha1, Sha256];
+const SHAS: &[Alg] = &[Sha1, Sha256];
 
 /// Every shape `algorithm_tests` must have. A single PUT can use any algorithm; a FULL_OBJECT
 /// multipart upload only a CRC; a COMPOSITE one any but CRC64NVME, which S3 doesn't combine.
 const SHAPES: &[Shape] = &[
     Shape {
         name: "single_put_one_get",
-        algorithms: ALL_CHECKSUMS,
+        lines: &[(ALL_CHECKSUMS, M::WholeResponse)],
         targets: ALL_TARGETS,
         extended: false,
     },
     Shape {
         name: "single_put_split",
-        algorithms: ALL_CHECKSUMS,
+        lines: &[(FULL_OBJECT_CRCS, M::FullObject), (SHAS, M::None)],
         targets: ALL_TARGETS,
         extended: true,
     },
     Shape {
         name: "full_object_mpu",
-        algorithms: FULL_OBJECT_CRCS,
+        lines: &[(FULL_OBJECT_CRCS, M::FullObject)],
         targets: &[MockGp, RealGp],
         extended: true,
     },
     Shape {
         name: "full_object_mpu_small",
-        algorithms: FULL_OBJECT_CRCS,
+        lines: &[(FULL_OBJECT_CRCS, M::WholeResponse)],
         targets: &[MockGp, RealGp],
         extended: true,
     },
     Shape {
         name: "composite_aligned",
-        algorithms: COMPOSITE,
+        lines: &[(COMPOSITE, M::PerPart)],
         targets: ALL_TARGETS,
         extended: true,
     },
     Shape {
         name: "composite_realigned",
-        algorithms: COMPOSITE,
+        lines: &[(COMPOSITE, M::PerPart)],
         targets: ALL_TARGETS,
         extended: true,
     },
     Shape {
         name: "composite_misaligned",
-        algorithms: COMPOSITE,
+        lines: &[(COMPOSITE, M::None)],
         targets: ALL_TARGETS,
         extended: true,
     },
     Shape {
         name: "client_sent_no_checksum",
-        algorithms: &[NoChecksum],
+        lines: &[(&[NoChecksum], M::FullObject)],
         targets: ALL_TARGETS,
         extended: true,
     },
     // Seeded on the mock: a new upload can't produce an object without a checksum.
     Shape {
         name: "stored_without_checksum",
-        algorithms: &[NoChecksum],
+        lines: &[(&[NoChecksum], M::None)],
         targets: &[MockGp, MockExpress],
         extended: true,
     },
     // Directory buckets: FULL_OBJECT parts carry part checksums there.
     Shape {
         name: "express_full_object_aligned",
-        algorithms: FULL_OBJECT_CRCS,
+        lines: &[(FULL_OBJECT_CRCS, M::PerPart)],
         targets: &[MockExpress, RealExpress],
         extended: false,
     },
     Shape {
         name: "express_full_object_misaligned",
-        algorithms: FULL_OBJECT_CRCS,
+        lines: &[(FULL_OBJECT_CRCS, M::FullObject)],
         targets: &[MockExpress, RealExpress],
         extended: false,
     },
@@ -258,24 +271,28 @@ const GROUPS: &[Group] = &[
     Group {
         name: "single_put",
         algorithms: &[Crc64Nvme, Crc32],
+        via: M::WholeResponse,
         targets: &[MockGp],
         requirements: &[EVERY_SINK, WHOLE_RESPONSE],
     },
     Group {
         name: "composite_mpu",
         algorithms: &[Crc32, Sha256],
+        via: M::PerPart,
         targets: &[MockGp],
         requirements: &[EVERY_SINK, MULTI_RANGE],
     },
     Group {
         name: "full_object_mpu",
         algorithms: &[Crc64Nvme, Crc32],
+        via: M::FullObject,
         targets: &[MockGp, RealGp],
         requirements: &[EVERY_SINK, MULTI_RANGE, FULL_OBJECT],
     },
     Group {
-        name: "full_object_large",
+        name: "full_object_waves",
         algorithms: &[Crc64Nvme],
+        via: M::FullObject,
         targets: &[MockGp],
         requirements: &[&[Required::HeldWaves]],
     },
@@ -283,6 +300,7 @@ const GROUPS: &[Group] = &[
     Group {
         name: "unequal_parts",
         algorithms: &[Crc32],
+        via: M::PerPart,
         targets: &[MockGp, RealGp],
         requirements: &[&[
             case(NotValidated(PartialCoverage), None, Stream),
@@ -294,21 +312,37 @@ const GROUPS: &[Group] = &[
     Group {
         name: "composite_one_get",
         algorithms: &[Crc32],
+        via: M::None,
         targets: &[MockGp, RealGp],
         requirements: &[&[
             case(NotValidated(CompositeChecksum), None, Stream),
             case(Undetected(CompositeChecksum), fault::corrupt(First), Stream),
         ]],
     },
+    // A split single PUT: what the path and file sinks leave on success and failure.
+    Group {
+        name: "single_put_split",
+        algorithms: &[Crc64Nvme],
+        via: M::FullObject,
+        targets: &[MockGp],
+        requirements: &[&[
+            case(Validated, None, Path),
+            case(Validated, None, File),
+            case(IntegrityError, fault::corrupt(Later), Path),
+            case(IntegrityError, fault::corrupt(Later), File),
+        ]],
+    },
     Group {
         name: "empty_crc",
         algorithms: &[Crc64Nvme],
+        via: M::FullObject,
         targets: &[MockGp],
         requirements: &[&[case(Validated, None, Stream), case(Validated, None, Path)]],
     },
     Group {
         name: "empty_sha",
         algorithms: &[Sha256],
+        via: M::None,
         targets: &[MockGp],
         requirements: &[&[case(NotValidated(Unavailable), None, Stream)]],
     },
@@ -363,22 +397,36 @@ fn missing(cases: &[&Case]) -> Vec<String> {
         );
     }
 
-    // Each shape's algorithms, intact and with `corrupt(tail)`.
+    // Each shape's algorithms, intact and with `corrupt(tail)`, each naming its mechanism.
     for shape in SHAPES {
-        for alg in shape.algorithms {
+        for (alg, via) in shape.algorithms() {
+            let mine: Vec<_> = cases
+                .iter()
+                .filter(|c| in_shape(c, shape.name) && c.object.alg == alg)
+                .collect();
             for (fault, word) in [(None, "no fault"), (fault::corrupt(Tail), "corrupt(tail)")] {
-                let found = cases
-                    .iter()
-                    .any(|c| in_shape(c, shape.name) && c.object.alg == *alg && c.fault == fault);
-                if !found {
+                if !mine.iter().any(|c| c.fault == fault) {
                     missing.push(format!("algorithm_tests::{} {alg:?}: {word}", shape.name));
                 }
+            }
+            if mine.iter().any(|c| c.mechanism != via) {
+                missing.push(format!(
+                    "algorithm_tests::{} {alg:?}: via {via:?}",
+                    shape.name
+                ));
             }
         }
     }
 
-    // Each group's requirements, for each of its algorithms.
+    // Each group's requirements, for each of its algorithms, and its mechanism.
     for group in GROUPS {
+        let via = group.via;
+        if cases
+            .iter()
+            .any(|c| in_group(c, group.name) && c.mechanism != via)
+        {
+            missing.push(format!("download_tests::{}: via {via:?}", group.name));
+        }
         for alg in group.algorithms {
             let mine: Vec<_> = cases
                 .iter()
@@ -484,17 +532,150 @@ fn required_coverage_reports_removals() {
         }),
         "algorithm_tests::single_put_one_get: must run on every platform",
     );
-    // The held large download no longer has more ranges than requests in flight.
+    // A mechanism changed, in a group and in a shape: the downgrade to `via: none` that would
+    // silently drop the mechanism checks.
     reports(
         changed(&|c| {
-            in_group(c, "full_object_large").then(|| {
+            in_group(c, "composite_mpu").then_some(Case {
+                mechanism: M::None,
+                ..*c
+            })
+        }),
+        "download_tests::composite_mpu: via PerPart",
+    );
+    reports(
+        changed(&|c| {
+            in_shape(c, "composite_aligned").then_some(Case {
+                mechanism: M::None,
+                ..*c
+            })
+        }),
+        "algorithm_tests::composite_aligned Crc32: via PerPart",
+    );
+    // The held download no longer has more ranges than requests in flight.
+    reports(
+        changed(&|c| {
+            in_group(c, "full_object_waves").then(|| {
                 let mut c = *c;
                 c.download.concurrency = Some(c.ranges() as usize);
                 c
             })
         }),
-        "download_tests::full_object_large Crc64Nvme: HeldWaves",
+        "download_tests::full_object_waves Crc64Nvme: HeldWaves",
     );
+}
+
+/// The reason the cases full-object validation must make pass are ignored with.
+const NEEDS_FULL_OBJECT: &str = "not validated against the full-object checksum";
+
+/// The table cases that are ignored, and why: a shape or group, its algorithms (all if empty),
+/// its setup (all if `None`), and the ignore reason. Every ignored case must be listed, and every
+/// listed case ignored with the reason, so ignoring or un-ignoring a case is a reviewed edit here.
+const IGNORED: &[(&str, &[Alg], Option<&str>, &str)] = &[
+    (
+        "algorithm_tests::single_put_split",
+        FULL_OBJECT_CRCS,
+        None,
+        NEEDS_FULL_OBJECT,
+    ),
+    (
+        "algorithm_tests::full_object_mpu",
+        &[],
+        None,
+        NEEDS_FULL_OBJECT,
+    ),
+    (
+        "algorithm_tests::full_object_mpu_small",
+        &[],
+        None,
+        NEEDS_FULL_OBJECT,
+    ),
+    (
+        "algorithm_tests::client_sent_no_checksum",
+        &[],
+        None,
+        NEEDS_FULL_OBJECT,
+    ),
+    (
+        "algorithm_tests::express_full_object_misaligned",
+        &[],
+        None,
+        NEEDS_FULL_OBJECT,
+    ),
+    (
+        "download_tests::single_put_split",
+        &[],
+        Some("default"),
+        NEEDS_FULL_OBJECT,
+    ),
+    (
+        "download_tests::full_object_mpu",
+        &[],
+        Some("default"),
+        NEEDS_FULL_OBJECT,
+    ),
+    (
+        "download_tests::full_object_mpu",
+        &[],
+        Some("out_of_order"),
+        NEEDS_FULL_OBJECT,
+    ),
+    (
+        "download_tests::full_object_mpu",
+        &[],
+        Some("odd_part_size"),
+        NEEDS_FULL_OBJECT,
+    ),
+    (
+        "download_tests::full_object_waves",
+        &[],
+        Some("out_of_order"),
+        NEEDS_FULL_OBJECT,
+    ),
+    (
+        "download_tests::empty_crc",
+        &[],
+        Some("default"),
+        NEEDS_FULL_OBJECT,
+    ),
+];
+
+/// The [`IGNORED`] entry a case falls under, if any.
+fn ignored_entry(
+    c: &Case,
+) -> Option<&'static (
+    &'static str,
+    &'static [Alg],
+    Option<&'static str>,
+    &'static str,
+)> {
+    IGNORED.iter().find(|(name, algs, setup, _)| {
+        let (table, name) = name.split_once("::").expect("a table and a name");
+        segment_after(c, table) == Some(name)
+            && (algs.is_empty() || algs.contains(&c.object.alg))
+            && setup.is_none_or(|setup| c.path.contains(&format!("::{setup}::")))
+    })
+}
+
+/// Every ignored table case is listed in [`IGNORED`] with its reason, and every listed case is
+/// ignored with it, so ignoring a case doesn't silently count it as covered.
+#[test]
+fn ignored_cases_are_listed() {
+    let cases = table_cases();
+    for c in &cases {
+        let listed = ignored_entry(c).map(|(_, _, _, reason)| *reason);
+        assert_eq!(
+            c.ignore, listed,
+            "{}: ignore reason differs from IGNORED",
+            c.path
+        );
+    }
+    for entry in IGNORED {
+        assert!(
+            cases.iter().any(|c| ignored_entry(c) == Some(entry)),
+            "{entry:?} matches no case"
+        );
+    }
 }
 
 /// The SDK's checksum algorithms that no upload checksum strategy produces.
@@ -506,8 +687,8 @@ const NOT_UPLOADABLE: &[&str] = &["MD5", "SHA512", "XXHASH128", "XXHASH3", "XXHA
 fn every_sdk_algorithm_is_placed() {
     let covered: Vec<_> = SHAPES
         .iter()
-        .flat_map(|shape| shape.algorithms)
-        .filter_map(|alg| alg.sdk())
+        .flat_map(|shape| shape.algorithms())
+        .filter_map(|(alg, _)| alg.sdk())
         .collect();
     for name in aws_sdk_s3::types::ChecksumAlgorithm::values() {
         let algorithm = aws_sdk_s3::types::ChecksumAlgorithm::from(*name);
@@ -524,13 +705,21 @@ fn every_sdk_algorithm_is_placed() {
 /// - no case both holds the first range and faults byte 0, since the mock applies one fault or
 ///   hold per response;
 /// - a `later` fault with the automatic part size is on an object whose first part is the
-///   default part size, so byte `B` is the second range's first byte.
+///   default part size, so byte `B` is the second range's first byte;
+/// - a `validated` or `integrity_error` case names a mechanism that checks it, not `via: none`.
 #[test]
 fn table_cases_are_well_formed() {
     let cases = table_cases();
     let seeds: std::collections::HashSet<_> = cases.iter().map(|c| c.seed()).collect();
     assert_eq!(seeds.len(), cases.len(), "two cases share a seed");
     for c in &cases {
+        let checked = matches!(c.expect, Expect::Validated(_) | Expect::IntegrityError(_));
+        assert!(
+            !(checked && c.mechanism == M::None),
+            "{}: {:?} with `via: none`",
+            c.path,
+            c.expect
+        );
         let at = c.fault.map(|f| f.at);
         assert!(
             !(c.hold.is_some() && at == Some(First)),

@@ -42,9 +42,9 @@ pub enum FaultType {
     /// effect on a GET whose range does not include the byte. Register it for a target built
     /// with [`FaultTarget::covering`] to apply it to whichever GET carries the byte.
     CorruptByte { offset: u64 },
-    /// GET sends its headers, then holds its body until `others` GetObject bodies of the same
-    /// object have ended, whether sent in full or not, or until `deadline` passes. The request
-    /// journal records which happened. Bodies are counted by the journal, so on a server built
+    /// GET sends its headers, then holds its body until `others` other GetObject bodies of the
+    /// same object have ended, whether sent in full or not, or until `deadline` passes. Bodies
+    /// that ended before the hold started count. The request journal records which happened. Bodies are counted by the journal, so on a server built
     /// without one the hold lasts until `deadline`.
     HoldBody {
         others: u32,

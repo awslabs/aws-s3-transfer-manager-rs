@@ -118,6 +118,9 @@ async fn corrupt_byte_flips_the_covered_byte_of_range_and_part_number_gets() -> 
         gets[1].fault,
         Some(FaultType::CorruptByte { offset: 1000 })
     ));
+    // The journal records the byte flipped, and none for the GET that didn't carry it.
+    let flipped: Vec<_> = gets.iter().map(|r| r.flipped).collect();
+    assert_eq!(flipped, [None, Some(1000), Some(1000)]);
     handle.shutdown().await?;
     Ok(())
 }
@@ -256,6 +259,21 @@ async fn journal_records_the_checksum_each_response_carried() -> Result<()> {
     Ok(())
 }
 
+/// Waits until the mock has applied a `HoldBody` fault to a GET, so a request sent afterward is
+/// admitted while the body is held.
+async fn hold_applied(server: &S3MockServer) {
+    for _ in 0..500 {
+        if gets(server)
+            .iter()
+            .any(|r| matches!(r.fault, Some(FaultType::HoldBody { .. })))
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("no GET was held: {:#?}", gets(server));
+}
+
 /// Registers a hold on the GET covering byte 0, released when one other body ends.
 fn hold_first_range(server: &S3MockServer, deadline: Duration) {
     server.insert_fault_for(
@@ -278,6 +296,7 @@ async fn hold_releases_when_other_bodies_end() -> Result<()> {
         let client = unvalidating_client(&handle).await;
         async move { get_with(&client, Some("bytes=0-1048575")).await }
     });
+    hold_applied(&server).await;
     // The held body does not end on its own.
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(!held.is_finished());
@@ -307,16 +326,14 @@ async fn hold_releases_when_another_body_is_cut_short() -> Result<()> {
         let client = unvalidating_client(&handle).await;
         async move { get_with(&client, Some("bytes=0-1048575")).await }
     });
+    hold_applied(&server).await;
     assert!(get(&handle, Some("bytes=1048576-16777215")).await.is_err());
     held.await??;
 
-    // The two GETs are sent concurrently, so either can be admitted first.
     let gets = bodies_ended(&server).await;
-    let (held, cut): (Vec<_>, Vec<_>) = gets
-        .iter()
-        .partition(|r| matches!(r.fault, Some(FaultType::HoldBody { .. })));
-    assert_eq!(held[0].hold, Some(HoldEnd::Released));
-    assert_eq!(cut[0].body.unwrap().ending, BodyEnding::CutByFault);
+    assert_eq!(gets[0].hold, Some(HoldEnd::Released));
+    assert_eq!(gets[1].body.unwrap().ending, BodyEnding::CutByFault);
+    assert!(gets[0].body.unwrap().order > gets[1].body.unwrap().order);
     handle.shutdown().await?;
     Ok(())
 }
@@ -343,6 +360,24 @@ async fn hold_expires_at_its_deadline() -> Result<()> {
     let gets = bodies_ended(&server).await;
     assert_eq!(gets[0].hold, Some(HoldEnd::Expired));
     assert_eq!(gets[0].body.unwrap().ending, BodyEnding::Sent);
+    handle.shutdown().await?;
+    Ok(())
+}
+
+/// A body of no bytes is recorded as sent: the connection never polls it.
+#[tokio::test]
+async fn empty_body_is_recorded_as_sent() -> Result<()> {
+    let (server, handle, _) = server_with(0).await?;
+    let response = unvalidating_client(&handle)
+        .await
+        .get_object()
+        .bucket(B)
+        .key(K)
+        .send()
+        .await?;
+    assert!(response.body.collect().await?.to_vec().is_empty());
+    let gets = bodies_ended(&server).await;
+    assert_eq!(gets[0].body.map(|b| b.ending), Some(BodyEnding::Sent));
     handle.shutdown().await?;
     Ok(())
 }

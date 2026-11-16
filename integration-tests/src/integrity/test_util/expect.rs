@@ -11,10 +11,11 @@ use aws_sdk_s3_transfer_manager::types::ChecksumValidation;
 use s3_mock_server::{BodyEnding, ChecksumScope, FaultType, HoldEnd, Operation, RequestRecord};
 
 use super::runner::{Check, Delivered, SENTINEL};
-use super::vocab::{Action, Alg, Case, Expect, Mechanism, NotValidatedReason, Sink};
+use super::vocab::{Action, Alg, At, Case, Expect, Mechanism, NotValidatedReason, Sink};
 use crate::assertions::check_integrity_error;
 use crate::test_util::data::fill_object_bytes;
 use crate::test_util::object::ChecksumValues;
+use aws_sdk_s3_transfer_manager::error::ErrorKind;
 
 /// Returns `Err(message)` from the enclosing check when `condition` is false.
 macro_rules! ensure {
@@ -150,6 +151,25 @@ impl Case {
         };
         let algorithm = alg.tm().ok_or("an integrity error needs an algorithm")?;
         check_integrity_error(error, &algorithm)?;
+        // The mismatch is the injected one: the checksum that failed is the stored checksum of
+        // the response containing the faulted byte, as the mechanism checks it.
+        if let (Some(fault), ErrorKind::IntegrityError(integrity)) = (self.fault, error.kind()) {
+            let byte = self.byte(fault.at);
+            let stored = match self.mechanism {
+                Mechanism::PerPart => self.object.part_checksum(self.seed(), byte),
+                Mechanism::WholeResponse | Mechanism::FullObject => {
+                    self.object.expected_checksum(self.seed()).map(|c| c.value)
+                }
+                Mechanism::None => None,
+            };
+            ensure!(
+                integrity.expected() == stored.as_deref(),
+                "integrity error expected {:?}, not the stored {stored:?} the {:?} mechanism \
+                 checks for byte {byte}",
+                integrity.expected(),
+                self.mechanism
+            );
+        }
         match self.sink {
             Sink::Stream => ensure!(
                 delivered.stream_ended_in_error,
@@ -195,37 +215,84 @@ impl Case {
 
         if let Some(fault) = self.fault {
             let byte = self.byte(fault.at);
-            let cut = gets.iter().position(|r| is_cut(r));
-            match fault.action {
-                Action::Corrupt => ensure!(
-                    gets.iter().any(|r| is_corrupt(r) && covers(r, byte)),
-                    "no GET covering byte {byte} was corrupted: {gets:#?}"
-                ),
-                Action::Truncate => {
+            // The GET the fault was applied to holds the range the position names: the first
+            // range, the range starting at `B`, or the final range.
+            let at_position = |r: &RequestRecord| -> Check {
+                let range = r
+                    .range
+                    .as_ref()
+                    .ok_or_else(|| format!("a faulted GET has no range: {r:#?}"))?;
+                let named = match fault.at {
+                    At::First => range.start == 0,
+                    At::Later => range.start == self.range_size(),
+                    At::Tail => range.end == self.object.len,
+                };
+                ensure!(
+                    named,
+                    "the GET faulted for {:?} has range {range:?}: {r:#?}",
+                    fault.at
+                );
+                Ok(())
+            };
+            let corrupted_at_byte = |r: &RequestRecord| matches!(r.fault, Some(FaultType::CorruptByte { offset }) if offset == byte);
+            ensure!(
+                gets.iter().all(|r| r.flipped.is_none_or(|f| f == byte)),
+                "a GET's body had another byte than {byte} flipped: {gets:#?}"
+            );
+            let cut = match fault.action {
+                Action::Corrupt => None,
+                Action::Truncate | Action::CorruptRetry => {
+                    let cuts: Vec<_> = (0..gets.len()).filter(|&i| is_cut(gets[i])).collect();
+                    ensure!(cuts.len() == 1, "expected one cut GET: {gets:#?}");
+                    let cut = cuts[0];
                     ensure!(
-                        gets.iter().filter(|r| is_cut(r)).count() == 1,
-                        "expected one cut GET: {gets:#?}"
+                        covers(gets[cut], byte),
+                        "the cut GET doesn't contain byte {byte}: {:#?}",
+                        gets[cut]
                     );
-                    let cut = cut.expect("one cut GET");
+                    at_position(gets[cut])?;
                     ensure!(
                         gets[cut].body.map(|b| b.ending) == Some(BodyEnding::CutByFault),
                         "the cut GET's body must end cut short: {:#?}",
                         gets[cut]
                     );
+                    Some(cut)
+                }
+            };
+            match (fault.action, cut) {
+                (Action::Corrupt, _) => {
+                    let corrupted: Vec<_> = gets.iter().filter(|r| corrupted_at_byte(r)).collect();
                     ensure!(
-                        gets[cut + 1..].iter().any(|r| covers(r, byte) && sent(r)),
-                        "no GET after the cut covering byte {byte} was sent in full: {gets:#?}"
+                        !corrupted.is_empty(),
+                        "no GET was corrupted at byte {byte}: {gets:#?}"
+                    );
+                    for r in &corrupted {
+                        at_position(r)?;
+                    }
+                    ensure!(
+                        corrupted.iter().any(|r| r.flipped == Some(byte)),
+                        "no corrupted GET's body had byte {byte} flipped: {corrupted:#?}"
                     );
                 }
-                Action::CorruptRetry => {
-                    let cut = cut.ok_or_else(|| format!("no GET was cut: {gets:#?}"))?;
+                (Action::Truncate, Some(cut)) => ensure!(
+                    gets[cut + 1..]
+                        .iter()
+                        .any(|r| r.range == gets[cut].range && sent(r)),
+                    "no GET of the cut GET's range was sent in full after it: {gets:#?}"
+                ),
+                (Action::CorruptRetry, Some(cut)) => {
+                    let retry = gets[cut + 1..]
+                        .iter()
+                        .find(|r| r.range == gets[cut].range && corrupted_at_byte(r))
+                        .ok_or_else(|| {
+                            format!("the cut GET's range wasn't corrupted after it: {gets:#?}")
+                        })?;
                     ensure!(
-                        gets[cut + 1..]
-                            .iter()
-                            .any(|r| covers(r, byte) && is_corrupt(r)),
-                        "no GET after the cut covering byte {byte} was corrupted: {gets:#?}"
+                        retry.flipped == Some(byte),
+                        "the retry's body didn't have byte {byte} flipped: {retry:#?}"
                     );
                 }
+                _ => unreachable!("a cut is found for truncate and corrupt_retry"),
             }
         }
 

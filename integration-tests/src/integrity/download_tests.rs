@@ -124,19 +124,37 @@ download_cases! {
         }
     }
 
-    // 65 ranges with at most 8 requests in flight: several waves of requests.
-    full_object_large {
-        object: |alg| Object::mpu(FullObject, alg).len(64 * 8 * MIB + 17).parts(8 * MIB);
+    // Five 5 MiB ranges with at most 2 requests in flight: the other ranges go out in several
+    // waves while the first is held.
+    full_object_waves {
+        object: |alg| Object::mpu(FullObject, alg).len(20 * MIB + 3).parts(8 * MIB);
         algorithms: [crc64nvme];
         via: full_object;
         targets: [mock_gp];
 
         download out_of_order {
-            options: Download::new().part_size(8 * MIB).concurrency(8);
+            options: Download::new().part_size(5 * MIB).concurrency(2);
             hold: first_range;
             // ref: RUST-1758
             ignore: "not validated against the full-object checksum";
             expect validated { [path] }
+        }
+    }
+
+    // 12 MiB + 5 single PUT, downloaded in two ranges: neither carries a checksum, so a file sink
+    // is published or kept only by the full-object check.
+    single_put_split {
+        object: |alg| Object::single_put(alg).len(12 * MIB + 5);
+        algorithms: [crc64nvme];
+        via: full_object;
+        targets: [mock_gp];
+
+        download default {
+            options: Download::new();
+            // ref: RUST-1758
+            ignore: "not validated against the full-object checksum";
+            expect validated { [path, file] }
+            expect integrity_error { corrupt(later): [path, file] }
         }
     }
 

@@ -42,7 +42,7 @@
 //! | `<group>`               | one or more | One kind of object. Its name is a path segment.      |
 //! | `object:`               | yes         | The [`Object`] to upload, built for each algorithm.  |
 //! | `algorithms:`           | yes         | The upload algorithms. Each gets its own module.     |
-//! | `via:`                  | yes         | How the bytes are checked: a [`Mechanism`].          |
+//! | `via:`                  | yes         | How the bytes are checked: a [`Mechanism`], pinned.  |
 //! | `targets:`              | yes         | Where cases run. Faulted and held ones: mocks only.  |
 //! | `download <setup>`      | one or more | One way of downloading. Its name is a path segment.  |
 //! | `options:`              | yes         | A [`Download`]: `Download::new()` and its methods.   |
@@ -52,7 +52,8 @@
 //! | `[<sink>, ...]`         | no          | One case per sink, with no fault. Comes first.       |
 //! | `<action>(<position>):` | no          | One case per sink, with that fault.                  |
 //!
-//! An outcome appears at most once per setup. Test path:
+//! An outcome appears at most once per setup, and an `expect` block with no entries fails to
+//! compile. Test path:
 //!
 //! ```text
 //! <group>::<algorithm>::<setup>::<outcome>[::<action>::<position>]::<sink>::<target>
@@ -221,6 +222,9 @@ macro_rules! __outcome_body {
             $crate::__action_cases!(truncate, $t, v);
             $crate::__action_cases!(corrupt_retry, $r, v);
         }
+    };
+    ($ctx:tt, $exp:tt;) => {
+        compile_error!("an `expect` block needs at least one entry");
     };
     ($ctx:tt, $exp:tt; [$($bare:ident),+] $(, $($rest:tt)*)?) => {
         $crate::__outcome_body!(@munch $ctx, $exp, [$($bare),+], [], [], []; $($($rest)*)?);

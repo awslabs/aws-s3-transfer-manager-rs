@@ -15,6 +15,7 @@
 use super::table_cases;
 use super::test_util::runner::Execution;
 use super::test_util::vocab::*;
+use s3_mock_server::FaultType;
 
 /// The case in the tables whose path ends with `suffix`.
 fn table_case(suffix: &str) -> &'static Case {
@@ -62,6 +63,8 @@ const PER_PART: &str = "download_tests::composite_mpu::crc32::aligned::validated
 const PER_PART_TRUNCATED: &str =
     "download_tests::composite_mpu::crc32::aligned::validated::truncate::later::stream";
 const HELD: &str = "download_tests::composite_mpu::crc32::out_of_order::validated::stream";
+const PER_PART_CORRUPT: &str =
+    "download_tests::composite_mpu::crc32::aligned::integrity_error::corrupt::later::path";
 
 // Outcome checks.
 
@@ -123,6 +126,15 @@ async fn integrity_error_rejects_another_algorithm() {
         case.check(&run),
         "integrity error in Some(Crc32), expected Sha256",
     );
+}
+
+/// `integrity_error` fails an error whose checksum isn't the one the mechanism checks for the
+/// faulted byte: a per-part download reports the part's checksum, not the object's.
+#[tokio::test(flavor = "multi_thread")]
+async fn integrity_error_requires_the_checked_checksum() {
+    let (case, run) = execute(PER_PART_CORRUPT).await;
+    let case = changed(case, |c| c.mechanism = Mechanism::WholeResponse);
+    assert_fails(case.check(&run), "not the stored");
 }
 
 /// The byte comparison fails a download that delivered a corrupted byte when the outcome says the
@@ -218,10 +230,7 @@ fn check_journal(case: &Case, run: &Execution) -> Result<(), String> {
 async fn corrupt_requires_a_corrupted_get() {
     let (case, run) = execute(INTACT).await;
     let case = changed(case, |c| c.fault = fault::corrupt(At::First));
-    assert_fails(
-        check_journal(&case, &run),
-        "no GET covering byte 0 was corrupted",
-    );
+    assert_fails(check_journal(&case, &run), "no GET was corrupted at byte 0");
 }
 
 /// A `truncate` case fails when no GET was cut short.
@@ -239,7 +248,81 @@ async fn corrupt_retry_requires_a_corrupted_retry() {
     let case = changed(case, |c| c.fault = fault::corrupt_retry(At::Later));
     assert_fails(
         check_journal(&case, &run),
-        "no GET after the cut covering byte 8388608 was corrupted",
+        "the cut GET's range wasn't corrupted after it",
+    );
+}
+
+/// A `truncate` case fails when the cut GET doesn't contain the named byte.
+#[tokio::test(flavor = "multi_thread")]
+async fn truncate_requires_the_cut_to_contain_the_byte() {
+    let (case, run) = execute(PER_PART_TRUNCATED).await;
+    let case = changed(case, |c| c.fault = fault::truncate(At::First));
+    assert_fails(
+        check_journal(&case, &run),
+        "the cut GET doesn't contain byte 0",
+    );
+}
+
+/// A `truncate` case fails when no GET of the cut GET's range was sent in full after it: the
+/// retry is what the download survives on. The execution's retry is given another range.
+#[tokio::test(flavor = "multi_thread")]
+async fn truncate_requires_a_retry_of_the_cut_range() {
+    let (case, mut run) = execute(PER_PART_TRUNCATED).await;
+    let requests = run.requests.as_mut().expect("a mock execution");
+    let cut = requests
+        .iter()
+        .position(|r| matches!(r.fault, Some(FaultType::TruncateBody { .. })))
+        .expect("a cut GET");
+    let range = requests[cut].range.clone();
+    for r in requests[cut + 1..].iter_mut().filter(|r| r.range == range) {
+        r.range = Some(0..1);
+    }
+    assert_fails(
+        check_journal(case, &run),
+        "no GET of the cut GET's range was sent in full after it",
+    );
+}
+
+/// A `corrupt` case fails when the corruption was registered at another byte than the named
+/// one. The execution's fault is changed to another offset.
+#[tokio::test(flavor = "multi_thread")]
+async fn corrupt_requires_the_named_offset() {
+    let (case, mut run) = execute(PER_PART_CORRUPT).await;
+    for r in run.requests.as_mut().expect("a mock execution") {
+        if let Some(FaultType::CorruptByte { offset }) = &mut r.fault {
+            *offset += 1;
+        }
+    }
+    assert_fails(check_journal(case, &run), "no GET was corrupted at byte");
+}
+
+/// A `corrupt` case fails when the mock flipped another byte than the named one.
+#[tokio::test(flavor = "multi_thread")]
+async fn corrupt_requires_the_named_byte_flipped() {
+    let (case, mut run) = execute(PER_PART_CORRUPT).await;
+    for r in run.requests.as_mut().expect("a mock execution") {
+        if let Some(flipped) = &mut r.flipped {
+            *flipped += 1;
+        }
+    }
+    assert_fails(check_journal(case, &run), "had another byte than");
+}
+
+/// A faulted GET must hold the range its position names, independently of how the position's
+/// byte was computed: `later` is the range starting at `B`. The execution's corrupted GET is
+/// given a range that contains the byte but starts elsewhere.
+#[tokio::test(flavor = "multi_thread")]
+async fn faults_require_the_named_range() {
+    let (case, mut run) = execute(PER_PART_CORRUPT).await;
+    let b = case.range_size();
+    for r in run.requests.as_mut().expect("a mock execution") {
+        if matches!(r.fault, Some(FaultType::CorruptByte { .. })) {
+            r.range = Some(b - 1..2 * b);
+        }
+    }
+    assert_fails(
+        check_journal(case, &run),
+        "the GET faulted for Later has range",
     );
 }
 
@@ -260,7 +343,7 @@ async fn hold_requires_the_held_body_to_end_last() {
     let requests = run.requests.as_mut().expect("a mock execution");
     let held = requests
         .iter()
-        .position(|r| matches!(r.fault, Some(s3_mock_server::FaultType::HoldBody { .. })))
+        .position(|r| matches!(r.fault, Some(FaultType::HoldBody { .. })))
         .expect("a held GET");
     let first = requests
         .iter()

@@ -275,27 +275,32 @@ impl<S: StorageBackend + 'static> Inner<S> {
             Some(crate::faults::FaultType::CorruptByte { offset }) => {
                 if let (Some(body), Some(range)) = (output.body.take(), request.range.as_ref()) {
                     let flip = range.contains(&offset).then(|| offset - range.start);
+                    let (state, id, start) = (self.state.clone(), request.id, range.start);
                     // State: (inner stream, body bytes yielded so far).
-                    let faulted = futures_util::stream::unfold(
-                        (body, 0u64),
-                        move |(mut stream, pos)| async move {
-                            match stream.next().await? {
-                                Ok(chunk) => {
-                                    let end = pos + chunk.len() as u64;
-                                    let chunk = match flip {
-                                        Some(at) if (pos..end).contains(&at) => {
-                                            let mut bytes = BytesMut::from(&chunk[..]);
-                                            bytes[(at - pos) as usize] ^= 0xFF;
-                                            bytes.freeze()
-                                        }
-                                        _ => chunk,
-                                    };
-                                    Some((Ok(chunk), (stream, end)))
+                    let faulted =
+                        futures_util::stream::unfold((body, 0u64), move |(mut stream, pos)| {
+                            let state = state.clone();
+                            async move {
+                                match stream.next().await? {
+                                    Ok(chunk) => {
+                                        let end = pos + chunk.len() as u64;
+                                        let chunk = match flip {
+                                            Some(at) if (pos..end).contains(&at) => {
+                                                let mut bytes = BytesMut::from(&chunk[..]);
+                                                bytes[(at - pos) as usize] ^= 0xFF;
+                                                state
+                                                    .journal
+                                                    .update(id, |r| r.flipped = Some(start + at));
+                                                bytes.freeze()
+                                            }
+                                            _ => chunk,
+                                        };
+                                        Some((Ok(chunk), (stream, end)))
+                                    }
+                                    Err(e) => Some((Err(std::io::Error::other(e)), (stream, pos))),
                                 }
-                                Err(e) => Some((Err(std::io::Error::other(e)), (stream, pos))),
                             }
-                        },
-                    );
+                        });
                     output.body = Some(StreamingBlob::wrap(faulted));
                 }
             }
@@ -675,7 +680,7 @@ impl<S: StorageBackend + 'static> s3s::S3 for Inner<S> {
         if let Some(body) = output.body.take_if(|_| self.state.journal.is_enabled()) {
             output.body = Some(StreamingBlob::wrap(crate::journal::JournaledBody::new(
                 body,
-                output.content_length.unwrap_or_default() as u64,
+                output.content_length.map(|n| n as u64),
                 self.state.clone(),
                 id,
             )));

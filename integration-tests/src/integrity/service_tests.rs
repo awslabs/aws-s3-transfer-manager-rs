@@ -13,7 +13,7 @@
 
 use aws_sdk_s3::types::{ChecksumMode, ChecksumType};
 
-use crate::assertions::assert_same_content;
+use crate::assertions::{assert_same_content, describe_sdk_error};
 use crate::harness::{target_tests, BucketKind, Target, TmTestClient};
 use crate::test_util::data::object_bytes;
 use crate::test_util::object::{
@@ -41,7 +41,7 @@ async fn get_range(t: &TmTestClient, key: &str, range: &str) -> (Vec<u8>, Option
         .checksum_mode(ChecksumMode::Enabled)
         .send()
         .await
-        .unwrap_or_else(|e| panic!("GET {range} of {key}: {e:?}"));
+        .unwrap_or_else(|e| panic!("GET {range} of {key}: {}", describe_sdk_error(&e)));
     let checksum = out
         .first_checksum()
         .map(|(alg, value)| (alg, value.to_owned()));
@@ -231,7 +231,12 @@ async fn kms_head_needs_no_grant_beyond_get() {
         .checksum_mode(ChecksumMode::Enabled)
         .send()
         .await
-        .expect("HeadObject in checksum mode under the GET-only role");
+        .unwrap_or_else(|e| {
+            panic!(
+                "HeadObject in checksum mode under the GET-only role: {}",
+                describe_sdk_error(&e)
+            )
+        });
     assert_eq!(
         StoredChecksum::from_head(&head),
         object.expected_checksum(seed)

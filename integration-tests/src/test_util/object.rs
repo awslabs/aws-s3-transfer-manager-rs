@@ -12,6 +12,7 @@ use aws_sdk_s3::types::{ChecksumMode, ChecksumType};
 use aws_sdk_s3_transfer_manager::io::{InputStream, PartData, PartStream, SizeHint, StreamContext};
 use aws_sdk_s3_transfer_manager::operation::upload::ChecksumStrategy;
 
+use crate::assertions::{describe_error, describe_sdk_error};
 use crate::harness::{ClientOptions, TmTestClient};
 use crate::test_util::data::{fill_object_bytes, object_bytes};
 
@@ -234,18 +235,7 @@ impl Object {
             (Alg::NoChecksum, false) => Alg::Crc64Nvme,
             (alg, _) => alg,
         };
-        let digest = |offset: u64, len: u64| {
-            let mut hasher = alg.hasher().expect("an algorithm");
-            let mut buf = vec![0; (1 << 20).min(len as usize)];
-            let mut done = 0;
-            while done < len {
-                let n = buf.len().min((len - done) as usize);
-                fill_object_bytes(seed, offset + done, &mut buf[..n]);
-                hasher.update(&buf[..n]);
-                done += n as u64;
-            }
-            aws_smithy_types::base64::encode(hasher.finalize())
-        };
+        let digest = |offset: u64, len: u64| digest(alg, seed, offset, len);
         let (value, checksum_type) = if self.layout == Layout::Composite {
             let mut offset = 0;
             let parts: Vec<String> = self
@@ -268,6 +258,25 @@ impl Object {
             value,
             checksum_type: Some(checksum_type),
         })
+    }
+
+    /// The stored checksum of the part containing object byte `byte`: the checksum a response of
+    /// that part carries. For a single PUT, the object's. `None` for an object stored without a
+    /// checksum, or a byte past its end.
+    pub(crate) fn part_checksum(&self, seed: u32, byte: u64) -> Option<String> {
+        let alg = self.expected_checksum(seed)?.algorithm;
+        let parts = self.stored_part_sizes();
+        if parts.is_empty() {
+            return (byte < self.len).then(|| digest(alg, seed, 0, self.len));
+        }
+        let mut offset = 0;
+        for size in parts {
+            if (offset..offset + size).contains(&byte) {
+                return Some(digest(alg, seed, offset, size));
+            }
+            offset += size;
+        }
+        None
     }
 
     /// Uploads the object's bytes for `seed` to `key` on `target`'s backend, then checks what was
@@ -332,7 +341,7 @@ impl Object {
             .expect("initiate upload")
             .join()
             .await
-            .unwrap_or_else(|e| panic!("upload {self:?}: {e:?}"));
+            .unwrap_or_else(|e| panic!("upload {self:?}: {}", describe_error(&e)));
     }
 
     fn prebuilt_parts(&self, seed: u32) -> Vec<PartData> {
@@ -358,7 +367,7 @@ impl Object {
             .checksum_mode(ChecksumMode::Enabled)
             .send()
             .await
-            .unwrap_or_else(|e| panic!("HeadObject of {self:?}: {e:?}"));
+            .unwrap_or_else(|e| panic!("HeadObject of {self:?}: {}", describe_sdk_error(&e)));
         assert_eq!(head.content_length(), Some(self.len as i64), "{self:?}");
         assert_eq!(
             StoredChecksum::from_head(&head),
@@ -426,7 +435,7 @@ pub(crate) async fn stored_checksum(t: &TmTestClient, key: &str) -> Option<Store
         .checksum_mode(ChecksumMode::Enabled)
         .send()
         .await
-        .unwrap_or_else(|e| panic!("HeadObject of {key}: {e:?}"));
+        .unwrap_or_else(|e| panic!("HeadObject of {key}: {}", describe_sdk_error(&e)));
     StoredChecksum::from_head(&head)
 }
 
@@ -443,7 +452,7 @@ pub(crate) async fn assert_stored_bytes(t: &TmTestClient, key: &str, seed: u32, 
         .key(t.key(key))
         .send()
         .await
-        .unwrap_or_else(|e| panic!("GetObject of {key}: {e:?}"))
+        .unwrap_or_else(|e| panic!("GetObject of {key}: {}", describe_sdk_error(&e)))
         .body;
     let mut offset = 0;
     let mut expected = Vec::new();
@@ -506,7 +515,11 @@ pub(crate) async fn assert_nothing_stored(t: &TmTestClient, key: &str) {
         .await
     {
         Err(e) if e.as_service_error().is_some_and(|e| e.is_not_found()) => {}
-        other => panic!("HeadObject of {key} must be NotFound, got {other:?}"),
+        Err(e) => panic!(
+            "HeadObject of {key} must be NotFound, got {}",
+            describe_sdk_error(&e)
+        ),
+        Ok(_) => panic!("HeadObject of {key} must be NotFound, but an object is stored"),
     }
     // FIXME(ci): add s3:ListBucketMultipartUploads on the general purpose test bucket to the CI
     // role, then check for open uploads in both bucket types.
@@ -521,7 +534,7 @@ pub(crate) async fn assert_nothing_stored(t: &TmTestClient, key: &str) {
         .prefix(t.key(""))
         .send()
         .await
-        .unwrap_or_else(|e| panic!("ListMultipartUploads for {key}: {e:?}"));
+        .unwrap_or_else(|e| panic!("ListMultipartUploads for {key}: {}", describe_sdk_error(&e)));
     let open: Vec<_> = uploads
         .uploads()
         .iter()
@@ -532,6 +545,21 @@ pub(crate) async fn assert_nothing_stored(t: &TmTestClient, key: &str) {
         open.is_empty(),
         "multipart uploads open for {key}: {open:?}"
     );
+}
+
+/// The base64 `alg` checksum of object `seed`'s bytes at `[offset, offset + len)`, computed in
+/// pieces so the bytes are never held at once. Panics for [`Alg::NoChecksum`].
+fn digest(alg: Alg, seed: u32, offset: u64, len: u64) -> String {
+    let mut hasher = alg.hasher().expect("an algorithm");
+    let mut buf = vec![0; (1 << 20).min(len as usize)];
+    let mut done = 0;
+    while done < len {
+        let n = buf.len().min((len - done) as usize);
+        fill_object_bytes(seed, offset + done, &mut buf[..n]);
+        hasher.update(&buf[..n]);
+        done += n as u64;
+    }
+    aws_smithy_types::base64::encode(hasher.finalize())
 }
 
 /// [`TmTestClient::head_part`] takes a logical key; `key` is already namespaced.
