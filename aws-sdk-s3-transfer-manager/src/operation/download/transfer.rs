@@ -832,8 +832,13 @@ impl DownloadTransfer {
             effective_part_size,
         } = discovery;
 
-        // Store object_meta for object_meta() and join()
-        let _ = self.inner.object_meta.set(object_meta.clone());
+        // Store object_meta for object_meta() and join(), without checksum values
+        // that describe a part. The local `object_meta` keeps the discovery
+        // response unchanged.
+        let _ = self
+            .inner
+            .object_meta
+            .set(process_object_metadata(object_meta.clone()));
 
         // Object checksum is known only when the whole object arrived in this
         // chunk. A larger multipart object's discovery chunk carries part 1's
@@ -1736,6 +1741,31 @@ fn validate_content_range(
     }
 }
 
+/// Converts the discovery response's metadata into the stored object's metadata.
+///
+/// Checksum values are kept only when they are the object's checksum: the
+/// response returned the whole object ([`ObjectMetadata::covers_whole_object`]),
+/// and the type is not
+/// [`ChecksumType::Composite`](crate::model::ChecksumType::Composite), whose
+/// value is a checksum of part checksums. Otherwise every checksum value is
+/// cleared. The checksum type and every other member are kept.
+fn process_object_metadata(mut meta: ObjectMetadata) -> ObjectMetadata {
+    let composite = meta.checksum_type == Some(crate::model::ChecksumType::Composite);
+    if composite || !meta.covers_whole_object() {
+        meta.checksum_crc32 = None;
+        meta.checksum_crc32_c = None;
+        meta.checksum_crc64_nvme = None;
+        meta.checksum_md5 = None;
+        meta.checksum_sha1 = None;
+        meta.checksum_sha256 = None;
+        meta.checksum_sha512 = None;
+        meta.checksum_xxhash64 = None;
+        meta.checksum_xxhash3 = None;
+        meta.checksum_xxhash128 = None;
+    }
+    meta
+}
+
 #[cfg(test)]
 mod tests {
     use crate::types::ByteSize;
@@ -1749,6 +1779,7 @@ mod tests {
     use http_body_1x::{Body as HttpBody, Frame, SizeHint};
 
     use super::*;
+    use crate::model::ChecksumType;
     use crate::operation::download::sink::FileSinkFactory;
     use crate::operation::download::test_util::fixtures::{
         assert_discovery_succeeds, crc32_object_client, disk_test_handle, disk_transfer, execute,
@@ -2083,6 +2114,90 @@ mod tests {
                 .expect("failed acquisition did not consume direct authority"),
         );
         assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+    }
+
+    // ref: RUST-1676
+    #[test]
+    fn object_metadata_clears_checksum_values_that_do_not_describe_the_object() {
+        let meta = |checksum_type, content_range: Option<&str>| {
+            let mut m = ObjectMetadata::default();
+            m.checksum_crc32 = Some("DUoRhQ==".to_string());
+            m.checksum_type = Some(checksum_type);
+            m.content_range = content_range.map(str::to_owned);
+            m
+        };
+
+        // A response covering the whole object keeps its value.
+        for range in [None, Some("bytes 0-99/100")] {
+            let m = process_object_metadata(meta(ChecksumType::FullObject, range));
+            assert_eq!(m.checksum_crc32(), Some("DUoRhQ=="), "{range:?}");
+        }
+
+        // A part or range of the object describes that part, whatever its type.
+        for range in ["bytes 0-49/100", "bytes 50-99/100"] {
+            let m = process_object_metadata(meta(ChecksumType::FullObject, Some(range)));
+            assert_eq!(m.checksum_crc32(), None, "{range}");
+            assert_eq!(m.checksum_type(), Some(&ChecksumType::FullObject));
+        }
+
+        // A composite value is a checksum of part checksums.
+        let m = process_object_metadata(meta(ChecksumType::Composite, None));
+        assert_eq!(m.checksum_crc32(), None);
+        assert_eq!(m.checksum_type(), Some(&ChecksumType::Composite));
+    }
+
+    /// Names of the checksum value members of `ObjectMetadata`, read from its `Debug`
+    /// output so a member added by regeneration is seen without being listed here.
+    fn checksum_value_members(meta: &ObjectMetadata) -> Vec<String> {
+        format!("{meta:#?}")
+            .lines()
+            .filter_map(|line| line.trim().split_once(": "))
+            .map(|(name, _)| name)
+            .filter(|name| name.starts_with("checksum_") && *name != "checksum_type")
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// This is a guard test to make sure every checksum value member is cleared.
+    /// Fails when `ObjectMetadata` gains a checksum value member that this test
+    /// does not populate, which is the signal to extend both this test and
+    /// `process_object_metadata`.
+    /// TODO: update `process_object_metadata` to handle extended checksum member.
+    #[test]
+    fn object_metadata_clears_every_checksum_value_member() {
+        let mut meta = ObjectMetadata::default();
+        meta.checksum_crc32 = Some("v".to_owned());
+        meta.checksum_crc32_c = Some("v".to_owned());
+        meta.checksum_crc64_nvme = Some("v".to_owned());
+        meta.checksum_md5 = Some("v".to_owned());
+        meta.checksum_sha1 = Some("v".to_owned());
+        meta.checksum_sha256 = Some("v".to_owned());
+        meta.checksum_sha512 = Some("v".to_owned());
+        meta.checksum_xxhash64 = Some("v".to_owned());
+        meta.checksum_xxhash3 = Some("v".to_owned());
+        meta.checksum_xxhash128 = Some("v".to_owned());
+        meta.checksum_type = Some(ChecksumType::Composite);
+
+        let members = checksum_value_members(&meta);
+        assert!(
+            !members.is_empty(),
+            "no checksum members found in Debug output"
+        );
+        let populated = format!("{meta:#?}");
+        for member in &members {
+            assert!(
+                populated.contains(&format!("{member}: Some(")),
+                "`{member}` is not populated by this test; set it and clear it in process_object_metadata"
+            );
+        }
+
+        let cleared = format!("{:#?}", process_object_metadata(meta));
+        for member in &members {
+            assert!(
+                cleared.contains(&format!("{member}: None")),
+                "`{member}` was not cleared"
+            );
+        }
     }
 
     fn create_download(object_size: u64, part_size: u64) -> DownloadTransfer {

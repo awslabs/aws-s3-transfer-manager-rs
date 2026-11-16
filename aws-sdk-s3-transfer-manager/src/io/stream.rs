@@ -388,14 +388,16 @@ impl PartData {
 
     /// Set this part's checksum, if you've calculated it yourself
     /// (base64 encoding of the big-endian checksum value for this part's data
-    /// using the algorithm specified in the [ChecksumStrategy](crate::operation::upload::ChecksumStrategy)).
+    /// using the algorithm specified in the
+    /// [`ChecksumStrategy`](crate::operation::upload::ChecksumStrategy)).
     ///
     /// The value is sent with the part only if the upload has a checksum
-    /// strategy, either set on the upload or applied by default; otherwise it is
-    /// ignored. If you don't set it, the SDK calculates the part's checksum as it
-    /// sends the part, when the S3 client's `request_checksum_calculation` is
+    /// strategy, either set on the upload or applied by default. Otherwise the
+    /// upload fails with [`ErrorKind::InputInvalid`](crate::error::ErrorKind::InputInvalid).
+    /// If you don't set it, the SDK calculates the part's checksum as it sends
+    /// the part, when the S3 client's `request_checksum_calculation` is
     /// `WhenSupported` (the default). See
-    /// [ChecksumStrategy](crate::operation::upload::ChecksumStrategy).
+    /// [`ChecksumStrategy`](crate::operation::upload::ChecksumStrategy).
     pub fn with_checksum(mut self, checksum: impl Into<String>) -> Self {
         self.checksum = Some(checksum.into());
         self
@@ -456,13 +458,15 @@ pub trait PartStream {
     /// If None is returned (the default implementation), S3 will not do this additional validation.
     ///
     /// This function is called once, after [`PartStream::poll_part()`] yields the final part,
-    /// if and only if you used a [ChecksumStrategy](crate::operation::upload::ChecksumStrategy) with
-    /// [ChecksumType::FullObject](crate::model::ChecksumType) and didn't set its
-    /// [full_object_checksum](crate::operation::upload::ChecksumStrategy::full_object_checksum)
+    /// if and only if you used a
+    /// [`ChecksumStrategy`](crate::operation::upload::ChecksumStrategy) with
+    /// [`ChecksumType::FullObject`](crate::model::ChecksumType) and didn't set its
+    /// [`full_object_checksum`](crate::operation::upload::ChecksumStrategy::full_object_checksum)
     /// value up front.
     ///
     /// Return the base64 encoding of the big-endian checksum value of the full object's data,
-    /// using the algorithm specified in the [ChecksumStrategy](crate::operation::upload::ChecksumStrategy)).
+    /// using the algorithm specified in the
+    /// [`ChecksumStrategy`](crate::operation::upload::ChecksumStrategy)).
     /// The value must cover the object's bytes in part-number order, which is the order S3
     /// assembles them in, not necessarily the order the parts were returned.
     fn full_object_checksum(&self) -> Option<String> {
