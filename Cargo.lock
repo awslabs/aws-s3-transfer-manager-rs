@@ -189,9 +189,9 @@ dependencies = [
 
 [[package]]
 name = "aws-runtime"
-version = "1.10.4"
+version = "1.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "de8930c11353c72ae54aa24dc94d692df74d59814839cbaf8069d63dbcb4c519"
+checksum = "f78d86ab4bb091d41e9d045810a6a46149ee3af579d510a4c23031e8872a4654"
 dependencies = [
  "aws-credential-types",
  "aws-sigv4",
@@ -215,9 +215,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-s3"
-version = "1.159.0"
+version = "1.158.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8d5c431c5db2f1f6f536c2a19425575e28273859c6ab399d9ac957f73678c7db"
+checksum = "453a8913ce5559e09b00138105107a8ac1ae26ffa1e9ac84c9202bd3ede62724"
 dependencies = [
  "arc-swap",
  "aws-credential-types",
@@ -264,6 +264,7 @@ dependencies = [
  "aws-smithy-http-client",
  "aws-smithy-managed-http",
  "aws-smithy-mocks",
+ "aws-smithy-observability",
  "aws-smithy-runtime",
  "aws-smithy-runtime-api",
  "aws-smithy-types",
@@ -295,6 +296,7 @@ dependencies = [
  "serde",
  "serde_json",
  "smallvec",
+ "static_assertions",
  "tempfile",
  "test-common",
  "tokio",
@@ -649,9 +651,9 @@ dependencies = [
 
 [[package]]
 name = "aws-smithy-runtime-api"
-version = "1.21.0"
+version = "1.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0467a2414e84b1b01e37452896fb3562b93926e81c619eba6ecf27ce9e682a0e"
+checksum = "d06a8615310f03c73ea8eea607ee1a9cb17b7ebe055b9152feda1d86831c215c"
 dependencies = [
  "aws-smithy-async",
  "aws-smithy-runtime-api-macros",
@@ -696,9 +698,9 @@ dependencies = [
 
 [[package]]
 name = "aws-smithy-types"
-version = "1.9.4"
+version = "1.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aff4bf014c512840b2bba80a20417b723cbd6a0a65c02e2d81f50b4268aedfc7"
+checksum = "6c3a040d8b963838a01d7d239b0118357388d0ab881857bb5fc2dd780bb87957"
 dependencies = [
  "base64-simd",
  "bytes",
@@ -4237,6 +4239,12 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
+
+[[package]]
+name = "static_assertions"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "std-next"

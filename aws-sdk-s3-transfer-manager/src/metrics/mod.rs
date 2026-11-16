@@ -697,6 +697,10 @@ mod tests {
     /// Every unit reports the same value through its byte and bit accessors,
     /// at both widths. The byte values are the unit definitions; a regression
     /// in either derivation changes one of the pairs.
+    ///
+    /// The `_usize` accessors are only checked when the value fits a target
+    /// `usize`; on 32-bit `Gibibyte.as_bits_usize()` is documented to panic
+    /// and is skipped.
     #[test]
     fn byte_unit_accessors_agree() {
         let units = [
@@ -710,17 +714,17 @@ mod tests {
         ];
         for (unit, bytes) in units {
             assert_eq!(unit.as_bytes_u64(), bytes, "{unit:?} bytes");
-            assert_eq!(
-                unit.as_bytes_usize() as u64,
-                bytes,
-                "{unit:?} bytes as usize"
-            );
             assert_eq!(unit.as_bits_u64(), bytes * 8, "{unit:?} bits");
-            assert_eq!(
-                unit.as_bits_usize() as u64,
-                bytes * 8,
-                "{unit:?} bits as usize"
-            );
+            if let Ok(bytes_usize) = usize::try_from(bytes) {
+                assert_eq!(
+                    unit.as_bytes_usize(),
+                    bytes_usize,
+                    "{unit:?} bytes as usize"
+                );
+            }
+            if let Ok(bits_usize) = usize::try_from(bytes * 8) {
+                assert_eq!(unit.as_bits_usize(), bits_usize, "{unit:?} bits as usize");
+            }
         }
     }
 

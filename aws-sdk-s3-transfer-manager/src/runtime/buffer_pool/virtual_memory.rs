@@ -780,7 +780,7 @@ mod tests {
         let base = range.base_address();
 
         assert_eq!(range.len(), page_size.get() * 2);
-        assert_eq!(base % page_size.get(), 0);
+        assert_eq!(base % page_size, 0);
 
         range.prepare().unwrap();
         // SAFETY: the prepared range is retained exclusively by this test.

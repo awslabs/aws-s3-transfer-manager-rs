@@ -61,6 +61,7 @@ use crate::operation::upload::request::{
     copy_fields_to_mpu_request, copy_fields_to_upload_part_request,
 };
 use crate::operation::upload::{UploadInput, UploadOutput, UploadOutputBuilder};
+use crate::telemetry::TARGET_TRANSFER_UPLOAD;
 use crate::transfer::{IoRequest, PendingCause, PollWork, Transfer, TransferContext, WorkOutcome};
 use crate::types::{AbortOutcome, AbortedUpload, BucketType, FailedMultipartUploadPolicy};
 
@@ -75,6 +76,19 @@ pub(crate) enum UploadWork {
     CompleteMPU(Box<CompleteMpuWork>, InFlight),
     PutObject { stream: InputStream, live: InFlight },
     AbortMPU { upload_id: String, live: InFlight },
+}
+
+impl UploadWork {
+    /// Short name of the work kind for span fields.
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::CreateMPU(_) => "create_multipart_upload",
+            Self::UploadPart(..) => "upload_part",
+            Self::CompleteMPU(..) => "complete_multipart_upload",
+            Self::PutObject { .. } => "put_object",
+            Self::AbortMPU { .. } => "abort_multipart_upload",
+        }
+    }
 }
 
 /// Payload for CompleteMultipartUpload, moved out of `UploadState::Completing` when the request is
@@ -299,7 +313,7 @@ impl UploadTransfer {
     /// aborting, so the caller can abort it.
     fn warn_upload_left_open(&self, upload_id: &str) {
         tracing::warn!(
-            target: crate::telemetry::TARGET_TRANSFER,
+            target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
             tid = %self.inner.ctx.id,
             upload_id = %upload_id,
             "upload ended before completing; the multipart upload may still be open"
@@ -521,6 +535,12 @@ impl UploadTransfer {
     /// - `PollWork::Ready { .. }` - work available to execute
     /// - `PollWork::Pending` - waiting for in-flight work to complete
     /// - `PollWork::Done` - transfer complete
+    #[tracing::instrument(
+        level = "trace",
+        target = TARGET_TRANSFER_UPLOAD,
+        skip_all,
+        fields(tid = %self.inner.ctx.id),
+    )]
     pub(crate) fn poll_work(&self) -> PollWork {
         if !self.inner.ctx.is_active() {
             return PollWork::Done;
@@ -709,9 +729,17 @@ impl UploadTransfer {
         }
     }
 
+    #[tracing::instrument(
+        level = "trace",
+        target = TARGET_TRANSFER_UPLOAD,
+        skip_all,
+        fields(tid = %self.inner.ctx.id, work = tracing::field::Empty),
+    )]
     pub(crate) async fn execute(&self, work: &mut IoRequest) -> WorkOutcome {
         // A work item executes once, so execute takes its payload by value.
-        match work.take_data::<UploadWork>() {
+        let data = work.take_data::<UploadWork>();
+        tracing::Span::current().record("work", data.kind());
+        match data {
             // Each arm keeps its `InFlight` guard until the request future is
             // gone, so the count is released only after that.
             UploadWork::CreateMPU(_live) => self.execute_create_mpu().await,
@@ -762,7 +790,50 @@ impl UploadTransfer {
         outcome
     }
 
+    /// Checks, without opening it, that a file-backed source names a regular
+    /// file before CreateMultipartUpload is sent, so a source that is already
+    /// non-regular fails without creating a multipart upload. The part reader
+    /// checks the opened file again after Create returns.
+    ///
+    /// The stream leaves `PendingInit` while the metadata is read, so the read
+    /// runs without the state lock, and returns afterwards. If the upload left
+    /// `PendingInit` in the meantime, the stream is dropped and Create proceeds
+    /// as it would for an abort that lands while Create is on the wire.
+    ///
+    /// Returns the failed outcome when the check fails, and `None` otherwise.
+    fn check_file_source(&self) -> Option<WorkOutcome> {
+        let stream = {
+            let mut state = self.inner.state.lock().expect("lock poisoned");
+            match &mut *state {
+                UploadState::PendingInit { stream, .. }
+                    if stream.as_ref().is_some_and(InputStream::is_file_backed) =>
+                {
+                    stream.take().expect("stream checked above")
+                }
+                _ => return None,
+            }
+        };
+        let checked = stream.check_file_type();
+        let mut state = self.inner.state.lock().expect("lock poisoned");
+        match checked {
+            // Create has not been sent, so no upload exists to abort.
+            Err(error) => {
+                Some(self.fail(state, error, FailedRequest::CreateMpu { upload_id: None }))
+            }
+            Ok(()) => {
+                if let UploadState::PendingInit { stream: slot, .. } = &mut *state {
+                    *slot = Some(stream);
+                }
+                None
+            }
+        }
+    }
+
     async fn do_execute_create_mpu(&self) -> WorkOutcome {
+        if let Some(outcome) = self.check_file_source() {
+            return outcome;
+        }
+
         let client = self.inner.ctx.s3_client();
 
         let mpu_req =
@@ -780,7 +851,10 @@ impl UploadTransfer {
                     .bucket_partition_override(self.inner.request.bucket()),
             )
             .send()
-            .instrument(tracing::debug_span!("send-create-multipart-upload"))
+            .instrument(tracing::trace_span!(
+                target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
+                "send-create-multipart-upload",
+            ))
             .await;
         let _ = req_metrics.finish();
         let resp = match response {
@@ -852,7 +926,10 @@ impl UploadTransfer {
             }
         };
 
-        tracing::trace!("upload request using multipart upload with part size: {part_size} bytes");
+        tracing::trace!(
+            target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
+            "upload request using multipart upload with part size: {part_size} bytes",
+        );
 
         let part_reader = Arc::new(
             match PartReaderBuilder::new()
@@ -871,7 +948,7 @@ impl UploadTransfer {
                     let state = self.inner.state.lock().expect("lock poisoned");
                     return self.fail(
                         state,
-                        e.into(),
+                        e,
                         FailedRequest::CreateMpu {
                             upload_id: Some(upload_id),
                         },
@@ -931,7 +1008,7 @@ impl UploadTransfer {
         );
 
         tracing::debug!(
-            target: crate::telemetry::TARGET_TRANSFER,
+            target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
             total_parts = size_hint.upper().map(|upper| upper.div_ceil(part_size)),
             part_size,
             "MPU created, transferring",
@@ -943,7 +1020,7 @@ impl UploadTransfer {
     async fn execute_upload_part(&self, mut work: UploadPartWork) -> WorkOutcome {
         if work.is_empty_object() {
             tracing::debug!(
-                target: crate::telemetry::TARGET_TRANSFER,
+                target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
                 tid = %self.inner.ctx.id,
                 "empty source satisfied its size hint; uploading required zero-byte part",
             );
@@ -967,7 +1044,10 @@ impl UploadTransfer {
             None => {
                 let future = match part_reader
                     .start_part_read()
-                    .instrument(tracing::debug_span!("read-upload-body"))
+                    .instrument(tracing::trace_span!(
+                        target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
+                        "read-upload-body",
+                    ))
                     .await
                 {
                     PartReadStart::Ready(future) => future,
@@ -1186,13 +1266,17 @@ impl UploadTransfer {
                     .config_override(self.inner.ctx.upload_override(self.inner.request.bucket()))
                     .disable_payload_signing()
                     .send()
-                    .instrument(tracing::debug_span!("send-upload-part", part_number))
+                    .instrument(tracing::trace_span!(
+                        target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
+                        "send-upload-part",
+                        part_number,
+                    ))
                     .await
                     .map_err(|e| crate::retry::GuardError::Inner(crate::error::Error::from(e)))
             }
         })
-        .instrument(tracing::debug_span!(
-            target: crate::telemetry::TARGET_TRANSFER,
+        .instrument(tracing::trace_span!(
+            target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
             "upload-part",
             tid = %self.inner.ctx.id,
             part_number
@@ -1330,8 +1414,8 @@ impl UploadTransfer {
             };
 
         let transfer_id = self.inner.ctx.id;
-        tracing::debug!(
-            target: crate::telemetry::TARGET_TRANSFER,
+        tracing::trace!(
+            target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
             tid = %transfer_id,
             content_length,
             is_file_backed,
@@ -1365,13 +1449,16 @@ impl UploadTransfer {
                     .config_override(self.inner.ctx.upload_override(self.inner.request.bucket()))
                     .disable_payload_signing()
                     .send()
-                    .instrument(tracing::debug_span!("send-put-object"))
+                    .instrument(tracing::trace_span!(
+                        target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
+                        "send-put-object",
+                    ))
                     .await
                     .map_err(|e| crate::retry::GuardError::Inner(crate::error::Error::from(e)))
             }
         })
-        .instrument(tracing::debug_span!(
-            target: crate::telemetry::TARGET_TRANSFER,
+        .instrument(tracing::trace_span!(
+            target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
             "put-object",
             tid = %transfer_id
         ))
@@ -1379,8 +1466,8 @@ impl UploadTransfer {
         let _ = req_metrics.finish();
         let resp = match result {
             Ok(resp) => {
-                tracing::debug!(
-                    target: crate::telemetry::TARGET_TRANSFER,
+                tracing::trace!(
+                    target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
                     tid = %transfer_id,
                     "put_object.send_exit_ok",
                 );
@@ -1388,7 +1475,7 @@ impl UploadTransfer {
             }
             Err(e) => {
                 tracing::debug!(
-                    target: crate::telemetry::TARGET_TRANSFER,
+                    target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
                     tid = %transfer_id,
                     error = %e,
                     "put_object.send_exit_err",
@@ -1522,7 +1609,10 @@ impl UploadTransfer {
                     .bucket_partition_override(self.inner.request.bucket()),
             )
             .send()
-            .instrument(tracing::debug_span!("send-complete-multipart-upload"))
+            .instrument(tracing::trace_span!(
+                target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
+                "send-complete-multipart-upload",
+            ))
             .await;
         let _ = req_metrics.finish();
         let resp = match response {
@@ -1531,6 +1621,7 @@ impl UploadTransfer {
                 let error: Error = e.into();
                 // The TM SEP requires a warning with the upload ID and cause.
                 tracing::warn!(
+                    target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
                     upload_id = %upload_id,
                     error = %error,
                     "CompleteMultipartUpload failed"
@@ -1610,7 +1701,10 @@ impl UploadTransfer {
                 .bucket_partition_override(self.inner.request.bucket()),
         )
         .send()
-        .instrument(tracing::debug_span!("send-abort-multipart-upload"))
+        .instrument(tracing::trace_span!(
+            target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
+            "send-abort-multipart-upload",
+        ))
         .await;
 
         match response {
@@ -1647,6 +1741,7 @@ impl UploadTransfer {
                 }
                 let error: Error = e.into();
                 tracing::warn!(
+                    target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
                     upload_id = %upload_id,
                     error = %error,
                     "AbortMultipartUpload failed; the multipart upload may still be open"
@@ -1681,7 +1776,7 @@ impl UploadTransfer {
         failed: FailedRequest,
     ) -> WorkOutcome {
         tracing::debug!(
-            target: crate::telemetry::TARGET_TRANSFER,
+            target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
             %error,
             "upload failed",
         );
@@ -2979,25 +3074,27 @@ mod tests {
         assert_eq!(final_error(&transfer).code(), Some("PreconditionFailed"));
     }
 
-    /// When the part reader cannot be built after Create succeeded, the
-    /// upload ID is handed to the abort and the upload is aborted.
+    /// A multipart file input whose metadata cannot be read fails before
+    /// CreateMultipartUpload is sent, so there is no upload to abort.
+    /// ref: RUST-1674
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
-    async fn part_reader_failure_after_create_aborts_the_upload() {
+    async fn file_open_failure_fails_before_create() {
         use std::io::Write;
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
         tmp.write_all(&vec![0u8; 16 * 1024 * 1024]).unwrap();
+        let create_mpu = create_mpu_ok();
         let abort_mpu = abort_mpu_for_test_upload();
         let transfer = create_test_transfer_with_stream(
             mock_client!(
                 aws_sdk_s3,
                 RuleMode::MatchAny,
-                &[create_mpu_ok(), abort_mpu.clone()]
+                &[create_mpu.clone(), abort_mpu.clone()]
             ),
             InputStream::from_path(tmp.path()).unwrap(),
         );
-        // The reader opens the file after Create returns; removing it makes
-        // that open fail.
+        // The file's metadata is read before Create is sent; removing the file
+        // makes that read fail.
         tmp.close().unwrap();
 
         let mut create = assert_ready(transfer.poll_work());
@@ -3005,22 +3102,122 @@ mod tests {
             transfer.execute(&mut create).await,
             WorkOutcome::Failed { .. }
         ));
-        assert_eq!(
-            aborting_view(&transfer),
-            AbortingView {
-                upload_id: Some("test-upload-id".to_owned()),
-                create_in_flight: false,
-                complete_mpu_in_flight: false,
-                abort_mpu: AbortMpuProgress::ToSend,
-                failure_recorded: true,
-            }
-        );
-        finish_failure_abort(&transfer).await;
-        assert_eq!(abort_mpu.num_calls(), 1);
+        assert_done(transfer.poll_work());
+        assert_eq!(create_mpu.num_calls(), 0);
+        assert_eq!(abort_mpu.num_calls(), 0);
         assert_eq!(
             final_error(&transfer).kind(),
             &crate::error::ErrorKind::IOError
         );
+    }
+
+    /// Helper function to replace the regular file at `path` with a FIFO, so the path
+    /// names a non-regular file only after the input stream read its metadata.
+    /// Android's app sandbox denies creating the FIFO.
+    #[cfg(all(unix, not(target_os = "android")))]
+    fn replace_with_fifo(path: &std::path::Path) {
+        std::fs::remove_file(path).unwrap();
+        nix::unistd::mkfifo(path, nix::sys::stat::Mode::S_IRWXU).unwrap();
+    }
+
+    /// Helper function to assert on not_regular_file_error
+    #[cfg(all(unix, not(target_os = "android")))]
+    fn assert_not_regular_file_error(error: &crate::error::Error) {
+        use aws_smithy_types::error::display::DisplayErrorContext;
+
+        assert_eq!(error.kind(), &crate::error::ErrorKind::InputInvalid);
+        let message = DisplayErrorContext(error).to_string();
+        assert!(message.contains("is not a regular file"), "{message}");
+    }
+
+    /// A file input that no longer opens as a regular file fails PutObject
+    /// before the request is sent.
+    /// ref: RUST-1674
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    #[cfg(all(unix, not(target_os = "android")))]
+    async fn put_object_rejects_a_source_replaced_by_a_fifo() {
+        // Create a regular file, that it would pass InputStream check
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("body");
+        std::fs::write(&path, vec![0u8; 1024]).unwrap();
+        let stream = InputStream::from_path(&path).unwrap();
+
+        // Replace it with FIFO
+        replace_with_fifo(&path);
+
+        // Then make sure we validate the file before sending the request.
+        let put_object = mock!(aws_sdk_s3::Client::put_object)
+            .then_output(|| aws_sdk_s3::operation::put_object::PutObjectOutput::builder().build());
+        let transfer = create_test_transfer_with_stream(
+            mock_client!(
+                aws_sdk_s3,
+                RuleMode::MatchAny,
+                std::slice::from_ref(&put_object)
+            ),
+            stream,
+        );
+
+        let mut work = assert_ready(transfer.poll_work());
+        assert!(matches!(
+            work.data_mut::<UploadWork>(),
+            UploadWork::PutObject { .. }
+        ));
+        assert!(matches!(
+            transfer.execute(&mut work).await,
+            WorkOutcome::Failed { .. }
+        ));
+        assert_done(transfer.poll_work());
+        assert_eq!(put_object.num_calls(), 0);
+        assert_not_regular_file_error(&final_error(&transfer));
+    }
+
+    /// A multipart file input that no longer opens as a regular file fails
+    /// before CreateMultipartUpload is sent, so no multipart upload exists to
+    /// abort or to be left open, whatever the failed-upload policy.
+    /// ref: RUST-1674
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    #[cfg(all(unix, not(target_os = "android")))]
+    async fn multipart_rejects_a_source_replaced_by_a_fifo() {
+        for policy in [None, Some(FailedMultipartUploadPolicy::Retain)] {
+            // Create a regular file, that it would pass InputStream check
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("body");
+            std::fs::write(&path, vec![0u8; 16 * 1024 * 1024]).unwrap();
+            let stream = InputStream::from_path(&path).unwrap();
+
+            // Replace the regular file with fifo
+            replace_with_fifo(&path);
+
+            let create_mpu = create_mpu_ok();
+            let upload_part = mock!(aws_sdk_s3::Client::upload_part)
+                .then_output(|| UploadPartOutput::builder().e_tag("test-etag").build());
+            let abort_mpu = abort_mpu_for_test_upload();
+            let transfer = create_test_transfer_with_policy(
+                mock_client!(
+                    aws_sdk_s3,
+                    RuleMode::MatchAny,
+                    &[create_mpu.clone(), upload_part.clone(), abort_mpu.clone()]
+                ),
+                stream,
+                2,
+                policy.clone(),
+            );
+
+            let mut create = assert_ready(transfer.poll_work());
+            assert!(matches!(
+                transfer.execute(&mut create).await,
+                WorkOutcome::Failed { .. }
+            ));
+            assert_done(transfer.poll_work());
+            assert_eq!(create_mpu.num_calls(), 0, "{policy:?}");
+            assert_eq!(upload_part.num_calls(), 0, "{policy:?}");
+            assert_eq!(abort_mpu.num_calls(), 0, "{policy:?}");
+            let error = final_error(&transfer);
+            assert_eq!(error.upload_id(), None, "{policy:?}");
+            assert_not_regular_file_error(&error);
+        }
     }
 
     /// A failed UploadPart aborts the upload and reports the part's error.

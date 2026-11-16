@@ -16,6 +16,9 @@ use aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Error;
 use aws_sdk_s3::operation::put_object::PutObjectError;
 use aws_sdk_s3::operation::upload_part::UploadPartError;
 use aws_sdk_s3::operation::RequestIdExt;
+use aws_smithy_observability::unit_of_work::checksums::{
+    ChecksumOutcome, ResponseChecksumAlgorithm,
+};
 use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
 use aws_smithy_runtime_api::client::result::{ConnectorError, SdkError};
 use aws_smithy_types::error::metadata::ProvideErrorMetadata;
@@ -141,9 +144,9 @@ pub enum ErrorKind {
 
 /// Detail about an integrity (checksum) validation failure.
 ///
-/// Each value is `Some` when it could be determined from the underlying
-/// validation error. The underlying error is available via
-/// [`std::error::Error::source`].
+/// [`algorithm`](Self::algorithm), [`expected`](Self::expected) and
+/// [`computed`](Self::computed) are all `Some` for a mismatch the SDK reported. The
+/// body error that ended the read is available via [`std::error::Error::source`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct IntegrityError {
@@ -573,54 +576,40 @@ where
     |err| Error::new(kind, err)
 }
 
-/// Maps a body-stream error to an [`Error`]. A checksum mismatch becomes
-/// [`ErrorKind::IntegrityError`]; any other stream failure becomes
-/// [`ErrorKind::IOError`]. `algorithm` records which checksum was being validated
-/// when known.
-pub(crate) fn body_read_error<E>(err: E, algorithm: Option<ChecksumAlgorithm>) -> Error
+/// Maps a body-stream error to an [`Error`].
+///
+/// `checksum` is the response's checksum outcome when `err` was read. A
+/// [`ChecksumOutcome::Mismatch`] makes it an [`ErrorKind::IntegrityError`] carrying the
+/// algorithm and the expected and computed checksums. Any other outcome, or none,
+/// makes it an [`ErrorKind::IOError`].
+pub(crate) fn body_read_error<E>(err: E, checksum: Option<ChecksumOutcome>) -> Error
 where
     E: Into<BoxError>,
 {
-    let boxed = err.into();
-    if let Some((expected, computed)) = checksum_mismatch_values(boxed.as_ref()) {
-        return Error {
+    match checksum {
+        Some(ChecksumOutcome::Mismatch {
+            algorithm,
+            expected,
+            computed,
+        }) => Error {
             kind: ErrorKind::IntegrityError(IntegrityError {
-                algorithm,
+                algorithm: Some(checksum_algorithm(algorithm)),
                 expected: Some(expected),
                 computed: Some(computed),
             }),
-            source: boxed,
+            source: err.into(),
             extra: None,
-        };
+        },
+        _ => Error::new(ErrorKind::IOError, err),
     }
-    Error::new(ErrorKind::IOError, boxed)
 }
 
-/// Walks the source chain for a smithy checksum-mismatch error, returning its
-/// expected and computed checksums base64-encoded.
-///
-/// TODO(vnext): the `downcast_ref` couples us to a specific `aws-smithy-checksums`
-/// version. It is `0.x`, so a minor bump produces a distinct `TypeId` and the
-/// downcast silently misses (a mismatch would then misclassify as retryable I/O).
-/// Replace with a stable, version-independent classification once smithy-rs
-/// exposes one: <https://github.com/smithy-lang/smithy-rs/issues/4718>. The
-/// `corrupt_body_*` integration tests assert `ErrorKind::IntegrityError` against
-/// the linked version, so a break is CI-visible rather than silent in the interim.
-fn checksum_mismatch_values(err: &(dyn std::error::Error + 'static)) -> Option<(String, String)> {
-    use aws_smithy_checksums::body::validate::Error as ChecksumError;
-    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(err);
-    while let Some(e) = source {
-        if let Some(ChecksumError::ChecksumMismatch { expected, actual }) =
-            e.downcast_ref::<ChecksumError>()
-        {
-            return Some((
-                aws_smithy_types::base64::encode(expected),
-                aws_smithy_types::base64::encode(actual),
-            ));
-        }
-        source = e.source();
-    }
-    None
+/// The [`ChecksumAlgorithm`] named like a response checksum algorithm: its variant
+/// for that name, or `Unknown` for a name it has no variant for. It maps by name so
+/// an algorithm a newer SDK validates, which observability has no variant for yet,
+/// still reads `Validated`.
+pub(crate) fn checksum_algorithm(algorithm: ResponseChecksumAlgorithm) -> ChecksumAlgorithm {
+    ChecksumAlgorithm::from(algorithm.as_str().to_ascii_uppercase().as_str())
 }
 
 /// Reads the operation name and service code/message/request ids into a
@@ -836,6 +825,43 @@ mod tests {
     fn display_plain_kind() {
         let e = Error::new(ErrorKind::OperationCancelled, "x");
         assert_eq!(e.to_string(), "operation cancelled");
+    }
+
+    /// A mismatch is classified from the response's checksum outcome, not from the
+    /// body error's type, so it holds when the body error carries no checksum error
+    /// type, as when two copies of `aws-smithy-checksums` are linked.
+    #[test]
+    fn body_read_error_classifies_mismatch_from_checksum_outcome() {
+        let outcome = ChecksumOutcome::Mismatch {
+            algorithm: ResponseChecksumAlgorithm::Crc32,
+            expected: "AAAAAA==".to_owned(),
+            computed: "BBBBBB==".to_owned(),
+        };
+        let e = body_read_error("opaque body error", Some(outcome));
+        let ErrorKind::IntegrityError(ie) = e.kind() else {
+            panic!("expected IntegrityError, got {:?}", e.kind());
+        };
+        assert_eq!(ie.algorithm(), Some(&ChecksumAlgorithm::Crc32));
+        assert_eq!(ie.expected(), Some("AAAAAA=="));
+        assert_eq!(ie.computed(), Some("BBBBBB=="));
+    }
+
+    /// Every algorithm the response outcome names maps to the variant of the same
+    /// name.
+    #[test]
+    fn checksum_algorithm_maps_each_known_name() {
+        for (algorithm, expected) in [
+            (ResponseChecksumAlgorithm::Crc32, ChecksumAlgorithm::Crc32),
+            (ResponseChecksumAlgorithm::Crc32c, ChecksumAlgorithm::Crc32C),
+            (
+                ResponseChecksumAlgorithm::Crc64Nvme,
+                ChecksumAlgorithm::Crc64Nvme,
+            ),
+            (ResponseChecksumAlgorithm::Sha1, ChecksumAlgorithm::Sha1),
+            (ResponseChecksumAlgorithm::Sha256, ChecksumAlgorithm::Sha256),
+        ] {
+            assert_eq!(checksum_algorithm(algorithm), expected);
+        }
     }
 
     #[test]

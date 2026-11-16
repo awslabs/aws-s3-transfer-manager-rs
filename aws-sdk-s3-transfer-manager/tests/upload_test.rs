@@ -1788,6 +1788,17 @@ async fn test_part_stream_panic_error_carries_upload_id() {
 /// Asserts that `error` is an `IOError` whose message is `I/O error {action} "{path}"` and whose
 /// source is a `NotFound` operating system error.
 fn assert_missing_file_error(error: &Error, action: &str, path: &std::path::Path) {
+    assert_file_io_error(error, action, path, std::io::ErrorKind::NotFound);
+}
+
+/// Asserts that `error` is an `IOError` whose message is `I/O error {action} "{path}"` and whose
+/// source is an operating system error of kind `source_kind`.
+fn assert_file_io_error(
+    error: &Error,
+    action: &str,
+    path: &std::path::Path,
+    source_kind: std::io::ErrorKind,
+) {
     assert_eq!(ErrorKind::IOError, *error.kind());
     assert_eq!(
         format!("I/O error {action} \"{}\"", path.display()),
@@ -1796,7 +1807,7 @@ fn assert_missing_file_error(error: &Error, action: &str, path: &std::path::Path
     let io_error = std::error::Error::source(error)
         .and_then(|s| s.downcast_ref::<std::io::Error>())
         .expect("the source is the operating system's error");
-    assert_eq!(std::io::ErrorKind::NotFound, io_error.kind());
+    assert_eq!(source_kind, io_error.kind());
 }
 
 // ref: RUST-1202
@@ -1810,9 +1821,9 @@ fn test_from_path_missing_file_error_names_action_and_path() {
     assert_missing_file_error(&error, "reading metadata of", &path);
 }
 
-/// Uploads a body read from `path`, which does not exist, with an explicit `length` so the
-/// stream builds without reading the file, and returns the error `join()` reports.
-async fn upload_missing_file(path: &std::path::Path, length: u64) -> Error {
+/// Uploads a body read from `path`, which cannot be read, with an explicit `length` so the stream
+/// builds without reading the file, and returns the error `join()` reports.
+async fn upload_unreadable_file(path: &std::path::Path, length: u64) -> Error {
     let mock = MultipartMock::new();
     let put_object = mock!(aws_sdk_s3::Client::put_object)
         .then_output(|| PutObjectOutput::builder().e_tag("test-etag").build());
@@ -1831,7 +1842,7 @@ async fn upload_missing_file(path: &std::path::Path, length: u64) -> Error {
         .unwrap()
         .join()
         .await
-        .expect_err("a missing source file must fail the upload");
+        .expect_err("an unreadable source file must fail the upload");
     assert_eq!(0, put_object.num_calls(), "no PutObject is sent");
     error
 }
@@ -1844,20 +1855,50 @@ async fn test_put_object_upload_missing_file_error_names_action_and_path() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("missing.bin");
 
-    let error = upload_missing_file(&path, 16).await;
+    let error = upload_unreadable_file(&path, 16).await;
     assert_missing_file_error(&error, "opening", &path);
 }
 
 // ref: RUST-1202
-/// A multipart upload whose source file cannot be opened fails with an error naming the action
-/// and path.
+/// A multipart upload whose source file is missing fails with an error naming the action and
+/// path. The file's metadata is read before CreateMultipartUpload is sent, so that read is the
+/// action that fails.
 #[tokio::test]
 async fn test_multipart_upload_missing_file_error_names_action_and_path() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("missing.bin");
 
-    let error = upload_missing_file(&path, 32 * ByteUnit::Mebibyte.as_bytes_u64()).await;
-    assert_missing_file_error(&error, "opening", &path);
+    let error = upload_unreadable_file(&path, 32 * ByteUnit::Mebibyte.as_bytes_u64()).await;
+    assert_missing_file_error(&error, "reading metadata of", &path);
+}
+
+// ref: RUST-1674
+/// A multipart upload whose source file has readable metadata but cannot be opened fails with an
+/// error naming the open and the path. The file's mode is
+/// `000`, so its metadata check passes and the part reader's open, after CreateMultipartUpload
+/// returns, fails with `PermissionDenied`. A process that can open the file regardless, such as
+/// one running as root, skips the test.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_multipart_upload_unreadable_file_error_names_action_and_path() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("unreadable.bin");
+    std::fs::write(&path, b"").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::File::open(&path).is_ok() {
+        return;
+    }
+
+    let error = upload_unreadable_file(&path, 32 * ByteUnit::Mebibyte.as_bytes_u64()).await;
+
+    assert_file_io_error(
+        &error,
+        "opening",
+        &path,
+        std::io::ErrorKind::PermissionDenied,
+    );
 }
 
 // --- Request body ------------------------------------------------------------
