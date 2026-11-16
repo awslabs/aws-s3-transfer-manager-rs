@@ -15,6 +15,7 @@ pub use handle::UploadObjectsHandle;
 mod output;
 pub use output::{UploadObjectsOutput, UploadObjectsOutputBuilder};
 
+mod observability;
 mod transfer;
 pub(crate) use transfer::UploadObjectsTransfer;
 

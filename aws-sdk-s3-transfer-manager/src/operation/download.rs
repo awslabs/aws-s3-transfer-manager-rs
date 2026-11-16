@@ -38,6 +38,8 @@ pub(crate) mod test_util;
 /// Read-ahead window — the occupancy bound on speculative issuance.
 pub(crate) mod read_ahead;
 
+/// The object-integrity result a completed download reports.
+mod checksum;
 mod context;
 mod observability;
 

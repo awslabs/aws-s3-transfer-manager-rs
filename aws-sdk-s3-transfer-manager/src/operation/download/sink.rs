@@ -96,7 +96,11 @@ impl SinkWrite for FileSink {
                 if preallocation_failure_is_fatal(&e) {
                     return Err(e);
                 }
-                tracing::warn!(error = %e, "failed to preallocate file space");
+                tracing::warn!(
+                    target: crate::telemetry::TARGET_TRANSFER_DOWNLOAD,
+                    error = %e,
+                    "failed to preallocate file space",
+                );
             }
         }
         Ok(())

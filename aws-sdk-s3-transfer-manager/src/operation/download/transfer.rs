@@ -18,10 +18,11 @@ use crate::sdk_v1::copy_download_input_fields_to_get_object as copy_fields_to_ge
 
 use crate::error::{self, ChunkRef, Error};
 use crate::operation::download::body::{BodySlot, BodyWriter, ChunkOutput, DrainError, Drained};
+use crate::operation::download::checksum::ChecksumTally;
 use crate::operation::download::context::{
     CompletionClaim, DownloadPendingReason, DownloadState, PendingClaim,
 };
-use crate::operation::download::discovery::{discover_obj, ObjectDiscovery};
+use crate::operation::download::discovery::{discover_obj, InitialChunk, ObjectDiscovery};
 use crate::operation::download::observability::{
     DownloadDestination, DownloadEvent, DownloadExecutionState, DownloadObservability,
     DownloadRequestKind, DownloadRequestMeasurement, DownloadStateSnapshot, DownloadTerminalReport,
@@ -34,8 +35,11 @@ use crate::operation::download::ObjectMetadata;
 use crate::runtime::buffer_pool::{
     AcquireError, BufferPool, Reservation, ReserveError, SegmentedBytes,
 };
+use crate::telemetry::TARGET_TRANSFER_DOWNLOAD;
 use crate::transfer::{IoRequest, PollWork, Transfer, TransferContext, TransferId, WorkOutcome};
 use crate::types::BucketType;
+use aws_smithy_observability::unit_of_work::checksums::{ChecksumCapture, ChecksumOutcome};
+use aws_smithy_observability::unit_of_work::Capture;
 use aws_smithy_types::error::display::DisplayErrorContext;
 use tracing::Instrument;
 
@@ -69,7 +73,7 @@ struct DownloadTransferInner {
     read_ahead: ReadAhead,
     /// Object metadata from discovery (set once discovery completes)
     object_meta: std::sync::OnceLock<ObjectMetadata>,
-    /// Object-integrity result (set once discovery completes)
+    /// Object-integrity result (set once the download completes successfully)
     integrity_checks: std::sync::OnceLock<crate::types::IntegrityChecks>,
     /// Expected total bytes produced by this download, discovered from the response.
     expected_download_len: std::sync::OnceLock<u64>,
@@ -92,6 +96,17 @@ pub(crate) enum DownloadWork {
     DrainResident,
 }
 
+impl DownloadWork {
+    /// Short name of the work kind for span fields.
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Discovery => "discovery",
+            Self::GetObjectRange { .. } => "get_object_range",
+            Self::DrainResident => "drain_resident",
+        }
+    }
+}
+
 /// Early return if transfer is terminal (failed/cancelled by another work item).
 macro_rules! bail_if_terminal {
     ($self:expr) => {
@@ -100,7 +115,7 @@ macro_rules! bail_if_terminal {
             // no longer active, so a completion this retirement claims is dropped rather
             // than finalized: the cancellation's terminal path owns the destination (see
             // `CompletionClaim`).
-            let _ = $self.decrement_in_flight(0);
+            let _ = $self.decrement_in_flight(0, None);
             return WorkOutcome::Cancelled;
         }
     };
@@ -269,7 +284,7 @@ impl DownloadTransfer {
         self.inner.object_meta.get()
     }
 
-    /// Object-integrity result from discovery.
+    /// Object-integrity result, set once the download completes successfully.
     pub(crate) fn integrity_checks(&self) -> Option<&crate::types::IntegrityChecks> {
         self.inner.integrity_checks.get()
     }
@@ -310,10 +325,18 @@ impl DownloadTransfer {
     /// issues is counted when issued, and the item that retires last with
     /// nothing left to issue claims completion and finalizes, as
     /// [`DownloadState`] describes.
-    #[tracing::instrument(level = "debug", skip(self), fields(tid = %self.id()))]
+    #[tracing::instrument(
+        level = "trace",
+        target = TARGET_TRANSFER_DOWNLOAD,
+        skip_all,
+        fields(tid = %self.id()),
+    )]
     pub(crate) fn poll_work(&self) -> PollWork {
         if !self.inner.ctx.is_active() {
-            tracing::debug!("not active, returning Done");
+            tracing::debug!(
+                target: crate::telemetry::TARGET_TRANSFER_DOWNLOAD,
+                "not active, returning Done",
+            );
             return PollWork::Done;
         }
 
@@ -342,6 +365,7 @@ impl DownloadTransfer {
                 part_size,
                 gate,
                 pending,
+                integrity: _,
             } => {
                 // Resolve the slot to issue into this poll, if one is ready. Two gates
                 // compose in order: the per-transfer read-ahead window, then shared
@@ -391,7 +415,7 @@ impl DownloadTransfer {
                         // consumer has freed and waits for a drain before claiming more.
                         // Trace: fires every gated poll in steady state.
                         tracing::trace!(
-                            target: crate::telemetry::TARGET_TRANSFER,
+                            target: crate::telemetry::TARGET_TRANSFER_DOWNLOAD,
                             issued = gate.issued(),
                             released = gate.released(),
                             in_flight = gate.resident(),
@@ -492,7 +516,7 @@ impl DownloadTransfer {
                     *remaining = None;
                     all_ranges_issued = true;
                     tracing::debug!(
-                        target: crate::telemetry::TARGET_TRANSFER,
+                        target: crate::telemetry::TARGET_TRANSFER_DOWNLOAD,
                         issued = gate.issued(),
                         ranges_in_flight = *ranges_in_flight,
                         "all ranges issued; draining in-flight tail",
@@ -686,9 +710,15 @@ impl DownloadTransfer {
         PollWork::Done
     }
 
-    #[tracing::instrument(level = "debug", skip(self, work), fields(tid = %self.id(), work = ?work.data))]
+    #[tracing::instrument(
+        level = "trace",
+        target = TARGET_TRANSFER_DOWNLOAD,
+        skip_all,
+        fields(tid = %self.id(), work = tracing::field::Empty),
+    )]
     pub(crate) async fn execute(&self, work: &mut IoRequest) -> WorkOutcome {
         let data = work.data_mut::<DownloadWork>();
+        tracing::Span::current().record("work", data.kind());
         match data {
             DownloadWork::Discovery => self.execute_discovery().await,
             DownloadWork::GetObjectRange { range, slot, etag } => {
@@ -814,12 +844,8 @@ impl DownloadTransfer {
         // chunk. A larger multipart object's discovery chunk carries part 1's
         // checksum, which is not the object checksum.
         let whole_object_in_chunk = input.range.is_none() && remaining.is_none();
-        let integrity = build_integrity_checks(
-            chunk_meta.as_ref(),
-            whole_object_in_chunk,
-            validation_enabled,
-        );
-        let _ = self.inner.integrity_checks.set(integrity);
+        let mut integrity = Box::<ChecksumTally>::default();
+        integrity.record_discovery(chunk_meta.as_ref(), whole_object_in_chunk);
 
         // Notify waiters that discovery completed
         self.inner.discovery_notify.notify_waiters();
@@ -866,15 +892,16 @@ impl DownloadTransfer {
         // returning `Pending` to the scheduler (discovery runs in async `execute`,
         // not `poll_work`).
         let initial_work = match (initial_chunk, chunk_meta) {
-            (Some(initial), Some(meta)) => {
+            (Some(mut initial), Some(meta)) => {
                 let req_metrics = initial
                     .request_metrics
+                    .take()
                     .expect("ranged discovery body carries its request measurement");
                 let mut slot = self.inner.writer.claim();
                 match self.reserve_discovery_chunk(initial.expected_len).await {
                     Ok(Some(reservation)) => {
                         slot.attach_reservation(reservation);
-                        Some((initial.body, initial.expected_len, req_metrics, meta, slot))
+                        Some((initial, req_metrics, meta, slot))
                     }
                     // Terminal (cancel/fail by another path) while reserving the discovery
                     // chunk: the transfer is already in its terminal state, so drop the
@@ -914,6 +941,7 @@ impl DownloadTransfer {
                 part_size: effective_part_size,
                 gate: super::context::OccupancyGate::with_issued(initial),
                 pending: None,
+                integrity,
             };
             let snapshot = self.snapshot(&work);
             // With no chunk and nothing remaining, discovery is the last work item to
@@ -951,16 +979,9 @@ impl DownloadTransfer {
 
         // If discovery returned an initial chunk, process it
         match initial_work {
-            Some((stream, expected_len, request, chunk_meta, slot)) => {
-                self.execute_read_discovery_body(
-                    stream,
-                    expected_len,
-                    request,
-                    slot,
-                    chunk_meta,
-                    etag,
-                )
-                .await
+            Some((initial, request, chunk_meta, slot)) => {
+                self.execute_read_discovery_body(initial, request, slot, chunk_meta, etag)
+                    .await
             }
             None => WorkOutcome::Success { data: None },
         }
@@ -968,13 +989,18 @@ impl DownloadTransfer {
 
     async fn execute_read_discovery_body(
         &self,
-        stream: aws_sdk_s3::primitives::ByteStream,
-        expected_len: usize,
+        initial: InitialChunk,
         mut req_metrics: DownloadRequestMeasurement,
         slot: BodySlot,
         chunk_meta: ChunkMetadata,
         etag: Option<Arc<str>>,
     ) -> WorkOutcome {
+        let InitialChunk {
+            body,
+            checksum,
+            expected_len,
+            request_metrics: _,
+        } = initial;
         req_metrics.resume();
         let seq = slot.seq();
         let input = self.inner.request.as_ref();
@@ -990,7 +1016,7 @@ impl DownloadTransfer {
             .as_deref()
             .and_then(crate::http::header::parse_content_range);
 
-        let mut initial = Some(stream);
+        let mut initial = Some((body, checksum));
         let recv_latencies = &self.inner.ctx.handle.telemetry.recv_latencies;
         // The deadline guards only the GET response (TTFB); the body-read is
         // untimed. The first attempt reuses the discovery body — no network send
@@ -1012,14 +1038,16 @@ impl DownloadTransfer {
             if let Some(etag) = etag.as_ref() {
                 builder = builder.if_match(etag.as_ref());
             }
+            let checksum = ChecksumCapture::new();
             let req = builder
                 .customize()
+                .interceptor(Capture::new().with(&checksum))
                 .config_override(ctx.download_get_override(input.bucket()));
             async move {
                 // Obtain the body stream. First attempt reuses the discovery body
                 // (no send, untimed); a re-issue is TTFB-guarded (times + records).
-                let body = match pre_issued {
-                    Some(s) => s,
+                let (body, checksum) = match pre_issued {
+                    Some(initial) => initial,
                     None => {
                         // A re-issue without a byte range would fetch the whole
                         // object into this chunk's slot. S3 always returns a
@@ -1037,37 +1065,40 @@ impl DownloadTransfer {
                                 ),
                             ));
                         }
-                        recv_latencies
+                        let body = recv_latencies
                             .guarded(allow_hedge, async {
                                 req.send()
                                     .await
                                     .map(|resp| resp.body)
                                     .map_err(crate::error::Error::from)
                             })
-                            .await?
+                            .await?;
+                        (body, checksum)
                     }
                 };
                 // Untimed: drain the body. Errors here are inner (retryable IO).
                 collect_response_body(
                     &ctx.handle.buffer_pool,
                     body,
+                    &checksum,
                     reservation,
                     expected_len,
                     || ctx.is_active(),
                 )
                 .await
+                .map(|bytes| (bytes, checksum))
                 .map_err(crate::retry::GuardError::Inner)
             }
         })
-        .instrument(tracing::debug_span!(
-            target: crate::telemetry::TARGET_TRANSFER,
+        .instrument(tracing::trace_span!(
+            target: crate::telemetry::TARGET_TRANSFER_DOWNLOAD,
             "download-part",
             tid = %self.id()
         ))
         .await;
         let _ = req_metrics.finish();
 
-        let bytes = match result {
+        let (bytes, checksum) = match result {
             Ok(val) => val,
             // Go terminal without retiring this chunk: fail() sets Terminal under
             // the lock, so no later retirement can claim completion over this
@@ -1078,14 +1109,13 @@ impl DownloadTransfer {
             }
         };
 
+        let offset = reissue_range
+            .as_ref()
+            .map(|range| *range.start())
+            .unwrap_or(0);
         let chunk = ChunkOutput {
             seq,
-            offset: chunk_meta
-                .content_range
-                .as_deref()
-                .and_then(crate::http::header::parse_content_range)
-                .map(|r| *r.start())
-                .unwrap_or(0),
+            offset,
             data: bytes,
             metadata: chunk_meta,
         };
@@ -1116,8 +1146,8 @@ impl DownloadTransfer {
             network_rx: bytes_received,
             ..Default::default()
         });
-
-        if let Some(claim) = self.decrement_in_flight(freed) {
+        let completed = Some((offset, bytes_received, checksum.try_outcome()));
+        if let Some(claim) = self.decrement_in_flight(freed, completed) {
             return self.finalize_completion(claim);
         }
 
@@ -1176,8 +1206,10 @@ impl DownloadTransfer {
                 if let Some(etag) = etag.as_ref() {
                     builder = builder.if_match(etag.as_ref());
                 }
+                let checksum = ChecksumCapture::new();
                 let req = builder
                     .customize()
+                    .interceptor(Capture::new().with(&checksum))
                     .config_override(ctx.download_get_override(input.bucket()));
                 async move {
                     // Timed (TTFB): obtain response headers. Validate the range here
@@ -1195,24 +1227,27 @@ impl DownloadTransfer {
                     let bytes = collect_response_body(
                         &ctx.handle.buffer_pool,
                         resp.body,
+                        &checksum,
                         reservation,
                         expected_len,
                         || ctx.is_active(),
                     )
                     .await
                     .map_err(crate::retry::GuardError::Inner)?;
-                    Ok::<_, crate::retry::GuardError<crate::error::Error>>((chunk_meta, bytes))
+                    Ok::<_, crate::retry::GuardError<crate::error::Error>>((
+                        chunk_meta, bytes, checksum,
+                    ))
                 }
             })
-            .instrument(tracing::debug_span!(
-                target: crate::telemetry::TARGET_TRANSFER,
+            .instrument(tracing::trace_span!(
+                target: crate::telemetry::TARGET_TRANSFER_DOWNLOAD,
                 "download-part-reissue",
                 tid = %self.id()
             ))
             .await;
         let _ = req_metrics.finish();
 
-        let (chunk_meta, bytes) = match result {
+        let (chunk_meta, bytes, checksum) = match result {
             Ok(val) => val,
             Err(e) => {
                 return self.fail_range(ChunkRef::new(seq, Some(*range.start()..=*range.end())), e)
@@ -1255,13 +1290,13 @@ impl DownloadTransfer {
             network_rx: bytes_received,
             ..Default::default()
         });
-
-        if let Some(claim) = self.decrement_in_flight(freed) {
+        let completed = Some((*range.start(), bytes_received, checksum.try_outcome()));
+        if let Some(claim) = self.decrement_in_flight(freed, completed) {
             return self.finalize_completion(claim);
         }
 
         tracing::trace!(
-            target: crate::telemetry::TARGET_TRANSFER,
+            target: crate::telemetry::TARGET_TRANSFER_DOWNLOAD,
             seq,
             offset = *range.start(),
             "chunk downloaded",
@@ -1279,17 +1314,27 @@ impl DownloadTransfer {
         self.fail(guard, e.with_chunk(location))
     }
 
-    /// Retire one in-flight range: drop `ranges_in_flight` and release `freed` parts of
-    /// read-ahead occupancy, then claim completion if no range remains and no range or
-    /// memory-relief item is still in flight. Both happen under the state lock, so
-    /// completion is claimed exactly once; the caller that receives the claim finalizes
-    /// the transfer.
+    /// Retire one in-flight range: record the checksum outcome of a range that
+    /// `completed`, drop `ranges_in_flight` and release `freed` parts of read-ahead
+    /// occupancy, then claim completion if no range remains and no range or
+    /// memory-relief item is still in flight. All of it happens under the state lock,
+    /// so completion is claimed exactly once, and the claim carries the outcome of
+    /// every range that retired before it; the caller that receives the claim
+    /// finalizes the transfer.
+    ///
+    /// `completed` is the offset, length and checksum outcome of the bytes a
+    /// successful range delivered, and `None` for a range retired without
+    /// delivering, on cancellation.
     ///
     /// Releasing the occupancy under the same lock `poll_work` reads the gate and arms
     /// `set_pending` under is what orders this completion's release against the issuer's
     /// park (the mutator protocol `lock -> mutate -> unlock -> try_wake`). `freed` is the
     /// disk drain's freed count (0 if this fill did not hit a drain edge).
-    fn decrement_in_flight(&self, freed: u64) -> Option<CompletionClaim> {
+    fn decrement_in_flight(
+        &self,
+        freed: u64,
+        completed: Option<(u64, u64, Option<ChecksumOutcome>)>,
+    ) -> Option<CompletionClaim> {
         let (completion, snapshot) = {
             let mut work = self.inner.state.lock().unwrap();
             match &mut *work {
@@ -1298,8 +1343,12 @@ impl DownloadTransfer {
                     gate,
                     remaining,
                     pending,
+                    integrity,
                     ..
                 } => {
+                    if let Some((offset, len, outcome)) = completed {
+                        integrity.record(offset, len, outcome);
+                    }
                     *ranges_in_flight = ranges_in_flight.saturating_sub(1);
                     gate.release(freed);
                     let snapshot = transferring_snapshot(
@@ -1330,7 +1379,7 @@ impl DownloadTransfer {
         completion
     }
 
-    /// Finalize a transfer whose successful completion `_claim` proves: flush the tail to
+    /// Finalize a transfer whose successful completion `claim` proves: flush the tail to
     /// disk (returning the last carrier charges as `ChunkOutput`s drop), establish the
     /// destination length, set the terminal status, and signal waiters. A finalization
     /// error fails the transfer with `ErrorKind::IOError` instead.
@@ -1338,7 +1387,7 @@ impl DownloadTransfer {
     /// The state is already `Terminal`, entered when the claim was taken; this runs after
     /// the state lock is released so disk IO never happens under it. Symmetric with
     /// `fail`, which error paths call from `execute`.
-    fn finalize_completion(&self, _claim: CompletionClaim) -> WorkOutcome {
+    fn finalize_completion(&self, claim: CompletionClaim) -> WorkOutcome {
         let expected_len = *self
             .inner
             .expected_download_len
@@ -1351,6 +1400,9 @@ impl DownloadTransfer {
             let guard = self.inner.state.lock().unwrap();
             return self.fail(guard, error::Error::new(error::ErrorKind::IOError, e));
         }
+        let validation_enabled = self.validation_enabled(&self.inner.request);
+        let integrity_checks = claim.checksum_tally().integrity_checks(validation_enabled);
+        let _ = self.inner.integrity_checks.set(integrity_checks);
         let state_snapshot = {
             let state = self.inner.state.lock().expect("lock poisoned");
             self.snapshot(&state)
@@ -1377,7 +1429,7 @@ impl DownloadTransfer {
     ) -> WorkOutcome {
         let description = DisplayErrorContext(&error).to_string();
         tracing::debug!(
-            target: crate::telemetry::TARGET_TRANSFER,
+            target: crate::telemetry::TARGET_TRANSFER_DOWNLOAD,
             error = %description,
             "download failed",
         );
@@ -1398,7 +1450,7 @@ impl DownloadTransfer {
                 "download failed after it had completed: {description}"
             );
             tracing::error!(
-                target: crate::telemetry::TARGET_TRANSFER,
+                target: crate::telemetry::TARGET_TRANSFER_DOWNLOAD,
                 tid = %self.inner.ctx.id,
                 error = %description,
                 "download failed after it had completed; the failure is not reported to the caller",
@@ -1580,9 +1632,13 @@ fn chunk_len(remaining: &std::ops::RangeInclusive<u64>, part_size: u64) -> usize
 ///
 /// A zero expected length is invalid. Empty objects complete without issuing a
 /// response-collection operation.
+///
+/// `checksum` is the capture attached to the request that returned `body`; a body
+/// error is classified from its outcome.
 async fn collect_response_body(
     pool: &BufferPool,
     body: aws_sdk_s3::primitives::ByteStream,
+    checksum: &ChecksumCapture,
     reservation: &Reservation,
     expected_len: usize,
     is_active: impl Fn() -> bool,
@@ -1597,7 +1653,7 @@ async fn collect_response_body(
     let mut body_stream = body;
 
     while let Some(result) = body_stream.next().await {
-        let data = result.map_err(|error| error::body_read_error(error, None))?;
+        let data = result.map_err(|error| error::body_read_error(error, checksum.try_outcome()))?;
         let remaining = expected_len
             .checked_sub(bytes_received)
             .ok_or_else(|| response_length_error(expected_len, bytes_received))?;
@@ -1770,17 +1826,16 @@ mod tests {
     use http_body_1x::{Body as HttpBody, Frame, SizeHint};
 
     use super::*;
-    use crate::model::{ChecksumType, ChunkMetadata};
     use crate::operation::download::sink::FileSinkFactory;
     use crate::operation::download::test_util::fixtures::{
-        assert_discovery_succeeds, disk_test_handle, disk_transfer, execute, finalize_started,
-        object_client_failing_at, relief_scenario, spawn_relief,
+        assert_discovery_succeeds, crc32_object_client, disk_test_handle, disk_transfer, execute,
+        finalize_started, object_client_failing_at, relief_scenario, spawn_relief,
     };
     use crate::operation::download::DownloadInput;
     use crate::scheduler::test_util::{assert_done, assert_pending, assert_ready};
     use crate::transfer::TransferContext;
     use crate::transfer::WorkOutcome;
-    use crate::types::{BucketType, ChecksumValidation, NotValidatedReason};
+    use crate::types::BucketType;
     use aws_sdk_s3::operation::get_object::GetObjectError;
     use aws_sdk_s3::operation::get_object::GetObjectOutput;
     use aws_sdk_s3::primitives::ByteStream;
@@ -1814,6 +1869,7 @@ mod tests {
             part_size: 8,
             gate,
             pending: None,
+            integrity: Box::default(),
         };
         assert_eq!(
             snapshot_state(&transferring, 4),
@@ -1915,9 +1971,11 @@ mod tests {
         expected_len: usize,
         is_active: impl Fn() -> bool,
     ) -> Result<SegmentedBytes, Error> {
+        let checksum = ChecksumCapture::new();
         let mut future = std::pin::pin!(collect_response_body(
             pool,
             body,
+            &checksum,
             reservation,
             expected_len,
             is_active,
@@ -3534,8 +3592,92 @@ mod tests {
         );
     }
 
+    /// Runs a three-part disk download over `crc32_object_client` whose part
+    /// `failing_part` (0-based), if set, fails, and returns the checksum verdict its
+    /// terminal report carries.
+    async fn crc32_download_terminal_checksum_validation(
+        failing_part: Option<u64>,
+    ) -> Option<crate::types::ChecksumValidation> {
+        use crate::operation::download::test_util::fixtures::object_bytes;
+
+        let part_size = 5 * MB;
+        let object = object_bytes(3 * part_size as usize);
+        let config = crate::Config::builder()
+            .sdk_client(crc32_object_client(
+                object,
+                failing_part.map(|n| n * part_size),
+            ))
+            .part_size(crate::types::PartSize::Target(part_size))
+            .diagnostics_for_test(crate::config::MemoryDiagnosticsConfig::default(), 1)
+            .build()
+            .expect("valid config");
+        let (transfer, _consumer, _dir) = disk_transfer(
+            crate::client::Handle::test_handle_tokio(config),
+            &FileSinkFactory,
+        );
+
+        assert_discovery_succeeds(&transfer).await;
+        let mut second = assert_ready(transfer.poll_work());
+        let mut third = assert_ready(transfer.poll_work());
+        let outcome = execute(&transfer, &mut second).await;
+        assert!(
+            matches!(outcome, WorkOutcome::Success { .. }),
+            "{outcome:?}"
+        );
+        let outcome = execute(&transfer, &mut third).await;
+        assert_eq!(
+            matches!(outcome, WorkOutcome::Failed { .. }),
+            failing_part.is_some(),
+            "{outcome:?}"
+        );
+
+        transfer
+            .test_terminal_summary()
+            .expect("summary diagnostics enabled")
+            .checksum_validation
+    }
+
+    /// A download whose third part fails after its first two validated reports no
+    /// checksum verdict: the verdict is decided only when a download completes.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn failed_download_reports_no_checksum_verdict() {
+        assert_eq!(
+            crc32_download_terminal_checksum_validation(Some(2)).await,
+            None
+        );
+    }
+
+    /// The same download with no failing part completes, and its terminal report
+    /// carries `Validated{Crc32}`, so the parts the failed download delivered were
+    /// validated.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn completed_download_reports_checksum_verdict() {
+        assert_eq!(
+            crc32_download_terminal_checksum_validation(None).await,
+            Some(crate::types::ChecksumValidation::Validated {
+                algorithm: crate::model::ChecksumAlgorithm::Crc32,
+            })
+        );
+    }
+
     /// How long a test waits for a scripted hold to start.
     const HOLD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// The checksum verdict `transfer` has published, if any.
+    fn published_verdict(transfer: &DownloadTransfer) -> Option<&crate::types::ChecksumValidation> {
+        transfer
+            .integrity_checks()
+            .map(crate::types::IntegrityChecks::checksum_validation)
+    }
+
+    /// The verdict of a download whose every part carried a matching CRC32.
+    fn validated_crc32() -> crate::types::ChecksumValidation {
+        crate::types::ChecksumValidation::Validated {
+            algorithm: crate::model::ChecksumAlgorithm::Crc32,
+        }
+    }
 
     /// The final range retiring while a memory-relief write is still landing does
     /// not complete the transfer: finalization cannot see the run that write
@@ -3571,6 +3713,7 @@ mod tests {
             transfer.ctx().is_active(),
             "the transfer completed while a destination write was in flight"
         );
+        assert_eq!(published_verdict(transfer), None);
         assert_pending(transfer.poll_work());
         assert_eq!(
             std::fs::metadata(path).unwrap().len(),
@@ -3586,6 +3729,7 @@ mod tests {
             transfer.ctx().transfer_status(),
             crate::types::TransferStatus::Completed
         );
+        assert_eq!(published_verdict(transfer), Some(&validated_crc32()));
         assert_eq!(std::fs::read(path).unwrap(), &object[..]);
         assert_eq!(transfer.ctx().metrics().disk_write, object.len() as u64);
         assert_done(transfer.poll_work());
@@ -3618,6 +3762,7 @@ mod tests {
             .take_error()
             .expect("the failure is reported");
         assert_eq!(error.kind(), &crate::error::ErrorKind::IOError);
+        assert_eq!(published_verdict(transfer), None);
         assert!(
             !finalize_started(&script.events()),
             "a failed transfer must not finalize its destination"
@@ -3702,6 +3847,7 @@ mod tests {
             transfer.ctx().is_active(),
             "the transfer completed while a relief item was queued"
         );
+        assert_eq!(published_verdict(transfer), None);
         assert_pending(transfer.poll_work());
         assert!(!finalize_started(&script.events()));
 
@@ -3711,6 +3857,7 @@ mod tests {
             transfer.ctx().transfer_status(),
             crate::types::TransferStatus::Completed
         );
+        assert_eq!(published_verdict(transfer), Some(&validated_crc32()));
         assert_eq!(std::fs::read(&scenario.path).unwrap(), &scenario.object[..]);
         assert_done(transfer.poll_work());
     }
@@ -3748,7 +3895,7 @@ mod tests {
         max_partitions: usize,
     ) -> HeldReliefDownload {
         use crate::operation::download::test_util::fixtures::{
-            managed_test_handle_with_max_partitions, object_bytes, object_client,
+            managed_test_handle_with_max_partitions, object_bytes,
         };
         use crate::operation::download::test_util::sink::{
             Action, Match, Op, ScriptedSinkFactory, WriteScript,
@@ -3770,7 +3917,7 @@ mod tests {
             .expect("the budget fits the blocker");
         let script = Arc::new(WriteScript::default()).on(Match::NthWrite(1), Action::Hold);
         let config = crate::Config::builder()
-            .sdk_client(object_client(Arc::clone(&object)))
+            .sdk_client(crc32_object_client(Arc::clone(&object), None))
             .part_size(crate::types::PartSize::Target(part_size as u64))
             .memory(crate::types::MemoryConfig::Explicit(pool))
             .build()
@@ -3852,13 +3999,17 @@ mod tests {
     }
 
     /// `join` waits for an in-flight memory-relief write, then publishes the
-    /// complete object.
+    /// complete object and its verdict.
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn write_to_path_join_waits_for_a_held_relief_write() {
         let download = write_to_path_with_held_relief_write(None, 4).await;
-        download.result.expect("the download succeeds");
+        let output = download.result.expect("the download succeeds");
         assert_eq!(std::fs::read(&download.dest).unwrap(), &download.object[..]);
+        assert_eq!(
+            output.integrity_checks().checksum_validation(),
+            &validated_crc32()
+        );
     }
 
     /// A memory-relief write that fails after the final range was received fails
@@ -3887,10 +4038,14 @@ mod tests {
     #[tokio::test]
     async fn held_relief_write_on_one_partition_preserves_completion_and_cleanup() {
         let download = write_to_path_with_held_relief_write(None, 1).await;
-        download
+        let output = download
             .result
             .expect("download succeeds after the write is released");
         assert_eq!(std::fs::read(&download.dest).unwrap(), &download.object[..]);
+        assert_eq!(
+            output.integrity_checks().checksum_validation(),
+            &validated_crc32()
+        );
 
         let download =
             write_to_path_with_held_relief_write(Some(std::io::ErrorKind::StorageFull), 1).await;

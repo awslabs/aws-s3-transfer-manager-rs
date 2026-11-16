@@ -33,11 +33,12 @@ aws-runtime = "1.10.2"
 # client, which feature unification would otherwise build into every downstream crate.
 # `default-https-client` does not build for wasm targets, so members that need it enable it, as
 # they enable `aws-config`'s `default` features.
-aws-sdk-s3 = { version = "1.154.0", default-features = false, features = ["http-1x", "rt-tokio", "sigv4a"] }
+aws-sdk-s3 = { version = "1.158.0", default-features = false, features = ["http-1x", "rt-tokio", "sigv4a"] }
 aws-smithy-checksums = "0.65.0"
 aws-smithy-dns = "0.2.3"
 aws-smithy-http-client = { version = "1.5.2", default-features = false }
 aws-smithy-mocks = "0.3.0"
+aws-smithy-observability = "0.3.1"
 aws-smithy-runtime = "1.16.1"
 aws-smithy-runtime-api = "1.19.1"
 aws-smithy-types = "1.9.0"

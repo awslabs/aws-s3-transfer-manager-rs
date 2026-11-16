@@ -5,7 +5,8 @@
 
 //! Retention scenarios, destination probes, and managed-runtime teardown for download tests.
 
-use super::{common, dummy_expected_request, rand_data, simple_object_connector};
+use super::object_connector;
+use crate::{common, dummy_expected_request, rand_data};
 use aws_sdk_s3_transfer_manager::{
     metrics::unit::ByteUnit,
     types::{ConcurrencyMode, PartSize},
@@ -20,7 +21,7 @@ use std::time::Duration;
 /// Unix pins the file's identity and compares it across open descriptors,
 /// excluding its own descriptor. Renaming or unlinking preserves the identity.
 /// Windows attempts an exclusive open, so the path must exist when probed.
-pub(super) struct OpenFileProbe {
+pub(crate) struct OpenFileProbe {
     #[cfg(unix)]
     id: (u64, u64),
     #[cfg(unix)]
@@ -31,7 +32,7 @@ pub(super) struct OpenFileProbe {
 
 impl OpenFileProbe {
     /// On Unix `path` must exist now; on Windows it must exist when probed.
-    pub(super) fn new(path: &std::path::Path) -> Self {
+    pub(crate) fn new(path: &std::path::Path) -> Self {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
@@ -109,7 +110,7 @@ impl OpenFileProbe {
     /// Waits up to one second for every other descriptor on this file to close.
     ///
     /// The deadline bounds the test, not destination release by the public API.
-    pub(super) async fn assert_released(&self) {
+    pub(crate) async fn assert_released(&self) {
         tokio::time::timeout(Duration::from_secs(1), async {
             while self.is_open() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -121,14 +122,14 @@ impl OpenFileProbe {
 }
 
 /// Drops the client and waits for its managed threads to join.
-pub(super) async fn drop_and_await_shutdown(tm: aws_sdk_s3_transfer_manager::Client) {
+pub(crate) async fn drop_and_await_shutdown(tm: aws_sdk_s3_transfer_manager::Client) {
     let completion = tm.shutdown_completion();
     drop(tm);
     await_shutdown(completion).await;
 }
 
 /// Waits for managed-runtime teardown, if the client owns a managed runtime.
-pub(super) async fn await_shutdown(
+pub(crate) async fn await_shutdown(
     completion: Option<aws_sdk_s3_transfer_manager::ShutdownCompletion>,
 ) {
     if let Some(completion) = completion {
@@ -141,7 +142,7 @@ pub(super) async fn await_shutdown(
 
 /// The destination a single-object download writes through.
 #[derive(Clone, Copy, Debug)]
-pub(super) enum Destination {
+pub(crate) enum Destination {
     /// `write_to_path`: a temporary file beside the path, renamed on success.
     Path,
     /// `write_to_file`: a file the caller opened and moved in.
@@ -150,7 +151,7 @@ pub(super) enum Destination {
 
 /// How a single-object download ends.
 #[derive(Clone, Copy, Debug)]
-pub(super) enum Ending {
+pub(crate) enum Ending {
     /// `join` succeeds.
     Success,
     /// A part request fails after discovery, so `join` fails.
@@ -167,7 +168,7 @@ pub(super) enum Ending {
 /// A transient work or polling reference can outlive `join`, `abort`, or handle
 /// drop. The probe waits for those references to retire without advancing the
 /// epoch collector. A retained transfer fails the bounded wait.
-pub(super) async fn assert_download_releases_destination(
+pub(crate) async fn assert_download_releases_destination(
     destination: Destination,
     ending: Ending,
     runtime_config: RuntimeConfig,
@@ -200,7 +201,7 @@ pub(super) async fn assert_download_releases_destination(
                     .unwrap(),
             ),
         ]),
-        _ => simple_object_connector(&data, part_size),
+        _ => object_connector(&data, part_size),
     };
     let config = aws_sdk_s3_transfer_manager::Config::builder()
         .s3_config(common::s3_config(http_client))

@@ -1302,6 +1302,11 @@ mod tests {
         assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
     }
 
+    // `usize::MAX` rounds to a carrier count that overflows the packed-lane
+    // limit (`u32::MAX`) only on 64-bit; on 32-bit it rounds to ~2^20 carriers,
+    // below the gate, and the acquisition path then scans whole-pool state.
+    // The overflow rejection path only has a meaningful fast gate on 64-bit.
+    #[cfg(target_pointer_width = "64")]
     #[test]
     fn test_reserve_overflow_preserves_existing_buffer() {
         let (pool, carrier_size) = test_pool(1, 1);
