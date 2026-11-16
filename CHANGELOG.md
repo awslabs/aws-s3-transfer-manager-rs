@@ -45,8 +45,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   paths are removed rather than re-exported.
 - `types::ByteSize` is a quantity of bytes, and configuration takes it wherever it takes a size:
   `PartSize::Target` and `MemoryBudgetConfig::Limit`. Construct it with `ByteSize::new`,
-  `ByteSize::kib`, `ByteSize::mib` or `ByteSize::gib`, all `const fn`. `Display` formats in the
-  largest binary unit that keeps the value at or above 1, and `display_as` formats in a fixed unit.
+  `ByteSize::kib`, `ByteSize::mib` or `ByteSize::gib`, all `const fn`. `as_u64` returns the byte
+  count, as does `From<ByteSize> for u64`, and `as_unit` returns the size in a given `ByteUnit` as
+  an `f64`. `Display` formats in the largest binary unit that keeps the value at or above 1, and
+  `display_as` formats in a fixed unit.
   Positions, counters, object lengths and in-memory buffer lengths stay integers.
 - `BufferPoolBuilder::memory_budget` with a `MemoryBudgetConfig::Limit` larger than `usize::MAX`
   returns `BufferPoolBuildError::CapacityOverflow`, which can happen only where `usize` is narrower
