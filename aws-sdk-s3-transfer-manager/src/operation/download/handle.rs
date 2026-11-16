@@ -161,7 +161,7 @@ impl<'a> DownloadIoCtl<'a> {
     ///
     /// Lowering the window caps resident memory for a consumer that has fallen
     /// behind; raising it restores prefetch depth once the consumer catches up.
-    pub fn set_read_ahead(&self, mode: crate::types::ReadAhead) {
+    pub fn set_read_ahead(&self, mode: crate::config::ReadAhead) {
         self.transfer.set_read_ahead(&mode);
     }
 
@@ -322,7 +322,7 @@ impl DownloadHandle {
     }
 
     /// Snapshot of current transfer metrics.
-    pub fn metrics(&self) -> crate::types::TransferMetrics {
+    pub fn metrics(&self) -> crate::metrics::TransferMetrics {
         self.inner.transfer.ctx().metrics()
     }
 }
@@ -451,7 +451,7 @@ impl ManagedDownloadHandle {
     }
 
     /// Snapshot of current transfer metrics.
-    pub fn metrics(&self) -> crate::types::TransferMetrics {
+    pub fn metrics(&self) -> crate::metrics::TransferMetrics {
         self.inner.transfer.ctx().metrics()
     }
 

@@ -223,7 +223,7 @@ impl UploadHandle {
     }
 
     /// Snapshot of current transfer metrics.
-    pub fn metrics(&self) -> crate::types::TransferMetrics {
+    pub fn metrics(&self) -> crate::metrics::TransferMetrics {
         self.transfer.ctx().metrics()
     }
 }

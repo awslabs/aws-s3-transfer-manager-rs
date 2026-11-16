@@ -3,7 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use crate::types::{FailedUpload, TransferMetrics};
+use crate::metrics::TransferMetrics;
+use crate::types::FailedUpload;
 
 /// Output type for uploading multiple objects.
 ///

@@ -41,7 +41,7 @@ mod test_util;
 mod tests;
 mod virtual_memory;
 
-use crate::types::MemoryBudgetConfig;
+use crate::config::MemoryBudgetConfig;
 use acquisition::acquire_count;
 pub use acquisition::AcquireError;
 use admission::{

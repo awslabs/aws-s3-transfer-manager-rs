@@ -29,10 +29,10 @@
 //! the host to size the automatic defaults, and applies any settings made on
 //! it. [`ConfigLoader::s3_config`](config::ConfigLoader::s3_config) replaces
 //! the shared-configuration load with an existing [`aws_types::SdkConfig`] or
-//! [`S3ClientConfig`].
+//! [`S3ClientConfig`](config::S3ClientConfig).
 //!
 //! [`Config::builder`] constructs a configuration from explicit values
-//! instead. It requires an [`S3ClientConfig`], loads no shared configuration,
+//! instead. It requires an [`S3ClientConfig`](config::S3ClientConfig), loads no shared configuration,
 //! and makes no EC2 instance metadata request; the client detects the host
 //! from local system information only. Use it when the S3 configuration is
 //! already complete and neither environment loading nor network detection is
@@ -103,16 +103,16 @@
 //!   [`aws_types::SdkConfig`] or S3 configuration supplies an HTTP client, for
 //!   example one built on `wasi:http`. `wasm32-wasip1` has no networking
 //!   interface for such a client.
-//! - [`Managed`] execution behaves as
-//!   [`RuntimeConfig::multi_thread_tokio`], and a current-thread tokio runtime
+//! - [`Managed`](config::Managed) execution behaves as
+//!   [`RuntimeConfig::multi_thread_tokio`](config::RuntimeConfig::multi_thread_tokio), and a current-thread tokio runtime
 //!   is supported. [`Client::shutdown_completion`] returns `None`. File reads
 //!   and writes run inline on the thread that polls the transfer.
 //! - The `__unstable_ext` feature, which adopts a prebuilt managed runtime, is
 //!   unavailable.
 //! - Memory detection is unavailable, so
-//!   [`MemoryBudgetConfig::Auto`](crate::types::MemoryBudgetConfig::Auto) uses
+//!   [`MemoryBudgetConfig::Auto`](crate::config::MemoryBudgetConfig::Auto) uses
 //!   its 2 GiB fallback. Use
-//!   [`MemoryBudgetConfig::Limit`](crate::types::MemoryBudgetConfig::Limit) to
+//!   [`MemoryBudgetConfig::Limit`](crate::config::MemoryBudgetConfig::Limit) to
 //!   fit the module's linear memory.
 //!
 //! # Runtime diagnostics
@@ -235,7 +235,7 @@ compile_error!("`__unstable_ext` adopts a managed runtime, which wasm targets ca
 /// Applications that need to share one memory budget across clients or another
 /// component can construct a [`BufferPool`](crate::memory::BufferPool) and
 /// install it through
-/// [`MemoryConfig::Explicit`](crate::memory::MemoryConfig::Explicit).
+/// [`MemoryConfig::Explicit`](crate::config::MemoryConfig::Explicit).
 ///
 /// [`BufferPool::metrics`](crate::memory::BufferPool::metrics) returns current
 /// accounting gauges without enabling diagnostic sampling. Buffer-pool events
@@ -245,7 +245,6 @@ pub mod memory {
         AcquireError, BufferPool, BufferPoolBuildError, BufferPoolBuilder, PooledBufMut,
         Reservation, ReserveError, ReserveFuture, SegmentedBytes,
     };
-    pub use crate::types::{MemoryBudgetConfig, MemoryConfig};
 }
 
 /// Test-only entry points used by external fuzz targets.
@@ -285,9 +284,8 @@ pub mod metrics;
 pub(crate) mod retry;
 
 pub use self::client::Client;
+pub use self::config::Config;
 use self::config::ConfigLoader;
-pub use self::config::S3ClientConfig;
-pub use self::config::{Config, Managed, RuntimeConfig};
 pub use self::runtime::{ShutdownCompletion, ShutdownError, ShutdownErrorKind};
 pub use self::transfer::SchedulingCtl;
 

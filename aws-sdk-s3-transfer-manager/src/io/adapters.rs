@@ -174,12 +174,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::TokioIo;
+    use crate::config::MemoryBudgetConfig;
     use crate::io::stream::StreamContext;
     use crate::io::PartData;
     use crate::io::PartStream;
     use crate::io::SizeHint;
     use crate::memory::BufferPool;
-    use crate::types::MemoryBudgetConfig;
+    use crate::types::ByteSize;
     use futures_test::task::new_count_waker;
     use std::pin::{pin, Pin};
     use std::task::{Context, Poll};
@@ -189,7 +190,7 @@ mod tests {
 
     fn test_stream_cx(part_size: usize) -> (StreamContext, BufferPool) {
         let buffer_pool = BufferPool::builder()
-            .memory_budget(MemoryBudgetConfig::Limit(1024 * 1024))
+            .memory_budget(MemoryBudgetConfig::Limit(ByteSize::new(1024 * 1024)))
             .build()
             .unwrap();
         (

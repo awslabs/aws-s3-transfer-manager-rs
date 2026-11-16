@@ -240,7 +240,7 @@ fn download_copies_ordinary_fields_and_keeps_runtime_controls_out_of_requests() 
         .expected_bucket_owner("owner")
         .checksum_mode(model::ChecksumMode::from("FUTURE_MODE"))
         .part_number(99)
-        .read_ahead(crate::types::ReadAhead::Parts(2))
+        .read_ahead(crate::config::ReadAhead::Parts(2))
         .build()
         .unwrap();
     let client = aws_smithy_mocks::mock_client!(aws_sdk_s3, []);
@@ -310,7 +310,10 @@ fn download_copies_ordinary_fields_and_keeps_runtime_controls_out_of_requests() 
     );
     assert_eq!(&input.response_expires, get.get_response_expires());
     assert_eq!(input.part_number(), Some(99));
-    assert_eq!(input.read_ahead(), Some(&crate::types::ReadAhead::Parts(2)));
+    assert_eq!(
+        input.read_ahead(),
+        Some(&crate::config::ReadAhead::Parts(2))
+    );
 }
 
 #[test]
@@ -595,7 +598,7 @@ fn upload_field_copy_distinguishes_absent_values_from_explicit_empty_and_false()
 
 #[test]
 fn multipart_output_updates_retain_real_metrics_and_create_only_members() {
-    let metrics = crate::types::TransferMetrics {
+    let metrics = crate::metrics::TransferMetrics {
         network_tx: 42,
         network_rx: 1,
         disk_read: 42,

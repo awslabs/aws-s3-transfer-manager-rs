@@ -15,7 +15,7 @@ use crate::operation::download::{DownloadInput, DownloadTransfer};
 use crate::runtime::buffer_pool::Reservation;
 use crate::scheduler::test_util::assert_ready;
 use crate::transfer::{IoRequest, TransferContext, WorkOutcome};
-use crate::types::BucketType;
+use crate::types::{BucketType, ByteSize};
 
 /// Deterministic object contents of `len` bytes, distinct from the zeros an
 /// unwritten or preallocated region reads as.
@@ -165,7 +165,7 @@ pub(crate) fn disk_test_handle(
 ) -> Arc<crate::client::Handle> {
     let config = crate::Config::builder()
         .sdk_client(client)
-        .part_size(crate::types::PartSize::Target(part_size))
+        .part_size(crate::config::PartSize::Target(ByteSize::new(part_size)))
         .build()
         .expect("valid config");
     crate::client::Handle::test_handle_tokio(config)
@@ -275,9 +275,9 @@ pub(crate) async fn relief_scenario(script: &Arc<WriteScript>) -> ReliefScenario
     let part_size = 8 * 1024 * 1024;
     let object = object_bytes(2 * part_size as usize);
     let pool = crate::memory::BufferPool::builder()
-        .memory_budget(crate::types::MemoryBudgetConfig::Limit(
-            2 * part_size as usize,
-        ))
+        .memory_budget(crate::config::MemoryBudgetConfig::Limit(ByteSize::new(
+            (2 * part_size as usize) as u64,
+        )))
         .build()
         .expect("test pool");
     let blocker = pool
@@ -286,8 +286,8 @@ pub(crate) async fn relief_scenario(script: &Arc<WriteScript>) -> ReliefScenario
         .expect("the budget fits the blocker");
     let config = crate::Config::builder()
         .sdk_client(crc32_object_client(Arc::clone(&object), None))
-        .part_size(crate::types::PartSize::Target(part_size))
-        .memory(crate::types::MemoryConfig::Explicit(pool))
+        .part_size(crate::config::PartSize::Target(ByteSize::new(part_size)))
+        .memory(crate::config::MemoryConfig::Explicit(pool))
         .build()
         .expect("valid config");
     let handle = crate::client::Handle::test_handle_tokio(config);

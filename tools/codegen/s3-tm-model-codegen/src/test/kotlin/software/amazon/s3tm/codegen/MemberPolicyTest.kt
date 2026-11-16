@@ -51,11 +51,11 @@ class MemberPolicyTest {
             "impl ::std::convert::From<crate::model::DownloadInput> for crate::model::builders::DownloadInputBuilder",
         ))
         val runtimeFields = listOf(
-            Triple("download_input", "read_ahead", "crate::types::ReadAhead"),
+            Triple("download_input", "read_ahead", "crate::config::ReadAhead"),
             Triple("upload_input", "body", "crate::io::InputStream"),
             Triple("upload_input", "checksum_strategy", "crate::operation::upload::ChecksumStrategy"),
             Triple("upload_input", "failed_multipart_upload_policy", "crate::types::FailedMultipartUploadPolicy"),
-            Triple("upload_output", "metrics", "crate::types::TransferMetrics"),
+            Triple("upload_output", "metrics", "crate::metrics::TransferMetrics"),
         )
         for ((file, name, type) in runtimeFields) {
             val value = rust(file)
@@ -104,7 +104,7 @@ class MemberPolicyTest {
             Triple(RustType.Integer(32), "::std::option::Option<i32>", "self.value"),
             Triple(RustType.Integer(64), "::std::option::Option<i64>", "self.value"),
             Triple(RustType.Float(64), "::std::option::Option<f64>", "self.value"),
-            Triple(TmRuntimeTypes.readAhead.toSymbol().rustType(), "::std::option::Option<&crate::types::ReadAhead>", "self.value.as_ref()"),
+            Triple(TmRuntimeTypes.readAhead.toSymbol().rustType(), "::std::option::Option<&crate::config::ReadAhead>", "self.value.as_ref()"),
             Triple(RustType.Vec(RustType.String), "&[::std::string::String]", "self.value.as_deref().unwrap_or_default()"),
             Triple(
                 RustType.HashMap(RustType.String, RustType.Vec(RustType.String)),
@@ -113,7 +113,7 @@ class MemberPolicyTest {
             ),
             Triple(
                 RustType.Box(TmRuntimeTypes.readAhead.toSymbol().rustType()),
-                "::std::option::Option<&crate::types::ReadAhead>",
+                "::std::option::Option<&crate::config::ReadAhead>",
                 "self.value.as_deref()",
             ),
         )

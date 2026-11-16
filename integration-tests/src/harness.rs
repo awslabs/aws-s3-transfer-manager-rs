@@ -26,9 +26,9 @@
 //!
 //! [`S3ClientConfig`]: aws_sdk_s3_transfer_manager::config::S3ClientConfig
 
+use aws_sdk_s3_transfer_manager::config::RuntimeConfig;
 use aws_sdk_s3_transfer_manager::config::S3ClientConfig;
 use aws_sdk_s3_transfer_manager::Client as TmClient;
-use aws_sdk_s3_transfer_manager::RuntimeConfig;
 use s3_mock_server::S3MockServer;
 
 /// Installs a process-global tracing subscriber for test diagnosis, once.
@@ -225,7 +225,7 @@ impl Target {
     /// builds its S3 client from.
     pub(crate) async fn connect_mock_configured(
         self,
-        part_size: Option<aws_sdk_s3_transfer_manager::types::PartSize>,
+        part_size: Option<aws_sdk_s3_transfer_manager::config::PartSize>,
         configure: impl FnOnce(aws_types::sdk_config::Builder) -> aws_types::sdk_config::Builder,
     ) -> TmTestClient {
         assert_eq!(self.backend, Backend::Mock, "mock-only helper");
@@ -237,7 +237,7 @@ impl Target {
     /// uploaded part boundaries (the precondition for per-part validation).
     pub(crate) async fn connect_with(
         self,
-        part_size: Option<aws_sdk_s3_transfer_manager::types::PartSize>,
+        part_size: Option<aws_sdk_s3_transfer_manager::config::PartSize>,
     ) -> TmTestClient {
         match self.backend {
             Backend::Mock => TmTestClient::connect_mock(part_size).await,
@@ -269,7 +269,9 @@ struct MockBackend {
 }
 
 impl TmTestClient {
-    async fn connect_mock(part_size: Option<aws_sdk_s3_transfer_manager::types::PartSize>) -> Self {
+    async fn connect_mock(
+        part_size: Option<aws_sdk_s3_transfer_manager::config::PartSize>,
+    ) -> Self {
         Self::connect_mock_with(
             part_size,
             None::<fn(aws_types::sdk_config::Builder) -> aws_types::sdk_config::Builder>,
@@ -282,7 +284,7 @@ impl TmTestClient {
     /// client uses SDK defaults (`ResponseChecksumValidation::WhenSupported`,
     /// stalled-stream protection enabled).
     async fn connect_mock_with(
-        part_size: Option<aws_sdk_s3_transfer_manager::types::PartSize>,
+        part_size: Option<aws_sdk_s3_transfer_manager::config::PartSize>,
         configure: Option<
             impl FnOnce(aws_types::sdk_config::Builder) -> aws_types::sdk_config::Builder,
         >,
@@ -317,7 +319,7 @@ impl TmTestClient {
             // Four requests preserve concurrent execution without making
             // sanitizer overhead look like a transport stall.
             builder = builder
-                .concurrency(aws_sdk_s3_transfer_manager::types::ConcurrencyMode::Explicit(4));
+                .concurrency(aws_sdk_s3_transfer_manager::config::ConcurrencyMode::Explicit(4));
         }
         Self {
             tm: TmClient::new(builder.build().expect("valid config")),
@@ -332,7 +334,7 @@ impl TmTestClient {
     #[cfg(e2e_test)]
     async fn connect_real(
         kind: BucketKind,
-        part_size: Option<aws_sdk_s3_transfer_manager::types::PartSize>,
+        part_size: Option<aws_sdk_s3_transfer_manager::config::PartSize>,
     ) -> Self {
         init_test_logs();
         let bucket_name = option_env!("S3_TEST_BUCKET_NAME_RS")

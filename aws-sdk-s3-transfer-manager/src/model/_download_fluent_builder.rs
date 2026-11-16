@@ -553,17 +553,20 @@ impl crate::operation::download::builders::DownloadFluentBuilder {
         self.inner.get_checksum_mode()
     }
     /// How far this download may prefetch ahead of the consumer. `None` uses the client default from [`Config`](crate::config::Config); `Some` overrides it for this request.
-    pub fn read_ahead(mut self, input: crate::types::ReadAhead) -> Self {
+    pub fn read_ahead(mut self, input: crate::config::ReadAhead) -> Self {
         self.inner = self.inner.read_ahead(input);
         self
     }
     /// How far this download may prefetch ahead of the consumer. `None` uses the client default from [`Config`](crate::config::Config); `Some` overrides it for this request.
-    pub fn set_read_ahead(mut self, input: ::std::option::Option<crate::types::ReadAhead>) -> Self {
+    pub fn set_read_ahead(
+        mut self,
+        input: ::std::option::Option<crate::config::ReadAhead>,
+    ) -> Self {
         self.inner = self.inner.set_read_ahead(input);
         self
     }
     /// How far this download may prefetch ahead of the consumer. `None` uses the client default from [`Config`](crate::config::Config); `Some` overrides it for this request.
-    pub fn get_read_ahead(&self) -> &::std::option::Option<crate::types::ReadAhead> {
+    pub fn get_read_ahead(&self) -> &::std::option::Option<crate::config::ReadAhead> {
         self.inner.get_read_ahead()
     }
 }

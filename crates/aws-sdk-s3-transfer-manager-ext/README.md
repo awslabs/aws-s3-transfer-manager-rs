@@ -27,7 +27,7 @@ let sdk_config = sdk_config.into_builder().http_client(pool.clone()).build();
 let client = tm::Client::new(
     tm::Config::builder()
         .s3_config(&sdk_config)
-        .runtime_config(tm::RuntimeConfig::managed(tm_ext::managed(runtime)))
+        .runtime_config(tm::config::RuntimeConfig::managed(tm_ext::managed(runtime)))
         .build()?,
 );
 drop(client);

@@ -3,13 +3,14 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+use aws_sdk_s3_transfer_manager::config::ReadAhead;
 use aws_sdk_s3_transfer_manager::{
     io::InputStream,
     operation::upload::ChecksumStrategy,
     types::{
         builders::{DownloadInputBuilder, UploadInputBuilder},
         ChecksumAlgorithm, ChunkMetadata, DownloadInput, FailedMultipartUploadPolicy, Object,
-        ObjectMetadata, Owner, ReadAhead, RestoreStatus, UploadInput,
+        ObjectMetadata, Owner, RestoreStatus, UploadInput,
     },
 };
 use aws_smithy_types::DateTime;
