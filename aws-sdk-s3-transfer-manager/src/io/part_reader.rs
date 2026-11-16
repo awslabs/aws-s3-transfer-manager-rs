@@ -90,7 +90,7 @@ impl Builder {
         self
     }
 
-    pub(crate) fn build(self) -> Result<PartReader, Error> {
+    pub(crate) fn build(self) -> Result<PartReader, crate::error::Error> {
         let stream = self.stream.expect("input stream set");
         let buffer_pool = self.buffer_pool.expect("buffer pool set");
         let metrics = self.metrics.expect("metrics set");
@@ -127,7 +127,7 @@ impl PartReader {
         buffer_pool: BufferPool,
         metrics: std::sync::Arc<crate::transfer::MetricsState>,
         telemetry: std::sync::Arc<crate::telemetry::Telemetry>,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, crate::error::Error> {
         let inner = match raw {
             RawInputStream::Buf(buf) => Inner::Bytes(BytesPartReader::new(buf)),
             RawInputStream::Fs(path_body) => {
@@ -364,14 +364,13 @@ struct PathBodyPartReader {
 }
 
 impl PathBodyPartReader {
-    fn new(body: PathBody) -> Result<Self, Error> {
+    fn new(body: PathBody) -> Result<Self, crate::error::Error> {
         // TODO(vnext): Consider O_DIRECT for large sequential uploads (requires aligned
         // buffers from buffer pool). Also consider fadvise(POSIX_FADV_SEQUENTIAL) — generation
         // order is sequential so kernel readahead would help, but concurrent execution creates
         // some scatter. Benchmark before adding.
         // TODO(vnext): does this need to be async now?
-        let file =
-            Arc::new(File::open(&body.path).map_err(|e| Error::io_at("opening", &body.path, e))?);
+        let file = Arc::new(body.open()?);
         let offset = body.offset;
         let content_length = body.length;
         Ok(Self {
