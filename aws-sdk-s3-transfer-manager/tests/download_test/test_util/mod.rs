@@ -33,8 +33,26 @@ pub(super) fn object_connector_with_checksum_headers(
     part_size: usize,
     checksum_header: impl Fn(usize, &[u8]) -> Option<(&'static str, String)>,
 ) -> StaticReplayClient {
-    let mut events = vec![head_event(data.len(), checksum_header(0, data))];
-    events.extend(get_events(data, part_size, checksum_header));
+    object_connector_with_object_and_range_checksum_headers(
+        data,
+        part_size,
+        checksum_header(0, data),
+        checksum_header,
+    )
+}
+
+/// Replays HEAD with `object_header` and GETs with independently chosen range headers.
+///
+/// Object and response checksum scopes may differ. Requests execute with concurrency 1;
+/// their order and headers are asserted from the connector's captured requests.
+pub(super) fn object_connector_with_object_and_range_checksum_headers(
+    data: &Bytes,
+    part_size: usize,
+    object_header: Option<(&'static str, String)>,
+    range_header: impl Fn(usize, &[u8]) -> Option<(&'static str, String)>,
+) -> StaticReplayClient {
+    let mut events = vec![head_event(data.len(), object_header)];
+    events.extend(get_events(data, part_size, range_header));
     StaticReplayClient::new(events)
 }
 

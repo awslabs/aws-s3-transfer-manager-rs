@@ -8,9 +8,9 @@
 use aws_sdk_s3_transfer_manager::config::RuntimeConfig;
 use aws_sdk_s3_transfer_manager::config::{ConcurrencyMode, PartSize};
 use aws_sdk_s3_transfer_manager::types::ByteSize;
-use aws_sdk_s3_transfer_manager::types::NotValidatedReason;
+use aws_sdk_s3_transfer_manager::types::ChecksumAlgorithm;
 
-use crate::assertions::assert_not_validated;
+use crate::assertions::assert_validated;
 use crate::harness::{mock_tm, mock_tm_with, MockTm};
 use crate::test_data::deterministic_data;
 
@@ -587,7 +587,7 @@ async fn test_download_write_to_path_integrity() {
 //   (e.g. aws-smithy-checksums CRC32) for better failure output and efficiency.
 // - Add priority change tests when priority API is exposed on handles.
 
-/// Test downloading an empty (0-byte) object completes without hanging.
+/// An empty object completes and validates its stored CRC64NVME without a body.
 #[tokio::test]
 async fn test_download_empty_object() {
     let m = setup().await;
@@ -613,7 +613,7 @@ async fn test_download_empty_object() {
 
     assert_eq!(data.len(), 0);
     let output = handle.join().await.expect("join should succeed");
-    assert_not_validated(&output, NotValidatedReason::Unavailable);
+    assert_validated(&output, ChecksumAlgorithm::Crc64Nvme);
     m.handle.shutdown().await.expect("shutdown");
 }
 

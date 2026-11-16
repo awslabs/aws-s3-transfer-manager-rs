@@ -1420,15 +1420,20 @@ impl DownloadTransfer {
         completion
     }
 
-    /// Finalize a transfer whose successful completion `claim` proves: flush the tail to
-    /// disk (returning the last carrier charges as `ChunkOutput`s drop), establish the
-    /// destination length, set the terminal status, and signal waiters. A finalization
-    /// error fails the transfer with `ErrorKind::IOError` instead.
+    /// Verifies accepted checksum evidence, flushes the destination tail, establishes
+    /// its length and publishes successful completion in that order.
     ///
-    /// The state is already `Terminal`, entered when the claim was taken; this runs after
-    /// the state lock is released so disk IO never happens under it. Symmetric with
-    /// `fail`, which error paths call from `execute`.
+    /// Integrity or coverage failure skips destination finalization and publishes no
+    /// verdict. Destination failure reports `ErrorKind::IOError`. The state is already
+    /// `Terminal`; verification and disk IO run after releasing the state lock.
     fn finalize_completion(&self, claim: CompletionClaim) -> WorkOutcome {
+        let integrity_checks = match claim.finish_integrity() {
+            Ok(checks) => checks,
+            Err(error) => {
+                let guard = self.inner.state.lock().unwrap();
+                return self.fail(guard, error);
+            }
+        };
         let expected_len = *self
             .inner
             .expected_download_len
@@ -1441,7 +1446,6 @@ impl DownloadTransfer {
             let guard = self.inner.state.lock().unwrap();
             return self.fail(guard, error::Error::new(error::ErrorKind::IOError, e));
         }
-        let integrity_checks = claim.integrity().response_checks();
         let _ = self.inner.integrity_checks.set(integrity_checks);
         let state_snapshot = {
             let state = self.inner.state.lock().expect("lock poisoned");
@@ -3669,6 +3673,113 @@ mod tests {
             },
         );
         assert!(std::fs::read(dir.path().join("out")).unwrap() == object[..part_size as usize]);
+    }
+
+    /// SDK-valid ranges cannot bypass a failed stored-object CRC. Verification
+    /// must precede the destination's scripted finalize failure and publish no verdict.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn whole_object_mismatch_precedes_destination_finalization() {
+        use crate::operation::download::test_util::fixtures::{
+            crc32_object_client_with_stored_checksum, object_bytes,
+        };
+        use crate::operation::download::test_util::sink::{
+            Action, Event, Match, Op, ScriptedSinkFactory, WriteScript,
+        };
+
+        let part_size = 5 * MB;
+        let object = object_bytes(part_size as usize + 37);
+        let expected = aws_smithy_types::base64::encode(0u32.to_be_bytes());
+        let mut crc = aws_smithy_checksums::ChecksumAlgorithm::Crc32.into_impl();
+        crc.update(&object);
+        let computed = aws_smithy_types::base64::encode(crc.finalize());
+        assert_ne!(expected, computed, "the stored checksum must mismatch");
+        let script = Arc::new(WriteScript::default()).on(
+            Match::Finalize,
+            Action::Fail(std::io::ErrorKind::StorageFull),
+        );
+        let (transfer, _consumer, _dir) = disk_transfer(
+            disk_test_handle(
+                crc32_object_client_with_stored_checksum(object, None, expected.clone()),
+                part_size,
+            ),
+            &ScriptedSinkFactory(Arc::clone(&script)),
+        );
+        assert_first_range_succeeds(&transfer).await;
+        let mut last = assert_ready(transfer.poll_work());
+        assert!(matches!(
+            execute(&transfer, &mut last).await,
+            WorkOutcome::Failed { .. }
+        ));
+        let error = transfer
+            .ctx()
+            .take_error()
+            .expect("failed transfer records its error");
+        let error::ErrorKind::IntegrityError(detail) = error.kind() else {
+            panic!("whole-object mismatch must win over destination failure: {error:?}");
+        };
+        assert_eq!(
+            detail.algorithm(),
+            Some(&crate::types::ChecksumAlgorithm::Crc32)
+        );
+        assert_eq!(detail.expected(), Some(expected.as_str()));
+        assert_eq!(detail.computed(), Some(computed.as_str()));
+        assert_eq!(
+            transfer.ctx().transfer_status(),
+            crate::types::TransferStatus::Failed
+        );
+        assert!(transfer.integrity_checks().is_none());
+        assert!(!script
+            .events()
+            .iter()
+            .any(|event| matches!(event, Event::Started(Op::Finalize { .. }))));
+        assert_done(transfer.poll_work());
+    }
+
+    /// Losing one range's calculated evidence is a terminal coverage error,
+    /// even though the SDK validated every response. It must not finalize the file.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn missing_whole_object_evidence_prevents_destination_finalization() {
+        use crate::operation::download::test_util::fixtures::object_bytes;
+        use crate::operation::download::test_util::sink::{
+            Event, Op, ScriptedSinkFactory, WriteScript,
+        };
+
+        let part_size = 5 * MB;
+        let script = Arc::new(WriteScript::default());
+        let (transfer, _consumer, _dir) = disk_transfer(
+            disk_test_handle(
+                crc32_object_client(object_bytes(part_size as usize + 37), None),
+                part_size,
+            ),
+            &ScriptedSinkFactory(Arc::clone(&script)),
+        );
+        assert_first_range_succeeds(&transfer).await;
+        let mut last = assert_ready(transfer.poll_work());
+        let DownloadWork::GetObjectRange { digest_mode, .. } = last.data_mut::<DownloadWork>()
+        else {
+            panic!("last work item must be the second range");
+        };
+        *digest_mode = RangeDigestMode::None;
+        assert!(matches!(
+            execute(&transfer, &mut last).await,
+            WorkOutcome::Failed { .. }
+        ));
+        assert_eq!(
+            transfer.ctx().take_error().unwrap().kind(),
+            &error::ErrorKind::RuntimeError
+        );
+        assert_eq!(
+            transfer.ctx().transfer_status(),
+            crate::types::TransferStatus::Failed
+        );
+        assert!(transfer.integrity_checks().is_none());
+        assert!(!script
+            .events()
+            .iter()
+            .any(|event| matches!(event, Event::Started(Op::Finalize { .. }))));
+        assert_done(transfer.poll_work());
     }
 
     /// Runs a three-part disk download over `crc32_object_client` whose part

@@ -182,7 +182,9 @@ impl<'a> DownloadIoCtl<'a> {
 /// # Lifecycle
 ///
 /// **Handles should be kept until the transfer completes or is explicitly cancelled.**
-/// The recommended pattern is to consume the body and then call [`join`](Self::join):
+/// Whole-object CRC verification runs after all ranges are collected. Body
+/// bytes may reach the caller before that check finishes; [`join`](Self::join)
+/// reports its final result. Consume the body and then call `join`:
 ///
 /// ```ignore
 /// let handle = tm.download()

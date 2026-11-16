@@ -103,18 +103,34 @@ pub(crate) fn crc32_object_client(
     object: Arc<[u8]>,
     failing_start: Option<u64>,
 ) -> aws_sdk_s3::Client {
+    let mut checksum = aws_smithy_checksums::ChecksumAlgorithm::Crc32.into_impl();
+    checksum.update(&object);
+    crc32_object_client_with_stored_checksum(
+        object,
+        failing_start,
+        aws_smithy_types::base64::encode(checksum.finalize()),
+    )
+}
+
+/// Serves independently validated CRC32 ranges and reports `stored_checksum` on HEAD.
+///
+/// The stored value may disagree with the served object, while every range still
+/// passes SDK validation. The range at `failing_start`, if set, returns a server error.
+/// Panics on a request without an inclusive byte range.
+pub(crate) fn crc32_object_client_with_stored_checksum(
+    object: Arc<[u8]>,
+    failing_start: Option<u64>,
+    stored_checksum: String,
+) -> aws_sdk_s3::Client {
     use aws_smithy_mocks::MockResponse;
     use aws_smithy_runtime_api::http::{Response, StatusCode};
     use aws_smithy_types::body::SdkBody;
 
     let object_len = object.len();
-    let mut checksum = aws_smithy_checksums::ChecksumAlgorithm::Crc32.into_impl();
-    checksum.update(&object);
-    let object_checksum = aws_smithy_types::base64::encode(checksum.finalize());
     strict_range_client(
         object,
         failing_start,
-        Some(object_checksum),
+        Some(stored_checksum),
         move |start, end, body| {
             let mut crc32 = aws_smithy_checksums::ChecksumAlgorithm::Crc32.into_impl();
             crc32.update(body);

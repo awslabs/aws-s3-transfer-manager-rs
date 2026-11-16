@@ -374,14 +374,6 @@ impl DownloadIntegrity {
         })
     }
 
-    /// Returns stored object values and the verdict derived only from SDK response coverage.
-    ///
-    /// This does not verify whole-object coverage or surface latched evidence errors.
-    /// It cannot establish that a whole-object validation plan succeeded.
-    pub(super) fn response_checks(&self) -> IntegrityChecks {
-        self.checks(self.response_validation())
-    }
-
     /// Pairs `validation` with the supplied whole-object metadata's stored checksum values.
     ///
     /// A [`ChecksumType::Composite`] value is a checksum of part checksums, which a
@@ -628,18 +620,18 @@ mod tests {
     }
 
     #[test]
-    fn integrity_checks_surface_values_only_for_a_whole_object_chunk() {
+    fn integrity_checks_surface_only_whole_object_metadata() {
         let mut meta = ObjectMetadata::default();
         meta.checksum_crc32 = Some("DUoRhQ==".to_owned());
         meta.checksum_type = Some(ChecksumType::FullObject);
 
         let whole = DownloadIntegrity::new(ValidationPlan::PerResponse, Some(meta));
-        let checks = whole.response_checks();
+        let checks = whole.finish().unwrap();
         assert_eq!(checks.checksum_crc32(), Some("DUoRhQ=="));
         assert_eq!(checks.checksum_type(), Some(&ChecksumType::FullObject));
 
         let part = DownloadIntegrity::new(ValidationPlan::PerResponse, None);
-        let checks = part.response_checks();
+        let checks = part.finish().unwrap();
         assert_eq!(checks.checksum_crc32(), None);
         assert_eq!(checks.checksum_type(), None);
     }
@@ -656,8 +648,9 @@ mod tests {
         meta.checksum_sha256 = Some("uU0nuZNNPgilLlLX2n2r+sSE7+N6U4DukIj3rOLvzek=-1".to_owned());
         meta.checksum_type = Some(ChecksumType::Composite);
 
-        let checks =
-            DownloadIntegrity::new(ValidationPlan::PerResponse, Some(meta)).response_checks();
+        let checks = DownloadIntegrity::new(ValidationPlan::PerResponse, Some(meta))
+            .finish()
+            .unwrap();
         assert_eq!(checks.checksum_crc32(), None);
         assert_eq!(checks.checksum_crc32c(), None);
         assert_eq!(checks.checksum_crc64_nvme(), None);

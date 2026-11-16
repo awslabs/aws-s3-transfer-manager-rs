@@ -17,6 +17,7 @@ use test_util::retention::{
 use test_util::{
     get_first_object_connector_with_checksum_headers, head_event, object_connector,
     object_connector_with_checksum_headers,
+    object_connector_with_object_and_range_checksum_headers,
 };
 
 use aws_sdk_s3_transfer_manager::config::RuntimeConfig;
@@ -1276,20 +1277,24 @@ async fn test_integrity_checks_part_level_only_reads_composite_checksum() {
     assert_not_validated(&validation, NotValidatedReason::CompositeChecksum);
 }
 
-/// The first chunk's response carries its CRC32 and the second's only a part-level
-/// checksum: some delivered bytes were validated, so the verdict is
-/// NotValidated{PartialCoverage}.
+/// HEAD reports a COMPOSITE checksum. The first chunk's response carries its CRC32
+/// and the second's only a part-level checksum. The verdict is NotValidated{PartialCoverage}.
 #[tokio::test]
 async fn test_integrity_checks_validated_and_part_level_read_partial_coverage() {
     let part_size = ByteSize::mib(5).as_usize();
     let data = rand_data(part_size + 1024);
-    let http_client = object_connector_with_checksum_headers(&data, part_size, |index, chunk| {
-        let value = match index {
-            0 => checksum_value(aws_smithy_checksums::ChecksumAlgorithm::Crc32, chunk),
-            _ => "AAAAAA==-2".to_owned(),
-        };
-        Some(("x-amz-checksum-crc32", value))
-    });
+    let http_client = object_connector_with_object_and_range_checksum_headers(
+        &data,
+        part_size,
+        Some(("x-amz-checksum-crc32", "AAAAAA==-2".to_owned())),
+        |index, chunk| {
+            let value = match index {
+                0 => checksum_value(aws_smithy_checksums::ChecksumAlgorithm::Crc32, chunk),
+                _ => "AAAAAA==-2".to_owned(),
+            };
+            Some(("x-amz-checksum-crc32", value))
+        },
+    );
     let tm = test_tm(http_client, part_size);
 
     let validation = download_checksum_validation(&tm, Some(ChecksumMode::Enabled)).await;

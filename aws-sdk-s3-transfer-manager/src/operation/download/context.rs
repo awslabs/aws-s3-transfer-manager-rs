@@ -138,8 +138,8 @@ impl DownloadState {
         pending
     }
 
-    /// Claims successful completion when nothing is left to issue and no work is in
-    /// flight, and enters `Terminal`.
+    /// Claims completion ownership when nothing is left to issue and no work is in
+    /// flight, and enters `Terminal`. The owner must still verify integrity and finalize.
     ///
     /// Returns `Some` at most once per transfer: from `Transferring` with no range
     /// remaining, no range or memory-relief item in flight, and no pending claim,
@@ -193,9 +193,15 @@ impl DownloadState {
 pub(crate) struct CompletionClaim(Box<DownloadIntegrity>);
 
 impl CompletionClaim {
-    /// Borrows accepted range evidence without consuming or verifying it.
-    pub(super) fn integrity(&self) -> &DownloadIntegrity {
-        &self.0
+    /// Consumes accepted evidence and verifies the transfer's validation plan.
+    ///
+    /// Returns a checksum mismatch as an integrity error, or invalid or incomplete
+    /// calculated coverage as a runtime error. Call outside the state lock and
+    /// before destination finalization; neither failure permits successful completion.
+    pub(super) fn finish_integrity(
+        self,
+    ) -> Result<crate::types::IntegrityChecks, crate::error::Error> {
+        self.0.finish()
     }
 }
 
