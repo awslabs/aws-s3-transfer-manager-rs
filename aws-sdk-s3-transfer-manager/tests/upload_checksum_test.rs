@@ -1010,8 +1010,8 @@ fn helper_create_transfer_manager(
         .request_checksum_calculation(sdk_checksum_calculation);
     let tm_config = aws_sdk_s3_transfer_manager::Config::builder()
         .s3_config(test_common::s3_config_with_test_http(s3_config))
-        .part_size(PartSize::Target(PART_SIZE as u64))
-        .multipart_threshold(PartSize::Target(PART_SIZE as u64))
+        .part_size(PartSize::Target(ByteSize::new(PART_SIZE as u64)))
+        .multipart_threshold(PartSize::Target(ByteSize::new(PART_SIZE as u64)))
         .concurrency(ConcurrencyMode::Explicit(1))
         .build()
         .expect("valid config");

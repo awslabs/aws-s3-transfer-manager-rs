@@ -1467,7 +1467,7 @@ async fn test_integrity_checks_one_part_composite_has_no_object_value() {
     use aws_sdk_s3_transfer_manager::types::ChecksumType;
 
     let data = Bytes::from_static(HELLO);
-    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let part_size = ByteSize::mib(5).as_usize();
     let response = http::Response::builder()
         .status(200)
         .header("Content-Length", format!("{}", data.len()))
@@ -1596,7 +1596,7 @@ async fn test_part_one_checksum_from_part_get_is_not_an_object_value() {
 async fn test_integrity_checks_part_aligned_range_checksum_is_not_an_object_value() {
     use aws_sdk_s3_transfer_manager::types::ChecksumType;
 
-    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let part_size = ByteSize::mib(5).as_usize();
     let data = Bytes::from(vec![b'a'; 2 * part_size]);
     // CRC32 of 5 MiB of `a`: the checksum of either stored part.
     const PART_CRC32: &str = "r/zBbw==";
