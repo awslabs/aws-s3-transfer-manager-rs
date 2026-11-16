@@ -478,21 +478,6 @@ impl ByteUnit {
         bytes as f64 / self.as_bytes_u64() as f64
     }
 
-    /// Figure out the best unit to display the given number of bytes in
-    /// and return a display context with the appropriate units set
-    pub fn display(total_bytes: u64) -> ByteSizeDisplayContext {
-        let units = &[ByteUnit::Gibibyte, ByteUnit::Mebibyte, ByteUnit::Kibibyte];
-        let mut unit = ByteUnit::Byte;
-        for u in units {
-            if total_bytes >= u.as_bytes_u64() {
-                unit = *u;
-                break;
-            }
-        }
-
-        ByteSizeDisplayContext::new(total_bytes, unit)
-    }
-
     /// The number of bytes represented by this unit
     pub(crate) const fn as_bytes_u64(&self) -> u64 {
         match self {

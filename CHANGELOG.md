@@ -73,8 +73,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not supported.
 - `io::walk::WalkErrorKind` and `metrics::unit::ByteUnit` are `#[non_exhaustive]`.
 - The fields of `metrics::ThroughputDisplayContext` and `metrics::unit::ByteCountDisplayContext`
-  are private. Create them with `Throughput::display_as`, `ByteUnit::display`, or
-  `ByteCountDisplayContext::new`.
+  are private. Create them with `Throughput::display_as` or `ByteCountDisplayContext::new`.
 - `config::Builder::build` returns `Result<Config, BuildError>` and returns an error when
   `s3_config` is not set, instead of panicking.
 - The transfer manager no longer enables the `behavior-version-latest` feature of `aws-config` or
