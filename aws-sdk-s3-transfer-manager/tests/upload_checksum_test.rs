@@ -21,7 +21,7 @@ use aws_smithy_mocks::{mock, mock_client, Rule, RuleMode};
 use bytes::Bytes;
 use pin_project_lite::pin_project;
 
-const PART_SIZE: usize = ByteSize::mib(5).as_u64() as usize;
+const PART_SIZE: usize = ByteSize::mib(5).as_usize();
 
 fn calculate_checksum(algorithm: &ChecksumAlgorithm, data: &[u8]) -> String {
     let smithy_algorithm =

@@ -171,7 +171,7 @@ pub(crate) async fn assert_download_releases_destination(
     ending: Ending,
     runtime_config: RuntimeConfig,
 ) {
-    let part_size = ByteSize::mib(5).as_u64() as usize;
+    let part_size = ByteSize::mib(5).as_usize();
     let data = rand_data(2 * part_size);
     let http_client = match ending {
         // Discovery returns the first part; the second part request fails.

@@ -60,7 +60,7 @@ async fn download(
 #[tokio::test]
 async fn test_download_bound_to_loopback() {
     let m = setup(&[LOOPBACK]).await;
-    let content: Vec<u8> = (0..ByteSize::mib(12).as_u64() as usize)
+    let content: Vec<u8> = (0..ByteSize::mib(12).as_usize())
         .map(|i| (i % 251) as u8)
         .collect();
     m.server

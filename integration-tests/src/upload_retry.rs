@@ -209,7 +209,7 @@ mod server_faults {
     /// A 10 MiB object — two 5 MiB parts under `Path::Multipart`, one `PutObject`
     /// under `Path::PutObject`.
     fn upload_data() -> Vec<u8> {
-        vec![0u8; 2 * ByteSize::mib(5).as_u64() as usize]
+        vec![0u8; 2 * ByteSize::mib(5).as_usize()]
     }
 
     /// Byte offset at which `StallRequestRead` makes the mock stop reading — the

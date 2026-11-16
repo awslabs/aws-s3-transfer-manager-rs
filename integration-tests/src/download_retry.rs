@@ -57,7 +57,7 @@ const PART_SIZE: PartSize = PartSize::Target(ByteSize::new(8 * 1024 * 1024));
 /// A multipart object large enough that a fault placed mid-stream surfaces during
 /// body iteration rather than at `send()`.
 fn multipart_data() -> Vec<u8> {
-    (0..ByteSize::mib(40).as_u64() as usize)
+    (0..ByteSize::mib(40).as_usize())
         .map(|i| (i % 256) as u8)
         .collect()
 }
@@ -85,7 +85,7 @@ const BUDGET: u32 = 3;
 /// only fire against that chunk's attempts, so the number of fires maps directly
 /// to retry attempts — no ambiguity about which chunk a fire hit.
 fn single_range_chunk_data() -> Vec<u8> {
-    (0..ByteSize::mib(12).as_u64() as usize)
+    (0..ByteSize::mib(12).as_usize())
         .map(|i| (i % 256) as u8)
         .collect()
 }
@@ -469,7 +469,7 @@ async fn corrupt_body_once_is_not_retried() {
 /// checksum when uploaded with a composite checksum, so a corrupt body on it is
 /// a checksum mismatch.
 fn two_part_data() -> Vec<u8> {
-    (0..ByteSize::mib(16).as_u64() as usize)
+    (0..ByteSize::mib(16).as_usize())
         .map(|i| (i % 256) as u8)
         .collect()
 }
@@ -522,7 +522,7 @@ async fn corrupt_body_on_retry_is_not_retried() {
 /// the discovery chunk alone, so every GET after the upload is that chunk's, and
 /// each covers the whole object and carries its checksum.
 fn one_part_data() -> Vec<u8> {
-    (0..ByteSize::mib(8).as_u64() as usize)
+    (0..ByteSize::mib(8).as_usize())
         .map(|i| (i % 256) as u8)
         .collect()
 }

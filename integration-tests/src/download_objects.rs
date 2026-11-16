@@ -126,7 +126,7 @@ async fn test_download_objects_many_small_files(rt: RuntimeConfig) {
         let m = mock_tm(rt).await;
 
         let count = 500usize;
-        let size = ByteSize::kib(4).as_u64() as usize;
+        let size = ByteSize::kib(4).as_usize();
         let bucket = "test-bucket";
         let prefix = "small/";
 
@@ -172,7 +172,7 @@ async fn test_download_objects_flat_content_roundtrip() {
         let m = mock_tm(RuntimeConfig::default()).await;
 
         let count = 20usize;
-        let size = ByteSize::kib(2).as_u64() as usize;
+        let size = ByteSize::kib(2).as_usize();
         let bucket = "test-bucket";
         let prefix = "roundtrip/";
 
@@ -269,7 +269,7 @@ async fn test_download_objects_multipart_children(rt: RuntimeConfig) {
     timeout(TEST_TIMEOUT, async {
         let m = mock_tm(rt).await;
 
-        let part = ByteSize::mib(8).as_u64() as usize;
+        let part = ByteSize::mib(8).as_usize();
         let count = 3usize;
         let size = 2 * part; // 16 MiB per file -> 2 parts each
         let bucket = "test-bucket";

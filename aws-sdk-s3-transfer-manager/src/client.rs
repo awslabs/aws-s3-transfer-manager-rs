@@ -1124,7 +1124,7 @@ mod tests {
             .machine_profile(Some(crate::runtime::platform::MachineProfile {
                 instance_type: None,
                 vcpus: 4,
-                ram_bytes: Some(ByteSize::mib(512).as_u64() as usize),
+                ram_bytes: Some(ByteSize::mib(512).as_usize()),
             }))
             .build()
             .expect("valid config");

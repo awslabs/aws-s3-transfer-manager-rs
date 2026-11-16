@@ -82,7 +82,7 @@ async fn test_upload_objects_many_small_files(rt: RuntimeConfig) {
         let m = mock_tm(rt).await;
 
         let count = 500usize;
-        let size = ByteSize::kib(4).as_u64() as usize;
+        let size = ByteSize::kib(4).as_usize();
         let dataset = make_flat_dataset(count, size);
 
         let bucket = "test-bucket";
@@ -132,7 +132,7 @@ async fn test_upload_objects_flat_directory_content_roundtrip() {
         let m = setup().await;
 
         let count = 20usize;
-        let size = ByteSize::kib(2).as_u64() as usize;
+        let size = ByteSize::kib(2).as_usize();
         let dir = tempfile::tempdir().expect("tempdir");
         // Write a distinct per-index byte pattern so we can verify the
         // mapping from filename to key is correct.
@@ -224,7 +224,7 @@ async fn test_upload_objects_multipart_children(rt: RuntimeConfig) {
     timeout(TEST_TIMEOUT, async {
         let m = mock_tm(rt).await;
 
-        let part = ByteSize::mib(8).as_u64() as usize;
+        let part = ByteSize::mib(8).as_usize();
         let count = 3usize;
         let size = 2 * part; // 16 MiB per file -> 2 parts each at default 8 MiB threshold
         let dataset = make_flat_dataset(count, size);
@@ -527,7 +527,7 @@ async fn upload_objects_throttle_storm_aborts_transfer() {
         let m = setup().await;
 
         let count = 200usize;
-        let size = ByteSize::kib(4).as_u64() as usize;
+        let size = ByteSize::kib(4).as_usize();
         let dataset = make_flat_dataset(count, size);
         let bucket = "test-bucket";
         let key_prefix = "storm/";
@@ -638,7 +638,7 @@ async fn upload_objects_transient_throttle_storm_recovers() {
         let m = setup_with_concurrency(16).await;
 
         let count = 200usize;
-        let size = ByteSize::kib(4).as_u64() as usize;
+        let size = ByteSize::kib(4).as_usize();
         let dataset = make_flat_dataset(count, size);
         let bucket = "test-bucket";
 
@@ -687,7 +687,7 @@ async fn download_objects_transient_throttle_storm_recovers() {
     timeout(TEST_TIMEOUT, async {
         let m = setup_with_concurrency(16).await;
         let count = 200usize;
-        let size = ByteSize::kib(4).as_u64() as usize;
+        let size = ByteSize::kib(4).as_usize();
         let bucket = "test-bucket";
         let prefix = "recover-dl/";
 

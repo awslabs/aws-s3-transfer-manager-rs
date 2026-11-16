@@ -37,7 +37,7 @@ async fn test_mpu_upload_stores_source_bytes() {
     let m = setup().await;
 
     // 24 MiB = 3 parts at the default 8 MiB part size.
-    let content = deterministic_data(ByteSize::mib(24).as_u64() as usize);
+    let content = deterministic_data(ByteSize::mib(24).as_usize());
 
     let upload_handle = m
         .client
@@ -70,7 +70,7 @@ async fn test_mpu_upload_concurrent(rt: RuntimeConfig) {
     // default multipart threshold, so every upload is a two-part multipart upload and the
     // threshold boundary itself is covered.
     for i in 0..5 {
-        let content = deterministic_data_seeded(ByteSize::mib(16).as_u64() as usize, i);
+        let content = deterministic_data_seeded(ByteSize::mib(16).as_usize(), i);
         let key = format!("concurrent-key-{}", i);
 
         let upload_handle = m
@@ -114,14 +114,14 @@ async fn test_mpu_upload_concurrent_tokio_mt() {
 
 /// Part size for the part-order tests, set on the client so that every part but the last is
 /// exactly one part long.
-const ORDERED_PART_SIZE: usize = ByteSize::mib(5).as_u64() as usize;
+const ORDERED_PART_SIZE: usize = ByteSize::mib(5).as_usize();
 
 /// Number of parts in the part-order tests.
 const ORDERED_PART_COUNT: u64 = 8;
 
 /// Length of the last part: shorter than a part, and odd, so the object does not end on a part or
 /// power-of-two boundary.
-const LAST_PART_LEN: usize = ByteSize::mib(1).as_u64() as usize + 17;
+const LAST_PART_LEN: usize = ByteSize::mib(1).as_usize() + 17;
 
 /// Arrival order for the fixed-order test. It is not part-number order, and the short last part
 /// arrives third.

@@ -625,7 +625,7 @@ async fn test_upload_unknown_content_length_multipart() {
     let (bucket_name, _) = get_bucket_names();
     let key = generate_key("unknown-content-length-multipart");
 
-    let part_size = ByteSize::mib(8).as_u64() as usize;
+    let part_size = ByteSize::mib(8).as_usize();
     let parts = vec![
         bytes::Bytes::from(vec![b'a'; part_size]),
         bytes::Bytes::from(vec![b'b'; part_size]),
@@ -660,7 +660,7 @@ async fn test_upload_unknown_content_length_many_parts() {
 
     // 40 full parts at the 5 MiB minimum crosses the 32 default capacity. Distinct byte per
     // part so a reordering shows up as a content mismatch, not just a size match.
-    let part_size = ByteSize::mib(5).as_u64() as usize;
+    let part_size = ByteSize::mib(5).as_usize();
     let parts: Vec<bytes::Bytes> = (0..40u8)
         .map(|i| bytes::Bytes::from(vec![i; part_size]))
         .collect();
@@ -740,7 +740,7 @@ async fn test_upload_unknown_content_length_with_checksum() {
     let (bucket_name, _) = get_bucket_names();
     let key = generate_key("unknown-content-length-checksum");
 
-    let part_size = ByteSize::mib(5).as_u64() as usize;
+    let part_size = ByteSize::mib(5).as_usize();
     let (tx, rx) = tokio::sync::mpsc::channel(2);
     let handle = tm
         .upload()

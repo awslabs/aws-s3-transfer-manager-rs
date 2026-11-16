@@ -516,12 +516,11 @@ async fn run(args: Args) -> Result<(), BoxError> {
     // (in-flight plus buffered transfer data; transfers backpressure at the cap).
     if let Some(gib) = std::env::var("S3FIO_MEMORY_LIMIT")
         .ok()
-        .and_then(|v| v.parse::<usize>().ok())
+        .and_then(|v| v.parse::<u64>().ok())
     {
-        let bytes = ByteSize::gib(gib as u64).as_u64() as usize;
         tracing::info!(gib, "memory budget limit (S3FIO_MEMORY_LIMIT, GiB)");
         let pool = BufferPool::builder()
-            .memory_budget(MemoryBudgetConfig::Limit(ByteSize::new(bytes as u64)))
+            .memory_budget(MemoryBudgetConfig::Limit(ByteSize::gib(gib)))
             .build()?;
         config_loader = config_loader.memory(MemoryConfig::Explicit(pool));
     }

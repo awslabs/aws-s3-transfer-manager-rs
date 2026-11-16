@@ -38,7 +38,7 @@ impl Builder {
     pub(crate) fn new() -> Self {
         Self {
             stream: None,
-            part_size: ByteSize::mib(5).as_u64() as usize,
+            part_size: ByteSize::mib(5).as_usize(),
             direct_io: false,
             buffer_pool: None,
             metrics: None,

@@ -41,7 +41,7 @@ async fn wait_for_terminal(status_fn: impl Fn() -> TransferStatus) {
 async fn test_upload_metrics_and_status() {
     let m = setup().await;
 
-    let size = ByteSize::mib(16).as_u64() as usize;
+    let size = ByteSize::mib(16).as_usize();
     let content = vec![0u8; size];
 
     let handle = m
@@ -75,7 +75,7 @@ async fn test_upload_metrics_and_status() {
 async fn test_put_object_upload_output_reports_final_metrics() {
     let m = setup().await;
 
-    let size = ByteSize::kib(1).as_u64() as usize;
+    let size = ByteSize::kib(1).as_usize();
     let handle = m
         .client
         .upload()
@@ -101,7 +101,7 @@ async fn test_put_object_upload_output_reports_final_metrics() {
 async fn test_upload_from_file_metrics() {
     let m = setup().await;
 
-    let size = ByteSize::mib(16).as_u64() as usize;
+    let size = ByteSize::mib(16).as_usize();
     let dir = tempfile::tempdir().unwrap();
     let file_path = dir.path().join("upload_src.dat");
     std::fs::write(&file_path, vec![0u8; size]).unwrap();
@@ -134,7 +134,7 @@ async fn test_upload_from_file_metrics() {
 async fn test_download_metrics_and_status() {
     let m = setup().await;
 
-    let size = ByteSize::mib(25).as_u64() as usize;
+    let size = ByteSize::mib(25).as_usize();
     let content = vec![0u8; size];
     m.server
         .add_object("test-bucket", "metrics-download", content, None)
@@ -173,7 +173,7 @@ async fn test_download_metrics_and_status() {
 async fn test_download_to_file_metrics(rt: RuntimeConfig) {
     let m = mock_tm(rt).await;
 
-    let size = ByteSize::mib(25).as_u64() as usize;
+    let size = ByteSize::mib(25).as_usize();
     let content = vec![0u8; size];
     m.server
         .add_object("test-bucket", "metrics-file-download", content, None)
@@ -228,7 +228,7 @@ async fn test_upload_abort_metrics() {
         Occurrence::Always,
     );
 
-    let size = ByteSize::mib(16).as_u64() as usize;
+    let size = ByteSize::mib(16).as_usize();
     let content = vec![0u8; size];
 
     let handle = m
@@ -272,7 +272,7 @@ async fn test_upload_abort_metrics() {
 async fn test_download_abort_status() {
     let m = setup().await;
 
-    let size = ByteSize::mib(100).as_u64() as usize;
+    let size = ByteSize::mib(100).as_usize();
     let content = vec![0u8; size];
     m.server
         .add_object("test-bucket", "metrics-abort-download", content, None)

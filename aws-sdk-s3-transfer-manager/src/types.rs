@@ -407,6 +407,18 @@ impl ByteSize {
         self.0
     }
 
+    /// This size in bytes, as a `usize`.
+    ///
+    /// # Panics
+    ///
+    /// Panics where `usize` is narrower than 64 bits and the size does not
+    /// fit. A `MemoryBudgetConfig::Limit` that does not fit is reported as
+    /// `BufferPoolBuildError::CapacityOverflow` rather than panicking.
+    pub const fn as_usize(self) -> usize {
+        assert!(self.0 <= usize::MAX as u64, "byte count exceeds usize::MAX");
+        self.0 as usize
+    }
+
     /// This size in `unit`, as an `f64`.
     pub fn as_unit(self, unit: ByteUnit) -> f64 {
         unit.convert(self.0)
@@ -440,12 +452,6 @@ impl fmt::Display for ByteSize {
             }
         }
         fmt::Display::fmt(&self.display_as(unit), f)
-    }
-}
-
-impl From<ByteSize> for u64 {
-    fn from(size: ByteSize) -> u64 {
-        size.0
     }
 }
 

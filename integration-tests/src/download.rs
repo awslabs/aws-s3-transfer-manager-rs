@@ -45,11 +45,11 @@ async fn drain_body(
 /// Test basic download with multiple ranges and verify data integrity
 #[tokio::test]
 async fn test_download_basic() {
-    let part_size = ByteSize::mib(5).as_u64() as usize;
+    let part_size = ByteSize::mib(5).as_usize();
     let m = setup_with_part_size(part_size).await;
 
     // Create test data that spans multiple parts (12MB = 3 parts at 5MB)
-    let content: Vec<u8> = (0..ByteSize::mib(12).as_u64() as usize)
+    let content: Vec<u8> = (0..ByteSize::mib(12).as_usize())
         .map(|i| (i % 256) as u8)
         .collect();
     let expected = content.clone();
@@ -80,7 +80,7 @@ async fn test_download_basic() {
 async fn test_download_body_not_consumed() {
     let m = setup().await;
 
-    let content = vec![0u8; ByteSize::mib(16).as_u64() as usize];
+    let content = vec![0u8; ByteSize::mib(16).as_usize()];
     m.server
         .add_object("test-bucket", "test-key", content, None)
         .await
@@ -105,10 +105,10 @@ async fn test_download_body_not_consumed() {
 /// Test abort cancels in-flight work
 #[tokio::test]
 async fn test_download_abort() {
-    let part_size = ByteSize::mib(1).as_u64() as usize;
+    let part_size = ByteSize::mib(1).as_usize();
     let m = setup_with_part_size(part_size).await;
 
-    let content = vec![0u8; ByteSize::mib(25).as_u64() as usize];
+    let content = vec![0u8; ByteSize::mib(25).as_usize()];
     m.server
         .add_object("test-bucket", "test-key", content, None)
         .await
@@ -156,7 +156,7 @@ async fn test_download_not_found() {
 async fn test_download_object_meta() {
     let m = setup().await;
 
-    let content = vec![42u8; ByteSize::mib(1).as_u64() as usize];
+    let content = vec![42u8; ByteSize::mib(1).as_usize()];
     m.server
         .add_object("test-bucket", "test-key", content.clone(), None)
         .await
@@ -186,7 +186,7 @@ async fn test_download_concurrent(rt: RuntimeConfig) {
 
     // Add multiple objects directly to server
     for i in 0..5 {
-        let content: Vec<u8> = (0..ByteSize::mib(2).as_u64() as usize)
+        let content: Vec<u8> = (0..ByteSize::mib(2).as_usize())
             .map(|j| ((i + j) % 256) as u8)
             .collect();
         m.server
@@ -241,10 +241,10 @@ async fn test_download_concurrent_tokio_mt() {
 #[cfg(any(unix, windows))]
 #[tokio::test]
 async fn test_download_write_to_path() {
-    let part_size = ByteSize::mib(5).as_u64() as usize;
+    let part_size = ByteSize::mib(5).as_usize();
     let m = setup_concurrent(part_size, 8).await;
 
-    let size = ByteSize::mib(100).as_u64() as usize;
+    let size = ByteSize::mib(100).as_usize();
     let content = deterministic_data(size);
     m.server
         .add_object("test-bucket", "write-to-path-key", content.clone(), None)
@@ -284,10 +284,10 @@ async fn test_download_write_to_path() {
 #[cfg(any(unix, windows))]
 #[tokio::test]
 async fn test_download_write_to_file() {
-    let part_size = ByteSize::mib(5).as_u64() as usize;
+    let part_size = ByteSize::mib(5).as_usize();
     let m = setup_concurrent(part_size, 8).await;
 
-    let size = ByteSize::mib(50).as_u64() as usize;
+    let size = ByteSize::mib(50).as_usize();
     let content = deterministic_data(size);
     m.server
         .add_object("test-bucket", "write-to-file-key", content.clone(), None)
@@ -361,10 +361,10 @@ async fn test_download_write_to_read_only_file_fails() {
 #[cfg(any(unix, windows))]
 #[tokio::test]
 async fn test_download_write_to_path_ranged() {
-    let part_size = ByteSize::mib(5).as_u64() as usize;
+    let part_size = ByteSize::mib(5).as_usize();
     let m = setup_concurrent(part_size, 8).await;
 
-    let size = ByteSize::mib(100).as_u64() as usize;
+    let size = ByteSize::mib(100).as_usize();
     let content = deterministic_data(size);
     m.server
         .add_object("test-bucket", "ranged-key", content.clone(), None)
@@ -405,10 +405,10 @@ async fn test_download_write_to_path_ranged() {
 /// is why these assert bytes rather than sizes.
 #[tokio::test]
 async fn test_download_tail_ranges_deliver_the_tail() {
-    let part_size = ByteSize::mib(5).as_u64() as usize;
+    let part_size = ByteSize::mib(5).as_usize();
     let m = setup_concurrent(part_size, 8).await;
 
-    let size = ByteSize::mib(10).as_u64() as usize;
+    let size = ByteSize::mib(10).as_usize();
     let content = deterministic_data(size);
     m.server
         .add_object("test-bucket", "tail-key", content.clone(), None)
@@ -447,10 +447,10 @@ async fn test_download_tail_ranges_deliver_the_tail() {
 #[cfg(any(unix, windows))]
 #[tokio::test]
 async fn test_download_tail_ranges_to_files_start_at_zero() {
-    let part_size = ByteSize::mib(5).as_u64() as usize;
+    let part_size = ByteSize::mib(5).as_usize();
     let m = setup_concurrent(part_size, 8).await;
 
-    let size = ByteSize::mib(10).as_u64() as usize;
+    let size = ByteSize::mib(10).as_usize();
     let content = deterministic_data(size);
     m.server
         .add_object("test-bucket", "tail-file-key", content.clone(), None)
@@ -492,10 +492,10 @@ async fn test_download_tail_ranges_to_files_start_at_zero() {
 #[cfg(any(unix, windows))]
 #[tokio::test]
 async fn test_download_write_to_path_single_part() {
-    let part_size = ByteSize::mib(5).as_u64() as usize;
+    let part_size = ByteSize::mib(5).as_usize();
     let m = setup_concurrent(part_size, 8).await;
 
-    let size = ByteSize::mib(2).as_u64() as usize;
+    let size = ByteSize::mib(2).as_usize();
     let content = deterministic_data(size);
     m.server
         .add_object("test-bucket", "single-part-key", content.clone(), None)
@@ -528,10 +528,10 @@ async fn test_download_write_to_path_single_part() {
 #[cfg(any(unix, windows))]
 #[tokio::test]
 async fn test_download_write_to_path_integrity() {
-    let part_size = ByteSize::mib(5).as_u64() as usize;
+    let part_size = ByteSize::mib(5).as_usize();
     let m = setup_concurrent(part_size, 16).await;
 
-    let size = ByteSize::mib(100).as_u64() as usize;
+    let size = ByteSize::mib(100).as_usize();
     let content = deterministic_data(size);
     m.server
         .add_object("test-bucket", "integrity-key", content.clone(), None)
@@ -637,7 +637,7 @@ async fn test_download_slow_consumer_does_not_wedge() {
     use std::time::Duration;
     use tokio::time::timeout;
 
-    let part_size = ByteSize::mib(1).as_u64() as usize;
+    let part_size = ByteSize::mib(1).as_usize();
     // 64 parts at 1 MiB, 16-way concurrency: the issuer runs well ahead of the slow
     // in-order consumer, exercising the gate's reopen path repeatedly.
     let m = setup_concurrent(part_size, 16).await;
@@ -693,7 +693,7 @@ async fn test_download_to_disk_exceeding_read_ahead_window_does_not_wedge() {
     use std::time::Duration;
     use tokio::time::timeout;
 
-    let part_size = ByteSize::mib(5).as_u64() as usize;
+    let part_size = ByteSize::mib(5).as_usize();
     let m = setup_concurrent(part_size, 8).await;
 
     // 40 parts (200 MiB) against a window of 32 (Parts(31) → 31 speculative + 1
@@ -746,7 +746,7 @@ async fn test_download_to_disk_below_segment_window_drains_in_runs() {
     use std::time::Duration;
     use tokio::time::timeout;
 
-    let part_size = ByteSize::mib(5).as_u64() as usize;
+    let part_size = ByteSize::mib(5).as_usize();
     let m = setup_concurrent(part_size, 8).await;
 
     // 40 parts against a window of 3 (Parts(2) → 2 speculative + 1 demand), far below
@@ -806,7 +806,7 @@ async fn test_concurrent_disk_downloads_under_tight_memory_budget_do_not_wedge(r
     use std::time::Duration;
     use tokio::time::timeout;
 
-    let part_size = ByteSize::mib(5).as_u64() as usize;
+    let part_size = ByteSize::mib(5).as_usize();
     let parts_per_object = 6; // multi-part, below the 16-part drain batch
     let object_size = parts_per_object * part_size;
     let transfers = 4;
@@ -814,7 +814,7 @@ async fn test_concurrent_disk_downloads_under_tight_memory_budget_do_not_wedge(r
     // The four objects together need 120 MiB of planned demand. A 64 MiB
     // carrier-rounded pool cannot admit every part, while leaving enough room
     // for several resident parts across transfers.
-    let pool_capacity_bytes = ByteSize::mib(64).as_u64() as usize;
+    let pool_capacity_bytes = ByteSize::mib(64).as_usize();
     let pool = BufferPool::builder()
         .memory_budget(MemoryBudgetConfig::Limit(ByteSize::new(
             pool_capacity_bytes as u64,

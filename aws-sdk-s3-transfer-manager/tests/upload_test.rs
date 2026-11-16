@@ -821,7 +821,7 @@ async fn test_large_upload_part_size_bump() {
 /// size (a dropped or duplicated part). Required by SEP step 7.
 #[tokio::test]
 async fn test_complete_mpu_sends_mpu_object_size() {
-    let part_size = ByteSize::mib(5).as_u64() as usize;
+    let part_size = ByteSize::mib(5).as_usize();
     // Two full parts plus a partial one, so the total is not a part-size multiple
     // and a stale part-count-derived value would not match.
     let content_length = 2 * part_size + 1024;
@@ -905,7 +905,7 @@ async fn test_explicit_zero_byte_part_is_not_duplicated() {
 /// value must still be sent so S3 can reject a mismatched assembly.
 #[tokio::test]
 async fn test_unknown_length_mpu_object_size_is_running_sum() {
-    let part_size = ByteSize::mib(5).as_u64() as usize;
+    let part_size = ByteSize::mib(5).as_usize();
     // Deliberately not a part-size multiple, so a part-count-derived value wouldn't match.
     let total = 2 * part_size + 1024;
 
@@ -942,7 +942,7 @@ async fn test_unknown_length_mpu_object_size_is_running_sum() {
 /// `MpuObjectSize` must carry the validated bytes actually emitted, not the planning bound.
 #[tokio::test]
 async fn test_bounded_length_sends_validated_actual_size() {
-    let part_size = ByteSize::mib(5).as_u64() as usize;
+    let part_size = ByteSize::mib(5).as_usize();
     let upper = 2 * part_size;
     let actual = part_size + 1024;
 
@@ -1167,7 +1167,7 @@ async fn test_content_length_contradicting_body_fails_at_initiate() {
 /// list part 1 twice — and whichever write S3 kept last could truncate the object.
 #[tokio::test]
 async fn test_unknown_length_with_data_never_sends_empty_part() {
-    let part_size = ByteSize::mib(5).as_u64() as usize;
+    let part_size = ByteSize::mib(5).as_usize();
 
     let mock = MultipartMock::new();
     let tm = mock.tm();
@@ -1215,7 +1215,7 @@ async fn test_unknown_length_with_data_never_sends_empty_part() {
 /// final part and the transfer decides "final" from end-of-stream rather than a count.
 #[tokio::test]
 async fn test_unknown_length_forwards_full_object_checksum() {
-    let part_size = ByteSize::mib(5).as_u64() as usize;
+    let part_size = ByteSize::mib(5).as_usize();
     // Base64 of a CRC32 value; the test only checks that it is forwarded verbatim.
     let expected_checksum = "AAAAAA==";
 
@@ -1257,7 +1257,7 @@ async fn test_unknown_length_forwards_full_object_checksum() {
 /// would report `total_bytes: None` forever.
 #[tokio::test]
 async fn test_unknown_length_reports_total_bytes_after_completion() {
-    let part_size = ByteSize::mib(5).as_u64() as usize;
+    let part_size = ByteSize::mib(5).as_usize();
     let tail = 512;
     let expected = (part_size + tail) as u64;
 
@@ -1337,7 +1337,7 @@ async fn test_unknown_length_reader_error_fails_transfer() {
 #[tokio::test]
 async fn test_unknown_length_many_parts_grows_part_list() {
     // Smallest permitted part size keeps the test cheap; 40 parts crosses the 32 default.
-    let part_size = ByteSize::mib(5).as_u64() as usize;
+    let part_size = ByteSize::mib(5).as_usize();
     let num_parts = 40usize;
     let expected_total = (part_size * num_parts) as i64;
 
@@ -2037,7 +2037,7 @@ async fn test_put_object_412_surfaces_precondition_failed_code() {
 /// silently drop the header at build time).
 #[tokio::test]
 async fn test_complete_mpu_forwards_if_match() {
-    let part_size = ByteSize::mib(5).as_u64() as usize;
+    let part_size = ByteSize::mib(5).as_usize();
     let content_length = 2 * part_size;
     let expected_etag = "\"expected-etag\"";
 
@@ -2076,7 +2076,7 @@ async fn test_complete_mpu_forwards_if_match() {
 /// exercises the MPU code path (which fails at a different site than PutObject).
 #[tokio::test]
 async fn test_complete_mpu_412_surfaces_precondition_failed_code() {
-    let part_size = ByteSize::mib(5).as_u64() as usize;
+    let part_size = ByteSize::mib(5).as_usize();
     let content_length = 2 * part_size;
 
     let complete_mpu =

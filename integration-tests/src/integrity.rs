@@ -126,7 +126,7 @@ fn small() -> Vec<u8> {
 
 /// Data larger than the default part size, forcing a multipart upload.
 fn multipart_data() -> Vec<u8> {
-    (0..ByteSize::mib(20).as_u64() as usize)
+    (0..ByteSize::mib(20).as_usize())
         .map(|i| (i % 256) as u8)
         .collect()
 }
@@ -137,7 +137,7 @@ fn multipart_data() -> Vec<u8> {
 /// per-range checksum for a single-stored-part object, so the SDK validates
 /// nothing on the split chunks.
 fn large_single_put() -> Vec<u8> {
-    (0..ByteSize::mib(12).as_u64() as usize)
+    (0..ByteSize::mib(12).as_usize())
         .map(|i| (i % 256) as u8)
         .collect()
 }
@@ -419,10 +419,10 @@ async fn mpu_composite_value_matches_expected_real_gp() {
     let algorithm = ChecksumAlgorithm::Crc32;
 
     // Two parts, each >= 5 MiB (S3's minimum part size for MPU).
-    let part1: Vec<u8> = (0..ByteSize::mib(5).as_u64() as usize)
+    let part1: Vec<u8> = (0..ByteSize::mib(5).as_usize())
         .map(|i| (i % 251) as u8)
         .collect();
-    let part2: Vec<u8> = (0..ByteSize::mib(5).as_u64() as usize)
+    let part2: Vec<u8> = (0..ByteSize::mib(5).as_usize())
         .map(|i| (i % 239) as u8)
         .collect();
 
@@ -689,7 +689,7 @@ async fn file_download_round_trips_real_express() {
 const MANY_PARTS: usize = 64;
 
 fn many_part_len() -> usize {
-    MANY_PARTS * ByteSize::mib(5).as_u64() as usize
+    MANY_PARTS * ByteSize::mib(5).as_usize()
 }
 
 /// A many-part object downloaded to a file round-trips on disk. Ranges align to
@@ -828,7 +828,7 @@ async fn large_object_file_download_validates(target: Target) {
     let dir = tempfile::tempdir().expect("tempdir");
     let src = dir.path().join("src.bin");
     let dest = dir.path().join("dest.bin");
-    let total = ByteSize::gib(6).as_u64() as usize;
+    let total = ByteSize::gib(6).as_usize();
     let src_digest = write_pattern_file(&src, total);
 
     t.put_from_path(
