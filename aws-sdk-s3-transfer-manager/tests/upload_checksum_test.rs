@@ -1032,6 +1032,7 @@ fn assert_input_invalid(error: &aws_sdk_s3_transfer_manager::error::Error, expec
     assert!(cause.contains(expected_cause), "unexpected cause: {cause}");
 }
 
+// ref: RUST-1672
 #[tokio::test]
 async fn test_mpu_part_checksum_without_strategy_is_rejected() {
     // The PartStream supplies part checksums, but no ChecksumStrategy is set and the SDK's
@@ -1097,6 +1098,7 @@ async fn test_mpu_part_checksum_without_strategy_is_rejected() {
     assert_eq!(abort.num_calls(), 1);
 }
 
+// ref: RUST-1672
 #[tokio::test]
 async fn test_mpu_content_md5_is_rejected() {
     // A whole-object Content-MD5 cannot be sent with any multipart request.
@@ -1135,6 +1137,7 @@ async fn test_mpu_content_md5_is_rejected() {
     );
 }
 
+// ref: RUST-1672
 #[tokio::test]
 async fn test_put_object_content_md5_is_sent() {
     let body = Bytes::from("abcdefghijklm".as_bytes());

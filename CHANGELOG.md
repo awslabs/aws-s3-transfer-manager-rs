@@ -134,6 +134,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and then failed to be renamed onto it.
 - `aws-sdk-s3-transfer-manager`: `IntegrityError::algorithm()` now names the algorithm on a
   checksum mismatch. It was always `None`.
+- `aws-sdk-s3-transfer-manager`: an upload now fails with `ErrorKind::InputInvalid` when a checksum the
+  caller supplied cannot be sent. A `PartStream` part that carries
+  a checksum on an upload with no `ChecksumStrategy`, and a `content_md5` on a multipart upload, are
+  both rejected before any request is sent.
+- `aws-sdk-s3-transfer-manager`: a download no longer reports a checksum value that does not cover
+  the whole object.
 
 ## [release-2026-11-05]
 
