@@ -4,7 +4,7 @@
  */
 
 use crate::error::checksum_algorithm;
-use crate::model::ChecksumAlgorithm;
+use crate::model::{ChecksumAlgorithm, ChecksumType};
 use crate::operation::download::ChunkMetadata;
 use crate::types::{ChecksumValidation, IntegrityChecks, NotValidatedReason};
 use aws_smithy_observability::unit_of_work::checksums::{
@@ -106,14 +106,19 @@ impl ChecksumTally {
 
     /// The object-integrity result of the completed download: the object's checksum
     /// values from the whole-object discovery metadata, and the download's verdict.
+    ///
+    /// A [`ChecksumType::Composite`] value is a checksum of part checksums, which a
+    /// checksum over the delivered bytes does not reproduce, so its value members
+    /// are `None` and only the type is reported.
     pub(super) fn integrity_checks(&self, validation_enabled: bool) -> IntegrityChecks {
         let meta = self.whole_object_meta.as_ref();
+        let values = meta.filter(|m| m.checksum_type != Some(ChecksumType::Composite));
         IntegrityChecks::new(
-            meta.and_then(|m| m.checksum_crc32.clone()),
-            meta.and_then(|m| m.checksum_crc32_c.clone()),
-            meta.and_then(|m| m.checksum_crc64_nvme.clone()),
-            meta.and_then(|m| m.checksum_sha1.clone()),
-            meta.and_then(|m| m.checksum_sha256.clone()),
+            values.and_then(|m| m.checksum_crc32.clone()),
+            values.and_then(|m| m.checksum_crc32_c.clone()),
+            values.and_then(|m| m.checksum_crc64_nvme.clone()),
+            values.and_then(|m| m.checksum_sha1.clone()),
+            values.and_then(|m| m.checksum_sha256.clone()),
             meta.and_then(|m| m.checksum_type.clone()),
             self.checksum_validation(validation_enabled),
         )
@@ -123,7 +128,6 @@ impl ChecksumTally {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::ChecksumType;
     use aws_smithy_observability::unit_of_work::checksums::ResponseChecksumAlgorithm;
 
     fn validated(algorithm: ResponseChecksumAlgorithm) -> Option<ChecksumOutcome> {
@@ -285,5 +289,28 @@ mod tests {
         let checks = part.integrity_checks(true);
         assert_eq!(checks.checksum_crc32(), None);
         assert_eq!(checks.checksum_type(), None);
+    }
+
+    #[test]
+    fn integrity_checks_omit_composite_values_and_keep_the_type() {
+        // A one-part multipart object with a composite checksum fits in the discovery
+        // chunk, but its `-1` value is a checksum of part checksums and does not
+        // describe the delivered bytes.
+        let mut meta = ChunkMetadata::default();
+        meta.checksum_crc32 = Some("DUoRhQ==-1".to_owned());
+        meta.checksum_crc32_c = Some("yZRlqg==-1".to_owned());
+        meta.checksum_sha1 = Some("Kq5sNclPz7QV2+lfQIuc6R7oRu0=-1".to_owned());
+        meta.checksum_sha256 = Some("uU0nuZNNPgilLlLX2n2r+sSE7+N6U4DukIj3rOLvzek=-1".to_owned());
+        meta.checksum_type = Some(ChecksumType::Composite);
+
+        let mut tally = ChecksumTally::default();
+        tally.record_discovery(Some(&meta), true);
+        let checks = tally.integrity_checks(true);
+        assert_eq!(checks.checksum_crc32(), None);
+        assert_eq!(checks.checksum_crc32c(), None);
+        assert_eq!(checks.checksum_crc64_nvme(), None);
+        assert_eq!(checks.checksum_sha1(), None);
+        assert_eq!(checks.checksum_sha256(), None);
+        assert_eq!(checks.checksum_type(), Some(&ChecksumType::Composite));
     }
 }

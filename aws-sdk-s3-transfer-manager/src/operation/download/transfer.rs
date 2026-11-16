@@ -1768,52 +1768,6 @@ fn process_object_metadata(mut meta: ObjectMetadata) -> ObjectMetadata {
     meta
 }
 
-/// Build the object-integrity result for a completed download.
-///
-/// `whole_object_in_chunk` must be true only when the entire object arrived in
-/// the discovery chunk, the one case where the chunk checksum can be the object
-/// checksum. Otherwise value members and the type are left `None`.
-///
-/// A [`ChecksumType::Composite`](crate::model::ChecksumType::Composite) value is a checksum of
-/// part checksums. Its value members are left `None` and only the type is reported.
-///
-/// Validation is reported `Disabled` when not requested, else
-/// `NotValidated{Unavailable}`. `Validated{algorithm}` requires a per-response
-/// validation outcome the Rust SDK does not currently expose.
-// TODO(vnext): resolve `Validated{algorithm}` from an SDK-reported per-response
-// validation outcome once the SDK exposes one, instead of always reporting
-// NotValidated when validation is enabled.
-fn build_integrity_checks(
-    chunk_meta: Option<&ChunkMetadata>,
-    whole_object_in_chunk: bool,
-    validation_enabled: bool,
-) -> crate::types::IntegrityChecks {
-    use crate::types::{ChecksumValidation, NotValidatedReason};
-
-    let checksum_validation = if validation_enabled {
-        ChecksumValidation::NotValidated {
-            reason: NotValidatedReason::Unavailable,
-        }
-    } else {
-        ChecksumValidation::NotValidated {
-            reason: NotValidatedReason::Disabled,
-        }
-    };
-
-    // Surface checksum values only when they describe the whole object's bytes.
-    let cm = chunk_meta.filter(|_| whole_object_in_chunk);
-    let values = cm.filter(|m| m.checksum_type != Some(crate::model::ChecksumType::Composite));
-    crate::types::IntegrityChecks::new(
-        values.and_then(|m| m.checksum_crc32.clone()),
-        values.and_then(|m| m.checksum_crc32_c.clone()),
-        values.and_then(|m| m.checksum_crc64_nvme.clone()),
-        values.and_then(|m| m.checksum_sha1.clone()),
-        values.and_then(|m| m.checksum_sha256.clone()),
-        cm.and_then(|m| m.checksum_type.clone()),
-        checksum_validation,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use std::future::Future;
@@ -1826,6 +1780,7 @@ mod tests {
     use http_body_1x::{Body as HttpBody, Frame, SizeHint};
 
     use super::*;
+    use crate::model::ChecksumType;
     use crate::operation::download::sink::FileSinkFactory;
     use crate::operation::download::test_util::fixtures::{
         assert_discovery_succeeds, crc32_object_client, disk_test_handle, disk_transfer, execute,
@@ -2160,71 +2115,32 @@ mod tests {
         assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
     }
 
-    fn chunk_with_crc32(value: &str) -> ChunkMetadata {
-        let mut m = ChunkMetadata::default();
-        m.checksum_crc32 = Some(value.to_string());
-        m.checksum_type = Some(ChecksumType::FullObject);
-        m
-    }
-
     #[test]
-    fn integrity_disabled_when_validation_not_enabled() {
-        // validation_enabled=false models a WhenRequired client with no request
-        // override: no validation is attempted, so the verdict is Disabled.
-        let ic = build_integrity_checks(Some(&chunk_with_crc32("DUoRhQ==")), true, false);
-        assert_eq!(
-            *ic.checksum_validation(),
-            ChecksumValidation::NotValidated {
-                reason: NotValidatedReason::Disabled
-            }
-        );
-    }
+    fn object_metadata_clears_checksum_values_that_do_not_describe_the_object() {
+        let meta = |checksum_type, parts_count| {
+            let mut m = ObjectMetadata::default();
+            m.checksum_crc32 = Some("DUoRhQ==".to_string());
+            m.checksum_type = Some(checksum_type);
+            m.parts_count = parts_count;
+            m
+        };
 
-    #[test]
-    fn integrity_unavailable_when_enabled_pending_sdk_signal() {
-        // TODO(vnext): becomes Validated once the SDK reports a validation outcome.
-        let ic = build_integrity_checks(Some(&chunk_with_crc32("DUoRhQ==")), true, true);
-        assert_eq!(
-            *ic.checksum_validation(),
-            ChecksumValidation::NotValidated {
-                reason: NotValidatedReason::Unavailable
-            }
-        );
-    }
+        // A whole-object value, and a one-part or absent part count, are kept.
+        for parts_count in [None, Some(1)] {
+            let m = process_object_metadata(meta(ChecksumType::FullObject, parts_count));
+            assert_eq!(m.checksum_crc32(), Some("DUoRhQ=="), "{parts_count:?}");
+        }
 
-    #[test]
-    fn integrity_surfaces_value_only_for_whole_object_chunk() {
-        // Whole object in the discovery chunk -> the chunk checksum IS the object's.
-        let whole = build_integrity_checks(Some(&chunk_with_crc32("DUoRhQ==")), true, false);
-        assert_eq!(whole.checksum_crc32(), Some("DUoRhQ=="));
-        assert_eq!(whole.checksum_type(), Some(&ChecksumType::FullObject));
+        // A part of a multipart object describes the part, whatever its type.
+        let m = process_object_metadata(meta(ChecksumType::FullObject, Some(2)));
+        assert_eq!(m.checksum_crc32(), None);
+        assert_eq!(m.checksum_type(), Some(&ChecksumType::FullObject));
+        assert_eq!(m.parts_count, Some(2));
 
-        // Multipart (object did not fit in the discovery chunk) -> part-1 value is
-        // NOT surfaced as the object value.
-        let multipart = build_integrity_checks(Some(&chunk_with_crc32("DUoRhQ==")), false, false);
-        assert_eq!(multipart.checksum_crc32(), None);
-        assert_eq!(multipart.checksum_type(), None);
-    }
-
-    #[test]
-    fn integrity_omits_value_for_composite_whole_object_chunk() {
-        // A one-part multipart object with a composite checksum fits in the
-        // discovery chunk, but its `-1` value is a checksum of part checksums and
-        // does not describe the delivered bytes.
-        let mut m = ChunkMetadata::default();
-        m.checksum_crc32 = Some("DUoRhQ==-1".to_string());
-        m.checksum_crc32_c = Some("yZRlqg==-1".to_string());
-        m.checksum_sha1 = Some("Kq5sNclPz7QV2+lfQIuc6R7oRu0=-1".to_string());
-        m.checksum_sha256 = Some("uU0nuZNNPgilLlLX2n2r+sSE7+N6U4DukIj3rOLvzek=-1".to_string());
-        m.checksum_type = Some(ChecksumType::Composite);
-
-        let ic = build_integrity_checks(Some(&m), true, true);
-        assert_eq!(ic.checksum_crc32(), None);
-        assert_eq!(ic.checksum_crc32c(), None);
-        assert_eq!(ic.checksum_crc64_nvme(), None);
-        assert_eq!(ic.checksum_sha1(), None);
-        assert_eq!(ic.checksum_sha256(), None);
-        assert_eq!(ic.checksum_type(), Some(&ChecksumType::Composite));
+        // A composite value is a checksum of part checksums.
+        let m = process_object_metadata(meta(ChecksumType::Composite, None));
+        assert_eq!(m.checksum_crc32(), None);
+        assert_eq!(m.checksum_type(), Some(&ChecksumType::Composite));
     }
 
     fn create_download(object_size: u64, part_size: u64) -> DownloadTransfer {
