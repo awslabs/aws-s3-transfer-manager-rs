@@ -604,6 +604,24 @@ where
     }
 }
 
+/// Returns an integrity error carrying the algorithm and stored/calculated S3 header values.
+///
+/// `expected` and `computed` are base64 checksum encodings for the same algorithm.
+pub(crate) fn integrity_mismatch(
+    algorithm: ChecksumAlgorithm,
+    expected: String,
+    computed: String,
+) -> Error {
+    Error::new(
+        ErrorKind::IntegrityError(IntegrityError {
+            algorithm: Some(algorithm),
+            expected: Some(expected),
+            computed: Some(computed),
+        }),
+        "calculated object checksum does not match its stored value",
+    )
+}
+
 /// The [`ChecksumAlgorithm`] named like a response checksum algorithm: its variant
 /// for that name, or `Unknown` for a name it has no variant for. It maps by name so
 /// an algorithm a newer SDK validates, which observability has no variant for yet,

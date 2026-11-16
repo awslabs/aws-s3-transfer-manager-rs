@@ -18,7 +18,7 @@ use crate::sdk_v1::copy_download_input_fields_to_get_object as copy_fields_to_ge
 
 use crate::error::{self, ChunkRef, Error};
 use crate::operation::download::body::{BodySlot, BodyWriter, ChunkOutput, DrainError, Drained};
-use crate::operation::download::checksum::ChecksumTally;
+use crate::operation::download::checksum::{DownloadIntegrity, ValidationPlan};
 use crate::operation::download::context::{
     CompletionClaim, DownloadPendingReason, DownloadState, PendingClaim,
 };
@@ -844,8 +844,15 @@ impl DownloadTransfer {
         // chunk. A larger multipart object's discovery chunk carries part 1's
         // checksum, which is not the object checksum.
         let whole_object_in_chunk = input.range.is_none() && remaining.is_none();
-        let mut integrity = Box::<ChecksumTally>::default();
-        integrity.record_discovery(chunk_meta.as_ref(), whole_object_in_chunk);
+        let plan = if validation_enabled {
+            ValidationPlan::PerResponse
+        } else {
+            ValidationPlan::Disabled
+        };
+        let integrity = Box::new(DownloadIntegrity::new(
+            plan,
+            whole_object_in_chunk.then(|| object_meta.clone()),
+        ));
 
         // Notify waiters that discovery completed
         self.inner.discovery_notify.notify_waiters();
@@ -1347,7 +1354,7 @@ impl DownloadTransfer {
                     ..
                 } => {
                     if let Some((offset, len, outcome)) = completed {
-                        integrity.record(offset, len, outcome);
+                        integrity.record_response(offset, len, outcome);
                     }
                     *ranges_in_flight = ranges_in_flight.saturating_sub(1);
                     gate.release(freed);
@@ -1400,8 +1407,7 @@ impl DownloadTransfer {
             let guard = self.inner.state.lock().unwrap();
             return self.fail(guard, error::Error::new(error::ErrorKind::IOError, e));
         }
-        let validation_enabled = self.validation_enabled(&self.inner.request);
-        let integrity_checks = claim.checksum_tally().integrity_checks(validation_enabled);
+        let integrity_checks = claim.integrity().response_checks();
         let _ = self.inner.integrity_checks.set(integrity_checks);
         let state_snapshot = {
             let state = self.inner.state.lock().expect("lock poisoned");

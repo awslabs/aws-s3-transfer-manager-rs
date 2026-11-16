@@ -4,7 +4,7 @@
  */
 
 use crate::operation::download::body::BodySlot;
-use crate::operation::download::checksum::ChecksumTally;
+use crate::operation::download::checksum::DownloadIntegrity;
 use crate::runtime::buffer_pool::ReserveFuture;
 use crate::transfer::{PendingCategory, PendingCause};
 
@@ -106,10 +106,10 @@ pub(crate) enum DownloadState {
         /// capacity is granted. Dropping terminal state releases the slot and
         /// cancellation-safely removes the future from the FIFO.
         pending: Option<PendingClaim>,
-        /// Checksum facts for the verdict: set at discovery, then updated in the
-        /// critical section that retires each range. A completion claim moves them
-        /// out.
-        integrity: Box<ChecksumTally>,
+        /// Validation requirements and checksum evidence for successfully accepted ranges.
+        /// Recorded under the state lock as ranges retire, so the completion claim
+        /// owns every accepted range's evidence.
+        integrity: Box<DownloadIntegrity>,
     },
 
     /// Terminal state - transfer ended (success, failure, or cancelled)
@@ -144,7 +144,7 @@ impl DownloadState {
     ///
     /// Returns `Some` at most once per transfer: from `Transferring` with no range
     /// remaining, no range or memory-relief item in flight, and no pending claim,
-    /// after which the state is `Terminal`. The claim carries the checksum tally
+    /// after which the state is `Terminal`. The claim carries the integrity evidence
     /// out of `Transferring`. Any other state returns `None` and is left
     /// unchanged. The caller holds the state lock across the check and the
     /// transition, and finalizes the destination only after releasing it.
@@ -153,7 +153,7 @@ impl DownloadState {
     /// while its range is still in `remaining`, because `poll_work` commits a range
     /// only once its slot is ready. The pattern matches `pending: None` to state the
     /// full condition, so entering `Terminal` here never leaves a claim to cancel,
-    /// and the state is replaced directly to move the tally out.
+    /// and the state is replaced directly to move the integrity evidence out.
     pub(crate) fn try_claim_completion(&mut self) -> Option<CompletionClaim> {
         let DownloadState::Transferring {
             remaining: None,
@@ -174,8 +174,10 @@ impl DownloadState {
     }
 }
 
-/// Proof that this caller claimed successful completion under the state lock,
-/// carrying the checksum tally of every range that retired before the claim.
+/// Exclusive completion ownership after all range and destination-drain work retires.
+///
+/// Carries the integrity evidence of every successfully retired range. Taking the
+/// claim does not verify that evidence or finalize the destination.
 ///
 /// Only [`DownloadState::try_claim_completion`] constructs it; `finalize_completion`
 /// consumes it. The private field keeps code outside this module from
@@ -189,11 +191,11 @@ impl DownloadState {
 /// status and the state together under the state lock.
 #[must_use = "a completion claimed while active must be finalized after releasing the state lock"]
 #[derive(Debug)]
-pub(crate) struct CompletionClaim(Box<ChecksumTally>);
+pub(crate) struct CompletionClaim(Box<DownloadIntegrity>);
 
 impl CompletionClaim {
-    /// The checksum facts of the completed download.
-    pub(super) fn checksum_tally(&self) -> &ChecksumTally {
+    /// Borrows accepted range evidence without consuming or verifying it.
+    pub(super) fn integrity(&self) -> &DownloadIntegrity {
         &self.0
     }
 }
