@@ -1504,6 +1504,7 @@ async fn test_integrity_checks_one_part_composite_has_no_object_value() {
     );
 }
 
+// ref: RUST-1676
 /// A validated multipart download with an Auto part size re-issues discovery as
 /// `partNumber=1`. That response carries part 1's checksum with a `FULL_OBJECT`
 /// type. It describes only the part, so neither `integrity_checks()` nor
@@ -1579,6 +1580,66 @@ async fn test_part_one_checksum_from_part_get_is_not_an_object_value() {
         assert_eq!(meta.checksum_crc32, None);
         assert_eq!(meta.checksum_type, Some(ChecksumType::FullObject));
         assert_eq!(meta.parts_count, Some(2));
+    }
+}
+
+// ref: RUST-1676
+/// With an explicit part size equal to the stored part size, discovery is a ranged
+/// GET that covers exactly stored part 1, so no `partNumber` request is made and
+/// the response has no `x-amz-mp-parts-count`. A directory bucket answers a range
+/// that matches a stored part of a `FULL_OBJECT` multipart object with that part's
+/// checksum and the object's `FULL_OBJECT` type. The value describes 5 MiB of a
+/// 10 MiB object, so neither `integrity_checks()` nor `object_meta` may report it
+/// as the object's checksum.
+#[tokio::test]
+async fn test_integrity_checks_part_aligned_range_checksum_is_not_an_object_value() {
+    use aws_sdk_s3_transfer_manager::types::ChecksumType;
+
+    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let data = Bytes::from(vec![b'a'; 2 * part_size]);
+    // CRC32 of 5 MiB of `a`: the checksum of either stored part.
+    const PART_CRC32: &str = "r/zBbw==";
+    let part = |start: usize| {
+        http::Response::builder()
+            .status(206)
+            .header("Content-Length", format!("{part_size}"))
+            .header(
+                "Content-Range",
+                format!("bytes {start}-{}/{}", start + part_size - 1, data.len()),
+            )
+            .header("ETag", "\"my-etag-2\"")
+            .header("x-amz-checksum-crc32", PART_CRC32)
+            .header("x-amz-checksum-type", "FULL_OBJECT")
+            .body(SdkBody::from(data.slice(start..start + part_size)))
+            .unwrap()
+    };
+    let http_client = StaticReplayClient::new(vec![
+        ReplayEvent::new(dummy_expected_request(), part(0)),
+        ReplayEvent::new(dummy_expected_request(), part(part_size)),
+    ]);
+    let tm = test_tm(http_client.clone(), part_size);
+
+    let mut handle = tm
+        .download()
+        .bucket("test-bucket")
+        .key("test-object")
+        .initiate()
+        .unwrap();
+    assert_eq!(drain(&mut handle).await.unwrap(), data);
+    let object_meta = handle.object_meta().await.unwrap().clone();
+    let output = handle.join().await.unwrap();
+
+    let requests = http_client.actual_requests().collect::<Vec<_>>();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests.iter().all(|r| !r.uri().contains("partNumber")),
+        "an explicit part size downloads by range only"
+    );
+    assert_eq!(output.integrity_checks().checksum_crc32(), None);
+    for meta in [&object_meta, &output.object_meta] {
+        assert_eq!(meta.checksum_crc32, None);
+        assert_eq!(meta.checksum_type, Some(ChecksumType::FullObject));
+        assert_eq!(meta.parts_count, None);
     }
 }
 

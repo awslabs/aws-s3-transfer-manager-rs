@@ -191,40 +191,64 @@ async fn fluent_and_modeled_initiation_return_canonical_object_and_chunk_metadat
     }
 }
 
+/// The 7-byte object served by [`download_suffix`].
 #[cfg(any(unix, windows))]
 #[cfg(feature = "sdk-v1")]
-#[cfg_attr(miri, ignore)]
-#[tokio::test]
-async fn managed_suffix_download_preserves_head_discovery_metadata_and_absolute_range() {
+const SUFFIX_OBJECT: &[u8] = b"payload";
+
+/// What a [`download_suffix`] download produced.
+#[cfg(any(unix, windows))]
+#[cfg(feature = "sdk-v1")]
+struct SuffixDownload {
+    /// Metadata from the handle once discovery completes.
+    handle_meta: types::ObjectMetadata,
+    /// Output of the completed download.
+    output: download::DownloadOutput,
+    /// Bytes written to the destination file.
+    written: Vec<u8>,
+}
+
+/// Downloads the last `suffix_len` bytes of [`SUFFIX_OBJECT`] to a file, with the
+/// object discovered by HEAD. The mocks require the HEAD suffix range and the
+/// absolute GET range derived from it.
+#[cfg(any(unix, windows))]
+#[cfg(feature = "sdk-v1")]
+async fn download_suffix(suffix_len: u64) -> SuffixDownload {
+    let start = SUFFIX_OBJECT.len() as u64 - suffix_len;
+    let content_range = format!("bytes {start}-6/7");
     let head = mock!(aws_sdk_s3::Client::head_object)
-        .match_requests(|input| {
-            assert_eq!(input.range(), Some("bytes=-3"));
+        .match_requests(move |input| {
+            assert_eq!(input.range(), Some(format!("bytes=-{suffix_len}").as_str()));
             assert_eq!(input.version_id(), Some("version"));
             true
         })
-        .then_output(|| {
-            HeadObjectOutput::builder()
-                .content_length(3)
-                .content_range("bytes 4-6/7")
-                .e_tag("etag")
-                .checksum_sha512("head-sha512")
-                .archive_status(aws_sdk_s3::types::ArchiveStatus::ArchiveAccess)
-                .build()
+        .then_output({
+            let content_range = content_range.clone();
+            move || {
+                HeadObjectOutput::builder()
+                    .content_length(suffix_len as i64)
+                    .content_range(&content_range)
+                    .e_tag("etag")
+                    .checksum_sha512("head-sha512")
+                    .checksum_type(aws_sdk_s3::types::ChecksumType::FullObject)
+                    .archive_status(aws_sdk_s3::types::ArchiveStatus::ArchiveAccess)
+                    .build()
+            }
         });
     let get = mock!(aws_sdk_s3::Client::get_object)
-        .match_requests(|input| {
-            assert_eq!(input.range(), Some("bytes=4-6"));
+        .match_requests(move |input| {
+            assert_eq!(input.range(), Some(format!("bytes={start}-6").as_str()));
             assert_eq!(input.if_match(), Some("etag"));
             assert_eq!(input.version_id(), Some("version"));
             true
         })
-        .then_output(|| {
+        .then_output(move || {
             GetObjectOutput::builder()
-                .content_length(3)
-                .content_range("bytes 4-6/7")
+                .content_length(suffix_len as i64)
+                .content_range(&content_range)
                 .e_tag("etag")
                 .checksum_sha512("get-sha512")
-                .body(ByteStream::from_static(b"oad"))
+                .body(ByteStream::from_static(&SUFFIX_OBJECT[start as usize..]))
                 .build()
         });
     let sdk = mock_client!(aws_sdk_s3, RuleMode::Sequential, &[&head, &get]);
@@ -243,31 +267,64 @@ async fn managed_suffix_download_preserves_head_discovery_metadata_and_absolute_
         .bucket("bucket")
         .key("key")
         .version_id("version")
-        .range("bytes=-3")
+        .range(format!("bytes=-{suffix_len}"))
         .read_ahead(ReadAhead::Parts(2))
         .write_to_path(&path)
         .await
         .unwrap();
-    let metadata: &types::ObjectMetadata = handle.object_meta().await.unwrap();
-    assert_eq!(metadata.total_object_size(), 7);
-    assert_eq!(
-        metadata.archive_status(),
-        Some(&types::ArchiveStatus::ArchiveAccess)
-    );
-    assert_eq!(metadata.checksum_sha512(), Some("head-sha512"));
+    let handle_meta = handle.object_meta().await.unwrap().clone();
     let output = handle.join().await.unwrap();
-    assert_eq!(std::fs::read(path).unwrap(), b"oad");
-    assert_eq!(output.object_meta.total_object_size(), 7);
-    assert_eq!(output.object_meta.checksum_sha512(), Some("head-sha512"));
-    assert_eq!(output.metrics.total_bytes, Some(3));
-    assert_eq!(output.metrics.network_rx, 3);
+    SuffixDownload {
+        handle_meta,
+        output,
+        written: std::fs::read(path).unwrap(),
+    }
+}
+
+/// A suffix range spanning the whole object keeps the HEAD checksum value, not the
+/// body response's.
+#[cfg(any(unix, windows))]
+#[cfg(feature = "sdk-v1")]
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn managed_suffix_download_preserves_head_discovery_metadata_and_absolute_range() {
+    let download = download_suffix(7).await;
+    assert_eq!(download.written, SUFFIX_OBJECT);
+    for meta in [&download.handle_meta, &download.output.object_meta] {
+        assert_eq!(meta.total_object_size(), 7);
+        assert_eq!(
+            meta.archive_status(),
+            Some(&types::ArchiveStatus::ArchiveAccess)
+        );
+        assert_eq!(meta.checksum_type(), Some(&types::ChecksumType::FullObject));
+        assert_eq!(meta.checksum_sha512(), Some("head-sha512"));
+    }
+    assert_eq!(download.output.metrics.total_bytes, Some(7));
+    assert_eq!(download.output.metrics.network_rx, 7);
     assert!(matches!(
-        output.integrity_checks().checksum_validation(),
+        download.output.integrity_checks().checksum_validation(),
         ChecksumValidation::NotValidated {
             reason: NotValidatedReason::Disabled | NotValidatedReason::Unavailable,
             ..
         }
     ));
+}
+
+// ref: RUST-1676
+/// A suffix range covering part of the object reports that part's checksum, so the
+/// value is cleared and the checksum type is kept.
+#[cfg(any(unix, windows))]
+#[cfg(feature = "sdk-v1")]
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn managed_partial_suffix_download_clears_head_checksum_value() {
+    let download = download_suffix(3).await;
+    assert_eq!(download.written, b"oad");
+    for meta in [&download.handle_meta, &download.output.object_meta] {
+        assert_eq!(meta.total_object_size(), 7);
+        assert_eq!(meta.checksum_type(), Some(&types::ChecksumType::FullObject));
+        assert_eq!(meta.checksum_sha512(), None);
+    }
 }
 
 #[cfg(feature = "sdk-v1")]

@@ -303,10 +303,7 @@ fn validate_response_content_range(
     let response = object_meta
         .range_from_content_range()
         .ok_or_else(|| error::discovery_failed("ranged response has invalid content-range"))?;
-    let total = content_range
-        .split_once('/')
-        .filter(|(_, total)| !total.contains('/'))
-        .and_then(|(_, total)| total.parse::<u64>().ok())
+    let total = crate::http::header::parse_content_range_total(content_range)
         .filter(|total| *total > 0)
         .ok_or_else(|| error::discovery_failed("ranged response has invalid object length"))?;
 
