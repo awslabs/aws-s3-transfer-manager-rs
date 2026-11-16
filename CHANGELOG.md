@@ -105,6 +105,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   trn1n.
 
 ### Fixed
+- `InputStream::from_path` and `PathBodyBuilder::build` reject a path that does not name a regular
+  file, such as a directory, a device, a FIFO, or a Windows pipe, with `ErrorKind::InputInvalid`.
 - `PathBodyBuilder::build` without a path returns an `ErrorKind::InputInvalid` error instead of
   panicking.
 - Framework metadata set on the `SdkConfig` or S3 configuration was missing from the
