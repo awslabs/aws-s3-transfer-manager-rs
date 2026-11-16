@@ -3,8 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use crate::metrics::{unit::ByteUnit, Throughput};
 use crate::runtime::buffer_pool::BufferPool;
+use aws_smithy_types::error::operation::BuildError;
 
 pub use crate::model::builders;
 pub use crate::model::{
@@ -62,6 +62,7 @@ pub enum MemoryBudgetConfig {
     ///
     /// [`MemoryMetrics::configured_capacity_bytes`]:
     ///     crate::metrics::MemoryMetrics::configured_capacity_bytes
+    /// [`ByteUnit`]: crate::metrics::unit::ByteUnit
     Limit(usize),
 }
 
@@ -70,6 +71,9 @@ pub enum MemoryBudgetConfig {
 #[derive(Debug, Clone, Default)]
 pub enum MemoryConfig {
     /// Construct an automatically sized pool when the client is created.
+    ///
+    /// The ceiling follows [`MemoryBudgetConfig::Auto`], raised to at least
+    /// 256 MiB but not above half of detected memory.
     #[default]
     Auto,
     /// Use an existing pool.
@@ -87,13 +91,48 @@ pub enum ConcurrencyMode {
     #[default]
     Auto,
 
-    /// Explicitly configured throughput setting the client should aim for.
+    /// Concurrency sized for a network throughput target, in gigabits per second.
     ///
-    /// In this mode, concurrency is limited by attempting to hit a throughput target.
+    /// The target replaces the throughput estimated from the execution
+    /// environment. It sets the in-flight request target once, when the client
+    /// is constructed; it does not limit throughput at run time. Requests beyond
+    /// what the per-host connection cap or the payload-memory ceiling allows wait
+    /// for a connection or for memory.
     TargetThroughput(TargetThroughput),
 
     /// Explicit concurrency control
     Explicit(usize),
+}
+
+/// A network throughput target for [`ConcurrencyMode::TargetThroughput`].
+///
+/// One target currently applies to uploads and downloads alike. The value is
+/// private so that per-direction targets can be added later without breaking
+/// callers.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TargetThroughput {
+    gbps: f64,
+}
+
+impl TargetThroughput {
+    /// A target of `gbps` gigabits per second, for uploads and downloads.
+    ///
+    /// Returns an error unless `gbps` is finite and positive.
+    pub fn gbps(gbps: f64) -> Result<Self, BuildError> {
+        if gbps.is_finite() && gbps > 0.0 {
+            Ok(Self { gbps })
+        } else {
+            Err(BuildError::invalid_field(
+                "gbps",
+                format!("throughput target must be finite and positive, got {gbps}"),
+            ))
+        }
+    }
+
+    /// The target in gigabits per second.
+    pub fn as_gbps(&self) -> f64 {
+        self.gbps
+    }
 }
 
 /// How far a download may prefetch ahead of the consumer.
@@ -111,43 +150,6 @@ pub enum ReadAhead {
     /// Read ahead at most `n` parts beyond the consumer's position. `0` fetches only
     /// the part the consumer is waiting on (no speculation). Still bounded by memory.
     Parts(usize),
-}
-
-/// Throughput target(s)
-#[derive(Debug, Clone)]
-pub struct TargetThroughput {
-    download: Throughput,
-    upload: Throughput,
-}
-
-impl TargetThroughput {
-    /// Create a new target throughput in Gigabits/sec that is
-    /// the same for both uploads and downloads.
-    pub fn new_gigabits_per_sec(gbps: u64) -> Self {
-        let target = Throughput::new_bytes_per_sec(gbps * ByteUnit::Gigabit.as_bytes_u64());
-        Self::new(target, target)
-    }
-
-    // TODO: we don't actually support limiting throughput by upload/download independently (yet), it will require updates to scheduler.
-
-    /// Create a new target throughput using the given upload and download
-    /// throughputs.
-    fn new(download_target: Throughput, upload_target: Throughput) -> Self {
-        Self {
-            download: download_target,
-            upload: upload_target,
-        }
-    }
-
-    /// Get the target throughput for uploads
-    pub fn upload(&self) -> &Throughput {
-        &self.upload
-    }
-
-    /// Get the target throughput for downloads
-    pub fn download(&self) -> &Throughput {
-        &self.download
-    }
 }
 
 /// Policy for how to handle a failed multipart upload
@@ -430,43 +432,54 @@ impl IntegrityChecks {
     }
 }
 
-/// Whether the bytes delivered by a download were validated against a checksum.
+/// Whether the bytes a download delivered were validated against S3's checksums.
 ///
-/// `Validated` means the *entire* delivered object was covered by a checksum and
-/// matched. Anything short of whole-object coverage is `NotValidated` with a
-/// [`NotValidatedReason`]; there is no partial state.
+/// Validation checks the bytes as they were received from S3, not the destination
+/// they were written to. `Validated` means a response checksum covered every
+/// delivered byte, and every one of those checksums matched. Anything less is
+/// `NotValidated` with a [`NotValidatedReason`]; partial coverage is
+/// `NotValidated { reason: PartialCoverage }`, not a separate state.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChecksumValidation {
-    /// Every delivered byte was validated against a checksum and matched.
+    /// A response checksum covered every delivered byte, and every one of those
+    /// checksums matched.
     #[non_exhaustive]
     Validated {
-        /// The algorithm used to validate.
+        /// The algorithm of the checksum that covered the lowest-offset delivered bytes.
         algorithm: crate::model::ChecksumAlgorithm,
     },
-    /// No whole-object validation occurred. `reason` explains why.
+    /// Not every delivered byte was validated. `reason` says why.
     #[non_exhaustive]
     NotValidated {
-        /// Why validation did not cover the whole object.
+        /// Why not every delivered byte was validated.
         reason: NotValidatedReason,
     },
 }
 
-/// Why a download's bytes were not whole-object checksum-validated.
+/// Why not every byte a download delivered was validated.
+///
+/// When more than one reason holds, the download reports the first in this order:
+/// `Disabled`, `PartialCoverage`, `CompositeChecksum`, `UnsupportedAlgorithm`,
+/// `Unavailable`.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotValidatedReason {
-    /// Checksum validation was not enabled for the request (client
-    /// `ResponseChecksumValidation::WhenRequired` with no request override).
+    /// Validation was not enabled: the request did not set `ChecksumMode::Enabled`,
+    /// and the client's `ResponseChecksumValidation` is `WhenRequired`.
     Disabled,
-    /// The object carries only a composite (`-N`) checksum, which cannot be
-    /// validated against delivered bytes.
+    /// A response carried only a part-level checksum, a value ending in `-N` such as
+    /// a composite upload's object checksum, which cannot be checked against the
+    /// bytes the response delivered.
     CompositeChecksum,
-    /// Some delivered bytes were validated but not the whole object.
+    /// Some delivered bytes were validated, and some were not.
     PartialCoverage,
-    /// No checksum covered the delivered bytes (object has no stored checksum,
-    /// or the requested range did not align to a stored part).
+    /// No response carried a checksum that could be checked, for example because the
+    /// object has no stored checksum. Also reported when no bytes were delivered.
     Unavailable,
+    /// A response carried checksums only in algorithms the SDK does not compute,
+    /// such as MD5.
+    UnsupportedAlgorithm,
 }
 
 impl IntegrityChecks {
@@ -488,6 +501,26 @@ impl IntegrityChecks {
             checksum_sha256,
             checksum_type,
             checksum_validation,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TargetThroughput;
+
+    #[test]
+    fn target_throughput_accepts_finite_positive_gbps() {
+        for gbps in [0.5, 1.0, 200.0] {
+            let target = TargetThroughput::gbps(gbps).unwrap();
+            assert_eq!(target.as_gbps(), gbps);
+        }
+    }
+
+    #[test]
+    fn target_throughput_rejects_values_that_are_not_a_rate() {
+        for gbps in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(TargetThroughput::gbps(gbps).is_err(), "gbps {gbps}");
         }
     }
 }

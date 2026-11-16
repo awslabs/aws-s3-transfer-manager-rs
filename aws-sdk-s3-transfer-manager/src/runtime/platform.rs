@@ -19,6 +19,13 @@ use std::path::{Path, PathBuf};
 /// in-flight connection.
 const POOL_FD_BUDGET_FRACTION: f64 = 0.5;
 
+/// Descriptors withheld from the connection budget for non-connection use.
+///
+/// That use (stdio, resolver sockets, logging, open transfer files) does not
+/// scale with the soft limit, so below twice this value the reserve, not
+/// [`POOL_FD_BUDGET_FRACTION`], bounds the budget.
+const POOL_FD_RESERVE: usize = 64;
+
 /// Ceiling on connections to one origin across all managed threads.
 ///
 /// Above every concurrency target outside the largest accelerator families,
@@ -53,8 +60,10 @@ impl ConnectionCap {
         Self::from_descriptor_limit(descriptor_limit())
     }
 
-    /// `clamp(soft × POOL_FD_BUDGET_FRACTION, MIN_CONNECTIONS_PER_HOST,
-    /// MAX_CONNECTIONS_PER_HOST)`, or the ceiling when no limit is known.
+    /// `clamp(min(soft × POOL_FD_BUDGET_FRACTION, soft - POOL_FD_RESERVE),
+    /// MIN_CONNECTIONS_PER_HOST, MAX_CONNECTIONS_PER_HOST)`, or the ceiling when
+    /// no limit is known. The floor applies even when the reserve exceeds the
+    /// soft limit.
     pub(crate) fn from_descriptor_limit(descriptors: Option<DescriptorLimit>) -> Self {
         let max_per_host = descriptors
             .map_or(MAX_CONNECTIONS_PER_HOST, |limit| {
@@ -75,7 +84,8 @@ impl ConnectionCap {
 
 /// Connections the descriptor budget allows for a soft limit.
 fn descriptor_budget(soft: usize) -> usize {
-    (soft as f64 * POOL_FD_BUDGET_FRACTION) as usize
+    let fraction = (soft as f64 * POOL_FD_BUDGET_FRACTION) as usize;
+    fraction.min(soft.saturating_sub(POOL_FD_RESERVE))
 }
 
 /// `RLIMIT_NOFILE` on Unix; `None` where there is no descriptor limit or
@@ -367,11 +377,11 @@ fn walk_paths(mount: &str, cgroup_path: &str, filename: &str) -> Vec<PathBuf> {
 // ---------------------------------------------------------------------------
 // Concurrency seeding
 //
-// Resolves `ConcurrencyMode::Auto` (and `TargetThroughput`) to a fixed in-flight
-// request target. The target is derived from an estimate of the machine's
-// network bandwidth: recognized EC2 instance families map to a per-vCPU Gbps rate
-// (NIC bandwidth scales linearly with vCPU count within a family), and
-// `target = ceil(gbps / GBPS_PER_CONN)`.
+// Resolves `ConcurrencyMode::Auto` and a configured throughput target to a
+// fixed in-flight request target. The target is derived from an estimate of the
+// machine's network bandwidth: recognized EC2 instance families map to a
+// per-vCPU Gbps rate (NIC bandwidth scales linearly with vCPU count within a
+// family), and `target = ceil(gbps / GBPS_PER_CONN)`.
 //
 // `N` is target *in-flight work* (the scheduler's `poll_work` gate). The
 // connection pool is capped separately, per host (`ConnectionCap`).
@@ -385,7 +395,7 @@ const MAX_CONCURRENCY_SEED: usize = 10_000;
 
 /// Assumed goodput per in-flight request, in Gbps. Matches CRT's per-connection
 /// figure (`100 / 250`).
-pub(crate) const GBPS_PER_CONN: f64 = 0.4;
+const GBPS_PER_CONN: f64 = 0.4;
 
 /// In-flight requests per vCPU for the fallback seed, used when the instance
 /// family is unknown (unrecognized type, or detection failed / off-EC2). Without
@@ -404,6 +414,9 @@ const FALLBACK_MIN: usize = 32;
 
 /// Peak network bandwidth of each EC2 instance family, as the raw spec of its
 /// largest member: `(family, max_nic_gbps, vcpus_at_that_size)`.
+///
+/// For multi-card families the figure is one card's bandwidth, since the
+/// client uses one card unless network interfaces are configured.
 ///
 /// There is no formula for a family's bandwidth — it is assigned per hardware
 /// generation and read from the published EC2 network-performance spec (e.g.
@@ -424,14 +437,16 @@ const FALLBACK_MIN: usize = 32;
 /// families are excluded so we never seed off a burst ceiling.
 const FAMILY_NIC_GBPS: &[(&str, f64, u32)] = &[
     // Ultra-high (GPU / ML training / inference accelerators)
-    ("p6-b300", 6400.0, 192),
-    ("p5", 3200.0, 192),
-    ("p5en", 3200.0, 192),
-    ("p6-b200", 3200.0, 192),
-    ("trn1n", 1600.0, 128),
+    // Multi-card: one card's bandwidth.
+    ("p6-b300", 350.0, 192),
+    ("p5", 400.0, 192),
+    ("p5en", 100.0, 192),
+    ("p5e", 100.0, 192),
+    ("p6-b200", 200.0, 192),
+    ("trn1n", 800.0, 128),
     ("p6e-gb200", 1700.0, 144),
     ("g7e", 1600.0, 192),
-    ("trn1", 800.0, 128),
+    ("trn1", 600.0, 128),
     ("dl1", 400.0, 96),
     ("p4d", 400.0, 96),
     ("p4de", 400.0, 96),
@@ -476,6 +491,19 @@ const FAMILY_NIC_GBPS: &[(&str, f64, u32)] = &[
     ("f2", 100.0, 192),
     ("i7ie", 100.0, 192),
     ("inf2", 100.0, 192),
+    // Above 1 Gbps per vCPU, which the vCPU fallback would under-seed.
+    ("m5n", 100.0, 96),
+    ("m5dn", 100.0, 96),
+    ("r5n", 100.0, 96),
+    ("r5dn", 100.0, 96),
+    ("m5zn", 100.0, 48),
+    ("x2iezn", 100.0, 48),
+    ("d3en", 75.0, 48),
+    ("is4gen", 50.0, 32),
+    ("d3", 25.0, 32),
+    ("c8ine", 75.0, 48),
+    ("g4dn", 100.0, 96),
+    ("g6e", 400.0, 192),
 ];
 
 /// Machine facts detected once, off the client-construction hot path (in the
@@ -613,15 +641,6 @@ pub(crate) enum AutoConcurrencySource {
     VcpuFallback,
 }
 
-impl AutoConcurrencySource {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::InstanceFamily => "instance_family",
-            Self::VcpuFallback => "vcpu_fallback",
-        }
-    }
-}
-
 /// Result of resolving automatic concurrency from one detected machine profile.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct ResolvedAutoConcurrency {
@@ -673,10 +692,29 @@ mod tests {
 
     #[test]
     fn test_cap_low_descriptor_limit_is_floored() {
-        // 8 descriptors -> 4 by fraction -> floored.
+        // 8 descriptors: below the reserve, so the budget is zero and the floor
+        // sets the cap.
         let cap = ConnectionCap::from_descriptor_limit(soft(8));
         assert_eq!(cap.max_per_host, MIN_CONNECTIONS_PER_HOST);
         assert!(cap.limited_by_descriptors());
+    }
+
+    #[test]
+    fn test_cap_reserve_binds_below_twice_the_reserve() {
+        // 100 descriptors: the fraction allows 50 and the reserve leaves 36.
+        assert_eq!(
+            ConnectionCap::from_descriptor_limit(soft(100)).max_per_host,
+            36
+        );
+    }
+
+    #[test]
+    fn test_cap_reserve_does_not_bind_above_twice_the_reserve() {
+        // 160 descriptors: the fraction allows 80 and the reserve leaves 96.
+        assert_eq!(
+            ConnectionCap::from_descriptor_limit(soft(160)).max_per_host,
+            80
+        );
     }
 
     #[test]
@@ -759,6 +797,9 @@ mod tests {
         assert!((MIN_CONNECTIONS_PER_HOST..=MAX_CONNECTIONS_PER_HOST).contains(&cap.max_per_host));
     }
 
+    // The test value represents a 64 GiB host (65_536_000 kB × 1024), which
+    // does not fit a 32-bit `usize`.
+    #[cfg(target_pointer_width = "64")]
     #[test]
     fn test_parse_meminfo_total() {
         let s = "MemFree: 100 kB\nMemTotal:    65536000 kB\nBuffers: 5 kB\n";
@@ -775,6 +816,9 @@ mod tests {
         assert_eq!(parse_cgroup_limit("max\n"), None);
     }
 
+    // 2^32 does not fit a 32-bit `usize`; the > u32 value is only meaningful
+    // on 64-bit platforms.
+    #[cfg(target_pointer_width = "64")]
     #[test]
     fn test_parse_cgroup_value() {
         assert_eq!(parse_cgroup_limit("4294967296\n"), Some(4_294_967_296));
@@ -855,7 +899,14 @@ mod tests {
         const GIB: usize = 1024 * 1024 * 1024;
 
         // The detected machine has at least 1 GiB; guards the platform syscall.
-        assert!(available_ram().expect("RAM detected") >= GIB);
+        // On 32-bit, `parse_meminfo_total` returns `None` when the host has
+        // more than ~4 GiB RAM because `MemTotal` kB × 1024 overflows
+        // `usize`; `None` is only accepted there.
+        match available_ram() {
+            Some(bytes) => assert!(bytes >= GIB),
+            None if cfg!(target_pointer_width = "32") => {}
+            None => panic!("available_ram must detect RAM on a supported 64-bit platform"),
+        }
     }
 
     // --- concurrency seeding ---
@@ -899,7 +950,6 @@ mod tests {
                 source: AutoConcurrencySource::InstanceFamily,
             }
         );
-        assert_eq!(resolved.source.as_str(), "instance_family");
     }
 
     #[test]
@@ -913,7 +963,6 @@ mod tests {
                 source: AutoConcurrencySource::VcpuFallback,
             }
         );
-        assert_eq!(resolved.source.as_str(), "vcpu_fallback");
     }
 
     #[test]
@@ -932,9 +981,9 @@ mod tests {
         // distinct from BOTH the clamp ceiling and the fallback, so the test
         // fails if the hyphenated key stops matching (falling through to
         // fallback) rather than passing via a coincident clamp.
-        // p6-b300 = 6400/192 = 33.333 Gbps/vCPU. At 24 vCPU: 800 Gbps ->
-        // ceil(800/0.4) = 2000. Fallback would be 5*24 = 120. Distinct.
-        assert_eq!(auto_concurrency_seed(Some("p6-b300.6xlarge"), 24), 2000);
+        // p6-b300 = 350/192 Gbps/vCPU. At 24 vCPU: 43.75 Gbps ->
+        // ceil(43.75/0.4) = 110. Fallback would be 5*24 = 120. Distinct.
+        assert_eq!(auto_concurrency_seed(Some("p6-b300.6xlarge"), 24), 110);
         assert_ne!(
             auto_concurrency_seed(Some("p6-b300.6xlarge"), 24),
             FALLBACK_INFLIGHT_PER_VCPU * 24

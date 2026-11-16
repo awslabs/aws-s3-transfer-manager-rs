@@ -44,6 +44,7 @@ jobs:
       - clippy
       - docs
       - minrust
+      - sdk-floor
       - check-external-types
       - check-deny
       - sanitizers
@@ -210,6 +211,7 @@ jobs:
       - freebsd
       - android
       - wasm32-wasi
+      - linux-i686
       - e2e
     steps:
       - name: Verify platform results
@@ -268,6 +270,44 @@ jobs:
           fi
           cargo nextest run --locked --workspace --all-features --no-fail-fast "${nextest_args[@]}"
           cargo test --locked --doc --workspace --all-features --no-fail-fast
+
+  linux-i686:
+    # 32-bit x86 target via multilib on x86_64 runner.
+    name: Linux i686 GNU
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    needs: basics
+    env:
+      CARGO_BUILD_TARGET: i686-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install 32-bit toolchain
+        # gcc-multilib provides the i686 C runtime and linker shims the Rust
+        # target needs; libssl-dev:i386 is required by crates that link
+        # OpenSSL (aws-lc-sys, openssl-sys) when built for 32-bit.
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y gcc-multilib g++-multilib libssl-dev:i386 pkg-config
+      - name: Install Rust ${{ env.rust_stable }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.rust_stable }}
+          targets: i686-unknown-linux-gnu
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: i686-unknown-linux-gnu
+      - name: Clippy (library and tests)
+        run: |
+          cargo clippy --locked -p aws-sdk-s3-transfer-manager --all-targets --no-deps
+      - name: Transfer-manager unit and integration tests
+        run: |
+          cargo test --locked -p aws-sdk-s3-transfer-manager --lib
+          cargo test --locked -p aws-sdk-s3-transfer-manager --tests
+      - name: Mock-server integration tests
+        run: |
+          cargo test --locked -p integration-tests
 
   e2e:
     name: E2E (${{ matrix.name }})
@@ -596,6 +636,43 @@ jobs:
         env:
           RUSTFLAGS: "" # remove -Dwarnings
 
+  sdk-floor:
+    # Every other job builds the lockfile's aws-sdk-s3, which can be newer than
+    # the minimum the transfer manager's manifest accepts.
+    name: aws-sdk-s3 minimum version
+    needs: basics
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust ${{ env.rust_stable }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.rust_stable }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Resolve aws-sdk-s3 to the declared minimum
+        run: |
+          floor=$(cargo metadata --format-version 1 --no-deps | jq -er '
+            [.packages[] | select(.name == "aws-sdk-s3-transfer-manager")
+              | .dependencies[] | select(.name == "aws-sdk-s3" and .kind == null) | .req]
+            | unique
+            | if length == 1 then .[0] | ltrimstr("^")
+              else error("conflicting aws-sdk-s3 requirements") end')
+          cargo update -p aws-sdk-s3 --precise "$floor"
+      - name: check --workspace
+        run: cargo check --workspace --all-features --tests
+      # A floor that compiles can still lack the SDK's checksum outcome, which these
+      # tests read. A filter that matches no test exits 0, so require a pass.
+      - name: checksum verdict tests
+        run: |
+          out=$(cargo test -p aws-sdk-s3-transfer-manager --all-features --test download_test \
+            -- test_integrity_checks 2>&1) || { echo "$out"; exit 1; }
+          echo "$out"
+          if ! grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$out"; then
+            echo "no checksum verdict test ran" >&2
+            exit 1
+          fi
+
   freebsd:
     name: FreeBSD 14.4
     runs-on: ubuntu-24.04
@@ -880,7 +957,7 @@ jobs:
         run: |
           cargo miri test -p aws-sdk-s3-transfer-manager --lib
         env:
-          MIRIFLAGS: -Zmiri-disable-isolation -Zmiri-strict-provenance
+          MIRIFLAGS: -Zmiri-disable-isolation -Zmiri-strict-provenance -Zmiri-recursive-validation
           RUSTFLAGS: -Dwarnings -Adeprecated
 
   loom:

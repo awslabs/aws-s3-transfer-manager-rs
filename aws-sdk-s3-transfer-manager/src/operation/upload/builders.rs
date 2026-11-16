@@ -5,6 +5,8 @@
 
 use std::sync::Arc;
 
+use crate::telemetry::TARGET_TRANSFER_UPLOAD;
+
 use super::{UploadHandle, UploadInputBuilder};
 
 /// Fluent builder for constructing a single object upload transfer.
@@ -26,7 +28,7 @@ impl UploadFluentBuilder {
     }
 
     /// Initiate an upload transfer for a single object.
-    #[tracing::instrument(skip_all, level = "debug", name = "initiate-upload", fields(
+    #[tracing::instrument(skip_all, level = "debug", target = TARGET_TRANSFER_UPLOAD, name = "initiate-upload", fields(
         bucket = self.inner.get_bucket().as_deref().unwrap_or_default(),
         key = self.inner.get_key().as_deref().unwrap_or_default(),
     ))]

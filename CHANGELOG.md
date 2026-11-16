@@ -23,6 +23,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   under `FailedMultipartUploadPolicy::Retain`, when AbortMultipartUpload failed, or when a worker
   panic, such as one in the caller's `PartStream`, failed the upload after the multipart upload
   was created. It is `None` when the multipart upload was aborted.
+- Client construction logs one `INFO` record of the resolved sizing (concurrency target and the
+  signal it came from, memory ceiling, part size, connection cap), a `WARN` when the part size
+  exceeds the memory ceiling, and a `WARN` when the soft file-descriptor limit holds connections
+  per host below the concurrency target.
+- `aws-sdk-s3-transfer-manager`: downloads report `ChecksumValidation::Validated` when a response
+  checksum covered every delivered byte and every one of those checksums matched.
+  `IntegrityChecks::checksum_validation` previously never reported `Validated`.
+- `aws-sdk-s3-transfer-manager`: `NotValidatedReason::UnsupportedAlgorithm`, reported when a
+  download's responses carried checksums only in algorithms the SDK does not compute, such as MD5.
 
 ### Changed
 - `aws-sdk-s3-transfer-manager`, `aws-sdk-s3-transfer-manager-ext`, `aws-smithy-topology`,
@@ -74,6 +83,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `photos/`, the key `photos/a.txt` was written to `<dest>/a.txt` and is now written to
   `<dest>/photos/a.txt`. A prefix that ends partway through a name no longer cuts it: with the
   prefix `photos`, the key `photos-other/x.txt` was written to `<dest>/-other/x.txt`.
+- `TargetThroughput::gbps` replaces `new_gigabits_per_sec`. It takes an `f64` instead of a `u64`,
+  so targets below 1 Gbps can be expressed, and returns `Result<TargetThroughput, BuildError>`,
+  rejecting a value that is not finite and positive.
+- `TargetThroughput` holds one target for uploads and downloads. `upload()` and `download()` are
+  replaced by `as_gbps()`.
+- The concurrency target, payload-memory ceiling, part size, and connection cap are resolved
+  together at client construction. The concurrency target is not lowered by the memory ceiling
+  or the connection cap: requests beyond either wait for memory admission or a connection.
+- The automatic part size is 8 MiB for both uploads and downloads. Downloads previously used
+  5 MiB, so objects larger than 5 MiB and up to 8 MiB now download with a single GET.
+- The per-host connection cap's descriptor budget is the smaller of half the soft
+  `RLIMIT_NOFILE` and the soft limit less 64 descriptors, so it binds only below a soft limit
+  of 128.
+- The automatic memory ceiling for a client is at least 256 MiB, limited to half of detected
+  memory. `BufferPool` built with `MemoryBudgetConfig::Auto` directly is unchanged.
+- `aws-sdk-s3-transfer-manager`: the minimum `aws-sdk-s3` is now 1.158.0, the first release that
+  reports the response checksum outcome the verdict is built from.
+- The bandwidth table adds m5n, m5dn, r5n, r5dn, m5zn, x2iezn, d3, d3en, is4gen, c8ine, g4dn
+  and g6e, and uses one network card's bandwidth for p5, p5e, p5en, p6-b200, p6-b300, trn1 and
+  trn1n.
 
 ### Fixed
 - `PathBodyBuilder::build` without a path returns an `ErrorKind::InputInvalid` error instead of
@@ -101,6 +130,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `.`, `./`, or `a/..`, with `ErrorKind::InputInvalid` before creating any file or requesting the
   object. Such an object was previously downloaded to a temporary file beside the destination
   and then failed to be renamed onto it.
+- `aws-sdk-s3-transfer-manager`: `IntegrityError::algorithm()` now names the algorithm on a
+  checksum mismatch. It was always `None`.
 
 ## [release-2026-11-05]
 
