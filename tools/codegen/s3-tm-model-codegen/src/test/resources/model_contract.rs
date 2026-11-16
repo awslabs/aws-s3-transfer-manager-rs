@@ -2,7 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use aws_smithy_types::DateTime;
-use s3_tm_model::model::{builders::DownloadInputBuilder, ChecksumAlgorithm, ChecksumType, ChunkMetadata, DownloadInput, Object, ObjectMetadata, ObjectStorageClass, Owner, RestoreStatus, StorageClass, UploadInput, UploadOutput,};
+use s3_tm_model::model::{
+    builders::DownloadInputBuilder, ChecksumAlgorithm, ChecksumType, ChunkMetadata, DownloadInput,
+    Object, ObjectMetadata, ObjectStorageClass, Owner, RestoreStatus, StorageClass, UploadInput,
+    UploadOutput,
+};
 
 #[test]
 fn enums_preserve_known_and_unknown_wire_values() {

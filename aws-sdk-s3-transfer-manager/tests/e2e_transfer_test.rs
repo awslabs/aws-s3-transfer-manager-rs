@@ -12,7 +12,7 @@ use aws_sdk_s3::types::ChecksumMode;
 use aws_sdk_s3_transfer_manager::config::PartSize;
 use aws_sdk_s3_transfer_manager::io::{InputStream, PartData, PartStream, SizeHint, StreamContext};
 use aws_sdk_s3_transfer_manager::operation::upload::ChecksumStrategy;
-use aws_sdk_s3_transfer_manager::types::{ByteSize, ByteUnit};
+use aws_sdk_s3_transfer_manager::types::ByteSize;
 use aws_smithy_runtime::test_util::capture_test_logs::show_test_logs;
 use std::pin::Pin;
 use std::task::Poll;

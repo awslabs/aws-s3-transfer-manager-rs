@@ -8,7 +8,9 @@
 //! Inputs describe resolved dependencies. Published requirements are authoritative:
 //! editing a manifest cannot repair the registry metadata of an occupied version.
 
-use super::registry::{DependencyKind, PublishedDependency, PublishedVersion as PublishedCrateVersion,};
+use super::registry::{
+    DependencyKind, PublishedDependency, PublishedVersion as PublishedCrateVersion,
+};
 use super::workspace::DependencyEdge;
 use anyhow::{Context, Error, Result, anyhow};
 use semver::{Version, VersionReq};
@@ -201,7 +203,9 @@ pub(super) fn stale_requirements_error(
 
 #[cfg(test)]
 mod test {
-    use super::super::registry::{DependencyKind, PublishedDependency, PublishedVersion as PublishedCrateVersion,};
+    use super::super::registry::{
+        DependencyKind, PublishedDependency, PublishedVersion as PublishedCrateVersion,
+    };
     use super::super::workspace::DependencyEdge;
     use super::{StaleRequirement, stale_requirements, stale_requirements_error};
     use semver::Version;

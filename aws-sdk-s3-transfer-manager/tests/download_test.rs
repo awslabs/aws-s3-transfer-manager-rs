@@ -8,7 +8,6 @@ mod common;
 mod test_util;
 
 #[cfg(unix)]
-use aws_sdk_s3_transfer_manager::types::ByteSize;
 use test_util::retention::await_shutdown;
 #[cfg(any(unix, windows))]
 use test_util::retention::{
@@ -18,6 +17,7 @@ use test_util::retention::{
 use test_util::{object_connector, object_connector_with_checksum_headers};
 
 use aws_sdk_s3_transfer_manager::config::RuntimeConfig;
+use aws_sdk_s3_transfer_manager::types::ByteSize;
 use aws_sdk_s3_transfer_manager::{
     error::{BoxError, ErrorKind},
     types::{
