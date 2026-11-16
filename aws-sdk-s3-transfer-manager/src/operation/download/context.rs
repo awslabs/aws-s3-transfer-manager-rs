@@ -67,8 +67,8 @@ impl std::fmt::Debug for PendingClaim {
 /// that uncounts the last one with nothing left to issue (discovery itself,
 /// for an object with no ranges) claims completion with
 /// [`try_claim_completion`](Self::try_claim_completion) under the state lock
-/// and finalizes the destination after releasing it. `poll_work` issues work
-/// and parks; it never completes a transfer. Failure can be claimed from any
+/// and verifies integrity before finalizing the destination after releasing it.
+/// `poll_work` issues work and parks; it never completes a transfer. Failure can be claimed from any
 /// path, through the transfer's `fail`.
 #[derive(Debug)]
 pub(crate) enum DownloadState {

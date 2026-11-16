@@ -1498,15 +1498,35 @@ async fn test_integrity_checks_surfaces_whole_object_checksum() {
     );
 }
 
-/// A one-part multipart object with a composite checksum fits in the discovery
-/// response. Its `-1` value is a checksum of part checksum. Neither integrity_checks
-/// and object_meta should reports it; both keep the checksum type.
+/// A checksum-mode HEAD response for `len` bytes with `etag` and `headers`.
+fn head_with_headers(len: usize, etag: &str, headers: &[(&str, &str)]) -> ReplayEvent {
+    let mut response = http::Response::builder()
+        .status(200)
+        .header("Content-Length", len.to_string())
+        .header("ETag", etag);
+    for (name, value) in headers {
+        response = response.header(*name, *value);
+    }
+    ReplayEvent::new(
+        dummy_expected_request(),
+        response.body(SdkBody::empty()).unwrap(),
+    )
+}
+
+/// A one-part multipart object with a composite checksum: HEAD reports its `-1`
+/// value, a checksum of part checksums. Neither `integrity_checks()` nor
+/// `object_meta` reports the value; both keep the checksum type.
 #[tokio::test]
 async fn test_integrity_checks_one_part_composite_has_no_object_value() {
     use aws_sdk_s3_transfer_manager::types::ChecksumType;
 
     let data = Bytes::from_static(HELLO);
     let part_size = ByteSize::mib(5).as_usize();
+    let composite = [
+        ("x-amz-checksum-crc32", "AAAAAA==-1"),
+        ("x-amz-checksum-type", "COMPOSITE"),
+    ];
+    let head = head_with_headers(data.len(), "\"my-etag-1\"", &composite);
     let response = http::Response::builder()
         .status(200)
         .header("Content-Length", format!("{}", data.len()))
@@ -1519,8 +1539,10 @@ async fn test_integrity_checks_one_part_composite_has_no_object_value() {
         .header("x-amz-checksum-type", "COMPOSITE")
         .body(SdkBody::from(data.clone()))
         .unwrap();
-    let http_client =
-        StaticReplayClient::new(vec![ReplayEvent::new(dummy_expected_request(), response)]);
+    let http_client = StaticReplayClient::new(vec![
+        head,
+        ReplayEvent::new(dummy_expected_request(), response),
+    ]);
     let tm = test_tm(http_client, part_size);
 
     let mut handle = tm
@@ -1545,10 +1567,11 @@ async fn test_integrity_checks_one_part_composite_has_no_object_value() {
 }
 
 // ref: RUST-1676
-/// A validated multipart download with an Auto part size re-issues discovery as
-/// `partNumber=1`. That response carries part 1's checksum with a `FULL_OBJECT`
-/// type. It describes only the part, so neither `integrity_checks()` nor
-/// `object_meta()` reports it as the object's checksum.
+/// A validated download of a COMPOSITE multipart object with an Auto part size
+/// fetches stored part 1 by `partNumber=1` to learn the part size. That response
+/// carries part 1's checksum. It describes only the part, so neither
+/// `integrity_checks()` nor `object_meta()` reports it as the object's checksum;
+/// both report HEAD's COMPOSITE type and no value.
 #[tokio::test]
 async fn test_part_one_checksum_from_part_get_is_not_an_object_value() {
     use aws_sdk_s3_transfer_manager::types::ChecksumType;
@@ -1558,18 +1581,19 @@ async fn test_part_one_checksum_from_part_get_is_not_an_object_value() {
     let data = Bytes::from_static(b"helloworld");
     let response = |range: &str, body: &'static [u8]| {
         http::Response::builder()
-            .status(200)
+            .status(206)
             .header("Content-Length", format!("{}", body.len()))
             .header("Content-Range", format!("bytes {range}/{}", data.len()))
             .header("ETag", "\"my-etag-2\"")
     };
     let http_client = StaticReplayClient::new(vec![
-        // Ranged discovery: the whole object, with a two-part ETag.
-        ReplayEvent::new(
-            dummy_expected_request(),
-            response("0-9", b"helloworld")
-                .body(SdkBody::from(data.clone()))
-                .unwrap(),
+        head_with_headers(
+            data.len(),
+            "\"my-etag-2\"",
+            &[
+                ("x-amz-checksum-crc32", "AAAAAA==-2"),
+                ("x-amz-checksum-type", "COMPOSITE"),
+            ],
         ),
         // partNumber=1: part 1 with its own checksum.
         ReplayEvent::new(
@@ -1577,7 +1601,7 @@ async fn test_part_one_checksum_from_part_get_is_not_an_object_value() {
             response("0-4", b"hello")
                 .header("x-amz-mp-parts-count", "2")
                 .header("x-amz-checksum-crc32", PART1_CRC32)
-                .header("x-amz-checksum-type", "FULL_OBJECT")
+                .header("x-amz-checksum-type", "COMPOSITE")
                 .body(SdkBody::from(&b"hello"[..]))
                 .unwrap(),
         ),
@@ -1609,28 +1633,32 @@ async fn test_part_one_checksum_from_part_get_is_not_an_object_value() {
 
     let requests = http_client.actual_requests().collect::<Vec<_>>();
     assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0].method(), "HEAD");
     assert!(
         requests[1].uri().contains("partNumber=1"),
-        "discovery re-issued as partNumber=1: {}",
+        "discovery fetched stored part 1: {}",
         requests[1].uri()
     );
 
     assert_eq!(output.integrity_checks().checksum_crc32(), None);
+    assert_eq!(
+        output.integrity_checks().checksum_type(),
+        Some(&ChecksumType::Composite)
+    );
     for meta in [&object_meta, &output.object_meta] {
         assert_eq!(meta.checksum_crc32, None);
-        assert_eq!(meta.checksum_type, Some(ChecksumType::FullObject));
-        assert_eq!(meta.parts_count, Some(2));
+        assert_eq!(meta.checksum_type, Some(ChecksumType::Composite));
     }
 }
 
 // ref: RUST-1676
-/// With an explicit part size equal to the stored part size, discovery is a ranged
-/// GET that covers exactly stored part 1, so no `partNumber` request is made and
-/// the response has no `x-amz-mp-parts-count`. A directory bucket answers a range
-/// that matches a stored part of a `FULL_OBJECT` multipart object with that part's
-/// checksum and the object's `FULL_OBJECT` type. The value describes 5 MiB of a
-/// 10 MiB object, so neither `integrity_checks()` nor `object_meta` may report it
-/// as the object's checksum.
+/// With an explicit part size equal to the stored part size, each ranged GET
+/// covers exactly one stored part, so no `partNumber` request is made. A
+/// directory bucket answers a range that matches a stored part of a
+/// `FULL_OBJECT` multipart object with that part's checksum and the object's
+/// `FULL_OBJECT` type. That value describes 5 MiB of a 10 MiB object, so
+/// `integrity_checks()` and `object_meta` report HEAD's object checksum, never
+/// the part's.
 #[tokio::test]
 async fn test_integrity_checks_part_aligned_range_checksum_is_not_an_object_value() {
     use aws_sdk_s3_transfer_manager::types::ChecksumType;
@@ -1653,7 +1681,16 @@ async fn test_integrity_checks_part_aligned_range_checksum_is_not_an_object_valu
             .body(SdkBody::from(data.slice(start..start + part_size)))
             .unwrap()
     };
+    let object_crc32 = checksum_value(aws_smithy_checksums::ChecksumAlgorithm::Crc32, &data);
     let http_client = StaticReplayClient::new(vec![
+        head_with_headers(
+            data.len(),
+            "\"my-etag-2\"",
+            &[
+                ("x-amz-checksum-crc32", &object_crc32),
+                ("x-amz-checksum-type", "FULL_OBJECT"),
+            ],
+        ),
         ReplayEvent::new(dummy_expected_request(), part(0)),
         ReplayEvent::new(dummy_expected_request(), part(part_size)),
     ]);
@@ -1670,14 +1707,19 @@ async fn test_integrity_checks_part_aligned_range_checksum_is_not_an_object_valu
     let output = handle.join().await.unwrap();
 
     let requests = http_client.actual_requests().collect::<Vec<_>>();
-    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0].method(), "HEAD");
     assert!(
         requests.iter().all(|r| !r.uri().contains("partNumber")),
         "an explicit part size downloads by range only"
     );
-    assert_eq!(output.integrity_checks().checksum_crc32(), None);
+    assert_ne!(object_crc32, PART_CRC32);
+    assert_eq!(
+        output.integrity_checks().checksum_crc32(),
+        Some(object_crc32.as_str())
+    );
     for meta in [&object_meta, &output.object_meta] {
-        assert_eq!(meta.checksum_crc32, None);
+        assert_eq!(meta.checksum_crc32.as_deref(), Some(object_crc32.as_str()));
         assert_eq!(meta.checksum_type, Some(ChecksumType::FullObject));
         assert_eq!(meta.parts_count, None);
     }

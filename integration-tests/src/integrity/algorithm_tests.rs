@@ -24,7 +24,7 @@ algorithm_cases! {
         targets: [mock_gp, mock_express, real_gp, real_express];
         // ref: RUST-1758
         [crc32, crc32c, crc64nvme] via full_object
-            => intact: validated, corrupt: integrity_error, ignore: "not validated against the full-object checksum";
+            => intact: validated, corrupt: integrity_error;
         [sha1, sha256] via none
             => intact: not_validated(Unavailable), corrupt: undetected(Unavailable);
     }
@@ -35,17 +35,17 @@ algorithm_cases! {
         targets: [mock_gp, real_gp];
         // ref: RUST-1758
         [crc32, crc32c, crc64nvme] via full_object
-            => intact: validated, corrupt: integrity_error, ignore: "not validated against the full-object checksum";
+            => intact: validated, corrupt: integrity_error;
     }
-    // Fits in one 8 MiB GET, which carries the object's checksum, but the automatic part size
-    // realigns the download to the 5 MiB stored parts, whose ranges carry none.
+    // Fits in one configured 8 MiB GET, which carries the object's checksum. FULL_OBJECT
+    // discovery keeps that size instead of realigning to the 5 MiB stored parts.
     full_object_mpu_small {
         object: |alg| Object::mpu(FullObject, alg).len(7 * MIB).parts(5 * MIB);
         tier: extended;
         targets: [mock_gp, real_gp];
         // ref: RUST-1758
         [crc32, crc32c, crc64nvme] via whole_response
-            => intact: validated, corrupt: integrity_error, ignore: "not validated against the full-object checksum";
+            => intact: validated, corrupt: integrity_error;
     }
     // Stored parts match the download part size.
     composite_aligned {
@@ -80,7 +80,7 @@ algorithm_cases! {
         targets: [mock_gp, mock_express, real_gp, real_express];
         // ref: RUST-1758
         [none] via full_object
-            => intact: validated(crc64nvme), corrupt: integrity_error(crc64nvme), ignore: "not validated against the full-object checksum";
+            => intact: validated(crc64nvme), corrupt: integrity_error(crc64nvme);
     }
     // Seeded on the mock with no stored checksum, like an object stored before S3 added one by
     // default. A new upload can't produce one, so there are no real targets.
@@ -107,6 +107,6 @@ algorithm_cases! {
         targets: [mock_express, real_express];
         // ref: RUST-1758
         [crc32, crc32c, crc64nvme] via full_object
-            => intact: validated, corrupt: integrity_error, ignore: "not validated against the full-object checksum";
+            => intact: validated, corrupt: integrity_error;
     }
 }

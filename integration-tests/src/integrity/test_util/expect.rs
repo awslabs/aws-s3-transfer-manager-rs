@@ -353,17 +353,10 @@ impl Case {
                 "no GET carried the object's checksum: {gets:#?}"
             ),
             (Expect::Validated(_), Mechanism::PerPart) => {
-                // Discovery may fetch range 0, discard it, and fetch it again by part number.
-                let refetched = |i: usize| {
-                    gets[i].range.as_ref().is_some_and(|r| r.start == 0)
-                        && gets[i + 1..]
-                            .iter()
-                            .any(|r| r.range.as_ref().is_some_and(|r| r.start == 0))
-                };
-                let without = (0..gets.len())
-                    .filter(|&i| sent(gets[i]) && !refetched(i))
-                    .filter(|&i| scope(gets[i]) != Some(ChecksumScope::Part))
-                    .map(|i| gets[i])
+                let without = gets
+                    .iter()
+                    .copied()
+                    .filter(|r| sent(r) && scope(r) != Some(ChecksumScope::Part))
                     .collect::<Vec<_>>();
                 ensure!(
                     without.is_empty(),

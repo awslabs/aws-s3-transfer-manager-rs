@@ -58,9 +58,9 @@
 //! | single-part                  | unset        | WhenSupported     | Validated{Crc32}                                       | mock + real |
 //! | single-part                  | unset        | WhenRequired      | NotValidated{Disabled}                                 | mock        |
 //! | single-part                  | ENABLED      | default           | object value surfaced; Validated{Crc32}                | mock + real |
-//! | multipart full-obj (GP)      | ENABLED      | default           | object value is NOT a part checksum; Validated{Crc32}  | mock + real |
-//! | multipart full-obj (Express) | ENABLED      | default           | object value is NOT a part checksum; Validated{Crc32}  | real        |
-//! | multipart composite          | ENABLED      | default           | object value is NOT a part checksum; Validated{Sha256} | mock + real |
+//! | multipart full-obj (GP)      | ENABLED      | default           | HEAD's object value, not a part's; Validated{Crc32}    | mock + real |
+//! | multipart full-obj (Express) | ENABLED      | default           | HEAD's object value, not a part's; Validated{Crc32}    | real        |
+//! | multipart composite          | ENABLED      | default           | COMPOSITE type, no value; Validated{Sha256}            | mock + real |
 //! | multipart (Auto sz)          | ENABLED      | default           | round-trip using configured ranges                     | mock + real |
 //! | composite MPU (Auto sz)      | ENABLED      | default           | Validated{Crc32}                                       | mock        |
 //! | single-part (file)           | ENABLED      | default           | round-trip on disk; Validated{Crc32}                   | mock + real |
@@ -331,9 +331,10 @@ async fn multipart_full_object(target: Target) {
         output.integrity_checks().checksum_crc32(),
         stored.checksum_crc32()
     );
-    assert!(
-        output.object_meta.checksum_crc32.is_none(),
-        "object metadata must not carry a part checksum as the object's"
+    assert_eq!(
+        output.object_meta.checksum_crc32.as_deref(),
+        stored.checksum_crc32(),
+        "object metadata must carry HEAD's object checksum, not a part's"
     );
 
     assert_validated(&output, ChecksumAlgorithm::Crc32);
@@ -405,10 +406,21 @@ async fn multipart_composite(target: Target) {
         .send()
         .await
         .expect("stored object checksum");
+    // A COMPOSITE value is a checksum of part checksums, so only the type is reported.
     assert!(stored.checksum_sha256().is_some());
     assert_eq!(
-        output.integrity_checks().checksum_sha256(),
-        stored.checksum_sha256()
+        stored.checksum_type(),
+        Some(&aws_sdk_s3::types::ChecksumType::Composite)
+    );
+    assert_eq!(output.integrity_checks().checksum_sha256(), None);
+    assert_eq!(
+        output.integrity_checks().checksum_type(),
+        Some(&aws_sdk_s3_transfer_manager::types::ChecksumType::Composite)
+    );
+    assert_eq!(output.object_meta.checksum_sha256, None);
+    assert_eq!(
+        output.object_meta.checksum_type,
+        Some(aws_sdk_s3_transfer_manager::types::ChecksumType::Composite)
     );
     assert_validated(&output, ChecksumAlgorithm::Sha256);
 
@@ -1032,7 +1044,7 @@ async fn multipart_default_tamper_caught_mock_gp() {
 /// A corrupted range of a split single-PUT download fails against the stored CRC,
 /// even though its individual responses carry no checksum for SDK validation.
 #[tokio::test]
-#[ignore = "TODO(vnext): wire checksums, or TM-computed whole-object checksum over the slot-buffer bytes, to validate split single-PUT downloads"]
+// ref: RUST-1758
 async fn single_put_split_tamper_caught_mock_gp() {
     let t = Target::mock_gp().connect().await; // default part sizes
     let data = large_single_put();

@@ -47,7 +47,7 @@ async fn download_matches(t: &TmTestClient, key: &str, seed: u32, len: u64) {
 /// A multipart upload with the default checksum strategy, downloaded with the default part size
 /// over one connection, completes and delivers the source bytes.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "stalls: discovery holds the only connection with an unread range-0 body while it requests partNumber=1"]
+// ref: RUST-1758
 async fn full_object_download_on_one_connection() {
     let t = capped(1).await;
     let (object, seed) = (Object::mpu(Layout::FullObject, Alg::Crc64Nvme), 11);
@@ -63,7 +63,7 @@ async fn full_object_download_on_one_connection() {
 /// connection, completes and delivers the source bytes. Its ranges are realigned to the stored
 /// parts.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "stalls: discovery holds the only connection with an unread range-0 body while it requests partNumber=1"]
+// ref: RUST-1758
 async fn composite_realigned_download_on_one_connection() {
     let t = capped(1).await;
     let object = Object::mpu(Layout::Composite, Alg::Crc32)
@@ -81,7 +81,7 @@ async fn composite_realigned_download_on_one_connection() {
 /// Four concurrent downloads of multipart uploads with the default checksum strategy, sharing a
 /// pool of two connections, all complete and deliver their source bytes.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "stalls: each download holds a connection with an unread range-0 body while it requests partNumber=1"]
+// ref: RUST-1758
 async fn downloads_share_capped_pool() {
     let t = capped(2).await;
     let object = Object::mpu(Layout::FullObject, Alg::Crc64Nvme);

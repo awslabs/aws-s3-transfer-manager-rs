@@ -8,7 +8,8 @@
 //! [`DownloadTransfer`] issues work under the state lock. Workers collect and
 //! capture frozen range bytes outside that lock, then record evidence only after
 //! publication and required destination writes succeed. The last retirement
-//! transfers exclusive completion ownership to its worker.
+//! transfers exclusive completion ownership to its worker. That owner verifies
+//! integrity before destination finalization and successful completion.
 
 use std::cmp;
 use std::future::Future;

@@ -15,6 +15,19 @@
 //! validated; use
 //! [`DownloadOutput::integrity_checks`](crate::operation::download::DownloadOutput::integrity_checks)
 //! for that result.
+//!
+//! Whole-object downloads with checksum validation enabled start with checksum-mode
+//! HEAD. A stored FULL_OBJECT CRC32, CRC32C or CRC64NVME checksum is verified by
+//! hashing accepted ranges and combining their CRCs in object-offset order.
+//! SDK response checks remain active. COMPOSITE objects use response checks;
+//! automatic part sizing resolves the first stored part before issuing later ranges.
+//! Caller ranges use response checks without whole-object CRC verification.
+//!
+//! Streamed bytes can arrive before the final whole-object check. Consume the body
+//! and await [`DownloadHandle::join`](crate::operation::download::DownloadHandle::join)
+//! before treating the download as successful.
+//! An integrity failure prevents a path destination from replacing the existing file;
+//! callers must discard bytes already received through a stream or caller-owned file.
 
 pub use crate::model::builders::DownloadInputBuilder;
 pub use crate::model::{ChunkMetadata, DownloadInput, ObjectMetadata};

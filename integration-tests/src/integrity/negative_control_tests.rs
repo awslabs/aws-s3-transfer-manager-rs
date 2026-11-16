@@ -415,3 +415,19 @@ fn fault_positions_resolve_to_object_bytes() {
     assert_eq!(explicit.byte(At::Later), 7 * MIB);
     assert_eq!(explicit.ranges(), 3);
 }
+
+/// A later GET of the same range cannot excuse an earlier fully sent response
+/// that lacked a part checksum.
+#[tokio::test(flavor = "multi_thread")]
+async fn per_part_checks_every_fully_sent_response() {
+    let (case, mut run) = execute(PER_PART).await;
+    let requests = run.requests.as_mut().expect("mock journal");
+    let first = requests
+        .iter()
+        .position(|request| request.operation == s3_mock_server::Operation::GetObject)
+        .expect("first GET");
+    let mut unchecked = requests[first].clone();
+    unchecked.checksum = None;
+    requests.insert(first, unchecked);
+    assert_fails(check_journal(case, &run), "without a part checksum");
+}

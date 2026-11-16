@@ -218,7 +218,6 @@ async fn download_objects_corrupt_composite_child_continue() {
 /// an integrity error, under `FailedTransferPolicy::Continue`.
 #[tokio::test(flavor = "multi_thread")]
 // ref: RUST-1758
-#[ignore = "not validated against the full-object checksum"]
 async fn download_objects_corrupt_full_object_child_continue() {
     corrupt_child_continue(
         Object::mpu(Layout::FullObject, Alg::Crc64Nvme)

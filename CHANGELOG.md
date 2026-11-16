@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Whole-object downloads verify stored CRC32, CRC32C and CRC64NVME checksums across
+  independently downloaded ranges, including empty objects. Successful verification reports
+  `ChecksumValidation::Validated`; a mismatch returns `ErrorKind::IntegrityError` from `join()`
+  before destination finalization. Streamed bytes may arrive before the final check.
 - `UploadObjectsInput::builder`, matching the other operation inputs.
 - `set_failure_policy` on `UploadObjectsInputBuilder`, `DownloadObjectsInputBuilder`,
   `UploadObjectsFluentBuilder`, and `DownloadObjectsFluentBuilder`. `None` selects the default,
@@ -67,6 +71,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ByteSize`'s `Display` replaces `ByteUnit::display`.
   `ByteCountDisplayContext` is renamed `ByteSizeDisplayContext`, and `ByteSize::display_as` is its
   only constructor: `ByteCountDisplayContext::new` is removed.
+- Whole-object downloads with checksum validation enabled start with checksum-mode HEAD.
+  `IntegrityChecks` reports its stored object checksum values for split downloads as well as
+  single-response downloads, except a COMPOSITE value, for which it reports only the type. Small nonempty objects use HEAD plus GET instead of a single GET;
+  caller-range and validation-off downloads retain their existing discovery paths.
 - `aws-sdk-s3-transfer-manager`, `aws-sdk-s3-transfer-manager-ext`, `aws-smithy-topology`,
   `aws-smithy-execution` and `aws-smithy-managed-http`: the minimum supported Rust version is
   1.96.0.
@@ -162,6 +170,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - `InputStream::from_path` and `PathBodyBuilder::build` reject a path that does not name a regular
   file, such as a directory, a device, a FIFO, or a Windows pipe, with `ErrorKind::InputInvalid`.
+- Validated multipart downloads no longer issue a discovery request while holding an unread
+  first-range response. This prevents discovery from stalling on a capped connection pool and
+  preserves validation for small FULL_OBJECT objects.
 - `PathBodyBuilder::build` without a path returns an `ErrorKind::InputInvalid` error instead of
   panicking.
 - The metrics in an upload's output are the transfer's metrics at completion. A single-request
