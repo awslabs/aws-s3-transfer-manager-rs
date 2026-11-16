@@ -2155,9 +2155,11 @@ mod tests {
             .collect()
     }
 
-    /// Every checksum value member is cleared. Fails when `ObjectMetadata` gains a
-    /// checksum value member that this test does not populate, which is the signal to
-    /// extend both this test and `process_object_metadata`.
+    /// This is a guard test to make sure every checksum value member is cleared.
+    /// Fails when `ObjectMetadata` gains a checksum value member that this test
+    /// does not populate, which is the signal to extend both this test and
+    /// `process_object_metadata`.
+    /// TODO: update `process_object_metadata` to handle extended checksum member.
     #[test]
     fn object_metadata_clears_every_checksum_value_member() {
         let mut meta = ObjectMetadata::default();
