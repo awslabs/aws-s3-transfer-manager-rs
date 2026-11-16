@@ -382,6 +382,7 @@ impl ManagedDownloadHandle {
         }
     }
 
+    #[cfg(any(unix, windows, target_os = "wasi"))]
     pub(crate) fn new_unmanaged(inner: DownloadHandleInner) -> Self {
         Self {
             inner,

@@ -21,6 +21,7 @@ use s3_mock_server::S3MockServer;
 use tempfile::TempDir;
 use tokio::time::timeout;
 
+use crate::assertions::wait_for_finished_elapsed;
 use crate::harness::{mock_tm, mock_tm_with, MockTm};
 
 /// Default test timeout. Any body exceeding this almost certainly
@@ -393,13 +394,14 @@ async fn test_upload_objects_empty_source() {
             .initiate()
             .expect("initiate upload_objects");
 
+        let elapsed = wait_for_finished_elapsed(|| handle.metrics()).await;
         let output = handle.join().await.expect("join upload_objects");
         assert_eq!(0, output.objects_uploaded());
         assert!(output.failed_transfers().is_empty());
         assert_eq!(0, output.metrics.network_tx);
-        assert!(
-            output.metrics.finished_at.is_some(),
-            "finished_at must be set even on zero-work transfer"
+        assert_eq!(
+            output.metrics.elapsed, elapsed,
+            "a zero-work transfer must record its finish"
         );
 
         // Create the bucket so count_objects can list it (no PutObject was

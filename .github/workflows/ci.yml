@@ -211,6 +211,7 @@ jobs:
       - freebsd
       - android
       - wasm32-wasi
+      - wasm32-unknown-unknown
       - linux-i686
       - e2e
     steps:
@@ -561,6 +562,32 @@ jobs:
       - name: Show mock S3 server output
         if: failure()
         run: cat "$RUNNER_TEMP/s3-mock-server.log" || true
+
+  # The transfer manager's dependency graph must build for
+  # wasm32-unknown-unknown, and the transfer manager must be clippy-clean there.
+  # The job compiles only; no runtime behavior on that target is exercised.
+  wasm32-unknown-unknown:
+    name: wasm32-unknown-unknown
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    needs: basics
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust ${{ env.rust_clippy }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.rust_clippy }}
+          targets: wasm32-unknown-unknown
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: wasm32-unknown-unknown
+      - name: Clippy
+        run: |
+          cargo clippy --locked -p aws-sdk-s3-transfer-manager \
+            --target wasm32-unknown-unknown --no-deps -- -D warnings
+          cargo clippy --locked -p aws-sdk-s3-transfer-manager --features sdk-v1 \
+            --target wasm32-unknown-unknown --no-deps -- -D warnings
 
   fmt:
     name: fmt

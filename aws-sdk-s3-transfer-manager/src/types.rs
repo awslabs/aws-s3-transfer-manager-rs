@@ -326,10 +326,13 @@ pub struct TransferMetrics {
     pub disk_write: u64,
     /// Expected total payload bytes, if known.
     pub total_bytes: Option<u64>,
-    /// When the transfer was initiated.
-    pub started_at: std::time::Instant,
-    /// When the transfer reached a terminal state, if it has.
-    pub finished_at: Option<std::time::Instant>,
+    /// Time from when the transfer was initiated until it recorded its
+    /// finish, or until this snapshot if it has not.
+    ///
+    /// The finish is recorded close to, but not in a fixed order with, the
+    /// change of the handle's status, so a snapshot taken around that change
+    /// may not hold the final value. The metrics in an operation's output do.
+    pub elapsed: std::time::Duration,
 }
 
 /// Type of the bucket for the transfer
