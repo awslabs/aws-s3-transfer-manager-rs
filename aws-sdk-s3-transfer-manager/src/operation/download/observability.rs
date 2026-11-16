@@ -15,11 +15,12 @@ use std::time::Duration;
 use crate::config::TransferDiagnosticsConfig;
 use crate::error::ErrorKind;
 use crate::metrics::RequestMetrics;
+use crate::metrics::TransferMetrics;
 use crate::transfer::{
     emit_pending_details, AttributedRequestMeasurement, RequestMetricsAttribution, TransferContext,
     TransferId, TransferPendingStats,
 };
-use crate::types::{ChecksumValidation, TransferMetrics, TransferStatus};
+use crate::types::{ChecksumValidation, TransferStatus};
 
 /// Delivery surface owned by one download.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

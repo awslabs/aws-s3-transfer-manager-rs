@@ -13,9 +13,9 @@
 
 use std::time::Duration;
 
-use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
-use aws_sdk_s3_transfer_manager::types::{ConcurrencyMode, PartSize};
-use aws_sdk_s3_transfer_manager::RuntimeConfig;
+use aws_sdk_s3_transfer_manager::config::RuntimeConfig;
+use aws_sdk_s3_transfer_manager::config::{ConcurrencyMode, PartSize};
+use aws_sdk_s3_transfer_manager::types::ByteSize;
 
 use crate::harness::{mock_tm_with_s3_config, MockTm};
 
@@ -30,7 +30,7 @@ async fn setup(interfaces: &[&str]) -> MockTm {
         RuntimeConfig::default(),
         |s3| s3.network_interfaces(interfaces),
         |b| {
-            b.part_size(PartSize::Target(5 * ByteUnit::Mebibyte.as_bytes_u64()))
+            b.part_size(PartSize::Target(ByteSize::mib(5)))
                 .concurrency(ConcurrencyMode::Explicit(8))
         },
     )
@@ -60,7 +60,7 @@ async fn download(
 #[tokio::test]
 async fn test_download_bound_to_loopback() {
     let m = setup(&[LOOPBACK]).await;
-    let content: Vec<u8> = (0..12 * ByteUnit::Mebibyte.as_bytes_usize())
+    let content: Vec<u8> = (0..ByteSize::mib(12).as_usize())
         .map(|i| (i % 251) as u8)
         .collect();
     m.server

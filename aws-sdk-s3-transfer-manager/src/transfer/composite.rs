@@ -13,7 +13,7 @@
 use std::time::Duration;
 
 use crate::error::ErrorKind;
-use crate::types::TransferMetrics;
+use crate::metrics::TransferMetrics;
 
 use super::{
     PendingCategory, PendingCause, TerminalOutcome, TransferContext, TransferPendingStats,

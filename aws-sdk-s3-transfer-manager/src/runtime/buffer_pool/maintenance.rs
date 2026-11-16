@@ -859,11 +859,12 @@ fn idle_retention_target(
 #[cfg(all(test, not(s3_tm_loom)))]
 mod tests {
     use super::*;
+    use crate::config::MemoryBudgetConfig;
     use crate::config::MemoryDiagnosticsConfig;
     use crate::runtime::buffer_pool::config::PoolConfig;
     use crate::runtime::buffer_pool::test_util::{test_pool, test_pool_with_scan_and_diagnostics};
     use crate::runtime::buffer_pool::virtual_memory::VirtualMemoryOperation;
-    use crate::types::MemoryBudgetConfig;
+    use crate::types::ByteSize;
     use std::sync::Barrier;
 
     const IDLE: Duration = Duration::from_secs(10);
@@ -938,9 +939,12 @@ mod tests {
             (512 * MIB, 128 * MIB),
             (1024 * MIB, 256 * MIB),
         ] {
-            let config =
-                PoolConfig::resolve_for_page(MemoryBudgetConfig::Limit(capacity_bytes), None, 4096)
-                    .unwrap();
+            let config = PoolConfig::resolve_for_page(
+                MemoryBudgetConfig::Limit(ByteSize::new(capacity_bytes as u64)),
+                None,
+                4096,
+            )
+            .unwrap();
             let target = idle_retention_target(
                 config.configured_capacity,
                 config.geometry.carriers_per_block(),

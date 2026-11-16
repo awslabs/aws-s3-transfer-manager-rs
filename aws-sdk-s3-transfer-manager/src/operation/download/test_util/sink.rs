@@ -317,6 +317,7 @@ impl SinkWrite for ScriptedSink {
 /// Tests of the script itself, against real temporary files.
 #[cfg(test)]
 mod tests {
+    use crate::types::ByteSize;
     use std::io;
     use std::sync::Arc;
     use std::time::Duration;
@@ -494,7 +495,9 @@ mod tests {
         let script = Arc::new(WriteScript::default());
         let config = crate::Config::builder()
             .sdk_client(object_client(Arc::clone(&object)))
-            .part_size(crate::types::PartSize::Target(5 * MIB as u64))
+            .part_size(crate::config::PartSize::Target(ByteSize::new(
+                5 * MIB as u64,
+            )))
             .build()
             .expect("valid config");
         let handle = managed_test_handle(config, 128);

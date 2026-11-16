@@ -3,11 +3,13 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+use aws_sdk_s3_transfer_manager::types::ByteSize;
 use std::error::Error;
 
+use aws_sdk_s3_transfer_manager::config::{MemoryBudgetConfig, MemoryConfig};
 use aws_sdk_s3_transfer_manager::memory::{
-    AcquireError, BufferPool, BufferPoolBuildError, BufferPoolBuilder, MemoryBudgetConfig,
-    MemoryConfig, PooledBufMut, Reservation, ReserveError, ReserveFuture, SegmentedBytes,
+    AcquireError, BufferPool, BufferPoolBuildError, BufferPoolBuilder, PooledBufMut, Reservation,
+    ReserveError, ReserveFuture, SegmentedBytes,
 };
 use bytes::{Buf, BufMut};
 
@@ -20,7 +22,7 @@ fn public_memory_api_supports_an_explicit_pool_flow() {
     assert_public_error::<ReserveError>();
 
     let builder: BufferPoolBuilder =
-        BufferPool::builder().memory_budget(MemoryBudgetConfig::Limit(1024 * 1024));
+        BufferPool::builder().memory_budget(MemoryBudgetConfig::Limit(ByteSize::new(1024 * 1024)));
     let pool: BufferPool = builder.build().expect("valid explicit pool");
     let _client_config = MemoryConfig::Explicit(pool.clone());
     let carrier_size = pool.carrier_size();

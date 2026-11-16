@@ -319,18 +319,21 @@ fn invalid_envelope(envelope: usize, remaining: usize) -> io::Error {
 
 #[cfg(test)]
 mod tests {
+    use crate::types::ByteSize;
     use std::task::Waker;
 
     use bytes::{Buf, BufMut};
 
     use super::*;
-    use crate::types::MemoryBudgetConfig;
+    use crate::config::MemoryBudgetConfig;
 
     const TEST_POOL_CAPACITY: usize = 1024 * 1024;
 
     fn test_pool() -> BufferPool {
         BufferPool::builder()
-            .memory_budget(MemoryBudgetConfig::Limit(TEST_POOL_CAPACITY))
+            .memory_budget(MemoryBudgetConfig::Limit(ByteSize::new(
+                TEST_POOL_CAPACITY as u64,
+            )))
             .build()
             .unwrap()
     }

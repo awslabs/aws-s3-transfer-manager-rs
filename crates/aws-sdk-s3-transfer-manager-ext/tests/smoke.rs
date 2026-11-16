@@ -69,7 +69,7 @@ async fn unused_managed_values_and_configs_own_shutdown_despite_retained_http() 
                 .build();
             let config = tm::Config::builder()
                 .s3_config(&sdk)
-                .runtime_config(tm::RuntimeConfig::managed(managed))
+                .runtime_config(tm::config::RuntimeConfig::managed(managed))
                 .build();
             drop(config);
         } else {
@@ -164,7 +164,7 @@ async fn adopted_file_upload_uses_configured_native_pool_and_retains_runtime_unt
         let client = tm::Client::new(
             tm::Config::builder()
                 .s3_config(&sdk)
-                .runtime_config(tm::RuntimeConfig::managed(tm_ext::managed(owner)))
+                .runtime_config(tm::config::RuntimeConfig::managed(tm_ext::managed(owner)))
                 .build()
                 .expect("valid config"),
         );
@@ -285,7 +285,7 @@ async fn caller_tokio_execution_has_no_owned_runtime_completion() {
     let client = tm::Client::new(
         tm::Config::builder()
             .s3_config(&sdk)
-            .runtime_config(tm::RuntimeConfig::multi_thread_tokio())
+            .runtime_config(tm::config::RuntimeConfig::multi_thread_tokio())
             .build()
             .expect("valid config"),
     );
@@ -320,7 +320,7 @@ async fn adopted_completion_waits_for_blocking_work_and_thread_local_cleanup() {
     let client = tm::Client::new(
         tm::Config::builder()
             .s3_config(&sdk)
-            .runtime_config(tm::RuntimeConfig::managed(tm_ext::managed(owner)))
+            .runtime_config(tm::config::RuntimeConfig::managed(tm_ext::managed(owner)))
             .build()
             .expect("valid config"),
     );

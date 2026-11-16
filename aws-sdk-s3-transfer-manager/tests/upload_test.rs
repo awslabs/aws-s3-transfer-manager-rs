@@ -15,15 +15,14 @@ use aws_sdk_s3::operation::complete_multipart_upload::{
 use aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput;
 use aws_sdk_s3::operation::put_object::{PutObjectError, PutObjectOutput};
 use aws_sdk_s3::operation::upload_part::UploadPartOutput;
+use aws_sdk_s3_transfer_manager::config::{MemoryBudgetConfig, MemoryConfig};
 use aws_sdk_s3_transfer_manager::error::{Error, ErrorKind};
 use aws_sdk_s3_transfer_manager::io::{
     InputStream, PartBuffer, PartData, PartStream, SizeHint, StreamContext,
 };
-use aws_sdk_s3_transfer_manager::memory::{
-    BufferPool, MemoryBudgetConfig, MemoryConfig, SegmentedBytes,
-};
-use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
+use aws_sdk_s3_transfer_manager::memory::{BufferPool, SegmentedBytes};
 use aws_sdk_s3_transfer_manager::operation::upload::ChecksumStrategy;
+use aws_sdk_s3_transfer_manager::types::ByteSize;
 use aws_sdk_s3_transfer_manager::types::FailedMultipartUploadPolicy;
 use aws_smithy_mocks::{mock, mock_client, Rule, RuleMode};
 use aws_smithy_runtime::test_util::capture_test_logs::capture_test_logs;
@@ -653,7 +652,7 @@ async fn test_custom_stream_resumes_after_part_buffer_admission() {
     const CAPACITY: usize = 1024 * 1024;
 
     let pool = BufferPool::builder()
-        .memory_budget(MemoryBudgetConfig::Limit(CAPACITY))
+        .memory_budget(MemoryBudgetConfig::Limit(ByteSize::new(CAPACITY as u64)))
         .build()
         .unwrap();
     let holder = pool.try_reserve(CAPACITY).unwrap().unwrap();
@@ -794,7 +793,7 @@ async fn test_large_upload_part_size_bump() {
     let tm = MultipartMock::new().tm();
 
     let (tx, rx) = mpsc::channel(1);
-    let size_hint = 100 * ByteUnit::Gibibyte.as_bytes_u64();
+    let size_hint = ByteSize::gib(100).as_u64();
     let stream = TestStream::with_size_hint(rx, SizeHint::default().with_upper(Some(size_hint)));
     let observed_part_size = stream.observed_part_size();
 
@@ -822,7 +821,7 @@ async fn test_large_upload_part_size_bump() {
 /// size (a dropped or duplicated part). Required by SEP step 7.
 #[tokio::test]
 async fn test_complete_mpu_sends_mpu_object_size() {
-    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let part_size = ByteSize::mib(5).as_usize();
     // Two full parts plus a partial one, so the total is not a part-size multiple
     // and a stale part-count-derived value would not match.
     let content_length = 2 * part_size + 1024;
@@ -906,7 +905,7 @@ async fn test_explicit_zero_byte_part_is_not_duplicated() {
 /// value must still be sent so S3 can reject a mismatched assembly.
 #[tokio::test]
 async fn test_unknown_length_mpu_object_size_is_running_sum() {
-    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let part_size = ByteSize::mib(5).as_usize();
     // Deliberately not a part-size multiple, so a part-count-derived value wouldn't match.
     let total = 2 * part_size + 1024;
 
@@ -943,7 +942,7 @@ async fn test_unknown_length_mpu_object_size_is_running_sum() {
 /// `MpuObjectSize` must carry the validated bytes actually emitted, not the planning bound.
 #[tokio::test]
 async fn test_bounded_length_sends_validated_actual_size() {
-    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let part_size = ByteSize::mib(5).as_usize();
     let upper = 2 * part_size;
     let actual = part_size + 1024;
 
@@ -1168,7 +1167,7 @@ async fn test_content_length_contradicting_body_fails_at_initiate() {
 /// list part 1 twice — and whichever write S3 kept last could truncate the object.
 #[tokio::test]
 async fn test_unknown_length_with_data_never_sends_empty_part() {
-    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let part_size = ByteSize::mib(5).as_usize();
 
     let mock = MultipartMock::new();
     let tm = mock.tm();
@@ -1216,7 +1215,7 @@ async fn test_unknown_length_with_data_never_sends_empty_part() {
 /// final part and the transfer decides "final" from end-of-stream rather than a count.
 #[tokio::test]
 async fn test_unknown_length_forwards_full_object_checksum() {
-    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let part_size = ByteSize::mib(5).as_usize();
     // Base64 of a CRC32 value; the test only checks that it is forwarded verbatim.
     let expected_checksum = "AAAAAA==";
 
@@ -1258,7 +1257,7 @@ async fn test_unknown_length_forwards_full_object_checksum() {
 /// would report `total_bytes: None` forever.
 #[tokio::test]
 async fn test_unknown_length_reports_total_bytes_after_completion() {
-    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let part_size = ByteSize::mib(5).as_usize();
     let tail = 512;
     let expected = (part_size + tail) as u64;
 
@@ -1338,7 +1337,7 @@ async fn test_unknown_length_reader_error_fails_transfer() {
 #[tokio::test]
 async fn test_unknown_length_many_parts_grows_part_list() {
     // Smallest permitted part size keeps the test cheap; 40 parts crosses the 32 default.
-    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let part_size = ByteSize::mib(5).as_usize();
     let num_parts = 40usize;
     let expected_total = (part_size * num_parts) as i64;
 
@@ -1541,7 +1540,7 @@ async fn test_positive_lower_bound_never_synthesizes_empty_part() {
 
     // Declare a positive exact size and then reach EOF without yielding a part.
     let (tx, rx) = mpsc::channel(1);
-    let declared = 5 * ByteUnit::Mebibyte.as_bytes_u64();
+    let declared = ByteSize::mib(5).as_u64();
     let handle = tm
         .upload()
         .bucket("test-bucket")
@@ -1868,7 +1867,7 @@ async fn test_multipart_upload_missing_file_error_names_action_and_path() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("missing.bin");
 
-    let error = upload_unreadable_file(&path, 32 * ByteUnit::Mebibyte.as_bytes_u64()).await;
+    let error = upload_unreadable_file(&path, ByteSize::mib(32).as_u64()).await;
     assert_missing_file_error(&error, "reading metadata of", &path);
 }
 
@@ -1891,7 +1890,7 @@ async fn test_multipart_upload_unreadable_file_error_names_action_and_path() {
         return;
     }
 
-    let error = upload_unreadable_file(&path, 32 * ByteUnit::Mebibyte.as_bytes_u64()).await;
+    let error = upload_unreadable_file(&path, ByteSize::mib(32).as_u64()).await;
 
     assert_file_io_error(
         &error,
@@ -2038,7 +2037,7 @@ async fn test_put_object_412_surfaces_precondition_failed_code() {
 /// silently drop the header at build time).
 #[tokio::test]
 async fn test_complete_mpu_forwards_if_match() {
-    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let part_size = ByteSize::mib(5).as_usize();
     let content_length = 2 * part_size;
     let expected_etag = "\"expected-etag\"";
 
@@ -2077,7 +2076,7 @@ async fn test_complete_mpu_forwards_if_match() {
 /// exercises the MPU code path (which fails at a different site than PutObject).
 #[tokio::test]
 async fn test_complete_mpu_412_surfaces_precondition_failed_code() {
-    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let part_size = ByteSize::mib(5).as_usize();
     let content_length = 2 * part_size;
 
     let complete_mpu =
@@ -2292,7 +2291,7 @@ async fn test_worker_panic_releases_stream_held_by_a_hung_part() {
             .s3_config(test_common::s3_config_with_test_http(
                 client.config().to_builder(),
             ))
-            .concurrency(aws_sdk_s3_transfer_manager::types::ConcurrencyMode::Explicit(4))
+            .concurrency(aws_sdk_s3_transfer_manager::config::ConcurrencyMode::Explicit(4))
             .build()
             .expect("valid config"),
     );

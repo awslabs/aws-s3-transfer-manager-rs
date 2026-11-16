@@ -112,7 +112,7 @@ pub struct UploadOutput {
     pub version_id: ::std::option::Option<::std::string::String>,
     /// Snapshot of transfer metrics at completion.
     #[cfg(not(s3_tm_out_of_tree))]
-    pub metrics: crate::types::TransferMetrics,
+    pub metrics: crate::metrics::TransferMetrics,
     /// <p>If present, indicates the Amazon Web Services KMS Encryption Context to use for object encryption. The value of this header is a Base64 encoded string of a UTF-8 encoded JSON, which contains the encryption context as key-value pairs. This value is stored as object metadata and automatically gets passed on to Amazon Web Services KMS for future <code>GetObject</code> operations on this object.</p>
     /// <p>For multipart uploads, retained from the initiation response after successful completion.</p>
     pub sse_kms_encryption_context: ::std::option::Option<::std::string::String>,
@@ -333,7 +333,7 @@ impl ::std::fmt::Debug for UploadOutput {
 impl crate::model::UploadOutput {
     /// Snapshot of transfer metrics at completion.
     #[cfg(not(s3_tm_out_of_tree))]
-    pub fn metrics(&self) -> &crate::types::TransferMetrics {
+    pub fn metrics(&self) -> &crate::metrics::TransferMetrics {
         &self.metrics
     }
     /// <p>If present, indicates the Amazon Web Services KMS Encryption Context to use for object encryption. The value of this header is a Base64 encoded string of a UTF-8 encoded JSON, which contains the encryption context as key-value pairs. This value is stored as object metadata and automatically gets passed on to Amazon Web Services KMS for future <code>GetObject</code> operations on this object.</p>
@@ -396,7 +396,7 @@ pub struct UploadOutputBuilder {
     pub(crate) upload_id: ::std::option::Option<::std::string::String>,
     pub(crate) version_id: ::std::option::Option<::std::string::String>,
     #[cfg(not(s3_tm_out_of_tree))]
-    pub(crate) metrics: ::std::option::Option<crate::types::TransferMetrics>,
+    pub(crate) metrics: ::std::option::Option<crate::metrics::TransferMetrics>,
     pub(crate) sse_kms_encryption_context: ::std::option::Option<::std::string::String>,
     pub(crate) sse_kms_key_id: ::std::option::Option<::std::string::String>,
     pub(crate) _request_id: ::std::option::Option<::std::string::String>,
@@ -1031,7 +1031,7 @@ impl UploadOutputBuilder {
     /// Snapshot of transfer metrics at completion.
     #[cfg(not(s3_tm_out_of_tree))]
     #[allow(dead_code)]
-    pub(crate) fn metrics(mut self, input: crate::types::TransferMetrics) -> Self {
+    pub(crate) fn metrics(mut self, input: crate::metrics::TransferMetrics) -> Self {
         self.metrics = ::std::option::Option::Some(input);
         self
     }
@@ -1040,7 +1040,7 @@ impl UploadOutputBuilder {
     #[allow(dead_code)]
     pub(crate) fn set_metrics(
         mut self,
-        input: ::std::option::Option<crate::types::TransferMetrics>,
+        input: ::std::option::Option<crate::metrics::TransferMetrics>,
     ) -> Self {
         self.metrics = input;
         self
@@ -1048,7 +1048,7 @@ impl UploadOutputBuilder {
     /// Snapshot of transfer metrics at completion.
     #[cfg(not(s3_tm_out_of_tree))]
     #[allow(dead_code)]
-    pub(crate) fn get_metrics(&self) -> &::std::option::Option<crate::types::TransferMetrics> {
+    pub(crate) fn get_metrics(&self) -> &::std::option::Option<crate::metrics::TransferMetrics> {
         &self.metrics
     }
     /// <p>If present, indicates the Amazon Web Services KMS Encryption Context to use for object encryption. The value of this header is a Base64 encoded string of a UTF-8 encoded JSON, which contains the encryption context as key-value pairs. This value is stored as object metadata and automatically gets passed on to Amazon Web Services KMS for future <code>GetObject</code> operations on this object.</p>

@@ -5,9 +5,9 @@
 
 use aws_config::BehaviorVersion;
 
+use crate::config::RuntimeConfig;
 use crate::config::{Builder, Config, S3ClientConfig};
-use crate::types::{ConcurrencyMode, MemoryConfig, PartSize, ReadAhead};
-use crate::RuntimeConfig;
+use crate::config::{ConcurrencyMode, MemoryConfig, PartSize, ReadAhead};
 
 /// Loads transfer manager [`Config`] from the environment.
 ///
@@ -24,10 +24,11 @@ use crate::RuntimeConfig;
 ///
 /// ```no_run
 /// # async fn example() {
-/// use aws_sdk_s3_transfer_manager::types::PartSize;
+/// use aws_sdk_s3_transfer_manager::config::PartSize;
+/// use aws_sdk_s3_transfer_manager::types::ByteSize;
 ///
 /// let config = aws_sdk_s3_transfer_manager::from_env()
-///     .part_size(PartSize::Target(16 * 1024 * 1024))
+///     .part_size(PartSize::Target(ByteSize::mib(16)))
 ///     .load()
 ///     .await;
 /// let client = aws_sdk_s3_transfer_manager::Client::new(config);
@@ -293,7 +294,8 @@ async fn imds_instance_type() -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use crate::types::PartSize;
+    use crate::config::PartSize;
+    use crate::types::ByteSize;
     use aws_config::{BehaviorVersion, Region};
     use aws_sdk_s3::config::{Credentials, Intercept, SharedCredentialsProvider};
     use aws_smithy_http_client::test_util::capture_request;
@@ -302,7 +304,7 @@ mod tests {
     #[tokio::test]
     async fn load_with_interceptor() {
         let config = crate::from_env()
-            .part_size(PartSize::Target(8))
+            .part_size(PartSize::Target(ByteSize::new(8)))
             .load()
             .await;
         let tm_client = crate::Client::new(config);
@@ -345,7 +347,7 @@ mod tests {
             .build();
         let config = crate::from_env()
             .s3_config(&sdk_config)
-            .runtime_config(crate::RuntimeConfig::multi_thread_tokio())
+            .runtime_config(crate::config::RuntimeConfig::multi_thread_tokio())
             .load()
             .await;
         assert!(
@@ -495,7 +497,7 @@ mod tests {
     async fn load_path_emits_attribution() {
         let (http_client, captured_request) = capture_request(None);
         let config = crate::from_env()
-            .part_size(PartSize::Target(8))
+            .part_size(PartSize::Target(ByteSize::new(8)))
             .load()
             .await;
         // Build the TM client so we can extract the S3 client's config with interceptors.
@@ -512,7 +514,7 @@ mod tests {
 
         let capture_request_config = crate::Config::builder()
             .sdk_client(aws_sdk_s3::Client::from_conf(sdk_s3_config))
-            .part_size(PartSize::Target(8))
+            .part_size(PartSize::Target(ByteSize::new(8)))
             .build()
             .expect("valid config");
 

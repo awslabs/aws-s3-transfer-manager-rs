@@ -13,12 +13,12 @@ use std::task::{Context, Poll};
 use aws_sdk_s3::config::interceptors::BeforeTransmitInterceptorContextRef;
 use aws_sdk_s3::config::{ConfigBag, Intercept, RuntimeComponents};
 use aws_sdk_s3::types::ChecksumAlgorithm;
+use aws_sdk_s3_transfer_manager::config::PartSize;
+use aws_sdk_s3_transfer_manager::config::RuntimeConfig;
 use aws_sdk_s3_transfer_manager::config::S3ClientConfig;
 use aws_sdk_s3_transfer_manager::io::{InputStream, PartData, PartStream, SizeHint, StreamContext};
-use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
 use aws_sdk_s3_transfer_manager::operation::upload::ChecksumStrategy;
-use aws_sdk_s3_transfer_manager::types::PartSize;
-use aws_sdk_s3_transfer_manager::RuntimeConfig;
+use aws_sdk_s3_transfer_manager::types::ByteSize;
 use aws_smithy_runtime_api::client::orchestrator::Metadata;
 use s3_mock_server::S3MockServer;
 use tokio::sync::mpsc;
@@ -38,7 +38,7 @@ async fn test_mpu_upload_stores_source_bytes() {
     let m = setup().await;
 
     // 24 MiB = 3 parts at the default 8 MiB part size.
-    let content = deterministic_data(24 * ByteUnit::Mebibyte.as_bytes_usize());
+    let content = deterministic_data(ByteSize::mib(24).as_usize());
 
     let upload_handle = m
         .client
@@ -71,7 +71,7 @@ async fn test_mpu_upload_concurrent(rt: RuntimeConfig) {
     // default multipart threshold, so every upload is a two-part multipart upload and the
     // threshold boundary itself is covered.
     for i in 0..5 {
-        let content = deterministic_data_seeded(16 * ByteUnit::Mebibyte.as_bytes_usize(), i);
+        let content = deterministic_data_seeded(ByteSize::mib(16).as_usize(), i);
         let key = format!("concurrent-key-{}", i);
 
         let upload_handle = m
@@ -115,14 +115,14 @@ async fn test_mpu_upload_concurrent_tokio_mt() {
 
 /// Part size for the part-order tests, set on the client so that every part but the last is
 /// exactly one part long.
-const ORDERED_PART_SIZE: usize = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+const ORDERED_PART_SIZE: usize = ByteSize::mib(5).as_usize();
 
 /// Number of parts in the part-order tests.
 const ORDERED_PART_COUNT: u64 = 8;
 
 /// Length of the last part: shorter than a part, and odd, so the object does not end on a part or
 /// power-of-two boundary.
-const LAST_PART_LEN: usize = ByteUnit::Mebibyte.as_bytes_usize() + 17;
+const LAST_PART_LEN: usize = ByteSize::mib(1).as_usize() + 17;
 
 /// Arrival order for the fixed-order test. It is not part-number order, and the short last part
 /// arrives third.
@@ -218,7 +218,7 @@ where
     let expected = ordered_object();
 
     let m = mock_tm_with(RuntimeConfig::default(), |b| {
-        b.part_size(PartSize::Target(ORDERED_PART_SIZE as u64))
+        b.part_size(PartSize::Target(ByteSize::new(ORDERED_PART_SIZE as u64)))
     })
     .await;
     let (tx, rx) = mpsc::channel(1);

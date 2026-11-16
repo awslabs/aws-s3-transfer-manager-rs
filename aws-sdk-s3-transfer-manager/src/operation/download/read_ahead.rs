@@ -51,29 +51,29 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// memory budget applies across transfers and usually binds concurrent work
 /// before one transfer reaches this window.
 ///
-/// The default for the public [`ReadAhead::Auto`](crate::types::ReadAhead) mode;
+/// The default for the public [`ReadAhead::Auto`](crate::config::ReadAhead) mode;
 /// [`window_parts_for`] resolves the knob to a window in parts.
 pub(crate) const DEFAULT_WINDOW_PARTS: u64 = 1024;
 
 /// Resolve the effective read-ahead window in parts for a download, in precedence
-/// order: the per-request [`ReadAhead`](crate::types::ReadAhead) override if set,
+/// order: the per-request [`ReadAhead`](crate::config::ReadAhead) override if set,
 /// else the client default. See [`window_parts_for`] for the per-mode mapping.
 pub(crate) fn resolve_window(
-    request: Option<&crate::types::ReadAhead>,
-    client_default: &crate::types::ReadAhead,
+    request: Option<&crate::config::ReadAhead>,
+    client_default: &crate::config::ReadAhead,
 ) -> u64 {
     window_parts_for(request.unwrap_or(client_default))
 }
 
-/// Map the public [`ReadAhead`](crate::types::ReadAhead) knob to a window in parts.
+/// Map the public [`ReadAhead`](crate::config::ReadAhead) knob to a window in parts.
 /// `Auto` is the fixed per-transfer cap; `Parts(n)` is `n + 1` — `n` parts of
 /// speculation beyond the part the consumer is waiting on, which is always admitted,
 /// so `Parts(0)` is demand paging. The single definition of the knob's meaning, used
 /// at transfer construction and by the dynamic control surface.
-pub(crate) fn window_parts_for(mode: &crate::types::ReadAhead) -> u64 {
+pub(crate) fn window_parts_for(mode: &crate::config::ReadAhead) -> u64 {
     match mode {
-        crate::types::ReadAhead::Auto => DEFAULT_WINDOW_PARTS,
-        crate::types::ReadAhead::Parts(n) => (*n as u64).saturating_add(1),
+        crate::config::ReadAhead::Auto => DEFAULT_WINDOW_PARTS,
+        crate::config::ReadAhead::Parts(n) => (*n as u64).saturating_add(1),
     }
 }
 
@@ -95,7 +95,7 @@ impl ReadAhead {
     }
 
     /// Create a controller with an explicit window, in parts. The resolved value of
-    /// the public [`ReadAhead`](crate::types::ReadAhead) knob enters here.
+    /// the public [`ReadAhead`](crate::config::ReadAhead) knob enters here.
     pub(crate) fn with_window(parts: u64) -> Self {
         Self {
             window: AtomicU64::new(parts),
@@ -179,7 +179,7 @@ mod tests {
 
     #[test]
     fn window_parts_for_maps_the_knob() {
-        use crate::types::ReadAhead as Knob;
+        use crate::config::ReadAhead as Knob;
         // Auto -> the fixed default.
         assert_eq!(window_parts_for(&Knob::Auto), DEFAULT_WINDOW_PARTS);
         // Parts(n) -> n + 1: n speculative parts plus the always-admitted demand part.

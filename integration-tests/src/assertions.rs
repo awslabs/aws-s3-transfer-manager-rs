@@ -10,9 +10,10 @@
 //! to a particular output type) stay with their module.
 
 use aws_sdk_s3_transfer_manager::error::{Error, ErrorKind};
+use aws_sdk_s3_transfer_manager::metrics::TransferMetrics;
 use aws_sdk_s3_transfer_manager::operation::download::DownloadOutput;
 use aws_sdk_s3_transfer_manager::types::{
-    ChecksumAlgorithm, ChecksumValidation, NotValidatedReason, TransferMetrics,
+    ChecksumAlgorithm, ChecksumValidation, NotValidatedReason,
 };
 use std::time::Duration;
 use tokio::time::timeout;

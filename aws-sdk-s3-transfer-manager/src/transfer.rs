@@ -512,8 +512,8 @@ impl MetricsState {
     }
 
     /// Snapshot current metrics into the public type.
-    pub(crate) fn snapshot(&self) -> crate::types::TransferMetrics {
-        crate::types::TransferMetrics {
+    pub(crate) fn snapshot(&self) -> crate::metrics::TransferMetrics {
+        crate::metrics::TransferMetrics {
             network_tx: self.network_tx.load(Ordering::Relaxed),
             network_rx: self.network_rx.load(Ordering::Relaxed),
             disk_read: self.disk_read.load(Ordering::Relaxed),
@@ -1222,7 +1222,7 @@ impl TransferContext {
     }
 
     /// Snapshot current transfer metrics.
-    pub(crate) fn metrics(&self) -> crate::types::TransferMetrics {
+    pub(crate) fn metrics(&self) -> crate::metrics::TransferMetrics {
         self.metrics.snapshot()
     }
 
