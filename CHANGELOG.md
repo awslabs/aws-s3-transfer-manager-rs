@@ -38,10 +38,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ReadAhead`, `ConcurrencyMode`, `TargetThroughput`, `MemoryConfig` and `MemoryBudgetConfig` move
   there from `types` (and, for the two memory types, from `memory`). `types` keeps the model shapes,
   the per-request policies and the outputs, and gains the value types. `TransferMetrics` moves from
-  `types` to `metrics`, which now holds observation snapshots only. `ByteUnit` and `Throughput` move
-  from `metrics` to `types`; the `metrics::unit` module is gone. The crate root re-exports `Client`,
-  `Config` and `from_env`; `RuntimeConfig`, `Managed` and `S3ClientConfig` are reachable through
-  `config`. No type is reachable at two paths, so the old paths are removed rather than re-exported.
+  `types` to `metrics`, which now holds observation snapshots only. `ByteUnit`, `Throughput` and
+  `ThroughputDisplayContext` move from `metrics` to `types`; the `metrics::unit` module is gone.
+  The crate root re-exports `Client`, `Config` and `from_env`; `RuntimeConfig`, `Managed` and
+  `S3ClientConfig` are reachable through `config`. No type is reachable at two paths, so the old
+  paths are removed rather than re-exported.
 - `types::ByteSize` is a quantity of bytes, and configuration takes it wherever it takes a size:
   `PartSize::Target` and `MemoryBudgetConfig::Limit`. Construct it with `ByteSize::new`,
   `ByteSize::kib`, `ByteSize::mib` or `ByteSize::gib`, all `const fn`. `Display` formats in the
@@ -71,9 +72,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `poll_part`.
 - `DownloadInput::part_number` and its getter are no longer public. Single-part downloads are
   not supported.
-- `io::walk::WalkErrorKind` and `metrics::unit::ByteUnit` are `#[non_exhaustive]`.
-- The fields of `metrics::ThroughputDisplayContext` and `metrics::unit::ByteCountDisplayContext`
-  are private. Create them with `Throughput::display_as` or `ByteCountDisplayContext::new`.
+- `io::walk::WalkErrorKind` and `types::ByteUnit` are `#[non_exhaustive]`.
+- The fields of `types::ThroughputDisplayContext` and `types::ByteSizeDisplayContext` are private.
+  Create them with `Throughput::display_as`, `ByteSize::display_as`, or
+  `ByteSizeDisplayContext::new`.
 - `config::Builder::build` returns `Result<Config, BuildError>` and returns an error when
   `s3_config` is not set, instead of panicking.
 - The transfer manager no longer enables the `behavior-version-latest` feature of `aws-config` or
