@@ -302,6 +302,7 @@ pub(crate) struct TmTestClient {
     /// The configuration `tm`'s S3 client was built from, before any test override.
     shared_config: aws_types::SdkConfig,
     bucket: String,
+    bucket_kind: BucketKind,
     /// A per-instance key prefix so concurrent tests sharing one (real) bucket do
     /// not collide on object keys. Each `connect()` gets a fresh prefix; callers
     /// pass logical keys (e.g. `"obj"`) and the harness namespaces them.
@@ -371,6 +372,7 @@ impl TmTestClient {
             tm: TmClient::new(builder.build().expect("valid config")),
             shared_config: base_config,
             bucket: bucket.to_string(),
+            bucket_kind: kind,
             key_prefix: format!("it-{}", uuid::Uuid::new_v4()),
             mock: Some(MockBackend { server, handle }),
             #[cfg(e2e_test)]
@@ -403,6 +405,7 @@ impl TmTestClient {
             tm: TmClient::new(loader.load().await),
             shared_config,
             bucket,
+            bucket_kind: kind,
             key_prefix: format!("it-{}", uuid::Uuid::new_v4()),
             mock: None,
             s3_client: Some(s3_client),
@@ -412,6 +415,11 @@ impl TmTestClient {
     /// The bucket name to target.
     pub(crate) fn bucket(&self) -> &str {
         &self.bucket
+    }
+
+    /// The kind of bucket [`bucket`](Self::bucket) is.
+    pub(crate) fn bucket_kind(&self) -> BucketKind {
+        self.bucket_kind
     }
 
     /// A new transfer manager client on this target's backend, with `options` applied.

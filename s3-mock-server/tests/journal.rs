@@ -310,9 +310,13 @@ async fn hold_releases_when_another_body_is_cut_short() -> Result<()> {
     assert!(get(&handle, Some("bytes=1048576-16777215")).await.is_err());
     held.await??;
 
+    // The two GETs are sent concurrently, so either can be admitted first.
     let gets = bodies_ended(&server).await;
-    assert_eq!(gets[0].hold, Some(HoldEnd::Released));
-    assert_eq!(gets[1].body.unwrap().ending, BodyEnding::CutByFault);
+    let (held, cut): (Vec<_>, Vec<_>) = gets
+        .iter()
+        .partition(|r| matches!(r.fault, Some(FaultType::HoldBody { .. })));
+    assert_eq!(held[0].hold, Some(HoldEnd::Released));
+    assert_eq!(cut[0].body.unwrap().ending, BodyEnding::CutByFault);
     handle.shutdown().await?;
     Ok(())
 }

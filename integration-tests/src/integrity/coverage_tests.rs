@@ -434,11 +434,11 @@ fn required_coverage_reports_removals() {
         missing(&cases)
     };
     let changed = |change: &dyn Fn(&Case) -> Option<Case>| {
-        let cases: Vec<&'static Case> = table_cases()
+        let cases: Vec<Case> = table_cases()
             .into_iter()
-            .map(|c| change(c).map(|n| &*Box::leak(Box::new(n))).unwrap_or(c))
+            .map(|c| change(c).unwrap_or(*c))
             .collect();
-        missing(&cases)
+        missing(&cases.iter().collect::<Vec<_>>())
     };
     let reports = |found: Vec<String>, expected: &str| {
         assert!(
