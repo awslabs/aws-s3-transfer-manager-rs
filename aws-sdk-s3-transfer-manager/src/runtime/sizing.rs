@@ -195,7 +195,11 @@ fn saturating_usize(bytes: u64) -> usize {
     usize::try_from(bytes).unwrap_or(usize::MAX)
 }
 
-#[cfg(test)]
+// The sizing tests model multi-GiB host RAM; those values exceed `usize` on
+// 32-bit platforms, so the tests only compile and run on 64-bit. The sizing
+// logic itself still compiles on 32-bit from the real `available_ram()`
+// signal, which fits a 32-bit `usize` by construction.
+#[cfg(all(test, target_pointer_width = "64"))]
 mod tests {
     use super::*;
 

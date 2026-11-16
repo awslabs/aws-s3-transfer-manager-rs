@@ -419,11 +419,6 @@ impl ByteSize {
             unit,
         }
     }
-
-    pub(crate) const fn as_usize(self) -> usize {
-        assert!(self.0 <= usize::MAX as u64, "byte count exceeds usize::MAX");
-        self.0 as usize
-    }
 }
 
 const fn mul(n: u64, unit_bytes: u64) -> u64 {

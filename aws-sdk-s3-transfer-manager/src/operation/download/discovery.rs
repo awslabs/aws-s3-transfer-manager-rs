@@ -111,17 +111,27 @@ pub(super) async fn discover_obj(
 ) -> Result<ObjectDiscovery, crate::error::Error> {
     let configured_part_size = transfer.ctx().handle.part_size_bytes();
     let strategy = ObjectDiscoveryStrategy::from_request(input)?;
-    tracing::trace!("discovering object with strategy {:?}", strategy);
+    tracing::trace!(
+        target: crate::telemetry::TARGET_TRANSFER_DOWNLOAD,
+        "discovering object with strategy {:?}",
+        strategy,
+    );
     let user_explicit_part_size = transfer.ctx().handle.user_set_part_size();
     let mut discovery = match strategy {
         ObjectDiscoveryStrategy::HeadObject => {
             discover_obj_with_head(transfer, input)
-                .instrument(tracing::debug_span!("send-head-object-for-discovery"))
+                .instrument(tracing::trace_span!(
+                    target: crate::telemetry::TARGET_TRANSFER_DOWNLOAD,
+                    "send-head-object-for-discovery",
+                ))
                 .await
         }
         ObjectDiscoveryStrategy::RangedGet(range) => {
             discover_obj_with_get(transfer, input, range)
-                .instrument(tracing::debug_span!("send-ranged-get-for-discovery"))
+                .instrument(tracing::trace_span!(
+                    target: crate::telemetry::TARGET_TRANSFER_DOWNLOAD,
+                    "send-ranged-get-for-discovery",
+                ))
                 .await
         }
     }?;
@@ -158,6 +168,7 @@ pub(super) async fn discover_obj(
             .map(|chunk| chunk.expected_len as u64)
             .unwrap_or(configured_part_size);
         tracing::debug!(
+            target: crate::telemetry::TARGET_TRANSFER_DOWNLOAD,
             configured_part_size,
             stored_part_size,
             "realigned multipart download to stored part size for validation"
@@ -167,6 +178,7 @@ pub(super) async fn discover_obj(
     }
 
     tracing::trace!(
+        target: crate::telemetry::TARGET_TRANSFER_DOWNLOAD,
         remaining = ?discovery.remaining,
         initial_chunk = discovery.initial_chunk.is_some(),
         effective_part_size = discovery.effective_part_size,
@@ -199,8 +211,8 @@ async fn discover_obj_with_get_first_part(
                 .map_err(|e| crate::retry::GuardError::Inner(error::Error::from(e)))
         }
     })
-    .instrument(tracing::debug_span!(
-        target: crate::telemetry::TARGET_TRANSFER,
+    .instrument(tracing::trace_span!(
+        target: crate::telemetry::TARGET_TRANSFER_DOWNLOAD,
         "discover-get-first-part",
         tid = %transfer.ctx().id
     ))
@@ -227,8 +239,8 @@ async fn discover_obj_with_head(
                 .map_err(|e| crate::retry::GuardError::Inner(error::Error::from(e)))
         }
     })
-    .instrument(tracing::debug_span!(
-        target: crate::telemetry::TARGET_TRANSFER,
+    .instrument(tracing::trace_span!(
+        target: crate::telemetry::TARGET_TRANSFER_DOWNLOAD,
         "discover-head",
         tid = %transfer.ctx().id
     ))
@@ -386,8 +398,8 @@ async fn discover_obj_with_get(
                 .map_err(|e| crate::retry::GuardError::Inner(error::Error::from(e)))
         }
     })
-    .instrument(tracing::debug_span!(
-        target: crate::telemetry::TARGET_TRANSFER,
+    .instrument(tracing::trace_span!(
+        target: crate::telemetry::TARGET_TRANSFER_DOWNLOAD,
         "discover-ranged-get",
         tid = %transfer.ctx().id
     ))

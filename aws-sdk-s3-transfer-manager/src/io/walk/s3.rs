@@ -126,6 +126,7 @@ impl S3Walker {
     pub fn walk(self, ctx: S3WalkContext) -> S3Walk {
         if ctx.bucket.kind() == BucketType::Express {
             tracing::warn!(
+                target: crate::telemetry::TARGET_TRANSFER,
                 bucket = %ctx.bucket.name(),
                 kind = ?ctx.bucket.kind(),
                 "directory bucket detected; listing results may not be lexicographically sorted"
@@ -135,6 +136,7 @@ impl S3Walker {
         let initial_prefix = self.prefix.clone().unwrap_or_default();
 
         tracing::debug!(
+            target: crate::telemetry::TARGET_TRANSFER,
             bucket = %ctx.bucket.name(),
             kind = ?ctx.bucket.kind(),
             prefix = %initial_prefix,
@@ -424,6 +426,7 @@ impl S3Walk {
                         self.initial_first_page_pending = false;
 
                         tracing::trace!(
+                            target: crate::telemetry::TARGET_TRANSFER,
                             %prefix,
                             objects = page.objects.len(),
                             common_prefixes = page.common_prefixes.len(),

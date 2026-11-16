@@ -197,8 +197,17 @@ impl Handle {
         runtime_factory: impl FnOnce(std::sync::Weak<Handle>) -> Arc<dyn ExecutionRuntime>,
     ) -> Arc<Self> {
         // Most client tests exercise scheduling rather than memory admission.
-        // Keep their automatic pool large enough not to become an incidental gate.
-        const DEFAULT_TEST_MEMORY_BUDGET_BYTES: usize = ByteSize::gib(8).as_u64() as usize;
+        // Keep their automatic pool large enough not to become an incidental
+        // gate. 8 GiB fits in a 64-bit `usize`; on 32-bit the conversion
+        // saturates to `usize::MAX`.
+        const DEFAULT_TEST_MEMORY_BUDGET_BYTES: usize = {
+            let bytes = ByteSize::gib(8).as_u64();
+            if bytes > usize::MAX as u64 {
+                usize::MAX
+            } else {
+                bytes as usize
+            }
+        };
 
         let memory_diagnostics = config.diagnostics().memory();
         let buffer_pool = match config.memory() {

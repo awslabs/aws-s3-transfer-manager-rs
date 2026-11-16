@@ -209,7 +209,9 @@ fn resolve_capacity_bytes(
                 detected_memory.ok_or(BufferPoolBuildError::MemoryDetectionUnavailable)?;
             Ok(floor_fraction_of(detected, fraction))
         }
-        MemoryBudgetConfig::Limit(bytes) => Ok(bytes.as_usize()),
+        MemoryBudgetConfig::Limit(bytes) => {
+            usize::try_from(bytes.as_u64()).map_err(|_| BufferPoolBuildError::CapacityOverflow)
+        }
     }
 }
 
@@ -493,6 +495,9 @@ mod tests {
         );
     }
 
+    // `8 * GIB` exceeds a 32-bit `usize`; the reserved-vs-prepared split only
+    // needs an above-committed value, which only exists on 64-bit.
+    #[cfg(target_pointer_width = "64")]
     #[test]
     fn test_pool_construction_prepares_no_capacity() {
         let pool = BufferPool::from_capacity(

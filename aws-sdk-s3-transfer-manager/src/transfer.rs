@@ -5,6 +5,7 @@
 
 //! Transfer types that define what a transfer is and what it produces.
 
+mod composite;
 mod pending;
 
 use crate::config::user_agent::OperationFeatures;
@@ -18,6 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Wake, Waker};
 
+pub(crate) use composite::{CompositePendingReason, CompositeTransferSummary};
 use pending::TransferPendingState;
 pub(crate) use pending::{
     emit_pending_details, PendingCategory, PendingCause, TransferPendingStats,
@@ -535,6 +537,39 @@ impl std::fmt::Debug for MetricsState {
     }
 }
 
+/// Terminal status reported once in a transfer's terminal summary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TerminalOutcome {
+    /// The transfer completed successfully.
+    Completed,
+    /// The transfer failed.
+    Failed,
+    /// The transfer was cancelled.
+    Cancelled,
+}
+
+impl TerminalOutcome {
+    /// Projects a status onto its terminal outcome, or `None` while active.
+    pub(crate) fn from_status(status: crate::types::TransferStatus) -> Option<Self> {
+        use crate::types::TransferStatus;
+        match status {
+            TransferStatus::Completed => Some(Self::Completed),
+            TransferStatus::Failed => Some(Self::Failed),
+            TransferStatus::Cancelled => Some(Self::Cancelled),
+            TransferStatus::Active => None,
+        }
+    }
+
+    /// Stable value of the summary's `outcome` field.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
 /// Common lifecycle management for transfer state machines.
 ///
 /// Handles status tracking, error storage, completion signaling, and scheduler
@@ -1018,11 +1053,9 @@ impl TransferContext {
     ///
     /// Setting the status alone is not observable to the owning handle: a
     /// terminal transition must be signalled via [`signal_terminal`] (directly,
-    /// or once in-flight work drains). For the common fail-and-abort case use
-    /// [`set_failed_and_signal`], which bundles both.
+    /// or once in-flight work drains).
     ///
     /// [`signal_terminal`]: Self::signal_terminal
-    /// [`set_failed_and_signal`]: Self::set_failed_and_signal
     pub(crate) fn set_failed(&self, err: impl Into<error::Error>) -> bool {
         if self.status.set_failed() {
             *self.error.lock().unwrap() = Some(Box::new(err.into()));
@@ -1138,24 +1171,6 @@ impl TransferContext {
         }
         self.wake_flag.take_pending();
         self.metrics.set_finished();
-    }
-
-    /// Mark the transfer failed and immediately signal terminal (the
-    /// fail-and-abort path: the transfer is terminal now, with nothing to wait
-    /// for — see [`signal_terminal`]). Bundling the two calls keeps an abort site
-    /// from setting the status without making the transition observable. When the
-    /// signal must instead wait for in-flight work to drain, call [`set_failed`]
-    /// alone and signal once that work completes.
-    ///
-    /// Returns the result of [`set_failed`] (first-write-wins: `true` if this
-    /// call set the status).
-    ///
-    /// [`signal_terminal`]: Self::signal_terminal
-    /// [`set_failed`]: Self::set_failed
-    pub(crate) fn set_failed_and_signal(&self, err: impl Into<error::Error>) -> bool {
-        let set = self.set_failed(err);
-        self.signal_terminal();
-        set
     }
 
     /// Record an IO sample to per-transfer metrics and per-client telemetry.

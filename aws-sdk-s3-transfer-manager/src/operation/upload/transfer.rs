@@ -61,6 +61,7 @@ use crate::operation::upload::request::{
     copy_fields_to_mpu_request, copy_fields_to_upload_part_request,
 };
 use crate::operation::upload::{UploadInput, UploadOutput, UploadOutputBuilder};
+use crate::telemetry::TARGET_TRANSFER_UPLOAD;
 use crate::transfer::{IoRequest, PendingCause, PollWork, Transfer, TransferContext, WorkOutcome};
 use crate::types::{AbortOutcome, AbortedUpload, BucketType, FailedMultipartUploadPolicy};
 
@@ -75,6 +76,19 @@ pub(crate) enum UploadWork {
     CompleteMPU(Box<CompleteMpuWork>, InFlight),
     PutObject { stream: InputStream, live: InFlight },
     AbortMPU { upload_id: String, live: InFlight },
+}
+
+impl UploadWork {
+    /// Short name of the work kind for span fields.
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::CreateMPU(_) => "create_multipart_upload",
+            Self::UploadPart(..) => "upload_part",
+            Self::CompleteMPU(..) => "complete_multipart_upload",
+            Self::PutObject { .. } => "put_object",
+            Self::AbortMPU { .. } => "abort_multipart_upload",
+        }
+    }
 }
 
 /// Payload for CompleteMultipartUpload, moved out of `UploadState::Completing` when the request is
@@ -299,7 +313,7 @@ impl UploadTransfer {
     /// aborting, so the caller can abort it.
     fn warn_upload_left_open(&self, upload_id: &str) {
         tracing::warn!(
-            target: crate::telemetry::TARGET_TRANSFER,
+            target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
             tid = %self.inner.ctx.id,
             upload_id = %upload_id,
             "upload ended before completing; the multipart upload may still be open"
@@ -521,6 +535,12 @@ impl UploadTransfer {
     /// - `PollWork::Ready { .. }` - work available to execute
     /// - `PollWork::Pending` - waiting for in-flight work to complete
     /// - `PollWork::Done` - transfer complete
+    #[tracing::instrument(
+        level = "trace",
+        target = TARGET_TRANSFER_UPLOAD,
+        skip_all,
+        fields(tid = %self.inner.ctx.id),
+    )]
     pub(crate) fn poll_work(&self) -> PollWork {
         if !self.inner.ctx.is_active() {
             return PollWork::Done;
@@ -709,9 +729,17 @@ impl UploadTransfer {
         }
     }
 
+    #[tracing::instrument(
+        level = "trace",
+        target = TARGET_TRANSFER_UPLOAD,
+        skip_all,
+        fields(tid = %self.inner.ctx.id, work = tracing::field::Empty),
+    )]
     pub(crate) async fn execute(&self, work: &mut IoRequest) -> WorkOutcome {
         // A work item executes once, so execute takes its payload by value.
-        match work.take_data::<UploadWork>() {
+        let data = work.take_data::<UploadWork>();
+        tracing::Span::current().record("work", data.kind());
+        match data {
             // Each arm keeps its `InFlight` guard until the request future is
             // gone, so the count is released only after that.
             UploadWork::CreateMPU(_live) => self.execute_create_mpu().await,
@@ -780,7 +808,10 @@ impl UploadTransfer {
                     .bucket_partition_override(self.inner.request.bucket()),
             )
             .send()
-            .instrument(tracing::debug_span!("send-create-multipart-upload"))
+            .instrument(tracing::trace_span!(
+                target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
+                "send-create-multipart-upload",
+            ))
             .await;
         let _ = req_metrics.finish();
         let resp = match response {
@@ -852,7 +883,10 @@ impl UploadTransfer {
             }
         };
 
-        tracing::trace!("upload request using multipart upload with part size: {part_size} bytes");
+        tracing::trace!(
+            target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
+            "upload request using multipart upload with part size: {part_size} bytes",
+        );
 
         let part_reader = Arc::new(
             match PartReaderBuilder::new()
@@ -931,7 +965,7 @@ impl UploadTransfer {
         );
 
         tracing::debug!(
-            target: crate::telemetry::TARGET_TRANSFER,
+            target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
             total_parts = size_hint.upper().map(|upper| upper.div_ceil(part_size)),
             part_size,
             "MPU created, transferring",
@@ -943,7 +977,7 @@ impl UploadTransfer {
     async fn execute_upload_part(&self, mut work: UploadPartWork) -> WorkOutcome {
         if work.is_empty_object() {
             tracing::debug!(
-                target: crate::telemetry::TARGET_TRANSFER,
+                target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
                 tid = %self.inner.ctx.id,
                 "empty source satisfied its size hint; uploading required zero-byte part",
             );
@@ -967,7 +1001,10 @@ impl UploadTransfer {
             None => {
                 let future = match part_reader
                     .start_part_read()
-                    .instrument(tracing::debug_span!("read-upload-body"))
+                    .instrument(tracing::trace_span!(
+                        target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
+                        "read-upload-body",
+                    ))
                     .await
                 {
                     PartReadStart::Ready(future) => future,
@@ -1186,13 +1223,17 @@ impl UploadTransfer {
                     .config_override(self.inner.ctx.upload_override(self.inner.request.bucket()))
                     .disable_payload_signing()
                     .send()
-                    .instrument(tracing::debug_span!("send-upload-part", part_number))
+                    .instrument(tracing::trace_span!(
+                        target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
+                        "send-upload-part",
+                        part_number,
+                    ))
                     .await
                     .map_err(|e| crate::retry::GuardError::Inner(crate::error::Error::from(e)))
             }
         })
-        .instrument(tracing::debug_span!(
-            target: crate::telemetry::TARGET_TRANSFER,
+        .instrument(tracing::trace_span!(
+            target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
             "upload-part",
             tid = %self.inner.ctx.id,
             part_number
@@ -1330,8 +1371,8 @@ impl UploadTransfer {
             };
 
         let transfer_id = self.inner.ctx.id;
-        tracing::debug!(
-            target: crate::telemetry::TARGET_TRANSFER,
+        tracing::trace!(
+            target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
             tid = %transfer_id,
             content_length,
             is_file_backed,
@@ -1365,13 +1406,16 @@ impl UploadTransfer {
                     .config_override(self.inner.ctx.upload_override(self.inner.request.bucket()))
                     .disable_payload_signing()
                     .send()
-                    .instrument(tracing::debug_span!("send-put-object"))
+                    .instrument(tracing::trace_span!(
+                        target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
+                        "send-put-object",
+                    ))
                     .await
                     .map_err(|e| crate::retry::GuardError::Inner(crate::error::Error::from(e)))
             }
         })
-        .instrument(tracing::debug_span!(
-            target: crate::telemetry::TARGET_TRANSFER,
+        .instrument(tracing::trace_span!(
+            target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
             "put-object",
             tid = %transfer_id
         ))
@@ -1379,8 +1423,8 @@ impl UploadTransfer {
         let _ = req_metrics.finish();
         let resp = match result {
             Ok(resp) => {
-                tracing::debug!(
-                    target: crate::telemetry::TARGET_TRANSFER,
+                tracing::trace!(
+                    target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
                     tid = %transfer_id,
                     "put_object.send_exit_ok",
                 );
@@ -1388,7 +1432,7 @@ impl UploadTransfer {
             }
             Err(e) => {
                 tracing::debug!(
-                    target: crate::telemetry::TARGET_TRANSFER,
+                    target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
                     tid = %transfer_id,
                     error = %e,
                     "put_object.send_exit_err",
@@ -1522,7 +1566,10 @@ impl UploadTransfer {
                     .bucket_partition_override(self.inner.request.bucket()),
             )
             .send()
-            .instrument(tracing::debug_span!("send-complete-multipart-upload"))
+            .instrument(tracing::trace_span!(
+                target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
+                "send-complete-multipart-upload",
+            ))
             .await;
         let _ = req_metrics.finish();
         let resp = match response {
@@ -1531,6 +1578,7 @@ impl UploadTransfer {
                 let error: Error = e.into();
                 // The TM SEP requires a warning with the upload ID and cause.
                 tracing::warn!(
+                    target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
                     upload_id = %upload_id,
                     error = %error,
                     "CompleteMultipartUpload failed"
@@ -1610,7 +1658,10 @@ impl UploadTransfer {
                 .bucket_partition_override(self.inner.request.bucket()),
         )
         .send()
-        .instrument(tracing::debug_span!("send-abort-multipart-upload"))
+        .instrument(tracing::trace_span!(
+            target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
+            "send-abort-multipart-upload",
+        ))
         .await;
 
         match response {
@@ -1647,6 +1698,7 @@ impl UploadTransfer {
                 }
                 let error: Error = e.into();
                 tracing::warn!(
+                    target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
                     upload_id = %upload_id,
                     error = %error,
                     "AbortMultipartUpload failed; the multipart upload may still be open"
@@ -1681,7 +1733,7 @@ impl UploadTransfer {
         failed: FailedRequest,
     ) -> WorkOutcome {
         tracing::debug!(
-            target: crate::telemetry::TARGET_TRANSFER,
+            target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
             %error,
             "upload failed",
         );
