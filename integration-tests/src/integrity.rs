@@ -410,7 +410,6 @@ async fn mpu_composite_value_matches_expected_real_gp() {
     use aws_sdk_s3::types::{
         ChecksumAlgorithm, ChecksumMode, CompletedMultipartUpload, CompletedPart,
     };
-    use aws_sdk_s3_transfer_manager::types::ByteUnit;
 
     let t = Target::real_gp().connect().await;
     let s3 = t.s3();
