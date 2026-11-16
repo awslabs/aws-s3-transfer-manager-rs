@@ -240,30 +240,6 @@ impl DownloadIntegrity {
         }
     }
 
-    /// Records `len` accepted bytes at absolute object `offset` with their SDK outcome.
-    ///
-    /// The range must have been successfully published and written where required.
-    /// Invalid bounds latch an error. A whole-object CRC plan also latches missing
-    /// calculated evidence; response accounting alone cannot satisfy that plan.
-    pub(super) fn record_response(
-        &mut self,
-        offset: u64,
-        len: u64,
-        outcome: Option<ChecksumOutcome>,
-    ) {
-        let Some(end) = offset.checked_add(len) else {
-            self.failure.get_or_insert_with(|| {
-                Error::new(ErrorKind::RuntimeError, "range checksum bounds overflow")
-            });
-            return;
-        };
-        self.record(RangeCompletion {
-            range: CompletedRange { start: offset, end },
-            response_outcome: outcome,
-            computed: None,
-        });
-    }
-
     /// Records one successfully accepted range and its checks.
     ///
     /// Reversed bounds and overflowing accepted-byte counts latch a runtime error and
@@ -427,29 +403,71 @@ impl DownloadIntegrity {
 }
 
 #[cfg(test)]
-mod tests {
+mod test_util {
     use super::*;
     use aws_smithy_observability::unit_of_work::checksums::ResponseChecksumAlgorithm;
 
-    fn validated(algorithm: ResponseChecksumAlgorithm) -> Option<ChecksumOutcome> {
+    pub(super) fn validated(algorithm: ResponseChecksumAlgorithm) -> Option<ChecksumOutcome> {
         Some(ChecksumOutcome::Validated {
             algorithm,
             computed: "AAAAAA==".to_owned(),
         })
     }
 
-    fn not_validated(reason: ResponseNotValidatedReason) -> Option<ChecksumOutcome> {
+    pub(super) fn not_validated(reason: ResponseNotValidatedReason) -> Option<ChecksumOutcome> {
         Some(ChecksumOutcome::NotValidated { reason })
     }
 
-    fn reason(reason: NotValidatedReason) -> ChecksumValidation {
+    pub(super) fn reason(reason: NotValidatedReason) -> ChecksumValidation {
         ChecksumValidation::NotValidated { reason }
     }
+
+    pub(super) fn whole_owner(bytes: &[u8]) -> DownloadIntegrity {
+        let mut checksum = aws_smithy_checksums::ChecksumAlgorithm::Crc32.into_impl();
+        checksum.update(bytes);
+        let mut meta = ObjectMetadata::default();
+        meta.checksum_crc32 = Some(aws_smithy_types::base64::encode(checksum.finalize()));
+        meta.checksum_type = Some(ChecksumType::FullObject);
+        let plan = stored::StoredChecksum::from_metadata(&meta)
+            .unwrap()
+            .into_plan(bytes.len() as u64);
+        DownloadIntegrity::new(plan, Some(meta))
+    }
+
+    /// Records response-only evidence over non-overflowing test bounds.
+    pub(super) fn record_response(
+        integrity: &mut DownloadIntegrity,
+        offset: u64,
+        len: u64,
+        outcome: Option<ChecksumOutcome>,
+    ) {
+        integrity.record(RangeCompletion {
+            range: CompletedRange {
+                start: offset,
+                end: offset.checked_add(len).expect("test range bounds"),
+            },
+            response_outcome: outcome,
+            computed: None,
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_util::*;
+    use super::*;
+    use crate::model::ChecksumType;
+    use aws_smithy_observability::unit_of_work::checksums::ResponseChecksumAlgorithm;
 
     #[test]
     fn disabled_when_validation_not_enabled() {
         let mut tally = DownloadIntegrity::new(ValidationPlan::Disabled, None);
-        tally.record_response(0, 8, validated(ResponseChecksumAlgorithm::Crc32));
+        record_response(
+            &mut tally,
+            0,
+            8,
+            validated(ResponseChecksumAlgorithm::Crc32),
+        );
         assert_eq!(
             tally.response_validation(),
             reason(NotValidatedReason::Disabled)
@@ -459,8 +477,18 @@ mod tests {
     #[test]
     fn validated_takes_the_lowest_offset_chunks_algorithm() {
         let mut tally = DownloadIntegrity::default();
-        tally.record_response(8, 8, validated(ResponseChecksumAlgorithm::Sha256));
-        tally.record_response(0, 8, validated(ResponseChecksumAlgorithm::Crc32));
+        record_response(
+            &mut tally,
+            8,
+            8,
+            validated(ResponseChecksumAlgorithm::Sha256),
+        );
+        record_response(
+            &mut tally,
+            0,
+            8,
+            validated(ResponseChecksumAlgorithm::Crc32),
+        );
         assert_eq!(
             tally.response_validation(),
             ChecksumValidation::Validated {
@@ -472,8 +500,14 @@ mod tests {
     #[test]
     fn partial_coverage_when_some_delivered_bytes_were_validated() {
         let mut tally = DownloadIntegrity::default();
-        tally.record_response(0, 8, validated(ResponseChecksumAlgorithm::Crc32));
-        tally.record_response(
+        record_response(
+            &mut tally,
+            0,
+            8,
+            validated(ResponseChecksumAlgorithm::Crc32),
+        );
+        record_response(
+            &mut tally,
             8,
             8,
             not_validated(ResponseNotValidatedReason::PartLevelChecksum),
@@ -487,12 +521,18 @@ mod tests {
     #[test]
     fn composite_checksum_when_a_chunk_had_only_a_part_level_checksum() {
         let mut tally = DownloadIntegrity::default();
-        tally.record_response(
+        record_response(
+            &mut tally,
             0,
             8,
             not_validated(ResponseNotValidatedReason::PartLevelChecksum),
         );
-        tally.record_response(8, 8, not_validated(ResponseNotValidatedReason::NoChecksum));
+        record_response(
+            &mut tally,
+            8,
+            8,
+            not_validated(ResponseNotValidatedReason::NoChecksum),
+        );
         assert_eq!(
             tally.response_validation(),
             reason(NotValidatedReason::CompositeChecksum)
@@ -502,12 +542,18 @@ mod tests {
     #[test]
     fn unsupported_algorithm_when_a_chunk_had_only_an_unsupported_checksum() {
         let mut tally = DownloadIntegrity::default();
-        tally.record_response(
+        record_response(
+            &mut tally,
             0,
             8,
             not_validated(ResponseNotValidatedReason::UnsupportedAlgorithm),
         );
-        tally.record_response(8, 8, not_validated(ResponseNotValidatedReason::NoChecksum));
+        record_response(
+            &mut tally,
+            8,
+            8,
+            not_validated(ResponseNotValidatedReason::NoChecksum),
+        );
         assert_eq!(
             tally.response_validation(),
             reason(NotValidatedReason::UnsupportedAlgorithm)
@@ -517,8 +563,14 @@ mod tests {
     #[test]
     fn partial_coverage_outranks_an_unsupported_algorithm() {
         let mut tally = DownloadIntegrity::default();
-        tally.record_response(0, 8, validated(ResponseChecksumAlgorithm::Crc32));
-        tally.record_response(
+        record_response(
+            &mut tally,
+            0,
+            8,
+            validated(ResponseChecksumAlgorithm::Crc32),
+        );
+        record_response(
+            &mut tally,
             8,
             8,
             not_validated(ResponseNotValidatedReason::UnsupportedAlgorithm),
@@ -532,12 +584,14 @@ mod tests {
     #[test]
     fn a_part_level_checksum_outranks_an_unsupported_algorithm() {
         let mut tally = DownloadIntegrity::default();
-        tally.record_response(
+        record_response(
+            &mut tally,
             0,
             8,
             not_validated(ResponseNotValidatedReason::UnsupportedAlgorithm),
         );
-        tally.record_response(
+        record_response(
+            &mut tally,
             8,
             8,
             not_validated(ResponseNotValidatedReason::PartLevelChecksum),
@@ -564,7 +618,7 @@ mod tests {
             not_validated(ResponseNotValidatedReason::Reused),
         ] {
             let mut tally = DownloadIntegrity::default();
-            tally.record_response(0, 8, outcome.clone());
+            record_response(&mut tally, 0, 8, outcome.clone());
             assert_eq!(
                 tally.response_validation(),
                 reason(NotValidatedReason::Unavailable),
@@ -610,18 +664,6 @@ mod tests {
         assert_eq!(checks.checksum_sha1(), None);
         assert_eq!(checks.checksum_sha256(), None);
         assert_eq!(checks.checksum_type(), Some(&ChecksumType::Composite));
-    }
-
-    fn whole_owner(bytes: &[u8]) -> DownloadIntegrity {
-        let mut checksum = aws_smithy_checksums::ChecksumAlgorithm::Crc32.into_impl();
-        checksum.update(bytes);
-        let mut meta = ObjectMetadata::default();
-        meta.checksum_crc32 = Some(aws_smithy_types::base64::encode(checksum.finalize()));
-        meta.checksum_type = Some(ChecksumType::FullObject);
-        let plan = stored::StoredChecksum::from_metadata(&meta)
-            .unwrap()
-            .into_plan(bytes.len() as u64);
-        DownloadIntegrity::new(plan, Some(meta))
     }
 
     #[test]
@@ -677,7 +719,12 @@ mod tests {
     #[test]
     fn missing_calculated_evidence_cannot_downgrade_verification() {
         let mut integrity = whole_owner(b"stored");
-        integrity.record_response(0, 6, validated(ResponseChecksumAlgorithm::Crc32));
+        record_response(
+            &mut integrity,
+            0,
+            6,
+            validated(ResponseChecksumAlgorithm::Crc32),
+        );
         assert_eq!(
             integrity.finish().unwrap_err().kind(),
             &ErrorKind::RuntimeError

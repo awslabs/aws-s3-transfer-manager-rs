@@ -3,7 +3,12 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Download transfer implementation for scheduler integration.
+//! Download work issuance, range acceptance and terminal destination handling.
+//!
+//! [`DownloadTransfer`] issues work under the state lock. Workers collect and
+//! capture frozen range bytes outside that lock, then record evidence only after
+//! publication and required destination writes succeed. The last retirement
+//! transfers exclusive completion ownership to its worker.
 
 use std::cmp;
 use std::future::Future;
@@ -18,7 +23,7 @@ use crate::sdk_v1::copy_download_input_fields_to_get_object as copy_fields_to_ge
 
 use crate::error::{self, ChunkRef, Error};
 use crate::operation::download::body::{BodySlot, BodyWriter, ChunkOutput, DrainError, Drained};
-use crate::operation::download::checksum::DownloadIntegrity;
+use crate::operation::download::checksum::{DownloadIntegrity, RangeCompletion, RangeDigestMode};
 use crate::operation::download::context::{
     CompletionClaim, DownloadPendingReason, DownloadState, PendingClaim,
 };
@@ -38,7 +43,7 @@ use crate::runtime::buffer_pool::{
 use crate::telemetry::TARGET_TRANSFER_DOWNLOAD;
 use crate::transfer::{IoRequest, PollWork, Transfer, TransferContext, TransferId, WorkOutcome};
 use crate::types::BucketType;
-use aws_smithy_observability::unit_of_work::checksums::{ChecksumCapture, ChecksumOutcome};
+use aws_smithy_observability::unit_of_work::checksums::ChecksumCapture;
 use aws_smithy_observability::unit_of_work::Capture;
 use aws_smithy_types::error::display::DisplayErrorContext;
 use tracing::Instrument;
@@ -83,12 +88,19 @@ struct DownloadTransferInner {
 
 /// Download-specific work data.
 #[derive(Debug)]
-pub(crate) enum DownloadWork {
+pub(super) enum DownloadWork {
+    /// Resolves object metadata, range geometry and the validation plan.
     Discovery,
+    /// Collects one range, then publishes its bytes and accepted checksum evidence.
     GetObjectRange {
+        /// Inclusive source-object bounds of this request.
         range: std::ops::RangeInclusive<u64>,
+        /// Claimed delivery slot; taken once when execution starts.
         slot: Option<BodySlot>,
+        /// `If-Match` condition pinning the request to the discovered version, when available.
         etag: Option<Arc<str>>,
+        /// Evidence required by the transfer's immutable validation plan.
+        digest_mode: RangeDigestMode,
     },
     /// Memory-pressure relief: flush the resident filled run to disk, returning
     /// its carrier charges before the transfer waits for more memory. Handled in
@@ -365,7 +377,7 @@ impl DownloadTransfer {
                 part_size,
                 gate,
                 pending,
-                integrity: _,
+                integrity,
             } => {
                 // Resolve the slot to issue into this poll, if one is ready. Two gates
                 // compose in order: the per-transfer read-ahead window, then shared
@@ -547,6 +559,7 @@ impl DownloadTransfer {
                         range: chunk_range,
                         slot: Some(slot),
                         etag: etag.clone(),
+                        digest_mode: integrity.range_digest_mode(),
                     })),
                 })
             }
@@ -719,11 +732,17 @@ impl DownloadTransfer {
         tracing::Span::current().record("work", data.kind());
         match data {
             DownloadWork::Discovery => self.execute_discovery().await,
-            DownloadWork::GetObjectRange { range, slot, etag } => {
+            DownloadWork::GetObjectRange {
+                range,
+                slot,
+                etag,
+                digest_mode,
+            } => {
                 self.execute_get_range(
                     range.clone(),
                     slot.take().expect("slot already consumed"),
                     etag.clone(),
+                    *digest_mode,
                 )
                 .await
             }
@@ -849,6 +868,7 @@ impl DownloadTransfer {
             validation_plan,
             reports_object_values.then(|| object_meta.clone()),
         ));
+        let digest_mode = integrity.range_digest_mode();
 
         // Notify waiters that discovery completed
         self.inner.discovery_notify.notify_waiters();
@@ -983,8 +1003,15 @@ impl DownloadTransfer {
         // If discovery returned an initial chunk, process it
         match initial_work {
             Some((initial, request, chunk_meta, slot)) => {
-                self.execute_read_discovery_body(initial, request, slot, chunk_meta, etag)
-                    .await
+                self.execute_read_discovery_body(
+                    initial,
+                    request,
+                    slot,
+                    chunk_meta,
+                    etag,
+                    digest_mode,
+                )
+                .await
             }
             None => WorkOutcome::Success { data: None },
         }
@@ -997,6 +1024,7 @@ impl DownloadTransfer {
         slot: BodySlot,
         chunk_meta: ChunkMetadata,
         etag: Option<Arc<str>>,
+        digest_mode: RangeDigestMode,
     ) -> WorkOutcome {
         let InitialChunk {
             body,
@@ -1112,10 +1140,18 @@ impl DownloadTransfer {
             }
         };
 
+        bail_if_terminal!(self);
         let offset = reissue_range
             .as_ref()
             .map(|range| *range.start())
             .unwrap_or(0);
+        // Only the successful attempt supplies evidence. Hash frozen delivery bytes
+        // before publishing them, outside both the retry loop and the state lock.
+        let completed = match digest_mode.capture(offset, &bytes, checksum.try_outcome()) {
+            Ok(completed) => completed,
+            Err(error) => return self.fail_range(ChunkRef::new(seq, None), error),
+        };
+        let bytes_received = completed.range.end - completed.range.start;
         let chunk = ChunkOutput {
             seq,
             offset,
@@ -1143,14 +1179,11 @@ impl DownloadTransfer {
             }
         }
 
-        let bytes_received =
-            u64::try_from(expected_len).expect("validated discovery length originated from u64");
         self.inner.ctx.record_io(&crate::metrics::IoSample {
             network_rx: bytes_received,
             ..Default::default()
         });
-        let completed = Some((offset, bytes_received, checksum.try_outcome()));
-        if let Some(claim) = self.decrement_in_flight(freed, completed) {
+        if let Some(claim) = self.decrement_in_flight(freed, Some(completed)) {
             return self.finalize_completion(claim);
         }
 
@@ -1162,6 +1195,7 @@ impl DownloadTransfer {
         range: std::ops::RangeInclusive<u64>,
         slot: BodySlot,
         etag: Option<Arc<str>>,
+        digest_mode: RangeDigestMode,
     ) -> WorkOutcome {
         let seq = slot.seq();
         let input = self.inner.request.as_ref();
@@ -1258,6 +1292,13 @@ impl DownloadTransfer {
         };
 
         bail_if_terminal!(self);
+        // Capture the immutable bytes that will be published, not response frames
+        // or failed retry attempts. The delivery cursor remains unchanged.
+        let completed = match digest_mode.capture(*range.start(), &bytes, checksum.try_outcome()) {
+            Ok(completed) => completed,
+            Err(error) => return self.fail_range(ChunkRef::new(seq, Some(range.clone())), error),
+        };
+        let bytes_received = completed.range.end - completed.range.start;
         let chunk = ChunkOutput {
             seq,
             offset: *range.start(),
@@ -1287,14 +1328,11 @@ impl DownloadTransfer {
             }
         }
 
-        let bytes_received =
-            u64::try_from(expected_len).expect("validated range length originated from u64");
         self.inner.ctx.record_io(&crate::metrics::IoSample {
             network_rx: bytes_received,
             ..Default::default()
         });
-        let completed = Some((*range.start(), bytes_received, checksum.try_outcome()));
-        if let Some(claim) = self.decrement_in_flight(freed, completed) {
+        if let Some(claim) = self.decrement_in_flight(freed, Some(completed)) {
             return self.finalize_completion(claim);
         }
 
@@ -1317,7 +1355,7 @@ impl DownloadTransfer {
         self.fail(guard, e.with_chunk(location))
     }
 
-    /// Retire one in-flight range: record the checksum outcome of a range that
+    /// Retire one in-flight range: record the checksum evidence of a range that
     /// `completed`, drop `ranges_in_flight` and release `freed` parts of read-ahead
     /// occupancy, then claim completion if no range remains and no range or
     /// memory-relief item is still in flight. All of it happens under the state lock,
@@ -1325,9 +1363,9 @@ impl DownloadTransfer {
     /// every range that retired before it; the caller that receives the claim
     /// finalizes the transfer.
     ///
-    /// `completed` is the offset, length and checksum outcome of the bytes a
-    /// successful range delivered, and `None` for a range retired without
-    /// delivering, on cancellation.
+    /// `completed` describes bytes successfully published and written where required.
+    /// Cancelled work supplies `None`; failed work must fail the transfer before
+    /// retirement so it cannot claim completion over an error.
     ///
     /// Releasing the occupancy under the same lock `poll_work` reads the gate and arms
     /// `set_pending` under is what orders this completion's release against the issuer's
@@ -1336,7 +1374,7 @@ impl DownloadTransfer {
     fn decrement_in_flight(
         &self,
         freed: u64,
-        completed: Option<(u64, u64, Option<ChecksumOutcome>)>,
+        completed: Option<RangeCompletion>,
     ) -> Option<CompletionClaim> {
         let (completion, snapshot) = {
             let mut work = self.inner.state.lock().unwrap();
@@ -1349,8 +1387,8 @@ impl DownloadTransfer {
                     integrity,
                     ..
                 } => {
-                    if let Some((offset, len, outcome)) = completed {
-                        integrity.record_response(offset, len, outcome);
+                    if let Some(completed) = completed {
+                        integrity.record(completed);
                     }
                     *ranges_in_flight = ranges_in_flight.saturating_sub(1);
                     gate.release(freed);
@@ -3590,6 +3628,47 @@ mod tests {
             std::fs::read(dir.path().join("out")).unwrap(),
             &object[..part_size as usize]
         );
+    }
+
+    /// Accepted range evidence must hash the published bytes, independently of
+    /// the SDK's per-response verdict. A later range supplies the remaining
+    /// coverage so missing or incorrect evidence from the worker fails finish.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn accepted_range_supplies_frozen_crc_evidence() {
+        use crate::operation::download::test_util::fixtures::object_bytes;
+
+        let part_size = 5 * MB;
+        let object = object_bytes(2 * part_size as usize);
+        let (transfer, _consumer, dir) = disk_transfer(
+            disk_test_handle(crc32_object_client(Arc::clone(&object), None), part_size),
+            &FileSinkFactory,
+        );
+        transfer.inner.writer.sync_drain_batch(1);
+        assert_first_range_succeeds(&transfer).await;
+        let mut integrity = {
+            let mut state = transfer.inner.state.lock().unwrap();
+            let DownloadState::Transferring { integrity, .. } =
+                std::mem::replace(&mut *state, DownloadState::Terminal)
+            else {
+                panic!("first range must leave the second range outstanding");
+            };
+            integrity
+        };
+        let remaining = SegmentedBytes::from(Bytes::copy_from_slice(&object[part_size as usize..]));
+        integrity.record(
+            integrity
+                .range_digest_mode()
+                .capture(part_size, &remaining, None)
+                .unwrap(),
+        );
+        assert_eq!(
+            integrity.finish().unwrap().checksum_validation(),
+            &crate::types::ChecksumValidation::Validated {
+                algorithm: crate::types::ChecksumAlgorithm::Crc32,
+            },
+        );
+        assert!(std::fs::read(dir.path().join("out")).unwrap() == object[..part_size as usize]);
     }
 
     /// Runs a three-part disk download over `crc32_object_client` whose part
