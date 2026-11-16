@@ -735,7 +735,7 @@ mod tests {
 
 #[cfg(test)]
 mod value_type_tests {
-    use super::{ByteSize, ByteSizeDisplayContext, ByteUnit, Throughput};
+    use super::{ByteSize, ByteUnit, Throughput};
     use std::str::FromStr;
     use std::time::Duration;
 
@@ -867,10 +867,7 @@ mod value_type_tests {
         assert_eq!("7.201 MiB", format!("{}", ByteSize::new(7550498)));
         assert_eq!(
             "0.007 GiB",
-            format!(
-                "{}",
-                ByteSize::new(7550498).display_as(ByteUnit::Gibibyte)
-            )
+            format!("{}", ByteSize::new(7550498).display_as(ByteUnit::Gibibyte))
         );
 
         assert_eq!("1.016 GiB", format!("{}", ByteSize::new(1091242563)));
