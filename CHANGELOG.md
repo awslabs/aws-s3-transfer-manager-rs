@@ -34,6 +34,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   download's responses carried checksums only in algorithms the SDK does not compute, such as MD5.
 
 ### Changed
+- `TransferMetrics::started_at` and `TransferMetrics::finished_at` are replaced by
+  `TransferMetrics::elapsed`: the time from when the transfer was initiated until it recorded its
+  finish, or until the snapshot if it has not. The metrics in an operation's output hold the final
+  value; a handle's `status` reports whether the transfer has finished.
 - Configuration types live in `config`, which now holds everything `Config` accepts: `PartSize`,
   `ReadAhead`, `ConcurrencyMode`, `TargetThroughput`, `MemoryConfig` and `MemoryBudgetConfig` move
   there from `types` (and, for the two memory types, from `memory`). `types` keeps the model shapes,
@@ -134,6 +138,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   file, such as a directory, a device, a FIFO, or a Windows pipe, with `ErrorKind::InputInvalid`.
 - `PathBodyBuilder::build` without a path returns an `ErrorKind::InputInvalid` error instead of
   panicking.
+- The metrics in an upload's output are the transfer's metrics at completion. A single-request
+  upload's output reported zero `network_tx`, and zero `disk_read` for a file source.
 - Framework metadata set on the `SdkConfig` or S3 configuration was missing from the
   `x-amz-user-agent` header of requests the transfer manager sent. The header now carries each
   entry as `lib/<name>/<version>` alongside the transfer manager's attribution, in the order

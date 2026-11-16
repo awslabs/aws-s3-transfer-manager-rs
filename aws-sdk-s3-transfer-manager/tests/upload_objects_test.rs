@@ -31,6 +31,22 @@ use tokio::{fs::symlink, sync::watch, time::timeout};
 /// hang in the TM rather than a real slow operation.
 const TEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Waits until two `metrics` snapshots taken 10 ms apart report the same
+/// `elapsed`, and returns it. `elapsed` stops advancing only once the transfer
+/// records its finish, so a transfer that never records one hangs until the
+/// caller's `TEST_TIMEOUT`.
+async fn wait_for_finished_elapsed(
+    metrics: impl Fn() -> aws_sdk_s3_transfer_manager::metrics::TransferMetrics,
+) -> Duration {
+    loop {
+        let first = metrics().elapsed;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        if metrics().elapsed == first {
+            return first;
+        }
+    }
+}
+
 // Create an S3 client with mock behavior configured for `PutObject`
 fn mock_s3_client_for_put_object(bucket_name: String) -> Client {
     let put_object = mock!(aws_sdk_s3::Client::put_object)
@@ -727,7 +743,8 @@ async fn test_drop_upload_objects_handle() {
 /// - `objects_uploaded` matches the number of source files
 /// - `network_tx` equals the sum of source file sizes
 /// - `disk_read` equals the sum of source file sizes
-/// - `started_at` is populated and precedes `finished_at`
+/// - `elapsed` stops advancing once the transfer finishes, and the output reports
+///   that final value
 #[tokio::test]
 async fn test_metrics_correctness_on_success() {
     timeout(TEST_TIMEOUT, async {
@@ -759,6 +776,7 @@ async fn test_metrics_correctness_on_success() {
             .initiate()
             .unwrap();
 
+        let elapsed = wait_for_finished_elapsed(|| handle.metrics()).await;
         let output = handle.join().await.unwrap();
         assert_eq!(4, output.objects_uploaded());
         assert!(output.failed_transfers().is_empty());
@@ -770,14 +788,7 @@ async fn test_metrics_correctness_on_success() {
             total_bytes, output.metrics.disk_read,
             "disk_read should equal sum of source file sizes"
         );
-        let finished = output
-            .metrics
-            .finished_at
-            .expect("finished_at must be set on successful transfer");
-        assert!(
-            output.metrics.started_at <= finished,
-            "started_at must not be after finished_at"
-        );
+        assert_eq!(output.metrics.elapsed, elapsed);
     })
     .await
     .expect("test_metrics_correctness_on_success timed out");
@@ -956,14 +967,15 @@ async fn test_empty_source_directory() {
             .initiate()
             .unwrap();
 
+        let elapsed = wait_for_finished_elapsed(|| handle.metrics()).await;
         let output = handle.join().await.unwrap();
         assert_eq!(0, output.objects_uploaded());
         assert!(output.failed_transfers().is_empty());
         assert_eq!(0, output.metrics.network_tx);
         assert_eq!(0, output.metrics.disk_read);
-        assert!(
-            output.metrics.finished_at.is_some(),
-            "finished_at must be set even on zero-work transfer"
+        assert_eq!(
+            output.metrics.elapsed, elapsed,
+            "a zero-work transfer must record its finish"
         );
     })
     .await

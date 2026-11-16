@@ -21,6 +21,7 @@ use aws_sdk_s3_transfer_manager::types::ByteSize;
 use aws_sdk_s3_transfer_manager::types::FailedTransferPolicy;
 use s3_mock_server::{FaultType, Occurrence, S3MockServer};
 
+use crate::assertions::wait_for_finished_elapsed;
 use crate::harness::mock_tm;
 use tokio::time::timeout;
 
@@ -353,13 +354,14 @@ async fn test_download_objects_empty_prefix() {
             .initiate()
             .expect("initiate download_objects");
 
+        let elapsed = wait_for_finished_elapsed(|| handle.metrics()).await;
         let output = handle.join().await.expect("join download_objects");
         assert_eq!(0, output.objects_downloaded());
         assert!(output.failed_transfers().is_empty());
         assert_eq!(0, output.metrics.network_rx);
-        assert!(
-            output.metrics.finished_at.is_some(),
-            "finished_at must be set even on zero-work transfer"
+        assert_eq!(
+            output.metrics.elapsed, elapsed,
+            "a zero-work transfer must record its finish"
         );
 
         let files_on_disk = count_files(dest.path());
