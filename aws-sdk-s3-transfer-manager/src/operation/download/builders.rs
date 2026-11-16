@@ -6,7 +6,9 @@ use std::sync::Arc;
 
 use crate::telemetry::TARGET_TRANSFER_DOWNLOAD;
 
-use super::{DownloadHandle, DownloadInputBuilder, ManagedDownloadHandle};
+#[cfg(any(unix, windows, target_os = "wasi"))]
+use super::ManagedDownloadHandle;
+use super::{DownloadHandle, DownloadInputBuilder};
 
 /// Fluent builder for constructing a single object download transfer.
 #[derive(Debug)]

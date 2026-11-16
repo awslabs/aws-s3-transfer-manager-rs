@@ -601,8 +601,7 @@ fn multipart_output_updates_retain_real_metrics_and_create_only_members() {
         disk_read: 42,
         disk_write: 0,
         total_bytes: Some(42),
-        started_at: std::time::Instant::now(),
-        finished_at: None,
+        elapsed: std::time::Duration::ZERO,
     };
     let create =
         aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput::builder()
