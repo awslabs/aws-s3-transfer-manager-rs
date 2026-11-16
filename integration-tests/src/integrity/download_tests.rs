@@ -218,76 +218,60 @@ download_cases! {
 /// caller ranges and validation-off downloads keep GET-first discovery.
 #[tokio::test(flavor = "multi_thread")]
 async fn discovery_request_counts_and_verdicts() {
-    use super::test_util::vocab::CaseTarget;
-    use s3_mock_server::Operation;
+    use super::test_util::{table_case, vocab::CaseTarget};
+    use s3_mock_server::Operation::{GetObject, HeadObject};
 
-    let cases = super::table_cases();
-    for (suffix, heads, gets) in [
+    for (suffix, expected_requests) in [
         (
             "download_tests::single_put::crc32::default::validated::stream",
-            1,
-            1,
+            &[HeadObject, GetObject][..],
         ),
         (
             "algorithm_tests::full_object_mpu_small::extended::crc32::validated::stream",
-            1,
-            1,
+            &[HeadObject, GetObject][..],
         ),
         (
             "download_tests::full_object_mpu::crc64nvme::default::validated::stream",
-            1,
-            3,
+            &[HeadObject, GetObject, GetObject, GetObject][..],
         ),
         (
             "algorithm_tests::single_put_split::extended::crc32::validated::stream",
-            1,
-            2,
+            &[HeadObject, GetObject, GetObject][..],
         ),
         (
             "algorithm_tests::single_put_split::extended::sha256::not_validated::stream",
-            1,
-            2,
+            &[HeadObject, GetObject, GetObject][..],
         ),
         (
             "download_tests::composite_mpu::crc32::auto_part_size::validated::stream",
-            1,
-            3,
+            &[HeadObject, GetObject, GetObject, GetObject][..],
         ),
         (
             "algorithm_tests::composite_realigned::extended::crc32::validated::stream",
-            1,
-            3,
+            &[HeadObject, GetObject, GetObject, GetObject][..],
         ),
         (
             "download_tests::composite_mpu::crc32::aligned::validated::stream",
-            1,
-            3,
+            &[HeadObject, GetObject, GetObject, GetObject][..],
         ),
         (
             "download_tests::empty_crc::crc64nvme::default::validated::stream",
-            1,
-            0,
+            &[HeadObject][..],
         ),
         (
             "algorithm_tests::stored_without_checksum::extended::none::not_validated::stream",
-            1,
-            3,
+            &[HeadObject, GetObject, GetObject, GetObject][..],
         ),
         (
             "download_tests::full_object_mpu::crc32::caller_range::not_validated::stream",
-            0,
-            2,
+            &[GetObject, GetObject][..],
         ),
         (
             "download_tests::single_put::crc32::validation_off::not_validated::stream",
-            0,
-            1,
+            &[GetObject][..],
         ),
     ] {
-        let case = cases
-            .iter()
-            .find(|case| case.path.ends_with(suffix))
-            .unwrap_or_else(|| panic!("no case {suffix}"));
+        let case = table_case(suffix);
         let execution = case.execute(CaseTarget::MockGp).await;
         case.check(&execution)
             .unwrap_or_else(|error| panic!("{suffix}: {error}"));
@@ -297,23 +281,8 @@ async fn discovery_request_counts_and_verdicts() {
             .expect("mock journal")
             .iter()
             .filter(|request| request.key.as_deref() == Some(execution.key.as_str()))
+            .map(|request| request.operation)
             .collect();
-        let count = |operation| {
-            requests
-                .iter()
-                .filter(|request| request.operation == operation)
-                .count()
-        };
-        assert_eq!(
-            (count(Operation::HeadObject), count(Operation::GetObject)),
-            (heads, gets),
-            "{suffix}: {requests:#?}",
-        );
-        let first = if heads == 0 {
-            Operation::GetObject
-        } else {
-            Operation::HeadObject
-        };
-        assert_eq!(requests[0].operation, first, "{suffix}: {requests:#?}");
+        assert_eq!(requests, expected_requests, "{suffix}");
     }
 }

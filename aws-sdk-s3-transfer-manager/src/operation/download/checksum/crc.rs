@@ -62,6 +62,7 @@ impl CrcAlgorithm {
     ///
     /// Both inputs are finalized CRCs under this algorithm; `right_len` is a byte
     /// count, not an absolute object offset. Inputs need no matching range size.
+    /// The SDK's checksum API exposes hashing but no finalized-CRC combination.
     fn combine(self, left: u64, right: u64, right_len: u64) -> u64 {
         let algorithm = match self {
             Self::Crc32 => crc_fast::CrcAlgorithm::Crc32IsoHdlc,
@@ -71,7 +72,7 @@ impl CrcAlgorithm {
         crc_fast::checksum_combine(algorithm, left, right, right_len)
     }
 
-    /// Encodes a finalized numeric CRC in S3's decoded, big-endian checksum format.
+    /// Encodes a finalized CRC as big-endian bytes, matching the SDK's CRC finalizers.
     fn bytes(self, value: u64) -> Vec<u8> {
         value.to_be_bytes()[8 - self.width()..].to_vec()
     }
@@ -147,6 +148,11 @@ impl CrcFold {
     /// Empty, reversed, out-of-bounds, overlapping or wrong-algorithm evidence latches
     /// a failure and clears the map. Duplicate bounds count as overlap. The failure
     /// is returned by [`Self::finish`]; subsequent records cannot repair it.
+    ///
+    /// Tree operations cost O(log m), with at most two CRC combinations costing
+    /// O(log L) each, where m is the retained interval count and L the right-hand
+    /// byte length. Lengths are `u64`, so combination examines at most 64 bits.
+    /// Clearing the map on failure costs O(m). No payload bytes are retained or read.
     pub(super) fn record(&mut self, range: CompletedRange, checksum: ComputedChecksum) {
         if self.failure.is_some() {
             return;

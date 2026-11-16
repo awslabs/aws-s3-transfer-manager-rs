@@ -17,9 +17,9 @@ pub(crate) enum DownloadPendingReason {
     ReadAhead,
     /// A claimed body slot is waiting for shared buffer-pool admission.
     MemoryAdmission,
-    /// Every range was issued and in-flight range work must retire.
+    /// Every range was issued and in-flight range work must finish.
     RangeCompletion,
-    /// Every range retired, and in-flight drains (memory-relief writes) must
+    /// Every range completed, and in-flight drains (memory-relief writes) must
     /// finish before the destination can be finalized.
     DrainCompletion,
 }
@@ -61,7 +61,7 @@ impl std::fmt::Debug for PendingClaim {
 /// # Completion
 ///
 /// Every work item `poll_work` issues is counted when it is issued and
-/// uncounted when it retires: a range in `ranges_in_flight`, a memory-relief
+/// uncounted when it finishes: a range in `ranges_in_flight`, a memory-relief
 /// item in `drains_in_flight`, and discovery by the `DiscoveryInFlight` state,
 /// its body, if any, then counted in `ranges_in_flight` like a range. The item
 /// that uncounts the last one with nothing left to issue (discovery itself,
@@ -85,7 +85,7 @@ pub(crate) enum DownloadState {
         /// Number of ranges currently in flight
         ranges_in_flight: usize,
         /// Memory-relief items in flight: counted when `poll_work` issues one
-        /// and uncounted when it retires, after writing every run it claimed.
+        /// and uncounted when it finishes, after writing every run it claimed.
         /// A claimed run is invisible to the terminal drain, so the transfer
         /// completes only when this is zero. At most one is in flight, since
         /// one item drains every drainable run.
@@ -106,8 +106,8 @@ pub(crate) enum DownloadState {
         /// cancellation-safely removes the future from the FIFO.
         pending: Option<PendingClaim>,
         /// Validation requirements and checksum evidence for successfully accepted ranges.
-        /// Recorded under the state lock as ranges retire, so the completion claim
-        /// owns every accepted range's evidence.
+        /// Recorded under the state lock as ranges complete successfully, so the
+        /// completion claim owns every accepted range's evidence.
         integrity: Box<DownloadIntegrity>,
     },
 
@@ -173,9 +173,9 @@ impl DownloadState {
     }
 }
 
-/// Exclusive completion ownership after all range and destination-drain work retires.
+/// Exclusive completion ownership after all range and destination-drain work completes.
 ///
-/// Carries the integrity evidence of every successfully retired range. Taking the
+/// Carries the integrity evidence of every successfully completed range. Taking the
 /// claim does not verify that evidence or finalize the destination.
 ///
 /// Only [`DownloadState::try_claim_completion`] constructs it; `finalize_completion`

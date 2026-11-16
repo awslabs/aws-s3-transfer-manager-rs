@@ -94,55 +94,23 @@ pub(super) enum ObjectChecksumMethod {
 
 impl ObjectChecksumMethod {
     /// Returns the range calculation required to supply evidence for this method.
-    fn range_digest_mode(self) -> RangeDigestMode {
+    fn range_digest_plan(self) -> RangeDigestPlan {
         match self {
-            Self::CombineRanges { algorithm } => RangeDigestMode::Calculate { algorithm },
+            Self::CombineRanges { algorithm } => RangeDigestPlan::Calculate { algorithm },
         }
     }
 }
 
-/// Per-range evidence required by the download's validation plan.
+/// Additional checksum calculation required for one download range.
 #[derive(Debug, Clone, Copy)]
-pub(super) enum RangeDigestMode {
-    /// Captures response outcomes and byte bounds without calculating another checksum.
+pub(super) enum RangeDigestPlan {
+    /// No additional digest; byte bounds and SDK outcomes are still captured.
     None,
     /// Calculates a CRC over the frozen bytes accepted for the range.
     Calculate {
         /// Must match the whole-object method that consumes this range's evidence.
         algorithm: CrcAlgorithm,
     },
-}
-
-impl RangeDigestMode {
-    /// Captures `[offset, offset + bytes.len())`, its SDK outcome and the selected CRC.
-    ///
-    /// `offset` is the absolute source-object offset of the first remaining byte.
-    /// Hashing neither advances the buffer's cursor nor copies payload bytes.
-    /// Capturing evidence does not accept it; record it only after publication and
-    /// any required destination writes succeed.
-    ///
-    /// Returns [`ErrorKind::RuntimeError`] if the length or exclusive end exceeds `u64`.
-    pub(super) fn capture(
-        self,
-        offset: u64,
-        bytes: &SegmentedBytes,
-        response_outcome: Option<ChecksumOutcome>,
-    ) -> Result<RangeCompletion, Error> {
-        let len = u64::try_from(bytes.len())
-            .map_err(|_| Error::new(ErrorKind::RuntimeError, "range length exceeds u64"))?;
-        let end = offset
-            .checked_add(len)
-            .ok_or_else(|| Error::new(ErrorKind::RuntimeError, "range checksum bounds overflow"))?;
-        let computed = match self {
-            Self::None => None,
-            Self::Calculate { algorithm } => Some(digest_segments(algorithm, bytes)),
-        };
-        Ok(RangeCompletion {
-            range: CompletedRange { start: offset, end },
-            response_outcome,
-            computed,
-        })
-    }
 }
 
 /// Absolute source-object byte bounds `[start, end)`, ordered by start and then end.
@@ -169,6 +137,38 @@ pub(super) struct RangeCompletion {
     pub(super) response_outcome: Option<ChecksumOutcome>,
     /// CRC over exactly `range`; required when the selected method combines range CRCs.
     pub(super) computed: Option<ComputedChecksum>,
+}
+
+impl RangeCompletion {
+    /// Captures byte bounds, the SDK outcome and the digest required by `digest_plan`.
+    ///
+    /// `offset` is the absolute source-object offset of the first remaining byte.
+    /// Hashing neither advances the buffer's cursor nor copies payload bytes.
+    /// Capturing evidence does not accept it; record it only after publication and
+    /// any required destination writes succeed.
+    ///
+    /// Returns [`ErrorKind::RuntimeError`] if the length or exclusive end exceeds `u64`.
+    pub(super) fn capture(
+        offset: u64,
+        bytes: &SegmentedBytes,
+        response_outcome: Option<ChecksumOutcome>,
+        digest_plan: RangeDigestPlan,
+    ) -> Result<Self, Error> {
+        let len = u64::try_from(bytes.len())
+            .map_err(|_| Error::new(ErrorKind::RuntimeError, "range length exceeds u64"))?;
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| Error::new(ErrorKind::RuntimeError, "range checksum bounds overflow"))?;
+        let computed = match digest_plan {
+            RangeDigestPlan::None => None,
+            RangeDigestPlan::Calculate { algorithm } => Some(digest_segments(algorithm, bytes)),
+        };
+        Ok(Self {
+            range: CompletedRange { start: offset, end },
+            response_outcome,
+            computed,
+        })
+    }
 }
 
 /// Owns accepted response coverage and the selected whole-object verification.
@@ -232,11 +232,11 @@ impl DownloadIntegrity {
         }
     }
 
-    /// Derives range evidence from the selected whole-object calculation.
-    pub(super) fn range_digest_mode(&self) -> RangeDigestMode {
+    /// Returns the additional digest required by the selected whole-object calculation.
+    pub(super) fn range_digest_plan(&self) -> RangeDigestPlan {
         match &self.plan {
-            ValidationPlan::WholeObject(plan) => plan.method.range_digest_mode(),
-            _ => RangeDigestMode::None,
+            ValidationPlan::WholeObject(plan) => plan.method.range_digest_plan(),
+            _ => RangeDigestPlan::None,
         }
     }
 
@@ -245,6 +245,11 @@ impl DownloadIntegrity {
     /// Reversed bounds and overflowing accepted-byte counts latch a runtime error and
     /// ignore later records. Whole-object CRC checks also latch missing, overlapping,
     /// out-of-bounds or wrong-algorithm evidence; failure cannot be repaired by retries.
+    /// These failures are returned as runtime errors by [`Self::finish`].
+    ///
+    /// Response accounting is O(1). CRC interval accounting is O(log m + log L),
+    /// where m is the retained interval count and L the merged byte length.
+    /// Clearing retained intervals on failure is O(m); recording never reads payload bytes.
     pub(super) fn record(&mut self, completion: RangeCompletion) {
         if self.failure.is_some() {
             return;
@@ -399,6 +404,7 @@ mod test_util {
     use super::*;
     use aws_smithy_observability::unit_of_work::checksums::ResponseChecksumAlgorithm;
 
+    /// Returns an SDK-validated outcome with a fixed encoded checksum.
     pub(super) fn validated(algorithm: ResponseChecksumAlgorithm) -> Option<ChecksumOutcome> {
         Some(ChecksumOutcome::Validated {
             algorithm,
@@ -406,14 +412,17 @@ mod test_util {
         })
     }
 
+    /// Returns an SDK outcome that supplies no validated byte coverage.
     pub(super) fn not_validated(reason: ResponseNotValidatedReason) -> Option<ChecksumOutcome> {
         Some(ChecksumOutcome::NotValidated { reason })
     }
 
+    /// Constructs the expected unvalidated transfer verdict for `reason`.
     pub(super) fn reason(reason: NotValidatedReason) -> ChecksumValidation {
         ChecksumValidation::NotValidated { reason }
     }
 
+    /// Creates a whole-object CRC32 owner expecting exactly `bytes` and its length.
     pub(super) fn whole_owner(bytes: &[u8]) -> DownloadIntegrity {
         let mut checksum = aws_smithy_checksums::ChecksumAlgorithm::Crc32.into_impl();
         checksum.update(bytes);
@@ -662,10 +671,10 @@ mod tests {
     #[test]
     fn whole_object_verification_validates_ranges_without_sdk_checksums() {
         let mut integrity = whole_owner(b"abcdefgh");
-        let mode = integrity.range_digest_mode();
+        let digest_plan = integrity.range_digest_plan();
         for (offset, bytes) in [(4, b"efgh".as_slice()), (0, b"abcd".as_slice())] {
             let bytes = SegmentedBytes::from(bytes::Bytes::copy_from_slice(bytes));
-            integrity.record(mode.capture(offset, &bytes, None).unwrap());
+            integrity.record(RangeCompletion::capture(offset, &bytes, None, digest_plan).unwrap());
         }
         assert_eq!(
             integrity.finish().unwrap().checksum_validation(),
@@ -680,10 +689,13 @@ mod tests {
         let mut integrity = whole_owner(b"stored");
         let bytes = SegmentedBytes::from(bytes::Bytes::from_static(b"broken"));
         integrity.record(
-            integrity
-                .range_digest_mode()
-                .capture(0, &bytes, validated(ResponseChecksumAlgorithm::Sha256))
-                .unwrap(),
+            RangeCompletion::capture(
+                0,
+                &bytes,
+                validated(ResponseChecksumAlgorithm::Sha256),
+                integrity.range_digest_plan(),
+            )
+            .unwrap(),
         );
         assert!(matches!(
             integrity.finish().unwrap_err().kind(),
@@ -696,10 +708,13 @@ mod tests {
         let mut integrity = whole_owner(b"stored");
         let bytes = SegmentedBytes::from(bytes::Bytes::from_static(b"stored"));
         integrity.record(
-            integrity
-                .range_digest_mode()
-                .capture(0, &bytes, validated(ResponseChecksumAlgorithm::Sha256))
-                .unwrap(),
+            RangeCompletion::capture(
+                0,
+                &bytes,
+                validated(ResponseChecksumAlgorithm::Sha256),
+                integrity.range_digest_plan(),
+            )
+            .unwrap(),
         );
         assert_eq!(
             integrity.finish().unwrap().checksum_validation(),
@@ -738,8 +753,7 @@ mod tests {
     fn capture_rejects_offset_overflow() {
         let bytes = SegmentedBytes::from(bytes::Bytes::from_static(b"a"));
         assert_eq!(
-            RangeDigestMode::None
-                .capture(u64::MAX, &bytes, None)
+            RangeCompletion::capture(u64::MAX, &bytes, None, RangeDigestPlan::None)
                 .unwrap_err()
                 .kind(),
             &ErrorKind::RuntimeError

@@ -12,18 +12,10 @@
 //! check can't fail first. Where the condition can't be produced by a download, the test changes
 //! the recorded execution instead.
 
-use super::table_cases;
 use super::test_util::runner::Execution;
+use super::test_util::table_case;
 use super::test_util::vocab::*;
 use s3_mock_server::FaultType;
-
-/// The case in the tables whose path ends with `suffix`.
-fn table_case(suffix: &str) -> &'static Case {
-    table_cases()
-        .into_iter()
-        .find(|c| c.path.ends_with(suffix))
-        .unwrap_or_else(|| panic!("no case ends with {suffix}"))
-}
 
 /// Executes the table case whose path ends with `suffix` on `mock_gp`.
 async fn execute(suffix: &str) -> (&'static Case, Execution) {
@@ -387,6 +379,8 @@ async fn whole_response_requires_the_object_checksum() {
 #[tokio::test(flavor = "multi_thread")]
 async fn full_object_requires_a_head_object() {
     let (case, mut run) = execute(INTACT).await;
+    case.check(&run)
+        .expect("intact execution must satisfy its original case");
     run.requests
         .as_mut()
         .expect("mock journal")

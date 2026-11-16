@@ -11,3 +11,13 @@ pub(crate) mod expect;
 pub(crate) mod macros;
 pub(crate) mod runner;
 pub(crate) mod vocab;
+
+/// Returns the table case whose full path ends with `suffix`.
+///
+/// Panics when neither case table contains a matching path.
+pub(super) fn table_case(suffix: &str) -> &'static vocab::Case {
+    super::table_cases()
+        .into_iter()
+        .find(|case| case.path.ends_with(suffix))
+        .unwrap_or_else(|| panic!("no case ends with {suffix}"))
+}

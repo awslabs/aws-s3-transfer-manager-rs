@@ -5,7 +5,8 @@
 
 //! Classifies stored S3 checksum metadata into download validation requirements.
 //!
-//! [`StoredChecksum`] selects the first supported header in SDK priority order.
+//! [`StoredChecksum`] recognizes explicit COMPOSITE metadata and otherwise
+//! selects the first supported header in SDK priority order.
 //! Only a decodable full-object CRC of the correct width can construct a
 //! whole-object plan; composite, SHA and unavailable values select response checks.
 //! [`ExpectedValue`] preserves the stored encoding alongside its decoded bytes.
@@ -15,19 +16,19 @@ use super::{ObjectChecksumMethod, ValidationPlan, WholeObjectPlan};
 use crate::error::{self, Error};
 use crate::model::{ChecksumAlgorithm, ChecksumType, ObjectMetadata};
 
-/// A stored CRC's decoded bytes and original S3 header value.
+/// A stored checksum's decoded bytes and original S3 header value.
 ///
-/// Classification checks that the decoded width matches the CRC algorithm carried
-/// by the whole-object plan. The original encoding is retained for mismatch errors.
+/// The decoded bytes are compared with the calculated value. The original
+/// encoding is retained for checksum mismatch errors.
 #[derive(Debug)]
 pub(in crate::operation::download) struct ExpectedValue {
-    /// Big-endian checksum bytes used for equality with the calculated CRC.
+    /// Decoded checksum bytes used for equality with the calculated value.
     pub(super) decoded: Vec<u8>,
     /// Original base64 value reported in the integrity error's expected field.
     pub(super) encoded: String,
 }
 
-/// Classification of the first present supported checksum, before selecting a calculation.
+/// Stored checksum metadata classified before selecting a calculation.
 ///
 /// Header priority is CRC64NVME, CRC32C, CRC32, SHA-1, then SHA-256. A later header
 /// does not replace a selected header that is malformed or cannot be verified.
@@ -40,25 +41,30 @@ pub(in crate::operation::download) enum StoredChecksum {
         /// Stored value checked against this algorithm's decoded width.
         expected: ExpectedValue,
     },
-    /// A value with a positive `-N` suffix, or a CRC explicitly marked COMPOSITE.
+    /// Metadata explicitly marked COMPOSITE, or a selected value with a positive `-N` suffix.
     Composite,
-    /// An unsuffixed SHA-1 or SHA-256 value; selects SDK response checks.
+    /// An unsuffixed SHA-1 or SHA-256 value not marked COMPOSITE; selects response checks.
     Ordered,
     /// No supported header, an unknown CRC type or a CRC with invalid base64.
     Unavailable,
 }
 
 impl StoredChecksum {
-    /// Classifies the first present supported header, without falling back to later headers.
+    /// Classifies explicit checksum type and the first present supported header.
     ///
-    /// A positive `-N` suffix selects composite checks regardless of checksum type.
+    /// Explicit COMPOSITE metadata selects composite checks even without a supported
+    /// header. A positive `-N` suffix also selects composite checks regardless of type.
+    /// Classification never falls back to later headers.
     /// Invalid CRC base64 or an unknown CRC type selects [`Self::Unavailable`].
     /// Returns [`crate::error::ErrorKind::ObjectNotDiscoverable`] when a full-object
     /// CRC decodes successfully but has the wrong width for its algorithm.
     pub(in crate::operation::download) fn from_metadata(
         meta: &ObjectMetadata,
     ) -> Result<Self, Error> {
-        let Some((selected_algorithm, value)) = Self::header(meta) else {
+        if matches!(meta.checksum_type, Some(ChecksumType::Composite)) {
+            return Ok(Self::Composite);
+        }
+        let Some((selected_algorithm, value)) = Self::preferred_checksum_header(meta) else {
             return Ok(Self::Unavailable);
         };
         let algorithm = match selected_algorithm {
@@ -76,9 +82,6 @@ impl StoredChecksum {
         let Some(algorithm) = algorithm else {
             return Ok(Self::Ordered);
         };
-        if matches!(meta.checksum_type, Some(ChecksumType::Composite)) {
-            return Ok(Self::Composite);
-        }
         if !matches!(meta.checksum_type, None | Some(ChecksumType::FullObject)) {
             return Ok(Self::Unavailable);
         }
@@ -107,8 +110,12 @@ impl StoredChecksum {
         })
     }
 
-    /// Returns the first present supported header, without decoding or validating it.
-    fn header(meta: &ObjectMetadata) -> Option<(ChecksumAlgorithm, &str)> {
+    /// Returns the first present supported header in SDK priority order:
+    /// CRC64NVME, CRC32C, CRC32, SHA-1, then SHA-256.
+    ///
+    /// Does not decode or validate the value. A malformed preferred header is not
+    /// replaced by a lower-priority header.
+    fn preferred_checksum_header(meta: &ObjectMetadata) -> Option<(ChecksumAlgorithm, &str)> {
         [
             (
                 ChecksumAlgorithm::Crc64Nvme,
@@ -125,7 +132,7 @@ impl StoredChecksum {
 
     /// Returns the selected header's algorithm even when its value cannot be verified.
     pub(super) fn algorithm(meta: &ObjectMetadata) -> Option<ChecksumAlgorithm> {
-        Self::header(meta).map(|(algorithm, _)| algorithm)
+        Self::preferred_checksum_header(meta).map(|(algorithm, _)| algorithm)
     }
 
     /// Selects a whole-object CRC check of `[0, object_len)` or SDK response checks.
@@ -192,6 +199,32 @@ mod tests {
             meta.checksum_type = checksum_type;
             let stored = StoredChecksum::from_metadata(&meta).unwrap();
             assert!(matches!(stored, StoredChecksum::Composite));
+            assert!(matches!(stored.into_plan(7), ValidationPlan::PerResponse));
+        }
+    }
+
+    #[test]
+    fn explicit_composite_type_classifies_sha_and_absent_headers() {
+        for algorithm in [
+            None,
+            Some(ChecksumAlgorithm::Sha1),
+            Some(ChecksumAlgorithm::Sha256),
+        ] {
+            let mut meta = ObjectMetadata::default();
+            meta.checksum_type = Some(ChecksumType::Composite);
+            match algorithm {
+                Some(ChecksumAlgorithm::Sha1) => meta.checksum_sha1 = Some("stored hash".into()),
+                Some(ChecksumAlgorithm::Sha256) => {
+                    meta.checksum_sha256 = Some("stored hash".into())
+                }
+                None => {}
+                _ => unreachable!("test includes only SHA algorithms"),
+            }
+            let stored = StoredChecksum::from_metadata(&meta).unwrap();
+            assert!(
+                matches!(stored, StoredChecksum::Composite),
+                "{algorithm:?}: {stored:?}"
+            );
             assert!(matches!(stored.into_plan(7), ValidationPlan::PerResponse));
         }
     }

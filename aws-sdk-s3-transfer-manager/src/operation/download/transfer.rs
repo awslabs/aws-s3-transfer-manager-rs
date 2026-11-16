@@ -3,13 +3,14 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Download work issuance, range acceptance and terminal destination handling.
+//! Download transfer state machine.
 //!
-//! [`DownloadTransfer`] issues work under the state lock. Workers collect and
-//! capture frozen range bytes outside that lock, then record evidence only after
-//! publication and required destination writes succeed. The last retirement
-//! transfers exclusive completion ownership to its worker. That owner verifies
-//! integrity before destination finalization and successful completion.
+//! [`DownloadTransfer`] resolves metadata and validation requirements through
+//! discovery, then issues range reads and destination drains under the state lock.
+//! Workers collect bytes and calculate required digests outside the lock. Only
+//! successfully published ranges and their required writes supply checksum evidence.
+//! The last completed work item claims exclusive completion ownership under the
+//! lock, then verifies integrity and finalizes the destination after releasing it.
 
 use std::cmp;
 use std::future::Future;
@@ -24,7 +25,7 @@ use crate::sdk_v1::copy_download_input_fields_to_get_object as copy_fields_to_ge
 
 use crate::error::{self, ChunkRef, Error};
 use crate::operation::download::body::{BodySlot, BodyWriter, ChunkOutput, DrainError, Drained};
-use crate::operation::download::checksum::{DownloadIntegrity, RangeCompletion, RangeDigestMode};
+use crate::operation::download::checksum::{DownloadIntegrity, RangeCompletion, RangeDigestPlan};
 use crate::operation::download::context::{
     CompletionClaim, DownloadPendingReason, DownloadState, PendingClaim,
 };
@@ -100,8 +101,8 @@ pub(super) enum DownloadWork {
         slot: Option<BodySlot>,
         /// `If-Match` condition pinning the request to the discovered version, when available.
         etag: Option<Arc<str>>,
-        /// Evidence required by the transfer's immutable validation plan.
-        digest_mode: RangeDigestMode,
+        /// Additional checksum calculation required for this range.
+        digest_plan: RangeDigestPlan,
     },
     /// Memory-pressure relief: flush the resident filled run to disk, returning
     /// its carrier charges before the transfer waits for more memory. Handled in
@@ -124,10 +125,9 @@ impl DownloadWork {
 macro_rules! bail_if_terminal {
     ($self:expr) => {
         if !$self.inner.ctx.is_active() {
-            // Bailing before any drain: no occupancy freed on this path. The transfer is
-            // no longer active, so a completion this retirement claims is dropped rather
-            // than finalized: the cancellation's terminal path owns the destination (see
-            // `CompletionClaim`).
+            // No occupancy is freed before a drain. If decrementing the in-flight
+            // count claims completion, drop the claim: cancellation's terminal path
+            // owns the destination (see `CompletionClaim`).
             let _ = $self.decrement_in_flight(0, None);
             return WorkOutcome::Cancelled;
         }
@@ -335,7 +335,7 @@ impl DownloadTransfer {
     /// - `PollWork::Done` - transfer complete
     ///
     /// This issues work and parks; it never completes a transfer. Each item it
-    /// issues is counted when issued, and the item that retires last with
+    /// issues is counted when issued, and the work item that finishes last with
     /// nothing left to issue claims completion and finalizes, as
     /// [`DownloadState`] describes.
     #[tracing::instrument(
@@ -478,9 +478,9 @@ impl DownloadTransfer {
                     );
                     return self.park(DownloadPendingReason::RangeCompletion, snapshot);
                 } else if *drains_in_flight > 0 {
-                    // Every range retired, but the memory-relief item is still in
+                    // Every range completed, but the memory-relief item is still in
                     // flight and may hold a claimed run that finalization cannot see.
-                    // It completes the transfer when it retires.
+                    // It completes the transfer when it finishes.
                     let snapshot = transferring_snapshot(
                         remaining.as_ref(),
                         *ranges_in_flight,
@@ -522,7 +522,7 @@ impl DownloadTransfer {
                     all_ranges_issued = false;
                 } else {
                     // The final range was just issued: issuance is done and the transfer
-                    // drains its in-flight tail, completed by the item that retires last.
+                    // drains its in-flight tail, completed by the work item that finishes last.
                     // Logged once per transfer.
                     *remaining = None;
                     all_ranges_issued = true;
@@ -560,7 +560,7 @@ impl DownloadTransfer {
                         range: chunk_range,
                         slot: Some(slot),
                         etag: etag.clone(),
-                        digest_mode: integrity.range_digest_mode(),
+                        digest_plan: integrity.range_digest_plan(),
                     })),
                 })
             }
@@ -737,13 +737,13 @@ impl DownloadTransfer {
                 range,
                 slot,
                 etag,
-                digest_mode,
+                digest_plan,
             } => {
                 self.execute_get_range(
                     range.clone(),
                     slot.take().expect("slot already consumed"),
                     etag.clone(),
-                    *digest_mode,
+                    *digest_plan,
                 )
                 .await
             }
@@ -759,7 +759,7 @@ impl DownloadTransfer {
     /// issued it, and is uncounted here, under the state lock, once it has
     /// written every run it claimed. Success therefore cannot be claimed while
     /// the item is queued or a claimed run is still being written, and whichever
-    /// item retires last, the final range or the relief item, claims the
+    /// work item finishes last, the final range or the relief item, claims the
     /// terminal transition exactly once. A relief item that finds the transfer
     /// no longer active writes nothing: its count goes with the `Transferring`
     /// state, and the terminal drain owns any resident run. A failed write
@@ -826,11 +826,6 @@ impl DownloadTransfer {
     async fn execute_discovery(&self) -> WorkOutcome {
         let input = self.inner.request.as_ref();
 
-        // Resolve the effective validation state the same way the SDK's GetObject
-        // mutator does: enabled if the request set ChecksumMode=Enabled, or the
-        // request left it unset and the client's ResponseChecksumValidation is not
-        // WhenRequired (WhenSupported, the default, and unknown values enable it).
-        // Computed before discovery because it selects checksum metadata and range layout.
         let validation_enabled = self.validation_enabled(input);
 
         let discovery = match discover_obj(self, input, validation_enabled).await {
@@ -863,13 +858,17 @@ impl DownloadTransfer {
 
         // HEAD reports object values even when later GETs carry only part metadata.
         // GET-first discovery reports object values only for a whole-object response.
-        let reports_object_values =
-            input.range.is_none() && (validation_enabled || remaining.is_none());
+        let object_checksum_metadata =
+            if input.range.is_none() && (validation_enabled || remaining.is_none()) {
+                Some(object_meta.clone())
+            } else {
+                None
+            };
         let integrity = Box::new(DownloadIntegrity::new(
             validation_plan,
-            reports_object_values.then(|| object_meta.clone()),
+            object_checksum_metadata,
         ));
-        let digest_mode = integrity.range_digest_mode();
+        let digest_plan = integrity.range_digest_plan();
 
         // Notify waiters that discovery completed
         self.inner.discovery_notify.notify_waiters();
@@ -969,7 +968,7 @@ impl DownloadTransfer {
             };
             let snapshot = self.snapshot(&work);
             // With no chunk and nothing remaining, discovery is the last work item to
-            // retire, so it claims completion under the lock that publishes the state.
+            // finish, so it claims completion under the lock that publishes the state.
             // A transfer that is no longer active is not completed.
             let completion = if self.inner.ctx.is_active() {
                 work.try_claim_completion()
@@ -1010,7 +1009,7 @@ impl DownloadTransfer {
                     slot,
                     chunk_meta,
                     etag,
-                    digest_mode,
+                    digest_plan,
                 )
                 .await
             }
@@ -1025,7 +1024,7 @@ impl DownloadTransfer {
         slot: BodySlot,
         chunk_meta: ChunkMetadata,
         etag: Option<Arc<str>>,
-        digest_mode: RangeDigestMode,
+        digest_plan: RangeDigestPlan,
     ) -> WorkOutcome {
         let InitialChunk {
             body,
@@ -1118,7 +1117,7 @@ impl DownloadTransfer {
                     || ctx.is_active(),
                 )
                 .await
-                .map(|bytes| (bytes, checksum))
+                .map(|segmented| (segmented, checksum))
                 .map_err(crate::retry::GuardError::Inner)
             }
         })
@@ -1130,10 +1129,10 @@ impl DownloadTransfer {
         .await;
         let _ = req_metrics.finish();
 
-        let (bytes, checksum) = match result {
+        let (segmented, checksum) = match result {
             Ok(val) => val,
-            // Go terminal without retiring this chunk: fail() sets Terminal under
-            // the lock, so no later retirement can claim completion over this
+            // Go terminal without completing this range work: fail() sets Terminal under
+            // the lock, so no later work completion can claim completion over this
             // error. The in-flight count is abandoned with the Transferring state.
             Err(e) => {
                 let guard = self.inner.state.lock().unwrap();
@@ -1141,6 +1140,7 @@ impl DownloadTransfer {
             }
         };
 
+        // Collection may finish after cancellation; stop before hashing or publication.
         bail_if_terminal!(self);
         let offset = reissue_range
             .as_ref()
@@ -1148,15 +1148,17 @@ impl DownloadTransfer {
             .unwrap_or(0);
         // Only the successful attempt supplies evidence. Hash frozen delivery bytes
         // before publishing them, outside both the retry loop and the state lock.
-        let completed = match digest_mode.capture(offset, &bytes, checksum.try_outcome()) {
-            Ok(completed) => completed,
-            Err(error) => return self.fail_range(ChunkRef::new(seq, None), error),
-        };
+        let completed =
+            match RangeCompletion::capture(offset, &segmented, checksum.try_outcome(), digest_plan)
+            {
+                Ok(completed) => completed,
+                Err(error) => return self.fail_range(ChunkRef::new(seq, None), error),
+            };
         let bytes_received = completed.range.end - completed.range.start;
         let chunk = ChunkOutput {
             seq,
             offset,
-            data: bytes,
+            data: segmented,
             metadata: chunk_meta,
         };
 
@@ -1196,7 +1198,7 @@ impl DownloadTransfer {
         range: std::ops::RangeInclusive<u64>,
         slot: BodySlot,
         etag: Option<Arc<str>>,
-        digest_mode: RangeDigestMode,
+        digest_plan: RangeDigestPlan,
     ) -> WorkOutcome {
         let seq = slot.seq();
         let input = self.inner.request.as_ref();
@@ -1262,7 +1264,7 @@ impl DownloadTransfer {
                         .await?;
                     // Untimed: drain the body. Errors here are inner (retryable IO).
                     let chunk_meta = crate::sdk_v1::chunk_metadata_from_get_object(&resp);
-                    let bytes = collect_response_body(
+                    let segmented = collect_response_body(
                         &ctx.handle.buffer_pool,
                         resp.body,
                         &checksum,
@@ -1273,7 +1275,7 @@ impl DownloadTransfer {
                     .await
                     .map_err(crate::retry::GuardError::Inner)?;
                     Ok::<_, crate::retry::GuardError<crate::error::Error>>((
-                        chunk_meta, bytes, checksum,
+                        chunk_meta, segmented, checksum,
                     ))
                 }
             })
@@ -1285,17 +1287,23 @@ impl DownloadTransfer {
             .await;
         let _ = req_metrics.finish();
 
-        let (chunk_meta, bytes, checksum) = match result {
+        let (chunk_meta, segmented, checksum) = match result {
             Ok(val) => val,
             Err(e) => {
                 return self.fail_range(ChunkRef::new(seq, Some(*range.start()..=*range.end())), e)
             }
         };
 
+        // Collection may finish after cancellation; stop before hashing or publication.
         bail_if_terminal!(self);
         // Capture the immutable bytes that will be published, not response frames
         // or failed retry attempts. The delivery cursor remains unchanged.
-        let completed = match digest_mode.capture(*range.start(), &bytes, checksum.try_outcome()) {
+        let completed = match RangeCompletion::capture(
+            *range.start(),
+            &segmented,
+            checksum.try_outcome(),
+            digest_plan,
+        ) {
             Ok(completed) => completed,
             Err(error) => return self.fail_range(ChunkRef::new(seq, Some(range.clone())), error),
         };
@@ -1303,7 +1311,7 @@ impl DownloadTransfer {
         let chunk = ChunkOutput {
             seq,
             offset: *range.start(),
-            data: bytes,
+            data: segmented,
             metadata: chunk_meta,
         };
 
@@ -1350,23 +1358,23 @@ impl DownloadTransfer {
     /// Fail a range request with an error, tagging the chunk it belongs to.
     fn fail_range(&self, location: ChunkRef, e: Error) -> WorkOutcome {
         // Go terminal before any wake (see the discovery-body error path). Do not
-        // decrement_in_flight first: as the last item to retire it would claim
+        // decrement_in_flight first: as the last work item to finish it would claim
         // completion and finalize over this error.
         let guard = self.inner.state.lock().unwrap();
         self.fail(guard, e.with_chunk(location))
     }
 
-    /// Retire one in-flight range: record the checksum evidence of a range that
-    /// `completed`, drop `ranges_in_flight` and release `freed` parts of read-ahead
-    /// occupancy, then claim completion if no range remains and no range or
-    /// memory-relief item is still in flight. All of it happens under the state lock,
-    /// so completion is claimed exactly once, and the claim carries the outcome of
-    /// every range that retired before it; the caller that receives the claim
-    /// finalizes the transfer.
+    /// Completes one in-flight range work item and releases its read-ahead occupancy.
+    ///
+    /// Under the state lock, records `completed` evidence, decrements the range
+    /// count and releases `freed` parts. Claims completion exactly once when no
+    /// range remains and no range or memory-relief work is still in flight.
+    /// The claim carries every successfully completed range's evidence; its owner
+    /// verifies integrity and finalizes the destination outside the lock.
     ///
     /// `completed` describes bytes successfully published and written where required.
     /// Cancelled work supplies `None`; failed work must fail the transfer before
-    /// retirement so it cannot claim completion over an error.
+    /// decrementing the in-flight count so it cannot claim completion over an error.
     ///
     /// Releasing the occupancy under the same lock `poll_work` reads the gate and arms
     /// `set_pending` under is what orders this completion's release against the issuer's
@@ -1487,7 +1495,7 @@ impl DownloadTransfer {
             // runs from a work item that is still counted, from discovery
             // before `Transferring`, from `poll_work` while the transfer is
             // active, or from `finalize_completion` before `set_completed`, and
-            // completion requires every counted item to have retired. Release
+            // completion requires every counted item to have finished. Release
             // builds log instead, since a panic would change nothing there:
             // success was already reported, and the scheduler contains panics.
             debug_assert!(
@@ -2300,6 +2308,45 @@ mod tests {
         DownloadTransfer::new(ctx, BucketType::Standard, input, writer)
     }
 
+    /// Request mode overrides client policy; an unset mode follows the client default.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn validation_enabled_resolves_request_and_client_settings() {
+        use aws_sdk_s3::config::ResponseChecksumValidation::{WhenRequired, WhenSupported};
+
+        for (client_setting, unset_enabled) in [
+            (None, true),
+            (Some(WhenSupported), true),
+            (Some(WhenRequired), false),
+        ] {
+            let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[head_rule(0)], |conf| {
+                match client_setting {
+                    Some(setting) => conf.response_checksum_validation(setting),
+                    None => conf,
+                }
+            });
+            let transfer =
+                create_get_first_download_with_client_and_detail(client, 8 * MB, 0, None);
+            for (request_mode, expected) in [
+                (None, unset_enabled),
+                (Some(crate::model::ChecksumMode::Enabled), true),
+            ] {
+                let input = DownloadInput::builder()
+                    .bucket("test-bucket")
+                    .key("test-key")
+                    .set_checksum_mode(request_mode)
+                    .build()
+                    .unwrap();
+                assert_eq!(
+                    transfer.validation_enabled(&input),
+                    expected,
+                    "client={client_setting:?}, request={:?}",
+                    input.checksum_mode,
+                );
+            }
+        }
+    }
+
     // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
     #[cfg_attr(miri, ignore)]
     #[test]
@@ -2424,7 +2471,7 @@ mod tests {
     }
 
     /// A zero-byte object has no ranges, so discovery is the last work item to
-    /// retire: its `execute` claims completion and finalizes the destination,
+    /// finish: its `execute` claims completion and finalizes the destination,
     /// and the next poll finds the transfer done.
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
@@ -3662,9 +3709,7 @@ mod tests {
         };
         let remaining = SegmentedBytes::from(Bytes::copy_from_slice(&object[part_size as usize..]));
         integrity.record(
-            integrity
-                .range_digest_mode()
-                .capture(part_size, &remaining, None)
+            RangeCompletion::capture(part_size, &remaining, None, integrity.range_digest_plan())
                 .unwrap(),
         );
         assert_eq!(
@@ -3758,11 +3803,11 @@ mod tests {
         );
         assert_first_range_succeeds(&transfer).await;
         let mut last = assert_ready(transfer.poll_work());
-        let DownloadWork::GetObjectRange { digest_mode, .. } = last.data_mut::<DownloadWork>()
+        let DownloadWork::GetObjectRange { digest_plan, .. } = last.data_mut::<DownloadWork>()
         else {
             panic!("last work item must be the second range");
         };
-        *digest_mode = RangeDigestMode::None;
+        *digest_plan = RangeDigestPlan::None;
         assert!(matches!(
             execute(&transfer, &mut last).await,
             WorkOutcome::Failed { .. }
@@ -3870,9 +3915,9 @@ mod tests {
         }
     }
 
-    /// The final range retiring while a memory-relief write is still landing does
+    /// The final range completing while a memory-relief write is still landing does
     /// not complete the transfer: finalization cannot see the run that write
-    /// claimed. The relief write completes the transfer when it retires, and the
+    /// claimed. The relief write completes the transfer when it finishes, and the
     /// destination then holds the whole object.
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
@@ -3926,7 +3971,7 @@ mod tests {
         assert_done(transfer.poll_work());
     }
 
-    /// A memory-relief write that fails after every range has retired fails the
+    /// A memory-relief write that fails after every range has completed fails the
     /// transfer instead of being discarded behind a completion.
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
@@ -4018,9 +4063,9 @@ mod tests {
         );
     }
 
-    /// The final range retiring while a relief item is queued does not complete
+    /// The final range completing while a relief item is queued does not complete
     /// the transfer, since the item has yet to claim and write the run it
-    /// relieves. The relief item completes the transfer when it retires.
+    /// relieves. The relief item completes the transfer when it finishes.
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn final_range_waits_for_a_queued_relief_item() {
@@ -4077,7 +4122,7 @@ mod tests {
     /// write occupies one slot, and keeps it off the held write's thread.
     /// Relief is issued one item at a time, so the held write is the only
     /// relief item, and the final range gets the second slot only once
-    /// discovery has retired. The held write's thread is then the only loaded
+    /// discovery has finished. The held write's thread is then the only loaded
     /// one, and routing, which picks the less loaded of two threads, picks
     /// another. With one detected partition, the final range instead waits
     /// for the held write to be released.
@@ -4254,7 +4299,7 @@ mod tests {
 
     /// A failure after the transfer completed panics in debug builds. The case
     /// is unreachable in practice, since completion is claimed only once every
-    /// counted work item has retired. The test reaches it by construction,
+    /// counted work item has finished. The test reaches it by construction,
     /// calling `fail` directly on a completed single-part download.
     #[cfg(debug_assertions)]
     #[cfg_attr(miri, ignore)]
@@ -4282,7 +4327,7 @@ mod tests {
     /// In release builds, a failure after the transfer completed leaves it
     /// completed and is logged at error level with its cause. The case is
     /// unreachable in practice, since completion is claimed only once every
-    /// counted work item has retired. The test reaches it by construction,
+    /// counted work item has finished. The test reaches it by construction,
     /// calling `fail` directly on a completed single-part download.
     #[cfg(not(debug_assertions))]
     #[cfg_attr(miri, ignore)]

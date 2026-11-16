@@ -103,7 +103,15 @@ fn parts_from_etag(etag: &str) -> Option<u32> {
 }
 
 impl ObjectDiscoveryStrategy {
-    fn from_request(input: &DownloadInput) -> Result<ObjectDiscoveryStrategy, crate::error::Error> {
+    /// Selects the initial request from caller bounds and the resolved checksum policy.
+    ///
+    /// Enabled whole-object validation uses HEAD. Inclusive caller ranges retain
+    /// a GET body; suffix and open-ended ranges require HEAD to resolve their bounds.
+    /// Invalid range syntax returns a range parsing error.
+    fn from_request(
+        input: &DownloadInput,
+        validation_enabled: bool,
+    ) -> Result<ObjectDiscoveryStrategy, crate::error::Error> {
         let strategy = match input.range() {
             Some(h) => {
                 let byte_range = header::Range::from_str(h)?.0;
@@ -115,6 +123,7 @@ impl ObjectDiscoveryStrategy {
                     _ => ObjectDiscoveryStrategy::HeadObject,
                 }
             }
+            None if validation_enabled => ObjectDiscoveryStrategy::HeadObject,
             None => ObjectDiscoveryStrategy::RangedGet(None),
         };
 
@@ -139,11 +148,13 @@ pub(super) async fn discover_obj(
 ) -> Result<ObjectDiscovery, crate::error::Error> {
     let configured_part_size = transfer.ctx().handle.part_size_bytes();
     let whole_object_validation = validation_enabled && input.range().is_none();
-    let strategy = if whole_object_validation {
-        ObjectDiscoveryStrategy::HeadObject
-    } else {
-        ObjectDiscoveryStrategy::from_request(input)?
-    };
+    let strategy = ObjectDiscoveryStrategy::from_request(input, validation_enabled)?;
+    tracing::trace!(
+        target: crate::telemetry::TARGET_TRANSFER_DOWNLOAD,
+        ?strategy,
+        validation_enabled,
+        "download discovery strategy selected",
+    );
     let mut discovery = match strategy {
         ObjectDiscoveryStrategy::HeadObject => {
             discover_obj_with_head(transfer, input)
@@ -173,11 +184,7 @@ pub(super) async fn discover_obj(
             .and_then(|length| u64::try_from(length).ok())
             .ok_or_else(|| error::discovery_failed("HeadObject has invalid content-length"))?;
         let stored = StoredChecksum::from_metadata(&discovery.object_meta)?;
-        let composite = matches!(stored, StoredChecksum::Composite)
-            || matches!(
-                discovery.object_meta.checksum_type,
-                Some(crate::model::ChecksumType::Composite)
-            );
+        let composite = matches!(stored, StoredChecksum::Composite);
         reason = match &stored {
             StoredChecksum::FullObjectCrc { .. } => "stored full-object CRC",
             StoredChecksum::Composite => "stored composite checksum",
@@ -219,10 +226,6 @@ pub(super) async fn discover_obj(
             ValidationPlan::Disabled
         };
     }
-    discovery
-        .validation_plan
-        .log(&discovery.object_meta, reason);
-
     tracing::trace!(
         target: crate::telemetry::TARGET_TRANSFER_DOWNLOAD,
         remaining = ?discovery.remaining,
@@ -230,6 +233,9 @@ pub(super) async fn discover_obj(
         effective_part_size = discovery.effective_part_size,
         "discovered object",
     );
+    discovery
+        .validation_plan
+        .log(&discovery.object_meta, reason);
 
     Ok(discovery)
 }
@@ -668,7 +674,10 @@ mod tests {
     use bytes::Buf;
     use std::sync::Arc;
 
-    fn strategy_from_range(range: Option<&str>) -> ObjectDiscoveryStrategy {
+    fn strategy_from_range(
+        range: Option<&str>,
+        validation_enabled: bool,
+    ) -> ObjectDiscoveryStrategy {
         let input = DownloadInput::builder()
             .bucket("test-bucket")
             .key("test-key")
@@ -676,7 +685,7 @@ mod tests {
             .build()
             .unwrap();
 
-        ObjectDiscoveryStrategy::from_request(&input).unwrap()
+        ObjectDiscoveryStrategy::from_request(&input, validation_enabled).unwrap()
     }
 
     fn test_handle(
@@ -714,24 +723,25 @@ mod tests {
     }
 
     #[test]
-    fn test_strategy_from_req() {
-        assert_eq!(
-            ObjectDiscoveryStrategy::RangedGet(None),
-            strategy_from_range(None)
-        );
-
-        assert_eq!(
-            ObjectDiscoveryStrategy::RangedGet(Some(100..=200)),
-            strategy_from_range(Some("bytes=100-200"))
-        );
-        assert_eq!(
-            ObjectDiscoveryStrategy::HeadObject,
-            strategy_from_range(Some("bytes=100-"))
-        );
-        assert_eq!(
-            ObjectDiscoveryStrategy::HeadObject,
-            strategy_from_range(Some("bytes=-500"))
-        );
+    fn discovery_strategy_uses_resolved_validation_and_caller_bounds() {
+        for validation_enabled in [false, true] {
+            let whole_object = if validation_enabled {
+                ObjectDiscoveryStrategy::HeadObject
+            } else {
+                ObjectDiscoveryStrategy::RangedGet(None)
+            };
+            assert_eq!(strategy_from_range(None, validation_enabled), whole_object);
+            assert_eq!(
+                strategy_from_range(Some("bytes=100-200"), validation_enabled),
+                ObjectDiscoveryStrategy::RangedGet(Some(100..=200)),
+            );
+            for range in ["bytes=100-", "bytes=-500"] {
+                assert_eq!(
+                    strategy_from_range(Some(range), validation_enabled),
+                    ObjectDiscoveryStrategy::HeadObject,
+                );
+            }
+        }
     }
 
     #[test]
@@ -1134,20 +1144,25 @@ mod tests {
         const MIB: u64 = 1024 * 1024;
         let stored_part = 16 * MIB;
         let total = 36 * MIB;
+        let head_output = HeadObjectOutput::builder()
+            .content_length(total as i64)
+            .e_tag("\"abc-3\"")
+            .checksum_crc32("AAAAAA==-3")
+            .checksum_type(aws_sdk_s3::types::ChecksumType::Composite)
+            .metadata("source", "head")
+            .version_id("head-version")
+            .server_side_encryption(aws_sdk_s3::types::ServerSideEncryption::AwsKms)
+            .ssekms_key_id("head-key")
+            .content_type("application/octet-stream")
+            .build();
+        let expected_object_meta = crate::sdk_v1::object_metadata_from_head_object(&head_output);
         let head = mock!(Client::head_object)
             .match_requests(|r| {
                 r.checksum_mode() == Some(&aws_sdk_s3::types::ChecksumMode::Enabled)
                     && r.if_match() == Some("caller-etag")
                     && r.version_id() == Some("version")
             })
-            .then_output(move || {
-                HeadObjectOutput::builder()
-                    .content_length(total as i64)
-                    .e_tag("\"abc-3\"")
-                    .checksum_crc32("AAAAAA==-3")
-                    .checksum_type(aws_sdk_s3::types::ChecksumType::Composite)
-                    .build()
-            });
+            .then_output(move || head_output.clone());
         let part = mock!(Client::get_object)
             .match_requests(|r| {
                 r.part_number() == Some(1)
@@ -1162,6 +1177,11 @@ mod tests {
                     .e_tag("\"abc-3\"")
                     .checksum_crc32("AQIDBA==")
                     .parts_count(3)
+                    .metadata("source", "part")
+                    .version_id("part-version")
+                    .server_side_encryption(aws_sdk_s3::types::ServerSideEncryption::Aes256)
+                    .content_type("text/plain")
+                    .cache_control("part-only")
                     .body(ByteStream::from_static(&[0u8; 8]))
                     .build()
             });
@@ -1179,15 +1199,64 @@ mod tests {
         assert_eq!(part.num_calls(), 1);
         assert_eq!(discovery.effective_part_size, stored_part);
         assert_eq!(discovery.remaining, Some(stored_part..=total - 1));
+        assert_eq!(discovery.object_meta, expected_object_meta);
+        assert_eq!(
+            discovery.object_meta.version_id.as_deref(),
+            Some("head-version")
+        );
+        assert_eq!(
+            discovery.object_meta.ssekms_key_id.as_deref(),
+            Some("head-key")
+        );
+        assert_eq!(
+            discovery.object_meta.server_side_encryption,
+            Some(crate::model::ServerSideEncryption::AwsKms),
+        );
+        assert_eq!(
+            discovery.object_meta.content_type.as_deref(),
+            Some("application/octet-stream"),
+        );
+        assert_eq!(
+            discovery
+                .object_meta
+                .metadata
+                .as_ref()
+                .unwrap()
+                .get("source")
+                .map(String::as_str),
+            Some("head"),
+        );
+        assert_eq!(discovery.object_meta.content_range, None);
+        assert_eq!(discovery.object_meta.parts_count, None);
+        assert_eq!(discovery.object_meta.cache_control, None);
         assert_eq!(discovery.object_meta.content_length, Some(total as i64));
         assert_eq!(
             discovery.object_meta.checksum_crc32.as_deref(),
             Some("AAAAAA==-3")
         );
+        let chunk_meta = discovery.chunk_meta.expect("part metadata");
+        assert_eq!(chunk_meta.checksum_crc32.as_deref(), Some("AQIDBA=="));
+        assert_eq!(chunk_meta.content_length, Some(stored_part as i64));
         assert_eq!(
-            discovery.chunk_meta.unwrap().checksum_crc32.as_deref(),
-            Some("AQIDBA==")
+            chunk_meta.content_range.as_deref(),
+            Some(format!("bytes 0-{}/{}", stored_part - 1, total).as_str()),
         );
+        assert_eq!(chunk_meta.parts_count, Some(3));
+        assert_eq!(
+            chunk_meta
+                .metadata
+                .as_ref()
+                .unwrap()
+                .get("source")
+                .map(String::as_str),
+            Some("part")
+        );
+        assert_eq!(chunk_meta.version_id.as_deref(), Some("part-version"));
+        assert_eq!(
+            chunk_meta.server_side_encryption,
+            Some(crate::model::ServerSideEncryption::Aes256)
+        );
+        assert_eq!(chunk_meta.cache_control.as_deref(), Some("part-only"));
         assert_eq!(
             discovery.initial_chunk.unwrap().expected_len,
             stored_part as usize
