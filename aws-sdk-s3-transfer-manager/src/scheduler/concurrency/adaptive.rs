@@ -282,7 +282,7 @@ impl AdaptiveConcurrencyController {
         let old_target = self.target.swap(clamped, Ordering::Relaxed);
 
         let phase = Phase::from_usize(self.phase.load(Ordering::Relaxed));
-        let gbps = crate::metrics::unit::ByteUnit::Gigabit.as_bytes_u64() as f64;
+        let gbps = crate::types::ByteUnit::Gigabit.as_bytes_u64() as f64;
         tracing::trace!(
             target: crate::telemetry::TARGET_CONCURRENCY,
             goodput_gbps = goodput / gbps,

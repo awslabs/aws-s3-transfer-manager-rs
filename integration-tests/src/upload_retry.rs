@@ -22,9 +22,10 @@
 //! to-first-byte deadline); these pin the recovery that is in place and document
 //! the response-wait gap that remains.
 
+use aws_sdk_s3_transfer_manager::config::PartSize;
 use aws_sdk_s3_transfer_manager::io::InputStream;
 use aws_sdk_s3_transfer_manager::operation::upload::ChecksumStrategy;
-use aws_sdk_s3_transfer_manager::types::PartSize;
+use aws_sdk_s3_transfer_manager::types::ByteSize;
 use s3_mock_server::S3MockServer;
 
 mod fault_connector;
@@ -79,7 +80,7 @@ async fn setup_with_fault(
         .s3_config(aws_sdk_s3_transfer_manager::config::S3ClientConfig::new(
             &shared_config,
         ))
-        .part_size(PartSize::Target(PART_SIZE))
+        .part_size(PartSize::Target(ByteSize::new(PART_SIZE)))
         .build()
         .expect("valid config");
     let tm = aws_sdk_s3_transfer_manager::Client::new(tm_config);
@@ -183,14 +184,14 @@ async fn upload_part_persistent_dispatch_io_error_fails() {
 mod server_faults {
     use std::time::Duration;
 
+    use aws_sdk_s3_transfer_manager::config::PartSize;
     use aws_sdk_s3_transfer_manager::io::InputStream;
-    use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
-    use aws_sdk_s3_transfer_manager::types::PartSize;
+    use aws_sdk_s3_transfer_manager::types::ByteSize;
     use aws_sdk_s3_transfer_manager::Client as TmClient;
     use s3_mock_server::{FaultType, Occurrence, S3MockServer};
 
     /// 5 MiB parts (the S3 multipart minimum).
-    const PART_SIZE: PartSize = PartSize::Target(5 * 1024 * 1024);
+    const PART_SIZE: PartSize = PartSize::Target(ByteSize::new(5 * 1024 * 1024));
 
     /// Which upload path a test drives. The transfer manager chooses multipart
     /// when the object is at least the multipart threshold, else a single
@@ -207,7 +208,7 @@ mod server_faults {
     /// A 10 MiB object — two 5 MiB parts under `Path::Multipart`, one `PutObject`
     /// under `Path::PutObject`.
     fn upload_data() -> Vec<u8> {
-        vec![0u8; 2 * 5 * ByteUnit::Mebibyte.as_bytes_usize()]
+        vec![0u8; 2 * ByteSize::mib(5).as_u64() as usize]
     }
 
     /// Byte offset at which `StallRequestRead` makes the mock stop reading — the
@@ -231,7 +232,7 @@ mod server_faults {
         // 10 MiB object: threshold below it → multipart; above it → single PutObject.
         let threshold = match path {
             Path::Multipart => PART_SIZE,
-            Path::PutObject => PartSize::Target(64 * 1024 * 1024),
+            Path::PutObject => PartSize::Target(ByteSize::new(64 * 1024 * 1024)),
         };
         let tm = TmClient::new(
             aws_sdk_s3_transfer_manager::Config::builder()

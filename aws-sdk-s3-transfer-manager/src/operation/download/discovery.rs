@@ -534,8 +534,8 @@ fn first_chunk_response_handler(
 
 #[cfg(test)]
 mod tests {
+    use crate::config::PartSize;
     use crate::http::header::ByteRange;
-    use crate::metrics::unit::ByteUnit;
     use crate::operation::download::discovery::{
         discover_obj, discover_obj_with_head, first_chunk_response_handler,
         validate_head_response_range, ObjectDiscoveryStrategy,
@@ -544,7 +544,8 @@ mod tests {
     use crate::operation::download::DownloadInput;
     use crate::transfer::TransferContext;
     use crate::types::BucketType;
-    use crate::types::PartSize;
+    use crate::types::ByteSize;
+
     use aws_sdk_s3::operation::get_object::{GetObjectError, GetObjectOutput};
     use aws_sdk_s3::operation::head_object::HeadObjectOutput;
     use aws_sdk_s3::Client;
@@ -572,7 +573,7 @@ mod tests {
     ) -> Arc<crate::client::Handle> {
         let tm_config = crate::Config::builder()
             .sdk_client(client)
-            .set_target_part_size(PartSize::Target(target_part_size))
+            .set_target_part_size(PartSize::Target(ByteSize::new(target_part_size)))
             .build()
             .expect("valid config");
         let tm = crate::Client::new(tm_config);
@@ -766,10 +767,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let transfer = test_transfer(
-            test_handle(client, 5 * ByteUnit::Mebibyte.as_bytes_u64()),
-            &input,
-        );
+        let transfer = test_transfer(test_handle(client, ByteSize::mib(5).as_u64()), &input);
 
         let discovery = discover_obj_with_head(&transfer, &input).await.unwrap();
         let remaining = discovery.remaining.unwrap();
@@ -787,7 +785,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_discover_obj_with_head_ranged_keeps_the_offsets() {
-        let total = 10 * ByteUnit::Mebibyte.as_bytes_u64();
+        let total = ByteSize::mib(10).as_u64();
         // `Range: bytes=-500`: the LAST 500 bytes of a 10MiB object.
         let head_obj_rule = mock!(Client::head_object).then_output(move || {
             HeadObjectOutput::builder()
@@ -804,10 +802,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let transfer = test_transfer(
-            test_handle(client, 5 * ByteUnit::Mebibyte.as_bytes_u64()),
-            &input,
-        );
+        let transfer = test_transfer(test_handle(client, ByteSize::mib(5).as_u64()), &input);
 
         let discovery = discover_obj_with_head(&transfer, &input).await.unwrap();
         assert_eq!(
@@ -838,10 +833,7 @@ mod tests {
             .range("bytes=-500")
             .build()
             .unwrap();
-        let transfer = test_transfer(
-            test_handle(client, 5 * ByteUnit::Mebibyte.as_bytes_u64()),
-            &input,
-        );
+        let transfer = test_transfer(test_handle(client, ByteSize::mib(5).as_u64()), &input);
 
         let error = discover_obj_with_head(&transfer, &input)
             .await
@@ -937,10 +929,7 @@ mod tests {
             .expected_bucket_owner("owner")
             .build()
             .unwrap();
-        let transfer = test_transfer(
-            test_handle(client, 5 * ByteUnit::Mebibyte.as_bytes_u64()),
-            &input,
-        );
+        let transfer = test_transfer(test_handle(client, ByteSize::mib(5).as_u64()), &input);
 
         let discovery = discover_obj_with_head(&transfer, &input).await.unwrap();
         assert_eq!(Some(500..=999), discovery.remaining);

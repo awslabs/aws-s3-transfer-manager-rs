@@ -16,11 +16,12 @@ use crate::config::TransferDiagnosticsConfig;
 use crate::error::ErrorKind;
 use crate::io::SizeHint;
 use crate::metrics::RequestMetrics;
+use crate::metrics::TransferMetrics;
 use crate::transfer::{
     emit_pending_details, AttributedRequestMeasurement, RequestMetricsAttribution, TransferContext,
     TransferId, TransferPendingStats,
 };
-use crate::types::{TransferMetrics, TransferStatus};
+use crate::types::TransferStatus;
 
 /// Copyable execution-state projection of
 /// [`UploadState`](super::context::UploadState).

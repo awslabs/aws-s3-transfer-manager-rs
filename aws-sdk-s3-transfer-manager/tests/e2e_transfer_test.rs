@@ -9,10 +9,10 @@
 // Set S3_TEST_BUCKET_NAME_RS environment variables to the bucket created.
 // By default, it uses aws-s3-transfer-manager-rs-test-bucket
 use aws_sdk_s3::types::ChecksumMode;
+use aws_sdk_s3_transfer_manager::config::PartSize;
 use aws_sdk_s3_transfer_manager::io::{InputStream, PartData, PartStream, SizeHint, StreamContext};
-use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
 use aws_sdk_s3_transfer_manager::operation::upload::ChecksumStrategy;
-use aws_sdk_s3_transfer_manager::types::PartSize;
+use aws_sdk_s3_transfer_manager::types::{ByteSize, ByteUnit};
 use aws_smithy_runtime::test_util::capture_test_logs::show_test_logs;
 use std::pin::Pin;
 use std::task::Poll;
@@ -39,7 +39,7 @@ fn generate_key(readable_key: &str) -> String {
 
 async fn test_tm() -> (aws_sdk_s3_transfer_manager::Client, aws_sdk_s3::Client) {
     let tm_config = aws_sdk_s3_transfer_manager::from_env()
-        .part_size(PartSize::Target(8 * ByteUnit::Mebibyte.as_bytes_u64()))
+        .part_size(PartSize::Target(ByteSize::mib(8)))
         .load()
         .await;
     let tm = aws_sdk_s3_transfer_manager::Client::new(tm_config);
@@ -625,7 +625,7 @@ async fn test_upload_unknown_content_length_multipart() {
     let (bucket_name, _) = get_bucket_names();
     let key = generate_key("unknown-content-length-multipart");
 
-    let part_size = 8 * ByteUnit::Mebibyte.as_bytes_usize();
+    let part_size = ByteSize::mib(8).as_u64() as usize;
     let parts = vec![
         bytes::Bytes::from(vec![b'a'; part_size]),
         bytes::Bytes::from(vec![b'b'; part_size]),
@@ -660,7 +660,7 @@ async fn test_upload_unknown_content_length_many_parts() {
 
     // 40 full parts at the 5 MiB minimum crosses the 32 default capacity. Distinct byte per
     // part so a reordering shows up as a content mismatch, not just a size match.
-    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let part_size = ByteSize::mib(5).as_u64() as usize;
     let parts: Vec<bytes::Bytes> = (0..40u8)
         .map(|i| bytes::Bytes::from(vec![i; part_size]))
         .collect();
@@ -740,7 +740,7 @@ async fn test_upload_unknown_content_length_with_checksum() {
     let (bucket_name, _) = get_bucket_names();
     let key = generate_key("unknown-content-length-checksum");
 
-    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let part_size = ByteSize::mib(5).as_u64() as usize;
     let (tx, rx) = tokio::sync::mpsc::channel(2);
     let handle = tm
         .upload()

@@ -6,6 +6,7 @@
 //! A scenario's connection to the mock S3 server, and a record of the
 //! requests its transfer-manager clients send.
 
+use aws_sdk_s3_transfer_manager::types::ByteSize;
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -13,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3_transfer_manager::config::Builder as ConfigBuilder;
-use aws_sdk_s3_transfer_manager::types::PartSize;
+use aws_sdk_s3_transfer_manager::config::PartSize;
 use aws_sdk_s3_transfer_manager::{Client, Config};
 use aws_smithy_async::rt::sleep::TokioSleep;
 use aws_smithy_runtime_api::client::http::{
@@ -180,7 +181,7 @@ impl Store {
     pub(crate) fn client(&self, configure: impl FnOnce(ConfigBuilder) -> ConfigBuilder) -> Client {
         let config = Config::builder()
             .s3_config(&self.sdk)
-            .part_size(PartSize::Target(PART_SIZE));
+            .part_size(PartSize::Target(ByteSize::new(PART_SIZE)));
         Client::new(configure(config).build().expect("valid config"))
     }
 

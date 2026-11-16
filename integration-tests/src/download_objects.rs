@@ -15,10 +15,10 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use aws_sdk_s3_transfer_manager::config::RuntimeConfig;
 use aws_sdk_s3_transfer_manager::io::walk::S3Walker;
-use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
+use aws_sdk_s3_transfer_manager::types::ByteSize;
 use aws_sdk_s3_transfer_manager::types::FailedTransferPolicy;
-use aws_sdk_s3_transfer_manager::RuntimeConfig;
 use s3_mock_server::{FaultType, Occurrence, S3MockServer};
 
 use crate::harness::mock_tm;
@@ -125,7 +125,7 @@ async fn test_download_objects_many_small_files(rt: RuntimeConfig) {
         let m = mock_tm(rt).await;
 
         let count = 500usize;
-        let size = 4 * ByteUnit::Kibibyte.as_bytes_usize();
+        let size = ByteSize::kib(4).as_u64() as usize;
         let bucket = "test-bucket";
         let prefix = "small/";
 
@@ -171,7 +171,7 @@ async fn test_download_objects_flat_content_roundtrip() {
         let m = mock_tm(RuntimeConfig::default()).await;
 
         let count = 20usize;
-        let size = 2 * ByteUnit::Kibibyte.as_bytes_usize();
+        let size = ByteSize::kib(2).as_u64() as usize;
         let bucket = "test-bucket";
         let prefix = "roundtrip/";
 
@@ -268,7 +268,7 @@ async fn test_download_objects_multipart_children(rt: RuntimeConfig) {
     timeout(TEST_TIMEOUT, async {
         let m = mock_tm(rt).await;
 
-        let part = 8 * ByteUnit::Mebibyte.as_bytes_usize();
+        let part = ByteSize::mib(8).as_u64() as usize;
         let count = 3usize;
         let size = 2 * part; // 16 MiB per file -> 2 parts each
         let bucket = "test-bucket";
@@ -1061,7 +1061,7 @@ async fn test_download_objects_key_path_safety() {
 // ---------------------------------------------------------------------------
 
 /// Part size of every ported corpus case (`targetPartSizeBytes`).
-const CORPUS_PART_SIZE: u64 = 8 * ByteUnit::Mebibyte.as_bytes_u64();
+const CORPUS_PART_SIZE: u64 = ByteSize::mib(8).as_u64();
 
 /// A `download-directory` case from the shared transfer manager test corpus.
 ///
@@ -1113,8 +1113,8 @@ fn file_sizes(dir: &Path) -> std::collections::BTreeMap<PathBuf, u64> {
 /// local path, the only failure the ported cases expect.
 async fn run_corpus_case(case: CorpusCase) {
     let m = crate::harness::mock_tm_with(RuntimeConfig::default(), |b| {
-        b.part_size(aws_sdk_s3_transfer_manager::types::PartSize::Target(
-            CORPUS_PART_SIZE,
+        b.part_size(aws_sdk_s3_transfer_manager::config::PartSize::Target(
+            ByteSize::new(CORPUS_PART_SIZE),
         ))
     })
     .await;

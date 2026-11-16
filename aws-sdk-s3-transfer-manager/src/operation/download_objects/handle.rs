@@ -84,7 +84,7 @@ impl DownloadObjectsHandle {
     }
 
     /// Snapshot of aggregated transfer metrics across every completed child.
-    pub fn metrics(&self) -> crate::types::TransferMetrics {
+    pub fn metrics(&self) -> crate::metrics::TransferMetrics {
         self.transfer.ctx().metrics()
     }
 

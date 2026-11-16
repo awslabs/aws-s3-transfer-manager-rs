@@ -694,6 +694,7 @@ impl Body {
 mod tests {
     use crate::memory::SegmentedBytes;
     use crate::operation::download::transfer::DownloadTransfer;
+    use crate::types::ByteSize;
     use crate::{error, operation::download::body::ChunkOutput};
     use bytes::{BufMut, Bytes};
     use std::sync::Arc;
@@ -1512,11 +1513,12 @@ mod tests {
     // ownership: to final consumer drop on the stream surface, or through the
     // positioned write on the disk surface.
 
-    use crate::memory::{BufferPool, MemoryBudgetConfig};
+    use crate::config::MemoryBudgetConfig;
+    use crate::memory::BufferPool;
 
     fn test_reservation_pool() -> (BufferPool, usize) {
         let pool = BufferPool::from_capacity(
-            MemoryBudgetConfig::Limit(1024 * 1024),
+            MemoryBudgetConfig::Limit(ByteSize::new(1024 * 1024)),
             None,
             crate::config::MemoryDiagnosticsConfig::default(),
         )

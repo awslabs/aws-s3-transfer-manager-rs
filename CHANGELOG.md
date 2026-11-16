@@ -34,6 +34,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   download's responses carried checksums only in algorithms the SDK does not compute, such as MD5.
 
 ### Changed
+- Configuration types live in `config`, which now holds everything `Config` accepts: `PartSize`,
+  `ReadAhead`, `ConcurrencyMode`, `TargetThroughput`, `MemoryConfig` and `MemoryBudgetConfig` move
+  there from `types` (and, for the two memory types, from `memory`). `types` keeps the model shapes,
+  the per-request policies and the outputs, and gains the value types. `TransferMetrics` moves from
+  `types` to `metrics`, which now holds observation snapshots only. `ByteUnit` and `Throughput` move
+  from `metrics` to `types`; the `metrics::unit` module is gone. The crate root re-exports `Client`,
+  `Config` and `from_env`; `RuntimeConfig`, `Managed` and `S3ClientConfig` are reachable through
+  `config`. No type is reachable at two paths, so the old paths are removed rather than re-exported.
+- `types::ByteSize` is a quantity of bytes, and configuration takes it wherever it takes a size:
+  `PartSize::Target` and `MemoryBudgetConfig::Limit`. Construct it with `ByteSize::new`,
+  `ByteSize::kib`, `ByteSize::mib` or `ByteSize::gib`, all `const fn`. `Display` formats in the
+  largest binary unit that keeps the value at or above 1, and `display_as` formats in a fixed unit.
+  Positions, counters, object lengths and in-memory buffer lengths stay integers.
+- `ByteUnit` keeps its variants, `AsRef<str>`, `FromStr` and `convert`, and is the unit a `ByteSize`
+  or `Throughput` is displayed in. Its `as_bytes_u64`, `as_bytes_usize`, `as_bits_u64` and
+  `as_bits_usize` methods are removed, as is `ByteUnit::display`: `ByteSize::mib(8)` replaces
+  `8 * ByteUnit::Mebibyte.as_bytes_u64()`, and `ByteSize`'s `Display` replaces `ByteUnit::display`.
+  `ByteCountDisplayContext` is renamed `ByteSizeDisplayContext` and is created by
+  `ByteSize::display_as`.
 - `aws-sdk-s3-transfer-manager`, `aws-sdk-s3-transfer-manager-ext`, `aws-smithy-topology`,
   `aws-smithy-execution` and `aws-smithy-managed-http`: the minimum supported Rust version is
   1.96.0.

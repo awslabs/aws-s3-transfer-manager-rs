@@ -5,13 +5,17 @@
 
 //! Execution configuration with managed ownership or caller-provided Tokio execution.
 
+use crate::runtime::buffer_pool::BufferPool;
+use crate::types::ByteSize;
+use aws_smithy_types::error::operation::BuildError;
+
 /// Selects execution for transfer-manager work.
 ///
 /// Defaults to owned managed execution. Configuring HTTP on the SDK or S3
 /// configuration does not change this selection.
 ///
 /// ```
-/// use aws_sdk_s3_transfer_manager::{Managed, RuntimeConfig};
+/// use aws_sdk_s3_transfer_manager::{config::Managed, config::RuntimeConfig};
 ///
 /// let managed = RuntimeConfig::managed(Managed::default());
 /// let caller_runtime = RuntimeConfig::multi_thread_tokio();
@@ -173,4 +177,106 @@ mod tests {
         );
         caller.block_on(runtime.shutdown()).unwrap();
     }
+}
+
+/// The concurrency mode the client should use for executing requests.
+#[non_exhaustive]
+#[derive(Debug, Clone, Default)]
+pub enum ConcurrencyMode {
+    /// Automatically configured concurrency based on the execution environment.
+    #[default]
+    Auto,
+
+    /// Concurrency sized for a network throughput target, in gigabits per second.
+    ///
+    /// The target replaces the throughput estimated from the execution
+    /// environment. It sets the in-flight request target once, when the client
+    /// is constructed; it does not limit throughput at run time. Requests beyond
+    /// what the per-host connection cap or the payload-memory ceiling allows wait
+    /// for a connection or for memory.
+    TargetThroughput(TargetThroughput),
+
+    /// Explicit concurrency control
+    Explicit(usize),
+}
+
+/// A network throughput target for [`ConcurrencyMode::TargetThroughput`].
+///
+/// One target currently applies to uploads and downloads alike. The value is
+/// private so that per-direction targets can be added later without breaking
+/// callers.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TargetThroughput {
+    gbps: f64,
+}
+
+impl TargetThroughput {
+    /// A target of `gbps` gigabits per second, for uploads and downloads.
+    ///
+    /// Returns an error unless `gbps` is finite and positive.
+    pub fn gbps(gbps: f64) -> Result<Self, BuildError> {
+        if gbps.is_finite() && gbps > 0.0 {
+            Ok(Self { gbps })
+        } else {
+            Err(BuildError::invalid_field(
+                "gbps",
+                format!("throughput target must be finite and positive, got {gbps}"),
+            ))
+        }
+    }
+
+    /// The target in gigabits per second.
+    pub fn as_gbps(&self) -> f64 {
+        self.gbps
+    }
+}
+
+/// Selects the payload-memory pool used by a transfer-manager client.
+#[non_exhaustive]
+#[derive(Debug, Clone, Default)]
+pub enum MemoryConfig {
+    /// Construct an automatically sized pool when the client is created.
+    ///
+    /// The ceiling follows [`MemoryBudgetConfig::Auto`], raised to at least
+    /// 256 MiB but not above half of detected memory.
+    #[default]
+    Auto,
+    /// Use an existing pool.
+    ///
+    /// Every client or component using a clone of this pool shares one
+    /// admission ceiling, prepared-storage cache, and metrics domain.
+    Explicit(BufferPool),
+}
+
+/// Configured capacity for reservation-based pooled transfer data.
+///
+/// Requests that fit within the resolved capacity backpressure when capacity
+/// is unavailable. A single reservation larger than the resolved capacity is
+/// rejected. Unreserved acquisition and process or runtime overhead are
+/// outside this ceiling.
+#[non_exhaustive]
+#[derive(Debug, Clone, Default)]
+pub enum MemoryBudgetConfig {
+    /// Use up to one quarter of detected effective memory, capped at 32 GiB.
+    ///
+    /// Effective memory includes process or container limits where the platform
+    /// exposes them. The result is rounded down to complete carriers. If
+    /// detection is unavailable, the pool uses 2 GiB.
+    #[default]
+    Auto,
+    /// Use the given fraction of detected effective memory.
+    ///
+    /// The fraction must be finite and in `(0.0, 1.0]`. This policy requires
+    /// memory detection and does not apply the automatic 32 GiB cap.
+    Fraction(f64),
+    /// An explicit byte limit that bypasses memory detection.
+    ///
+    /// The resolved capacity never exceeds this value and may be smaller by
+    /// less than one platform allocation unit. Values too small to fund one
+    /// allocation unit are rejected. The resolved capacity is reported by
+    /// [`MemoryMetrics::configured_capacity_bytes`].
+    ///
+    /// [`MemoryMetrics::configured_capacity_bytes`]:
+    ///     crate::metrics::MemoryMetrics::configured_capacity_bytes
+    Limit(ByteSize),
 }

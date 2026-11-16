@@ -15,11 +15,10 @@ use aws_sdk_s3::{
     },
     Client,
 };
+use aws_sdk_s3_transfer_manager::config::PartSize;
+use aws_sdk_s3_transfer_manager::types::ByteSize;
 use aws_sdk_s3_transfer_manager::{
-    error::ErrorKind,
-    io::walk::FsWalker,
-    metrics::unit::ByteUnit,
-    types::{FailedTransferPolicy, PartSize},
+    error::ErrorKind, io::walk::FsWalker, types::FailedTransferPolicy,
 };
 use aws_smithy_mocks::{mock, mock_client, RuleMode};
 use aws_smithy_runtime_api::http::StatusCode;
@@ -127,7 +126,7 @@ async fn test_successful_multiple_objects_upload_via_multipart_upload() {
     timeout(TEST_TIMEOUT, async {
         let recursion_root = "test";
         // should be in sync with `aws_sdk_s3_transfer_manager::config::MIN_MULTIPART_PART_SIZE_BYTES`
-        const MIN_MULTIPART_PART_SIZE_BYTES: u64 = 5 * ByteUnit::Mebibyte.as_bytes_u64();
+        const MIN_MULTIPART_PART_SIZE_BYTES: u64 = ByteSize::mib(5).as_u64();
         let files = vec![
             ("sample.jpg", MIN_MULTIPART_PART_SIZE_BYTES as usize),
             (
@@ -144,7 +143,7 @@ async fn test_successful_multiple_objects_upload_via_multipart_upload() {
                     .config()
                     .to_builder(),
             ))
-            .multipart_threshold(PartSize::Target(5))
+            .multipart_threshold(PartSize::Target(ByteSize::new(5)))
             .build()
             .expect("valid config");
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);
@@ -1096,7 +1095,7 @@ async fn test_drop_during_walk_in_progress() {
 #[tokio::test]
 async fn test_multipart_metrics_aggregate_across_children() {
     timeout(TEST_TIMEOUT, async {
-        const MIN_MULTIPART: u64 = 5 * ByteUnit::Mebibyte.as_bytes_u64();
+        const MIN_MULTIPART: u64 = ByteSize::mib(5).as_u64();
         let files = vec![
             ("a.bin", MIN_MULTIPART as usize),
             ("b.bin", MIN_MULTIPART as usize),
@@ -1112,7 +1111,7 @@ async fn test_multipart_metrics_aggregate_across_children() {
                     .config()
                     .to_builder(),
             ))
-            .multipart_threshold(PartSize::Target(5))
+            .multipart_threshold(PartSize::Target(ByteSize::new(5)))
             .build()
             .expect("valid config");
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);
@@ -1859,7 +1858,7 @@ async fn test_upload_objects_children_send_mpu_object_size() {
         // Three files of distinct sizes, all above the multipart threshold, so
         // a naive "always send the same value" implementation would only pass
         // one child at a time.
-        let one_mib = ByteUnit::Mebibyte.as_bytes_u64();
+        let one_mib = ByteSize::mib(1).as_u64();
         let files = vec![
             ("a.bin", (5 * one_mib) as usize),
             ("b.bin", (6 * one_mib) as usize),
@@ -1905,7 +1904,7 @@ async fn test_upload_objects_children_send_mpu_object_size() {
 
         let config = aws_sdk_s3_transfer_manager::Config::builder()
             .s3_config(test_common::s3_config_with_test_http(client.config().to_builder()))
-            .multipart_threshold(PartSize::Target(5))
+            .multipart_threshold(PartSize::Target(ByteSize::new(5)))
             .build()
 .expect("valid config");
         let sut = aws_sdk_s3_transfer_manager::Client::new(config);

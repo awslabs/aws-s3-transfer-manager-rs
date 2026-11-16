@@ -616,6 +616,7 @@ mod sys {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::ByteSize;
     use std::io::IoSlice;
     use std::path::Path;
     use std::task::{Context, Waker};
@@ -623,13 +624,13 @@ mod tests {
     use bytes::Bytes;
     use bytes_utils::SegmentedBuf;
 
+    use crate::config::MemoryBudgetConfig;
     use crate::io::PartBuffer;
     use crate::memory::BufferPool;
-    use crate::types::MemoryBudgetConfig;
 
     fn test_pool() -> BufferPool {
         BufferPool::builder()
-            .memory_budget(MemoryBudgetConfig::Limit(1024 * 1024))
+            .memory_budget(MemoryBudgetConfig::Limit(ByteSize::new(1024 * 1024)))
             .build()
             .unwrap()
     }

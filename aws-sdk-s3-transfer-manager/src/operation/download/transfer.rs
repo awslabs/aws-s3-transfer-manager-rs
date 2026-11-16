@@ -234,7 +234,7 @@ impl DownloadTransfer {
     /// Apply a dynamic read-ahead change, resolving the public knob to a window. The
     /// next issuance-gate read observes the new value, and the disk drain batch is
     /// re-coupled to it so a window below the segment size drains in smaller runs.
-    pub(crate) fn set_read_ahead(&self, mode: &crate::types::ReadAhead) {
+    pub(crate) fn set_read_ahead(&self, mode: &crate::config::ReadAhead) {
         let window = super::read_ahead::window_parts_for(mode);
         self.inner.read_ahead.set_window(window);
         self.inner.writer.sync_drain_batch(window);
@@ -1712,6 +1712,7 @@ fn validate_content_range(
 
 #[cfg(test)]
 mod tests {
+    use crate::types::ByteSize;
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1846,7 +1847,9 @@ mod tests {
 
     fn test_pool() -> BufferPool {
         crate::memory::BufferPool::builder()
-            .memory_budget(crate::types::MemoryBudgetConfig::Limit(128 * 1024))
+            .memory_budget(crate::config::MemoryBudgetConfig::Limit(ByteSize::new(
+                128 * 1024,
+            )))
             .build()
             .expect("response collector test pool")
     }
@@ -2088,7 +2091,7 @@ mod tests {
     ) -> DownloadTransfer {
         let config = crate::Config::builder()
             .sdk_client(client)
-            .part_size(crate::types::PartSize::Target(part_size))
+            .part_size(crate::config::PartSize::Target(ByteSize::new(part_size)))
             .diagnostics_for_test(crate::config::MemoryDiagnosticsConfig::default(), detail)
             .build()
             .expect("valid config");
@@ -2379,7 +2382,7 @@ mod tests {
 
         let config = crate::Config::builder()
             .sdk_client(client)
-            .part_size(crate::types::PartSize::Target(8 * MB))
+            .part_size(crate::config::PartSize::Target(ByteSize::new(8 * MB)))
             .build()
             .expect("valid config");
 
@@ -2773,13 +2776,15 @@ mod tests {
 
         let mut config = crate::Config::builder()
             .sdk_client(client)
-            .part_size(crate::types::PartSize::Target(part_size));
+            .part_size(crate::config::PartSize::Target(ByteSize::new(part_size)));
         if let Some(capacity_bytes) = capacity_bytes {
             let pool = crate::memory::BufferPool::builder()
-                .memory_budget(crate::types::MemoryBudgetConfig::Limit(capacity_bytes))
+                .memory_budget(crate::config::MemoryBudgetConfig::Limit(ByteSize::new(
+                    capacity_bytes as u64,
+                )))
                 .build()
                 .expect("test pool");
-            config = config.memory(crate::types::MemoryConfig::Explicit(pool));
+            config = config.memory(crate::config::MemoryConfig::Explicit(pool));
         }
         let config = config.build().expect("valid config");
 
@@ -3151,13 +3156,15 @@ mod tests {
         let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get_obj]);
 
         let pool = crate::memory::BufferPool::builder()
-            .memory_budget(crate::types::MemoryBudgetConfig::Limit(part_size as usize))
+            .memory_budget(crate::config::MemoryBudgetConfig::Limit(ByteSize::new(
+                (part_size as usize) as u64,
+            )))
             .build()
             .expect("test pool");
         let config = crate::Config::builder()
             .sdk_client(client)
-            .part_size(crate::types::PartSize::Target(part_size))
-            .memory(crate::types::MemoryConfig::Explicit(pool.clone()))
+            .part_size(crate::config::PartSize::Target(ByteSize::new(part_size)))
+            .memory(crate::config::MemoryConfig::Explicit(pool.clone()))
             .diagnostics_for_test(crate::config::MemoryDiagnosticsConfig::default(), 1)
             .build()
             .expect("valid config");
@@ -3436,7 +3443,7 @@ mod tests {
                 object,
                 failing_part.map(|n| n * part_size),
             ))
-            .part_size(crate::types::PartSize::Target(part_size))
+            .part_size(crate::config::PartSize::Target(ByteSize::new(part_size)))
             .diagnostics_for_test(crate::config::MemoryDiagnosticsConfig::default(), 1)
             .build()
             .expect("valid config");
@@ -3737,7 +3744,9 @@ mod tests {
         let part_size = 8 * 1024 * 1024;
         let object = object_bytes(2 * part_size);
         let pool = crate::memory::BufferPool::builder()
-            .memory_budget(crate::types::MemoryBudgetConfig::Limit(2 * part_size))
+            .memory_budget(crate::config::MemoryBudgetConfig::Limit(ByteSize::new(
+                2 * part_size as u64,
+            )))
             .build()
             .expect("test pool");
         let blocker = pool
@@ -3747,8 +3756,10 @@ mod tests {
         let script = Arc::new(WriteScript::default()).on(Match::NthWrite(1), Action::Hold);
         let config = crate::Config::builder()
             .sdk_client(crc32_object_client(Arc::clone(&object), None))
-            .part_size(crate::types::PartSize::Target(part_size as u64))
-            .memory(crate::types::MemoryConfig::Explicit(pool))
+            .part_size(crate::config::PartSize::Target(ByteSize::new(
+                part_size as u64,
+            )))
+            .memory(crate::config::MemoryConfig::Explicit(pool))
             .build()
             .expect("valid config");
         let (handle, partition_count) =
@@ -4049,15 +4060,15 @@ mod tests {
             )
         });
         let pool = crate::memory::BufferPool::builder()
-            .memory_budget(crate::types::MemoryBudgetConfig::Limit(
-                (2 * part_size) as usize,
-            ))
+            .memory_budget(crate::config::MemoryBudgetConfig::Limit(ByteSize::new(
+                2 * part_size,
+            )))
             .build()
             .expect("test pool");
         let config = crate::Config::builder()
             .sdk_client(mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get_obj]))
-            .part_size(crate::types::PartSize::Target(part_size))
-            .memory(crate::types::MemoryConfig::Explicit(pool.clone()))
+            .part_size(crate::config::PartSize::Target(ByteSize::new(part_size)))
+            .memory(crate::config::MemoryConfig::Explicit(pool.clone()))
             .build()
             .expect("valid config");
         let handle = crate::client::Handle::test_handle_tokio(config);
@@ -4134,13 +4145,15 @@ mod tests {
         });
         let capacity_bytes = (2 * resident_per_transfer * part_size) as usize;
         let pool = crate::memory::BufferPool::builder()
-            .memory_budget(crate::types::MemoryBudgetConfig::Limit(capacity_bytes))
+            .memory_budget(crate::config::MemoryBudgetConfig::Limit(ByteSize::new(
+                capacity_bytes as u64,
+            )))
             .build()
             .expect("test pool");
         let config = crate::Config::builder()
             .sdk_client(mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get_obj]))
-            .part_size(crate::types::PartSize::Target(part_size))
-            .memory(crate::types::MemoryConfig::Explicit(pool.clone()))
+            .part_size(crate::config::PartSize::Target(ByteSize::new(part_size)))
+            .memory(crate::config::MemoryConfig::Explicit(pool.clone()))
             .build()
             .expect("valid config");
         let handle = crate::client::Handle::test_handle_tokio(config);
@@ -4196,7 +4209,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn test_read_ahead_resolution_precedence() {
-        use crate::types::ReadAhead;
+        use crate::config::ReadAhead;
 
         let build = |client_mode: ReadAhead, input_override: Option<ReadAhead>| {
             let get_obj = mock!(aws_sdk_s3::Client::get_object).then_output(|| {
@@ -4209,7 +4222,7 @@ mod tests {
             });
             let config = crate::Config::builder()
                 .sdk_client(mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get_obj]))
-                .part_size(crate::types::PartSize::Target(8 * MB))
+                .part_size(crate::config::PartSize::Target(ByteSize::new(8 * MB)))
                 .read_ahead(client_mode)
                 .build()
                 .expect("valid config");
@@ -4252,19 +4265,19 @@ mod tests {
         // Parts(n) resolves to n + 1 (n speculative parts plus the demand part).
         transfer
             .io_ctl()
-            .set_read_ahead(crate::types::ReadAhead::Parts(4));
+            .set_read_ahead(crate::config::ReadAhead::Parts(4));
         assert_eq!(transfer.read_ahead().window(), 5);
 
         // Parts(0) is demand paging: a window of exactly one outstanding part.
         transfer
             .io_ctl()
-            .set_read_ahead(crate::types::ReadAhead::Parts(0));
+            .set_read_ahead(crate::config::ReadAhead::Parts(0));
         assert_eq!(transfer.read_ahead().window(), 1);
 
         // Auto returns to the default fixed window.
         transfer
             .io_ctl()
-            .set_read_ahead(crate::types::ReadAhead::Auto);
+            .set_read_ahead(crate::config::ReadAhead::Auto);
         assert_eq!(
             transfer.read_ahead().window(),
             super::super::read_ahead::DEFAULT_WINDOW_PARTS

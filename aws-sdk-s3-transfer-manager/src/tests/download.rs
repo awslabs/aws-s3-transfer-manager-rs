@@ -62,7 +62,7 @@ fn request_with_all_forwarded_fields() -> DownloadInput {
         .request_payer(RequestPayer::Requester)
         .expected_bucket_owner("owner")
         .checksum_mode(ChecksumMode::Enabled)
-        .read_ahead(crate::types::ReadAhead::Parts(3))
+        .read_ahead(crate::config::ReadAhead::Parts(3))
         .build()
         .unwrap();
     input.part_number = Some(7);

@@ -8,6 +8,7 @@ mod common;
 mod test_util;
 
 #[cfg(unix)]
+use aws_sdk_s3_transfer_manager::types::ByteSize;
 use test_util::retention::await_shutdown;
 #[cfg(any(unix, windows))]
 use test_util::retention::{
@@ -16,13 +17,12 @@ use test_util::retention::{
 };
 use test_util::{object_connector, object_connector_with_checksum_headers};
 
-use aws_sdk_s3_transfer_manager::RuntimeConfig;
+use aws_sdk_s3_transfer_manager::config::RuntimeConfig;
 use aws_sdk_s3_transfer_manager::{
     error::{BoxError, ErrorKind},
-    metrics::unit::ByteUnit,
     types::{
-        ChecksumAlgorithm, ChecksumMode, ChecksumValidation, ConcurrencyMode, IntegrityChecks,
-        NotValidatedReason, PartSize, TransferStatus,
+        ChecksumAlgorithm, ChecksumMode, ChecksumValidation, IntegrityChecks, NotValidatedReason,
+        TransferStatus,
     },
 };
 use aws_smithy_runtime_api::client::http::{
@@ -44,6 +44,7 @@ use std::{
 };
 use tokio::sync::Semaphore;
 
+use aws_sdk_s3_transfer_manager::config::{ConcurrencyMode, PartSize};
 use aws_smithy_http_client::test_util::{ReplayEvent, StaticReplayClient};
 use aws_smithy_runtime::test_util::capture_test_logs::show_test_logs;
 use aws_smithy_types::body::SdkBody;
@@ -87,7 +88,7 @@ fn test_tm(
 ) -> aws_sdk_s3_transfer_manager::Client {
     let config = aws_sdk_s3_transfer_manager::Config::builder()
         .s3_config(common::s3_config(http_client))
-        .part_size(PartSize::Target(part_size as u64))
+        .part_size(PartSize::Target(ByteSize::new(part_size as u64)))
         .concurrency(ConcurrencyMode::Explicit(1))
         .build()
         .expect("valid config");
@@ -98,8 +99,8 @@ fn test_tm(
 /// Test the object ranges are expected and we get all the data
 #[tokio::test]
 async fn test_download_ranges() {
-    let data = rand_data(12 * ByteUnit::Mebibyte.as_bytes_usize());
-    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let data = rand_data(ByteSize::mib(12).as_u64() as usize);
+    let part_size = ByteSize::mib(5).as_u64() as usize;
 
     let (tm, http_client) = simple_test_tm(&data, part_size);
 
@@ -130,8 +131,8 @@ async fn test_download_ranges() {
 /// Test body not consumed which should not prevent the handle from being dropped
 #[tokio::test]
 async fn test_body_not_consumed() {
-    let data = rand_data(12 * ByteUnit::Mebibyte.as_bytes_usize());
-    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let data = rand_data(ByteSize::mib(12).as_u64() as usize);
+    let part_size = ByteSize::mib(5).as_u64() as usize;
 
     let (tm, _) = simple_test_tm(&data, part_size);
 
@@ -166,7 +167,7 @@ fn no_such_key_connector() -> StaticReplayClient {
 /// was delivered before the caller started waiting.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_object_meta_after_discovery_failure() {
-    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let part_size = ByteSize::mib(5).as_u64() as usize;
     let http_client = no_such_key_connector();
     let tm = test_tm(http_client.clone(), part_size);
 
@@ -265,8 +266,8 @@ impl HttpConnector for ParkAfterDiscoveryConnector {
 ///
 /// The body is never consumed.
 async fn abort_download_with_executing_gets(runtime_config: RuntimeConfig) {
-    let total = 25 * ByteUnit::Mebibyte.as_bytes_usize();
-    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let total = ByteSize::mib(25).as_u64() as usize;
+    let part_size = ByteSize::mib(5).as_u64() as usize;
     let requests = Arc::new(AtomicUsize::new(0));
     let parked_started = Arc::new(Semaphore::new(0));
     let connector = SharedHttpConnector::new(ParkAfterDiscoveryConnector {
@@ -278,7 +279,7 @@ async fn abort_download_with_executing_gets(runtime_config: RuntimeConfig) {
         .s3_config(common::s3_config(http_client_fn(move |_, _| {
             connector.clone()
         })))
-        .part_size(PartSize::Target(part_size as u64))
+        .part_size(PartSize::Target(ByteSize::new(part_size as u64)))
         .concurrency(ConcurrencyMode::Explicit(2))
         .runtime_config(runtime_config)
         .build()
@@ -367,9 +368,9 @@ impl http_body_1x::Body for FailingBody {
 /// Test chunk/part failure is retried
 #[tokio::test]
 async fn test_retry_failed_chunk() {
-    let data = rand_data(12 * ByteUnit::Mebibyte.as_bytes_usize());
-    let part_size = 8 * ByteUnit::Mebibyte.as_bytes_usize();
-    let frame_size = 16 * ByteUnit::Kibibyte.as_bytes_usize();
+    let data = rand_data(ByteSize::mib(12).as_u64() as usize);
+    let part_size = ByteSize::mib(8).as_u64() as usize;
+    let frame_size = ByteSize::kib(16).as_u64() as usize;
     let fail_after_byte = frame_size * 4;
 
     let http_client = StaticReplayClient::new(vec![
@@ -445,8 +446,8 @@ const ERROR_RESPONSE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 /// Test non retryable SdkError
 #[tokio::test]
 async fn test_non_retryable_error() {
-    let data = rand_data(20 * ByteUnit::Mebibyte.as_bytes_usize());
-    let part_size = 8 * ByteUnit::Mebibyte.as_bytes_usize();
+    let data = rand_data(ByteSize::mib(20).as_u64() as usize);
+    let part_size = ByteSize::mib(8).as_u64() as usize;
 
     let http_client = StaticReplayClient::new(vec![
         ReplayEvent::new(
@@ -489,8 +490,8 @@ async fn test_non_retryable_error() {
 /// Test max attempts exhausted reading a stream
 #[tokio::test]
 async fn test_retry_max_attempts() {
-    let data = rand_data(12 * ByteUnit::Mebibyte.as_bytes_usize());
-    let part_size = 8 * ByteUnit::Mebibyte.as_bytes_usize();
+    let data = rand_data(ByteSize::mib(12).as_u64() as usize);
+    let part_size = ByteSize::mib(8).as_u64() as usize;
     let frame_size = 16 * 1024;
     let fail_after_byte = frame_size * 4;
 
@@ -548,8 +549,8 @@ async fn test_retry_max_attempts() {
 /// Test the if_match header was added correctly based on the response from server.
 #[tokio::test]
 async fn test_download_if_match() {
-    let data = rand_data(12 * ByteUnit::Mebibyte.as_bytes_usize());
-    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let data = rand_data(ByteSize::mib(12).as_u64() as usize);
+    let part_size = ByteSize::mib(5).as_u64() as usize;
 
     let (tm, http_client) = simple_test_tm(&data, part_size);
 
@@ -584,8 +585,8 @@ const OBJECT_MODIFIED_RESPONSE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 #[tokio::test]
 async fn test_download_object_modified() {
     let _logs = show_test_logs();
-    let data = rand_data(12 * ByteUnit::Mebibyte.as_bytes_usize());
-    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let data = rand_data(ByteSize::mib(12).as_u64() as usize);
+    let part_size = ByteSize::mib(5).as_u64() as usize;
 
     // Create a static replay client (http connector) to mock the S3 response when object modified during download.
     //
@@ -651,8 +652,8 @@ async fn test_download_object_modified() {
 #[cfg(any(unix, windows))]
 #[tokio::test]
 async fn test_download_write_to_path() {
-    let data = rand_data(10 * ByteUnit::Mebibyte.as_bytes_usize());
-    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let data = rand_data(ByteSize::mib(10).as_u64() as usize);
+    let part_size = ByteSize::mib(5).as_u64() as usize;
     let (tm, _http_client) = simple_test_tm(&data, part_size);
 
     let dir = tempfile::tempdir().unwrap();
@@ -688,7 +689,7 @@ async fn test_download_write_to_path() {
 #[tokio::test]
 async fn test_download_write_to_path_missing_parent_error_names_action_and_path() {
     let data = rand_data(16);
-    let (tm, _http_client) = simple_test_tm(&data, 5 * ByteUnit::Mebibyte.as_bytes_usize());
+    let (tm, _http_client) = simple_test_tm(&data, ByteSize::mib(5).as_u64() as usize);
 
     let dir = tempfile::tempdir().unwrap();
     let dest_path = dir.path().join("missing").join("output.dat");
@@ -868,8 +869,8 @@ async fn write_to_path_drop_clients_then_unlink_releases_destination() {
 #[tokio::test(flavor = "current_thread")]
 async fn test_download_write_to_path_leaves_existing_temp_file() {
     const SEED: u64 = 0x5eed_0042;
-    let data = rand_data(10 * ByteUnit::Mebibyte.as_bytes_usize());
-    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let data = rand_data(ByteSize::mib(10).as_u64() as usize);
+    let part_size = ByteSize::mib(5).as_u64() as usize;
     let (tm, _http_client) = simple_test_tm(&data, part_size);
 
     let dir = tempfile::tempdir().unwrap();
@@ -900,8 +901,8 @@ async fn test_download_write_to_path_leaves_existing_temp_file() {
 #[cfg(any(unix, windows))]
 #[tokio::test]
 async fn test_download_write_to_path_abort_cleans_up() {
-    let data = rand_data(10 * ByteUnit::Mebibyte.as_bytes_usize());
-    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let data = rand_data(ByteSize::mib(10).as_u64() as usize);
+    let part_size = ByteSize::mib(5).as_u64() as usize;
     let (tm, _http_client) = simple_test_tm(&data, part_size);
 
     let dir = tempfile::tempdir().unwrap();
@@ -935,8 +936,8 @@ async fn test_download_write_to_path_abort_cleans_up() {
 #[tokio::test]
 async fn test_download_write_to_path_error_cleans_up() {
     let _logs = show_test_logs();
-    let data = rand_data(20 * ByteUnit::Mebibyte.as_bytes_usize());
-    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let data = rand_data(ByteSize::mib(20).as_u64() as usize);
+    let part_size = ByteSize::mib(5).as_u64() as usize;
 
     // Discovery succeeds, second request fails with 412 PreconditionFailed.
     let http_client = StaticReplayClient::new(vec![
@@ -998,8 +999,8 @@ async fn test_download_write_to_path_error_cleans_up() {
 #[cfg(any(unix, windows))]
 #[tokio::test]
 async fn test_download_write_to_file_rejects_append_mode() {
-    let data = rand_data(10 * ByteUnit::Mebibyte.as_bytes_usize());
-    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let data = rand_data(ByteSize::mib(10).as_u64() as usize);
+    let part_size = ByteSize::mib(5).as_u64() as usize;
     let (tm, http_client) = simple_test_tm(&data, part_size);
 
     let dir = tempfile::tempdir().unwrap();
@@ -1034,8 +1035,8 @@ async fn test_download_write_to_file_rejects_append_mode() {
 async fn test_checksum_mode_enabled_by_default() {
     // Multipart object so the assertion covers the discovery GET and every
     // subsequent range-chunk GET.
-    let data = rand_data(20 * ByteUnit::Mebibyte.as_bytes_usize());
-    let part_size = 8 * ByteUnit::Mebibyte.as_bytes_usize();
+    let data = rand_data(ByteSize::mib(20).as_u64() as usize);
+    let part_size = ByteSize::mib(8).as_u64() as usize;
     let (tm, http_client) = simple_test_tm(&data, part_size);
 
     let mut handle = tm
@@ -1137,7 +1138,7 @@ fn when_required_tm(
         .s3_config(aws_sdk_s3_transfer_manager::config::S3ClientConfig::new(
             &shared,
         ))
-        .part_size(PartSize::Target(part_size as u64))
+        .part_size(PartSize::Target(ByteSize::new(part_size as u64)))
         .concurrency(ConcurrencyMode::Explicit(1))
         .build()
         .expect("valid config");
@@ -1184,7 +1185,7 @@ fn assert_not_validated(validation: &ChecksumValidation, expected: NotValidatedR
 #[tokio::test]
 async fn test_integrity_checks_default_mode_validates() {
     let data = Bytes::from_static(HELLO);
-    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let part_size = ByteSize::mib(5).as_u64() as usize;
     let tm = test_tm(single_part_connector(&data, Some(HELLO_CRC32)), part_size);
 
     let validation = download_checksum_validation(&tm, None).await;
@@ -1197,7 +1198,7 @@ async fn test_integrity_checks_default_mode_validates() {
 #[tokio::test]
 async fn test_integrity_checks_disabled_when_validation_when_required() {
     let data = Bytes::from_static(HELLO);
-    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let part_size = ByteSize::mib(5).as_u64() as usize;
     let tm = when_required_tm(single_part_connector(&data, Some(HELLO_CRC32)), part_size);
 
     let mut handle = tm
@@ -1222,7 +1223,7 @@ async fn test_integrity_checks_disabled_when_validation_when_required() {
 #[tokio::test]
 async fn test_integrity_checks_enabled_validates() {
     let data = Bytes::from_static(HELLO);
-    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let part_size = ByteSize::mib(5).as_u64() as usize;
     let tm = test_tm(single_part_connector(&data, Some(HELLO_CRC32)), part_size);
 
     let validation = download_checksum_validation(&tm, Some(ChecksumMode::Enabled)).await;
@@ -1234,7 +1235,7 @@ async fn test_integrity_checks_enabled_validates() {
 #[tokio::test]
 async fn test_integrity_checks_part_level_only_reads_composite_checksum() {
     let data = Bytes::from_static(HELLO);
-    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let part_size = ByteSize::mib(5).as_u64() as usize;
     let tm = test_tm(single_part_connector(&data, Some("DUoRhQ==-3")), part_size);
 
     let validation = download_checksum_validation(&tm, Some(ChecksumMode::Enabled)).await;
@@ -1246,7 +1247,7 @@ async fn test_integrity_checks_part_level_only_reads_composite_checksum() {
 /// NotValidated{PartialCoverage}.
 #[tokio::test]
 async fn test_integrity_checks_validated_and_part_level_read_partial_coverage() {
-    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let part_size = ByteSize::mib(5).as_u64() as usize;
     let data = rand_data(part_size + 1024);
     let http_client = object_connector_with_checksum_headers(&data, part_size, |index, chunk| {
         let value = match index {
@@ -1266,7 +1267,7 @@ async fn test_integrity_checks_validated_and_part_level_read_partial_coverage() 
 #[tokio::test]
 async fn test_integrity_checks_no_checksum_reads_unavailable() {
     let data = Bytes::from_static(HELLO);
-    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let part_size = ByteSize::mib(5).as_u64() as usize;
     let tm = test_tm(single_part_connector(&data, None), part_size);
 
     let validation = download_checksum_validation(&tm, Some(ChecksumMode::Enabled)).await;
@@ -1278,7 +1279,7 @@ async fn test_integrity_checks_no_checksum_reads_unavailable() {
 #[tokio::test]
 async fn test_integrity_checks_md5_only_reads_unsupported_algorithm() {
     let data = Bytes::from_static(HELLO);
-    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let part_size = ByteSize::mib(5).as_u64() as usize;
     let http_client = object_connector_with_checksum_headers(&data, data.len(), |_, _| {
         Some(("x-amz-checksum-md5", "XrY7u+Ae7tCTyyK7j1rNww==".to_owned()))
     });
@@ -1294,7 +1295,7 @@ async fn test_integrity_checks_md5_only_reads_unsupported_algorithm() {
 #[tokio::test]
 async fn test_integrity_checks_enabled_validates_when_validation_when_required() {
     let data = Bytes::from_static(HELLO);
-    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let part_size = ByteSize::mib(5).as_u64() as usize;
     let tm = when_required_tm(single_part_connector(&data, Some(HELLO_CRC32)), part_size);
 
     let validation = download_checksum_validation(&tm, Some(ChecksumMode::Enabled)).await;
@@ -1307,7 +1308,7 @@ async fn test_integrity_checks_enabled_validates_when_validation_when_required()
 #[tokio::test]
 async fn test_integrity_checks_each_algorithm_validates() {
     let data = Bytes::from_static(HELLO);
-    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let part_size = ByteSize::mib(5).as_u64() as usize;
     for (sdk_algorithm, tm_algorithm, header, object_value) in checksum_cases() {
         let value = checksum_value(sdk_algorithm, HELLO);
         let http_client = object_connector_with_checksum_headers(&data, part_size, |_, _| {
@@ -1344,7 +1345,7 @@ async fn test_integrity_checks_each_algorithm_validates() {
 #[tokio::test]
 async fn test_integrity_checks_each_algorithm_mismatch_is_integrity_error() {
     let data = Bytes::from_static(HELLO);
-    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let part_size = ByteSize::mib(5).as_u64() as usize;
     for (sdk_algorithm, tm_algorithm, header, _) in checksum_cases() {
         let expected = checksum_value(sdk_algorithm, b"other object");
         let computed = checksum_value(sdk_algorithm, HELLO);
@@ -1380,7 +1381,7 @@ async fn test_integrity_checks_each_algorithm_mismatch_is_integrity_error() {
 /// Validated{Crc32}.
 #[tokio::test]
 async fn test_integrity_checks_head_discovery_validates() {
-    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let part_size = ByteSize::mib(5).as_u64() as usize;
     let tail = Bytes::from_static(&HELLO[6..]);
     let content_range = format!("bytes 6-{}/{}", HELLO.len() - 1, HELLO.len());
     let response = || {
@@ -1436,7 +1437,7 @@ async fn test_integrity_checks_head_discovery_validates() {
 #[tokio::test]
 async fn test_integrity_checks_surfaces_whole_object_checksum() {
     let data = Bytes::from_static(HELLO);
-    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let part_size = ByteSize::mib(5).as_u64() as usize;
     let tm = test_tm(single_part_connector(&data, Some(HELLO_CRC32)), part_size);
 
     let mut handle = tm
@@ -1458,8 +1459,8 @@ async fn test_integrity_checks_surfaces_whole_object_checksum() {
 /// part 1's checksum, which MUST NOT be surfaced as the object's checksum.
 #[tokio::test]
 async fn test_integrity_checks_multipart_does_not_surface_part_checksum() {
-    let data = rand_data(12 * ByteUnit::Mebibyte.as_bytes_usize());
-    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let data = rand_data(ByteSize::mib(12).as_u64() as usize);
+    let part_size = ByteSize::mib(5).as_u64() as usize;
     // object_connector splits into parts and stamps no checksum header,
     // but even if part 1 carried one, it must not be reported as the object value.
     let (tm, _c) = simple_test_tm(&data, part_size);

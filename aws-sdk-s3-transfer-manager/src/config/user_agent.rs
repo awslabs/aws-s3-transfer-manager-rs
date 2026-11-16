@@ -11,8 +11,8 @@ use aws_sdk_s3::config::{AppName, Intercept, IntoShared};
 use aws_types::os_shim_internal::Env;
 use std::sync::Arc;
 
+use crate::config::{ConcurrencyMode, MemoryConfig, PartSize};
 use crate::runtime::platform::MachineProfile;
-use crate::types::{ConcurrencyMode, MemoryConfig, PartSize};
 use crate::Config;
 
 /// This crate's name and version, as the `md/` pair the user agent carries. Neither
@@ -205,9 +205,10 @@ fn framework_metadata(cfg: &aws_sdk_s3::config::ConfigBag) -> Vec<FrameworkMetad
 
 #[cfg(test)]
 mod tests {
+    use crate::config::RuntimeConfig;
+    use crate::config::{ConcurrencyMode, MemoryConfig, PartSize};
     use crate::runtime::platform::MachineProfile;
-    use crate::types::{ConcurrencyMode, MemoryConfig, PartSize};
-    use crate::RuntimeConfig;
+    use crate::types::ByteSize;
     use aws_config::{BehaviorVersion, Region};
     use aws_runtime::user_agent::{AwsUserAgent, BusinessMetric, FrameworkMetadata};
     use aws_sdk_s3::config::interceptors::BeforeTransmitInterceptorContextRef;
@@ -438,7 +439,7 @@ mod tests {
         let tm = crate::Client::new(
             crate::Config::builder()
                 .runtime_config(RuntimeConfig::multi_thread_tokio())
-                .part_size(PartSize::Target(8 << 20))
+                .part_size(PartSize::Target(ByteSize::new(8 << 20)))
                 .sdk_client(client)
                 .build()
                 .expect("valid config"),
@@ -762,7 +763,7 @@ mod tests {
     #[tokio::test]
     async fn configuration_metrics_follow_the_configuration() {
         let pool = crate::runtime::buffer_pool::BufferPool::from_capacity(
-            crate::types::MemoryBudgetConfig::Limit(256 * 1024 * 1024),
+            crate::config::MemoryBudgetConfig::Limit(ByteSize::new(256 * 1024 * 1024)),
             None,
             Default::default(),
         )
@@ -776,7 +777,7 @@ mod tests {
             ("defaults", off_ec2(), vec![]),
             (
                 "part size",
-                off_ec2().part_size(PartSize::Target(8 << 20)),
+                off_ec2().part_size(PartSize::Target(ByteSize::new(8 << 20))),
                 vec![BusinessMetric::S3CustomPartSize],
             ),
             (
@@ -787,7 +788,7 @@ mod tests {
             (
                 "throughput target",
                 off_ec2().concurrency(ConcurrencyMode::TargetThroughput(
-                    crate::types::TargetThroughput::gbps(25.0).unwrap(),
+                    crate::config::TargetThroughput::gbps(25.0).unwrap(),
                 )),
                 vec![BusinessMetric::S3CustomThroughput],
             ),

@@ -3,12 +3,12 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use crate::metrics::unit::ByteUnit;
+use crate::config::{ConcurrencyMode, MemoryConfig, PartSize};
 #[cfg(not(target_family = "wasm"))]
 use crate::runtime::ManagedExecution;
 use crate::scheduler::{ConcurrencyController, FixedConcurrency, Scheduler};
 use crate::telemetry::Telemetry;
-use crate::types::{ConcurrencyMode, MemoryConfig, PartSize};
+use crate::types::ByteSize;
 use crate::Config;
 use std::sync::Arc;
 use std::time::Duration;
@@ -73,8 +73,8 @@ impl Handle {
     /// are enabled for a given request.
     pub(crate) fn mpu_threshold_bytes(&self) -> u64 {
         match self.config.multipart_threshold() {
-            PartSize::Auto => 16 * ByteUnit::Mebibyte.as_bytes_u64(),
-            PartSize::Target(explicit) => *explicit,
+            PartSize::Auto => ByteSize::mib(16).as_u64(),
+            PartSize::Target(explicit) => explicit.as_u64(),
         }
     }
 
@@ -198,12 +198,14 @@ impl Handle {
     ) -> Arc<Self> {
         // Most client tests exercise scheduling rather than memory admission.
         // Keep their automatic pool large enough not to become an incidental gate.
-        const DEFAULT_TEST_MEMORY_BUDGET_BYTES: usize = 8 * ByteUnit::Gibibyte.as_bytes_usize();
+        const DEFAULT_TEST_MEMORY_BUDGET_BYTES: usize = ByteSize::gib(8).as_u64() as usize;
 
         let memory_diagnostics = config.diagnostics().memory();
         let buffer_pool = match config.memory() {
             MemoryConfig::Auto => BufferPool::from_capacity(
-                crate::types::MemoryBudgetConfig::Limit(DEFAULT_TEST_MEMORY_BUDGET_BYTES),
+                crate::config::MemoryBudgetConfig::Limit(ByteSize::new(
+                    DEFAULT_TEST_MEMORY_BUDGET_BYTES as u64,
+                )),
                 None,
                 memory_diagnostics,
             )
@@ -220,7 +222,7 @@ impl Handle {
             connection_cap: crate::runtime::platform::ConnectionCap::from_descriptor_limit(None),
             explicit_concurrency: Some(controller.target()),
             explicit_part_size: match config.part_size() {
-                PartSize::Target(n) => Some(*n),
+                PartSize::Target(n) => Some(n.as_u64()),
                 PartSize::Auto => None,
             },
             ceiling_override_bytes: Some(
@@ -317,7 +319,7 @@ impl Client {
                 ConcurrencyMode::Auto | ConcurrencyMode::TargetThroughput(_) => None,
             },
             explicit_part_size: match config.part_size() {
-                PartSize::Target(n) => Some(*n),
+                PartSize::Target(n) => Some(n.as_u64()),
                 PartSize::Auto => None,
             },
             ceiling_override_bytes: explicit_pool_ceiling,
@@ -333,7 +335,7 @@ impl Client {
         let memory_diagnostics = config.diagnostics().memory();
         let buffer_pool = match config.memory() {
             MemoryConfig::Auto => BufferPool::from_capacity(
-                crate::types::MemoryBudgetConfig::Limit(plan.ceiling_bytes),
+                crate::config::MemoryBudgetConfig::Limit(ByteSize::new(plan.ceiling_bytes as u64)),
                 profile.ram_bytes,
                 memory_diagnostics,
             )
@@ -642,7 +644,7 @@ fn log_resource_sizing(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::RuntimeConfig;
+    use crate::config::RuntimeConfig;
     use aws_smithy_runtime_api::client::http::SharedHttpClient;
 
     fn test_config() -> crate::Config {
@@ -1074,7 +1076,7 @@ mod tests {
     #[test]
     fn test_client_uses_the_explicit_buffer_pool() {
         let pool = BufferPool::from_capacity(
-            crate::types::MemoryBudgetConfig::Limit(16 * ByteUnit::Mebibyte.as_bytes_usize()),
+            crate::config::MemoryBudgetConfig::Limit(ByteSize::mib(16)),
             None,
             crate::config::MemoryDiagnosticsConfig::default(),
         )
@@ -1113,7 +1115,7 @@ mod tests {
             .machine_profile(Some(crate::runtime::platform::MachineProfile {
                 instance_type: None,
                 vcpus: 4,
-                ram_bytes: Some(512 * ByteUnit::Mebibyte.as_bytes_usize()),
+                ram_bytes: Some(ByteSize::mib(512).as_u64() as usize),
             }))
             .build()
             .expect("valid config");
@@ -1131,7 +1133,7 @@ mod tests {
     #[test]
     fn test_handle_test_constructor_preserves_an_explicit_pool() {
         let pool = BufferPool::from_capacity(
-            crate::types::MemoryBudgetConfig::Limit(16 * ByteUnit::Mebibyte.as_bytes_usize()),
+            crate::config::MemoryBudgetConfig::Limit(ByteSize::mib(16)),
             None,
             crate::config::MemoryDiagnosticsConfig::default(),
         )
@@ -1187,8 +1189,8 @@ mod tests {
 
     // --- concurrency resolution wiring ---
 
+    use crate::config::ConcurrencyMode;
     use crate::runtime::platform::{self, MachineProfile};
-    use crate::types::ConcurrencyMode;
 
     /// A profile with the given instance type and vCPU count, and no detected
     /// memory, so the ceiling is the no-detection fallback.
@@ -1264,7 +1266,9 @@ mod tests {
     fn configured_throughput_drives_the_resolved_target() {
         // A throughput target sets the controller's target.
         let client = Client::new(config_with(
-            ConcurrencyMode::TargetThroughput(crate::types::TargetThroughput::gbps(100.0).unwrap()),
+            ConcurrencyMode::TargetThroughput(
+                crate::config::TargetThroughput::gbps(100.0).unwrap(),
+            ),
             Some(profile(None, 4)),
         ));
 

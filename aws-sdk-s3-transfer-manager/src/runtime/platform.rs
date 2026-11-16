@@ -632,7 +632,7 @@ pub(crate) fn seed_from_gbps(gbps: f64) -> usize {
 
 /// Source used to resolve [`ConcurrencyMode::Auto`].
 ///
-/// [`ConcurrencyMode::Auto`]: crate::types::ConcurrencyMode::Auto
+/// [`ConcurrencyMode::Auto`]: crate::config::ConcurrencyMode::Auto
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AutoConcurrencySource {
     /// The detected EC2 family supplied a network-bandwidth estimate.

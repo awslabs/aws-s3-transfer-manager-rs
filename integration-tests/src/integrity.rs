@@ -107,17 +107,18 @@ use crate::assertions::{
     assert_integrity_error, assert_not_validated, assert_same_content, assert_validated,
 };
 use crate::harness::{BucketKind, Target};
-use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
+use aws_sdk_s3_transfer_manager::config::PartSize;
 use aws_sdk_s3_transfer_manager::operation::upload::ChecksumStrategy;
+use aws_sdk_s3_transfer_manager::types::ByteSize;
 use aws_sdk_s3_transfer_manager::types::ChecksumMode;
-use aws_sdk_s3_transfer_manager::types::{ChecksumAlgorithm, NotValidatedReason, PartSize};
+use aws_sdk_s3_transfer_manager::types::{ChecksumAlgorithm, NotValidatedReason};
 use s3_mock_server::{FaultType, Occurrence};
 
 /// A part size pinned equally for upload and download. Multipart downloads align
 /// automatically for an Auto part size; this pins an explicit size to cover the
 /// explicit-part-size path (where the user's size must match the upload to
 /// validate).
-const ALIGNED_PART_SIZE: PartSize = PartSize::Target(5 * 1024 * 1024);
+const ALIGNED_PART_SIZE: PartSize = PartSize::Target(ByteSize::new(5 * 1024 * 1024));
 
 fn small() -> Vec<u8> {
     b"hello world, integrity contract".to_vec()
@@ -125,7 +126,7 @@ fn small() -> Vec<u8> {
 
 /// Data larger than the default part size, forcing a multipart upload.
 fn multipart_data() -> Vec<u8> {
-    (0..20 * ByteUnit::Mebibyte.as_bytes_usize())
+    (0..ByteSize::mib(20).as_u64() as usize)
         .map(|i| (i % 256) as u8)
         .collect()
 }
@@ -136,7 +137,7 @@ fn multipart_data() -> Vec<u8> {
 /// per-range checksum for a single-stored-part object, so the SDK validates
 /// nothing on the split chunks.
 fn large_single_put() -> Vec<u8> {
-    (0..12 * ByteUnit::Mebibyte.as_bytes_usize())
+    (0..ByteSize::mib(12).as_u64() as usize)
         .map(|i| (i % 256) as u8)
         .collect()
 }
@@ -409,7 +410,7 @@ async fn mpu_composite_value_matches_expected_real_gp() {
     use aws_sdk_s3::types::{
         ChecksumAlgorithm, ChecksumMode, CompletedMultipartUpload, CompletedPart,
     };
-    use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
+    use aws_sdk_s3_transfer_manager::types::ByteUnit;
 
     let t = Target::real_gp().connect().await;
     let s3 = t.s3();
@@ -419,10 +420,10 @@ async fn mpu_composite_value_matches_expected_real_gp() {
     let algorithm = ChecksumAlgorithm::Crc32;
 
     // Two parts, each >= 5 MiB (S3's minimum part size for MPU).
-    let part1: Vec<u8> = (0..5 * ByteUnit::Mebibyte.as_bytes_usize())
+    let part1: Vec<u8> = (0..ByteSize::mib(5).as_u64() as usize)
         .map(|i| (i % 251) as u8)
         .collect();
-    let part2: Vec<u8> = (0..5 * ByteUnit::Mebibyte.as_bytes_usize())
+    let part2: Vec<u8> = (0..ByteSize::mib(5).as_u64() as usize)
         .map(|i| (i % 239) as u8)
         .collect();
 
@@ -689,7 +690,7 @@ async fn file_download_round_trips_real_express() {
 const MANY_PARTS: usize = 64;
 
 fn many_part_len() -> usize {
-    MANY_PARTS * 5 * ByteUnit::Mebibyte.as_bytes_usize()
+    MANY_PARTS * ByteSize::mib(5).as_u64() as usize
 }
 
 /// A many-part object downloaded to a file round-trips on disk. Ranges align to
@@ -813,20 +814,22 @@ static SERIAL_TEST_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(
 
 #[cfg(e2e_test)]
 async fn large_object_file_download_validates(target: Target) {
-    use aws_sdk_s3_transfer_manager::types::PartSize;
+    use aws_sdk_s3_transfer_manager::config::PartSize;
 
     // Hold the gate for the whole test so peak temp-disk usage stays within one
     // test's footprint (see SERIAL_TEST_GATE).
     let _serial = SERIAL_TEST_GATE.lock().await;
 
     // 6 GiB at an 8 MiB part size = ~768 ranged GETs, past the 512-slot window.
-    let part = 8 * ByteUnit::Mebibyte.as_bytes_u64();
-    let t = target.connect_with(Some(PartSize::Target(part))).await;
+    let part = ByteSize::mib(8).as_u64();
+    let t = target
+        .connect_with(Some(PartSize::Target(ByteSize::new(part))))
+        .await;
 
     let dir = tempfile::tempdir().expect("tempdir");
     let src = dir.path().join("src.bin");
     let dest = dir.path().join("dest.bin");
-    let total = 6 * ByteUnit::Gibibyte.as_bytes_usize();
+    let total = ByteSize::gib(6).as_u64() as usize;
     let src_digest = write_pattern_file(&src, total);
 
     t.put_from_path(

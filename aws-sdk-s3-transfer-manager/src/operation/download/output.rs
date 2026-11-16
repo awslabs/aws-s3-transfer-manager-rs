@@ -19,7 +19,7 @@ pub struct DownloadOutput {
     /// delivered bytes were validated.
     pub object_meta: ObjectMetadata,
     /// Snapshot of transfer metrics at completion.
-    pub metrics: crate::types::TransferMetrics,
+    pub metrics: crate::metrics::TransferMetrics,
     /// Object-integrity information: the object's reported checksum values and
     /// whether the delivered bytes were checksum-validated.
     integrity_checks: IntegrityChecks,
@@ -28,7 +28,7 @@ pub struct DownloadOutput {
 impl DownloadOutput {
     pub(crate) fn new(
         object_meta: ObjectMetadata,
-        metrics: crate::types::TransferMetrics,
+        metrics: crate::metrics::TransferMetrics,
         integrity_checks: IntegrityChecks,
     ) -> Self {
         Self {

@@ -7,11 +7,9 @@
 
 use super::object_connector;
 use crate::{common, dummy_expected_request, rand_data};
-use aws_sdk_s3_transfer_manager::{
-    metrics::unit::ByteUnit,
-    types::{ConcurrencyMode, PartSize},
-    RuntimeConfig,
-};
+use aws_sdk_s3_transfer_manager::config::RuntimeConfig;
+use aws_sdk_s3_transfer_manager::config::{ConcurrencyMode, PartSize};
+use aws_sdk_s3_transfer_manager::types::ByteSize;
 use aws_smithy_http_client::test_util::{ReplayEvent, StaticReplayClient};
 use aws_smithy_types::body::SdkBody;
 use std::time::Duration;
@@ -173,7 +171,7 @@ pub(crate) async fn assert_download_releases_destination(
     ending: Ending,
     runtime_config: RuntimeConfig,
 ) {
-    let part_size = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+    let part_size = ByteSize::mib(5).as_u64() as usize;
     let data = rand_data(2 * part_size);
     let http_client = match ending {
         // Discovery returns the first part; the second part request fails.
@@ -205,7 +203,7 @@ pub(crate) async fn assert_download_releases_destination(
     };
     let config = aws_sdk_s3_transfer_manager::Config::builder()
         .s3_config(common::s3_config(http_client))
-        .part_size(PartSize::Target(part_size as u64))
+        .part_size(PartSize::Target(ByteSize::new(part_size as u64)))
         .concurrency(ConcurrencyMode::Explicit(1))
         .runtime_config(runtime_config)
         .build()

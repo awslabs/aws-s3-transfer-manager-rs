@@ -2,13 +2,14 @@
  * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
+use aws_sdk_s3_transfer_manager::config::RuntimeConfig;
+use aws_sdk_s3_transfer_manager::config::{ConcurrencyMode, PartSize, TargetThroughput};
+use aws_sdk_s3_transfer_manager::config::{MemoryBudgetConfig, MemoryConfig};
 use aws_sdk_s3_transfer_manager::io::InputStream;
-use aws_sdk_s3_transfer_manager::memory::{BufferPool, MemoryBudgetConfig, MemoryConfig};
-use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
-use aws_sdk_s3_transfer_manager::metrics::Throughput;
+use aws_sdk_s3_transfer_manager::memory::BufferPool;
 use aws_sdk_s3_transfer_manager::operation::download::Body;
-use aws_sdk_s3_transfer_manager::types::{ConcurrencyMode, PartSize, TargetThroughput};
-use aws_sdk_s3_transfer_manager::RuntimeConfig;
+use aws_sdk_s3_transfer_manager::types::ByteSize;
+use aws_sdk_s3_transfer_manager::types::Throughput;
 use aws_smithy_types::date_time::{DateTime, Format};
 use clap::{CommandFactory, Parser};
 use std::error::Error;
@@ -310,7 +311,7 @@ async fn do_recursive_download(
     println!(
         "downloaded {} objects totalling {transfer_size_bytes} bytes ({})",
         output.objects_downloaded(),
-        ByteUnit::display(transfer_size_bytes)
+        ByteSize::new(transfer_size_bytes)
     );
     Ok(transfer_size_bytes)
 }
@@ -360,7 +361,7 @@ async fn do_recursive_upload(
     println!(
         "uploaded {} objects totalling {transfer_size_bytes} bytes ({})",
         output.objects_uploaded(),
-        ByteUnit::display(transfer_size_bytes)
+        ByteSize::new(transfer_size_bytes)
     );
     Ok(transfer_size_bytes)
 }
@@ -509,7 +510,7 @@ async fn run(args: Args) -> Result<(), BoxError> {
     let mut config_loader = aws_sdk_s3_transfer_manager::from_env()
         .concurrency(args.concurrency.mode())
         .runtime_config(args.runtime.mode())
-        .part_size(PartSize::Target(args.part_size));
+        .part_size(PartSize::Target(ByteSize::new(args.part_size)));
 
     // S3FIO_MEMORY_LIMIT=N caps the transfer manager's memory pool at N GiB
     // (in-flight plus buffered transfer data; transfers backpressure at the cap).
@@ -517,10 +518,10 @@ async fn run(args: Args) -> Result<(), BoxError> {
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
     {
-        let bytes = gib * ByteUnit::Gibibyte.as_bytes_usize();
+        let bytes = ByteSize::gib(gib as u64).as_u64() as usize;
         tracing::info!(gib, "memory budget limit (S3FIO_MEMORY_LIMIT, GiB)");
         let pool = BufferPool::builder()
-            .memory_budget(MemoryBudgetConfig::Limit(bytes))
+            .memory_budget(MemoryBudgetConfig::Limit(ByteSize::new(bytes as u64)))
             .build()?;
         config_loader = config_loader.memory(MemoryConfig::Explicit(pool));
     }
@@ -633,7 +634,7 @@ async fn run(args: Args) -> Result<(), BoxError> {
                 "iteration {i}/{}: {} ({}) {throughput} in {elapsed:?}",
                 args.iterations,
                 bytes,
-                ByteUnit::display(bytes),
+                ByteSize::new(bytes),
             );
         }
 

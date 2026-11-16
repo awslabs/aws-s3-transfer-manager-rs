@@ -17,6 +17,7 @@
 //! ignored private arena probe; these benchmarks measure elapsed cost without
 //! exposing private counters to the benchmark crate.
 
+use aws_sdk_s3_transfer_manager::types::ByteSize;
 use std::future::Future;
 use std::hint::black_box;
 use std::io::IoSlice;
@@ -27,8 +28,9 @@ use std::task::{Context, Poll, Wake, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use aws_sdk_s3_transfer_manager::config::MemoryBudgetConfig;
 use aws_sdk_s3_transfer_manager::memory::{
-    BufferPool, MemoryBudgetConfig, PooledBufMut, Reservation, ReserveFuture, SegmentedBytes,
+    BufferPool, PooledBufMut, Reservation, ReserveFuture, SegmentedBytes,
 };
 use bytes::{Buf, BufMut};
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
@@ -70,7 +72,7 @@ impl PreparedPool {
     fn with_occupancy_fraction(capacity: usize, occupied_parts: usize, total_parts: usize) -> Self {
         assert!(total_parts != 0 && occupied_parts < total_parts);
         let pool = BufferPool::builder()
-            .memory_budget(MemoryBudgetConfig::Limit(capacity))
+            .memory_budget(MemoryBudgetConfig::Limit(ByteSize::new(capacity as u64)))
             .build()
             .expect("benchmark pool should build");
         assert_eq!(
@@ -112,7 +114,7 @@ impl PreparedPool {
 /// Prepares a pool without retaining a reservation.
 fn prepared_unreserved_pool(capacity: usize) -> BufferPool {
     let pool = BufferPool::builder()
-        .memory_budget(MemoryBudgetConfig::Limit(capacity))
+        .memory_budget(MemoryBudgetConfig::Limit(ByteSize::new(capacity as u64)))
         .build()
         .expect("benchmark pool should build");
     let prepared = pool

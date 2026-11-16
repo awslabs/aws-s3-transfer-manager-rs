@@ -411,13 +411,14 @@ async fn read_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::ByteSize;
     use std::fmt::Debug;
     use std::future::poll_fn;
     use std::io::Write;
     use std::task::Waker;
 
+    use crate::config::MemoryBudgetConfig;
     use crate::io::InputStream;
-    use crate::types::MemoryBudgetConfig;
 
     const TEST_POOL_CAPACITY: usize = 4 * 1024 * 1024;
 
@@ -450,7 +451,9 @@ mod tests {
 
     fn test_pool() -> BufferPool {
         BufferPool::builder()
-            .memory_budget(MemoryBudgetConfig::Limit(TEST_POOL_CAPACITY))
+            .memory_budget(MemoryBudgetConfig::Limit(ByteSize::new(
+                TEST_POOL_CAPACITY as u64,
+            )))
             .build()
             .unwrap()
     }

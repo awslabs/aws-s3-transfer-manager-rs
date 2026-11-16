@@ -11,7 +11,7 @@ use super::admission::MAX_PACKED_CARRIERS;
 use super::geometry::PoolGeometry;
 use super::virtual_memory::page_size;
 use super::CarrierCount;
-use crate::types::MemoryBudgetConfig;
+use crate::config::MemoryBudgetConfig;
 
 /// Default carrier size before runtime page-size alignment.
 const DEFAULT_CARRIER_BYTES: usize = 16 * 1024;
@@ -209,7 +209,7 @@ fn resolve_capacity_bytes(
                 detected_memory.ok_or(BufferPoolBuildError::MemoryDetectionUnavailable)?;
             Ok(floor_fraction_of(detected, fraction))
         }
-        MemoryBudgetConfig::Limit(bytes) => Ok(bytes),
+        MemoryBudgetConfig::Limit(bytes) => Ok(bytes.as_usize()),
     }
 }
 
@@ -246,6 +246,7 @@ fn floor_fraction_of(total: usize, fraction: f64) -> usize {
 mod tests {
     use super::*;
     use crate::runtime::buffer_pool::BufferPool;
+    use crate::types::ByteSize;
 
     const GIB: usize = 1024 * 1024 * 1024;
 
@@ -354,8 +355,12 @@ mod tests {
         // Capacity rounds down so it never exceeds the byte limit, while a
         // reservation must cover its complete allocation unit.
         let limit = DEFAULT_CARRIER_BYTES + 123;
-        let resolved =
-            PoolConfig::resolve_for_page(MemoryBudgetConfig::Limit(limit), None, 4096).unwrap();
+        let resolved = PoolConfig::resolve_for_page(
+            MemoryBudgetConfig::Limit(ByteSize::new(limit as u64)),
+            None,
+            4096,
+        )
+        .unwrap();
         let envelope = resolved.geometry.carriers_for_bytes(limit).unwrap();
 
         assert_eq!(resolved.configured_capacity, CarrierCount::new(1));
@@ -367,7 +372,7 @@ mod tests {
     fn test_capacity_below_one_carrier_is_rejected() {
         assert_eq!(
             PoolConfig::resolve_for_page(
-                MemoryBudgetConfig::Limit(DEFAULT_CARRIER_BYTES - 1),
+                MemoryBudgetConfig::Limit(ByteSize::new((DEFAULT_CARRIER_BYTES - 1) as u64)),
                 None,
                 4096,
             ),
@@ -377,9 +382,12 @@ mod tests {
 
     #[test]
     fn test_carrier_rounds_up_to_large_runtime_page() {
-        let resolved =
-            PoolConfig::resolve_for_page(MemoryBudgetConfig::Limit(256 * 1024), None, 128 * 1024)
-                .unwrap();
+        let resolved = PoolConfig::resolve_for_page(
+            MemoryBudgetConfig::Limit(ByteSize::new(256 * 1024)),
+            None,
+            128 * 1024,
+        )
+        .unwrap();
         assert_eq!(resolved.geometry.carrier_size(), 128 * 1024);
         assert_eq!(resolved.geometry.block_size(), 256 * 1024);
         assert_eq!(resolved.configured_capacity, CarrierCount::new(2));
@@ -387,8 +395,12 @@ mod tests {
 
     #[test]
     fn test_block_size_is_independent_of_carrier_bitmap_width() {
-        let resolved =
-            PoolConfig::resolve_for_page(MemoryBudgetConfig::Limit(GIB), None, 4096).unwrap();
+        let resolved = PoolConfig::resolve_for_page(
+            MemoryBudgetConfig::Limit(ByteSize::new(GIB as u64)),
+            None,
+            4096,
+        )
+        .unwrap();
 
         assert_eq!(resolved.geometry.carrier_size(), 16 * 1024);
         assert_eq!(resolved.geometry.block_size(), 128 * 1024 * 1024);
@@ -402,9 +414,12 @@ mod tests {
     #[test]
     fn test_optimistic_scan_preserves_its_byte_reach_across_page_geometry() {
         for page_size in [4096, 128 * 1024] {
-            let resolved =
-                PoolConfig::resolve_for_page(MemoryBudgetConfig::Limit(GIB), None, page_size)
-                    .unwrap();
+            let resolved = PoolConfig::resolve_for_page(
+                MemoryBudgetConfig::Limit(ByteSize::new(GIB as u64)),
+                None,
+                page_size,
+            )
+            .unwrap();
             let carrier_size = resolved.geometry.carrier_size();
             let scan_bytes = resolved.optimistic_scan_words * u64::BITS as usize * carrier_size;
 
@@ -418,7 +433,7 @@ mod tests {
         const PART_BYTES: usize = 8 * 1024 * 1024;
 
         let pool = BufferPool::from_capacity(
-            MemoryBudgetConfig::Limit(GIB),
+            MemoryBudgetConfig::Limit(ByteSize::new(GIB as u64)),
             None,
             crate::config::MemoryDiagnosticsConfig::default(),
         )
@@ -437,9 +452,12 @@ mod tests {
 
     #[test]
     fn test_block_size_is_capped_by_small_configured_capacity() {
-        let resolved =
-            PoolConfig::resolve_for_page(MemoryBudgetConfig::Limit(8 * 1024 * 1024), None, 4096)
-                .unwrap();
+        let resolved = PoolConfig::resolve_for_page(
+            MemoryBudgetConfig::Limit(ByteSize::new(8 * 1024 * 1024)),
+            None,
+            4096,
+        )
+        .unwrap();
 
         assert_eq!(resolved.geometry.block_size(), 8 * 1024 * 1024);
         assert_eq!(
@@ -452,8 +470,12 @@ mod tests {
     #[test]
     fn test_capacity_accepts_the_exact_packed_carrier_limit() {
         let bytes = u32::MAX as usize * DEFAULT_CARRIER_BYTES;
-        let resolved =
-            PoolConfig::resolve_for_page(MemoryBudgetConfig::Limit(bytes), None, 4096).unwrap();
+        let resolved = PoolConfig::resolve_for_page(
+            MemoryBudgetConfig::Limit(ByteSize::new(bytes as u64)),
+            None,
+            4096,
+        )
+        .unwrap();
         assert_eq!(resolved.configured_capacity, MAX_PACKED_CARRIERS);
     }
 
@@ -462,7 +484,11 @@ mod tests {
     fn test_capacity_rejects_packed_carrier_overflow() {
         let bytes = (u32::MAX as usize + 1) * DEFAULT_CARRIER_BYTES;
         assert_eq!(
-            PoolConfig::resolve_for_page(MemoryBudgetConfig::Limit(bytes), None, 4096),
+            PoolConfig::resolve_for_page(
+                MemoryBudgetConfig::Limit(ByteSize::new(bytes as u64)),
+                None,
+                4096
+            ),
             Err(BufferPoolBuildError::CapacityOverflow)
         );
     }
@@ -470,7 +496,7 @@ mod tests {
     #[test]
     fn test_pool_construction_prepares_no_capacity() {
         let pool = BufferPool::from_capacity(
-            MemoryBudgetConfig::Limit(GIB),
+            MemoryBudgetConfig::Limit(ByteSize::new(GIB as u64)),
             Some(8 * GIB),
             crate::config::MemoryDiagnosticsConfig::default(),
         )
@@ -484,7 +510,7 @@ mod tests {
     #[test]
     fn test_public_builder_constructs_a_lazy_explicit_pool() {
         let pool = BufferPool::builder()
-            .memory_budget(MemoryBudgetConfig::Limit(GIB))
+            .memory_budget(MemoryBudgetConfig::Limit(ByteSize::new(GIB as u64)))
             .build()
             .unwrap();
 
@@ -506,7 +532,7 @@ mod tests {
         }
         assert_eq!(
             BufferPool::builder()
-                .memory_budget(MemoryBudgetConfig::Limit(1))
+                .memory_budget(MemoryBudgetConfig::Limit(ByteSize::new(1)))
                 .build()
                 .unwrap_err(),
             BufferPoolBuildError::InvalidCapacity
