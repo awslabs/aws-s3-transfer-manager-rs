@@ -464,8 +464,15 @@ impl StorageBackend for InMemoryStorage {
             }
         }
 
-        // Combine all parts in the specified order
-        let mut combined = BytesMut::new();
+        // Combine all parts in the specified order, into one allocation of the object's size: a
+        // growing buffer would reallocate and copy the object as it doubles past each power of two.
+        let combined_len = request
+            .parts
+            .iter()
+            .filter_map(|(part_number, _)| upload_parts.get(part_number))
+            .map(|(part_data, _)| part_data.len())
+            .sum();
+        let mut combined = BytesMut::with_capacity(combined_len);
         let mut etags = Vec::new();
         let mut total_size = 0u64;
 
