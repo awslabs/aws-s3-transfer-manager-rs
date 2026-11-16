@@ -15,11 +15,12 @@ use std::time::Duration;
 use crate::config::TransferDiagnosticsConfig;
 use crate::error::ErrorKind;
 use crate::metrics::RequestMetrics;
+use crate::metrics::TransferMetrics;
 use crate::transfer::{
     emit_pending_details, AttributedRequestMeasurement, RequestMetricsAttribution, TransferContext,
     TransferId, TransferPendingStats,
 };
-use crate::types::{ChecksumValidation, TransferMetrics, TransferStatus};
+use crate::types::{ChecksumValidation, TransferStatus};
 
 /// Delivery surface owned by one download.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -470,11 +471,7 @@ impl DownloadObservability {
             outcome,
             destination: state.destination,
             error_kind: report.error_kind,
-            elapsed: report
-                .metrics
-                .finished_at
-                .map(|finished_at| finished_at.saturating_duration_since(report.metrics.started_at))
-                .unwrap_or_default(),
+            elapsed: report.metrics.elapsed,
             metrics: report.metrics,
             requests: state.requests,
             request_total: report.request_total,
@@ -587,11 +584,7 @@ fn emit_event(transfer_id: TransferId, event: DownloadEvent, snapshot: DownloadS
 }
 
 fn emit_terminal_lifecycle(report: &DownloadTerminalReport, outcome: DownloadTerminalOutcome) {
-    let elapsed = report
-        .metrics
-        .finished_at
-        .map(|finished_at| finished_at.saturating_duration_since(report.metrics.started_at))
-        .unwrap_or_default();
+    let elapsed = report.metrics.elapsed;
     tracing::debug!(
         target: crate::telemetry::TARGET_TRANSFER_DOWNLOAD,
         tid = %report.transfer_id,
@@ -736,8 +729,6 @@ fn emit_request_detail(
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
-
     use super::*;
 
     fn config(detail: u64) -> TransferDiagnosticsConfig {
@@ -762,15 +753,13 @@ mod tests {
     }
 
     fn transfer_metrics() -> TransferMetrics {
-        let now = Instant::now();
         TransferMetrics {
             network_tx: 0,
             network_rx: 8 * 1024 * 1024,
             disk_read: 0,
             disk_write: 0,
             total_bytes: Some(8 * 1024 * 1024),
-            started_at: now,
-            finished_at: Some(now),
+            elapsed: Duration::ZERO,
         }
     }
 

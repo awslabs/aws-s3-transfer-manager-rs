@@ -18,7 +18,7 @@
 //! by the connection cap or the ceiling: work beyond either waits for a
 //! connection or for memory admission at run time.
 
-use crate::metrics::unit::ByteUnit;
+use crate::types::ByteSize;
 
 use super::buffer_pool::auto_capacity_bytes;
 use super::platform::{
@@ -27,14 +27,14 @@ use super::platform::{
 };
 
 /// Part size for uploads and downloads when none is configured.
-pub(crate) const DEFAULT_PART_SIZE: u64 = 8 * ByteUnit::Mebibyte.as_bytes_u64();
+pub(crate) const DEFAULT_PART_SIZE: u64 = ByteSize::mib(8).as_u64();
 
 /// Lower bound on the automatic ceiling when memory is detected.
 ///
 /// Holds three [`DEFAULT_PART_SIZE`] buffers for each request at the minimum
 /// concurrency target, so a small host rarely waits on memory admission at that
 /// target. Limited to `1 / FLOOR_MAX_RAM_DIVISOR` of detected memory.
-const AUTO_FLOOR_BYTES: u64 = 256 * ByteUnit::Mebibyte.as_bytes_u64();
+const AUTO_FLOOR_BYTES: u64 = ByteSize::mib(256).as_u64();
 
 /// Divisor of detected memory that limits [`AUTO_FLOOR_BYTES`], so the
 /// automatic ceiling stays below detected memory.

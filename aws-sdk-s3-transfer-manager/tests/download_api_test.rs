@@ -7,11 +7,12 @@ mod common;
 
 #[cfg(feature = "sdk-v1")]
 use aws_sdk_s3::operation::{get_object::GetObjectOutput, head_object::HeadObjectOutput};
+use aws_sdk_s3_transfer_manager::config::ReadAhead;
 #[cfg(feature = "sdk-v1")]
 use aws_sdk_s3_transfer_manager::types::{ChecksumValidation, NotValidatedReason};
 use aws_sdk_s3_transfer_manager::{
     operation::download,
-    types::{self, ReadAhead},
+    types::{self},
     Client, Config,
 };
 #[cfg(feature = "sdk-v1")]

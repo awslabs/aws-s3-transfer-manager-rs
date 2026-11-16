@@ -7,13 +7,14 @@
 
 use std::time::Duration;
 
+use aws_sdk_s3_transfer_manager::config::RuntimeConfig;
 use aws_sdk_s3_transfer_manager::io::InputStream;
-use aws_sdk_s3_transfer_manager::metrics::unit::ByteUnit;
+use aws_sdk_s3_transfer_manager::types::ByteSize;
 use aws_sdk_s3_transfer_manager::types::TransferStatus;
-use aws_sdk_s3_transfer_manager::RuntimeConfig;
 use s3_mock_server::{FaultType, Occurrence, Operation};
 use tokio::time::timeout;
 
+use crate::assertions::wait_for_finished_elapsed;
 use crate::harness::{mock_tm, MockTm};
 
 async fn setup() -> MockTm {
@@ -34,11 +35,13 @@ async fn wait_for_terminal(status_fn: impl Fn() -> TransferStatus) {
     .expect("transfer did not reach terminal state within 30s");
 }
 
+/// A multipart upload's output reports the handle's final metrics: the bytes
+/// sent and the `elapsed` frozen at the recorded finish.
 #[tokio::test]
 async fn test_upload_metrics_and_status() {
     let m = setup().await;
 
-    let size = 16 * ByteUnit::Mebibyte.as_bytes_usize();
+    let size = ByteSize::mib(16).as_usize();
     let content = vec![0u8; size];
 
     let handle = m
@@ -56,11 +59,40 @@ async fn test_upload_metrics_and_status() {
     let metrics = handle.metrics();
     assert_eq!(metrics.network_tx, size as u64);
     assert_eq!(metrics.total_bytes, Some(size as u64));
-    assert!(metrics.finished_at.is_some());
-    assert!(metrics.started_at <= metrics.finished_at.unwrap());
+    let elapsed = wait_for_finished_elapsed(|| handle.metrics()).await;
 
     let output = handle.join().await.expect("join");
     assert_eq!(output.metrics.network_tx, size as u64);
+    assert_eq!(output.metrics.elapsed, elapsed);
+
+    m.handle.shutdown().await.expect("shutdown");
+}
+
+/// A single-request (PutObject) upload's output reports the bytes sent and the
+/// `elapsed` frozen at the recorded finish. 1 KiB is below the 5 MiB floor of
+/// the multipart threshold; the absent upload ID confirms the PutObject path.
+#[tokio::test]
+async fn test_put_object_upload_output_reports_final_metrics() {
+    let m = setup().await;
+
+    let size = ByteSize::kib(1).as_usize();
+    let handle = m
+        .client
+        .upload()
+        .bucket("test-bucket")
+        .key("metrics-put-object")
+        .body(InputStream::from(vec![0u8; size]))
+        .initiate()
+        .expect("initiate upload");
+
+    wait_for_terminal(|| handle.status()).await;
+    assert_eq!(handle.status(), TransferStatus::Completed);
+    let elapsed = wait_for_finished_elapsed(|| handle.metrics()).await;
+
+    let output = handle.join().await.expect("join");
+    assert_eq!(output.upload_id(), None);
+    assert_eq!(output.metrics.network_tx, size as u64);
+    assert_eq!(output.metrics.elapsed, elapsed);
 
     m.handle.shutdown().await.expect("shutdown");
 }
@@ -69,7 +101,7 @@ async fn test_upload_metrics_and_status() {
 async fn test_upload_from_file_metrics() {
     let m = setup().await;
 
-    let size = 16 * ByteUnit::Mebibyte.as_bytes_usize();
+    let size = ByteSize::mib(16).as_usize();
     let dir = tempfile::tempdir().unwrap();
     let file_path = dir.path().join("upload_src.dat");
     std::fs::write(&file_path, vec![0u8; size]).unwrap();
@@ -102,7 +134,7 @@ async fn test_upload_from_file_metrics() {
 async fn test_download_metrics_and_status() {
     let m = setup().await;
 
-    let size = 25 * ByteUnit::Mebibyte.as_bytes_usize();
+    let size = ByteSize::mib(25).as_usize();
     let content = vec![0u8; size];
     m.server
         .add_object("test-bucket", "metrics-download", content, None)
@@ -123,8 +155,7 @@ async fn test_download_metrics_and_status() {
     let metrics = handle.metrics();
     assert_eq!(metrics.network_rx, size as u64);
     assert_eq!(metrics.total_bytes, Some(size as u64));
-    assert!(metrics.finished_at.is_some());
-    assert!(metrics.started_at <= metrics.finished_at.unwrap());
+    let elapsed = wait_for_finished_elapsed(|| handle.metrics()).await;
 
     let output = timeout(Duration::from_secs(30), handle.join())
         .await
@@ -133,7 +164,7 @@ async fn test_download_metrics_and_status() {
 
     assert_eq!(output.metrics.network_rx, size as u64);
     assert_eq!(output.metrics.total_bytes, Some(size as u64));
-    assert!(output.metrics.finished_at.is_some());
+    assert_eq!(output.metrics.elapsed, elapsed);
 
     m.handle.shutdown().await.expect("shutdown");
 }
@@ -142,7 +173,7 @@ async fn test_download_metrics_and_status() {
 async fn test_download_to_file_metrics(rt: RuntimeConfig) {
     let m = mock_tm(rt).await;
 
-    let size = 25 * ByteUnit::Mebibyte.as_bytes_usize();
+    let size = ByteSize::mib(25).as_usize();
     let content = vec![0u8; size];
     m.server
         .add_object("test-bucket", "metrics-file-download", content, None)
@@ -197,7 +228,7 @@ async fn test_upload_abort_metrics() {
         Occurrence::Always,
     );
 
-    let size = 16 * ByteUnit::Mebibyte.as_bytes_usize();
+    let size = ByteSize::mib(16).as_usize();
     let content = vec![0u8; size];
 
     let handle = m
@@ -241,7 +272,7 @@ async fn test_upload_abort_metrics() {
 async fn test_download_abort_status() {
     let m = setup().await;
 
-    let size = 100 * ByteUnit::Mebibyte.as_bytes_usize();
+    let size = ByteSize::mib(100).as_usize();
     let content = vec![0u8; size];
     m.server
         .add_object("test-bucket", "metrics-abort-download", content, None)

@@ -12,20 +12,22 @@ pub mod io {
     pub struct InputStream(pub Vec<u8>);
 }
 pub mod types {
-    #[derive(Debug, Clone, PartialEq)]
-    pub enum ReadAhead {
-        Parts(usize),
-    }
     #[derive(Debug, Clone)]
     pub enum FailedMultipartUploadPolicy {
         Abort,
     }
+}
+pub mod metrics {
     #[derive(Debug, Clone)]
     pub struct TransferMetrics(pub u64);
 }
 pub mod config {
     /// Client configuration.
     pub struct Config;
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum ReadAhead {
+        Parts(usize),
+    }
 }
 pub mod operation {
     pub mod download {
@@ -69,7 +71,10 @@ pub mod operation {
 
 #[cfg(test)]
 mod tests {
-    use super::{io::InputStream, model::*, operation::upload::ChecksumStrategy, types::*};
+    use super::{
+        config::ReadAhead, io::InputStream, metrics::TransferMetrics, model::*,
+        operation::upload::ChecksumStrategy, types::*,
+    };
 
     // The part number is crate-private: callers cannot select a part, but the
     // crate sets it on its own requests and relies on the builder conversion

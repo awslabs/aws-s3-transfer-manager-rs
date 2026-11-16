@@ -13,8 +13,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use aws_sdk_s3_transfer_manager::config::RuntimeConfig;
 use aws_sdk_s3_transfer_manager::config::S3ClientConfig;
-use aws_sdk_s3_transfer_manager::RuntimeConfig;
 use s3_mock_server::S3MockServer;
 use tokio::net::{TcpListener, TcpStream};
 

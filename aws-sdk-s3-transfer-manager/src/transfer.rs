@@ -512,15 +512,23 @@ impl MetricsState {
     }
 
     /// Snapshot current metrics into the public type.
-    pub(crate) fn snapshot(&self) -> crate::types::TransferMetrics {
-        crate::types::TransferMetrics {
+    pub(crate) fn snapshot(&self) -> crate::metrics::TransferMetrics {
+        crate::metrics::TransferMetrics {
             network_tx: self.network_tx.load(Ordering::Relaxed),
             network_rx: self.network_rx.load(Ordering::Relaxed),
             disk_read: self.disk_read.load(Ordering::Relaxed),
             disk_write: self.disk_write.load(Ordering::Relaxed),
             total_bytes: self.total_bytes.get().copied(),
-            started_at: self.started_at,
-            finished_at: self.finished_at.get().copied(),
+            elapsed: self.elapsed(),
+        }
+    }
+
+    /// Returns the time from the transfer's start to its recorded finish, or
+    /// to now if no finish is recorded.
+    fn elapsed(&self) -> std::time::Duration {
+        match self.finished_at.get() {
+            Some(finished_at) => finished_at.saturating_duration_since(self.started_at),
+            None => self.started_at.elapsed(),
         }
     }
 }
@@ -1214,7 +1222,7 @@ impl TransferContext {
     }
 
     /// Snapshot current transfer metrics.
-    pub(crate) fn metrics(&self) -> crate::types::TransferMetrics {
+    pub(crate) fn metrics(&self) -> crate::metrics::TransferMetrics {
         self.metrics.snapshot()
     }
 
@@ -1275,6 +1283,31 @@ impl SchedulingCtl<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A snapshot's `elapsed` advances while no finish is recorded and stops at
+    /// the recorded finish. The 5 ms sleeps exceed any monotonic clock step, so
+    /// a snapshot that kept advancing after `set_finished` fails the equality.
+    #[test]
+    fn metrics_elapsed_stops_at_recorded_finish() {
+        let metrics = MetricsState::new();
+        let before = metrics.snapshot().elapsed;
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let active = metrics.snapshot().elapsed;
+        assert!(
+            active > before,
+            "elapsed must advance while the transfer is active"
+        );
+
+        metrics.set_finished();
+        let finished = metrics.snapshot().elapsed;
+        assert!(finished >= active);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert_eq!(
+            metrics.snapshot().elapsed,
+            finished,
+            "elapsed must stop advancing at the recorded finish"
+        );
+    }
 
     mod state_machine_status {
         use super::*;
@@ -1462,8 +1495,7 @@ mod tests {
             assert_eq!(stats.disk_read, 0);
             assert_eq!(stats.disk_write, 0);
             assert_eq!(stats.total_bytes, None);
-            assert!(stats.started_at.elapsed().as_secs() < 1);
-            assert!(stats.finished_at.is_none());
+            assert!(stats.elapsed.as_secs() < 1);
         }
 
         #[cfg_attr(miri, ignore)]
@@ -1698,15 +1730,30 @@ mod tests {
             assert!(!ctx.claim_terminal_report());
         }
 
+        /// A new context's `elapsed` advances; after `signal_terminal` it does
+        /// not. The first check fails a context that records its finish at
+        /// creation, the second one that never records it. The 5 ms sleeps
+        /// exceed any monotonic clock step.
         #[cfg_attr(miri, ignore)]
         #[test]
-        fn finished_at_set_on_terminal() {
+        fn signal_terminal_stops_elapsed() {
             let handle = test_handle();
             let (ctx, _rx) = TransferContext::new(handle);
-            assert!(ctx.metrics().finished_at.is_none());
+            let before = ctx.metrics().elapsed;
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            assert!(
+                ctx.metrics().elapsed > before,
+                "elapsed must advance before the transfer finishes"
+            );
             ctx.set_completed();
             ctx.signal_terminal();
-            assert!(ctx.metrics().finished_at.is_some());
+            let finished = ctx.metrics().elapsed;
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            assert_eq!(
+                ctx.metrics().elapsed,
+                finished,
+                "signal_terminal must record the finish"
+            );
         }
 
         #[cfg_attr(miri, ignore)]

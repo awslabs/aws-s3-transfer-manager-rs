@@ -34,6 +34,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   download's responses carried checksums only in algorithms the SDK does not compute, such as MD5.
 
 ### Changed
+- `TransferMetrics::started_at` and `TransferMetrics::finished_at` are replaced by
+  `TransferMetrics::elapsed`: the time from when the transfer was initiated until it recorded its
+  finish, or until the snapshot if it has not. The metrics in an operation's output hold the final
+  value; a handle's `status` reports whether the transfer has finished.
+- Configuration types live in `config`, which now holds everything `Config` accepts: `PartSize`,
+  `ReadAhead`, `ConcurrencyMode`, `TargetThroughput`, `MemoryConfig` and `MemoryBudgetConfig` move
+  there from `types` (and, for the two memory types, from `memory`). `types` keeps the model shapes,
+  the per-request policies and the outputs, and gains the value types. `TransferMetrics` moves from
+  `types` to `metrics`, which now holds observation snapshots only. `ByteUnit`, `Throughput` and
+  `ThroughputDisplayContext` move from `metrics` to `types`; the `metrics::unit` module is gone.
+  The crate root re-exports `Client`, `Config` and `from_env`; `RuntimeConfig`, `Managed` and
+  `S3ClientConfig` are reachable through `config`. No type is reachable at two paths, so the old
+  paths are removed rather than re-exported.
+- `types::ByteSize` is a quantity of bytes, and configuration takes it wherever it takes a size:
+  `PartSize::Target` and `MemoryBudgetConfig::Limit`. Construct it with `ByteSize::new`,
+  `ByteSize::kib`, `ByteSize::mib` or `ByteSize::gib`, all `const fn`. `as_u64` and `as_usize`
+  return the byte count, the latter panicking only where `usize` is narrower than 64 bits and the
+  size does not fit, and `as_unit` returns the size in a given `ByteUnit` as an `f64`. `Display`
+  formats in the largest binary unit that keeps the value at or above 1, and `display_as` formats
+  in a fixed unit.
+  Positions, counters, object lengths and in-memory buffer lengths stay integers.
+- `BufferPoolBuilder::memory_budget` with a `MemoryBudgetConfig::Limit` larger than `usize::MAX`
+  returns `BufferPoolBuildError::CapacityOverflow`, which can happen only where `usize` is narrower
+  than 64 bits.
+- `ByteUnit` keeps its variants, `AsRef<str>` and `FromStr`, and is the unit a `ByteSize` or
+  `Throughput` is displayed in. Its `as_bytes_u64`, `as_bytes_usize`, `as_bits_u64`, `as_bits_usize`
+  and `convert` methods are removed, as is `ByteUnit::display`: `ByteSize::mib(8)` replaces
+  `8 * ByteUnit::Mebibyte.as_bytes_u64()`, `ByteSize::as_unit` replaces `ByteUnit::convert`, and
+  `ByteSize`'s `Display` replaces `ByteUnit::display`.
+  `ByteCountDisplayContext` is renamed `ByteSizeDisplayContext`, and `ByteSize::display_as` is its
+  only constructor: `ByteCountDisplayContext::new` is removed.
 - `aws-sdk-s3-transfer-manager`, `aws-sdk-s3-transfer-manager-ext`, `aws-smithy-topology`,
   `aws-smithy-execution` and `aws-smithy-managed-http`: the minimum supported Rust version is
   1.96.0.
@@ -49,10 +80,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `poll_part`.
 - `DownloadInput::part_number` and its getter are no longer public. Single-part downloads are
   not supported.
-- `io::walk::WalkErrorKind` and `metrics::unit::ByteUnit` are `#[non_exhaustive]`.
-- The fields of `metrics::ThroughputDisplayContext` and `metrics::unit::ByteCountDisplayContext`
-  are private. Create them with `Throughput::display_as`, `ByteUnit::display`, or
-  `ByteCountDisplayContext::new`.
+- `io::walk::WalkErrorKind` and `types::ByteUnit` are `#[non_exhaustive]`.
+- The fields of `types::ThroughputDisplayContext` and `types::ByteSizeDisplayContext` are private.
+  Create them with `Throughput::display_as` or `ByteSize::display_as`.
 - `config::Builder::build` returns `Result<Config, BuildError>` and returns an error when
   `s3_config` is not set, instead of panicking.
 - The transfer manager no longer enables the `behavior-version-latest` feature of `aws-config` or
@@ -109,6 +139,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   file, such as a directory, a device, a FIFO, or a Windows pipe, with `ErrorKind::InputInvalid`.
 - `PathBodyBuilder::build` without a path returns an `ErrorKind::InputInvalid` error instead of
   panicking.
+- The metrics in an upload's output are the transfer's metrics at completion. A single-request
+  upload's output reported zero `network_tx`, and zero `disk_read` for a file source.
 - Framework metadata set on the `SdkConfig` or S3 configuration was missing from the
   `x-amz-user-agent` header of requests the transfer manager sent. The header now carries each
   entry as `lib/<name>/<version>` alongside the transfer manager's attribution, in the order

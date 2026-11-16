@@ -6,11 +6,12 @@
 use aws_smithy_types::error::operation::BuildError;
 use std::cmp;
 
-use crate::metrics::unit::ByteUnit;
-use crate::types::{ConcurrencyMode, MemoryConfig, PartSize, ReadAhead};
+use crate::types::ByteSize;
 
 mod runtime;
-pub use runtime::{Managed, RuntimeConfig};
+pub use runtime::{
+    ConcurrencyMode, Managed, MemoryBudgetConfig, MemoryConfig, RuntimeConfig, TargetThroughput,
+};
 
 mod diagnostics;
 pub(crate) use diagnostics::{
@@ -21,8 +22,40 @@ mod loader;
 pub use loader::ConfigLoader;
 pub(crate) mod user_agent;
 
-/// Minimum upload part size in bytes
-pub(crate) const MIN_MULTIPART_PART_SIZE_BYTES: u64 = 5 * ByteUnit::Mebibyte.as_bytes_u64();
+/// Minimum upload part size
+pub(crate) const MIN_MULTIPART_PART_SIZE: ByteSize = ByteSize::mib(5);
+
+/// The target part size for an upload or download request.
+#[non_exhaustive]
+#[derive(Debug, Clone, Default)]
+pub enum PartSize {
+    /// Automatically configure an optimal target part size based on the execution environment.
+    #[default]
+    Auto,
+
+    /// Target part size explicitly given.
+    ///
+    /// NOTE: This is a suggestion and will be used if possible but may be adjusted for an individual request
+    /// as required by the underlying API.
+    Target(ByteSize),
+}
+
+/// How far a download may prefetch ahead of the consumer.
+///
+/// Read-ahead is speculative issuance: parts fetched before the consumer has read
+/// up to them. This bounds that speculation. It does not gate in-order delivery or
+/// override the memory budget; those are separate bounds.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ReadAhead {
+    /// Read ahead as far as available memory allows.
+    #[default]
+    Auto,
+
+    /// Read ahead at most `n` parts beyond the consumer's position. `0` fetches only
+    /// the part the consumer is waiting on (no speculation). Still bounded by memory.
+    Parts(usize),
+}
 
 /// S3 client configuration for the transfer manager.
 ///
@@ -289,7 +322,7 @@ impl Builder {
     pub fn multipart_threshold(self, threshold: PartSize) -> Self {
         let threshold = match threshold {
             PartSize::Target(part_size) => {
-                PartSize::Target(cmp::max(part_size, MIN_MULTIPART_PART_SIZE_BYTES))
+                PartSize::Target(cmp::max(part_size, MIN_MULTIPART_PART_SIZE))
             }
             tps => tps,
         };
@@ -312,7 +345,7 @@ impl Builder {
     pub fn part_size(self, part_size: PartSize) -> Self {
         let threshold = match part_size {
             PartSize::Target(part_size) => {
-                PartSize::Target(cmp::max(part_size, MIN_MULTIPART_PART_SIZE_BYTES))
+                PartSize::Target(cmp::max(part_size, MIN_MULTIPART_PART_SIZE))
             }
             tps => tps,
         };

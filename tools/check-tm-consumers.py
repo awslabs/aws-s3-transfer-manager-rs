@@ -34,7 +34,7 @@ def write_consumer(directory, name, extension):
     dependencies = {
         TM: {"path": str(ROOT / TM), "default-features": False},
     }
-    source = """use aws_sdk_s3_transfer_manager::{Managed, RuntimeConfig};
+    source = """use aws_sdk_s3_transfer_manager::config::{Managed, RuntimeConfig};
 
 fn main() {
     let _ = RuntimeConfig::managed(Managed::default());
@@ -69,7 +69,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .runtime(execution.clone())
         .build()?;
     let _http = pool.clone();
-    let _config = tm::RuntimeConfig::managed(tm_ext::managed(runtime));
+    let _config = tm::config::RuntimeConfig::managed(tm_ext::managed(runtime));
     Ok(())
 }
 """

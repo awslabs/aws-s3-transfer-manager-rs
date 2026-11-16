@@ -139,6 +139,7 @@ impl Upload {
 
 #[cfg(test)]
 mod test {
+    use crate::types::ByteSize;
 
     use aws_sdk_s3::operation::abort_multipart_upload::AbortMultipartUploadOutput;
     use aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput;
@@ -158,13 +159,12 @@ mod test {
     use std::time::Duration;
     use tokio::sync::Semaphore;
 
+    use crate::config::RuntimeConfig;
+    use crate::config::{ConcurrencyMode, PartSize};
     use crate::io::InputStream;
-    use crate::metrics::unit::ByteUnit;
     use crate::operation::upload::UploadInput;
-    use crate::types::{
-        AbortOutcome, ConcurrencyMode, FailedMultipartUploadPolicy, PartSize, TransferStatus,
-    };
-    use crate::RuntimeConfig;
+
+    use crate::types::{AbortOutcome, FailedMultipartUploadPolicy, TransferStatus};
 
     /// Polls `future` once and returns the result of that poll.
     ///
@@ -253,8 +253,8 @@ mod test {
         let tm_config = crate::Config::builder()
             .concurrency(ConcurrencyMode::Explicit(1))
             .runtime_config(runtime_config)
-            .set_multipart_threshold(PartSize::Target(10))
-            .set_target_part_size(PartSize::Target(5 * ByteUnit::Mebibyte.as_bytes_u64()))
+            .set_multipart_threshold(PartSize::Target(ByteSize::new(10)))
+            .set_target_part_size(PartSize::Target(ByteSize::mib(5)))
             .sdk_client(client)
             .build()
             .expect("valid config");
@@ -536,8 +536,8 @@ mod test {
         let tm_config = crate::Config::builder()
             .concurrency(ConcurrencyMode::Explicit(concurrency))
             .runtime_config(runtime_config)
-            .set_multipart_threshold(PartSize::Target(10))
-            .set_target_part_size(PartSize::Target(5 * ByteUnit::Mebibyte.as_bytes_u64()))
+            .set_multipart_threshold(PartSize::Target(ByteSize::new(10)))
+            .set_target_part_size(PartSize::Target(ByteSize::mib(5)))
             .sdk_client(client)
             .build()
             .expect("valid config");
@@ -824,7 +824,7 @@ mod test {
         let tm_config = crate::Config::builder()
             .concurrency(ConcurrencyMode::Explicit(1))
             .runtime_config(runtime_config)
-            .set_multipart_threshold(PartSize::Target(ByteUnit::Mebibyte.as_bytes_u64()))
+            .set_multipart_threshold(PartSize::Target(ByteSize::mib(1)))
             .sdk_client(client)
             .build()
             .expect("valid config");
@@ -900,8 +900,8 @@ mod test {
 
         let tm_config = crate::Config::builder()
             .concurrency(ConcurrencyMode::Explicit(1))
-            .set_multipart_threshold(PartSize::Target(10))
-            .set_target_part_size(PartSize::Target(5 * ByteUnit::Mebibyte.as_bytes_u64()))
+            .set_multipart_threshold(PartSize::Target(ByteSize::new(10)))
+            .set_target_part_size(PartSize::Target(ByteSize::mib(5)))
             .sdk_client(client)
             .build()
             .expect("valid config");
@@ -928,14 +928,14 @@ mod test {
 /// Integration-style tests using StaticReplayClient for retry behavior
 #[cfg(test)]
 mod retry_tests {
+    use crate::types::ByteSize;
     use aws_sdk_s3::config::Region;
     use aws_smithy_http_client::test_util::{ReplayEvent, StaticReplayClient};
     use aws_smithy_types::body::SdkBody;
     use bytes::Bytes;
 
+    use crate::config::{ConcurrencyMode, PartSize};
     use crate::io::InputStream;
-    use crate::metrics::unit::ByteUnit;
-    use crate::types::{ConcurrencyMode, PartSize};
 
     fn dummy_request() -> http::Request<SdkBody> {
         http::Request::builder().body(SdkBody::empty()).unwrap()
@@ -1014,8 +1014,8 @@ mod retry_tests {
 
         let tm_config = crate::Config::builder()
             .concurrency(ConcurrencyMode::Explicit(1))
-            .set_multipart_threshold(PartSize::Target(10))
-            .set_target_part_size(PartSize::Target(5 * ByteUnit::Mebibyte.as_bytes_u64()))
+            .set_multipart_threshold(PartSize::Target(ByteSize::new(10)))
+            .set_target_part_size(PartSize::Target(ByteSize::mib(5)))
             .sdk_client(s3_client)
             .build()
             .expect("valid config");
@@ -1126,8 +1126,8 @@ mod retry_tests {
 
         let tm_config = crate::Config::builder()
             .concurrency(ConcurrencyMode::Explicit(1))
-            .set_multipart_threshold(PartSize::Target(10))
-            .set_target_part_size(PartSize::Target(5 * ByteUnit::Mebibyte.as_bytes_u64()))
+            .set_multipart_threshold(PartSize::Target(ByteSize::new(10)))
+            .set_target_part_size(PartSize::Target(ByteSize::mib(5)))
             .sdk_client(s3_client)
             .build()
             .expect("valid config");

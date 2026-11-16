@@ -10,10 +10,32 @@
 //! to a particular output type) stay with their module.
 
 use aws_sdk_s3_transfer_manager::error::{Error, ErrorKind};
+use aws_sdk_s3_transfer_manager::metrics::TransferMetrics;
 use aws_sdk_s3_transfer_manager::operation::download::DownloadOutput;
 use aws_sdk_s3_transfer_manager::types::{
     ChecksumAlgorithm, ChecksumValidation, NotValidatedReason,
 };
+use std::time::Duration;
+use tokio::time::timeout;
+
+/// Waits until two `metrics` snapshots taken 10 ms apart report the same
+/// `elapsed`, and returns it.
+///
+/// `TransferMetrics::elapsed` stops advancing only once the transfer records
+/// its finish, so a transfer that never records one fails after 30 s.
+pub(crate) async fn wait_for_finished_elapsed(metrics: impl Fn() -> TransferMetrics) -> Duration {
+    timeout(Duration::from_secs(30), async {
+        loop {
+            let first = metrics().elapsed;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            if metrics().elapsed == first {
+                return first;
+            }
+        }
+    })
+    .await
+    .expect("elapsed kept advancing for 30s: the transfer did not record its finish")
+}
 
 /// Assert a download's verdict is `Validated` with `expected`.
 pub(crate) fn assert_validated(output: &DownloadOutput, expected: ChecksumAlgorithm) {

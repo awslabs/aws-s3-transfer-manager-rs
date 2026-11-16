@@ -21,6 +21,6 @@
 /// The transfer manager continues to preserve HTTP configured through the
 /// SDK or S3 configuration. With no configured HTTP it builds its default
 /// transport against the adopted runtime's partitions.
-pub fn managed(runtime: aws_smithy_execution::ManagedRuntime) -> crate::Managed {
-    crate::Managed::from_runtime(runtime)
+pub fn managed(runtime: aws_smithy_execution::ManagedRuntime) -> crate::config::Managed {
+    crate::config::Managed::from_runtime(runtime)
 }

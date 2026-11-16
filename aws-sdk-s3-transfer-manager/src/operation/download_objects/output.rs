@@ -3,7 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use crate::types::{FailedDownload, TransferMetrics};
+use crate::metrics::TransferMetrics;
+use crate::types::FailedDownload;
 
 /// Output type for downloading multiple objects.
 ///

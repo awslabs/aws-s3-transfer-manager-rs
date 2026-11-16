@@ -3,8 +3,10 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use crate::runtime::buffer_pool::BufferPool;
-use aws_smithy_types::error::operation::BuildError;
+use std::fmt::{self, Display};
+use std::ops;
+use std::str::FromStr;
+use std::time::Duration;
 
 pub use crate::model::builders;
 pub use crate::model::{
@@ -13,144 +15,6 @@ pub use crate::model::{
     ObjectStorageClass, Owner, ReplicationStatus, RequestCharged, RequestPayer, RestoreStatus,
     ServerSideEncryption, StorageClass, UploadInput, UploadOutput,
 };
-
-/// The target part size for an upload or download request.
-#[non_exhaustive]
-#[derive(Debug, Clone, Default)]
-pub enum PartSize {
-    /// Automatically configure an optimal target part size based on the execution environment.
-    #[default]
-    Auto,
-
-    /// Target part size explicitly given.
-    ///
-    /// NOTE: This is a suggestion and will be used if possible but may be adjusted for an individual request
-    /// as required by the underlying API.
-    Target(u64),
-}
-
-/// Configured capacity for reservation-based pooled transfer data.
-///
-/// Requests that fit within the resolved capacity backpressure when capacity
-/// is unavailable. A single reservation larger than the resolved capacity is
-/// rejected. Unreserved acquisition and process or runtime overhead are
-/// outside this ceiling.
-#[non_exhaustive]
-#[derive(Debug, Clone, Default)]
-pub enum MemoryBudgetConfig {
-    /// Use up to one quarter of detected effective memory, capped at 32 GiB.
-    ///
-    /// Effective memory includes process or container limits where the platform
-    /// exposes them. The result is rounded down to complete carriers. If
-    /// detection is unavailable, the pool uses 2 GiB.
-    #[default]
-    Auto,
-    /// Use the given fraction of detected effective memory.
-    ///
-    /// The fraction must be finite and in `(0.0, 1.0]`. This policy requires
-    /// memory detection and does not apply the automatic 32 GiB cap.
-    Fraction(f64),
-    /// An explicit byte limit that bypasses memory detection.
-    ///
-    /// The resolved capacity never exceeds this value and may be smaller by
-    /// less than one platform allocation unit. Values too small to fund one
-    /// allocation unit are rejected. The resolved capacity is reported by
-    /// [`MemoryMetrics::configured_capacity_bytes`].
-    ///
-    /// Use the [`ByteUnit`] helpers, for example
-    /// `Limit(2 * ByteUnit::Gibibyte.as_bytes_usize())`.
-    ///
-    /// [`MemoryMetrics::configured_capacity_bytes`]:
-    ///     crate::metrics::MemoryMetrics::configured_capacity_bytes
-    /// [`ByteUnit`]: crate::metrics::unit::ByteUnit
-    Limit(usize),
-}
-
-/// Selects the payload-memory pool used by a transfer-manager client.
-#[non_exhaustive]
-#[derive(Debug, Clone, Default)]
-pub enum MemoryConfig {
-    /// Construct an automatically sized pool when the client is created.
-    ///
-    /// The ceiling follows [`MemoryBudgetConfig::Auto`], raised to at least
-    /// 256 MiB but not above half of detected memory.
-    #[default]
-    Auto,
-    /// Use an existing pool.
-    ///
-    /// Every client or component using a clone of this pool shares one
-    /// admission ceiling, prepared-storage cache, and metrics domain.
-    Explicit(BufferPool),
-}
-
-/// The concurrency mode the client should use for executing requests.
-#[non_exhaustive]
-#[derive(Debug, Clone, Default)]
-pub enum ConcurrencyMode {
-    /// Automatically configured concurrency based on the execution environment.
-    #[default]
-    Auto,
-
-    /// Concurrency sized for a network throughput target, in gigabits per second.
-    ///
-    /// The target replaces the throughput estimated from the execution
-    /// environment. It sets the in-flight request target once, when the client
-    /// is constructed; it does not limit throughput at run time. Requests beyond
-    /// what the per-host connection cap or the payload-memory ceiling allows wait
-    /// for a connection or for memory.
-    TargetThroughput(TargetThroughput),
-
-    /// Explicit concurrency control
-    Explicit(usize),
-}
-
-/// A network throughput target for [`ConcurrencyMode::TargetThroughput`].
-///
-/// One target currently applies to uploads and downloads alike. The value is
-/// private so that per-direction targets can be added later without breaking
-/// callers.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct TargetThroughput {
-    gbps: f64,
-}
-
-impl TargetThroughput {
-    /// A target of `gbps` gigabits per second, for uploads and downloads.
-    ///
-    /// Returns an error unless `gbps` is finite and positive.
-    pub fn gbps(gbps: f64) -> Result<Self, BuildError> {
-        if gbps.is_finite() && gbps > 0.0 {
-            Ok(Self { gbps })
-        } else {
-            Err(BuildError::invalid_field(
-                "gbps",
-                format!("throughput target must be finite and positive, got {gbps}"),
-            ))
-        }
-    }
-
-    /// The target in gigabits per second.
-    pub fn as_gbps(&self) -> f64 {
-        self.gbps
-    }
-}
-
-/// How far a download may prefetch ahead of the consumer.
-///
-/// Read-ahead is speculative issuance: parts fetched before the consumer has read
-/// up to them. This bounds that speculation. It does not gate in-order delivery or
-/// override the memory budget; those are separate bounds.
-#[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub enum ReadAhead {
-    /// Read ahead as far as available memory allows.
-    #[default]
-    Auto,
-
-    /// Read ahead at most `n` parts beyond the consumer's position. `0` fetches only
-    /// the part the consumer is waiting on (no speculation). Still bounded by memory.
-    Parts(usize),
-}
 
 /// Policy for how to handle a failed multipart upload
 ///
@@ -310,26 +174,6 @@ impl TransferStatus {
     pub fn is_terminal(&self) -> bool {
         !matches!(self, Self::Active)
     }
-}
-
-/// Snapshot of transfer progress and IO metrics.
-#[derive(Debug, Clone, Copy)]
-#[non_exhaustive]
-pub struct TransferMetrics {
-    /// Bytes sent over network (upload payload).
-    pub network_tx: u64,
-    /// Bytes received from network (download payload).
-    pub network_rx: u64,
-    /// Bytes read from disk.
-    pub disk_read: u64,
-    /// Bytes written to disk.
-    pub disk_write: u64,
-    /// Expected total payload bytes, if known.
-    pub total_bytes: Option<u64>,
-    /// When the transfer was initiated.
-    pub started_at: std::time::Instant,
-    /// When the transfer reached a terminal state, if it has.
-    pub finished_at: Option<std::time::Instant>,
 }
 
 /// Type of the bucket for the transfer
@@ -510,9 +354,379 @@ impl IntegrityChecks {
     }
 }
 
+// ===== Value types =====
+/// A quantity of bytes.
+///
+/// Used wherever configuration takes a size, so the unit is part of the value
+/// instead of the reader's guess. Positions, counters and buffer lengths stay
+/// integers.
+///
+/// ```
+/// use aws_sdk_s3_transfer_manager::types::ByteSize;
+///
+/// const PART: ByteSize = ByteSize::mib(8);
+/// assert_eq!(PART.as_u64(), 8 * 1024 * 1024);
+/// assert_eq!(PART.to_string(), "8 MiB");
+/// ```
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ByteSize(u64);
+
+impl ByteSize {
+    /// A size of `bytes` bytes.
+    pub const fn new(bytes: u64) -> Self {
+        Self(bytes)
+    }
+
+    /// A size of `n` kibibytes (`n` * 2<sup>10</sup> bytes).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the byte count exceeds `u64::MAX`. In a `const` context that
+    /// is a compile error.
+    pub const fn kib(n: u64) -> Self {
+        Self(mul(n, ByteUnit::Kibibyte.as_bytes_u64()))
+    }
+
+    /// A size of `n` mebibytes (`n` * 2<sup>20</sup> bytes).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the byte count exceeds `u64::MAX`. In a `const` context that
+    /// is a compile error.
+    pub const fn mib(n: u64) -> Self {
+        Self(mul(n, ByteUnit::Mebibyte.as_bytes_u64()))
+    }
+
+    /// A size of `n` gibibytes (`n` * 2<sup>30</sup> bytes).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the byte count exceeds `u64::MAX`. In a `const` context that
+    /// is a compile error.
+    pub const fn gib(n: u64) -> Self {
+        Self(mul(n, ByteUnit::Gibibyte.as_bytes_u64()))
+    }
+
+    /// This size in bytes.
+    pub const fn as_u64(self) -> u64 {
+        self.0
+    }
+
+    /// This size in bytes, as a `usize`.
+    ///
+    /// # Panics
+    ///
+    /// Panics where `usize` is narrower than 64 bits and the size does not
+    /// fit. A `MemoryBudgetConfig::Limit` that does not fit is reported as
+    /// `BufferPoolBuildError::CapacityOverflow` rather than panicking.
+    pub const fn as_usize(self) -> usize {
+        assert!(self.0 <= usize::MAX as u64, "byte count exceeds usize::MAX");
+        self.0 as usize
+    }
+
+    /// This size in `unit`, as an `f64`.
+    pub fn as_unit(self, unit: ByteUnit) -> f64 {
+        unit.convert(self.0)
+    }
+
+    /// Returns a type that formats this size in a fixed `unit`.
+    pub fn display_as(self, unit: ByteUnit) -> ByteSizeDisplayContext {
+        ByteSizeDisplayContext {
+            total_bytes: self.0,
+            unit,
+        }
+    }
+}
+
+const fn mul(n: u64, unit_bytes: u64) -> u64 {
+    match n.checked_mul(unit_bytes) {
+        Some(bytes) => bytes,
+        None => panic!("byte count exceeds u64::MAX"),
+    }
+}
+
+impl fmt::Display for ByteSize {
+    /// Formats in the largest binary unit that keeps the value at or above 1.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let units = &[ByteUnit::Gibibyte, ByteUnit::Mebibyte, ByteUnit::Kibibyte];
+        let mut unit = ByteUnit::Byte;
+        for u in units {
+            if self.0 >= u.as_bytes_u64() {
+                unit = *u;
+                break;
+            }
+        }
+        fmt::Display::fmt(&self.display_as(unit), f)
+    }
+}
+
+/// A unit a [`ByteSize`] or [`Throughput`] is displayed in.
+///
+/// The set is uneven: decimal bit units (`Kilobit`, `Megabit`, `Gigabit`) for
+/// rates, and binary byte units (`Kibibyte`, `Mebibyte`, `Gibibyte`) for sizes.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ByteUnit {
+    /// 1 byte
+    Byte,
+    /// 1000 bits (125 bytes)
+    Kilobit,
+    /// 2<sup>10</sup> bytes.
+    Kibibyte,
+    /// 125 * 10<sup>3</sup> bytes.
+    Megabit,
+    /// 2<sup>20</sup> bytes.
+    Mebibyte,
+    /// 125 * 10<sup>6</sup> bytes.
+    Gigabit,
+    /// 2<sup>30</sup> bytes.
+    Gibibyte,
+}
+
+impl ByteUnit {
+    /// Convert some number of bytes into this unit as an `f64`
+    pub(crate) fn convert(&self, bytes: u64) -> f64 {
+        bytes as f64 / self.as_bytes_u64() as f64
+    }
+
+    /// The number of bytes represented by this unit
+    pub(crate) const fn as_bytes_u64(&self) -> u64 {
+        match self {
+            ByteUnit::Byte => 1,
+            ByteUnit::Kilobit => 125,
+            ByteUnit::Kibibyte => 1 << 10,
+            ByteUnit::Megabit => 125_000,
+            ByteUnit::Mebibyte => 1 << 20,
+            ByteUnit::Gigabit => 125_000_000,
+            ByteUnit::Gibibyte => 1 << 30,
+        }
+    }
+
+    pub(crate) const fn as_str(&self) -> &'static str {
+        match self {
+            ByteUnit::Byte => "B",
+            ByteUnit::Kilobit => "Kb",
+            ByteUnit::Kibibyte => "KiB",
+            ByteUnit::Megabit => "Mb",
+            ByteUnit::Mebibyte => "MiB",
+            ByteUnit::Gigabit => "Gb",
+            ByteUnit::Gibibyte => "GiB",
+        }
+    }
+}
+
+impl AsRef<str> for ByteUnit {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl FromStr for ByteUnit {
+    type Err = crate::error::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let unit = match s {
+            "B" => ByteUnit::Byte,
+            "Kb" => ByteUnit::Kilobit,
+            "KiB" => ByteUnit::Kibibyte,
+            "Mb" => ByteUnit::Megabit,
+            "MiB" => ByteUnit::Mebibyte,
+            "Gb" => ByteUnit::Gigabit,
+            "GiB" => ByteUnit::Gibibyte,
+            _ => {
+                return Err(crate::error::invalid_input(format!(
+                    "unknown byte unit '{}'",
+                    s
+                )))
+            }
+        };
+
+        Ok(unit)
+    }
+}
+
+/// Formats a byte count in a fixed [`ByteUnit`].
+///
+/// A count that is a whole multiple of the unit is displayed as an integer;
+/// any other count is displayed with the formatter's precision, three
+/// decimal places by default.
+#[derive(Debug)]
+pub struct ByteSizeDisplayContext {
+    total_bytes: u64,
+    unit: ByteUnit,
+}
+
+impl fmt::Display for ByteSizeDisplayContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.total_bytes.is_multiple_of(self.unit.as_bytes_u64()) {
+            let converted = self.total_bytes / self.unit.as_bytes_u64();
+            return write!(f, "{converted} {}", self.unit.as_str());
+        }
+        let precision = f.precision().unwrap_or(3);
+        write!(
+            f,
+            "{1:.*} {2:}",
+            precision,
+            self.unit.convert(self.total_bytes),
+            self.unit.as_str()
+        )
+    }
+}
+
+/// Measured bytes transferred over some duration
+#[derive(Debug, Clone, Copy)]
+pub struct Throughput {
+    bytes_transferred: u64,
+    elapsed: Duration,
+}
+
+impl Throughput {
+    /// Create a new throughput measurement with the given bytes read and time elapsed
+    pub const fn new(bytes_transferred: u64, elapsed: Duration) -> Throughput {
+        Throughput {
+            bytes_transferred,
+            elapsed,
+        }
+    }
+
+    /// Create a new throughput measurement assuming a one second duration
+    ///
+    /// This is convenience for:
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use aws_sdk_s3_transfer_manager::types::{ByteSize, Throughput};
+    /// let bytes_transferred = ByteSize::mib(5).as_u64();
+    /// assert_eq!(
+    ///     Throughput::new(bytes_transferred, Duration::from_secs(1)),
+    ///     Throughput::new_bytes_per_sec(bytes_transferred)
+    /// );
+    /// ```
+    pub const fn new_bytes_per_sec(bytes_transferred: u64) -> Throughput {
+        Self::new(bytes_transferred, Duration::from_secs(1))
+    }
+
+    /// Convert this throughput into a specific unit per second
+    pub fn as_unit_per_sec(&self, unit: ByteUnit) -> f64 {
+        (self.bytes_transferred as f64 / unit.as_bytes_u64() as f64) / self.elapsed.as_secs_f64()
+    }
+
+    /// Convert this throughput into bytes / sec
+    pub fn as_bytes_per_sec(&self) -> f64 {
+        self.as_unit_per_sec(ByteUnit::Byte)
+    }
+
+    /// Total bytes transferred
+    pub const fn bytes_transferred(&self) -> u64 {
+        self.bytes_transferred
+    }
+
+    /// Returns a type that can be used to format/display this throughput in a particular unit
+    pub fn display_as(&self, unit: ByteUnit) -> ThroughputDisplayContext<'_> {
+        ThroughputDisplayContext {
+            throughput: self,
+            unit,
+        }
+    }
+}
+
+impl PartialEq for Throughput {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_bytes_per_sec() == other.as_bytes_per_sec()
+    }
+}
+
+impl PartialOrd for Throughput {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.as_bytes_per_sec()
+            .partial_cmp(&other.as_bytes_per_sec())
+    }
+}
+
+/// Add two throughputs
+impl ops::Add for Throughput {
+    type Output = Self;
+
+    fn add(self, rhs: Self) -> Self::Output {
+        let bps = self.as_bytes_per_sec() + rhs.as_bytes_per_sec();
+
+        Throughput::new_bytes_per_sec(bps.round() as u64)
+    }
+}
+
+/// Subtract throughput
+impl ops::Sub for Throughput {
+    type Output = Self;
+
+    fn sub(self, rhs: Self) -> Self::Output {
+        let bps = self.as_bytes_per_sec() - rhs.as_bytes_per_sec();
+        Throughput::new_bytes_per_sec(bps.round() as u64)
+    }
+}
+
+/// Multiply throughput by a scalar
+impl ops::Mul<u64> for Throughput {
+    type Output = Self;
+
+    fn mul(self, rhs: u64) -> Self::Output {
+        Throughput::new(self.bytes_transferred * rhs, self.elapsed)
+    }
+}
+
+/// Divide throughput by a scalar
+impl ops::Div<u64> for Throughput {
+    type Output = Self;
+
+    fn div(self, rhs: u64) -> Self::Output {
+        Throughput::new(self.bytes_transferred / rhs, self.elapsed)
+    }
+}
+
+impl fmt::Display for Throughput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let context = ThroughputDisplayContext {
+            throughput: self,
+            unit: ByteUnit::Megabit,
+        };
+        Display::fmt(&context, f)
+    }
+}
+
+/// Formats a [`Throughput`] as a rate in a fixed [`ByteUnit`] per
+/// second.
+///
+/// Created by [`Throughput::display_as`]. The rate is displayed with the
+/// formatter's precision when one is given.
+#[derive(Debug)]
+pub struct ThroughputDisplayContext<'a> {
+    throughput: &'a Throughput,
+    unit: ByteUnit,
+}
+
+impl fmt::Display for ThroughputDisplayContext<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(precision) = f.precision() {
+            write!(
+                f,
+                "{1:.*} {2:}/s",
+                precision,
+                self.throughput.as_unit_per_sec(self.unit),
+                self.unit.as_str()
+            )
+        } else {
+            write!(
+                f,
+                "{} {}/s",
+                self.throughput.as_unit_per_sec(self.unit),
+                self.unit.as_str()
+            )
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::TargetThroughput;
+    use crate::config::TargetThroughput;
 
     #[test]
     fn target_throughput_accepts_finite_positive_gbps() {
@@ -527,5 +741,153 @@ mod tests {
         for gbps in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             assert!(TargetThroughput::gbps(gbps).is_err(), "gbps {gbps}");
         }
+    }
+}
+
+#[cfg(test)]
+mod value_type_tests {
+    use super::{ByteSize, ByteUnit, Throughput};
+    use std::str::FromStr;
+    use std::time::Duration;
+
+    /// Every unit reports the same value through its byte and bit accessors,
+    /// at both widths. The byte values are the unit definitions; a regression
+    /// in either derivation changes one of the pairs.
+    #[test]
+    fn byte_unit_accessors_agree() {
+        let units = [
+            (ByteUnit::Byte, 1u64),
+            (ByteUnit::Kilobit, 125),
+            (ByteUnit::Kibibyte, 1024),
+            (ByteUnit::Megabit, 125_000),
+            (ByteUnit::Mebibyte, 1024 * 1024),
+            (ByteUnit::Gigabit, 125_000_000),
+            (ByteUnit::Gibibyte, 1024 * 1024 * 1024),
+        ];
+        for (unit, bytes) in units {
+            assert_eq!(unit.as_bytes_u64(), bytes, "{unit:?} bytes");
+        }
+    }
+
+    #[test]
+    fn byte_size_constructors_and_display() {
+        assert_eq!(ByteSize::kib(2).as_u64(), 2 * 1024);
+        assert_eq!(ByteSize::mib(8).as_u64(), 8 * 1024 * 1024);
+        assert_eq!(ByteSize::gib(3).as_u64(), 3 * 1024 * 1024 * 1024);
+
+        // the largest binary unit that keeps the value at or above 1
+        assert_eq!(ByteSize::new(512).to_string(), "512 B");
+        assert_eq!(ByteSize::kib(4).to_string(), "4 KiB");
+        assert_eq!(ByteSize::mib(8).to_string(), "8 MiB");
+        assert_eq!(ByteSize::new(1_610_612_736).to_string(), "1.500 GiB");
+
+        // a fixed unit on request
+        assert_eq!(
+            ByteSize::gib(1).display_as(ByteUnit::Mebibyte).to_string(),
+            "1024 MiB"
+        );
+        assert_eq!(ByteSize::mib(1).as_unit(ByteUnit::Kibibyte), 1024.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "byte count exceeds u64::MAX")]
+    fn byte_size_overflow_panics() {
+        let _ = ByteSize::gib(u64::MAX);
+    }
+
+    #[test]
+    fn test_throughput_display() {
+        // default
+        assert_eq!(
+            "1 Mb/s",
+            format!("{}", Throughput::new(125_000, Duration::from_secs(1)))
+        );
+
+        let t = Throughput::new(1_000_000, Duration::from_secs(1));
+
+        // explicit
+        assert_eq!("1000000 B/s", format!("{}", t.display_as(ByteUnit::Byte)));
+        assert_eq!("8000 Kb/s", format!("{}", t.display_as(ByteUnit::Kilobit)));
+        assert_eq!(
+            "976.5625 KiB/s",
+            format!("{}", t.display_as(ByteUnit::Kibibyte))
+        );
+        assert_eq!("8 Mb/s", format!("{}", t.display_as(ByteUnit::Megabit)));
+        assert_eq!(
+            "0.954 MiB/s",
+            format!("{:.3}", t.display_as(ByteUnit::Mebibyte))
+        );
+        assert_eq!("0.008 Gb/s", format!("{}", t.display_as(ByteUnit::Gigabit)));
+        assert_eq!(
+            "0.00093 GiB/s",
+            format!("{:.5}", t.display_as(ByteUnit::Gibibyte))
+        );
+    }
+
+    #[test]
+    fn test_from_str() {
+        let units = &[
+            ByteUnit::Byte,
+            ByteUnit::Kilobit,
+            ByteUnit::Kibibyte,
+            ByteUnit::Megabit,
+            ByteUnit::Mebibyte,
+            ByteUnit::Gigabit,
+            ByteUnit::Gibibyte,
+        ];
+
+        for u in units {
+            let u2 = ByteUnit::from_str(u.as_str()).unwrap();
+            assert_eq!(*u, u2);
+        }
+
+        assert!(ByteUnit::from_str("kb").is_err());
+    }
+
+    #[test]
+    fn test_ops() {
+        let t = Throughput::new_bytes_per_sec(ByteSize::mib(10).as_u64());
+        let t2 = Throughput::new_bytes_per_sec(ByteSize::mib(5).as_u64());
+
+        assert_eq!(
+            t + t2,
+            Throughput::new_bytes_per_sec(t.bytes_transferred() + t2.bytes_transferred())
+        );
+        assert_eq!(t - t2, t2);
+        assert_eq!(
+            t * 2,
+            Throughput::new_bytes_per_sec(t.bytes_transferred() * 2)
+        );
+        assert_eq!(t / 2, t2);
+    }
+
+    #[test]
+    fn test_byte_display_context() {
+        assert_eq!("1 KiB", format!("{}", ByteSize::new(1024)));
+        assert_eq!("1 MiB", format!("{}", ByteSize::new(1024 * 1024)));
+        assert_eq!("1 GiB", format!("{}", ByteSize::new(1024 * 1024 * 1024)));
+
+        assert_eq!("727 B", format!("{}", ByteSize::new(727)));
+        assert_eq!(
+            "0.710 KiB",
+            format!("{}", ByteSize::new(727).display_as(ByteUnit::Kibibyte))
+        );
+        assert_eq!("3.420 KiB", format!("{}", ByteSize::new(3502)));
+        assert_eq!("3.41992 KiB", format!("{:.5}", ByteSize::new(3502)));
+
+        assert_eq!("7.201 MiB", format!("{}", ByteSize::new(7550498)));
+        assert_eq!(
+            "0.007 GiB",
+            format!("{}", ByteSize::new(7550498).display_as(ByteUnit::Gibibyte))
+        );
+
+        assert_eq!("1.016 GiB", format!("{}", ByteSize::new(1091242563)));
+        assert_eq!(
+            "1040.690 MiB",
+            format!(
+                "{}",
+                ByteSize::new(1091242563).display_as(ByteUnit::Mebibyte)
+            )
+        );
     }
 }

@@ -4,8 +4,8 @@
  */
 
 use crate::io::InputStream;
+use crate::metrics::TransferMetrics;
 use crate::model::{ChunkMetadata, ObjectMetadata, UploadInput, UploadOutput};
-use crate::types::TransferMetrics;
 
 #[test]
 fn modeled_upload_uses_the_real_stream_and_take_body_leaves_an_empty_stream() {
@@ -58,8 +58,7 @@ fn upload_output_validates_and_preserves_real_transfer_metrics() {
         disk_read: 42,
         disk_write: 0,
         total_bytes: Some(42),
-        started_at: std::time::Instant::now(),
-        finished_at: None,
+        elapsed: std::time::Duration::ZERO,
     };
     let builder = UploadOutput::builder().metrics(metrics);
     assert_eq!(builder.get_metrics().as_ref().unwrap().network_tx, 42);

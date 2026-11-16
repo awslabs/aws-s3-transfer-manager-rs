@@ -270,7 +270,7 @@ without touching the buffer or the drain logic.
 
 ### Read-ahead control surface
 
-`crate::types::ReadAhead { Auto, Parts(n) }` is the public knob for the window, exposed at three
+`crate::config::ReadAhead { Auto, Parts(n) }` is the public knob for the window, exposed at three
 scopes with precedence dynamic > request > client:
 
 - `Config::builder().read_ahead(..)` — client default.

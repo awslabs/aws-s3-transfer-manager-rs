@@ -13,7 +13,7 @@
 use std::time::Duration;
 
 use crate::error::ErrorKind;
-use crate::types::TransferMetrics;
+use crate::metrics::TransferMetrics;
 
 use super::{
     PendingCategory, PendingCause, TerminalOutcome, TransferContext, TransferPendingStats,
@@ -88,10 +88,7 @@ impl CompositeTransferSummary {
         Some(Self {
             outcome,
             error_kind: ctx.error_kind(),
-            elapsed: metrics
-                .finished_at
-                .map(|finished_at| finished_at.saturating_duration_since(metrics.started_at))
-                .unwrap_or_default(),
+            elapsed: metrics.elapsed,
             metrics,
             successful,
             failed,

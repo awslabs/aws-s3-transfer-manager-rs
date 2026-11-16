@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+use aws_sdk_s3_transfer_manager::types::ByteSize;
 use std::{str::FromStr, task::Poll};
 
 use aws_sdk_s3::operation::{
@@ -10,17 +11,17 @@ use aws_sdk_s3::operation::{
     create_multipart_upload::CreateMultipartUploadOutput, put_object::PutObjectOutput,
     upload_part::UploadPartOutput,
 };
+use aws_sdk_s3_transfer_manager::config::{ConcurrencyMode, PartSize};
 use aws_sdk_s3_transfer_manager::{
     io::{InputStream, PartData, PartStream, SizeHint},
-    metrics::unit::ByteUnit,
     operation::upload::{ChecksumStrategy, UploadOutput},
-    types::{ChecksumAlgorithm, ChecksumType, ConcurrencyMode, PartSize},
+    types::{ChecksumAlgorithm, ChecksumType},
 };
 use aws_smithy_mocks::{mock, mock_client, Rule, RuleMode};
 use bytes::Bytes;
 use pin_project_lite::pin_project;
 
-const PART_SIZE: usize = 5 * ByteUnit::Mebibyte.as_bytes_usize();
+const PART_SIZE: usize = ByteSize::mib(5).as_usize();
 
 fn calculate_checksum(algorithm: &ChecksumAlgorithm, data: &[u8]) -> String {
     let smithy_algorithm =
@@ -629,8 +630,8 @@ async fn run_test(config: TestConfig) -> UploadOutput {
         .s3_config(test_common::s3_config_with_test_http(
             s3_client.config().to_builder(),
         ))
-        .part_size(PartSize::Target(PART_SIZE as u64))
-        .multipart_threshold(PartSize::Target(PART_SIZE as u64))
+        .part_size(PartSize::Target(ByteSize::new(PART_SIZE as u64)))
+        .multipart_threshold(PartSize::Target(ByteSize::new(PART_SIZE as u64)))
         .concurrency(ConcurrencyMode::Explicit(1)) // guarantee parts sent in order
         .build()
         .expect("valid config");

@@ -19,7 +19,7 @@ use crate::io::stream::RawInputStream;
 use crate::io::InputStream;
 use crate::io::PartData;
 use crate::memory::BufferPool;
-use crate::metrics::unit::ByteUnit;
+use crate::types::ByteSize;
 
 use super::stream::{BoxStream, StreamContext};
 
@@ -38,7 +38,7 @@ impl Builder {
     pub(crate) fn new() -> Self {
         Self {
             stream: None,
-            part_size: 5 * ByteUnit::Mebibyte.as_bytes_u64() as usize,
+            part_size: ByteSize::mib(5).as_usize(),
             direct_io: false,
             buffer_pool: None,
             metrics: None,
@@ -663,6 +663,7 @@ impl Drop for DynNextPartFuture {
 
 #[cfg(test)]
 mod test {
+    use crate::types::ByteSize;
     use std::future::Future;
     use std::io::Write;
     use std::pin::Pin;
@@ -673,6 +674,7 @@ mod test {
     use bytes::{Buf, Bytes};
     use tempfile::NamedTempFile;
 
+    use crate::config::MemoryBudgetConfig;
     use crate::io::part_reader::{
         Builder, BytesPartReader, PartData, PartReadStart, PartReader, PathBodyPartReader,
     };
@@ -680,7 +682,6 @@ mod test {
     use crate::io::stream::{PartStream, StreamContext};
     use crate::io::InputStream;
     use crate::memory::BufferPool;
-    use crate::types::MemoryBudgetConfig;
 
     fn test_stream_cx(part_size: usize) -> StreamContext {
         StreamContext::new(
@@ -694,7 +695,7 @@ mod test {
 
     fn test_pool() -> BufferPool {
         BufferPool::builder()
-            .memory_budget(MemoryBudgetConfig::Limit(1024 * 1024))
+            .memory_budget(MemoryBudgetConfig::Limit(ByteSize::new(1024 * 1024)))
             .build()
             .unwrap()
     }
