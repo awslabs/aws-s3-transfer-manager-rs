@@ -450,6 +450,9 @@ impl From<ByteSize> for u64 {
 }
 
 /// A unit a [`ByteSize`] or [`Throughput`] is displayed in.
+///
+/// The set is uneven: decimal bit units (`Kilobit`, `Megabit`, `Gigabit`) for
+/// rates, and binary byte units (`Kibibyte`, `Mebibyte`, `Gibibyte`) for sizes.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ByteUnit {

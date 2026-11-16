@@ -47,6 +47,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ByteSize::kib`, `ByteSize::mib` or `ByteSize::gib`, all `const fn`. `Display` formats in the
   largest binary unit that keeps the value at or above 1, and `display_as` formats in a fixed unit.
   Positions, counters, object lengths and in-memory buffer lengths stay integers.
+- `BufferPoolBuilder::memory_budget` with a `MemoryBudgetConfig::Limit` larger than `usize::MAX`
+  returns `BufferPoolBuildError::CapacityOverflow`, which can happen only where `usize` is narrower
+  than 64 bits.
 - `ByteUnit` keeps its variants, `AsRef<str>`, `FromStr` and `convert`, and is the unit a `ByteSize`
   or `Throughput` is displayed in. Its `as_bytes_u64`, `as_bytes_usize`, `as_bits_u64` and
   `as_bits_usize` methods are removed, as is `ByteUnit::display`: `ByteSize::mib(8)` replaces
