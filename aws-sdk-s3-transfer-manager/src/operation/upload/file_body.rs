@@ -946,7 +946,7 @@ mod tests {
         }
     }
 
-    /// The open rejects the `NUL` device, whose metadata reports a file.
+    /// The open rejects the `NUL` device
     /// ref: RUST-1674
     #[cfg_attr(miri, ignore)]
     #[tokio::test]

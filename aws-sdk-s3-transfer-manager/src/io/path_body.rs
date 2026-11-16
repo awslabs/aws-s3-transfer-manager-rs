@@ -55,16 +55,17 @@ impl PathBody {
     pub(super) fn open(&self) -> Result<File, Error> {
         let path = &self.path;
         let file = open_without_blocking(path).map_err(|e| error::io_at("opening", path, e))?;
+        // On Windows, `is_file` holds for pipes, and reading the metadata of a
+        // character device such as `NUL` fails. The handle type is checked first
+        // so both report `InputInvalid`.
+        #[cfg(windows)]
+        if !crate::io::fs::is_disk_file(&file) {
+            return Err(not_regular_file(path));
+        }
         let metadata = file
             .metadata()
             .map_err(|e| error::io_at("reading metadata of", path, e))?;
-        // On Windows, `is_file` holds for anything that is not a directory or a
-        // symbolic link, including pipes and devices such as `NUL`.
-        #[cfg(not(windows))]
-        let regular = metadata.is_file();
-        #[cfg(windows)]
-        let regular = metadata.is_file() && crate::io::fs::is_disk_file(&file);
-        if !regular {
+        if !metadata.is_file() {
             return Err(not_regular_file(path));
         }
         restore_blocking(&file).map_err(|e| error::io_at("opening", path, e))?;
