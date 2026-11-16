@@ -23,14 +23,11 @@
 //! corrupt bytes that a stored checksum could have caught.
 //!
 //! `DownloadOutput::integrity_checks()` reports two things:
-//!   * the object's checksum value members and type, surfaced only when the whole
-//!     object is covered by a single returned checksum (single-part objects); for
-//!     a larger multipart object the discovery chunk carries only part 1's
-//!     checksum, which is not the object checksum and is not surfaced. A
-//!     composite value is never surfaced, even when the object fits in one chunk.
-//!     `DownloadOutput::object_meta` copies the discovery response's checksum
-//!     values and type, except that it clears composite values and values from a
-//!     part GET of a multipart object.
+//!   * the object's stored checksum values and type from checksum-mode HEAD for
+//!     validated whole-object downloads. Part metadata cannot replace them. A
+//!     composite value is never surfaced, only its type.
+//!     `DownloadOutput::object_meta` carries the same values, except that it
+//!     clears composite values and values from a response for part of the object.
 //!   * `ChecksumValidation`: `Validated{algorithm}` when the whole object was
 //!     validated, else `NotValidated{reason}`.
 //!
@@ -333,10 +330,20 @@ async fn multipart_full_object(target: Target) {
         .await
         .expect("download");
     assert_same_content(&data, &bytes);
-    // A part's checksum must not be surfaced as the object's checksum.
-    assert!(
-        output.integrity_checks().checksum_crc32().is_none(),
-        "must not surface a part checksum as the object checksum"
+    let stored = t
+        .s3_client()
+        .await
+        .head_object()
+        .bucket(t.bucket())
+        .key(t.key("obj"))
+        .checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled)
+        .send()
+        .await
+        .expect("stored object checksum");
+    assert!(stored.checksum_crc32().is_some());
+    assert_eq!(
+        output.integrity_checks().checksum_crc32(),
+        stored.checksum_crc32()
     );
     assert!(
         output.object_meta.checksum_crc32.is_none(),
@@ -402,9 +409,20 @@ async fn multipart_composite(target: Target) {
         .await
         .expect("download");
     assert_same_content(&data, &bytes);
-    assert!(
-        output.integrity_checks().checksum_sha256().is_none(),
-        "must not surface a part checksum as the object checksum"
+    let stored = t
+        .s3_client()
+        .await
+        .head_object()
+        .bucket(t.bucket())
+        .key(t.key("obj"))
+        .checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled)
+        .send()
+        .await
+        .expect("stored object checksum");
+    assert!(stored.checksum_sha256().is_some());
+    assert_eq!(
+        output.integrity_checks().checksum_sha256(),
+        stored.checksum_sha256()
     );
     assert_validated(&output, ChecksumAlgorithm::Sha256);
 

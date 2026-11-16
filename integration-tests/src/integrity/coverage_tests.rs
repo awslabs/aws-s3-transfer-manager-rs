@@ -760,12 +760,12 @@ fn reports_object_values_by_case_kind() {
     assert!(reports(
         "download_tests::full_object_mpu::crc32::default::validated::stream"
     ));
-    // An empty object: its one response is the whole object.
+    // HEAD reports an empty object's value without a data response.
     assert!(reports(
         "download_tests::empty_sha::sha256::default::not_validated::stream"
     ));
-    // Ranges carrying part checksums: a part's value is never the object's.
-    assert!(!reports(
+    // HEAD reports the object's value even when GETs carry only part values.
+    assert!(reports(
         "download_tests::composite_mpu::crc32::aligned::validated::stream"
     ));
     // Validation off.

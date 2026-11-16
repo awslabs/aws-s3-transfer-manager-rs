@@ -679,9 +679,8 @@ async fn upload_objects_transient_throttle_storm_recovers() {
 }
 
 /// Download counterpart to `upload_objects_transient_throttle_storm_recovers`.
-/// For a small single-part object, discovery is the sole request, so a
-/// throttle storm on discovery must recover via the TM retry loop — parity with
-/// the upload path. Drives the same load-driven storm the upload test survives.
+/// A throttle storm on HEAD discovery and subsequent GETs must recover via
+/// the TM retry loop. Drives the same load-driven storm the upload test survives.
 #[tokio::test]
 async fn download_objects_transient_throttle_storm_recovers() {
     timeout(TEST_TIMEOUT, async {

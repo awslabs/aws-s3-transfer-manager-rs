@@ -386,7 +386,11 @@ async fn whole_response_requires_the_object_checksum() {
 /// `via: full_object` fails a download that sent no HeadObject reporting a full-object checksum.
 #[tokio::test(flavor = "multi_thread")]
 async fn full_object_requires_a_head_object() {
-    let (case, run) = execute(INTACT).await;
+    let (case, mut run) = execute(INTACT).await;
+    run.requests
+        .as_mut()
+        .expect("mock journal")
+        .retain(|request| request.operation != s3_mock_server::Operation::HeadObject);
     let case = changed(case, |c| c.mechanism = Mechanism::FullObject);
     assert_fails(check_journal(&case, &run), "no HeadObject reported");
 }

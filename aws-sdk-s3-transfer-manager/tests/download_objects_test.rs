@@ -8,6 +8,7 @@ use aws_sdk_s3::{
     error::DisplayErrorContext,
     operation::{
         get_object::GetObjectOutput,
+        head_object::HeadObjectOutput,
         list_objects_v2::{ListObjectsV2Error, ListObjectsV2Output},
     },
     primitives::ByteStream,
@@ -65,6 +66,12 @@ impl MockObject {
         GetObjectOutput::builder()
             .body(ByteStream::from(self.contents.clone()))
             .content_length(self.contents.len() as i64)
+            .content_range(format!(
+                "bytes 0-{}/{}",
+                self.contents.len() - 1,
+                self.contents.len()
+            ))
+            .e_tag("my-etag")
             .build()
     }
 }
@@ -92,6 +99,20 @@ fn get_object_rule(mobj: &MockObject) -> Rule {
             })
             .then_output(move || mock_obj.get_object_output())
     }
+}
+
+/// HEAD reports metadata even when the subsequent GET is configured to fail.
+fn head_object_rule(mobj: &MockObject) -> Rule {
+    let key = mobj.object.key().unwrap().to_owned();
+    let len = mobj.contents.len() as i64;
+    mock!(aws_sdk_s3::Client::head_object)
+        .match_requests(move |r| r.key() == Some(key.as_str()))
+        .then_output(move || {
+            HeadObjectOutput::builder()
+                .content_length(len)
+                .e_tag("my-etag")
+                .build()
+        })
 }
 
 /// Mock bucket with the set of objects for testing transfer manager.
@@ -125,10 +146,15 @@ impl MockBucket {
         self.objects.iter().map(get_object_rule).collect()
     }
 
+    fn head_object_rules(&self) -> Vec<Rule> {
+        self.objects.iter().map(head_object_rule).collect()
+    }
+
     /// Return the mock rules representing this bucket. This includes
-    /// the `ListObjectsV2` call as well as all of the `GetObject` calls.
+    /// the listing, HEAD metadata and GET bodies.
     fn rules(&self) -> Vec<aws_smithy_mocks::Rule> {
         let mut rules = self.get_object_rules();
+        rules.extend(self.head_object_rules());
         rules.push(self.list_objects_rule());
         rules
     }
@@ -511,7 +537,9 @@ async fn test_abort_on_handle_should_terminate_tasks_gracefully() {
             }
         });
         let list = bucket.list_objects_rule();
-        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[list, get]);
+        let mut rules = bucket.head_object_rules();
+        rules.extend([list, get]);
+        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, rules.as_slice());
 
         let config = aws_sdk_s3_transfer_manager::Config::builder()
             .s3_config(test_common::s3_config_with_test_http(
@@ -676,7 +704,12 @@ async fn test_aborted_download_objects_error_source_is_failed_child_error() {
                 .build()
         });
         let mut rules = bucket.get_object_rules();
-        rules.extend([denied, list]);
+        rules.extend(bucket.head_object_rules());
+        rules.extend([
+            head_object_rule(&MockObject::new_with_error("denied")),
+            denied,
+            list,
+        ]);
         let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, rules.as_slice());
 
         let config = aws_sdk_s3_transfer_manager::Config::builder()
@@ -751,7 +784,9 @@ async fn test_drop_download_objects_handle() {
             }
         });
         let list = bucket.list_objects_rule();
-        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[list, get]);
+        let mut rules = bucket.head_object_rules();
+        rules.extend([list, get]);
+        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, rules.as_slice());
 
         let config = aws_sdk_s3_transfer_manager::Config::builder()
             .s3_config(test_common::s3_config_with_test_http(
@@ -841,6 +876,15 @@ impl aws_smithy_runtime_api::client::http::HttpConnector for ParkedGetConnector 
         use aws_smithy_runtime_api::client::http::HttpConnectorFuture;
         use aws_smithy_runtime_api::client::result::ConnectorError;
 
+        if request.method() == "HEAD" {
+            let mut response = HttpResponse::new(
+                StatusCode::try_from(200).unwrap(),
+                aws_smithy_types::body::SdkBody::empty(),
+            );
+            response.headers_mut().insert("Content-Length", "1024");
+            response.headers_mut().insert("ETag", "my-etag");
+            return HttpConnectorFuture::ready(Ok(response));
+        }
         assert_eq!("GET", request.method());
         if request.uri().contains("list-type=2") {
             return HttpConnectorFuture::ready(Ok(HttpResponse::new(

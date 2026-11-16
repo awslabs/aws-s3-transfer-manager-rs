@@ -18,7 +18,7 @@ use crate::sdk_v1::copy_download_input_fields_to_get_object as copy_fields_to_ge
 
 use crate::error::{self, ChunkRef, Error};
 use crate::operation::download::body::{BodySlot, BodyWriter, ChunkOutput, DrainError, Drained};
-use crate::operation::download::checksum::{DownloadIntegrity, ValidationPlan};
+use crate::operation::download::checksum::DownloadIntegrity;
 use crate::operation::download::context::{
     CompletionClaim, DownloadPendingReason, DownloadState, PendingClaim,
 };
@@ -490,10 +490,8 @@ impl DownloadTransfer {
 
                 // A slot is ready. Commit the range it issues, sliced from the unchanged
                 // `remaining` (identical for a fresh claim or a resumed pending one).
-                // `part_size` is the stored part size for a validated multipart object
-                // (so each range aligns to a stored part boundary and S3 returns the
-                // part's checksum for the SDK to validate), else the configured download
-                // part size. Set at discovery.
+                // Automatic COMPOSITE validation uses the stored first-part size;
+                // other plans use the configured download part size. Discovery resolves it.
                 let part_size = *part_size;
                 let range = remaining
                     .as_ref()
@@ -812,7 +810,7 @@ impl DownloadTransfer {
         // mutator does: enabled if the request set ChecksumMode=Enabled, or the
         // request left it unset and the client's ResponseChecksumValidation is not
         // WhenRequired (WhenSupported, the default, and unknown values enable it).
-        // Computed before discovery because it drives range alignment.
+        // Computed before discovery because it selects checksum metadata and range layout.
         let validation_enabled = self.validation_enabled(input);
 
         let discovery = match discover_obj(self, input, validation_enabled).await {
@@ -830,28 +828,26 @@ impl DownloadTransfer {
             initial_chunk,
             chunk_meta,
             effective_part_size,
+            validation_plan,
         } = discovery;
 
         // Store object_meta for object_meta() and join(), without checksum values
-        // that describe a part. The local `object_meta` keeps the discovery
-        // response unchanged.
+        // that don't describe the object's bytes: a composite value, and a value
+        // from a response for part of the object. Whole-object checksum-mode HEAD
+        // metadata keeps its other values. The local `object_meta` keeps the
+        // discovery response unchanged.
         let _ = self
             .inner
             .object_meta
             .set(process_object_metadata(object_meta.clone()));
 
-        // Object checksum is known only when the whole object arrived in this
-        // chunk. A larger multipart object's discovery chunk carries part 1's
-        // checksum, which is not the object checksum.
-        let whole_object_in_chunk = input.range.is_none() && remaining.is_none();
-        let plan = if validation_enabled {
-            ValidationPlan::PerResponse
-        } else {
-            ValidationPlan::Disabled
-        };
+        // HEAD reports object values even when later GETs carry only part metadata.
+        // GET-first discovery reports object values only for a whole-object response.
+        let reports_object_values =
+            input.range.is_none() && (validation_enabled || remaining.is_none());
         let integrity = Box::new(DownloadIntegrity::new(
-            plan,
-            whole_object_in_chunk.then(|| object_meta.clone()),
+            validation_plan,
+            reports_object_values.then(|| object_meta.clone()),
         ));
 
         // Notify waiters that discovery completed
@@ -1788,8 +1784,9 @@ mod tests {
     use crate::model::ChecksumType;
     use crate::operation::download::sink::FileSinkFactory;
     use crate::operation::download::test_util::fixtures::{
-        assert_discovery_succeeds, crc32_object_client, disk_test_handle, disk_transfer, execute,
-        finalize_started, object_client_failing_at, relief_scenario, spawn_relief,
+        assert_discovery_succeeds, assert_first_range_succeeds, crc32_object_client,
+        disk_test_handle, disk_transfer, execute, finalize_started, head_rule,
+        object_client_failing_at, relief_scenario, spawn_relief,
     };
     use crate::operation::download::DownloadInput;
     use crate::scheduler::test_util::{assert_done, assert_pending, assert_ready};
@@ -2224,17 +2221,19 @@ mod tests {
                 .body(ByteStream::from(chunk.clone()))
                 .build()
         });
-        create_download_with_client_and_detail(
+        create_get_first_download_with_client_and_detail(
             mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get_obj]),
             part_size,
             detail,
+            Some(object_size),
         )
     }
 
-    fn create_download_with_client_and_detail(
+    fn create_get_first_download_with_client_and_detail(
         client: aws_sdk_s3::Client,
         part_size: u64,
         detail: u64,
+        object_size: Option<u64>,
     ) -> DownloadTransfer {
         let config = crate::Config::builder()
             .sdk_client(client)
@@ -2248,6 +2247,7 @@ mod tests {
         let input = DownloadInput::builder()
             .bucket("test-bucket")
             .key("test-key")
+            .set_range(object_size.map(|len| format!("bytes=0-{}", len - 1)))
             .build()
             .unwrap();
 
@@ -2349,8 +2349,17 @@ mod tests {
         let part = mock!(aws_sdk_s3::Client::get_object)
             .match_requests(|request| request.part_number() == Some(1))
             .then_output(|| GetObjectOutput::builder().content_length(0).build());
-        let client = mock_client!(aws_sdk_s3, &[&ranged, &part]);
-        let transfer = create_download_with_client_and_detail(client, part_size, 1);
+        let client = mock_client!(
+            aws_sdk_s3,
+            RuleMode::Sequential,
+            &[&ranged, &part],
+            |conf| {
+                conf.response_checksum_validation(
+                    aws_sdk_s3::config::ResponseChecksumValidation::WhenRequired,
+                )
+            }
+        );
+        let transfer = create_get_first_download_with_client_and_detail(client, part_size, 1, None);
 
         assert_discovery_succeeds(&transfer).await;
         assert_done(transfer.poll_work());
@@ -2382,16 +2391,7 @@ mod tests {
         };
 
         let part_size = 8 * MB;
-        let expected_range = format!("bytes=0-{}", part_size - 1);
-        let ranged = mock!(aws_sdk_s3::Client::get_object)
-            .match_requests(move |request| request.range() == Some(expected_range.as_str()))
-            .then_error(|| {
-                GetObjectError::generic(ErrorMetadata::builder().code("InvalidRange").build())
-            });
-        let part = mock!(aws_sdk_s3::Client::get_object)
-            .match_requests(|request| request.part_number() == Some(1))
-            .then_output(|| GetObjectOutput::builder().content_length(0).build());
-        let client = mock_client!(aws_sdk_s3, &[&ranged, &part]);
+        let client = mock_client!(aws_sdk_s3, &[head_rule(0)]);
         let script = Arc::new(WriteScript::default());
         let (transfer, _consumer, _dir) = disk_transfer(
             disk_test_handle(client, part_size),
@@ -2704,7 +2704,8 @@ mod tests {
         let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get_obj], |conf| {
             conf.retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
         });
-        let transfer = create_download_with_client_and_detail(client, part_size, 1);
+        let transfer =
+            create_get_first_download_with_client_and_detail(client, part_size, 1, Some(part_size));
 
         assert_discovery_succeeds(&transfer).await;
 
@@ -2777,6 +2778,23 @@ mod tests {
             use aws_smithy_runtime_api::client::http::HttpConnectorFuture;
             use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
 
+            if request.method() == "HEAD" {
+                let mut response = HttpResponse::new(
+                    200.try_into().unwrap(),
+                    aws_smithy_types::body::SdkBody::empty(),
+                );
+                response
+                    .headers_mut()
+                    .insert("content-length", self.object_size.to_string());
+                response.headers_mut().insert("etag", "\"abc-2\"");
+                response
+                    .headers_mut()
+                    .insert("x-amz-checksum-crc32", "AAAAAA==-2");
+                response
+                    .headers_mut()
+                    .insert("x-amz-checksum-type", "COMPOSITE");
+                return HttpConnectorFuture::ready(Ok(response));
+            }
             let is_part_request = request.uri().contains("partNumber=1");
             let (start, end) = if is_part_request {
                 (0, self.stored_part_size - 1)
@@ -2812,12 +2830,10 @@ mod tests {
         }
     }
 
-    /// The multipart realignment re-issue belongs to the `partNumber=1`
-    /// discovery request. The superseded ranged discovery must not accrue the
-    /// re-issue's latency while its unread body is held.
+    /// The layout GET accrues its own latency independently of the completed HEAD.
     #[cfg_attr(miri, ignore)]
     #[tokio::test(start_paused = true)]
-    async fn discovery_realign_reissue_is_excluded_from_first_discovery_elapsed() {
+    async fn layout_get_latency_is_excluded_from_head_discovery_elapsed() {
         let stored_part_size = 8 * MB;
         let part_delay = std::time::Duration::from_secs(10);
         let connector = aws_smithy_runtime_api::client::http::SharedHttpConnector::new(
@@ -2836,8 +2852,7 @@ mod tests {
                 .with_test_defaults()
                 .build(),
         );
-        // No explicit part size: discovery issues the Auto-sized ranged GET,
-        // then realigns to the stored part size via partNumber=1.
+        // Automatic sizing uses the stored first part after checksum-mode HEAD.
         let config = crate::Config::builder()
             .sdk_client(client)
             .diagnostics_for_test(crate::config::MemoryDiagnosticsConfig::default(), 1)
@@ -2864,18 +2879,18 @@ mod tests {
         let summary = transfer
             .test_terminal_summary()
             .expect("summary diagnostics enabled");
-        assert_eq!(summary.requests.discovery_range.requests, 1);
+        assert_eq!(summary.requests.discovery_head.requests, 1);
         assert_eq!(summary.requests.discovery_part.requests, 1);
         assert_eq!(summary.requests.range.requests, 1);
         assert!(
             summary.requests.discovery_part.elapsed >= part_delay,
-            "the delayed re-issue accrues to its own request: {:?}",
+            "the delayed layout GET accrues to its own request: {:?}",
             summary.requests.discovery_part.elapsed,
         );
         assert!(
-            summary.requests.discovery_range.elapsed < part_delay / 10,
-            "superseded discovery elapsed {:?} includes the {part_delay:?} re-issue",
-            summary.requests.discovery_range.elapsed,
+            summary.requests.discovery_head.elapsed < part_delay / 10,
+            "HEAD discovery elapsed {:?} includes the {part_delay:?} re-issue",
+            summary.requests.discovery_head.elapsed,
         );
     }
 
@@ -2940,6 +2955,7 @@ mod tests {
         let input = DownloadInput::builder()
             .bucket("test-bucket")
             .key("test-key")
+            .range(format!("bytes=0-{}", object_size - 1))
             .build()
             .unwrap();
 
@@ -3321,6 +3337,7 @@ mod tests {
         let input = DownloadInput::builder()
             .bucket("test-bucket")
             .key("test-key")
+            .range(format!("bytes=0-{}", object_size - 1))
             .build()
             .unwrap();
 
@@ -3389,7 +3406,7 @@ mod tests {
         let (transfer, _consumer, dir) = disk_transfer(handle, &FileSinkFactory);
         let path = dir.path().join("out");
 
-        assert_discovery_succeeds(&transfer).await;
+        assert_first_range_succeeds(&transfer).await;
         let mut second = assert_ready(transfer.poll_work());
         execute(&transfer, &mut second).await;
         let metrics = transfer.ctx().metrics();
@@ -3505,7 +3522,7 @@ mod tests {
         let (transfer, _consumer, _dir) =
             disk_transfer(handle, &ScriptedSinkFactory(Arc::clone(&script)));
 
-        assert_discovery_succeeds(&transfer).await;
+        assert_first_range_succeeds(&transfer).await;
         let writer = transfer.writer().clone();
         let untracked = std::thread::spawn(move || writer.drain(DrainMode::Eager));
         let held = script.wait_held(TIMEOUT);
@@ -3555,7 +3572,7 @@ mod tests {
         let (transfer, _consumer, dir) =
             disk_transfer(disk_test_handle(client, part_size), &FileSinkFactory);
 
-        assert_discovery_succeeds(&transfer).await;
+        assert_first_range_succeeds(&transfer).await;
         let mut failing = assert_ready(transfer.poll_work());
         let mut behind = assert_ready(transfer.poll_work());
         execute(&transfer, &mut behind).await;
@@ -3599,7 +3616,7 @@ mod tests {
             &FileSinkFactory,
         );
 
-        assert_discovery_succeeds(&transfer).await;
+        assert_first_range_succeeds(&transfer).await;
         let mut second = assert_ready(transfer.poll_work());
         let mut third = assert_ready(transfer.poll_work());
         let outcome = execute(&transfer, &mut second).await;
@@ -4055,7 +4072,7 @@ mod tests {
     async fn failure_after_completion_panics_in_debug_builds() {
         // A single-part object: discovery receives it whole and completes.
         let transfer = create_download(8 * MB, 8 * MB);
-        assert_discovery_succeeds(&transfer).await;
+        assert_first_range_succeeds(&transfer).await;
         assert_eq!(
             transfer.ctx().transfer_status(),
             crate::types::TransferStatus::Completed
@@ -4084,7 +4101,7 @@ mod tests {
 
         // A single-part object: discovery receives it whole and completes.
         let transfer = create_download(8 * MB, 8 * MB);
-        assert_discovery_succeeds(&transfer).await;
+        assert_first_range_succeeds(&transfer).await;
         assert_eq!(
             transfer.ctx().transfer_status(),
             crate::types::TransferStatus::Completed
@@ -4213,7 +4230,11 @@ mod tests {
             .build()
             .expect("test pool");
         let config = crate::Config::builder()
-            .sdk_client(mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get_obj]))
+            .sdk_client(mock_client!(
+                aws_sdk_s3,
+                RuleMode::MatchAny,
+                &[head_rule(object_size), get_obj]
+            ))
             .part_size(crate::config::PartSize::Target(ByteSize::new(part_size)))
             .memory(crate::config::MemoryConfig::Explicit(pool.clone()))
             .build()
@@ -4298,7 +4319,11 @@ mod tests {
             .build()
             .expect("test pool");
         let config = crate::Config::builder()
-            .sdk_client(mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get_obj]))
+            .sdk_client(mock_client!(
+                aws_sdk_s3,
+                RuleMode::MatchAny,
+                &[head_rule(object_size), get_obj]
+            ))
             .part_size(crate::config::PartSize::Target(ByteSize::new(part_size)))
             .memory(crate::config::MemoryConfig::Explicit(pool.clone()))
             .build()
@@ -4315,7 +4340,7 @@ mod tests {
         // discovery fills seq 0, then (resident-1) range GETs fill seqs 1.. . Each fill's
         // in-execute Batched drain frees nothing (below batch), so all stay resident.
         async fn fill_resident(t: &DownloadTransfer, resident: u64) {
-            assert_discovery_succeeds(t).await; // seq 0 filled + reserved
+            assert_first_range_succeeds(t).await; // seq 0 filled + reserved
             for _ in 1..resident {
                 let mut w = assert_ready(t.poll_work());
                 execute(t, &mut w).await;
@@ -4407,7 +4432,7 @@ mod tests {
     #[tokio::test]
     async fn test_io_ctl_set_read_ahead_resizes_window() {
         let (transfer, _consumer) = create_download_for_gate(128 * MB, 8 * MB);
-        assert_discovery_succeeds(&transfer).await;
+        assert_first_range_succeeds(&transfer).await;
 
         // Parts(n) resolves to n + 1 (n speculative parts plus the demand part).
         transfer
@@ -4529,12 +4554,13 @@ mod tests {
                 }
             });
 
-            create_download_with_client_and_detail(
+            create_get_first_download_with_client_and_detail(
                 mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get_obj], |conf| {
                     conf.retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
                 }),
                 part_size,
                 detail,
+                Some(object_size),
             )
         }
     }

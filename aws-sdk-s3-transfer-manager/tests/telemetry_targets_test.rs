@@ -95,9 +95,17 @@ impl<S: tracing::Subscriber> Layer<S> for Capture {
 fn s3_client() -> aws_sdk_s3::Client {
     let put =
         mock!(aws_sdk_s3::Client::put_object).then_output(|| PutObjectOutput::builder().build());
+    let head = mock!(aws_sdk_s3::Client::head_object).then_output(|| {
+        aws_sdk_s3::operation::head_object::HeadObjectOutput::builder()
+            .content_length(5)
+            .e_tag("my-etag")
+            .build()
+    });
     let get = mock!(aws_sdk_s3::Client::get_object).then_output(|| {
         GetObjectOutput::builder()
             .content_length(5)
+            .content_range("bytes 0-4/5")
+            .e_tag("my-etag")
             .body(ByteStream::from_static(b"hello"))
             .build()
     });
@@ -110,7 +118,7 @@ fn s3_client() -> aws_sdk_s3::Client {
             ))
             .build()
     });
-    mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[put, get, list])
+    mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[put, head, get, list])
 }
 
 /// Counts records named `name` on `target`.

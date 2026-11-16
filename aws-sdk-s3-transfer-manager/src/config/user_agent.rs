@@ -504,9 +504,10 @@ mod tests {
         let request = captured.expect_request();
 
         // Endpoint resolver and the S3-specific addressing flag.
+        assert_eq!(request.method(), "HEAD");
         assert_eq!(
             request.uri(),
-            "https://s3.example.internal/foo/bar?x-id=GetObject",
+            "https://s3.example.internal/foo/bar",
             "endpoint or path style lost in the rebuild"
         );
         // Auth: the credential scope names their region, and the credential their access key.
@@ -737,13 +738,19 @@ mod tests {
             GetObjectOutput::builder()
                 .content_length(1)
                 .content_range("bytes 0-0/1")
+                .e_tag("test-etag")
                 .body(ByteStream::from_static(b"x"))
                 .build()
         });
         let put = mock!(aws_sdk_s3::Client::put_object)
             .then_output(|| PutObjectOutput::builder().build());
-        let s3 = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[list, get, put], |c| c
-            .interceptor(recorder.clone()));
+        let head = crate::operation::download::test_util::fixtures::head_rule(1);
+        let s3 = mock_client!(
+            aws_sdk_s3,
+            RuleMode::MatchAny,
+            &[list, head, get, put],
+            |c| c.interceptor(recorder.clone())
+        );
         crate::Client::new(
             builder
                 .runtime_config(RuntimeConfig::multi_thread_tokio())

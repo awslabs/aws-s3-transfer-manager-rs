@@ -13,14 +13,14 @@
 use super::crc::CrcAlgorithm;
 use super::{ObjectChecksumMethod, ValidationPlan, WholeObjectPlan};
 use crate::error::{self, Error};
-use crate::model::{ChecksumType, ObjectMetadata};
+use crate::model::{ChecksumAlgorithm, ChecksumType, ObjectMetadata};
 
 /// A stored CRC's decoded bytes and original S3 header value.
 ///
 /// Classification checks that the decoded width matches the CRC algorithm carried
 /// by the whole-object plan. The original encoding is retained for mismatch errors.
 #[derive(Debug)]
-pub(super) struct ExpectedValue {
+pub(in crate::operation::download) struct ExpectedValue {
     /// Big-endian checksum bytes used for equality with the calculated CRC.
     pub(super) decoded: Vec<u8>,
     /// Original base64 value reported in the integrity error's expected field.
@@ -32,7 +32,7 @@ pub(super) struct ExpectedValue {
 /// Header priority is CRC64NVME, CRC32C, CRC32, SHA-1, then SHA-256. A later header
 /// does not replace a selected header that is malformed or cannot be verified.
 #[derive(Debug)]
-pub(super) enum StoredChecksum {
+pub(in crate::operation::download) enum StoredChecksum {
     /// Plain CRC with valid base64, the correct width and absent or FULL_OBJECT type.
     FullObjectCrc {
         /// CRC parameters used for range calculation and whole-object comparison.
@@ -55,21 +55,17 @@ impl StoredChecksum {
     /// Invalid CRC base64 or an unknown CRC type selects [`Self::Unavailable`].
     /// Returns [`crate::error::ErrorKind::ObjectNotDiscoverable`] when a full-object
     /// CRC decodes successfully but has the wrong width for its algorithm.
-    pub(super) fn from_metadata(meta: &ObjectMetadata) -> Result<Self, Error> {
-        let selected = [
-            (
-                meta.checksum_crc64_nvme.as_deref(),
-                Some(CrcAlgorithm::Crc64Nvme),
-            ),
-            (meta.checksum_crc32_c.as_deref(), Some(CrcAlgorithm::Crc32c)),
-            (meta.checksum_crc32.as_deref(), Some(CrcAlgorithm::Crc32)),
-            (meta.checksum_sha1.as_deref(), None),
-            (meta.checksum_sha256.as_deref(), None),
-        ]
-        .into_iter()
-        .find_map(|(value, algorithm)| value.map(|value| (value, algorithm)));
-        let Some((value, algorithm)) = selected else {
+    pub(in crate::operation::download) fn from_metadata(
+        meta: &ObjectMetadata,
+    ) -> Result<Self, Error> {
+        let Some((selected_algorithm, value)) = Self::header(meta) else {
             return Ok(Self::Unavailable);
+        };
+        let algorithm = match selected_algorithm {
+            ChecksumAlgorithm::Crc64Nvme => Some(CrcAlgorithm::Crc64Nvme),
+            ChecksumAlgorithm::Crc32C => Some(CrcAlgorithm::Crc32c),
+            ChecksumAlgorithm::Crc32 => Some(CrcAlgorithm::Crc32),
+            _ => None,
         };
         if value
             .rsplit_once('-')
@@ -111,12 +107,33 @@ impl StoredChecksum {
         })
     }
 
+    /// Returns the first present supported header, without decoding or validating it.
+    fn header(meta: &ObjectMetadata) -> Option<(ChecksumAlgorithm, &str)> {
+        [
+            (
+                ChecksumAlgorithm::Crc64Nvme,
+                meta.checksum_crc64_nvme.as_deref(),
+            ),
+            (ChecksumAlgorithm::Crc32C, meta.checksum_crc32_c.as_deref()),
+            (ChecksumAlgorithm::Crc32, meta.checksum_crc32.as_deref()),
+            (ChecksumAlgorithm::Sha1, meta.checksum_sha1.as_deref()),
+            (ChecksumAlgorithm::Sha256, meta.checksum_sha256.as_deref()),
+        ]
+        .into_iter()
+        .find_map(|(algorithm, value)| value.map(|value| (algorithm, value)))
+    }
+
+    /// Returns the selected header's algorithm even when its value cannot be verified.
+    pub(super) fn algorithm(meta: &ObjectMetadata) -> Option<ChecksumAlgorithm> {
+        Self::header(meta).map(|(algorithm, _)| algorithm)
+    }
+
     /// Selects a whole-object CRC check of `[0, object_len)` or SDK response checks.
     ///
     /// `object_len` is the complete source-object length in bytes, including zero.
     /// Only [`Self::FullObjectCrc`] supplies a whole-object plan; other classifications
     /// retain response-only validation without claiming whole-object coverage.
-    pub(super) fn into_plan(self, object_len: u64) -> ValidationPlan {
+    pub(in crate::operation::download) fn into_plan(self, object_len: u64) -> ValidationPlan {
         match self {
             Self::FullObjectCrc {
                 algorithm,

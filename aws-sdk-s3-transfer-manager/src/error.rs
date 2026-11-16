@@ -51,6 +51,8 @@ pub struct Error {
 struct ErrorExtra {
     /// Set when the error originated from an S3 service call.
     service: Option<ServiceMetadata>,
+    /// HTTP status of an unsuccessful service response, including bodyless HEAD errors.
+    http_status: Option<u16>,
     /// Set when the error is attributable to a specific chunk of an object.
     location: Option<ChunkRef>,
     /// Set when a local filesystem operation on a known path failed.
@@ -294,6 +296,11 @@ impl Error {
     /// The service error code, if any (e.g. `"NoSuchKey"`, `"AccessDenied"`).
     pub fn code(&self) -> Option<&str> {
         self.service().and_then(|m| m.code.as_deref())
+    }
+
+    /// HTTP status of the service response, if the error has one.
+    pub(crate) fn http_status(&self) -> Option<u16> {
+        self.extra.as_ref().and_then(|e| e.http_status)
     }
 
     /// The service error message, if any.
@@ -709,12 +716,14 @@ pub(crate) trait SdkOperationError:
 /// failure.
 pub(crate) fn service_error<E: SdkOperationError>(e: SdkError<E, HttpResponse>) -> Error {
     let service = service_metadata(E::OPERATION_NAME, &e);
+    let http_status = e.raw_response().map(|response| response.status().as_u16());
     let transient_transport = is_sdk_transient_transport(&e);
     Error {
         kind: ErrorKind::ServiceError,
         source: Box::new(e),
         extra: Some(Box::new(ErrorExtra {
             service: Some(service),
+            http_status,
             transient_transport,
             ..Default::default()
         })),

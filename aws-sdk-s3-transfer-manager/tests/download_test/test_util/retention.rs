@@ -5,7 +5,7 @@
 
 //! Retention scenarios, destination probes, and managed-runtime teardown for download tests.
 
-use super::object_connector;
+use super::{head_event, object_connector};
 use crate::{common, dummy_expected_request, rand_data};
 use aws_sdk_s3_transfer_manager::config::RuntimeConfig;
 use aws_sdk_s3_transfer_manager::config::{ConcurrencyMode, PartSize};
@@ -174,8 +174,9 @@ pub(crate) async fn assert_download_releases_destination(
     let part_size = ByteSize::mib(5).as_usize();
     let data = rand_data(2 * part_size);
     let http_client = match ending {
-        // Discovery returns the first part; the second part request fails.
+        // HEAD resolves discovery; the second data part request fails.
         Ending::BodyFailure => StaticReplayClient::new(vec![
+            head_event(data.len(), None),
             ReplayEvent::new(
                 dummy_expected_request(),
                 http::Response::builder()

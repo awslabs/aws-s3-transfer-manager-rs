@@ -1138,6 +1138,7 @@ fn validate_path(root_dir: &Path, local_path: &Path, key: &str) -> Result<(), Er
 mod tests {
     use super::*;
     use crate::io::walk::{S3WalkContext, S3Walker};
+    use crate::operation::download::test_util::fixtures::head_rule;
     use crate::transfer::TransferContext;
     use aws_sdk_s3::operation::get_object::GetObjectOutput;
     use aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output;
@@ -1161,10 +1162,12 @@ mod tests {
         let get = mock!(aws_sdk_s3::Client::get_object).then_output(|| {
             GetObjectOutput::builder()
                 .content_length(5)
+                .content_range("bytes 0-4/5")
+                .e_tag("test-etag")
                 .body(aws_sdk_s3::primitives::ByteStream::from_static(b"hello"))
                 .build()
         });
-        mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[list, get])
+        mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[head_rule(5), list, get])
     }
 
     fn mock_s3_get_failure() -> aws_sdk_s3::Client {
@@ -1181,7 +1184,7 @@ mod tests {
                     .build(),
             )
         });
-        mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[list, get])
+        mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[head_rule(5), list, get])
     }
 
     fn mock_s3_list_failure() -> aws_sdk_s3::Client {
@@ -1542,6 +1545,8 @@ mod tests {
         let get = mock!(aws_sdk_s3::Client::get_object).then_output(|| {
             GetObjectOutput::builder()
                 .content_length(5)
+                .content_range("bytes 0-4/5")
+                .e_tag("test-etag")
                 .body(aws_sdk_s3::primitives::ByteStream::from_static(b"hello"))
                 .build()
         });
@@ -1550,7 +1555,11 @@ mod tests {
                 .set_contents(Some(vec![Object::builder().key("a.txt").size(5).build()]))
                 .build()
         });
-        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[list, get.clone()]);
+        let client = mock_client!(
+            aws_sdk_s3,
+            RuleMode::MatchAny,
+            &[head_rule(5), list, get.clone()]
+        );
         let (transfer, completion_rx) = setup(&dest, FailedTransferPolicy::Continue, client);
 
         timeout(Duration::from_secs(10), async {
@@ -1823,12 +1832,18 @@ mod tests {
         let get = mock!(aws_sdk_s3::Client::get_object).then_output(|| {
             GetObjectOutput::builder()
                 .content_length(5)
+                .content_range("bytes 0-4/5")
+                .e_tag("test-etag")
                 .body(aws_sdk_s3::primitives::ByteStream::new(
                     aws_smithy_types::body::SdkBody::from_body_1_x(NeverBody),
                 ))
                 .build()
         });
-        let s3_client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[page1, page2, get]);
+        let s3_client = mock_client!(
+            aws_sdk_s3,
+            RuleMode::MatchAny,
+            &[head_rule(5), page1, page2, get]
+        );
         let config = crate::Config::builder()
             .sdk_client(s3_client.clone())
             .build()
@@ -1936,10 +1951,12 @@ mod tests {
         let get = mock!(aws_sdk_s3::Client::get_object).then_output(|| {
             GetObjectOutput::builder()
                 .content_length(5)
+                .content_range("bytes 0-4/5")
+                .e_tag("test-etag")
                 .body(aws_sdk_s3::primitives::ByteStream::from_static(b"hello"))
                 .build()
         });
-        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[list, get]);
+        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[head_rule(5), list, get]);
 
         let (transfer, completion_rx) = setup(dir.path(), FailedTransferPolicy::Continue, client);
 
@@ -2014,6 +2031,8 @@ mod tests {
         let get = mock!(aws_sdk_s3::Client::get_object).then_output(|| {
             GetObjectOutput::builder()
                 .content_length(5)
+                .content_range("bytes 0-4/5")
+                .e_tag("test-etag")
                 .body(aws_sdk_s3::primitives::ByteStream::from_static(b"hello"))
                 .build()
         });
@@ -2026,7 +2045,11 @@ mod tests {
                 ))
                 .build()
         });
-        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[list, get.clone()]);
+        let client = mock_client!(
+            aws_sdk_s3,
+            RuleMode::MatchAny,
+            &[head_rule(5), list, get.clone()]
+        );
         let (transfer, completion_rx) = setup(&dest, FailedTransferPolicy::Continue, client);
 
         timeout(Duration::from_secs(10), async {
@@ -2075,10 +2098,12 @@ mod tests {
         let get = mock!(aws_sdk_s3::Client::get_object).then_output(|| {
             GetObjectOutput::builder()
                 .content_length(5)
+                .content_range("bytes 0-4/5")
+                .e_tag("test-etag")
                 .body(aws_sdk_s3::primitives::ByteStream::from_static(b"hello"))
                 .build()
         });
-        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[list, get]);
+        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[head_rule(5), list, get]);
         let (transfer, completion_rx) = setup_with_walker(
             dir.path(),
             FailedTransferPolicy::Abort,
@@ -2175,10 +2200,12 @@ mod tests {
         let get = mock!(aws_sdk_s3::Client::get_object).then_output(|| {
             GetObjectOutput::builder()
                 .content_length(3)
+                .content_range("bytes 0-2/3")
+                .e_tag("test-etag")
                 .body(aws_sdk_s3::primitives::ByteStream::from_static(b"abc"))
                 .build()
         });
-        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[list, get]);
+        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[head_rule(3), list, get]);
         let (transfer, completion_rx) = setup_with_walker(
             dir.path(),
             FailedTransferPolicy::Continue,
@@ -2231,10 +2258,12 @@ mod tests {
         let get = mock!(aws_sdk_s3::Client::get_object).then_output(|| {
             GetObjectOutput::builder()
                 .content_length(2)
+                .content_range("bytes 0-1/2")
+                .e_tag("test-etag")
                 .body(aws_sdk_s3::primitives::ByteStream::from_static(b"ok"))
                 .build()
         });
-        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[list, get]);
+        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[head_rule(2), list, get]);
 
         let (transfer, completion_rx) = setup(dir.path(), FailedTransferPolicy::Continue, client);
 
@@ -2292,10 +2321,12 @@ mod tests {
         let get = mock!(aws_sdk_s3::Client::get_object).then_output(|| {
             GetObjectOutput::builder()
                 .content_length(5)
+                .content_range("bytes 0-4/5")
+                .e_tag("test-etag")
                 .body(aws_sdk_s3::primitives::ByteStream::from_static(b"hello"))
                 .build()
         });
-        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[list, get]);
+        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[head_rule(5), list, get]);
 
         let (transfer, _completion_rx) = setup(dir.path(), FailedTransferPolicy::Continue, client);
 
@@ -2368,10 +2399,12 @@ mod tests {
         let get = mock!(aws_sdk_s3::Client::get_object).then_output(|| {
             GetObjectOutput::builder()
                 .content_length(2)
+                .content_range("bytes 0-1/2")
+                .e_tag("test-etag")
                 .body(aws_sdk_s3::primitives::ByteStream::from_static(b"ok"))
                 .build()
         });
-        let s3_client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[list, get]);
+        let s3_client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[head_rule(2), list, get]);
 
         let config = crate::Config::builder()
             .sdk_client(s3_client.clone())
@@ -2452,7 +2485,7 @@ mod tests {
                     .build(),
             )
         });
-        let s3_client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[list, get]);
+        let s3_client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[head_rule(2), list, get]);
 
         let config = crate::Config::builder()
             .sdk_client(s3_client.clone())
@@ -2512,10 +2545,12 @@ mod tests {
         let get = mock!(aws_sdk_s3::Client::get_object).then_output(|| {
             GetObjectOutput::builder()
                 .content_length(2)
+                .content_range("bytes 0-1/2")
+                .e_tag("test-etag")
                 .body(aws_sdk_s3::primitives::ByteStream::from_static(b"ok"))
                 .build()
         });
-        let s3_client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[list, get]);
+        let s3_client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[head_rule(2), list, get]);
 
         let config = crate::Config::builder()
             .sdk_client(s3_client.clone())
@@ -2797,10 +2832,12 @@ mod tests {
         let get = mock!(aws_sdk_s3::Client::get_object).then_output(|| {
             GetObjectOutput::builder()
                 .content_length(4)
+                .content_range("bytes 0-3/4")
+                .e_tag("test-etag")
                 .body(aws_sdk_s3::primitives::ByteStream::from_static(b"data"))
                 .build()
         });
-        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[list, get]);
+        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[head_rule(4), list, get]);
 
         let config = crate::Config::builder()
             .sdk_client(client.clone())
@@ -2852,10 +2889,12 @@ mod tests {
         let get = mock!(aws_sdk_s3::Client::get_object).then_output(|| {
             GetObjectOutput::builder()
                 .content_length(3)
+                .content_range("bytes 0-2/3")
+                .e_tag("test-etag")
                 .body(aws_sdk_s3::primitives::ByteStream::from_static(b"abc"))
                 .build()
         });
-        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[list, get]);
+        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[head_rule(3), list, get]);
 
         let config = crate::Config::builder()
             .sdk_client(client.clone())
@@ -2953,10 +2992,12 @@ mod tests {
         let get = mock!(aws_sdk_s3::Client::get_object).then_output(|| {
             GetObjectOutput::builder()
                 .content_length(2)
+                .content_range("bytes 0-1/2")
+                .e_tag("test-etag")
                 .body(aws_sdk_s3::primitives::ByteStream::from_static(b"ok"))
                 .build()
         });
-        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[list, get]);
+        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[head_rule(2), list, get]);
 
         let (transfer, completion_rx) = setup(dir.path(), FailedTransferPolicy::Continue, client);
 
@@ -3109,10 +3150,12 @@ mod tests {
         let get = mock!(aws_sdk_s3::Client::get_object).then_output(|| {
             GetObjectOutput::builder()
                 .content_length(1)
+                .content_range("bytes 0-0/1")
+                .e_tag("test-etag")
                 .body(aws_sdk_s3::primitives::ByteStream::from_static(b"x"))
                 .build()
         });
-        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[list, get]);
+        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[head_rule(1), list, get]);
         let (transfer, _rx) = setup(dir.path(), FailedTransferPolicy::Continue, client);
 
         // Dispatch one walk and execute it, capturing the keys it delivers.

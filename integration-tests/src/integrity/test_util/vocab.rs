@@ -427,14 +427,12 @@ impl Case {
     /// Whether the download must report the object's stored checksum values and type
     /// (`integrity_checks()`). When false, it must report none.
     ///
-    /// They're reported when validation is on, there's no caller range, and either the whole
-    /// object arrives in one response, or the object is validated full-object.
+    /// Checksum-mode HEAD reports stored object values on every validated whole-object
+    /// download. Caller ranges, validation-off downloads and objects without checksums
+    /// must report none.
     pub(crate) const fn reports_object_values(&self) -> bool {
-        let one_response = self.object.len == 0
-            || matches!(self.mechanism, Mechanism::WholeResponse)
-            || matches!(self.download.part_size, Some(p) if p >= self.object.len);
         self.download.validation
             && self.download.range.is_none()
-            && (one_response || matches!(self.mechanism, Mechanism::FullObject))
+            && !(self.object.seeded && matches!(self.object.alg, Alg::NoChecksum))
     }
 }

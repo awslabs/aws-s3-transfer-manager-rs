@@ -14,7 +14,10 @@ use test_util::retention::{
     assert_download_releases_destination, drop_and_await_shutdown, Destination, Ending,
     OpenFileProbe,
 };
-use test_util::{object_connector, object_connector_with_checksum_headers};
+use test_util::{
+    get_first_object_connector_with_checksum_headers, head_event, object_connector,
+    object_connector_with_checksum_headers,
+};
 
 use aws_sdk_s3_transfer_manager::config::RuntimeConfig;
 use aws_sdk_s3_transfer_manager::types::ByteSize;
@@ -51,9 +54,8 @@ use aws_smithy_types::body::SdkBody;
 use bytes::Bytes;
 use test_common::drain;
 
-// NOTE: these tests are somewhat brittle as they assume particular paths through the codebase.
-// As an example we generally assume object discovery goes through `GetObject` with a ranged get
-// for the first part.
+// Replay fixtures use HEAD-first discovery for validated whole-object downloads.
+// Caller ranges and validation-off downloads use their respective discovery paths.
 
 fn rand_data(size: usize) -> Bytes {
     iter::repeat_with(fastrand::alphanumeric)
@@ -115,15 +117,16 @@ async fn test_download_ranges() {
 
     assert_eq!(data.len(), body.len());
     let requests = http_client.actual_requests().collect::<Vec<_>>();
-    assert_eq!(3, requests.len());
+    assert_eq!(4, requests.len());
+    assert_eq!(requests[0].method(), "HEAD");
 
-    assert_eq!(requests[0].headers().get("Range"), Some("bytes=0-5242879"));
+    assert_eq!(requests[1].headers().get("Range"), Some("bytes=0-5242879"));
     assert_eq!(
-        requests[1].headers().get("Range"),
+        requests[2].headers().get("Range"),
         Some("bytes=5242880-10485759")
     );
     assert_eq!(
-        requests[2].headers().get("Range"),
+        requests[3].headers().get("Range"),
         Some("bytes=10485760-12582911")
     );
 }
@@ -205,7 +208,8 @@ async fn test_object_meta_after_discovery_failure() {
 /// Connector modelling a ranged-GET object store for an object of `total`
 /// bytes.
 ///
-/// The first GET is answered with the requested range. Every later GET stays
+/// HEAD reports the object's metadata. The first GET is answered with the
+/// requested range. Every later GET stays
 /// in flight until its future is dropped; each one adds a permit to
 /// `parked_started` when it begins.
 #[derive(Debug)]
@@ -246,6 +250,15 @@ impl ParkAfterDiscoveryConnector {
 
 impl HttpConnector for ParkAfterDiscoveryConnector {
     fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
+        if request.method() == "HEAD" {
+            let mut response =
+                HttpResponse::new(StatusCode::try_from(200).unwrap(), SdkBody::empty());
+            response
+                .headers_mut()
+                .insert("Content-Length", self.total.to_string());
+            response.headers_mut().insert("ETag", "my-etag");
+            return HttpConnectorFuture::ready(Ok(response));
+        }
         assert_eq!("GET", request.method());
         let seq = self.requests.fetch_add(1, Ordering::SeqCst);
         if seq == 0 {
@@ -374,6 +387,7 @@ async fn test_retry_failed_chunk() {
     let fail_after_byte = frame_size * 4;
 
     let http_client = StaticReplayClient::new(vec![
+        head_event(data.len(), None),
         ReplayEvent::new(
             dummy_expected_request(),
             http::Response::builder()
@@ -431,7 +445,7 @@ async fn test_retry_failed_chunk() {
 
     assert_eq!(data.len(), body.len());
     let requests = http_client.actual_requests().collect::<Vec<_>>();
-    assert_eq!(3, requests.len());
+    assert_eq!(4, requests.len());
 }
 
 const ERROR_RESPONSE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -450,6 +464,7 @@ async fn test_non_retryable_error() {
     let part_size = ByteSize::mib(8).as_usize();
 
     let http_client = StaticReplayClient::new(vec![
+        head_event(data.len(), None),
         ReplayEvent::new(
             dummy_expected_request(),
             http::Response::builder()
@@ -484,7 +499,7 @@ async fn test_non_retryable_error() {
     let _ = drain(&mut handle).await.unwrap_err();
 
     let requests = http_client.actual_requests().collect::<Vec<_>>();
-    assert_eq!(2, requests.len());
+    assert_eq!(3, requests.len());
 }
 
 /// Test max attempts exhausted reading a stream
@@ -516,18 +531,21 @@ async fn test_retry_max_attempts() {
     .take(3)
     .collect::<Vec<_>>();
 
-    let mut events = vec![ReplayEvent::new(
-        dummy_expected_request(),
-        http::Response::builder()
-            .status(200)
-            .header("Content-Length", format!("{}", part_size))
-            .header(
-                "Content-Range",
-                format!("bytes 0-{}/{}", part_size - 1, data.len()),
-            )
-            .body(SdkBody::from(data.slice(0..part_size)))
-            .unwrap(),
-    )];
+    let mut events = vec![
+        head_event(data.len(), None),
+        ReplayEvent::new(
+            dummy_expected_request(),
+            http::Response::builder()
+                .status(200)
+                .header("Content-Length", format!("{}", part_size))
+                .header(
+                    "Content-Range",
+                    format!("bytes 0-{}/{}", part_size - 1, data.len()),
+                )
+                .body(SdkBody::from(data.slice(0..part_size)))
+                .unwrap(),
+        ),
+    ];
 
     events.append(&mut failures);
 
@@ -543,7 +561,7 @@ async fn test_retry_max_attempts() {
 
     let _ = drain(&mut handle).await.unwrap_err();
     let requests = http_client.actual_requests().collect::<Vec<_>>();
-    assert_eq!(4, requests.len());
+    assert_eq!(5, requests.len());
 }
 
 /// Test the if_match header was added correctly based on the response from server.
@@ -564,13 +582,15 @@ async fn test_download_if_match() {
     let _ = drain(&mut handle).await.unwrap();
 
     let requests = http_client.actual_requests().collect::<Vec<_>>();
-    assert_eq!(3, requests.len());
+    assert_eq!(4, requests.len());
+    assert_eq!(requests[0].method(), "HEAD");
 
     // The first request is to discover the object meta data and should not have any if-match
     assert_eq!(requests[0].headers().get("If-Match"), None);
     // All the following requests should have the if-match header
     assert_eq!(requests[1].headers().get("If-Match"), Some("my-etag"));
     assert_eq!(requests[2].headers().get("If-Match"), Some("my-etag"));
+    assert_eq!(requests[3].headers().get("If-Match"), Some("my-etag"));
 }
 
 const OBJECT_MODIFIED_RESPONSE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -593,10 +613,8 @@ async fn test_download_object_modified() {
     // Assumptions:
     //     1. First request for discovery, succeed with etag
     //     2. Followed requests fail to mock the object changed during download.
-    let events = data
-        .chunks(part_size)
-        .enumerate()
-        .map(|(idx, chunk)| {
+    let events = std::iter::once(head_event(data.len(), None))
+        .chain(data.chunks(part_size).enumerate().map(|(idx, chunk)| {
             let start = idx * part_size;
             let end = std::cmp::min(start + part_size, data.len()) - 1;
             let mut response = http::Response::builder()
@@ -622,7 +640,7 @@ async fn test_download_object_modified() {
                 dummy_expected_request(),
                 response,
             )
-        })
+        }))
         .collect();
 
     let http_client = StaticReplayClient::new(events);
@@ -791,7 +809,11 @@ async fn download_objects_releases_destination_files() {
             .unwrap(),
     );
     let config = aws_sdk_s3_transfer_manager::Config::builder()
-        .s3_config(common::s3_config(StaticReplayClient::new(vec![list, get])))
+        .s3_config(common::s3_config(StaticReplayClient::new(vec![
+            list,
+            head_event(data.len(), None),
+            get,
+        ])))
         .concurrency(ConcurrencyMode::Explicit(1))
         .build()
         .expect("valid config");
@@ -826,10 +848,18 @@ async fn write_to_path_drop_clients_then_unlink_releases_destination() {
         http::Response::builder()
             .status(200)
             .header("Content-Length", data.len().to_string())
+            .header(
+                "Content-Range",
+                format!("bytes 0-{}/{}", data.len() - 1, data.len()),
+            )
+            .header("ETag", "my-etag")
             .body(SdkBody::from(data.clone()))
             .unwrap(),
     );
-    let shared = common::shared_config(StaticReplayClient::new(vec![response]));
+    let shared = common::shared_config(StaticReplayClient::new(vec![
+        head_event(data.len(), None),
+        response,
+    ]));
     // Reproduce the reported drop sequence with both clients sharing SDK configuration.
     let s3 = aws_sdk_s3::Client::new(&shared);
     let tm = aws_sdk_s3_transfer_manager::Client::new(
@@ -941,6 +971,7 @@ async fn test_download_write_to_path_error_cleans_up() {
 
     // Discovery succeeds, second request fails with 412 PreconditionFailed.
     let http_client = StaticReplayClient::new(vec![
+        head_event(data.len(), None),
         ReplayEvent::new(
             dummy_expected_request(),
             http::Response::builder()
@@ -1033,8 +1064,7 @@ async fn test_download_write_to_file_rejects_append_mode() {
 /// the stored checksum and therefore stop validating downloads.
 #[tokio::test]
 async fn test_checksum_mode_enabled_by_default() {
-    // Multipart object so the assertion covers the discovery GET and every
-    // subsequent range-chunk GET.
+    // Multipart object so the assertion covers discovery HEAD and every range GET.
     let data = rand_data(ByteSize::mib(20).as_usize());
     let part_size = ByteSize::mib(8).as_usize();
     let (tm, http_client) = simple_test_tm(&data, part_size);
@@ -1053,7 +1083,7 @@ async fn test_checksum_mode_enabled_by_default() {
         assert_eq!(
             req.headers().get("x-amz-checksum-mode"),
             Some("ENABLED"),
-            "GET #{i} must carry x-amz-checksum-mode=ENABLED by default"
+            "request #{i} must carry x-amz-checksum-mode=ENABLED by default"
         );
     }
 }
@@ -1199,7 +1229,11 @@ async fn test_integrity_checks_default_mode_validates() {
 async fn test_integrity_checks_disabled_when_validation_when_required() {
     let data = Bytes::from_static(HELLO);
     let part_size = ByteSize::mib(5).as_usize();
-    let tm = when_required_tm(single_part_connector(&data, Some(HELLO_CRC32)), part_size);
+    let http_client =
+        get_first_object_connector_with_checksum_headers(&data, data.len(), |_, _| {
+            Some(("x-amz-checksum-crc32", HELLO_CRC32.to_owned()))
+        });
+    let tm = when_required_tm(http_client, part_size);
 
     let mut handle = tm
         .download()
@@ -1341,7 +1375,7 @@ async fn test_integrity_checks_each_algorithm_validates() {
 
 /// Each algorithm the SDK validates: a response whose checksum does not match its
 /// body fails the body and `join` with IntegrityError, carrying the algorithm and
-/// both values, after a single request.
+/// both values, after one HEAD and one GET.
 #[tokio::test]
 async fn test_integrity_checks_each_algorithm_mismatch_is_integrity_error() {
     let data = Bytes::from_static(HELLO);
@@ -1372,7 +1406,7 @@ async fn test_integrity_checks_each_algorithm_mismatch_is_integrity_error() {
             assert_eq!(details.expected(), Some(expected.as_str()));
             assert_eq!(details.computed(), Some(computed.as_str()));
         }
-        assert_eq!(http_client.actual_requests().count(), 1, "{tm_algorithm:?}");
+        assert_eq!(http_client.actual_requests().count(), 2, "{tm_algorithm:?}");
     }
 }
 
@@ -1644,15 +1678,21 @@ async fn test_integrity_checks_part_aligned_range_checksum_is_not_an_object_valu
     }
 }
 
-/// Multipart object (data larger than part_size) → discovery chunk carries only
-/// part 1's checksum, which MUST NOT be surfaced as the object's checksum.
+/// Range-response checksums must not be surfaced as object values when HEAD
+/// has no stored checksum.
 #[tokio::test]
 async fn test_integrity_checks_multipart_does_not_surface_part_checksum() {
     let data = rand_data(ByteSize::mib(12).as_usize());
     let part_size = ByteSize::mib(5).as_usize();
-    // object_connector splits into parts and stamps no checksum header,
-    // but even if part 1 carried one, it must not be reported as the object value.
-    let (tm, _c) = simple_test_tm(&data, part_size);
+    let http_client = object_connector_with_checksum_headers(&data, part_size, |_, bytes| {
+        (bytes.len() <= part_size).then(|| {
+            (
+                "x-amz-checksum-crc32",
+                checksum_value(aws_smithy_checksums::ChecksumAlgorithm::Crc32, bytes),
+            )
+        })
+    });
+    let tm = test_tm(http_client, part_size);
 
     let mut handle = tm
         .download()

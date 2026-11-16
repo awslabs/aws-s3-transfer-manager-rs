@@ -99,21 +99,19 @@ fn fluent_fields_use_upstream_getters_and_preserve_conditions_read_ahead_and_red
 #[tokio::test]
 async fn fluent_and_modeled_initiation_return_canonical_object_and_chunk_metadata() {
     for fluent in [true, false] {
-        let get = mock!(aws_sdk_s3::Client::get_object)
+        let head = mock!(aws_sdk_s3::Client::head_object)
             .match_requests(|input| {
                 assert_eq!(input.bucket(), Some("bucket"));
                 assert_eq!(input.key(), Some("key"));
                 assert_eq!(input.version_id(), Some("version"));
                 assert_eq!(
-                    input.response_content_type(),
-                    Some("application/octet-stream")
+                    input.checksum_mode(),
+                    Some(&aws_sdk_s3::types::ChecksumMode::Enabled)
                 );
-                assert_eq!(input.part_number(), None);
                 true
             })
             .then_output(|| {
-                GetObjectOutput::builder()
-                    .body(ByteStream::from_static(b"payload"))
+                HeadObjectOutput::builder()
                     .content_length(7)
                     .e_tag("etag")
                     .delete_marker(false)
@@ -126,7 +124,37 @@ async fn fluent_and_modeled_initiation_return_canonical_object_and_chunk_metadat
                     .request_charged(aws_sdk_s3::types::RequestCharged::Requester)
                     .build()
             });
-        let sdk = mock_client!(aws_sdk_s3, RuleMode::Sequential, &[&get]);
+        let get = mock!(aws_sdk_s3::Client::get_object)
+            .match_requests(|input| {
+                assert_eq!(input.bucket(), Some("bucket"));
+                assert_eq!(input.key(), Some("key"));
+                assert_eq!(input.version_id(), Some("version"));
+                assert_eq!(
+                    input.response_content_type(),
+                    Some("application/octet-stream")
+                );
+                assert_eq!(input.part_number(), None);
+                assert_eq!(input.if_match(), Some("etag"));
+                assert_eq!(input.range(), Some("bytes=0-6"));
+                true
+            })
+            .then_output(|| {
+                GetObjectOutput::builder()
+                    .body(ByteStream::from_static(b"payload"))
+                    .content_length(7)
+                    .content_range("bytes 0-6/7")
+                    .e_tag("etag")
+                    .delete_marker(false)
+                    .bucket_key_enabled(false)
+                    .missing_meta(0)
+                    .tag_count(2)
+                    .checksum_sha512("server-sha512")
+                    .checksum_md5("server-md5")
+                    .expires_string("unparsed-service-date")
+                    .request_charged(aws_sdk_s3::types::RequestCharged::Requester)
+                    .build()
+            });
+        let sdk = mock_client!(aws_sdk_s3, RuleMode::Sequential, &[&head, &get]);
         let tm = Client::new(
             Config::builder()
                 .s3_config(test_common::s3_config_with_test_http(

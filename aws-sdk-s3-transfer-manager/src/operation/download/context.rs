@@ -93,9 +93,8 @@ pub(crate) enum DownloadState {
         /// ETag for consistency (shared across all range requests)
         etag: Option<std::sync::Arc<str>>,
         /// Per-chunk size used to slice `remaining`. Normally the configured
-        /// download part size; for a multipart object being validated it is the
-        /// object's stored part size so each range aligns to a stored part
-        /// boundary (S3 returns a per-part checksum only for an aligned range).
+        /// download part size; automatic COMPOSITE validation uses the stored
+        /// first-part size so later ranges can receive per-part checksums.
         part_size: u64,
         /// Read-ahead occupancy accounting. Bounds resident memory by gating
         /// issuance on `issued - released < window`.

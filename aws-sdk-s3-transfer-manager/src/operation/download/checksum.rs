@@ -40,6 +40,34 @@ pub(super) enum ValidationPlan {
     WholeObject(WholeObjectPlan),
 }
 
+impl ValidationPlan {
+    /// Logs the selected checks separately from their eventual validation outcome.
+    pub(super) fn log(&self, meta: &ObjectMetadata, reason: &str) {
+        let (target, method, algorithm) = match self {
+            Self::Disabled => ("disabled", None, None),
+            Self::PerResponse => ("per_response", None, None),
+            Self::WholeObject(plan) => {
+                let ObjectChecksumMethod::CombineRanges { algorithm } = plan.method;
+                (
+                    "whole_object",
+                    Some("combine_ranges"),
+                    Some(algorithm.model()),
+                )
+            }
+        };
+        tracing::debug!(
+            target: crate::telemetry::TARGET_TRANSFER_DOWNLOAD,
+            validation_target = target,
+            method,
+            ?algorithm,
+            stored_algorithm = ?stored::StoredChecksum::algorithm(meta),
+            stored_type = ?meta.checksum_type,
+            reason,
+            "download validation plan",
+        );
+    }
+}
+
 /// A whole-object calculation, its expected value and the required byte coverage.
 ///
 /// The expected value is decoded and checked against the method's algorithm width.
