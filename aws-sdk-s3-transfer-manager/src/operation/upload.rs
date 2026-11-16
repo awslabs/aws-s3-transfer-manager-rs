@@ -15,15 +15,20 @@
 //!
 //! # Integrity inputs
 //!
-//! An upload fails with [`ErrorKind::InputInvalid`](crate::error::ErrorKind::InputInvalid) when a
-//! checksum you supplied is invalid. These are the invalid cases:
+//! An upload fails with [`ErrorKind::InputInvalid`](crate::error::ErrorKind::InputInvalid) when it
+//! cannot send an integrity check you supplied:
 //!
+//! - The upload sets [Content-MD5](crate::operation::upload::UploadInput::content_md5()) and is
+//!   sent as a multipart upload: the body's size has no upper bound, the body is a
+//!   [`PartStream`](crate::io::PartStream), or its upper bound is at least the multipart
+//!   threshold. A Content-MD5 covers the whole object, which only a single-request upload
+//!   carries. `initiate` returns this error, and no request is sent.
 //! - A [`PartStream`](crate::io::PartStream) part carries a
 //!   [checksum](crate::io::PartData::with_checksum), but the upload has no
-//!   [checksum strategy](crate::operation::upload::ChecksumStrategy) set.
-//! - The upload sets [Content-MD5](crate::operation::upload::UploadInput::content_md5()),
-//!   and the upload is sent as a multipart upload. A
-//!   Content-MD5 covers the whole object, which only a single-request upload can carry.
+//!   [checksum strategy](crate::operation::upload::ChecksumStrategy) to name its algorithm.
+//!   [`UploadHandle::join`](crate::operation::upload::UploadHandle::join) returns this error.
+//!   The part is not sent; earlier parts may have been, and the multipart upload is then
+//!   handled as for any failed part.
 
 /// Operation builders
 pub mod builders;

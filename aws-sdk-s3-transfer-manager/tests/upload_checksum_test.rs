@@ -1123,9 +1123,6 @@ async fn test_mpu_content_md5_is_rejected() {
         .content_md5(content_md5)
         .body(InputStream::from(body))
         .initiate()
-        .unwrap()
-        .join()
-        .await
         .expect_err("content_md5 on a multipart upload must fail the upload");
 
     assert_input_invalid(
