@@ -447,7 +447,7 @@ async fn test_when_required_calculated_crc32c_sends_put_object_checksum() {
 async fn test_when_required_calculated_crc32c_sends_upload_part_checksums() {
     let (handle, tm, recorder) = when_required_tm().await;
     // 24 MiB = 3 parts at the default 8 MiB part size.
-    let content = deterministic_data(24 * ByteUnit::Mebibyte.as_bytes_usize());
+    let content = deterministic_data(ByteSize::mib(24).as_usize());
 
     let output = tm
         .upload()
