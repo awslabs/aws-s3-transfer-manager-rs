@@ -474,7 +474,7 @@ pub enum ByteUnit {
 
 impl ByteUnit {
     /// Convert some number of bytes into this unit as an `f64`
-    pub fn convert(&self, bytes: u64) -> f64 {
+    pub(crate) fn convert(&self, bytes: u64) -> f64 {
         bytes as f64 / self.as_bytes_u64() as f64
     }
 
@@ -543,13 +543,6 @@ impl FromStr for ByteUnit {
 pub struct ByteSizeDisplayContext {
     total_bytes: u64,
     unit: ByteUnit,
-}
-
-impl ByteSizeDisplayContext {
-    /// Create a new display context for the number of bytes in a specific unit
-    pub fn new(total_bytes: u64, unit: ByteUnit) -> Self {
-        Self { total_bytes, unit }
-    }
 }
 
 impl fmt::Display for ByteSizeDisplayContext {
@@ -866,7 +859,7 @@ mod value_type_tests {
         assert_eq!("727 B", format!("{}", ByteSize::new(727)));
         assert_eq!(
             "0.710 KiB",
-            format!("{}", ByteSizeDisplayContext::new(727, ByteUnit::Kibibyte))
+            format!("{}", ByteSize::new(727).display_as(ByteUnit::Kibibyte))
         );
         assert_eq!("3.420 KiB", format!("{}", ByteSize::new(3502)));
         assert_eq!("3.41992 KiB", format!("{:.5}", ByteSize::new(3502)));
@@ -876,7 +869,7 @@ mod value_type_tests {
             "0.007 GiB",
             format!(
                 "{}",
-                ByteSizeDisplayContext::new(7550498, ByteUnit::Gibibyte)
+                ByteSize::new(7550498).display_as(ByteUnit::Gibibyte)
             )
         );
 
@@ -885,7 +878,7 @@ mod value_type_tests {
             "1040.690 MiB",
             format!(
                 "{}",
-                ByteSizeDisplayContext::new(1091242563, ByteUnit::Mebibyte)
+                ByteSize::new(1091242563).display_as(ByteUnit::Mebibyte)
             )
         );
     }

@@ -53,12 +53,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `BufferPoolBuilder::memory_budget` with a `MemoryBudgetConfig::Limit` larger than `usize::MAX`
   returns `BufferPoolBuildError::CapacityOverflow`, which can happen only where `usize` is narrower
   than 64 bits.
-- `ByteUnit` keeps its variants, `AsRef<str>`, `FromStr` and `convert`, and is the unit a `ByteSize`
-  or `Throughput` is displayed in. Its `as_bytes_u64`, `as_bytes_usize`, `as_bits_u64` and
-  `as_bits_usize` methods are removed, as is `ByteUnit::display`: `ByteSize::mib(8)` replaces
-  `8 * ByteUnit::Mebibyte.as_bytes_u64()`, and `ByteSize`'s `Display` replaces `ByteUnit::display`.
-  `ByteCountDisplayContext` is renamed `ByteSizeDisplayContext` and is created by
-  `ByteSize::display_as`.
+- `ByteUnit` keeps its variants, `AsRef<str>` and `FromStr`, and is the unit a `ByteSize` or
+  `Throughput` is displayed in. Its `as_bytes_u64`, `as_bytes_usize`, `as_bits_u64`, `as_bits_usize`
+  and `convert` methods are removed, as is `ByteUnit::display`: `ByteSize::mib(8)` replaces
+  `8 * ByteUnit::Mebibyte.as_bytes_u64()`, `ByteSize::as_unit` replaces `ByteUnit::convert`, and
+  `ByteSize`'s `Display` replaces `ByteUnit::display`.
+  `ByteCountDisplayContext` is renamed `ByteSizeDisplayContext`, and `ByteSize::display_as` is its
+  only constructor: `ByteCountDisplayContext::new` is removed.
 - `aws-sdk-s3-transfer-manager`, `aws-sdk-s3-transfer-manager-ext`, `aws-smithy-topology`,
   `aws-smithy-execution` and `aws-smithy-managed-http`: the minimum supported Rust version is
   1.96.0.
@@ -76,8 +77,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not supported.
 - `io::walk::WalkErrorKind` and `types::ByteUnit` are `#[non_exhaustive]`.
 - The fields of `types::ThroughputDisplayContext` and `types::ByteSizeDisplayContext` are private.
-  Create them with `Throughput::display_as`, `ByteSize::display_as`, or
-  `ByteSizeDisplayContext::new`.
+  Create them with `Throughput::display_as` or `ByteSize::display_as`.
 - `config::Builder::build` returns `Result<Config, BuildError>` and returns an error when
   `s3_config` is not set, instead of panicking.
 - The transfer manager no longer enables the `behavior-version-latest` feature of `aws-config` or
