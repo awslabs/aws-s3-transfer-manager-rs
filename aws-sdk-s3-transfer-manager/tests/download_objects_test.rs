@@ -963,3 +963,131 @@ async fn test_abort_stops_child_get_before_temp_file_cleanup() {
         "child GetObject must be dropped before its temp file is removed"
     );
 }
+
+/// A listed object that fits in one range is downloaded with a single GET pinned to
+/// the listed ETag, without HeadObject. An object that changed since the listing
+/// (412), one listed larger than a range, and an empty one discover the object with
+/// HeadObject as any download does.
+#[tokio::test]
+async fn test_listed_object_that_fits_one_range_skips_head() {
+    const PART_SIZE: u64 = 8 * 1024 * 1024;
+    let listed = |key: &str, size: i64, e_tag: &str| {
+        aws_sdk_s3::types::Object::builder()
+            .key(key)
+            .size(size)
+            .e_tag(e_tag)
+            .build()
+    };
+    let get_output = |contents: &'static [u8], e_tag: &'static str| {
+        move || {
+            GetObjectOutput::builder()
+                .body(ByteStream::from_static(contents))
+                .content_length(contents.len() as i64)
+                .content_range(format!("bytes 0-{}/{}", contents.len() - 1, contents.len()))
+                .e_tag(e_tag)
+                .build()
+        }
+    };
+    let head_output = |len: i64, e_tag: &'static str| {
+        move || {
+            HeadObjectOutput::builder()
+                .content_length(len)
+                .e_tag(e_tag)
+                .build()
+        }
+    };
+    let head = |key: &'static str| {
+        mock!(aws_sdk_s3::Client::head_object).match_requests(move |r| r.key() == Some(key))
+    };
+    let get = |key: &'static str, if_match: &'static str| {
+        mock!(aws_sdk_s3::Client::get_object)
+            .match_requests(move |r| r.key() == Some(key) && r.if_match() == Some(if_match))
+    };
+
+    let list = mock!(aws_sdk_s3::Client::list_objects_v2).then_output(move || {
+        ListObjectsV2Output::builder()
+            .contents(listed("small", 11, "\"listed\""))
+            .contents(listed("changed", 11, "\"stale\""))
+            .contents(listed("large", PART_SIZE as i64 + 1, "\"listed-large\""))
+            .contents(listed("empty", 0, "\"empty\""))
+            .build()
+    });
+    let small_get = mock!(aws_sdk_s3::Client::get_object)
+        .match_requests(|r| {
+            r.key() == Some("small")
+                && r.if_match() == Some("\"listed\"")
+                && r.range() == Some(format!("bytes=0-{}", PART_SIZE - 1).as_str())
+        })
+        .then_output(get_output(b"hello world", "\"listed\""));
+    let small_head = head("small").then_output(head_output(11, "\"listed\""));
+    let changed_stale_get = get("changed", "\"stale\"").then_http_response(|| {
+        HttpResponse::new(StatusCode::try_from(412).unwrap(), Bytes::new().into())
+    });
+    let changed_head = head("changed").then_output(head_output(12, "\"current\""));
+    let changed_get =
+        get("changed", "\"current\"").then_output(get_output(b"new contents", "\"current\""));
+    let large_head = head("large").then_output(head_output(11, "\"large\""));
+    let large_get = get("large", "\"large\"").then_output(get_output(b"hello world", "\"large\""));
+    let empty_head = head("empty").then_output(head_output(0, "\"empty\""));
+
+    let client = mock_client!(
+        aws_sdk_s3,
+        RuleMode::MatchAny,
+        &[
+            &list,
+            &small_get,
+            &small_head,
+            &changed_stale_get,
+            &changed_head,
+            &changed_get,
+            &large_head,
+            &large_get,
+            &empty_head,
+        ]
+    );
+    let config = aws_sdk_s3_transfer_manager::Config::builder()
+        .s3_config(test_common::s3_config_with_test_http(
+            client.config().to_builder(),
+        ))
+        .build()
+        .expect("valid config");
+    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+    let dest = tempfile::tempdir().unwrap();
+
+    let output = tm
+        .download_objects()
+        .bucket("test-bucket")
+        .destination(dest.path())
+        .initiate()
+        .unwrap()
+        .join()
+        .await
+        .unwrap();
+
+    assert_eq!(output.objects_downloaded(), 4);
+    assert_eq!(small_get.num_calls(), 1);
+    assert_eq!(
+        small_head.num_calls(),
+        0,
+        "a listed small object skips HEAD"
+    );
+    assert_eq!(changed_stale_get.num_calls(), 1);
+    assert_eq!(changed_head.num_calls(), 1, "a 412 falls back to HEAD");
+    assert_eq!(changed_get.num_calls(), 1);
+    assert_eq!(
+        large_head.num_calls(),
+        1,
+        "an object listed larger than a range uses HEAD"
+    );
+    assert_eq!(large_get.num_calls(), 1);
+    assert_eq!(empty_head.num_calls(), 1, "an empty object uses HEAD");
+    assert_eq!(
+        std::fs::read(dest.path().join("small")).unwrap(),
+        b"hello world"
+    );
+    assert_eq!(
+        std::fs::read(dest.path().join("changed")).unwrap(),
+        b"new contents"
+    );
+    assert_eq!(std::fs::read(dest.path().join("empty")).unwrap(), b"");
+}

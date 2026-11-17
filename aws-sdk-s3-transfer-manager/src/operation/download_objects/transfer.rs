@@ -551,7 +551,8 @@ impl DownloadObjectsTransfer {
                     .key()
                     .expect("S3Walk yields objects with keys")
                     .to_string();
-                let result = self.spawn_single_child(handle, &key, parent_id);
+                let listed = crate::operation::download::ListedObject::from_listing(&obj);
+                let result = self.spawn_single_child(handle, &key, parent_id, listed);
                 (obj, result.map(|h| ChildTransfer { handle: h, key }))
             })
             .collect()
@@ -580,6 +581,7 @@ impl DownloadObjectsTransfer {
         handle: &Arc<crate::client::Handle>,
         key: &str,
         parent_id: u64,
+        listed: Option<crate::operation::download::ListedObject>,
     ) -> Result<ManagedDownloadHandle, Error> {
         let dest_path = local_key_path(
             &self.inner.destination,
@@ -630,7 +632,8 @@ impl DownloadObjectsTransfer {
             error::io_at("preparing temporary file for", &dest_path, e).with_local_key(key)
         })?;
 
-        let inner = Download::orchestrate_with_sink(handle.clone(), input, sink, Some(parent_id))?;
+        let inner =
+            Download::orchestrate_with_sink(handle.clone(), input, sink, Some(parent_id), listed)?;
         Ok(ManagedDownloadHandle::new(inner, temp_path, dest_path))
     }
 

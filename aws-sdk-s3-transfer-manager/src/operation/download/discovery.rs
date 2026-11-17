@@ -155,8 +155,44 @@ pub(super) async fn discover_obj(
         validation_enabled,
         "download discovery strategy selected",
     );
-    let mut discovery = match strategy {
-        ObjectDiscoveryStrategy::HeadObject => {
+    // A `download_objects` child whose listed object fits in one range skips HEAD: one
+    // checksum-mode GET pinned to the listed ETag returns the whole object with its
+    // checksum. A caller's If-Match takes precedence, and an empty object keeps HEAD,
+    // since S3 rejects a Range on an empty object.
+    let listed = transfer.listed_object().filter(|listed| {
+        whole_object_validation
+            && input.if_match().is_none()
+            && listed.size != 0
+            && listed.size <= configured_part_size
+    });
+    let mut listed_get = false;
+    let mut discovery = match (strategy, listed) {
+        (ObjectDiscoveryStrategy::HeadObject, Some(listed)) => {
+            match discover_obj_with_get(transfer, input, None, Some(&listed.e_tag))
+                .instrument(tracing::trace_span!(
+                    target: crate::telemetry::TARGET_TRANSFER_DOWNLOAD,
+                    "send-listed-get-for-discovery",
+                ))
+                .await
+            {
+                Ok(discovery) => {
+                    listed_get = true;
+                    Ok(discovery)
+                }
+                // The object changed since the listing. A 412 has no body to hold a
+                // connection, so discover the current object with HEAD.
+                Err(error) if error.http_status() == Some(412) => {
+                    discover_obj_with_head(transfer, input)
+                        .instrument(tracing::trace_span!(
+                            target: crate::telemetry::TARGET_TRANSFER_DOWNLOAD,
+                            "send-head-object-for-discovery",
+                        ))
+                        .await
+                }
+                Err(error) => Err(error),
+            }
+        }
+        (ObjectDiscoveryStrategy::HeadObject, None) => {
             discover_obj_with_head(transfer, input)
                 .instrument(tracing::trace_span!(
                     target: crate::telemetry::TARGET_TRANSFER_DOWNLOAD,
@@ -164,8 +200,8 @@ pub(super) async fn discover_obj(
                 ))
                 .await
         }
-        ObjectDiscoveryStrategy::RangedGet(range) => {
-            discover_obj_with_get(transfer, input, range)
+        (ObjectDiscoveryStrategy::RangedGet(range), _) => {
+            discover_obj_with_get(transfer, input, range, None)
                 .instrument(tracing::trace_span!(
                     target: crate::telemetry::TARGET_TRANSFER_DOWNLOAD,
                     "send-ranged-get-for-discovery",
@@ -176,7 +212,11 @@ pub(super) async fn discover_obj(
     discovery.effective_part_size = configured_part_size;
 
     let reason;
-    if whole_object_validation {
+    if listed_get {
+        // The GET covered the listed object, so its response checksum is the object's.
+        reason = "listed object fits one range";
+        discovery.validation_plan = ValidationPlan::PerResponse;
+    } else if whole_object_validation {
         // Whole-object HEAD validation establishes the length before checksum classification.
         let object_len = discovery
             .object_meta
@@ -502,6 +542,7 @@ async fn discover_obj_with_get(
     transfer: &DownloadTransfer,
     input: &DownloadInput,
     range_from_user: Option<RangeInclusive<u64>>,
+    if_match: Option<&str>,
 ) -> Result<ObjectDiscovery, error::Error> {
     let target_part_size = transfer.ctx().handle.part_size_bytes();
     // Convert input to builder and set the range properly as the first range get.
@@ -515,8 +556,11 @@ async fn discover_obj_with_get(
     let mut req_metrics = transfer.start_request(DownloadRequestKind::DiscoveryRange);
     let retry_classify = crate::retry::classify_discovery_retry;
     let result = crate::retry::retry(req_metrics.metrics_mut(), retry_classify, |_allow_hedge| {
-        let builder =
+        let mut builder =
             copy_fields_to_get_object_request(input, transfer.ctx().s3_client().get_object());
+        if let Some(if_match) = if_match {
+            builder = builder.if_match(if_match);
+        }
         let checksum = ChecksumCapture::new();
         let req = builder
             .range(header::Range::bytes(byte_range.clone()))

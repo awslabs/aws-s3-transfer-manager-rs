@@ -86,6 +86,8 @@ struct DownloadTransferInner {
     expected_download_len: std::sync::OnceLock<u64>,
     /// Notified when discovery completes (success or failure)
     discovery_notify: tokio::sync::Notify,
+    /// The object as a `download_objects` listing reported it, for a child download.
+    listed: Option<super::ListedObject>,
 }
 
 /// Download-specific work data.
@@ -141,6 +143,18 @@ impl DownloadTransfer {
         input: DownloadInput,
         writer: BodyWriter,
     ) -> Self {
+        Self::new_listed(ctx, bucket_type, input, writer, None)
+    }
+
+    /// [`Self::new`] for an object a listing reported as `listed`, which discovery
+    /// may use to skip HeadObject.
+    pub(crate) fn new_listed(
+        ctx: TransferContext,
+        bucket_type: BucketType,
+        input: DownloadInput,
+        writer: BodyWriter,
+        listed: Option<super::ListedObject>,
+    ) -> Self {
         // Resolve the read-ahead knob (per-request override, else client default)
         // to a window in parts before `ctx` and `input` are moved into the struct.
         let window =
@@ -168,6 +182,7 @@ impl DownloadTransfer {
             integrity_checks: std::sync::OnceLock::new(),
             expected_download_len: std::sync::OnceLock::new(),
             discovery_notify: tokio::sync::Notify::new(),
+            listed,
         });
         Self { inner }
     }
@@ -175,6 +190,11 @@ impl DownloadTransfer {
     /// Access the transfer context.
     pub(crate) fn ctx(&self) -> &TransferContext {
         &self.inner.ctx
+    }
+
+    /// The object as a `download_objects` listing reported it, for a child download.
+    pub(super) fn listed_object(&self) -> Option<&super::ListedObject> {
+        self.inner.listed.as_ref()
     }
 
     /// Starts one request measurement attributed to download request kind.
