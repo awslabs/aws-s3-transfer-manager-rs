@@ -1648,6 +1648,8 @@ async fn test_part_one_checksum_from_part_get_is_not_an_object_value() {
     for meta in [&object_meta, &output.object_meta] {
         assert_eq!(meta.checksum_crc32, None);
         assert_eq!(meta.checksum_type, Some(ChecksumType::Composite));
+        // A plain HEAD reports no part count; the part-1 response supplies it.
+        assert_eq!(meta.parts_count, Some(2));
     }
 }
 
@@ -1721,6 +1723,7 @@ async fn test_integrity_checks_part_aligned_range_checksum_is_not_an_object_valu
     for meta in [&object_meta, &output.object_meta] {
         assert_eq!(meta.checksum_crc32.as_deref(), Some(object_crc32.as_str()));
         assert_eq!(meta.checksum_type, Some(ChecksumType::FullObject));
+        // No request named a part number, so the part count is unknown.
         assert_eq!(meta.parts_count, None);
     }
 }

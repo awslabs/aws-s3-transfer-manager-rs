@@ -213,7 +213,12 @@ pub(super) async fn discover_obj(
                 .ok_or_else(|| error::discovery_failed("nonempty object has an empty first part"))?
                 .expected_len as u64;
             layout.effective_part_size = stored_part_size;
+            // HEAD describes the object, but a plain HEAD reports no part count.
+            // The part-1 response is pinned to HEAD's ETag, so its part count is
+            // the object's.
+            let parts_count = layout.object_meta.parts_count;
             layout.object_meta = discovery.object_meta;
+            layout.object_meta.parts_count = parts_count;
             layout.validation_plan = discovery.validation_plan;
             discovery = layout;
         }
@@ -1155,7 +1160,9 @@ mod tests {
             .ssekms_key_id("head-key")
             .content_type("application/octet-stream")
             .build();
-        let expected_object_meta = crate::sdk_v1::object_metadata_from_head_object(&head_output);
+        let mut expected_object_meta =
+            crate::sdk_v1::object_metadata_from_head_object(&head_output);
+        expected_object_meta.parts_count = Some(3);
         let head = mock!(Client::head_object)
             .match_requests(|r| {
                 r.checksum_mode() == Some(&aws_sdk_s3::types::ChecksumMode::Enabled)
@@ -1227,7 +1234,8 @@ mod tests {
             Some("head"),
         );
         assert_eq!(discovery.object_meta.content_range, None);
-        assert_eq!(discovery.object_meta.parts_count, None);
+        // A plain HEAD has no part count; the part-1 response supplies the object's.
+        assert_eq!(discovery.object_meta.parts_count, Some(3));
         assert_eq!(discovery.object_meta.cache_control, None);
         assert_eq!(discovery.object_meta.content_length, Some(total as i64));
         assert_eq!(
