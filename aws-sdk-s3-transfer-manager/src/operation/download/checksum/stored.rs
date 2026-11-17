@@ -9,12 +9,20 @@
 //! selects the first supported header in SDK priority order.
 //! Only a decodable full-object CRC of the correct width can construct a
 //! whole-object plan; composite, SHA and unavailable values select response checks.
+//! Metadata the transfer manager doesn't recognize, such as an unsupported
+//! algorithm or checksum type, is ignored. A malformed value for a recognized
+//! algorithm fails discovery.
 //! [`ExpectedValue`] preserves the stored encoding alongside its decoded bytes.
 
 use super::crc::CrcAlgorithm;
 use super::{ObjectChecksumMethod, ValidationPlan, WholeObjectPlan};
 use crate::error::{self, Error};
 use crate::model::{ChecksumAlgorithm, ChecksumType, ObjectMetadata};
+
+/// The discovery error for a malformed stored `algorithm` checksum value.
+fn malformed(algorithm: &ChecksumAlgorithm, problem: &str) -> Error {
+    error::discovery_failed(format!("stored {} checksum {problem}", algorithm.as_str()))
+}
 
 /// A stored checksum's decoded bytes and original S3 header value.
 ///
@@ -31,7 +39,8 @@ pub(in crate::operation::download) struct ExpectedValue {
 /// Stored checksum metadata classified before selecting a calculation.
 ///
 /// Header priority is CRC64NVME, CRC32C, CRC32, SHA-1, then SHA-256. A later header
-/// does not replace a selected header that is malformed or cannot be verified.
+/// does not replace a selected header that cannot be verified, and a malformed
+/// selected header fails discovery.
 #[derive(Debug)]
 pub(in crate::operation::download) enum StoredChecksum {
     /// Plain CRC with valid base64, the correct width and absent or FULL_OBJECT type.
@@ -45,7 +54,8 @@ pub(in crate::operation::download) enum StoredChecksum {
     Composite,
     /// An unsuffixed SHA-1 or SHA-256 value not marked COMPOSITE; selects response checks.
     Ordered,
-    /// No supported header, an unknown CRC type or a CRC with invalid base64.
+    /// No supported header, or a CRC whose checksum type is neither absent nor
+    /// FULL_OBJECT, such as a type this version doesn't recognize.
     Unavailable,
 }
 
@@ -54,10 +64,13 @@ impl StoredChecksum {
     ///
     /// Explicit COMPOSITE metadata selects composite checks even without a supported
     /// header. A positive `-N` suffix also selects composite checks regardless of type.
-    /// Classification never falls back to later headers.
-    /// Invalid CRC base64 or an unknown CRC type selects [`Self::Unavailable`].
-    /// Returns [`crate::error::ErrorKind::ObjectNotDiscoverable`] when a full-object
-    /// CRC decodes successfully but has the wrong width for its algorithm.
+    /// Classification never falls back to later headers. A CRC whose checksum type
+    /// is neither absent nor FULL_OBJECT selects [`Self::Unavailable`].
+    ///
+    /// Returns [`crate::error::ErrorKind::ObjectNotDiscoverable`] when the selected
+    /// value is malformed: a `-` suffix that isn't a positive part count, or a
+    /// full-object CRC that isn't valid base64 or has the wrong decoded width for
+    /// its algorithm.
     pub(in crate::operation::download) fn from_metadata(
         meta: &ObjectMetadata,
     ) -> Result<Self, Error> {
@@ -73,11 +86,15 @@ impl StoredChecksum {
             ChecksumAlgorithm::Crc32 => Some(CrcAlgorithm::Crc32),
             _ => None,
         };
-        if value
-            .rsplit_once('-')
-            .is_some_and(|(_, count)| count.parse::<u32>().is_ok_and(|count| count > 0))
-        {
-            return Ok(Self::Composite);
+        // Base64 has no `-`, so a `-` always introduces a part count suffix.
+        if let Some((_, count)) = value.rsplit_once('-') {
+            return match count.parse::<u32>() {
+                Ok(count) if count > 0 => Ok(Self::Composite),
+                _ => Err(malformed(
+                    &selected_algorithm,
+                    "has a part count suffix that isn't a positive number",
+                )),
+            };
         }
         let Some(algorithm) = algorithm else {
             return Ok(Self::Ordered);
@@ -85,20 +102,12 @@ impl StoredChecksum {
         if !matches!(meta.checksum_type, None | Some(ChecksumType::FullObject)) {
             return Ok(Self::Unavailable);
         }
-        let decoded = match aws_smithy_types::base64::decode(value) {
-            Ok(decoded) => decoded,
-            Err(_) => {
-                tracing::error!(
-                    target: crate::telemetry::TARGET_TRANSFER_DOWNLOAD,
-                    ?algorithm,
-                    "stored checksum has invalid base64 encoding",
-                );
-                return Ok(Self::Unavailable);
-            }
-        };
+        let decoded = aws_smithy_types::base64::decode(value)
+            .map_err(|_| malformed(&selected_algorithm, "isn't valid base64"))?;
         if decoded.len() != algorithm.width() {
-            return Err(error::discovery_failed(
-                "stored CRC checksum has an invalid decoded width",
+            return Err(malformed(
+                &selected_algorithm,
+                "has the wrong decoded width for its algorithm",
             ));
         }
         Ok(Self::FullObjectCrc {
@@ -234,10 +243,16 @@ mod tests {
         let mut meta = ObjectMetadata::default();
         meta.checksum_crc64_nvme = Some("not base64".into());
         meta.checksum_crc32_c = Some("AAAAAA==".into());
-        assert!(matches!(
-            StoredChecksum::from_metadata(&meta).unwrap(),
-            StoredChecksum::Unavailable
-        ));
+        let error = StoredChecksum::from_metadata(&meta).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            &crate::error::ErrorKind::ObjectNotDiscoverable
+        );
+        let message = format!("{error}: {error:?}");
+        assert!(
+            message.contains("stored CRC64NVME checksum isn't valid base64"),
+            "a malformed preferred header is not replaced by a later one: {message}"
+        );
         meta.checksum_crc64_nvme = Some("AAAAAAAAAAA=".into());
         assert!(matches!(
             StoredChecksum::from_metadata(&meta).unwrap(),
@@ -257,22 +272,59 @@ mod tests {
         ));
     }
 
+    /// Every malformed value for a recognized algorithm fails discovery, naming the
+    /// algorithm and the problem.
     #[test]
-    fn malformed_width_fails_but_invalid_base64_is_unavailable() {
-        for value in ["", "AA==", "AAAAAAAAAAA="] {
+    fn malformed_values_fail_discovery() {
+        let crc32 = |value: &str| {
             let mut meta = ObjectMetadata::default();
             meta.checksum_crc32 = Some(value.into());
+            meta
+        };
+        let sha256 = |value: &str| {
+            let mut meta = ObjectMetadata::default();
+            meta.checksum_sha256 = Some(value.into());
+            meta
+        };
+        for (meta, problem) in [
+            (crc32(""), "wrong decoded width"),
+            (crc32("AA=="), "wrong decoded width"),
+            (crc32("AAAAAAAAAAA="), "wrong decoded width"),
+            (crc32("!"), "isn't valid base64"),
+            (crc32("AAAA AA=="), "isn't valid base64"),
+            (crc32("AAAAAA==-0"), "part count suffix"),
+            (crc32("AAAAAA==-x"), "part count suffix"),
+            (crc32("AAAAAA==-"), "part count suffix"),
+            (sha256("stored-hash"), "part count suffix"),
+        ] {
+            let error = StoredChecksum::from_metadata(&meta).unwrap_err();
             assert_eq!(
-                StoredChecksum::from_metadata(&meta).unwrap_err().kind(),
-                &crate::error::ErrorKind::ObjectNotDiscoverable
+                error.kind(),
+                &crate::error::ErrorKind::ObjectNotDiscoverable,
+                "{meta:?}"
             );
+            let message = format!("{error}: {error:?}");
+            assert!(message.contains(problem), "{meta:?}: {message}");
         }
+    }
+
+    /// Metadata the transfer manager doesn't recognize is ignored rather than failing:
+    /// an unsupported algorithm, or a checksum type other than COMPOSITE or FULL_OBJECT.
+    #[test]
+    fn unrecognized_metadata_is_unavailable() {
         let mut meta = ObjectMetadata::default();
-        meta.checksum_crc32 = Some("!".into());
+        meta.checksum_xxhash64 = Some("AAAAAAAAAAA=".into());
         assert!(matches!(
             StoredChecksum::from_metadata(&meta).unwrap(),
             StoredChecksum::Unavailable
         ));
+
+        let mut meta = ObjectMetadata::default();
+        meta.checksum_crc32 = Some("AAAAAA==".into());
+        meta.checksum_type = Some(ChecksumType::from("FUTURE_TYPE"));
+        let stored = StoredChecksum::from_metadata(&meta).unwrap();
+        assert!(matches!(stored, StoredChecksum::Unavailable));
+        assert!(matches!(stored.into_plan(7), ValidationPlan::PerResponse));
     }
 
     #[test]
