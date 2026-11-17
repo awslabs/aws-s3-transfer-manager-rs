@@ -295,7 +295,7 @@ pub use self::client::Client;
 pub use self::config::Config;
 use self::config::ConfigLoader;
 pub use self::runtime::{ShutdownCompletion, ShutdownError, ShutdownErrorKind};
-pub use self::transfer::SchedulingCtl;
+pub use self::transfer::{AbortHandle, SchedulingCtl};
 
 /// Create a [`ConfigLoader`] that loads configuration from the environment.
 ///
