@@ -103,9 +103,7 @@ pub enum ErrorKind {
 
     /// The transfer manager could not continue for an internal reason that is
     /// neither an input, I/O, nor service failure: a worker panicked while
-    /// executing the transfer, the memory budget could not admit a request, or
-    /// a response violated an invariant the transfer depends on, such as a
-    /// `Content-Range` that does not match the requested range.
+    /// executing the transfer, or the memory budget could not admit a request.
     RuntimeError,
 
     /// Object discovery failed for a reason that is not a service-call error, such
@@ -113,7 +111,9 @@ pub enum ErrorKind {
     ObjectNotDiscoverable,
 
     /// A request to S3 failed, or S3 answered with a response the transfer
-    /// cannot use, such as an UploadPart response without an ETag. The
+    /// cannot use, such as an UploadPart response without an ETag or a ranged
+    /// GetObject or HeadObject response whose `Content-Range` doesn't match the
+    /// requested range. The
     /// originating operation, service error code (when S3 reported one),
     /// message, and request ids are available via the accessors on [`Error`]
     /// ([`Error::operation_name`], [`Error::code`], [`Error::request_id`]).
@@ -744,6 +744,22 @@ pub(crate) fn invalid_service_response<O>(
 where
     O: RequestId + RequestIdExt,
 {
+    invalid_service_response_ids(
+        operation,
+        output.request_id(),
+        output.extended_request_id(),
+        message,
+    )
+}
+
+/// [`invalid_service_response`] for a response already converted to transfer manager
+/// metadata, which carries the request ids but not the SDK's request id traits.
+pub(crate) fn invalid_service_response_ids(
+    operation: &'static str,
+    request_id: Option<&str>,
+    extended_request_id: Option<&str>,
+    message: impl Into<String>,
+) -> Error {
     let message = message.into();
     Error {
         kind: ErrorKind::ServiceError,
@@ -753,8 +769,8 @@ where
                 operation,
                 code: None,
                 message: Some(message),
-                request_id: output.request_id().map(str::to_owned),
-                extended_request_id: output.extended_request_id().map(str::to_owned),
+                request_id: request_id.map(str::to_owned),
+                extended_request_id: extended_request_id.map(str::to_owned),
             }),
             ..Default::default()
         })),

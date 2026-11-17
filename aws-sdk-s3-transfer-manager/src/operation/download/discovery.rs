@@ -344,7 +344,9 @@ fn validate_whole_object_head(
         .and_then(|length| u64::try_from(length).ok())
         .ok_or_else(|| error::discovery_failed("HeadObject has invalid content-length"))?;
     if meta.content_range.is_some() {
-        return Err(error::discovery_failed(
+        return Err(unusable_response(
+            "HeadObject",
+            meta,
             "whole-object HeadObject has unexpected content-range",
         ));
     }
@@ -363,7 +365,7 @@ fn validate_layout_response(
     head: &ObjectMetadata,
     part: &ObjectMetadata,
 ) -> Result<(), error::Error> {
-    let response = validate_response_content_range(part)?;
+    let response = validate_response_content_range("GetObject", part)?;
     if *response.range.start() != 0
         || Some(response.total) != head.content_length.and_then(|len| u64::try_from(len).ok())
         || part.e_tag != head.e_tag
@@ -388,7 +390,24 @@ fn validate_head_response_range(
         .ok_or_else(|| error::discovery_failed("ranged HeadObject request missing range"))
         .and_then(header::Range::from_str)?
         .0;
-    Ok(validate_ranged_response(&requested, object_meta)?.range)
+    Ok(validate_ranged_response("HeadObject", &requested, object_meta)?.range)
+}
+
+/// The error for a discovery response whose range metadata the transfer can't use:
+/// [`ErrorKind::ServiceError`](crate::error::ErrorKind::ServiceError) with `operation`
+/// and the response's request ids, the same as a later range response that fails
+/// the same check.
+fn unusable_response(
+    operation: &'static str,
+    meta: &ObjectMetadata,
+    message: &str,
+) -> error::Error {
+    error::invalid_service_response_ids(
+        operation,
+        meta.request_id(),
+        meta.extended_request_id(),
+        message,
+    )
 }
 
 /// Absolute response offsets and the complete object length.
@@ -407,33 +426,33 @@ struct ValidatedContentRange {
 /// Returns an error when `Content-Range` or `Content-Length` is missing,
 /// malformed, inconsistent, or outside the complete object.
 fn validate_response_content_range(
+    operation: &'static str,
     object_meta: &ObjectMetadata,
 ) -> Result<ValidatedContentRange, error::Error> {
+    let unusable = |message| unusable_response(operation, object_meta, message);
     let content_range = object_meta
         .content_range
         .as_deref()
-        .ok_or_else(|| error::discovery_failed("ranged response missing content-range"))?;
+        .ok_or_else(|| unusable("ranged response missing content-range"))?;
     let response = object_meta
         .range_from_content_range()
-        .ok_or_else(|| error::discovery_failed("ranged response has invalid content-range"))?;
+        .ok_or_else(|| unusable("ranged response has invalid content-range"))?;
     let total = crate::http::header::parse_content_range_total(content_range)
         .filter(|total| *total > 0)
-        .ok_or_else(|| error::discovery_failed("ranged response has invalid object length"))?;
+        .ok_or_else(|| unusable("ranged response has invalid object length"))?;
 
     let start = *response.start();
     let end = *response.end();
     if start > end || end >= total {
-        return Err(error::discovery_failed(
-            "ranged response exceeds the object",
-        ));
+        return Err(unusable("ranged response exceeds the object"));
     }
     let response_len = end - start + 1;
     let content_length = object_meta
         .content_length
         .and_then(|length| u64::try_from(length).ok())
-        .ok_or_else(|| error::discovery_failed("ranged response has invalid content-length"))?;
+        .ok_or_else(|| unusable("ranged response has invalid content-length"))?;
     if content_length != response_len {
-        return Err(error::discovery_failed(
+        return Err(unusable(
             "ranged response length disagrees with content-range",
         ));
     }
@@ -449,10 +468,11 @@ fn validate_response_content_range(
 /// Returns an error when the response headers are invalid or describe a
 /// different range.
 fn validate_ranged_response(
+    operation: &'static str,
     requested: &ByteRange,
     object_meta: &ObjectMetadata,
 ) -> Result<ValidatedContentRange, error::Error> {
-    let validated = validate_response_content_range(object_meta)?;
+    let validated = validate_response_content_range(operation, object_meta)?;
     let start = *validated.range.start();
     let end = *validated.range.end();
     let response_len = end - start + 1;
@@ -468,7 +488,9 @@ fn validate_ranged_response(
         }
     };
     if !matches_request {
-        return Err(error::discovery_failed(
+        return Err(unusable_response(
+            operation,
+            object_meta,
             "ranged response does not match the requested range",
         ));
     }
@@ -584,37 +606,44 @@ fn first_chunk_response_handler(
             u64::try_from(length)
                 .map_err(|_| error::discovery_failed("response has negative content-length"))
         })?;
-    let validated_range = match requested_range {
-        Some(requested) if object_meta.content_range.is_some() => {
-            Some(validate_ranged_response(requested, &object_meta)?)
-        }
-        // Without Content-Range, the response cannot prove whether the
-        // discovery Range was honored. Accept it as a complete object only
-        // when the caller requested the complete object.
-        Some(_) if range_from_user.is_none() => None,
-        Some(_) => {
-            return Err(error::discovery_failed(
-                "ranged response missing content-range",
-            ));
-        }
-        // An empty body contains no offsets to validate. Treat it as an empty
-        // object without parsing an optional Content-Range denominator.
-        None if chunk_content_len == 0 => None,
-        None if object_meta.content_range.is_some() => {
-            let validated = validate_response_content_range(&object_meta)?;
-            if *validated.range.start() != 0 {
-                return Err(error::discovery_failed(
-                    "partNumber response does not start at byte zero",
+    let validated_range =
+        match requested_range {
+            Some(requested) if object_meta.content_range.is_some() => Some(
+                validate_ranged_response("GetObject", requested, &object_meta)?,
+            ),
+            // Without Content-Range, the response cannot prove whether the
+            // discovery Range was honored. Accept it as a complete object only
+            // when the caller requested the complete object.
+            Some(_) if range_from_user.is_none() => None,
+            Some(_) => {
+                return Err(unusable_response(
+                    "GetObject",
+                    &object_meta,
+                    "ranged response missing content-range",
                 ));
             }
-            Some(validated)
-        }
-        None => {
-            return Err(error::discovery_failed(
-                "nonempty partNumber response missing content-range",
-            ));
-        }
-    };
+            // An empty body contains no offsets to validate. Treat it as an empty
+            // object without parsing an optional Content-Range denominator.
+            None if chunk_content_len == 0 => None,
+            None if object_meta.content_range.is_some() => {
+                let validated = validate_response_content_range("GetObject", &object_meta)?;
+                if *validated.range.start() != 0 {
+                    return Err(unusable_response(
+                        "GetObject",
+                        &object_meta,
+                        "partNumber response does not start at byte zero",
+                    ));
+                }
+                Some(validated)
+            }
+            None => {
+                return Err(unusable_response(
+                    "GetObject",
+                    &object_meta,
+                    "nonempty partNumber response missing content-range",
+                ));
+            }
+        };
     let (object_range_start, next_byte, object_size) = match validated_range.as_ref() {
         Some(validated) => (
             *validated.range.start(),
@@ -798,10 +827,8 @@ mod tests {
         )
         .expect_err("response offsets must match the range sent to S3");
 
-        assert_eq!(
-            error.kind(),
-            &crate::error::ErrorKind::ObjectNotDiscoverable
-        );
+        assert_eq!(error.kind(), &crate::error::ErrorKind::ServiceError);
+        assert_eq!(error.operation_name(), Some("GetObject"));
     }
 
     #[test]
@@ -850,10 +877,8 @@ mod tests {
         )
         .expect_err("a user range requires absolute response offsets");
 
-        assert_eq!(
-            error.kind(),
-            &crate::error::ErrorKind::ObjectNotDiscoverable
-        );
+        assert_eq!(error.kind(), &crate::error::ErrorKind::ServiceError);
+        assert_eq!(error.operation_name(), Some("GetObject"));
     }
 
     #[test]
@@ -869,9 +894,10 @@ mod tests {
 
             assert_eq!(
                 error.kind(),
-                &crate::error::ErrorKind::ObjectNotDiscoverable,
+                &crate::error::ErrorKind::ServiceError,
                 "accepted {content_range:?}"
             );
+            assert_eq!(error.operation_name(), Some("GetObject"));
         }
     }
 
@@ -965,10 +991,8 @@ mod tests {
         let error = discover_obj_with_head(&transfer, &input)
             .await
             .expect_err("ranged discovery requires absolute response offsets");
-        assert_eq!(
-            error.kind(),
-            &crate::error::ErrorKind::ObjectNotDiscoverable
-        );
+        assert_eq!(error.kind(), &crate::error::ErrorKind::ServiceError);
+        assert_eq!(error.operation_name(), Some("HeadObject"));
     }
 
     #[test]
@@ -997,9 +1021,10 @@ mod tests {
                 .expect_err("response range must match the request");
             assert_eq!(
                 error.kind(),
-                &crate::error::ErrorKind::ObjectNotDiscoverable,
+                &crate::error::ErrorKind::ServiceError,
                 "{requested} accepted {returned}"
             );
+            assert_eq!(error.operation_name(), Some("HeadObject"));
         }
     }
 
@@ -1424,11 +1449,6 @@ mod tests {
                 .content_length(10)
                 .e_tag("")
                 .build(),
-            HeadObjectOutput::builder()
-                .content_length(10)
-                .e_tag("etag")
-                .content_range("bytes 0-9/10")
-                .build(),
         ] {
             let metadata = crate::sdk_v1::object_metadata_from_head_object(&response);
             assert_eq!(
@@ -1438,6 +1458,16 @@ mod tests {
                 &crate::error::ErrorKind::ObjectNotDiscoverable
             );
         }
+        // A Content-Range on a whole-object HEAD is a response the transfer can't use.
+        let response = HeadObjectOutput::builder()
+            .content_length(10)
+            .e_tag("etag")
+            .content_range("bytes 0-9/10")
+            .build();
+        let metadata = crate::sdk_v1::object_metadata_from_head_object(&response);
+        let error = super::validate_whole_object_head(&metadata).unwrap_err();
+        assert_eq!(error.kind(), &crate::error::ErrorKind::ServiceError);
+        assert_eq!(error.operation_name(), Some("HeadObject"));
         let response = HeadObjectOutput::builder().content_length(0).build();
         let metadata = crate::sdk_v1::object_metadata_from_head_object(&response);
         assert!(super::validate_whole_object_head(&metadata)

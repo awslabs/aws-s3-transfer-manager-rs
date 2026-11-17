@@ -1232,6 +1232,11 @@ impl DownloadTransfer {
         // the retry loop.
         let mut req_metrics = self.start_request(DownloadRequestKind::Range);
         let retry_classify = crate::retry::classify_body_retry;
+        let object_len = self
+            .inner
+            .object_meta
+            .get()
+            .map(ObjectMetadata::total_object_size);
         let result =
             crate::retry::retry(req_metrics.metrics_mut(), retry_classify, |allow_hedge| {
                 let rh = range_header.clone();
@@ -1258,7 +1263,15 @@ impl DownloadTransfer {
                     let resp = recv_latencies
                         .guarded(allow_hedge, async move {
                             let resp = req.send().await.map_err(error::service_error)?;
-                            validate_content_range(&rh_validate, resp.content_range())?;
+                            validate_content_range(
+                                &rh_validate,
+                                resp.content_range(),
+                                resp.content_length(),
+                                object_len,
+                            )
+                            .map_err(|message| {
+                                error::invalid_service_response("GetObject", &resp, message)
+                            })?;
                             Ok::<_, crate::error::Error>(resp)
                         })
                         .await?;
@@ -1770,26 +1783,37 @@ fn parse_byte_range(s: &str) -> Option<(u64, u64)> {
     (start <= end).then_some((start, end))
 }
 
-/// Validate that the response Content-Range matches the requested range.
+/// Validate that a range response delivered the requested range.
 ///
-/// Both the requested range and the response are parsed to numeric `(start, end)` and
-/// compared for equality. Returns `Err` when either side is absent or unparseable, or
-/// when the parsed ranges differ.
+/// Both the requested range and the response's Content-Range are parsed to numeric
+/// `(start, end)` and compared for equality. A response without Content-Range is
+/// accepted only when the request covers the whole `object_len`-byte object and the
+/// response's Content-Length is `object_len`, as from a server that ignores Range
+/// and returns the complete object with `200 OK`. Those bytes are exactly the
+/// requested range. Returns the mismatch description otherwise.
 fn validate_content_range(
     requested_range: &str,
     response_content_range: Option<&str>,
-) -> Result<(), Error> {
+    response_content_length: Option<i64>,
+    object_len: Option<u64>,
+) -> Result<(), String> {
     let requested = parse_byte_range(requested_range);
     let response = response_content_range.and_then(parse_byte_range);
 
+    let whole_object = |len: u64| len.checked_sub(1).map(|end| (0, end));
     match (requested, response) {
         (Some(req), Some(resp)) if req == resp => Ok(()),
-        _ => Err(error::Error::new(
-            error::ErrorKind::RuntimeError,
-            format!(
-                "content range mismatch: requested {}, response {:?}",
-                requested_range, response_content_range
-            ),
+        (Some(req), None)
+            if response_content_range.is_none()
+                && object_len.and_then(whole_object) == Some(req)
+                && response_content_length.and_then(|len| u64::try_from(len).ok())
+                    == object_len =>
+        {
+            Ok(())
+        }
+        _ => Err(format!(
+            "content range mismatch: requested {}, response {:?}",
+            requested_range, response_content_range
         )),
     }
 }
@@ -4803,51 +4827,85 @@ mod tests {
 
     #[test]
     fn test_validate_content_range_success() {
-        assert!(validate_content_range("bytes=1024-2047", Some("bytes 1024-2047/4096")).is_ok());
-        assert!(validate_content_range("1024-2047", Some("bytes 1024-2047/4096")).is_ok());
+        assert!(validate_content_range(
+            "bytes=1024-2047",
+            Some("bytes 1024-2047/4096"),
+            None,
+            None
+        )
+        .is_ok());
+        assert!(
+            validate_content_range("1024-2047", Some("bytes 1024-2047/4096"), None, None).is_ok()
+        );
     }
 
     #[test]
     fn test_validate_content_range_mismatch() {
-        assert!(validate_content_range("bytes=1024-2047", Some("bytes 2048-3071/4096")).is_err());
+        assert!(validate_content_range(
+            "bytes=1024-2047",
+            Some("bytes 2048-3071/4096"),
+            None,
+            None
+        )
+        .is_err());
     }
 
     #[test]
     fn test_validate_content_range_missing() {
-        assert!(validate_content_range("bytes=1024-2047", None).is_err());
+        assert!(validate_content_range("bytes=1024-2047", None, None, None).is_err());
     }
 
     #[test]
     fn test_validate_content_range_substring_false_positive() {
         // The substring "0-9" appears in "bytes 10-99/100", but the ranges differ.
         // A naive `.contains()` match would wrongly pass this.
-        assert!(validate_content_range("bytes=0-9", Some("bytes 10-99/100")).is_err());
+        assert!(validate_content_range("bytes=0-9", Some("bytes 10-99/100"), None, None).is_err());
     }
 
     #[test]
     fn test_validate_content_range_exact_match_small_range() {
-        assert!(validate_content_range("bytes=0-9", Some("bytes 0-9/100")).is_ok());
+        assert!(validate_content_range("bytes=0-9", Some("bytes 0-9/100"), None, None).is_ok());
     }
 
     #[test]
     fn test_validate_content_range_unsized_total() {
         // RFC 7233 allows `bytes START-END/*` when the total is unknown.
-        assert!(validate_content_range("bytes=0-9", Some("bytes 0-9/*")).is_ok());
+        assert!(validate_content_range("bytes=0-9", Some("bytes 0-9/*"), None, None).is_ok());
     }
 
     #[test]
     fn test_validate_content_range_large_range_match() {
-        assert!(validate_content_range("bytes=100-199", Some("bytes 100-199/500")).is_ok());
+        assert!(
+            validate_content_range("bytes=100-199", Some("bytes 100-199/500"), None, None).is_ok()
+        );
     }
 
     #[test]
     fn test_validate_content_range_response_none() {
-        assert!(validate_content_range("bytes=0-9", None).is_err());
+        assert!(validate_content_range("bytes=0-9", None, None, None).is_err());
+    }
+
+    /// A server that ignores Range may answer a request for the whole object with the
+    /// complete object and no Content-Range. Only a whole-object request whose response
+    /// length is the object's length is accepted.
+    #[test]
+    fn test_validate_content_range_complete_response_without_content_range() {
+        assert!(validate_content_range("bytes=0-4", None, Some(5), Some(5)).is_ok());
+        // Part of the object, even if the response length matches the request.
+        assert!(validate_content_range("bytes=0-4", None, Some(5), Some(10)).is_err());
+        assert!(validate_content_range("bytes=5-9", None, Some(10), Some(10)).is_err());
+        // The whole object, but the response length is wrong or missing.
+        assert!(validate_content_range("bytes=0-4", None, Some(4), Some(5)).is_err());
+        assert!(validate_content_range("bytes=0-4", None, None, Some(5)).is_err());
+        // The object length is unknown.
+        assert!(validate_content_range("bytes=0-4", None, Some(5), None).is_err());
+        // A Content-Range that is present must still match.
+        assert!(validate_content_range("bytes=0-4", Some("bytes abc"), Some(5), Some(5)).is_err());
     }
 
     #[test]
     fn test_validate_content_range_garbage_response() {
-        assert!(validate_content_range("bytes=0-9", Some("bytes abc")).is_err());
+        assert!(validate_content_range("bytes=0-9", Some("bytes abc"), None, None).is_err());
     }
 
     #[test]

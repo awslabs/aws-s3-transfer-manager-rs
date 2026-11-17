@@ -1498,6 +1498,76 @@ async fn test_integrity_checks_surfaces_whole_object_checksum() {
     );
 }
 
+/// A server that ignores `Range` answers a GET for the whole object with `200 OK`,
+/// the complete object and no `Content-Range`. HEAD gave the object's length, so
+/// those are exactly the requested bytes.
+#[tokio::test]
+async fn test_whole_object_download_accepts_a_complete_response_without_content_range() {
+    let data = Bytes::from_static(HELLO);
+    let complete = http::Response::builder()
+        .status(200)
+        .header("Content-Length", data.len().to_string())
+        .header("ETag", "\"my-etag\"")
+        .body(SdkBody::from(data.clone()))
+        .unwrap();
+    let http_client = StaticReplayClient::new(vec![
+        head_with_headers(data.len(), "\"my-etag\"", &[]),
+        ReplayEvent::new(dummy_expected_request(), complete),
+    ]);
+    let tm = test_tm(http_client.clone(), ByteSize::mib(5).as_usize());
+
+    let mut handle = tm
+        .download()
+        .bucket("test-bucket")
+        .key("test-object")
+        .initiate()
+        .unwrap();
+    assert_eq!(drain(&mut handle).await.unwrap(), data);
+    handle.join().await.expect("download");
+    let methods: Vec<_> = http_client
+        .actual_requests()
+        .map(|request| request.method().to_owned())
+        .collect();
+    assert_eq!(methods, ["HEAD", "GET"]);
+}
+
+/// A server that ignores `Range` returns the complete object for a request of part of
+/// it. Those aren't the requested bytes, so the download fails with a service error
+/// that names the operation and the response's request id.
+#[tokio::test]
+async fn test_range_response_without_content_range_fails_with_service_error() {
+    let part_size = ByteSize::mib(5).as_usize();
+    let data = rand_data(part_size + 1024);
+    let complete = || {
+        http::Response::builder()
+            .status(200)
+            .header("Content-Length", data.len().to_string())
+            .header("ETag", "\"my-etag\"")
+            .header("x-amz-request-id", "range-ignoring-request")
+            .body(SdkBody::from(data.clone()))
+            .unwrap()
+    };
+    let http_client = StaticReplayClient::new(vec![
+        head_with_headers(data.len(), "\"my-etag\"", &[]),
+        ReplayEvent::new(dummy_expected_request(), complete()),
+        ReplayEvent::new(dummy_expected_request(), complete()),
+    ]);
+    let tm = test_tm(http_client, part_size);
+
+    let mut handle = tm
+        .download()
+        .bucket("test-bucket")
+        .key("test-object")
+        .initiate()
+        .unwrap();
+    let _ = drain(&mut handle).await;
+    let error = handle.join().await.unwrap_err();
+    assert_eq!(error.kind(), &ErrorKind::ServiceError, "{error:?}");
+    assert_eq!(error.operation_name(), Some("GetObject"));
+    assert_eq!(error.request_id(), Some("range-ignoring-request"));
+    assert_eq!(error.code(), None);
+}
+
 /// A checksum-mode HEAD response for `len` bytes with `etag` and `headers`.
 fn head_with_headers(len: usize, etag: &str, headers: &[(&str, &str)]) -> ReplayEvent {
     let mut response = http::Response::builder()

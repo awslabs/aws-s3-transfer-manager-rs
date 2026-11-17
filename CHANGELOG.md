@@ -71,6 +71,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ByteSize`'s `Display` replaces `ByteUnit::display`.
   `ByteCountDisplayContext` is renamed `ByteSizeDisplayContext`, and `ByteSize::display_as` is its
   only constructor: `ByteCountDisplayContext::new` is removed.
+- A download response whose `Content-Range` doesn't match the requested range fails with
+  `ErrorKind::ServiceError`, carrying the operation and the response's request ids, whether discovery
+  or a later range received it. It previously failed with `ErrorKind::ObjectNotDiscoverable` in
+  discovery and `ErrorKind::RuntimeError` afterwards.
+- A ranged GET that covers the whole object accepts a `200 OK` response without `Content-Range` when
+  its `Content-Length` is the object's length, as from a server that ignores `Range`.
 - Whole-object downloads with checksum validation enabled start with checksum-mode HEAD.
   `IntegrityChecks` reports its stored object checksum values for split downloads as well as
   single-response downloads, except a COMPOSITE value, for which it reports only the type. Small nonempty objects use HEAD plus GET instead of a single GET;
