@@ -158,12 +158,15 @@ pub(super) async fn discover_obj(
     // A `download_objects` child whose listed object fits in one range skips HEAD: one
     // checksum-mode GET pinned to the listed ETag returns the whole object with its
     // checksum. A caller's If-Match takes precedence, and an empty object keeps HEAD,
-    // since S3 rejects a Range on an empty object.
+    // since S3 rejects a Range on an empty object. A multipart object keeps HEAD too:
+    // a single GET of a COMPOSITE object carries only the composite value, which can't
+    // validate the bytes, while HEAD discovery validates each stored part.
     let listed = transfer.listed_object().filter(|listed| {
         whole_object_validation
             && input.if_match().is_none()
             && listed.size != 0
             && listed.size <= configured_part_size
+            && parts_from_etag(&listed.e_tag).is_none()
     });
     let mut listed_get = false;
     let mut discovery = match (strategy, listed) {

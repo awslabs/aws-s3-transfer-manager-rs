@@ -86,8 +86,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `IntegrityChecks` reports its stored object checksum values for split downloads as well as
   single-response downloads, except a COMPOSITE value, for which it reports only the type. Small
   nonempty objects use HEAD plus GET instead of a single GET, except in `download_objects`: a listed
-  object no larger than the part size is downloaded with one checksum-mode GET pinned to its listed
-  ETag, falling back to HEAD if the object changed since the listing. Caller-range and
+  single-part object no larger than the part size is downloaded with one checksum-mode GET pinned to
+  its listed ETag, falling back to HEAD if the object changed since the listing. Caller-range and
   validation-off downloads retain their existing discovery paths.
 - `aws-sdk-s3-transfer-manager`, `aws-sdk-s3-transfer-manager-ext`, `aws-smithy-topology`,
   `aws-smithy-execution` and `aws-smithy-managed-http`: the minimum supported Rust version is

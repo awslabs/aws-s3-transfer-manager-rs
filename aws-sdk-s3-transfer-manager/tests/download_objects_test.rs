@@ -966,8 +966,8 @@ async fn test_abort_stops_child_get_before_temp_file_cleanup() {
 
 /// A listed object that fits in one range is downloaded with a single GET pinned to
 /// the listed ETag, without HeadObject. An object that changed since the listing
-/// (412), one listed larger than a range, and an empty one discover the object with
-/// HeadObject as any download does.
+/// (412), one listed larger than a range, an empty one, and a multipart one discover
+/// the object with HeadObject as any download does.
 #[tokio::test]
 async fn test_listed_object_that_fits_one_range_skips_head() {
     const PART_SIZE: u64 = 8 * 1024 * 1024;
@@ -1010,6 +1010,7 @@ async fn test_listed_object_that_fits_one_range_skips_head() {
             .contents(listed("changed", 11, "\"stale\""))
             .contents(listed("large", PART_SIZE as i64 + 1, "\"listed-large\""))
             .contents(listed("empty", 0, "\"empty\""))
+            .contents(listed("multipart", 11, "\"abc-2\""))
             .build()
     });
     let small_get = mock!(aws_sdk_s3::Client::get_object)
@@ -1029,6 +1030,9 @@ async fn test_listed_object_that_fits_one_range_skips_head() {
     let large_head = head("large").then_output(head_output(11, "\"large\""));
     let large_get = get("large", "\"large\"").then_output(get_output(b"hello world", "\"large\""));
     let empty_head = head("empty").then_output(head_output(0, "\"empty\""));
+    let multipart_head = head("multipart").then_output(head_output(11, "\"abc-2\""));
+    let multipart_get =
+        get("multipart", "\"abc-2\"").then_output(get_output(b"hello world", "\"abc-2\""));
 
     let client = mock_client!(
         aws_sdk_s3,
@@ -1043,6 +1047,8 @@ async fn test_listed_object_that_fits_one_range_skips_head() {
             &large_head,
             &large_get,
             &empty_head,
+            &multipart_head,
+            &multipart_get,
         ]
     );
     let config = aws_sdk_s3_transfer_manager::Config::builder()
@@ -1064,7 +1070,7 @@ async fn test_listed_object_that_fits_one_range_skips_head() {
         .await
         .unwrap();
 
-    assert_eq!(output.objects_downloaded(), 4);
+    assert_eq!(output.objects_downloaded(), 5);
     assert_eq!(small_get.num_calls(), 1);
     assert_eq!(
         small_head.num_calls(),
@@ -1081,6 +1087,12 @@ async fn test_listed_object_that_fits_one_range_skips_head() {
     );
     assert_eq!(large_get.num_calls(), 1);
     assert_eq!(empty_head.num_calls(), 1, "an empty object uses HEAD");
+    assert_eq!(
+        multipart_head.num_calls(),
+        1,
+        "a multipart object uses HEAD"
+    );
+    assert_eq!(multipart_get.num_calls(), 1);
     assert_eq!(
         std::fs::read(dest.path().join("small")).unwrap(),
         b"hello world"
