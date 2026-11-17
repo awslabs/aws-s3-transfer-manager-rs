@@ -144,8 +144,8 @@ impl PoolDiagnosticDelta {
 
         Self {
             reservation_enqueues: counter_delta(
-                current.memory.reservation_enqueues_total(),
-                previous.memory.reservation_enqueues_total(),
+                current.memory.waits_total(),
+                previous.memory.waits_total(),
             ),
             optimistic_scans,
             optimistic_scan_words,
@@ -235,15 +235,15 @@ fn emit_snapshot(
         target: crate::telemetry::TARGET_MEMORY,
         configured_interval_ms = interval.as_millis(),
         elapsed_ms = elapsed.as_millis(),
-        configured_capacity_bytes = current.memory.configured_capacity_bytes(),
-        admission_used_bytes = current.memory.admission_used_bytes(),
+        configured_capacity_bytes = current.memory.capacity_bytes(),
+        admission_used_bytes = current.memory.admitted_bytes(),
         admission_overage_bytes = current.memory.admission_overage_bytes(),
         active_planned_demand_bytes = current.memory.active_planned_demand_bytes(),
-        charged_capacity_bytes = current.memory.charged_capacity_bytes(),
+        charged_capacity_bytes = current.memory.in_use_bytes(),
         prepared_capacity_bytes = current.memory.prepared_capacity_bytes(),
-        queued_reservations = current.memory.queued_reservations(),
+        queued_reservations = current.memory.waiting_requests(),
         queued_reservations_peak = current.queue.peak_depth,
-        reservation_enqueues_total = current.memory.reservation_enqueues_total(),
+        reservation_enqueues_total = current.memory.waits_total(),
         reservation_enqueues_delta = delta.reservation_enqueues,
         reservation_queue_nonempty = current.queue.current_depth != 0,
         reservation_queue_nonempty_duration_ms =

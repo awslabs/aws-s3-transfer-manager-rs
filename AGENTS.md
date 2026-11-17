@@ -52,6 +52,7 @@ Some changes need a check that CI runs as a separate job:
 | Change | Command |
 |---|---|
 | Documentation or doc comments | `RUSTDOCFLAGS="-Dwarnings --cfg docsrs" cargo +nightly doc --lib --no-deps --document-private-items` |
+| `[package.metadata.docs.rs]` or public items behind a feature or `cfg` | `just docs` (requires `cargo install cargo-docs-rs`) |
 | Anything under `fuzz/` | `cargo fmt --manifest-path fuzz/Cargo.toml -- --check`, then `RUSTFLAGS='--cfg s3_tm_fuzz' .github/scripts/run-fuzz-targets.sh smoke` |
 | Atomics, the wake protocol, `runtime/sync` | `LOOM_MAX_PREEMPTIONS=3 RUSTFLAGS='--cfg s3_tm_loom' cargo test -p aws-sdk-s3-transfer-manager --lib --release -- loom_tests` |
 | `unsafe` code, buffer ownership | `MIRIFLAGS='-Zmiri-disable-isolation -Zmiri-strict-provenance -Zmiri-recursive-validation' cargo +nightly miri test -p aws-sdk-s3-transfer-manager --lib` |

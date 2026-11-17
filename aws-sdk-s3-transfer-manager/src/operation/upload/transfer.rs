@@ -881,7 +881,7 @@ impl UploadTransfer {
                 let state = self.inner.state.lock().expect("lock poisoned");
                 return self.fail(
                     state,
-                    e.into(),
+                    crate::error::service_error(e),
                     FailedRequest::CreateMpu { upload_id: None },
                 );
             }
@@ -1295,7 +1295,7 @@ impl UploadTransfer {
                         part_number,
                     ))
                     .await
-                    .map_err(|e| crate::retry::GuardError::Inner(crate::error::Error::from(e)))
+                    .map_err(|e| crate::retry::GuardError::Inner(crate::error::service_error(e)))
             }
         })
         .instrument(tracing::trace_span!(
@@ -1477,7 +1477,7 @@ impl UploadTransfer {
                         "send-put-object",
                     ))
                     .await
-                    .map_err(|e| crate::retry::GuardError::Inner(crate::error::Error::from(e)))
+                    .map_err(|e| crate::retry::GuardError::Inner(crate::error::service_error(e)))
             }
         })
         .instrument(tracing::trace_span!(
@@ -1646,7 +1646,7 @@ impl UploadTransfer {
         let resp = match response {
             Ok(resp) => resp,
             Err(e) => {
-                let error: Error = e.into();
+                let error = crate::error::service_error(e);
                 // The TM SEP requires a warning with the upload ID and cause.
                 tracing::warn!(
                     target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
@@ -1770,7 +1770,7 @@ impl UploadTransfer {
                     // and its error says nothing about the object.
                     return WorkOutcome::Success { data: None };
                 }
-                let error: Error = e.into();
+                let error = crate::error::service_error(e);
                 tracing::warn!(
                     target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
                     upload_id = %upload_id,

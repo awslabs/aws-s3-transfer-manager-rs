@@ -106,15 +106,15 @@ pub(crate) async fn mock_tm_with(
         aws_sdk_s3_transfer_manager::config::Builder,
     ) -> aws_sdk_s3_transfer_manager::config::Builder,
 ) -> MockTm {
-    mock_tm_with_s3_config(runtime, |s3| s3, configure).await
+    mock_tm_with_s3_config(runtime, |shared| shared, configure).await
 }
 
-/// Build a mock TM, applying `configure_s3` to the mock server's
-/// [`S3ClientConfig`] (runtime-HTTP options) and `configure` to the TM Config
-/// builder.
+/// Build a mock TM, applying `configure_shared` to the mock server's shared
+/// configuration, from which the transfer manager builds its S3 client, and
+/// `configure` to the TM Config builder.
 pub(crate) async fn mock_tm_with_s3_config(
     runtime: RuntimeConfig,
-    configure_s3: impl FnOnce(S3ClientConfig) -> S3ClientConfig,
+    configure_shared: impl FnOnce(aws_types::sdk_config::Builder) -> aws_types::sdk_config::Builder,
     configure: impl FnOnce(
         aws_sdk_s3_transfer_manager::config::Builder,
     ) -> aws_sdk_s3_transfer_manager::config::Builder,
@@ -129,7 +129,7 @@ pub(crate) async fn mock_tm_with_s3_config(
         .create_bucket("test-bucket")
         .await
         .expect("create bucket");
-    let s3_config = configure_s3(mock_s3_config(&handle).await);
+    let s3_config = mock_s3_config(&handle, configure_shared).await;
     let cfg = configure(aws_sdk_s3_transfer_manager::Config::builder().s3_config(s3_config))
         .runtime_config(runtime)
         .build()
@@ -142,10 +142,16 @@ pub(crate) async fn mock_tm_with_s3_config(
 }
 
 /// S3 client configuration for the mock server: its endpoint, test
-/// credentials, region, and path-style addressing. The transfer manager builds
-/// the client from it and installs the runtime's HTTP transport.
-async fn mock_s3_config(handle: &s3_mock_server::ServerHandle) -> S3ClientConfig {
-    S3ClientConfig::new(&handle.shared_config().await)
+/// credentials, region, and path-style addressing, with `configure_shared`
+/// applied to the shared configuration. The transfer manager builds the client
+/// from it and, unless `configure_shared` sets an HTTP client, installs the
+/// runtime's HTTP transport.
+async fn mock_s3_config(
+    handle: &s3_mock_server::ServerHandle,
+    configure_shared: impl FnOnce(aws_types::sdk_config::Builder) -> aws_types::sdk_config::Builder,
+) -> S3ClientConfig {
+    let shared = configure_shared(handle.shared_config().await.into_builder()).build();
+    S3ClientConfig::new(&shared)
 }
 
 // ---------------------------------------------------------------------------

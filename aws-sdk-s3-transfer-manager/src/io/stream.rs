@@ -293,13 +293,10 @@ impl StreamContext {
         self.part_size
     }
 
-    /// Creates empty pooled storage for one part produced by this stream.
-    ///
-    /// Creating the buffer does not reserve memory. The stream must retain the
-    /// [`PartBuffer`] across `Poll::Pending` and call
-    /// [`PartBuffer::poll_acquire`] before writing.
-    pub fn part_buffer(&self) -> PartBuffer {
-        PartBuffer::new(self.buffer_pool.clone(), self.part_size)
+    /// Creates an empty [`PartBuffer`] of [`Self::part_size`] bytes, charged to this context's
+    /// pool.
+    pub(crate) fn part_buffer(&self) -> PartBuffer {
+        PartBuffer::new(&self.buffer_pool, self.part_size)
     }
 
     /// Whether file I/O should run directly on the calling thread.
@@ -434,11 +431,7 @@ pub trait PartStream {
     /// retained in `Self`; dropping them and recreating the operation on the next poll can lose
     /// progress or notification. A later poll may use a different thread and a different waker.
     ///
-    /// Implementations must return promptly and must not block the executor thread. Sources that
-    /// need transfer-manager-owned storage can create a [`PartBuffer`] through
-    /// [`StreamContext::part_buffer`]. Creating the buffer does not reserve memory. Retain it in
-    /// `Self` across `Pending`, poll its admission before writing, and freeze it only after the
-    /// complete part is available.
+    /// Implementations must return promptly and must not block the executor thread.
     fn poll_part(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,

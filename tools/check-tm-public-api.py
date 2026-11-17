@@ -65,7 +65,8 @@ def check_ordinary():
                 ignore=shutil.ignore_patterns("target", ".git"),
             )
         # The snapshot omits the extension crate, so it also omits the TM
-        # dev-dependency on it, which only `--cfg s3_tm_dial9` builds use.
+        # dev-dependencies on it, which only examples and tests use: the
+        # `--cfg s3_tm_dial9` table and the extension crate's own entry.
         tm_manifest = snapshot / TM / "Cargo.toml"
         text, removed = re.subn(
             r"^\[target\.'cfg\(s3_tm_dial9\)'\.dev-dependencies\]\n(?:(?!\[).*\n)*",
@@ -76,6 +77,11 @@ def check_ordinary():
         )
         if removed != 1:
             raise RuntimeError("expected one s3_tm_dial9 dev-dependency table")
+        text, removed = re.subn(
+            r"^aws-sdk-s3-transfer-manager-ext = .*\n", "", text, flags=re.M
+        )
+        if removed != 1:
+            raise RuntimeError("expected one extension-crate dev-dependency")
         tm_manifest.write_text(text)
 
         manifest = (ROOT / "Cargo.toml").read_text()

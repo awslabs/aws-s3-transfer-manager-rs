@@ -1070,7 +1070,7 @@ impl DownloadTransfer {
                                 req.send()
                                     .await
                                     .map(|resp| resp.body)
-                                    .map_err(crate::error::Error::from)
+                                    .map_err(error::service_error)
                             })
                             .await?;
                         (body, checksum)
@@ -1217,7 +1217,7 @@ impl DownloadTransfer {
                     let rh_validate = rh.clone();
                     let resp = recv_latencies
                         .guarded(allow_hedge, async move {
-                            let resp = req.send().await.map_err(crate::error::Error::from)?;
+                            let resp = req.send().await.map_err(error::service_error)?;
                             validate_content_range(&rh_validate, resp.content_range())?;
                             Ok::<_, crate::error::Error>(resp)
                         })
@@ -1992,9 +1992,9 @@ mod tests {
             1,
             "transport owner must drop after its frame is copied"
         );
-        assert_ne!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_ne!(pool.metrics().in_use_bytes(), 0);
         assert_eq!(output.copy_to_bytes(EXPECTED_LEN).as_ref(), expected);
-        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_eq!(pool.metrics().in_use_bytes(), 0);
     }
 
     #[test]
@@ -2016,7 +2016,7 @@ mod tests {
 
         assert_eq!(error.kind(), &error::ErrorKind::IOError);
         assert_eq!(pool.acquisition_attempts(), acquisitions_before);
-        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_eq!(pool.metrics().in_use_bytes(), 0);
     }
 
     #[test]
@@ -2037,7 +2037,7 @@ mod tests {
         let error = collect_ready(&pool, short, &reservation, EXPECTED_LEN)
             .expect_err("short attempt unexpectedly succeeded");
         assert_eq!(error.kind(), &error::ErrorKind::IOError);
-        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_eq!(pool.metrics().in_use_bytes(), 0);
 
         let expected: Vec<u8> = (0..EXPECTED_LEN)
             .map(|index| (index.wrapping_mul(17) % 251) as u8)
@@ -2056,12 +2056,12 @@ mod tests {
         );
         reservation.close_acquisition();
         assert_ne!(
-            pool.metrics().charged_capacity_bytes(),
+            pool.metrics().in_use_bytes(),
             0,
             "immutable output retains pooled owners after reservation close"
         );
         drop(output);
-        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_eq!(pool.metrics().in_use_bytes(), 0);
     }
 
     #[test]
@@ -2079,7 +2079,7 @@ mod tests {
             .expect_err("oversized attempt unexpectedly succeeded");
 
         assert_eq!(error.kind(), &error::ErrorKind::IOError);
-        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_eq!(pool.metrics().in_use_bytes(), 0);
     }
 
     #[test]
@@ -2093,7 +2093,7 @@ mod tests {
             .expect_err("cancelled attempt unexpectedly succeeded");
 
         assert_eq!(error.kind(), &error::ErrorKind::OperationCancelled);
-        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_eq!(pool.metrics().in_use_bytes(), 0);
     }
 
     #[test]
@@ -2108,12 +2108,12 @@ mod tests {
             .expect_err("acquisition escaped its reservation envelope");
 
         assert_eq!(error.kind(), &error::ErrorKind::RuntimeError);
-        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_eq!(pool.metrics().in_use_bytes(), 0);
         drop(
             pool.acquire(&reservation, 1)
                 .expect("failed acquisition did not consume direct authority"),
         );
-        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_eq!(pool.metrics().in_use_bytes(), 0);
     }
 
     // ref: RUST-1676
@@ -2733,7 +2733,7 @@ mod tests {
         let task = tokio::spawn(async move { execute(&executing, &mut work).await });
 
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while pool.metrics().queued_reservations() != 1 {
+            while pool.metrics().waiting_requests() != 1 {
                 tokio::task::yield_now().await;
             }
         })
@@ -3019,7 +3019,7 @@ mod tests {
             "the completed discovery response has closed acquisition authority"
         );
         assert_eq!(
-            pool.metrics().admission_used_bytes(),
+            pool.metrics().admitted_bytes(),
             part_size,
             "the delivered discovery payload remains charged"
         );
@@ -3027,12 +3027,12 @@ mod tests {
         // The discovery chunk plus one range exactly fill configured capacity.
         let _w1 = assert_ready(transfer.poll_work());
         assert_eq!(pool.metrics().active_planned_demand_bytes(), part_size);
-        assert_eq!(pool.metrics().admission_used_bytes(), 2 * part_size);
+        assert_eq!(pool.metrics().admitted_bytes(), 2 * part_size);
 
         // Part 2 cannot fit and waits in the memory-admission FIFO, holding
         // the claimed slot in `pending` until a chunk frees.
         assert_pending(transfer.poll_work());
-        assert_eq!(pool.metrics().queued_reservations(), 1);
+        assert_eq!(pool.metrics().waiting_requests(), 1);
         {
             let state = transfer.inner.state.lock().unwrap();
             match &*state {
@@ -3047,11 +3047,11 @@ mod tests {
         // grants that capacity directly to the FIFO head.
         drop(consumer.try_take_next().expect("discovery chunk is filled"));
         assert_eq!(
-            pool.metrics().admission_used_bytes(),
+            pool.metrics().admitted_bytes(),
             2 * part_size,
             "freed capacity re-granted to the memory waiter"
         );
-        assert_eq!(pool.metrics().queued_reservations(), 0);
+        assert_eq!(pool.metrics().waiting_requests(), 0);
 
         // Poll #3: the waiting claim was granted, so it is ready and no longer pending.
         let _w2 = assert_ready(transfer.poll_work());
@@ -3145,7 +3145,7 @@ mod tests {
         let _w1 = assert_ready(transfer.poll_work());
         assert_pending(transfer.poll_work());
         assert_eq!(
-            pool.metrics().queued_reservations(),
+            pool.metrics().waiting_requests(),
             1,
             "part 2's reservation is queued for memory"
         );
@@ -3158,7 +3158,7 @@ mod tests {
         // held slot released. The queue is empty, so a freed chunk cannot be misgranted
         // to the dead transfer.
         assert_eq!(
-            pool.metrics().queued_reservations(),
+            pool.metrics().waiting_requests(),
             0,
             "cancel must dequeue the memory waiter"
         );
@@ -3170,7 +3170,7 @@ mod tests {
             "only part 1 retains acquisition authority; the waiter was not granted"
         );
         assert_eq!(
-            pool.metrics().admission_used_bytes(),
+            pool.metrics().admitted_bytes(),
             2 * part_size,
             "the discovery payload and part-1 reservation remain charged"
         );
@@ -3200,7 +3200,7 @@ mod tests {
         let task = tokio::spawn(async move { execute(&executing, &mut work).await });
 
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while pool.metrics().queued_reservations() != 1 {
+            while pool.metrics().waiting_requests() != 1 {
                 tokio::task::yield_now().await;
             }
         })
@@ -3212,7 +3212,7 @@ mod tests {
 
         assert!(matches!(task.await.unwrap(), WorkOutcome::Cancelled));
         assert_eq!(
-            pool.metrics().queued_reservations(),
+            pool.metrics().waiting_requests(),
             0,
             "terminal notification must cancel the discovery reservation future"
         );
@@ -3241,7 +3241,7 @@ mod tests {
         let _w1 = assert_ready(transfer.poll_work());
         assert_pending(transfer.poll_work());
         assert_eq!(
-            pool.metrics().queued_reservations(),
+            pool.metrics().waiting_requests(),
             1,
             "part 2's reservation is queued for memory"
         );
@@ -3256,7 +3256,7 @@ mod tests {
 
         // The waiting PendingClaim was dropped by `enter_terminal`.
         assert_eq!(
-            pool.metrics().queued_reservations(),
+            pool.metrics().waiting_requests(),
             0,
             "fail must dequeue the memory waiter"
         );
@@ -3266,7 +3266,7 @@ mod tests {
             "only part 1 retains acquisition authority; the waiter was not granted"
         );
         assert_eq!(
-            pool.metrics().admission_used_bytes(),
+            pool.metrics().admitted_bytes(),
             2 * part_size,
             "the discovery payload and part-1 reservation remain charged"
         );
@@ -4230,7 +4230,7 @@ mod tests {
             "all reservations released after both transfers complete"
         );
         assert_eq!(
-            pool.metrics().queued_reservations(),
+            pool.metrics().waiting_requests(),
             0,
             "no memory waiters remain"
         );
@@ -4319,7 +4319,7 @@ mod tests {
         fill_resident(&b, resident_per_transfer).await;
 
         assert_eq!(
-            pool.metrics().admission_used_bytes(),
+            pool.metrics().admitted_bytes(),
             capacity_bytes as u64,
             "both transfers hold charged resident parts; memory budget is exactly full"
         );
@@ -4339,7 +4339,7 @@ mod tests {
             "all reservations released after both large multipart transfers complete"
         );
         assert_eq!(
-            pool.metrics().queued_reservations(),
+            pool.metrics().waiting_requests(),
             0,
             "no memory waiters remain"
         );

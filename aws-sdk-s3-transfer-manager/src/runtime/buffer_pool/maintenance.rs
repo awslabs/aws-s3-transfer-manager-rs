@@ -1520,7 +1520,7 @@ mod loom_tests {
             let _ = reclaim.join().unwrap();
             let owned = claim.join().unwrap().unwrap();
             drop(owned);
-            assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+            assert_eq!(pool.metrics().in_use_bytes(), 0);
         });
     }
 

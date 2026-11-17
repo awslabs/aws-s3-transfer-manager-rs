@@ -11,6 +11,10 @@ readme = "README.md"
 categories = ["asynchronous", "concurrency"]
 keywords = ["aws", "smithy", "runtime", "execution"]
 
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 [dependencies]
 aws-smithy-topology = { version = "0.1.0", path = "../aws-smithy-topology" }
 dial9 = { version = "0.5.3", default-features = false, features = ["tokio"], optional = true }

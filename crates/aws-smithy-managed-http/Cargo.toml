@@ -12,7 +12,8 @@ categories = ["asynchronous", "network-programming"]
 keywords = ["aws", "smithy", "http", "https"]
 
 [package.metadata.docs.rs]
-features = ["client"]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 aws-smithy-execution = { version = "0.1.0", path = "../aws-smithy-execution", optional = true }

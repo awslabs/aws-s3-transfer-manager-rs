@@ -784,11 +784,11 @@ mod test {
             assert_eq!(expected, actual);
         }
         assert_eq!(
-            pool.metrics().charged_capacity_bytes(),
+            pool.metrics().in_use_bytes(),
             (parts.len() * pool.carrier_size()) as u64
         );
         drop(parts);
-        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_eq!(pool.metrics().in_use_bytes(), 0);
     }
 
     #[cfg_attr(miri, ignore)]
@@ -843,16 +843,13 @@ mod test {
         };
         let part = future.await.unwrap().unwrap();
         assert_eq!(part.data.len(), part_size);
-        assert_eq!(
-            pool.metrics().charged_capacity_bytes(),
-            (carrier_size * 3) as u64
-        );
+        assert_eq!(pool.metrics().in_use_bytes(), (carrier_size * 3) as u64);
 
         let segments = part.data.into_segments();
         assert_eq!(segments.len(), 1);
         assert_eq!(segments[0].as_ref(), data);
         drop(segments);
-        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_eq!(pool.metrics().in_use_bytes(), 0);
     }
 
     #[cfg_attr(miri, ignore)]
@@ -860,7 +857,7 @@ mod test {
     async fn dropping_file_read_waiting_for_admission_cancels_its_request() {
         let pool = test_pool();
         let carrier_size = pool.carrier_size();
-        let capacity = pool.metrics().configured_capacity_bytes() as usize;
+        let capacity = pool.metrics().capacity_bytes() as usize;
         let reservation = pool.try_reserve(capacity).unwrap().unwrap();
         let holder = pool.acquire(&reservation, capacity).unwrap();
         let mut tmp = NamedTempFile::new().unwrap();
@@ -882,13 +879,13 @@ mod test {
         let waker = Waker::noop();
         let mut cx = Context::from_waker(waker);
         assert!(Pin::new(&mut future).poll(&mut cx).is_pending());
-        assert_eq!(pool.metrics().queued_reservations(), 1);
+        assert_eq!(pool.metrics().waiting_requests(), 1);
 
         drop(future);
-        assert_eq!(pool.metrics().queued_reservations(), 0);
+        assert_eq!(pool.metrics().waiting_requests(), 0);
         drop(holder);
         drop(reservation);
-        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_eq!(pool.metrics().in_use_bytes(), 0);
     }
 
     #[cfg_attr(miri, ignore)]
@@ -918,7 +915,7 @@ mod test {
 
         assert!(future.await.is_err());
         assert_eq!(pool.metrics().active_planned_demand_bytes(), 0);
-        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_eq!(pool.metrics().in_use_bytes(), 0);
     }
 
     #[derive(Debug)]

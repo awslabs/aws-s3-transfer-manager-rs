@@ -12,6 +12,12 @@ A high performance Amazon S3 transfer manager for Rust.
 categories = ["asynchronous", "concurrency"]
 keywords = ["AWS", "Amazon", "S3", "high-performance", "transfer-manager"]
 
+# Not `all-features`: `__unstable_ext` is a version-coupled hook whose entry point is the extension
+# crate.
+[package.metadata.docs.rs]
+features = ["sdk-v1"]
+rustdoc-args = ["--cfg", "docsrs"]
+
 [dependencies]
 aws-config = { workspace = true }
 aws-sdk-s3 = { workspace = true }
@@ -130,11 +136,15 @@ loom = { version = "0.7", features = ["checkpoint"] }
 [target.'cfg(not(target_env = "msvc"))'.dev-dependencies]
 jemallocator = "0.5.4"
 
-# The `cp` example's dial9 tracing: build with RUSTFLAGS="--cfg s3_tm_dial9 ...". Path-only so
-# publishing drops it (the extension crate depends on this crate).
+# The `cp` example adopts a runtime it builds. Path-only so publishing drops it (the extension
+# crate depends on this crate). Excluded on wasm, where `__unstable_ext` does not compile.
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
+aws-sdk-s3-transfer-manager-ext = { path = "../crates/aws-sdk-s3-transfer-manager-ext" }
+
+# The `cp` example's dial9 tracing: build with RUSTFLAGS="--cfg s3_tm_dial9 ...".
 [target.'cfg(s3_tm_dial9)'.dev-dependencies]
 aws-sdk-s3-transfer-manager-ext = { path = "../crates/aws-sdk-s3-transfer-manager-ext", features = ["dial9"] }
 dial9 = { version = "0.5", features = ["tokio", "cpu-profiling"] }
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(e2e_test)', 'cfg(s3_tm_loom)', 'cfg(s3_tm_asan)', 'cfg(s3_tm_fuzz)', 'cfg(s3_tm_tsan)', 'cfg(s3_tm_out_of_tree)', 'cfg(s3_tm_dial9)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(e2e_test)', 'cfg(s3_tm_loom)', 'cfg(s3_tm_asan)', 'cfg(s3_tm_fuzz)', 'cfg(s3_tm_bench)', 'cfg(s3_tm_tsan)', 'cfg(s3_tm_out_of_tree)', 'cfg(s3_tm_dial9)'] }
