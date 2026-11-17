@@ -202,7 +202,6 @@ dependencies = [
  "aws-types",
  "bytes",
  "bytes-utils",
- "crc-fast",
  "crossbeam-skiplist",
  "crossbeam-utils",
  "fastrand",

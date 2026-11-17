@@ -10,6 +10,8 @@
 //! Retained intervals are disjoint and nonadjacent. Invalid evidence clears them
 //! and latches a failure that subsequent records cannot repair.
 
+mod combine;
+
 use std::collections::BTreeMap;
 use std::ops::Bound::{Excluded, Unbounded};
 
@@ -62,14 +64,17 @@ impl CrcAlgorithm {
     ///
     /// Both inputs are finalized CRCs under this algorithm; `right_len` is a byte
     /// count, not an absolute object offset. Inputs need no matching range size.
-    /// The SDK's checksum API exposes hashing but no finalized-CRC combination.
+    /// The SDK's checksum API exposes hashing but no finalized-CRC combination;
+    /// [`combine`] costs one multiplication modulo the polynomial per nonzero
+    /// hexadecimal digit of `right_len`, at most 16, and is called with the transfer's
+    /// state lock held.
     fn combine(self, left: u64, right: u64, right_len: u64) -> u64 {
-        let algorithm = match self {
-            Self::Crc32 => crc_fast::CrcAlgorithm::Crc32IsoHdlc,
-            Self::Crc32c => crc_fast::CrcAlgorithm::Crc32Iscsi,
-            Self::Crc64Nvme => crc_fast::CrcAlgorithm::Crc64Nvme,
+        let combiner = match self {
+            Self::Crc32 => &combine::CRC32,
+            Self::Crc32c => &combine::CRC32C,
+            Self::Crc64Nvme => &combine::CRC64_NVME,
         };
-        crc_fast::checksum_combine(algorithm, left, right, right_len)
+        combiner.combine(left, right, right_len)
     }
 
     /// Encodes a finalized CRC as big-endian bytes, matching the SDK's CRC finalizers.
