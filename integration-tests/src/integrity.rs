@@ -727,7 +727,15 @@ async fn file_download_round_trips_real_express() {
 
 /// Number of aligned parts for the multi-chunk file tests. 64 * 5 MiB = 320 MiB,
 /// enough to coalesce and flush across dozens of slots.
-const MANY_PARTS: usize = 64;
+///
+/// On 32-bit targets, 16 parts (80 MiB). The in-memory mock holds an upload's parts
+/// and then one contiguous copy of the object, which a 32-bit address space shared
+/// with the other tests can't reliably provide at 320 MiB.
+const MANY_PARTS: usize = if cfg!(target_pointer_width = "32") {
+    16
+} else {
+    64
+};
 
 fn many_part_len() -> usize {
     MANY_PARTS * ByteSize::mib(5).as_usize()

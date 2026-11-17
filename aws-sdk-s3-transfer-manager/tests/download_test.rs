@@ -210,16 +210,13 @@ async fn test_object_meta_after_discovery_failure() {
 /// bytes.
 ///
 /// HEAD reports the object's metadata. The first GET, which must request a range
-/// starting at byte 0, is answered from `first_range`. Every later GET stays in
+/// starting at byte 0, is answered with `first_range`. Every later GET stays in
 /// flight until its future is dropped; each one adds a permit to
 /// `parked_started` when it begins.
-///
-/// The first GET is a range request that can run alongside a parked one, so its
-/// body is built before the download starts: generating it in `call()` would
-/// occupy a runtime worker that `abort()` waits for.
 #[derive(Debug)]
 struct ParkAfterFirstGetConnector {
     total: usize,
+    /// The first GET's body, built before the download so `call()` does no work.
     first_range: Bytes,
     requests: Arc<AtomicUsize>,
     parked_started: Arc<Semaphore>,
@@ -322,7 +319,11 @@ async fn abort_download_with_executing_gets(runtime_config: RuntimeConfig) {
         .expect("start semaphore closed")
         .forget();
 
-    tokio::time::timeout(Duration::from_secs(1), handle.abort())
+    // The first range GET can still be collecting its body alongside the parked
+    // one, and the managed runtime's abort() waits for it. Under the thread
+    // sanitizer that collection alone can take more than a second.
+    let abort_limit = Duration::from_secs(if cfg!(s3_tm_tsan) { 10 } else { 1 });
+    tokio::time::timeout(abort_limit, handle.abort())
         .await
         .expect("abort hung while a ranged GET was executing");
 
